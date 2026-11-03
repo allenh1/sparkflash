@@ -59,6 +59,18 @@ pub fn embedded_prefill_cubin() -> &'static [u8] {
     PREFILL_CUBIN
 }
 
+/// GLM-5.3-Flash's bulk prefill cubin (block-scaled FP8 dense GEMM and routed experts).
+#[cfg(sparkflash_qwen4_cubin)]
+const GLM_PREFILL_CUBIN: &[u8] = include_bytes!(env!("SPARKFLASH_GLM_PREFILL_CUBIN"));
+#[cfg(not(sparkflash_qwen4_cubin))]
+const GLM_PREFILL_CUBIN: &[u8] = &[];
+
+/// The GLM bulk prefill cubin this build embeds.
+#[must_use]
+pub fn embedded_glm_prefill_cubin() -> &'static [u8] {
+    GLM_PREFILL_CUBIN
+}
+
 /// Tokens per layer-major prefill chunk, unless `SPARKFLASH_QWEN4_PREFILL_CHUNK` says otherwise.
 ///
 /// The routed experts are 1.26 GB of NVFP4 a layer and a chunk reads each expert it routes to
@@ -97,13 +109,34 @@ const MOE_GATE_UP_COLUMNS: usize = 64;
 const MOE_DOWN_COLUMNS: usize = 128;
 /// K per pipeline stage (Q4P_BK): four 16-column E4M3 scale groups.
 const MOE_K_STAGE: usize = 64;
-/// The key and value head widths the scan is compiled for (Q4P_GDN_KEY, Q4P_GDN_VALUE).
-const GDN_KEY: usize = 128;
-const GDN_VALUE: usize = 128;
+/// The key head width the scan is compiled for (Q4P_GDN_KEY).
+pub const GDN_KEY: usize = 128;
+/// The value head width the scan is compiled for (Q4P_GDN_VALUE).
+pub const GDN_VALUE: usize = 128;
 /// Floats per staged (token, key head): q then k, padded (Q4P_GDN_ROW).
-const GDN_QK_ROW: usize = 288;
+pub const GDN_QK_ROW: usize = 288;
+/// Blocks the scan aims for: one an SM on GB10's forty-eight.
+const GDN_SCAN_TARGET_BLOCKS: usize = 48;
+/// The most a head's value columns split: eight columns, one warp, a block.
+const GDN_SCAN_MAX_SPLITS: usize = 16;
+
+/// q4p_gdn_scan's and q4p_kda_scan's grid and block width for `heads` heads: the fewest
+/// power-of-two splits of a head's value columns that give every SM a block, each split
+/// 4 * GDN_VALUE / splits threads. A value column's recurrence reads no other column, so any
+/// split computes the same bits; a rank holding eight heads (TP=4) would otherwise run the scan
+/// on eight of the forty-eight SMs.
+pub fn gdn_scan_shape(heads: usize) -> ((u32, u32, u32), u32) {
+    let mut splits = 1;
+    while heads * splits < GDN_SCAN_TARGET_BLOCKS && splits < GDN_SCAN_MAX_SPLITS {
+        splits *= 2;
+    }
+    (
+        (heads as u32, splits as u32, 1),
+        (4 * GDN_VALUE / splits) as u32,
+    )
+}
 /// The conv history q4p_gdn_conv_state carries in registers (Q4P_CONV_HISTORY).
-const CONV_HISTORY: usize = 8;
+pub const CONV_HISTORY: usize = 8;
 /// The dense MMA's token and column tile (OM_BM, OM_BN).
 const DENSE_TILE: usize = 128;
 /// CTAs a split dense MMA aims for: two per SM on GB10's forty-eight.
@@ -622,10 +655,11 @@ impl DeviceSequence {
                 groups as u64,
             ],
         )?;
+        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
         self.launch(
             kernels.gdn_scan,
-            (heads as u32, 1, 1),
-            ((4 * GDN_VALUE) as u32, 1, 1),
+            scan_grid,
+            (scan_threads, 1, 1),
             &[
                 scratch.gdn_qk.0,
                 scratch.gdn_decay_beta.0,

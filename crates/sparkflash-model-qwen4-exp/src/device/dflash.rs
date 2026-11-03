@@ -784,6 +784,7 @@ impl GpuDflash2 {
         scratch: &DraftScratch,
         index: usize,
         (streams, hc): (Deviceptr, usize),
+        first: usize,
         rows: usize,
     ) -> Result<(), BackendError> {
         let config = &self.config;
@@ -796,8 +797,11 @@ impl GpuDflash2 {
             (hidden.div_ceil(256) as u32, rows as u32, 1),
             (256, 1, 1),
             &[
-                streams.0,
-                scratch.features.0,
+                streams.offset(first * hc * hidden * 4).0,
+                scratch
+                    .features
+                    .offset(first * config.feature_width() * 4)
+                    .0,
                 hidden as u64,
                 hc as u64,
                 config.feature_width() as u64,
@@ -1398,7 +1402,29 @@ impl DeviceSequence {
             return Ok(());
         }
         let streams = (self.hyper, self.backend.config.hc_count);
-        draft.capture(self, scratch, index, streams, batch)
+        let (first, rows) = self.own_rows.unwrap_or((0, batch));
+        draft.capture(self, scratch, index, streams, first, rows)
+    }
+
+    /// Every rank's captured rows of a sequence-parallel forward ([Self::own_rows]) gathered into
+    /// its peers' rows, so the drafter's context path reads the whole chunk on every rank.
+    pub(super) fn gather_features(&self) -> Result<(), BackendError> {
+        let (Some(draft), Some(scratch), Some((first, count))) = (
+            self.backend.dflash.as_ref(),
+            self.draft.as_ref(),
+            self.own_rows,
+        ) else {
+            return Ok(());
+        };
+        if !self.spec_enabled {
+            return Ok(());
+        }
+        let row = draft.config.feature_width() * 4;
+        self.gather_rows(
+            scratch.features.offset(self.window * row),
+            scratch.features.offset(first * row),
+            count * row,
+        )
     }
 
     /// Commit `rows` captured rows of the last forward, from row `first_row` on, which sit at

@@ -221,6 +221,11 @@ impl Kernel {
         self.shared_bytes
     }
 
+    /// The canonical cubin pin name, so a failed launch can say which kernel it was.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// The raw function word and pin name, for a crate-internal dispatch table that must be
     /// `Sync` (a raw CUfunction is not).
     pub(crate) fn to_raw(self) -> (u64, &'static str) {
@@ -4324,17 +4329,40 @@ impl Cuda {
     /// The driver's cuCtxGetStreamPriorityRange, cuStreamCreateWithPriority or cuEventCreate
     /// failure code.
     pub fn side_stream_urgent(&self) -> Result<SideStream, String> {
+        let stream = self.urgent_stream()?;
+        let event_create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+            self.sym(b"cuEventCreate")?;
+        let mut event: CuEvent = std::ptr::null_mut();
+        // SAFETY: the symbol belongs to this context's library and the out-pointer is valid for
+        // the call; the flag is the documented disable-timing flag.
+        let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
+        if r != 0 {
+            return Err(format!("cuEventCreate for the side stream failed: {r}"));
+        }
+        Ok(SideStream { stream, event })
+    }
+
+    /// [Self::run_stream] at the context's greatest stream priority, for a stream that carries a
+    /// forward's collectives while another stream computes ([Self::side_stream_urgent]).
+    ///
+    /// # Errors
+    /// The driver's cuCtxGetStreamPriorityRange or cuStreamCreateWithPriority failure code.
+    pub fn run_stream_urgent(&self) -> Result<RunStream, String> {
+        Ok(RunStream {
+            stream: self.urgent_stream()?,
+        })
+    }
+
+    /// A non-blocking stream at the context's greatest stream priority.
+    fn urgent_stream(&self) -> Result<CuStream, String> {
         let range: libloading::Symbol<unsafe extern "C" fn(*mut i32, *mut i32) -> CuResult> =
             self.sym(b"cuCtxGetStreamPriorityRange")?;
         let create: libloading::Symbol<unsafe extern "C" fn(*mut CuStream, u32, i32) -> CuResult> =
             self.sym(b"cuStreamCreateWithPriority")?;
-        let event_create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
-            self.sym(b"cuEventCreate")?;
         let (mut least, mut greatest) = (0i32, 0i32);
         let mut stream: CuStream = std::ptr::null_mut();
-        let mut event: CuEvent = std::ptr::null_mut();
         // SAFETY: the symbols belong to this context's library and the out-pointers are valid for
-        // the calls; the flags are the documented non-blocking and disable-timing flags.
+        // the calls; the flag is the documented non-blocking flag.
         let r = unsafe { range(&mut least, &mut greatest) };
         if r != 0 {
             return Err(format!("cuCtxGetStreamPriorityRange failed: {r}"));
@@ -4343,11 +4371,7 @@ impl Cuda {
         if r != 0 {
             return Err(format!("cuStreamCreateWithPriority failed: {r}"));
         }
-        let r = unsafe { event_create(&mut event, CU_EVENT_DISABLE_TIMING) };
-        if r != 0 {
-            return Err(format!("cuEventCreate for the side stream failed: {r}"));
-        }
-        Ok(SideStream { stream, event })
+        Ok(stream)
     }
 
     /// Creates a [StreamEvent] (timing disabled).

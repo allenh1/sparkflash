@@ -94,9 +94,11 @@ use sparkflash_kernels::cuda_driver::{
 };
 use sparkflash_model::{BackendError, StepCost};
 use sparkflash_model_qwen4_exp::device::{
-    DraftDevice, DraftScratch, GEMV_MAX_BATCH, GpuDflash2, GpuMat, GpuMatE4m3, MAX_BUDGET_BLOCKS,
-    MAX_SELECTED_TOKENS, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS, TILED_GEMV_ROUND, cubin_available,
-    embedded_cubin, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
+    CONV_HISTORY, DraftDevice, DraftScratch, GDN_KEY, GDN_QK_ROW, GDN_VALUE, GEMV_MAX_BATCH,
+    GpuDflash2, GpuMat, GpuMatE4m3, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS, TILED_GEMV_BLOCKS,
+    TILED_GEMV_PARTIALS, TILED_GEMV_ROUND, cubin_available, embedded_cubin,
+    embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape, gemv_e4m3, reduce_two_shot,
+    splits_two_shot, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
 use sparkflash_weights::linalg::{ScaleGrid, argmax};
 use sparkflash_weights::mhc::HcGeometry;
@@ -123,8 +125,60 @@ pub enum LatentCache {
     Fp8,
 }
 
+/// How the bulk prefill's GEMMs take their f32 activations (SPARKFLASH_GLM_PREFILL_ACTIVATION).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillActivation {
+    /// `fp8`, the default for a release whose projections quantise their activations: an FP8
+    /// weight's input as the release's dynamic E4M3 codes (per 128 columns, as the decode GEMV
+    /// quantises it) into an E4M3 x E4M3 MMA, and a BF16 weight's as [Self::Split].
+    Fp8,
+    /// `split`, the default otherwise: each activation as a bf16 head and remainder, two MMA
+    /// chains a stage.
+    Split,
+    /// `bf16`: the bf16 head alone, one chain.
+    Bf16,
+}
+
+impl PrefillActivation {
+    fn from_env(config: &Glm5NextConfig) -> Result<Self, BackendError> {
+        match std::env::var("SPARKFLASH_GLM_PREFILL_ACTIVATION") {
+            Err(std::env::VarError::NotPresent) => Ok(if config.dynamic_activations {
+                Self::Fp8
+            } else {
+                Self::Split
+            }),
+            Ok(value) => match value.as_str() {
+                "fp8" if config.dynamic_activations => Ok(Self::Fp8),
+                "fp8" => Err(refusal(
+                    "SPARKFLASH_GLM_PREFILL_ACTIVATION=fp8 quantises activations this release \
+                     does not; take split or bf16",
+                )),
+                "split" => Ok(Self::Split),
+                "bf16" => Ok(Self::Bf16),
+                other => Err(refusal(format!(
+                    "SPARKFLASH_GLM_PREFILL_ACTIVATION={other} is none of fp8, split and bf16"
+                ))),
+            },
+            Err(error) => Err(refusal(format!(
+                "SPARKFLASH_GLM_PREFILL_ACTIVATION is not readable: {error}"
+            ))),
+        }
+    }
+}
+
 /// The most rows one step carries: the tiled GEMVs' batch.
 pub const MAX_ROWS: usize = GEMV_MAX_BATCH;
+
+/// The default bulk prefill chunk. A chunk of more than eight rows reads every weight once for
+/// the chunk instead of once for eight rows, and 4,096 is the widest measured: about 315 tok/s at a
+/// 6.1k-token prompt against 205 at 512 rows, at about 8 GiB of chunk scratch (the per-layer
+/// buffers shared, no verify windows) beside the 78 GB of weights and the 1M window. 8,192 rows
+/// does not load, so 4,096 is also the cap.
+pub const DEFAULT_PREFILL_ROWS: usize = 4096;
+/// The narrowest bulk chunk: below this the token GEMVs remain the prefill path.
+pub const MIN_PREFILL_ROWS: usize = 16;
+/// The widest chunk the scratch is sized for at the default context.
+pub const MAX_PREFILL_ROWS: usize = 4096;
 
 /// The modelled wall of a block-drafted round at TP=4 on four GB10-class nodes that verifies
 /// `depth` drafts (ms), for [DepthPolicy](sparkflash_model::DepthPolicy): the drafter's block and
@@ -139,6 +193,12 @@ pub const DFLASH2_STEP_COST: StepCost = StepCost {
 
 /// The side of a block-scaled FP8 tile the kernels read (Q4E_FP8_BLOCK).
 const FP8_BLOCK: usize = 128;
+/// The dynamic shared memory of the bulk prefill's E4M3 x E4M3 GEMMs (GLM_Q8_SHARED): their
+/// cp.async stages and a column tile's weight scales.
+const Q8_SHARED: u32 = 68_608;
+/// The widest inner those GEMMs take (GLM_Q8_BLOCKS 128-column blocks): the kernel holds a column
+/// tile's weight scales in shared memory and does nothing for a wider one.
+const Q8_MAX_INNER: usize = 128 * FP8_BLOCK;
 /// Threads in a block of every kernel the arm launches (Q4E_BLOCK and Q4E_TG_THREADS), but the
 /// recurrence's and the router's one warp and the argmax's [ARGMAX_BLOCK]. The routed GEMV holds
 /// a step's picks a thread each.
@@ -152,10 +212,36 @@ const RECUR_THREADS: u32 = 128;
 /// own chain, so the head's state streams through that many SMs with the whole head's bits.
 const RECUR_PARTS: usize = 4;
 const TILE_ROWS: usize = 32;
+/// The most rows one grouped tiled GEMV launch takes ([DeviceRank::gemv_small]): that many over
+/// [MAX_ROWS] groups, each with its own split partials and tile counters in the scratch.
+const GEMV_GROUP_ROWS: usize = 512;
+const GEMV_GROUPS: usize = GEMV_GROUP_ROWS / MAX_ROWS;
 /// The most (copy, row) pairs of an `fn` projection q4e_mhc_post works out: Q4E_MHC_PAIRS a warp.
 const MHC_FUSED_PAIRS: usize = 8 * 12;
 /// Pools a block of q4e_glm_index_scores scores (Q4E_QSA_TILE).
 const SCORE_TILE: usize = 64;
+/// glm_prefill_mla_attend's geometry (GMA_HEADS, GMA_LATENT): a rank's heads as one MMA's M, over
+/// the latent's four 128-column scale blocks.
+const GMA_HEADS: usize = 16;
+const GMA_LATENT: usize = 512;
+/// The decode attention's bounds (qwen4_exp_sm121.cu's Q4E_GLM_MLA_HEADS and
+/// Q4E_GLM_MAX_LATENT): a rank's heads q4e_glm_mla_scores stages, over the widest latent.
+const MLA_HEADS: usize = 16;
+const MLA_MAX_LATENT: usize = 512;
+/// q4e_glm_mla_scores' positions a block, q4e_glm_mla_mix's heads a block and
+/// q4e_glm_mla_project's value columns a block.
+const MLA_SCORE_SLOTS: usize = 64;
+const MLA_MIX_HEADS: usize = 8;
+const MLA_PROJECT_THREADS: u32 = 64;
+/// A routed-expert item's rows (glm_prefill_sm121.cu's GLM_MOE_ROWS): one expert's slots, one
+/// 128-row MMA tile.
+const MOE_ITEM_ROWS: usize = 128;
+
+/// The most items `slots` routed slots over `experts` experts lay out: every expert's last item
+/// may be partial.
+fn moe_items(slots: usize, experts: usize) -> usize {
+    slots.div_ceil(MOE_ITEM_ROWS) + experts.min(slots) + 1
+}
 /// The bounds of the kernels' shared buffers: Q4E_MAX_EXPERTS, Q4E_MAX_TOPK, Q4E_MHC_MAX_HC,
 /// Q4E_GLM_MAX_POOL, Q4E_GLM_MAX_INDEX_HEADS and Q4E_GLM_MAX_INDEX_DIM, and q4e_attn's head width.
 const MAX_EXPERTS: usize = 512;
@@ -171,6 +257,20 @@ const MAX_ATTENTION_HEAD_DIM: usize = 256;
 
 fn cuda_error(error: String) -> BackendError {
     BackendError::new("glm5_device", format!("CUDA: {error}"))
+}
+
+/// Refuses an inner wider than the bulk E4M3 x E4M3 GEMMs take ([Q8_MAX_INNER]).
+fn q8_inner(columns: usize) -> Result<(), BackendError> {
+    if columns > Q8_MAX_INNER {
+        return Err(BackendError::new(
+            "glm5_device",
+            format!(
+                "an FP8-activation prefill GEMM over {columns} columns is wider than its \
+                 {Q8_MAX_INNER}; SPARKFLASH_GLM_PREFILL_ACTIVATION=split takes it"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The CUDA context a rank and its sequences share, owned so a rank outlives the call that opened
@@ -297,27 +397,69 @@ struct Kernels {
     expert_fp8: Kernel,
     mhc_in: Kernel,
     mhc_post: Kernel,
+    sum_slots: Kernel,
     rmsnorm: Kernel,
     rmsnorm_rows: Kernel,
     conv: Kernel,
     kda_decay: Kernel,
     recur: Kernel,
+    /// A bulk chunk's convolution and recurrence (Qwen's prefill image,
+    /// kernels/qwen4_prefill_sm121.cu): the convolution a thread an output, then the history
+    /// advanced, the token kernel's products in its order; the rows' normed q and k and beta,
+    /// the scan with the state in registers, and the gated norm. The token kernels ([Self::conv],
+    /// [Self::recur]) stay the decode and verify path, whose bits a replay is defined by.
+    conv_rows: Kernel,
+    conv_history: Kernel,
+    kda_prep: Kernel,
+    kda_scan: Kernel,
+    kda_gate: Kernel,
     copy_flat: Kernel,
     layer_norm: Kernel,
     pool: Kernel,
     index_scores: Kernel,
     pick: Kernel,
     /// The absorbed MLA ([DeviceRank::dsa_attend]): the latent cache writer, the query's
-    /// projection into the latent space, and attention with the value projection.
+    /// projection into the latent space, then the attention's logits, softmax, weighted latent
+    /// and value projection.
     mla_cache: Kernel,
     mla_cache_fp8: Kernel,
     mla_absorb: Kernel,
-    mla_attend: Kernel,
+    mla_scores: Kernel,
+    mla_softmax: Kernel,
+    mla_mix: Kernel,
+    mla_project: Kernel,
     swiglu: Kernel,
     router: Kernel,
     combine: Kernel,
     fold: Kernel,
     prefetch_l2: Kernel,
+    /// The bulk prefill image (kernels/glm_prefill_sm121.cu): dense block-scaled FP8 and BF16
+    /// GEMMs, the padded routed-expert plan, and its gather/SwiGLU/scatter.
+    prefill_dense_bf16: Kernel,
+    prefill_dense_fp8: Kernel,
+    /// The same two GEMMs over the bf16 head of each activation alone, and the routed one.
+    prefill_dense_bf16_bf16a: Kernel,
+    prefill_dense_fp8_bf16a: Kernel,
+    prefill_moe_mma_bf16a: Kernel,
+    prefill_moe_plan: Kernel,
+    prefill_moe_mma: Kernel,
+    prefill_moe_swiglu: Kernel,
+    /// The checkpoint's dynamic activation scheme ([PrefillActivation::Fp8]): rows quantised per
+    /// 128 columns, the SwiGLU into the down projection's codes, and the E4M3 x E4M3 dense and
+    /// routed GEMMs over them.
+    prefill_quantise: Kernel,
+    prefill_moe_swiglu_q8: Kernel,
+    prefill_dense_q8: Kernel,
+    prefill_moe_q8: Kernel,
+    /// A BF16 part of at most 8 (i + 1) rows ([DeviceRank::bulk_gemm]'s mixers and gates).
+    prefill_skinny: [Kernel; 4],
+    /// The chunk's MLA ([DeviceRank::bulk_attend]): the tensor-core sparse attention over the
+    /// E4M3 latent (and over its bf16 heads alone), and the per-head GEMM of the absorbed query
+    /// and the value projection.
+    prefill_mla_attend: Kernel,
+    prefill_mla_attend_bf16a: Kernel,
+    prefill_heads_bf16: Kernel,
+    prefill_heads_fp8: Kernel,
 }
 
 // SAFETY: a kernel is an immutable function handle loaded from the cubin. Every launch goes
@@ -329,6 +471,24 @@ impl Kernels {
     fn load(cuda: &Cuda, head_dim: usize) -> Result<Self, String> {
         let named = |name| {
             cuda.load_named(embedded_cubin(), name)
+                .map(|(_, kernel)| kernel)
+        };
+        if embedded_glm_prefill_cubin().is_empty() {
+            return Err("this build embeds no GLM bulk prefill cubin".to_owned());
+        }
+        let prefill = |name| {
+            cuda.load_named(embedded_glm_prefill_cubin(), name)
+                .map(|(_, kernel)| kernel)
+        };
+        let prefill_q8 = |name| {
+            cuda.load_named_shared(embedded_glm_prefill_cubin(), name, Q8_SHARED)
+                .map(|(_, kernel)| kernel)
+        };
+        if embedded_prefill_cubin().is_empty() {
+            return Err("this build embeds no prefill cubin for the bulk KDA scan".to_owned());
+        }
+        let scan = |name| {
+            cuda.load_named(embedded_prefill_cubin(), name)
                 .map(|(_, kernel)| kernel)
         };
         // The recurrence stages a block's slice of a head's state in shared memory.
@@ -347,11 +507,17 @@ impl Kernels {
             expert_fp8: named("q4e_expert_gemv_e4m3_block")?,
             mhc_in: named("q4e_mhc_in")?,
             mhc_post: named("q4e_mhc_post")?,
+            sum_slots: named("q4e_sum_slots")?,
             rmsnorm: named("q4e_rmsnorm")?,
             rmsnorm_rows: named("q4e_rmsnorm_rows")?,
             conv: named("q4e_gdn_conv")?,
             kda_decay: named("q4e_kda_decay")?,
             recur,
+            conv_rows: scan("q4p_gdn_conv")?,
+            conv_history: scan("q4p_gdn_conv_state")?,
+            kda_prep: scan("q4p_kda_prep")?,
+            kda_scan: scan("q4p_kda_scan")?,
+            kda_gate: scan("q4p_gdn_gate")?,
             copy_flat: named("q4e_copy_flat")?,
             layer_norm: named("q4e_layer_norm")?,
             pool: named("q4e_glm_pool")?,
@@ -360,12 +526,37 @@ impl Kernels {
             mla_cache: named("q4e_glm_mla_cache")?,
             mla_cache_fp8: named("q4e_glm_mla_cache_fp8")?,
             mla_absorb: named("q4e_glm_mla_absorb")?,
-            mla_attend: named("q4e_glm_mla_attend")?,
+            mla_scores: named("q4e_glm_mla_scores")?,
+            mla_softmax: named("q4e_glm_mla_softmax")?,
+            mla_mix: named("q4e_glm_mla_mix")?,
+            mla_project: named("q4e_glm_mla_project")?,
             swiglu: named("q4e_swiglu_limited")?,
             router: named("q4e_noaux_router")?,
             combine: named("q4e_moe_combine")?,
             prefetch_l2: named("q4e_prefetch_l2")?,
             fold: named("q4e_fold_streams")?,
+            prefill_dense_bf16: prefill("glm_prefill_bf16_mma")?,
+            prefill_dense_fp8: prefill("glm_prefill_fp8b128_mma")?,
+            prefill_dense_bf16_bf16a: prefill("glm_prefill_bf16_mma_bf16a")?,
+            prefill_dense_fp8_bf16a: prefill("glm_prefill_fp8b128_mma_bf16a")?,
+            prefill_moe_mma_bf16a: prefill("glm_moe_fp8b128_mma_bf16a")?,
+            prefill_moe_plan: prefill("glm_moe_plan")?,
+            prefill_moe_mma: prefill("glm_moe_fp8b128_mma")?,
+            prefill_moe_swiglu: prefill("glm_moe_swiglu")?,
+            prefill_quantise: prefill("glm_quantise_rows")?,
+            prefill_moe_swiglu_q8: prefill("glm_moe_swiglu_q8")?,
+            prefill_dense_q8: prefill_q8("glm_prefill_q8_mma")?,
+            prefill_moe_q8: prefill_q8("glm_moe_q8_mma")?,
+            prefill_skinny: [
+                prefill("glm_prefill_skinny_bf16_1")?,
+                prefill("glm_prefill_skinny_bf16_2")?,
+                prefill("glm_prefill_skinny_bf16_3")?,
+                prefill("glm_prefill_skinny_bf16_4")?,
+            ],
+            prefill_mla_attend: prefill("glm_prefill_mla_attend")?,
+            prefill_mla_attend_bf16a: prefill("glm_prefill_mla_attend_bf16a")?,
+            prefill_heads_bf16: prefill("glm_prefill_heads_bf16_mma")?,
+            prefill_heads_fp8: prefill("glm_prefill_heads_fp8b128_mma")?,
         })
     }
 }
@@ -387,6 +578,9 @@ fn recur_parts(head: usize) -> usize {
 /// A rank's copy is 16.8 MB at the release's geometry, against the 82 GB rank. Dequantising once
 /// at load keeps every attention step a plain f32 dot product, and the cached latent carries the
 /// release's activation quantisation, so the products are the expansion's own.
+///
+/// A BF16 kv_b also uploads its key rows transposed as BF16, `[head][kv_lora][nope]`, the B operand
+/// the bulk prefill's per-head absorption GEMM reads (a widened BF16 weight narrows back exactly).
 fn absorb_kv_b(
     cuda: &Cuda,
     stream: &RunStream,
@@ -394,7 +588,7 @@ fn absorb_kv_b(
     linear: &DeviceLinear,
     nope: usize,
     value: usize,
-) -> Result<Deviceptr, BackendError> {
+) -> Result<(Deviceptr, Option<Deviceptr>), BackendError> {
     let (rows, columns) = (linear.rows, linear.columns);
     let per_head = nope + value;
     if per_head == 0 || !rows.is_multiple_of(per_head) {
@@ -404,6 +598,11 @@ fn absorb_kv_b(
     }
     let widened = dequantise_kv_b(cuda, linear)?;
     let mut laid = Vec::with_capacity(widened.len() * 4);
+    let mut key_t = Vec::with_capacity(if linear.scales.is_none() {
+        rows / per_head * nope * columns * 2
+    } else {
+        0
+    });
     for head in widened.chunks_exact(per_head * columns) {
         let (keys, values) = head.split_at(nope * columns);
         for weight in keys {
@@ -414,8 +613,20 @@ fn absorb_kv_b(
                 laid.extend_from_slice(&row[column].to_le_bytes());
             }
         }
+        if linear.scales.is_none() {
+            for column in 0..columns {
+                for row in keys.chunks_exact(columns) {
+                    key_t.extend_from_slice(&((row[column].to_bits() >> 16) as u16).to_le_bytes());
+                }
+            }
+        }
     }
-    memory.upload(stream, &laid)
+    let key_t = if key_t.is_empty() {
+        None
+    } else {
+        Some(memory.upload(stream, &key_t)?)
+    };
+    Ok((memory.upload(stream, &laid)?, key_t))
 }
 
 /// kv_b's rows, `[rows][columns]` row-major, as the f32 the absorbed MLA multiplies.
@@ -740,6 +951,10 @@ struct DeviceDsa {
     kv_dequant: Deviceptr,
     /// Whether the latent cache holds the release's quantised activation.
     quantise: bool,
+    /// This rank's BF16 kv_b key rows transposed, `[head][kv_lora][nope]`: the bulk prefill's
+    /// absorption as a per-head GEMM ([DeviceRank::bulk_attend]). Absent for an FP8 kv_b, whose
+    /// chunks absorb on the decode kernel.
+    kv_key_t: Option<Deviceptr>,
     heads: usize,
 }
 
@@ -1227,6 +1442,7 @@ impl<'a, S: WeightSource + ?Sized> Uploader<'a, S> {
             // Derived from `kv_b` once the rank is built ([DeviceRank::absorb_mla]).
             kv_dequant: Deviceptr(0),
             quantise: false,
+            kv_key_t: None,
             heads: heads / self.layout.world_size,
         })
     }
@@ -1331,10 +1547,21 @@ struct Scratch {
     forget: Deviceptr,
     gate: Deviceptr,
     kda_out: Deviceptr,
+    /// A bulk chunk's scan inputs ([DeviceRank::scan]): `[rows][heads][GDN_QK_ROW]` normed q
+    /// and k, padded as the scan stages them, and `[rows][heads]` (unused factor, beta) pairs.
+    /// One float each in a scratch no bulk chunk runs on.
+    kda_qk: Deviceptr,
+    kda_beta: Deviceptr,
     dsa_fused: Deviceptr,
     query: Deviceptr,
     /// `[rows][heads][kv_lora]`: the query projected into the latent space ([DeviceRank::dsa_attend]).
     q_abs: Deviceptr,
+    /// A decode step's attention ([DeviceRank::dsa_attend]): `[rows][heads][MAX_SELECTED_TOKENS]`
+    /// logits, then softmax weights, `[rows][heads]` softmax sums and `[rows][heads][kv_lora]`
+    /// weighted latents, for at most [MAX_ROWS] rows.
+    mla_logits: Deviceptr,
+    mla_total: Deviceptr,
+    mla_mixed: Deviceptr,
     attn_out: Deviceptr,
     index_fused: Deviceptr,
     index_query: Deviceptr,
@@ -1377,6 +1604,21 @@ struct Scratch {
     counters: Deviceptr,
     /// The KDA recurrence's per-head counters, which each launch leaves zeroed.
     recur_counters: Deviceptr,
+    /// The bulk prefill's routed-expert plan and its padded operands: `slot_of` a slot (or -1) a
+    /// padded row, `items` the (expert, .., count, ..) list, and the gate/up and activated rows,
+    /// [MOE_ITEM_ROWS] an item.
+    moe_slot_of: Deviceptr,
+    moe_items: Deviceptr,
+    moe_item_count: Deviceptr,
+    moe_gate_up: Deviceptr,
+    moe_activated: Deviceptr,
+    /// [PrefillActivation::Fp8]'s quantised operands: a projection's input as E4M3 codes and one
+    /// f32 scale a row's 128 columns (up to the streams' width a row), and the routed experts'
+    /// activated rows the same way.
+    q8_codes: Deviceptr,
+    q8_scales: Deviceptr,
+    moe_act_codes: Deviceptr,
+    moe_act_scales: Deviceptr,
 }
 
 /// A KDA layer's activations, its own so they last until the next step: what a speculative
@@ -1416,7 +1658,8 @@ pub struct DeviceSequence {
 /// the sequence's last step, which the next step's first token pairs with.
 struct SequenceDrafter {
     layer: SequenceLayer,
-    /// `[MAX_ROWS][hidden]`.
+    /// `[MAX_ROWS][hidden]`: the last step's last [MAX_ROWS] rows ([DeviceRank::fill]), all a
+    /// later step reads (the row at the last kept position, and a verify keeps at most its rows).
     hidden: Deviceptr,
     /// The row of `hidden` at the last position the sequence keeps; `None` before its first step.
     last: Option<usize>,
@@ -1431,6 +1674,14 @@ struct Pending {
     first: usize,
     rows: usize,
     step_rows: usize,
+}
+
+/// Which rows of a step go through the LM head: all of them, or only the last (a prefill chunk
+/// needs one row's logits, not one a token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadRows {
+    All,
+    Last,
 }
 
 /// What a step hands back for each of its rows.
@@ -1576,6 +1827,17 @@ pub struct DeviceRank {
     /// The DFlash 2 block drafter, once [DeviceRank::load_block_drafter] loads one.
     block: Option<BlockDrafter>,
     scratch: Scratch,
+    /// The bulk prefill's scratch, sized for [DeviceRank::prefill_rows] rows. Swapped in around a
+    /// prefill step so the decode scratch's size does not grow with the chunk.
+    prefill: Option<Scratch>,
+    prefill_rows: usize,
+    /// Whether the router and the indexer's projections keep the token GEMV's bits in bulk
+    /// prefill, so expert choice and selected tokens are the decode path's.
+    exact_prefill: bool,
+    /// How the bulk prefill's GEMMs take their f32 activations.
+    prefill_activation: PrefillActivation,
+    /// The fewest rows a device-leg all-reduce takes in two shots ([Self::reduce_into]).
+    two_shot_rows: usize,
     /// Steps this rank has run: a verify's commit has to come before the next one, which
     /// overwrites the inputs it replays.
     steps: u64,
@@ -1752,15 +2014,39 @@ impl DeviceRank {
         for layer in &mut layers {
             if let DeviceBranch::Sparse(dsa) = &mut layer.branch {
                 dsa.quantise = quantise(dsa);
-                dsa.kv_dequant = absorb_kv_b(&cuda, &stream, &mut memory, &dsa.kv_b, nope, value)?;
+                (dsa.kv_dequant, dsa.kv_key_t) =
+                    absorb_kv_b(&cuda, &stream, &mut memory, &dsa.kv_b, nope, value)?;
             }
         }
         if let Some(mtp) = &mut mtp {
             mtp.dsa.quantise = quantise(&mtp.dsa);
-            mtp.dsa.kv_dequant =
+            (mtp.dsa.kv_dequant, mtp.dsa.kv_key_t) =
                 absorb_kv_b(&cuda, &stream, &mut memory, &mtp.dsa.kv_b, nope, value)?;
         }
-        let scratch = Self::scratch(config, layout, &stream, &mut memory)?;
+        // A chunk's scratch is about 9.6 GiB at 4,096 rows, and there is no point paying it for a
+        // configuration the chunk cannot take (the f32 latent cache, or a shape the bulk MLA does
+        // not serve): SPARKFLASH_GLM_KV_CACHE=f32 at the 1M window loads as it did before the bulk
+        // prefill, and its prompts run the token path.
+        let chunk_shapes = config.kv_lora_rank == GMA_LATENT
+            && config.v_head_dim.is_multiple_of(128)
+            && layers.iter().all(|layer| match &layer.branch {
+                DeviceBranch::Sparse(dsa) => dsa.quantise && dsa.heads == GMA_HEADS,
+                DeviceBranch::Linear(_) => true,
+            });
+        let prefill_rows = Self::prefill_rows_from_env()?.filter(|_| chunk_shapes);
+        let before = memory.bytes;
+        let prefill = prefill_rows
+            .map(|rows| Self::scratch(config, layout, rows, &stream, &mut memory, true))
+            .transpose()?;
+        if let Some(rows) = prefill_rows.filter(|_| prefill.is_some()) {
+            // The chunk scratch beside the weights and the latent window, which is what decides
+            // the widest chunk a node takes: printed so a load that just fits says how close it is.
+            eprintln!(
+                "GLM bulk prefill: {rows} rows a chunk, {:.1} GiB of chunk scratch",
+                (memory.bytes - before) as f64 / (1u64 << 30) as f64
+            );
+        }
+        let scratch = Self::scratch(config, layout, MAX_ROWS, &stream, &mut memory, false)?;
         let prefetch = Prefetch::new(&cuda)?;
         let mut rank = Self {
             cuda,
@@ -1777,6 +2063,11 @@ impl DeviceRank {
             mtp,
             block: None,
             scratch,
+            prefill,
+            prefill_rows: prefill_rows.unwrap_or(MAX_ROWS),
+            exact_prefill: std::env::var("SPARKFLASH_GLM_PREFILL_EXACT").as_deref() != Ok("0"),
+            prefill_activation: PrefillActivation::from_env(config)?,
+            two_shot_rows: sparkflash_weights::tp::two_shot_rows().map_err(weights_error)?,
             steps: 0,
             heads: AtomicU64::new(0),
             prefetch,
@@ -1874,6 +2165,7 @@ impl DeviceRank {
                 MAX_BUDGET_BLOCKS,
             ),
             ("the tokens a query selects", selected, MAX_SELECTED_TOKENS),
+            ("kv_lora_rank", config.kv_lora_rank, MLA_MAX_LATENT),
             (
                 "qk_nope_head_dim",
                 config.qk_nope_head_dim,
@@ -1920,16 +2212,44 @@ impl DeviceRank {
         Ok(())
     }
 
+    /// The bulk prefill chunk `SPARKFLASH_GLM_PREFILL_CHUNK` asks for, or the default; `None` when
+    /// `SPARKFLASH_GLM_PREFILL=0` keeps the token path.
+    fn prefill_rows_from_env() -> Result<Option<usize>, BackendError> {
+        if std::env::var("SPARKFLASH_GLM_PREFILL").as_deref() == Ok("0") {
+            return Ok(None);
+        }
+        let rows = match std::env::var("SPARKFLASH_GLM_PREFILL_CHUNK") {
+            Ok(value) => value.trim().parse::<usize>().map_err(|_| {
+                refusal(format!(
+                    "SPARKFLASH_GLM_PREFILL_CHUNK={value} is not a whole number of rows"
+                ))
+            })?,
+            Err(_) => DEFAULT_PREFILL_ROWS,
+        };
+        if rows < MIN_PREFILL_ROWS {
+            return Ok(None);
+        }
+        Ok(Some(rows.min(MAX_PREFILL_ROWS)))
+    }
+
     /// Floats in one KDA layer's convolution windows on a rank of `width` channels a mix.
     fn window_floats(config: &Glm5NextConfig, width: usize) -> usize {
         config.linear_conv_kernel_dim.saturating_sub(1) * 3 * width
     }
 
+    /// One rank's scratch for `rows` rows. `chunk` sizes it for a bulk prefill chunk: the
+    /// per-layer buffers of a kind are one allocation shared by every layer (a layer's launches
+    /// are ordered on the rank's stream, so no two layers hold one buffer at once), and the KDA
+    /// convolution windows are a placeholder, because a chunk never verifies and only a verify
+    /// keeps windows for a commit to restore. At 4096 rows that is 8.4 GiB instead of 55 GiB of
+    /// per-layer buffers, which is what lets a chunk wider than 2048 rows fit beside the weights.
     fn scratch(
         config: &Glm5NextConfig,
         layout: TpLayout,
+        rows: usize,
         stream: &RunStream,
         memory: &mut Allocations,
+        chunk: bool,
     ) -> Result<Scratch, BackendError> {
         let world = layout.world_size;
         let hidden = config.hidden_size;
@@ -1944,63 +2264,101 @@ impl DeviceRank {
         let intermediate = (config.intermediate_size / world)
             .max(config.moe_intermediate_size * config.n_shared_experts / world);
         let mixes = HcGeometry::from(config).hc_mix_count();
+        let moe_items_max = moe_items(rows * topk, config.n_routed_experts);
+        let moe_rows = moe_items_max * MOE_ITEM_ROWS;
+        // A chunk's grouped GEMVs hold a launch's groups' partials at once.
+        let groups = rows.div_ceil(MAX_ROWS).min(GEMV_GROUPS);
         Ok(Scratch {
-            streams: memory.floats(MAX_ROWS * config.hc_mult * hidden)?,
-            raw: memory.floats(MAX_ROWS * mixes)?,
-            coeffs: memory.floats(MAX_ROWS * mixes)?,
+            streams: memory.floats(rows * config.hc_mult * hidden)?,
+            raw: memory.floats(rows * mixes)?,
+            coeffs: memory.floats(rows * mixes)?,
             mix_parts: memory
-                .floats(MAX_ROWS * (config.hc_mult * hidden).div_ceil(TILED_GEMV_ROUND) * mixes)?,
-            collapsed: memory.floats(MAX_ROWS * hidden)?,
-            partial: memory.floats(MAX_ROWS * hidden)?,
-            slots: memory.floats(world * MAX_ROWS * hidden)?,
-            linear: (0..config.linear_layers())
-                .map(|_| {
+                .floats(rows * (config.hc_mult * hidden).div_ceil(TILED_GEMV_ROUND) * mixes)?,
+            collapsed: memory.floats(rows * hidden)?,
+            partial: memory.floats(rows * hidden)?,
+            slots: memory.floats(world * rows * hidden)?,
+            linear: {
+                let mut one = || {
                     Ok(LinearScratch {
-                        fused: memory.floats(MAX_ROWS * (3 * width + 2 * head + linear_heads))?,
-                        mixed: memory.floats(MAX_ROWS * 3 * width)?,
-                        decay: memory.floats(MAX_ROWS * width)?,
-                        windows: memory
-                            .floats((MAX_ROWS - 1) * Self::window_floats(config, width))?,
+                        fused: memory.floats(rows * (3 * width + 2 * head + linear_heads))?,
+                        mixed: memory.floats(rows * 3 * width)?,
+                        decay: memory.floats(rows * width)?,
+                        windows: if chunk {
+                            memory.floats(1)?
+                        } else {
+                            memory.floats((rows - 1) * Self::window_floats(config, width))?
+                        },
                     })
-                })
-                .collect::<Result<_, BackendError>>()?,
-            forget: memory.floats(MAX_ROWS * width)?,
-            gate: memory.floats(MAX_ROWS * width)?,
-            kda_out: memory.floats(MAX_ROWS * width)?,
-            dsa_fused: memory.floats(MAX_ROWS * (config.q_lora_rank + config.kv_lora_rank))?,
-            query: memory.floats(MAX_ROWS * heads * nope)?,
-            q_abs: memory.floats(MAX_ROWS * heads * config.kv_lora_rank)?,
-            attn_out: memory.floats(MAX_ROWS * heads * value)?,
-            index_fused: memory.floats(MAX_ROWS * (2 * index_dim + index_heads))?,
-            index_query: memory.floats(MAX_ROWS * index_heads * index_dim)?,
-            scores: memory
-                .floats(MAX_ROWS * (config.max_position_embeddings / config.index_kpool))?,
-            selected: memory.floats(MAX_ROWS * MAX_SELECTED_TOKENS)?,
-            count: memory.floats(MAX_ROWS)?,
-            gate_up: memory.floats(MAX_ROWS * 2 * intermediate)?,
-            activated: memory.floats(MAX_ROWS * intermediate)?,
-            shared_out: memory.floats(MAX_ROWS * hidden)?,
-            router_logits: memory.floats(MAX_ROWS * config.n_routed_experts)?,
-            expert_indices: memory.floats(MAX_ROWS * topk)?,
-            expert_weights: memory.floats(MAX_ROWS * topk)?,
-            expert_gate_up: memory.floats(MAX_ROWS * topk * 2 * expert)?,
-            expert_activated: memory.floats(MAX_ROWS * topk * expert)?,
-            expert_out: memory.floats(MAX_ROWS * topk * hidden)?,
-            head: memory.floats(MAX_ROWS * hidden)?,
-            head_normed: memory.floats(MAX_ROWS * hidden)?,
-            mtp_embed: memory.floats(MAX_ROWS * hidden)?,
-            mtp_in: memory.floats(MAX_ROWS * 2 * hidden)?,
-            mtp_x: memory.floats(MAX_ROWS * hidden)?,
-            mtp_out: memory.floats(MAX_ROWS * hidden)?,
+                };
+                if chunk {
+                    let shared = one()?;
+                    (0..config.linear_layers())
+                        .map(|_| Ok(LinearScratch { ..shared }))
+                        .collect::<Result<Vec<_>, BackendError>>()?
+                } else {
+                    (0..config.linear_layers())
+                        .map(|_| one())
+                        .collect::<Result<Vec<_>, BackendError>>()?
+                }
+            },
+            forget: memory.floats(rows * width)?,
+            gate: memory.floats(rows * width)?,
+            kda_out: memory.floats(rows * width)?,
+            kda_qk: memory.floats(if rows > MAX_ROWS {
+                rows * linear_heads * GDN_QK_ROW
+            } else {
+                1
+            })?,
+            kda_beta: memory.floats(if rows > MAX_ROWS {
+                rows * linear_heads * 2
+            } else {
+                1
+            })?,
+            dsa_fused: memory.floats(rows * (config.q_lora_rank + config.kv_lora_rank))?,
+            query: memory.floats(rows * heads * nope)?,
+            q_abs: memory.floats(rows * heads * config.kv_lora_rank)?,
+            mla_logits: memory.floats(rows.min(MAX_ROWS) * heads * MAX_SELECTED_TOKENS)?,
+            mla_total: memory.floats(rows.min(MAX_ROWS) * heads)?,
+            mla_mixed: memory.floats(rows.min(MAX_ROWS) * heads * config.kv_lora_rank)?,
+            attn_out: memory.floats(rows * heads * value)?,
+            index_fused: memory.floats(rows * (2 * index_dim + index_heads))?,
+            index_query: memory.floats(rows * index_heads * index_dim)?,
+            scores: memory.floats(rows * (config.max_position_embeddings / config.index_kpool))?,
+            selected: memory.floats(rows * MAX_SELECTED_TOKENS)?,
+            count: memory.floats(rows)?,
+            gate_up: memory.floats(rows * 2 * intermediate)?,
+            activated: memory.floats(rows * intermediate)?,
+            shared_out: memory.floats(rows * hidden)?,
+            router_logits: memory.floats(rows * config.n_routed_experts)?,
+            expert_indices: memory.floats(rows * topk)?,
+            expert_weights: memory.floats(rows * topk)?,
+            expert_gate_up: memory.floats(rows * topk * 2 * expert)?,
+            expert_activated: memory.floats(rows * topk * expert)?,
+            expert_out: memory.floats(rows * topk * hidden)?,
+            head: memory.floats(rows * hidden)?,
+            head_normed: memory.floats(rows * hidden)?,
+            mtp_embed: memory.floats(rows * hidden)?,
+            mtp_in: memory.floats(rows * 2 * hidden)?,
+            mtp_x: memory.floats(rows * hidden)?,
+            mtp_out: memory.floats(rows * hidden)?,
             // q4e_mhc_post's [pre | post | comb] for one stream: 1.0 * reduced + 1.0 * x.
-            mtp_coeffs: memory.upload(stream, &to_bytes(&[0.0, 1.0, 1.0].repeat(MAX_ROWS)))?,
-            logits: memory.floats(world * MAX_ROWS * (config.vocab_size / world))?,
-            logits_host: memory.mapped(world * MAX_ROWS * (config.vocab_size / world) * 4)?,
-            drafted: memory.mapped(MAX_ROWS * MAX_ROWS * 4)?,
-            picks: memory.mapped(MAX_ROWS * 4)?,
-            partials: memory.floats(TILED_GEMV_PARTIALS)?,
-            counters: memory.zeroed(stream, TILED_GEMV_BLOCKS * 4)?,
+            mtp_coeffs: memory.upload(stream, &to_bytes(&[0.0, 1.0, 1.0].repeat(rows)))?,
+            logits: memory.floats(world * rows * (config.vocab_size / world))?,
+            logits_host: memory.mapped(world * rows * (config.vocab_size / world) * 4)?,
+            drafted: memory.mapped(rows * rows * 4)?,
+            picks: memory.mapped(rows * 4)?,
+            partials: memory.floats(TILED_GEMV_PARTIALS * groups)?,
+            counters: memory.zeroed(stream, TILED_GEMV_BLOCKS * groups * 4)?,
             recur_counters: memory.zeroed(stream, linear_heads * 4)?,
+            moe_slot_of: memory.zeroed(stream, moe_rows * 4)?,
+            moe_items: memory.zeroed(stream, moe_items_max * 16)?,
+            moe_item_count: memory.zeroed(stream, 4)?,
+            moe_gate_up: memory.floats(moe_rows * 2 * expert)?,
+            moe_activated: memory.floats(moe_rows * expert)?,
+            q8_codes: memory.bytes(rows * config.hc_mult * hidden)?,
+            q8_scales: memory.floats(rows * (config.hc_mult * hidden).div_ceil(FP8_BLOCK))?,
+            moe_act_codes: memory.bytes(moe_rows * expert)?,
+            moe_act_scales: memory.floats(moe_rows * expert.div_ceil(FP8_BLOCK))?,
         })
     }
 
@@ -2251,12 +2609,283 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         self.cuda
             .launch_on(&self.stream, kernel, grid, (threads, 1, 1), args)
-            .map_err(cuda_error)
+            .map_err(|error| cuda_error(format!("{}: {error}", kernel.name())))
     }
 
     /// `output = W input` for `rows` rows, BF16 or block-scaled FP8 by the weight, each of a fused
-    /// projection's parts as one block of every row's outputs.
+    /// projection's parts as one block of every row's outputs. A prefill-sized batch takes the
+    /// bulk tensor-core GEMM; a decode step keeps the tiled GEMV, whose bits a verified row is
+    /// defined by.
     fn gemv(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if rows > MAX_ROWS {
+            return self.bulk_gemm(linear, input, output, rows);
+        }
+        self.gemv_small(linear, input, output, rows)
+    }
+
+    /// The bulk prefill's projection: one tensor-core GEMM over all `rows` of each part, an FP8
+    /// part's over the input's E4M3 codes ([PrefillActivation::Fp8], quantised once for all
+    /// parts). A BF16 part of at most 32 rows the 32-column tile cannot cover (a 24-row mixer, a
+    /// 16-row gate) takes the skinny kernel, and any other such part the tiled GEMV.
+    fn bulk_gemm(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if !input.0.is_multiple_of(16) {
+            return Err(refusal(
+                "a bulk GEMM's input is not 16-byte aligned; its reads would be torn",
+            ));
+        }
+        let columns = linear.columns;
+        let element = if linear.scales.is_some() { 1 } else { 2 };
+        let starts = [
+            0,
+            linear.parts[0],
+            linear.parts[1],
+            linear.parts[2],
+            linear.rows,
+        ];
+        let mut quantised = false;
+        for part in 0..4 {
+            let (first, end) = (starts[part], starts[part + 1]);
+            if end <= first {
+                continue;
+            }
+            let part_rows = end - first;
+            let weight = linear.weight.offset(first * columns * element);
+            let scales = linear.scales.map(|scales| {
+                scales.offset(
+                    (first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>(),
+                )
+            });
+            let out = output.offset(rows * first * 4);
+            // The block-scaled kernel indexes its scales a 128-column K block at a time, so a
+            // scaled part also needs the K run to be whole blocks, not just whole 32-column
+            // stages; the skinny kernel reads eight floats a lane a 256-column step.
+            let tiled = part_rows % 32 == 0
+                && columns.is_multiple_of(32)
+                && scales.is_none_or(|_| columns.is_multiple_of(FP8_BLOCK))
+                && scales.is_none_or(|_| first.is_multiple_of(FP8_BLOCK));
+            if !tiled && scales.is_none() && part_rows <= 32 && columns.is_multiple_of(256) {
+                self.launch(
+                    self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
+                    (rows.div_ceil(16) as u32, 1, 1),
+                    BLOCK,
+                    &[
+                        weight.0,
+                        input.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?;
+                continue;
+            }
+            if !tiled {
+                let row = DeviceLinear {
+                    weight,
+                    scales,
+                    rows: part_rows,
+                    columns,
+                    parts: [part_rows; 3],
+                };
+                self.gemv_grouped(&row, input, out, rows)?;
+                continue;
+            }
+            let grid = (part_rows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1);
+            let (fp8, bf16) = if self.prefill_activation == PrefillActivation::Bf16 {
+                (
+                    self.kernels.prefill_dense_fp8_bf16a,
+                    self.kernels.prefill_dense_bf16_bf16a,
+                )
+            } else {
+                (
+                    self.kernels.prefill_dense_fp8,
+                    self.kernels.prefill_dense_bf16,
+                )
+            };
+            match scales {
+                Some(scales)
+                    if self.prefill_activation == PrefillActivation::Fp8
+                        && columns.is_multiple_of(FP8_BLOCK) =>
+                {
+                    q8_inner(columns)?;
+                    if !quantised {
+                        self.quantise(input, rows, columns)?;
+                        quantised = true;
+                    }
+                    let s = &self.scratch;
+                    self.launch(
+                        self.kernels.prefill_dense_q8,
+                        grid,
+                        BLOCK,
+                        &[
+                            weight.0,
+                            scales.0,
+                            s.q8_codes.0,
+                            s.q8_scales.0,
+                            out.0,
+                            part_rows as u64,
+                            columns as u64,
+                            rows as u64,
+                        ],
+                    )?
+                }
+                Some(scales) => self.launch(
+                    fp8,
+                    grid,
+                    BLOCK,
+                    &[
+                        weight.0,
+                        scales.0,
+                        input.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?,
+                None => self.launch(
+                    bf16,
+                    grid,
+                    BLOCK,
+                    &[
+                        weight.0,
+                        input.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?,
+            }
+        }
+        Ok(())
+    }
+
+    /// `rows` rows of `columns` f32 at `input` as the release's dynamic activation, into the
+    /// scratch's E4M3 codes and per-128-column scales.
+    fn quantise(&self, input: Deviceptr, rows: usize, columns: usize) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let widest = self.config.hc_mult * self.config.hidden_size;
+        if !columns.is_multiple_of(FP8_BLOCK) || columns > widest {
+            return Err(refusal(format!(
+                "the prefill quantises whole 128-column blocks of rows of at most {widest} \
+                 columns, not {columns}"
+            )));
+        }
+        // One warp a 128-column block.
+        let warps = rows * columns / FP8_BLOCK;
+        self.launch(
+            self.kernels.prefill_quantise,
+            ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
+            BLOCK,
+            &[
+                input.0,
+                s.q8_codes.0,
+                s.q8_scales.0,
+                rows as u64,
+                columns as u64,
+            ],
+        )
+    }
+
+    /// A projection for a bulk chunk, with the token GEMV when `exact` keeps a routing or
+    /// selection projection's bits. The token GEMV runs eight rows a group; its per-row chain
+    /// does not depend on the batch or the group, so this is the decode path's arithmetic.
+    fn projection(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+        exact: bool,
+    ) -> Result<(), BackendError> {
+        if exact && rows > MAX_ROWS {
+            return self.gemv_chunked(linear, input, output, rows);
+        }
+        self.gemv(linear, input, output, rows)
+    }
+
+    /// The token GEMV over a batch larger than its eight-row tile: up to [GEMV_GROUP_ROWS] rows a
+    /// launch, each part on its own past that.
+    fn gemv_chunked(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if rows <= GEMV_GROUP_ROWS {
+            return self.gemv_small(linear, input, output, rows);
+        }
+        let columns = linear.columns;
+        let element = if linear.scales.is_some() { 1 } else { 2 };
+        let starts = [
+            0,
+            linear.parts[0],
+            linear.parts[1],
+            linear.parts[2],
+            linear.rows,
+        ];
+        for part in 0..4 {
+            let (first, end) = (starts[part], starts[part + 1]);
+            if end <= first {
+                continue;
+            }
+            let part_rows = end - first;
+            let row = DeviceLinear {
+                weight: linear.weight.offset(first * columns * element),
+                scales: linear.scales.map(|scales| {
+                    scales.offset(
+                        (first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>(),
+                    )
+                }),
+                rows: part_rows,
+                columns,
+                parts: [part_rows; 3],
+            };
+            self.gemv_grouped(&row, input, output.offset(rows * first * 4), rows)?;
+        }
+        Ok(())
+    }
+
+    /// A one-part `linear` over `rows` rows, [GEMV_GROUP_ROWS] a grouped launch.
+    fn gemv_grouped(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let mut done = 0;
+        while done < rows {
+            let count = GEMV_GROUP_ROWS.min(rows - done);
+            self.gemv_small(
+                linear,
+                input.offset(done * linear.columns * 4),
+                output.offset(done * linear.rows * 4),
+                count,
+            )?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    /// The tiled GEMV: the decode path and the fallback for a part the bulk tile cannot cover. Past
+    /// [MAX_ROWS] rows (up to [GEMV_GROUP_ROWS]) it launches a group of eight rows a z-block, each
+    /// the eight-row launch's arithmetic.
+    fn gemv_small(
         &self,
         linear: &DeviceLinear,
         input: Deviceptr,
@@ -2267,6 +2896,11 @@ impl DeviceRank {
             return Err(refusal(
                 "a tiled GEMV's input is not 16-byte aligned; its reads would be torn",
             ));
+        }
+        if rows > GEMV_GROUP_ROWS {
+            return Err(refusal(format!(
+                "a tiled GEMV takes at most {GEMV_GROUP_ROWS} rows a launch, not {rows}"
+            )));
         }
         let tiles = linear.rows.div_ceil(TILE_ROWS);
         let scratch = &self.scratch;
@@ -2295,7 +2929,8 @@ impl DeviceRank {
             args.push(u64::from(self.config.dynamic_activations));
         }
         args.extend(linear.parts.map(|start| start as u64));
-        self.launch(kernel, (tiles as u32, splits as u32, 1), BLOCK, &args)
+        let groups = rows.div_ceil(MAX_ROWS) as u32;
+        self.launch(kernel, (tiles as u32, splits as u32, groups), BLOCK, &args)
     }
 
     /// The routed experts' FP8 GEMV over the router's picks for `rows` rows: `outputs` a pick, a
@@ -2447,13 +3082,28 @@ impl DeviceRank {
         rows: usize,
         device_leg: bool,
     ) -> Result<bool, BackendError> {
-        let next = next.and_then(|hyper| self.fused_projection(hyper));
+        // The fused mixer writes one tiled GEMV's split partials; a prefill chunk takes the bulk
+        // GEMM instead, whose 128-row tiles the mixer's 24-row projection does not feed.
+        let next = if rows > MAX_ROWS {
+            None
+        } else {
+            next.and_then(|hyper| self.fused_projection(hyper))
+        };
         self.reduce_into(tp, self.scratch.partial, residual, next, rows, device_leg)?;
         Ok(next.is_some())
     }
 
-    /// [Self::mix_out] of the partials at `partial`, which the host leg overwrites with their
-    /// sum.
+    /// Whether a device-leg all-reduce of `rows` rows takes two shots: at least
+    /// [Self::two_shot_rows] rows (0 for never) of whole float4 chunks a rank.
+    fn two_shot(&self, rows: usize) -> bool {
+        let world = self.layout.world_size;
+        self.two_shot_rows > 0
+            && rows >= self.two_shot_rows
+            && splits_two_shot(rows * self.geometry.dim, world)
+    }
+
+    /// [Self::mix_out] of the partials at `partial`, which the two-shot and host legs overwrite
+    /// with their sum.
     fn reduce_into(
         &self,
         tp: &TpRuntime,
@@ -2465,12 +3115,38 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         let s = &self.scratch;
         let hidden = self.geometry.dim;
-        let world = if device_leg {
+        let world = self.layout.world_size;
+        let world = if device_leg && self.two_shot(rows) {
+            // Two shots, half the one-shot's bytes. Each element is q4e_mhc_post's fold, so the
+            // bits are the one-shot's.
+            reduce_two_shot(
+                tp,
+                self.stream.raw(),
+                partial,
+                s.slots,
+                rows * hidden,
+                |mine, count| {
+                    self.launch(
+                        self.kernels.sum_slots,
+                        (blocks(count / 4), 1, 1),
+                        BLOCK,
+                        &[
+                            mine.0,
+                            s.slots.0,
+                            count as u64,
+                            self.layout.rank as u64,
+                            world as u64,
+                        ],
+                    )
+                },
+            )?;
+            1
+        } else if device_leg {
             // `partial` holds the rows' partials and `slots` a world of them, and every rank runs
             // the same steps.
             tp.exchange_on_device(self.stream.raw(), partial.0, s.slots.0, rows * hidden * 4)
                 .map_err(weights_error)?;
-            self.layout.world_size
+            world
         } else {
             let mut bytes = vec![0u8; rows * hidden * 4];
             self.cuda
@@ -2531,6 +3207,42 @@ impl DeviceRank {
             let SequenceLayer::Linear { conv, .. } = &run.layers[layer] else {
                 return Err(other_kind());
             };
+            let (raw, mixed) = (
+                own.fused.offset(floats(run.first * mixes)),
+                own.mixed.offset(floats(run.first * mixes)),
+            );
+            if self.bulk(run) {
+                self.launch(
+                    self.kernels.conv_rows,
+                    (blocks(mixes), run.len as u32, 1),
+                    BLOCK,
+                    &[
+                        raw.0,
+                        conv.0,
+                        kda.conv.0,
+                        mixed.0,
+                        mixes as u64,
+                        config.linear_conv_kernel_dim as u64,
+                    ],
+                )?;
+                self.launch(
+                    self.kernels.conv_history,
+                    (blocks(mixes), 1, 1),
+                    BLOCK,
+                    &[
+                        raw.0,
+                        conv.0,
+                        mixes as u64,
+                        config.linear_conv_kernel_dim as u64,
+                        run.len as u64,
+                        // A chunk never verifies, so it keeps no windows.
+                        0,
+                        0,
+                        0,
+                    ],
+                )?;
+                continue;
+            }
             // A verify keeps the windows after each of its rows but the last, for a commit that
             // keeps fewer rows to restore.
             let (windows, kept) = if run.verify {
@@ -2546,10 +3258,10 @@ impl DeviceRank {
                 (blocks(mixes), 1, 1),
                 BLOCK,
                 &[
-                    own.fused.offset(floats(run.first * mixes)).0,
+                    raw.0,
                     conv.0,
                     kda.conv.0,
-                    own.mixed.offset(floats(run.first * mixes)).0,
+                    mixed.0,
                     mixes as u64,
                     config.linear_conv_kernel_dim as u64,
                     run.len as u64,
@@ -2583,22 +3295,111 @@ impl DeviceRank {
             else {
                 return Err(other_kind());
             };
+            let inputs = [
+                own.mixed.offset(floats(run.first * mixes)),
+                s.gate.offset(floats(run.first * width)),
+                beta.offset(floats(run.first * heads)),
+                own.decay.offset(floats(run.first * width)),
+            ];
+            let out = s.kda_out.offset(floats(run.first * width));
+            if self.bulk(run) {
+                self.scan(kda, inputs, *recurrent, out, run.len)?;
+                continue;
+            }
             // A verify leaves the memory it read in place and its last row's in the spare.
             let into = if run.verify { spare } else { recurrent };
-            self.recur(
-                kda,
-                [
-                    own.mixed.offset(floats(run.first * mixes)),
-                    s.gate.offset(floats(run.first * width)),
-                    beta.offset(floats(run.first * heads)),
-                    own.decay.offset(floats(run.first * width)),
-                ],
-                (*recurrent, *into),
-                Some(s.kda_out.offset(floats(run.first * width))),
-                run.len,
-            )?;
+            self.recur(kda, inputs, (*recurrent, *into), Some(out), run.len)?;
         }
         self.gemv(&kda.o, s.kda_out, s.partial, rows)
+    }
+
+    /// Whether a run's KDA takes the bulk chunk's convolution and scan ([Self::scan]): more rows
+    /// than a step's tile, never a verify (whose windows and memory a commit restores), at the
+    /// head and history widths the prefill image is compiled for.
+    fn bulk(&self, run: &Run<'_>) -> bool {
+        let config = &self.config;
+        !run.verify
+            && run.len > MAX_ROWS
+            && config.linear_head_dim == GDN_KEY
+            && config.linear_head_dim == GDN_VALUE
+            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim)
+    }
+
+    /// A bulk chunk's KDA recurrence over `len` rows of one sequence, Qwen's prefill scan with
+    /// the state in registers ([Self::recur]'s inputs, the memory stepped in place): a 4096-row
+    /// chunk's is ~16 ms a layer through the token kernel, whose steps are 128-term chains on a
+    /// quarter of its threads. The arithmetic is the token kernel's in another association, so
+    /// a chunk matches it to f32 rounding, as the bulk GEMMs match the GEMVs.
+    fn scan(
+        &self,
+        kda: &DeviceKda,
+        [mixed, gate, beta, decay]: [Deviceptr; 4],
+        state: Deviceptr,
+        out: Deviceptr,
+        len: usize,
+    ) -> Result<(), BackendError> {
+        let config = &self.config;
+        let s = &self.scratch;
+        let heads = kda.heads;
+        let (key_width, value) = (kda.width as u64, GDN_VALUE as u64);
+        // One value head a key head.
+        let groups = 1;
+        self.launch(
+            self.kernels.kda_prep,
+            (heads as u32, len as u32, 1),
+            GDN_KEY as u32,
+            &[
+                mixed.0,
+                beta.0,
+                s.kda_qk.0,
+                s.kda_beta.0,
+                key_width,
+                heads as u64,
+                heads as u64,
+                value,
+                groups,
+            ],
+        )?;
+        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
+        self.launch(
+            self.kernels.kda_scan,
+            scan_grid,
+            scan_threads,
+            &[
+                s.kda_qk.0,
+                s.kda_beta.0,
+                decay.0,
+                mixed.0,
+                state.0,
+                out.0,
+                key_width,
+                heads as u64,
+                heads as u64,
+                value,
+                groups,
+                len as u64,
+                // No per-row snapshots: a chunk never verifies.
+                0,
+                0,
+                0,
+            ],
+        )?;
+        self.launch(
+            self.kernels.kda_gate,
+            (heads as u32, len as u32, 1),
+            GDN_VALUE as u32,
+            &[
+                out.0,
+                gate.0,
+                kda.o_norm.0,
+                out.0,
+                heads as u64,
+                value,
+                float(config.rms_norm_eps as f32),
+                // The sigmoid output gate.
+                1,
+            ],
+        )
     }
 
     /// KDA's recurrence over `len` rows of one sequence: `inputs` are the convolved rows, the
@@ -2766,8 +3567,185 @@ impl DeviceRank {
         if let Some(indexer) = &dsa.indexer {
             self.index_pick(indexer, layer, runs, rows)?;
         }
-        // The absorbed form: the query projected into the latent space, then one kernel an
-        // attention over the latent cache and kv_b's value rows.
+        if rows > MAX_ROWS && dsa.quantise {
+            self.bulk_attend(dsa, layer, runs, rows)?;
+            return self.gemv(&dsa.o, s.attn_out, s.partial, rows);
+        }
+        if heads > MLA_HEADS {
+            return Err(refusal(format!(
+                "the decode MLA stages at most {MLA_HEADS} heads a rank, not {heads}"
+            )));
+        }
+        // The absorbed form: the query projected into the latent space, then the attention over
+        // the latent cache in four launches (qwen4_exp_sm121.cu's q4e_glm_mla_scores) and kv_b's
+        // value rows.
+        for run in runs {
+            let SequenceLayer::Sparse {
+                latent: cache,
+                latent_scales: scales,
+                ..
+            } = &run.layers[layer]
+            else {
+                return Err(other_kind());
+            };
+            let (first, len) = (run.first as u64, run.len as u32);
+            self.launch(
+                self.kernels.mla_absorb,
+                (heads as u32, len, latent.div_ceil(BLOCK as usize) as u32),
+                BLOCK,
+                &[
+                    s.query.0,
+                    dsa.kv_dequant.0,
+                    s.q_abs.0,
+                    first,
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
+                ],
+            )?;
+            let cache = [cache.0, cache.0, scales.0];
+            let selection = [s.selected.0, s.count.0];
+            let quantise = u64::from(dsa.quantise);
+            self.launch(
+                self.kernels.mla_scores,
+                ((MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32, len, 1),
+                BLOCK,
+                &[
+                    &[s.q_abs.0][..],
+                    &cache,
+                    &selection,
+                    &[
+                        s.mla_logits.0,
+                        first,
+                        heads as u64,
+                        nope as u64,
+                        latent as u64,
+                        MAX_SELECTED_TOKENS as u64,
+                        quantise,
+                    ],
+                ]
+                .concat(),
+            )?;
+            self.launch(
+                self.kernels.mla_softmax,
+                (heads as u32, len, 1),
+                BLOCK,
+                &[s.mla_logits.0, s.count.0, s.mla_total.0, first],
+            )?;
+            self.launch(
+                self.kernels.mla_mix,
+                (
+                    latent.div_ceil(32) as u32,
+                    heads.div_ceil(MLA_MIX_HEADS) as u32,
+                    len,
+                ),
+                (32 * MLA_MIX_HEADS) as u32,
+                &[
+                    &cache[..],
+                    &selection,
+                    &[
+                        s.mla_logits.0,
+                        s.mla_total.0,
+                        s.mla_mixed.0,
+                        first,
+                        heads as u64,
+                        latent as u64,
+                        MAX_SELECTED_TOKENS as u64,
+                        quantise,
+                    ],
+                ]
+                .concat(),
+            )?;
+            self.launch(
+                self.kernels.mla_project,
+                (
+                    heads as u32,
+                    (value as u32).div_ceil(MLA_PROJECT_THREADS),
+                    1,
+                ),
+                MLA_PROJECT_THREADS,
+                &[
+                    s.mla_mixed.0,
+                    dsa.kv_dequant.0,
+                    s.count.0,
+                    s.attn_out.0,
+                    first,
+                    u64::from(len),
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
+                ],
+            )?;
+        }
+        self.gemv(&dsa.o, s.attn_out, s.partial, rows)
+    }
+
+    /// A bulk chunk's attention ([Self::dsa_attend]) on the tensor cores: the query absorbed
+    /// into the latent space by a per-head GEMM over kv_b's transposed key rows (the decode
+    /// kernel for an FP8 kv_b), each row's 16 heads over its selected E4M3 latents at once
+    /// (glm_prefill_mla_attend, the weighted latent over the query), and the value projection
+    /// by a per-head GEMM over kv_b's value rows, into `attn_out`.
+    fn bulk_attend(
+        &self,
+        dsa: &DeviceDsa,
+        layer: usize,
+        runs: &[Run<'_>],
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let config = &self.config;
+        let (heads, nope, value) = (dsa.heads, config.qk_nope_head_dim, config.v_head_dim);
+        let latent = config.kv_lora_rank;
+        if latent != GMA_LATENT || heads != GMA_HEADS || !value.is_multiple_of(128) {
+            return Err(refusal(format!(
+                "the bulk MLA takes {GMA_HEADS} heads of a {GMA_LATENT}-wide latent and whole \
+                 128-column value tiles, not {heads} of {latent} and {value}"
+            )));
+        }
+        let row_tiles = rows.div_ceil(128) as u32;
+        match dsa.kv_key_t {
+            Some(key_t) => self.launch(
+                self.kernels.prefill_heads_bf16,
+                ((latent / 128) as u32, row_tiles, heads as u32),
+                BLOCK,
+                &[
+                    key_t.0,
+                    s.query.0,
+                    s.q_abs.0,
+                    latent as u64,
+                    nope as u64,
+                    rows as u64,
+                    (heads * nope) as u64,
+                    (heads * latent) as u64,
+                    nope as u64,
+                    latent as u64,
+                    (latent * nope * 2) as u64,
+                ],
+            )?,
+            None => self.launch(
+                self.kernels.mla_absorb,
+                (
+                    heads as u32,
+                    rows as u32,
+                    latent.div_ceil(BLOCK as usize) as u32,
+                ),
+                BLOCK,
+                &[
+                    s.query.0,
+                    dsa.kv_dequant.0,
+                    s.q_abs.0,
+                    0,
+                    nope as u64,
+                    value as u64,
+                    latent as u64,
+                ],
+            )?,
+        }
+        let attend = if self.prefill_activation == PrefillActivation::Bf16 {
+            self.kernels.prefill_mla_attend_bf16a
+        } else {
+            self.kernels.prefill_mla_attend
+        };
         for run in runs {
             let SequenceLayer::Sparse {
                 latent: cache,
@@ -2778,52 +3756,62 @@ impl DeviceRank {
                 return Err(other_kind());
             };
             self.launch(
-                self.kernels.mla_absorb,
-                (
-                    heads as u32,
-                    run.len as u32,
-                    latent.div_ceil(BLOCK as usize) as u32,
-                ),
-                BLOCK,
-                &[
-                    s.query.0,
-                    dsa.kv_dequant.0,
-                    s.q_abs.0,
-                    run.first as u64,
-                    nope as u64,
-                    value as u64,
-                    latent as u64,
-                ],
-            )?;
-            self.launch(
-                self.kernels.mla_attend,
-                (heads as u32, run.len as u32, 1),
+                attend,
+                (run.len as u32, 1, 1),
                 BLOCK,
                 &[
                     s.q_abs.0,
-                    cache.0,
                     cache.0,
                     scales.0,
-                    dsa.kv_dequant.0,
                     s.selected.0,
                     s.count.0,
-                    s.attn_out.0,
                     run.first as u64,
-                    nope as u64,
-                    value as u64,
-                    latent as u64,
                     MAX_SELECTED_TOKENS as u64,
-                    u64::from(dsa.quantise),
+                    float((nope as f32).sqrt()),
                 ],
             )?;
         }
-        self.gemv(&dsa.o, s.attn_out, s.partial, rows)
+        // kv_b's value rows of head h: rows h (nope + value) + nope .. + value of the matrix.
+        let per_head = nope + value;
+        let element = if dsa.kv_b.scales.is_some() { 1 } else { 2 };
+        let weight = dsa.kv_b.weight.offset(nope * latent * element);
+        let geometry = [
+            value as u64,
+            latent as u64,
+            rows as u64,
+            (heads * latent) as u64,
+            (heads * value) as u64,
+            latent as u64,
+            value as u64,
+            (per_head * latent * element) as u64,
+        ];
+        let grid = ((value / 128) as u32, row_tiles, heads as u32);
+        match dsa.kv_b.scales {
+            Some(scales) => {
+                let blocks = latent / FP8_BLOCK;
+                let mut args = vec![
+                    weight.0,
+                    scales.offset((nope / FP8_BLOCK) * blocks * 4).0,
+                    s.q_abs.0,
+                    s.attn_out.0,
+                ];
+                args.extend(geometry);
+                args.push(((per_head / FP8_BLOCK) * blocks) as u64);
+                self.launch(self.kernels.prefill_heads_fp8, grid, BLOCK, &args)
+            }
+            None => {
+                let mut args = vec![weight.0, s.q_abs.0, s.attn_out.0];
+                args.extend(geometry);
+                self.launch(self.kernels.prefill_heads_bf16, grid, BLOCK, &args)
+            }
+        }
     }
 
-    /// The indexer's caching half: each row's key and gate into the caches, then row by row in
-    /// each sequence's order any block the row completes pooled. A pool is only ever scored by a
-    /// row at or past the one that completes it, so every pool a row scores is in by
-    /// [Self::index_pick]. The scores' head weights stay in `index_fused`.
+    /// The indexer's caching half: each row's key and gate into the caches, then any block each
+    /// row completes pooled, a sequence's rows in one launch (a pool reads only cached keys and
+    /// gates). A pool is only ever scored by a row at or past the one that completes it, so every
+    /// pool a row scores is in by [Self::index_pick]. The scores' head weights stay in
+    /// `index_fused`.
     fn index_cache(
         &self,
         indexer: &DeviceIndexer,
@@ -2835,7 +3823,13 @@ impl DeviceRank {
         let config = &self.config;
         let (dim, pool) = (config.index_head_dim, config.index_kpool);
         let floats = |count: usize| count * 4;
-        self.gemv(&indexer.fused, s.collapsed, s.index_fused, rows)?;
+        self.projection(
+            &indexer.fused,
+            s.collapsed,
+            s.index_fused,
+            rows,
+            self.exact_prefill,
+        )?;
         let gates = indexer.fused.part(s.index_fused, 1, rows);
         for run in runs {
             let SequenceLayer::Sparse {
@@ -2871,28 +3865,26 @@ impl DeviceRank {
                     (run.len * dim) as u64,
                 ],
             )?;
-            for position in run.position..run.position + run.len {
-                self.launch(
-                    self.kernels.pool,
-                    (1, 1, 1),
-                    BLOCK,
-                    &[
-                        index_keys.0,
-                        index_gates.0,
-                        indexer.ape.0,
-                        pooled.0,
-                        dim as u64,
-                        pool as u64,
-                        position as u64,
-                    ],
-                )?;
-            }
+            self.launch(
+                self.kernels.pool,
+                (run.len as u32, 1, 1),
+                BLOCK,
+                &[
+                    index_keys.0,
+                    index_gates.0,
+                    indexer.ape.0,
+                    pooled.0,
+                    dim as u64,
+                    pool as u64,
+                    run.position as u64,
+                ],
+            )?;
         }
         Ok(())
     }
 
     /// The indexer's picking half: each row's query scores every whole pool, and the scores pick
-    /// the tokens the row attends over.
+    /// the tokens the row attends over, a sequence's rows in one launch of each.
     fn index_pick(
         &self,
         indexer: &DeviceIndexer,
@@ -2909,49 +3901,58 @@ impl DeviceRank {
         );
         let score_stride = config.max_position_embeddings / pool;
         let floats = |count: usize| count * 4;
-        self.gemv(&indexer.wq_b, s.dsa_fused, s.index_query, rows)?;
+        self.projection(
+            &indexer.wq_b,
+            s.dsa_fused,
+            s.index_query,
+            rows,
+            self.exact_prefill,
+        )?;
         let head_weights = indexer.fused.part(s.index_fused, 2, rows);
         for run in runs {
             let SequenceLayer::Sparse { pooled, .. } = &run.layers[layer] else {
                 return Err(other_kind());
             };
-            for offset in 0..run.len {
-                let (row, position) = (run.first + offset, run.position + offset);
-                let scores = s.scores.offset(floats(row * score_stride));
-                let pools = (position + 1) / pool;
-                self.launch(
-                    self.kernels.index_scores,
-                    (pools.div_ceil(SCORE_TILE).max(1) as u32, 1, 1),
-                    BLOCK,
-                    &[
-                        s.index_query.offset(floats(row * heads * dim)).0,
-                        head_weights.offset(floats(row * heads)).0,
-                        pooled.0,
-                        scores.0,
-                        position as u64,
-                        heads as u64,
-                        dim as u64,
-                        pool as u64,
-                        float(inverse_sqrt(dim)),
-                        float(inverse_sqrt(heads)),
-                    ],
-                )?;
-                self.launch(
-                    self.kernels.pick,
-                    (1, 1, 1),
-                    BLOCK,
-                    &[
-                        scores.0,
-                        s.selected.offset(floats(row * MAX_SELECTED_TOKENS)).0,
-                        s.count.offset(floats(row)).0,
-                        position as u64,
-                        pool as u64,
-                        config.index_pools() as u64,
-                        0,
-                        MAX_SELECTED_TOKENS as u64,
-                    ],
-                )?;
-            }
+            let (row, position) = (run.first, run.position);
+            // The last row scores the most pools; a block past a row's own pools is a no-op.
+            let last_pools = (position + run.len) / pool;
+            self.launch(
+                self.kernels.index_scores,
+                (
+                    last_pools.div_ceil(SCORE_TILE).max(1) as u32,
+                    run.len as u32,
+                    1,
+                ),
+                BLOCK,
+                &[
+                    s.index_query.offset(floats(row * heads * dim)).0,
+                    head_weights.offset(floats(row * heads)).0,
+                    pooled.0,
+                    s.scores.offset(floats(row * score_stride)).0,
+                    position as u64,
+                    heads as u64,
+                    dim as u64,
+                    pool as u64,
+                    float(inverse_sqrt(dim)),
+                    float(inverse_sqrt(heads)),
+                    score_stride as u64,
+                ],
+            )?;
+            self.launch(
+                self.kernels.pick,
+                (run.len as u32, 1, 1),
+                BLOCK,
+                &[
+                    s.scores.offset(floats(row * score_stride)).0,
+                    s.selected.offset(floats(row * MAX_SELECTED_TOKENS)).0,
+                    s.count.offset(floats(row)).0,
+                    position as u64,
+                    pool as u64,
+                    config.index_pools() as u64,
+                    score_stride as u64,
+                    MAX_SELECTED_TOKENS as u64,
+                ],
+            )?;
         }
         Ok(())
     }
@@ -2986,7 +3987,13 @@ impl DeviceRank {
             config.num_experts_per_tok,
         );
         self.mlp(&moe.shared, s.shared_out, rows)?;
-        self.gemv(&moe.router, s.collapsed, s.router_logits, rows)?;
+        self.projection(
+            &moe.router,
+            s.collapsed,
+            s.router_logits,
+            rows,
+            self.exact_prefill,
+        )?;
         self.launch(
             self.kernels.router,
             (rows as u32, 1, 1),
@@ -3003,6 +4010,9 @@ impl DeviceRank {
                 float(config.routed_scaling_factor as f32),
             ],
         )?;
+        if rows > MAX_ROWS {
+            return self.bulk_moe(moe, rows);
+        }
         self.expert_gemv(
             moe.gate_up,
             Deviceptr(0),
@@ -3034,9 +4044,171 @@ impl DeviceRank {
             true,
             rows,
         )?;
+        self.combine_experts(rows)
+    }
+
+    /// The routed experts over a prefill chunk, grouped by expert: one item (up to
+    /// [MOE_ITEM_ROWS] slots) a block set, the same tensor-core body as a dense projection. The
+    /// gate/up GEMM reads each item row from its token's row, and the down GEMM writes each kept
+    /// row, times its routing weight, to its slot's row.
+    fn bulk_moe(&self, moe: &DeviceMoe, rows: usize) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let config = &self.config;
+        let (hidden, width, topk) = (
+            config.hidden_size,
+            moe.intermediate,
+            config.num_experts_per_tok,
+        );
+        let slots = rows * topk;
+        let items = moe_items(slots, config.n_routed_experts);
+        let moe_rows = items * MOE_ITEM_ROWS;
+        self.launch(
+            self.kernels.prefill_moe_plan,
+            (1, 1, 1),
+            1024,
+            &[
+                s.expert_indices.0,
+                slots as u64,
+                config.n_routed_experts as u64,
+                s.moe_slot_of.0,
+                s.moe_items.0,
+                s.moe_item_count.0,
+                items as u64,
+            ],
+        )?;
+        if self.prefill_activation == PrefillActivation::Fp8
+            && width.is_multiple_of(FP8_BLOCK)
+            && hidden.is_multiple_of(FP8_BLOCK)
+        {
+            self.bulk_moe_q8(moe, rows, items)?;
+            return self.combine_experts(rows);
+        }
+        let mma = if self.prefill_activation == PrefillActivation::Bf16 {
+            self.kernels.prefill_moe_mma_bf16a
+        } else {
+            self.kernels.prefill_moe_mma
+        };
+        self.launch(
+            mma,
+            ((2 * width).div_ceil(128) as u32, 1, items as u32),
+            BLOCK,
+            &[
+                moe.gate_up.0,
+                s.moe_items.0,
+                s.collapsed.0,
+                s.moe_gate_up.0,
+                (2 * width) as u64,
+                hidden as u64,
+                s.moe_slot_of.0,
+                topk as u64,
+                0,
+            ],
+        )?;
+        self.launch(
+            self.kernels.prefill_moe_swiglu,
+            (blocks(moe_rows * width), 1, 1),
+            BLOCK,
+            &[
+                s.moe_gate_up.0,
+                width as u64,
+                moe_rows as u64,
+                float(config.swiglu_limit as f32),
+                s.moe_activated.0,
+            ],
+        )?;
+        self.launch(
+            mma,
+            (hidden.div_ceil(128) as u32, 1, items as u32),
+            BLOCK,
+            &[
+                moe.down.0,
+                s.moe_items.0,
+                s.moe_activated.0,
+                s.expert_out.0,
+                hidden as u64,
+                width as u64,
+                s.moe_slot_of.0,
+                topk as u64,
+                s.expert_weights.0,
+            ],
+        )?;
+        self.combine_experts(rows)
+    }
+
+    /// [Self::bulk_moe]'s GEMMs over the release's dynamic activation: the chunk's rows quantised
+    /// once for every expert's gate/up, and the SwiGLU into the down projection's codes, each an
+    /// E4M3 x E4M3 MMA as the decode GEMV quantises the same rows.
+    fn bulk_moe_q8(&self, moe: &DeviceMoe, rows: usize, items: usize) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let config = &self.config;
+        let (hidden, width, topk) = (
+            config.hidden_size,
+            moe.intermediate,
+            config.num_experts_per_tok,
+        );
+        q8_inner(hidden)?;
+        q8_inner(width)?;
+        self.quantise(s.collapsed, rows, hidden)?;
+        self.launch(
+            self.kernels.prefill_moe_q8,
+            ((2 * width).div_ceil(128) as u32, 1, items as u32),
+            BLOCK,
+            &[
+                moe.gate_up.0,
+                s.moe_items.0,
+                s.q8_codes.0,
+                s.q8_scales.0,
+                s.moe_gate_up.0,
+                (2 * width) as u64,
+                hidden as u64,
+                s.moe_slot_of.0,
+                topk as u64,
+                0,
+            ],
+        )?;
+        let moe_rows = items * MOE_ITEM_ROWS;
+        // One warp a 128-column block of an item row.
+        let warps = moe_rows * width / FP8_BLOCK;
+        self.launch(
+            self.kernels.prefill_moe_swiglu_q8,
+            ((warps * 32).div_ceil(BLOCK as usize) as u32, 1, 1),
+            BLOCK,
+            &[
+                s.moe_gate_up.0,
+                width as u64,
+                moe_rows as u64,
+                float(config.swiglu_limit as f32),
+                s.moe_act_codes.0,
+                s.moe_act_scales.0,
+            ],
+        )?;
+        self.launch(
+            self.kernels.prefill_moe_q8,
+            (hidden.div_ceil(128) as u32, 1, items as u32),
+            BLOCK,
+            &[
+                moe.down.0,
+                s.moe_items.0,
+                s.moe_act_codes.0,
+                s.moe_act_scales.0,
+                s.expert_out.0,
+                hidden as u64,
+                width as u64,
+                s.moe_slot_of.0,
+                topk as u64,
+                s.expert_weights.0,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The routed experts' rows and the shared expert's into each row's partial.
+    fn combine_experts(&self, rows: usize) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let config = &self.config;
         self.launch(
             self.kernels.combine,
-            (blocks(hidden), rows as u32, 1),
+            (blocks(config.hidden_size), rows as u32, 1),
             BLOCK,
             &[
                 s.partial.0,
@@ -3045,8 +4217,8 @@ impl DeviceRank {
                 0,
                 0,
                 0,
-                topk as u64,
-                hidden as u64,
+                config.num_experts_per_tok as u64,
+                config.hidden_size as u64,
                 config.hc_mult as u64,
             ],
         )
@@ -3113,6 +4285,80 @@ impl DeviceRank {
     ) -> Result<Vec<Vec<f32>>, BackendError> {
         let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
         Ok(logits.pop().unwrap_or_default())
+    }
+
+    /// Whether `sequence`'s prompt may run the bulk prefill. The rank's chunk scratch exists only
+    /// for a configuration the chunk can take (see `load`), and the block drafter keeps a step's
+    /// rows of features, so a chunk's rows would run past those. Otherwise the prompt runs the
+    /// token path, which is what these configurations ran before there was a bulk prefill.
+    fn chunk_ready(&self, sequence: &DeviceSequence) -> bool {
+        self.prefill.is_some() && sequence.block.is_none()
+    }
+    /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits. A chunk
+    /// carries up to [DeviceRank::prefill_rows] rows through the tensor-core GEMMs and the padded
+    /// routed-expert path; a prompt shorter than [MIN_PREFILL_ROWS], a rank opened with
+    /// SPARKFLASH_GLM_PREFILL=0, or a sequence [Self::chunk_ready] refuses runs the token path
+    /// exactly as [Self::forward_batch] does.
+    ///
+    /// # Errors
+    /// As [Self::forward_batch], and when the prefill scratch is missing from a rank that was
+    /// built with one.
+    pub fn forward_prefill(
+        &mut self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, BackendError> {
+        if tokens.is_empty() {
+            return Err(refusal("an empty prompt has no logits"));
+        }
+        if self.prefill.is_none() || tokens.len() < MIN_PREFILL_ROWS || !self.chunk_ready(sequence)
+        {
+            let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
+            return Ok(logits
+                .pop()
+                .and_then(|mut rows| rows.pop())
+                .unwrap_or_default());
+        }
+        self.check_sequence(sequence, tokens)?;
+        if sequence.pending.is_some() {
+            return Err(refusal(
+                "the sequence's verify is not committed; commit it before its next step",
+            ));
+        }
+        let device_leg = self.collective(tp, gather)?;
+        let chunk = self.prefill_rows;
+        let mut last = Vec::new();
+        for part in tokens.chunks(chunk) {
+            let run = Run {
+                layers: &sequence.layers,
+                position: sequence.position,
+                first: 0,
+                len: part.len(),
+                verify: false,
+                drafter: sequence.drafter.as_ref(),
+                block: sequence.block.as_ref(),
+            };
+            self.steps = self.steps.wrapping_add(1);
+            let prefill = self
+                .prefill
+                .take()
+                .ok_or_else(|| refusal("the prefill scratch is missing"))?;
+            let decode = std::mem::replace(&mut self.scratch, prefill);
+            let result =
+                self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
+            self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
+            let rows = result?;
+            last = rows.into_iter().next().unwrap_or_default();
+            sequence.position += part.len();
+            sequence.logits_at = None;
+            if let Some(drafter) = &mut sequence.drafter {
+                // The chunk's last row is its stash's last ([Self::fill]).
+                drafter.last = Some(part.len().min(MAX_ROWS) - 1);
+            }
+        }
+        Ok(last)
     }
 
     /// Run each sequence's tokens through this rank's slice together and return each sequence's
@@ -3410,7 +4656,7 @@ impl DeviceRank {
             let firsts: Vec<usize> = runs.iter().map(|run| run.first).collect();
             self.steps = self.steps.wrapping_add(1);
             let mut rows = self
-                .step::<R>(tp, gather, &runs, &tokens, device_leg)?
+                .step::<R>(tp, gather, &runs, &tokens, device_leg, HeadRows::All)?
                 .into_iter();
             let head = self.heads.load(Ordering::Relaxed);
             for ((member, take), first) in members.into_iter().zip(firsts) {
@@ -3462,6 +4708,7 @@ impl DeviceRank {
         runs: &[Run<'_>],
         tokens: &[u32],
         device_leg: bool,
+        head_rows: HeadRows,
     ) -> Result<Vec<R>, BackendError> {
         let s = &self.scratch;
         let config = &self.config;
@@ -3525,7 +4772,16 @@ impl DeviceRank {
                 0,
             ],
         )?;
-        let logits = R::head(self, (tp, gather), s.head_normed, rows, device_leg)?;
+        let logits = match head_rows {
+            HeadRows::All => R::head(self, (tp, gather), s.head_normed, rows, device_leg)?,
+            HeadRows::Last => R::head(
+                self,
+                (tp, gather),
+                s.head_normed.offset((rows - 1) * hidden * 4),
+                1,
+                device_leg,
+            )?,
+        };
         self.fill(runs, tokens)?;
         Ok(logits)
     }
@@ -3542,7 +4798,7 @@ impl DeviceRank {
                 let streams = self.scratch.streams.offset(run.first * hc * hidden * 4);
                 block
                     .draft
-                    .capture(self, scratch, index, (streams, hc), run.len)?;
+                    .capture(self, scratch, index, (streams, hc), 0, run.len)?;
             }
         }
         Ok(())
@@ -3836,16 +5092,21 @@ impl DeviceRank {
             self.mtp_input(mtp, rows)?;
             self.dsa_cache(&mtp.dsa, 0, &filled, rows)?;
         }
+        // Each run's last [MAX_ROWS] rows into its stash: a prefill chunk's earlier rows are never
+        // read again, and the stash holds no more.
         for run in runs {
             if let Some(drafter) = run.drafter {
+                let kept = run.len.min(MAX_ROWS);
                 self.launch(
                     self.kernels.copy_flat,
-                    (blocks(run.len * hidden), 1, 1),
+                    (blocks(kept * hidden), 1, 1),
                     BLOCK,
                     &[
                         drafter.hidden.0,
-                        s.head_normed.offset(floats(run.first * hidden)).0,
-                        (run.len * hidden) as u64,
+                        s.head_normed
+                            .offset(floats((run.first + run.len - kept) * hidden))
+                            .0,
+                        (kept * hidden) as u64,
                     ],
                 )?;
             }

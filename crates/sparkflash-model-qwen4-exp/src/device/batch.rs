@@ -315,6 +315,9 @@ impl DeviceSequence {
         let weights = &backend.weights;
         let width = config.hyper_width();
         self.probe_rows = total;
+        // A batch never runs sequence-parallel; a forward that failed part-way may have left
+        // its share set.
+        self.own_rows = None;
         if super::prof::enabled() {
             super::prof::begin();
         }
@@ -355,6 +358,7 @@ impl DeviceSequence {
                         layer,
                         chunk,
                         width_rows,
+                        None,
                         ple_snapshot,
                         verify,
                         stride,
@@ -372,6 +376,7 @@ impl DeviceSequence {
                         layer,
                         chunk,
                         width_rows,
+                        None,
                         ple_snapshot,
                         verify,
                         stride,
@@ -429,18 +434,7 @@ impl DeviceSequence {
                     self.sparse_output(&layer.branch, index, total)?;
                 }
             }
-            self.launch(
-                kernels.inject,
-                (width.div_ceil(256).max(1) as u32, total as u32, 1),
-                (256, 1, 1),
-                &[
-                    self.hyper.0,
-                    self.branch.0,
-                    self.injection.0,
-                    config.hc_count as u64,
-                    config.hidden_size as u64,
-                ],
-            )?;
+            self.inject_branch(self.hyper, self.injection, total)?;
             self.probe_finite(index, "after_attn", self.hyper, total * width)?;
             self.prof_mark("attn_inject")?;
             let (mixed, injection) = self.hyper(&layer.mlp_hyper, self.hyper, true, total)?;

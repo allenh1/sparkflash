@@ -173,6 +173,54 @@ pub trait TpCollective: Send {
             detail: "this collective has no device leg".to_owned(),
         })
     }
+
+    /// The two-shot exchange's first half, under [Self::exchange_on_device]'s contract: chunk
+    /// `peer` of this rank's `bytes` at `send` (`world()` equal chunks) goes to `peer`, and every
+    /// peer's chunk `rank` lands at `slots + peer * bytes / world()` (this rank's own slot is not
+    /// written). The caller sums its chunk in ascending rank order and shares it with
+    /// [Self::exchange_on_device], so each rank sends half the one-shot exchange's bytes and every
+    /// element is the one-shot's sum.
+    ///
+    /// # Errors
+    ///
+    /// [EngineError::Shape] from the default body, which has no device leg.
+    fn scatter_on_device(
+        &mut self,
+        _stream: u64,
+        _send: u64,
+        _slots: u64,
+        _bytes: usize,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Shape {
+            what: "TpCollective::scatter_on_device".to_owned(),
+            detail: "this collective has no device leg".to_owned(),
+        })
+    }
+}
+
+/// The fewest rows a step sends through the two-shot all-reduce
+/// ([TpCollective::scatter_on_device]) by default: below it the second hop's latency costs more
+/// than the halved bytes save.
+pub const TWO_SHOT_ROWS: usize = 16;
+
+/// The fewest rows a step sends through the two-shot all-reduce: `SPARKFLASH_TWO_SHOT_ROWS` (0
+/// for never), else [TWO_SHOT_ROWS].
+///
+/// # Errors
+///
+/// [EngineError::Shape] for a value that is not a row count.
+pub fn two_shot_rows() -> Result<usize, EngineError> {
+    match std::env::var("SPARKFLASH_TWO_SHOT_ROWS") {
+        Err(std::env::VarError::NotPresent) => Ok(TWO_SHOT_ROWS),
+        Ok(rows) => rows.parse().map_err(|_| EngineError::Shape {
+            what: "SPARKFLASH_TWO_SHOT_ROWS".to_owned(),
+            detail: format!("{rows:?} is not a row count"),
+        }),
+        Err(error) => Err(EngineError::Shape {
+            what: "SPARKFLASH_TWO_SHOT_ROWS".to_owned(),
+            detail: error.to_string(),
+        }),
+    }
 }
 
 /// The one-rank adapter: every collective is a strict no-op, so the seam is value-transparent. It
@@ -438,6 +486,31 @@ impl TpRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .exchange_on_device(stream, send, slots, bytes)
+    }
+
+    /// Enqueues the two-shot exchange's first half through the adapter, as
+    /// [TpCollective::scatter_on_device].
+    ///
+    /// # Errors
+    ///
+    /// Whatever the adapter reports, plus [EngineError::Shape] for an empty payload.
+    pub fn scatter_on_device(
+        &self,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        if bytes == 0 {
+            return Err(EngineError::Shape {
+                what: "TP device scatter".to_owned(),
+                detail: "an empty payload has nothing to exchange".to_owned(),
+            });
+        }
+        self.collective
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scatter_on_device(stream, send, slots, bytes)
     }
 }
 

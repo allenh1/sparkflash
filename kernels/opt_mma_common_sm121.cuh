@@ -68,6 +68,22 @@ __device__ __forceinline__ void om_ldsm4(uint32_t addr, uint32_t &r0, uint32_t &
                  : "r"(addr));
 }
 
+// ldmatrix of four transposed 8x8 b16 tiles: a [k][n] row-major tile as an MMA's col-major B
+// operand (P x V over keys stored a row a key).
+__device__ __forceinline__ void om_ldsm4_t(uint32_t addr, uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(addr));
+}
+
+// The byte offset of 16-byte chunk `chunk` of row `row` in a tile of `row_bytes`-byte rows whose
+// chunks are XOR-swizzled by the row's low three bits, so the eight row addresses of an ldmatrix
+// phase fall in distinct banks whether it reads along rows or across them (opt_bulk_attn's key
+// tile, generalised).
+__device__ __forceinline__ uint32_t om_swz_off(uint32_t row, uint32_t chunk, uint32_t row_bytes) {
+    return row * row_bytes + ((chunk ^ (row & 7u)) << 4);
+}
+
 // D += A x B with the ue8m0 scales: lane l supplies A row (l / 4) + 8 (l % 2) and B column l / 4.
 __device__ __forceinline__ void om_mma_e4m3(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
                                             uint32_t sfa, uint32_t sfb) {

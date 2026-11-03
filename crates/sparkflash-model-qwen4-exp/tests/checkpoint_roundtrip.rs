@@ -168,13 +168,13 @@ fn a_sharded_checkpoint_loads_to_the_same_model_as_a_single_shard() {
 }
 
 #[test]
-fn a_tensor_parallel_world_is_refused_before_any_device_work() {
+fn a_tensor_parallel_world_without_its_collective_is_refused_before_any_device_work() {
     let temp = tempfile::tempdir().expect("a temporary directory");
     let fixture = SyntheticCheckpoint::write(temp.path()).expect("the fixture writes");
     let error = Qwen4ExpDeviceBackend::open_for_world(&fixture.directory, 32, 2)
-        .expect_err("this pack serves TP=1 only");
+        .expect_err("a rank of a group has partials to sum and nothing to sum them over");
     assert_eq!(error.code(), "qwen4_device");
-    assert!(error.message().contains("TP=1"), "{error}");
+    assert!(error.message().contains("open_rank"), "{error}");
 }
 
 #[test]

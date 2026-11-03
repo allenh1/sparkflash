@@ -10826,10 +10826,6 @@ struct OptSeams {
 }
 #[cfg(feature = "cuda")]
 const OPT_SEAMS_SCRATCH: usize = 80 * 32 * 4 + 5120 * 4 + 64;
-/// The fewest rows a step sends through the two-shot all-reduce by default: below it the second
-/// hop's latency costs more than the halved bytes save.
-#[cfg(feature = "cuda")]
-const TWO_SHOT_ROWS: usize = 16;
 #[cfg(feature = "cuda")]
 const OPT_SEAMS_ROW_OFFSET: u64 = 80 * 32 * 4;
 #[cfg(feature = "cuda")]
@@ -11816,10 +11812,8 @@ impl<'a> DeviceLayer<'a> {
             }
             _ => None,
         };
-        let two_shot_rows = std::env::var("SPARKFLASH_TWO_SHOT_ROWS")
-            .ok()
-            .and_then(|rows| rows.parse().ok())
-            .unwrap_or(TWO_SHOT_ROWS);
+        let two_shot_rows = sparkflash_engine::parallel_tp::two_shot_rows()
+            .map_err(|error| format!("layer device: {error}"))?;
         let opt_attn = match kernel_cubin_dir {
             Some(dir) if std::env::var("SPARKFLASH_OPT_ATTN").as_deref() != Ok("0") => {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_attn_sm121.cubin"))

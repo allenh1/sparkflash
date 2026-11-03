@@ -703,10 +703,13 @@ extern "C" __global__ __launch_bounds__(128) void q4p_kda_prep(
                             key_heads, heads, value_dim, groups);
 }
 
-// The recurrence, state in registers. Grid (heads), 4 * Q4P_GDN_VALUE threads: warp w owns value
-// columns 8w..8w+7, and the four lanes of a column split the 128 keys into quarters of 32, so a
-// column's dot products are 32-term chains plus two shuffles. The state is read once and written
-// once per chunk; `out` gets the raw (pre-norm) head output [token][heads * value_dim].
+// The recurrence, state in registers. Grid (heads, splits), 4 * Q4P_GDN_VALUE / splits threads (a
+// multiple of 32): blockIdx.y owns 1 / splits of the head's value columns, warp w of it columns
+// 8w..8w+7 of those, and the four lanes of a column split the 128 keys into quarters of 32, so a
+// column's dot products are 32-term chains plus two shuffles. A value column's recurrence reads no
+// other column, so the split changes no bit; it gives the SMs work when a rank holds few heads.
+// The state is read once and written once per chunk; `out` gets the raw (pre-norm) head output
+// [token][heads * value_dim].
 //
 // The arithmetic is the host oracle's per element: S *= decay; memory = S . k; delta =
 // (v - memory) * beta; S += k * delta; out = S . q. When snapshot is non-null, region t of it
@@ -727,14 +730,17 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
     __shared__ __align__(16) float s_v[2][Q4P_GDN_TILE * Q4P_GDN_VALUE];
     __shared__ __align__(16) float2 s_db[2][Q4P_GDN_TILE];
     __shared__ __align__(16) float s_cd[2][kChannel ? Q4P_GDN_TILE * Q4P_GDN_HALF : 4];
-    if (value_dim != Q4P_GDN_VALUE || (int)blockDim.x != 4 * Q4P_GDN_VALUE) {
+    if (value_dim != Q4P_GDN_VALUE || (int)(blockDim.x * gridDim.y) != 4 * Q4P_GDN_VALUE ||
+        (blockDim.x & 31u) != 0u) {
         return;
     }
     const int head = blockIdx.x;
     const int kh = head / groups;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
-    const int column = (tid >> 5) * 8 + (lane >> 2);
+    // This block's value columns start here; there are blockDim.x / 4 of them.
+    const int first_column = blockIdx.y * (blockDim.x >> 2);
+    const int column = first_column + (tid >> 5) * 8 + (lane >> 2);
     const int quarter = lane & 3;
     const int conv_width = key_width * 2 + heads * Q4P_GDN_VALUE;
     const int val_width = heads * Q4P_GDN_VALUE;
@@ -749,7 +755,8 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
         s[i] = recurrent[i * Q4P_GDN_VALUE];
     }
 
-    const int v_chunks = Q4P_GDN_VALUE >> 2;
+    // This block's value columns in 16-byte chunks.
+    const int v_chunks = blockDim.x >> 4;
     auto stage = [&](int buffer, int t0) {
         const int rows = min(Q4P_GDN_TILE, batch - t0);
         // q / k: Q4P_GDN_ROW floats a token, in 16-byte chunks.
@@ -764,8 +771,9 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
             const int r = c / v_chunks;
             const int within = c - r * v_chunks;
             const float* src = mixed + (unsigned long long)(t0 + r) * conv_width + key_width * 2 +
-                               head * Q4P_GDN_VALUE + within * 4;
-            om_cp16(om_smem(&s_v[buffer][r * Q4P_GDN_VALUE + within * 4]), src, true);
+                               head * Q4P_GDN_VALUE + first_column + within * 4;
+            om_cp16(om_smem(&s_v[buffer][r * Q4P_GDN_VALUE + first_column + within * 4]), src,
+                    true);
         }
         if (tid < rows) {
             s_db[buffer][tid] = decay_beta[(unsigned long long)(t0 + tid) * heads + head];

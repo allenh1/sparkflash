@@ -413,6 +413,41 @@ bit-identical (row hashes, parity tests and generated texts).
 | grouped attention (above) | `sparse_attn`; the 128-row bench at 6.67 ms a launch | 2.01 ms a launch; `sparse_attn` 622 ms |
 | the three together | | the forward 6.9 to 3.9 s; prefill ~1,000 tok/s from 2k to 36k (36k: 472 to 990) |
 
+### GLM-5.3-Flash, prefill (four Sparks, TP=4)
+
+| change | probe that pointed at it | result |
+| :-- | :-- | :-- |
+| a tensor-core image over 128x128 tiles, K in 32-column stages, block-scaled FP8 weights folded per 128-column block | prompt rows on the token GEMV, eight at a time: 82 tok/s at 6.1k tokens | 205 tok/s at a 512-row chunk |
+| routed experts grouped into items of 32 slots: gather, one gate/up MMA pass an expert, SwiGLU, down, weighted scatter | the expert arm re-read each routed slice per row | (in the same change) |
+| a 4,096-row chunk | the chunk width sweep at one 6.1k prompt: 512 rows 205, 2,048 296 | 316 tok/s, 19.4 s to first token |
+| per-layer KDA scratch shared by every layer and no verify windows on a chunk | 55 GiB of per-layer buffers at 4,096 rows against ~30 GiB free beside the weights and the 1M window | the chunk fits at ~8 GiB |
+| bf16-only activations (dropping the split's low half) | the MMA chain count, not the weight reads | 317 against 316 tok/s: the low half is free, measured and not kept |
+| the release's E4M3 activations into an E4M3 x E4M3 MMA, and a kernel of its own for the mHC's narrow projections | nsys at 6.5k: the bf16 MMAs and the mHC's skinny GEMMs on top | 6.5k 574 to 758 tok/s |
+| dense tiles visited in groups of eight output columns | a 6,144 x 4,096 x 4,096 bench: 8.49 ms, L2 thrash | 2.15 ms (96 TFLOP/s) |
+| the two-shot all-reduce for a chunk's partials | NCCL at 0.9 s of a 6 s chunk | 6.5k 821 tok/s, same texts |
+| weight tiles row-major and swizzled instead of split over two 32-column halves | the expert MMA streaming at 126 GB/s against a plain copy's 205 | 910 tok/s, same texts |
+| the KDA recurrence and convolution over the chunk (the Qwen arm's prefill kernels) | `gdn_recur` at 2.0 s, latency-bound on a 16x4 grid | 6.5k 974 with the recurrence, 1,114 with the convolution too (a run moves ~10%); 915 at 34.8k (vLLM 647) |
+
+### GLM-5.3-Flash, decode (four Sparks, TP=4)
+
+| change | probe that pointed at it | result |
+| :-- | :-- | :-- |
+| the latent attention in four launches (scores a warp a position, softmax, mix a lane a column, project), every sum in the one kernel's order | nsys at 13k positions: the attention 18.5 ms of a 64 ms step on 16 of 48 SMs | ~2 ms; the step 64.2 to 48.3 ms, bits unchanged |
+
+### Qwen3.8-Flash-Next, prefill (DGX Sparks)
+
+| change | probe that pointed at it | result |
+| :-- | :-- | :-- |
+| PLE rows read once a chunk (bulk, 64 `pread` workers), no whole-prompt warm-up | ~1.9 s of NVMe reads a chunk: 65,536 rows a chunk through a 16,384-row cache | TP=1 578-625 to 985-1,012 tok/s |
+| TP=2 and TP=4: heads, GDN heads and expert widths sharded, partials summed one- or two-shot | | TP=4 ~1,375 tok/s |
+| a six-head grouped attention for a TP=4 rank's six heads a KV head | `sparse_attn` 542 ms a chunk on the one-head fallback | 220 ms; ~1,525 tok/s |
+| sequence-parallel hyper-connections from the layer after the PLE, bit-identical | hyper stages ~643 ms of a TP=4 chunk, replicated on every rank | 186 ms; ~1,700-1,800 tok/s at 8-17k |
+| the PLE table reads split over the ranks, the embeddings gathered | every rank read the whole chunk's PLE rows | 8-17k 1,710-1,860 to 1,835-2,060 tok/s |
+| a sequence-parallel chunk as two halves, each half's collectives on a second stream beside the other half's compute, bit-identical | about a third of the chunk in collectives the compute waited for | 2,000-2,280 tok/s |
+| the collective stream at the context's greatest priority | nsys: NCCL 1,639 ms of a 2.6 s chunk, collective stream the critical path | NCCL 875 ms; 2,020-2,420 tok/s, compute now the path |
+| the GDN scan split over value columns, token GEMM tiles and the embedding one launch each, bit-identical | 12 scan blocks on 48 SMs; 3,968 GEMM, 5,330 reduce and 4,096 embed launches a chunk | compute stream ~290 ms shorter; no rate change while the collectives were the path |
+
+
 ### DeepSeek-V4.1-Flash (four DGX Sparks, TP=4)
 
 | change | probe that pointed at it | result |

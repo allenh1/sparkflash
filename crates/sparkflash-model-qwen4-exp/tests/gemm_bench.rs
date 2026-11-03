@@ -233,3 +233,102 @@ fn the_gemm_cost_at_the_models_shapes() {
         eprintln!("320 x 10240 at batch {batch:>3}: {elapsed:.3} ms");
     }
 }
+
+/// A prefill chunk's whole 128-token tiles in one launch (blockIdx.z a tile) give every token the
+/// bits a launch of its tile alone gives it, split or not: the narrow projections' bits do not
+/// move when the tiles share a launch.
+#[test]
+fn tiles_in_one_launch_match_launches_of_their_own() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let (_, kernel) = cuda
+        .load_named(embedded_cubin(), "q4e_gemm_bf16")
+        .expect("q4e_gemm_bf16");
+    let (_, reduce) = cuda
+        .load_named(embedded_cubin(), "q4e_gemm_reduce")
+        .expect("q4e_gemm_reduce");
+    // A TP=4 rank's Gated DeltaNet `a` projection: eight rows of the 2,560-wide hidden row.
+    let (rows, columns, batch, tiles) = (8_usize, 2560_usize, 128_usize, 3_usize);
+    let count = batch * rows;
+    let mut total = 0usize;
+    let weights: Vec<u8> = (0..rows * columns * 2)
+        .map(|index| (index.wrapping_mul(37) >> 3) as u8 & 0x3f)
+        .collect();
+    let w = cuda.alloc(weights.len(), &mut total).expect("weights");
+    cuda.copy_htod(&w, &weights).expect("upload weights");
+    let x_bytes: Vec<u8> = (0..tiles * batch * columns)
+        .flat_map(|index| ((((index * 7919) % 211) as f32) * 0.013 - 1.3).to_le_bytes())
+        .collect();
+    let x = cuda.alloc(x_bytes.len(), &mut total).expect("x");
+    cuda.copy_htod(&x, &x_bytes).expect("upload x");
+    let download = |out: &sparkflash_kernels::cuda_driver::Deviceptr| {
+        cuda.synchronize().expect("drain");
+        let mut host = vec![0u8; tiles * count * 4];
+        cuda.copy_dtoh(&mut host, out).expect("out back");
+        host.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .collect::<Vec<u32>>()
+    };
+    for segments in [1_usize, 48] {
+        let partials = cuda
+            .alloc(tiles * segments * count * 4, &mut total)
+            .expect("partials");
+        let partials = if segments > 1 { partials.0 } else { 0 };
+        let mut outputs = Vec::new();
+        // One launch of all the tiles, then a launch a tile.
+        for (launches, per_launch) in [(1_usize, tiles), (tiles, 1)] {
+            let out = cuda.alloc(tiles * count * 4, &mut total).expect("out");
+            for launch in 0..launches {
+                let first = launch * per_launch;
+                let at = out.offset(first * count * 4);
+                cuda.launch(
+                    kernel,
+                    (rows.div_ceil(64) as u32, segments as u32, per_launch as u32),
+                    (128, 1, 1),
+                    &[
+                        w.0,
+                        x.offset(first * batch * columns * 4).0,
+                        at.0,
+                        rows as u64,
+                        columns as u64,
+                        batch as u64,
+                        // The silu epilogue, so the reduce's tail is covered too.
+                        1,
+                        u64::from(1.5_f32.to_bits()),
+                        segments as u64,
+                        partials,
+                    ],
+                )
+                .expect("gemm");
+                if segments > 1 {
+                    cuda.launch(
+                        reduce,
+                        (count.div_ceil(256) as u32, per_launch as u32, 1),
+                        (256, 1, 1),
+                        &[
+                            partials,
+                            at.0,
+                            count as u64,
+                            segments as u64,
+                            1,
+                            u64::from(1.5_f32.to_bits()),
+                        ],
+                    )
+                    .expect("reduce");
+                }
+            }
+            outputs.push(download(&out));
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "{segments} segments: the tiles in one launch differ from a launch each"
+        );
+        assert!(
+            outputs[0].iter().any(|bits| *bits != 0),
+            "nothing was written"
+        );
+    }
+}

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Each kernel source, the cubin it compiles to, and the env var its path is exported under.
-const IMAGES: [(&str, &str, &str); 3] = [
+const IMAGES: [(&str, &str, &str); 4] = [
     (
         "kernels/qwen4_exp_sm121.cu",
         "qwen4_exp_sm121.cubin",
@@ -44,6 +44,11 @@ const IMAGES: [(&str, &str, &str); 3] = [
         "kernels/dflash2_sm121.cu",
         "dflash2_sm121.cubin",
         "SPARKFLASH_QWEN4_DFLASH2_CUBIN",
+    ),
+    (
+        "kernels/glm_prefill_sm121.cu",
+        "glm_prefill_sm121.cubin",
+        "SPARKFLASH_GLM_PREFILL_CUBIN",
     ),
 ];
 

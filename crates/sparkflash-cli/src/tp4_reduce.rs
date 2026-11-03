@@ -337,6 +337,34 @@ impl TpCollective for DeviceExchange {
         unsafe { self.reduce.exchange_bf16(send, slots, bytes / 2, stream) }
             .map_err(|error| refuse(error.to_string()))
     }
+
+    fn scatter_on_device(
+        &mut self,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        let refuse = |detail: String| EngineError::Shape {
+            what: "NCCL device scatter".to_owned(),
+            detail,
+        };
+        let world = self.world();
+        if !bytes.is_multiple_of(2 * world) {
+            return Err(refuse(format!(
+                "{bytes} bytes are not {world} chunks of whole bf16 words, the unit the exchange \
+                 moves"
+            )));
+        }
+        // SAFETY: TpCollective::scatter_on_device's contract is scatter_bf16's: `send` holds
+        // `bytes` and `slots` as many on the communicator's device, `stream` is a stream there,
+        // and every rank enqueues the same exchanges in the same order.
+        unsafe {
+            self.reduce
+                .scatter_bf16(send, slots, bytes / 2 / world, stream)
+        }
+        .map_err(|error| refuse(error.to_string()))
+    }
 }
 
 #[cfg(test)]

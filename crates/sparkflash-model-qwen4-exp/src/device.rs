@@ -89,6 +89,7 @@ use sparkflash_model::{
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
+use sparkflash_weights::tp::{TpLayout, TpRuntime};
 
 use crate::config::{LayerKind, Qwen4ExpConfig};
 use crate::ple::PleTable;
@@ -99,14 +100,17 @@ mod blocks;
 mod dflash;
 mod fused;
 mod prefill;
+mod tp;
 
 use dflash::DFLASH2_STEP_COST;
 pub use dflash::{DraftDevice, DraftScratch, GpuDflash2, embedded_dflash2_cubin, gemv_e4m3};
 pub use prefill::{
-    ATTENTION_CHUNK, DEFAULT_PREFILL_CHUNK, DENSE_ROWS, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK,
-    PrefillPlan, TOKEN_PREFILL_CHUNK, embedded_prefill_cubin,
+    ATTENTION_CHUNK, CONV_HISTORY, DEFAULT_PREFILL_CHUNK, DENSE_ROWS, GDN_KEY, GDN_QK_ROW,
+    GDN_VALUE, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK,
+    embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape,
 };
 use prefill::{PrefillKernels, PrefillScratch};
+pub use tp::{reduce_two_shot, splits_two_shot};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -222,10 +226,21 @@ pub const ATTN_GROUP_HEADS: usize = 4;
 /// configuration that selects more attends through q4e_attn.
 pub const ATTN_GROUP_SELECTED: usize = 2052;
 
-/// q4e_attn_group's dynamic shared memory: a row of logits and a block of reduction floats for
-/// each head, then the token's selection (45,136 bytes).
-pub const ATTN_GROUP_SHARED_BYTES: u32 =
-    ((ATTN_GROUP_HEADS * (ATTN_GROUP_SELECTED + 256) + ATTN_GROUP_SELECTED) * 4) as u32;
+/// The grouped attention kernels by the query heads each computes together, in the order a
+/// configuration takes them: the first whose count divides its query groups. Six is a four-rank
+/// group's share of the released twelve.
+pub const ATTN_GROUP_KERNELS: [(usize, &str); 2] =
+    [(ATTN_GROUP_HEADS, "q4e_attn_group"), (6, "q4e_attn_group6")];
+
+/// A grouped attention kernel's dynamic shared memory over `heads` heads: a row of logits and a
+/// block of reduction floats for each head, then the token's selection.
+#[must_use]
+pub const fn attn_group_shared_bytes(heads: usize) -> u32 {
+    ((heads * (ATTN_GROUP_SELECTED + 256) + ATTN_GROUP_SELECTED) * 4) as u32
+}
+
+/// q4e_attn_group's dynamic shared memory (45,136 bytes).
+pub const ATTN_GROUP_SHARED_BYTES: u32 = attn_group_shared_bytes(ATTN_GROUP_HEADS);
 
 /// The rows an MTP verify forward takes at most: the token being decoded and two chained drafts.
 const MTP_VERIFY_ROWS: usize = 3;
@@ -574,6 +589,8 @@ struct Kernels {
     hyper_mix: Kernel,
     hyper_inject: Kernel,
     inject: Kernel,
+    /// The two-shot all-reduce's in-place sum of this rank's chunk ([tp::reduce_two_shot]).
+    sum_slots: Kernel,
     swiglu: Kernel,
     router: Kernel,
     moe_permute: Kernel,
@@ -591,9 +608,9 @@ struct Kernels {
     qsa_scores: Kernel,
     qsa_pick: Kernel,
     attn: Kernel,
-    /// q4e_attn for ATTN_GROUP_HEADS query heads of a KV head at once, bit-identical per head;
-    /// none when the device refuses its shared memory.
-    attn_group: Option<Kernel>,
+    /// q4e_attn for several query heads of a KV head at once, bit-identical per head: the
+    /// [ATTN_GROUP_KERNELS] the device grants their shared memory, with their head counts.
+    attn_group: [Option<(usize, Kernel)>; ATTN_GROUP_KERNELS.len()],
     ple_gate: Kernel,
     ple_conv: Kernel,
     deinterleave: Kernel,
@@ -652,6 +669,7 @@ impl Kernels {
             hyper_mix: named(cuda, "q4e_hyper_mix")?,
             hyper_inject: named(cuda, "q4e_hyper_inject")?,
             inject: named(cuda, "q4e_inject")?,
+            sum_slots: named(cuda, "q4e_sum_slots")?,
             swiglu: named(cuda, "q4e_swiglu")?,
             router: named(cuda, "q4e_router")?,
             moe_permute: named(cuda, "q4e_moe_permute")?,
@@ -669,17 +687,18 @@ impl Kernels {
             qsa_scores: named(cuda, "q4e_qsa_scores")?,
             qsa_pick: named(cuda, "q4e_qsa_pick")?,
             attn: named(cuda, "q4e_attn")?,
-            // Its buffers live only in the dynamic reservation, so a refusal means q4e_attn.
-            attn_group: cuda
-                .load_named_shared(QWEN4_CUBIN, "q4e_attn_group", ATTN_GROUP_SHARED_BYTES)
-                .map_err(|error| {
-                    eprintln!(
-                        "q4e_attn_group: {ATTN_GROUP_SHARED_BYTES} bytes of shared memory \
-                         refused ({error}); q4e_attn"
-                    );
-                })
-                .ok()
-                .map(|(_, kernel)| kernel),
+            // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
+            attn_group: ATTN_GROUP_KERNELS.map(|(heads, name)| {
+                let bytes = attn_group_shared_bytes(heads);
+                cuda.load_named_shared(QWEN4_CUBIN, name, bytes)
+                    .map_err(|error| {
+                        eprintln!(
+                            "{name}: {bytes} bytes of shared memory refused ({error}); q4e_attn"
+                        );
+                    })
+                    .ok()
+                    .map(|(_, kernel)| (heads, kernel))
+            }),
             ple_gate: named(cuda, "q4e_ple_gate")?,
             ple_conv: named(cuda, "q4e_ple_conv")?,
             deinterleave: named(cuda, "q4e_deinterleave")?,
@@ -878,6 +897,61 @@ impl<'a> Uploader<'a> {
         })
     }
 
+    /// The row runs `ranges` (first, count) of the BF16 checkpoint matrix `name`, `[rows,
+    /// columns]`, one after another: a rank's heads of a projection that stacks several kinds of
+    /// head, such as the GDN's Q, K and V.
+    fn mat_rows(
+        &self,
+        source: &dyn WeightSource,
+        name: &str,
+        (rows, columns): (usize, usize),
+        ranges: &[(usize, usize)],
+    ) -> Result<GpuMat, String> {
+        if let [(first, count)] = ranges {
+            return self.mat_part(source, name, (rows, columns), Part::Rows(*first, *count));
+        }
+        let bytes = self.rows_of(source, name, (rows, columns * 2), ranges)?;
+        let part_rows = ranges.iter().map(|(_, count)| count).sum();
+        Ok(GpuMat {
+            pointer: self
+                .sink
+                .borrow_mut()
+                .weight(name, part_rows * columns * 2, bytes)?,
+            rows: part_rows,
+            columns,
+        })
+    }
+
+    /// The row runs `ranges` of the tensor `name`, `rows` rows of `row_bytes` each, one after
+    /// another; nothing when the sink wants no bytes.
+    fn rows_of(
+        &self,
+        source: &dyn WeightSource,
+        name: &str,
+        (rows, row_bytes): (usize, usize),
+        ranges: &[(usize, usize)],
+    ) -> Result<Vec<u8>, String> {
+        for &(first, count) in ranges {
+            Part::Rows(first, count).shape((rows, row_bytes))?;
+        }
+        if !self.wants_bytes() {
+            return Ok(Vec::new());
+        }
+        let bytes = source.read(name).map_err(|error| error.to_string())?;
+        if bytes.len() != rows * row_bytes {
+            return Err(format!(
+                "{name} is {} bytes, expected {} for {rows} rows of {row_bytes}",
+                bytes.len(),
+                rows * row_bytes
+            ));
+        }
+        Ok(ranges
+            .iter()
+            .flat_map(|&(first, count)| &bytes[first * row_bytes..(first + count) * row_bytes])
+            .copied()
+            .collect())
+    }
+
     /// A BF16 checkpoint matrix held as E4M3 ([GpuMatE4m3::quantize]); the BF16 upload is freed
     /// once quantized.
     fn mat_e4m3(
@@ -960,6 +1034,25 @@ impl<'a> Uploader<'a> {
         self.sink.borrow_mut().weight(name, len, bytes)
     }
 
+    /// The row runs `ranges` of the BF16 tensor `name`, `rows` rows of `row_len` values, one
+    /// after another: a rank's channels of a per-channel vector or filter.
+    fn vector_rows(
+        &self,
+        source: &dyn WeightSource,
+        name: &str,
+        (rows, row_len): (usize, usize),
+        ranges: &[(usize, usize)],
+    ) -> Result<Deviceptr, String> {
+        if let [(0, count)] = ranges
+            && *count == rows
+        {
+            return self.vector(source, name, rows * row_len);
+        }
+        let bytes = self.rows_of(source, name, (rows, row_len * 2), ranges)?;
+        let len = ranges.iter().map(|(_, count)| count).sum::<usize>() * row_len * 2;
+        self.sink.borrow_mut().weight(name, len, bytes)
+    }
+
     /// One block-scaled FP8 expert matrix: the codes and the BF16 inverse-scale grid.
     fn fp8(
         &self,
@@ -1005,15 +1098,43 @@ impl<'a> Uploader<'a> {
         Ok((weight_pointer, scale_pointer))
     }
 
-    fn nvfp4(
+    /// `part` of the NVFP4 checkpoint matrix at `prefix`, `[rows, columns]`, its rows or columns
+    /// zero-padded to `padded`: a rank's share of an expert, widened to the kernels' tile. Zero
+    /// codes under a zero block scale add nothing to any dot product, so the padding changes no
+    /// sum. The whole matrix unpadded (one rank's share) is the checkpoint's bytes as they are,
+    /// a last partial scale group included.
+    fn nvfp4_part(
         &self,
         source: &dyn WeightSource,
         prefix: &str,
-        rows: usize,
-        columns: usize,
+        (rows, columns): (usize, usize),
+        part: Part,
+        padded: usize,
     ) -> Result<GpuNvfp4, String> {
-        let weight_len = rows * columns.div_ceil(2);
-        let scale_len = rows * columns.div_ceil(16);
+        let (part_rows, part_columns) = part.shape((rows, columns))?;
+        let (out_rows, out_columns, kept) = match part {
+            Part::Rows(..) => (padded, part_columns, part_rows),
+            Part::Columns(..) => (part_rows, padded, part_columns),
+        };
+        let whole = (out_rows, out_columns) == (rows, columns) && kept == padded;
+        if !whole
+            && (padded < kept || !columns.is_multiple_of(16) || !out_columns.is_multiple_of(16))
+        {
+            return Err(format!(
+                "{part:?} of the NVFP4 [{rows}, {columns}] at {prefix} does not pad to {padded} \
+                 in whole 16-column scale groups"
+            ));
+        }
+        if let Part::Columns(first, count) = part
+            && !whole
+            && (!first.is_multiple_of(16) || !count.is_multiple_of(16))
+        {
+            return Err(format!(
+                "{part:?} of {prefix} splits a 16-column NVFP4 scale group"
+            ));
+        }
+        let weight_len = out_rows * out_columns.div_ceil(2);
+        let scale_len = out_rows * out_columns.div_ceil(16);
         let (weight, scales) = if self.wants_bytes() {
             let weight = source
                 .read(&format!("{prefix}.weight"))
@@ -1021,19 +1142,51 @@ impl<'a> Uploader<'a> {
             let scales = source
                 .read(&format!("{prefix}.weight_scale"))
                 .map_err(|error| error.to_string())?;
-            if weight.len() != weight_len {
+            let (whole_weight, whole_scales) =
+                (rows * columns.div_ceil(2), rows * columns.div_ceil(16));
+            if weight.len() != whole_weight {
                 return Err(format!(
-                    "{prefix}.weight is {} bytes, expected {weight_len} for an NVFP4 [{rows}, {columns}]",
+                    "{prefix}.weight is {} bytes, expected {whole_weight} for an NVFP4 [{rows}, {columns}]",
                     weight.len()
                 ));
             }
-            if scales.len() != scale_len {
+            if scales.len() != whole_scales {
                 return Err(format!(
-                    "{prefix}.weight_scale is {} bytes, expected {scale_len}",
+                    "{prefix}.weight_scale is {} bytes, expected {whole_scales}",
                     scales.len()
                 ));
             }
-            (weight, scales)
+            // The codes are two a byte and the scales one a 16-column group, so the part of each
+            // is the same part of a byte matrix that many times narrower.
+            let narrow = |bytes: Vec<u8>, per: usize| -> Vec<u8> {
+                if whole {
+                    return bytes;
+                }
+                let shape = (rows, columns / per);
+                let piece = match part {
+                    Part::Rows(first, count) => Part::Rows(first, count),
+                    Part::Columns(first, count) => Part::Columns(first / per, count / per),
+                };
+                let kept = piece.of(&bytes, shape);
+                match part {
+                    // Whole zero rows after the part's.
+                    Part::Rows(..) => {
+                        let mut out = kept.into_owned();
+                        out.resize(out_rows * out_columns / per, 0);
+                        out
+                    }
+                    // Each row's zero tail after its columns.
+                    Part::Columns(..) => kept
+                        .chunks_exact(part_columns / per)
+                        .flat_map(|row| {
+                            row.iter()
+                                .copied()
+                                .chain(std::iter::repeat_n(0, (out_columns - part_columns) / per))
+                        })
+                        .collect(),
+                }
+            };
+            (narrow(weight, 2), narrow(scales, 16))
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1095,9 +1248,16 @@ impl GpuWeights {
         directory: &Path,
         source: &dyn WeightSource,
         config: &Qwen4ExpConfig,
+        shard: tp::Shard,
     ) -> Result<Self, String> {
         let mut sink = Direct { cuda };
-        build_weights(&Uploader::new(cuda, &mut sink), directory, source, config)
+        build_shard(
+            &Uploader::new(cuda, &mut sink),
+            directory,
+            source,
+            config,
+            shard,
+        )
     }
 }
 
@@ -1108,7 +1268,45 @@ pub(crate) fn build_weights(
     source: &dyn WeightSource,
     config: &Qwen4ExpConfig,
 ) -> Result<GpuWeights, String> {
+    build_shard(uploader, directory, source, config, tp::Shard::WHOLE)
+}
+
+/// [build_weights] for one rank's `shard` of the model: its share of every attention block's
+/// heads, every GDN block's key and value heads and every expert's width, and the rest whole
+/// ([tp::rank_config] describes the shares). `config` is the whole model's.
+fn build_shard(
+    uploader: &Uploader<'_>,
+    directory: &Path,
+    source: &dyn WeightSource,
+    config: &Qwen4ExpConfig,
+    shard: tp::Shard,
+) -> Result<GpuWeights, String> {
     let hidden = config.hidden_size;
+    // Each share as (first, count) in heads or columns, and the parts of a matrix they name.
+    let heads = shard.even(config.num_attention_heads);
+    let kv_heads = shard.kv_heads(config.num_key_value_heads);
+    let key_heads = shard.even(config.linear_num_key_heads);
+    let value_heads = shard.even(config.linear_num_value_heads);
+    let expert_share = shard.even(config.moe_intermediate_size);
+    let expert_width = shard.expert_width(config.moe_intermediate_size);
+    let shared = shard.even(config.shared_expert_intermediate_size);
+    let rows =
+        |(first, count): (usize, usize), width: usize| Part::Rows(first * width, count * width);
+    let columns =
+        |(first, count): (usize, usize), width: usize| Part::Columns(first * width, count * width);
+    let (key_dim, value_dim) = (config.linear_key_head_dim, config.linear_value_head_dim);
+    // The GDN's mixed projection stacks the Q, K and V heads: a rank's rows are a run of each.
+    let qkv_rows = [
+        (key_heads.0 * key_dim, key_heads.1 * key_dim),
+        (
+            config.linear_key_width() + key_heads.0 * key_dim,
+            key_heads.1 * key_dim,
+        ),
+        (
+            2 * config.linear_key_width() + value_heads.0 * value_dim,
+            value_heads.1 * value_dim,
+        ),
+    ];
     let width = config.hyper_width();
     let hyper = |prefix: String, inject: bool| -> Result<GpuHyper, String> {
         Ok(GpuHyper {
@@ -1155,50 +1353,54 @@ pub(crate) fn build_weights(
             LayerKind::Linear => {
                 let prefix = format!("{prefix}.linear_attn");
                 GpuBranch::Linear {
-                    in_qkv: uploader.mat(
+                    in_qkv: uploader.mat_rows(
                         source,
                         &format!("{prefix}.in_proj_qkv.weight"),
-                        config.linear_conv_width(),
-                        hidden,
+                        (config.linear_conv_width(), hidden),
+                        &qkv_rows,
                     )?,
-                    in_z: uploader.mat(
+                    in_z: uploader.mat_part(
                         source,
                         &format!("{prefix}.in_proj_z.weight"),
-                        config.linear_value_width(),
-                        hidden,
+                        (config.linear_value_width(), hidden),
+                        rows(value_heads, value_dim),
                     )?,
-                    in_b: uploader.mat(
+                    in_b: uploader.mat_part(
                         source,
                         &format!("{prefix}.in_proj_b.weight"),
-                        config.linear_num_value_heads,
-                        hidden,
+                        (config.linear_num_value_heads, hidden),
+                        rows(value_heads, 1),
                     )?,
-                    in_a: uploader.mat(
+                    in_a: uploader.mat_part(
                         source,
                         &format!("{prefix}.in_proj_a.weight"),
-                        config.linear_num_value_heads,
-                        hidden,
+                        (config.linear_num_value_heads, hidden),
+                        rows(value_heads, 1),
                     )?,
-                    out_proj: uploader.mat(
+                    out_proj: uploader.mat_part(
                         source,
                         &format!("{prefix}.out_proj.weight"),
-                        hidden,
-                        config.linear_value_width(),
+                        (hidden, config.linear_value_width()),
+                        columns(value_heads, value_dim),
                     )?,
-                    conv: uploader.vector(
+                    // A channel's taps are a row of the depthwise filter.
+                    conv: uploader.vector_rows(
                         source,
                         &format!("{prefix}.conv1d.weight"),
-                        config.linear_conv_width() * config.linear_conv_kernel_dim,
+                        (config.linear_conv_width(), config.linear_conv_kernel_dim),
+                        &qkv_rows,
                     )?,
-                    a_log: uploader.vector(
+                    a_log: uploader.vector_rows(
                         source,
                         &format!("{prefix}.A_log"),
-                        config.linear_num_value_heads,
+                        (config.linear_num_value_heads, 1),
+                        &[value_heads],
                     )?,
-                    dt_bias: uploader.vector(
+                    dt_bias: uploader.vector_rows(
                         source,
                         &format!("{prefix}.dt_bias"),
-                        config.linear_num_value_heads,
+                        (config.linear_num_value_heads, 1),
+                        &[value_heads],
                     )?,
                     norm: uploader.vector(
                         source,
@@ -1209,30 +1411,31 @@ pub(crate) fn build_weights(
             }
             LayerKind::Sparse => {
                 let prefix = format!("{prefix}.self_attn");
+                // A query head's rows are its query and its gate, interleaved.
                 GpuBranch::Sparse {
-                    q_proj: uploader.mat(
+                    q_proj: uploader.mat_part(
                         source,
                         &format!("{prefix}.q_proj.weight"),
-                        config.q_proj_width(),
-                        hidden,
+                        (config.q_proj_width(), hidden),
+                        rows(heads, 2 * config.head_dim),
                     )?,
-                    k_proj: uploader.mat(
+                    k_proj: uploader.mat_part(
                         source,
                         &format!("{prefix}.k_proj.weight"),
-                        config.kv_proj_width(),
-                        hidden,
+                        (config.kv_proj_width(), hidden),
+                        rows(kv_heads, config.head_dim),
                     )?,
-                    v_proj: uploader.mat(
+                    v_proj: uploader.mat_part(
                         source,
                         &format!("{prefix}.v_proj.weight"),
-                        config.kv_proj_width(),
-                        hidden,
+                        (config.kv_proj_width(), hidden),
+                        rows(kv_heads, config.head_dim),
                     )?,
-                    o_proj: uploader.mat(
+                    o_proj: uploader.mat_part(
                         source,
                         &format!("{prefix}.o_proj.weight"),
-                        hidden,
-                        config.attn_out_width(),
+                        (hidden, config.attn_out_width()),
+                        columns(heads, config.head_dim),
                     )?,
                     q_norm: uploader.vector(
                         source,
@@ -1269,23 +1472,26 @@ pub(crate) fn build_weights(
             .map(|expert| {
                 let prefix = format!("{mlp}.experts.{expert}");
                 Ok(GpuExpert {
-                    gate: uploader.nvfp4(
+                    gate: uploader.nvfp4_part(
                         source,
                         &format!("{prefix}.gate_proj"),
-                        config.moe_intermediate_size,
-                        hidden,
+                        (config.moe_intermediate_size, hidden),
+                        rows(expert_share, 1),
+                        expert_width,
                     )?,
-                    up: uploader.nvfp4(
+                    up: uploader.nvfp4_part(
                         source,
                         &format!("{prefix}.up_proj"),
-                        config.moe_intermediate_size,
-                        hidden,
+                        (config.moe_intermediate_size, hidden),
+                        rows(expert_share, 1),
+                        expert_width,
                     )?,
-                    down: uploader.nvfp4(
+                    down: uploader.nvfp4_part(
                         source,
                         &format!("{prefix}.down_proj"),
-                        hidden,
-                        config.moe_intermediate_size,
+                        (hidden, config.moe_intermediate_size),
+                        columns(expert_share, 1),
+                        expert_width,
                     )?,
                 })
             })
@@ -1297,23 +1503,23 @@ pub(crate) fn build_weights(
                 config.num_experts,
                 hidden,
             )?,
-            shared: uploader.mat(
+            shared: uploader.mat_part(
                 source,
                 &format!("{mlp}.shared_expert.gate_proj.weight"),
-                config.shared_expert_intermediate_size,
-                hidden,
+                (config.shared_expert_intermediate_size, hidden),
+                rows(shared, 1),
             )?,
-            shared_up: uploader.mat(
+            shared_up: uploader.mat_part(
                 source,
                 &format!("{mlp}.shared_expert.up_proj.weight"),
-                config.shared_expert_intermediate_size,
-                hidden,
+                (config.shared_expert_intermediate_size, hidden),
+                rows(shared, 1),
             )?,
-            shared_down: uploader.mat(
+            shared_down: uploader.mat_part(
                 source,
                 &format!("{mlp}.shared_expert.down_proj.weight"),
-                hidden,
-                config.shared_expert_intermediate_size,
+                (hidden, config.shared_expert_intermediate_size),
+                columns(shared, 1),
             )?,
             shared_gate: uploader.mat(
                 source,
@@ -1398,7 +1604,9 @@ pub(crate) fn build_weights(
             ple,
         });
     }
-    let mtp = if config.mtp_num_hidden_layers > 0 {
+    // No rank holds a share of the MTP layer ([tp::rank_config]); a sharded rank drafts with the
+    // DFlash 2 head or not at all.
+    let mtp = if config.mtp_num_hidden_layers > 0 && shard.world == 1 {
         let prefix = "mtp";
         let layer = format!("{prefix}.layers.0");
         let attn_prefix = format!("{layer}.self_attn");
@@ -1596,7 +1804,7 @@ impl Qwen4ExpDeviceBackend {
         context_limit: usize,
         prefill: PrefillPlan,
     ) -> Result<Self, BackendError> {
-        Self::open_inner(checkpoint, context_limit, prefill, None)
+        Self::open_inner(checkpoint, context_limit, prefill, None, None)
     }
 
     /// [Self::open] over a converted rank file instead of the checkpoint's tensors, so the
@@ -1615,6 +1823,7 @@ impl Qwen4ExpDeviceBackend {
             context_limit,
             PrefillPlan::from_env(),
             Some(rank_file),
+            None,
         )
     }
 
@@ -1628,19 +1837,18 @@ impl Qwen4ExpDeviceBackend {
         prefill: PrefillPlan,
         rank_file: &Path,
     ) -> Result<Self, BackendError> {
-        Self::open_inner(checkpoint, context_limit, prefill, Some(rank_file))
+        Self::open_inner(checkpoint, context_limit, prefill, Some(rank_file), None)
     }
 
-    /// Open the checkpoint for a tensor-parallel group of this size.
+    /// Open the checkpoint for a world of this size with no collective to sum its partials over.
     ///
-    /// The pack is TP=1 by construction. A rank would need its own shard of every expert - the
-    /// routed experts are NVFP4 rows, not a split table - plus a collective around every
-    /// projection, and neither the checkpoint layout nor these kernels carry that. A world larger
-    /// than one is a typed refusal here rather than a rank-0 fallback that would quietly compute a
-    /// fraction of the model and answer as if it had not.
+    /// Only a world of one has nothing to sum: a larger one is one rank of a tensor-parallel
+    /// group, which [Self::open_rank] opens with the group's collective. A world larger than one
+    /// is a typed refusal here rather than a rank that would quietly compute a fraction of the
+    /// model and answer as if it had not.
     ///
     /// # Errors
-    /// The TP refusal, then everything [Self::open] refuses.
+    /// The refusal, then everything [Self::open] refuses.
     pub fn open_for_world(
         checkpoint: &Path,
         context_limit: usize,
@@ -1650,11 +1858,61 @@ impl Qwen4ExpDeviceBackend {
             return Err(BackendError::new(
                 "qwen4_device",
                 format!(
-                    "this pack serves TP=1 only: a {world_size}-rank group would need a per-rank                      expert shard and a collective around every projection, neither of which the                      checkpoint or these kernels carry"
+                    "a {world_size}-rank group sums every branch over its collective; open each \
+                     rank with Qwen4ExpDeviceBackend::open_rank"
                 ),
             ));
         }
-        Self::open_inner(checkpoint, context_limit, PrefillPlan::from_env(), None)
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env(),
+            None,
+            None,
+        )
+    }
+
+    /// Open rank `tp.rank()` of a tensor-parallel group of `tp.world()` ranks: this rank's share
+    /// of every sharded weight ([tp::rank_config] says which), with each branch's partials summed
+    /// over `tp` before they are injected, so every rank holds the same residual streams. The
+    /// drafter runs whole on every rank; the MTP layer is not loaded.
+    ///
+    /// The rank serves one sequence at a time - every forward is a collective the whole group
+    /// steps through together - so it refuses [Self::enable_fusion].
+    ///
+    /// # Errors
+    /// A world the model's heads or widths do not split over, then everything [Self::open]
+    /// refuses.
+    pub fn open_rank(
+        checkpoint: &Path,
+        context_limit: usize,
+        tp: TpRuntime,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env(),
+            None,
+            Some(tp),
+        )
+    }
+
+    /// A sequence of an [Self::open_rank] group that drafts only when `speculative` says so.
+    ///
+    /// Every rank of the group must take the same steps: a speculative step verifies a draft
+    /// chain, a plain one a token, and each is a collective. The ranks that do not sample run
+    /// greedy, so only a request whose tokens are each its row's argmax may speculate; rank 0
+    /// decides and every rank opens the request's sequence with that decision.
+    ///
+    /// # Errors
+    /// A window that does not fit beside the weights.
+    pub fn open_rank_session(
+        &self,
+        speculative: bool,
+    ) -> Result<Box<dyn ModelSession>, BackendError> {
+        let mut session = DeviceSequence::allocate(Arc::clone(&self.shared), self.context_limit)?;
+        session.spec_enabled &= speculative;
+        Ok(Box::new(session))
     }
 
     fn open_inner(
@@ -1662,6 +1920,7 @@ impl Qwen4ExpDeviceBackend {
         context_limit: usize,
         prefill: PrefillPlan,
         converted: Option<&Path>,
+        tp: Option<TpRuntime>,
     ) -> Result<Self, BackendError> {
         let directory = if checkpoint.is_dir() {
             checkpoint.to_path_buf()
@@ -1785,6 +2044,22 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
+        let shard = tp.as_ref().map_or(tp::Shard::WHOLE, |tp| {
+            tp::Shard::of(TpLayout {
+                rank: tp.rank(),
+                world_size: tp.world(),
+            })
+        });
+        // The rank's kernels run on its share; the walk reads the whole tensors and keeps it.
+        let local = tp::rank_config(&config, shard)
+            .map_err(|error| BackendError::new("qwen4_tp", error))?;
+        if shard.world > 1 && converted.is_some() {
+            return Err(BackendError::new(
+                "qwen4_tp",
+                "a converted rank file holds the TP=1 weights; a sharded rank reads its share from \
+                 the checkpoint (unset SPARKFLASH_QWEN_CONVERTED_DIR)",
+            ));
+        }
         let weights = match converted {
             Some(path) => crate::convert::load_converted(&cuda, &config, &directory, path, &source)
                 .map_err(|error| {
@@ -1793,9 +2068,11 @@ impl Qwen4ExpDeviceBackend {
                         format!("converted rank {}: {error}", path.display()),
                     )
                 })?,
-            None => GpuWeights::upload(&cuda, &directory, &source, &config).map_err(|error| {
-                BackendError::new("qwen4_device", format!("weight upload: {error}"))
-            })?,
+            None => {
+                GpuWeights::upload(&cuda, &directory, &source, &config, shard).map_err(|error| {
+                    BackendError::new("qwen4_device", format!("weight upload: {error}"))
+                })?
+            }
         };
         // The GDN recurrence's state is one head's `key_dim x value_dim` floats; staging it in
         // shared memory turns three global trips per token into three per chunk.
@@ -1827,15 +2104,32 @@ impl Qwen4ExpDeviceBackend {
         let verify_rows = dflash.as_ref().map_or(MTP_VERIFY_ROWS, |draft| {
             draft.config.block_size.max(MTP_VERIFY_ROWS)
         });
+        let tp = tp
+            .map(|runtime| {
+                tp::TensorParallel::new(&cuda, runtime, prefill.chunk, config.hidden_size)
+            })
+            .transpose()?;
+        if let Some(tp) = &tp {
+            eprintln!(
+                "qwen4: rank {} of {}: {} query heads, {} GDN value heads, experts {} wide; {} collective",
+                tp.runtime.rank(),
+                tp.runtime.world(),
+                local.num_attention_heads,
+                local.linear_num_value_heads,
+                local.moe_intermediate_size,
+                tp.runtime.label()
+            );
+        }
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle(cuda),
             kernels: KernelSet(kernels),
-            config: Arc::clone(&config),
+            config: Arc::new(local),
             weights,
             dflash,
             prefill,
             pooled: std::sync::Mutex::new(None),
             verify_rows,
+            tp,
         });
         let _ = DeviceSequence::allocate(Arc::clone(&shared), context_limit)?;
         Ok(Self {
@@ -1863,6 +2157,17 @@ impl Qwen4ExpDeviceBackend {
     /// # Errors
     /// A pooled session the device refuses, or a thread that cannot be started.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
+        if let Some(tp) = &self.shared.tp {
+            return Err(BackendError::new(
+                "qwen4_tp",
+                format!(
+                    "rank {} of {} serves one sequence at a time: every forward is a collective \
+                     its group steps through together",
+                    tp.runtime.rank(),
+                    tp.runtime.world()
+                ),
+            ));
+        }
         self.fused = Some(fused::FusedEngine::start(
             Arc::clone(&self.shared),
             self.context_limit,
@@ -1970,7 +2275,10 @@ impl Qwen4ExpDeviceBackend {
     }
 }
 
-fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescriptor {
+/// What the device arm serves over a window of `context` tokens: the text channels the pack
+/// renders, without the vision tower.
+#[must_use]
+pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescriptor {
     ModelDescriptor {
         id: crate::MODEL_ID.to_owned(),
         family: crate::FAMILY.to_owned(),
@@ -1998,6 +2306,8 @@ struct DeviceSequence {
     batch_stream: Option<RunStream>,
     /// Recorded after the PLE staging copy; the host waits on it before rewriting the slab.
     ple_staged: StagingFence,
+    /// Recorded after the embed that reads the token slab, the same way.
+    tokens_staged: StagingFence,
     position: usize,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
@@ -2076,6 +2386,8 @@ struct DeviceSequence {
     ple_conv_out: Deviceptr,
     /// Rewritten only once this session's staging fence says the last copy out of it has run.
     ple_host_staging: HostMapped,
+    /// A chunk's token ids, which the embed reads in place: one launch embeds the whole chunk.
+    token_staging: HostMapped,
     ple_hashers: Vec<Option<crate::ngram::PleHasher>>,
     /// The widened stream the MTP layer reads: one row per position, assembled shifted by one so
     /// that entry `q` is (hidden_{q-1}, embedding(t_q)).
@@ -2118,6 +2430,14 @@ struct DeviceSequence {
     /// sum, which `SPARKFLASH_QWEN4_MTP_FOLD=sum` selects.
     mtp_fold_scale: f32,
     spec_enabled: bool,
+    /// This rank's `(first, count)` rows while a layer of a forward runs sequence-parallel
+    /// ([Self::sequence_parallel]); None outside one.
+    own_rows: Option<(usize, usize)>,
+    /// The first row of the rows a sequence-parallel collective spans: 0, or the second half's
+    /// first while a chunk runs as two halves ([Self::overlapped_layers]).
+    window: usize,
+    /// The second stream of a chunk that runs as two halves, made with the first such chunk.
+    overlap: Option<tp::Overlap>,
     spec_trace: bool,
     /// Verify passes and the drafts they offered and kept, which the serving layer reports.
     speculation: Speculation,
@@ -2163,6 +2483,7 @@ struct ReusableBuffers {
     prefill: PrefillScratch,
     draft: Option<DraftScratch>,
     ple_host_staging: HostMapped,
+    token_staging: HostMapped,
 }
 
 impl ReusableBuffers {
@@ -2186,6 +2507,7 @@ impl ReusableBuffers {
         );
         cuda.free_buffers(&ptrs);
         cuda.free_host_mapped(&self.ple_host_staging);
+        cuda.free_host_mapped(&self.token_staging);
     }
 }
 
@@ -2195,6 +2517,9 @@ impl Drop for DeviceSequence {
         // uses this stream, so this waits for this session's work only.
         let _ = self.backend.cuda.make_current();
         let _ = self.backend.cuda.synchronize_stream(&self.stream);
+        if let Some(overlap) = self.overlap.take() {
+            overlap.release(&self.backend.cuda);
+        }
         let reusable = ReusableBuffers {
             keys: std::mem::take(&mut self.keys),
             values: std::mem::take(&mut self.values),
@@ -2260,17 +2585,20 @@ impl Drop for DeviceSequence {
             prefill: self.prefill,
             draft: self.draft,
             ple_host_staging: self.ple_host_staging,
+            token_staging: self.token_staging,
         };
         if let Ok(mut guard) = self.backend.pooled.lock()
             && guard.is_none()
         {
             *guard = Some(reusable);
             self.backend.cuda.destroy_event(&self.ple_staged.0);
+            self.backend.cuda.destroy_event(&self.tokens_staged.0);
             self.backend.cuda.destroy_run_stream(&self.stream);
             return;
         }
         reusable.free(&self.backend.cuda);
         self.backend.cuda.destroy_event(&self.ple_staged.0);
+        self.backend.cuda.destroy_event(&self.tokens_staged.0);
         self.backend.cuda.destroy_run_stream(&self.stream);
     }
 }
@@ -2319,6 +2647,9 @@ struct SequenceShared {
     /// The most rows a speculative verify forward takes: the token being decoded and the drafts
     /// after it. Every row but the last has a snapshot region to roll back to.
     verify_rows: usize,
+    /// The world this rank's partials are summed over, when the arm is one rank of several; its
+    /// `config` is then the rank's share ([tp::rank_config]).
+    tp: Option<tp::TensorParallel>,
 }
 
 impl Drop for SequenceShared {
@@ -2327,6 +2658,9 @@ impl Drop for SequenceShared {
             && let Some(reusable) = guard.take()
         {
             reusable.free(&self.cuda);
+        }
+        if let Some(tp) = &self.tp {
+            self.cuda.free_buffers(&[&tp.slots]);
         }
     }
 }
@@ -2507,7 +2841,8 @@ impl DeviceSequence {
     /// A projection over a chunk of GEMM_MIN_BATCH tokens or more.
     ///
     /// The tensor-core MMA takes every matrix whose shape fits its tile; the rest (a handful of
-    /// rows wide) run the token GEMM, GEMM_TILE_TOKENS tokens at a time.
+    /// rows wide) run the token GEMM in tiles of GEMM_TILE_TOKENS tokens, the whole tiles in one
+    /// launch and the remainder in its own.
     fn gemm(
         &self,
         matrix: &GpuMat,
@@ -2520,30 +2855,45 @@ impl DeviceSequence {
         if self.dense_mma(matrix, input, output, batch, epilogue, scale)? {
             return Ok(());
         }
-        let mut base = 0usize;
-        while base < batch {
-            let count = GEMM_TILE_TOKENS.min(batch - base);
+        let tiles = batch / GEMM_TILE_TOKENS;
+        if tiles > 0 {
+            self.gemm_tokens(
+                matrix,
+                input,
+                output,
+                GEMM_TILE_TOKENS,
+                tiles,
+                epilogue,
+                scale,
+            )?;
+        }
+        let base = tiles * GEMM_TILE_TOKENS;
+        if base < batch {
             self.gemm_tokens(
                 matrix,
                 input.offset(base * matrix.columns * 4),
                 output.offset(base * matrix.rows * 4),
-                count,
+                batch - base,
+                1,
                 epilogue,
                 scale,
             )?;
-            base += count;
         }
         Ok(())
     }
 
-    /// The shared-memory token GEMM: one launch covers up to GEMM_TILE_TOKENS tokens for one
-    /// matrix.
+    /// The shared-memory token GEMM over `runs` runs of `batch` tokens (at most
+    /// GEMM_TILE_TOKENS) laid end to end, as few launches as the partials allow. A run's K split
+    /// is chosen from its own `batch`, so each token gets the bits a launch of its run alone
+    /// would give it.
+    #[allow(clippy::too_many_arguments)]
     fn gemm_tokens(
         &self,
         matrix: &GpuMat,
         input: Deviceptr,
         output: Deviceptr,
         batch: usize,
+        runs: usize,
         epilogue: u32,
         scale: f32,
     ) -> Result<(), BackendError> {
@@ -2562,38 +2912,54 @@ impl DeviceSequence {
         } else {
             0_u64
         };
-        self.launch(
-            self.backend.kernels.gemm_bf16,
-            (matrix.rows.div_ceil(64) as u32, segments as u32, 1),
-            (128, 1, 1),
-            &[
-                matrix.pointer.0,
-                input.0,
-                output.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
-                batch as u64,
-                epilogue as u64,
-                u64::from(scale.to_bits()),
-                segments as u64,
-                partials,
-            ],
-        )?;
-        if segments > 1 {
-            let count = batch * matrix.rows;
+        let count = batch * matrix.rows;
+        // The runs whose slices fit the partials at once.
+        let per_launch = if segments > 1 {
+            (GEMM_PARTIAL_FLOATS / (segments * count)).max(1)
+        } else {
+            runs
+        };
+        let mut done = 0usize;
+        while done < runs {
+            let launched = per_launch.min(runs - done);
+            let output = output.offset(done * count * 4);
             self.launch(
-                self.backend.kernels.gemm_reduce,
-                (count.div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
+                self.backend.kernels.gemm_bf16,
+                (
+                    matrix.rows.div_ceil(64) as u32,
+                    segments as u32,
+                    launched as u32,
+                ),
+                (128, 1, 1),
                 &[
-                    partials,
+                    matrix.pointer.0,
+                    input.offset(done * batch * matrix.columns * 4).0,
                     output.0,
-                    count as u64,
-                    segments as u64,
+                    matrix.rows as u64,
+                    matrix.columns as u64,
+                    batch as u64,
                     epilogue as u64,
                     u64::from(scale.to_bits()),
+                    segments as u64,
+                    partials,
                 ],
             )?;
+            if segments > 1 {
+                self.launch(
+                    self.backend.kernels.gemm_reduce,
+                    (count.div_ceil(256).max(1) as u32, launched as u32, 1),
+                    (256, 1, 1),
+                    &[
+                        partials,
+                        output.0,
+                        count as u64,
+                        segments as u64,
+                        epilogue as u64,
+                        u64::from(scale.to_bits()),
+                    ],
+                )?;
+            }
+            done += launched;
         }
         Ok(())
     }
@@ -2776,6 +3142,20 @@ impl DeviceSequence {
         inject: bool,
         batch: usize,
     ) -> Result<(Deviceptr, Option<Deviceptr>), BackendError> {
+        self.hyper_rows(block, input, inject, 0, batch)
+    }
+
+    /// [Self::hyper] over rows `first..first + batch` of a chunk whose widened rows start at
+    /// `input`: each row is read and its outputs written at its own row of every buffer, so a
+    /// rank of a sequence-parallel forward leaves its share where the gather puts its peers'.
+    fn hyper_rows(
+        &self,
+        block: &GpuHyper,
+        input: Deviceptr,
+        inject: bool,
+        first: usize,
+        batch: usize,
+    ) -> Result<(Deviceptr, Option<Deviceptr>), BackendError> {
         let config = &self.backend.config;
         let width = config.hyper_width();
         const WARPS: usize = 8;
@@ -2793,11 +3173,16 @@ impl DeviceSequence {
         // tokens, sixteen times over, and measured 145 ms of a 128-token chunk against the few
         // milliseconds one pass costs - a quarter of the stage was the hyper streams' weight
         // traffic alone. The nonlinearities ride along as the GEMM tile is written.
+        let normed = self.normed.offset(first * width * 4);
+        let mixed = self.mixed.offset(first * config.hidden_size * 4);
+        let injection = self.injection.offset(first * config.hc_count * 4);
         if batch >= GEMM_MIN_BATCH {
+            let low = self.hyper_low.offset(first * config.hc_lowrank * 4);
+            let raw = self.hyper_mix_raw.offset(first * width * 4);
             self.norm(
-                input,
+                input.offset(first * width * 4),
                 block.norm,
-                self.normed,
+                normed,
                 width,
                 config.hidden_size,
                 true,
@@ -2806,16 +3191,16 @@ impl DeviceSequence {
             )?;
             let hc = config.hc_count as f32;
             self.prof_mark("hyper_norm")?;
-            self.gemm(&block.down, self.normed, self.hyper_low, batch, 1, hc)?;
+            self.gemm(&block.down, normed, low, batch, 1, hc)?;
             self.prof_mark("hyper_low")?;
             if inject {
                 let weights = block.inject.as_ref().ok_or_else(|| {
                     BackendError::new("qwen4_device", "missing block_inject weight")
                 })?;
-                self.gemm(weights, self.normed, self.injection, batch, 2, hc)?;
+                self.gemm(weights, normed, injection, batch, 2, hc)?;
                 self.prof_mark("hyper_inject")?;
             }
-            self.gemm(&block.up, self.hyper_low, self.hyper_mix_raw, batch, 0, 1.0)?;
+            self.gemm(&block.up, low, raw, batch, 0, 1.0)?;
             self.prof_mark("hyper_raw")?;
             self.launch(
                 self.backend.kernels.hyper_mix,
@@ -2829,9 +3214,9 @@ impl DeviceSequence {
                 ),
                 (256, 1, 1),
                 &[
-                    self.hyper_mix_raw.0,
-                    self.normed.0,
-                    self.mixed.0,
+                    raw.0,
+                    normed.0,
+                    mixed.0,
                     config.hidden_size as u64,
                     config.hc_count as u64,
                     batch as u64,
@@ -2839,7 +3224,7 @@ impl DeviceSequence {
             )?;
             self.prof_mark("hyper_down")?;
             self.prof_mark("hyper_up")?;
-            return Ok((self.mixed, inject.then_some(self.injection)));
+            return Ok((mixed, inject.then_some(injection)));
         }
         // Below the GEMM's chunk width these passes keep one register accumulator per token, so
         // they are launched in groups of GEMV_MAX_BATCH tokens and each group is offset into the
@@ -2855,9 +3240,9 @@ impl DeviceSequence {
                 .inject
                 .as_ref()
                 .is_none_or(|weights| tiled_operands(&[weights.pointer], width));
-        let mut base = 0usize;
-        while base < batch {
-            let count = GEMV_MAX_BATCH.min(batch - base);
+        let mut base = first;
+        while base < first + batch {
+            let count = GEMV_MAX_BATCH.min(first + batch - base);
             let normed = self.normed.offset(base * width * 4);
             let low = self.hyper_low.offset(base * config.hc_lowrank * 4);
             let injection = self.injection.offset(base * config.hc_count * 4);
@@ -2945,7 +3330,7 @@ impl DeviceSequence {
         }
         self.prof_mark("hyper_down")?;
         self.prof_mark("hyper_up")?;
-        Ok((self.mixed, inject.then_some(self.injection)))
+        Ok((mixed, inject.then_some(injection)))
     }
 
     /// Assemble the MTP's widened rows: the previous forward's last row, then this forward's
@@ -3097,18 +3482,7 @@ impl DeviceSequence {
         let (mixed, injection) = self.hyper(&mtp.attn_hyper, self.mtp_hyper, true, batch)?;
         let injection = injection.expect("the MTP attention hyper-connection injects");
         self.sparse_attention(&mtp.attn, slot, mixed, position, batch)?;
-        self.launch(
-            kernels.inject,
-            (flat(width), batch as u32, 1),
-            (256, 1, 1),
-            &[
-                self.mtp_hyper.0,
-                self.branch.0,
-                injection.0,
-                config.hc_count as u64,
-                hidden as u64,
-            ],
-        )?;
+        self.inject_branch(self.mtp_hyper, injection, batch)?;
         self.prof_mark("mtp_attn")?;
         let (mixed, injection) = self.hyper(&mtp.mlp_hyper, self.mtp_hyper, true, batch)?;
         let injection = injection.expect("the MTP MLP hyper-connection injects");
@@ -3157,6 +3531,7 @@ impl DeviceSequence {
         layer: &GpuLayer,
         tokens: &[u32],
         batch: usize,
+        share: Option<(usize, usize)>,
         ple_snapshot: u64,
         snapshot_rows: usize,
         region_stride: u64,
@@ -3178,43 +3553,41 @@ impl DeviceSequence {
             .push(tokens, None)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         let embed_dim = config.ple_embed_dim;
-        let total_bytes = batch * embed_dim * 4;
+        // A sequence-parallel chunk reads only this rank's share of the table rows and gathers
+        // its peers' embeddings: the same bytes decoded the same way, a quarter of the reads at
+        // TP=4.
+        let (first, count) = share.unwrap_or((0, batch));
+        let row_bytes = embed_dim * 4;
+        let mine = self.ple_embedding.offset(first * row_bytes);
         // The fence waits for the last copy out of the slab, not for the layers queued
         // since, so the table reads below overlap the device's work on the layers before.
         cuda.host_wait(&self.ple_staged.0)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         {
-            let mut table = ple
-                .table
+            let staging = &self.ple_host_staging;
+            ple.table
                 .lock()
-                .map_err(|_| BackendError::new("qwen4_device", "the PLE table lock is poisoned"))?;
-            if batch > 1 {
-                let flat: Vec<u64> = rows.iter().flat_map(|row| row.iter().copied()).collect();
-                table
-                    .prefetch(&flat)
-                    .map_err(|error| BackendError::new("qwen4_device", error))?;
-            }
-            for (t, row) in rows.iter().enumerate() {
-                let embedding = table
-                    .embedding(row)
-                    .map_err(|error| BackendError::new("qwen4_device", error))?;
-                let src = bytemuck::cast_slice::<f32, u8>(&embedding);
-                self.ple_host_staging
-                    .write_at(t * embed_dim * 4, src)
-                    .map_err(|error| BackendError::new("qwen4_device", error))?;
-            }
+                .map_err(|_| BackendError::new("qwen4_device", "the PLE table lock is poisoned"))?
+                .embeddings(&rows[first..first + count], |t, embedding| {
+                    staging.write_at(t * row_bytes, bytemuck::cast_slice::<f32, u8>(embedding))
+                })
+                .map_err(|error| BackendError::new("qwen4_device", error))?;
         }
         self.prof_mark("ple_host")?;
         cuda.copy_htod_async_on(
             self.clock(),
-            &self.ple_embedding,
+            &mine,
             &self.ple_host_staging,
             0,
-            total_bytes,
+            count * row_bytes,
         )
         .map_err(|error| BackendError::new("qwen4_device", error))?;
         cuda.record_event_on(self.clock(), &self.ple_staged.0)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if share.is_some() {
+            self.gather_rows(self.ple_embedding, mine, count * row_bytes)?;
+            self.prof_mark("ple_gather")?;
+        }
         self.probe_finite(
             index,
             "ple_embedding",
@@ -3310,6 +3683,51 @@ impl DeviceSequence {
         Ok(())
     }
 
+    /// A layer's attention block over `batch` rows of `mixed` from `position` on, its output in
+    /// `self.branch`: a linear (Gated DeltaNet) block's projections, convolution, recurrence and
+    /// output projection, or a sparse-attention block.
+    #[allow(clippy::too_many_arguments)]
+    fn attend(
+        &self,
+        index: usize,
+        layer: &GpuLayer,
+        mixed: Deviceptr,
+        position: usize,
+        batch: usize,
+        chunk: bool,
+        snapshot_rows: usize,
+        conv_snapshot: u64,
+        region_stride: u64,
+    ) -> Result<(), BackendError> {
+        match &layer.branch {
+            GpuBranch::Linear { .. } => {
+                // A verify's convolved rows, `b` and `a` go where the replay that commits them
+                // reads them; any other forward uses the shared scratch.
+                let (conv_out, b_out, a_out) = match (snapshot_rows > 0, self.gdn_replay[index]) {
+                    (true, Some(inputs)) => self.replay_slices(inputs),
+                    _ => (self.linear_conv, self.linear_b, self.linear_a),
+                };
+                self.linear_project(&layer.branch, mixed, b_out, a_out, batch)?;
+                self.linear_state(
+                    index,
+                    &layer.branch,
+                    conv_out,
+                    b_out,
+                    a_out,
+                    batch,
+                    chunk,
+                    snapshot_rows,
+                    conv_snapshot,
+                    region_stride,
+                )?;
+                self.linear_output(index, &layer.branch, batch)
+            }
+            GpuBranch::Sparse { .. } => {
+                self.sparse_attention(&layer.branch, index, mixed, position, batch)
+            }
+        }
+    }
+
     fn forward_batch(
         &mut self,
         tokens: &[u32],
@@ -3331,32 +3749,55 @@ impl DeviceSequence {
         let kernels = &*backend.kernels;
         let weights = &backend.weights;
         let width = config.hyper_width();
+        // A sharded chunk splits its hyper-connections over the ranks from the layer after the
+        // last PLE block on: a PLE block convolves each row with the rows before it, which a rank
+        // holding only its own share would not have.
+        self.own_rows = None;
+        self.window = 0;
+        let shares = self.sequence_parallel(batch, chunk);
+        let parallel_from = weights
+            .layers
+            .iter()
+            .rposition(|layer| layer.ple.is_some())
+            .map_or(0, |last| last + 1);
+        // From there on, a chunk whose halves split into whole pieces runs them overlapped.
+        let overlap_from = if shares.is_some() && self.overlaps(batch) {
+            parallel_from
+        } else {
+            weights.layers.len()
+        };
         if prof::enabled() {
             prof::begin();
         }
-        let embed_blocks = width.div_ceil(256).max(1) as u32;
-        for (t, &token) in tokens.iter().enumerate() {
-            // On the session's stream like every other launch of the forward: the default stream
-            // the loader uses is not ordered against it, so an embed left there raced the layers
-            // that read its rows.
-            self.launch(
-                kernels.embed,
-                (embed_blocks, 1, 1),
-                (256, 1, 1),
-                &[
-                    weights.embed.pointer.0,
-                    self.hyper.offset(t * width * 4).0,
-                    u64::from(token),
-                    config.hidden_size as u64,
-                    width as u64,
-                    0,
-                ],
-            )?;
-        }
+        // The whole chunk in one launch, grid row t widening tokens[t], on the session's stream
+        // like every other launch of the forward: the default stream the loader uses is not
+        // ordered against it, so an embed left there raced the layers that read its rows. The
+        // ids are read in place from the slab, which is rewritten only once the last embed ran.
+        let cuda = &backend.cuda;
+        cuda.host_wait(&self.tokens_staged.0)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.token_staging
+            .write_at(0, bytemuck::cast_slice::<u32, u8>(tokens))
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.launch(
+            kernels.embed,
+            (width.div_ceil(256).max(1) as u32, batch as u32, 1),
+            (256, 1, 1),
+            &[
+                weights.embed.pointer.0,
+                self.hyper.0,
+                0,
+                config.hidden_size as u64,
+                width as u64,
+                self.token_staging.device().0,
+            ],
+        )?;
+        cuda.record_event_on(self.clock(), &self.tokens_staged.0)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
         self.probe_finite(0, "embed", self.hyper, batch * width)?;
         self.prof_mark("embed")?;
         let position = self.position;
-        for (index, layer) in weights.layers.iter().enumerate() {
+        for (index, layer) in weights.layers.iter().enumerate().take(overlap_from) {
             // A speculative verify saves the convolution windows after each of its rows but the
             // last, so the rows past the ones the model agreed with can be given back; a plain
             // forward passes no snapshot at all. The kernels write row r's windows `r` regions
@@ -3371,62 +3812,34 @@ impl DeviceSequence {
             let conv_snapshot = snapshot_ptr(conv_slot);
             let ple_snapshot = snapshot_ptr(ple_slot);
             let region_stride = self.snapshot_stride as u64;
+            self.own_rows = shares.filter(|_| index >= parallel_from);
             self.ple_step(
                 index,
                 layer,
                 tokens,
                 batch,
+                shares,
                 ple_snapshot,
                 snapshot_rows,
                 region_stride,
             )?;
-            let (mixed, injection) = self.hyper(&layer.attn_hyper, self.hyper, true, batch)?;
-            let _ = injection;
+            let (mixed, _) = self.branch_input(&layer.attn_hyper, batch)?;
             self.prof_mark("hyper_attn")?;
-            match &layer.branch {
-                GpuBranch::Linear { .. } => {
-                    // A verify's convolved rows, `b` and `a` go where the replay that commits
-                    // them reads them; any other forward uses the shared scratch.
-                    let (conv_out, b_out, a_out) = match (snapshot_rows > 0, self.gdn_replay[index])
-                    {
-                        (true, Some(inputs)) => self.replay_slices(inputs),
-                        _ => (self.linear_conv, self.linear_b, self.linear_a),
-                    };
-                    self.linear_project(&layer.branch, mixed, b_out, a_out, batch)?;
-                    self.linear_state(
-                        index,
-                        &layer.branch,
-                        conv_out,
-                        b_out,
-                        a_out,
-                        batch,
-                        chunk,
-                        snapshot_rows,
-                        conv_snapshot,
-                        region_stride,
-                    )?;
-                    self.linear_output(index, &layer.branch, batch)?;
-                }
-                GpuBranch::Sparse { .. } => {
-                    self.sparse_attention(&layer.branch, index, mixed, position, batch)?;
-                }
-            }
-            self.launch(
-                kernels.inject,
-                (width.div_ceil(256).max(1) as u32, batch as u32, 1),
-                (256, 1, 1),
-                &[
-                    self.hyper.0,
-                    self.branch.0,
-                    self.injection.0,
-                    config.hc_count as u64,
-                    config.hidden_size as u64,
-                ],
+            self.attend(
+                index,
+                layer,
+                mixed,
+                position,
+                batch,
+                chunk,
+                snapshot_rows,
+                conv_snapshot,
+                region_stride,
             )?;
+            self.inject_branch(self.hyper, self.injection, batch)?;
             self.probe_finite(index, "after_attn", self.hyper, batch * width)?;
             self.prof_mark("attn_inject")?;
-            let (mixed, injection) = self.hyper(&layer.mlp_hyper, self.hyper, true, batch)?;
-            let injection = injection.expect("the MLP hyper-connection injects");
+            let (mixed, injection) = self.branch_input(&layer.mlp_hyper, batch)?;
             self.probe_finite(index, "mixed", mixed, batch * config.hidden_size)?;
             self.prof_mark("hyper_mlp")?;
             self.mlp(
@@ -3436,15 +3849,24 @@ impl DeviceSequence {
             self.capture_features(index, batch)?;
             self.prof_mark("inject_mlp")?;
         }
-        if logit_rows == 0 {
+        if overlap_from < weights.layers.len() {
+            self.overlapped_layers(&weights.layers[overlap_from..], overlap_from, chunk, batch)?;
+        } else if self.own_rows.is_some() {
+            self.gather_features()?;
+        }
+        let last_hyper = match logit_rows {
+            0 => None,
+            rows => Some(self.head_rows(batch, rows)?),
+        };
+        self.own_rows = None;
+        self.window = 0;
+        let Some(last_hyper) = last_hyper else {
             prof::report(self.position + batch - 1, batch);
             self.position += batch;
             return Ok(None);
-        }
-        let start = batch - logit_rows;
+        };
         // The head sees only the logit rows; in a decode or a verify they are every row.
         self.probe_rows = logit_rows;
-        let last_hyper = self.hyper.offset(start * width * 4);
         let (mixed, _) = self.hyper(&weights.mixer, last_hyper, false, logit_rows)?;
         self.gemv(&weights.lm_head, mixed, self.logits, logit_rows)?;
         self.probe_finite(48, "logits", self.logits, config.vocab_size * logit_rows)?;
@@ -3718,6 +4140,10 @@ impl DeviceSequence {
             cuda.stream_event()
                 .map_err(|error| BackendError::new("qwen4_device", error))?,
         );
+        let tokens_staged = StagingFence(
+            cuda.stream_event()
+                .map_err(|error| BackendError::new("qwen4_device", error))?,
+        );
         let hidden = config.hidden_size;
         let width = config.hyper_width();
         // Every per-row buffer holds one prefill chunk. The indexer's score grid is the exception:
@@ -3911,6 +4337,9 @@ impl DeviceSequence {
             let ple_host_staging = cuda
                 .alloc_host_mapped((rows * config.ple_embed_dim * 4).max(4), &mut total)
                 .map_err(|error| BackendError::new("qwen4_device", error))?;
+            let token_staging = cuda
+                .alloc_host_mapped(rows * 4, &mut total)
+                .map_err(|error| BackendError::new("qwen4_device", error))?;
             let prefill = PrefillScratch::allocate(cuda, &config, rows, &mut total)
                 .map_err(|error| BackendError::new("qwen4_device", error))?;
             let draft = shared
@@ -3933,6 +4362,7 @@ impl DeviceSequence {
                 prefill,
                 draft,
                 ple_host_staging,
+                token_staging,
             }
         };
         let history = config.linear_conv_kernel_dim.saturating_sub(1).max(1);
@@ -3970,6 +4400,7 @@ impl DeviceSequence {
             stream,
             batch_stream: None,
             ple_staged,
+            tokens_staged,
             position: 0,
             score_stride,
             keys: buffers.keys,
@@ -4071,10 +4502,14 @@ impl DeviceSequence {
             } else {
                 1.0 / config.hc_count as f32
             },
+            own_rows: None,
+            window: 0,
+            overlap: None,
             spec_trace: std::env::var_os("SPARKFLASH_QWEN4_SPEC_TRACE").is_some(),
             speculation: Speculation::default(),
             probe_rows: 1,
             ple_host_staging: buffers.ple_host_staging,
+            token_staging: buffers.token_staging,
             ple_hashers,
             sampling: Sampling::default(),
             sampler: crate::sampling::Sampler::new(),
@@ -4455,25 +4890,9 @@ impl ModelSession for DeviceSequence {
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         self.sampler.record_prompt(tokens);
-        // Pre-warm all PLE n-gram rows across the full prompt in one parallel shard read pass.
-        if tokens.len() > 1 {
-            for (index, layer) in self.backend.weights.layers.iter().enumerate() {
-                if let (Some(ple), Some(hasher)) = (&layer.ple, self.ple_hashers[index].as_ref()) {
-                    let mut preview = hasher.clone();
-                    let rows = preview
-                        .push(tokens, None)
-                        .map_err(|error| BackendError::new("qwen4_device", error))?;
-                    let flat: Vec<u64> = rows.iter().flat_map(|row| row.iter().copied()).collect();
-                    ple.table
-                        .lock()
-                        .map_err(|_| {
-                            BackendError::new("qwen4_device", "the PLE table lock is poisoned")
-                        })?
-                        .prefetch(&flat)
-                        .map_err(|error| BackendError::new("qwen4_device", error))?;
-                }
-            }
-        }
+        // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
+        // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
+        // keeps, so the chunks would find most of them evicted again.
         let forwards = self.backend.prefill.forwards(tokens.len());
         let last_idx = forwards.len() - 1;
         // The first draft block sits just past the prompt and its anchor row reaches

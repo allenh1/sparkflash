@@ -38,7 +38,7 @@ use crate::weights::{WeightError, WeightSource};
 
 pub use sparkflash_weights::tp::{
     BitGather, BitGatherHandle, EXACT_WIRE_REL_L2_BAR, LocalBus, LocalRank, SingleRank,
-    TpCollective, TpLayout, TpRuntime, Wire, canonical_reduce_into,
+    TWO_SHOT_ROWS, TpCollective, TpLayout, TpRuntime, Wire, canonical_reduce_into, two_shot_rows,
 };
 
 /// Whether a plan name is one of the two paged Engram table tensors of an Engram layer.

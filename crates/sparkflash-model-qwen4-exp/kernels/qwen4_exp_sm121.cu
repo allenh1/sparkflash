@@ -1304,7 +1304,8 @@ struct Q4eTgStore {
 // fourth (0 <= second <= third <= fourth <= rows): part p's outputs land as one [batch][its rows]
 // block after the blocks of the parts before it, so each part of a fused projection is the next
 // kernel's contiguous input at any batch. One token's outputs are the plain row order, and every
-// boundary at `rows` is Q4eTgStore at any batch.
+// boundary at `rows` is Q4eTgStore at any batch. A grouped launch (q4e_tg_group) stores its
+// group's `count` tokens from `first` on into the layout of all `batch`.
 struct Q4eTgPartStore {
     float* y;
     int rows;
@@ -1312,16 +1313,36 @@ struct Q4eTgPartStore {
     int second;
     int third;
     int fourth;
+    int first;
+    int count;
     __device__ void operator()(int tile, int warp, int r, int t, float sum) const {
         const int row = tile * Q4E_TG_TILE + warp * Q4E_TG_ROWS + r;
-        if (t < batch && row < rows) {
+        if (t < count && row < rows) {
             const int start = row < second ? 0 : row < third ? second : row < fourth ? third : fourth;
             const int end = row < second ? second : row < third ? third : row < fourth ? fourth : rows;
-            y[(unsigned long long)batch * start + (unsigned long long)t * (end - start) + row - start] =
-                sum;
+            y[(unsigned long long)batch * start +
+              (unsigned long long)(first + t) * (end - start) + row - start] = sum;
         }
     }
 };
+
+// A grouped tiled launch: blockIdx.z is a group of Q4E_MAX_BATCH tokens, each group the body of a
+// launch of its own over its tokens with its own split partials and tile counters (`partials` and
+// `counters` hold gridDim.z of a launch's each), so a token's sum is the chain of an ungrouped
+// launch - a prefill chunk runs the decode GEMV's arithmetic in one launch instead of one an
+// eight rows. Moves x, partials and counters to the group's, and returns its first token and count
+// (zero or less past the batch).
+__device__ __forceinline__ int2 q4e_tg_group(const float* __restrict__& x,
+                                             float* __restrict__& partials,
+                                             unsigned int* __restrict__& counters, int columns,
+                                             int batch) {
+    const int group = blockIdx.z;
+    const int first = group * Q4E_MAX_BATCH;
+    x += (unsigned long long)first * columns;
+    partials += (unsigned long long)group * gridDim.y * Q4E_MAX_BATCH * gridDim.x * Q4E_TG_TILE;
+    counters += (unsigned long long)group * gridDim.x;
+    return make_int2(first, min(Q4E_MAX_BATCH, batch - first));
+}
 
 // y = W x through the tiled body: grid (ceil(rows / 32), splits), Q4E_TG_THREADS threads.
 extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
@@ -1340,19 +1361,22 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
 
 // q4e_gemv_tiled_bf16 with its outputs in Q4eTgPartStore's layout: GLM-5.3-Flash's fused BF16
 // projections (KDA's q, k, v, f_a, g_a and b; the indexer's wk, compress gate and weights_proj).
+// Grid (ceil(rows / 32), splits, ceil(batch / Q4E_MAX_BATCH)): q4e_tg_group.
 extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
     q4e_gemv_tiled_bf16_parts(const __nv_bfloat16* __restrict__ w, const float* __restrict__ x,
                               float* __restrict__ y, int rows, int columns, int batch,
                               float* __restrict__ partials, unsigned int* __restrict__ counters,
                               int second, int third, int fourth) {
     OPT_PDL_LAUNCH();
-    if (batch > Q4E_MAX_BATCH) {
+    const int2 group = q4e_tg_group(x, partials, counters, columns, batch);
+    if (batch > Q4E_MAX_BATCH * (int)gridDim.z || group.y <= 0) {
         OPT_PDL_WAIT();
         return;
     }
-    q4e_tiled_gemv<Q4eTgBf16>(Q4eTgRows<__nv_bfloat16>{w, rows, columns},
-                              Q4eTgPartStore{y, rows, batch, second, third, fourth}, x, columns,
-                              batch, partials, counters);
+    q4e_tiled_gemv<Q4eTgBf16>(
+        Q4eTgRows<__nv_bfloat16>{w, rows, columns},
+        Q4eTgPartStore{y, rows, batch, second, third, fourth, group.x, group.y}, x, columns,
+        group.y, partials, counters);
 }
 
 // y = (W x) * scales[row] for an E4M3 W with one f32 scale a row (the drafter's matrices, which
@@ -1377,8 +1401,8 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
 // (weight_scale_inv, [ceil(rows / 128)][ceil(columns / 128)]) and x_q is x quantised as the
 // checkpoint's dynamic activation scheme does it, per 128 columns (q4e_tg_fp8_activation), when
 // `quantise` is set, and is x unquantised when it is clear. The outputs are in Q4eTgPartStore's
-// layout (the MLA's fused q_a and kv_a). Grid (ceil(rows / 32), splits), Q4E_TG_THREADS threads,
-// and columns a multiple of 128.
+// layout (the MLA's fused q_a and kv_a). Grid (ceil(rows / 32), splits, ceil(batch /
+// Q4E_MAX_BATCH)) as q4e_tg_group, Q4E_TG_THREADS threads, and columns a multiple of 128.
 extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
     q4e_gemv_tiled_e4m3_block(const unsigned char* __restrict__ w,
                               const float* __restrict__ scales, const float* __restrict__ x,
@@ -1386,13 +1410,16 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
                               float* __restrict__ partials, unsigned int* __restrict__ counters,
                               int quantise, int second, int third, int fourth) {
     OPT_PDL_LAUNCH();
-    if (batch > Q4E_MAX_BATCH || columns % Q4E_FP8_BLOCK != 0) {
+    const int2 group = q4e_tg_group(x, partials, counters, columns, batch);
+    if (batch > Q4E_MAX_BATCH * (int)gridDim.z || group.y <= 0 ||
+        columns % Q4E_FP8_BLOCK != 0) {
         OPT_PDL_WAIT();
         return;
     }
-    q4e_tiled_gemv<Q4eTgE4m3Block>(Q4eTgBlockRows{{w, rows, columns}, scales, quantise},
-                                   Q4eTgPartStore{y, rows, batch, second, third, fourth}, x,
-                                   columns, batch, partials, counters);
+    q4e_tiled_gemv<Q4eTgE4m3Block>(
+        Q4eTgBlockRows{{w, rows, columns}, scales, quantise},
+        Q4eTgPartStore{y, rows, batch, second, third, fourth, group.x, group.y}, x, columns,
+        group.y, partials, counters);
 }
 
 // L2 prefetch of up to four weight spans (address, bytes; a zero length skips the span), each split
@@ -1672,6 +1699,10 @@ __device__ __forceinline__ void q4e_gemm_compute(const __nv_bfloat16 (*s_w)[QG_K
 // epilogue. A narrow matrix leaves only (rows / 8) * (batch / 8) threads of work - 640 for the
 // hyper-connection's 320-row down projection, a fortieth of the GPU - and no tile shape fixes
 // that without splitting K. With one segment the block writes `y` itself, as before.
+//
+// blockIdx.z picks one of gridDim.z runs of `batch` tokens laid end to end (a prefill chunk's
+// 128-token tiles): its tokens, outputs and partials sit z runs on. A token's sum depends only
+// on `columns` and `segments`, so it has the bits its own launch would give it.
 extern "C" __global__ void q4e_gemm_bf16(const __nv_bfloat16* __restrict__ w,
                                           const float* __restrict__ x, float* __restrict__ y,
                                           int rows, int columns, int batch, int epilogue,
@@ -1681,6 +1712,14 @@ extern "C" __global__ void q4e_gemm_bf16(const __nv_bfloat16* __restrict__ w,
     __shared__ float s_x[2][QG_TOKENS][QG_XSTRIDE];
     if (columns <= 0 || batch <= 0 || batch > QG_TOKENS) {
         return;
+    }
+    {
+        const unsigned long long run = blockIdx.z;
+        x += run * batch * columns;
+        y += run * batch * rows;
+        if (segments > 1) {
+            partials += run * segments * batch * rows;
+        }
     }
     const int tx = threadIdx.x;
     const int row_in_block = (tx >> 4) * 8;
@@ -1779,11 +1818,15 @@ extern "C" __global__ void q4e_gemm_bf16(const __nv_bfloat16* __restrict__ w,
     }
 }
 
-// Add a split GEMM's segment sums in order and write the epilogue once.
+// Add a split GEMM's segment sums in order and write the epilogue once. blockIdx.y picks one of
+// gridDim.y runs of `count` outputs, each with its own `segments` slices, as q4e_gemm_bf16's
+// blockIdx.z lays them out.
 extern "C" __global__ void q4e_gemm_reduce(const float* __restrict__ partials,
                                             float* __restrict__ y, int count, int segments,
                                             int epilogue, float scale) {
     OPT_PDL_ENTRY();
+    partials += (unsigned long long)blockIdx.y * segments * count;
+    y += (unsigned long long)blockIdx.y * count;
     for (int index = (int)(blockIdx.x * blockDim.x + threadIdx.x); index < count;
          index += (int)(gridDim.x * blockDim.x)) {
         float value = partials[index];
@@ -2149,20 +2192,35 @@ extern "C" __global__ void q4e_hyper_inject(const float* __restrict__ normed,
     }
 }
 
-// Inject a branch output back into the widened residual streams (gridDim.y = batch).
+// Inject a branch output back into the widened residual streams (gridDim.y = batch, a thread a
+// column for every stream).
+//
+// With world > 1 the branch is this rank's partial of a tensor-parallel sum, folded here as
+// q4e_mhc_post folds it: in ascending rank order from 0.0, this rank's own from branch and every
+// peer's from its slot of slots ([world][batch][hidden], this rank's slot unread), so every rank
+// injects the same bits.
 extern "C" __global__ void q4e_inject(float* __restrict__ hyper, const float* __restrict__ branch,
-                                      const float* __restrict__ injection, int hc, int hidden) {
+                                      const float* __restrict__ injection, int hc, int hidden,
+                                      const float* __restrict__ slots, int rank, int world) {
     OPT_PDL_ENTRY();
-    int b = blockIdx.y;
-    int total = hc * hidden;
-    float* hyper_b = hyper + (unsigned long long)b * total;
-    const float* branch_b = branch + (unsigned long long)b * hidden;
+    const int b = blockIdx.y;
+    float* hyper_b = hyper + (unsigned long long)b * hc * hidden;
     const float* injection_b = injection + (unsigned long long)b * hc;
-    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < total;
-         index += blockDim.x * gridDim.x) {
-        int stream = index / hidden;
-        int column = index % hidden;
-        hyper_b[index] += branch_b[column] * injection_b[stream];
+    const unsigned long long slot = (unsigned long long)gridDim.y * hidden;
+    for (int column = blockIdx.x * blockDim.x + threadIdx.x; column < hidden;
+         column += blockDim.x * gridDim.x) {
+        const unsigned long long at = (unsigned long long)b * hidden + column;
+        float y = branch[at];
+        if (world > 1) {
+            float sum = 0.0f;
+            for (int r = 0; r < world; ++r) {
+                sum = __fadd_rn(sum, r == rank ? y : slots[r * slot + at]);
+            }
+            y = sum;
+        }
+        for (int stream = 0; stream < hc; ++stream) {
+            hyper_b[(unsigned long long)stream * hidden + column] += y * injection_b[stream];
+        }
     }
 }
 
@@ -3830,7 +3888,8 @@ extern "C" __global__ void q4e_glm_mla_absorb(const float* __restrict__ q,
 // weighted latent sum projected by kv_b's value rows, which a head keeps transposed after its key
 // rows ([latent][value]) so a warp's reads of them are consecutive words. grid (heads, rows),
 // Q4E_BLOCK threads. The score and softmax phases are q4e_attn's, over the latent instead of an
-// expanded key.
+// expanded key. The decode step runs it split four ways (q4e_glm_mla_scores below); this kernel
+// is the bits the split is held to (tests/glm_kernels.rs).
 extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
                                               const float* __restrict__ latent_cache,
                                               const unsigned char* __restrict__ codes,
@@ -3945,6 +4004,339 @@ extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
     }
 }
 
+// q4e_glm_mla_attend's attention in four launches, so a full selection spreads over the GPU. The
+// one kernel runs a block a head and a row: 16 of 48 SMs at a one-row step, each gathering its
+// 2,048 selected latents one after another, twice, 1.3-1.8 ms a launch past 2k positions. Every sum
+// here keeps the order it has there and every reduction its tree, so the outputs are its bits:
+//
+//   q4e_glm_mla_scores   a warp a selected position: its latent is read once for every head;
+//   q4e_glm_mla_softmax  the attend kernel's softmax, the weights over the logits in place;
+//   q4e_glm_mla_mix      the weighted latent sum, a lane a latent column and a warp a head;
+//   q4e_glm_mla_project  the value projection, every row of a run over one read of kv_b.
+//
+// The logits are [row][head][Q4E_MAX_SELECTED], the mixed latents [row][head][latent], and the
+// softmax sums [row][head].
+#define Q4E_GLM_MLA_HEADS 16
+
+// q4e_glm_mla_at in two halves, so a thread's gathers are all in flight before the first is
+// decoded: the load of a cached latent's word (its E4M3 code, or the f32 cache's bits) and block
+// scale, then the decode, the same product. The position and column are clamped in range by the
+// caller, so every load is unconditional.
+__device__ __forceinline__ void q4e_glm_mla_load(const float* __restrict__ latent_cache,
+                                                 const unsigned char* __restrict__ codes,
+                                                 const float* __restrict__ scales, int width,
+                                                 int row, int column, int quantise,
+                                                 unsigned int& word, float& scale) {
+    if (quantise) {
+        word = codes[(unsigned long long)row * width + column];
+        scale = scales[(unsigned long long)row * (width / Q4E_FP8_BLOCK) +
+                       column / Q4E_FP8_BLOCK];
+    } else {
+        word = __float_as_uint(latent_cache[(unsigned long long)row * width + column]);
+        scale = 1.0f;
+    }
+}
+
+__device__ __forceinline__ float q4e_glm_mla_decode(unsigned int word, float scale,
+                                                    int quantise) {
+    return quantise ? q4e_e4m3((unsigned char)word) * scale : __uint_as_float(word);
+}
+#define Q4E_GLM_MLA_SCORE_SLOTS 64
+#define Q4E_GLM_MLA_MIX_TILE 128
+#define Q4E_GLM_MLA_MIX_HEADS 8
+#define Q4E_GLM_MLA_PROJECT_ROWS 8
+#define Q4E_GLM_MLA_PROJECT_AHEAD 32
+
+// The logits: grid (Q4E_MAX_SELECTED / Q4E_GLM_MLA_SCORE_SLOTS, rows), Q4E_BLOCK threads, at most
+// Q4E_GLM_MLA_HEADS heads. A lane sums its columns lane, lane + 32, ... and the warp folds them as
+// the attend kernel's warp does.
+extern "C" __global__ void q4e_glm_mla_scores(const float* __restrict__ q_abs,
+                                              const float* __restrict__ latent_cache,
+                                              const unsigned char* __restrict__ codes,
+                                              const float* __restrict__ scales,
+                                              const int* __restrict__ selected,
+                                              const int* __restrict__ selected_count,
+                                              float* __restrict__ logits, int base, int heads,
+                                              int nope, int latent, int select_stride,
+                                              int quantise) {
+    OPT_PDL_ENTRY();
+    __shared__ float query[Q4E_GLM_MLA_HEADS * Q4E_GLM_MAX_LATENT];
+    const int row = base + blockIdx.y;
+    const int nsel = selected_count[row];
+    const int first = blockIdx.x * Q4E_GLM_MLA_SCORE_SLOTS;
+    if (heads > Q4E_GLM_MLA_HEADS || latent > Q4E_GLM_MAX_LATENT || nsel > Q4E_MAX_SELECTED ||
+        first >= nsel) {
+        return;
+    }
+    // Every load of the staging in flight at once, and each warp's positions in one load.
+    const float4* q = reinterpret_cast<const float4*>(q_abs + (unsigned long long)row * heads *
+                                                                   latent);
+    float4* staged = reinterpret_cast<float4*>(query);
+#pragma unroll 8
+    for (int i = threadIdx.x; i < heads * latent / 4; i += blockDim.x) {
+        staged[i] = q[i];
+    }
+    const int* sel = selected + (unsigned long long)row * select_stride;
+    float* out = logits + (unsigned long long)row * heads * Q4E_MAX_SELECTED;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const float scale = sqrtf((float)nope);
+    const int last = min(first + Q4E_GLM_MLA_SCORE_SLOTS, nsel);
+    const int mine = first + warp + warps * lane;
+    const int positions = mine < last ? sel[mine] : 0;
+    __syncthreads();
+    // A warp scores GROUP positions at once, so each staged query word it reads serves all of
+    // them; each (head, position) sum is still a lane's columns in order, then the warp's fold.
+    constexpr int SPAN = Q4E_GLM_MAX_LATENT / 32;
+    constexpr int GROUP = 4;
+    for (int group = 0; first + warp + warps * group < last; group += GROUP) {
+        float x[GROUP][SPAN];
+#pragma unroll
+        for (int g = 0; g < GROUP; ++g) {
+            const int at = __shfl_sync(0xFFFFFFFFu, positions, group + g);
+            unsigned int word[SPAN];
+            float block[SPAN];
+#pragma unroll
+            for (int k = 0; k < SPAN; ++k) {
+                q4e_glm_mla_load(latent_cache, codes, scales, latent, at,
+                                 min(lane + 32 * k, latent - 1), quantise, word[k], block[k]);
+            }
+#pragma unroll
+            for (int k = 0; k < SPAN; ++k) {
+                x[g][k] = lane + 32 * k < latent
+                              ? q4e_glm_mla_decode(word[k], block[k], quantise)
+                              : 0.0f;
+            }
+        }
+        for (int head = 0; head < heads; ++head) {
+            const float* qh = query + head * latent;
+            float dot[GROUP];
+#pragma unroll
+            for (int g = 0; g < GROUP; ++g) {
+                dot[g] = 0.0f;
+            }
+#pragma unroll
+            for (int k = 0; k < SPAN; ++k) {
+                const int c = lane + 32 * k;
+                if (c < latent) {
+                    const float qc = qh[c];
+#pragma unroll
+                    for (int g = 0; g < GROUP; ++g) {
+                        dot[g] = fmaf(qc, x[g][k], dot[g]);
+                    }
+                }
+            }
+#pragma unroll
+            for (int g = 0; g < GROUP; ++g) {
+                dot[g] = q4e_warp_sum(dot[g]);
+                const int slot = first + warp + warps * (group + g);
+                if (lane == 0 && slot < last) {
+                    out[head * Q4E_MAX_SELECTED + slot] = dot[g] / scale;
+                }
+            }
+        }
+    }
+}
+
+// The softmax: grid (heads, rows), Q4E_BLOCK threads, the attend kernel's block max and sum. Each
+// logit becomes its unnormalised weight, and the sum goes to total.
+extern "C" __global__ void q4e_glm_mla_softmax(float* __restrict__ logits,
+                                               const int* __restrict__ selected_count,
+                                               float* __restrict__ total, int base) {
+    OPT_PDL_ENTRY();
+    __shared__ float reduce[Q4E_BLOCK];
+    const int head = blockIdx.x;
+    const int heads = gridDim.x;
+    const int row = base + blockIdx.y;
+    const int nsel = selected_count[row];
+    if (nsel <= 0 || nsel > Q4E_MAX_SELECTED) {
+        return;
+    }
+    float* weights = logits + ((unsigned long long)row * heads + head) * Q4E_MAX_SELECTED;
+    float local_max = -INFINITY;
+    for (int slot = threadIdx.x; slot < nsel; slot += blockDim.x) {
+        local_max = fmaxf(local_max, weights[slot]);
+    }
+    const float maximum = q4e_block_max(local_max, reduce);
+    float local_sum = 0.0f;
+    for (int slot = threadIdx.x; slot < nsel; slot += blockDim.x) {
+        const float weight = __expf(weights[slot] - maximum);
+        weights[slot] = weight;
+        local_sum += weight;
+    }
+    const float sum = q4e_block_sum(local_sum, reduce);
+    if (threadIdx.x == 0) {
+        total[(unsigned long long)row * heads + head] = sum;
+    }
+}
+
+// The weighted latent sum over the selection, in its order, over the softmax's sum: grid
+// (latent / 32, heads / Q4E_GLM_MLA_MIX_HEADS, rows), 32 * Q4E_GLM_MLA_MIX_HEADS threads. A tile
+// of positions' 32 columns and its weights load into registers while the block folds the tile
+// before it, so a warp is never waiting on one position's gather.
+extern "C" __global__ void q4e_glm_mla_mix(const float* __restrict__ latent_cache,
+                                           const unsigned char* __restrict__ codes,
+                                           const float* __restrict__ scales,
+                                           const int* __restrict__ selected,
+                                           const int* __restrict__ selected_count,
+                                           const float* __restrict__ weights,
+                                           const float* __restrict__ total,
+                                           float* __restrict__ mixed, int base, int heads,
+                                           int latent, int select_stride, int quantise) {
+    OPT_PDL_ENTRY();
+    constexpr int TILE = Q4E_GLM_MLA_MIX_TILE;
+    constexpr int WARPS = Q4E_GLM_MLA_MIX_HEADS;
+    __shared__ int at[Q4E_MAX_SELECTED];
+    __shared__ float xs[TILE][32];
+    __shared__ float ws[WARPS][TILE];
+    const int row = base + blockIdx.z;
+    const int nsel = selected_count[row];
+    if (nsel <= 0 || nsel > Q4E_MAX_SELECTED || latent > Q4E_GLM_MAX_LATENT ||
+        blockDim.x != 32 * WARPS) {
+        return;
+    }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int column = blockIdx.x * 32 + lane;
+    const int head = blockIdx.y * WARPS + warp;
+    const int* sel = selected + (unsigned long long)row * select_stride;
+#pragma unroll
+    for (int i = 0; i < (Q4E_MAX_SELECTED + 32 * WARPS - 1) / (32 * WARPS); ++i) {
+        const int slot = threadIdx.x + 32 * WARPS * i;
+        if (slot < nsel) {
+            at[slot] = sel[slot];
+        }
+    }
+    __syncthreads();
+    const float* wh = weights + ((unsigned long long)row * heads + head) * Q4E_MAX_SELECTED;
+    unsigned int word[TILE / WARPS];
+    float block[TILE / WARPS];
+    float w[TILE / 32];
+    const int read = min(column, latent - 1);
+    auto fetch = [&](int first) {
+#pragma unroll
+        for (int i = 0; i < TILE / WARPS; ++i) {
+            q4e_glm_mla_load(latent_cache, codes, scales, latent,
+                             at[min(first + warp + WARPS * i, nsel - 1)], read, quantise,
+                             word[i], block[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < TILE / 32; ++i) {
+            w[i] = head < heads ? wh[min(first + lane + 32 * i, nsel - 1)] : 0.0f;
+        }
+    };
+    fetch(0);
+    float accumulator = 0.0f;
+    for (int first = 0; first < nsel; first += TILE) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < TILE / WARPS; ++i) {
+            xs[warp + WARPS * i][lane] = q4e_glm_mla_decode(word[i], block[i], quantise);
+        }
+#pragma unroll
+        for (int i = 0; i < TILE / 32; ++i) {
+            ws[warp][lane + 32 * i] = w[i];
+        }
+        __syncthreads();
+        if (first + TILE < nsel) {
+            fetch(first + TILE);
+        }
+        const int count = min(TILE, nsel - first);
+        if (count == TILE) {
+#pragma unroll 16
+            for (int slot = 0; slot < TILE; ++slot) {
+                accumulator = fmaf(ws[warp][slot], xs[slot][lane], accumulator);
+            }
+        } else {
+            for (int slot = 0; slot < count; ++slot) {
+                accumulator = fmaf(ws[warp][slot], xs[slot][lane], accumulator);
+            }
+        }
+    }
+    if (column < latent && head < heads) {
+        mixed[((unsigned long long)row * heads + head) * latent + column] =
+            accumulator / total[(unsigned long long)row * heads + head];
+    }
+}
+
+// The value projection, kv_b's value rows ([latent][value] a head, after its key rows) over the
+// mixed latent: grid (heads, value / blockDim.x rounded up), rows base .. base + rows at once, so
+// the weights are read once a run. A row with nothing selected is zero, as the attend kernel
+// leaves it.
+extern "C" __global__ void q4e_glm_mla_project(const float* __restrict__ mixed,
+                                               const float* __restrict__ kv_b,
+                                               const int* __restrict__ selected_count,
+                                               float* __restrict__ out, int base, int rows,
+                                               int nope, int value, int latent) {
+    OPT_PDL_ENTRY();
+    constexpr int ROWS = Q4E_GLM_MLA_PROJECT_ROWS;
+    constexpr int AHEAD = Q4E_GLM_MLA_PROJECT_AHEAD;
+    __shared__ float ms[ROWS][Q4E_GLM_MAX_LATENT];
+    const int head = blockIdx.x;
+    const int heads = gridDim.x;
+    const int j = blockIdx.y * blockDim.x + threadIdx.x;
+    if (latent > Q4E_GLM_MAX_LATENT) {
+        return;
+    }
+    const float* wj = kv_b + (unsigned long long)head * (nope + value) * latent +
+                      (unsigned long long)nope * latent + j;
+    for (int first = 0; first < rows; first += ROWS) {
+        const int count = min(ROWS, rows - first);
+        __syncthreads();
+        for (int r = 0; r < count; ++r) {
+            const float* m =
+                mixed + ((unsigned long long)(base + first + r) * heads + head) * latent;
+#pragma unroll 8
+            for (int c = threadIdx.x; c < latent; c += blockDim.x) {
+                ms[r][c] = m[c];
+            }
+        }
+        __syncthreads();
+        if (j >= value) {
+            continue;
+        }
+        float accumulator[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            accumulator[r] = 0.0f;
+        }
+        int c = 0;
+        for (; c + AHEAD <= latent; c += AHEAD) {
+            float w[AHEAD];
+#pragma unroll
+            for (int k = 0; k < AHEAD; ++k) {
+                w[k] = wj[(unsigned long long)(c + k) * value];
+            }
+#pragma unroll
+            for (int k = 0; k < AHEAD; ++k) {
+#pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    accumulator[r] = fmaf(w[k], ms[r][c + k], accumulator[r]);
+                }
+            }
+        }
+        for (; c < latent; ++c) {
+            const float wc = wj[(unsigned long long)c * value];
+#pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                accumulator[r] = fmaf(wc, ms[r][c], accumulator[r]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const int at = base + first + r;
+            if (r < count) {
+                const int nsel = selected_count[at];
+                if (nsel <= Q4E_MAX_SELECTED) {
+                    out[((unsigned long long)at * heads + head) * value + j] =
+                        nsel > 0 ? accumulator[r] : 0.0f;
+                }
+            }
+        }
+    }
+}
+
 // Block reductions of HEADS values at once, each over the same tree as q4e_block_max and
 // q4e_block_sum, so each head's result is bit-identical to reducing it alone; scratch holds
 // HEADS * blockDim.x floats. Reusable back to back, as those are.
@@ -4001,7 +4393,8 @@ __device__ void q4e_block_sum_heads(float* value, float* scratch) {
 }
 
 // The query heads q4e_attn_group computes in one CTA; it divides the released configuration's
-// twelve query heads a KV head.
+// twelve query heads a KV head. q4e_attn_group6 takes six, the share of a KV head's twelve each rank
+// of a four-rank group holds.
 #define Q4E_ATTN_GROUP 4
 // The selected tokens q4e_attn_group stages in shared memory: the released configuration's 2,051
 // (512 blocks of four and the incomplete tail) rounded up to a multiple of four. The host sends a
@@ -4011,7 +4404,7 @@ __device__ void q4e_block_sum_heads(float* value, float* scratch) {
 #define Q4E_ATTN_GROUP_KEYS 2
 #define Q4E_ATTN_GROUP_VALUES 16
 
-// q4e_attn for Q4E_ATTN_GROUP query heads of one KV head at once.
+// q4e_attn for HEADS query heads of one KV head at once (q4e_attn_group: Q4E_ATTN_GROUP of them).
 //
 // Every head is computed exactly as q4e_attn computes it alone: the same lane takes the same
 // channels of a key in the same order, the same warp and block trees reduce them, and the value
@@ -4020,19 +4413,19 @@ __device__ void q4e_block_sum_heads(float* value, float* scratch) {
 // the group instead of once a head, and twelve query heads share a KV head. The loads are batched
 // ahead of the arithmetic that consumes them, which reorders reads and nothing else.
 //
-// blockIdx.x is the head group (its first head is blockIdx.x * Q4E_ATTN_GROUP) and blockIdx.y the
-// token. Dynamic shared memory holds a row of Q4E_ATTN_GROUP_SELECTED logits a head, then a block
-// of reduction floats a head, then the token's selection.
-extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
-                                          const float* __restrict__ gate,
-                                          const __nv_bfloat16* __restrict__ keys,
-                                          const __nv_bfloat16* __restrict__ values,
-                                          const int* __restrict__ selected,
-                                          const int* __restrict__ selected_count,
-                                          float* __restrict__ out, int heads, int kv_heads,
-                                          int head_dim, int groups, int select_stride) {
-    OPT_PDL_ENTRY();
-    constexpr int HEADS = Q4E_ATTN_GROUP;
+// blockIdx.x is the head group (its first head is blockIdx.x * HEADS) and blockIdx.y the token.
+// Dynamic shared memory holds a row of Q4E_ATTN_GROUP_SELECTED logits a head, then a block of
+// reduction floats a head, then the token's selection.
+template <int HEADS>
+__device__ __forceinline__ void q4e_attn_group_heads(const float* __restrict__ q,
+                                                     const float* __restrict__ gate,
+                                                     const __nv_bfloat16* __restrict__ keys,
+                                                     const __nv_bfloat16* __restrict__ values,
+                                                     const int* __restrict__ selected,
+                                                     const int* __restrict__ selected_count,
+                                                     float* __restrict__ out, int heads,
+                                                     int kv_heads, int head_dim, int groups,
+                                                     int select_stride) {
     constexpr int IN = Q4E_ATTN_GROUP_KEYS;
     constexpr int UNROLL = Q4E_ATTN_GROUP_VALUES;
     extern __shared__ float q4e_attn_shared[];
@@ -4188,6 +4581,32 @@ extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
                 (1.0f + __expf(-gate[row + head * head_dim + dim]));
         }
     }
+}
+
+extern "C" __global__ void q4e_attn_group(const float* __restrict__ q,
+                                          const float* __restrict__ gate,
+                                          const __nv_bfloat16* __restrict__ keys,
+                                          const __nv_bfloat16* __restrict__ values,
+                                          const int* __restrict__ selected,
+                                          const int* __restrict__ selected_count,
+                                          float* __restrict__ out, int heads, int kv_heads,
+                                          int head_dim, int groups, int select_stride) {
+    OPT_PDL_ENTRY();
+    q4e_attn_group_heads<Q4E_ATTN_GROUP>(q, gate, keys, values, selected, selected_count, out,
+                                         heads, kv_heads, head_dim, groups, select_stride);
+}
+
+extern "C" __global__ void q4e_attn_group6(const float* __restrict__ q,
+                                           const float* __restrict__ gate,
+                                           const __nv_bfloat16* __restrict__ keys,
+                                           const __nv_bfloat16* __restrict__ values,
+                                           const int* __restrict__ selected,
+                                           const int* __restrict__ selected_count,
+                                           float* __restrict__ out, int heads, int kv_heads,
+                                           int head_dim, int groups, int select_stride) {
+    OPT_PDL_ENTRY();
+    q4e_attn_group_heads<6>(q, gate, keys, values, selected, selected_count, out, heads,
+                            kv_heads, head_dim, groups, select_stride);
 }
 
 // The PLE gate and its post-gate norm (blockIdx.y = batch token).
@@ -4782,6 +5201,28 @@ extern "C" __global__ void q4e_mhc_post(float* __restrict__ streams,
     }
 }
 
+// The two-shot exchange's sum: this rank's chunk of the TP all-reduce in place, q4e_mhc_post's
+// Wire::F32 fold in ascending rank order from 0.0, this rank's own partial from `own` and every
+// peer's from its slot of `slots` ([world][count], this rank's slot unread). The chunks are then
+// shared, so every element is the one-shot exchange's sum. count is a multiple of 4. grid
+// (ceil(count / 4 / Q4E_BLOCK)).
+extern "C" __global__ void q4e_sum_slots(float* __restrict__ own, const float* __restrict__ slots,
+                                         long long count, int rank, int world) {
+    OPT_PDL_ENTRY();
+    const long long at = 4 * ((long long)blockIdx.x * blockDim.x + threadIdx.x);
+    if (at >= count) {
+        return;
+    }
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int r = 0; r < world; ++r) {
+        const float4 term = *reinterpret_cast<const float4*>(r == rank ? own + at
+                                                                        : slots + r * count + at);
+        sum = make_float4(__fadd_rn(sum.x, term.x), __fadd_rn(sum.y, term.y),
+                          __fadd_rn(sum.z, term.z), __fadd_rn(sum.w, term.w));
+    }
+    *reinterpret_cast<float4*>(own + at) = sum;
+}
+
 // GLM's clamped SwiGLU over rows of [gate (width) | up (width)]: silu(min(gate, limit)) *
 // clamp(up, -limit, limit), with linalg's silu. grid (ceil(width / Q4E_BLOCK), rows).
 extern "C" __global__ void q4e_swiglu_limited(const float* __restrict__ gate_up,
@@ -4931,13 +5372,15 @@ extern "C" __global__ void q4e_layer_norm(const float* __restrict__ x,
 // their keys, summed in token order (forward.rs's Indexer::select). `keys` and `gates` are the
 // layer's per-position caches ([positions][dim]); the pooled key lands at row
 // (position + 1) / pool - 1 of `pooled`. A token that completes no pool is a no-op, so a step
-// launches this whatever its position. One block, threads over the channels.
+// launches this whatever its position. grid (positions): block b pools for `position` + b, threads
+// over the channels; a pool reads only cached keys and gates, so a run's pools are one launch.
 extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
                                         const float* __restrict__ gates,
                                         const __nv_bfloat16* __restrict__ ape,
                                         float* __restrict__ pooled, int dim, int pool,
                                         int position) {
     OPT_PDL_ENTRY();
+    position += blockIdx.x;
     if (pool <= 0 || pool > Q4E_GLM_MAX_POOL || (position + 1) % pool != 0) {
         return;
     }
@@ -4986,16 +5429,23 @@ extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
 // sum_h w_h max(q_h . k_pool * score_scale, 0) with w_h = head_weights[h] * head_scale, summed in
 // head order (forward.rs's Indexer::select). The query heads are staged in shared memory and a
 // warp scores a pool, Q4E_QSA_TILE pools a block, the layout q4e_glm_pick reads.
-// grid (ceil(pools / Q4E_QSA_TILE)), Q4E_BLOCK threads.
+// grid (ceil(pools / Q4E_QSA_TILE) of the last row, rows), Q4E_BLOCK threads: blockIdx.y is the
+// row at `position` + y, its query heads and head weights the y-th of the run's and its scores
+// `score_stride` floats on from the previous row's.
 extern "C" __global__ void q4e_glm_index_scores(const float* __restrict__ query,
                                                 const float* __restrict__ head_weights,
                                                 const float* __restrict__ pooled,
                                                 float* __restrict__ scores, int position,
                                                 int heads, int dim, int pool, float score_scale,
-                                                float head_scale) {
+                                                float head_scale, int score_stride) {
     OPT_PDL_ENTRY();
     __shared__ float staged[Q4E_GLM_MAX_INDEX_HEADS * Q4E_GLM_MAX_INDEX_DIM];
     __shared__ float weight[Q4E_GLM_MAX_INDEX_HEADS];
+    const int row = blockIdx.y;
+    position += row;
+    query += (unsigned long long)row * heads * dim;
+    head_weights += (unsigned long long)row * heads;
+    scores += (unsigned long long)row * score_stride;
     const int pools = (position + 1) / pool;
     const int first = blockIdx.x * Q4E_QSA_TILE;
     if (first >= pools || heads > Q4E_GLM_MAX_INDEX_HEADS || dim > Q4E_GLM_MAX_INDEX_DIM) {

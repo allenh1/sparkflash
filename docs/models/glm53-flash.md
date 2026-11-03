@@ -105,7 +105,11 @@ wire: each sublayer's partials are exchanged on the devices and summed in rank o
 kernel, so the tokens are the TCP path's. That is `SPARK_COMM_REDUCE`'s default on the device arm
 for every model, DeepSeek's included. The NCCL transport variables in [serving.md](../serving.md)
 apply. `SPARK_COMM_REDUCE=tcp` keeps the partials on the host seam, which needs no NCCL; any other
-value refuses.
+value refuses. A step of 16 rows or more (a prefill chunk) sums two-shot instead, with the
+reduce-scatter and gather the Qwen3.8 arm shares (`reduce_two_shot`), on the device scatter
+DeepSeek's two-shot uses: each rank sums its quarter of the
+elements in the same rank order and the sums are gathered, so the bits are the one-shot's at half
+the bytes a rank (`SPARKFLASH_TWO_SHOT_ROWS`, default 16, 0 for never).
 
 Measured on the four Sparks (converted ranks, the 1M window, greedy, one request at a time):
 
@@ -132,6 +136,96 @@ above. MTP speculation, one request at a time, same texts as without it:
 
 A sampled request and a logprobs request decode a token a step, with the same text as without
 drafting. The drafting window's MTP caches leave the prompt's first-token time as it was.
+
+### Bulk prefill
+
+A prompt of [MIN_PREFILL_ROWS](#the-released-model-at-tp4) (16) rows or more runs in chunks through
+the tensor cores
+(`kernels/glm_prefill_sm121.cu`, embedded in the binary). The release quantises an FP8
+projection's input to E4M3 codes with an f32 scale per 128 columns, as the decode GEMV does, so
+by default the bulk GEMMs take it the same way: each chunk row is quantised once
+(`glm_quantise_rows`) and an `m16n8k32` E4M3 x E4M3 MMA runs against the block-scaled weight, both
+scales folded into a per-block partial sum after every 128 K columns. A BF16 weight (the KDA
+projections) takes its f32 activation as a bf16 head and remainder, two `m16n8k16` chains a
+stage. The output tile is 128x128; the dense GEMMs visit their tiles in groups of eight output
+columns, so the blocks running at once share their weight tiles in L2 (a 6,144 x 4,096 x 4,096
+FP8 GEMM went from 8.49 to 2.15 ms, 96 TFLOP/s). A tile lands in shared memory row-major with a
+swizzle, so a weight row's 64 bytes stay together: split over two 32-column halves, as the first
+version stored them, the expert stream held at about 126 GB/s against 205 GB/s for a plain copy.
+
+The routed experts are grouped by expert into items of up to 128 sorted slots: each item gathers
+its rows, runs the same MMA body over the expert's gate/up slice once, SwiGLUs, runs the down
+slice, and scatters the weighted rows, so an expert's 6.3 MB rank slice is read once for the chunk
+instead of once per row. The router and the indexer's projections stay on the token GEMV
+(`SPARKFLASH_GLM_PREFILL_EXACT=0` puts them on the tensor cores too) so expert choice and selected
+tokens are the decode path's. The KDA layers' short convolution and recurrence run over the whole
+chunk in one launch each, with the Qwen3.8 arm's prefill kernels (`q4p_gdn_conv`, `q4p_kda_scan`),
+instead of a row at a time (the scan splits each head's value columns over blocks until the heads
+fill the 48 SMs, `gdn_scan_shape`; a column's recurrence is the same in any split, so the bits
+are too); the mHC's narrow projections (24 or fewer outputs) have a kernel of
+their own that reads the chunk's rows once. A chunk's sublayer partials are summed with the
+two-shot all-reduce past 16 rows ([TP=4](#the-released-model-at-tp4)), half the bytes a rank
+of the one-shot exchange.
+
+Two things had to change for a chunk as wide as 4,096 rows. The per-layer KDA buffers are one
+allocation shared by every layer (a layer's launches are stream-ordered, so no two layers hold one
+buffer at once), and a chunk's KDA convolution windows are a one-float placeholder, because a chunk
+never verifies and only a verify keeps windows for a commit to restore. At 4,096 rows that is
+**9.6 GiB of device scratch** instead of ~55 GiB (the rank prints it at load: `GLM bulk prefill:
+4096 rows a chunk, 9.6 GiB of chunk scratch`), plus 2.4 GiB of page-locked host memory the ranks
+read the LM head's logits through, which is what lets the chunk fit beside the 78 GB of weights and
+the 1M window. Most of the 9.6 GiB is the indexer's worst-case score rows and the LM head's
+full-chunk logits, so a narrower chunk saves less than its row count suggests and a wider one costs
+more. The MTP layer's stash keeps a chunk's last eight rows, the most a draft reads; it had copied
+all 4,096 into a buffer that holds eight.
+
+Measured on the four Sparks, one cold random-word prompt, greedy, per-request prefill rate (the
+prompt's tokens over time to first token). The first block is the first version, at ~6.1k tokens:
+
+| Chunk | Prefill | Time to first token at ~6.1k |
+| --: | --: | --: |
+| 8 rows (token path, `SPARKFLASH_GLM_PREFILL=0`) | 82.3 tok/s | 75.2 s |
+| 512 | 205 tok/s | 30.1 s |
+| 2,048 | 296 tok/s | 21.0 s |
+| 4,096 | 314-316 tok/s | 19.4-19.7 s |
+
+and what the changes above made of the 4,096-row default, one run a step. A run's rate moves by
+about 10% between runs, so a small step is within the noise; the last step's prefill share is
+mostly that, since the split attention is the decode path's:
+
+| Build | 2.2k | 6.5k | 17.3k | 34.8k |
+| :-- | --: | --: | --: | --: |
+| bf16 split activations, before tonight's changes | 682 | 574 | 665 | 601 |
+| E4M3 activations, narrow mHC kernel | 733 | 758 | 714 | 656 |
+| two-shot chunk reduce | 701 | 821 | 774 | 699 |
+| row-major weight tiles | 851 | 910 | 824 | 762 |
+| KDA recurrence over the chunk | 893 | 974 | 888 | 797 |
+| **KDA convolution over the chunk, split decode attention ([Context](#context)): the default** | **1,013** | **1,114** | **1,040** | **915** |
+
+vLLM serving the same checkpoint on the same four Sparks prefills one request at 647 tok/s.
+
+A fresh server's first cold 6.1k-token prompt measures 610 tok/s to first token on the default
+build (2026-11-03); the rates above are from a server already serving.
+- 8,192 rows does not serve: the ranks exit while loading, so 4,096 is the cap. 4,096 is also the
+  default; `SPARKFLASH_GLM_PREFILL_CHUNK` picks another width. Below 16 rows a prompt runs on the
+  token path, and a width past 4,096 is clamped to it rather than refused.
+- The chunk's scratch is allocated only for a configuration the chunk can take: the f32 latent
+  cache (whose absorbed MLA stages run at most eight rows) and a shape the bulk MLA does not serve
+  load without it, and their prompts prefill on the token path. The block drafter, which keeps a
+  step's rows of features, also keeps a sequence on the token path when one is attached.
+- A chunk's output is **not bit-identical** to the token path's: the MMAs sum each output's 128-wide
+  K stage in their own order, so a chunk edge and the token path disagree in the last bits and a
+  greedy completion can part company a few tokens in (4 of 4 code prompts did, at 6.1k tokens).
+  `SPARKFLASH_GLM_PREFILL=0` keeps the token path's bits, as
+  [SPARKFLASH_PREFILL_EXACT](../serving.md) does for the other packs. Within one launch a row's
+  bits do not depend on which other rows share it, and the two-shot reduce, the row-major tiles,
+  the chunk-wide KDA kernels and the split attention each left the greedy texts as they were.
+- `SPARKFLASH_GLM_PREFILL_ACTIVATION` picks how the bulk GEMMs take their activations: `fp8` (the
+  default for this release), `split` (a bf16 head and remainder, the first version's arithmetic
+  and the default for a release that does not quantise activations) or `bf16` (the head alone).
+  `fp8` on a release that does not quantise activations, and any other value, refuse at startup.
+  The E4M3 GEMM takes at most 16,384 inner columns; a wider projection is refused with a message
+  naming `split` rather than skipped.
 
 ### Startup: the converted rank file
 
@@ -164,11 +258,14 @@ layer, **18.2 KiB a position a rank** over the eleven sparse layers:
 | 524,288 | 9.1 GiB | 17.2 GiB |
 | 1,048,576 | **18.2 GiB** | 34.4 GiB |
 
-The default is the model's full **1,048,576**: 18.2 GiB beside the 82 GB rank, leaving about 18 GiB
-for the kernels' scratch and the node. The f32 column is the expansion's exact operand; it is what
-`DeviceRank::load` uses by default (and what the parity tests run), but at 1M it leaves 1-2 GiB and
-is not a serving configuration. `SPARKFLASH_GLM_KV_CACHE=f32` selects it on the serve arm; the
-default there is `fp8`, and `f32` wants `--context 524288` or less.
+The default is the model's full **1,048,576** in E4M3: 18.2 GiB beside the 82 GB rank, leaving
+about 18 GiB for the kernels' scratch and the node. `LatentCache::Auto` picks per rank: the E4M3
+latent when the release's dynamic activation applies and kv_b is block-scaled, which it is.
+The f32 column is the expansion's exact operand and is not a serving configuration at 1M (it
+leaves 1-2 GiB); `SPARKFLASH_GLM_KV_CACHE=f32` selects it on the serve arm, whose default is
+`fp8`, and `f32` wants `--context 524288` or less. It is also the one cache the bulk prefill
+cannot take: its absorbed MLA stages run at most eight rows, so a prompt of 16 rows or more with
+the f32 cache falls back to the token path.
 
 Attention runs in latent space. The query is projected into the latent once a row
 (`q4e_glm_mla_absorb`), the softmax is over the latent (`q4e_glm_mla_attend`), and the weighted
@@ -184,6 +281,18 @@ in the same order, so the bits do too. That matters under PDL: before it, the ne
 weight loads and the side-stream prefetch slowed the two kernels several-fold, and PDL gained
 nothing on this arm (35.2 ms a harness step either way). With the loads ahead PDL gains 2.4 ms:
 35.3 to 32.3 ms a step, the same last logits.
+
+That one kernel still runs a block a head and row, so a decode step's attention uses 16 of the
+48 SMs and each block gathers its 2,048 selected latents one after another: past a few thousand
+positions it was the step's largest cost after the experts. The decode path now runs it in four
+launches (`q4e_glm_mla_scores`, a warp a selected position, reading its latent once for every
+head; `q4e_glm_mla_softmax`; `q4e_glm_mla_mix`, a lane a latent column; `q4e_glm_mla_project`,
+every row of a run over one read of kv_b), each sum in the order the one kernel keeps and each
+reduction its tree, so the outputs are its bits (`tests/glm_kernels.rs` holds the four to the one
+kernel on both cache formats). The gathers are issued before any is decoded, and the scores
+kernel scores four positions a staged query read. At 13k positions the attention went from
+18.5 ms to about 2 ms a step, and the step from 64.2 to 48.3 ms, with the same greedy texts.
+`q4e_glm_mla_attend` remains the reference the split is tested against.
 
 Keeping kv_b in BF16, widened exactly in the kernels, gives the same bits and halves the weight
 read: 0.3 ms a harness step, and the same 34 ms in serve. But at 2,204 positions it stepped 51.6 ms

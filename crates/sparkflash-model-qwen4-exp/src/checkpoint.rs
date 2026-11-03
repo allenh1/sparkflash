@@ -145,83 +145,133 @@ impl CheckpointRows {
     }
 }
 
+impl CheckpointRows {
+    /// One shard's ranges, read into `out` (their lengths summed) in request order.
+    fn read_into(
+        &self,
+        shard: usize,
+        ranges: &[(u64, usize)],
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let Some(Some(resolved)) = self.shards.get(shard) else {
+            let bytes = self
+                .source
+                .read_ranges_paged(&self.tensor_name(shard), ranges)
+                .map_err(|error| error.to_string())?;
+            if bytes.len() != out.len() {
+                return Err(format!(
+                    "PLE shard {shard} returned {} bytes for {} requested",
+                    bytes.len(),
+                    out.len()
+                ));
+            }
+            out.copy_from_slice(&bytes);
+            return Ok(());
+        };
+        use std::os::unix::fs::FileExt;
+        let mut cursor = 0usize;
+        for &(offset, len) in ranges {
+            let end = offset
+                .checked_add(len as u64)
+                .ok_or_else(|| format!("PLE shard {shard} range overflow"))?;
+            if end > resolved.byte_len {
+                return Err(format!(
+                    "PLE shard {shard} range {offset}..{end} exceeds shard length {}",
+                    resolved.byte_len
+                ));
+            }
+            if len > 0 {
+                resolved
+                    .file
+                    .read_exact_at(
+                        &mut out[cursor..cursor + len],
+                        resolved.data_offset + offset,
+                    )
+                    .map_err(|error| format!("PLE shard {shard} pread: {error}"))?;
+            }
+            cursor += len;
+        }
+        Ok(())
+    }
+}
+
+/// Ranges one pread worker takes at a time, and the most workers a read keeps in flight. A
+/// token's sixteen rows are sixteen shards and so sixteen pieces, as before; a prefill chunk's
+/// 65,536 rows are about a thousand, and the deeper queue is what lets the NVMe answer them in
+/// parallel rather than 512 serial reads per shard.
+const PLE_READ_PIECE: usize = 64;
+const PLE_READ_WORKERS: usize = 64;
+
+/// One read of [CheckpointRows::read_shards]: a shard, a group of its byte ranges and the slice of
+/// the request's output they fill.
+type ShardPiece<'a> = (usize, &'a [(u64, usize)], &'a mut [u8]);
+
 impl RowReader for CheckpointRows {
     fn read_rows(&self, shard: usize, ranges: &[(u64, usize)]) -> Result<Vec<u8>, String> {
-        if let Some(Some(resolved)) = self.shards.get(shard) {
-            use std::os::unix::fs::FileExt;
-            let total_bytes: usize = ranges.iter().map(|(_, len)| *len).sum();
-            let mut out = vec![0u8; total_bytes];
-            let mut cursor = 0usize;
-            for &(offset, len) in ranges {
-                let end = offset
-                    .checked_add(len as u64)
-                    .ok_or_else(|| format!("PLE shard {shard} range overflow"))?;
-                if end > resolved.byte_len {
-                    return Err(format!(
-                        "PLE shard {shard} range {offset}..{end} exceeds shard length {}",
-                        resolved.byte_len
-                    ));
-                }
-                if len > 0 {
-                    resolved
-                        .file
-                        .read_exact_at(
-                            &mut out[cursor..cursor + len],
-                            resolved.data_offset + offset,
-                        )
-                        .map_err(|error| format!("PLE shard {shard} pread: {error}"))?;
-                }
-                cursor += len;
-            }
-            return Ok(out);
-        }
-        let name = self.tensor_name(shard);
-        self.source
-            .read_ranges_paged(&name, ranges)
-            .map_err(|error| error.to_string())
+        let mut out = vec![0u8; ranges.iter().map(|(_, len)| *len).sum()];
+        self.read_into(shard, ranges, &mut out)?;
+        Ok(out)
     }
 
     fn read_shards(
         &self,
         requests: &[(usize, Vec<(u64, usize)>)],
     ) -> Result<Vec<(usize, Vec<u8>)>, String> {
-        if requests.len() <= 1 {
-            return requests
-                .iter()
-                .map(|(shard, ranges)| Ok((*shard, self.read_rows(*shard, ranges)?)))
-                .collect();
-        }
-        let workers = requests.len().min(16);
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        type ShardReadSlot = std::sync::Mutex<Option<Result<(usize, Vec<u8>), String>>>;
-        let slots: Vec<ShardReadSlot> = (0..requests.len())
-            .map(|_| std::sync::Mutex::new(None))
+        let mut outputs: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|(_, ranges)| vec![0u8; ranges.iter().map(|(_, len)| *len).sum()])
             .collect();
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| {
-                    loop {
-                        let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if idx >= requests.len() {
-                            break;
-                        }
-                        let (shard, ranges) = &requests[idx];
-                        let res = self.read_rows(*shard, ranges).map(|bytes| (*shard, bytes));
-                        if let Ok(mut slot) = slots[idx].lock() {
-                            *slot = Some(res);
-                        }
-                    }
-                });
+        // Every piece owns a disjoint slice of its request's output, so the workers write in place.
+        let mut pieces: Vec<ShardPiece> = Vec::new();
+        for ((shard, ranges), out) in requests.iter().zip(outputs.iter_mut()) {
+            let mut rest: &mut [u8] = out;
+            for group in ranges.chunks(PLE_READ_PIECE) {
+                let bytes = group.iter().map(|(_, len)| *len).sum();
+                let (head, tail) = std::mem::take(&mut rest).split_at_mut(bytes);
+                pieces.push((*shard, group, head));
+                rest = tail;
             }
-        });
-        slots
-            .into_iter()
-            .map(|slot| {
-                slot.into_inner()
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or_else(|| Err("PLE shard worker did not complete".to_owned()))
-            })
-            .collect()
+        }
+        if pieces.len() <= 1 {
+            for (shard, group, out) in pieces {
+                self.read_into(shard, group, out)?;
+            }
+        } else {
+            let workers = pieces.len().min(PLE_READ_WORKERS);
+            let queue = std::sync::Mutex::new(pieces.into_iter());
+            let failure = std::sync::Mutex::new(None::<String>);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        loop {
+                            let next = match queue.lock() {
+                                Ok(mut queue) => queue.next().ok_or(None),
+                                Err(_) => Err(Some("the PLE read queue is poisoned".to_owned())),
+                            };
+                            let result = match next {
+                                Ok((shard, group, out)) => self.read_into(shard, group, out),
+                                Err(None) => break,
+                                Err(Some(error)) => Err(error),
+                            };
+                            if let Err(error) = result {
+                                if let Ok(mut failure) = failure.lock() {
+                                    failure.get_or_insert(error);
+                                }
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(error) = failure.into_inner().map_err(|error| error.to_string())? {
+                return Err(error);
+            }
+        }
+        Ok(requests
+            .iter()
+            .map(|(shard, _)| *shard)
+            .zip(outputs)
+            .collect())
     }
 
     fn shard_rows(&self) -> u64 {

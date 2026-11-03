@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next (NVFP4)
 
-Status: **served at TP=1 on an RTX Spark (GB10), with a tensor-core prefill and the DFlash 2
+Status: **served at TP=1 on an RTX Spark (GB10), and at TP=2 and TP=4 over DGX Sparks
+([Tensor parallel](#tensor-parallel-tp2-and-tp4)), with a tensor-core prefill and the DFlash 2
 block drafter.** The pack is `sparkflash-model-qwen4-exp`, registered as
 `nvidia/Qwen3.8-Flash-Next-NVFP4` (weight selector `qwen3.8-flash-next-nvfp4`). There is no host
 forward arm: the model runs on the device or not at all. The current rates are in
@@ -81,6 +82,9 @@ accepted (1,085 of 1,477) and covers 3.9 tokens a verify step, from 2.0 on the p
 worst to 7.4 on the one it drafts best. Prefill was 96-174 tok/s on
 the token kernels before the tensor-core image.
 
+On DGX Sparks the same arm prefills about 1,000 tok/s at TP=1, 1.0-1.5k at TP=2 and 1.4-1.8k at
+TP=4, and decodes 27-49 tok/s with DFlash 2; see [Tensor parallel](#tensor-parallel-tp2-and-tp4).
+
 ### Prefill on the tensor cores
 
 `kernels/qwen4_prefill_sm121.cu` is a second image that takes a chunk of `GEMM_MIN_BATCH` (64)
@@ -102,6 +106,14 @@ tokens the weight traffic alone caps prefill near 580 tok/s, at 512 near 2,300).
   keeps its state in shared memory across the chunk;
 * the sparse-attention indexer, selection and attention take 128 rows at a time
   (`ATTENTION_CHUNK`), since a row's block scores are a context's worth of floats.
+
+A 4,096-token chunk names 65,536 PLE table rows (16 heads a token), four times the host row
+cache. Read a token at a time through the cache, a chunk evicted rows it had fetched before it
+decoded them, and the pass over the whole prompt that warmed the cache ahead of the chunks read
+every row twice: on a DGX Spark that was about 1.9 s of NVMe reads a chunk. A chunk now reads its
+rows in one bulk call, 64 `pread` workers over disjoint ranges, and decodes each as it lands, and
+the warm-up pass is gone. On a DGX Spark (TP=1), prefill went from 625, 586 and 578 tok/s to
+1,012, 1,009 and 985 at 2.2k, 8.6k and 17.1k tokens.
 
 | variable | effect |
 | :-- | :-- |
@@ -574,8 +586,9 @@ model id; with no `--tokenizer`, it uses that snapshot's `tokenizer.json`. `--ch
 `--tokenizer` still override the cache.
 
 `--model` takes either the catalogue id or the weights id (`qwen3.8-flash-next-nvfp4`). The
-V4.1-only flags (`--engine`, `--engram-dir`, `--continuous-batching`, the `--tp4-*` group and the
-device-token window) are refused alongside it rather than silently ignored. `--synthetic` writes
+V4.1-only flags (`--engine`, `--engram-dir`, `--continuous-batching` and the device-token window)
+are refused alongside it rather than silently ignored; the `--tp4-*` group serves it over two or
+four nodes ([Tensor parallel](#tensor-parallel-tp2-and-tp4)). `--synthetic` writes
 the pack's own tiny fixture to a temporary directory and serves it with a byte codec: that is a
 runnable demo of the same path - router, queue, streaming, sampling - on a workstation with no
 132.6 GB checkpoint, and it says so at startup.
@@ -667,6 +680,147 @@ one full 262,144-token window and needs a shorter `--context` for a second sessi
 test `two_concurrent_requests_are_both_served` drives two requests through the real router and checks
 that both complete; `SPARKFLASH_QWEN4_BATCH_TRACE` names each fused step's members on stderr, which is
 how a run proves its requests were actually fused.
+
+### Tensor parallel: TP=2 and TP=4
+
+The checkpoint also serves over two or four GB10 nodes, one process a rank, through the
+serve-owned group the GLM-5.3-Flash arm uses ([glm53-flash](glm53-flash.md#the-released-model-at-tp4)):
+
+```bash
+cargo build --release -p sparkflash-cli --features tp4-serve
+
+# On node R of W (W is 2 or 4); every node holds the checkpoint and the drafter.
+sparkflash serve --model nvidia/Qwen3.8-Flash-Next-NVFP4 --checkpoint "$CKPT" \
+    --tokenizer "$CKPT/tokenizer.json" --context 65536 \
+    --tp4-rank "$R" --tp4-world-size "$W" --tp4-peers "$PEER0,$PEER1,$PEER2,$PEER3" \
+    --tp4-base-port 29841 --tp4-control-port 29941 --bind 0.0.0.0:8000
+```
+
+The peers are the ranks' addresses in rank order (`192.0.2.10,...` for node0-3); at TP=2 the
+first two are used. Rank 0 owns HTTP, the tokenizer and the control hub, and needs
+`--checkpoint DIR`. Each rank reads its share from the checkpoint at load; there is no converted
+rank file. The NCCL transport variables in [serving.md](../serving.md) apply.
+
+What a rank holds ([`device/tp.rs`](../../crates/sparkflash-model-qwen4-exp/src/device/tp.rs)):
+
+* `1 / W` of each attention block's 24 query heads with `o_proj`'s matching columns, and the
+  key-value head they read: the two KV heads split at TP=2 and are each held by two ranks at TP=4;
+* `1 / W` of each Gated DeltaNet block's key and value heads (their projection rows, convolution
+  channels, gates and decay) and `out_proj`'s matching columns;
+* `1 / W` of every routed and shared expert's intermediate width (gate and up rows, down columns).
+  A routed share is padded with zero rows and columns to whole 64-column tiles of the prefill MMA,
+  which add nothing to any sum: 320 at TP=2, 160 padded to 192 at TP=4;
+* everything else whole: the embeddings, the hyper-connections, the router, the indexer, the PLE,
+  the LM head and the DFlash 2 drafter.
+
+A world the heads or widths do not split over is refused at load. Each branch leaves a partial of
+its hidden row, and the ranks sum the partials before the row is injected: they exchange them over
+the NCCL device leg and each sums the slots in rank order (`q4e_sum_slots`). Below 16 rows every
+rank sends every peer its whole partial; from 16 rows (`SPARKFLASH_TWO_SHOT_ROWS`) the sum is
+two-shot, a reduce-scatter and then a gather of the summed pieces, half the bytes a rank. Either
+way every rank holds the same residual streams, so the router's experts, the indexer's blocks, the
+token and the drafter's proposals are the same on every rank without a second collective. A
+world's output is deterministic but not TP=1's bits: a projection's sum is split `W` ways and the
+partials are added in rank order, so a greedy completion at TP=2 or TP=4 parts company with TP=1
+(and TP=2 with TP=4) some tokens in, with coherent text on both sides.
+
+**Sequence parallelism in prefill.** With everything sharded, the replicated hyper-connection
+work - each block's stream fold, its norm and mixing GEMMs and the inject - was about a quarter
+of a TP=4 chunk. From the layer after the PLE on, a chunk whose rows are a multiple of `W` x 512 runs it on
+`1 / W` of the rows a rank: each rank folds its own rows, the folded rows are gathered (each
+rank's slot of the same exchange), the branch runs on every row as before, and its partials are
+reduce-scattered, so each rank sums and injects only its own rows. The ranks' streams then hold
+their own rows until the chunk's end, where the drafter's feature rows are gathered and the last
+rank sends the rows the head reads. The pieces are whole 512-row prefill pieces (`DENSE_ROWS`), so
+each row computes to the bits it has without the split, and the greedy texts are the same. On a
+4,096-row TP=4 chunk the hyper stages went from about 643 to 186 ms. The PLE block's table
+reads split the same way: each rank reads its `1 / W` of the chunk's rows from the table and the
+embeddings are gathered, the same bytes decoded the same way (8-17k prompts at TP=4 from about
+1,710-1,860 to 1,835-2,060 tok/s). `SPARKFLASH_SEQUENCE_PARALLEL=0` turns it off; a value other
+than 0 or 1 refuses. Like the other switches here, it is set the same on every rank.
+
+**Overlapped halves.** Under sequence parallelism a third of the chunk was collectives that the
+compute waited for. From the layer after the PLE on, a chunk whose rows are a multiple of
+2 x `W` x 512 now runs as two halves on two streams (`overlapped_layers` in
+[`device/tp.rs`](../../crates/sparkflash-model-qwen4-exp/src/device/tp.rs)). A half is computed
+as a chunk of its own would be: its attention at its own positions, the second after the first,
+and its rows in the same whole 512-row pieces, so every row keeps its bits and the greedy texts
+are the ones before. Once the session's stream has written a half's branch partials, the second
+stream reduce-scatters them, injects this rank's rows, folds them for the next block and gathers
+the folded rows, while the session's stream computes the other half's branch. The second stream
+is made at the context's greatest priority (`Cuda::run_stream_urgent`, as DeepSeek's bulk
+collective stream is): a collective queued behind the other half's grids waits for SMs, and its
+peers wait with it. The halves took 8-17k prompts at TP=4 to about 2,000-2,280 tok/s, and the
+priority to 2,020-2,420 (the table below). `SPARKFLASH_SEQUENCE_OVERLAP=0` runs the chunk on one stream again; a
+value other than 0 or 1 refuses.
+
+**Fewer launches.** Three stages launched far more often than their work needed, all without
+changing a bit:
+
+* the Gated DeltaNet scan (`q4p_gdn_scan`, which GLM-5.3-Flash's KDA layers also run) ran a block
+  a head, 12 blocks on a TP=4 rank's heads against 48 SMs; it now splits a head's value columns
+  over blocks until the heads fill the SMs (`gdn_scan_shape`). A column's recurrence is the same
+  in any split (`tests/glm_kernels.rs` compares splits 2-16 with one, bit for bit);
+* the token GEMM (`q4e_gemm_bf16`, the narrow projections a TP=4 rank leaves on the CUDA cores:
+  the Gated DeltaNet's `a` and `b`, the shared expert's gate, the hyper-connection mixes)
+  launched a 128-row tile at a time, and its split-K reduce once a tile; a chunk's whole tiles
+  are now one launch on the grid's third axis, each tile summed exactly as its own launch was
+  (`tests/gemm_bench.rs`). On a TP=4 chunk that was 3,968 GEMM and 5,330 reduce launches on the
+  compute stream, ~370 ms, now 238 and 1,600 (most of the latter the dense MMA's own), ~114 ms;
+* the embedding was a launch a token, 4,096 a chunk; the chunk's ids now go into a mapped host
+  slab the kernel reads in place, one launch a chunk.
+
+The collective stream was the critical path when they landed, so the rate barely moved; they
+are what the compute stream has to give up now that it is.
+
+**Six-head grouped attention.** `q4e_attn_group` computes four query heads of one KV head
+together, sharing their key and value reads. A TP=4 rank holds six heads of its KV head, which
+four does not divide, so it fell back to a block a head. `q4e_attn_group6` is the same body at six
+heads, bit-identical per head to the one-head kernel (`tests/attn_kernel.rs`): a TP=4 chunk's
+sparse attention went from 542 to 220 ms, and prefill from about 1,375 to 1,525 tok/s.
+
+Limits on a tensor-parallel group:
+
+* One request at a time: every forward is a collective all the ranks step through, so
+  `--fuse-batch` is refused.
+* The MTP layer is not loaded; a greedy request (every token its row's argmax) drafts with DFlash 2,
+  which every rank runs whole. Rank 0 decides whether a request speculates and the request frame
+  carries the decision; a sampled or logprobs request decodes a token a step.
+* Prompt logprobs are a typed refusal.
+
+Measured on four DGX Sparks (GB10), greedy, one request at a time, random-word prompts; the
+prefill rate is the prompt's tokens over its time to first token, and decode is 128 tokens:
+
+| | TP=1 | TP=2 | TP=4 |
+| :-- | --: | --: | --: |
+| prefill, ~1.1k-token prompt | 627-789 tok/s | 817-1,235 tok/s | **1,178-1,550 tok/s** |
+| prefill, ~8.6k | 964-1,005 | 1,722-1,741 | **2,227-2,422** |
+| prefill, ~17.1k | 999-1,000 | 1,717-1,724 | **2,021-2,203** |
+| decode, DFlash 2 | 19-37 tok/s | 32-43 tok/s | **33-49 tok/s** |
+
+Two passes each after a 2k-token warm-up, on one build; the TP=1, TP=2 and TP=4 greedy texts are
+the ones before the PLE split, the overlapped halves and the launch changes, character for
+character. A prompt's rate moves by 10-30% between passes at the same length (the first ~1.1k
+prompt after the warm-up is the slow end), so read the ranges, not the ends; some decode runs
+stop at an end-of-text token near 40 tokens, which is where the low decode ends come from. vLLM
+serving the same checkpoint at TP=4 on the same four Sparks logged 5,701.8 prompt tokens/s and
+9.7 generated tokens/s with one request running (its logger's interval averages, not a
+per-request time to first token): decode here is about four to five times vLLM's, and prefill is
+about 40% of its logged rate.
+
+What the TP=4 chunk spends its time on, from nsys on rank 0 at an 8.5k prompt (nsys's cost per
+launch makes the spans longer than a plain run's): a 4,096-row chunk spans about 2.0 s. The
+compute stream is busy 81% of it: the dense MMAs ~410 ms, the routed experts ~480 ms and their
+combine ~100 ms, the sparse attention ~180 ms and its block scores ~70 ms, the token GEMMs and
+split-K reduces ~114 ms, the Gated DeltaNet scan ~57 ms. The collective stream is busy 55%, ~875
+ms of it NCCL: a rank sends about 126 MB a layer (each branch's f32 partials reduce-scattered and
+its folded rows gathered). With the halves overlapped, the compute stream is the path. What
+would shorten it most changes a TP=4 row's bits, which this arm does not do on its own: the
+narrow projections padded onto the tensor cores (TP=1 already runs them there), FP4 activations
+for the part's idle FP4 tensor cores, or expert parallelism in place of split expert widths.
+Within the bits, the experts' f32 slot partials (~840 MB a layer written and read back) and the
+padding of a TP=4 expert share from 160 to 192 columns are what is left.
+
 
 ### The stream a launch runs on
 

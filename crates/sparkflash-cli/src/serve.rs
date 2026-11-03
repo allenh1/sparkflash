@@ -871,13 +871,19 @@ impl ServeOptions {
             if cli.device_token_live {
                 unsupported.push("--device-token-live");
             }
-            // The GLM pack is the one that brings a four-rank arm; every other packed model is
-            // TP=1, so the flag stays a V4.1/GLM-only surface rather than a silent no-op.
+            // The GLM and Qwen3.8-Flash-Next packs bring tensor-parallel arms; every other packed
+            // model is TP=1, so the flag stays off their surface rather than a silent no-op.
             #[cfg(feature = "tp4-serve")]
             if cli.tp4_rank.is_some()
                 && !cli.model.as_deref().is_some_and(|model| {
-                    model.eq_ignore_ascii_case(sparkflash_model_glm5_next::MODEL_ID)
-                        || model.eq_ignore_ascii_case(sparkflash_model_glm5_next::WEIGHTS_ID)
+                    [
+                        sparkflash_model_glm5_next::MODEL_ID,
+                        sparkflash_model_glm5_next::WEIGHTS_ID,
+                        sparkflash_model_qwen4_exp::MODEL_ID,
+                        sparkflash_model_qwen4_exp::WEIGHTS_ID,
+                    ]
+                    .iter()
+                    .any(|id| model.eq_ignore_ascii_case(id))
                 })
             {
                 unsupported.push("--tp4-rank");
@@ -4613,8 +4619,25 @@ impl Tp4RankApi for GlmTp4Rank {
         if prompt.is_empty() {
             return Err("an empty prompt has no logits".to_owned());
         }
+        let started = Instant::now();
         self.sampler.record_prompt(prompt);
-        self.step(prompt)
+        let logits = self
+            .rank
+            .forward_prefill(&self.tp, &self.gather, &mut self.sequence, prompt)
+            .map_err(|error| format!("the GLM rank's prefill failed: {error}"))?;
+        let token = self.sampler.choose(&logits, &self.sampling);
+        let next_token = if self.eos.contains(&token) {
+            None
+        } else {
+            Some(token)
+        };
+        self.steps += 1;
+        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Tp4Step {
+            logits,
+            next_token,
+            accepted: Vec::new(),
+        })
     }
 
     fn prefill_prompt_logprobs(
@@ -4657,13 +4680,77 @@ impl Tp4RankApi for GlmTp4Rank {
 #[cfg(feature = "tp4-serve")]
 const GLM_DRAFTS_ENV: &str = "SPARKFLASH_GLM_DRAFTS";
 
+/// The engine collective of one rank of a pack's serve group: the TCP seams the pack's harness
+/// opens, on `base_port + rank`, with the run's NCCL communicator as their device leg.
+///
+/// The partials travel on the f32 wire, exchanged on the devices over NCCL by default
+/// (ReducePath::default_for, the device arms' path for every model) and on the host seam with
+/// `SPARK_COMM_REDUCE=tcp`; both sum them in rank order, so the two give the same tokens. A world
+/// of 1 has nothing to exchange, so it defaults to the seam alone. `run` names the run every rank
+/// must agree on before the communicator opens.
+#[cfg(feature = "tp4-serve")]
+fn open_pack_collective(
+    config: &Tp4RankConfig,
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    model: &str,
+    hidden: usize,
+    run: &str,
+) -> Result<(TpRuntime, BitGatherHandle), String> {
+    let layout = TpLayout {
+        rank: config.rank,
+        world_size: config.world_size,
+    };
+    let value = std::env::var(COMM_REDUCE_ENV).ok();
+    let default = if config.world_size > 1 {
+        ReducePath::Nccl
+    } else {
+        ReducePath::Tcp
+    };
+    let nccl = match ReducePath::parse(value.as_deref(), default)? {
+        ReducePath::Nccl if config.world_size > 1 => true,
+        ReducePath::Nccl => {
+            return Err(format!(
+                "{COMM_REDUCE_ENV}=nccl needs a world of 2 or more; a world of 1 has nothing to exchange"
+            ));
+        }
+        ReducePath::Tcp => false,
+        ReducePath::Roce => {
+            return Err(format!(
+                "{COMM_REDUCE_ENV}={:?} has no {model} path: nccl or tcp",
+                value.unwrap_or_default()
+            ));
+        }
+    };
+    // The engine collective is a separate socket set from the serve control channel: one
+    // transport per rank, on base_port + rank, exactly as the harness opens it.
+    let mut reduce = None;
+    let transport: Option<Box<dyn sparkflash_comm::Transport>> = if config.world_size > 1 {
+        let tcp = crate::tp4_host::tcp_config(config.rank, &config.peers, config.base_port, true)?;
+        let transport = sparkflash_comm::TcpTransport::connect(tcp)
+            .map_err(|error| format!("tcp connect: {error}"))?;
+        if nccl {
+            reduce = Some(crate::tp4_reduce::open_exchange_reduce(
+                cuda, &transport, layout, hidden, run,
+            )?);
+        }
+        Some(Box::new(transport))
+    } else {
+        None
+    };
+    let (mut collective, gather) =
+        crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
+    if let Some(reduce) = reduce {
+        collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
+    }
+    let tp = TpRuntime::new(layout, collective).map_err(|error| error.to_string())?;
+    Ok((tp, BitGatherHandle::new(gather)))
+}
+
 /// Opens one GLM-5.3-Flash rank of the serve-owned TP=4 group.
 ///
 /// The weights come from the checkpoint directory (or its index's parent), the configuration from
 /// its `config.json` or the carried release, and the collective from the same TCP seams the
-/// `glm-tp4` harness uses. The partials travel on the f32 wire, exchanged on the devices over NCCL
-/// by default and on the host seam with `SPARK_COMM_REDUCE=tcp`; both sum them in rank order, so
-/// the two give the same tokens.
+/// `glm-tp4` harness uses ([open_pack_collective]).
 #[cfg(feature = "tp4-serve")]
 fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
     let started = Instant::now();
@@ -4691,59 +4778,13 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         rank: config.rank,
         world_size: config.world_size,
     };
-    // The seam gets the run's NCCL communicator as its device leg, as `glm-tp4 --collective nccl`
-    // does: the partials are exchanged on the devices. That is the default, the device arm's path
-    // for every model (ReducePath::default_for); tcp keeps them on the host seam, and roce has no
-    // GLM path. A world of 1 has nothing to exchange, so it defaults to the seam alone.
-    let value = std::env::var(COMM_REDUCE_ENV).ok();
-    let default = if config.world_size > 1 {
-        ReducePath::Nccl
-    } else {
-        ReducePath::Tcp
-    };
-    let nccl = match ReducePath::parse(value.as_deref(), default)? {
-        ReducePath::Nccl if config.world_size > 1 => true,
-        ReducePath::Nccl => {
-            return Err(format!(
-                "{COMM_REDUCE_ENV}=nccl needs a world of 2 or more; a world of 1 has nothing to exchange"
-            ));
-        }
-        ReducePath::Tcp => false,
-        ReducePath::Roce => {
-            return Err(format!(
-                "{COMM_REDUCE_ENV}={:?} has no GLM path: nccl or tcp",
-                value.unwrap_or_default()
-            ));
-        }
-    };
-    // The engine collective is a separate socket set from the serve control channel: one
-    // transport per rank, on base_port + rank, exactly as the harness opens it.
-    let mut reduce = None;
-    let transport: Option<Box<dyn sparkflash_comm::Transport>> = if config.world_size > 1 {
-        let tcp = crate::tp4_host::tcp_config(config.rank, &config.peers, config.base_port, true)?;
-        let transport = sparkflash_comm::TcpTransport::connect(tcp)
-            .map_err(|error| format!("tcp connect: {error}"))?;
-        if nccl {
-            let run = format!("glm-serve;{glm_config:?};{}", config.context);
-            reduce = Some(crate::tp4_reduce::open_exchange_reduce(
-                &cuda,
-                &transport,
-                layout,
-                glm_config.hidden_size,
-                &run,
-            )?);
-        }
-        Some(Box::new(transport))
-    } else {
-        None
-    };
-    let (mut collective, gather) =
-        crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
-    if let Some(reduce) = reduce {
-        collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
-    }
-    let tp = TpRuntime::new(layout, collective).map_err(|error| error.to_string())?;
-    let gather = BitGatherHandle::new(gather);
+    let (tp, gather) = open_pack_collective(
+        config,
+        &cuda,
+        "GLM",
+        glm_config.hidden_size,
+        &format!("glm-serve;{glm_config:?};{}", config.context),
+    )?;
     // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
     // f32 for the expansion's exact arithmetic at a smaller window.
     let latent_cache = match std::env::var("SPARKFLASH_GLM_KV_CACHE").as_deref() {
@@ -4855,6 +4896,173 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         logits: false,
         drafts,
         speculative: false,
+        load_ms,
+        steps: 0,
+        last_step_ms: 0,
+    }))
+}
+
+/// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
+///
+/// The backend holds this rank's share of the weights ([Qwen4ExpDeviceBackend::open_rank]) and
+/// every branch is summed over the group before it is injected, so each rank computes the same
+/// rows, logits and greedy picks. A request opens its own sequence: a speculative one (rank 0's
+/// decision, [Tp4Sampling::speculative]) drafts with the DFlash drafter every rank runs whole, and
+/// the verified tokens come back one decode call at a time on every rank alike, so the workers see
+/// the same token frames a one-token request sends.
+///
+/// [Qwen4ExpDeviceBackend::open_rank]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank
+#[cfg(feature = "tp4-serve")]
+struct QwenTp4Rank {
+    backend: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend,
+    /// The request's sequence; the last one is dropped before the next is allocated.
+    session: Option<Box<dyn sparkflash_model::ModelSession>>,
+    /// Keeps the primary context the collective's communicator was opened in.
+    _cuda: CudaHandle,
+    load_ms: u64,
+    steps: u64,
+    last_step_ms: u64,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl QwenTp4Rank {
+    fn step<Run>(&mut self, run: Run) -> Result<Tp4Step, String>
+    where
+        Run: FnOnce(
+            &mut dyn sparkflash_model::ModelSession,
+        )
+            -> Result<sparkflash_model::StepOutput, sparkflash_model::BackendError>,
+    {
+        let session = self
+            .session
+            .as_deref_mut()
+            .ok_or_else(|| "the Qwen rank has no request open".to_owned())?;
+        let started = Instant::now();
+        let output = run(session).map_err(|error| format!("the Qwen rank's step: {error}"))?;
+        self.steps += 1;
+        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Tp4Step {
+            logits: output.logits,
+            next_token: output.next_token,
+            accepted: Vec::new(),
+        })
+    }
+}
+
+#[cfg(feature = "tp4-serve")]
+impl Tp4RankApi for QwenTp4Rank {
+    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        let request = sparkflash_model::Sampling {
+            temperature: sampling.temperature,
+            seed: sampling.seed,
+            ..sparkflash_model::Sampling::default()
+        };
+        if sampling.speculative && (sampling.logits || !Sampler::new().takes_argmax(&request)) {
+            return Err(
+                "a speculative request must take each row's argmax and read no row; this one \
+                 samples or asks for logprobs"
+                    .to_owned(),
+            );
+        }
+        self.session = None;
+        let mut session = self
+            .backend
+            .open_rank_session(sampling.speculative)
+            .map_err(|error| format!("the Qwen request window: {error}"))?;
+        session.set_sampling(request);
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+        self.step(|session| session.prefill(prompt))
+    }
+
+    fn prefill_prompt_logprobs(
+        &mut self,
+        _prompt: &[u32],
+        _selection: Option<usize>,
+    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+        // The session reads back one logits row a step; the prompt-logprob contract needs every
+        // scored position's row, which the TP=1 arm does not expose either.
+        Err(format!(
+            "{} the Qwen3.8-Flash-Next tensor-parallel arm does not score prompt logprobs yet",
+            crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
+        ))
+    }
+
+    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
+        self.step(|session| session.decode(token))
+    }
+
+    fn metrics(&self) -> Tp4RankMetrics {
+        Tp4RankMetrics {
+            load_ms: self.load_ms,
+            // Like the GLM arm, the collective and the resident bytes are not instrumented here;
+            // the fields report zero rather than a number nobody measured.
+            resident_cache_bytes: 0,
+            resident_cache_tensors: 0,
+            reduce_calls: 0,
+            reduce_elements: 0,
+            steps: self.steps,
+            last_step_ms: self.last_step_ms,
+        }
+    }
+}
+
+/// The Qwen3.8-Flash-Next configuration beside `checkpoint` (a directory, or a file in one).
+#[cfg(feature = "tp4-serve")]
+fn qwen_checkpoint_config(
+    checkpoint: &Path,
+) -> Result<(PathBuf, sparkflash_model_qwen4_exp::Qwen4ExpConfig), String> {
+    let directory = if checkpoint.is_dir() {
+        checkpoint.to_path_buf()
+    } else {
+        checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let path = directory.join(CHECKPOINT_CONFIG_NAME);
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let config = sparkflash_model_qwen4_exp::Qwen4ExpConfig::from_json(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok((directory, config))
+}
+
+/// Opens one Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group of 2 or 4: its share
+/// of the checkpoint's weights and the collective [open_pack_collective] opens.
+#[cfg(feature = "tp4-serve")]
+fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let started = Instant::now();
+    let (directory, qwen_config) = qwen_checkpoint_config(&config.checkpoint)?;
+    let cuda = CudaHandle::new(
+        sparkflash_kernels::cuda_driver::Cuda::load().map_err(|error| format!("CUDA: {error}"))?,
+    );
+    let (tp, _gather) = open_pack_collective(
+        config,
+        &cuda,
+        "Qwen3.8-Flash-Next",
+        qwen_config.hidden_size,
+        &format!("qwen-serve;{qwen_config:?};{}", config.context),
+    )?;
+    let label = tp.label();
+    let backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank(
+        &directory,
+        config.context,
+        tp,
+    )
+    .map_err(|error| format!("{}: {error}", directory.display()))?;
+    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    eprintln!(
+        "sparkflash serve: Qwen rank {}/{} loaded in {:.1} s from {}; {label} collective",
+        config.rank,
+        config.world_size,
+        load_ms as f64 / 1000.0,
+        directory.display()
+    );
+    Ok(Box::new(QwenTp4Rank {
+        backend,
+        session: None,
+        _cuda: cuda,
         load_ms,
         steps: 0,
         last_step_ms: 0,
@@ -5555,11 +5763,18 @@ fn tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), Strin
     tp4_worker_loop(rank.as_mut(), &mut control, rank_config.rank)
 }
 
-/// Runs one GLM-5.3-Flash worker rank until its control channel ends.
+/// Runs one worker rank of a model pack's group until its control channel ends: `open` opens the
+/// pack's rank over a window of `--context` tokens, or the pack's `default_context`.
 #[cfg(feature = "tp4-serve")]
-fn glm_tp4_worker(options: &ServeOptions, tp4: &Tp4ServeOptions) -> Result<(), String> {
-    let rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
-    let mut rank = open_glm_tp4_rank(&rank_config)?;
+fn pack_tp4_worker(
+    options: &ServeOptions,
+    tp4: &Tp4ServeOptions,
+    default_context: usize,
+    open: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String>,
+) -> Result<(), String> {
+    let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
+    rank_config.context = options.context.unwrap_or(default_context);
+    let mut rank = open(&rank_config)?;
     log_tp4_metrics(rank_config.rank, "open", &rank.metrics());
     let mut control = tp4_control_worker(&rank_config)?;
     tp4_worker_loop(rank.as_mut(), &mut control, rank_config.rank)
@@ -5926,7 +6141,12 @@ fn glm_tp4_cluster_snapshot(context: usize) -> ClusterStatsSnapshot {
 #[cfg(feature = "tp4-serve")]
 fn serve_glm_tp4(options: &ServeOptions, tp4: &Tp4ServeOptions) -> ExitCode {
     if tp4.rank != 0 {
-        return match glm_tp4_worker(options, tp4) {
+        return match pack_tp4_worker(
+            options,
+            tp4,
+            sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT,
+            open_glm_tp4_rank,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(message) => {
                 eprintln!("sparkflash serve: rank {}: {message}", tp4.rank);
@@ -6051,6 +6271,101 @@ fn serve_glm_tp4(options: &ServeOptions, tp4: &Tp4ServeOptions) -> ExitCode {
     // XML is still streamed as content until a GLM tool parser lands.
     let engine: Arc<dyn ApiInferenceEngine> =
         sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver));
+    serve_with_seam(engine, metrics, seam, None, options, descriptor)
+}
+
+/// Runs one process of a Qwen3.8-Flash-Next tensor-parallel group (`--tp4-world 2` or 4).
+///
+/// Rank 0 owns HTTP, the tokenizer, the chat template and streaming, as the TP=1 arm does; every
+/// rank holds its share of the weights ([open_qwen_tp4_rank]) and steps through the same
+/// collectives. The control channel and the request loop are the GLM group's.
+#[cfg(feature = "tp4-serve")]
+fn serve_qwen_tp4(options: &ServeOptions, tp4: &Tp4ServeOptions) -> ExitCode {
+    let refuse = |message: String| {
+        eprintln!("sparkflash serve: {message}");
+        ExitCode::from(EXIT_REFUSED)
+    };
+    if tp4.rank != 0 {
+        return match pack_tp4_worker(
+            options,
+            tp4,
+            sparkflash_model_qwen4_exp::DEFAULT_DEVICE_CONTEXT,
+            open_qwen_tp4_rank,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(message) => refuse(format!("rank {}: {message}", tp4.rank)),
+        };
+    }
+    let Some(checkpoint) = options.checkpoint.clone() else {
+        return refuse(format!(
+            "--model {} --tp4-rank needs --checkpoint DIR",
+            sparkflash_model_qwen4_exp::MODEL_ID
+        ));
+    };
+    let (directory, config) = match qwen_checkpoint_config(&checkpoint) {
+        Ok(found) => found,
+        Err(message) => return refuse(message),
+    };
+    // The prompt seam and the detokenizer are the same file; load it before the rank upload so a
+    // missing tokenizer costs a startup message, not a load.
+    let tokenizer = options
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| directory.join("tokenizer.json"));
+    if !tokenizer.is_file() {
+        return refuse(format!(
+            "--model {} needs --tokenizer FILE, or a tokenizer.json beside the checkpoint at {}",
+            sparkflash_model_qwen4_exp::MODEL_ID,
+            tokenizer.display()
+        ));
+    }
+    let seam: Arc<dyn sparkflash_model::PromptCodec> =
+        match sparkflash_model_qwen4_exp::QwenCodec::from_path(&tokenizer) {
+            Ok(codec) => Arc::new(codec),
+            Err(message) => return refuse(message),
+        };
+    let context = options
+        .context
+        .unwrap_or(sparkflash_model_qwen4_exp::DEFAULT_DEVICE_CONTEXT);
+    if context == 0 || context > config.max_position_embeddings {
+        return refuse(format!(
+            "context limit {context} is outside 1..={}",
+            config.max_position_embeddings
+        ));
+    }
+    let descriptor = sparkflash_model_qwen4_exp::device::descriptor_for(&config, context);
+    let mut rank_config = match tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT) {
+        Ok(config) => config,
+        Err(message) => return refuse(message),
+    };
+    rank_config.context = context;
+    let max_tokens = options
+        .max_tokens
+        .min(sparkflash_model_qwen4_exp::MAX_OUTPUT_TOKENS);
+    let mut cluster = glm_tp4_cluster_snapshot(context);
+    cluster.model = sparkflash_model_qwen4_exp::MODEL_ID.to_owned();
+    let spec = Tp4EngineSpec {
+        model: sparkflash_model_qwen4_exp::MODEL_ID.to_owned(),
+        vocab_size: config.vocab_size,
+        capabilities: descriptor.capabilities,
+        cluster,
+        tokenizer,
+        open: open_qwen_tp4_rank,
+    };
+    let driver = match Tp4Driver::start(spec, rank_config, max_tokens) {
+        Ok(driver) => driver,
+        Err(message) => return refuse(message),
+    };
+    println!(
+        "sparkflash serve: {} TP={} rank 0 on {}; control {}; workers never detokenize",
+        sparkflash_model_qwen4_exp::MODEL_ID,
+        tp4.world_size,
+        tp4.peers[0],
+        tp4.control_port
+    );
+    let metrics = driver.metrics();
+    let engine: Arc<dyn ApiInferenceEngine> =
+        sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver));
     serve_with_seam(engine, metrics, seam, None, options, descriptor)
 }
 
@@ -6207,6 +6522,10 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
 fn serve_pack(model: &str, options: &ServeOptions) -> ExitCode {
     match model {
         sparkflash_model_qwen4_exp::MODEL_ID | sparkflash_model_qwen4_exp::WEIGHTS_ID => {
+            #[cfg(feature = "tp4-serve")]
+            if let Some(tp4) = options.tp4.as_ref() {
+                return serve_qwen_tp4(options, tp4);
+            }
             serve_qwen4_exp(options)
         }
         sparkflash_model_glm5_next::MODEL_ID | sparkflash_model_glm5_next::WEIGHTS_ID => {
@@ -11019,22 +11338,22 @@ mod tp4_serve_tests {
     use super::*;
 
     #[test]
-    fn the_glm_pack_may_take_the_four_rank_flags() {
-        let options =
-            ServeOptions::parse(tp4_args(&["--model", sparkflash_model_glm5_next::MODEL_ID]))
-                .expect("the GLM pack takes the group flags");
-        assert_eq!(
-            options.model.as_deref(),
-            Some(sparkflash_model_glm5_next::MODEL_ID)
-        );
-        assert!(options.tp4.is_some());
+    fn the_glm_and_qwen_packs_may_take_the_group_flags() {
+        for model in [
+            sparkflash_model_glm5_next::MODEL_ID,
+            sparkflash_model_qwen4_exp::MODEL_ID,
+        ] {
+            let options = ServeOptions::parse(tp4_args(&["--model", model]))
+                .expect("the pack takes the group flags");
+            assert_eq!(options.model.as_deref(), Some(model));
+            assert!(options.tp4.is_some());
+        }
     }
 
     #[test]
-    fn a_packed_model_without_a_four_rank_arm_still_refuses_the_group_flags() {
-        let error =
-            ServeOptions::parse(tp4_args(&["--model", sparkflash_model_qwen4_exp::MODEL_ID]))
-                .expect_err("the Qwen arm serves TP=1 only");
+    fn a_packed_model_without_a_group_arm_still_refuses_the_group_flags() {
+        let error = ServeOptions::parse(tp4_args(&["--model", "example/no-group-arm"]))
+            .expect_err("a pack without a tensor-parallel arm serves TP=1 only");
         assert!(error.contains("--tp4-rank"), "{error}");
     }
 

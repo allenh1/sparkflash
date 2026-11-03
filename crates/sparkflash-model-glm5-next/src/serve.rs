@@ -272,7 +272,28 @@ impl ModelSession for Glm5NextSession {
         }
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
-        self.step(tokens)
+        let mut rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let logits = rank.forward_prefill(
+            &self.shared.tp,
+            &self.shared.gather,
+            &mut self.sequence,
+            tokens,
+        )?;
+        let token = self.sampler.choose(&logits, &self.sampling);
+        let next_token = if self.shared.eos.contains(&token) {
+            None
+        } else {
+            Some(token)
+        };
+        Ok(StepOutput {
+            logits,
+            next_token,
+            draft: Vec::new(),
+        })
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {

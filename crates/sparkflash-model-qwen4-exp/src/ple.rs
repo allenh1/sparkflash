@@ -180,15 +180,58 @@ impl<R: RowReader> PleTable<R> {
     /// # Errors
     /// When a head count or row is outside the table, or the reader fails.
     pub fn embedding(&mut self, rows: &[u64]) -> Result<Vec<f32>, String> {
-        if rows.len() != self.heads {
-            return Err(format!(
+        self.check_heads(rows)?;
+        let missing = self.missing(rows);
+        self.fetch(&missing)?;
+        let out = self.decode(rows)?;
+        self.trim();
+        Ok(out)
+    }
+
+    /// [Self::embedding] for many positions at once, handed to `each` in order.
+    ///
+    /// Every row the positions miss is read in one pass before any is decoded, and the cache is
+    /// trimmed once, after the last: a prefill chunk names far more rows than the cache keeps
+    /// (4,096 tokens are 65,536), and trimming between the read and the decode would evict most of
+    /// them and read each again, one position's sixteen at a time.
+    ///
+    /// # Errors
+    /// As embedding, or what `each` returns.
+    pub fn embeddings<P: AsRef<[u64]>>(
+        &mut self,
+        positions: &[P],
+        mut each: impl FnMut(usize, &[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        for rows in positions {
+            self.check_heads(rows.as_ref())?;
+        }
+        let flat: Vec<u64> = positions
+            .iter()
+            .flat_map(|rows| rows.as_ref().iter().copied())
+            .collect();
+        let missing = self.missing(&flat);
+        self.fetch(&missing)?;
+        for (index, rows) in positions.iter().enumerate() {
+            each(index, &self.decode(rows.as_ref())?)?;
+        }
+        self.trim();
+        Ok(())
+    }
+
+    fn check_heads(&self, rows: &[u64]) -> Result<(), String> {
+        if rows.len() == self.heads {
+            Ok(())
+        } else {
+            Err(format!(
                 "the PLE expects {} head rows, got {}",
                 self.heads,
                 rows.len()
-            ));
+            ))
         }
-        let missing = self.missing(rows);
-        self.fetch(&missing)?;
+    }
+
+    /// One position's rows, all already in the cache, decoded in head order.
+    fn decode(&self, rows: &[u64]) -> Result<Vec<f32>, String> {
         let mut out = Vec::with_capacity(self.heads * self.row_bytes);
         for row in rows {
             let bytes = self
@@ -200,7 +243,6 @@ impl<R: RowReader> PleTable<R> {
                     .map_err(|error| error.to_string())?;
             out.extend(decoded);
         }
-        self.trim();
         Ok(out)
     }
 
@@ -392,6 +434,33 @@ mod tests {
                 .collect();
             table.embedding(&rows).expect("rows are in range");
             assert!(table.cache.len() <= 4, "the cache grew past its bound");
+        }
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_cache_reads_each_row_once() {
+        let config = Qwen4ExpConfig::tiny();
+        let heads = config.ngram_heads();
+        let mut table = tiny_table(4);
+        let positions: Vec<Vec<u64>> = (0..8u64)
+            .map(|position| (0..heads as u64).map(|head| position * 97 + head).collect())
+            .collect();
+        let mut seen = Vec::new();
+        table
+            .embeddings(&positions, |index, embedding| {
+                seen.push((index, embedding.to_vec()));
+                Ok(())
+            })
+            .expect("rows are in range");
+        assert_eq!(table.counters().misses, (positions.len() * heads) as u64);
+        assert!(table.cache.len() <= 4, "the cache grew past its bound");
+        let mut single = tiny_table(64);
+        for (index, rows) in positions.iter().enumerate() {
+            assert_eq!(seen[index].0, index);
+            assert_eq!(
+                seen[index].1,
+                single.embedding(rows).expect("rows are in range")
+            );
         }
     }
 

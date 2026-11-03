@@ -33,8 +33,8 @@ use sparkflash_model::BackendError;
 
 use super::prefill::ATTENTION_CHUNK;
 use super::{
-    ATTN_GROUP_HEADS, ATTN_GROUP_SELECTED, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH,
-    GpuBranch, GpuExperts, GpuMoe, MAX_SELECTED_TOKENS,
+    ATTN_GROUP_SELECTED, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts,
+    GpuMoe, MAX_SELECTED_TOKENS,
 };
 
 /// The routed slots q4e_moe_permute sorts in shared memory (Q4E_MAX_PERMUTE).
@@ -353,15 +353,19 @@ impl DeviceSequence {
             )?;
             self.probe_selected(slot, base, rows)?;
             self.prof_mark("sparse_pick")?;
-            // The grouped kernel reads a token's selection once for four heads and computes each
-            // as q4e_attn would; it takes any configuration whose groups and selection it holds.
-            let (attn, heads) = kernels
+            // A grouped kernel reads a token's selection once for several heads and computes
+            // each as q4e_attn would; it takes any configuration whose groups and selection it
+            // holds.
+            let (heads, attn) = kernels
                 .attn_group
-                .filter(|_| {
-                    config.query_groups().is_multiple_of(ATTN_GROUP_HEADS)
+                .iter()
+                .flatten()
+                .copied()
+                .find(|&(heads, _)| {
+                    config.query_groups().is_multiple_of(heads)
                         && config.max_selected_tokens() <= ATTN_GROUP_SELECTED
                 })
-                .map_or((kernels.attn, 1), |kernel| (kernel, ATTN_GROUP_HEADS));
+                .unwrap_or((1, kernels.attn));
             self.launch(
                 attn,
                 ((config.num_attention_heads / heads) as u32, rows as u32, 1),
@@ -616,6 +620,26 @@ impl DeviceSequence {
         chunk: bool,
         batch: usize,
     ) -> Result<(), BackendError> {
+        self.mlp_branch(moe, mixed, hyper, injection, layer, chunk, batch)?;
+        if self.backend.tp.is_some() {
+            self.inject_branch(hyper, injection, batch)?;
+        }
+        Ok(())
+    }
+
+    /// [Self::mlp] short of a sharded arm's inject: the combination is left in `self.branch`
+    /// for [Self::inject_branch] to sum over the world and inject.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn mlp_branch(
+        &self,
+        moe: &GpuMoe,
+        mixed: Deviceptr,
+        hyper: Deviceptr,
+        injection: Deviceptr,
+        layer: usize,
+        chunk: bool,
+        batch: usize,
+    ) -> Result<(), BackendError> {
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
         self.gemv(&moe.router, mixed, self.probabilities, batch)?;
@@ -656,6 +680,9 @@ impl DeviceSequence {
         self.prof_mark("experts")?;
         self.shared_expert(moe, mixed, batch)?;
         self.prof_mark("shared")?;
+        // One rank's combination is its share of the sum: it is summed over the world before it
+        // is injected, so the combine only writes it ([Self::inject_branch]).
+        let sharded = self.backend.tp.is_some();
         self.launch(
             kernels.moe_combine,
             (
@@ -669,7 +696,7 @@ impl DeviceSequence {
                 self.expert_accumulator.0,
                 self.shared_out.0,
                 self.expert_gate.0,
-                hyper.0,
+                if sharded { 0 } else { hyper.0 },
                 injection.0,
                 config.num_experts_per_tok as u64,
                 config.hidden_size as u64,

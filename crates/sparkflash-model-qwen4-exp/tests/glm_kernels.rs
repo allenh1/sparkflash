@@ -467,8 +467,6 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
         .expect("q4p_gdn_gate");
     let qk = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * QK_ROW]);
     let decay_beta = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * 2]);
-    let state = upload_f32(&cuda, &fixture.start);
-    let raw = upload_f32(&cuda, &vec![0.0; TOKENS * WIDTH]);
     let out = upload_f32(&cuda, &vec![0.0; TOKENS * WIDTH]);
     cuda.launch(
         prep,
@@ -488,30 +486,65 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
         ],
     )
     .expect("kda_prep launch");
-    cuda.launch(
-        scan,
-        (HEADS as u32, 1, 1),
-        ((4 * DIM) as u32, 1, 1),
-        &[
-            qk.0,
-            decay_beta.0,
-            device.decay.0,
-            device.mixed.0,
-            state.0,
-            raw.0,
-            WIDTH as u64,
-            HEADS as u64,
-            HEADS as u64,
-            DIM as u64,
-            1,
-            TOKENS as u64,
-            // No per-row snapshots.
-            0,
-            0,
-            0,
-        ],
-    )
-    .expect("kda_scan launch");
+    // The scan from the fixture's start state with each head's value columns split `splits` ways.
+    let run_scan = |splits: usize| {
+        let state = upload_f32(&cuda, &fixture.start);
+        let raw = upload_f32(&cuda, &vec![0.0; TOKENS * WIDTH]);
+        cuda.launch(
+            scan,
+            (HEADS as u32, splits as u32, 1),
+            ((4 * DIM / splits) as u32, 1, 1),
+            &[
+                qk.0,
+                decay_beta.0,
+                device.decay.0,
+                device.mixed.0,
+                state.0,
+                raw.0,
+                WIDTH as u64,
+                HEADS as u64,
+                HEADS as u64,
+                DIM as u64,
+                1,
+                TOKENS as u64,
+                // No per-row snapshots.
+                0,
+                0,
+                0,
+            ],
+        )
+        .expect("kda_scan launch");
+        (raw, state)
+    };
+    let (raw, state) = run_scan(1);
+    // A value column's recurrence reads no other column, so every split is the same bits.
+    let whole = (
+        download_f32(&cuda, &raw, TOKENS * WIDTH),
+        download_f32(&cuda, &state, HEADS * DIM * DIM),
+    );
+    for splits in [2, 4, 8, 16] {
+        let (split_raw, split_state) = run_scan(splits);
+        for (what, expected, got) in [
+            (
+                "outputs",
+                &whole.0,
+                download_f32(&cuda, &split_raw, TOKENS * WIDTH),
+            ),
+            (
+                "state",
+                &whole.1,
+                download_f32(&cuda, &split_state, HEADS * DIM * DIM),
+            ),
+        ] {
+            assert!(
+                expected
+                    .iter()
+                    .zip(&got)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "the scan's {what} split {splits} ways differ from the whole head's"
+            );
+        }
+    }
     cuda.launch(
         gate,
         (HEADS as u32, TOKENS as u32, 1),
@@ -736,5 +769,191 @@ fn the_fp8_gemv_matches_glms_host_fp8_linear_at_rank_shapes() {
                 "{label}: token {token} at batch 8 differs from its batch-1 run"
             );
         }
+    }
+}
+
+/// A kernel, its grid, its block width and its arguments.
+type Launch = (Kernel, (u32, u32, u32), u32, Vec<u64>);
+
+/// The absorbed MLA at one rank's geometry: GLM-5.3-Flash's 16 heads of 256 key and value
+/// columns over a 512-wide latent, and the indexer's 2,048 picks out of q4e_glm_pick's stride.
+const MLA_NOPE: usize = 256;
+const MLA_VALUE: usize = 256;
+const MLA_LATENT: usize = 512;
+const MLA_STRIDE: usize = 2304;
+const MLA_POSITIONS: usize = 3000;
+
+fn upload_i32(cuda: &Cuda, values: &[i32]) -> Deviceptr {
+    upload(
+        cuda,
+        &values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The split attention (q4e_glm_mla_scores, _softmax, _mix and _project) against the one kernel
+/// it replaces, bit for bit, over the E4M3 cache and the f32 one: a full selection, one that
+/// ends inside a tile, an empty one and a short one, in one run that starts past row 0.
+#[test]
+fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
+    let Some(cuda) = open(false) else {
+        return;
+    };
+    let load = |name: &'static str| cuda.load_named(embedded_cubin(), name).expect(name).1;
+    let attend = load("q4e_glm_mla_attend");
+    let (scores, softmax, mix, project) = (
+        load("q4e_glm_mla_scores"),
+        load("q4e_glm_mla_softmax"),
+        load("q4e_glm_mla_mix"),
+        load("q4e_glm_mla_project"),
+    );
+    let mut rng = Lcg(0x6d6c_6121);
+    let counts = [0, 2048, 1000, 0, 37, 2048];
+    let rows = counts.len();
+    let (base, run) = (1, rows - 1);
+    let q_abs = upload_f32(&cuda, &rng.values(rows * HEADS * MLA_LATENT));
+    let codes: Vec<u8> = (0..MLA_POSITIONS * MLA_LATENT)
+        .map(|_| finite_code(&mut rng))
+        .collect();
+    let scales: Vec<f32> = (0..MLA_POSITIONS * MLA_LATENT / FP8_BLOCK)
+        .map(|_| (1.5 + rng.next()) / 448.0)
+        .collect();
+    let latent: Vec<f32> = (0..MLA_POSITIONS * MLA_LATENT)
+        .map(|index| quant::f8e4m3_to_f32(codes[index]) * scales[index / FP8_BLOCK])
+        .collect();
+    let (codes, scales, latent) = (
+        upload(&cuda, &codes),
+        upload_f32(&cuda, &scales),
+        upload_f32(&cuda, &latent),
+    );
+    let kv_b = upload_f32(
+        &cuda,
+        &rng.values(HEADS * (MLA_NOPE + MLA_VALUE) * MLA_LATENT),
+    );
+    let selected: Vec<i32> = (0..rows * MLA_STRIDE)
+        .map(|_| ((rng.next() + 1.0) * 0.5 * (MLA_POSITIONS - 1) as f32) as i32)
+        .collect();
+    let selected = upload_i32(&cuda, &selected);
+    let count = upload_i32(&cuda, &counts);
+    let unset = vec![f32::from_bits(0x7FC0_1234); rows * HEADS * MLA_VALUE];
+    for quantise in [1u64, 0] {
+        let expected = upload_f32(&cuda, &unset);
+        cuda.launch(
+            attend,
+            (HEADS as u32, run as u32, 1),
+            (256, 1, 1),
+            &[
+                q_abs.0,
+                latent.0,
+                codes.0,
+                scales.0,
+                kv_b.0,
+                selected.0,
+                count.0,
+                expected.0,
+                base as u64,
+                MLA_NOPE as u64,
+                MLA_VALUE as u64,
+                MLA_LATENT as u64,
+                MLA_STRIDE as u64,
+                quantise,
+            ],
+        )
+        .expect("mla_attend launch");
+        let got = upload_f32(&cuda, &unset);
+        let logits = upload_f32(&cuda, &vec![0.0; rows * HEADS * MLA_STRIDE]);
+        let total = upload_f32(&cuda, &vec![0.0; rows * HEADS]);
+        let mixed = upload_f32(&cuda, &vec![0.0; rows * HEADS * MLA_LATENT]);
+        let launches: [Launch; 4] = [
+            (
+                scores,
+                ((MLA_STRIDE / 64) as u32, run as u32, 1),
+                256,
+                vec![
+                    q_abs.0,
+                    latent.0,
+                    codes.0,
+                    scales.0,
+                    selected.0,
+                    count.0,
+                    logits.0,
+                    base as u64,
+                    HEADS as u64,
+                    MLA_NOPE as u64,
+                    MLA_LATENT as u64,
+                    MLA_STRIDE as u64,
+                    quantise,
+                ],
+            ),
+            (
+                softmax,
+                (HEADS as u32, run as u32, 1),
+                256,
+                vec![logits.0, count.0, total.0, base as u64],
+            ),
+            (
+                mix,
+                (
+                    (MLA_LATENT / 32) as u32,
+                    HEADS.div_ceil(8) as u32,
+                    run as u32,
+                ),
+                256,
+                vec![
+                    latent.0,
+                    codes.0,
+                    scales.0,
+                    selected.0,
+                    count.0,
+                    logits.0,
+                    total.0,
+                    mixed.0,
+                    base as u64,
+                    HEADS as u64,
+                    MLA_LATENT as u64,
+                    MLA_STRIDE as u64,
+                    quantise,
+                ],
+            ),
+            (
+                project,
+                (HEADS as u32, MLA_VALUE.div_ceil(64) as u32, 1),
+                64,
+                vec![
+                    mixed.0,
+                    kv_b.0,
+                    count.0,
+                    got.0,
+                    base as u64,
+                    run as u64,
+                    MLA_NOPE as u64,
+                    MLA_VALUE as u64,
+                    MLA_LATENT as u64,
+                ],
+            ),
+        ];
+        for (kernel, grid, threads, arguments) in &launches {
+            cuda.launch(*kernel, *grid, (*threads, 1, 1), arguments)
+                .expect("split attention launch");
+        }
+        let expected = download_f32(&cuda, &expected, rows * HEADS * MLA_VALUE);
+        let got = download_f32(&cuda, &got, rows * HEADS * MLA_VALUE);
+        assert!(
+            expected[HEADS * MLA_VALUE..2 * HEADS * MLA_VALUE]
+                .iter()
+                .any(|value| *value != 0.0 && value.is_finite()),
+            "the full selection's row came out empty"
+        );
+        assert_same_bits(
+            if quantise == 1 {
+                "E4M3 cache"
+            } else {
+                "f32 cache"
+            },
+            &expected,
+            &got,
+        );
     }
 }

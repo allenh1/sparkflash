@@ -250,6 +250,41 @@ impl TpCollective for DeviceBusRank {
         slots: u64,
         bytes: usize,
     ) -> Result<(), EngineError> {
+        self.copy_from_peers(send, bytes, |peer, from| {
+            (slots + (peer * bytes) as u64, from)
+        })
+    }
+
+    fn scatter_on_device(
+        &mut self,
+        _stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        let (world, rank) = (self.world(), self.host.rank);
+        if !bytes.is_multiple_of(world) {
+            return Err(EngineError::Shape {
+                what: "device scatter twin".to_owned(),
+                detail: format!("{bytes} bytes are not {world} equal chunks"),
+            });
+        }
+        let chunk = bytes / world;
+        self.copy_from_peers(send, chunk, |peer, from| {
+            (slots + (peer * chunk) as u64, from + (rank * chunk) as u64)
+        })
+    }
+}
+
+impl DeviceBusRank {
+    /// Publishes `send` and copies `bytes` from every peer's published address into this rank's
+    /// device memory, `place(peer, its send)` giving the (destination, source) pair.
+    fn copy_from_peers(
+        &mut self,
+        send: u64,
+        bytes: usize,
+        place: impl Fn(usize, u64) -> (u64, u64),
+    ) -> Result<(), EngineError> {
         let failed = |detail: String| EngineError::Shape {
             what: "device exchange twin".to_owned(),
             detail,
@@ -263,8 +298,8 @@ impl TpCollective for DeviceBusRank {
         let sends = self.exchange.sends.lock().unwrap().clone();
         for (peer, &from) in sends.iter().enumerate() {
             if peer != rank {
-                let slot = Deviceptr(slots + (peer * bytes) as u64);
-                cuda.copy_dtod_async(&slot, &Deviceptr(from), bytes)
+                let (to, from) = place(peer, from);
+                cuda.copy_dtod_async(&Deviceptr(to), &Deviceptr(from), bytes)
                     .map_err(failed)?;
             }
         }

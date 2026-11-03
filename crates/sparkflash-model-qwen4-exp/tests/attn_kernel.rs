@@ -22,7 +22,7 @@
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model_qwen4_exp::device::{
-    ATTN_GROUP_HEADS, ATTN_GROUP_SELECTED, ATTN_GROUP_SHARED_BYTES, MAX_SELECTED_TOKENS,
+    ATTN_GROUP_KERNELS, ATTN_GROUP_SELECTED, MAX_SELECTED_TOKENS, attn_group_shared_bytes,
     cubin_available, embedded_cubin,
 };
 
@@ -185,30 +185,41 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
         reference.iter().all(|&bits| !f32::from_bits(bits).is_nan()),
         "q4e_attn left an output unwritten"
     );
-    let (_, kernel) = cuda
-        .load_named_shared(embedded_cubin(), "q4e_attn_group", ATTN_GROUP_SHARED_BYTES)
-        .expect("the cubin carries q4e_attn_group");
-    let grouped = run(kernel, ATTN_GROUP_HEADS);
-    for (token, &selected) in counts.iter().enumerate() {
-        if selected > ATTN_GROUP_SELECTED {
+    let mut checked = 0;
+    for (group, name) in ATTN_GROUP_KERNELS {
+        if !groups.is_multiple_of(group) {
             continue;
         }
-        for head in 0..heads {
-            let at = (token * heads + head) * head_dim;
-            let span = at..at + head_dim;
-            if let Some(dim) = span
-                .clone()
-                .position(|index| grouped[index] != reference[index])
-            {
-                panic!(
-                    "token {token} ({selected} selected) head {head} channel {dim}: {} against \
-                     q4e_attn's {}",
-                    f32::from_bits(grouped[at + dim]),
-                    f32::from_bits(reference[at + dim]),
-                );
+        checked += 1;
+        let (_, kernel) = cuda
+            .load_named_shared(embedded_cubin(), name, attn_group_shared_bytes(group))
+            .unwrap_or_else(|error| panic!("the cubin carries {name}: {error}"));
+        let grouped = run(kernel, group);
+        for (token, &selected) in counts.iter().enumerate() {
+            if selected > ATTN_GROUP_SELECTED {
+                continue;
+            }
+            for head in 0..heads {
+                let at = (token * heads + head) * head_dim;
+                let span = at..at + head_dim;
+                if let Some(dim) = span
+                    .clone()
+                    .position(|index| grouped[index] != reference[index])
+                {
+                    panic!(
+                        "{name}: token {token} ({selected} selected) head {head} channel {dim}: \
+                         {} against q4e_attn's {}",
+                        f32::from_bits(grouped[at + dim]),
+                        f32::from_bits(reference[at + dim]),
+                    );
+                }
             }
         }
     }
+    assert!(
+        checked > 0,
+        "no grouped kernel divides {groups} query groups"
+    );
 }
 
 #[test]
@@ -230,6 +241,20 @@ fn the_grouped_attention_matches_the_per_head_kernel_at_the_released_shape() {
             ATTN_GROUP_SELECTED,
             MAX_SELECTED_TOKENS,
         ],
+    );
+}
+
+#[test]
+fn the_grouped_attention_matches_the_per_head_kernel_at_a_four_rank_share() {
+    // Rank 3 of four: six query heads and the second KV head, which it shares with rank 2.
+    grouped_matches_per_head(
+        &Shape {
+            heads: 6,
+            kv_heads: 1,
+            head_dim: 256,
+            context: 9000,
+        },
+        &[0, 1, 700, 2051, ATTN_GROUP_SELECTED, MAX_SELECTED_TOKENS],
     );
 }
 
@@ -307,10 +332,10 @@ fn bench_the_attention_kernels() {
         let counts = upload_i32(&cuda, &vec![count as i32; rows]);
         let out = upload_f32(&cuda, &vec![0.0; rows * width]);
         let mut line = format!("rows {rows:>3} selected {count}:");
-        for (group, name, shared) in [
-            (1, "q4e_attn", 0),
-            (ATTN_GROUP_HEADS, "q4e_attn_group", ATTN_GROUP_SHARED_BYTES),
-        ] {
+        let grouped = ATTN_GROUP_KERNELS
+            .iter()
+            .map(|&(group, name)| (group, name, attn_group_shared_bytes(group)));
+        for (group, name, shared) in std::iter::once((1, "q4e_attn", 0)).chain(grouped) {
             let (_, kernel) = cuda
                 .load_named_shared(embedded_cubin(), name, shared)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
