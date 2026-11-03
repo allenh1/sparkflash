@@ -398,7 +398,7 @@ pub fn e4m3_encode(value: f32) -> u8 {
 ///
 /// This is the **FFN** rule: the reference quantises the pre-norm hidden as a raw f32 row, so the
 /// values encoded are the f32 values, not their BF16 rounds (the rule is stated in the FFN seam's
-/// evidence, `crates/sparkflash-cli/src/tp4_forward.rs`: "the activation quantiser still takes the
+/// evidence, `crates/sparkflash-deepseek-forward/src/tp4_forward.rs`: "the activation quantiser still takes the
 /// f32 row"). The attention projections' rule is the narrowed one below; the difference is a real
 /// semantic difference, not a detail, and the two agree only on rows that are already
 /// BF16-representable.

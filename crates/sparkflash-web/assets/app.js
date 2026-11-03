@@ -40,6 +40,7 @@ const S = {
   guideOpen: {},
   guideHtml: {},
   models: null,
+  shelfHtml: "",
   autoDiscovered: false,
   firstState: true,
   tab: "overview",
@@ -395,6 +396,7 @@ function renderState() {
 
   renderCluster(state);
   renderGuide();
+  renderShelf();
   renderJobs();
   if (!S.configDirty) paintConfig(state.config, state.discovery);
 }
@@ -477,6 +479,7 @@ async function loadModels(quiet = false) {
     button.classList.remove("busy");
   }
   paintModels();
+  renderShelf();
 }
 
 function formatSize(bytes) {
@@ -589,11 +592,114 @@ function paintModelSource() {
   }
   const saved = S.state?.config?.model?.id;
   const note = saved && id && id !== saved
-    ? (isSolo() ? "Changing the model restarts the local server." : "Changing the model needs a fresh conversion on every rank.")
+    ? (isSolo()
+      ? "Changing the model here restarts the local server. Use Overview → Models to prepare and swap."
+      : "Changing the model here needs a fresh conversion on every rank. Use Overview → Models to prepare and swap.")
     : "";
   const element = $("model-source");
   element.innerHTML = esc(text) + (note ? '<span class="model-note">' + esc(note) + "</span>" : "");
   element.classList.toggle("warn", warn);
+}
+
+// The Overview shelf: every cached model, what is prepared, and the one button that swaps to it.
+function shelfJobsFor(entry) {
+  // The label starts with the exact model id ("Prepare org/foo-2 on rank 1 ..."), so a
+  // substring match would let org/foo-2 light up org/foo and hide its Swap button.
+  const prefix = "Prepare " + entry.id + " on rank ";
+  return (S.jobs || []).filter((job) => job.status === "running" &&
+    job.kind.startsWith("prepare-") &&
+    String(job.label || "").startsWith(prefix));
+}
+
+function shelfState(entry) {
+  const state = S.state;
+  const online = !!(state?.latest?.online);
+  const active = entry.active || entry.id === state?.config?.model?.id;
+  const swapping = (S.jobs || []).some((job) => job.status === "running" && job.kind === "swap");
+  const jobs = shelfJobsFor(entry);
+  const preparing = entry.preparing || jobs.length > 0;
+  const ready = entry.prepared && entry.complete;
+  return { active, online, swapping, preparing, ready, jobs };
+}
+
+function shelfButton(entry, status) {
+  if (status.active) {
+    return '<span class="tag ' + (status.online ? "good" : "") + '">' + (status.online ? "Serving" : "Selected") + "</span>";
+  }
+  if (status.swapping) return '<span class="tag run">Swapping</span>';
+  if (status.preparing) return '<span class="tag run">Preparing</span>';
+  if (!entry.complete) {
+    return '<button class="btn btn-sm" type="button" disabled>Downloading</button>';
+  }
+  if (!entry.compatible) {
+    return '<button class="btn btn-sm" type="button" disabled>Incompatible with this plan</button>';
+  }
+  if (status.ready) {
+    const label = status.online ? "Swap to this model" : "Switch and start";
+    return '<button class="btn btn-sm btn-primary" type="button" data-shelf-act="swap" data-model-id="' + esc(entry.id) + '">' + label + "</button>";
+  }
+  if (entry.requires_conversion) {
+    return '<button class="btn btn-sm" type="button" data-shelf-act="prepare" data-model-id="' + esc(entry.id) + '">Prepare in background</button>';
+  }
+  return '<button class="btn btn-sm" type="button" disabled>Not on every Spark</button>';
+}
+
+function renderShelf() {
+  const host = $("model-shelf");
+  if (!host) return;
+  if (!S.models) {
+    host.innerHTML = '<p class="empty">Reading the Hugging Face cache…</p>';
+    return;
+  }
+  if (S.models.error) {
+    host.innerHTML = '<p class="empty">' + esc(S.models.error) + "</p>";
+    return;
+  }
+  const activeId = S.state?.config?.model?.id;
+  const isActive = (entry) => entry.active || entry.id === activeId;
+  const entries = (S.models.shelf || []).slice().sort((left, right) => {
+    if (isActive(left) !== isActive(right)) return isActive(left) ? -1 : 1;
+    return left.id.localeCompare(right.id);
+  });
+  if (entries.length === 0) {
+    host.innerHTML = '<p class="empty">No cached model this build can run. Download one on the Setup page.</p>';
+    return;
+  }
+  const swapping = (S.jobs || []).some((job) => job.status === "running" && job.kind === "swap");
+  const html = entries.map((entry) => {
+    const status = shelfState(entry);
+    const notes = [];
+    if (!entry.complete) {
+      notes.push("Download is incomplete");
+    } else if (!entry.compatible) {
+      notes.push("Needs a different cluster plan");
+    } else if (entry.requires_conversion) {
+      notes.push(entry.prepared
+        ? "Sharded on all " + entry.world_size + " Sparks"
+        : "Sharded on " + entry.prepared_ranks.length + " of " + entry.world_size + " Sparks");
+    } else {
+      notes.push("Loads its released checkpoint directly");
+    }
+    if (entry.note && !entry.active) notes.push(entry.note);
+    if (status.preparing) notes.push("Background sharding is running; the current model keeps serving");
+    const bars = status.jobs.map((job) => progressBar(job, "Preparing…")).join("");
+    return '<div class="shelf-model' + (status.active ? " active" : "") + '">' +
+      '<div class="shelf-main"><strong title="' + esc(entry.id) + '">' + esc(entry.id) + "</strong>" +
+      '<span class="shelf-meta">' + esc(formatSize(entry.bytes)) + " · " + esc(entry.weights || "unknown") +
+      " · " + (entry.requires_conversion ? "TP shards" : "direct checkpoint") + "</span>" +
+      '<span class="shelf-note-line' + (entry.note && !entry.active ? " warn" : "") + '">' + esc(notes.join(" · ")) + "</span>" +
+      (bars ? '<div class="shelf-bars">' + bars + "</div>" : "") + "</div>" +
+      '<div class="shelf-actions">' + shelfButton(entry, status) + "</div></div>";
+  }).join("");
+  if (S.shelfHtml !== html) {
+    S.shelfHtml = html;
+    host.innerHTML = html;
+  }
+  const note = $("shelf-note");
+  if (note) {
+    note.classList.toggle("hidden", !swapping);
+    note.textContent = swapping ? "A model swap is stopping the current server, saving the new selection and launching it. In-flight requests drain first." : "";
+  }
 }
 
 function setValue(id, value) {
@@ -841,7 +947,8 @@ const GUIDE_NEEDS = {
 
 // Jobs whose result changes what the node check finds.
 const isSetupJob = (kind) =>
-  ["download", "sync-software", "sync-model", "launch"].includes(kind) || kind.startsWith("convert-");
+  ["download", "sync-software", "sync-model", "launch", "swap"].includes(kind) ||
+  kind.startsWith("convert-") || kind.startsWith("prepare-");
 
 function latestJob(match) {
   let found = null;
@@ -1633,14 +1740,21 @@ function maybeInspect() {
   let finished = false;
   for (const job of S.jobs) {
     if (S.jobSeen.get(job.id) === "running" && job.status !== "running" && isSetupJob(job.kind)) finished = true;
-    S.jobSeen.set(job.id, job.status);
   }
+  // Do not consume the finished transition while another check is in flight: the early return
+  // used to strand the shelf on "Preparing" because no later tick saw the job end.
   if (!state || !state.config_exists || state.config_error || S.inspectBusy) return;
+  for (const job of S.jobs) S.jobSeen.set(job.id, job.status);
   const nodes = JSON.stringify(state.config.cluster.nodes);
   const stale = !freshSetup(state) && S.inspectedFor !== nodes;
   const old = !S.autoInspected && (!state.setup || state.now_ms - state.setup.checked_ms > 120000);
   S.autoInspected = true;
-  if (finished) loadModels(true);
+  if (finished) {
+    // Four prepare jobs finish together; one probe per finished job would open one SSH per
+    // (rank, cached model) four times over. Coalesce them into a single refresh.
+    clearTimeout(S.shelfRefreshTimer);
+    S.shelfRefreshTimer = setTimeout(() => loadModels(true), 1500);
+  }
   if (finished || stale || old) inspect(true);
 }
 
@@ -2331,6 +2445,48 @@ function bindEvents() {
   });
 
   $("rescan-models").addEventListener("click", () => loadModels());
+  $("shelf-refresh").addEventListener("click", () => loadModels());
+  $("model-shelf").addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-shelf-act]");
+    if (!button || button.disabled || !requireSaved()) return;
+    const id = button.dataset.modelId;
+    if (button.dataset.shelfAct === "prepare") {
+      const ok = await confirmAction({
+        title: "Shard " + id + " in the background?",
+        body: "Each Spark converts its share of this model into its own converted directory. " +
+          "The current server keeps running while the shards are written; the swap button appears " +
+          "when every rank is ready.",
+        ok: "Prepare in background",
+      });
+      if (ok) {
+        button.disabled = true;
+        try {
+          await postAction("/api/actions/prepare-model", { id }, false);
+        } finally {
+          button.disabled = false;
+        }
+      }
+    } else if (button.dataset.shelfAct === "swap") {
+      const online = !!(S.state?.latest && S.state.latest.online);
+      const ok = await confirmAction({
+        title: "Swap to " + id + "?",
+        body: (online
+          ? "Rank 0 drains in-flight requests, the cluster stops, the saved model changes, and the new model launches automatically. "
+          : "The saved model changes and the new model launches automatically. ") +
+          "Connected clients get errors until the new model is ready. " +
+          "The target was verified as sharded on every rank.",
+        ok: "Swap model",
+      });
+      if (ok) {
+        button.disabled = true;
+        try {
+          await postAction("/api/actions/swap", { id }, true);
+        } finally {
+          button.disabled = false;
+        }
+      }
+    }
+  });
   $("model-id").addEventListener("change", () => {
     applyModelProfile();
     paintModelSource();

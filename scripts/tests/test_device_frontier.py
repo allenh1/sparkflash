@@ -16,7 +16,7 @@
 """Unit tests for scripts/device-frontier.py: the four-rank device-probe verdict tool.
 
 No network, no GPU, no row: every test builds synthetic documents in the writer's exact shape
-(crates/sparkflash-cli/src/tp4_forward.rs write_layer_device_frontier, win/layer-device @ 5d5a5ffd)
+(crates/sparkflash-deepseek-forward/src/tp4_forward.rs write_layer_device_frontier, win/layer-device @ 5d5a5ffd)
 and asserts the three exit codes in both directions:
 
     0 coherent probe / completed layer

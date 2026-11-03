@@ -233,10 +233,48 @@ is not in the cache is refused with the cache path in the message; stop and stat
 non-empty `model.checkpoint` skips the lookup. Use it for a checkpoint outside the cache, and its
 `config.json` `model_type` is checked the same way.
 
-Switching models means converting every rank again: the converted weights belong to one
-checkpoint. The console writes each conversion under a child of `model.converted_dir` named after
-the repository and a hash of the resolved checkpoint path, so a different model cannot be
-mistaken for an already converted one.
+Switching models needs one set of converted weights per rank per checkpoint. The console writes
+each conversion under a child of `model.converted_dir` named after the repository and a hash of
+the resolved checkpoint path, so a different model cannot be mistaken for an already converted
+one. The **Models** panel below is the normal way to shard the next model in the background and
+swap to it without touching the setting; editing the selector here still requires stopping the
+server and converting again.
+
+## Swapping models without editing the configuration
+
+The **Models** panel on **Overview** is not a setting. It lists every cached model this build can
+run and gives each one the one action it needs:
+
+- **Prepare in background** shards a model other than the selected one. Each Spark converts its
+  own share into the model's checkpoint-specific `converted_dir` child. The current server keeps
+  running: preparation is CPU, disk and SSH work, and it does not touch the rank files the serving
+  model was started from. Preparing the selected model is refused on purpose, because those are
+  the shards a launch reads; stop the cluster and use Convert for that case. Preparation progress
+  appears in the panel and in Activity, and the button becomes **Swap** when every rank has the
+  checkpoint, the tokenizer, its converted rank file, and (for DeepSeek V4.1) a conversion
+  manifest that is not older than that rank file.
+- **Swap to this model** is one in-process job. It verifies every rank again, always sends the
+  stop, confirms through the launcher's `status` command that no rank process is left, saves the
+  new model selection atomically, and launches it. The stop is sent even when telemetry says the
+  server is offline: a failed telemetry fetch looks the same as a stopped server, and both
+  launchers report a launch over a live process as success, so `status` is the evidence used here.
+  In-flight requests finish during the drain; clients get connection errors until the new model
+  answers `/readyz`. If the target is not prepared on every rank, the swap is refused before
+  anything is stopped. A background prepare of some *other* model may keep running through the
+  swap; a prepare of the target cannot overlap it.
+- **When a swap fails after the stop, the cluster stays down.** If the new selection cannot be
+  saved, the previous selection is kept. If the launch job fails (a missing binary, a rank that
+  exits during start-up), the previous selection is saved back and the swap job fails with both
+  facts. Nothing is relaunched automatically: fix the cause and press **Start**, or swap to a
+  prepared model. A launch job only proves the ranks survived their start-up check; a weight-load
+  failure after that is visible on the Overview status and in the job log, not as a failed swap.
+- The active model is marked **Serving** or **Selected** and has no swap button. A model that needs
+  a different topology (the TP=1 Qwen pack on a four-Spark plan, for example) is listed as
+  incompatible and cannot be selected by accident.
+
+The saved configuration still follows the model selector: `model.checkpoint` stays empty after a
+swap, so the cache's `refs/main` remains authoritative. A swap does not copy a checkpoint to the
+other Sparks; Step 5 of setup does that.
 
 ## Applying changes
 
@@ -361,10 +399,12 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
 | `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
-| `GET /api/models` | Models in the lead's hub cache |
+| `GET /api/models` | Models in the lead's hub cache, plus the swap shelf and each model's prepared ranks |
 | `GET /api/series?window_secs=N` | Downsampled graph window |
 | `GET /api/jobs`, `GET /api/jobs/{id}` | Job list and full log |
-| `POST /api/actions/convert` | `{ranks?: [0,1,2,3]}` |
+| `POST /api/actions/convert` | `{ranks?: [0,1,2,3]}` for the active model; refused while it serves |
+| `POST /api/actions/prepare-model` | `{id}`: shard a cached model in the background while another serves |
+| `POST /api/actions/swap` | `{id}`: verify, stop, select and launch a prepared cached model as one job |
 | `POST /api/actions/download` | Download `model.id` into the lead's hub cache |
 | `POST /api/actions/sync` | `{what: "software" \| "model"}`: copy from the lead to the other nodes |
 | `POST /api/actions/launch`, `/stop`, `/status` | Launcher actions |
@@ -380,7 +420,9 @@ curl -X POST -H 'x-sparkflash-web: 1' http://127.0.0.1:8790/api/actions/status
 
 Everything above is exercised without a GPU, a checkpoint, multicast or an SSH server. The
 control-plane crate uses trait-backed discovery and SSH probes, a temp-directory config, and axum
-`oneshot` route tests. Run:
+`oneshot` route tests, including the refusal paths for an unprepared target, a read-only
+configuration and a launcher that exits during start-up. Real rank start-up, weight loading and
+the conversion tools' output are exercised by the launchers, not by these tests. Run:
 
 ```bash
 cargo test -p sparkflash-web

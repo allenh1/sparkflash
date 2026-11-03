@@ -17,7 +17,7 @@
 //! launches with, and the per-rank wo_a/wo_b shapes.
 //!
 //! The five stages this module serves (`reference_seam`, `ref_select`, `stage_attention`,
-//! `attention_body`, `attention_output` in `crates/sparkflash-cli/src/tp4_forward.rs`) are being
+//! `attention_body`, `attention_output` in `crates/sparkflash-deepseek-forward/src/tp4_forward.rs`) are being
 //! wired from refusal stubs to device launches in one pass. Before that pass each stage body would
 //! have re-derived its operands from the host twin next to it, and two stages that disagree about
 //! the window start, the store cursor or the selected-id space are exactly the failure mode the
@@ -38,7 +38,7 @@
 //!   [`crate::mla_ref::HSI_BLOCKS`] x [`crate::mla_ref::HSI_BLOCK_TOKENS`].
 //!
 //! The one rule this crate cannot import is the CLI's `DeviceKvCache` layout (it lives beside the
-//! layer arm, in `crates/sparkflash-cli/src/layer_device.rs`). [`cache_layer_bytes`] is that
+//! layer arm, in `crates/sparkflash-deepseek-forward/src/layer_device.rs`). [`cache_layer_bytes`] is that
 //! formula, and the test `the_cache_layer_run_is_the_cli_device_kv_cache_formula` reads the CLI
 //! source and refuses a drift, so the helper and the allocation it addresses cannot disagree
 //! silently.
@@ -46,7 +46,7 @@
 //! ## What this module deliberately does not do
 //!
 //! It does not decide *whether* a stage may run: that is the stage's contract in
-//! `crates/sparkflash-cli/src/layer_device.rs` and its refusal text. It does not read device memory:
+//! `crates/sparkflash-deepseek-forward/src/layer_device.rs` and its refusal text. It does not read device memory:
 //! a stage that needs to know whether a store row was published derives it from the position here
 //! ([`StoreOperands::new`]) instead of reading a cursor word back, because a decode step's row count
 //! is a function of the position, not of a round trip.
@@ -753,7 +753,7 @@ pub fn window_ring_addresses(
 
 /// The bytes one layer's `DeviceKvCache` row run occupies.
 ///
-/// This is `crates/sparkflash-cli/src/layer_device.rs`'s `DeviceKvCache::layer_bytes_for`, which
+/// This is `crates/sparkflash-deepseek-forward/src/layer_device.rs`'s `DeviceKvCache::layer_bytes_for`, which
 /// the kernels crate cannot import: `align_up(capacity_rows * row_values * 2, align)`. The test
 /// `the_cache_layer_run_is_the_cli_device_kv_cache_formula` reads that source and refuses a drift.
 ///
@@ -1507,13 +1507,13 @@ mod tests {
 
     #[test]
     fn the_cache_layer_run_is_the_cli_device_kv_cache_formula() {
-        // The kernels crate cannot import the CLI's DeviceKvCache, so the formula is restated and
-        // the CLI source is checked instead: an edit to either side fails here.
+        // The kernels crate cannot import the forward's DeviceKvCache, so the formula is
+        // restated and that source is checked instead: an edit to either side fails here.
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../sparkflash-cli/src/layer_device.rs"
+            "/../sparkflash-deepseek-forward/src/layer_device.rs"
         ))
-        .expect("the CLI is in the tree");
+        .expect("the forward crate is in the tree");
         assert!(
             source.contains("pub const ALIGN: usize = 256;"),
             "the cache alignment moved; attention_operands::CACHE_ALIGN is stale"

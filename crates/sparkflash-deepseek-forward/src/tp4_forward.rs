@@ -505,7 +505,7 @@ impl BlockTimer {
     /// the accessor unused rather than dropping it from the type.
     #[must_use]
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn snapshot(self) -> Option<probe::Snapshot> {
+    pub fn snapshot(self) -> Option<probe::Snapshot> {
         self.snapshot
     }
 
@@ -1740,7 +1740,7 @@ static CUBIN_CACHE: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, C
 /// # Errors
 /// The file read failure, with the path in the message.
 #[cfg(feature = "cuda")]
-pub(crate) fn cached_cubin(path: &Path) -> Result<(std::sync::Arc<[u8]>, String), String> {
+pub fn cached_cubin(path: &Path) -> Result<(std::sync::Arc<[u8]>, String), String> {
     let mut guard = CUBIN_CACHE
         .lock()
         .map_err(|error| format!("cubin cache lock: {error}"))?;
@@ -1761,7 +1761,7 @@ pub(crate) fn cached_cubin(path: &Path) -> Result<(std::sync::Arc<[u8]>, String)
 
 /// Starts a fresh cubin cache at run scope.
 #[cfg(feature = "cuda")]
-pub(crate) fn reset_cubin_cache() {
+pub fn reset_cubin_cache() {
     if let Ok(mut guard) = CUBIN_CACHE.lock() {
         *guard = Some(std::collections::HashMap::new());
     }
@@ -1959,7 +1959,7 @@ fn layer_evidence_readbacks() -> bool {
 /// The number of evidence digests actually taken on this thread (test hook).
 #[cfg(test)]
 #[must_use]
-pub(crate) fn evidence_hash_calls() -> u64 {
+pub fn evidence_hash_calls() -> u64 {
     EVIDENCE_HASH_CALLS.with(std::cell::Cell::get)
 }
 
@@ -1970,7 +1970,7 @@ pub(crate) fn evidence_hash_calls() -> u64 {
 /// proof. With the evidence flag on it is exactly [sha256_hex], so the identity kit's chain JSON is
 /// byte-identical to the pre-M2 evidence-bearing path.
 #[must_use]
-pub(crate) fn evidence_sha256(bytes: &[u8]) -> String {
+pub fn evidence_sha256(bytes: &[u8]) -> String {
     if evidence_record_enabled() {
         EVIDENCE_HASH_CALLS.with(|calls| calls.set(calls.get() + 1));
         sha256_hex(bytes)
@@ -1988,7 +1988,7 @@ pub(crate) fn evidence_sha256(bytes: &[u8]) -> String {
 /// run. This helper checks the flag first, so the lean path allocates nothing and the evidence path
 /// hashes the identical bytes.
 #[must_use]
-pub(crate) fn evidence_f32_sha256(values: &[f32]) -> String {
+pub fn evidence_f32_sha256(values: &[f32]) -> String {
     if evidence_record_enabled() {
         evidence_sha256(&f32_le_bytes(values))
     } else {
@@ -2002,7 +2002,7 @@ pub(crate) fn evidence_f32_sha256(values: &[f32]) -> String {
 ///
 /// The narrowing is idempotent on a value that is already BF16-exact (a device GEMM output read
 /// back as f32), so it is safe at every W8A8 activation seam. This mirrors the single-node native
-/// chain's quantise_native_activation (crates/sparkflash-cli/src/attention_device.rs) exactly, so
+/// chain's quantise_native_activation (crates/sparkflash-deepseek-forward/src/attention_device.rs) exactly, so
 /// the four-rank loop and that chain feed the same codes and scales to the same kernel.
 ///
 /// # Errors
@@ -2415,7 +2415,7 @@ fn native_dense_parity_checks(
     let (chain_mismatches, chain_slots, chain_max_abs, chain_length_mismatch) =
         native_parity_compare_bf16(&chain_out, out_bf16);
     let chain_launch = serde_json::json!({
-        "construction": "Mxfp8DenseParams::new(a_fp8, a_scales, w_fp8, w_scales, out, rows=1, cols, inner, trace_ring=0, layer_id, step_seq=0) + mxfp8_dense_launch::launch (the single-node chain's dense() construction, crates/sparkflash-cli/src/attention_device.rs)",
+        "construction": "Mxfp8DenseParams::new(a_fp8, a_scales, w_fp8, w_scales, out, rows=1, cols, inner, trace_ring=0, layer_id, step_seq=0) + mxfp8_dense_launch::launch (the single-node chain's dense() construction, crates/sparkflash-deepseek-forward/src/attention_device.rs)",
         "trace_ring": "0 (the chain's value); the loop passes a zeroed 64-B ring whose active_scope_mask is 0, so the trace path is off in both",
         "cubin_sha256": cubin_sha256,
         "out_sha256": sha256_hex(&chain_out),
@@ -2785,7 +2785,7 @@ pub fn token_stage(request: &TokenStageRequest<'_>) -> TokenStageOutcome {
 /// The caller must hold the arena epoch open; [crate::tp4_resident::bind_device_sets_in_arena_with]
 /// provides exactly that, and its closure is the only caller in the chain.
 #[must_use]
-pub(crate) fn run_with_arena(
+pub fn run_with_arena(
     request: &TokenStageRequest<'_>,
     plan: &ForwardPlan,
     arena: &sparkflash_device::arena::ResidentArena,
@@ -6225,21 +6225,21 @@ struct SeamDevice<'a> {
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
-pub(crate) struct SeamStagedWeights {
+pub struct SeamStagedWeights {
     /// `compressor.wkv`: the projection whose f32 row `pool_group` pools (present on kv-source layers).
-    pub(crate) wkv: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
+    pub wkv: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
     /// `compressor.wgate`: present only above ratio 1 (the layers whose groups are pooled).
-    pub(crate) wgate: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
+    pub wgate: Option<(Deviceptr, sparkflash_kernels::hostw_gemv_launch::Mode)>,
     /// `indexer.wk`: the index keys' projection (present on kv-source layers).
-    pub(crate) index_wk: Option<Deviceptr>,
+    pub index_wk: Option<Deviceptr>,
     /// `indexer.k_norm`: the index key norm weight (bf16) and its byte length (present on kv-source layers).
-    pub(crate) index_k_norm: Option<(Deviceptr, usize)>,
+    pub index_k_norm: Option<(Deviceptr, usize)>,
     /// `indexer.weights_proj`: the per-query weight projection (present on index-source layers).
-    pub(crate) weights_proj: Option<Deviceptr>,
+    pub weights_proj: Option<Deviceptr>,
     /// `indexer.wq_b`: the B12x E4M3 weight and E8M0 scale grid (present on index-source layers).
-    pub(crate) indexer_wq_b: Option<(Deviceptr, Deviceptr)>,
+    pub indexer_wq_b: Option<(Deviceptr, Deviceptr)>,
     /// `compressor.norm`: the norm weight (model dtype) and its byte length.
-    pub(crate) compressor_norm: Option<(Deviceptr, usize)>,
+    pub compressor_norm: Option<(Deviceptr, usize)>,
 }
 
 /// The compressor ring's rows per owner (see `attach_seam_ring`).
@@ -8962,13 +8962,15 @@ pub fn write_forward_progress(
 /// that writes the flag takes this lock. Production installs once, from the thread that runs the
 /// forward, so it never contends.
 #[cfg(test)]
-pub(crate) fn probe_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn probe_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|error| error.into_inner())
 }
 
+/// Host-side probe meters: per-scope call counts, bytes and time, and the evidence JSON they
+/// emit for the forward's performance record.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-pub(crate) mod probe {
+pub mod probe {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -9039,7 +9041,7 @@ pub(crate) mod probe {
     /// is what makes a nested block honest: `layer_total` differences its own snapshots, so it
     /// never double-counts the blocks inside it.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub(crate) struct Snapshot {
+    pub struct Snapshot {
         meter: ProbeMeterReading,
         arena: HostCounters,
         sha: HostCounters,
@@ -9120,7 +9122,7 @@ pub(crate) mod probe {
     /// Arms or clears the probe for this thread, and arms the driver meter with it; called once at
     /// run scope and once at exit. Clearing the meter here is what makes a second token stage in one
     /// process report its own work instead of the first stage's plus its own.
-    pub(crate) fn begin_run(perf: ForwardPerf) {
+    pub fn begin_run(perf: ForwardPerf) {
         let enabled = perf.probe;
         ACTIVE.store(enabled, Ordering::Relaxed);
         let deferred = enabled && perf.probe_nosync;
@@ -9138,18 +9140,18 @@ pub(crate) mod probe {
     }
 
     /// Whether a probe run is installed on this thread.
-    pub(crate) fn installed() -> bool {
+    pub fn installed() -> bool {
         ACTIVE.load(Ordering::Relaxed)
     }
 
     /// Clears the probe (tests, and a second run in one process).
-    pub(crate) fn reset() {
+    pub fn reset() {
         begin_run(ForwardPerf::OFF);
     }
 
     /// Whether this run's blocks measure the host-side wall only (the no-sync probe mode).
     #[cfg(feature = "cuda")]
-    pub(crate) fn deferred() -> bool {
+    pub fn deferred() -> bool {
         installed() && probe_meter_deferred()
     }
 
@@ -9158,7 +9160,7 @@ pub(crate) mod probe {
     ///
     /// A no-op on the drained path, where every block already closed itself.
     #[cfg(feature = "cuda")]
-    pub(crate) fn finish(cuda: &sparkflash_kernels::cuda_driver::Cuda) {
+    pub fn finish(cuda: &sparkflash_kernels::cuda_driver::Cuda) {
         if !deferred() {
             return;
         }
@@ -9202,7 +9204,7 @@ pub(crate) mod probe {
     }
 
     /// The reading a block starts from; None on the default path.
-    pub(crate) fn snapshot(enabled: bool) -> Option<Snapshot> {
+    pub fn snapshot(enabled: bool) -> Option<Snapshot> {
         if !enabled {
             return None;
         }
@@ -9210,7 +9212,7 @@ pub(crate) mod probe {
     }
 
     /// Starts a counter clock when the probe is installed; None in the default path.
-    pub(crate) fn counter_timer() -> Option<Instant> {
+    pub fn counter_timer() -> Option<Instant> {
         installed().then(Instant::now)
     }
 
@@ -9219,7 +9221,7 @@ pub(crate) mod probe {
     }
 
     /// Adds one `read_arena_bytes` call to the run and layer counters.
-    pub(crate) fn count_arena_read(bytes: usize, timer: Option<Instant>) {
+    pub fn count_arena_read(bytes: usize, timer: Option<Instant>) {
         let Some(ns) = elapsed_ns(timer) else {
             return;
         };
@@ -9233,7 +9235,7 @@ pub(crate) mod probe {
     }
 
     /// Adds one `sha256_hex` call to the run and layer counters.
-    pub(crate) fn count_sha256(bytes: usize, timer: Option<Instant>) {
+    pub fn count_sha256(bytes: usize, timer: Option<Instant>) {
         let Some(ns) = elapsed_ns(timer) else {
             return;
         };
@@ -9272,7 +9274,7 @@ pub(crate) mod probe {
     }
 
     /// Marks the current position (and whether it materialises head blocks).
-    pub(crate) fn begin_position(position: usize, head: bool) {
+    pub fn begin_position(position: usize, head: bool) {
         if !installed() {
             return;
         }
@@ -9285,7 +9287,7 @@ pub(crate) mod probe {
     }
 
     /// Records one progress write (serialised bytes, host ms) against the current position.
-    pub(crate) fn progress(bytes: usize, timer: BlockTimer) {
+    pub fn progress(bytes: usize, timer: BlockTimer) {
         let Some(ms) = timer.elapsed_ms() else {
             return;
         };
@@ -9373,7 +9375,7 @@ pub(crate) mod probe {
 
     /// Records a run-scope block (one synchronise at its boundary).
     #[cfg(feature = "cuda")]
-    pub(crate) fn run(
+    pub fn run(
         cuda: &sparkflash_kernels::cuda_driver::Cuda,
         name: &'static str,
         timer: BlockTimer,
@@ -9383,7 +9385,7 @@ pub(crate) mod probe {
 
     /// Records a position-scope block.
     #[cfg(feature = "cuda")]
-    pub(crate) fn position(
+    pub fn position(
         cuda: &sparkflash_kernels::cuda_driver::Cuda,
         name: &'static str,
         timer: BlockTimer,
@@ -9393,7 +9395,7 @@ pub(crate) mod probe {
 
     /// Records a layer-scope block for `layer`.
     #[cfg(feature = "cuda")]
-    pub(crate) fn layer(
+    pub fn layer(
         cuda: &sparkflash_kernels::cuda_driver::Cuda,
         layer: usize,
         name: &'static str,
@@ -9403,17 +9405,17 @@ pub(crate) mod probe {
     }
 
     /// Counts one execution of a steady-state loop stage: no timer, no snapshot, no drain.
-    pub(crate) fn count(name: &'static str) {
+    pub fn count(name: &'static str) {
         STAGE_COUNTS.with(|counts| *counts.borrow_mut().entry(name).or_insert(0) += 1);
     }
 
     /// One stage's count as this thread has recorded it, for a per-position written gate.
-    pub(crate) fn stage_count(name: &'static str) -> u64 {
+    pub fn stage_count(name: &'static str) -> u64 {
         STAGE_COUNTS.with(|counts| counts.borrow().get(name).copied().unwrap_or(0))
     }
 
     /// The per-run stage counts, ascending by name, for the run record.
-    pub(crate) fn stage_counts() -> Vec<(&'static str, u64)> {
+    pub fn stage_counts() -> Vec<(&'static str, u64)> {
         STAGE_COUNTS.with(|counts| {
             counts
                 .borrow()
@@ -9425,7 +9427,7 @@ pub(crate) mod probe {
 
     /// Records a head-scope block (grouped under the current position).
     #[cfg(feature = "cuda")]
-    pub(crate) fn head(
+    pub fn head(
         cuda: &sparkflash_kernels::cuda_driver::Cuda,
         name: &'static str,
         timer: BlockTimer,
@@ -9638,7 +9640,7 @@ pub(crate) mod probe {
     ///
     /// # Errors
     /// A serialisation failure or the filesystem write, with the path named.
-    pub(crate) fn write(
+    pub fn write(
         path: &Path,
         rank: usize,
         world: usize,

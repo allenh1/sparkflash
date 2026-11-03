@@ -38,11 +38,11 @@ tp4-serve = []
 # (scripts/build-aarch64.sh --features=cuda) produces a binary that can resolve the RoCE reduce
 # transport. The backend stays inert unless SPARK_COMM_REDUCE=roce asks for it; a TCP row is the
 # row it always was, and the run prints the path it resolved.
-cuda = ["sparkflash-device/cuda", "rdma", "dep:io-uring"]
+cuda = ["sparkflash-device/cuda", "sparkflash-deepseek-forward/cuda", "rdma", "dep:io-uring"]
 # The real libibverbs RDMA backend, forwarded from sparkflash-comm. No build dependency is added
 # (libibverbs is dlopen'd at run time); this only compiles the backend in and makes
 # --comm-backend rdma reachable. The four-node window is still what the run needs.
-rdma = ["sparkflash-comm/rdma"]
+rdma = ["sparkflash-comm/rdma", "sparkflash-deepseek-forward/rdma"]
 
 [[bin]]
 name = "sparkflash"
@@ -52,6 +52,7 @@ path = "src/main.rs"
 sparkflash-trace = { workspace = true }
 sparkflash-model = { workspace = true }
 sparkflash-model-deepseek-v41 = { workspace = true }
+sparkflash-deepseek-forward = { workspace = true }
 sparkflash-model-qwen4-exp = { workspace = true }
 sparkflash-model-glm5-next = { workspace = true }
 sparkflash-api = { workspace = true }

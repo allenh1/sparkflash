@@ -128,6 +128,99 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
     }
 }
 
+/// The background conversion for one rank of a model that is not the one being served.
+///
+/// It is the documented `sparkflash convert` command with a distinct kind, so the setup guide
+/// does not mistake a background preparation for the active model's conversion and a running
+/// server does not block it.
+#[must_use]
+pub fn prepare_command(config: &SparkConfig, rank: usize) -> CommandSpec {
+    let mut spec = convert_command(config, rank);
+    spec.kind = format!("prepare-r{rank}");
+    spec.label = format!(
+        "Prepare {} on rank {rank} ({})",
+        config.model.id, config.cluster.nodes[rank].ssh
+    );
+    spec
+}
+
+/// A read-only check that `rank` has everything a launch of `config` needs: the checkpoint, its
+/// tokenizer, and (for a converted model) this rank's converted file and manifest.
+///
+/// It prints `ready`, or `missing` followed by the missing pieces, so the model shelf can say
+/// which Spark still needs preparation.
+#[must_use]
+pub fn prepared_probe_command(config: &SparkConfig, rank: usize) -> CommandSpec {
+    let checkpoint = config.node_path(&config.model.checkpoint);
+    let tokenizer = config.effective_tokenizer();
+    let mut checks = vec![
+        format!(
+            "[ -d {} ] || missing=\"$missing checkpoint\"",
+            shell_quote(&checkpoint.display().to_string())
+        ),
+        format!(
+            "[ -f {} ] || missing=\"$missing tokenizer\"",
+            shell_quote(&tokenizer.display().to_string())
+        ),
+    ];
+    if config.requires_conversion() {
+        let converted = config.converted_path();
+        let rank_file = converted.join(format!("rank-{rank}-of-{}.bin", config.world_size()));
+        checks.push(format!(
+            "[ -f {} ] || missing=\"$missing rank-file\"",
+            shell_quote(&rank_file.display().to_string())
+        ));
+        if config.requires_conversion_manifest() {
+            let manifest = converted.join("sparkflash-converted-manifest.json");
+            checks.push(format!(
+                "[ -f {} ] || missing=\"$missing manifest\"",
+                shell_quote(&manifest.display().to_string())
+            ));
+            // "not older" matches `inspect` (manifest.mtime >= rank_file.mtime); a strict
+            // `-nt` would report a copied or equally-stamped pair as unprepared forever.
+            checks.push(format!(
+                "[ ! {} -ot {} ] || missing=\"$missing manifest-newer-than-rank\"",
+                shell_quote(&manifest.display().to_string()),
+                shell_quote(&rank_file.display().to_string())
+            ));
+        }
+    }
+    let script = format!(
+        "missing=''; {}; if [ -z \"$missing\" ]; then echo ready; else echo \"missing$missing\"; fi",
+        checks.join("; ")
+    );
+    let label = format!(
+        "Check {} on rank {rank} ({})",
+        config.model.id, config.cluster.nodes[rank].ssh
+    );
+    if config.cluster.nodes[rank].local {
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), script],
+            env: BTreeMap::new(),
+            cwd: None,
+            label,
+            kind: "prepared".to_owned(),
+        };
+    }
+    let mut args = batch_ssh_args(config);
+    args.push(config.ssh_destination(rank));
+    // Run the script under bash, like `inspect` does: `[ -nt ]`/`[ -ot ]` are not POSIX and a
+    // login shell's startup output on stdout would stop the probe from printing a bare `ready`.
+    args.push(format!(
+        "bash -c {} sparkflash-prepared",
+        shell_quote(&script)
+    ));
+    CommandSpec {
+        program: "ssh".to_owned(),
+        args,
+        env: BTreeMap::new(),
+        cwd: None,
+        label,
+        kind: "prepared".to_owned(),
+    }
+}
+
 /// A launcher subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeAction {
@@ -542,6 +635,42 @@ mod tests {
             !sync.args.iter().any(|arg| arg.ends_with("/target/cubins")),
             "{:?}",
             sync.args
+        );
+    }
+
+    #[test]
+    fn a_background_prepare_is_a_separate_job_kind_and_the_probe_checks_every_rank() {
+        let mut config = SparkConfig::default();
+        config.model.checkpoint = "/data/DeepSeek-V4.1-Flash".to_owned();
+        let prepare = prepare_command(&config, 1);
+        assert_eq!(prepare.kind, "prepare-r1");
+        assert!(prepare.label.contains(crate::config::DEFAULT_MODEL_ID));
+        assert_eq!(prepare.program, "ssh");
+        assert!(
+            prepare
+                .args
+                .last()
+                .is_some_and(|arg| arg.contains("convert"))
+        );
+
+        let local = prepared_probe_command(&config, 0);
+        assert_eq!(local.kind, "prepared");
+        assert_eq!(local.program, "bash");
+        let script = &local.args[1];
+        assert!(script.contains("rank-0-of-4.bin"), "{script}");
+        assert!(
+            script.contains("sparkflash-converted-manifest.json"),
+            "{script}"
+        );
+        assert!(script.contains("tokenizer.json"), "{script}");
+
+        let remote = prepared_probe_command(&config, 2);
+        assert_eq!(remote.program, "ssh");
+        assert!(
+            remote
+                .args
+                .last()
+                .is_some_and(|arg| arg.contains("rank-2-of-4.bin"))
         );
     }
 

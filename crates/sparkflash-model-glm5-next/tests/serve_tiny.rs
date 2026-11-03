@@ -34,7 +34,7 @@ use sparkflash_model_glm5_next::device::CudaHandle;
 use sparkflash_model_glm5_next::{
     Glm5NextConfig, Glm5NextDeviceBackend, MODEL_ID, cubin_available,
 };
-use sparkflash_model_qwen4_exp::ByteCodec;
+use sparkflash_ops::codec::ByteCodec;
 use sparkflash_serve::{HostDriver, HostOptions};
 use tower::ServiceExt as _;
 

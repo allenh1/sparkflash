@@ -43,8 +43,8 @@ use sparkflash_model_glm5_next::device::CudaHandle;
 use sparkflash_model_glm5_next::{
     DeviceRank, DeviceSequence, Glm5NextConfig, Glm5NextWeights, MAX_ROWS,
 };
-use sparkflash_model_qwen4_exp::device::cubin_available;
-use sparkflash_model_qwen4_exp::dflash::write_synthetic_drafter;
+use sparkflash_ops::dflash::write_synthetic_drafter;
+use sparkflash_ops::images::qwen4_available as cubin_available;
 use sparkflash_weights::linalg::{self, EngineError, REFERENCE_TENSOR_LIMIT};
 use sparkflash_weights::rank_file::rank_file_name;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};

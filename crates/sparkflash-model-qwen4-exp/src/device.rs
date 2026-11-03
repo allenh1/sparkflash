@@ -103,13 +103,15 @@ mod prefill;
 mod tp;
 
 use dflash::DFLASH2_STEP_COST;
-pub use dflash::{DraftDevice, DraftScratch, GpuDflash2, embedded_dflash2_cubin, gemv_e4m3};
+pub use dflash::embedded_dflash2_cubin;
 pub use prefill::{
     ATTENTION_CHUNK, CONV_HISTORY, DEFAULT_PREFILL_CHUNK, DENSE_ROWS, GDN_KEY, GDN_QK_ROW,
     GDN_VALUE, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK,
     embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape,
 };
 use prefill::{PrefillKernels, PrefillScratch};
+pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
+pub use sparkflash_ops::gemv::gemv_e4m3;
 pub use tp::{reduce_two_shot, splits_two_shot};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
@@ -203,12 +205,6 @@ mod prof {
     }
 }
 
-/// The cubin build.rs embeds. Empty on a CPU-only build.
-#[cfg(sparkflash_qwen4_cubin)]
-const QWEN4_CUBIN: &[u8] = include_bytes!(env!("SPARKFLASH_QWEN4_CUBIN"));
-#[cfg(not(sparkflash_qwen4_cubin))]
-const QWEN4_CUBIN: &[u8] = &[];
-
 /// The QSA selection buffer the attention kernel reserves, in tokens.
 ///
 /// Mirrors Q4E_MAX_SELECTED in kernels/qwen4_exp_sm121.cu. The released configuration selects at
@@ -262,11 +258,8 @@ pub const MAX_INDEXER_HEAD_DIM: usize = 128;
 /// Tokens the token GEMM's tile holds (QG_TOKENS); a wider chunk goes through it in slices.
 const GEMM_TILE_TOKENS: usize = 128;
 
-/// Above this many tokens the dense BF16 projections switch from the register-tiled GEMV to the
-/// shared-memory GEMM. The GEMV keeps one accumulator per token, so it re-reads a matrix once per
-/// eight tokens; the GEMM stages the chunk's activations and reads a weight tile once, which is
-/// why prefill wants the larger chunk and decode still wants the GEMV.
-pub const GEMV_MAX_BATCH: usize = 8;
+use sparkflash_ops::gemv::tiled_operands;
+pub use sparkflash_ops::gemv::{GEMV_MAX_BATCH, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS};
 
 /// Below this many tokens the GEMM's fixed 128-token tile wastes more work than the extra weight
 /// passes it saves: the GEMV is then run once per eight tokens instead. At the tile size the
@@ -277,54 +270,11 @@ const GEMM_MIN_BATCH: usize = 64;
 /// model has at the default chunk width, and the launchers clamp their segment counts to fit.
 const GEMM_PARTIAL_FLOATS: usize = 4 << 20;
 
-/// Blocks a tiled decode GEMV (q4e_gemv_tiled_bf16 and the hyper passes) aims for: four on each
-/// SM of a 48-SM part. A matrix with fewer 32-row tiles splits its inner dimension to get there.
-pub const TILED_GEMV_BLOCKS: usize = 192;
-
-/// Floats of split sums a tiled GEMV can need: a split launch has fewer than
-/// 2 x TILED_GEMV_BLOCKS blocks, each holding 32 rows of up to GEMV_MAX_BATCH tokens.
-pub const TILED_GEMV_PARTIALS: usize = 2 * TILED_GEMV_BLOCKS * GEMV_MAX_BATCH * 32;
+pub use sparkflash_ops::gemv::{
+    TILED_GEMV_E4M3_ROUND, TILED_GEMV_MIN_COLUMNS, TILED_GEMV_ROUND, tiled_gemv_e4m3_splits,
+    tiled_gemv_splits,
+};
 const _: () = assert!(TILED_GEMV_PARTIALS <= GEMM_PARTIAL_FLOATS);
-
-/// The narrowest activation row the plain decode GEMV goes tiled at. Below it a verify's eight
-/// rows stay in L1 and the one-warp-a-row kernel is at the weight bandwidth; above it they come
-/// from L2 once per output row.
-const TILED_GEMV_MIN_COLUMNS: usize = 4096;
-
-/// Columns a tiled decode GEMV block takes a round: one 16-byte chunk a lane, eight BF16 weights
-/// or sixteen E4M3 ones.
-pub const TILED_GEMV_ROUND: usize = 256;
-/// Columns an E4M3 tiled decode GEMV block takes a round: one 16-byte chunk a lane, sixteen codes.
-pub const TILED_GEMV_E4M3_ROUND: usize = 512;
-
-/// How many blocks a tiled decode GEMV over `tiles` tiles of 32 rows splits its `columns` into -
-/// a function of the shape alone, never the batch, so a row's sum is the same chain at one token
-/// and at a verify's eight. The splits share the 256-column rounds evenly and none is empty.
-#[must_use]
-pub fn tiled_gemv_splits(tiles: usize, columns: usize) -> usize {
-    split_rounds(tiles, columns.div_ceil(TILED_GEMV_ROUND))
-}
-
-/// `tiled_gemv_splits` for an E4M3 matrix, whose rounds are 512 columns.
-#[must_use]
-pub fn tiled_gemv_e4m3_splits(tiles: usize, columns: usize) -> usize {
-    split_rounds(tiles, columns.div_ceil(TILED_GEMV_E4M3_ROUND))
-}
-
-fn split_rounds(tiles: usize, rounds: usize) -> usize {
-    if tiles >= TILED_GEMV_BLOCKS || rounds <= 1 {
-        return 1;
-    }
-    let wanted = TILED_GEMV_BLOCKS.div_ceil(tiles).min(rounds);
-    rounds.div_ceil(rounds.div_ceil(wanted))
-}
-
-/// Whether the tiled decode GEMV can read these operands: 16-byte aligned rows of `columns`
-/// values, a whole number of 16-byte chunks long. Scratch rows are always aligned; the check
-/// guards a weight sliced out of a larger allocation.
-fn tiled_operands(pointers: &[Deviceptr], columns: usize) -> bool {
-    columns.is_multiple_of(8) && pointers.iter().all(|pointer| pointer.0.is_multiple_of(16))
-}
 
 /// Whether this build embeds a Qwen4-Exp cubin.
 ///
@@ -332,7 +282,7 @@ fn tiled_operands(pointers: &[Deviceptr], columns: usize) -> bool {
 /// checks this first and skips rather than failing the whole suite on a workstation.
 #[must_use]
 pub fn cubin_available() -> bool {
-    !QWEN4_CUBIN.is_empty()
+    !embedded_cubin().is_empty()
 }
 
 /// The cubin this build embeds.
@@ -342,101 +292,10 @@ pub fn cubin_available() -> bool {
 /// a wrong index from it is otherwise only visible as a panic two hundred lines away.
 #[must_use]
 pub fn embedded_cubin() -> &'static [u8] {
-    QWEN4_CUBIN
+    sparkflash_kernels::images::qwen4_exp_cubin()
 }
 
-/// One uploaded BF16 matrix, `[rows][columns]` row-major.
-#[derive(Debug, Clone, Copy)]
-pub struct GpuMat {
-    /// The matrix's first element on the device.
-    pub pointer: Deviceptr,
-    /// Output rows the matrix holds.
-    pub rows: usize,
-    /// Values in a row, which is the inner dimension a GEMV walks.
-    pub columns: usize,
-}
-
-/// One matrix as E4M3 codes with one f32 scale a row (`q4e_quantize_e4m3_rows`): the drafter's
-/// projections and the copy of the head drafts score with. Half the BF16's bytes, and only drafts
-/// read it, which a verify checks against the BF16 model.
-#[derive(Debug, Clone, Copy)]
-pub struct GpuMatE4m3 {
-    /// The matrix's E4M3 codes on the device, `[rows][columns]` with a byte a value.
-    pub weight: Deviceptr,
-    /// One f32 scale a row, the factor the codes were quantized with.
-    pub scales: Deviceptr,
-    /// Output rows the matrix holds.
-    pub rows: usize,
-    /// Values in a row, which is the inner dimension a GEMV walks.
-    pub columns: usize,
-}
-
-impl GpuMatE4m3 {
-    /// An E4M3 copy of an uploaded BF16 matrix, quantized on the device by `quantize`
-    /// (`q4e_quantize_e4m3_rows`), its bytes added to `total`. The quantization runs on the
-    /// default stream and has finished when this returns, so `matrix` must be on the device by
-    /// the call; the caller frees the copy ([Self::free]).
-    ///
-    /// # Errors
-    /// When the rows are not whole 16-byte runs of codes, or the device refuses an allocation or
-    /// the launch.
-    pub fn quantize(
-        cuda: &Cuda,
-        quantize: Kernel,
-        matrix: &GpuMat,
-        total: &mut usize,
-    ) -> Result<Self, String> {
-        // The tiled GEMV reads a row sixteen codes at a time.
-        if !matrix.columns.is_multiple_of(16) {
-            return Err(format!(
-                "a [{}, {}] matrix has no whole 16-byte E4M3 rows",
-                matrix.rows, matrix.columns
-            ));
-        }
-        let weight = cuda.alloc(matrix.rows * matrix.columns, total)?;
-        let scales = cuda
-            .alloc(matrix.rows * 4, total)
-            .inspect_err(|_| cuda.free_buffers(&[&weight]))?;
-        let quantized = Self {
-            weight,
-            scales,
-            rows: matrix.rows,
-            columns: matrix.columns,
-        };
-        const WARPS: usize = 8;
-        let launched = cuda
-            .launch(
-                quantize,
-                (matrix.rows.div_ceil(WARPS) as u32, 1, 1),
-                ((WARPS * 32) as u32, 1, 1),
-                &[
-                    matrix.pointer.0,
-                    weight.0,
-                    scales.0,
-                    matrix.rows as u64,
-                    matrix.columns as u64,
-                ],
-            )
-            // Loading runs on the default stream and a session's stream is not ordered against
-            // it, so the quantization has to finish before the first forward can read the copy.
-            .and_then(|()| {
-                cuda.synchronize()
-                    .map_err(|error| format!("the E4M3 quantization did not finish: {error}"))
-            });
-        match launched {
-            Ok(()) => Ok(quantized),
-            Err(error) => {
-                quantized.free(cuda);
-                Err(error)
-            }
-        }
-    }
-
-    /// Frees the codes and scales; nothing may run on them after.
-    pub fn free(&self, cuda: &Cuda) {
-        cuda.free_buffers(&[&self.weight, &self.scales]);
-    }
-}
+pub use sparkflash_ops::gemv::{GpuMat, GpuMatE4m3};
 
 /// One uploaded NVFP4 expert matrix and its two per-tensor scales.
 #[derive(Debug, Clone, Copy)]
@@ -625,16 +484,16 @@ struct Kernels {
 
 impl Kernels {
     fn load(cuda: &Cuda, gdn_stage_bytes: u32) -> Result<Self, String> {
-        if QWEN4_CUBIN.is_empty() {
+        if embedded_cubin().is_empty() {
             return Err(
                 "this build has no Qwen4-Exp cubin: rebuild on a host with nvcc (or set \
                  SPARKFLASH_NVCC) so build.rs compiles \
-                 crates/sparkflash-model-qwen4-exp/kernels/qwen4_exp_sm121.cu"
+                 kernels/qwen4_exp_sm121.cu"
                     .to_owned(),
             );
         }
         fn named(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(QWEN4_CUBIN, name)?;
+            let (_, kernel) = cuda.load_named(embedded_cubin(), name)?;
             Ok(kernel)
         }
         /// A handle that reserves `shared` bytes of dynamic shared memory per launch, falling back
@@ -643,7 +502,7 @@ impl Kernels {
             if shared == 0 {
                 return named(cuda, name);
             }
-            match cuda.load_named_shared(QWEN4_CUBIN, name, shared) {
+            match cuda.load_named_shared(embedded_cubin(), name, shared) {
                 Ok((_, kernel)) => Ok(kernel),
                 Err(error) => {
                     eprintln!("{name}: {shared} bytes of shared memory refused ({error}); global");
@@ -690,7 +549,7 @@ impl Kernels {
             // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
             attn_group: ATTN_GROUP_KERNELS.map(|(heads, name)| {
                 let bytes = attn_group_shared_bytes(heads);
-                cuda.load_named_shared(QWEN4_CUBIN, name, bytes)
+                cuda.load_named_shared(embedded_cubin(), name, bytes)
                     .map_err(|error| {
                         eprintln!(
                             "{name}: {bytes} bytes of shared memory refused ({error}); q4e_attn"
@@ -788,6 +647,7 @@ impl Sink for Direct<'_> {
 }
 
 /// The checkpoint walk: each upload goes to the sink in the order the model is built.
+#[allow(dead_code)]
 pub(crate) struct Uploader<'a> {
     /// The context [Uploader::mat_e4m3] quantizes on; unset for the host-only convert walks.
     cuda: Option<&'a Cuda>,
@@ -837,6 +697,7 @@ impl Part {
     }
 }
 
+#[allow(dead_code)]
 impl<'a> Uploader<'a> {
     pub(crate) fn new(cuda: &'a Cuda, sink: &'a mut dyn Sink) -> Self {
         Self {
@@ -2001,12 +1862,12 @@ impl Qwen4ExpDeviceBackend {
         // The checkpoint is checked before the build is: a wrong context limit or a malformed
         // configuration is a fact about the request, and reporting it should not depend on whether
         // this binary happens to carry a cubin.
-        if QWEN4_CUBIN.is_empty() {
+        if embedded_cubin().is_empty() {
             return Err(BackendError::new(
                 "qwen4_device",
                 "this build has no Qwen4-Exp sm_121 cubin. Rebuild with nvcc available (or \
                  SPARKFLASH_NVCC pointing at it) so build.rs compiles \
-                 crates/sparkflash-model-qwen4-exp/kernels/qwen4_exp_sm121.cu.",
+                 kernels/qwen4_exp_sm121.cu.",
             ));
         }
         let cuda = Cuda::load()
@@ -2082,7 +1943,7 @@ impl Qwen4ExpDeviceBackend {
             .map_err(|error| BackendError::new("qwen4_device", format!("kernel load: {error}")))?;
         // A configured drafter that cannot be loaded is refused rather than served without: the
         // caller asked for it by name.
-        let dflash = GpuDflash2::from_env(&cuda, &config, &weights.lm_head)?;
+        let dflash = dflash::load_dflash_from_env(&cuda, &config, &weights.lm_head)?;
         // One line, because a run that silently drafts nothing is indistinguishable from one whose
         // drafter failed to resolve: the flag and the cache are the two knobs that decide it.
         match (&dflash, crate::dflash::drafter_directory()) {
@@ -5002,7 +4863,7 @@ impl ModelSession for DeviceSequence {
 /// # Errors
 /// A build without the cubin, a driver failure, or a read-back that disagrees with the host.
 pub fn device_self_test() -> Result<(), BackendError> {
-    if QWEN4_CUBIN.is_empty() {
+    if embedded_cubin().is_empty() {
         return Err(BackendError::new(
             "qwen4_device",
             "this build has no Qwen4-Exp cubin; rebuild with nvcc to run the device self-test",

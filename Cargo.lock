@@ -2352,6 +2352,7 @@ dependencies = [
  "sha2",
  "sparkflash-api",
  "sparkflash-comm",
+ "sparkflash-deepseek-forward",
  "sparkflash-device",
  "sparkflash-engine",
  "sparkflash-engram",
@@ -2385,6 +2386,29 @@ dependencies = [
  "serde_json",
  "sparkflash-trace",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-deepseek-forward"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "io-uring",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sparkflash-api",
+ "sparkflash-comm",
+ "sparkflash-device",
+ "sparkflash-engine",
+ "sparkflash-engram",
+ "sparkflash-kernels",
+ "sparkflash-kv",
+ "sparkflash-model",
+ "sparkflash-model-deepseek-v41",
+ "sparkflash-vision",
+ "tempfile",
 ]
 
 [[package]]
@@ -2483,6 +2507,7 @@ dependencies = [
  "sparkflash-trace",
  "sparkflash-weights",
  "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
@@ -2514,7 +2539,7 @@ dependencies = [
  "sparkflash-api",
  "sparkflash-kernels",
  "sparkflash-model",
- "sparkflash-model-qwen4-exp",
+ "sparkflash-ops",
  "sparkflash-serve",
  "sparkflash-weights",
  "tempfile",
@@ -2541,6 +2566,7 @@ dependencies = [
  "sparkflash-engram",
  "sparkflash-kernels",
  "sparkflash-model",
+ "sparkflash-ops",
  "sparkflash-serve",
  "sparkflash-vision",
  "sparkflash-weights",
@@ -2548,6 +2574,19 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "sparkflash-ops"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "serde",
+ "serde_json",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-weights",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -59,7 +59,7 @@ const K_BLOCK: usize = 32;
 const K_BLOCKS: usize = Q_LORA_RANK / K_BLOCK;
 
 /// The shared staging buffer's size in projection outputs: MAX_OUT_BYTES = 32,768 bf16 values in
-/// crates/sparkflash-cli/src/attention_device.rs. Indexer wq_b emits rows * 4096 values, so the
+/// crates/sparkflash-deepseek-forward/src/attention_device.rs. Indexer wq_b emits rows * 4096 values, so the
 /// seam chunks rows at eight per launch rather than silently growing the shared constant; the
 /// rows_are_independent_so_a_chunked_launch_is_the_same_bytes test proves chunking is
 /// bit-transparent, which is the decision the docs record.

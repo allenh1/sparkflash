@@ -32,7 +32,7 @@ use sparkflash_model::{
     BackendError, Capabilities, ModelBackend, ModelDescriptor, ModelSession, Sampling, Speculation,
     StepOutput,
 };
-use sparkflash_model_qwen4_exp::sampling::Sampler;
+use sparkflash_ops::sampler::Sampler;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 

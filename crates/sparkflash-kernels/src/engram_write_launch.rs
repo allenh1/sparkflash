@@ -14,7 +14,7 @@
 
 //! The typed launch capability of the Engram residual write
 //! (kernels/engram_write_sm121.cu; the `engram_write` stage of
-//! crates/sparkflash-cli/src/layer_device.rs:764-768, kernel `engram_write_bf16`).
+//! crates/sparkflash-deepseek-forward/src/layer_device.rs:764-768, kernel `engram_write_bf16`).
 //!
 //! The argument array is the kernel declaration's parameter list in order - four device pointers,
 //! the row width `dim`, and the trace ring/layer/step words the other seam kernels carry for ABI

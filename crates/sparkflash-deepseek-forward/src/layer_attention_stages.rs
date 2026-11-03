@@ -17,11 +17,11 @@
 //! the whole-layer device arm, as pure functions over explicit handles.
 //!
 //! This module is the launch half only. The `LayerStages` method bodies in
-//! `crates/sparkflash-cli/src/tp4_forward.rs` gather the spans and pointers out of `DeviceLayer`
+//! `crates/sparkflash-deepseek-forward/src/tp4_forward.rs` gather the spans and pointers out of `DeviceLayer`
 //! and call the functions here; nothing here sees `DeviceLayer`, allocates, loads an image, reads
 //! the environment or counts a probe. The arithmetic that decides *whether* a stage may run is in
 //! `sparkflash_kernels::attention_operands` and the stage contracts in
-//! `crates/sparkflash-cli/src/layer_device.rs`; this module turns a validated set of operands into
+//! `crates/sparkflash-deepseek-forward/src/layer_device.rs`; this module turns a validated set of operands into
 //! the pinned argument arrays the kernels declare, and refuses a shape the launch cannot take.
 //!
 //! The wiring spec and the operand derivation are in `docs/build/s1-p2-attention-wiring.md`. Two

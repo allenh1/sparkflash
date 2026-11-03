@@ -63,36 +63,36 @@ pub(super) fn gumbel(seed: u64, position: u32, id: u32) -> f32 {
 
 /// One request's sampling parameters, as the device path applies them.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Sampler {
+pub struct Sampler {
     /// 0 is greedy.
-    pub(crate) temperature: f32,
+    pub temperature: f32,
     /// 1 keeps the whole distribution.
-    pub(crate) top_p: f32,
+    pub top_p: f32,
     /// 0 keeps every token.
-    pub(crate) top_k: u32,
-    pub(crate) seed: u64,
+    pub top_k: u32,
+    pub seed: u64,
 }
 
 impl Sampler {
     /// The argmax: the harness's and the reference's rule.
-    pub(crate) const GREEDY: Self = Self {
+    pub const GREEDY: Self = Self {
         temperature: 0.0,
         top_p: 1.0,
         top_k: 0,
         seed: 0,
     };
 
-    pub(crate) fn is_greedy(&self) -> bool {
+    pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
     }
 
     /// True when the candidate set is cut (top-k or top-p) and the host picks.
-    pub(crate) fn truncated(&self) -> bool {
+    pub fn truncated(&self) -> bool {
         !self.is_greedy() && (self.top_k > 0 || self.top_p < 1.0)
     }
 
     /// 1 / T, or 0 for greedy (the kernels' "no noise" value).
-    pub(crate) fn inv_t(&self) -> f32 {
+    pub fn inv_t(&self) -> f32 {
         if self.is_greedy() {
             0.0
         } else {
@@ -102,7 +102,7 @@ impl Sampler {
 
     /// The head kernel's noise arguments `(inv_t bits, seed)`: zero unless the device argmax is the
     /// sample (temperature only). The truncated mode takes raw logits for the host cut.
-    pub(crate) fn head_noise(&self) -> (u64, u64) {
+    pub fn head_noise(&self) -> (u64, u64) {
         if self.is_greedy() || self.truncated() {
             (0, 0)
         } else {
@@ -112,7 +112,7 @@ impl Sampler {
 
     /// The drafter's noise arguments `(inv_t bits, seed)`: the full tempered distribution in both
     /// sampling modes (a draft is only a proposal; the target's cut decides what is emitted).
-    pub(crate) fn draft_noise(&self) -> (u64, u64) {
+    pub fn draft_noise(&self) -> (u64, u64) {
         if self.is_greedy() {
             (0, 0)
         } else {

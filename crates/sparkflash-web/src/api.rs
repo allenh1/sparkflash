@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{
     CommandSpec, ServeAction, SyncTarget, SyncWhat, convert_command, download_command,
-    inspect_command, local_hostname, serve_action_command, sync_command,
+    inspect_command, local_hostname, prepare_command, prepared_probe_command, serve_action_command,
+    sync_command,
 };
 use crate::config::{
     MAX_CONCURRENCY, MODEL_PROFILES, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID,
@@ -44,16 +45,21 @@ use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 /// so another site open in the operator's browser cannot launch, stop or reconfigure the cluster.
 pub const ACTION_HEADER: &str = "x-sparkflash-web";
 
-/// The cluster actions that change whether the group runs; one at a time.
-const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop"];
+/// The cluster actions that change whether the group runs; one at a time. A swap is the
+/// in-process stop, switch and launch sequence, so it is exclusive with both.
+const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop", "swap"];
 
-/// What a conversion must not overlap: a launch or stop, or the checkpoint changing under it.
-const CONVERT_EXCLUSIVE: &[&str] = &["launch", "stop", "download", "sync-model"];
+/// What a conversion must not overlap: a launch, stop or swap, or the checkpoint changing
+/// under it.
+const CONVERT_EXCLUSIVE: &[&str] = &["launch", "stop", "swap", "download", "sync-model"];
 
 /// What a launch must not overlap: anything that changes the files the ranks start from.
+/// Background `prepare-*` jobs are deliberately absent: sharding another model may continue
+/// while the current one serves and a normal launch must not be blocked by it.
 const LAUNCH_EXCLUSIVE: &[&str] = &[
     "launch",
     "stop",
+    "swap",
     "download",
     "sync-model",
     "sync-software",
@@ -67,14 +73,25 @@ const LAUNCH_EXCLUSIVE: &[&str] = &[
 const MODEL_EXCLUSIVE: &[&str] = &[
     "download",
     "sync-model",
+    "swap",
     "convert-r0",
     "convert-r1",
     "convert-r2",
     "convert-r3",
+    "prepare-r0",
+    "prepare-r1",
+    "prepare-r2",
+    "prepare-r3",
 ];
 
 /// How long one node check may take, on top of the SSH connect timeout.
 const INSPECT_SECS: u64 = 60;
+
+/// How long a stop or its confirmation through the launcher may take.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How long the launcher's start-up survival check may take.
+const LAUNCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
@@ -474,6 +491,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/actions/convert", post(convert))
         .route("/api/actions/download", post(download))
         .route("/api/actions/prepare", post(prepare))
+        .route("/api/actions/prepare-model", post(prepare_model))
+        .route("/api/actions/swap", post(swap))
         .route("/api/actions/sync", post(sync))
         .route("/api/actions/launch", post(launch))
         .route("/api/actions/stop", post(stop))
@@ -740,12 +759,28 @@ async fn put_config(State(web): State<WebState>, Json(body): Json<serde_json::Va
 
 /// Validates, saves and adopts `config`, answering with the saved view.
 fn store_config(web: &WebState, config: SparkConfig) -> Response {
-    if let Err(error) = config.validate() {
-        return api_error(StatusCode::BAD_REQUEST, error.message);
+    if let Err((status, message)) = save_and_adopt(web, config.clone()) {
+        return api_error(status, message);
     }
-    if let Err(error) = config.save(&web.config_path) {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, error.message);
-    }
+    Json(ConfigView {
+        path: web.config_path.display().to_string(),
+        exists: true,
+        load_error: None,
+        config,
+    })
+    .into_response()
+}
+
+/// The save-and-adopt half of [`store_config`], shared with the swap task, which has no HTTP
+/// response to build. The error keeps the status `store_config` should answer with: a bad value
+/// is the caller's, a failed write is ours.
+fn save_and_adopt(web: &WebState, config: SparkConfig) -> Result<(), (StatusCode, String)> {
+    config
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.message))?;
+    config
+        .save(&web.config_path)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.message))?;
     {
         let mut state = web.config.write().expect("config lock");
         state.config = config.clone();
@@ -754,13 +789,7 @@ fn store_config(web: &WebState, config: SparkConfig) -> Response {
     }
     *web.telemetry.write().expect("telemetry lock") =
         Arc::new(TelemetrySource::new(&config.web.serve_url));
-    Json(ConfigView {
-        path: web.config_path.display().to_string(),
-        exists: true,
-        load_error: None,
-        config,
-    })
-    .into_response()
+    Ok(())
 }
 
 async fn reload_config(State(web): State<WebState>) -> Response {
@@ -958,7 +987,7 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
     let exclusive: &[&str] = match request.what {
-        SyncWhat::Software => &["launch"],
+        SyncWhat::Software => &["launch", "swap"],
         SyncWhat::Model => MODEL_EXCLUSIVE,
     };
     match web.jobs.start_exclusive(command, exclusive).await {
@@ -972,11 +1001,45 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
 struct ModelsView {
     cache: Option<String>,
     models: Vec<CachedModel>,
+    /// The cached models that can be prepared and swapped from the Overview page.
+    shelf: Vec<ShelfModel>,
     error: Option<String>,
 }
 
+/// One cached model's readiness to be selected without editing the configuration.
+#[derive(Serialize)]
+struct ShelfModel {
+    /// The Hugging Face model id.
+    id: String,
+    /// The control-plane weight selector.
+    weights: Option<String>,
+    /// The engine selector.
+    engine: Option<String>,
+    /// The checkpoint's size in bytes.
+    bytes: u64,
+    /// Whether the download is complete.
+    complete: bool,
+    /// Whether launch needs per-rank converted weights.
+    requires_conversion: bool,
+    /// Whether this is the model the configuration currently names.
+    active: bool,
+    /// Whether this cluster plan can run the model at all.
+    compatible: bool,
+    /// Whether every rank already has what a launch needs.
+    prepared: bool,
+    /// The ranks whose probe reported ready.
+    prepared_ranks: Vec<usize>,
+    /// The number of ranks in this plan.
+    world_size: usize,
+    /// A job is currently sharding this model.
+    preparing: bool,
+    /// Why this model cannot be swapped to, when it cannot.
+    note: Option<String>,
+}
+
 async fn models(State(web): State<WebState>) -> Json<ModelsView> {
-    let cache = web.config().hub_cache_dir();
+    let config = web.config();
+    let cache = config.hub_cache_dir();
     let listed = match cache.clone() {
         Some(dir) => tokio::task::spawn_blocking(move || hf::list(&dir))
             .await
@@ -989,11 +1052,172 @@ async fn models(State(web): State<WebState>) -> Json<ModelsView> {
         Ok(models) => (models, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    let shelf = model_shelf(&web, &config, &models).await;
     Json(ModelsView {
         cache: cache.map(|dir| dir.display().to_string()),
         models,
+        shelf,
         error,
     })
+}
+
+/// The shelf the Overview page draws: every cached model this build can run, with the ranks
+/// that already hold everything a launch needs.
+async fn model_shelf(
+    web: &WebState,
+    config: &SparkConfig,
+    models: &[CachedModel],
+) -> Vec<ShelfModel> {
+    let jobs = web.jobs.list();
+    // Building each target reads the cached config.json and resolves refs/main, so it belongs off
+    // the async worker.
+    let candidates: Vec<(CachedModel, Result<SparkConfig, String>)> = {
+        let config = config.clone();
+        let models = models.to_vec();
+        tokio::task::spawn_blocking(move || {
+            models
+                .into_iter()
+                .filter(|model| model.supported)
+                .map(|model| {
+                    let target = config
+                        .for_cached_model(&model)
+                        .map_err(|error| error.message);
+                    (model, target)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let configs: Vec<SparkConfig> = candidates
+        .iter()
+        .filter_map(|(_, target)| target.as_ref().ok().cloned())
+        .collect();
+    // Before the first save the node list is still a placeholder, so probing it would open SSH
+    // to names that are not this cluster yet. The shelf can still show the cache.
+    let can_probe = web.config_exists();
+    let matrix = if !can_probe || configs.is_empty() {
+        Vec::new()
+    } else {
+        let probe = Arc::clone(&web.ssh);
+        let timeout =
+            std::time::Duration::from_secs(config.web.ssh_timeout_secs.saturating_add(10));
+        tokio::task::spawn_blocking(move || prepared_matrix(&configs, probe.as_ref(), timeout))
+            .await
+            .unwrap_or_default()
+    };
+
+    let mut next = 0usize;
+    candidates
+        .into_iter()
+        .map(|(model, target)| {
+            let ranks = if target.is_ok() {
+                let ranks = matrix.get(next).cloned().unwrap_or_default();
+                next += 1;
+                ranks
+            } else {
+                Vec::new()
+            };
+            let active = model.id == config.model.id;
+            let preparing = target.as_ref().is_ok_and(|target| {
+                let scope = target.converted_path().display().to_string();
+                jobs.iter().any(|job| {
+                    job.status == JobStatus::Running
+                        && (job.kind.starts_with("prepare-") || job.kind.starts_with("convert-"))
+                        && job.command.contains(&scope)
+                })
+            });
+            let prepared = !ranks.is_empty() && ranks.iter().all(|ready| *ready);
+            let note = match &target {
+                Err(error) => Some(error.clone()),
+                Ok(_) if !can_probe => {
+                    Some("save the configuration to check every Spark".to_owned())
+                }
+                Ok(_) if !prepared => {
+                    let missing: Vec<String> = ranks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, ready)| !**ready)
+                        .map(|(rank, _)| format!("rank {rank}"))
+                        .collect();
+                    Some(if missing.is_empty() {
+                        "not prepared yet".to_owned()
+                    } else {
+                        format!("not prepared on {}", missing.join(", "))
+                    })
+                }
+                Ok(_) => None,
+            };
+            ShelfModel {
+                id: model.id,
+                weights: model.weights,
+                engine: model.engine,
+                bytes: model.bytes,
+                complete: model.complete,
+                requires_conversion: target.as_ref().map_or_else(
+                    |_| model.requires_conversion.unwrap_or(true),
+                    SparkConfig::requires_conversion,
+                ),
+                active,
+                compatible: target.is_ok(),
+                prepared,
+                prepared_ranks: ranks
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(rank, ready)| ready.then_some(rank))
+                    .collect(),
+                world_size: config.world_size(),
+                preparing,
+                note,
+            }
+        })
+        .collect()
+}
+
+/// Probes every (model, rank) pair in parallel. The probes are read-only existence checks, one
+/// SSH stream per rank, and never touch a checkpoint.
+fn prepared_matrix(
+    configs: &[SparkConfig],
+    probe: &dyn SshProbe,
+    timeout: std::time::Duration,
+) -> Vec<Vec<bool>> {
+    let mut ready: Vec<Vec<bool>> = configs
+        .iter()
+        .map(|config| vec![false; config.world_size()])
+        .collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (index, config) in configs.iter().enumerate() {
+            for rank in 0..config.world_size() {
+                let command = prepared_probe_command(config, rank);
+                handles.push((
+                    index,
+                    rank,
+                    scope.spawn(move || probe.capture(&command, timeout)),
+                ));
+            }
+        }
+        for (index, rank, handle) in handles {
+            if let Ok(result) = handle.join() {
+                ready[index][rank] = result.is_ok_and(|text| text.trim() == "ready");
+            }
+        }
+    });
+    ready
+}
+
+/// The ranks of one model that already hold everything a launch needs.
+async fn prepared_ranks(web: &WebState, config: &SparkConfig) -> Result<Vec<bool>, String> {
+    let config = config.clone();
+    let probe = Arc::clone(&web.ssh);
+    let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs.saturating_add(10));
+    tokio::task::spawn_blocking(move || {
+        prepared_matrix(std::slice::from_ref(&config), probe.as_ref(), timeout)
+            .pop()
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|error| format!("the preparation check failed: {error}"))
 }
 
 #[derive(Deserialize)]
@@ -1083,6 +1307,421 @@ async fn convert(State(web): State<WebState>, Json(request): Json<ConvertRequest
         }
     }
     accepted_jobs(&web, &started)
+}
+
+#[derive(Deserialize)]
+struct ModelRequest {
+    /// The Hugging Face model id to prepare or swap to.
+    id: String,
+}
+
+/// The cached model `id` as a resolved configuration, using this build's profile for it.
+fn cached_target(web: &WebState, id: &str) -> Result<(SparkConfig, CachedModel), String> {
+    let active = web.usable_config()?;
+    let cache = active.hub_cache_dir().ok_or_else(|| {
+        "no Hugging Face cache directory: set HF_HUB_CACHE or model.hub_cache".to_owned()
+    })?;
+    let model = hf::lookup(&cache, id).ok_or_else(|| {
+        format!(
+            "{id} is not in the Hugging Face cache at {}",
+            cache.display()
+        )
+    })?;
+    if !model.complete {
+        return Err(format!("{id} is still downloading"));
+    }
+    if !model.supported {
+        return Err(format!("{id} is not a model type this build can run"));
+    }
+    let target = active
+        .for_cached_model(&model)
+        .map_err(|error| error.message)?;
+    Ok((target, model))
+}
+
+/// The running conversion or preparation for `config`, if one is writing its files.
+fn conversion_job(web: &WebState, config: &SparkConfig) -> Option<u64> {
+    let scope = config.converted_path().display().to_string();
+    web.jobs
+        .list()
+        .iter()
+        .find(|job| {
+            job.status == JobStatus::Running
+                && (job.kind.starts_with("convert-") || job.kind.starts_with("prepare-"))
+                && job.command.contains(&scope)
+        })
+        .map(|job| job.id)
+}
+
+/// Shards a different model on every rank while the current server keeps running.
+async fn prepare_model(State(web): State<WebState>, Json(request): Json<ModelRequest>) -> Response {
+    if !web.config_exists() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "save the configuration before preparing a model",
+        );
+    }
+    let lookup = {
+        let web = web.clone();
+        let id = request.id.clone();
+        tokio::task::spawn_blocking(move || cached_target(&web, &id)).await
+    };
+    let (target, model) = match lookup {
+        Ok(Ok(target)) => target,
+        Ok(Err(message)) => return api_error(StatusCode::CONFLICT, message),
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the model lookup failed: {error}"),
+            );
+        }
+    };
+    if !target.requires_conversion() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} loads its released checkpoint directly; there is nothing to shard",
+                model.id
+            ),
+        );
+    }
+    // The selected model is the one a launch reads. Rewriting its rank files while it serves,
+    // loads or is about to start is the one overlap a background prepare must never have; the
+    // foreground Convert action owns that case and refuses while the cluster is online.
+    if target.model.id == web.config().model.id {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} is the selected model; stop the cluster and use Convert, or swap to another model first",
+                model.id
+            ),
+        );
+    }
+    if let Some(id) = web.jobs.running_in(&["swap"]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("job {id} is swapping models; wait for it to finish"),
+        );
+    }
+    if let Some(id) = conversion_job(&web, &target) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "conversion job {id} is already working on {}",
+                target.model.id
+            ),
+        );
+    }
+    let mut started = Vec::new();
+    for rank in 0..target.world_size() {
+        let command = prepare_command(&target, rank);
+        match web
+            .jobs
+            .start_exclusive(command, &["download", "sync-model", "swap"])
+            .await
+        {
+            Ok(id) => started.push(id),
+            Err(error) => {
+                let note = if started.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (ranks already started: {started:?})")
+                };
+                return api_error(StatusCode::CONFLICT, format!("{}{note}", error.message));
+            }
+        }
+    }
+    accepted_jobs(&web, &started)
+}
+
+/// Stops the serving model, selects `request.id`, and launches it again as one in-process job.
+async fn swap(State(web): State<WebState>, Json(request): Json<ModelRequest>) -> Response {
+    if !web.config_exists() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "save the configuration before swapping models",
+        );
+    }
+    let lookup = {
+        let web = web.clone();
+        let id = request.id.clone();
+        tokio::task::spawn_blocking(move || cached_target(&web, &id)).await
+    };
+    let (target, model) = match lookup {
+        Ok(Ok(target)) => target,
+        Ok(Err(message)) => return api_error(StatusCode::CONFLICT, message),
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("the model lookup failed: {error}"),
+            );
+        }
+    };
+    let current = match web
+        .usable_config()
+        .map(|config| config.resolved().unwrap_or(config))
+    {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    if target.model.id == current.model.id {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("{} is already the selected model", model.id),
+        );
+    }
+    if let Some(id) = web.jobs.running_in(&[
+        "swap",
+        "launch",
+        "stop",
+        "download",
+        "sync-model",
+        "sync-software",
+        "convert-r0",
+        "convert-r1",
+        "convert-r2",
+        "convert-r3",
+    ]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("job {id} is changing the cluster; wait for it to finish"),
+        );
+    }
+    if let Some(id) = conversion_job(&web, &target) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("{} is still being prepared by job {id}", model.id),
+        );
+    }
+    let ready = match prepared_ranks(&web, &target).await {
+        Ok(ready) => ready,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    let missing: Vec<String> = ready
+        .iter()
+        .enumerate()
+        .filter(|(_, ready)| !**ready)
+        .map(|(rank, _)| format!("rank {rank}"))
+        .collect();
+    if !missing.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} is not prepared on {}; prepare it before swapping",
+                model.id,
+                missing.join(", ")
+            ),
+        );
+    }
+    // A background prepare that started while the ranks were being probed must not overlap the
+    // swap. The job reservation below then blocks any new one.
+    if let Some(id) = conversion_job(&web, &target) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("{} is still being prepared by job {id}", model.id),
+        );
+    }
+    let label = format!("Swap to {}", model.id);
+    // The scope makes the reservation atomic against a prepare of *this* checkpoint, without
+    // waiting for a background prepare of some other model.
+    let scope = target.converted_path().display().to_string();
+    let task = match web.jobs.start_task_scoped(
+        "swap",
+        &label,
+        format!(
+            "in-process swap {} -> {}",
+            current.model.id, target.model.id
+        ),
+        &[
+            "launch",
+            "stop",
+            "swap",
+            "download",
+            "sync-model",
+            "sync-software",
+            "convert-r0",
+            "convert-r1",
+            "convert-r2",
+            "convert-r3",
+        ],
+        &scope,
+    ) {
+        Ok(task) => task,
+        Err(error) => return api_error(StatusCode::CONFLICT, error.message),
+    };
+    let job_id = task.id();
+    let web_for_task = web.clone();
+    tokio::spawn(run_swap(web_for_task, task, current, target));
+    accepted_jobs(&web, &[job_id])
+}
+
+async fn run_swap(
+    web: WebState,
+    task: crate::jobs::JobTask,
+    current: SparkConfig,
+    target: SparkConfig,
+) {
+    match swap_steps(&web, &task, &current, &target).await {
+        Ok(()) => task.finish(true),
+        Err(message) => {
+            task.log(message);
+            task.finish(false);
+        }
+    }
+}
+
+async fn swap_steps(
+    web: &WebState,
+    task: &crate::jobs::JobTask,
+    current: &SparkConfig,
+    target: &SparkConfig,
+) -> Result<(), String> {
+    task.log(format!(
+        "Swapping {} -> {}; the target is prepared on every rank",
+        current.model.id, target.model.id
+    ));
+    let previous = web.config();
+    // The stop is sent even when telemetry says the server is offline: a failed telemetry fetch
+    // looks exactly like a stopped server, and launching over a live one is reported as success by
+    // both launchers. The stop command is idempotent, so a stopped cluster is left alone.
+    task.log(format!(
+        "Stopping {} and letting in-flight requests drain",
+        current.model.id
+    ));
+    let stop = web
+        .jobs
+        .start_exclusive(serve_action_command(current, ServeAction::Stop), &[])
+        .await
+        .map_err(|error| format!("the stop was not accepted: {}", error.message))?;
+    task.log(format!("stop job {stop} started"));
+    wait_job(web, stop, STOP_TIMEOUT).await?;
+    task.log("Stop finished; confirming through the launcher that no rank is still running");
+    wait_stopped(current).await?;
+    task.log(format!("Saving {} as the selected model", target.model.id));
+    // The saved file keeps `checkpoint` empty, as the model selector does: the cache's
+    // `refs/main` stays authoritative, and the next launch resolves it again.
+    let mut saved = target.clone();
+    saved.model.checkpoint.clear();
+    saved.model.tokenizer.clear();
+    if let Err((_, message)) = save_and_adopt(web, saved) {
+        return Err(format!(
+            "the stop succeeded but the new selection could not be saved: {message}; the cluster is stopped and the previous selection was kept"
+        ));
+    }
+    task.log(format!("Launching {}", target.model.id));
+    let launch = match web
+        .jobs
+        .start_exclusive(serve_action_command(target, ServeAction::Launch), &[])
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            let restored = restore_selection(web, previous);
+            return Err(format!(
+                "the launch was not accepted: {}; {restored} and the cluster is stopped",
+                error.message
+            ));
+        }
+    };
+    task.log(format!(
+        "launch job {launch} started; waiting for the launcher to confirm the ranks survived start-up"
+    ));
+    if let Err(message) = wait_job(web, launch, LAUNCH_TIMEOUT).await {
+        let restored = restore_selection(web, previous);
+        return Err(format!(
+            "the launch failed: {message}; {restored} and the cluster is stopped"
+        ));
+    }
+    task.log(
+        "Launcher confirmed the ranks are up; they answer /readyz when the weights finish loading",
+    );
+    Ok(())
+}
+
+/// Puts the pre-swap selection back after a failed launch, so the saved model is the one that was
+/// running rather than one that never started. Returns what happened, for the job log.
+fn restore_selection(web: &WebState, previous: SparkConfig) -> String {
+    match save_and_adopt(web, previous) {
+        Ok(()) => "the previous selection was restored".to_owned(),
+        Err((_, message)) => format!("restoring the previous selection failed: {message}"),
+    }
+}
+
+async fn wait_job(web: &WebState, id: u64, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let Some(detail) = web.jobs.get(id) else {
+            return Err(format!("job {id} disappeared before it finished"));
+        };
+        if detail.summary.status.is_done() {
+            if detail.summary.status == JobStatus::Succeeded {
+                return Ok(());
+            }
+            let reason = detail
+                .summary
+                .last_line
+                .unwrap_or_else(|| "no output".to_owned());
+            return Err(format!("job {id} failed: {reason}"));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "job {id} did not finish within {}s",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Asks the launcher whether any rank process is still alive.
+///
+/// The command is run directly rather than as a job: the drain is polled, and a job per poll would
+/// evict the activity history and race the job-list cap.
+async fn launcher_running(config: &SparkConfig) -> Result<bool, String> {
+    let spec = serve_action_command(config, ServeAction::Status);
+    let mut command = tokio::process::Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .envs(&spec.env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(cwd) = &spec.cwd {
+        command.current_dir(cwd);
+    }
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("the launcher status could not run: {error}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(format!("the launcher status failed: {}", text.trim()));
+    }
+    // A status line says either "running" or "not running"; only the former is a live process.
+    Ok(text
+        .lines()
+        .any(|line| line.contains("running") && !line.contains("not running")))
+}
+
+/// Confirms through the launcher's `status` command that every rank has stopped.
+///
+/// Telemetry is deliberately not used here: a failed fetch is indistinguishable from an offline
+/// server, and both launchers report a launch over a live process as success. `status` checks the
+/// processes themselves, so it is evidence that the old model is really gone.
+async fn wait_stopped(config: &SparkConfig) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + STOP_TIMEOUT;
+    loop {
+        if !launcher_running(config).await? {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(
+                "a rank is still running after the stop; the model was not switched".to_owned(),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn launch(State(web): State<WebState>) -> Response {
@@ -1210,6 +1849,9 @@ mod tests {
             command: &CommandSpec,
             _timeout: std::time::Duration,
         ) -> Result<String, String> {
+            if command.kind == "prepared" {
+                return Ok("ready".to_owned());
+            }
             let rank = if command.program == "bash" {
                 0
             } else {
@@ -1301,6 +1943,7 @@ mod tests {
         )
         .expect("utf8");
         assert!(html.contains("SparkFlash Control"));
+        assert!(html.contains("model-shelf"));
         assert!(html.contains("prefers-color-scheme") || html.contains("dark"));
         let css = app
             .oneshot(
@@ -1675,6 +2318,194 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_model_shelf_names_the_active_model_and_its_prepared_ranks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::QWEN_MODEL_ID,
+            "abc123",
+            "qwen4_exp",
+        );
+        let app = test_router(test_state_with(dir.path(), true, None));
+        let models = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/models")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("models"),
+        )
+        .await;
+        let shelf = models["shelf"].as_array().expect("shelf");
+        let active = shelf
+            .iter()
+            .find(|model| model["id"] == crate::config::DEFAULT_MODEL_ID)
+            .expect("the active model");
+        assert_eq!(active["active"], true);
+        assert_eq!(active["prepared"], true);
+        assert_eq!(active["world_size"], 4);
+        assert_eq!(active["prepared_ranks"], serde_json::json!([0, 1, 2, 3]));
+        let qwen = shelf
+            .iter()
+            .find(|model| model["id"] == crate::config::QWEN_MODEL_ID)
+            .expect("the cached Qwen model");
+        assert_eq!(qwen["compatible"], false);
+        assert!(
+            qwen["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cluster.nodes"),
+            "{qwen}"
+        );
+
+        // A TP=1 model cannot be swapped into a four-Spark plan; the refusal names the topology
+        // before anything is stopped.
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/swap",
+                &serde_json::json!({"id": crate::config::QWEN_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cluster.nodes"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_prepare_starts_one_job_per_rank_without_touching_the_active_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::GLM_MODEL_ID,
+            "glm123",
+            "glm5_next",
+        );
+        let state = test_state_with(dir.path(), true, None);
+        {
+            let mut config = state.config.write().expect("config lock");
+            config.config.paths.binary = "/bin/true".to_owned();
+            for node in &mut config.config.cluster.nodes {
+                node.local = true;
+            }
+        }
+        let app = test_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/prepare-model",
+                &serde_json::json!({"id": crate::config::GLM_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        let jobs = body["jobs"].as_array().expect("jobs");
+        assert_eq!(jobs.len(), 4);
+        let mut kinds: Vec<&str> = jobs
+            .iter()
+            .map(|job| job["kind"].as_str().expect("kind"))
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            ["prepare-r0", "prepare-r1", "prepare-r2", "prepare-r3"]
+        );
+        for job in jobs {
+            assert!(
+                job["label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(crate::config::GLM_MODEL_ID),
+                "{job}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_swap_saves_the_prepared_model_and_launches_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::GLM_MODEL_ID,
+            "glm123",
+            "glm5_next",
+        );
+        let launch_script = dir.path().join("serve.sh");
+        std::fs::write(&launch_script, "#!/bin/sh\nexit 0\n").expect("launch script");
+        let state = test_state_with(dir.path(), true, None);
+        {
+            let mut config = state.config.write().expect("config lock");
+            config.config.paths.binary = "/bin/true".to_owned();
+            config.config.paths.serve_script = launch_script.display().to_string();
+            for node in &mut config.config.cluster.nodes {
+                node.local = true;
+            }
+        }
+        let jobs = Arc::clone(&state.jobs);
+        let app = test_router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/actions/swap",
+                &serde_json::json!({"id": crate::config::GLM_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        let id = body["jobs"][0]["id"].as_u64().expect("swap job id");
+        let detail = loop {
+            let detail = jobs.get(id).expect("swap job");
+            if detail.summary.status.is_done() {
+                break detail;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(detail.summary.status, JobStatus::Succeeded, "{detail:?}");
+
+        let config = body_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("config"),
+        )
+        .await;
+        assert_eq!(config["config"]["model"]["id"], crate::config::GLM_MODEL_ID);
+        assert_eq!(config["config"]["model"]["checkpoint"], "");
+    }
+
+    #[tokio::test]
     async fn a_cached_model_this_build_cannot_run_is_refused_even_if_posted_directly() {
         let dir = tempfile::tempdir().expect("tempdir");
         crate::hf::tests::cache_model(&dir.path().join("hub"), "org/llama", "abc", "llama");
@@ -1962,6 +2793,261 @@ mod tests {
         assert_eq!(
             status_of(app, get("attacker.example")).await,
             StatusCode::MISDIRECTED_REQUEST
+        );
+    }
+    /// A probe that answers every readiness check with a missing piece, for the refusal path.
+    struct UnpreparedSsh;
+    impl SshProbe for UnpreparedSsh {
+        fn probe(&self, _command: &CommandSpec) -> ProbeOutcome {
+            ProbeOutcome {
+                ok: true,
+                message: String::new(),
+            }
+        }
+        fn capture(
+            &self,
+            command: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            if command.kind == "prepared" {
+                Ok("missing rank-file".to_owned())
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+
+    fn local_plan(state: &WebState, serve_script: Option<&std::path::Path>) {
+        let mut config = state.config.write().expect("config lock");
+        config.config.paths.binary = "/bin/true".to_owned();
+        if let Some(script) = serve_script {
+            config.config.paths.serve_script = script.display().to_string();
+        }
+        for node in &mut config.config.cluster.nodes {
+            node.local = true;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_is_not_prepared_before_the_configuration_is_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state(dir.path()));
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/prepare-model",
+                &serde_json::json!({"id": crate::config::DEFAULT_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("save the configuration"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_prepare_never_rewrites_the_selected_models_shards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        let state = test_state_with(dir.path(), true, None);
+        local_plan(&state, None);
+        let app = test_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/prepare-model",
+                &serde_json::json!({"id": crate::config::DEFAULT_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("selected model"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swap_refuses_a_target_that_is_not_prepared_on_every_rank() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::GLM_MODEL_ID,
+            "glm123",
+            "glm5_next",
+        );
+        let mut state = test_state_with(dir.path(), true, None);
+        state.ssh = Arc::new(UnpreparedSsh);
+        local_plan(&state, None);
+        let app = test_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/swap",
+                &serde_json::json!({"id": crate::config::GLM_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not prepared on rank 0"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_fails_the_swap_and_restores_the_selection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::GLM_MODEL_ID,
+            "glm123",
+            "glm5_next",
+        );
+        let launch_script = dir.path().join("serve.sh");
+        std::fs::write(
+            &launch_script,
+            "#!/bin/sh\ncase \"$1\" in\n  status) echo 'serve-four-node: rank 0 not running on spark0'; exit 0;;\n  launch) echo 'launch exploded' >&2; exit 1;;\n  *) exit 0;;\nesac\n",
+        )
+        .expect("launch script");
+        let state = test_state_with(dir.path(), true, None);
+        local_plan(&state, Some(&launch_script));
+        let jobs = Arc::clone(&state.jobs);
+        let app = test_router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                "/api/actions/swap",
+                &serde_json::json!({"id": crate::config::GLM_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        let id = body["jobs"][0]["id"].as_u64().expect("swap job id");
+        let detail = loop {
+            let detail = jobs.get(id).expect("swap job");
+            if detail.summary.status.is_done() {
+                break detail;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(detail.summary.status, JobStatus::Failed, "{detail:?}");
+        assert!(
+            detail.log.iter().any(|line| line.contains("launch failed")),
+            "{detail:?}"
+        );
+        assert!(
+            detail
+                .log
+                .iter()
+                .any(|line| line.contains("previous selection was restored")),
+            "{detail:?}"
+        );
+        let config = body_json(
+            app.oneshot(
+                Request::builder()
+                    .uri("/api/config")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("config"),
+        )
+        .await;
+        assert_eq!(
+            config["config"]["model"]["id"],
+            crate::config::DEFAULT_MODEL_ID
+        );
+    }
+
+    #[tokio::test]
+    async fn a_swap_is_refused_while_the_target_is_being_prepared() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::GLM_MODEL_ID,
+            "glm123",
+            "glm5_next",
+        );
+        let state = test_state_with(dir.path(), true, None);
+        local_plan(&state, None);
+        // A prepare job for the swap target, running long enough to overlap the request. The
+        // command carries the target's converted scope, exactly as the real prepare does.
+        let scope = {
+            let config = state.usable_config().expect("config");
+            let cache = config.hub_cache_dir().expect("hub cache");
+            let model = hf::lookup(&cache, crate::config::GLM_MODEL_ID).expect("cached GLM");
+            config
+                .for_cached_model(&model)
+                .expect("compatible target")
+                .converted_path()
+                .display()
+                .to_string()
+        };
+        let spec = CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), format!("sleep 5; # {scope}")],
+            env: BTreeMap::new(),
+            cwd: None,
+            label: format!("Prepare {} on rank 0", crate::config::GLM_MODEL_ID),
+            kind: "prepare-r0".to_owned(),
+        };
+        state
+            .jobs
+            .start_exclusive(spec, &[])
+            .await
+            .expect("prepare job");
+        let app = test_router(state);
+        let response = app
+            .oneshot(post_json(
+                "/api/actions/swap",
+                &serde_json::json!({"id": crate::config::GLM_MODEL_ID}).to_string(),
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("still being prepared"),
+            "{body}"
         );
     }
 }

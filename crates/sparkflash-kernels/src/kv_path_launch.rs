@@ -24,13 +24,13 @@
 //! the [crate::kv_path_ref] span sizes and never a computed pointer arithmetic: an overrun on a
 //! device span is a silently corrupted workspace, and a refusal is a stage error the loop can print.
 //!
-//! Tracing. The pinned contract (KERNEL_CONTRACTS in crates/sparkflash-cli/src/layer_device.rs) does
+//! Tracing. The pinned contract (KERNEL_CONTRACTS in crates/sparkflash-deepseek-forward/src/layer_device.rs) does
 //! not carry the trace ring/layer/step words for these kernels, and the protocol's 16 scopes do not
 //! describe a kv append, so there is no trace argument to pass.
 //!
 //! Kernels. All four kv-path kernels are here: the fused kv_norm + rope (one bf16 rounding, the host
 //! order), rope on a stored row's tail, the whole-row fp8 round-trip, and the cache append. The append's geometry and visibility contract are the frozen
-//! DeviceKvCache interface in crates/sparkflash-cli/src/layer_device.rs (win/layer-device @ ee0a0daa):
+//! DeviceKvCache interface in crates/sparkflash-deepseek-forward/src/layer_device.rs (win/layer-device @ ee0a0daa):
 //! one row is 2 * head_dim bf16 values (k then v), the row for position p lives at slot p % rows, and
 //! publication is stream order after the position's window read.
 
@@ -468,7 +468,7 @@ pub fn launch_window_quant(
 }
 
 /// The alignment the device KV cache guarantees: its base and every layer's row run (the frozen
-/// DeviceKvCache.ALIGN in crates/sparkflash-cli/src/layer_device.rs).
+/// DeviceKvCache.ALIGN in crates/sparkflash-deepseek-forward/src/layer_device.rs).
 pub const CACHE_ALIGN: usize = 256;
 
 /// One cache-append launch's arguments, in the kernel declaration's order.

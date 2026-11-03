@@ -97,7 +97,8 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 /// script's `PROBED_KERNELS` table must name the same forty-two kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
-/// than it says.
+/// than it says. The four `MODEL_IMAGES` sources and the RoCEnante kernel are the documented
+/// exceptions: they live under `kernels/` but are compiled by their own probes, not this baseline.
 #[test]
 fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -169,9 +170,12 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         "the declared length and the parsed entries must agree"
     );
 
-    // Every listed kernel is a file under kernels/, and every kernel file there except the RoCEnante
-    // one is listed: that kernel belongs to another milestone, is compiled by build.rs's own probe and
-    // is covered by the syntax gate, not by this baseline.
+    // Every listed kernel is a file under kernels/, and every kernel file there is listed, except the
+    // RoCEnante kernel (another milestone, compiled by build.rs's own probe and covered by the syntax
+    // gate) and the four model images (compiled by the per-arm probes, shared here only so
+    // `sparkflash_ops::images` can hand every arm the same bytes).
+    let model_images = model_image_files(&build_script)
+        .unwrap_or_else(|error| panic!("build.rs MODEL_IMAGES: {error}"));
     let kernels_dir = crate_dir.join("../../kernels");
     let mut on_disk: Vec<String> = std::fs::read_dir(&kernels_dir)
         .expect("kernels/ must be readable")
@@ -194,13 +198,65 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
     let unlisted: Vec<&str> = on_disk
         .iter()
         .map(String::as_str)
-        .filter(|file| !listed.contains(&file.trim_end_matches(".cu")))
+        .filter(|file| {
+            !listed.contains(&file.trim_end_matches(".cu"))
+                && !model_images.iter().any(|name| name == file)
+                && *file != "rocenante_oneshot_sm121.cu"
+        })
         .collect();
-    assert_eq!(
-        unlisted,
-        vec!["rocenante_oneshot_sm121.cu"],
-        "only the RoCEnante kernel may sit outside the baseline list"
+    assert!(
+        unlisted.is_empty(),
+        "every .cu under kernels/ must be a baseline kernel, a MODEL_IMAGES source or the \
+         RoCEnante kernel; unexpected: {unlisted:?}"
     );
+}
+
+/// The model-arm sources named by build.rs's `MODEL_IMAGES` table, with its declared length.
+///
+/// They are not part of the shared baseline, but they do live under `kernels/`, so the on-disk sweep
+/// has to know about them. Parsing the table (instead of hard-coding four names here) keeps a fifth
+/// model image from appearing as an unexplained unlisted kernel.
+fn model_image_files(build_script: &str) -> Result<Vec<String>, String> {
+    let table_start = build_script
+        .find("const MODEL_IMAGES")
+        .ok_or("build.rs must declare the model-image table")?;
+    let table = &build_script[table_start..];
+    let open = table
+        .find(';')
+        .ok_or("the table type must declare its length")?
+        + 1;
+    let close = table[open..]
+        .find(']')
+        .ok_or("the declared length must be closed")?
+        + open;
+    let declared: usize = table[open..close]
+        .trim()
+        .parse()
+        .map_err(|_| "the declared length must be a number".to_owned())?;
+    let end = table
+        .find("];")
+        .ok_or("the model-image table must be closed")?;
+    let mut names = Vec::new();
+    let mut rest = &table[..end];
+    while let Some(open) = rest.find('"') {
+        let after_open = &rest[open + 1..];
+        let close = after_open
+            .find('"')
+            .ok_or("a quoted string is always closed")?;
+        let literal = &after_open[..close];
+        if literal.ends_with(".cu") {
+            names.push(literal.to_owned());
+        }
+        rest = &after_open[close + 1..];
+    }
+    if names.len() != declared {
+        return Err(format!(
+            "the MODEL_IMAGES body names {} sources but its type declares {declared}: {names:?}",
+            names.len()
+        ));
+    }
+    names.sort_unstable();
+    Ok(names)
 }
 
 /// The kernel files named by build.rs's `PROBED_KERNELS` table, and the length its type declares.
@@ -259,6 +315,27 @@ fn probed_kernel_files(build_script: &str) -> Result<(usize, Vec<String>), Strin
         ));
     }
     Ok((declared, probed))
+}
+
+/// The model-image table parser: one-line and wrapped tables, a declared count that disagrees with
+/// the body, and the missing table.
+#[test]
+fn the_model_image_parser_reads_the_declared_count_and_every_source() {
+    let one_line = r#"const MODEL_IMAGES: [(&str, &str, &str); 2] = [("a_sm121.cu", "a_sm121.cubin", "A"), ("b_sm121.cu", "b_sm121.cubin", "B")];"#;
+    assert_eq!(
+        model_image_files(one_line).expect("a one-line table must parse"),
+        vec!["a_sm121.cu".to_owned(), "b_sm121.cu".to_owned()]
+    );
+    let drift =
+        r#"const MODEL_IMAGES: [(&str, &str, &str); 3] = [("a_sm121.cu", "a_sm121.cubin", "A")];"#;
+    assert!(
+        model_image_files(drift).is_err(),
+        "a count drift must be rejected"
+    );
+    assert!(
+        model_image_files("fn main() {}").is_err(),
+        "a missing table must be named"
+    );
 }
 
 /// The probe-table parser itself: wrapped tuples, one-line tables and a declared length that

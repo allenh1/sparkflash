@@ -905,9 +905,9 @@ mod tests {
         assert!(source.contains("static_assert(SPARK_M4_INDEX_HEADS == 32u"));
         let host = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../sparkflash-cli/src/tp4_forward.rs"
+            "/../sparkflash-deepseek-forward/src/tp4_forward.rs"
         ))
-        .expect("the cli is in the tree");
+        .expect("the forward crate is in the tree");
         assert!(host.contains("mla_ref::INDEX_HEADS * mla_ref::INDEX_HEAD_DIM * 2"));
     }
 

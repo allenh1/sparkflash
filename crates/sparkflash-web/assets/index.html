@@ -87,6 +87,18 @@ limitations under the License.
         </div>
       </div>
 
+      <section class="panel shelf-panel" id="models-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Models</h2>
+            <p class="panel-sub" id="shelf-sub">Prepared models can be swapped without editing the configuration.</p>
+          </div>
+          <button id="shelf-refresh" class="btn btn-sm" type="button"><svg><use href="#i-refresh"/></svg>Refresh</button>
+        </div>
+        <div id="model-shelf" class="shelf"><p class="empty">Reading the Hugging Face cache…</p></div>
+        <p id="shelf-note" class="note hidden"></p>
+      </section>
+
       <div class="kpis" aria-label="Current serving figures">
         <article class="kpi" data-kpi="decode">
           <div class="kpi-label">Decode <span>last request</span></div>

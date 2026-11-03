@@ -1,0 +1,36 @@
+# Qwen3.8-Flash-Next-NVFP4 runtime profile.
+#
+# The typed source of truth for this arm. A field left unset takes the arm's default; the
+# environment variables listed in sparkflash_model::profile::ENV_OVERRIDES remain overrides and
+# are documented in docs/adding-a-model.md.
+
+family = "qwen4-exp"
+weights = "qwen3.8-flash-next-nvfp4"
+
+[runtime]
+context_tokens = 262144
+concurrency = 1
+
+[prefill]
+enabled = true
+chunk = 4096
+tensor_cores = true
+exact = false
+
+[attention]
+latent_cache = "auto"
+selected_tokens = 2304
+
+[speculation]
+enabled = true
+depth = 3
+mtp_fold_scale = 1.0
+
+[sequence]
+parallel = true
+overlap = true
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

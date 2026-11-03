@@ -17,7 +17,7 @@
 //! `engram_widen_f32` (bf16 -> f32).
 //!
 //! WHY THIS MODULE EXISTS. The S1 layer arm carries the residual stream as `hc_mult * dim` f32 values
-//! (`LayerResidual::stream`, crates/sparkflash-cli/src/layer_device.rs:372-382), while the released
+//! (`LayerResidual::stream`, crates/sparkflash-deepseek-forward/src/layer_device.rs:372-382), while the released
 //! Engram head reads and writes it as bf16 (`model.py:311-365`) - so the landed
 //! `engram_gate_write_sm121` (bf16 stream in, bf16 out) and the declared stage write
 //! `engram_write_bf16` (f32 stream in and out) meet at a dtype boundary. These launches are that

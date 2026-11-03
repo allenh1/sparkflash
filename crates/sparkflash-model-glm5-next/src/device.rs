@@ -92,14 +92,34 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, HostMapped, Kernel,
     RunStream, SideStream,
 };
+use sparkflash_kernels::images;
 use sparkflash_model::{BackendError, StepCost};
-use sparkflash_model_qwen4_exp::device::{
-    CONV_HISTORY, DraftDevice, DraftScratch, GDN_KEY, GDN_QK_ROW, GDN_VALUE, GEMV_MAX_BATCH,
-    GpuDflash2, GpuMat, GpuMatE4m3, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS, TILED_GEMV_BLOCKS,
-    TILED_GEMV_PARTIALS, TILED_GEMV_ROUND, cubin_available, embedded_cubin,
-    embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape, gemv_e4m3, reduce_two_shot,
-    splits_two_shot, tiled_gemv_e4m3_splits, tiled_gemv_splits,
+use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
+use sparkflash_ops::gdn::{
+    CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS,
+    gdn_scan_shape,
 };
+use sparkflash_ops::gemv::{
+    GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
+    TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
+};
+use sparkflash_ops::tp::{reduce_two_shot, splits_two_shot};
+
+fn cubin_available() -> bool {
+    !images::qwen4_exp_cubin().is_empty()
+}
+
+fn embedded_cubin() -> &'static [u8] {
+    images::qwen4_exp_cubin()
+}
+
+fn embedded_glm_prefill_cubin() -> &'static [u8] {
+    images::glm_prefill_cubin()
+}
+
+fn embedded_prefill_cubin() -> &'static [u8] {
+    images::qwen4_prefill_cubin()
+}
 use sparkflash_weights::linalg::{ScaleGrid, argmax};
 use sparkflash_weights::mhc::HcGeometry;
 use sparkflash_weights::tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
@@ -5398,7 +5418,7 @@ impl DeviceRank {
 }
 
 /// The block drafter's launches go on the rank's stream, and its BF16 GEMVs through the rank's.
-impl DraftDevice for DeviceRank {
+impl GemvDevice for DeviceRank {
     fn launch(
         &self,
         kernel: Kernel,
@@ -5433,6 +5453,8 @@ impl DraftDevice for DeviceRank {
     }
 }
 
+impl DraftDevice for DeviceRank {}
+
 /// The rank as the block drafter's device while it scores a block: the rank's launches, GEMVs and
 /// tiled scratch, and the TP collective that sums the sharded drafter's partials as
 /// [DeviceRank::mix_out] sums the model's, into one stream by `mtp_coeffs` (`x + reduced`).
@@ -5442,7 +5464,7 @@ struct Scoring<'r> {
     device_leg: bool,
 }
 
-impl DraftDevice for Scoring<'_> {
+impl GemvDevice for Scoring<'_> {
     fn launch(
         &self,
         kernel: Kernel,
@@ -5450,7 +5472,7 @@ impl DraftDevice for Scoring<'_> {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), BackendError> {
-        DraftDevice::launch(self.rank, kernel, grid, block, args)
+        GemvDevice::launch(self.rank, kernel, grid, block, args)
     }
 
     fn gemv(
@@ -5460,13 +5482,15 @@ impl DraftDevice for Scoring<'_> {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
-        DraftDevice::gemv(self.rank, matrix, input, output, rows)
+        GemvDevice::gemv(self.rank, matrix, input, output, rows)
     }
 
     fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
-        DraftDevice::tiled_scratch(self.rank)
+        GemvDevice::tiled_scratch(self.rank)
     }
+}
 
+impl DraftDevice for Scoring<'_> {
     fn reduce_add(
         &self,
         partial: Deviceptr,

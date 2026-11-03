@@ -182,7 +182,8 @@ class DumpTest(unittest.TestCase):
 
     def test_the_existing_d40_demo_dump_is_readable(self):
         """The compatibility fixture is a dump this test did not write."""
-        path = os.path.normpath(os.path.join(SCRIPTS, "..", "crates", "sparkflash-cli", "tests",
+        path = os.path.normpath(os.path.join(SCRIPTS, "..", "crates",
+                                             "sparkflash-deepseek-forward", "tests",
                                              "fixtures", "logits-dump-demo-scale.jsonl"))
         rows = compare.read_dump(path)
         self.assertEqual([row["position"] for row in rows], list(range(129, 138)))

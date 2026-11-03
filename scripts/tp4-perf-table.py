@@ -46,7 +46,7 @@ beside it. Both columns of 8.2 therefore come from one pass.
 
 Trimmed rows: the emitter writes each block row trimmed at its last non-zero field, with `wall_ms`
 always first, so a valid row is any length from 1 to the legend's and the missing trailing fields are
-zero (`crates/sparkflash-cli/src/tp4_forward.rs:9400-9402`). Short rows are padded, not refused.
+zero (`crates/sparkflash-deepseek-forward/src/tp4_forward.rs:9400-9402`). Short rows are padded, not refused.
 Only a host-only row is accepted (`--forward-perf-probe-nosync`): the probe's legend says a
 device-inclusive row's wall and `kernel_ns` are on different bases and must not be mixed with these.
 
@@ -121,7 +121,7 @@ def as_record(row: list, fields: list[str]) -> dict:
     """Decode one block row.
 
     The emitter trims a row at its last non-zero field with `wall_ms` always first
-    (`crates/sparkflash-cli/src/tp4_forward.rs:9400-9402`), so a valid row can be any length from 1
+    (`crates/sparkflash-deepseek-forward/src/tp4_forward.rs:9400-9402`), so a valid row can be any length from 1
     to the legend's, and the missing trailing fields are zero. Padding is therefore decoding, not
     guessing: a wait-only host block whose wall sits entirely in `wait_ms` arrives as 19 values, a
     host-only block as one. An empty row or a row longer than the legend is refused.

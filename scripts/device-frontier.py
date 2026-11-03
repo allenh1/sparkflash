@@ -19,12 +19,12 @@ WHAT IT READS
     <row-dir>/tp4-layer-device-r{0,1,2,3}.json           (flat collection)
     <row-dir>/rank{0,1,2,3}/tp4-layer-device-r{0,1,2,3}.json  (collected four-rank layout)
 One document per rank, written by write_layer_device_frontier in
-crates/sparkflash-cli/src/tp4_forward.rs (win/layer-device @ 5d5a5ffd). The writer emits it on
+crates/sparkflash-deepseek-forward/src/tp4_forward.rs (win/layer-device @ 5d5a5ffd). The writer emits it on
 both device-layer paths: the refused path (status "refused", with a "message" key) and the
 completed path (status "completed", without "message").
 
 THE FRONTIER, AND WHY PARSING IT IS THE POINT
-    StageRuns::summary() in crates/sparkflash-cli/src/layer_device.rs is free text:
+    StageRuns::summary() in crates/sparkflash-deepseek-forward/src/layer_device.rs is free text:
       "device-only through A -> B -> C (3 stage(s)); stopped at <stage>: <message>"
       "no stage ran; stopped at <stage>: <message>"                      (degenerate)
       "device-only through A -> ... -> ffn_epilogue (20 stage(s))"       (completed)

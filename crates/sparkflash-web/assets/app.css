@@ -513,6 +513,30 @@ main {
 .model-source.warn { color: var(--warn); }
 .model-note { display: block; margin-top: 3px; color: var(--warn); font-family: var(--font); font-size: 12px; }
 
+/* The Overview model shelf */
+
+.shelf-panel { margin-bottom: 20px; }
+.shelf { display: flex; flex-direction: column; }
+.shelf-model {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 0;
+  border-top: 1px solid var(--border);
+}
+.shelf-model:first-child { border-top: 0; padding-top: 2px; }
+.shelf-model.active { border-left: 2px solid var(--accent); padding-left: 12px; margin-left: -14px; }
+.shelf-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1; }
+.shelf-main strong { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+.shelf-meta { color: var(--muted); font-size: 11.5px; font-family: var(--mono); overflow-wrap: anywhere; }
+.shelf-note-line { color: var(--text-2); font-size: 12px; }
+.shelf-note-line.warn { color: var(--warn); }
+.shelf-actions { flex: none; display: flex; align-items: center; gap: 8px; }
+.shelf-bars { max-width: 560px; margin-top: 6px; }
+.shelf-bars .progress-track { height: 4px; }
+.shelf-panel .empty { padding: 8px 0; color: var(--muted); }
+
 input[type="text"], input[type="number"], select, textarea {
   width: 100%;
   min-height: 34px;

@@ -281,7 +281,7 @@ mod device {
         /// # Errors
         /// A missing cubin, a read failure, an allocation/copy failure, or a bound tail pointer
         /// that cannot be read.
-        pub(crate) fn open(
+        pub fn open(
             cuda: &Cuda,
             kernel_dir: &Path,
             bind: &crate::tp4_resident::DeviceBind,

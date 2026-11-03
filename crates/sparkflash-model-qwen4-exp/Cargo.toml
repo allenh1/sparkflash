@@ -25,6 +25,7 @@ sparkflash-model = { workspace = true }
 sparkflash-weights = { workspace = true }
 sparkflash-engram = { workspace = true }
 sparkflash-kernels = { workspace = true }
+sparkflash-ops = { workspace = true }
 sparkflash-vision = { workspace = true }
 anyhow = { workspace = true }
 libm = "0.2"

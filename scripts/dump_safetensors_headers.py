@@ -16,7 +16,7 @@
 """Dump a safetensors checkpoint's headers as name -> {"dtype", "shape"} JSON.
 
 This is the header source for the host attention-operand gate
-(crates/sparkflash-cli/src/tp4_operands.rs, --tensor-index): it reads each shard's header only, so
+(crates/sparkflash-deepseek-forward/src/tp4_operands.rs, --tensor-index): it reads each shard's header only, so
 the full 96k-tensor dump of the released fifty-shard checkpoint is a few megabytes and no tensor
 data is read. The checkpoint directory must hold model.safetensors.index.json.
 

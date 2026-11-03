@@ -1,0 +1,33 @@
+# GLM-5.3-Flash (FP8, TP=4) runtime profile.
+
+family = "glm5-next"
+weights = "glm5.3-flash-fp8"
+
+[runtime]
+context_tokens = 1048576
+concurrency = 1
+
+[prefill]
+enabled = true
+chunk = 2048
+tensor_cores = true
+activation = "split"
+exact = true
+
+[attention]
+latent_cache = "auto"
+selected_tokens = 2304
+
+[speculation]
+enabled = true
+depth = 3
+mtp_fold_scale = 1.0
+
+[sequence]
+parallel = true
+overlap = true
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

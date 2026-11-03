@@ -1,0 +1,29 @@
+# DeepSeek-V4.1-Flash (TP=4) runtime profile.
+
+family = "deepseek-v41"
+weights = "deepseek-v4.1-flash"
+
+[runtime]
+context_tokens = 1048576
+concurrency = 32
+
+[prefill]
+enabled = true
+chunk = 4096
+tensor_cores = true
+
+[attention]
+selected_tokens = 2048
+
+[speculation]
+enabled = true
+depth = 3
+
+[sequence]
+parallel = true
+overlap = true
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

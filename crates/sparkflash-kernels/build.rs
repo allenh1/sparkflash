@@ -257,6 +257,35 @@ const PROBED_KERNELS: [(&str, &str); 42] = [
 /// one include they all share.
 const M4_COMMON_HEADER: &str = "m4_common_sm121.cuh";
 
+/// The four model images that used to be compiled by a model crate's own build script.
+///
+/// The sources and the cubins now live in the shared stack: a model crate carries no CUDA and no
+/// kernel build script. The paths are exported to this crate so `sparkflash_ops::images` can hand
+/// every arm the same bytes; a CPU-only build exports paths to files that do not exist and gates
+/// every read on `sparkflash_model_cubin`.
+const MODEL_IMAGES: [(&str, &str, &str); 4] = [
+    (
+        "qwen4_exp_sm121.cu",
+        "qwen4_exp_sm121.cubin",
+        "SPARKFLASH_QWEN4_CUBIN",
+    ),
+    (
+        "qwen4_prefill_sm121.cu",
+        "qwen4_prefill_sm121.cubin",
+        "SPARKFLASH_QWEN4_PREFILL_CUBIN",
+    ),
+    (
+        "dflash2_sm121.cu",
+        "dflash2_sm121.cubin",
+        "SPARKFLASH_QWEN4_DFLASH2_CUBIN",
+    ),
+    (
+        "glm_prefill_sm121.cu",
+        "glm_prefill_sm121.cubin",
+        "SPARKFLASH_GLM_PREFILL_CUBIN",
+    ),
+];
+
 /// The combined probe: all forty-two kernel sources in one translation unit with the trace macros
 /// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
 /// files defining the same macro to different values, or two identical non-inline symbols), and it
@@ -279,11 +308,18 @@ fn main() {
     println!("cargo:rerun-if-changed=../../kernels");
     println!("cargo:rerun-if-changed=cuda_stub");
     println!("cargo:rustc-check-cfg=cfg(sparkflash_cuda_toolkit)");
+    println!("cargo:rustc-check-cfg=cfg(sparkflash_model_cubin)");
     println!("cargo:rerun-if-env-changed=SPARKFLASH_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=SPARKFLASH_NVCC");
     println!("cargo:rerun-if-env-changed=SPARKFLASH_CLANG");
+    println!("cargo:rerun-if-env-changed=SPARKFLASH_NVCC_HOST");
 
     let arch = std::env::var("SPARKFLASH_CUDA_ARCH").unwrap_or_else(|_| "sm_121a".to_owned());
+    let out_dir = out_dir().unwrap_or_else(|error| panic!("{}", error.stderr));
+    for (source, cubin, env) in MODEL_IMAGES {
+        println!("cargo:rerun-if-changed=../../kernels/{source}");
+        println!("cargo:rustc-env={env}={}", out_dir.join(cubin).display());
+    }
 
     let Some(nvcc) = which_nvcc() else {
         // No nvcc: the clang CUDA frontend can still parse the kernel against the stub
@@ -309,6 +345,24 @@ fn main() {
             kernels.display()
         );
         return;
+    }
+
+    let mut model_images_built = true;
+    for (source, cubin, _) in MODEL_IMAGES {
+        let path = kernels.join(source);
+        if !path.is_file() {
+            println!(
+                "cargo:warning=sparkflash-kernels: {source} is missing; the shared model images                  are incomplete"
+            );
+            model_images_built = false;
+            continue;
+        }
+        if !compile_cubin(&nvcc, &arch, &path, &out_dir.join(cubin)) {
+            model_images_built = false;
+        }
+    }
+    if model_images_built {
+        println!("cargo:rustc-cfg=sparkflash_model_cubin");
     }
 
     let trace_header = kernels.join("trace_globaltimer_sm121.cuh");
@@ -462,6 +516,57 @@ fn check_roce_probe(nvcc: &Path, arch: &str, kernels: &Path) -> Result<(), Probe
     let probe = out_dir.join("roce_abi_probe.cu");
     std::fs::write(&probe, ROCE_PROBE).map_err(|e| ProbeFailure::new(e.to_string()))?;
     compile_file(nvcc, arch, &probe, &[kernels], "roce_abi_probe")
+}
+
+/// Compiles one model image to a cubin. False, with a warning, when nvcc cannot target the arch;
+/// any other compile error is fatal. The host-compiler search mirrors the rule the model build
+/// script used: nvcc 12.9 refuses the distribution gcc, so prefer a supported g++ unless the
+/// caller names one.
+fn compile_cubin(nvcc: &Path, arch: &str, source: &Path, cubin: &Path) -> bool {
+    let mut command = Command::new(nvcc);
+    command.args([
+        "-std=c++17",
+        "-allow-unsupported-compiler",
+        &format!("-arch={arch}"),
+        "-cubin",
+    ]);
+    command.arg("-I").arg("../../kernels");
+    if let Some(host) = std::env::var_os("SPARKFLASH_NVCC_HOST")
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["g++-14", "g++-13", "g++-12"]
+                .iter()
+                .map(|name| PathBuf::from("/usr/bin").join(name))
+                .find(|candidate| candidate.is_file())
+        })
+    {
+        command.arg("-ccbin").arg(host);
+    }
+    command.arg(source).arg("-o").arg(cubin);
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {}: {error}", nvcc.display()));
+    if output.status.success() {
+        return true;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("Unsupported gpu architecture")
+        || stderr.contains("unsupported architecture")
+        || stderr.contains("unsupported CUDA gpu architecture")
+    {
+        println!(
+            "cargo:warning=sparkflash-kernels: {} cannot target {arch}; the shared model images              are not built. Set SPARKFLASH_CUDA_ARCH to a supported architecture.",
+            nvcc.display()
+        );
+        return false;
+    }
+    panic!(
+        "sparkflash-kernels: {} failed to compile the shared model image with {}:
+{}",
+        source.display(),
+        nvcc.display(),
+        stderr
+    );
 }
 
 /// Compiles one translation unit to PTX with nvcc. No host codegen and no link, but the

@@ -47,28 +47,16 @@ use sparkflash_model::BackendError;
 use super::{DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GpuMat};
 use crate::config::Qwen4ExpConfig;
 
-/// The tensor-core cubin build.rs embeds. Empty on a CPU-only build.
-#[cfg(sparkflash_qwen4_cubin)]
-const PREFILL_CUBIN: &[u8] = include_bytes!(env!("SPARKFLASH_QWEN4_PREFILL_CUBIN"));
-#[cfg(not(sparkflash_qwen4_cubin))]
-const PREFILL_CUBIN: &[u8] = &[];
-
 /// The tensor-core prefill cubin this build embeds, for kernel-level tests.
 #[must_use]
 pub fn embedded_prefill_cubin() -> &'static [u8] {
-    PREFILL_CUBIN
+    sparkflash_kernels::images::qwen4_prefill_cubin()
 }
-
-/// GLM-5.3-Flash's bulk prefill cubin (block-scaled FP8 dense GEMM and routed experts).
-#[cfg(sparkflash_qwen4_cubin)]
-const GLM_PREFILL_CUBIN: &[u8] = include_bytes!(env!("SPARKFLASH_GLM_PREFILL_CUBIN"));
-#[cfg(not(sparkflash_qwen4_cubin))]
-const GLM_PREFILL_CUBIN: &[u8] = &[];
 
 /// The GLM bulk prefill cubin this build embeds.
 #[must_use]
 pub fn embedded_glm_prefill_cubin() -> &'static [u8] {
-    GLM_PREFILL_CUBIN
+    sparkflash_kernels::images::glm_prefill_cubin()
 }
 
 /// Tokens per layer-major prefill chunk, unless `SPARKFLASH_QWEN4_PREFILL_CHUNK` says otherwise.
@@ -168,7 +156,7 @@ impl PrefillPlan {
             } else {
                 chunk
             },
-            tensor_cores: tensor_cores && !PREFILL_CUBIN.is_empty(),
+            tensor_cores: tensor_cores && !embedded_prefill_cubin().is_empty(),
         }
     }
 
@@ -196,19 +184,26 @@ impl PrefillPlan {
     /// adjust it.
     #[must_use]
     pub fn from_env() -> Self {
-        let tensor_cores = !PREFILL_CUBIN.is_empty()
-            && std::env::var("SPARKFLASH_QWEN4_PREFILL_MMA")
-                .map(|value| value != "0")
-                .unwrap_or(true);
-        let fallback = if tensor_cores {
-            DEFAULT_PREFILL_CHUNK
+        // The typed profile is the source of truth. The two environment names are aliases in
+        // sparkflash_model::profile::ENV_OVERRIDES, so an out-of-domain value is refused rather
+        // than silently falling back to a default.
+        let mut profile = sparkflash_model::profile::ModelProfile::from_toml(include_str!(
+            "../../config/qwen38_flash_next_nvfp4.toml"
+        ))
+        .unwrap_or_default();
+        let _ = profile.apply_env(|name| match name {
+            "SPARKFLASH_QWEN4_PREFILL_CHUNK" | "SPARKFLASH_QWEN4_PREFILL_MMA" => {
+                std::env::var(name).ok()
+            }
+            _ => None,
+        });
+        let tensor_cores =
+            !embedded_prefill_cubin().is_empty() && profile.prefill.tensor_cores.unwrap_or(true);
+        let chunk = if tensor_cores {
+            profile.prefill.chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
         } else {
             TOKEN_PREFILL_CHUNK
         };
-        let chunk = std::env::var("SPARKFLASH_QWEN4_PREFILL_CHUNK")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(fallback);
         Self::new(chunk, tensor_cores)
     }
 }
@@ -230,15 +225,15 @@ pub(super) struct PrefillKernels {
 
 impl PrefillKernels {
     pub(super) fn load(cuda: &Cuda) -> Result<Self, String> {
-        if PREFILL_CUBIN.is_empty() {
+        if embedded_prefill_cubin().is_empty() {
             return Err(
                 "this build has no Qwen4-Exp prefill cubin: rebuild on a host with nvcc so \
-                 build.rs compiles crates/sparkflash-model-qwen4-exp/kernels/qwen4_prefill_sm121.cu"
+                 the shared sparkflash-kernels build script compiles kernels/qwen4_prefill_sm121.cu"
                     .to_owned(),
             );
         }
         let named = |name: &'static str| -> Result<Kernel, String> {
-            let (_, kernel) = cuda.load_named(PREFILL_CUBIN, name)?;
+            let (_, kernel) = cuda.load_named(embedded_prefill_cubin(), name)?;
             Ok(kernel)
         };
         Ok(Self {

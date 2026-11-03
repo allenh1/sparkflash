@@ -490,7 +490,7 @@ fn registry() -> &'static Mutex<BTreeMap<&'static str, GraphSeam>> {
 ///
 /// \# Errors
 /// The switch has an unknown value, or the direct path itself fails.
-pub(crate) fn segment<F>(cuda: &Cuda, name: &'static str, mut segment: F) -> Result<(), String>
+pub fn segment<F>(cuda: &Cuda, name: &'static str, mut segment: F) -> Result<(), String>
 where
     F: FnMut(&Cuda) -> Result<(), String>,
 {
@@ -516,7 +516,7 @@ where
 
 /// A one-line report of every seam this process opened, for a window's end-of-run line.
 #[allow(dead_code)] // printed by the run loop when the seam wiring lands; kept next to the seams
-pub(crate) fn report() -> String {
+pub fn report() -> String {
     let Ok(seams) = registry().lock() else {
         return "tp4-graph: seam registry lock poisoned".to_string();
     };

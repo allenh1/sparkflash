@@ -61,6 +61,7 @@ pub mod flash_mla_csa2_ring_launch;
 pub mod flash_mla_csa2_seq_launch;
 pub mod hostw_gemv_launch;
 pub mod hostw_gemv_ref;
+pub mod images;
 pub mod index_channels;
 pub mod kv_path_launch;
 pub mod kv_path_ref;

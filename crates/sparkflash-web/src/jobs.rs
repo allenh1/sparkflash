@@ -162,6 +162,51 @@ struct Inner {
     jobs: VecDeque<JobEntry>,
 }
 
+/// A running in-process job. The owner logs progress and finishes it; dropping it unfinished is
+/// recorded as a failure so a panicked task cannot leave the UI showing "running" forever.
+pub struct JobTask {
+    manager: Arc<JobManager>,
+    id: u64,
+    finished: bool,
+}
+
+impl JobTask {
+    /// The job id shown in the activity list.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Appends one line to the bounded job log.
+    pub fn log(&self, line: impl Into<String>) {
+        self.manager.append(self.id, line.into());
+    }
+
+    /// Records a progress report, for a task that can size its work.
+    pub fn progress(&self, progress: JobProgress) {
+        self.manager.report(self.id, progress);
+    }
+
+    /// Marks the job succeeded or failed. Consumes the task so the drop guard is disarmed.
+    pub fn finish(mut self, success: bool) {
+        self.finished = true;
+        self.manager
+            .finish(self.id, Some(if success { 0 } else { 1 }));
+    }
+}
+
+impl Drop for JobTask {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.manager.append(
+                self.id,
+                "the in-process task ended without a result".to_owned(),
+            );
+            self.manager.finish(self.id, None);
+        }
+    }
+}
+
 /// The process manager shared by the API and the background jobs.
 #[derive(Clone)]
 pub struct JobManager {
@@ -278,6 +323,54 @@ impl JobManager {
         Ok(id)
     }
 
+    /// Starts a job whose work runs in this process, such as a model swap that stops, saves and
+    /// launches in sequence. The caller finishes it through the returned [`JobTask`], and a
+    /// dropped task is reported as failed instead of staying "running" forever.
+    ///
+    /// # Errors
+    /// Returns [`JobError`] when a conflicting job is running or [`MAX_JOBS`] jobs are in flight.
+    pub fn start_task(
+        self: &Arc<Self>,
+        kind: &str,
+        label: &str,
+        command: impl Into<String>,
+        exclusive_with: &[&str],
+    ) -> Result<JobTask, JobError> {
+        let id = self.allocate_entry_scoped(kind, label, command.into(), exclusive_with, None)?;
+        Ok(JobTask {
+            manager: Arc::clone(self),
+            id,
+            finished: false,
+        })
+    }
+
+    /// Starts an in-process job that also refuses to overlap a background prepare job whose
+    /// command contains `scope`.
+    ///
+    /// A swap needs this: preparing a *different* model may keep running through the swap, but a
+    /// prepare of the model being swapped to rewrites the very rank files the launch will read. A
+    /// kind list cannot express "a prepare for this checkpoint", so the scope is matched against
+    /// the prepare job's command line while the job table is locked.
+    ///
+    /// # Errors
+    /// Returns [`JobError`] when a conflicting job is running or [`MAX_JOBS`] jobs are in flight.
+    pub fn start_task_scoped(
+        self: &Arc<Self>,
+        kind: &str,
+        label: &str,
+        command: impl Into<String>,
+        exclusive_with: &[&str],
+        scope: &str,
+    ) -> Result<JobTask, JobError> {
+        let id =
+            self.allocate_entry_scoped(kind, label, command.into(), exclusive_with, Some(scope))?;
+        Ok(JobTask {
+            manager: Arc::clone(self),
+            id,
+            finished: false,
+        })
+    }
+
     /// Lists jobs, newest first.
     #[must_use]
     pub fn list(&self) -> Vec<JobSummary> {
@@ -321,21 +414,50 @@ impl JobManager {
             .map(|job| job.id)
     }
 
-    /// Whether a conversion for `rank` is already in flight.
+    /// Whether a conversion for `rank` is already in flight, either the foreground
+    /// `convert-r` or a background `prepare-r` for another model.
     #[must_use]
     pub fn convert_running(&self, rank: usize) -> bool {
-        let kind = format!("convert-r{rank}");
-        self.running_in(&[kind.as_str()]).is_some()
+        let convert = format!("convert-r{rank}");
+        let prepare = format!("prepare-r{rank}");
+        self.running_in(&[convert.as_str(), prepare.as_str()])
+            .is_some()
     }
 
     fn allocate(&self, spec: &CommandSpec, exclusive_with: &[&str]) -> Result<u64, JobError> {
+        self.allocate_entry(&spec.kind, &spec.label, spec.display(), exclusive_with)
+    }
+
+    fn allocate_entry(
+        &self,
+        kind: &str,
+        label: &str,
+        command: String,
+        exclusive_with: &[&str],
+    ) -> Result<u64, JobError> {
+        self.allocate_entry_scoped(kind, label, command, exclusive_with, None)
+    }
+
+    /// The one place a job is admitted. The kind list and the optional prepare scope are checked
+    /// under the same lock that inserts the entry, so two racing requests cannot both pass.
+    fn allocate_entry_scoped(
+        &self,
+        kind: &str,
+        label: &str,
+        command: String,
+        exclusive_with: &[&str],
+        scope: Option<&str>,
+    ) -> Result<u64, JobError> {
         let mut inner = self.inner.lock().expect("job lock");
-        if !exclusive_with.is_empty()
-            && let Some(running) = inner.jobs.iter().find(|job| {
-                job.status == JobStatus::Running
-                    && (job.kind == spec.kind || exclusive_with.contains(&job.kind.as_str()))
-            })
-        {
+        let conflict = inner.jobs.iter().find(|job| {
+            job.status == JobStatus::Running
+                && ((!exclusive_with.is_empty()
+                    && (job.kind == kind || exclusive_with.contains(&job.kind.as_str())))
+                    || scope.is_some_and(|scope| {
+                        job.kind.starts_with("prepare-") && job.command.contains(scope)
+                    }))
+        });
+        if let Some(running) = conflict {
             return Err(JobError {
                 message: format!("job {} ({}) is still running", running.id, running.label),
             });
@@ -352,9 +474,9 @@ impl JobManager {
         inner.next_id += 1;
         inner.jobs.push_back(JobEntry {
             id,
-            kind: spec.kind.clone(),
-            label: spec.label.clone(),
-            command: spec.display(),
+            kind: kind.to_owned(),
+            label: label.to_owned(),
+            command,
             status: JobStatus::Running,
             started_ms: now_ms(),
             finished_ms: None,
@@ -569,6 +691,37 @@ mod tests {
         assert_eq!(manager.running_in(&["other"]), None);
         wait_done(&manager, id).await;
         assert_eq!(manager.running_in(&["test"]), None);
+    }
+
+    #[tokio::test]
+    async fn an_in_process_task_is_visible_and_dropping_it_reports_failure() {
+        let manager = Arc::new(JobManager::new());
+        let task = manager
+            .start_task("swap", "Swap model", "in-process swap", &["launch"])
+            .expect("accepted");
+        assert_eq!(manager.running_in(&["swap"]), Some(task.id()));
+        task.log("stopping the old model");
+        task.finish(true);
+        let detail = manager.get(1).expect("job");
+        assert_eq!(detail.summary.status, JobStatus::Succeeded);
+        assert_eq!(detail.summary.exit_code, Some(0));
+        assert!(detail.log.iter().any(|line| line.contains("stopping")));
+
+        let abandoned = manager
+            .start_task("swap", "Swap again", "in-process swap", &[])
+            .expect("accepted");
+        let id = abandoned.id();
+        drop(abandoned);
+        let detail = manager.get(id).expect("job");
+        assert_eq!(detail.summary.status, JobStatus::Failed);
+        assert!(
+            detail
+                .log
+                .iter()
+                .any(|line| line.contains("ended without a result")),
+            "{:?}",
+            detail.log
+        );
     }
 
     #[tokio::test]

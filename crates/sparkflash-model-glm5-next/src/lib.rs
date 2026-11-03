@@ -96,7 +96,7 @@ pub mod tensor;
 /// Whether this build embeds the device cubin the arm runs.
 #[must_use]
 pub fn cubin_available() -> bool {
-    sparkflash_model_qwen4_exp::device::cubin_available()
+    sparkflash_ops::images::qwen4_available()
 }
 
 pub use codec::GlmCodec;

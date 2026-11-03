@@ -17,7 +17,7 @@
 //! # What this module is for
 //!
 //! The layer port's twentieth stage (`LayerStages::moe_routed`, see
-//! `crates/sparkflash-cli/src/layer_device.rs`) refused with "the five device MoE launches exist;
+//! `crates/sparkflash-deepseek-forward/src/layer_device.rs`) refused with "the five device MoE launches exist;
 //! the host combine of their outputs is the step". The five launches
 //! (`routed_gate_up_sm121` twice, `swiglu_mxfp8_quant_weighted_sm121`,
 //! `b12x_mxfp4_moe_stored_sm121` and the router) all run on the device, but they are only half of

@@ -71,16 +71,20 @@ pub fn run(args: &[&str]) -> ExitCode {
 }
 
 /// One rank's loaded plan, reachable by both the evidence path and the device loop.
-pub(crate) struct RankSetup {
+pub struct RankSetup {
+    /// The rank's resident plan: arenas, layer schedule and device allocations.
     pub plan: ResidentPlan,
+    /// How this rank's tensors shard across the world.
     pub shard_plan: sparkflash_device::shard::ShardPlan,
+    /// What produced the weights, as named by the streaming source.
     pub source_kind: String,
+    /// How many tensors the loader saw.
     pub tensors_seen: usize,
 }
 
 /// Loads the headers for one rank and plans it. The streaming source itself stays owned by the
 /// caller (`args.source`); this is the setup both the evidence path and the device loop need.
-pub(crate) fn load_rank_setup(args: &ResidentArgs) -> Result<RankSetup, String> {
+pub fn load_rank_setup(args: &ResidentArgs) -> Result<RankSetup, String> {
     let (entries, source_kind, tensors_seen) = load_entries(args)?;
     let plan = ResidentPlan::plan(args.rank, args.world, entries)
         .map_err(|error| format!("plan rank {}: {error}", args.rank))?;
@@ -96,9 +100,7 @@ pub(crate) fn load_rank_setup(args: &ResidentArgs) -> Result<RankSetup, String> 
 }
 
 /// The setup for one rank plus its streaming source, reachable from the chain's loop path.
-pub(crate) fn setup_for_chain(
-    argv: &[&str],
-) -> Result<(RankSetup, Option<SafeTensorsSource>), String> {
+pub fn setup_for_chain(argv: &[&str]) -> Result<(RankSetup, Option<SafeTensorsSource>), String> {
     let args = ResidentArgs::parse(argv)?;
     let setup = load_rank_setup(&args)?;
     Ok((setup, args.source))
@@ -121,7 +123,7 @@ pub(crate) fn setup_for_chain(
 /// different shapes builds a different index.
 #[cfg(any(feature = "cuda", test))]
 #[derive(Debug, Default, Clone)]
-pub(crate) struct PlanIndex {
+pub struct PlanIndex {
     entries: std::collections::HashMap<String, PlannedTensor>,
 }
 
@@ -139,7 +141,7 @@ struct PlannedTensor {
 impl PlanIndex {
     /// Indexes every shard of one rank plan by tensor name.
     #[must_use]
-    pub(crate) fn from_plan(plan: &ResidentPlan) -> Self {
+    pub fn from_plan(plan: &ResidentPlan) -> Self {
         let shards = plan.shards();
         let mut entries = std::collections::HashMap::with_capacity(shards.len());
         for shard in shards {
@@ -156,7 +158,7 @@ impl PlanIndex {
 
     /// This rank's shard shape of one tensor, or `None` when the plan does not carry the name.
     #[must_use]
-    pub(crate) fn shard_shape(&self, name: &str) -> Option<&[usize]> {
+    pub fn shard_shape(&self, name: &str) -> Option<&[usize]> {
         self.entries
             .get(name)
             .map(|tensor| tensor.shard_shape.as_slice())
@@ -164,7 +166,7 @@ impl PlanIndex {
 
     /// The device operand layout of one tensor, or `None` when the plan does not carry the name.
     #[must_use]
-    pub(crate) fn operand_layout(&self, name: &str) -> Option<OperandLayout> {
+    pub fn operand_layout(&self, name: &str) -> Option<OperandLayout> {
         self.entries.get(name).map(|tensor| tensor.layout.clone())
     }
 
@@ -172,7 +174,7 @@ impl PlanIndex {
     ///
     /// # Errors
     /// The tensor is planned as a stored operand, or the plan does not carry the name.
-    pub(crate) fn b12x_geometry(&self, name: &str) -> Result<(usize, usize), String> {
+    pub fn b12x_geometry(&self, name: &str) -> Result<(usize, usize), String> {
         match self.operand_layout(name) {
             Some(OperandLayout::B12x { cols, inner, .. }) => Ok((cols, inner)),
             Some(other) => Err(format!(
@@ -192,7 +194,7 @@ impl PlanIndex {
 /// The value owns no arena reference (only the pointers and the set checks), so it outlives the
 /// streaming arena the way the evidence needs it to. A launch path must hold the arena itself
 /// alive; this struct is evidence, not an owner.
-pub(crate) struct DeviceBind {
+pub struct DeviceBind {
     /// Attention-projection bind: pointers plus the named coverage.
     pub attention: crate::resident_weights::RankBind,
     /// The ten stored seam tensors per layer (six mHC F32 + four BF16 norms): pointers plus the
@@ -512,7 +514,7 @@ fn bind_in_arena(
 /// unfalsifiable count.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_device_sets_in_arena(
+pub fn bind_device_sets_in_arena(
     setup: &RankSetup,
     source: &SafeTensorsSource,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
@@ -533,7 +535,7 @@ pub(crate) fn bind_device_sets_in_arena(
 /// the streaming epoch ends, so the pass must execute inside this call.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_device_sets_in_arena_with<T>(
+pub fn bind_device_sets_in_arena_with<T>(
     setup: &RankSetup,
     source: &SafeTensorsSource,
     table: &std::collections::BTreeMap<String, (usize, usize)>,
@@ -561,7 +563,7 @@ pub(crate) fn bind_device_sets_in_arena_with<T>(
 /// Without the cuda feature the arena cannot be opened, so binding is refused.
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_device_sets_in_arena(
+pub fn bind_device_sets_in_arena(
     _setup: &RankSetup,
     _source: &SafeTensorsSource,
     _table: &std::collections::BTreeMap<String, (usize, usize)>,
@@ -576,7 +578,7 @@ pub(crate) fn bind_device_sets_in_arena(
 /// Without the cuda feature the arena cannot be opened, so the forward variant is refused too.
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_device_sets_in_arena_with<T>(
+pub fn bind_device_sets_in_arena_with<T>(
     _setup: &RankSetup,
     _source: &SafeTensorsSource,
     _table: &std::collections::BTreeMap<String, (usize, usize)>,
@@ -847,7 +849,7 @@ fn plan_only_evidence(plan: &ResidentPlan) -> (Value, Vec<String>) {
 /// Streams the resident set: layout and allocate from the plan, then read, tile, upload, verify and
 /// drop one tensor at a time. Never holds the stored set and the arena at once.
 #[cfg(feature = "cuda")]
-pub(crate) fn upload_arena_streaming<T>(
+pub fn upload_arena_streaming<T>(
     plan: &ResidentPlan,
     shard_plan: &sparkflash_device::shard::ShardPlan,
     source: &SafeTensorsSource,
@@ -1191,7 +1193,7 @@ fn upload_arena(
 
 /// Without the cuda feature this build cannot open a driver, so streaming --upload is refused.
 #[cfg(not(feature = "cuda"))]
-pub(crate) fn upload_arena_streaming<T>(
+pub fn upload_arena_streaming<T>(
     _plan: &ResidentPlan,
     _shard_plan: &sparkflash_device::shard::ShardPlan,
     _source: &SafeTensorsSource,
@@ -1230,7 +1232,7 @@ impl Kind {
 
 /// The parsed arguments of one tp4-resident invocation.
 #[derive(Debug)]
-pub(crate) struct ResidentArgs {
+pub struct ResidentArgs {
     rank: usize,
     world: usize,
     source: Option<SafeTensorsSource>,
@@ -1392,7 +1394,7 @@ struct IndexedTensor {
 /// This is the form produced from a checkpoint's safetensors headers (\`name: {dtype, shape}\`). An
 /// Hugging Face \`model.safetensors.index.json\` is not a header dump - it has no shapes - so it is
 /// refused with a message naming the checkpoint mode instead of being half-read.
-pub(crate) fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String> {
+pub fn entries_from_tensor_index(path: &Path) -> Result<Vec<HeaderEntry>, String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
     let value: Value = serde_json::from_str(&text)

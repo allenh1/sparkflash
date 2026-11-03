@@ -882,6 +882,51 @@ impl SparkConfig {
         Some(preferred)
     }
 
+    /// A copy that selects `model` from the Hugging Face cache and resolves its checkpoint.
+    ///
+    /// The architecture, engine and context ceiling come from the cached checkpoint's profile,
+    /// never from the caller. This is the one place the model shelf and the swap action build a
+    /// target configuration, so a prepared model cannot be paired with the wrong engine.
+    ///
+    /// # Errors
+    /// When the cache entry is not runnable by this build, or the target cannot share this
+    /// cluster (a TP=1 pack on a four-Spark plan, for example), or its checkpoint does not
+    /// resolve.
+    pub fn for_cached_model(&self, model: &crate::hf::CachedModel) -> Result<Self, ConfigError> {
+        if !model.supported {
+            return Err(ConfigError::new(format!(
+                "{} is not a model type this build can run",
+                model.id
+            )));
+        }
+        if !model.complete {
+            return Err(ConfigError::new(format!(
+                "{} is still downloading, so it cannot be selected yet",
+                model.id
+            )));
+        }
+        let weights = model.weights.as_deref().ok_or_else(|| {
+            ConfigError::new(format!(
+                "{} has no control-plane weights selector",
+                model.id
+            ))
+        })?;
+        let engine = model.engine.as_deref().ok_or_else(|| {
+            ConfigError::new(format!("{} has no control-plane engine selector", model.id))
+        })?;
+        let mut config = self.clone();
+        config.model.id = model.id.clone();
+        config.model.checkpoint.clear();
+        config.model.tokenizer.clear();
+        config.model.weights = weights.to_owned();
+        config.engine.kind = engine.to_owned();
+        if let Some(context) = model.context_tokens {
+            config.runtime.max_context_tokens = config.runtime.max_context_tokens.min(context);
+        }
+        config.validate()?;
+        config.resolved()
+    }
+
     /// Whether the selected weights are the TP=1 Qwen pack.
     #[must_use]
     pub fn is_qwen(&self) -> bool {
