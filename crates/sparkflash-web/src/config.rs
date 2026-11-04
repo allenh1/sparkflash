@@ -40,7 +40,7 @@ pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID, GL
 /// The engines this build can run the weights with.
 ///
 /// V4.1-Flash and GLM-5.3-Flash are tensor-parallel-4 packs. Qwen3.8-Flash-Next is the TP=1
-/// pack engine, which serves directly from the Hugging Face checkpoint and needs no conversion.
+/// pack engine: it converts its checkpoint into one rank file and boots from that file.
 pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID, GLM_ENGINE_ID];
 
 /// The control-plane weight selector for V4.1-Flash.
@@ -132,7 +132,7 @@ pub const MODEL_PROFILES: &[ModelProfile] = &[
         engine: QWEN_ENGINE_ID,
         id: QWEN_MODEL_ID,
         context_tokens: QWEN_CONTEXT_TOKENS,
-        requires_conversion: false,
+        requires_conversion: true,
         requires_cubins: false,
     },
     ModelProfile {
@@ -970,8 +970,9 @@ impl SparkConfig {
 
     /// Whether launch must run the one-time per-rank conversion first.
     ///
-    /// The Qwen pack loads the released checkpoint directly; V4.1 and GLM have a separate
-    /// converted layout.
+    /// Every pack boots from the rank file its converter writes: V4.1 and GLM at four ranks,
+    /// Qwen3.8-Flash-Next at one. [Self::requires_conversion_manifest] says whether the file
+    /// alone is the completion marker.
     #[must_use]
     pub fn requires_conversion(&self) -> bool {
         profile_for_weights(&self.model.weights).is_none_or(|profile| profile.requires_conversion)
@@ -987,11 +988,11 @@ impl SparkConfig {
 
     /// Whether the node check should require a conversion manifest beside this rank's file.
     ///
-    /// The GLM converter writes one rank file and no manifest; its rank file is the completion
-    /// marker. V4.1 writes a manifest after each rank file.
+    /// The GLM and Qwen converters write one rank file and no manifest; that file is the
+    /// completion marker. V4.1 writes a manifest after each rank file.
     #[must_use]
     pub fn requires_conversion_manifest(&self) -> bool {
-        !self.is_glm()
+        !(self.is_glm() || self.is_qwen())
     }
 
     /// The single-node launcher script, next to the four-node one.
@@ -1296,6 +1297,14 @@ impl SparkConfig {
             "SPARKFLASH_LOG_ROOT".to_owned(),
             self.node_path(&self.paths.log_root).display().to_string(),
         );
+        // A converted Qwen rank file is one slab read instead of 77.8 GiB of per-tensor uploads.
+        // The checkpoint stays the configuration, tokenizer and host-paged PLE source.
+        if self.is_qwen() {
+            env.insert(
+                "SPARKFLASH_QWEN_CONVERTED_DIR".to_owned(),
+                self.converted_path().display().to_string(),
+            );
+        }
         for (key, value) in &self.network.env {
             env.insert(key.clone(), value.clone());
         }
@@ -1475,11 +1484,16 @@ mod tests {
         assert!(config.is_qwen());
         assert!(config.is_solo());
         assert_eq!(config.world_size(), 1);
-        assert!(!config.requires_conversion());
+        assert!(config.requires_conversion());
+        assert!(!config.requires_conversion_manifest());
         assert!(!config.requires_cubins());
         assert_eq!(config.max_context_tokens(), QWEN_CONTEXT_TOKENS);
         let env = config.local_launch_env();
         assert_eq!(env["SPARKFLASH_MODEL"], QWEN_WEIGHTS_ID);
+        assert_eq!(
+            env["SPARKFLASH_QWEN_CONVERTED_DIR"],
+            config.converted_path().display().to_string()
+        );
         assert_eq!(
             env["SPARKFLASH_CHECKPOINT"],
             "/data/Qwen3.8-Flash-Next-NVFP4"

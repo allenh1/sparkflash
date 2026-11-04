@@ -686,7 +686,7 @@ function renderShelf() {
     return '<div class="shelf-model' + (status.active ? " active" : "") + '">' +
       '<div class="shelf-main"><strong title="' + esc(entry.id) + '">' + esc(entry.id) + "</strong>" +
       '<span class="shelf-meta">' + esc(formatSize(entry.bytes)) + " · " + esc(entry.weights || "unknown") +
-      " · " + (entry.requires_conversion ? "TP shards" : "direct checkpoint") + "</span>" +
+      " · " + (entry.requires_conversion ? "converted rank file" : "direct checkpoint") + "</span>" +
       '<span class="shelf-note-line' + (entry.note && !entry.active ? " warn" : "") + '">' + esc(notes.join(" · ")) + "</span>" +
       (bars ? '<div class="shelf-bars">' + bars + "</div>" : "") + "</div>" +
       '<div class="shelf-actions">' + shelfButton(entry, status) + "</div></div>";

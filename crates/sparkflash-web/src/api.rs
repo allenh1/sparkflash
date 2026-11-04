@@ -1263,10 +1263,7 @@ async fn convert(State(web): State<WebState>, Json(request): Json<ConvertRequest
     if !config.requires_conversion() {
         return api_error(
             StatusCode::CONFLICT,
-            format!(
-                "{} loads its released checkpoint directly; there is no conversion step",
-                config.model.weights
-            ),
+            format!("{} has no converted layout to write", config.model.weights),
         );
     }
     if web.stats.latest().is_some_and(|sample| sample.online) {
@@ -1379,10 +1376,7 @@ async fn prepare_model(State(web): State<WebState>, Json(request): Json<ModelReq
     if !target.requires_conversion() {
         return api_error(
             StatusCode::CONFLICT,
-            format!(
-                "{} loads its released checkpoint directly; there is nothing to shard",
-                model.id
-            ),
+            format!("{} has no converted layout to prepare", model.id),
         );
     }
     // The selected model is the one a launch reads. Rewriting its rank files while it serves,
@@ -2049,6 +2043,7 @@ mod tests {
             crate::config::QWEN_WEIGHTS_ID
         );
 
+        // The solo pack converts too: one rank file, which its launch reads.
         let convert = app
             .oneshot(
                 Request::builder()
@@ -2061,13 +2056,11 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(convert.status(), StatusCode::CONFLICT);
+        assert_eq!(convert.status(), StatusCode::ACCEPTED);
         let body = body_json(convert).await;
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("no conversion step")
+        assert_eq!(
+            body["jobs"][0]["kind"].as_str().unwrap_or_default(),
+            "convert-r0"
         );
     }
 

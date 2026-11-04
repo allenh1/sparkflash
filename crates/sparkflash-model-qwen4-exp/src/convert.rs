@@ -12,16 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Per-rank converted weights: one file, the bytes the weight walk uploads, in its order, so a
-//! rank boots from one parallel direct-I/O read instead of 77.8 GiB of per-tensor checkpoint
-//! reads and allocations.
+//! Per-rank converted weights: one file a rank, the bytes that rank's weight walk uploads, in its
+//! order, so a rank boots from one parallel direct-I/O read instead of 77.8 GiB of per-tensor
+//! checkpoint reads and allocations.
+//!
+//! **Attribution:** pre-converting per-rank layouts and loading them with parallel `O_DIRECT`
+//! reads draws on prior art in [`b12x`](https://github.com/local-inference-lab/b12x)
+//! (`b12x/loader/_direct.c`) and [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference)
+//! (Apache-2.0; Luke Alonso `@lukealonso`, `@original-el8`, and contributors). See the root
+//! `NOTICE` file.
 //!
 //! The container is the one the V4.1 and GLM arms write ([sparkflash_weights::rank_file]): every
-//! upload of the walk is a slot (its key, offset, length and digest), and the index also records
-//! the two per-tensor NVFP4 scales in walk order. [convert_rank] walks the checkpoint twice on the
-//! host: once for the slots' offsets and the scales, and once to stream each weight's bytes to its
-//! slot. [load_converted] reads the file into one device allocation and runs the same walk over a
-//! [Slab], which returns each weight's address without reading the checkpoint.
+//! upload of the rank's walk is a slot (its key, offset, length and digest), and the index also
+//! records the two per-tensor NVFP4 scales in walk order. [convert_rank] walks the checkpoint
+//! twice on the host: once for the slots' offsets and the scales, and once to stream each weight's
+//! bytes to its slot. [load_converted] reads the file into one device allocation and runs the same
+//! walk over a [Slab], which returns each weight's address without reading the checkpoint.
+//!
+//! The walk is the tensor-parallel one ([crate::device::build_shard]), so a file holds its rank's
+//! share of every sharded tensor - the attention and Gated DeltaNet heads, the experts' padded
+//! width and the shared expert - exactly as
+//! [crate::device::Qwen4ExpDeviceBackend::open_rank] uploads it. A TP=1 file
+//! ([rank_file_name] of rank 0 in a world of 1) is the whole model.
 //!
 //! Qwen's PLE n-gram table is host-paged, so the checkpoint directory (and its 51.2 GiB of PLE
 //! shards) still has to be present: the converted file replaces the resident weights' upload, not
@@ -35,13 +47,16 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr,
 };
 use sparkflash_weights::WeightSource;
+pub use sparkflash_weights::rank_file::rank_file_name;
 use sparkflash_weights::rank_file::{
     ConvertedPreamble, PayloadDigest, RankFileWriter, align_up_page, data_offset_for,
-    rank_file_name, verify_payloads,
+    verify_payloads,
 };
+use sparkflash_weights::tp::TpLayout;
 
 use crate::config::Qwen4ExpConfig;
-use crate::device::{GpuWeights, Sink, Uploader, build_weights, check_length};
+use crate::device::tp::{Shard, rank_config};
+use crate::device::{GpuWeights, Sink, Uploader, build_shard, check_length};
 
 /// What a Qwen4-Exp rank file's index names as its model.
 pub const CONVERTED_MODEL: &str = "qwen4-exp";
@@ -50,7 +65,7 @@ pub const CONVERTED_MODEL: &str = "qwen4-exp";
 /// assume of every weight.
 const SLOT_ALIGN_BYTES: usize = 256;
 
-/// The one file this TP=1 pack writes.
+/// The TP=1 file's name, the one a solo launch reads; [rank_file_name] names a sharded rank's.
 pub const RANK_FILE_NAME: &str = "rank-0-of-1.bin";
 
 /// One upload of the rank's walk.
@@ -71,9 +86,9 @@ pub struct ConvertedSlot {
 pub struct ConvertedIndex {
     /// [CONVERTED_MODEL].
     pub model: String,
-    /// The rank, always 0.
+    /// The rank, `0..world`.
     pub rank: usize,
-    /// The tensor-parallel world, always 1.
+    /// The tensor-parallel world this file's walk was sharded for.
     pub world: usize,
     /// What the converter read, as it was given.
     pub source: String,
@@ -244,17 +259,31 @@ pub struct ConvertedRank {
     pub file_digest: u64,
 }
 
-/// Writes the TP=1 rank file into output_dir (as [rank_file_name] names it) from the checkpoint
-/// source, recording label as what was read. It runs on the host; no device is touched.
+/// Writes rank `layout.rank`'s file into output_dir (as [rank_file_name] names it) from the
+/// checkpoint source, recording label as what was read. It runs on the host; no device is
+/// touched.
+///
+/// # Errors
+/// A world the model's heads or widths do not split over ([rank_config]), then everything the
+/// weight walk refuses of the configuration or the checkpoint, and a file that cannot be written.
 pub fn convert_rank(
     source: &dyn WeightSource,
     config: &Qwen4ExpConfig,
+    layout: TpLayout,
     directory: &Path,
     output_dir: &Path,
     label: &str,
 ) -> Result<ConvertedRank, String> {
+    let shard = Shard::of(layout);
+    rank_config(config, shard)?;
     let mut plan = Plan::default();
-    let _ = build_weights(&Uploader::planning(&mut plan), directory, source, config)?;
+    let _ = build_shard(
+        &Uploader::planning(&mut plan),
+        directory,
+        source,
+        config,
+        shard,
+    )?;
     let Plan {
         slots,
         scalars,
@@ -262,8 +291,8 @@ pub fn convert_rank(
     } = plan;
     let mut index = ConvertedIndex {
         model: CONVERTED_MODEL.to_owned(),
-        rank: 0,
-        world: 1,
+        rank: layout.rank,
+        world: layout.world_size,
         source: label.to_owned(),
         slots,
         nvfp4_scalars: scalars,
@@ -277,13 +306,19 @@ pub fn convert_rank(
 
     fs::create_dir_all(output_dir)
         .map_err(|error| format!("create {}: {error}", output_dir.display()))?;
-    let path = output_dir.join(rank_file_name(0, 1));
+    let path = output_dir.join(rank_file_name(layout.rank, layout.world_size));
     let mut writing = Writing {
         writer: RankFileWriter::create(&path, data_offset)?,
         slots: &mut index.slots,
         next: 0,
     };
-    let _ = build_weights(&Uploader::planning(&mut writing), directory, source, config)?;
+    let _ = build_shard(
+        &Uploader::planning(&mut writing),
+        directory,
+        source,
+        config,
+        shard,
+    )?;
     let Writing { writer, next, .. } = writing;
     if next != index.slots.len() {
         return Err(format!(
@@ -294,7 +329,13 @@ pub fn convert_rank(
     index.file_digest = writer.file_digest();
     let bytes =
         serde_json::to_vec(&index).map_err(|error| format!("serialise the index: {error}"))?;
-    let header_hash = writer.finish(0, 1, &bytes, index.data_bytes, padded_data_bytes)?;
+    let header_hash = writer.finish(
+        layout.rank,
+        layout.world_size,
+        &bytes,
+        index.data_bytes,
+        padded_data_bytes,
+    )?;
     Ok(ConvertedRank {
         path,
         file_bytes: data_offset + padded_data_bytes,
@@ -326,16 +367,20 @@ fn expect_slot<'s>(
     Ok(slot)
 }
 
-/// The rank file in dir, when it holds one.
+/// `layout`'s rank file in dir, when it holds one.
 #[must_use]
-pub fn find_rank_file(dir: &Path) -> Option<PathBuf> {
-    let path = dir.join(rank_file_name(0, 1));
+pub fn find_rank_file(dir: &Path, layout: TpLayout) -> Option<PathBuf> {
+    let path = dir.join(rank_file_name(layout.rank, layout.world_size));
     path.is_file().then_some(path)
 }
 
-/// Reads a rank file's preamble and index, once it is a Qwen4-Exp TP=1 file whose slots lie in
-/// its data. Touching no weight, this is the boot check.
-pub fn read_index(path: &Path) -> Result<(ConvertedPreamble, ConvertedIndex), String> {
+/// Reads a rank file's preamble and index, once it is a Qwen4-Exp file of rank `layout.rank` in
+/// a world of `layout.world_size` whose slots lie in its data. Touching no weight, this is the
+/// boot check.
+pub fn read_index(
+    path: &Path,
+    layout: TpLayout,
+) -> Result<(ConvertedPreamble, ConvertedIndex), String> {
     let (mut preamble, index): (_, ConvertedIndex) =
         sparkflash_weights::rank_file::read_index(path)?;
     let shown = path.display();
@@ -346,8 +391,8 @@ pub fn read_index(path: &Path) -> Result<(ConvertedPreamble, ConvertedIndex), St
         ));
     }
     for (what, by_preamble, by_index, wanted) in [
-        ("rank", preamble.rank, index.rank, 0),
-        ("world", preamble.world, index.world, 1),
+        ("rank", preamble.rank, index.rank, layout.rank),
+        ("world", preamble.world, index.world, layout.world_size),
     ] {
         if by_preamble != wanted || by_index != wanted {
             return Err(format!(
@@ -377,8 +422,8 @@ pub fn read_index(path: &Path) -> Result<(ConvertedPreamble, ConvertedIndex), St
 }
 
 /// Re-reads every slot of a rank file and checks its digest, and the digest of the digests.
-pub fn verify_converted(path: &Path) -> Result<ConvertedIndex, String> {
-    let (preamble, index) = read_index(path)?;
+pub fn verify_converted(path: &Path, layout: TpLayout) -> Result<ConvertedIndex, String> {
+    let (preamble, index) = read_index(path, layout)?;
     verify_payloads(
         path,
         preamble.data_offset,
@@ -393,15 +438,18 @@ pub fn verify_converted(path: &Path) -> Result<ConvertedIndex, String> {
     Ok(index)
 }
 
-/// Reads one rank file into one device allocation and returns the weights the walk places in it.
+/// Reads rank `layout.rank`'s file into one device allocation and returns the weights the
+/// rank's walk places in it.
 pub(crate) fn load_converted(
     cuda: &Cuda,
     config: &Qwen4ExpConfig,
     directory: &Path,
     path: &Path,
     source: &dyn WeightSource,
+    layout: TpLayout,
 ) -> Result<GpuWeights, String> {
-    let (preamble, index) = read_index(path)?;
+    let shard = Shard::of(layout);
+    let (preamble, index) = read_index(path, layout)?;
     let data = usize::try_from(preamble.padded_data_bytes)
         .map_err(|_| "the rank file's data does not fit this machine's range".to_owned())?;
     let mut total = 0usize;
@@ -416,7 +464,13 @@ pub(crate) fn load_converted(
         true,
     )?;
     let mut sink = Slab::new(base, &index, cuda);
-    let weights = build_weights(&Uploader::planning(&mut sink), directory, source, config)?;
+    let weights = build_shard(
+        &Uploader::planning(&mut sink),
+        directory,
+        source,
+        config,
+        shard,
+    )?;
     if sink.next != index.slots.len() {
         return Err(format!(
             "the rank file holds {} weights, and this configuration loads {}",
@@ -455,6 +509,19 @@ mod tests {
         file.write_all_at(&[byte[0] ^ 1], at).unwrap();
     }
 
+    /// The file a solo launch reads.
+    const TP1: TpLayout = TpLayout {
+        rank: 0,
+        world_size: 1,
+    };
+
+    fn placed(slots: &[ConvertedSlot]) -> Vec<(String, usize, usize)> {
+        slots
+            .iter()
+            .map(|slot| (slot.key.clone(), slot.offset, slot.bytes))
+            .collect()
+    }
+
     #[test]
     fn a_rank_file_holds_the_walk_and_refuses_what_is_not_it() {
         let config = Qwen4ExpConfig::tiny();
@@ -464,11 +531,19 @@ mod tests {
             SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))
                 .expect("the fixture opens");
         let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let converted = convert_rank(&source, &config, checkpoint.path(), first.path(), "fixture")
-            .expect("the rank converts");
+        let converted = convert_rank(
+            &source,
+            &config,
+            TP1,
+            checkpoint.path(),
+            first.path(),
+            "fixture",
+        )
+        .expect("the rank converts");
         let again = convert_rank(
             &source,
             &config,
+            TP1,
             checkpoint.path(),
             second.path(),
             "fixture",
@@ -482,7 +557,7 @@ mod tests {
         );
         assert_eq!(bytes.len() as u64, converted.file_bytes);
 
-        let index = verify_converted(&converted.path).expect("it verifies");
+        let index = verify_converted(&converted.path, TP1).expect("it verifies");
         assert_eq!(index.slots.len(), converted.slots);
         assert_eq!(index.file_digest, converted.file_digest);
 
@@ -506,38 +581,152 @@ mod tests {
         assert_eq!(bytes[at..at + slot.bytes], source.read(&spec).unwrap());
 
         let mut replay = Plan::default();
-        let _ = build_weights(
+        let _ = build_shard(
             &Uploader::planning(&mut replay),
             checkpoint.path(),
             &source,
             &config,
+            Shard::WHOLE,
         )
         .expect("the walk replays");
-        let placed = |slots: &[ConvertedSlot]| -> Vec<(String, usize, usize)> {
-            slots
-                .iter()
-                .map(|slot| (slot.key.clone(), slot.offset, slot.bytes))
-                .collect()
-        };
         assert_eq!(placed(&replay.slots), placed(&index.slots));
         assert_eq!(replay.scalars, index.nvfp4_scalars);
 
-        let error = verify_converted(&checkpoint.path().join(rank_file_name(0, 1))).unwrap_err();
+        let error =
+            verify_converted(&checkpoint.path().join(rank_file_name(0, 1)), TP1).unwrap_err();
         assert!(
             error.contains("No such file") || error.contains("not found"),
             "{error}"
         );
 
-        let (preamble, index) = read_index(&converted.path).unwrap();
+        let (preamble, index) = read_index(&converted.path, TP1).unwrap();
         flip(
             &converted.path,
             preamble.data_offset + index.slots[2].offset as u64,
         );
-        read_index(&converted.path).expect("the boot check reads no weight");
-        let error = verify_converted(&converted.path).unwrap_err();
+        read_index(&converted.path, TP1).expect("the boot check reads no weight");
+        let error = verify_converted(&converted.path, TP1).unwrap_err();
         assert!(error.contains("digest mismatch"), "{error}");
         flip(&converted.path, PREAMBLE_BYTES as u64 + 8);
-        let error = read_index(&converted.path).unwrap_err();
+        let error = read_index(&converted.path, TP1).unwrap_err();
         assert!(error.contains("header hash"), "{error}");
+    }
+
+    /// A configuration every world 1, 2 and 4 divides the way [rank_config] requires.
+    fn tensor_parallel_config() -> Qwen4ExpConfig {
+        Qwen4ExpConfig {
+            num_attention_heads: 4,
+            num_key_value_heads: 4,
+            linear_num_key_heads: 4,
+            linear_num_value_heads: 4,
+            // Two whole 64-row expert tiles at TP=4, one at TP=2.
+            moe_intermediate_size: 128,
+            ..Qwen4ExpConfig::tiny()
+        }
+    }
+
+    #[test]
+    fn every_tensor_configuration_writes_the_file_its_rank_uploads() {
+        let config = tensor_parallel_config();
+        let checkpoint = tempfile::tempdir().expect("a temporary directory");
+        write_synthetic_checkpoint(checkpoint.path(), &config, 7).expect("the fixture writes");
+        let source =
+            SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))
+                .expect("the fixture opens");
+        let expert = "model.language_model.layers.0.mlp.experts.0.gate_proj".to_owned();
+        for (rank, world_size) in [(0, 1), (0, 2), (1, 2), (0, 4), (3, 4)] {
+            let layout = TpLayout { rank, world_size };
+            let out = tempfile::tempdir().expect("an output directory");
+            let converted = convert_rank(
+                &source,
+                &config,
+                layout,
+                checkpoint.path(),
+                out.path(),
+                "fixture",
+            )
+            .expect("the rank converts");
+            assert_eq!(
+                converted.path.file_name().and_then(std::ffi::OsStr::to_str),
+                Some(rank_file_name(rank, world_size).as_str())
+            );
+            let index = verify_converted(&converted.path, layout).expect("it verifies");
+            assert_eq!((index.rank, index.world), (rank, world_size));
+            assert_eq!(
+                find_rank_file(out.path(), layout).as_deref(),
+                Some(converted.path.as_path())
+            );
+
+            // The same walk, as the rank's load runs it, places every slot the file holds.
+            let shard = Shard::of(layout);
+            let mut replay = Plan::default();
+            let _ = build_shard(
+                &Uploader::planning(&mut replay),
+                checkpoint.path(),
+                &source,
+                &config,
+                shard,
+            )
+            .expect("the walk replays");
+            assert_eq!(placed(&replay.slots), placed(&index.slots));
+            assert_eq!(replay.scalars, index.nvfp4_scalars);
+
+            // An expert's file slot is its share padded to whole MMA tiles, not the whole matrix.
+            let gate = index
+                .slots
+                .iter()
+                .find(|slot| slot.key == expert.clone() + ".weight")
+                .expect("the walk uploads the expert's gate");
+            let width = shard.expert_width(config.moe_intermediate_size);
+            assert_eq!(gate.bytes, width * config.hidden_size / 2);
+
+            // The file says which rank it is, and a load that is not that rank refuses it.
+            let other = TpLayout {
+                rank: (rank + 1) % world_size,
+                world_size,
+            };
+            if other != layout {
+                let error = read_index(&converted.path, other)
+                    .expect_err("another rank's file is not this rank's");
+                assert!(error.contains("rank") || error.contains("world"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_world_the_model_does_not_split_over_is_refused() {
+        let config = tensor_parallel_config();
+        let checkpoint = tempfile::tempdir().expect("a temporary directory");
+        write_synthetic_checkpoint(checkpoint.path(), &config, 7).expect("the fixture writes");
+        let source =
+            SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))
+                .expect("the fixture opens");
+        let out = tempfile::tempdir().expect("an output directory");
+        let error = convert_rank(
+            &source,
+            &config,
+            TpLayout {
+                rank: 0,
+                world_size: 3,
+            },
+            checkpoint.path(),
+            out.path(),
+            "fixture",
+        )
+        .expect_err("four heads do not split over three ranks");
+        assert!(error.contains("do not split"), "{error}");
+        let error = convert_rank(
+            &source,
+            &config,
+            TpLayout {
+                rank: 2,
+                world_size: 2,
+            },
+            checkpoint.path(),
+            out.path(),
+            "fixture",
+        )
+        .expect_err("rank 2 is not a rank of 2");
+        assert!(error.contains("not a rank"), "{error}");
     }
 }

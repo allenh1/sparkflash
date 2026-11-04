@@ -5030,6 +5030,12 @@ fn qwen_checkpoint_config(
 
 /// Opens one Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group of 2 or 4: its share
 /// of the checkpoint's weights and the collective [open_pack_collective] opens.
+///
+/// With `SPARKFLASH_QWEN_CONVERTED_DIR` set, the share is read from that directory's
+/// `rank-R-of-W.bin` - one parallel direct-I/O read - instead of the checkpoint's tensors. The
+/// file must have been written for this rank's world
+/// (`sparkflash convert --tp-world-size W`); the checkpoint directory stays the configuration,
+/// tokenizer and host-paged PLE source.
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
     let started = Instant::now();
@@ -5045,19 +5051,52 @@ fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Str
         &format!("qwen-serve;{qwen_config:?};{}", config.context),
     )?;
     let label = tp.label();
-    let backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank(
-        &directory,
-        config.context,
-        tp,
-    )
+    let layout = TpLayout {
+        rank: config.rank,
+        world_size: config.world_size,
+    };
+    let converted = match std::env::var("SPARKFLASH_QWEN_CONVERTED_DIR") {
+        Ok(dir) => Some(
+            sparkflash_model_qwen4_exp::convert::find_rank_file(Path::new(&dir), layout)
+                .ok_or_else(|| {
+                    format!(
+                        "{dir} holds no {} for this rank",
+                        sparkflash_model_qwen4_exp::convert::rank_file_name(
+                            layout.rank,
+                            layout.world_size
+                        )
+                    )
+                })?,
+        ),
+        Err(_) => None,
+    };
+    let backend = match &converted {
+        Some(path) => {
+            sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank_converted(
+                &directory,
+                config.context,
+                tp,
+                path,
+            )
+        }
+        None => sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank(
+            &directory,
+            config.context,
+            tp,
+        ),
+    }
     .map_err(|error| format!("{}: {error}", directory.display()))?;
     let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     eprintln!(
-        "sparkflash serve: Qwen rank {}/{} loaded in {:.1} s from {}; {label} collective",
+        "sparkflash serve: Qwen rank {}/{} loaded in {:.1} s from {}{}; {label} collective",
         config.rank,
         config.world_size,
         load_ms as f64 / 1000.0,
-        directory.display()
+        directory.display(),
+        converted.as_ref().map_or_else(String::new, |path| format!(
+            " (converted {})",
+            path.display()
+        )),
     );
     Ok(Box::new(QwenTp4Rank {
         backend,
@@ -6647,18 +6686,24 @@ fn serve_qwen4_exp(options: &ServeOptions) -> ExitCode {
     }
     // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
     // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
+    let layout = TpLayout {
+        rank: 0,
+        world_size: 1,
+    };
     let converted = match std::env::var("SPARKFLASH_QWEN_CONVERTED_DIR") {
-        Ok(dir) => match sparkflash_model_qwen4_exp::convert::find_rank_file(Path::new(&dir)) {
-            Some(path) => Some(path),
-            None => {
-                eprintln!(
-                    "sparkflash serve: {} holds no {} for Qwen4-Exp TP=1",
-                    dir,
-                    sparkflash_model_qwen4_exp::convert::RANK_FILE_NAME
-                );
-                return ExitCode::from(EXIT_REFUSED);
+        Ok(dir) => {
+            match sparkflash_model_qwen4_exp::convert::find_rank_file(Path::new(&dir), layout) {
+                Some(path) => Some(path),
+                None => {
+                    eprintln!(
+                        "sparkflash serve: {} holds no {} for Qwen4-Exp TP=1",
+                        dir,
+                        sparkflash_model_qwen4_exp::convert::RANK_FILE_NAME
+                    );
+                    return ExitCode::from(EXIT_REFUSED);
+                }
             }
-        },
+        }
         Err(_) => None,
     };
     let opened = match &converted {

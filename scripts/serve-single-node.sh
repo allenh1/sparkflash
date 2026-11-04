@@ -15,8 +15,9 @@
 
 # Single-node TP=1 serving launcher for model packs that bring their own arm.
 #
-# Qwen3.8-Flash-Next is served directly from its Hugging Face checkpoint: there is no per-rank
-# conversion, no NCCL, and no SSH. This is the local counterpart of serve-four-node.sh.
+# Qwen3.8-Flash-Next boots from its one rank file when SPARKFLASH_QWEN_CONVERTED_DIR names the
+# directory it was converted into, and from the Hugging Face checkpoint otherwise: no NCCL and no
+# SSH either way. This is the local counterpart of serve-four-node.sh.
 #
 # Usage:
 #   scripts/serve-single-node.sh print     print the command (default; no network access)
@@ -32,6 +33,9 @@
 #   SPARKFLASH_HTTP_BIND    listen address (default 127.0.0.1:8000)
 #   SPARKFLASH_BIN          binary (default <repo>/target/release/sparkflash)
 #   SPARKFLASH_LOG_ROOT     log and pid directory (default <repo>/target/serve-single)
+#   SPARKFLASH_QWEN_CONVERTED_DIR
+#                           directory holding rank-0-of-1.bin (optional; the checkpoint is read
+#                           per tensor without it). The launched server inherits it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

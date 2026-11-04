@@ -316,9 +316,9 @@ cannot remove. `scripts/setup.sh` runs it for the Sparks picked in the terminal.
 | :-- | :-- |
 | **Download** | `python3 -I scripts/hf-download.py --repo <model.id> --cache <hub cache>` on the lead |
 | **Deploy** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files). Deploy runs automatically when the node check finds a missing or older copy |
-| **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, ranks 1–3 over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size 4 --tp-rank R --no-pad-moe-640 --no-verify` |
+| **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, the others over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size <world_size> --tp-rank R --no-verify`, plus `--no-pad-moe-640` for V4.1; the TP=1 Qwen pack converts rank 0 of 1 |
 | **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES`, paths, and every `NCCL_*` value from the TOML. Each rank is started detached, so the job ends once all four are running |
-| **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context and HTTP bind. The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |
+| **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context, HTTP bind and `SPARKFLASH_QWEN_CONVERTED_DIR` (the one rank file the pack boots from). The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |
 | **Stop** | `scripts/serve-four-node.sh stop`, or `scripts/serve-single-node.sh stop` (SIGTERM; rank 0 drains first) |
 | **Rank status** | `scripts/serve-four-node.sh status`, or `scripts/serve-single-node.sh status` |
 

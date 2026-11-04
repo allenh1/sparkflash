@@ -300,7 +300,7 @@ with a Python transcription of the reference, including the row after an EOS.
 host, and refuses without a cubin, with a TP world other than 1, or with a context limit outside
 `1..=262,144`.
 
-### Converted rank file
+### Converted rank files
 
 `sparkflash convert --checkpoint "$CKPT" --output-dir "$CONV"` writes one `rank-0-of-1.bin`
 (80,565,841,920 bytes, 151,721 slots, 73,728 NVFP4 scale pairs); `--inspect FILE --verify-weights`
@@ -308,9 +308,21 @@ re-reads every slot. The file holds the exact bytes the walk uploads, plus the t
 NVFP4 scales in walk order; the routed experts' pointer tables are rebuilt at load because they
 hold device addresses.
 
-`SPARKFLASH_QWEN_CONVERTED_DIR=$CONV sparkflash serve ...` reads the file into one allocation with
-the parallel direct-I/O path the V4.1 and GLM arms use. Measured on an RTX Spark: **15.7 s from
-launch to `/health`**, against 132 s from the released checkpoint; both include the DFlash 2
+Every tensor configuration converts the same way: `--tp-world-size W` (with `--tp-rank R`, or
+`--ranks` for several) writes `rank-R-of-W.bin`, the bytes that rank's walk uploads - its share of
+the attention and Gated DeltaNet heads, its experts padded to whole 64-column MMA tiles and its
+share of the shared expert - so a file is exactly what `open_rank` would place on the device:
+
+```bash
+# One rank file a rank, for a world of 2 or 4; the checkpoint is read, never written.
+sparkflash convert --checkpoint "$CKPT" --output-dir "$CONV" --tp-world-size 4
+sparkflash convert --inspect "$CONV/rank-2-of-4.bin" --verify-weights
+```
+
+`SPARKFLASH_QWEN_CONVERTED_DIR=$CONV` makes a launch read its own rank file into one allocation
+with the parallel direct-I/O path the V4.1 and GLM arms use: `serve` takes rank 0's file at TP=1,
+and a `--tp4-rank R` process takes `rank-R-of-W.bin`. Measured on an RTX Spark at TP=1: **15.7 s
+from launch to `/health`**, against 132 s from the released checkpoint; both include the DFlash 2
 drafter. Conversion is one pass and took 341 s on the node.
 
 The checkpoint directory is still required: its `config.json`, `tokenizer.json` and 51.2 GiB of
@@ -698,8 +710,11 @@ sparkflash serve --model nvidia/Qwen3.8-Flash-Next-NVFP4 --checkpoint "$CKPT" \
 
 The peers are the ranks' addresses in rank order (`192.0.2.10,...` for node0-3); at TP=2 the
 first two are used. Rank 0 owns HTTP, the tokenizer and the control hub, and needs
-`--checkpoint DIR`. Each rank reads its share from the checkpoint at load; there is no converted
-rank file. The NCCL transport variables in [serving.md](../serving.md) apply.
+`--checkpoint DIR`. Each rank reads its share from the checkpoint at load unless
+`SPARKFLASH_QWEN_CONVERTED_DIR` names the directory its `rank-R-of-W.bin` was converted into
+([Converted rank files](#converted-rank-files)); the file holds that rank's share, so one
+`sparkflash convert --tp-world-size W` serves every rank of the group. The NCCL transport
+variables in [serving.md](../serving.md) apply.
 
 What a rank holds ([`device/tp.rs`](../../crates/sparkflash-model-qwen4-exp/src/device/tp.rs)):
 

@@ -151,6 +151,10 @@ fn parity_on(
         let file = sparkflash_model_qwen4_exp::convert::convert_rank(
             &source,
             &config,
+            sparkflash_weights::tp::TpLayout {
+                rank: 0,
+                world_size: 1,
+            },
             temp.path(),
             converted_dir.path(),
             "fixture",

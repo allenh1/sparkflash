@@ -100,7 +100,7 @@ mod blocks;
 mod dflash;
 mod fused;
 mod prefill;
-mod tp;
+pub(crate) mod tp;
 
 use dflash::DFLASH2_STEP_COST;
 pub use dflash::embedded_dflash2_cubin;
@@ -1122,20 +1122,11 @@ impl GpuWeights {
     }
 }
 
-/// The weight walk: each upload goes to the uploader's sink in the model's order.
-pub(crate) fn build_weights(
-    uploader: &Uploader<'_>,
-    directory: &Path,
-    source: &dyn WeightSource,
-    config: &Qwen4ExpConfig,
-) -> Result<GpuWeights, String> {
-    build_shard(uploader, directory, source, config, tp::Shard::WHOLE)
-}
-
-/// [build_weights] for one rank's `shard` of the model: its share of every attention block's
-/// heads, every GDN block's key and value heads and every expert's width, and the rest whole
-/// ([tp::rank_config] describes the shares). `config` is the whole model's.
-fn build_shard(
+/// The weight walk: each upload goes to the uploader's sink in the model's order, for one rank's
+/// `shard` of the model - its share of every attention block's heads, every GDN block's key and
+/// value heads and every expert's width, and the rest whole ([tp::rank_config] describes the
+/// shares). `config` is the whole model's; [tp::Shard::WHOLE] is the whole model.
+pub(crate) fn build_shard(
     uploader: &Uploader<'_>,
     directory: &Path,
     source: &dyn WeightSource,
@@ -1758,6 +1749,50 @@ impl Qwen4ExpDeviceBackend {
         )
     }
 
+    /// [Self::open_rank] over rank `tp.rank()`'s converted file instead of the checkpoint's
+    /// tensors: one parallel read into one allocation. The file holds the rank's share, so it
+    /// must have been written for the same `tp.world()` (see
+    /// [crate::convert::convert_rank]). The checkpoint directory is still the configuration,
+    /// tokenizer and host-paged PLE source.
+    ///
+    /// # Errors
+    /// Everything [Self::open_rank] refuses, and a rank file of another world or rank.
+    pub fn open_rank_converted(
+        checkpoint: &Path,
+        context_limit: usize,
+        tp: TpRuntime,
+        rank_file: &Path,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env(),
+            Some(rank_file),
+            Some(tp),
+        )
+    }
+
+    /// [Self::open_rank_converted] with an explicit prefill plan, so a test can pin the chunk
+    /// width.
+    ///
+    /// # Errors
+    /// Everything [Self::open_rank_converted] refuses.
+    pub fn open_with_prefill_rank_converted(
+        checkpoint: &Path,
+        context_limit: usize,
+        prefill: PrefillPlan,
+        tp: TpRuntime,
+        rank_file: &Path,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            prefill,
+            Some(rank_file),
+            Some(tp),
+        )
+    }
+
     /// A sequence of an [Self::open_rank] group that drafts only when `speculative` says so.
     ///
     /// Every rank of the group must take the same steps: a speculative step verifies a draft
@@ -1914,27 +1949,29 @@ impl Qwen4ExpDeviceBackend {
         // The rank's kernels run on its share; the walk reads the whole tensors and keeps it.
         let local = tp::rank_config(&config, shard)
             .map_err(|error| BackendError::new("qwen4_tp", error))?;
-        if shard.world > 1 && converted.is_some() {
-            return Err(BackendError::new(
-                "qwen4_tp",
-                "a converted rank file holds the TP=1 weights; a sharded rank reads its share from \
-                 the checkpoint (unset SPARKFLASH_QWEN_CONVERTED_DIR)",
-            ));
-        }
-        let weights = match converted {
-            Some(path) => crate::convert::load_converted(&cuda, &config, &directory, path, &source)
+        let weights =
+            match converted {
+                Some(path) => crate::convert::load_converted(
+                    &cuda,
+                    &config,
+                    &directory,
+                    path,
+                    &source,
+                    TpLayout {
+                        rank: shard.rank,
+                        world_size: shard.world,
+                    },
+                )
                 .map_err(|error| {
                     BackendError::new(
                         "qwen4_weights",
                         format!("converted rank {}: {error}", path.display()),
                     )
                 })?,
-            None => {
-                GpuWeights::upload(&cuda, &directory, &source, &config, shard).map_err(|error| {
-                    BackendError::new("qwen4_device", format!("weight upload: {error}"))
-                })?
-            }
-        };
+                None => GpuWeights::upload(&cuda, &directory, &source, &config, shard).map_err(
+                    |error| BackendError::new("qwen4_device", format!("weight upload: {error}")),
+                )?,
+            };
         // The GDN recurrence's state is one head's `key_dim x value_dim` floats; staging it in
         // shared memory turns three global trips per token into three per chunk.
         let stage =

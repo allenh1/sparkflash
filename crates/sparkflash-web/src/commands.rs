@@ -84,8 +84,9 @@ pub fn convert_command(config: &SparkConfig, rank: usize) -> CommandSpec {
         "--tp-rank".to_owned(),
         rank_text,
     ];
-    // 640-wide routed-expert padding is DeepSeek's layout; the GLM converter refuses the flag.
-    if !config.is_glm() {
+    // 640-wide routed-expert padding is DeepSeek's layout; the GLM and Qwen converters refuse
+    // nothing of it but have no padded layout to write.
+    if !(config.is_glm() || config.is_qwen()) {
         convert_args.push("--no-pad-moe-640".to_owned());
     }
     convert_args.push("--no-verify".to_owned());
@@ -750,8 +751,35 @@ mod tests {
             command.env["SPARKFLASH_CONTEXT"],
             crate::config::QWEN_CONTEXT_TOKENS.to_string()
         );
+        // The one rank file the pack boots from, in the directory its conversion writes.
+        assert_eq!(
+            command.env["SPARKFLASH_QWEN_CONVERTED_DIR"],
+            config.converted_path().display().to_string()
+        );
         assert!(!command.args.iter().any(|arg| arg == "ssh"));
         assert_eq!(command.label, "Start server");
+    }
+
+    #[test]
+    fn a_solo_qwen_conversion_writes_one_rank_file() {
+        let mut config = SparkConfig::default();
+        config.model.weights = crate::config::QWEN_WEIGHTS_ID.to_owned();
+        config.model.id = crate::config::QWEN_MODEL_ID.to_owned();
+        config.model.checkpoint = "/data/Qwen3.8-Flash-Next-NVFP4".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = crate::config::QWEN_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = crate::config::QWEN_CONTEXT_TOKENS;
+        config.cluster.nodes = vec![crate::config::NodeConfig::new("this-spark.local", "", true)];
+        let command = convert_command(&config, 0);
+        assert_eq!(command.kind, "convert-r0");
+        let world = command
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--tp-world-size")
+            .map(|pair| pair[1].as_str());
+        assert_eq!(world, Some("1"));
+        // 640-wide routed-expert padding is DeepSeek's layout; the Qwen converter writes none.
+        assert!(!command.args.iter().any(|arg| arg == "--no-pad-moe-640"));
     }
 
     #[test]

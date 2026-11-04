@@ -25,9 +25,9 @@
 //!
 //! A checkpoint whose `config.json` names GLM-5.3's model type is converted by the GLM pack
 //! instead, into the same container ([sparkflash_model_glm5_next::convert]); a Qwen4-Exp
-//! checkpoint is converted by its pack's TP=1 converter
-//! ([sparkflash_model_qwen4_exp::convert]). `--inspect` tells the three apart by the model a
-//! file's index names.
+//! checkpoint is converted by its pack ([sparkflash_model_qwen4_exp::convert]), one file a rank
+//! of the `--tp-world-size` world, holding that rank's share. `--inspect` tells the three apart
+//! by the model a file's index names.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -60,7 +60,7 @@ fn emit_progress(done: u64, total: u64, detail: &str) {
 }
 
 /// Usage string for `sparkflash convert`.
-pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size 4] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
+pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
 
 /// Entry point called by `main.rs`.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -84,7 +84,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let mut checkpoint: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
-    let mut world_size: usize = 4;
+    // The V4.1 and GLM packs are four-rank; a Qwen4-Exp checkpoint is TP=1 unless the world is
+    // asked for, so its command from before the sharded converter still writes one file.
+    let mut world_size: Option<usize> = None;
     let mut ranks: Vec<usize> = Vec::new();
     let mut pad_moe_640 = true;
     let mut verify = true;
@@ -105,9 +107,10 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
             "--output-dir" | "-o" => output_dir = Some(PathBuf::from(take(flag)?)),
             "--tp-world-size" | "--world-size" => {
                 let raw = take(flag)?;
-                world_size = raw
-                    .parse::<usize>()
-                    .map_err(|_| format!("{flag}: {raw} is not a positive integer"))?;
+                world_size = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("{flag}: {raw} is not a positive integer"))?,
+                );
             }
             "--tp-rank" => {
                 let raw = take("--tp-rank")?;
@@ -150,8 +153,16 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         checkpoint.ok_or_else(|| format!("--checkpoint DIR is required (usage: {USAGE})"))?;
     let out_dir = output_dir.unwrap_or_else(|| checkpoint_dir.clone());
     if let Some(config) = qwen_config(&checkpoint_dir)? {
-        return convert_qwen(&checkpoint_dir, &out_dir, &config, &ranks, verify);
+        return convert_qwen(
+            &checkpoint_dir,
+            &out_dir,
+            &config,
+            world_size.unwrap_or(1),
+            &ranks,
+            verify,
+        );
     }
+    let world_size = world_size.unwrap_or(4);
     if let Some(config) = glm_config(&checkpoint_dir)? {
         if !pad_moe_640 {
             return Err(
@@ -242,43 +253,51 @@ fn qwen_config(dir: &Path) -> Result<Option<Qwen4ExpConfig>, String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Converts the TP=1 rank file of a Qwen4-Exp checkpoint and re-reads its digests when `verify`
-/// asks. The pack is TP=1; a rank other than 0 is refused rather than named a second file.
+/// Converts `ranks` (every rank when empty) of a Qwen4-Exp checkpoint's `world_size`-rank
+/// group one at a time, so one rank's share is all the converter holds, and re-reads each file's
+/// digests when `verify` asks. A world or rank the model does not split over is refused by the
+/// pack's converter.
 fn convert_qwen(
     dir: &Path,
     out_dir: &Path,
     config: &Qwen4ExpConfig,
+    world_size: usize,
     ranks: &[usize],
     verify: bool,
 ) -> Result<Vec<String>, String> {
-    if let Some(rank) = ranks.iter().find(|rank| **rank != 0) {
-        return Err(format!(
-            "Qwen4-Exp is TP=1 and has no rank {rank}; convert rank 0 only"
-        ));
-    }
     let source = SafeTensorsSource::open(dir, &dir.join(INDEX_NAME))
         .map_err(|error| format!("{}: {error}", dir.display()))?;
     let label = dir.file_name().map_or_else(
         || dir.display().to_string(),
         |name| name.to_string_lossy().into_owned(),
     );
-    let started = Instant::now();
-    let converted = qwen_convert_rank(&source, config, dir, out_dir, &label)
-        .map_err(|error| format!("Qwen4-Exp rank 0/1: {error}"))?;
-    if verify {
-        qwen_verify_converted(&converted.path)
-            .map_err(|error| format!("Qwen4-Exp rank 0/1: {error}"))?;
+    let ranks: Vec<usize> = if ranks.is_empty() {
+        (0..world_size).collect()
+    } else {
+        ranks.to_vec()
+    };
+    let mut lines = Vec::new();
+    for rank in ranks {
+        let layout = TpLayout { rank, world_size };
+        let started = Instant::now();
+        let converted = qwen_convert_rank(&source, config, layout, dir, out_dir, &label)
+            .map_err(|error| format!("Qwen4-Exp rank {rank}/{world_size}: {error}"))?;
+        if verify {
+            qwen_verify_converted(&converted.path, layout)
+                .map_err(|error| format!("Qwen4-Exp rank {rank}/{world_size}: {error}"))?;
+        }
+        lines.push(format!(
+            "sparkflash convert: {QWEN_CONVERTED_MODEL} rank {rank}/{world_size}: wrote {} ({} bytes, {} weights, {} NVFP4 scale pairs, header_hash={:#018x}, file_digest={:#018x}, verified={verify}, {} ms)",
+            converted.path.display(),
+            converted.file_bytes,
+            converted.slots,
+            qwen_read_index(&converted.path, layout).map_or(0, |(_, index)| index.nvfp4_scalars.len()),
+            converted.header_hash,
+            converted.file_digest,
+            started.elapsed().as_millis(),
+        ));
     }
-    Ok(vec![format!(
-        "sparkflash convert: {QWEN_CONVERTED_MODEL} rank 0/1: wrote {} ({} bytes, {} weights, {} NVFP4 scale pairs, header_hash={:#018x}, file_digest={:#018x}, verified={verify}, {} ms)",
-        converted.path.display(),
-        converted.file_bytes,
-        converted.slots,
-        qwen_read_index(&converted.path).map_or(0, |(_, index)| index.nvfp4_scalars.len()),
-        converted.header_hash,
-        converted.file_digest,
-        started.elapsed().as_millis(),
-    )])
+    Ok(lines)
 }
 
 /// Converts `ranks` (every rank when empty) of a GLM-5.3 checkpoint one at a time, so one rank's
@@ -356,16 +375,21 @@ fn inspect_glm(
     )])
 }
 
-/// One Qwen4-Exp rank file's index, with `verify_weights` every slot's digest.
+/// One Qwen4-Exp rank file's index, checked as the rank and world its preamble names, and with
+/// `verify_weights` every slot's digest.
 fn inspect_qwen(
     path: &Path,
     preamble: ConvertedPreamble,
     verify_weights: bool,
 ) -> Result<Vec<String>, String> {
+    let layout = TpLayout {
+        rank: preamble.rank,
+        world_size: preamble.world,
+    };
     let index = if verify_weights {
-        qwen_verify_converted(path)?
+        qwen_verify_converted(path, layout)?
     } else {
-        qwen_read_index(path)?.1
+        qwen_read_index(path, layout)?.1
     };
     Ok(vec![format!(
         "sparkflash convert inspect {}: {} rank {}/{}, {} weights, {} NVFP4 scale pairs from {}, data_offset={}, padded_data_bytes={}, header_hash={:#018x}, file_digest={:#018x}, weights_verified={verify_weights}",
@@ -498,12 +522,20 @@ mod tests {
         assert!(inspect_lines[0].contains("weights_verified=true"));
     }
 
-    /// A checkpoint whose `config.json` names GLM-5.3 is the GLM pack's to convert, so DeepSeek's
-    /// padding flag is refused for it, and `--inspect` reads a GLM rank file by its index's model.
+    /// A checkpoint whose `config.json` names Qwen4-Exp is the Qwen pack's to convert: TP=1 by
+    /// default, and one file a rank of the world `--tp-world-size` names. `--inspect` reads a
+    /// rank file by the model and layout its own index names.
     #[test]
     fn a_qwen_checkpoint_and_rank_file_go_to_the_qwen_pack() {
         let directory = tempfile::tempdir().expect("a temporary directory");
-        let config = sparkflash_model_qwen4_exp::Qwen4ExpConfig::tiny();
+        // Four heads, four key-value heads and a 128-wide expert split over 1, 2 and 4 ranks.
+        let config = sparkflash_model_qwen4_exp::Qwen4ExpConfig {
+            num_key_value_heads: 4,
+            linear_num_key_heads: 4,
+            linear_num_value_heads: 4,
+            moe_intermediate_size: 128,
+            ..sparkflash_model_qwen4_exp::Qwen4ExpConfig::tiny()
+        };
         sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory.path(), &config, 7)
             .expect("the fixture writes");
         let output = tempfile::tempdir().expect("an output directory");
@@ -520,6 +552,30 @@ mod tests {
         let inspected = run_lines(&["--inspect", file.to_str().unwrap(), "--verify-weights"])
             .expect("the rank file inspects");
         assert!(inspected[0].contains("qwen4-exp"), "{}", inspected[0]);
+        assert!(
+            inspected[0].contains("weights_verified=true"),
+            "{}",
+            inspected[0]
+        );
+
+        let sharded = tempfile::tempdir().expect("a sharded output directory");
+        let lines = run_lines(&[
+            "--checkpoint",
+            directory.path().to_str().unwrap(),
+            "--output-dir",
+            sharded.path().to_str().unwrap(),
+            "--tp-world-size",
+            "2",
+            "--tp-rank",
+            "1",
+        ])
+        .expect("rank 1 of 2 converts");
+        assert!(lines[0].contains("qwen4-exp rank 1/2"), "{}", lines[0]);
+        let rank = sharded.path().join("rank-1-of-2.bin");
+        assert!(rank.is_file());
+        let inspected = run_lines(&["--inspect", rank.to_str().unwrap(), "--verify-weights"])
+            .expect("the sharded rank file inspects");
+        assert!(inspected[0].contains("rank 1/2"), "{}", inspected[0]);
         assert!(
             inspected[0].contains("weights_verified=true"),
             "{}",
