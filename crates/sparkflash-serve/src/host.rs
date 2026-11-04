@@ -14,9 +14,13 @@
 
 //! The generic host driver.
 //!
-//! The driver owns one backend and opens one sequence per request. Requests arrive through a
-//! bounded channel and their events leave through a bounded reply channel, so a client that stops
-//! reading applies backpressure to the engine rather than growing an unbounded buffer.
+//! The driver owns one backend and one sequence per worker. A worker keeps its sequence between
+//! requests when the backend says the sequence can continue from the prefix the next prompt shares
+//! with it ([ModelSession::reusable_prefix]), so a chat turn prefills only the text it added
+//! instead of the whole conversation. A prompt that does not extend the held tokens gets a fresh
+//! session; the two are equivalent, and only the work differs. Requests arrive through a bounded
+//! channel and their events leave through a bounded reply channel, so a client that stops reading
+//! applies backpressure to the engine rather than growing an unbounded buffer.
 //!
 //! `HostOptions::concurrency` chooses how many requests execute at once. Each worker owns one
 //! session at a time, so concurrency N means N independent sequences progressing in parallel; it
@@ -24,7 +28,9 @@
 //! which preserves the serial one-job-at-a-time behavior. A value above 1 is for backends whose
 //! sessions are independent; a backend whose sessions share mutable engine state must serialize
 //! that state itself (the Qwen device arm gives each session its own stream, so their kernels can
-//! overlap). A backend that only supports one live session must stay at 1.
+//! overlap). A backend that only supports one live session must stay at 1. With more than one
+//! worker a request is served by whichever worker takes it, so a prefix is reused only when the
+//! same worker sees the next request.
 //!
 //! This adapter is intentionally smaller than the V4.1 reference driver. It supports text
 //! requests, stop strings, sample logprobs and the standard usage/timing envelope. Prompt
@@ -50,7 +56,9 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_model::telemetry::PrefixMatchPlan;
-use sparkflash_model::{ModelBackend, ModelDescriptor, PromptCodec, Sampling, Speculation};
+use sparkflash_model::{
+    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation,
+};
 use tokio::sync::mpsc;
 
 /// The default engine queue depth.
@@ -289,15 +297,12 @@ impl InferenceEngine for HostDriver {
                 ENGINE_GONE_CODE,
             );
         }
-        let head = stream::once(async move {
-            EngineEvent::Started {
-                prompt_tokens,
-                cached_tokens: 0,
-            }
-        });
+        // The worker sends `Started` once it has decided which session serves the request, so the
+        // event can carry the prefix the engine already holds. It is still the first event.
         let answers = stream::unfold(
             AnswerState {
                 answers,
+                prompt_tokens,
                 done: false,
             },
             move |mut state| async move {
@@ -305,13 +310,20 @@ impl InferenceEngine for HostDriver {
                     return None;
                 }
                 match state.answers.recv().await {
+                    Some(Reply::Started { cached_tokens }) => Some((
+                        EngineEvent::Started {
+                            prompt_tokens: state.prompt_tokens,
+                            cached_tokens,
+                        },
+                        state,
+                    )),
                     Some(Reply::Delta(text)) => Some((EngineEvent::ContentDelta(text), state)),
                     Some(Reply::TokenLogprobs(logprob)) => {
                         Some((EngineEvent::TokenLogprobs(logprob), state))
                     }
                     Some(Reply::Done(summary)) => {
                         state.done = true;
-                        Some((finished_event(prompt_tokens, *summary), state))
+                        Some((finished_event(state.prompt_tokens, *summary), state))
                     }
                     Some(Reply::Failed(message)) => {
                         state.done = true;
@@ -337,7 +349,7 @@ impl InferenceEngine for HostDriver {
                 }
             },
         );
-        head.chain(answers).boxed()
+        answers.boxed()
     }
 
     fn cluster_stats(&self) -> ClusterStatsSnapshot {
@@ -356,6 +368,7 @@ impl InferenceEngine for HostDriver {
 /// The state of one request's answer stream.
 struct AnswerState {
     answers: mpsc::Receiver<Reply>,
+    prompt_tokens: usize,
     done: bool,
 }
 
@@ -372,6 +385,10 @@ struct Job {
 
 /// One element of the worker's answer.
 enum Reply {
+    /// The worker admitted the request and knows how much of its prompt the engine holds.
+    Started {
+        cached_tokens: usize,
+    },
     Delta(String),
     TokenLogprobs(Box<TokenLogprob>),
     Done(Box<HostSummary>),
@@ -384,6 +401,8 @@ struct HostSummary {
     finish_reason: FinishReason,
     timing: RequestTiming,
     speculation: Speculation,
+    /// Prompt tokens the session already held, from [ModelSession::cached_tokens].
+    cached_tokens: usize,
 }
 
 /// The wall-clock numbers one request measured.
@@ -395,8 +414,10 @@ struct RequestTiming {
 }
 
 impl RequestTiming {
+    /// `prompt_tokens` is the tokens the prefill forwarded, not the whole prompt: the cached
+    /// prefix neither took time nor belongs in the rate.
     fn measure(
-        prompt_tokens: usize,
+        prefilled_tokens: usize,
         completion_tokens: usize,
         prefill: Duration,
         ttft: Option<Duration>,
@@ -405,7 +426,7 @@ impl RequestTiming {
         let first = ttft.map_or(0.0, |instant| instant.as_secs_f64());
         Self {
             ttft_ms: first * 1000.0,
-            prefill_tok_per_s: rate(prompt_tokens, prefill.as_secs_f64()),
+            prefill_tok_per_s: rate(prefilled_tokens, prefill.as_secs_f64()),
             decode_tok_per_s: rate(
                 completion_tokens.saturating_sub(1),
                 total.as_secs_f64() - first,
@@ -432,11 +453,14 @@ fn host_thread(
     // report per worker, and a clone held by a worker that later hangs would keep the channel
     // open after the reports it needs have already arrived.
     drop(ready);
+    // The sequence this worker last served, kept for the next request when the backend says it
+    // can continue from the prefix that request shares with it.
+    let mut held: Option<Box<dyn ModelSession>> = None;
     while let Ok(job) = jobs.recv() {
         metrics.request_admitted();
         let replies = job.replies.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            run_request(backend.as_ref(), codec.as_ref(), job, &metrics)
+            run_request(backend.as_ref(), codec.as_ref(), job, &metrics, &mut held)
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
@@ -463,22 +487,55 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// How many of `prompt` the held session already holds, when it may serve this request.
+///
+/// The session must have a reusable history, the prompt must extend it (strictly: a session with
+/// nothing left to forward has no logits for the last token), and the histories must agree token
+/// for token.
+fn reusable_prefix_len(session: &dyn ModelSession, prompt: &[u32]) -> Option<usize> {
+    let history = session.reusable_prefix()?;
+    (!history.is_empty() && prompt.len() > history.len() && prompt.starts_with(history))
+        .then_some(history.len())
+}
+
 fn run_request(
     backend: &dyn ModelBackend,
     codec: &dyn PromptCodec,
     job: Job,
     metrics: &Metrics,
+    held: &mut Option<Box<dyn ModelSession>>,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let mut session = backend
-        .open_session()
-        .map_err(|error| format!("the backend could not open a sequence: {error}"))?;
+    let (mut session, cached) = match held.take() {
+        Some(session) => match reusable_prefix_len(session.as_ref(), &job.prompt_tokens) {
+            Some(cached) => (session, cached),
+            None => (
+                backend
+                    .open_session()
+                    .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
+                0,
+            ),
+        },
+        None => (
+            backend
+                .open_session()
+                .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
+            0,
+        ),
+    };
     session.set_sampling(job.sampling);
     if job.logprobs.wants_prompt() {
         return Err(
             "the generic host backend does not expose per-position prompt logits yet".to_owned(),
         );
     }
+    // The worker owns the decision, so the client learns the hit before the prefill runs and the
+    // event stays first in the stream.
+    job.replies
+        .blocking_send(Reply::Started {
+            cached_tokens: cached,
+        })
+        .map_err(|_| "the client stopped reading this response".to_owned())?;
     let prefill_started = Instant::now();
     let mut step = session.prefill(&job.prompt_tokens).map_err(|error| {
         format!(
@@ -487,6 +544,7 @@ fn run_request(
         )
     })?;
     let prefill_elapsed = prefill_started.elapsed();
+    let cached = session.cached_tokens();
     let mut generated = Vec::new();
     let mut decoded = String::new();
     let mut stop_buffer = StopBuffer::new(&job.stop);
@@ -537,8 +595,10 @@ fn run_request(
             .map_err(|_| "the client stopped reading this response".to_owned())?;
     }
     let elapsed = started.elapsed();
+    // The prefill rate is the work the engine did, not the prompt it was given: the tokens the
+    // session already held cost nothing and are reported as the request's cache hit.
     let timing = RequestTiming::measure(
-        job.prompt_tokens.len(),
+        job.prompt_tokens.len().saturating_sub(cached),
         completion_tokens,
         prefill_elapsed,
         ttft,
@@ -551,14 +611,24 @@ fn run_request(
     } else {
         FinishReason::Stop
     };
+    let speculation = session.speculation();
     job.replies
         .blocking_send(Reply::Done(Box::new(HostSummary {
             completion_tokens,
             finish_reason,
             timing,
-            speculation: session.speculation(),
+            speculation,
+            cached_tokens: cached,
         })))
         .map_err(|_| "the client stopped reading this response".to_owned())?;
+    // Hold the sequence for the next request when it can continue from a prefix. The client has
+    // its whole answer by now, so a failure to store costs nothing.
+    if session
+        .reusable_prefix()
+        .is_some_and(|prefix| !prefix.is_empty())
+    {
+        *held = Some(session);
+    }
     Ok(())
 }
 
@@ -758,21 +828,23 @@ fn top_k(logprobs: &[f32], count: usize) -> Vec<usize> {
 fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     let speculation = summary.speculation;
+    let cached = summary.cached_tokens.min(prompt_tokens);
     let stats = DeepSeekSparkRequestStats {
         kv_cache: PrefixMatchPlan {
             total_prompt_tokens: prompt_tokens,
-            global_kv_cached_tokens: 0,
-            uma_hit_tokens: 0,
+            global_kv_cached_tokens: cached,
+            uma_hit_tokens: cached,
             nvme_restored_tokens: 0,
             swa_tail_hit: false,
             encoder_swa_replay_tokens: 0,
-            // The host path has no prefix cache: every prompt token is part of the uncached
-            // suffix. Reporting zero here made the extended stats look like a 100% hit while the
-            // OpenAI usage block correctly said zero cached tokens.
-            uncached_suffix_tokens: prompt_tokens,
+            uncached_suffix_tokens: prompt_tokens - cached,
             decoder_swa_replay_tokens: 0,
         },
-        kv_cache_hit_rate: 0.0,
+        kv_cache_hit_rate: if prompt_tokens == 0 {
+            0.0
+        } else {
+            cached as f64 / prompt_tokens as f64
+        },
         engram_layers: default_engram_layers(),
         // The confidence gate is the V4.1 driver's; the generic host offers every draft it gets.
         dspark_speculative: DSparkStepStats::from_counts(
@@ -799,8 +871,8 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
             prompt_tokens_details: PromptTokensDetails {
-                cached_tokens: 0,
-                uma_cached_tokens: 0,
+                cached_tokens: cached,
+                uma_cached_tokens: cached,
                 nvme_cached_tokens: 0,
                 image_tokens: 0,
             },
@@ -809,8 +881,8 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
                 accepted_prediction_tokens: 0,
                 rejected_prediction_tokens: 0,
             },
-            prompt_cache_hit_tokens: 0,
-            prompt_cache_miss_tokens: prompt_tokens,
+            prompt_cache_hit_tokens: cached,
+            prompt_cache_miss_tokens: prompt_tokens - cached,
         },
         stats: Box::new(stats),
     }

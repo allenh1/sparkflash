@@ -2207,6 +2207,12 @@ struct DeviceSequence {
     /// Recorded after the embed that reads the token slab, the same way.
     tokens_staged: StagingFence,
     position: usize,
+    /// Every token this sequence has forwarded, oldest first: every prefill's fresh tokens and
+    /// every decode's. The serving adapter may keep the sequence between requests and hand it a
+    /// prompt that starts with these ([ModelSession::reusable_prefix]).
+    consumed: Vec<u32>,
+    /// How many of the last prefill's tokens its caches already held, for the request's usage.
+    prefill_cached: usize,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
     /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements; the MTP
@@ -4300,6 +4306,8 @@ impl DeviceSequence {
             ple_staged,
             tokens_staged,
             position: 0,
+            consumed: Vec::new(),
+            prefill_cached: 0,
             score_stride,
             keys: buffers.keys,
             values: buffers.values,
@@ -4769,11 +4777,28 @@ impl ModelSession for DeviceSequence {
         self.speculation
     }
 
+    /// The tokens this sequence has forwarded, while its caches end exactly where they end.
+    ///
+    /// A verified chain the adapter has not handed back is already in the caches, so the state is
+    /// ahead of the tokens the caller knows: that sequence reports nothing and the next request
+    /// opens a fresh one. The same holds for a position the tokens do not explain.
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        (self.spec_queue.is_empty() && self.position == self.consumed.len())
+            .then_some(self.consumed.as_slice())
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.prefill_cached
+    }
+
     fn set_sampling(&mut self, sampling: Sampling) {
         // The penalties, temperature, top-k and top-p run on the host over the logits row this
         // step already copied back, so non-greedy requests are served rather than approximated.
         self.sampling = sampling;
         self.sampler.reset();
+        // The adapter calls this once per request, and a kept sequence carries the last one's
+        // counts: a request reports its own speculation, not the session's lifetime.
+        self.speculation = Speculation::default();
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
@@ -4787,7 +4812,33 @@ impl ModelSession for DeviceSequence {
             .cuda
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
+        // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
+        // case only the tokens past it are forwarded. Its sampler history is the whole prompt
+        // either way: the penalties count every token the request reads.
+        let reused = self
+            .consumed
+            .iter()
+            .zip(tokens)
+            .take_while(|(held, given)| held == given)
+            .count();
+        if reused != self.consumed.len() || reused >= tokens.len() {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "a prefill must extend the {} token(s) this sequence holds by at least one; \
+                     this one does not",
+                    self.consumed.len()
+                ),
+            ));
+        }
+        self.prefill_cached = reused;
         self.sampler.record_prompt(tokens);
+        self.consumed.extend_from_slice(&tokens[reused..]);
+        // A proposal drafted past the previous end anchors on a token the new suffix replaces; it
+        // is re-drafted from the new end below, like a fresh prompt's.
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        let tokens = &tokens[reused..];
         // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
         // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
         // keeps, so the chunks would find most of them evicted again.
@@ -4847,6 +4898,7 @@ impl ModelSession for DeviceSequence {
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         self.sampler.record(token);
+        self.consumed.push(token);
         // A verified chain already fed the model this token, and its logits here are the ones the
         // last step read back; only the choice of the following token is left to make.
         if let Some(front) = self.spec_queue.first() {

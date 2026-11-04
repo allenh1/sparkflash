@@ -540,6 +540,67 @@ fn a_wide_chunk_computes_every_row_as_dense_rows_chunks_do() {
     }
 }
 
+/// A sequence kept across requests holds the prefix it forwarded: the next prompt forwards only
+/// the tokens past it, and lands on the logits a cold prefill of the whole prompt produces.
+#[test]
+fn a_kept_sequence_prefills_only_the_tokens_past_its_prefix() {
+    if !cubin_available() {
+        eprintln!("skipping the kept sequence: this build has no Qwen4-Exp cubin");
+        return;
+    }
+    let config = Qwen4ExpConfig::tiny();
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    write_synthetic_checkpoint(temp.path(), &config, 7).expect("the fixture writes");
+    let backend = match Qwen4ExpDeviceBackend::open_with_prefill(
+        temp.path(),
+        64,
+        PrefillPlan::new(CHUNK, false),
+    ) {
+        Ok(backend) => backend,
+        Err(error) if error.code() == "qwen4_device" && error.message().contains("CUDA:") => {
+            eprintln!("skipping the kept sequence: {error}");
+            return;
+        }
+        Err(error) => panic!("the device arm refused the fixture checkpoint: {error}"),
+    };
+    let prompt: Vec<u32> = (0..9).map(|index| 3 + (index % 5) as u32).collect();
+    let mut warm = backend.open_session().expect("a device session opens");
+    let mut step = warm.prefill(&prompt).expect("the prompt prefills");
+    let mut fed = prompt.clone();
+    // The serving adapter decodes every token it emits, so the kept history is the prompt and
+    // the reply.
+    for _ in 0..3 {
+        let token = step.next_token.expect("the fixture answers three tokens");
+        fed.push(token);
+        step = warm.decode(token).expect("the decode runs");
+    }
+    assert_eq!(
+        warm.reusable_prefix(),
+        Some(fed.as_slice()),
+        "an idle sequence holds exactly the tokens it forwarded"
+    );
+    assert_eq!(warm.cached_tokens(), 0);
+
+    let mut extended = fed.clone();
+    extended.extend_from_slice(&[25, 27, 29, 31]);
+    let continued = warm.prefill(&extended).expect("the suffix prefills");
+    assert_eq!(
+        warm.cached_tokens(),
+        fed.len(),
+        "only the tokens past the held prefix were forwarded"
+    );
+    assert_eq!(warm.reusable_prefix(), Some(extended.as_slice()));
+
+    let mut cold = backend.open_session().expect("a second session opens");
+    let fresh = cold.prefill(&extended).expect("the whole prompt prefills");
+    compare(
+        "a continued prefill against a cold one",
+        &fresh.logits,
+        &continued.logits,
+        RELATIVE_TOLERANCE,
+    );
+}
+
 /// The prefill's logits and three decode steps' after it under `chunk`-token tensor-core chunks,
 /// or None when this machine cannot run the device.
 fn wide_chunk_logits(

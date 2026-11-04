@@ -132,10 +132,10 @@ impl Default for Sampling {
 
 /// One sequence's backend state.
 ///
-/// A session is created per request so two requests never share KV state. It is `Send`, so a
-/// serving adapter may move it between worker threads, but it is not `Sync`: exactly one thread
-/// calls [`ModelSession::prefill`] or [`ModelSession::decode`] at a time. A backend whose sessions
-/// share mutable engine state must serialize that state itself; see [`ModelBackend`].
+/// A session serves one request at a time. It is `Send`, so a serving adapter may move it between
+/// worker threads and keep it between requests, but it is not `Sync`: exactly one thread calls
+/// [`ModelSession::prefill`] or [`ModelSession::decode`] at a time. A backend whose sessions share
+/// mutable engine state must serialize that state itself; see [`ModelBackend`].
 pub trait ModelSession: Send {
     /// Applies this request's sampler before any step.
     ///
@@ -162,6 +162,26 @@ pub trait ModelSession: Send {
     /// The default is zero, for a backend that drafts nothing.
     fn speculation(&self) -> Speculation {
         Speculation::default()
+    }
+
+    /// The tokens whose state this sequence holds, when it can continue from them.
+    ///
+    /// A serving adapter may keep a session between requests and hand it a prompt that starts
+    /// with these tokens; the session then forwards only the rest. `None` - the default - says
+    /// the session cannot serve another request, and the adapter opens a fresh one. A history
+    /// counts only tokens the sequence has actually forwarded and still holds: a state that is
+    /// ahead of them (an un-consumed speculative tail, say) must report `None` rather than a
+    /// prefix it cannot honour.
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        None
+    }
+
+    /// How many of the last [`Self::prefill`]'s tokens the sequence already held.
+    ///
+    /// This is what the request reports as its cache hit. The default is zero, for a session
+    /// that forwards every prompt token.
+    fn cached_tokens(&self) -> usize {
+        0
     }
 }
 

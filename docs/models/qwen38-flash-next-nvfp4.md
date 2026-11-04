@@ -883,10 +883,26 @@ channels: text before `</think>` becomes `reasoning_content`, `<tool_call>` XML 
 `finish_reason: "tool_calls"` when it carried a call. The adapter is installed by the Qwen serving
 arm only.
 
-The host arm has no prefix cache: every request prefills its whole prompt, so the OpenAI usage
-block reports `cached_tokens: 0`, `prompt_cache_hit_tokens: 0`, and
-`prompt_cache_miss_tokens: prompt_tokens`, and the extended KV stats report the whole prompt as
-the uncached suffix. That is the honest answer rather than a zeroed hit rate.
+The arm reuses a prompt's prefix across requests. The serving driver keeps one sequence per
+worker, and a request whose prompt extends the tokens that sequence forwarded - a chat turn that
+resends the conversation with the new message appended - prefills only the tokens past them. The
+OpenAI usage block reports the held tokens as `cached_tokens`/`prompt_cache_hit_tokens` and the
+rest as `prompt_cache_miss_tokens`, the extended KV stats report the same split, and the prefill
+rate counts the tokens that were actually forwarded.
+
+The reuse is deliberately narrow, because the Gated DeltaNet recurrence has no checkpoint to
+rewind to:
+
+* a prompt that shares a prefix but diverges before the end (the same system prompt with a
+  different first user turn, say) starts a fresh sequence and prefills whole;
+* a request cut short of its verified tail (`max_tokens`, a stop string) reports no reusable
+  state - its caches hold tokens the caller never saw - so the next request starts cold rather
+  than continue from a position the transcript does not contain;
+* with `--concurrency` above 1 a request is served by whichever worker takes it, so only a
+  request the same worker keeps continues from a prefix;
+* the suffix is prefilled as its own chunk, so a continued request's logits can differ from a cold
+  one's in the prefill's last bits (the same about-1e-5 relation the tensor-core image and the
+  token kernels have). A greedy answer does not move in practice.
 
 Decode used to fall with context because `q4e_qsa_pick` scanned all 512 kept blocks for every
 block past the indexer budget. The kept set is a min-heap now, so each later block costs
