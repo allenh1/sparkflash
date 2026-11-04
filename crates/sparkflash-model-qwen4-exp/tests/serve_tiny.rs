@@ -29,17 +29,15 @@ use serde_json::{Value, json};
 use sparkflash_api::engine::InferenceEngine;
 use sparkflash_api::state::AppState;
 use sparkflash_model::ModelBackend;
-use sparkflash_model_qwen4_exp::ByteCodec;
 use sparkflash_model_qwen4_exp::device::{Qwen4ExpDeviceBackend, cubin_available};
 use sparkflash_model_qwen4_exp::{MODEL_ID, SyntheticCheckpoint};
+use sparkflash_ops::codec::ByteCodec;
 use sparkflash_serve::{HostDriver, HostOptions};
 use tower::ServiceExt as _;
 
 /// The context window the served fixture allocates.
 const CONTEXT: usize = 32;
 
-/// The pack's fixture codec: every id maps to a printable character, so a decoded completion is
-/// never empty by construction, and no id it produces is an end-of-generation id.
 /// The router the tests drive, or None when this build/machine cannot run the device.
 ///
 /// Built once and cloned: several tests sharing one process must not each open their own CUDA

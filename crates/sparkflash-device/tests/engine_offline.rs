@@ -100,6 +100,7 @@ fn request(temperature: f32) -> EngineRequest {
         trace_scopes: 0,
         trace_steps: 0,
         constraint: None,
+        forced_tokens: Vec::new(),
     }
 }
 

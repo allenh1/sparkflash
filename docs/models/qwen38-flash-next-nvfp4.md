@@ -120,6 +120,93 @@ the warm-up pass is gone. On a DGX Spark (TP=1), prefill went from 625, 586 and 
 | `SPARKFLASH_QWEN4_PREFILL_MMA=0` | every chunk on the token kernels, at their 128-token chunk |
 | `SPARKFLASH_QWEN4_PREFILL_CHUNK=N` | tokens per chunk, clamped to 16..4,096 and, past 512, rounded down to a multiple of 512; the scratch is about 0.85 MiB a token |
 | `SPARKFLASH_QWEN4_PREFILL_PARTS=dense,experts,gdn` | which of the image's three paths a chunk may take, for bisecting a difference against the token kernels |
+| `SPARKFLASH_DECODE_MMA=off` | decode steps, verifies and chunks under 64 rows on the token kernels ([Decode on the tensor cores](#decode-on-the-tensor-cores)) |
+
+### Decode on the tensor cores
+
+`[decode] tensor_cores` (on by default; `SPARKFLASH_DECODE_MMA=off` turns it off, the DeepSeek
+arm's switch, spelling and default) puts every forward on the tensor-core image: a decode step, a
+speculative verify, a chunk under 64 rows and the suffix of a continued request. Each kernel there
+computes a row to the bits it gets in a 4,096-token chunk, whatever else shares the launch, so a
+chat turn continued from the sequence a worker kept ([Serving](#serving)) is bit for bit
+a cold prefill of its whole transcript. On the eight-prompt resume set (first turns of up to 480
+tokens, then a second user turn), every continued turn matched its cold prefill exactly, with the
+drafter and without. With the token kernels decoding, seven of the eight continued turns differed
+(all eight without the drafter): mean KL 6.4e-4 a token against the cold prefill, top-1 agreement
+99.2%, and two of the eight greedy continuations changed (three without the drafter). The
+numerics report is [v1-tc-decode.md](../numerics/qwen38/v1-tc-decode.md).
+
+Three of the image's kernels have a tile cut for wide chunks, so each has a few-row twin that runs
+the same chain of MMAs on the same operands and differs only in how the work is cut:
+
+* `q4p_dense_rows` for the BF16 projections: one m16 tile of rows and four warps of eight output
+  columns a CTA. A round is one 512-byte load of each of a warp's eight weight rows, 16 bytes a
+  lane (`ld.global.nc.L1::no_allocate.L2::256B`, the stream a plain GEMV reads), staged in the
+  warp's own shared tile and taken back out with `ldmatrix` into the B fragments the wide tile's
+  `ldmatrix` fills; the next round streams while this one computes. On the release's large shapes
+  it reads 214-233 GB/s, 3-8% past the first form (a 16-byte load a K block, quad-transposed in
+  registers), where the CTA tile's shared-memory staging managed about 160;
+* `q4p_moe_rows_gate_up` and `q4p_moe_rows_down` for the routed experts: two groups of eight
+  weight rows a warp, read 16 bytes a lane and quad-transposed, against the panel's 128 (177 to
+  127 us a layer at one token);
+* `q4p_gemm_rows` for the token GEMM the image falls back to on shapes off its tile (the
+  hyper-connection's four-row injection, the GDN gates, the shared-expert gate), one thread an
+  output over its rows' weights, which the CTA first stages in shared memory 16 bytes a load.
+
+Their splits of K are the wide chunk's: the dense projection's chosen per 512-row piece as before,
+the token GEMM's a whole tile's whatever the run's width. Where the wide tile leaves its slices to
+`q4e_gemm_reduce` (and an unsplit sum to `q4p_epilogue`), a few-row launch finishes its own: the
+last CTA of a tile to write its slice adds the slices in the same order and applies the same
+epilogue, counted in on a ticket a tile that it resets, the token path's tiled-GEMV scheme. The
+tickets sit after the partials of every `gemm_partials` region, so they follow it into a batch
+lane's slice and the overlap stream's copy. A decode step drops a reduce or epilogue launch for
+nearly every projection it makes.
+
+Projections of one input go out as one `q4p_dense_rows` launch (`gemm_group`): up to four
+matrices the dense tile takes, with the same split, and up to two it does not, which ride the
+launch as `q4p_gemm_rows` CTAs past the dense ones. A Gated DeltaNet layer's in-projection is one
+launch (q, k and v with z; the b and a gates riding), the MoE block's router, shared expert and
+shared up another (the shared expert's one-row gate riding), and the hyper connection's down
+projection carries its four-row injection. Each CTA finds its matrix or its rider from its column
+block, so a matrix's rows see exactly the work they would alone, and a rider runs the same device
+function on the same split as its own `q4p_gemm_rows` launch; the grouping fills the 48 SMs a
+narrow matrix leaves idle and takes the small launches out of the step. `tests/few_rows.rs` holds
+each twin to its tile for every row of a 1..=63-row launch, slices and finished outputs both, a
+grouped launch to each matrix's own and a rider to its own launch, and the dense and expert forms
+to an f64 bound; `device_parity`'s `a_continued_conversation_is_the_bits_of_a_cold_prefill` holds
+the whole forward to it. Every `q4p_` kernel now also launches with programmatic dependent
+launch, as the token kernels do; `crates/sparkflash-kernels/tests/pdl_entry.rs` holds each one to
+the dependency wait.
+
+Why a bf16 head and remainder rather than f32: the token kernels are f32 FMA chains, the host
+oracle's arithmetic, and f32 costs nothing in a step that is bound by reading weights. The tensor
+cores take no f32 operand and TF32 keeps 10 bits, so the image splits each f32 activation into its
+bf16 head and the bf16 of what is left, about 16 significant bits, and runs both through the same
+weight fragments into one f32 accumulator. At the release's shapes that is within 5e-5 of the
+largest output against f64 (measured 7e-6 to 5e-5), where a single bf16 activation lands near
+6e-4. It is the prefill's own arithmetic: decode now matches the prompt rather than the reverse.
+
+On DGX Sparks (greedy, the median of five 256-token completions of raw story prompts, timed from
+the first streamed token to the last), the default against `SPARKFLASH_DECODE_MMA=off`:
+
+| | tensor cores (default) | token kernels |
+| :-- | ---: | ---: |
+| TP=1, no drafter (`SPARKFLASH_QWEN4_SPEC=0`) | 18.5 tok/s | 20.1 tok/s |
+| TP=1, DFlash 2 (`SPARKFLASH_QWEN4_SPEC=1`) | 28.0 tok/s | 29.9 tok/s |
+| TP=4, DFlash 2 | 39.8 tok/s | 43.1 tok/s |
+
+The token kernels remain faster at one stream: at TP=1 by 8% without the drafter and 6% with it, and
+at TP=4 by 8%. Four streams under `--fuse-batch` (TP=1, 256 tokens each, two launches of each arm)
+measured no difference past the run's noise: 43.7 to 46.7 tok/s aggregate on the tensor cores
+against 34.4 to 48.5 on the token kernels, with step medians of 79 to 81 ms against 77 to 117 (the
+first pass after the first boot, 25.9 tok/s on a cold page cache, left out). At TP=1, both an nsys
+critical-path split of a step and the `SPARKFLASH_QWEN4_PROF` stages put the difference in
+`q4p_dense_rows` reading the medium shapes slower than the token GEMVs do, where the large ones are
+at parity (the LM head 5.45 against 5.31 ms) and attention's q/k/v projection is faster. In the
+order of what they cost: the hyper connection's down and up projections (about 1.8 ms of a 52 ms
+step; 147 and 188 GB/s against the tiled GEMVs' 200 and 220), the Gated DeltaNet in-projection (0.9
+ms, 372 against 347 us a layer), attention's in-projection, whose four matrices take two splits and
+so two launches (0.45 ms), and the MoE block's group (0.3 ms).
 
 ### Speculative decode with DFlash 2
 
@@ -150,9 +237,11 @@ drafts over the eight-prompt set - is the drafter's own, not a mis-fed one; and 
 confirms the taps are a TP1/CP1 capture, which is what this arm serves.
 
 A step verifies the chain as one forward of the target over up to eight rows. Every row computes
-exactly as the one-token decode step it stands in for - the batched GEMV, the tiled wide GEMVs and
-the hyper passes are held to the row-alone bits by `tests/verify_rows.rs` - so the greedy text with
-a drafter is the text without one. The verify leaves each Gated DeltaNet layer's recurrent state
+exactly as the one-token decode step it stands in for - by default on the tensor-core image's
+few-row forms, which `tests/few_rows.rs` holds to the bits a row gets at any row count; with
+`SPARKFLASH_DECODE_MMA=off` on the batched GEMV, the tiled wide GEMVs and the hyper passes, which
+`tests/verify_rows.rs` holds to the row-alone bits - so the greedy text with a drafter is the text
+without one. The verify leaves each Gated DeltaNet layer's recurrent state
 as it found it, writes its last row's state into a spare, and keeps the rows' convolved inputs and
 gates. A step that keeps every row swaps the spare in; one that keeps fewer first replays just
 those rows into the spare through the same recurrence kernel, which is bit for bit the state they
@@ -406,8 +495,9 @@ localised the E4M3 bug to layer 0's expert accumulator without a 77.8 GiB bisect
 outside the expert table is a typed error that prints every index and weight, not an
 index-out-of-bounds panic.
 
-The device arithmetic has one documented numeric difference: NVFP4 experts use f32 activations, so
-`input_scale` is carried but not applied. That is more accurate than W4A4 but not bit-identical to
+The device arithmetic has one documented numeric difference: NVFP4 experts take 16-bit
+activations (a BF16 head and remainder; f32 on the token kernels), so `input_scale` is carried but
+not applied. That is more accurate than W4A4 but not bit-identical to
 vLLM's quantised path, which is why the gate is a tolerance.
 
 ## Decode throughput
@@ -614,7 +704,11 @@ Concurrency alone does not add throughput. A decode step reads about 10.9 GB of 
 row, so two sessions on their own streams read it twice: measured on this node with four 256-token
 prompts, 29.9 tok/s aggregate at one session with the DFlash 2 drafter, 32.8 at two and 32.4 at
 four (1.10x), and 1.03x on 32-token greedy requests. The DRAM is the ceiling and the streams share
-no bytes.
+no bytes. These figures, and the table below, were measured on the token kernels, before D68 made
+the tensor-core decode the default; they are what `SPARKFLASH_DECODE_MMA=off` serves. On the
+default, one session with the drafter measures 28.0 tok/s, and four `--fuse-batch` streams
+measure the same as on the token kernels within the run's noise
+([Decode on the tensor cores](#decode-on-the-tensor-cores)).
 
 `--fuse-batch` (requires `--concurrency` above 1, `--model` only) steps the sessions as one batch
 instead. Every member's row goes through one pass over the weights: the row-independent stages -
@@ -692,6 +786,15 @@ one full 262,144-token window and needs a shorter `--context` for a second sessi
 test `two_concurrent_requests_are_both_served` drives two requests through the real router and checks
 that both complete; `SPARKFLASH_QWEN4_BATCH_TRACE` names each fused step's members on stderr, which is
 how a run proves its requests were actually fused.
+
+A slot keeps its sequence between requests, so a request's first prompt starts the slot on a fresh
+one: its prefill worker allocates the new sequence before the old goes, as the host driver does for
+a fresh session, and a device with no room for it refuses that request. Until that, a slot
+prefilled each new prompt onto the last request's caches, so a reused slot answered a conversation
+nobody sent; since the host path's prefix reuse the sequence refuses such a prompt, and every
+request a reused slot took failed. The four-member figures above were measured before either, so
+their later runs decoded past their own prompts' context. `a_reopened_slot_starts_cold` serves B,
+then A, then B again on one slot and requires the third run to be the first.
 
 ### Tensor parallel: TP=2 and TP=4
 
@@ -797,7 +900,7 @@ sparse attention went from 542 to 220 ms, and prefill from about 1,375 to 1,525 
 Limits on a tensor-parallel group:
 
 * One request at a time: every forward is a collective all the ranks step through, so
-  `--fuse-batch` is refused.
+  `--fuse-batch`, `--kv-budget-gib` and `--concurrency` above 1 are refused.
 * The MTP layer is not loaded; a greedy request (every token its row's argmax) drafts with DFlash 2,
   which every rank runs whole. Rank 0 decides whether a request speculates and the request frame
   carries the decision; a sampled or logprobs request decodes a token a step.
@@ -899,10 +1002,14 @@ rewind to:
   state - its caches hold tokens the caller never saw - so the next request starts cold rather
   than continue from a position the transcript does not contain;
 * with `--concurrency` above 1 a request is served by whichever worker takes it, so only a
-  request the same worker keeps continues from a prefix;
-* the suffix is prefilled as its own chunk, so a continued request's logits can differ from a cold
-  one's in the prefill's last bits (the same about-1e-5 relation the tensor-core image and the
-  token kernels have). A greedy answer does not move in practice.
+  request the same worker keeps continues from a prefix, and a `--fuse-batch` session keeps none
+  yet: every request prefills its whole prompt;
+* the suffix is prefilled as its own chunk, and with the decode steps on the tensor cores (the
+  default) every row computes to the bits it gets in any chunk, so a continued request is bit for
+  bit a cold prefill of its transcript ([Decode on the tensor
+  cores](#decode-on-the-tensor-cores)). With `SPARKFLASH_DECODE_MMA=off` the decode steps and a
+  short suffix run on the token kernels and a continued request is not a cold one: on the resume
+  set, mean KL 6.4e-4 a token and two of eight greedy continuations changed.
 
 Decode used to fall with context because `q4e_qsa_pick` scanned all 512 kept blocks for every
 block past the indexer budget. The kept set is a min-heap now, so each later block costs
@@ -948,14 +1055,18 @@ throughput work, not a correctness question.
     SPARKFLASH_CUDA_ARCH=sm_120 cargo test -p sparkflash-model-qwen4-exp --test serve_tiny
     cargo run -p sparkflash-model-qwen4-exp --example device_self_test   # needs nvcc + a GPU
     cargo test --release -p sparkflash-model-qwen4-exp --test verify_rows    # needs a GPU
+    cargo test --release -p sparkflash-model-qwen4-exp --test few_rows       # needs a GPU
     cargo test --release -p sparkflash-model-qwen4-exp --test dflash_kernel  # needs a GPU
 
-`verify_rows` holds every kernel a verify forward runs - the batched BF16 GEMV, the tiled wide
-GEMVs, the hyper passes, the snapshot writers, the recurrence replay - to the bits the same row
-gets alone, which is what keeps a drafter's greedy text equal to the plain decode's, and checks the
-drafter's E4M3 GEMV against the codes and scales its quantiser writes. `dflash_kernel` checks the
-drafter's vocabulary top-k, candidate selector, block convolution and ring attention against
-host references. Three `#[ignore]` benches
+`verify_rows` holds every kernel a token-kernel verify forward runs - the batched BF16 GEMV, the
+tiled wide GEMVs, the hyper passes, the snapshot writers, the recurrence replay - to the bits the
+same row gets alone, which is what keeps a drafter's greedy text equal to the plain decode's, and
+checks the drafter's E4M3 GEMV against the codes and scales its quantiser writes. `few_rows` holds
+the tensor-core image's few-row forms (`q4p_dense_rows`, `q4p_moe_rows_*`, `q4p_gemm_rows`) to the
+bits their wide tiles give every row of a 1..=63-row launch, their own split reduce and epilogue
+to the bits `q4e_gemm_reduce` and `q4p_epilogue` give the tile's, and to an f64 bound.
+`dflash_kernel` checks the drafter's vocabulary top-k, candidate selector, block convolution and
+ring attention against host references. Three `#[ignore]` benches
 time kernels at the released shapes without a checkpoint: `decode_bench` (the decode step's
 kernels at one token and a verify's eight), `expert_bench` and `gemm_bench`
 (`-- --ignored --nocapture`).
@@ -1036,9 +1147,10 @@ Then, on the node:
 With no `--checkpoint`, the server uses that cache snapshot; with no `--tokenizer`, it uses the
 snapshot's `tokenizer.json`. Both flags still override the cache for a custom copy.
 
-`--context 64` (or no `--context` with `--synthetic`) is what the tiny fixture serves, because the
-fixture's own configuration has a 64-token window: passing the released 262,144 to it is refused at
-open, which is the context guard doing its job rather than a fixture bug.
+With no `--context` the server serves the smaller of 262,144 and the checkpoint's own window, so the
+tiny fixture serves 64, its configuration's window: passing the released 262,144 to it is refused
+at startup, which is the context guard doing its job rather than a fixture bug. Every rank of a
+group derives the window the same way.
 
 The startup log reports the device, the resolved pack and the window:
 

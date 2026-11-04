@@ -55,6 +55,8 @@ sparkflash-model-deepseek-v41 = { workspace = true }
 sparkflash-deepseek-forward = { workspace = true }
 sparkflash-model-qwen4-exp = { workspace = true }
 sparkflash-model-glm5-next = { workspace = true }
+sparkflash-ops = { workspace = true }
+sparkflash-weights = { workspace = true }
 sparkflash-api = { workspace = true }
 sparkflash-serve = { workspace = true }
 sparkflash-vision = { workspace = true }

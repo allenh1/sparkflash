@@ -31,7 +31,9 @@ use std::sync::Arc;
 use sparkflash_kernels::cuda_driver::{Deviceptr, RunStream, StreamEvent};
 use sparkflash_model::{BackendError, StepOutput};
 
-use super::{DeviceSequence, GpuBranch, SCRATCH_SLOTS, SequenceShared};
+use super::{
+    DeviceSequence, GpuBranch, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared, zero_split_tickets,
+};
 
 /// The most sessions one batch steps together.
 ///
@@ -85,6 +87,15 @@ impl BatchBuffers {
         let stream = cuda
             .run_stream()
             .map_err(|error| BackendError::new("qwen4_batch", error))?;
+        // A member's `gemm_partials` is its first row's region, tickets and all.
+        zero_split_tickets(
+            cuda,
+            &stream,
+            shared.kernels.zero,
+            combined[PARTIALS_SLOT],
+            rows,
+        )
+        .map_err(|error| BackendError::new("qwen4_batch", error))?;
         let mut enters = Vec::with_capacity(MAX_BATCH);
         for _ in 0..MAX_BATCH {
             enters.push(
@@ -412,7 +423,7 @@ impl DeviceSequence {
                             b_out,
                             a_out,
                             width_rows,
-                            false,
+                            session.chunk_path(width_rows),
                             width_rows - 1,
                             conv_snapshot,
                             session.snapshot_stride as u64,
@@ -442,9 +453,11 @@ impl DeviceSequence {
             self.probe_finite(index, "mixed", mixed, total * config.hidden_size)?;
             self.prof_mark("hyper_mlp")?;
             // The routed experts do not share between different tokens, but the router, the shared
-            // expert and both hyper-connections read their weights once for every row.
+            // expert and both hyper-connections read their weights once for every row. On the
+            // chunk path the routed experts are the chunk's MMA, whose rows are computed alone.
+            let chunk = self.chunk_path(total);
             self.mlp(
-                &layer.moe, mixed, self.hyper, injection, index, false, total,
+                &layer.moe, mixed, self.hyper, injection, index, chunk, total,
             )?;
             self.probe_finite(index, "after_mlp", self.hyper, total * width)?;
             // The drafter reads a few layers' widened rows; a member's own slice is the rows its

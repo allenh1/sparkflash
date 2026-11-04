@@ -1,0 +1,77 @@
+{
+  "schema": "sparkflash-numerics-prompts/1",
+  "note": "The reference suite (docs/NUMERICS.md). Each prompt is tokenized by the server once, at capture, and the reference stores the ids; a check replays the ids, so it measures the model's arithmetic and never the tokenizer. Coverage of every routed expert is a separate suite (prerequisite `coverage`).",
+  "prompts": [
+    {
+      "name": "arithmetic",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A train leaves at 09:40 and travels 183 km at an average of 61 km/h. It then waits 25 minutes and travels another 96 km at 72 km/h. At what time does it arrive? Show each step."
+        }
+      ]
+    },
+    {
+      "name": "code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a Rust function `fn merge_intervals(v: Vec<(i64, i64)>) -> Vec<(i64, i64)>` that merges overlapping closed intervals, then list three edge cases a test should cover."
+        }
+      ]
+    },
+    {
+      "name": "tool-json",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You extract structured data. Answer with one JSON object and nothing else."
+        },
+        {
+          "role": "user",
+          "content": "Extract the fields name, date (ISO 8601), amount (number) and currency from: 'Invoice from Larkspur Tooling, dated the 3rd of March 2026, for one thousand two hundred and five euros and fifty cents.'"
+        }
+      ]
+    },
+    {
+      "name": "translation",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Translate into French, German and Simplified Chinese: 'The bridge will be closed for repairs from Monday until the end of the month.'"
+        }
+      ]
+    },
+    {
+      "name": "logic",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Ana, Ben and Chloe each own exactly one of a cat, a dog and a parrot. Ben is allergic to fur. Chloe's pet cannot fly. Ana does not own the dog. Who owns which pet? Explain the deduction."
+        }
+      ]
+    },
+    {
+      "name": "retrieval",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Here is a maintenance log.\n\nDay 1: east pump at 47 psi; routine inspection, no findings.\nDay 2: south pump at 41 psi; routine inspection, no findings.\nDay 3: west pump at 48 psi; routine inspection, no findings.\nDay 4: north pump at 42 psi; routine inspection, no findings.\nDay 5: east pump at 49 psi; routine inspection, no findings.\nDay 6: south pump at 43 psi; filter changed.\nDay 7: west pump at 50 psi; routine inspection, no findings.\nDay 8: north pump at 44 psi; routine inspection, no findings.\nDay 9: east pump at 51 psi; routine inspection, no findings.\nDay 10: south pump at 45 psi; routine inspection, no findings.\nDay 11: west pump at 52 psi; routine inspection, no findings.\nDay 12: north pump at 46 psi; filter changed.\nDay 13: east pump at 40 psi; routine inspection, no findings.\nDay 14: south pump at 47 psi; routine inspection, no findings.\nDay 15: west pump at 41 psi; routine inspection, no findings.\nDay 16: north pump at 48 psi; routine inspection, no findings.\nDay 17: east pump at 42 psi; seal on the east pump replaced; spare part number K-2291.\nDay 18: south pump at 49 psi; filter changed.\nDay 19: west pump at 43 psi; routine inspection, no findings.\nDay 20: north pump at 50 psi; routine inspection, no findings.\nDay 21: east pump at 44 psi; routine inspection, no findings.\nDay 22: south pump at 51 psi; routine inspection, no findings.\nDay 23: west pump at 45 psi; routine inspection, no findings.\nDay 24: north pump at 52 psi; filter changed.\nDay 25: east pump at 46 psi; routine inspection, no findings.\nDay 26: south pump at 40 psi; routine inspection, no findings.\nDay 27: west pump at 47 psi; routine inspection, no findings.\nDay 28: north pump at 41 psi; routine inspection, no findings.\nDay 29: east pump at 48 psi; routine inspection, no findings.\nDay 30: south pump at 42 psi; filter changed.\n\nOn which day was a seal replaced, on which pump, and what was the part number?"
+        }
+      ]
+    },
+    {
+      "name": "summary",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Summarize in two sentences: Tidal power converts the rise and fall of the sea into electricity. Barrage designs hold water behind a dam at high tide and release it through turbines; stream designs place turbines directly in fast tidal currents. Output is predictable years ahead because tides follow the moon, but suitable sites are few and construction in salt water is costly. Environmental effects on sediment and fish migration remain under study."
+        }
+      ]
+    },
+    {
+      "name": "raw-continuation",
+      "prompt": "The three laws of thermodynamics can be stated informally as follows. First,"
+    }
+  ]
+}

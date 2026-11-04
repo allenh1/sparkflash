@@ -22,8 +22,9 @@
 //! [module:mhc], the delta-rule recurrence of [module:linear_attention], and the block and expert
 //! selections of [module:topk]), and the tensor-parallel seam every pack shards through
 //! ([module@tp]). A model pack supplies tensor names and shapes; none of those appear here, only
-//! the role-tagged container they are planned in ([module:plan]), and the per-rank converted file
-//! a rank's slices are written to and read back from ([module:rank_file]).
+//! the role-tagged container they are planned in ([module:plan]), the per-rank converted file
+//! a rank's slices are written to and read back from ([module:rank_file]), and the Hugging Face
+//! hub cache a model id resolves to its checkpoint in ([module:hub]).
 //!
 //! The arithmetic is unchanged from the V4.1 engine extraction: this is a move, not a rewrite.
 
@@ -31,6 +32,7 @@
 
 pub mod config;
 pub mod dtype;
+pub mod hub;
 pub mod linalg;
 pub mod linear_attention;
 pub mod mhc;
@@ -51,4 +53,6 @@ pub use dtype::DType;
 pub use linalg::EngineError;
 pub use plan::TensorPlan;
 pub use spec::TensorSpec;
-pub use weights::{Conformance, TensorView, WeightError, WeightSource, check_source_against_specs};
+pub use weights::{
+    Conformance, TensorView, WeightError, WeightSource, check_length, check_source_against_specs,
+};

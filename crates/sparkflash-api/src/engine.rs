@@ -344,6 +344,12 @@ pub struct EngineRequest {
     /// The JSON Schema a structured-output request must satisfy, when the engine can enforce one.
     /// None for every request that did not ask for structured output.
     pub constraint: Option<serde_json::Value>,
+    /// Teacher forcing: the token ids to generate instead of the model's choice, one per
+    /// position, with each position's logprobs scored under the model. Empty for every ordinary
+    /// request. Only an engine that declares [`Capabilities::forced_decoding`] accepts it; the
+    /// router has already checked that the request is greedy, asks for logprobs, carries no
+    /// penalty, stop string or constraint, and that [`Self::max_tokens`] is its length.
+    pub forced_tokens: Vec<u32>,
 }
 
 /// One element of the normalized decode stream.
@@ -600,6 +606,8 @@ pub enum Capability {
     /// An engine that can turn image parts into visual tokens: the vision tower, the aligner and the
     /// three image delimiters.
     Vision,
+    /// An engine whose generation loop feeds caller-supplied tokens instead of its own choice.
+    ForcedDecoding,
 }
 
 impl Capability {
@@ -608,6 +616,7 @@ impl Capability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Vision => "vision",
+            Self::ForcedDecoding => "forced_decoding",
         }
     }
 }
@@ -622,7 +631,8 @@ impl std::fmt::Display for Capability {
 ///
 /// Returned by [`InferenceEngine::validate_request`] before any generation, so the HTTP layer can
 /// answer with a client error that names the missing channel instead of streaming an answer computed
-/// from the request's text tokens alone. The only channel today is [`Capability::Vision`].
+/// from the request's text tokens alone. The channels are [`Capability::Vision`] and
+/// [`Capability::ForcedDecoding`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("this engine does not implement the {capability} capability: {detail}")]
 pub struct MissingCapability {
@@ -656,6 +666,18 @@ impl MissingCapability {
                      this engine (DECISIONS.md D18, D59), so an image part cannot be turned into \
                      visual tokens; the request is refused rather than answered from its text tokens \
                      alone",
+        }
+    }
+
+    /// The missing forced-decoding capability: this engine's loop always feeds its own choice, so
+    /// a teacher-forced request would come back as an ordinary generation scored on other tokens.
+    #[must_use]
+    pub fn forced_decoding() -> Self {
+        Self {
+            capability: Capability::ForcedDecoding,
+            detail: "this engine's generation loop feeds only its own choice, so forced_tokens \
+                     cannot be honoured; the request is refused rather than answered with \
+                     logprobs of tokens it did not ask about",
         }
     }
 }
@@ -722,6 +744,9 @@ pub trait InferenceEngine: Send + Sync {
         if !request.images.is_empty() || (!request.vision.is_empty() && !self.capabilities().vision)
         {
             return Err(MissingCapability::vision());
+        }
+        if !request.forced_tokens.is_empty() && !self.capabilities().forced_decoding {
+            return Err(MissingCapability::forced_decoding());
         }
         Ok(())
     }
@@ -1186,6 +1211,7 @@ mod tests {
             trace_scopes: 0,
             trace_steps: 0,
             constraint: None,
+            forced_tokens: Vec::new(),
         }
     }
 
@@ -1231,6 +1257,7 @@ mod tests {
         // covers it. Vision is declared by an engine with the tower loaded, never by `ALL` (D59).
         let every_text_channel = Capabilities {
             constrained: false,
+            forced_decoding: false,
             tools: true,
             thinking: true,
             reasoning_effort: true,

@@ -22,13 +22,18 @@ use serde_json::Value;
 use sparkflash_model::{PromptCodec, PromptError};
 
 /// A codec for a tiny fixture vocabulary.
+///
+/// A fixture's vocabulary is a few dozen tokens, so a real tokenizer cannot address it and a
+/// released template's ids are meaningless. This codec maps text bytes and token ids onto that
+/// vocabulary, and never produces ids 0 to 2, which hold a fixture's end-of-text ids: a demo that
+/// ends immediately would prove nothing.
 #[derive(Debug, Clone, Copy)]
 pub struct ByteCodec {
     vocabulary: u32,
 }
 
 impl ByteCodec {
-    /// A codec for a vocabulary of this size (at least 3).
+    /// A codec for a vocabulary of this size (at least 3, so a byte can avoid the stop ids).
     ///
     /// # Panics
     /// When the vocabulary is smaller than three tokens.
@@ -41,6 +46,7 @@ impl ByteCodec {
     }
 
     fn id_for(byte: u8, vocabulary: u32) -> u32 {
+        // Skip the low ids so a prompt byte does not land on an end-of-generation id.
         let span = vocabulary - 3;
         3 + u32::from(byte) % span
     }

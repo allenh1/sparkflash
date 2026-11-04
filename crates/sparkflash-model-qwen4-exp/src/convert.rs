@@ -22,9 +22,10 @@
 //! (Apache-2.0; Luke Alonso `@lukealonso`, `@original-el8`, and contributors). See the root
 //! `NOTICE` file.
 //!
-//! The container is the one the V4.1 and GLM arms write ([sparkflash_weights::rank_file]): every
-//! upload of the rank's walk is a slot (its key, offset, length and digest), and the index also
-//! records the two per-tensor NVFP4 scales in walk order. [convert_rank] walks the checkpoint
+//! The file is the walk-ordered rank file the GLM arm also writes
+//! ([sparkflash_weights::rank_file::SlotIndex]): every upload of the rank's walk is a slot (its
+//! key, offset, length and digest), and this pack records the two per-tensor NVFP4 scales of every
+//! NVFP4 matrix in walk order ([Nvfp4Scalars]). [convert_rank] walks the checkpoint
 //! twice on the host: once for the slots' offsets and the scales, and once to stream each weight's
 //! bytes to its slot. [load_converted] reads the file into one device allocation and runs the same
 //! walk over a [Slab], which returns each weight's address without reading the checkpoint.
@@ -33,96 +34,51 @@
 //! share of every sharded tensor - the attention and Gated DeltaNet heads, the experts' padded
 //! width and the shared expert - exactly as
 //! [crate::device::Qwen4ExpDeviceBackend::open_rank] uploads it. A TP=1 file
-//! ([rank_file_name] of rank 0 in a world of 1) is the whole model.
+//! ([sparkflash_weights::rank_file::rank_file_name] of rank 0 in a world of 1) is the whole
+//! model.
 //!
 //! Qwen's PLE n-gram table is host-paged, so the checkpoint directory (and its 51.2 GiB of PLE
 //! shards) still has to be present: the converted file replaces the resident weights' upload, not
 //! the pager's source.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr,
 };
-use sparkflash_weights::WeightSource;
-pub use sparkflash_weights::rank_file::rank_file_name;
 use sparkflash_weights::rank_file::{
-    ConvertedPreamble, PayloadDigest, RankFileWriter, align_up_page, data_offset_for,
-    verify_payloads,
+    SlotCursor, SlotFileWriter, SlotIndex, SlotPlan, SlotRecords, WrittenRank,
 };
 use sparkflash_weights::tp::TpLayout;
+use sparkflash_weights::{WeightSource, check_length};
 
 use crate::config::Qwen4ExpConfig;
 use crate::device::tp::{Shard, rank_config};
-use crate::device::{GpuWeights, Sink, Uploader, build_shard, check_length};
+use crate::device::{GpuWeights, Sink, Uploader, build_shard};
 
 /// What a Qwen4-Exp rank file's index names as its model.
 pub const CONVERTED_MODEL: &str = "qwen4-exp";
 
-/// Where each slot starts: the alignment of a device allocation, which the kernels' vector loads
-/// assume of every weight.
-const SLOT_ALIGN_BYTES: usize = 256;
+/// What a Qwen4-Exp rank file records beside its slots.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Nvfp4Scalars {
+    /// The two per-tensor NVFP4 scales of every NVFP4 matrix, in walk order.
+    pub nvfp4_scalars: Vec<[u32; 2]>,
+}
 
-/// The TP=1 file's name, the one a solo launch reads; [rank_file_name] names a sharded rank's.
-pub const RANK_FILE_NAME: &str = "rank-0-of-1.bin";
-
-/// One upload of the rank's walk.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvertedSlot {
-    /// The checkpoint name it is built from, or the derived table's name.
-    pub key: String,
-    /// Its byte offset from the file's data_offset, a multiple of 256.
-    pub offset: usize,
-    /// Its length in bytes.
-    pub bytes: usize,
-    /// The FNV-1a 64 digest of its bytes.
-    pub digest: u64,
+impl SlotRecords for Nvfp4Scalars {
+    const MODEL: &'static str = CONVERTED_MODEL;
 }
 
 /// The JSON index of a Qwen4-Exp rank file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConvertedIndex {
-    /// [CONVERTED_MODEL].
-    pub model: String,
-    /// The rank, `0..world`.
-    pub rank: usize,
-    /// The tensor-parallel world this file's walk was sharded for.
-    pub world: usize,
-    /// What the converter read, as it was given.
-    pub source: String,
-    /// Every upload, in walk order.
-    pub slots: Vec<ConvertedSlot>,
-    /// The two per-tensor NVFP4 scales of every NVFP4 matrix, in walk order.
-    pub nvfp4_scalars: Vec<[u32; 2]>,
-    /// The end of the last slot.
-    pub data_bytes: u64,
-    /// The digest of the slots' digests, in order.
-    pub file_digest: u64,
-}
+pub type ConvertedIndex = SlotIndex<Nvfp4Scalars>;
 
 /// The first pass: each upload's slot, at the next aligned offset, and each NVFP4 scale pair.
 #[derive(Default)]
 struct Plan {
-    slots: Vec<ConvertedSlot>,
+    plan: SlotPlan,
     scalars: Vec<[u32; 2]>,
-    end: usize,
-}
-
-impl Plan {
-    fn place(&mut self, key: &str, len: usize) -> Deviceptr {
-        let offset = self.end.next_multiple_of(SLOT_ALIGN_BYTES);
-        self.slots.push(ConvertedSlot {
-            key: key.to_owned(),
-            offset,
-            bytes: len,
-            // The widest digest, so the placeholder index is never shorter than the final one.
-            digest: u64::MAX,
-        });
-        self.end = offset + len;
-        Deviceptr(0)
-    }
 }
 
 impl Sink for Plan {
@@ -135,11 +91,13 @@ impl Sink for Plan {
     }
 
     fn weight(&mut self, key: &str, len: usize, _: Vec<u8>) -> Result<Deviceptr, String> {
-        Ok(self.place(key, len))
+        self.plan.place(key, len);
+        Ok(Deviceptr(0))
     }
 
     fn derived(&mut self, key: &str, len: usize, _: &[u8]) -> Result<Deviceptr, String> {
-        Ok(self.place(key, len))
+        self.plan.place(key, len);
+        Ok(Deviceptr(0))
     }
 
     fn nvfp4_scalars(&mut self, scale_2: f32, input_scale: f32) -> Result<(f32, f32), String> {
@@ -150,31 +108,22 @@ impl Sink for Plan {
 }
 
 /// The second pass: each upload's bytes to the slot the first pass gave it.
-struct Writing<'a> {
-    writer: RankFileWriter,
-    slots: &'a mut [ConvertedSlot],
-    next: usize,
-}
+struct Writing(SlotFileWriter<Nvfp4Scalars>);
 
-impl Sink for Writing<'_> {
+impl Sink for Writing {
     fn wants_bytes(&self) -> bool {
         true
     }
 
     fn weight(&mut self, key: &str, len: usize, bytes: Vec<u8>) -> Result<Deviceptr, String> {
-        check_length(key, len, &bytes)?;
-        let at = expect_slot(self.slots, self.next, key, len)?.offset;
-        self.slots[self.next].digest = self.writer.put(at, &bytes)?;
-        self.next += 1;
+        self.0.put(key, len, &bytes)?;
         Ok(Deviceptr(0))
     }
 
     fn derived(&mut self, key: &str, len: usize, _: &[u8]) -> Result<Deviceptr, String> {
-        let at = expect_slot(self.slots, self.next, key, len)?.offset;
         // The table holds device addresses, which change with every allocation, so the file
         // stores a deterministic placeholder and the loader writes the rebuilt table instead.
-        self.slots[self.next].digest = self.writer.put(at, &vec![0; len])?;
-        self.next += 1;
+        self.0.put(key, len, &vec![0; len])?;
         Ok(Deviceptr(0))
     }
 
@@ -187,8 +136,7 @@ impl Sink for Writing<'_> {
 /// weight at the same length, and the NVFP4 scales come from the index.
 pub(crate) struct Slab<'a> {
     base: Deviceptr,
-    slots: &'a [ConvertedSlot],
-    next: usize,
+    slots: SlotCursor<'a>,
     scalars: &'a [[u32; 2]],
     next_scalar: usize,
     cuda: &'a Cuda,
@@ -198,9 +146,8 @@ impl<'a> Slab<'a> {
     fn new(base: Deviceptr, index: &'a ConvertedIndex, cuda: &'a Cuda) -> Self {
         Self {
             base,
-            slots: &index.slots,
-            next: 0,
-            scalars: &index.nvfp4_scalars,
+            slots: SlotCursor::new(&index.slots),
+            scalars: &index.extra.nvfp4_scalars,
             next_scalar: 0,
             cuda,
         }
@@ -217,16 +164,12 @@ impl Sink for Slab<'_> {
     }
 
     fn weight(&mut self, key: &str, len: usize, _: Vec<u8>) -> Result<Deviceptr, String> {
-        let at = expect_slot(self.slots, self.next, key, len)?.offset;
-        self.next += 1;
-        Ok(self.base.offset(at))
+        Ok(self.base.offset(self.slots.take(key, len)?))
     }
 
     fn derived(&mut self, key: &str, len: usize, bytes: &[u8]) -> Result<Deviceptr, String> {
         check_length(key, len, bytes)?;
-        let at = expect_slot(self.slots, self.next, key, len)?.offset;
-        self.next += 1;
-        let pointer = self.base.offset(at);
+        let pointer = self.base.offset(self.slots.take(key, len)?);
         self.cuda.copy_htod(&pointer, bytes)?;
         Ok(pointer)
     }
@@ -240,28 +183,9 @@ impl Sink for Slab<'_> {
     }
 }
 
-/// One converted rank file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConvertedRank {
-    /// The file written.
-    pub path: PathBuf,
-    /// Its size: data_offset and the page-padded data.
-    pub file_bytes: u64,
-    /// Where the data starts.
-    pub data_offset: u64,
-    /// The end of the last slot.
-    pub data_bytes: u64,
-    /// The uploads it holds.
-    pub slots: usize,
-    /// The FNV-1a 64 hash of the index.
-    pub header_hash: u64,
-    /// The digest of the slots' digests.
-    pub file_digest: u64,
-}
-
-/// Writes rank `layout.rank`'s file into output_dir (as [rank_file_name] names it) from the
-/// checkpoint source, recording label as what was read. It runs on the host; no device is
-/// touched.
+/// Writes rank `layout.rank`'s file into output_dir (as
+/// [sparkflash_weights::rank_file::rank_file_name] names it) from the checkpoint source, recording
+/// label as what was read. It runs on the host; no device is touched.
 ///
 /// # Errors
 /// A world the model's heads or widths do not split over ([rank_config]), then everything the
@@ -273,7 +197,7 @@ pub fn convert_rank(
     directory: &Path,
     output_dir: &Path,
     label: &str,
-) -> Result<ConvertedRank, String> {
+) -> Result<WrittenRank, String> {
     let shard = Shard::of(layout);
     rank_config(config, shard)?;
     let mut plan = Plan::default();
@@ -284,34 +208,15 @@ pub fn convert_rank(
         config,
         shard,
     )?;
-    let Plan {
-        slots,
-        scalars,
-        end,
-    } = plan;
-    let mut index = ConvertedIndex {
-        model: CONVERTED_MODEL.to_owned(),
-        rank: layout.rank,
-        world: layout.world_size,
-        source: label.to_owned(),
-        slots,
-        nvfp4_scalars: scalars,
-        data_bytes: end as u64,
-        file_digest: u64::MAX,
-    };
-    let placeholder =
-        serde_json::to_vec(&index).map_err(|error| format!("serialise the index: {error}"))?;
-    let data_offset = data_offset_for(placeholder.len());
-    let padded_data_bytes = align_up_page(end) as u64;
-
-    fs::create_dir_all(output_dir)
-        .map_err(|error| format!("create {}: {error}", output_dir.display()))?;
-    let path = output_dir.join(rank_file_name(layout.rank, layout.world_size));
-    let mut writing = Writing {
-        writer: RankFileWriter::create(&path, data_offset)?,
-        slots: &mut index.slots,
-        next: 0,
-    };
+    let Plan { plan, scalars } = plan;
+    let index = plan.into_index(
+        layout,
+        label,
+        Nvfp4Scalars {
+            nvfp4_scalars: scalars,
+        },
+    );
+    let mut writing = Writing(SlotFileWriter::create(output_dir, index)?);
     let _ = build_shard(
         &Uploader::planning(&mut writing),
         directory,
@@ -319,123 +224,7 @@ pub fn convert_rank(
         config,
         shard,
     )?;
-    let Writing { writer, next, .. } = writing;
-    if next != index.slots.len() {
-        return Err(format!(
-            "the second walk placed {next} weights where the first placed {}",
-            index.slots.len()
-        ));
-    }
-    index.file_digest = writer.file_digest();
-    let bytes =
-        serde_json::to_vec(&index).map_err(|error| format!("serialise the index: {error}"))?;
-    let header_hash = writer.finish(
-        layout.rank,
-        layout.world_size,
-        &bytes,
-        index.data_bytes,
-        padded_data_bytes,
-    )?;
-    Ok(ConvertedRank {
-        path,
-        file_bytes: data_offset + padded_data_bytes,
-        data_offset,
-        data_bytes: index.data_bytes,
-        slots: index.slots.len(),
-        header_hash,
-        file_digest: index.file_digest,
-    })
-}
-
-fn expect_slot<'s>(
-    slots: &'s [ConvertedSlot],
-    next: usize,
-    key: &str,
-    len: usize,
-) -> Result<&'s ConvertedSlot, String> {
-    let Some(slot) = slots.get(next) else {
-        return Err(format!(
-            "the rank file ends before {key}, which this configuration loads"
-        ));
-    };
-    if slot.key != key || slot.bytes != len {
-        return Err(format!(
-            "the rank file's slot {next} is {} ({} bytes), where this configuration loads {key}              ({len} bytes)",
-            slot.key, slot.bytes
-        ));
-    }
-    Ok(slot)
-}
-
-/// `layout`'s rank file in dir, when it holds one.
-#[must_use]
-pub fn find_rank_file(dir: &Path, layout: TpLayout) -> Option<PathBuf> {
-    let path = dir.join(rank_file_name(layout.rank, layout.world_size));
-    path.is_file().then_some(path)
-}
-
-/// Reads a rank file's preamble and index, once it is a Qwen4-Exp file of rank `layout.rank` in
-/// a world of `layout.world_size` whose slots lie in its data. Touching no weight, this is the
-/// boot check.
-pub fn read_index(
-    path: &Path,
-    layout: TpLayout,
-) -> Result<(ConvertedPreamble, ConvertedIndex), String> {
-    let (mut preamble, index): (_, ConvertedIndex) =
-        sparkflash_weights::rank_file::read_index(path)?;
-    let shown = path.display();
-    if index.model != CONVERTED_MODEL {
-        return Err(format!(
-            "{shown} is a {} rank file, not {CONVERTED_MODEL}",
-            index.model
-        ));
-    }
-    for (what, by_preamble, by_index, wanted) in [
-        ("rank", preamble.rank, index.rank, layout.rank),
-        ("world", preamble.world, index.world, layout.world_size),
-    ] {
-        if by_preamble != wanted || by_index != wanted {
-            return Err(format!(
-                "{shown} is {what} {by_preamble} by its preamble and {by_index} by its index,                  where this load is {what} {wanted}"
-            ));
-        }
-    }
-    if preamble.data_bytes != index.data_bytes || index.data_bytes > preamble.padded_data_bytes {
-        return Err(format!(
-            "{shown} holds {} data bytes by its preamble, {} by its index, in {} padded",
-            preamble.data_bytes, index.data_bytes, preamble.padded_data_bytes
-        ));
-    }
-    for slot in &index.slots {
-        let end = slot.offset.checked_add(slot.bytes);
-        if !slot.offset.is_multiple_of(SLOT_ALIGN_BYTES)
-            || end.is_none_or(|end| end as u64 > index.data_bytes)
-        {
-            return Err(format!(
-                "{shown}: slot {} at {} ({} bytes) is unaligned or past the {} data bytes",
-                slot.key, slot.offset, slot.bytes, index.data_bytes
-            ));
-        }
-    }
-    preamble.file_digest = index.file_digest;
-    Ok((preamble, index))
-}
-
-/// Re-reads every slot of a rank file and checks its digest, and the digest of the digests.
-pub fn verify_converted(path: &Path, layout: TpLayout) -> Result<ConvertedIndex, String> {
-    let (preamble, index) = read_index(path, layout)?;
-    verify_payloads(
-        path,
-        preamble.data_offset,
-        index.slots.iter().map(|slot| PayloadDigest {
-            name: &slot.key,
-            offset: slot.offset,
-            bytes: slot.bytes,
-            digest: slot.digest,
-        }),
-        index.file_digest,
-    )?;
-    Ok(index)
+    writing.0.finish()
 }
 
 /// Reads rank `layout.rank`'s file into one device allocation and returns the weights the
@@ -449,7 +238,7 @@ pub(crate) fn load_converted(
     layout: TpLayout,
 ) -> Result<GpuWeights, String> {
     let shard = Shard::of(layout);
-    let (preamble, index) = read_index(path, layout)?;
+    let (preamble, index) = ConvertedIndex::read(path, layout)?;
     let data = usize::try_from(preamble.padded_data_bytes)
         .map_err(|_| "the rank file's data does not fit this machine's range".to_owned())?;
     let mut total = 0usize;
@@ -471,17 +260,11 @@ pub(crate) fn load_converted(
         config,
         shard,
     )?;
-    if sink.next != index.slots.len() {
-        return Err(format!(
-            "the rank file holds {} weights, and this configuration loads {}",
-            index.slots.len(),
-            sink.next
-        ));
-    }
-    if sink.next_scalar != index.nvfp4_scalars.len() {
+    sink.slots.finish()?;
+    if sink.next_scalar != index.extra.nvfp4_scalars.len() {
         return Err(format!(
             "the rank file holds {} NVFP4 scales, and this configuration loads {}",
-            index.nvfp4_scalars.len(),
+            index.extra.nvfp4_scalars.len(),
             sink.next_scalar
         ));
     }
@@ -492,7 +275,11 @@ pub(crate) fn load_converted(
 mod tests {
     use std::os::unix::fs::FileExt;
 
-    use sparkflash_weights::rank_file::PREAMBLE_BYTES;
+    use std::fs;
+
+    use sparkflash_weights::rank_file::{
+        PREAMBLE_BYTES, Slot, find_converted_rank_file, rank_file_name,
+    };
     use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 
     use super::*;
@@ -515,7 +302,7 @@ mod tests {
         world_size: 1,
     };
 
-    fn placed(slots: &[ConvertedSlot]) -> Vec<(String, usize, usize)> {
+    fn placed(slots: &[Slot]) -> Vec<(String, usize, usize)> {
         slots
             .iter()
             .map(|slot| (slot.key.clone(), slot.offset, slot.bytes))
@@ -557,7 +344,7 @@ mod tests {
         );
         assert_eq!(bytes.len() as u64, converted.file_bytes);
 
-        let index = verify_converted(&converted.path, TP1).expect("it verifies");
+        let index = ConvertedIndex::verify(&converted.path, TP1).expect("it verifies");
         assert_eq!(index.slots.len(), converted.slots);
         assert_eq!(index.file_digest, converted.file_digest);
 
@@ -589,26 +376,26 @@ mod tests {
             Shard::WHOLE,
         )
         .expect("the walk replays");
-        assert_eq!(placed(&replay.slots), placed(&index.slots));
-        assert_eq!(replay.scalars, index.nvfp4_scalars);
+        assert_eq!(placed(replay.plan.slots()), placed(&index.slots));
+        assert_eq!(replay.scalars, index.extra.nvfp4_scalars);
 
         let error =
-            verify_converted(&checkpoint.path().join(rank_file_name(0, 1)), TP1).unwrap_err();
+            ConvertedIndex::verify(&checkpoint.path().join(rank_file_name(0, 1)), TP1).unwrap_err();
         assert!(
             error.contains("No such file") || error.contains("not found"),
             "{error}"
         );
 
-        let (preamble, index) = read_index(&converted.path, TP1).unwrap();
+        let (preamble, index) = ConvertedIndex::read(&converted.path, TP1).unwrap();
         flip(
             &converted.path,
             preamble.data_offset + index.slots[2].offset as u64,
         );
-        read_index(&converted.path, TP1).expect("the boot check reads no weight");
-        let error = verify_converted(&converted.path, TP1).unwrap_err();
+        ConvertedIndex::read(&converted.path, TP1).expect("the boot check reads no weight");
+        let error = ConvertedIndex::verify(&converted.path, TP1).unwrap_err();
         assert!(error.contains("digest mismatch"), "{error}");
         flip(&converted.path, PREAMBLE_BYTES as u64 + 8);
-        let error = read_index(&converted.path, TP1).unwrap_err();
+        let error = ConvertedIndex::read(&converted.path, TP1).unwrap_err();
         assert!(error.contains("header hash"), "{error}");
     }
 
@@ -650,10 +437,10 @@ mod tests {
                 converted.path.file_name().and_then(std::ffi::OsStr::to_str),
                 Some(rank_file_name(rank, world_size).as_str())
             );
-            let index = verify_converted(&converted.path, layout).expect("it verifies");
+            let index = ConvertedIndex::verify(&converted.path, layout).expect("it verifies");
             assert_eq!((index.rank, index.world), (rank, world_size));
             assert_eq!(
-                find_rank_file(out.path(), layout).as_deref(),
+                find_converted_rank_file(out.path(), rank, world_size).as_deref(),
                 Some(converted.path.as_path())
             );
 
@@ -668,8 +455,8 @@ mod tests {
                 shard,
             )
             .expect("the walk replays");
-            assert_eq!(placed(&replay.slots), placed(&index.slots));
-            assert_eq!(replay.scalars, index.nvfp4_scalars);
+            assert_eq!(placed(replay.plan.slots()), placed(&index.slots));
+            assert_eq!(replay.scalars, index.extra.nvfp4_scalars);
 
             // An expert's file slot is its share padded to whole MMA tiles, not the whole matrix.
             let gate = index
@@ -686,7 +473,7 @@ mod tests {
                 world_size,
             };
             if other != layout {
-                let error = read_index(&converted.path, other)
+                let error = ConvertedIndex::read(&converted.path, other)
                     .expect_err("another rank's file is not this rank's");
                 assert!(error.contains("rank") || error.contains("world"), "{error}");
             }

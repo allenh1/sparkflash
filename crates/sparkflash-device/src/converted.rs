@@ -58,6 +58,7 @@ pub use sparkflash_weights::rank_file::{
 use sparkflash_weights::rank_file::{
     FNV_OFFSET, PayloadDigest, RankFileWriter, data_offset_for, fold_digest, verify_payloads,
 };
+use sparkflash_weights::tp::TpLayout;
 
 use crate::arena::{
     AllocationMode, ArenaAllocator, ArenaEvidence, ArenaSlice, DIRECT_CHUNK_BYTES,
@@ -227,27 +228,9 @@ impl ConvertOptions {
         }
     }
 
-    /// Returns the sorted list of ranks to convert.
+    /// Returns the sorted list of ranks to convert ([TpLayout::selected_ranks]).
     pub fn selected_ranks(&self) -> Result<Vec<usize>, String> {
-        if self.world_size == 0 {
-            return Err("world_size must be at least 1".to_string());
-        }
-        let mut ranks = if self.ranks.is_empty() {
-            (0..self.world_size).collect()
-        } else {
-            self.ranks.clone()
-        };
-        ranks.sort_unstable();
-        ranks.dedup();
-        for &rank in &ranks {
-            if rank >= self.world_size {
-                return Err(format!(
-                    "rank {rank} is outside world_size {}",
-                    self.world_size
-                ));
-            }
-        }
-        Ok(ranks)
+        TpLayout::selected_ranks(self.world_size, &self.ranks)
     }
 }
 

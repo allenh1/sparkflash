@@ -334,7 +334,9 @@ after a start still ran its 40-token prompt in 0.81 s, against 0.34-0.42 s for t
 * The vision tower is planned in the checkpoint and not loaded, so the descriptor declares no
   vision channel.
 * Fused batching and drafting in the session are not implemented; the four-rank serve arm drafts
-  with the MTP layer, one request at a time.
+  with the MTP layer, one request at a time. `--fuse-batch` and `--kv-budget-gib` are therefore
+  refused at TP=1, and a group refuses those two and `--concurrency` above 1, rather than ignore
+  them.
 
 ## Evidence
 

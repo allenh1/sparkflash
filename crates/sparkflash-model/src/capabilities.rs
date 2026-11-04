@@ -35,17 +35,24 @@ pub struct Capabilities {
     /// Whether the engine enforces a JSON Schema on the decoder, so `response_format` is a
     /// guarantee rather than an instruction.
     pub constrained: bool,
+    /// Whether the engine's generation loop can feed caller-supplied tokens instead of its own
+    /// choice (teacher forcing, `forced_tokens`), which is how a numerics comparison scores a
+    /// served configuration against a frozen reference sequence (docs/NUMERICS.md §4). A property
+    /// of the serving driver, not the model: the driver that implements it declares it.
+    pub forced_decoding: bool,
 }
 
 impl Capabilities {
-    /// Every text channel, declared; vision stays opt-in because it depends on the tower being
-    /// loaded by the engine.
+    /// Every text channel a model renders, declared; vision stays opt-in because it depends on the
+    /// tower being loaded by the engine. Constrained decoding is the engine's to declare, and
+    /// forced decoding the serving driver's: the host driver and the TP drivers add it.
     pub const ALL: Self = Self {
         tools: true,
         thinking: true,
         reasoning_effort: true,
         vision: false,
         constrained: false,
+        forced_decoding: false,
     };
 
     /// The same text channels plus vision.

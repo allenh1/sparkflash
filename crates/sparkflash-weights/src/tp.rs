@@ -62,6 +62,28 @@ impl TpLayout {
         Ok(())
     }
 
+    /// The ranks of a world of `world_size` that a conversion writes: `ranks` sorted and without
+    /// repeats, or every rank when it names none.
+    ///
+    /// # Errors
+    /// When `world_size` is zero or a rank is not below it.
+    pub fn selected_ranks(world_size: usize, ranks: &[usize]) -> Result<Vec<usize>, String> {
+        if world_size == 0 {
+            return Err("world_size must be at least 1".to_string());
+        }
+        let mut ranks = if ranks.is_empty() {
+            (0..world_size).collect()
+        } else {
+            ranks.to_vec()
+        };
+        ranks.sort_unstable();
+        ranks.dedup();
+        if let Some(rank) = ranks.iter().find(|&&rank| rank >= world_size) {
+            return Err(format!("rank {rank} is outside world_size {world_size}"));
+        }
+        Ok(ranks)
+    }
+
     /// The share of one sharded width this rank holds: `width / world_size`.
     ///
     /// `what` names the width in the error, e.g. `"moe_inter_dim"`.
@@ -829,6 +851,16 @@ impl BitGather for LocalRank {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversion_selects_ranks_inside_its_world() {
+        assert_eq!(TpLayout::selected_ranks(4, &[]).unwrap(), [0, 1, 2, 3]);
+        assert_eq!(TpLayout::selected_ranks(4, &[3, 1, 3]).unwrap(), [1, 3]);
+        let error = TpLayout::selected_ranks(0, &[]).unwrap_err();
+        assert!(error.contains("world_size must be at least 1"), "{error}");
+        let error = TpLayout::selected_ranks(2, &[0, 2]).unwrap_err();
+        assert!(error.contains("rank 2 is outside world_size 2"), "{error}");
+    }
 
     #[test]
     fn local_width_splits_or_refuses() {

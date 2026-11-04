@@ -63,6 +63,8 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use sparkflash_weights::rng::is_prime;
+
 use crate::config::{ConfigError, ModelConfig};
 use crate::dtype::{DType, SCALE_BLOCK};
 use crate::linalg::{self, EngineError, ScaleGrid};
@@ -194,24 +196,6 @@ fn find_next_prime(start: u64, seen: &BTreeSet<u64>) -> u64 {
         candidate = candidate.saturating_add(1);
     }
     candidate
-}
-
-/// Whether value is prime, by trial division. Only used for the drawn bucket moduli.
-fn is_prime(value: u64) -> bool {
-    if value < 2 {
-        return false;
-    }
-    if value.is_multiple_of(2) {
-        return value == 2;
-    }
-    let mut divisor = 3u64;
-    while divisor.saturating_mul(divisor) <= value {
-        if value.is_multiple_of(divisor) {
-            return false;
-        }
-        divisor += 2;
-    }
-    true
 }
 
 /// The reference's multiplier stream: NumPy's default_rng, ported from NumPy's own sources.

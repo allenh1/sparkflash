@@ -287,3 +287,38 @@ fn four_members_on_one_prompt_agree() {
         );
     }
 }
+
+/// A slot's next request starts from nothing, whatever the last one left.
+///
+/// The engine keeps a slot's sequence between requests, and a handle offers none of its history
+/// for reuse: every prompt it posts is a whole conversation. A slot that prefilled that prompt onto
+/// the last request's caches would answer a conversation nobody sent, so one slot serves prompt B,
+/// then prompt A, then B again, and the third run must be the first.
+#[test]
+fn a_reopened_slot_starts_cold() {
+    let Some(directory) = fixture() else {
+        return;
+    };
+    let Some(fused) = open(&directory, 1) else {
+        return;
+    };
+    let run = |prompt: &[u32]| {
+        let mut session = fused.open_session().expect("the slot's session");
+        let step = session
+            .prefill(prompt)
+            .expect("a prefill on a slot an earlier request used");
+        (
+            step.logits.clone(),
+            generate(&mut *session, step.next_token),
+        )
+    };
+    let (cold_logits, cold) = run(PROMPT_B);
+    let _ = run(PROMPT_A);
+    let (again_logits, again) = run(PROMPT_B);
+    compare("prefill B on a used slot", &cold_logits, &again_logits);
+    eprintln!("cold  {cold:?}\nagain {again:?}");
+    assert_eq!(
+        again, cold,
+        "a reopened slot answered differently from a fresh one"
+    );
+}

@@ -122,11 +122,12 @@ fn embedded_prefill_cubin() -> &'static [u8] {
 }
 use sparkflash_weights::linalg::{ScaleGrid, argmax};
 use sparkflash_weights::mhc::HcGeometry;
+use sparkflash_weights::rank_file::SlotCursor;
 use sparkflash_weights::tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
-use sparkflash_weights::{DType, TensorSpec, WeightSource};
+use sparkflash_weights::{DType, TensorSpec, WeightSource, check_length};
 
 use crate::config::{Glm5NextConfig, IndexerKind, LayerKind, MlpKind};
-use crate::convert::{ConvertedSlot, ConvertedSpecs, expect_slot};
+use crate::convert::{ConvertedIndex, ConvertedSpecs};
 use crate::forward::{INDEX_KEY_NORM_EPS, inverse_sqrt};
 use crate::tensor::{Glm5NextTensorPlan, LM_PREFIX, Split};
 
@@ -815,18 +816,6 @@ pub(crate) trait Sink {
     }
 }
 
-/// A weight's bytes against the length its shapes give, which every sink handed bytes checks.
-pub(crate) fn check_length(key: &str, len: usize, bytes: &[u8]) -> Result<(), BackendError> {
-    if bytes.len() == len {
-        Ok(())
-    } else {
-        Err(refusal(format!(
-            "{key} came to {} bytes where its shapes give {len}",
-            bytes.len()
-        )))
-    }
-}
-
 /// Each weight in its own device allocation, uploaded as it is read.
 struct Direct<'a> {
     stream: &'a RunStream,
@@ -839,7 +828,7 @@ impl Sink for Direct<'_> {
     }
 
     fn weight(&mut self, key: &str, len: usize, bytes: Vec<u8>) -> Result<Deviceptr, BackendError> {
-        check_length(key, len, &bytes)?;
+        check_length(key, len, &bytes).map_err(refusal)?;
         self.memory.upload(self.stream, &bytes)
     }
 
@@ -852,8 +841,7 @@ impl Sink for Direct<'_> {
 /// upload is the next slot of the file's index, which must be the same weight at the same length.
 struct Slab<'a> {
     base: Deviceptr,
-    slots: &'a [ConvertedSlot],
-    next: usize,
+    slots: SlotCursor<'a>,
     stream: &'a RunStream,
     memory: &'a mut Allocations,
 }
@@ -864,8 +852,7 @@ impl Sink for Slab<'_> {
     }
 
     fn weight(&mut self, key: &str, len: usize, _: Vec<u8>) -> Result<Deviceptr, BackendError> {
-        let at = expect_slot(self.slots, self.next, key, len)?.offset;
-        self.next += 1;
+        let at = self.slots.take(key, len).map_err(refusal)?;
         Ok(self.base.offset(at))
     }
 
@@ -1971,7 +1958,7 @@ impl DeviceRank {
         layout: TpLayout,
         cache: LatentCache,
     ) -> Result<Self, BackendError> {
-        let (preamble, index) = crate::convert::read_index(path, layout).map_err(refusal)?;
+        let (preamble, index) = ConvertedIndex::read(path, layout).map_err(refusal)?;
         let specs = ConvertedSpecs::new(&index).map_err(refusal)?;
         let data = usize::try_from(preamble.padded_data_bytes)
             .map_err(|_| refusal("the rank file's data does not fit this machine's range"))?;
@@ -1979,19 +1966,12 @@ impl DeviceRank {
             let base = memory.file(path, preamble.data_offset, data)?;
             let mut sink = Slab {
                 base,
-                slots: &index.slots,
-                next: 0,
+                slots: SlotCursor::new(&index.slots),
                 stream,
                 memory,
             };
             let weights = Uploader::new(&specs, config, layout, &mut sink).weights()?;
-            if sink.next != index.slots.len() {
-                return Err(refusal(format!(
-                    "the rank file holds {} weights, and this configuration loads {}",
-                    index.slots.len(),
-                    sink.next
-                )));
-            }
+            sink.slots.finish().map_err(refusal)?;
             Ok(weights)
         })
     }

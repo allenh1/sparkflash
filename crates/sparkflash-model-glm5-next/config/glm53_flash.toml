@@ -1,5 +1,6 @@
 # GLM-5.3-Flash (FP8, TP=4) runtime profile.
 
+model = "zai-org/GLM-5.3-Flash"
 family = "glm5-next"
 weights = "glm5.3-flash-fp8"
 

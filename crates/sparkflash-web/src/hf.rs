@@ -22,128 +22,22 @@
 //! <cache>/models--<org>--<name>/blobs/             the file contents
 //! ```
 //!
-//! The cache directory is `HF_HUB_CACHE`, else `$HF_HOME/hub`, else
-//! `$XDG_CACHE_HOME/huggingface/hub`, else `~/.cache/huggingface/hub`, the same order
-//! `huggingface_hub` uses. A model id therefore names its checkpoint without a configured path,
-//! and listing the `models--*` folders lists every model a node can serve.
+//! The cache directory and the id-to-snapshot resolution are [sparkflash_weights::hub]'s, the
+//! one resolver the serving binary and every model pack use too. This module adds what only the
+//! control plane needs: listing the `models--*` folders, which lists every model a node can serve,
+//! and choosing among them.
 
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Serialize;
+pub use sparkflash_weights::hub::{default_cache_dir, is_model_id, repo_folder, resolve};
+use sparkflash_weights::hub::{folder_id, snapshot_of};
 
 use crate::config::{profile_for_id, profile_for_model_type};
 
 /// The `config.json` `model_type` values the supported weights load.
 pub const SUPPORTED_MODEL_TYPES: &[&str] =
     &["deepseek_v41", "qwen4_exp", "qwen4_exp_text", "glm5_next"];
-
-/// The hub cache directory from this process's environment, as `huggingface_hub` resolves it.
-#[must_use]
-pub fn default_cache_dir() -> Option<PathBuf> {
-    cache_dir_from(|key| std::env::var_os(key))
-}
-
-fn cache_dir_from(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    let set = |key: &str| {
-        var(key)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    };
-    if let Some(cache) = set("HF_HUB_CACHE").or_else(|| set("HUGGINGFACE_HUB_CACHE")) {
-        return Some(cache);
-    }
-    if let Some(home) = set("HF_HOME") {
-        return Some(home.join("hub"));
-    }
-    if let Some(cache) = set("XDG_CACHE_HOME") {
-        return Some(cache.join("huggingface").join("hub"));
-    }
-    set("HOME").map(|home| home.join(".cache").join("huggingface").join("hub"))
-}
-
-/// Whether `id` is a Hugging Face model id: `name` or `org/name`, each part letters, digits,
-/// `-`, `_` or `.`, not starting or ending with `-` or `.`, and no `--` or `..` anywhere.
-#[must_use]
-pub fn is_model_id(id: &str) -> bool {
-    let parts: Vec<&str> = id.split('/').collect();
-    (1..=2).contains(&parts.len())
-        && !id.contains("--")
-        && !id.contains("..")
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part.len() <= 96
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                && !part.starts_with(['-', '.'])
-                && !part.ends_with(['-', '.'])
-        })
-}
-
-/// The cache folder for a model id: `org/name` is `models--org--name`.
-#[must_use]
-pub fn repo_folder(id: &str) -> String {
-    format!("models--{}", id.replace('/', "--"))
-}
-
-/// The model id a cache folder holds, the inverse of [`repo_folder`]. Ids never contain `--`,
-/// so the mapping is unambiguous.
-fn folder_id(folder: &str) -> Option<String> {
-    folder
-        .strip_prefix("models--")
-        .filter(|rest| !rest.is_empty())
-        .map(|rest| rest.replace("--", "/"))
-}
-
-/// A model id resolved to a checkout in the cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snapshot {
-    /// The snapshot directory, used as the checkpoint.
-    pub path: PathBuf,
-    /// The commit hash the snapshot is named after.
-    pub revision: String,
-}
-
-/// The snapshot `id` resolves to in `cache`: the commit `refs/main` names, or the newest snapshot
-/// when the download recorded no ref (a download pinned to a commit writes none).
-///
-/// # Errors
-///
-/// A message naming the cache when the model or its snapshot is not there.
-pub fn resolve(cache: &Path, id: &str) -> Result<Snapshot, String> {
-    if !is_model_id(id) {
-        return Err(format!("{id:?} is not a Hugging Face model id"));
-    }
-    let repo = cache.join(repo_folder(id));
-    if !repo.is_dir() {
-        return Err(format!(
-            "{id} is not in the Hugging Face cache at {}",
-            cache.display()
-        ));
-    }
-    snapshot_of(&repo).ok_or_else(|| format!("{id} has no snapshot in {}", repo.display()))
-}
-
-fn snapshot_of(repo: &Path) -> Option<Snapshot> {
-    let snapshots = repo.join("snapshots");
-    if let Ok(text) = std::fs::read_to_string(repo.join("refs").join("main")) {
-        let revision = text.trim().to_owned();
-        let path = snapshots.join(&revision);
-        if !revision.is_empty() && path.is_dir() {
-            return Some(Snapshot { path, revision });
-        }
-    }
-    std::fs::read_dir(&snapshots)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .max_by_key(|entry| entry.metadata().and_then(|meta| meta.modified()).ok())
-        .map(|entry| Snapshot {
-            path: entry.path(),
-            revision: entry.file_name().to_string_lossy().into_owned(),
-        })
-}
 
 /// One model found in the cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -293,6 +187,8 @@ fn blob_totals(blobs: &Path) -> (u64, bool) {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// Writes a cached model the way `huggingface_hub` does, and returns its snapshot path.
@@ -308,98 +204,6 @@ pub(crate) mod tests {
         std::fs::write(snapshot.join("config.json"), &config).expect("config");
         std::fs::write(snapshot.join("tokenizer.json"), "{}").expect("tokenizer");
         snapshot
-    }
-
-    #[test]
-    fn the_cache_directory_follows_the_huggingface_hub_order() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |key: &str| {
-                pairs
-                    .iter()
-                    .find(|(name, _)| *name == key)
-                    .map(|(_, value)| OsString::from(value))
-            }
-        };
-        static ALL: [(&str, &str); 4] = [
-            ("HF_HUB_CACHE", "/hub"),
-            ("HF_HOME", "/hf"),
-            ("XDG_CACHE_HOME", "/xdg"),
-            ("HOME", "/home/user"),
-        ];
-        assert_eq!(cache_dir_from(env(&ALL)), Some(PathBuf::from("/hub")));
-        assert_eq!(
-            cache_dir_from(env(&ALL[1..])),
-            Some(PathBuf::from("/hf/hub"))
-        );
-        assert_eq!(
-            cache_dir_from(env(&ALL[2..])),
-            Some(PathBuf::from("/xdg/huggingface/hub"))
-        );
-        assert_eq!(
-            cache_dir_from(env(&ALL[3..])),
-            Some(PathBuf::from("/home/user/.cache/huggingface/hub"))
-        );
-        assert_eq!(
-            cache_dir_from(env(&[("HF_HUB_CACHE", ""), ("HOME", "/home/user")])),
-            Some(PathBuf::from("/home/user/.cache/huggingface/hub"))
-        );
-        assert_eq!(cache_dir_from(env(&[])), None);
-    }
-
-    #[test]
-    fn model_ids_map_to_cache_folders_and_back() {
-        assert_eq!(
-            repo_folder("deepseek-ai/DeepSeek-V4.1-Flash"),
-            "models--deepseek-ai--DeepSeek-V4.1-Flash"
-        );
-        assert_eq!(
-            folder_id("models--deepseek-ai--DeepSeek-V4.1-Flash").as_deref(),
-            Some("deepseek-ai/DeepSeek-V4.1-Flash")
-        );
-        assert_eq!(folder_id("models--gpt2").as_deref(), Some("gpt2"));
-        assert_eq!(folder_id("datasets--org--name"), None);
-        assert!(is_model_id("deepseek-ai/DeepSeek-V4.1-Flash"));
-        assert!(is_model_id("gpt2"));
-        for bad in [
-            "", "a/b/c", "a--b/c", "../x", "org/-x", "org/x.", "org/x y", "/x",
-        ] {
-            assert!(!is_model_id(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn resolve_follows_refs_main_to_its_snapshot() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let snapshot = cache_model(dir.path(), "org/model", "abc123", "deepseek_v41");
-        // A second, newer snapshot that main does not point at must not win.
-        std::fs::create_dir_all(snapshot.parent().expect("snapshots").join("fff999"))
-            .expect("other snapshot");
-        let resolved = resolve(dir.path(), "org/model").expect("resolves");
-        assert_eq!(resolved.path, snapshot);
-        assert_eq!(resolved.revision, "abc123");
-    }
-
-    #[test]
-    fn resolve_uses_the_only_snapshot_without_a_ref() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let snapshot = cache_model(dir.path(), "org/model", "abc123", "deepseek_v41");
-        std::fs::remove_file(dir.path().join("models--org--model/refs/main")).expect("drop ref");
-        assert_eq!(
-            resolve(dir.path(), "org/model").expect("resolves").path,
-            snapshot
-        );
-    }
-
-    #[test]
-    fn a_missing_model_names_the_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let error = resolve(dir.path(), "org/absent").expect_err("absent");
-        assert!(error.contains("org/absent is not in the Hugging Face cache at"));
-        assert!(
-            resolve(dir.path(), "not an id")
-                .expect_err("bad id")
-                .contains("not a Hugging Face model id")
-        );
     }
 
     #[test]

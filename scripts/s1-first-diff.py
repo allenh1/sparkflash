@@ -16,9 +16,9 @@
 """DEBUGGER, not a gate (D55): the S1 device arm's attribution report - the FIRST differing layer.
 
 Use this when `scripts/numerical-gate.sh` has already failed, or when a slice claims bit identity
-and you need the layer that broke. It judges no row: the amended gate (D54/D55, `docs/RULES.md` §3)
-is what decides a row, and it does so teacher-forced against the host arm's measured distance. This
-report answers "where", never "pass/fail".
+and you need the layer that broke. It judges no row: the amended gate (D54/D55) is what decides a
+row, and it does so teacher-forced against the host arm's measured distance. This report answers
+"where", never "pass/fail".
 
 The device arm has no per-stage observation read in its product path, so a divergence inside it is
 localised by a DEBUG row: `SPARKFLASH_DEVICE_DIFF=1` makes the four-rank loop run the host arm's

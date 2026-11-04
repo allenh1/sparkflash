@@ -82,7 +82,8 @@ struct Job {
 }
 
 enum Work {
-    Prefill(Vec<u32>),
+    /// A prompt, and whether it is the first its handle posts: a request's own start.
+    Prefill(Vec<u32>, bool),
     Decode(u32),
     Sampling(Sampling),
     /// The engine's owner is dropping it; the thread frees its pool and returns.
@@ -102,6 +103,8 @@ struct PrefillJob {
     slot: usize,
     session: DeviceSequence,
     tokens: Vec<u32>,
+    /// Whether the prompt opens its request, so the slot starts it on a fresh sequence.
+    fresh: bool,
     reply: Sender<Reply>,
 }
 
@@ -109,6 +112,43 @@ struct PrefillJob {
 struct Finished {
     slot: usize,
     session: DeviceSequence,
+}
+
+/// A pooled sequence, set up as every member of the batch is.
+fn member(
+    shared: &Arc<SequenceShared>,
+    context_limit: usize,
+) -> Result<DeviceSequence, BackendError> {
+    let mut session = DeviceSequence::allocate(Arc::clone(shared), context_limit)?;
+    // A member may verify its drafts inside the batch - its rows join the same pass - but the MTP
+    // drafter accepts too few of them to pay for the rows it adds, so that is opt in until the
+    // block drafter, whose drafts are worth verifying, is the one loaded.
+    if !fuse_spec() {
+        session.spec_enabled = false;
+    }
+    Ok(session)
+}
+
+/// Give a slot a fresh sequence for a new request when an earlier one ran on it.
+///
+/// A handle is one request, so the first prompt it posts starts a sequence. A slot keeps its
+/// sequence between requests, though, and prefilling that one would continue the last request's
+/// caches - which the sequence refuses, since the prompt does not extend what it holds. The new
+/// sequence is allocated before the old one goes, as the host driver's own fresh session is: a
+/// device with no room for it refuses this request and the slot keeps the sequence it had.
+fn renew(
+    session: &mut DeviceSequence,
+    shared: &Arc<SequenceShared>,
+    context_limit: usize,
+) -> Result<(), BackendError> {
+    if session.position == 0 && session.consumed.is_empty() {
+        return Ok(());
+    }
+    let mut fresh = member(shared, context_limit)?;
+    // The request's sampling reached the engine before its prompt did, on the old sequence.
+    fresh.set_sampling(session.sampling);
+    *session = fresh;
+    Ok(())
 }
 
 /// The engine thread and the free slots of its session pool.
@@ -147,14 +187,7 @@ impl FusedEngine {
             .map_err(|error| BackendError::new("qwen4_batch", error))?;
         let mut pool: Vec<Option<DeviceSequence>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
-            let mut session = DeviceSequence::allocate(Arc::clone(&shared), context_limit)?;
-            // A member may verify its drafts inside the batch - its rows join the same pass - but
-            // the MTP drafter accepts too few of them to pay for the rows it adds, so that is opt
-            // in until the block drafter, whose drafts are worth verifying, is the one loaded.
-            if !fuse_spec() {
-                session.spec_enabled = false;
-            }
-            pool.push(Some(session));
+            pool.push(Some(member(&shared, context_limit)?));
         }
         // Every member may verify as many drafts as a lone session does, so the combined rows have
         // to hold one member's worst case for each of them.
@@ -183,12 +216,18 @@ impl FusedEngine {
         for worker in 0..capacity {
             let (prefills, awaiting) = channel::<PrefillJob>();
             let prefilled = prefilled.clone();
+            let worker_shared = Arc::clone(&shared);
             prefill_threads.push(
                 std::thread::Builder::new()
                     .name(format!("sparkflash-qwen4-prefill-{worker}"))
                     .spawn(move || {
                         while let Ok(mut job) = awaiting.recv() {
-                            let answer = job.session.prefill(&job.tokens);
+                            let renewed = if job.fresh {
+                                renew(&mut job.session, &worker_shared, context_limit)
+                            } else {
+                                Ok(())
+                            };
+                            let answer = renewed.and_then(|()| job.session.prefill(&job.tokens));
                             // The sequence goes back before the answer does: the caller's next job
                             // is a decode on it, and the reply is what lets the caller post that
                             // job at all.
@@ -260,6 +299,7 @@ impl FusedEngine {
             engine: Arc::clone(self),
             stats: Arc::clone(&self.stats[slot]),
             sampling: Sampling::default(),
+            fresh: true,
         })
     }
 
@@ -306,6 +346,8 @@ pub(super) struct FusedSession {
     /// This slot's speculative counters, refreshed by the engine after each step.
     stats: Arc<Mutex<Speculation>>,
     sampling: Sampling,
+    /// Whether no prompt has been posted yet: the next one starts the request.
+    fresh: bool,
 }
 
 impl FusedSession {
@@ -344,7 +386,8 @@ impl ModelSession for FusedSession {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        match self.ask(Work::Prefill(tokens.to_vec())) {
+        let fresh = std::mem::replace(&mut self.fresh, false);
+        match self.ask(Work::Prefill(tokens.to_vec(), fresh)) {
             Reply::Step(result) => result,
             Reply::Applied => Err(BackendError::new(
                 "qwen4_batch",
@@ -452,10 +495,10 @@ fn run(
         // A prefill runs alone: its prompt is one sequence's chunk, not a row of a batch.
         if let Some(at) = pending
             .iter()
-            .position(|job| matches!(job.work, Work::Prefill(_)))
+            .position(|job| matches!(job.work, Work::Prefill(..)))
         {
             let job = pending.remove(at);
-            let Work::Prefill(tokens) = job.work else {
+            let Work::Prefill(tokens, fresh) = job.work else {
                 unreachable!("the job was chosen for its prefill");
             };
             // The sequence leaves the pool for as long as the prompt runs; the other members keep
@@ -471,6 +514,7 @@ fn run(
                 slot: job.slot,
                 session,
                 tokens,
+                fresh,
                 reply: job.reply,
             };
             // Round robin: a worker that is already prefilling takes the next prompt and runs it

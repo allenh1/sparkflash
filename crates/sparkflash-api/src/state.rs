@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::device_token::DeviceTokenSource;
 use crate::engine::InferenceEngine;
 use crate::metrics::Metrics;
-use sparkflash_model::{ModelDescriptor, PromptCodec};
+use sparkflash_model::{ModelDescriptor, NumericsIdentity, PromptCodec};
 
 /// The default interval between SSE keep-alive comment frames while an engine stream is idle.
 ///
@@ -182,6 +182,8 @@ pub struct AppState {
     served_checkpoint: Option<Arc<str>>,
     /// An operator-supplied identifier for the build serving these weights.
     build_id: Option<Arc<str>>,
+    /// The numerics identity this process claims (docs/NUMERICS.md), for the card.
+    numerics: Option<Arc<NumericsIdentity>>,
 }
 
 impl AppState {
@@ -207,6 +209,7 @@ impl AppState {
             model_aliases: Vec::new(),
             served_checkpoint: None,
             build_id: None,
+            numerics: None,
         }
     }
 
@@ -242,6 +245,23 @@ impl AppState {
     #[must_use]
     pub fn build_id(&self) -> Option<&str> {
         self.build_id.as_deref()
+    }
+
+    /// Records the numerics identity this process serves, for the card's `numerics` member.
+    ///
+    /// Every serve command resolves one ([NumericsIdentity::resolve_process]) and prints its boot
+    /// line before it binds, so `/v1/models` says which declared arithmetic answered, or that
+    /// none is registered or an override set at boot withdrew the claim.
+    #[must_use]
+    pub fn with_numerics(mut self, numerics: NumericsIdentity) -> Self {
+        self.numerics = Some(Arc::new(numerics));
+        self
+    }
+
+    /// The numerics identity, if the serve command resolved one.
+    #[must_use]
+    pub fn numerics(&self) -> Option<&NumericsIdentity> {
+        self.numerics.as_deref()
     }
 
     /// Adds model ids this server answers to besides its own descriptor id.

@@ -2362,11 +2362,13 @@ dependencies = [
  "sparkflash-model-deepseek-v41",
  "sparkflash-model-glm5-next",
  "sparkflash-model-qwen4-exp",
+ "sparkflash-ops",
  "sparkflash-scheduler",
  "sparkflash-serve",
  "sparkflash-trace",
  "sparkflash-vision",
  "sparkflash-web",
+ "sparkflash-weights",
  "tempfile",
  "tokenizers",
  "tokio",
@@ -2655,6 +2657,7 @@ dependencies = [
  "mdns-sd",
  "serde",
  "serde_json",
+ "sparkflash-weights",
  "tempfile",
  "tokio",
  "toml",
@@ -2669,6 +2672,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

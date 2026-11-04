@@ -103,6 +103,15 @@ pub struct PrefillProfile {
     pub exact: Option<bool>,
 }
 
+/// The decode section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DecodeProfile {
+    /// Whether a decode step and a speculative verify take the tensor cores, in the form that
+    /// computes a row to the same bits at every row count.
+    pub tensor_cores: Option<bool>,
+}
+
 /// The attention-cache representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +190,10 @@ pub struct DiagnosticsProfile {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelProfile {
+    /// The registry model the profile configures (`numerics/registry.toml`). The declaration
+    /// check (`scripts/numerics.py ci`) reads it to know whose references a changed setting needs
+    /// recaptured, and a test holds it to the descriptor `weights` selects.
+    pub model: Option<String>,
     /// The model family the profile belongs to, for a mismatch check.
     pub family: Option<String>,
     /// The weights selector.
@@ -189,6 +202,8 @@ pub struct ModelProfile {
     pub runtime: RuntimeProfile,
     /// Bulk prefill.
     pub prefill: PrefillProfile,
+    /// Decode steps and speculative verifies.
+    pub decode: DecodeProfile,
     /// Attention caches.
     pub attention: AttentionProfile,
     /// Speculation.
@@ -214,6 +229,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_QWEN4_PREFILL_MMA", "prefill.tensor_cores"),
     ("SPARKFLASH_GLM_PREFILL_EXACT", "prefill.exact"),
     ("SPARKFLASH_GLM_PREFILL_ACTIVATION", "prefill.activation"),
+    ("SPARKFLASH_DECODE_MMA", "decode.tensor_cores"),
     ("SPARKFLASH_GLM_LATENT_CACHE", "attention.latent_cache"),
     ("SPARKFLASH_QWEN4_SPEC", "speculation.enabled"),
     ("SPARKFLASH_QWEN4_SPEC_DEPTH", "speculation.depth"),
@@ -292,7 +308,8 @@ impl ModelProfile {
     /// Apply environment overrides, refusing values outside a field's domain.
     ///
     /// # Errors
-    /// A malformed number, a value other than 0 or 1, or an unknown probe or activation name.
+    /// A malformed number, a switch other than 0, 1, off or on, or an unknown probe or activation
+    /// name.
     pub fn apply_env(
         &mut self,
         lookup: impl Fn(&str) -> Option<String>,
@@ -331,6 +348,9 @@ impl ModelProfile {
                 self.prefill.tensor_cores = Some(parse_bool(name, value, field)?)
             }
             "prefill.exact" => self.prefill.exact = Some(parse_bool(name, value, field)?),
+            "decode.tensor_cores" => {
+                self.decode.tensor_cores = Some(parse_bool(name, value, field)?)
+            }
             "prefill.activation" => {
                 self.prefill.activation = Some(match value {
                     "fp8" => ActivationMode::Fp8,
@@ -396,7 +416,8 @@ impl ModelProfile {
         let mut out = String::new();
         let _ = writeln!(
             out,
-            "sparkflash profile (family={}, weights={})",
+            "sparkflash profile (model={}, family={}, weights={})",
+            self.model.as_deref().unwrap_or("-"),
             self.family.as_deref().unwrap_or("-"),
             self.weights.as_deref().unwrap_or("-")
         );
@@ -417,6 +438,7 @@ impl ModelProfile {
         row!("prefill.tensor_cores", self.prefill.tensor_cores);
         row!("prefill.activation", self.prefill.activation);
         row!("prefill.exact", self.prefill.exact);
+        row!("decode.tensor_cores", self.decode.tensor_cores);
         row!("attention.latent_cache", self.attention.latent_cache);
         row!("attention.selected_tokens", self.attention.selected_tokens);
         row!("speculation.enabled", self.speculation.enabled);
@@ -451,9 +473,9 @@ fn parse_usize(
 
 fn parse_bool(name: &'static str, value: &str, field: &'static str) -> Result<bool, ProfileError> {
     match value {
-        "1" | "true" => Ok(true),
-        "0" | "false" => Ok(false),
-        other => Err(env_error(name, other, field, "0 or 1")),
+        "1" | "true" | "on" => Ok(true),
+        "0" | "false" | "off" => Ok(false),
+        other => Err(env_error(name, other, field, "0 or 1 (off or on)")),
     }
 }
 
@@ -506,6 +528,55 @@ probe = "hash"
         assert!(summary.contains("diagnostics.probe = Hash"), "{summary}");
     }
 
+    /// `scripts/numerics.py ci` asks each arm profile's `model` whose references a changed setting
+    /// needs recaptured. This holds that answer to the descriptor the profile's weights select, so
+    /// a wrong `model` cannot send the recapture to another model's references.
+    #[test]
+    fn every_arm_profile_names_the_model_its_weights_select() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("the crates folder");
+        let mut profiles = Vec::new();
+        for arm in std::fs::read_dir(crates).expect("the crates folder lists") {
+            let arm = arm.expect("a crate").path();
+            let is_arm = arm
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("sparkflash-model-"));
+            let Ok(config) = std::fs::read_dir(arm.join("config")) else {
+                continue;
+            };
+            if !is_arm {
+                continue;
+            }
+            profiles.extend(
+                config
+                    .map(|file| file.expect("a profile").path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "toml")
+                    }),
+            );
+        }
+        assert!(profiles.len() >= 3, "found only {profiles:?}");
+        for path in profiles {
+            let shown = path.display();
+            let profile =
+                ModelProfile::load(&path).unwrap_or_else(|error| panic!("{shown}: {error}"));
+            let weights = profile
+                .weights
+                .as_deref()
+                .unwrap_or_else(|| panic!("{shown} names no weights"));
+            let descriptor = crate::descriptor::find_model_by_weights(weights)
+                .unwrap_or_else(|| panic!("{shown}: no descriptor serves the weights {weights}"));
+            assert_eq!(
+                profile.model.as_deref(),
+                Some(descriptor.id.as_str()),
+                "{shown} must name the model its weights {weights} select"
+            );
+        }
+    }
+
     #[test]
     fn an_unknown_key_is_refused() {
         let error = ModelProfile::from_toml("[runtime]\nconcurreny = 2\n").expect_err("typo");
@@ -542,6 +613,19 @@ probe = "hash"
             .apply_env(|name| (name == "SPARKFLASH_QWEN4_PREFILL_MMA").then(|| "yes".to_owned()))
             .expect_err("yes is not a bool");
         assert!(matches!(error, ProfileError::Env { .. }));
+    }
+
+    #[test]
+    fn a_switch_takes_the_deepseek_spellings_too() {
+        let mut profile = ModelProfile::default();
+        profile
+            .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "off".to_owned()))
+            .expect("off is a switch value");
+        assert_eq!(profile.decode.tensor_cores, Some(false));
+        profile
+            .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "on".to_owned()))
+            .expect("on is a switch value");
+        assert_eq!(profile.decode.tensor_cores, Some(true));
     }
 
     #[test]

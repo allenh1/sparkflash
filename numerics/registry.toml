@@ -1,0 +1,152 @@
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The numerics registry: the declared arithmetic of every served configuration (docs/NUMERICS.md,
+# DECISIONS.md D67).
+#
+# Nothing changes unless someone declared it. Each [[config]] names one configuration - model,
+# world size, numerics profile, parallel plan and CUDA architecture - and the numerics version it
+# serves, with the fingerprint of the reference that version produced. `scripts/numerics.py check`
+# captures a running server and fails when its bits differ from the fingerprint here;
+# `scripts/numerics.py ci` fails a commit whose reference or fingerprint changed without a version
+# bump, or whose version bumped without a change. The binary embeds this file and reports the
+# entry it serves at boot and on /v1/models.
+#
+# [[anchor]] entries are the frozen quality references a declared change is measured against
+# (docs/NUMERICS.md §4). They are never edited or removed.
+
+schema = 1
+
+# The four prerequisites docs/NUMERICS.md §5 names. Until every one is true, no configuration may
+# bump its version, which is to say no arithmetic change may land; `scripts/numerics.py ci`
+# enforces that. Turning one on is a reviewed edit with the tool or data it names in the same diff.
+[prerequisites]
+# The frozen anchors below, plus the teacher-forced comparison (`scripts/numerics.py compare`).
+anchor = false
+# The CI declaration check (`scripts/numerics.py ci`, run by the scripts-tests job).
+declaration_check = true
+# Inputs that reach every routed expert of every layer, with the per-layer hit counts to prove it.
+coverage = false
+# Per-layer and per-expert relative error against the reference forward.
+monitors = false
+
+# Qwen3.8-Flash-Next: the host driver at world 1, the TP driver at 2 and 4. Each world sums in its
+# own order, so each has its own reference. Version 1 decodes on the tensor cores, in the
+# arithmetic its prefill already used (D68), so a continued chat turn is the bits of a cold one;
+# v1-tc-decode.md measures that against the anchor, which keeps the token-kernel decode
+# (SPARKFLASH_DECODE_MMA=off), and v1-tp-floor.md the reassociation floor docs/NUMERICS.md §4
+# names.
+[[config]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/qwen38-tp1-sm121a.json"
+fingerprint = "37578a09102537e51b3ff5ba0d5bef2becbf1c7578459e5fbe9c5e53c872901b"
+report = "docs/numerics/qwen38/v1-tc-decode.md"
+captured = "2026-11-03"
+note = "NVFP4 weights; tensor-core prefill and decode (each activation a BF16 head and remainder, FP32 sums); BF16 KV cache; context 65,536."
+
+[[config]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 2
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/qwen38-tp2-sm121a.json"
+fingerprint = "d1d546aed4e8f285494cddcdcd1b9b788a60af3494ee260ba68deda5f936b425"
+report = "docs/numerics/qwen38/v1-tc-decode.md"
+captured = "2026-11-03"
+note = "The TP driver on two nodes over NCCL, context 65,536."
+
+[[config]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/qwen38-tp4-sm121a.json"
+fingerprint = "007e70467d0d4b0667191ffc5e896b34cd1769c333bf42916b0eef2327bbca5b"
+report = "docs/numerics/qwen38/v1-tc-decode.md"
+captured = "2026-11-03"
+note = "The TP driver on four nodes over NCCL, context 65,536."
+
+# DeepSeek-V4.1-Flash's TP=4 device path serves greedy text only, so its evidence is text and it
+# has no anchor. Its greedy text depends on the server's history: a request resumed from the
+# prefix a reused lane holds can differ from the same request prefilled whole (docs/NUMERICS.md
+# §7). The reference is the suite's first pass on a freshly booted server, which reproduces; a
+# check must run on a freshly booted server too.
+[[config]]
+model = "deepseek-ai/DeepSeek-V4.1-Flash"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "text"
+reference = "references/deepseek-v41-tp4-sm121a.json"
+fingerprint = "4e513949b99c263eb407459bfeedc6b513bcd0f37f2e30cc348838976ac725a1"
+captured = "2026-11-03"
+note = "Production's launch (debug build, NCCL reduce, prefix reuse on), 128 greedy tokens, on a freshly booted server."
+
+# GLM-5.3-Flash serves only at world 4. Its shipped default keeps the attention window's latent
+# cache in E4M3 and prefills in bulk with FP8 operands; v1-e4m3-window.md measures that trade
+# against the f32-cache anchor below.
+[[config]]
+model = "zai-org/GLM-5.3-Flash"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/glm53-tp4-sm121a.json"
+fingerprint = "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6"
+report = "docs/numerics/glm53/v1-e4m3-window.md"
+captured = "2026-11-03"
+note = "The shipped default: E4M3 latent cache, bulk FP8 prefill, default context."
+
+[[anchor]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+evidence = "logprobs"
+reference = "references/qwen38-anchor.json"
+fingerprint = "8c4ccd634bae03a0c4062e56b385e725f8ca3ab7cba697f982c80b887effd327"
+captured = "2026-11-03"
+note = "The world-1 configuration above with top-20 logprobs: the smallest world, today's arithmetic."
+
+[[anchor]]
+model = "zai-org/GLM-5.3-Flash"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+evidence = "logprobs"
+reference = "references/glm53-anchor.json"
+fingerprint = "6de4f3ab892cfe9e9464e16e722538acde33f444ab8d26108c9537177039bf3b"
+captured = "2026-11-03"
+note = """\
+SPARKFLASH_GLM_KV_CACHE=f32 at --context 131072, top-20 logprobs. GLM has no world-1 device arm, \
+so the anchor is the smallest world with the attention window's latent cache in f32; an f32 cache \
+takes the token-path prefill."""

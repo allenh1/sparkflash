@@ -31,7 +31,7 @@
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 
-use super::prefill::ATTENTION_CHUNK;
+use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
     ATTN_GROUP_SELECTED, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts,
     GpuMoe, MAX_SELECTED_TOKENS,
@@ -466,7 +466,8 @@ impl DeviceSequence {
     /// The state-dependent half of a linear block: the causal convolution and the delta-rule
     /// recurrence over `batch` rows, reading and writing `self.gdn_conv[index]` and
     /// `self.gdn_recurrent[index]` and leaving the value rows in `self.linear_out`. A batched step
-    /// runs it once per row with `batch` 1.
+    /// runs it once per member over that member's rows. `chunk` takes the tensor-core prefill
+    /// image's forms, a verify's included.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn linear_state(
         &self,
@@ -501,21 +502,21 @@ impl DeviceSequence {
             self.gdn_recurrent[index].expect("a linear layer has a recurrent state");
         // A verify leaves the state as it found it and its last row's in the spare.
         let recurrent_out = if snapshot_rows == 0 {
-            recurrent_state.0
+            recurrent_state
         } else {
-            self.gdn_spare[index]
-                .expect("a verified linear layer has a spare state")
-                .0
+            self.gdn_spare[index].expect("a verified linear layer has a spare state")
         };
         let chunked = chunk
             && self.gdn_chunk(
                 *conv,
                 conv_state,
-                recurrent_state,
+                (recurrent_state, recurrent_out),
                 *a_log,
                 *dt_bias,
                 *norm,
+                [conv_out, b_out, a_out],
                 batch,
+                (conv_snapshot, snapshot_rows, region_stride),
             )?;
         if !chunked {
             self.launch(
@@ -555,7 +556,7 @@ impl DeviceSequence {
                     dt_bias.0,
                     norm.0,
                     recurrent_state.0,
-                    recurrent_out,
+                    recurrent_out.0,
                     self.linear_out.0,
                     config.linear_key_width() as u64,
                     config.linear_num_value_heads as u64,
@@ -642,7 +643,24 @@ impl DeviceSequence {
     ) -> Result<(), BackendError> {
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
-        self.gemv(&moe.router, mixed, self.probabilities, batch)?;
+        // On the GEMM path the router and the shared expert's gate, up and sigmoid gate read the
+        // same rows of `mixed`, so a few rows take them in one launch; each output keeps the bits
+        // its own launch gives it ([Self::gemm_group]).
+        let grouped = batch >= GEMM_MIN_BATCH || self.chunk_path(batch);
+        if grouped {
+            self.gemm_group(
+                &[
+                    Projection::plain(&moe.router, self.probabilities),
+                    Projection::plain(&moe.shared, self.shared_hidden),
+                    Projection::plain(&moe.shared_up, self.shared_up),
+                    Projection::plain(&moe.shared_gate, self.expert_gate),
+                ],
+                mixed,
+                batch,
+            )?;
+        } else {
+            self.gemv(&moe.router, mixed, self.probabilities, batch)?;
+        }
         self.probe_finite(
             layer,
             "router_logits",
@@ -678,7 +696,7 @@ impl DeviceSequence {
             batch * config.num_experts_per_tok * config.hidden_size,
         )?;
         self.prof_mark("experts")?;
-        self.shared_expert(moe, mixed, batch)?;
+        self.shared_expert(moe, mixed, batch, grouped)?;
         self.prof_mark("shared")?;
         // One rank's combination is its share of the sum: it is summed over the world before it
         // is injected, so the combine only writes it ([Self::inject_branch]).
@@ -850,21 +868,22 @@ impl DeviceSequence {
     }
 
     /// The shared expert: SwiGLU of the gate and up projections, its sigmoid gate's logit in
-    /// `self.expert_gate`, and the down projection in `self.shared_out`.
+    /// `self.expert_gate`, and the down projection in `self.shared_out`. On the GEMM path
+    /// (`projected`) the projections of `mixed` already ran beside the router.
     fn shared_expert(
         &self,
         moe: &GpuMoe,
         mixed: Deviceptr,
         batch: usize,
+        projected: bool,
     ) -> Result<(), BackendError> {
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
         let intermediate = config.shared_expert_intermediate_size;
-        if batch >= GEMM_MIN_BATCH {
+        if projected {
             // The same argument as the hyper passes: one weight pass per chunk instead of one per
-            // group of eight tokens.
-            self.gemm(&moe.shared, mixed, self.shared_hidden, batch, 0, 1.0)?;
-            self.gemm(&moe.shared_up, mixed, self.shared_up, batch, 0, 1.0)?;
+            // group of eight tokens. A decode step on the chunk path comes here too, so its row
+            // gets a chunk row's bits.
             self.launch(
                 kernels.swiglu,
                 ((batch * intermediate).div_ceil(256).max(1) as u32, 1, 1),
@@ -876,7 +895,6 @@ impl DeviceSequence {
                     (batch * intermediate) as u64,
                 ],
             )?;
-            self.gemm(&moe.shared_gate, mixed, self.expert_gate, batch, 0, 1.0)?;
         } else {
             // Same register-accumulator bound as the hyper passes: one launch per group of
             // GEMV_MAX_BATCH tokens, offset into the chunk's staging rows.

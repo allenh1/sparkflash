@@ -69,6 +69,10 @@ pub struct ChatCompletionRequest {
     pub prompt_logprobs: Option<i32>,
     /// Specific vocabulary ids whose logprobs are wanted at every generated position.
     pub logprob_token_ids: Option<Vec<u32>>,
+    /// vLLM's `return_tokens_as_token_ids`: with logprobs, every token is reported as the string
+    /// `token_id:{id}` instead of its decoded text (and `bytes` are that string's bytes), so two
+    /// ids that decode to the same text stay distinguishable.
+    pub return_tokens_as_token_ids: Option<bool>,
     /// vLLM's chat `echo`: prepend the final message to the continuation.
     ///
     /// When the tokenizer seam is attached the prompt ids are the released V4.1 template's real ids
@@ -343,6 +347,19 @@ pub struct CompletionRequest {
     ///
     /// Takes precedence over `logprobs`'s natural top-k, as vLLM's extension does.
     pub logprob_token_ids: Option<Vec<u32>>,
+    /// vLLM's `return_tokens_as_token_ids`: with logprobs, `tokens[]` and the `top_logprobs` keys
+    /// are the strings `token_id:{id}` instead of decoded text, so two ids that decode to the same
+    /// text (byte-fallback pieces, for one) stay distinguishable.
+    pub return_tokens_as_token_ids: Option<bool>,
+    /// SparkFlash teacher forcing: generate exactly these token ids instead of the model's choice.
+    ///
+    /// Each position's logprobs are the model's distribution given the prompt and the forced
+    /// tokens before it, which is what scores a model against a frozen reference sequence
+    /// (docs/NUMERICS.md §4) on an engine that has no all-position prompt logprobs. It needs
+    /// `logprobs`, one prompt, greedy sampling and no penalty, stop string or constraint;
+    /// `max_tokens` defaults to the forced length and must equal it when given. An engine that
+    /// does not declare `forced_decoding` refuses the request rather than sample instead.
+    pub forced_tokens: Option<Vec<u32>>,
     /// Raw reasoning effort, validated by crate::reasoning.
     pub reasoning_effort: Option<Value>,
     /// Whether thinking is enabled.

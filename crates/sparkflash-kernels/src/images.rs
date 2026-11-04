@@ -20,6 +20,12 @@
 //! a model crate carries no CUDA and no kernel build script and no model crate depends on another
 //! for a kernel.
 
+/// The CUDA architecture this build's kernels target (`SPARKFLASH_CUDA_ARCH`, default `sm_121a`).
+///
+/// The numerics registry keys every configuration by it: the same source compiled for another
+/// architecture is a different arithmetic until a reference says otherwise.
+pub const CUDA_ARCH: &str = env!("SPARKFLASH_BUILT_CUDA_ARCH");
+
 /// One image the shared stack builds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Image {

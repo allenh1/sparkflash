@@ -212,6 +212,11 @@ scripts-tests:
     - bash scripts/identity-gate.sh --self-test
     - python3 -m unittest scripts/tests/test_identity_gate.py -v
     - bash scripts/numerical-gate.sh --self-test
+    # The numerics declaration check (docs/NUMERICS.md §5): it diffs numerics/ against the MR's
+    # base, so it needs git to trust a checkout the runner cloned as another user.
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - python3 scripts/numerics.py self-test
+    - python3 scripts/numerics.py ci
     - python3 ci/test_check_features.py
 
 # Actually compiles CUDA. This replaces a job that ran `command -v nvcc || exit 0` in a

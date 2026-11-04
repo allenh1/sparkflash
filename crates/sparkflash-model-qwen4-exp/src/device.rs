@@ -86,10 +86,10 @@ use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession, Sampling,
     Speculation, StepOutput,
 };
-use sparkflash_weights::WeightSource;
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
+use sparkflash_weights::{WeightSource, check_length};
 
 use crate::config::{LayerKind, Qwen4ExpConfig};
 use crate::ple::PleTable;
@@ -109,7 +109,7 @@ pub use prefill::{
     GDN_VALUE, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK,
     embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape,
 };
-use prefill::{PrefillKernels, PrefillScratch};
+use prefill::{PrefillKernels, PrefillScratch, Projection};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 pub use tp::{reduce_two_shot, splits_two_shot};
@@ -215,6 +215,9 @@ pub const MAX_SELECTED_TOKENS: usize = 2304;
 /// Per-row activation buffers a session exposes to a batch, in one canonical order.
 const SCRATCH_SLOTS: usize = 48;
 
+/// The slot of [DeviceSequence::scratch_pointers] that is `gemm_partials`.
+const PARTIALS_SLOT: usize = 42;
+
 /// The query heads q4e_attn_group computes together (Q4E_ATTN_GROUP).
 pub const ATTN_GROUP_HEADS: usize = 4;
 
@@ -269,6 +272,41 @@ const GEMM_MIN_BATCH: usize = 64;
 /// Floats reserved for a split GEMM's segment sums: sixteen MiB covers every narrow matrix the
 /// model has at the default chunk width, and the launchers clamp their segment counts to fit.
 const GEMM_PARTIAL_FLOATS: usize = 4 << 20;
+
+/// Arrival counters after the partials of every `gemm_partials` region, so they go wherever the
+/// region is swapped or carved: one for each tile of a split few-row launch, which counts its
+/// slices in and whose last slice resets it (q4p_last_slice). Zero between launches.
+const GEMM_SPLIT_TICKETS: usize = GEMM_PARTIAL_FLOATS / 256;
+
+/// The words a `gemm_partials` region holds: its partials, then its tickets.
+const GEMM_PARTIAL_REGION: usize = GEMM_PARTIAL_FLOATS + GEMM_SPLIT_TICKETS;
+
+/// A `gemm_partials` region's tickets.
+fn split_tickets(partials: Deviceptr) -> Deviceptr {
+    partials.offset(GEMM_PARTIAL_FLOATS * 4)
+}
+
+/// Zero the tickets of the `gemm_partials` regions `count` regions apart from `first` on
+/// `stream`, and wait: a fresh allocation's are whatever it held.
+fn zero_split_tickets(
+    cuda: &Cuda,
+    stream: &RunStream,
+    zero: Kernel,
+    first: Deviceptr,
+    count: usize,
+) -> Result<(), String> {
+    for region in 0..count {
+        let tickets = split_tickets(first.offset(region * GEMM_PARTIAL_REGION * 4));
+        cuda.launch_on(
+            stream,
+            zero,
+            (GEMM_SPLIT_TICKETS.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            &[tickets.0, GEMM_SPLIT_TICKETS as u64],
+        )?;
+    }
+    cuda.synchronize_stream(stream)
+}
 
 pub use sparkflash_ops::gemv::{
     TILED_GEMV_E4M3_ROUND, TILED_GEMV_MIN_COLUMNS, TILED_GEMV_ROUND, tiled_gemv_e4m3_splits,
@@ -605,18 +643,6 @@ pub(crate) trait Sink {
     /// The two per-tensor NVFP4 scales; a sink that records them returns what the walk read, and
     /// a slab sink returns the pair the rank file's index recorded.
     fn nvfp4_scalars(&mut self, scale_2: f32, input_scale: f32) -> Result<(f32, f32), String>;
-}
-
-/// A weight's bytes against the length its shapes give, which every sink handed bytes checks.
-pub(crate) fn check_length(key: &str, len: usize, bytes: &[u8]) -> Result<(), String> {
-    if bytes.len() == len {
-        Ok(())
-    } else {
-        Err(format!(
-            "{key} came to {} bytes where its shapes give {len}",
-            bytes.len()
-        ))
-    }
 }
 
 /// Each weight in its own device allocation, uploaded as it is read.
@@ -1673,7 +1699,7 @@ impl Qwen4ExpDeviceBackend {
         Self::open_inner(
             checkpoint,
             context_limit,
-            PrefillPlan::from_env(),
+            PrefillPlan::from_env()?,
             Some(rank_file),
             None,
         )
@@ -1718,7 +1744,7 @@ impl Qwen4ExpDeviceBackend {
         Self::open_inner(
             checkpoint,
             context_limit,
-            PrefillPlan::from_env(),
+            PrefillPlan::from_env()?,
             None,
             None,
         )
@@ -1743,7 +1769,7 @@ impl Qwen4ExpDeviceBackend {
         Self::open_inner(
             checkpoint,
             context_limit,
-            PrefillPlan::from_env(),
+            PrefillPlan::from_env()?,
             None,
             Some(tp),
         )
@@ -1766,7 +1792,7 @@ impl Qwen4ExpDeviceBackend {
         Self::open_inner(
             checkpoint,
             context_limit,
-            PrefillPlan::from_env(),
+            PrefillPlan::from_env()?,
             Some(rank_file),
             Some(tp),
         )
@@ -2184,13 +2210,7 @@ pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescripto
         context_tokens: context.min(config.max_position_embeddings),
         max_output_tokens: crate::MAX_OUTPUT_TOKENS,
         vocab_size: config.vocab_size,
-        capabilities: Capabilities {
-            tools: true,
-            thinking: true,
-            reasoning_effort: true,
-            vision: false,
-            constrained: false,
-        },
+        capabilities: Capabilities::ALL,
     }
 }
 
@@ -2786,10 +2806,31 @@ impl DeviceSequence {
         Ok(())
     }
 
+    /// The K split [Self::gemm_tokens] gives `matrix` over a run of `batch` tokens.
+    pub(super) fn token_split(&self, matrix: &GpuMat, batch: usize) -> usize {
+        // A block computes an 8 x 8 tile of (row, token) per thread, so a matrix with few rows
+        // leaves the GPU almost entirely idle: the hyper-connection's 320-row down projection is
+        // 640 threads, five blocks on forty-eight SMs, and measured 0.67 ms for a 6.5 MiB read
+        // that should take a fortieth of that. Splitting the inner dimension over blockIdx.y and
+        // reducing the slices costs one extra read of a few hundred kilobytes and fills the GPU.
+        let split_for = if self.backend.prefill.decode {
+            GEMM_TILE_TOKENS
+        } else {
+            batch
+        };
+        let price = (matrix.rows.div_ceil(64) * split_for.div_ceil(64)).max(1);
+        let budget = (GEMM_PARTIAL_FLOATS / (split_for * matrix.rows).max(1)).max(1);
+        (96 / price)
+            .clamp(1, (matrix.columns / 32).max(1))
+            .min(budget)
+    }
+
     /// The shared-memory token GEMM over `runs` runs of `batch` tokens (at most
-    /// GEMM_TILE_TOKENS) laid end to end, as few launches as the partials allow. A run's K split
-    /// is chosen from its own `batch`, so each token gets the bits a launch of its run alone
-    /// would give it.
+    /// GEMM_TILE_TOKENS) laid end to end, as few launches as the partials allow. A token's sums
+    /// depend on the K split and nothing else in the launch. With the decode steps on the chunk
+    /// path ([prefill::PrefillPlan::decode]) the split is a whole tile's whatever the run's width,
+    /// so a token gets the bits it gets in any run; otherwise it is chosen from the run's own
+    /// `batch`, the bits a launch of its run alone would give it.
     #[allow(clippy::too_many_arguments)]
     fn gemm_tokens(
         &self,
@@ -2801,54 +2842,61 @@ impl DeviceSequence {
         epilogue: u32,
         scale: f32,
     ) -> Result<(), BackendError> {
-        // A block computes an 8 x 8 tile of (row, token) per thread, so a matrix with few rows
-        // leaves the GPU almost entirely idle: the hyper-connection's 320-row down projection is
-        // 640 threads, five blocks on forty-eight SMs, and measured 0.67 ms for a 6.5 MiB read
-        // that should take a fortieth of that. Splitting the inner dimension over blockIdx.y and
-        // reducing the slices costs one extra read of a few hundred kilobytes and fills the GPU.
-        let price = (matrix.rows.div_ceil(64) * batch.div_ceil(64)).max(1);
-        let budget = (GEMM_PARTIAL_FLOATS / (batch * matrix.rows).max(1)).max(1);
-        let segments = (96 / price)
-            .clamp(1, (matrix.columns / 32).max(1))
-            .min(budget);
+        let segments = self.token_split(matrix, batch);
         let partials = if segments > 1 {
             self.gemm_partials.0
         } else {
             0_u64
         };
         let count = batch * matrix.rows;
-        // The runs whose slices fit the partials at once.
+        // A few rows take q4p_gemm_rows, the same sums a thread an output, whose split tiles add
+        // their slices themselves: one ticket a 128-output tile of a run.
+        let rows_kernel = batch < GEMM_MIN_BATCH;
+        // The runs whose slices fit the partials, and their tiles the tickets, at once. A run
+        // alone always fits both: its split slices take `segments * count` partials, so at most
+        // GEMM_PARTIAL_FLOATS / 256 128-output tiles.
         let per_launch = if segments > 1 {
-            (GEMM_PARTIAL_FLOATS / (segments * count)).max(1)
+            let fit = (GEMM_PARTIAL_FLOATS / (segments * count)).max(1);
+            if rows_kernel {
+                fit.min((GEMM_SPLIT_TICKETS / count.div_ceil(128)).max(1))
+            } else {
+                fit
+            }
         } else {
             runs
         };
+        let tickets = split_tickets(self.gemm_partials).0;
         let mut done = 0usize;
         while done < runs {
             let launched = per_launch.min(runs - done);
             let output = output.offset(done * count * 4);
+            let (kernel, blocks) = if rows_kernel {
+                (self.backend.kernels.prefill.gemm_rows, count.div_ceil(128))
+            } else {
+                (self.backend.kernels.gemm_bf16, matrix.rows.div_ceil(64))
+            };
+            let args = [
+                matrix.pointer.0,
+                input.offset(done * batch * matrix.columns * 4).0,
+                output.0,
+                matrix.rows as u64,
+                matrix.columns as u64,
+                batch as u64,
+                epilogue as u64,
+                u64::from(scale.to_bits()),
+                segments as u64,
+                partials,
+                tickets,
+            ];
+            // q4e_gemm_bf16 takes no tickets.
+            let arity = if rows_kernel { 11 } else { 10 };
             self.launch(
-                self.backend.kernels.gemm_bf16,
-                (
-                    matrix.rows.div_ceil(64) as u32,
-                    segments as u32,
-                    launched as u32,
-                ),
+                kernel,
+                (blocks as u32, segments as u32, launched as u32),
                 (128, 1, 1),
-                &[
-                    matrix.pointer.0,
-                    input.offset(done * batch * matrix.columns * 4).0,
-                    output.0,
-                    matrix.rows as u64,
-                    matrix.columns as u64,
-                    batch as u64,
-                    epilogue as u64,
-                    u64::from(scale.to_bits()),
-                    segments as u64,
-                    partials,
-                ],
+                &args[..arity],
             )?;
-            if segments > 1 {
+            if segments > 1 && !rows_kernel {
                 self.launch(
                     self.backend.kernels.gemm_reduce,
                     (count.div_ceil(256).max(1) as u32, launched as u32, 1),
@@ -2909,10 +2957,12 @@ impl DeviceSequence {
         output: Deviceptr,
         batch: usize,
     ) -> Result<(), BackendError> {
+        // A forward on the chunk path takes the chunk's GEMM at every row count, so a decode
+        // step's row gets the bits the same row gets in a prompt chunk.
+        if batch >= GEMM_MIN_BATCH || self.chunk_path(batch) {
+            return self.gemm(matrix, input, output, batch, 0, 1.0);
+        }
         if batch > GEMV_MAX_BATCH {
-            if batch >= GEMM_MIN_BATCH {
-                return self.gemm(matrix, input, output, batch, 0, 1.0);
-            }
             return self.gemv_grouped(matrix, input, output, batch);
         }
         if matrix.columns >= TILED_GEMV_MIN_COLUMNS
@@ -2970,12 +3020,18 @@ impl DeviceSequence {
         y3: Deviceptr,
         batch: usize,
     ) -> Result<(), BackendError> {
-        if batch > GEMV_MAX_BATCH {
-            if batch >= GEMM_MIN_BATCH {
-                self.gemm(m0, input, y0, batch, 0, 1.0)?;
-                self.gemm(m1, input, y1, batch, 0, 1.0)?;
-                self.gemm(m2, input, y2, batch, 0, 1.0)?;
-                self.gemm(m3, input, y3, batch, 0, 1.0)?;
+        if batch > GEMV_MAX_BATCH || self.chunk_path(batch) {
+            if batch >= GEMM_MIN_BATCH || self.chunk_path(batch) {
+                self.gemm_group(
+                    &[
+                        Projection::plain(m0, y0),
+                        Projection::plain(m1, y1),
+                        Projection::plain(m2, y2),
+                        Projection::plain(m3, y3),
+                    ],
+                    input,
+                    batch,
+                )?;
             } else {
                 self.gemv_grouped(m0, input, y0, batch)?;
                 self.gemv_grouped(m1, input, y1, batch)?;
@@ -3080,7 +3136,7 @@ impl DeviceSequence {
         let normed = self.normed.offset(first * width * 4);
         let mixed = self.mixed.offset(first * config.hidden_size * 4);
         let injection = self.injection.offset(first * config.hc_count * 4);
-        if batch >= GEMM_MIN_BATCH {
+        if batch >= GEMM_MIN_BATCH || self.chunk_path(batch) {
             let low = self.hyper_low.offset(first * config.hc_lowrank * 4);
             let raw = self.hyper_mix_raw.offset(first * width * 4);
             self.norm(
@@ -3095,15 +3151,27 @@ impl DeviceSequence {
             )?;
             let hc = config.hc_count as f32;
             self.prof_mark("hyper_norm")?;
-            self.gemm(&block.down, normed, low, batch, 1, hc)?;
-            self.prof_mark("hyper_low")?;
+            // The injection reads the same normed rows as the down projection: a few rows take it
+            // beside that launch ([Self::gemm_group]).
+            let mut projections = vec![Projection {
+                matrix: &block.down,
+                output: low,
+                epilogue: 1,
+                scale: hc,
+            }];
             if inject {
                 let weights = block.inject.as_ref().ok_or_else(|| {
                     BackendError::new("qwen4_device", "missing block_inject weight")
                 })?;
-                self.gemm(weights, normed, injection, batch, 2, hc)?;
-                self.prof_mark("hyper_inject")?;
+                projections.push(Projection {
+                    matrix: weights,
+                    output: injection,
+                    epilogue: 2,
+                    scale: hc,
+                });
             }
+            self.gemm_group(&projections, normed, batch)?;
+            self.prof_mark("hyper_low")?;
             self.gemm(&block.up, low, raw, batch, 0, 1.0)?;
             self.prof_mark("hyper_raw")?;
             self.launch(
@@ -3643,9 +3711,10 @@ impl DeviceSequence {
         debug_assert!((1..=self.backend.prefill.chunk).contains(&batch));
         debug_assert!(logit_rows <= self.backend.verify_rows && logit_rows <= batch);
         debug_assert!(snapshot_rows < self.backend.verify_rows && snapshot_rows < batch.max(1));
-        // A wide chunk takes the tensor cores; a forward that snapshots a row is a speculative
-        // verify, which has to compute as the decode steps it stands in for.
-        let chunk = self.chunk_path(batch) && snapshot_rows == 0;
+        // A wide chunk takes the tensor cores, and with the decode steps there every forward
+        // does. A forward that snapshots a row is a speculative verify, which computes as the
+        // decode steps it stands in for: on the chunk path exactly when they are.
+        let chunk = self.chunk_path(batch);
         // The model's weights and kernels out of a handle of their own, so the layer loop can take
         // the session mutably for a layer's PLE block without giving up the weights it is reading.
         let backend = Arc::clone(&self.backend);
@@ -3893,8 +3962,9 @@ impl DeviceSequence {
     }
 
     /// Run layer `index`'s recurrence over the first `rows` rows of its last verify, from the
-    /// state in `from`, leaving the state in `to`. It is the verify's own kernel on the verify's
-    /// own inputs, so the state is bit for bit the one those rows left behind.
+    /// state in `from`, leaving the state in `to`. It is the verify's own kernels on the verify's
+    /// own inputs - the chunk path's scan when the verify took it - so the state is bit for bit
+    /// the one those rows left behind.
     fn replay_recurrent(
         &self,
         index: usize,
@@ -3914,6 +3984,11 @@ impl DeviceSequence {
         let inputs = self.gdn_replay[index]
             .ok_or_else(|| BackendError::new("qwen4_device", "a GDN layer has no verify inputs"))?;
         let (conv, b, a) = self.replay_slices(inputs);
+        if self.chunk_path(rows)
+            && self.gdn_recurrence(*a_log, *dt_bias, [conv, b, a], (from, to), rows)?
+        {
+            return Ok(());
+        }
         self.launch(
             kernels.gdn_recur,
             (config.linear_num_value_heads as u32, 1, 1),
@@ -4224,7 +4299,7 @@ impl DeviceSequence {
                 alloc!(rows * config.num_experts_per_tok)?,
                 alloc!(2 * rows * config.num_experts_per_tok)?,
                 alloc!(rows * config.hc_count * hidden)?,
-                alloc!(GEMM_PARTIAL_FLOATS)?,
+                alloc!(GEMM_PARTIAL_REGION)?,
                 alloc!(rows * width)?,
                 alloc!(rows * hidden)?,
                 alloc!(rows * hidden)?,
@@ -4287,6 +4362,7 @@ impl DeviceSequence {
         }
         let s = buffers.scratch;
         zero_gpu(s[49], TILED_GEMV_BLOCKS)?;
+        zero_gpu(split_tickets(s[42]), GEMM_SPLIT_TICKETS)?;
         let mut linear_at = 0usize;
         let gdn_replay = buffers
             .gdn_conv
@@ -4524,7 +4600,7 @@ impl DeviceSequence {
         self.expert_perm = p[39];
         self.expert_run = p[40];
         self.hyper_mix_raw = p[41];
-        self.gemm_partials = p[42];
+        self.gemm_partials = p[PARTIALS_SLOT];
         self.mtp_rows = p[43];
         self.mtp_folded = p[44];
         self.mtp_embed = p[45];
@@ -4592,7 +4668,7 @@ impl DeviceSequence {
             topk,
             2 * topk,
             config.hc_count * hidden,
-            GEMM_PARTIAL_FLOATS,
+            GEMM_PARTIAL_REGION,
             width,
             hidden,
             hidden,
@@ -4752,13 +4828,7 @@ impl ModelBackend for Qwen4ExpDeviceBackend {
         // The text arm renders the released tool catalogue, the `<think>` continuation and the
         // reasoning-effort instruction. The vision tower and MTP are planned but not loaded, so
         // only those text channels are claimed.
-        Capabilities {
-            tools: true,
-            thinking: true,
-            reasoning_effort: true,
-            vision: false,
-            constrained: false,
-        }
+        Capabilities::ALL
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {

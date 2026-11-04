@@ -244,3 +244,19 @@ pub fn check_source_against_specs<S: WeightSource + ?Sized>(
     }
     report
 }
+
+/// Checks that the bytes a weight walk read for the upload `key` are the `len` its shapes give,
+/// before anything is uploaded or written from them.
+///
+/// # Errors
+/// A message naming the upload and both lengths.
+pub fn check_length(key: &str, len: usize, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() == len {
+        Ok(())
+    } else {
+        Err(format!(
+            "{key} came to {} bytes where its shapes give {len}",
+            bytes.len()
+        ))
+    }
+}

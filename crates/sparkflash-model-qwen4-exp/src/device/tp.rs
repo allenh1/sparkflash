@@ -28,12 +28,13 @@
 
 use std::sync::Arc;
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, RunStream, StreamEvent};
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, RunStream, StreamEvent};
 use sparkflash_model::BackendError;
 use sparkflash_weights::tp::{TpLayout, TpRuntime, Wire};
 
 use super::{
-    DENSE_ROWS, DeviceSequence, GEMM_PARTIAL_FLOATS, GpuHyper, GpuLayer, MAX_INTERMEDIATE,
+    DENSE_ROWS, DeviceSequence, GEMM_PARTIAL_REGION, GpuHyper, GpuLayer, MAX_INTERMEDIATE,
+    zero_split_tickets,
 };
 use crate::config::Qwen4ExpConfig;
 
@@ -317,12 +318,13 @@ pub(super) struct Overlap {
 unsafe impl Send for Overlap {}
 
 impl Overlap {
-    fn new(cuda: &Cuda) -> Result<Self, BackendError> {
+    fn new(cuda: &Cuda, zero: Kernel) -> Result<Self, BackendError> {
         let error = |error: String| BackendError::new("qwen4_tp", error);
         let event = || cuda.stream_event().map_err(error);
         let (computed, gathered) = ([event()?, event()?], [event()?, event()?]);
         let stream = cuda.run_stream_urgent().map_err(error)?;
-        let partials = cuda.alloc(GEMM_PARTIAL_FLOATS * 4, &mut 0).map_err(error)?;
+        let partials = cuda.alloc(GEMM_PARTIAL_REGION * 4, &mut 0).map_err(error)?;
+        zero_split_tickets(cuda, &stream, zero, partials, 1).map_err(error)?;
         Ok(Self {
             stream,
             partials,
@@ -376,7 +378,7 @@ impl DeviceSequence {
             )
         })?;
         if self.overlap.is_none() {
-            self.overlap = Some(Overlap::new(&backend.cuda)?);
+            self.overlap = Some(Overlap::new(&backend.cuda, backend.kernels.zero)?);
         }
         let config = &backend.config;
         let (rank, world) = (tp.runtime.rank(), tp.runtime.world());

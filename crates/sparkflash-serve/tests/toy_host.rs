@@ -19,7 +19,7 @@
 //! the same OpenAI router is the Phase 3 acceptance check.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -154,9 +154,12 @@ impl ModelSession for ToySession {
 }
 
 fn app() -> Router {
-    let backend = Box::new(ToyBackend {
+    app_with(Box::new(ToyBackend {
         descriptor: descriptor(),
-    });
+    }))
+}
+
+fn app_with(backend: Box<dyn ModelBackend>) -> Router {
     let driver = HostDriver::start(
         backend,
         Arc::new(ToyCodec),
@@ -174,7 +177,11 @@ fn app() -> Router {
 }
 
 async fn post(path: &str, body: Value) -> (StatusCode, Value) {
-    let response = app()
+    send(app(), path, body).await
+}
+
+async fn send(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -225,4 +232,139 @@ async fn the_toy_model_serves_a_chat_completion_through_the_router() {
     assert_eq!(kv["global_kv_cached_tokens"], 0);
     assert_eq!(kv["uncached_suffix_tokens"], prompt_tokens);
     assert_eq!(body["x_deepseek_spark_stats"]["kv_cache_hit_rate"], 0.0);
+}
+
+/// The token the stubborn toy always prefers, whatever it was fed.
+const PREFERRED: u32 = b'z' as u32 + 2;
+
+/// A toy that always prefers [`PREFERRED`] and records every token it is fed, so a forced request
+/// can show the driver fed the forced ids rather than the backend's choice.
+struct StubbornBackend {
+    descriptor: ModelDescriptor,
+    fed: Arc<Mutex<Vec<u32>>>,
+}
+
+impl ModelBackend for StubbornBackend {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        Ok(Box::new(StubbornSession {
+            fed: Arc::clone(&self.fed),
+        }))
+    }
+}
+
+struct StubbornSession {
+    fed: Arc<Mutex<Vec<u32>>>,
+}
+
+impl StubbornSession {
+    fn step() -> StepOutput {
+        let mut logits = vec![0.0; VOCAB];
+        logits[PREFERRED as usize] = 4.0;
+        StepOutput {
+            logits,
+            next_token: Some(PREFERRED),
+            draft: Vec::new(),
+        }
+    }
+}
+
+impl ModelSession for StubbornSession {
+    fn set_sampling(&mut self, _sampling: Sampling) {}
+
+    fn prefill(&mut self, _tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        Ok(Self::step())
+    }
+
+    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        self.fed.lock().expect("fed").push(token);
+        Ok(Self::step())
+    }
+}
+
+#[tokio::test]
+async fn a_forced_completion_feeds_and_scores_the_forced_tokens() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let forced: Vec<u32> = "abc".bytes().map(|byte| u32::from(byte) + 2).collect();
+    let app = app_with(Box::new(StubbornBackend {
+        descriptor: descriptor(),
+        fed: Arc::clone(&fed),
+    }));
+    let (status, body) = send(
+        app,
+        "/v1/completions",
+        json!({
+            "model": MODEL,
+            "prompt": "hi",
+            "forced_tokens": forced,
+            "logprobs": 1,
+            "return_tokens_as_token_ids": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let choice = &body["choices"][0];
+    assert_eq!(choice["text"], "abc", "the forced tokens are the answer");
+    assert_eq!(choice["finish_reason"], "length");
+    let tokens: Vec<String> = forced.iter().map(|id| format!("token_id:{id}")).collect();
+    assert_eq!(choice["logprobs"]["tokens"], json!(tokens));
+    // Each forced token is scored under the row the backend produced for it: every row prefers
+    // PREFERRED by 4 nats over the other 257 tokens.
+    let expected = -(257.0_f64 + 4.0_f64.exp()).ln();
+    for (position, logprob) in choice["logprobs"]["token_logprobs"]
+        .as_array()
+        .expect("token logprobs")
+        .iter()
+        .enumerate()
+    {
+        let logprob = logprob.as_f64().expect("a finite logprob");
+        assert!(
+            (logprob - expected).abs() < 1e-4,
+            "position {position}: {logprob} != {expected}"
+        );
+        let top = &choice["logprobs"]["top_logprobs"][position];
+        assert!(
+            top.get(format!("token_id:{PREFERRED}")).is_some(),
+            "position {position}: the backend's own choice stays visible in top_logprobs: {top}"
+        );
+    }
+    assert_eq!(
+        *fed.lock().expect("fed"),
+        forced,
+        "the driver fed the forced tokens, never the backend's choice"
+    );
+}
+
+#[tokio::test]
+async fn a_forced_completion_longer_than_the_serve_cap_is_refused_not_cut() {
+    let fed = Arc::new(Mutex::new(Vec::new()));
+    let app = app_with(Box::new(StubbornBackend {
+        descriptor: descriptor(),
+        fed: Arc::clone(&fed),
+    }));
+    let forced = vec![PREFERRED; 17];
+    let (status, body) = send(
+        app,
+        "/v1/completions",
+        json!({
+            "model": MODEL,
+            "prompt": "hi",
+            "forced_tokens": forced,
+            "logprobs": 0
+        }),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "a cut sequence is never answered: {body}"
+    );
+    assert!(
+        body.to_string().contains("forced_tokens"),
+        "the refusal names forced_tokens: {body}"
+    );
+    assert!(fed.lock().expect("fed").is_empty(), "nothing ran");
 }

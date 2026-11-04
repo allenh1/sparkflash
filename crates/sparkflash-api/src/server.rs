@@ -913,6 +913,7 @@ fn device_completion_eligibility(request: &CompletionRequest) -> Option<DeviceTo
         || request.logprobs.is_some()
         || request.prompt_logprobs.is_some()
         || request.logprob_token_ids.is_some()
+        || request.forced_tokens.is_some()
         || request.temperature.is_some()
         || request.top_p.is_some()
         || request.top_k.is_some()
@@ -1426,6 +1427,7 @@ impl RequestBuilder {
             trace_scopes: self.trace.map_or(0, |directive| directive.scopes),
             trace_steps: self.trace.map_or(0, |directive| directive.steps),
             constraint: self.constraint,
+            forced_tokens: Vec::new(),
         })
     }
 }
@@ -1693,12 +1695,24 @@ struct LogprobInfo {
     /// Whether explicit `logprob_token_ids` selected the alternatives: vLLM then returns every
     /// entry of the position, truncation only applies to a natural top-k.
     explicit_token_ids: bool,
+    /// vLLM's `return_tokens_as_token_ids`: every reported token is the string `token_id:{id}`.
+    tokens_as_ids: bool,
 }
 
 impl LogprobInfo {
     /// Whether generated-token logprobs were requested at all.
     fn wants_sample(self) -> bool {
         self.sample.is_some() || self.explicit_token_ids
+    }
+
+    /// The string a logprob entry reports for a token: its decoded text, or vLLM's
+    /// `token_id:{id}` under `return_tokens_as_token_ids`.
+    fn token_string(self, text: &str, token_id: u32) -> String {
+        if self.tokens_as_ids {
+            format!("token_id:{token_id}")
+        } else {
+            text.to_owned()
+        }
     }
 }
 
@@ -1772,6 +1786,104 @@ fn resolve_logprob_selection(
         ));
     }
     Ok(Some(LogprobSelection::Top(value as u32)))
+}
+
+/// Resolves and validates `forced_tokens`, SparkFlash's teacher-forcing extension.
+///
+/// A forced request scores the model on the caller's tokens, so everything that would make the
+/// generated sequence differ from them, or make the scores mean something else, is refused rather
+/// than ignored: it needs `logprobs`, exactly one prompt and one choice, greedy sampling, no
+/// nucleus/top-k filter or penalty, no stop string, and a `max_tokens` that is absent or equal to
+/// its length; every id must be inside the engine's vocabulary. Whether the engine can feed the
+/// tokens at all is its own answer ([`crate::engine::Capability::ForcedDecoding`]).
+fn resolve_forced_tokens(
+    request: &CompletionRequest,
+    prompts: usize,
+    n: usize,
+    sample: Option<LogprobSelection>,
+    vocab_size: Option<usize>,
+) -> Result<Vec<u32>, ApiError> {
+    let Some(forced) = request.forced_tokens.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let refuse = |message: String| {
+        Err(ApiError::invalid_request(
+            message,
+            Some("forced_tokens".to_owned()),
+            Some("invalid_forced_tokens".to_owned()),
+        ))
+    };
+    if forced.is_empty() {
+        return refuse("`forced_tokens` must name at least one token".to_owned());
+    }
+    if sample.is_none() {
+        return refuse(
+            "`forced_tokens` needs `logprobs`: a forced sequence is only useful for its scores"
+                .to_owned(),
+        );
+    }
+    if prompts != 1 || n != 1 {
+        return refuse(format!(
+            "`forced_tokens` is one sequence for one prompt and one choice; this request has {prompts} prompt(s) and n={n}"
+        ));
+    }
+    if let Some(max_tokens) = request.max_tokens
+        && max_tokens != forced.len()
+    {
+        return refuse(format!(
+            "`max_tokens` is {max_tokens} but `forced_tokens` has {} tokens; omit it or make them equal",
+            forced.len()
+        ));
+    }
+    let unneutral = [
+        (
+            "temperature",
+            request.temperature.is_some_and(|value| value > 0.0),
+        ),
+        ("top_p", request.top_p.is_some_and(|value| value < 1.0)),
+        ("top_k", request.top_k.is_some_and(|value| value > 0)),
+        (
+            "repetition_penalty",
+            request.repetition_penalty.is_some_and(|value| value != 1.0),
+        ),
+        (
+            "presence_penalty",
+            request.presence_penalty.is_some_and(|value| value != 0.0),
+        ),
+        (
+            "frequency_penalty",
+            request.frequency_penalty.is_some_and(|value| value != 0.0),
+        ),
+    ];
+    if let Some((field, _)) = unneutral.iter().find(|(_, set)| *set) {
+        return refuse(format!(
+            "`forced_tokens` is greedy teacher forcing; `{field}` would change which token is fed or how it is scored, so it must be left at its neutral value"
+        ));
+    }
+    if !normalize_stop(request.stop.as_ref())?.is_empty() {
+        return refuse(
+            "`forced_tokens` generates exactly the forced sequence; a stop string would cut it short"
+                .to_owned(),
+        );
+    }
+    let Some(vocab) = vocab_size else {
+        return refuse(
+            "this engine does not report its vocabulary size, so `forced_tokens` cannot be bounded"
+                .to_owned(),
+        );
+    };
+    let outside: Vec<String> = forced
+        .iter()
+        .filter(|&&id| id as usize >= vocab)
+        .map(u32::to_string)
+        .collect();
+    if !outside.is_empty() {
+        return refuse(format!(
+            "token id(s) [{}] in `forced_tokens` are outside the vocabulary of {vocab}",
+            outside.join(", ")
+        ));
+    }
+    Ok(forced.clone())
 }
 
 /// Resolves and validates `logprob_token_ids`.
@@ -1856,6 +1968,8 @@ fn reject_streaming_prompt_logprobs(stream: bool, explicit: Option<i32>) -> Resu
 struct CompletionPosition<'a> {
     /// The decoded token string.
     token: &'a str,
+    /// The token's vocabulary id.
+    token_id: u32,
     /// The logprob entry, or `None` for prompt position 0, which has no conditioning token.
     logprob: Option<&'a TokenLogprob>,
 }
@@ -1868,6 +1982,7 @@ fn prompt_positions(prompt: &PromptLogprobs) -> Vec<CompletionPosition<'_>> {
         .enumerate()
         .map(|(index, token)| CompletionPosition {
             token: &token.token,
+            token_id: token.token_id,
             logprob: prompt.positions.get(index).and_then(Option::as_ref),
         })
         .collect()
@@ -1880,25 +1995,34 @@ fn generated_positions(output: &EngineOutput) -> Vec<CompletionPosition<'_>> {
         .iter()
         .map(|logprob| CompletionPosition {
             token: &logprob.token,
+            token_id: logprob.token_id,
             logprob: Some(logprob),
         })
         .collect()
 }
 
-/// Builds the OpenAI completion `logprobs` object for a position list.
+/// Builds the OpenAI completion `logprobs` object for a position list, and the offset after its
+/// last token, where a streamed completion's next chunk starts.
 ///
 /// vLLM's `top_logprobs` entry is the position's whole map, in vLLM's insertion order: the
 /// sampled/actual token first, then the selected alternatives. Each value is the clamped logprob.
-fn completion_logprobs_value(positions: &[CompletionPosition<'_>], text_base: usize) -> Value {
+/// Under `return_tokens_as_token_ids` the tokens and keys are `token_id:{id}`, and the offsets
+/// advance by those strings' lengths, as vLLM's do.
+fn completion_logprobs_value(
+    positions: &[CompletionPosition<'_>],
+    text_base: usize,
+    info: LogprobInfo,
+) -> (Value, usize) {
     let mut text_offset = Vec::with_capacity(positions.len());
     let mut token_logprobs = Vec::with_capacity(positions.len());
     let mut tokens = Vec::with_capacity(positions.len());
     let mut top_logprobs = Vec::with_capacity(positions.len());
     let mut offset = text_base;
     for position in positions {
+        let token = info.token_string(position.token, position.token_id);
         text_offset.push(json!(offset));
-        offset += position.token.chars().count();
-        tokens.push(Value::String(position.token.to_owned()));
+        offset += token.chars().count();
+        tokens.push(Value::String(token));
         match position.logprob {
             None => {
                 token_logprobs.push(Value::Null);
@@ -1909,7 +2033,7 @@ fn completion_logprobs_value(positions: &[CompletionPosition<'_>], text_base: us
                 let mut map = Map::new();
                 for alternative in &logprob.top {
                     map.insert(
-                        alternative.token.clone(),
+                        info.token_string(&alternative.token, alternative.token_id),
                         json!(clamped_logprob(alternative.logprob)),
                     );
                 }
@@ -1917,12 +2041,13 @@ fn completion_logprobs_value(positions: &[CompletionPosition<'_>], text_base: us
             }
         }
     }
-    json!({
+    let value = json!({
         "text_offset": text_offset,
         "token_logprobs": token_logprobs,
         "tokens": tokens,
         "top_logprobs": top_logprobs,
-    })
+    });
+    (value, offset)
 }
 
 /// Builds the id-keyed `prompt_logprobs` array: one entry per prompt token, `null` at position 0.
@@ -1983,17 +2108,19 @@ fn chat_logprobs_entry(logprob: &TokenLogprob, info: LogprobInfo) -> Value {
     let alternatives: Vec<Value> = chat_top_entries(logprob, info)
         .iter()
         .map(|alternative| {
+            let token = info.token_string(&alternative.token, alternative.token_id);
             json!({
-                "token": alternative.token,
+                "token": token,
                 "logprob": clamped_logprob(alternative.logprob),
-                "bytes": utf8_bytes(&alternative.token),
+                "bytes": utf8_bytes(&token),
             })
         })
         .collect();
+    let token = info.token_string(&logprob.token, logprob.token_id);
     json!({
-        "token": logprob.token,
+        "token": token,
         "logprob": clamped_logprob(logprob.logprob),
-        "bytes": utf8_bytes(&logprob.token),
+        "bytes": utf8_bytes(&token),
         "top_logprobs": alternatives,
     })
 }
@@ -2186,6 +2313,7 @@ async fn chat_completions(
     let logprob_info = LogprobInfo {
         sample,
         explicit_token_ids,
+        tokens_as_ids: request.return_tokens_as_token_ids.unwrap_or(false),
     };
     let model = resolve_model(&state, request.model.as_deref())?;
     let trace = trace_context(&headers)?;
@@ -3279,6 +3407,7 @@ async fn completions(
         vocab_size,
     )?;
     reject_streaming_prompt_logprobs(request.stream, request.prompt_logprobs)?;
+    let forced_tokens = resolve_forced_tokens(&request, prompts.len(), n, sample, vocab_size)?;
     let token_ids = resolve_logprob_token_ids(request.logprob_token_ids, sample, vocab_size)?;
     let logprobs = LogprobsRequest {
         sample,
@@ -3288,6 +3417,7 @@ async fn completions(
     let logprob_info = LogprobInfo {
         sample,
         explicit_token_ids,
+        tokens_as_ids: request.return_tokens_as_token_ids.unwrap_or(false),
     };
     let stop = normalize_stop(request.stop.as_ref())?;
     let mut engine_requests = Vec::with_capacity(prompts.len() * n);
@@ -3307,13 +3437,38 @@ async fn completions(
                 None => summarize_prompt_text(&prompt.text),
             },
         };
-        let max_tokens = if echo && request.max_tokens == Some(0) {
+        // A forced request generates exactly its forced tokens: resolve_forced_tokens has refused
+        // a different explicit max_tokens, and the ceilings below refuse rather than cut it.
+        let requested_max_tokens = if forced_tokens.is_empty() {
+            request.max_tokens
+        } else {
+            let ceiling = state
+                .max_output_tokens()
+                .min(state.max_seq_len().saturating_sub(summary.token_ids.len()));
+            if forced_tokens.len() > ceiling {
+                return Err(ApiError::invalid_request(
+                    format!(
+                        "`forced_tokens` has {} tokens but this request can generate at most \
+                         {ceiling} (output ceiling {}, context {} with a {}-token prompt); a \
+                         forced sequence is generated whole or refused",
+                        forced_tokens.len(),
+                        state.max_output_tokens(),
+                        state.max_seq_len(),
+                        summary.token_ids.len(),
+                    ),
+                    Some("forced_tokens".to_owned()),
+                    Some("invalid_forced_tokens".to_owned()),
+                ));
+            }
+            Some(forced_tokens.len())
+        };
+        let max_tokens = if echo && requested_max_tokens == Some(0) {
             0
         } else {
             resolve_max_tokens_with_ceiling(
                 None,
                 "max_tokens",
-                request.max_tokens,
+                requested_max_tokens,
                 "max_tokens",
                 spec,
                 summary.token_ids.len(),
@@ -3332,29 +3487,34 @@ async fn completions(
             } else {
                 format!("{id}-{prompt_index}-{choice}")
             };
-            engine_requests.push(
-                RequestBuilder {
-                    id: request_id,
-                    model: model.clone(),
-                    summary: summary.clone(),
-                    max_tokens,
-                    temperature: request.temperature,
-                    top_p: request.top_p,
-                    top_k: request.top_k,
-                    repetition_penalty: request.repetition_penalty,
-                    presence_penalty: request.presence_penalty,
-                    frequency_penalty: request.frequency_penalty,
-                    skip_special_tokens: request.skip_special_tokens,
-                    spec,
-                    stop: stop.clone(),
-                    seed: state.choice_seed(request.seed, choice, n),
-                    logprobs: logprobs.clone(),
-                    trace,
-                    vision: Vec::new(),
-                    constraint: None,
-                }
-                .build()?,
-            );
+            let mut engine_request = RequestBuilder {
+                id: request_id,
+                model: model.clone(),
+                summary: summary.clone(),
+                max_tokens,
+                // Forced decoding is greedy; resolve_forced_tokens refused any other temperature.
+                temperature: if forced_tokens.is_empty() {
+                    request.temperature
+                } else {
+                    Some(0.0)
+                },
+                top_p: request.top_p,
+                top_k: request.top_k,
+                repetition_penalty: request.repetition_penalty,
+                presence_penalty: request.presence_penalty,
+                frequency_penalty: request.frequency_penalty,
+                skip_special_tokens: request.skip_special_tokens,
+                spec,
+                stop: stop.clone(),
+                seed: state.choice_seed(request.seed, choice, n),
+                logprobs: logprobs.clone(),
+                trace,
+                vision: Vec::new(),
+                constraint: None,
+            }
+            .build()?;
+            engine_request.forced_tokens = forced_tokens.clone();
+            engine_requests.push(engine_request);
             request_plan.push((prompt_index, choice));
         }
     }
@@ -3462,7 +3622,7 @@ fn completion_body(
                     positions.extend(prompt_positions(prompt_logprobs));
                 }
                 positions.extend(generated_positions(output));
-                completion_logprobs_value(&positions, 0)
+                completion_logprobs_value(&positions, 0, logprob_info).0
             } else {
                 Value::Null
             };
@@ -3804,9 +3964,10 @@ fn completions_stream_response(
         let mut buffered: Vec<String> = (0..request_count).map(|_| String::new()).collect();
         let mut prompt_logprobs: Vec<Option<PromptLogprobs>> =
             (0..request_count).map(|_| None).collect();
-        // vLLM starts a streamed chunk's text_offset at the length of the text it has already
-        // sent, not at zero for every chunk.
-        let mut emitted_chars = vec![0usize; request_count];
+        // vLLM starts a streamed chunk's text_offset where the previous chunk's last token ended:
+        // its offset plus the length of the string it reported (`token_id:N` under
+        // return_tokens_as_token_ids), so the streamed offsets are the non-streamed ones.
+        let mut next_offset = vec![0usize; request_count];
         let mut echo_sent = vec![false; request_count];
         let mut usage_parts: Vec<(usize, usize, OpenAiUsageWithCache)> =
             Vec::with_capacity(request_count);
@@ -3825,7 +3986,6 @@ fn completions_stream_response(
                     if logprob_info.wants_sample() {
                         buffered[request_index].push_str(&text);
                     } else {
-                        emitted_chars[request_index] += text.chars().count();
                         yield Ok(sse_frame(&completion_chunk(
                             &id,
                             &model,
@@ -3855,11 +4015,15 @@ fn completions_stream_response(
                         };
                         positions.push(CompletionPosition {
                             token: &logprob.token,
+                            token_id: logprob.token_id,
                             logprob: Some(&logprob),
                         });
-                        let logprobs =
-                            completion_logprobs_value(&positions, emitted_chars[request_index]);
-                        emitted_chars[request_index] += text.chars().count();
+                        let (logprobs, next) = completion_logprobs_value(
+                            &positions,
+                            next_offset[request_index],
+                            logprob_info,
+                        );
+                        next_offset[request_index] = next;
                         yield Ok(sse_frame(&completion_chunk(
                             &id,
                             &model,
@@ -3893,10 +4057,14 @@ fn completions_stream_response(
                             let logprobs = if positions.is_empty() {
                                 None
                             } else {
-                                Some(completion_logprobs_value(
-                                    &positions,
-                                    emitted_chars[request_index],
-                                ))
+                                Some(
+                                    completion_logprobs_value(
+                                        &positions,
+                                        next_offset[request_index],
+                                        logprob_info,
+                                    )
+                                    .0,
+                                )
                             };
                             yield Ok(sse_frame(&completion_chunk(
                                 &id,
@@ -6825,6 +6993,11 @@ fn model_card(state: &AppState, created: u64) -> Value {
         },
         "endpoints": endpoints,
     });
+    // Teacher forcing (`forced_tokens`), which a numerics comparison needs; listed only where the
+    // driver implements it, so its absence is the refusal a client would otherwise meet as a 400.
+    if capabilities.forced_decoding {
+        advertised["forced_decoding"] = json!(true);
+    }
     if capabilities.reasoning_effort {
         advertised["reasoning_effort"] = json!({
             "type": "integer",
@@ -6853,7 +7026,7 @@ fn model_card(state: &AppState, created: u64) -> Value {
     // The weights that actually answered, which is not the model id when a finetune is served
     // under the base model's name: without this, `/v1/models` cannot distinguish the two.
     let checkpoint = state.served_checkpoint();
-    json!({
+    let mut card = json!({
         "id": state.model_id(),
         "object": "model",
         "created": created,
@@ -6878,7 +7051,13 @@ fn model_card(state: &AppState, created: u64) -> Value {
         "max_output_tokens": state.max_output_tokens(),
         "fabric_mode": state.engine.cluster_stats().fabric_mode,
         "capabilities": advertised,
-    })
+    });
+    // Which declared arithmetic answered (docs/NUMERICS.md): a registered version and its
+    // reference fingerprint, or the reason this process claims none.
+    if let Some(numerics) = state.numerics() {
+        card["numerics"] = numerics.card();
+    }
+    card
 }
 
 async fn cluster_stats(State(state): State<AppState>) -> Response {

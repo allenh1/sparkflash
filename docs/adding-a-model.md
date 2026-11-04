@@ -87,6 +87,18 @@ Every arm has one typed TOML profile:
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/config/glm53_flash.toml` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml` |
 
+A profile opens with the registry model it configures, beside its family and weights:
+
+```toml
+model = "zai-org/GLM-5.3-Flash"
+family = "glm5-next"
+weights = "glm5.3-flash-fp8"
+```
+
+The declaration check reads `model` to know whose references a changed setting needs recaptured
+([NUMERICS.md](NUMERICS.md) §5), and a `sparkflash-model` test holds it to the descriptor that
+`weights` selects.
+
 `sparkflash_model::profile::ModelProfile` parses with `deny_unknown_fields`, validates ranges and
 prints the resolved values at boot. The environment is an override only; the complete override
 table is `sparkflash_model::profile::ENV_OVERRIDES`. A value outside a field's domain is refused,
@@ -116,12 +128,43 @@ assert!(report.passed(), "failed: {:?}", report.failures());
 A case names the first element outside the tolerance, not just the layer. A new arm runs the same
 harness with its host forward as the reference; the harness has no model-specific code.
 
-## 5. Checklist
+## 5. Shared homes
+
+Everything an arm needs outside its own forward already has one home. Add to that home, or move
+the mechanism there; never copy it into the arm.
+
+| mechanism | home |
+| :-- | :-- |
+| model id to checkpoint (the Hugging Face cache) | `sparkflash_weights::hub` |
+| `--synthetic` prompts without a tokenizer | `sparkflash_ops::codec::ByteCodec` |
+| `config.json` errors and a field that is one value or a list | `sparkflash_model::config::{ConfigError, OneOrMany}` |
+| an arm that renders every text channel (tools, thinking, reasoning effort) | `Capabilities::ALL`; forced decoding is the driver's, which the host and TP drivers add |
+| a tensor's byte length against its slot | `sparkflash_weights::weights::check_length` |
+| walk-ordered rank files: placement, index, writer, read-back cursor | `sparkflash_weights::rank_file::{SlotPlan, SlotIndex, SlotFileWriter, SlotCursor, SlotRecords}` |
+| `sparkflash convert` for such a pack (ranks, read-back, refusals) | `SlotPack` in `sparkflash-cli/src/convert.rs` |
+| `sparkflash serve` at TP=1 and in a tensor-parallel group | `PackArm` in `sparkflash-cli/src/serve/pack.rs` |
+| deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
+
+A served arm implements `PackArm` (its ids, fixture, configuration, descriptor, tokenizer, open
+and response layer) and adds a `Pack` variant. The shared driver then finds the checkpoint
+(`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
+the same configuration, and refuses at parse time any option the arm does not apply
+(`Pack::unapplied`): a group serves one request at a time, so `--concurrency`, `--fuse-batch` and
+`--kv-budget-gib` are refused there, and an arm without a fused batch or a KV budget says so at
+TP=1. A directory of rank files named by an environment variable resolves through
+`converted_rank_file`, which refuses a directory that holds no file for the rank.
+
+## 6. Checklist
 
 - [ ] the config parses, validates, and its boot summary is in the startup log;
+- [ ] nothing in section 5 is reimplemented in the arm;
 - [ ] no `.cu`/`.cuh` and no kernel build script in the model crate;
 - [ ] no dependency on another model crate;
 - [ ] every op is a plan, validated before its first launch;
 - [ ] the parity harness passes layer by layer against the host reference;
 - [ ] new environment aliases are in `ENV_OVERRIDES` and documented here;
-- [ ] the arm is registered in the model registry and has a descriptor.
+- [ ] the arm is registered in the model registry and has a descriptor;
+- [ ] every profile override the arm adds is classified in `sparkflash_model::numerics` as
+      arithmetic or neutral, and each configuration it serves has a captured reference in
+      `numerics/registry.toml` ([NUMERICS.md](NUMERICS.md));
+- [ ] the arm's profile names its registry model (`model`, section 3).

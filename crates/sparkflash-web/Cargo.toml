@@ -21,6 +21,7 @@ authors.workspace = true
 description = "Lead-node web control plane for SparkFlash"
 
 [dependencies]
+sparkflash-weights = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

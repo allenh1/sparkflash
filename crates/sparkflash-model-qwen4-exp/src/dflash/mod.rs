@@ -22,6 +22,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub use sparkflash_model::dflash2::*;
+use sparkflash_weights::hub;
 use sparkflash_weights::safetensors::write_checkpoint;
 use sparkflash_weights::{DType, TensorSpec};
 
@@ -43,7 +44,7 @@ pub fn drafter_directory() -> Option<PathBuf> {
 }
 
 fn resolve_drafter_dir(value: Option<&OsStr>) -> Option<PathBuf> {
-    let cache = crate::cache::cache_dir();
+    let cache = hub::default_cache_dir();
     resolve_drafter_dir_in(cache.as_deref(), value)
 }
 
@@ -54,13 +55,13 @@ fn resolve_drafter_dir_in(cache: Option<&Path>, value: Option<&OsStr>) -> Option
             return Some(path);
         }
         if let Some(snapshot) =
-            cache.and_then(|cache| crate::cache::cached_model_in(cache, &path.to_string_lossy()))
+            cache.and_then(|cache| hub::cached_model_in(cache, &path.to_string_lossy()))
         {
             return Some(snapshot);
         }
         return Some(path);
     }
-    cache.and_then(|cache| crate::cache::cached_model_in(cache, DFLASH2_MODEL_ID))
+    cache.and_then(|cache| hub::cached_model_in(cache, DFLASH2_MODEL_ID))
 }
 
 impl From<&Qwen4ExpConfig> for DraftTarget {

@@ -14,10 +14,15 @@
 
 //! The chunk-wide prefill path on the tensor cores (kernels/qwen4_prefill_sm121.cu).
 //!
-//! A prompt chunk of [GEMM_MIN_BATCH](super::GEMM_MIN_BATCH) tokens or more runs its dense
-//! projections, its routed experts and its Gated DeltaNet recurrence here. A decode step and a
-//! speculative verify are a handful of rows and never do, so a verified row is computed by
-//! exactly the kernels of the decode step that would have produced it.
+//! A prompt chunk runs its dense projections, its routed experts and its Gated DeltaNet recurrence
+//! here, and so do a decode step and a speculative verify ([PrefillPlan::decode], on by default).
+//! Every form computes a row from that row alone, in an order the matrix fixes: a dense
+//! projection splits K as a DENSE_ROWS piece does and a token GEMM as a GEMM_TILE_TOKENS tile
+//! does, whatever the launch's row count. So a row gets the same bits in a 4,096-row chunk, a
+//! 22-row suffix, a verify and a one-token step, and a conversation that reuses its transcript's
+//! state lands exactly where a cold prefill of the transcript does. `SPARKFLASH_DECODE_MMA=off`
+//! puts the steps and the verifies back on the token kernels, and chunks under GEMM_MIN_BATCH
+//! rows with them.
 //!
 //! The forms split every f32 activation - the dense projections' and the routed experts' - into a
 //! bf16 head and the bf16 of its remainder and accumulate in f32, so a chunk here matches the
@@ -44,7 +49,9 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
 
-use super::{DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GpuMat};
+use super::{
+    DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat, split_tickets,
+};
 use crate::config::Qwen4ExpConfig;
 
 /// The tensor-core prefill cubin this build embeds, for kernel-level tests.
@@ -97,6 +104,11 @@ const MOE_GATE_UP_COLUMNS: usize = 64;
 const MOE_DOWN_COLUMNS: usize = 128;
 /// K per pipeline stage (Q4P_BK): four 16-column E4M3 scale groups.
 const MOE_K_STAGE: usize = 64;
+/// q4p_moe_rows' intermediate (gate_up) and output (down) columns a CTA: four warps of 8 and 16.
+const MOE_ROWS_GATE_UP_COLUMNS: usize = 32;
+const MOE_ROWS_DOWN_COLUMNS: usize = 64;
+/// The K a q4p_moe_rows lane reads at once: two stages, 16 bytes of a packed row.
+const MOE_ROWS_K: usize = 2 * MOE_K_STAGE;
 /// The key head width the scan is compiled for (Q4P_GDN_KEY).
 pub const GDN_KEY: usize = 128;
 /// The value head width the scan is compiled for (Q4P_GDN_VALUE).
@@ -127,10 +139,58 @@ pub fn gdn_scan_shape(heads: usize) -> ((u32, u32, u32), u32) {
 pub const CONV_HISTORY: usize = 8;
 /// The dense MMA's token and column tile (OM_BM, OM_BN).
 const DENSE_TILE: usize = 128;
+/// q4p_dense_rows' rows (one m16 tile) and columns (four warps of 8) a CTA, for launches of fewer
+/// than GEMM_MIN_BATCH rows.
+const DENSE_ROWS_TILE: usize = 16;
+const DENSE_ROWS_COLUMNS: usize = 32;
 /// CTAs a split dense MMA aims for: two per SM on GB10's forty-eight.
 const DENSE_TARGET_CTAS: usize = 96;
 /// The thinnest K slice a split takes, in 32-column blocks.
 const DENSE_MIN_SLICE_BLOCKS: usize = 8;
+
+/// The partials and tickets a q4p_dense_rows launch of `group` over `batch` rows split
+/// `segments` ways takes: none unsplit, where every CTA stores its own finished outputs.
+fn dense_rows_need(
+    group: &[(&GpuMat, Deviceptr)],
+    batch: usize,
+    segments: usize,
+) -> (usize, usize) {
+    if segments == 1 {
+        return (0, 0);
+    }
+    group
+        .iter()
+        .fold((0, 0), |(partials, tickets), (matrix, _)| {
+            (
+                partials + segments * batch * matrix.rows,
+                tickets
+                    + matrix.rows.div_ceil(DENSE_ROWS_COLUMNS) * batch.div_ceil(DENSE_ROWS_TILE),
+            )
+        })
+}
+
+/// One projection of a [DeviceSequence::gemm_group]: `matrix` into `output`, finished by the
+/// token GEMM's `epilogue` (1 = silu(v / scale), 2 = sigmoid(v / scale) scaled to two, otherwise
+/// the sum).
+#[derive(Clone, Copy)]
+pub(super) struct Projection<'a> {
+    pub(super) matrix: &'a GpuMat,
+    pub(super) output: Deviceptr,
+    pub(super) epilogue: u32,
+    pub(super) scale: f32,
+}
+
+impl<'a> Projection<'a> {
+    /// `matrix` into `output`, the sum itself.
+    pub(super) fn plain(matrix: &'a GpuMat, output: Deviceptr) -> Self {
+        Self {
+            matrix,
+            output,
+            epilogue: 0,
+            scale: 1.0,
+        }
+    }
+}
 
 /// How a prompt is cut and whether its chunks take the tensor cores, fixed when the backend
 /// loads.
@@ -141,29 +201,47 @@ pub struct PrefillPlan {
     /// Whether a chunk of GEMM_MIN_BATCH tokens or more takes this image.
     /// `SPARKFLASH_QWEN4_PREFILL_MMA=0` keeps every chunk on the token kernels, for A/B runs.
     pub tensor_cores: bool,
+    /// Whether every other forward takes it too - a short chunk, a decode step, a speculative
+    /// verify - so a row computes to the same bits at every row count (`SPARKFLASH_DECODE_MMA`,
+    /// on wherever `tensor_cores` is). Off, those stay on the token kernels, as before.
+    pub decode: bool,
 }
 
 impl PrefillPlan {
     /// A plan for `chunk`-token chunks, clamped to the widths the scratch supports and, past
     /// DENSE_ROWS, rounded down to a whole number of them. The tensor cores are only taken when
-    /// this build carries the prefill image.
+    /// this build carries the prefill image; the decode steps take them with the chunks.
     #[must_use]
     pub fn new(chunk: usize, tensor_cores: bool) -> Self {
         let chunk = chunk.clamp(MIN_PREFILL_CHUNK, MAX_PREFILL_CHUNK);
+        let tensor_cores = tensor_cores && !embedded_prefill_cubin().is_empty();
         Self {
             chunk: if chunk > DENSE_ROWS {
                 chunk - chunk % DENSE_ROWS
             } else {
                 chunk
             },
-            tensor_cores: tensor_cores && !embedded_prefill_cubin().is_empty(),
+            tensor_cores,
+            decode: tensor_cores,
         }
     }
 
-    /// The forwards a prompt of `tokens` runs as: `chunk` tokens each, except that a tail past the
-    /// last whole DENSE_ROWS too short for the tensor cores runs on its own. Every row then
-    /// computes as it did when chunks were DENSE_ROWS wide: dense pieces start where those chunks
-    /// did, and such a tail was a chunk of its own on the token kernels then too.
+    /// This plan with the decode steps, verifies and short chunks on the token kernels instead
+    /// (`decode` false), or on the tensor cores with the chunks (true, where they are).
+    #[must_use]
+    pub fn with_decode(self, decode: bool) -> Self {
+        Self {
+            decode: decode && self.tensor_cores,
+            ..self
+        }
+    }
+
+    /// The forwards a prompt of `tokens` runs as: `chunk` tokens each. With the decode steps on
+    /// the token kernels, a tail past the last whole DENSE_ROWS too short for the tensor cores
+    /// runs on its own, so every row computes as it did when chunks were DENSE_ROWS wide: dense
+    /// pieces start where those chunks did, and such a tail was a chunk of its own on the token
+    /// kernels then too. With them on the tensor cores a row's bits do not depend on its forward,
+    /// and the tail stays in the chunk.
     #[must_use]
     pub fn forwards(&self, tokens: usize) -> Vec<std::ops::Range<usize>> {
         let mut forwards = Vec::with_capacity(tokens.div_ceil(self.chunk.max(1)) + 1);
@@ -171,7 +249,7 @@ impl PrefillPlan {
         while start < tokens {
             let mut end = (start + self.chunk).min(tokens);
             let tail = (end - start) % DENSE_ROWS;
-            if end - start > DENSE_ROWS && tail < GEMM_MIN_BATCH {
+            if !self.decode && end - start > DENSE_ROWS && tail < GEMM_MIN_BATCH {
                 end -= tail;
             }
             forwards.push(start..end);
@@ -180,42 +258,73 @@ impl PrefillPlan {
         forwards
     }
 
-    /// The serving default, as `SPARKFLASH_QWEN4_PREFILL_MMA` and `SPARKFLASH_QWEN4_PREFILL_CHUNK`
-    /// adjust it.
-    #[must_use]
-    pub fn from_env() -> Self {
-        // The typed profile is the source of truth. The two environment names are aliases in
+    /// The serving default, as `SPARKFLASH_QWEN4_PREFILL_MMA`, `SPARKFLASH_QWEN4_PREFILL_CHUNK`
+    /// and `SPARKFLASH_DECODE_MMA` adjust it.
+    ///
+    /// # Errors
+    /// A value outside its switch's domain, or `SPARKFLASH_DECODE_MMA=on` where the chunks are
+    /// not on the tensor cores (`SPARKFLASH_QWEN4_PREFILL_MMA=0`, or a build without the image).
+    pub fn from_env() -> Result<Self, BackendError> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// [Self::from_env] over `lookup` instead of the process environment.
+    ///
+    /// # Errors
+    /// As [Self::from_env].
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, BackendError> {
+        // The typed profile is the source of truth. The environment names are aliases in
         // sparkflash_model::profile::ENV_OVERRIDES, so an out-of-domain value is refused rather
         // than silently falling back to a default.
+        const SWITCHES: [&str; 3] = [
+            "SPARKFLASH_QWEN4_PREFILL_CHUNK",
+            "SPARKFLASH_QWEN4_PREFILL_MMA",
+            "SPARKFLASH_DECODE_MMA",
+        ];
+        let refuse = |error: sparkflash_model::ProfileError| {
+            BackendError::new("qwen4_config", error.to_string())
+        };
+        let ours = |name: &str| SWITCHES.contains(&name).then(|| lookup(name)).flatten();
         let mut profile = sparkflash_model::profile::ModelProfile::from_toml(include_str!(
             "../../config/qwen38_flash_next_nvfp4.toml"
         ))
-        .unwrap_or_default();
-        let _ = profile.apply_env(|name| match name {
-            "SPARKFLASH_QWEN4_PREFILL_CHUNK" | "SPARKFLASH_QWEN4_PREFILL_MMA" => {
-                std::env::var(name).ok()
-            }
-            _ => None,
-        });
+        .map_err(refuse)?;
+        profile.apply_env(ours).map_err(refuse)?;
         let tensor_cores =
             !embedded_prefill_cubin().is_empty() && profile.prefill.tensor_cores.unwrap_or(true);
+        // What the environment alone asked of the decode steps: an explicit `on` the chunks
+        // cannot honour is refused, where the profile's default follows the chunks.
+        let mut asked = sparkflash_model::profile::ModelProfile::default();
+        asked.apply_env(ours).map_err(refuse)?;
+        if asked.decode.tensor_cores == Some(true) && !tensor_cores {
+            return Err(BackendError::new(
+                "qwen4_config",
+                "SPARKFLASH_DECODE_MMA=on runs the decode steps on the prefill's tensor-core \
+                 image, which is off here (SPARKFLASH_QWEN4_PREFILL_MMA=0, or a build without \
+                 the image); unset it or set it to off",
+            ));
+        }
         let chunk = if tensor_cores {
             profile.prefill.chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
         } else {
             TOKEN_PREFILL_CHUNK
         };
-        Self::new(chunk, tensor_cores)
+        Ok(Self::new(chunk, tensor_cores).with_decode(profile.decode.tensor_cores.unwrap_or(true)))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefillKernels {
     dense_mma: Kernel,
+    dense_rows: Kernel,
+    pub(super) gemm_rows: Kernel,
     epilogue: Kernel,
     split_bf16: Kernel,
     moe_plan: Kernel,
     moe_gate_up: Kernel,
     moe_down: Kernel,
+    moe_rows_gate_up: Kernel,
+    moe_rows_down: Kernel,
     gdn_conv: Kernel,
     gdn_conv_state: Kernel,
     gdn_prep: Kernel,
@@ -238,11 +347,15 @@ impl PrefillKernels {
         };
         Ok(Self {
             dense_mma: named("q4p_dense_mma")?,
+            dense_rows: named("q4p_dense_rows")?,
+            gemm_rows: named("q4p_gemm_rows")?,
             epilogue: named("q4p_epilogue")?,
             split_bf16: named("q4p_split_bf16")?,
             moe_plan: named("q4p_moe_plan")?,
             moe_gate_up: named("q4p_moe_gate_up")?,
             moe_down: named("q4p_moe_down")?,
+            moe_rows_gate_up: named("q4p_moe_rows_gate_up")?,
+            moe_rows_down: named("q4p_moe_rows_down")?,
             gdn_conv: named("q4p_gdn_conv")?,
             gdn_conv_state: named("q4p_gdn_conv_state")?,
             gdn_prep: named("q4p_gdn_prep")?,
@@ -333,10 +446,11 @@ fn dense_segments(rows: usize, k_blocks: usize, tokens: usize) -> usize {
 }
 
 impl DeviceSequence {
-    /// Whether a chunk of `batch` rows takes this path. The caller also keeps it off for a
-    /// forward that snapshots a row, which only a speculative verify does.
+    /// Whether a forward of `batch` rows takes this path: every forward with the decode steps on
+    /// it ([PrefillPlan::decode]), otherwise a chunk of GEMM_MIN_BATCH rows or more.
     pub(super) fn chunk_path(&self, batch: usize) -> bool {
-        self.backend.prefill.tensor_cores && batch >= GEMM_MIN_BATCH
+        let plan = &self.backend.prefill;
+        plan.tensor_cores && (plan.decode || batch >= GEMM_MIN_BATCH)
     }
 
     /// A projection over the chunk on the tensor cores, when its shape fits the MMA tile: 32-row
@@ -348,9 +462,11 @@ impl DeviceSequence {
     /// scaled to two. A matrix too narrow to fill the GPU splits its inner dimension over the
     /// grid's third axis and q4e_gemm_reduce adds the slices in order, applying the epilogue.
     ///
-    /// The split is chosen per DENSE_ROWS piece of the chunk, from its first row. A row's sums
-    /// depend on the split and nothing else in the launch, so whole pieces go in one launch, as
-    /// many as the partials hold.
+    /// The split is chosen per DENSE_ROWS piece of the chunk. A row's sums depend on the split and
+    /// nothing else in the launch, so whole pieces go in one launch, as many as the partials hold.
+    /// With the decode steps here every piece is split as a whole one is, so a row's split is the
+    /// matrix's alone; otherwise a short piece (a tail, or a chunk under DENSE_ROWS) takes the
+    /// split for its own width, as it did before the decode steps came here.
     pub(super) fn dense_mma(
         &self,
         matrix: &GpuMat,
@@ -360,20 +476,14 @@ impl DeviceSequence {
         epilogue: u32,
         scale: f32,
     ) -> Result<bool, BackendError> {
-        if !self.chunk_path(batch)
-            || !part("dense")
-            || !matrix.rows.is_multiple_of(32)
-            || !matrix.columns.is_multiple_of(32)
-            || ![matrix.pointer, input, output].into_iter().all(aligned)
-        {
+        if !self.dense_fits(matrix, input, output, batch) {
             return Ok(false);
         }
-        let k_blocks = matrix.columns / 32;
         let mut done = 0usize;
         while done < batch {
             let left = batch - done;
             let piece = left.min(DENSE_ROWS);
-            let segments = dense_segments(matrix.rows, k_blocks, piece);
+            let segments = self.dense_split(matrix, piece);
             let rows = if piece < DENSE_ROWS {
                 piece
             } else if segments > 1 {
@@ -396,6 +506,238 @@ impl DeviceSequence {
         Ok(true)
     }
 
+    /// Whether `batch` rows of `matrix` from `input` into `output` take the dense MMA.
+    fn dense_fits(
+        &self,
+        matrix: &GpuMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        batch: usize,
+    ) -> bool {
+        self.chunk_path(batch)
+            && part("dense")
+            && matrix.rows.is_multiple_of(32)
+            && matrix.columns.is_multiple_of(32)
+            && [matrix.pointer, input, output].into_iter().all(aligned)
+    }
+
+    /// The K split of `matrix` for a piece of `piece` rows ([Self::dense_mma]).
+    fn dense_split(&self, matrix: &GpuMat, piece: usize) -> usize {
+        let reference = if self.backend.prefill.decode {
+            DENSE_ROWS
+        } else {
+            piece
+        };
+        dense_segments(matrix.rows, matrix.columns / 32, reference)
+    }
+
+    /// Projections of one `input` over `batch` rows, each into its own output.
+    ///
+    /// A few rows on the tensor cores put the matrices whose splits and epilogues agree in one
+    /// q4p_dense_rows launch, up to four, as many as the partials and tickets hold, and up to two
+    /// matrices off the tile ride along on the first as q4p_gemm_rows CTAs: a layer's projections
+    /// of one input then cost one launch where they cost one each, and every output has the bits
+    /// its own launch gives it. Everything else - a wide chunk, the token kernels, a rider past
+    /// what the partials hold - is [Self::gemm] a matrix at a time.
+    pub(super) fn gemm_group(
+        &self,
+        projections: &[Projection],
+        input: Deviceptr,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        // (split, epilogue, scale bits) and the matrices launched together under them.
+        type Group<'a> = ((usize, u32, u32), Vec<(&'a GpuMat, Deviceptr)>);
+        let mut grouped: Vec<Group> = Vec::new();
+        let mut off_tile = Vec::new();
+        for projection in projections {
+            let (matrix, output) = (projection.matrix, projection.output);
+            if batch >= GEMM_MIN_BATCH || matrix.columns != projections[0].matrix.columns {
+                self.gemm(
+                    matrix,
+                    input,
+                    output,
+                    batch,
+                    projection.epilogue,
+                    projection.scale,
+                )?;
+                continue;
+            }
+            if !self.dense_fits(matrix, input, output, batch) {
+                off_tile.push(projection);
+                continue;
+            }
+            let key = (
+                self.dense_split(matrix, batch),
+                projection.epilogue,
+                projection.scale.to_bits(),
+            );
+            let segments = key.0;
+            let joins = grouped.iter_mut().find(|(at, group)| {
+                let (partials, tickets) = dense_rows_need(group, batch, segments);
+                *at == key
+                    && group.len() < 4
+                    && (segments == 1
+                        || (partials + segments * batch * matrix.rows <= GEMM_PARTIAL_FLOATS
+                            && tickets
+                                + matrix.rows.div_ceil(DENSE_ROWS_COLUMNS)
+                                    * batch.div_ceil(DENSE_ROWS_TILE)
+                                <= GEMM_SPLIT_TICKETS))
+            });
+            match joins {
+                Some((_, group)) => group.push((matrix, output)),
+                None => grouped.push((key, vec![(matrix, output)])),
+            }
+        }
+        let mut riders = Vec::new();
+        if let Some(((segments, _, _), group)) = grouped.first() {
+            let (mut partials, mut tickets) = dense_rows_need(group, batch, *segments);
+            for projection in &off_tile {
+                let (more, counters) = self.rider_need(projection.matrix, batch);
+                if riders.len() == 2
+                    || partials + more > GEMM_PARTIAL_FLOATS
+                    || tickets + counters > GEMM_SPLIT_TICKETS
+                {
+                    break;
+                }
+                riders.push(**projection);
+                partials += more;
+                tickets += counters;
+            }
+        }
+        for projection in &off_tile[riders.len()..] {
+            self.gemm(
+                projection.matrix,
+                input,
+                projection.output,
+                batch,
+                projection.epilogue,
+                projection.scale,
+            )?;
+        }
+        for (index, ((segments, epilogue, scale), group)) in grouped.into_iter().enumerate() {
+            let riding: &[Projection] = if index == 0 { &riders } else { &[] };
+            self.dense_rows_launch(
+                &group,
+                input,
+                batch,
+                segments,
+                epilogue,
+                f32::from_bits(scale),
+                riding,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The partials and tickets a q4p_gemm_rows launch of `matrix` over `batch` rows takes.
+    fn rider_need(&self, matrix: &GpuMat, batch: usize) -> (usize, usize) {
+        let split = self.token_split(matrix, batch);
+        let count = batch * matrix.rows;
+        if split > 1 {
+            (split * count, count.div_ceil(128))
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// One q4p_dense_rows launch of `group` over `batch` rows split `segments` ways, and the
+    /// `riders` (at most two) that run beside it, each as its own q4p_gemm_rows launch would: its
+    /// split and epilogue, its slices and counters in the partials region past the group's.
+    #[allow(clippy::too_many_arguments)]
+    fn dense_rows_launch(
+        &self,
+        group: &[(&GpuMat, Deviceptr)],
+        input: Deviceptr,
+        batch: usize,
+        segments: usize,
+        epilogue: u32,
+        scale: f32,
+        riders: &[Projection],
+    ) -> Result<(), BackendError> {
+        let mut columns = 0usize;
+        let mut matrices = [0u64; 16];
+        let (mut partials, mut tiles) = (0usize, 0usize);
+        for (slot, &(matrix, output)) in group.iter().enumerate() {
+            let target = if segments > 1 {
+                self.gemm_partials.offset(partials * 4)
+            } else {
+                output
+            };
+            matrices[slot * 4..slot * 4 + 4].copy_from_slice(&[
+                matrix.pointer.0,
+                target.0,
+                output.0,
+                matrix.rows as u64,
+            ]);
+            columns += matrix.rows.div_ceil(DENSE_ROWS_COLUMNS);
+            let (more, counters) = dense_rows_need(&[(matrix, output)], batch, segments);
+            partials += more;
+            tiles += counters;
+        }
+        let mut riding = [0u64; 16];
+        let mut ctas = 0usize;
+        for (slot, rider) in riders.iter().enumerate().take(2) {
+            let split = self.token_split(rider.matrix, batch);
+            let count = batch * rider.matrix.rows;
+            riding[slot * 8..slot * 8 + 8].copy_from_slice(&[
+                rider.matrix.pointer.0,
+                rider.output.0,
+                rider.matrix.rows as u64,
+                u64::from(rider.epilogue),
+                u64::from(rider.scale.to_bits()),
+                split as u64,
+                self.gemm_partials.offset(partials * 4).0,
+                split_tickets(self.gemm_partials).offset(tiles * 4).0,
+            ]);
+            let (more, counters) = self.rider_need(rider.matrix, batch);
+            partials += more;
+            tiles += counters;
+            ctas += count.div_ceil(128) * split;
+        }
+        if group.is_empty()
+            || group.len() > 4
+            || riders.len() > 2
+            || partials > GEMM_PARTIAL_FLOATS
+            || tiles > GEMM_SPLIT_TICKETS
+        {
+            return Err(BackendError::new(
+                "qwen4_prefill",
+                format!(
+                    "a q4p_dense_rows launch of {} matrices and {} riders over {batch} rows split \
+                     {segments} ways needs {partials} partials and {tiles} tickets, past the \
+                     {GEMM_PARTIAL_FLOATS} and {GEMM_SPLIT_TICKETS} there are",
+                    group.len(),
+                    riders.len()
+                ),
+            ));
+        }
+        // The riders' CTAs, numbered over every (y, z) of the grid past the dense tiles.
+        let planes = batch.div_ceil(DENSE_ROWS_TILE) * segments;
+        let mut args = vec![
+            input.0,
+            group[0].0.columns as u64,
+            batch as u64,
+            segments as u64,
+            split_tickets(self.gemm_partials).0,
+            u64::from(epilogue),
+            u64::from(scale.to_bits()),
+            group.len() as u64,
+        ];
+        args.extend_from_slice(&matrices);
+        args.extend_from_slice(&[columns as u64, riders.len() as u64]);
+        args.extend_from_slice(&riding);
+        self.launch(
+            self.backend.kernels.prefill.dense_rows,
+            (
+                (columns + ctas.div_ceil(planes)) as u32,
+                batch.div_ceil(DENSE_ROWS_TILE) as u32,
+                segments as u32,
+            ),
+            (128, 1, 1),
+            &args,
+        )
+    }
+
     /// One dense MMA launch over `batch` rows split `segments` ways, and its reduction or
     /// epilogue.
     #[allow(clippy::too_many_arguments)]
@@ -416,6 +758,19 @@ impl DeviceSequence {
         } else {
             output
         };
+        // A few rows take q4p_dense_rows, the same sums on a tile cut for them, which adds a split
+        // tile's slices and applies the epilogue itself.
+        if batch < GEMM_MIN_BATCH {
+            return self.dense_rows_launch(
+                &[(matrix, output)],
+                input,
+                batch,
+                segments,
+                epilogue,
+                scale,
+                &[],
+            );
+        }
         self.launch(
             kernels.prefill.dense_mma,
             (
@@ -473,7 +828,9 @@ impl DeviceSequence {
     /// (its f32 rows hold exactly both), and down scales each row by its routing weight into
     /// `expert_accumulator`. An expert's weights are read once per item: at a 512-token chunk
     /// (ten rows an expert on average) about once per chunk, at 4,096 about three times, by
-    /// items next to each other in the grid.
+    /// items next to each other in the grid. A few rows - a decode step, a verify - take the
+    /// q4p_moe_rows forms, the same sums on a tile cut for them, when both K dimensions are whole
+    /// stage pairs.
     pub(super) fn routed_experts_mma(
         &self,
         table: Deviceptr,
@@ -522,10 +879,30 @@ impl DeviceSequence {
         // The grid covers the most items the plan can write; past the count it wrote, a CTA
         // returns before touching anything.
         let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
+        let rows = batch < GEMM_MIN_BATCH
+            && hidden.is_multiple_of(MOE_ROWS_K)
+            && intermediate.is_multiple_of(MOE_ROWS_K);
+        let (gate_up, gate_up_columns, down, down_columns, block) = if rows {
+            (
+                kernels.moe_rows_gate_up,
+                MOE_ROWS_GATE_UP_COLUMNS,
+                kernels.moe_rows_down,
+                MOE_ROWS_DOWN_COLUMNS,
+                (128, 1, 1),
+            )
+        } else {
+            (
+                kernels.moe_gate_up,
+                MOE_GATE_UP_COLUMNS,
+                kernels.moe_down,
+                MOE_DOWN_COLUMNS,
+                (256, 1, 1),
+            )
+        };
         self.launch(
-            kernels.moe_gate_up,
-            ((intermediate / MOE_GATE_UP_COLUMNS) as u32, items, 1),
-            (256, 1, 1),
+            gate_up,
+            ((intermediate / gate_up_columns) as u32, items, 1),
+            block,
             &[
                 table.0,
                 scales.0,
@@ -542,9 +919,9 @@ impl DeviceSequence {
             ],
         )?;
         self.launch(
-            kernels.moe_down,
-            ((hidden / MOE_DOWN_COLUMNS) as u32, items, 1),
-            (256, 1, 1),
+            down,
+            ((hidden / down_columns) as u32, items, 1),
+            block,
             &[
                 table.0,
                 scales.0,
@@ -564,43 +941,53 @@ impl DeviceSequence {
         Ok(true)
     }
 
-    /// The chunk's Gated DeltaNet after its projections: the conv over every token at once, the
+    /// Whether this configuration's Gated DeltaNet is the one the scan is compiled for.
+    fn gdn_fits(&self) -> bool {
+        let config = &self.backend.config;
+        let groups = config.value_groups();
+        part("gdn")
+            && config.linear_key_head_dim == GDN_KEY
+            && config.linear_value_head_dim == GDN_VALUE
+            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim)
+            && groups != 0
+            && groups <= GDN_KEY
+            && config.linear_num_key_heads * groups == config.linear_num_value_heads
+    }
+
+    /// The forward's Gated DeltaNet after its projections: the conv over every row at once, the
     /// normalised queries and keys and each row's decay and beta, the scan with the state in
-    /// registers, and the gated norm in place. Reads `linear_qkv`, `linear_z`, `linear_a` and
-    /// `linear_b`, leaves the gated rows in `linear_out` and advances both states. Returns false,
-    /// launching nothing, for a configuration other than the one the scan is compiled for.
+    /// registers, and the gated norm in place. Reads `linear_qkv` and `linear_z` and the rows'
+    /// `b` and `a` from `inputs`, writes the convolved rows to `inputs`' first, and leaves the
+    /// gated rows in `linear_out`. The conv history advances in place; the recurrent state is
+    /// read from `recurrent_state` and written to `recurrent_out`, which is the same buffer
+    /// except in a speculative verify. Returns false, launching nothing, for a configuration
+    /// other than the one the scan is compiled for.
+    ///
+    /// `snapshot` is the verify's (conv windows, rows, region stride): region r receives the
+    /// windows after row r, for the first `rows` rows, as q4e_gdn_conv writes them.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn gdn_chunk(
         &self,
         conv_weight: Deviceptr,
         conv_state: Deviceptr,
-        recurrent_state: Deviceptr,
+        (recurrent_state, recurrent_out): (Deviceptr, Deviceptr),
         a_log: Deviceptr,
         dt_bias: Deviceptr,
         norm: Deviceptr,
+        inputs: [Deviceptr; 3],
         batch: usize,
+        (snapshot, snapshot_rows, region_stride): (u64, usize, u64),
     ) -> Result<bool, BackendError> {
-        let config = &self.backend.config;
-        let taps = config.linear_conv_kernel_dim;
-        let key_heads = config.linear_num_key_heads;
-        let heads = config.linear_num_value_heads;
-        let groups = config.value_groups();
-        let width = config.linear_conv_width();
-        if !part("gdn")
-            || config.linear_key_head_dim != GDN_KEY
-            || config.linear_value_head_dim != GDN_VALUE
-            || !(2..=CONV_HISTORY + 1).contains(&taps)
-            || groups == 0
-            || groups > GDN_KEY
-            || key_heads * groups != heads
-        {
+        if !self.gdn_fits() {
             return Ok(false);
         }
+        let config = &self.backend.config;
+        let taps = config.linear_conv_kernel_dim;
+        let heads = config.linear_num_value_heads;
+        let width = config.linear_conv_width();
         let kernels = &self.backend.kernels.prefill;
-        let scratch = &self.prefill;
+        let [conv_out, ..] = inputs;
         let columns = width.div_ceil(256).max(1) as u32;
-        // A chunk is never a speculative verify, so it writes no snapshot region.
-        let (null, no_rows, no_stride) = (0_u64, 0_u64, 0_u64);
         self.launch(
             kernels.gdn_conv,
             (columns, batch as u32, 1),
@@ -609,7 +996,7 @@ impl DeviceSequence {
                 self.linear_qkv.0,
                 conv_state.0,
                 conv_weight.0,
-                self.linear_conv.0,
+                conv_out.0,
                 width as u64,
                 taps as u64,
             ],
@@ -624,53 +1011,18 @@ impl DeviceSequence {
                 width as u64,
                 taps as u64,
                 batch as u64,
-                null,
-                no_rows,
-                no_stride,
+                snapshot,
+                snapshot_rows as u64,
+                region_stride,
             ],
         )?;
         self.prof_mark("gdn_conv")?;
-        let key_width = config.linear_key_width();
-        self.launch(
-            kernels.gdn_prep,
-            (key_heads as u32, batch as u32, 1),
-            (GDN_KEY as u32, 1, 1),
-            &[
-                self.linear_conv.0,
-                self.linear_a.0,
-                self.linear_b.0,
-                a_log.0,
-                dt_bias.0,
-                scratch.gdn_qk.0,
-                scratch.gdn_decay_beta.0,
-                key_width as u64,
-                key_heads as u64,
-                heads as u64,
-                GDN_VALUE as u64,
-                groups as u64,
-            ],
-        )?;
-        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
-        self.launch(
-            kernels.gdn_scan,
-            scan_grid,
-            (scan_threads, 1, 1),
-            &[
-                scratch.gdn_qk.0,
-                scratch.gdn_decay_beta.0,
-                self.linear_conv.0,
-                recurrent_state.0,
-                self.linear_out.0,
-                key_width as u64,
-                key_heads as u64,
-                heads as u64,
-                GDN_VALUE as u64,
-                groups as u64,
-                batch as u64,
-                null,
-                no_rows,
-                no_stride,
-            ],
+        self.gdn_recurrence(
+            a_log,
+            dt_bias,
+            inputs,
+            (recurrent_state, recurrent_out),
+            batch,
         )?;
         self.launch(
             kernels.gdn_gate,
@@ -689,5 +1041,122 @@ impl DeviceSequence {
         )?;
         self.prof_mark("gdn_recur")?;
         Ok(true)
+    }
+
+    /// The recurrence over `rows` convolved rows and their `b` and `a` ([conv, b, a]), from the
+    /// state in `from` to the state in `to`, the raw head outputs in `linear_out`. A verify's
+    /// commit replays its kept rows through this from the inputs the verify left, so the state is
+    /// bit for bit the one those rows left behind. Returns false, launching nothing, where
+    /// [Self::gdn_chunk] would.
+    pub(super) fn gdn_recurrence(
+        &self,
+        a_log: Deviceptr,
+        dt_bias: Deviceptr,
+        [conv, b, a]: [Deviceptr; 3],
+        (from, to): (Deviceptr, Deviceptr),
+        rows: usize,
+    ) -> Result<bool, BackendError> {
+        if !self.gdn_fits() {
+            return Ok(false);
+        }
+        let config = &self.backend.config;
+        let key_heads = config.linear_num_key_heads;
+        let heads = config.linear_num_value_heads;
+        let groups = config.value_groups();
+        let key_width = config.linear_key_width();
+        let kernels = &self.backend.kernels.prefill;
+        let scratch = &self.prefill;
+        self.launch(
+            kernels.gdn_prep,
+            (key_heads as u32, rows as u32, 1),
+            (GDN_KEY as u32, 1, 1),
+            &[
+                conv.0,
+                a.0,
+                b.0,
+                a_log.0,
+                dt_bias.0,
+                scratch.gdn_qk.0,
+                scratch.gdn_decay_beta.0,
+                key_width as u64,
+                key_heads as u64,
+                heads as u64,
+                GDN_VALUE as u64,
+                groups as u64,
+            ],
+        )?;
+        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
+        // The verify's windows are the conv's snapshot; the recurrent state is replayed rather
+        // than saved a row at a time, so the scan writes no snapshot of its own.
+        self.launch(
+            kernels.gdn_scan,
+            scan_grid,
+            (scan_threads, 1, 1),
+            &[
+                scratch.gdn_qk.0,
+                scratch.gdn_decay_beta.0,
+                conv.0,
+                from.0,
+                to.0,
+                self.linear_out.0,
+                key_width as u64,
+                key_heads as u64,
+                heads as u64,
+                GDN_VALUE as u64,
+                groups as u64,
+                rows as u64,
+                0,
+                0,
+                0,
+            ],
+        )?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(pairs: &[(&str, &str)]) -> Result<PrefillPlan, BackendError> {
+        PrefillPlan::from_lookup(|name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+    }
+
+    #[test]
+    fn the_decode_steps_follow_the_chunks_by_default() {
+        let plan = plan(&[]).expect("the default plan");
+        assert_eq!(plan.decode, plan.tensor_cores);
+    }
+
+    #[test]
+    fn decode_mma_off_keeps_the_decode_steps_on_the_token_kernels() {
+        for value in ["off", "0", "false"] {
+            let plan = plan(&[("SPARKFLASH_DECODE_MMA", value)]).expect("off is a value");
+            assert!(!plan.decode, "SPARKFLASH_DECODE_MMA={value}");
+        }
+    }
+
+    #[test]
+    fn a_decode_mma_value_outside_the_switch_is_refused() {
+        let error = plan(&[("SPARKFLASH_DECODE_MMA", "fast")]).expect_err("not a switch value");
+        assert_eq!(error.code(), "qwen4_config");
+        let error = plan(&[("SPARKFLASH_QWEN4_PREFILL_MMA", "2")]).expect_err("not a switch value");
+        assert_eq!(error.code(), "qwen4_config");
+    }
+
+    #[test]
+    fn decode_mma_on_without_the_tensor_core_chunks_is_refused() {
+        let error = plan(&[
+            ("SPARKFLASH_QWEN4_PREFILL_MMA", "0"),
+            ("SPARKFLASH_DECODE_MMA", "on"),
+        ])
+        .expect_err("the decode steps cannot take an image the chunks do not");
+        assert_eq!(error.code(), "qwen4_config");
+        assert!(error.message().contains("SPARKFLASH_DECODE_MMA=on"));
     }
 }

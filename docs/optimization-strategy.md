@@ -143,6 +143,7 @@ correctness tool, never a timing one.
 | `SPARKFLASH_QWEN4_SPEC_TRACE=1` | each draft's confidence, its rank in the target's row, and whether it was kept: the input for tuning the drafter and the depth policy |
 | `SPARKFLASH_QWEN4_PREFILL_PARTS=dense,experts,gdn` | which tensor-core prefill paths a chunk may take: bisects a difference against the token kernels |
 | `SPARKFLASH_QWEN4_PREFILL_MMA=0`, `SPARKFLASH_QWEN4_PREFILL_CHUNK=N` | the token-kernel prefill, and the chunk width |
+| `SPARKFLASH_DECODE_MMA=off` | decode steps and verifies on the token kernels: bisects a decode difference against the tensor-core image's few-row forms |
 
 ### 1.4 The DeepSeek probes
 

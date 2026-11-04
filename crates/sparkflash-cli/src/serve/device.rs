@@ -56,6 +56,7 @@ use sparkflash_api::engine::{
 use sparkflash_api::telemetry_types::DSparkStepStats;
 use sparkflash_api::{AppState, Metrics};
 use sparkflash_engine::config::ModelConfig;
+use sparkflash_model::numerics::ConfigKey;
 use sparkflash_model_deepseek_v41::encoding::{HfTokenizerEncoder, TokenizerSeam};
 
 use super::{
@@ -1457,6 +1458,14 @@ fn start_leader(
     device: &DeviceServeOptions,
     control: SocketAddr,
 ) -> Result<(), String> {
+    // DeepSeek's TP=4 device path serves no logprobs or token ids, so its reference fingerprints
+    // greedy texts only (docs/NUMERICS.md, evidence "text").
+    let numerics = crate::serve::announce_numerics(ConfigKey::tp(
+        sparkflash_model::DEFAULT_MODEL_ID,
+        tp4.world_size,
+        options.numerics,
+        sparkflash_kernels::images::CUDA_ARCH,
+    ))?;
     let tokenizer_path = match options.tokenizer.clone() {
         Some(path) => path,
         None => default_tokenizer()?,
@@ -1539,7 +1548,8 @@ fn start_leader(
                 .as_ref()
                 .map(|path| path.display().to_string()),
         )
-        .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok());
+        .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
+        .with_numerics(numerics);
     let bind = options.bind;
     let boot = Instant::now();
     std::thread::Builder::new()

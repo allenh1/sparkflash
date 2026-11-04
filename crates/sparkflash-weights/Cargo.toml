@@ -25,3 +25,6 @@ description = "Generic tensor storage formats, safetensors container, weight sou
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

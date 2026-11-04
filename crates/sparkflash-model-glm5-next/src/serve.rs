@@ -182,13 +182,7 @@ impl ModelBackend for Glm5NextDeviceBackend {
     fn capabilities(&self) -> Capabilities {
         // The text arm renders the tool catalogue, the `<think>` block and the reasoning-effort
         // instruction; the vision tower and the drafters are not loaded.
-        Capabilities {
-            tools: true,
-            thinking: true,
-            reasoning_effort: true,
-            vision: false,
-            constrained: false,
-        }
+        Capabilities::ALL
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
@@ -308,7 +302,7 @@ impl ModelSession for Glm5NextSession {
 
 /// The descriptor one rank serves: the pack's id, this build's output ceiling, and the context the
 /// sequence actually allocates.
-fn descriptor_for(config: &Glm5NextConfig, context: usize) -> ModelDescriptor {
+pub fn descriptor_for(config: &Glm5NextConfig, context: usize) -> ModelDescriptor {
     ModelDescriptor {
         id: crate::MODEL_ID.to_owned(),
         family: crate::FAMILY.to_owned(),
@@ -316,13 +310,7 @@ fn descriptor_for(config: &Glm5NextConfig, context: usize) -> ModelDescriptor {
         context_tokens: context.min(config.max_position_embeddings),
         max_output_tokens: crate::MAX_OUTPUT_TOKENS,
         vocab_size: config.vocab_size,
-        capabilities: Capabilities {
-            tools: true,
-            thinking: true,
-            reasoning_effort: true,
-            vision: false,
-            constrained: false,
-        },
+        capabilities: Capabilities::ALL,
     }
 }
 

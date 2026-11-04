@@ -37,6 +37,7 @@
 //! One MTP layer follows the decoder in the checkpoint.
 
 use serde::Deserialize;
+use sparkflash_model::config::OneOrMany;
 use sparkflash_model::dflash2::DraftTarget;
 use sparkflash_weights::mhc::HcGeometry;
 
@@ -812,22 +813,6 @@ impl QuantizationSpec {
             other => Err(ConfigError::Invalid(format!(
                 "weight_block_size {other:?}: only square FP8 tiles are served"
             ))),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OneOrMany<T> {
-    One(T),
-    Many(Vec<T>),
-}
-
-impl<T> OneOrMany<T> {
-    fn into_vec(self) -> Vec<T> {
-        match self {
-            Self::One(value) => vec![value],
-            Self::Many(values) => values,
         }
     }
 }

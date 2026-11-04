@@ -34,6 +34,7 @@
 //! one key per residual stream.
 
 use serde::Deserialize;
+use sparkflash_model::config::OneOrMany;
 
 /// The end-of-text id the chat template and the PLE segment rule use.
 pub const ENDOFTEXT_TOKEN: u32 = 248_044;
@@ -1046,28 +1047,6 @@ fn default_vision_positions() -> usize {
 
 fn default_vision_rope_theta() -> f64 {
     10_000.0
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum OneOrMany<T> {
-    One(T),
-    Many(Vec<T>),
-}
-
-impl<T> OneOrMany<T> {
-    fn into_vec(self) -> Vec<T> {
-        match self {
-            Self::One(value) => vec![value],
-            Self::Many(values) => values,
-        }
-    }
-}
-
-impl<T: Default> Default for OneOrMany<T> {
-    fn default() -> Self {
-        Self::One(T::default())
-    }
 }
 
 fn default_conv_kernel() -> usize {

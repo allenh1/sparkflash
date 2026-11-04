@@ -59,7 +59,6 @@
 //!   drafter (Apache-2.0), and [SGLang](https://github.com/sgl-project/sglang)'s DFlash support
 //!   (Apache-2.0), read for the arithmetic and the verify protocol; no source is copied.
 
-pub mod cache;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
@@ -73,12 +72,11 @@ pub mod sampling;
 pub mod tensor;
 pub mod vision;
 
-pub use cache::{cache_dir, cached_model_dir, cached_model_in};
 pub use checkpoint::{
     CheckpointRows, SyntheticCheckpoint, load_weights, open_ple_table, write_synthetic_checkpoint,
     write_synthetic_checkpoint_sharded,
 };
-pub use codec::{ByteCodec, QwenCodec};
+pub use codec::QwenCodec;
 pub use config::{ConfigError, LayerKind, Qwen4ExpConfig};
 pub use forward::{ForwardError, Qwen4ExpWeights, ReferenceState, ReferenceWeights};
 pub use ngram::{NgramHead, PleHasher, PleLayout, layer_multipliers};

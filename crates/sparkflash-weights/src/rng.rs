@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SplitMix64, and the per-tensor stream synthetic checkpoints draw their values from.
+//! SplitMix64, the per-tensor stream synthetic checkpoints draw their values from, and the prime
+//! test the n-gram tables draw their moduli with.
 //!
 //! [splitmix64] is Steele, Lea and Flood's finaliser with the golden-ratio increment: the draw the
 //! n-gram hashes are seeded with, and the mixer behind [TensorRng]. A pack's fixture writer
 //! decides what a tensor's values mean; this only hands it a stream that depends on nothing but the
-//! seed and the tensor's name.
+//! seed and the tensor's name. [is_prime] is the test DeepSeek's Engram and Qwen's per-layer
+//! embeddings both walk to their next prime with.
 
 /// The SplitMix64 increment, floor(2^64 / golden ratio).
 pub const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -35,6 +37,25 @@ pub fn splitmix64(value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(SPLITMIX_M1);
     value = (value ^ (value >> 27)).wrapping_mul(SPLITMIX_M2);
     value ^ (value >> 31)
+}
+
+/// Whether value is prime, by trial division up to its square root.
+#[must_use]
+pub fn is_prime(value: u64) -> bool {
+    if value < 2 {
+        return false;
+    }
+    if value.is_multiple_of(2) {
+        return value == 2;
+    }
+    let mut divisor = 3u64;
+    while divisor.saturating_mul(divisor) <= value {
+        if value.is_multiple_of(divisor) {
+            return false;
+        }
+        divisor += 2;
+    }
+    true
 }
 
 /// A deterministic per-tensor random stream.
@@ -75,5 +96,28 @@ impl TensorRng {
     pub fn nibble(&mut self) -> u8 {
         self.state = splitmix64(self.state);
         ((self.state >> 40) & 0x0F) as u8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_prime_test_agrees_with_a_sieve() {
+        let limit = 10_000usize;
+        let mut composite = vec![false; limit];
+        for n in 2..limit {
+            if !composite[n] {
+                for multiple in (n * n..limit).step_by(n) {
+                    composite[multiple] = true;
+                }
+            }
+            assert_eq!(is_prime(n as u64), !composite[n], "{n}");
+        }
+        assert!(!is_prime(0) && !is_prime(1));
+        // A large prime and the square of one, where the square-root bound matters.
+        assert!(is_prime(2_147_483_647));
+        assert!(!is_prime(65_521 * 65_521));
     }
 }

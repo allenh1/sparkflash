@@ -33,6 +33,7 @@ pub mod config;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
+pub mod numerics;
 pub mod profile;
 pub mod prompt;
 pub mod speculation;
@@ -48,6 +49,7 @@ pub use descriptor::{
     find_model_by_weights, model_context_tokens, model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
+pub use numerics::{ConfigKey, NumericsIdentity, NumericsProfile, NumericsStatus};
 pub use profile::{ModelProfile, ProfileError};
 pub use prompt::{PromptCodec, PromptError};
 pub use speculation::{DepthPolicy, StepCost};

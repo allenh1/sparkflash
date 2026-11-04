@@ -45,29 +45,10 @@ use std::collections::VecDeque;
 use crate::config::Qwen4ExpConfig;
 
 use sparkflash_weights::rng::SPLITMIX_GAMMA;
-pub use sparkflash_weights::rng::splitmix64;
+pub use sparkflash_weights::rng::{is_prime, splitmix64};
 
 /// The factor in the per-PLE-layer seed: 10007 * ple_layer_index.
 pub const MULTIPLIER_SEED_FACTOR: u64 = 10_007;
-
-/// Whether value is prime, by trial division up to its square root.
-#[must_use]
-pub fn is_prime(value: u64) -> bool {
-    if value < 2 {
-        return false;
-    }
-    if value.is_multiple_of(2) {
-        return value == 2;
-    }
-    let mut divisor = 3u64;
-    while divisor.saturating_mul(divisor) <= value {
-        if value.is_multiple_of(divisor) {
-            return false;
-        }
-        divisor += 2;
-    }
-    true
-}
 
 /// The count-th prime strictly after start.
 ///

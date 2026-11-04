@@ -315,6 +315,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SPARKFLASH_NVCC_HOST");
 
     let arch = std::env::var("SPARKFLASH_CUDA_ARCH").unwrap_or_else(|_| "sm_121a".to_owned());
+    // The numerics registry keys a configuration by the architecture its kernels target
+    // (docs/NUMERICS.md §5): bits from two architectures are never compared.
+    println!("cargo:rustc-env=SPARKFLASH_BUILT_CUDA_ARCH={arch}");
     let out_dir = out_dir().unwrap_or_else(|error| panic!("{}", error.stderr));
     for (source, cubin, env) in MODEL_IMAGES {
         println!("cargo:rerun-if-changed=../../kernels/{source}");

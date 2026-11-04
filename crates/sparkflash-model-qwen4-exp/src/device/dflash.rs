@@ -46,7 +46,7 @@ pub(super) fn load_dflash_from_env(
         return Ok(None);
     };
     let loaded = cuda
-        .load_named(embedded_dflash2_cubin(), "q4e_quantize_e4m3_rows")
+        .load_named(super::embedded_cubin(), "q4e_quantize_e4m3_rows")
         .and_then(|(_, quantize)| GpuMatE4m3::quantize(cuda, quantize, head, &mut 0))
         .and_then(|head| {
             GpuDflash2::load(cuda, &directory, target, &head, (0, 1))

@@ -2362,8 +2362,8 @@ async fn streaming_completions_echo_the_prompt_in_the_first_chunk() {
     assert_eq!(scored[1]["choices"][0]["text"], " world");
     assert_eq!(
         scored[1]["choices"][0]["logprobs"]["text_offset"],
-        json!([10]),
-        "the streamed offset continues from the text already sent"
+        json!([8]),
+        "the streamed offset continues after the last reported token, as the unstreamed one does"
     );
 }
 

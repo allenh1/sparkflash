@@ -107,12 +107,20 @@ fn pdl_enabled() -> bool {
 }
 
 /// Whether a kernel launches with programmatic stream serialization: the opt kernels and the
-/// Qwen4-Exp pack's q4e kernels. Every one opens with griddepcontrol.launch_dependents +
-/// griddepcontrol.wait (OPT_PDL_ENTRY), so it reads and writes nothing before the previous grid
-/// has completed and stream order holds.
+/// Qwen4-Exp pack's q4e (token) and q4p (tensor-core) kernels. Every one opens with
+/// griddepcontrol.launch_dependents + griddepcontrol.wait (OPT_PDL_ENTRY), or issues only constant
+/// weight loads between the two, so it reads and writes nothing before the previous grid has
+/// completed and stream order holds.
 fn programmatic(kernel: &Kernel) -> bool {
-    (kernel.name.starts_with("opt_") || kernel.name.starts_with("q4e_")) && pdl_enabled()
+    PROGRAMMATIC_PREFIXES
+        .iter()
+        .any(|prefix| kernel.name.starts_with(prefix))
+        && pdl_enabled()
 }
+
+/// The kernel name prefixes [programmatic] launches with programmatic stream serialization;
+/// tests/pdl_entry.rs holds every such kernel in kernels/ to the dependency wait.
+pub const PROGRAMMATIC_PREFIXES: [&str; 3] = ["opt_", "q4e_", "q4p_"];
 
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
 fn name(code: CuResult) -> String {

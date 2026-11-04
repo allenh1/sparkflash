@@ -98,10 +98,10 @@ OPEN-TIME REFUSAL ROWS (exit 3) - the arm refused inside DeviceLayer::open
     correct cheap outcome, not a malformed row and not a missing-evidence row: this tool parses the
     refusal out of the per-rank chain log (the only place it is written), prints it verbatim, names
     the stage that was being opened (mhc_entry for layer 0), reports what the row DOES have
-    (bind/loop/token JSON, run.meta), and exits 3 with verdict OPEN-REFUSAL. The rule is recorded in
-    docs/RULES.md: such a row is never a frontier stage, never a ms/step, and no published
-    number changes. Exit 2 stays reserved for a row whose documents are missing with no named
-    open-time refusal to explain the absence.
+    (bind/loop/token JSON, run.meta), and exits 3 with verdict OPEN-REFUSAL. The rule: such a row
+    is never a frontier stage, never a ms/step, and no published number changes. Exit 2 stays
+    reserved for a row whose documents are missing with no named open-time refusal to explain the
+    absence.
 
 EXIT CODES (the rule that matters: 2 is a STOP, never a retry, never a pass)
     0  coherent: a real frontier probe (default), or a gate-eligible completed layer

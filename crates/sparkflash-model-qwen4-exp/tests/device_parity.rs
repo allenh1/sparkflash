@@ -120,9 +120,10 @@ fn parity_with(config: Qwen4ExpConfig, label: &str, prompt_len: usize) -> bool {
     )
 }
 
-/// The loop under a chosen prefill plan, with the bound the prefill's logits must meet. The
-/// decode steps after it always run on the token kernels, so they also check the caches and
-/// recurrent state the prefill left behind.
+/// The loop under a chosen prefill plan, with the bound the logits must meet. The decode steps
+/// after the prefill run under the same plan - on the tensor cores when its chunks are, as
+/// SPARKFLASH_DECODE_MMA has them by default - so they also check the caches and recurrent state
+/// the prefill left behind.
 fn parity_on(
     mut config: Qwen4ExpConfig,
     label: &str,
@@ -414,8 +415,9 @@ fn a_prompt_spanning_two_chunks_matches_the_host_oracle() {
 /// The tensor-core prefill image against the oracle, on a geometry every one of its paths takes:
 /// 128-wide GDN heads with three value heads a key head (the release's grouping), a hidden width
 /// the routed-expert MMA tiles, 32-row multiples for the dense projections, and a prompt of one
-/// full chunk and a 100-row one, whose last MMA tile is partial. The decode steps after it run on
-/// the token kernels over the caches and recurrent state the chunks left.
+/// full chunk and a 100-row one, whose last MMA tile is partial. The decode steps and verifies
+/// after it run on the same image, in its decode form, over the caches and recurrent state the
+/// chunks left, and are held to the same bound.
 #[test]
 fn the_tensor_core_prefill_matches_the_host_oracle() {
     let mut config = Qwen4ExpConfig::tiny();
@@ -488,8 +490,8 @@ fn a_vectorised_four_stream_geometry_matches_the_host_oracle() {
 }
 
 /// A chunk wider than DENSE_ROWS computes every row to the bits DENSE_ROWS-wide chunks do: its
-/// dense projections run a DENSE_ROWS piece at a time with the split such a chunk took, and a tail
-/// too short for the tensor cores runs on its own, as it did then. The hidden width is wide enough
+/// dense projections run a DENSE_ROWS piece at a time, every piece, a short tail's too, with the
+/// split a whole one takes. The hidden width is wide enough
 /// that one 2,048-row launch of the 32-row router would split K four ways where a 512-row one
 /// splits it eight, so a piece computed any other way shows here. One prompt ends in a 30-row tail
 /// (its own forward), the other in a 100-row one (a short piece of the wide forward).
@@ -599,6 +601,135 @@ fn a_kept_sequence_prefills_only_the_tokens_past_its_prefix() {
         &continued.logits,
         RELATIVE_TOLERANCE,
     );
+}
+
+/// Two logits rows that must be the same bits.
+fn assert_bits(stage: &str, expected: &[f32], actual: &[f32]) {
+    assert_eq!(
+        expected.len(),
+        actual.len(),
+        "{stage}: the rows differ in length"
+    );
+    let differ: Vec<usize> = expected
+        .iter()
+        .zip(actual)
+        .enumerate()
+        .filter(|(_, (expected, actual))| expected.to_bits() != actual.to_bits())
+        .map(|(index, _)| index)
+        .collect();
+    if let Some(&first) = differ.first() {
+        panic!(
+            "{stage}: {} of {} logits differ, the first at {first} ({} against {})",
+            differ.len(),
+            expected.len(),
+            expected[first],
+            actual[first]
+        );
+    }
+}
+
+/// A continued conversation resumes on the bits a cold prefill of its transcript leaves.
+///
+/// With the decode steps on the tensor cores every form computes a row from that row alone, in an
+/// order fixed by the matrix, so a token's state does not depend on how many rows shared its
+/// forward: the prompt's chunks, the decode steps and the speculative verifies that generated the
+/// reply (the fixture carries an MTP layer), and the suffix prefill of the next turn. A kept
+/// sequence that answered and then took the next user turn must hold what a cold prefill of the
+/// whole transcript holds: the same logits to the bit, and the same for the steps after. The
+/// prompts put the cold prefill's chunk boundaries where the warm run had none: one partial chunk,
+/// and a full one with a 100-row tail.
+#[test]
+fn a_continued_conversation_is_the_bits_of_a_cold_prefill() {
+    if !cubin_available() || embedded_prefill_cubin().is_empty() {
+        eprintln!(
+            "skipping the continued conversation: this build has no Qwen4-Exp cubin or prefill \
+             image"
+        );
+        return;
+    }
+    let mut config = Qwen4ExpConfig::tiny();
+    config.hidden_size = 256;
+    config.hc_count = 4;
+    config.hc_lowrank = 32;
+    config.layer_types = vec![LayerKind::Linear, LayerKind::Linear, LayerKind::Sparse];
+    config.ple_layer_ids = vec![2];
+    config.linear_key_head_dim = 128;
+    config.linear_value_head_dim = 128;
+    config.linear_num_key_heads = 4;
+    config.linear_num_value_heads = 12;
+    config.moe_intermediate_size = 128;
+    config.shared_expert_intermediate_size = 128;
+    config.num_experts = 64;
+    config.num_experts_per_tok = 10;
+    config.max_position_embeddings = 1024;
+    config.num_hidden_layers = config.layer_types.len();
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    write_synthetic_checkpoint(temp.path(), &config, 13).expect("the fixture writes");
+    for prompt_len in [73, CHUNK + 100] {
+        let backend = match Qwen4ExpDeviceBackend::open_with_prefill(
+            temp.path(),
+            prompt_len + 64,
+            PrefillPlan::new(CHUNK, true),
+        ) {
+            Ok(backend) => backend,
+            Err(error) if error.code() == "qwen4_device" && error.message().contains("CUDA:") => {
+                eprintln!("skipping the continued conversation: {error}");
+                return;
+            }
+            Err(error) => panic!("the device arm refused the fixture checkpoint: {error}"),
+        };
+        let prompt: Vec<u32> = (0..prompt_len)
+            .map(|index| 3 + (index * 5 % 11) as u32)
+            .collect();
+        let mut warm = backend.open_session().expect("a device session opens");
+        let mut step = warm.prefill(&prompt).expect("the prompt prefills");
+        // The serving adapter decodes every token it emits, a verified chain one token at a time,
+        // and the sequence is reusable once the chain has been handed back.
+        let mut fed = prompt.clone();
+        while fed.len() < prompt_len + 6 || warm.reusable_prefix().is_none() {
+            assert!(
+                fed.len() < prompt_len + 24,
+                "{prompt_len}-token prompt: the verified chain never drained"
+            );
+            let token = step.next_token.expect("the fixture answers");
+            fed.push(token);
+            step = warm.decode(token).expect("the decode runs");
+        }
+        let mut transcript = fed.clone();
+        transcript.extend_from_slice(&[25, 27, 29, 31]);
+        let continued = warm.prefill(&transcript).expect("the next turn prefills");
+        assert_eq!(
+            warm.cached_tokens(),
+            fed.len(),
+            "{prompt_len}-token prompt: only the next turn was forwarded"
+        );
+        let mut cold = backend.open_session().expect("a second session opens");
+        let fresh = cold.prefill(&transcript).expect("the transcript prefills");
+        assert_bits(
+            &format!("{prompt_len}-token prompt, the next turn"),
+            &fresh.logits,
+            &continued.logits,
+        );
+        let (mut warm_next, mut cold_next) = (continued.next_token, fresh.next_token);
+        for index in 0..4 {
+            let token = warm_next.expect("the fixture answers");
+            assert_eq!(
+                cold_next,
+                Some(token),
+                "{prompt_len}-token prompt, step {index}: the two sequences chose differently"
+            );
+            let (warm_step, cold_step) = (
+                warm.decode(token).expect("the warm decode runs"),
+                cold.decode(token).expect("the cold decode runs"),
+            );
+            assert_bits(
+                &format!("{prompt_len}-token prompt, step {index} of the next turn"),
+                &cold_step.logits,
+                &warm_step.logits,
+            );
+            (warm_next, cold_next) = (warm_step.next_token, cold_step.next_token);
+        }
+    }
 }
 
 /// The prefill's logits and three decode steps' after it under `chunk`-token tensor-core chunks,

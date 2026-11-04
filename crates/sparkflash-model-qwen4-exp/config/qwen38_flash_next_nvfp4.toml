@@ -4,6 +4,7 @@
 # environment variables listed in sparkflash_model::profile::ENV_OVERRIDES remain overrides and
 # are documented in docs/adding-a-model.md.
 
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 family = "qwen4-exp"
 weights = "qwen3.8-flash-next-nvfp4"
 
@@ -16,6 +17,9 @@ enabled = true
 chunk = 4096
 tensor_cores = true
 exact = false
+
+[decode]
+tensor_cores = true
 
 [attention]
 latent_cache = "auto"

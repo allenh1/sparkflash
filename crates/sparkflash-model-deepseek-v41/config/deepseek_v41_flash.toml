@@ -1,5 +1,6 @@
 # DeepSeek-V4.1-Flash (TP=4) runtime profile.
 
+model = "deepseek-ai/DeepSeek-V4.1-Flash"
 family = "deepseek-v41"
 weights = "deepseek-v4.1-flash"
 

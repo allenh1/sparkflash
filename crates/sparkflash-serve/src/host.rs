@@ -142,7 +142,13 @@ impl HostDriver {
             return Err("the host engine needs at least one worker".to_owned());
         }
         let descriptor = Arc::new(backend.descriptor().clone());
-        let capabilities = backend.capabilities();
+        // The model says what it can render; the driver adds what its own loop implements.
+        // run_request feeds a forced token in place of the backend's choice, through the same
+        // session.decode every request takes, so teacher forcing is this driver's to declare.
+        let capabilities = Capabilities {
+            forced_decoding: true,
+            ..backend.capabilities()
+        };
         let (jobs, queued) = bounded(options.queue_capacity.max(1));
         let (ready, reported) = std::sync::mpsc::channel();
         let metrics = Arc::new(Metrics::new());
@@ -260,10 +266,22 @@ impl InferenceEngine for HostDriver {
         }
         let prompt_tokens = request.prompt_tokens.len();
         let max_tokens = request.max_tokens.min(self.max_tokens);
+        // The serve cap would otherwise cut a forced sequence short and answer a prefix of it.
+        if !request.forced_tokens.is_empty() && request.forced_tokens.len() != max_tokens {
+            return refused(
+                &format!(
+                    "forced_tokens has {} tokens but this request generates {max_tokens} (the server's --max-tokens is {}); a forced sequence is generated whole or refused",
+                    request.forced_tokens.len(),
+                    self.max_tokens
+                ),
+                REFUSED_CODE,
+            );
+        }
         let enqueued_at = Instant::now();
         let (replies, answers) = mpsc::channel(self.reply_buffer);
         let job = Job {
             prompt_tokens: request.prompt_tokens,
+            forced_tokens: request.forced_tokens,
             max_tokens,
             sampling: Sampling {
                 temperature: request.temperature,
@@ -375,6 +393,8 @@ struct AnswerState {
 /// One queued generation request.
 struct Job {
     prompt_tokens: Vec<u32>,
+    /// Teacher forcing: the tokens fed in place of the backend's choice; empty for a generation.
+    forced_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: Sampling,
     logprobs: LogprobsRequest,
@@ -553,7 +573,9 @@ fn run_request(
     let mut ttft: Option<Duration> = None;
     let want_sample = job.logprobs.wants_sample();
     while completion_tokens < job.max_tokens {
-        let Some(token) = next else {
+        // A forced request feeds its own token whatever the backend chose, including past a
+        // choice that would have ended generation; the logprobs below score it under this row.
+        let Some(token) = job.forced_tokens.get(completion_tokens).copied().or(next) else {
             break;
         };
         if ttft.is_none() {
