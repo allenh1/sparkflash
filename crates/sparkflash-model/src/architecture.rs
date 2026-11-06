@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::config::{ConfigError, OneOrMany};
 use crate::parts::{Part, PartSet, Target, built};
+use crate::vision_geometry::VisionGeometry;
 
 /// The architecture of one released checkpoint.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +57,31 @@ pub struct Architecture {
     pub vision: Option<Vision>,
     /// The MTP/DSpark stages, if the release carries any.
     pub mtp: Option<Mtp>,
+    /// The checkpoint's special-token ids, as `config.json` and the tokenizer declare them.
+    pub tokens: Tokens,
+}
+
+/// The special-token ids a checkpoint names.
+///
+/// A release names these in `config.json` (root or `text_config`) and, for the end-of-generation
+/// set, sometimes only in `generation_config.json`. [Architecture::from_checkpoint_dir] merges the
+/// two so a serving path never falls back to a compiled-in spelling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tokens {
+    /// Beginning-of-sequence id, when the checkpoint names one.
+    pub bos_token_id: Option<u32>,
+    /// Every id that ends a generation, in the checkpoint's order.
+    pub eos_token_ids: Vec<u32>,
+    /// Padding id, when the checkpoint names one.
+    pub pad_token_id: Option<u32>,
+    /// The image placeholder's id, when the checkpoint carries a vision tower.
+    pub image_token_id: Option<u32>,
+    /// The video placeholder's id, when the checkpoint carries one.
+    pub video_token_id: Option<u32>,
+    /// The delimiter before an image's merged rows.
+    pub vision_start_token_id: Option<u32>,
+    /// The delimiter after an image's merged rows.
+    pub vision_end_token_id: Option<u32>,
 }
 
 /// One decoder layer.
@@ -390,6 +416,12 @@ pub struct Mtp {
     pub routed_experts: Option<usize>,
     /// Experts a token activates per stage.
     pub active_experts: Option<usize>,
+    /// Whether every rank allocates the stage's cache.
+    ///
+    /// A release that drafts from the stage at every world size declares true (the default).
+    /// Qwen4-Exp clears it: at TP>1 its rank configuration sets `mtp_num_hidden_layers = 0` and
+    /// drafts with DFlash, so only the TP1 rank carries the stage's cache.
+    pub replicated: bool,
 }
 
 /// The stored weight format a release declares.
@@ -405,6 +437,136 @@ pub struct Quantization {
     pub activation: Option<String>,
     /// The expert weight format (`fp4`, ...).
     pub expert: Option<String>,
+    /// The dense projections' stored format.
+    pub dense_format: WeightFormat,
+    /// The backbone decoder experts' stored format.
+    pub expert_format: WeightFormat,
+    /// The MTP stage's expert format, which a release may store differently from the backbone's.
+    pub mtp_expert_format: Option<WeightFormat>,
+}
+
+/// The arithmetic a weight format uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleDType {
+    /// A 32-bit float inverse scale.
+    F32,
+    /// A BF16 inverse scale.
+    Bf16,
+    /// An 8-bit E4M3 (or `ue8m0`) scale.
+    #[default]
+    E4M3,
+}
+
+/// The stored format of one class of weights.
+///
+/// This is the arithmetic, not the producer's name: a ModelOpt release writes
+/// `quant_method: "modelopt"` and records the format in `quant_algo` / `quantized_layers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightFormat {
+    /// Unquantized BF16.
+    #[default]
+    Bf16,
+    /// E4M3 codes with an inverse scale a tile.
+    Fp8Tile {
+        /// Rows a scale covers.
+        block_m: usize,
+        /// Columns a scale covers.
+        block_n: usize,
+        /// The scale's dtype.
+        scale_dtype: ScaleDType,
+        /// Whether activations are quantized per block at run time.
+        dynamic_activations: bool,
+    },
+    /// E2M1 codes grouped with per-group E4M3 scales and a global scale.
+    NvFp4 {
+        /// Elements a scale covers.
+        group_size: usize,
+    },
+    /// E4M3 codes with one power-of-two `ue8m0` scale a block.
+    MxFp8 {
+        /// Elements a scale covers.
+        block: usize,
+    },
+    /// E2M1 codes with one power-of-two `ue8m0` scale a block.
+    MxFp4 {
+        /// Elements a scale covers.
+        block: usize,
+    },
+}
+
+impl WeightFormat {
+    /// The arithmetic's released name, for a document that renders the plan back.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::Fp8Tile { .. } => "FP8",
+            Self::NvFp4 { .. } => "NVFP4",
+            Self::MxFp8 { .. } => "MXFP8",
+            Self::MxFp4 { .. } => "MXFP4",
+        }
+    }
+
+    /// The format a name and a scale declaration describe.
+    ///
+    /// The producer's spellings carry the arithmetic: `fp4` without a power-of-two scale is
+    /// NVIDIA's 16-element group, and the same name with a `ue8m0` scale is MXFP4's 32-element
+    /// block. `fp8` with `ue8m0` is MXFP8 rather than a tile-scaled E4M3 format, which is what
+    /// the DeepSeek release declares. A name this parser does not know stays BF16 rather than
+    /// guessing a narrower arithmetic.
+    #[must_use]
+    pub fn from_name(method: Option<&str>, block: Option<usize>, scale: Option<&str>) -> Self {
+        let name = method.unwrap_or("").to_ascii_lowercase();
+        let scale = scale.unwrap_or("").to_ascii_lowercase();
+        if name.contains("nvfp4") {
+            return Self::NvFp4 {
+                group_size: block.unwrap_or(16),
+            };
+        }
+        if name.contains("mxfp4") {
+            return Self::MxFp4 {
+                block: block.unwrap_or(32),
+            };
+        }
+        if name.contains("mxfp8") {
+            return Self::MxFp8 {
+                block: block.unwrap_or(32),
+            };
+        }
+        if name.contains("fp4") {
+            // The releases spell their 4-bit arithmetic `fp4`, not `nvfp4` or `mxfp4`. The
+            // scale identifies which one: a ue8m0 scale is an MX block, and anything else is
+            // NVIDIA's per-16-element group.
+            return if scale.contains("ue8m0") {
+                Self::MxFp4 {
+                    block: block.unwrap_or(32),
+                }
+            } else {
+                Self::NvFp4 {
+                    group_size: block.unwrap_or(16),
+                }
+            };
+        }
+        if name.contains("fp8") || name.contains("e4m3") {
+            if scale.contains("ue8m0") {
+                return Self::MxFp8 {
+                    block: block.unwrap_or(32),
+                };
+            }
+            let scale_dtype = if scale.contains("bf16") {
+                ScaleDType::Bf16
+            } else {
+                ScaleDType::F32
+            };
+            return Self::Fp8Tile {
+                block_m: block.unwrap_or(128),
+                block_n: block.unwrap_or(128),
+                scale_dtype,
+                dynamic_activations: true,
+            };
+        }
+        Self::Bf16
+    }
 }
 
 /// The vision tower's geometry.
@@ -420,8 +582,20 @@ pub struct Vision {
     pub intermediate: usize,
     /// Patch side.
     pub patch_size: usize,
+    /// Frames one patch covers.
+    pub temporal_patch_size: usize,
     /// Spatial merge factor before the aligner.
     pub spatial_merge: usize,
+    /// The aligner's hidden width.
+    pub projection_intermediate: usize,
+    /// Image channels.
+    pub in_channels: usize,
+    /// Learned position-grid entries, or zero when the tower ropes only.
+    pub num_position_embeddings: usize,
+    /// The smallest image the tower plans, in pixels.
+    pub min_pixels: usize,
+    /// The largest image the tower plans, in pixels.
+    pub max_pixels: usize,
     /// The width the aligner hands the language model.
     pub out_hidden_size: usize,
     /// Axial RoPE base.
@@ -469,8 +643,9 @@ impl Architecture {
 
         let layers = layers(text)?;
         let quantization = quantization(root)?;
-        let vision = vision(root)?;
+        let vision = vision(root, hidden_size)?;
         let mtp = mtp(text, hidden_size)?;
+        let tokens = tokens(root, text)?;
 
         Ok(Self {
             family,
@@ -485,7 +660,221 @@ impl Architecture {
             quantization,
             vision,
             mtp,
+            tokens,
         })
+    }
+
+    /// Read a checkpoint's `config.json`, merging `generation_config.json` when it sits beside.
+    ///
+    /// A serving path calls this with the snapshot directory it resolved from the Hugging Face
+    /// cache, so the architecture, its special-token ids and its end-of-generation set all come
+    /// from the checkpoint rather than from a compiled-in document.
+    ///
+    /// # Errors
+    /// A read error, a malformed document, or a shape [Self::from_json] refuses.
+    pub fn from_checkpoint_dir(dir: &std::path::Path) -> Result<Self, ConfigError> {
+        let mut architecture = Self::from_path(&dir.join("config.json"))?;
+        let generation = dir.join("generation_config.json");
+        if generation.is_file() {
+            let text = std::fs::read_to_string(&generation)
+                .map_err(|error| ConfigError::Json(format!("{}: {error}", generation.display())))?;
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|error| ConfigError::Json(error.to_string()))?;
+            // A generation config can add stop ids the model config does not name, but it
+            // cannot remove the model's own: the config's order is the served order, and the
+            // first id is the one the PLE segment rule resets on. Union generation-only ids
+            // after the config's, then dedup.
+            if value
+                .get("eos_token_id")
+                .is_some_and(|field| !field.is_null())
+            {
+                let mut ids = architecture.tokens.eos_token_ids.clone();
+                ids.extend(eos_ids(&value)?);
+                architecture.tokens.eos_token_ids = dedup(ids);
+            }
+            if let Some(id) = optional_u32(&value, "bos_token_id")? {
+                architecture.tokens.bos_token_id.get_or_insert(id);
+            }
+            if let Some(id) = optional_u32(&value, "pad_token_id")? {
+                architecture.tokens.pad_token_id.get_or_insert(id);
+            }
+        }
+        Ok(architecture)
+    }
+
+    /// The cache claim this architecture makes at `world` ranks.
+    ///
+    /// The two terms are the ones a serving flag can move: [`KvPlan::per_token`] is every cache
+    /// a position adds (attention K/V, an absorbed latent, an indexer's keys and pooled key), and
+    /// [`KvPlan::fixed`] is every state a session allocates regardless of its window (a recurrent
+    /// state and the spare a verify keeps beside it). The arithmetic is the same one the arms'
+    /// hand-written plans used, now read from the parsed geometry.
+    ///
+    /// The fixed term is deliberately not uniform across attention families: a GDN layer counts
+    /// its recurrent state and verify spare only, while a KDA layer includes its convolution
+    /// history. Qwen's GDN convolution history and its PLE convolution frames are outside this
+    /// plan, which is the convention the pinned Qwen TP=1 figure was taken under; adding them
+    /// would recalibrate that figure and is a separate change.
+    ///
+    /// `per_token` is a full-window upper bound: it counts every cache as if the position were
+    /// inside every layer's window and does not subtract a layer's per-layer sliding window.
+    /// A caller sizing a shorter context therefore gets a safe over-count, not a wrong one.
+    ///
+    /// `latent_fp8` is the caller's explicit choice of the absorbed-MLA latent representation,
+    /// not a value re-derived from the quantization block: true stores E4M3 codes plus one f32
+    /// scale per 128-wide block, false stores the f32 latent. The E4M3 choice needs a latent
+    /// width that is whole 128-wide scale tiles; a narrower row falls back to f32, the same
+    /// condition the device's latent-cache choice applies. A GLM pack passes its
+    /// [`crate::profile::LatentCacheMode`] choice and Qwen passes false. The latent row is
+    /// `kv_lora_rank + rope.rotated_dims`, because the absorbed cache keeps the rope part
+    /// beside the compressed latent.
+    ///
+    /// An indexer's key, gate and pooled key are counted only for a layer that
+    /// [`Indexer::owns_keys`]; a shared indexer reads another layer's selection and allocates
+    /// nothing. The pooled key is counted as `dim / pool` a position, which is exactly the
+    /// device's `capacity / pool` rows. An MTP stage allocates the same caches as the last
+    /// backbone attention layer, including an indexer (the GLM device allocator builds its MTP
+    /// stage with `own_indexer = true`) whenever the architecture declares indexer geometry
+    /// anywhere, even if that last layer shares another layer's selection. A stage whose
+    /// [`Mtp::replicated`] is false is counted only at TP1.
+    ///
+    /// # Errors
+    /// A checkpoint with CSA2 compression, whose compressed caches are not the one latent row a
+    /// layer this plan models, is refused rather than described by a wrong number.
+    pub fn kv_plan(&self, world: usize, latent_fp8: bool) -> Result<crate::KvPlan, ConfigError> {
+        if self
+            .layers
+            .iter()
+            .any(|layer| layer.attention.compression.is_some())
+        {
+            return Err(invalid(
+                "kv_plan: the checkpoint uses CSA2 compression, whose compressed cache is not \
+                 the one latent row this plan models; the compressed release needs its own plan",
+            ));
+        }
+        let world = world.max(1) as u64;
+        let mut per_token = 0u64;
+        let mut fixed = 0u64;
+        for layer in &self.layers {
+            match &layer.attention.kind {
+                AttentionKind::Gqa { kv_heads, .. } => {
+                    let heads = ((*kv_heads as u64).div_ceil(world)).max(1);
+                    let kv = 2u64
+                        .saturating_mul(heads)
+                        .saturating_mul(layer.attention.head_dim as u64)
+                        .saturating_mul(2);
+                    per_token = per_token.saturating_add(kv);
+                    if let Some(indexer) = &layer.attention.indexer
+                        && indexer.owns_keys
+                    {
+                        // QSA keeps one indexer key row per position.
+                        per_token =
+                            per_token.saturating_add((indexer.head_dim as u64).saturating_mul(2));
+                    }
+                }
+                AttentionKind::Mla { kv_lora_rank, .. } => {
+                    let width = (*kv_lora_rank as u64)
+                        .saturating_add(layer.attention.rope.rotated_dims as u64);
+                    per_token = per_token.saturating_add(latent_bytes(width, latent_fp8));
+                    if let Some(indexer) = &layer.attention.indexer
+                        && indexer.owns_keys
+                    {
+                        per_token = per_token.saturating_add(mla_indexer_bytes(indexer));
+                    }
+                }
+                AttentionKind::Gdn(gdn) => {
+                    fixed = fixed.saturating_add(gdn_state_bytes(gdn, world));
+                }
+                AttentionKind::Kda(kda) => {
+                    let heads = ((kda.heads as u64).div_ceil(world)).max(1);
+                    let head = kda.head_dim as u64;
+                    let history = kda.conv_kernel.saturating_sub(1) as u64;
+                    fixed = fixed.saturating_add(
+                        history
+                            .saturating_mul(3)
+                            .saturating_mul(heads)
+                            .saturating_mul(head)
+                            .saturating_mul(4),
+                    );
+                    fixed = fixed.saturating_add(
+                        heads
+                            .saturating_mul(head)
+                            .saturating_mul(head)
+                            .saturating_mul(8),
+                    );
+                }
+            }
+        }
+        if let Some(mtp) = &self.mtp
+            && (mtp.replicated || world == 1)
+        {
+            per_token = per_token.saturating_add(
+                self.mtp_per_token(world, latent_fp8)
+                    .saturating_mul(mtp.stages as u64),
+            );
+        }
+        Ok(crate::KvPlan::new(per_token, fixed))
+    }
+
+    /// The per-position cache one MTP stage adds.
+    ///
+    /// A stage reuses the backbone's last attention kind: an absorbed-MLA stage adds its latent
+    /// and the indexer's key, gate and pooled key; a GQA stage adds its K/V rows and its
+    /// indexer key. The device allocator builds both stages with their own indexer
+    /// (`DeviceRank::mtp` passes `own_indexer = true`), so the plan counts one whenever the
+    /// architecture declares indexer geometry anywhere, even when the last backbone attention
+    /// layer shares another layer's selection and declares none of its own.
+    fn mtp_per_token(&self, world: u64, latent_fp8: bool) -> u64 {
+        let Some(last) = self.layers.iter().rev().find(|layer| {
+            matches!(
+                layer.attention.kind,
+                AttentionKind::Gqa { .. } | AttentionKind::Mla { .. }
+            )
+        }) else {
+            return 0;
+        };
+        // The device's MTP indexer reads its geometry from the checkpoint, not from the last
+        // layer's schedule. Prefer that layer's own indexer, then any indexer the architecture
+        // declares.
+        let declared = self
+            .layers
+            .iter()
+            .find_map(|layer| layer.attention.indexer.as_ref());
+        match &last.attention.kind {
+            AttentionKind::Gqa { kv_heads, .. } => {
+                let heads = ((*kv_heads as u64).div_ceil(world)).max(1);
+                let indexer = last
+                    .attention
+                    .indexer
+                    .as_ref()
+                    .filter(|indexer| indexer.owns_keys)
+                    .or(declared)
+                    .map_or(0, |indexer| (indexer.head_dim as u64) * 2);
+                2u64.saturating_mul(heads)
+                    .saturating_mul(last.attention.head_dim as u64)
+                    .saturating_mul(2)
+                    .saturating_add(indexer)
+            }
+            AttentionKind::Mla { kv_lora_rank, .. } => {
+                let width =
+                    (*kv_lora_rank as u64).saturating_add(last.attention.rope.rotated_dims as u64);
+                let indexer = last
+                    .attention
+                    .indexer
+                    .as_ref()
+                    .filter(|indexer| indexer.owns_keys)
+                    .or(declared)
+                    .map_or(0, mla_indexer_bytes);
+                latent_bytes(width, latent_fp8).saturating_add(indexer)
+            }
+            _ => 0,
+        }
+    }
+
+    /// The vision tower's geometry in the shared structural form, when the checkpoint carries one.
+    #[must_use]
+    pub fn vision_geometry(&self) -> Option<VisionGeometry> {
+        self.vision.as_ref().map(VisionGeometry::from_vision)
     }
 
     /// The parts a run of this architecture needs.
@@ -572,13 +961,50 @@ impl Architecture {
 
 fn layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
     let count = required_usize(text, "num_hidden_layers", "text_config")?;
-    let layer_types = string_list(text.get("layer_types"))?;
+    let mut layer_types = string_list(text.get("layer_types"))?;
     let ratios = usize_list(text.get("compress_ratios"))?;
     let indexer_types = string_list(text.get("indexer_types"))?;
     if layer_types.is_empty() && ratios.is_empty() {
-        return Err(invalid(
-            "the configuration has neither layer_types nor compress_ratios, so its decoder schedule is unknown",
-        ));
+        // A release that names only `full_attention_interval` uses the reference rule: every
+        // Nth layer is full/sparse attention and the rest are linear. A Qwen-shaped release
+        // that names linear-attention geometry but omits the interval gets the same default
+        // Qwen4ExpConfig::from_json applies (4), so the two parsers cannot disagree about a
+        // checkpoint that omits `layer_types`. A release with no schedule and no linear
+        // geometry is the plain dense/GQA case: every layer is full attention.
+        let interval = match optional_usize(text, "full_attention_interval")? {
+            Some(0) => {
+                return Err(invalid(
+                    "full_attention_interval must not be zero".to_owned(),
+                ));
+            }
+            Some(interval) => Some(interval),
+            None if has_linear_attention(text) => Some(4),
+            None => None,
+        };
+        layer_types = match interval {
+            Some(interval) => (0..count)
+                .map(|index| {
+                    if (index + 1).is_multiple_of(interval) {
+                        "full_attention".to_owned()
+                    } else {
+                        "linear_attention".to_owned()
+                    }
+                })
+                .collect(),
+            None => vec!["full_attention".to_owned(); count],
+        };
+    } else if layer_types.is_empty() {
+        // A compressed release with ratios but no names: the reference names its ratio-zero
+        // layers full attention and its compressed layers compressed attention.
+        layer_types = (0..count)
+            .map(|index| {
+                if ratios.get(index).copied().unwrap_or(0) > 0 {
+                    "compressed_attention".to_owned()
+                } else {
+                    "full_attention".to_owned()
+                }
+            })
+            .collect();
     }
     let kv_sources = usize_list(text.get("kv_source_layer_ids"))?;
     let index_sources = usize_list(text.get("index_source_layer_ids"))?;
@@ -633,6 +1059,19 @@ fn layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
     Ok(layers)
 }
 
+/// Whether a document carries the linear-attention geometry of a hybrid release.
+fn has_linear_attention(text: &Value) -> bool {
+    object(text, "linear_attn_config").is_some()
+        || [
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+        ]
+        .iter()
+        .any(|field| text.get(*field).is_some())
+}
+
 /// The per-layer selection lists a released document uses.
 struct Schedule<'a> {
     kv_sources: &'a [usize],
@@ -649,27 +1088,54 @@ fn attention(
     schedule: &Schedule<'_>,
 ) -> Result<Attention, ConfigError> {
     let heads = required_usize(text, "num_attention_heads", "text_config")?;
+    if heads == 0 {
+        return Err(invalid(format!("layer {index} has zero query heads")));
+    }
     let declared_head_dim = optional_usize(text, "head_dim")?.unwrap_or(0);
     let nope = optional_usize(text, "qk_nope_head_dim")?.unwrap_or(0);
-    let rope_dim = optional_usize(text, "qk_rope_head_dim")?.unwrap_or(0);
+    let declared_rope_dim = optional_usize(text, "qk_rope_head_dim")?;
+    let rope_dim = declared_rope_dim.unwrap_or(0);
     let head_dim = if declared_head_dim > 0 {
         declared_head_dim
-    } else {
+    } else if nope + rope_dim > 0 {
         nope + rope_dim
+    } else {
+        // A standard Llama/Qwen2 configuration names neither: the head width is the model's
+        // width divided by its query heads, and only when the division is exact. A ragged
+        // width is a refused shape, not a silent truncation.
+        let hidden = required_usize(text, "hidden_size", "text_config")?;
+        if !hidden.is_multiple_of(heads) {
+            return Err(invalid(format!(
+                "layer {index} has no head_dim and hidden_size {hidden} is not divisible by {heads} heads"
+            )));
+        }
+        hidden / heads
     };
     if head_dim == 0 {
         return Err(invalid(format!(
-            "layer {index} has no head_dim and no qk_nope_head_dim"
+            "layer {index} has no head_dim, no qk_nope_head_dim and no divisible hidden_size"
         )));
     }
     let window = optional_usize(text, "sliding_window")?;
-    let partial = optional_f64(text, "partial_rotary_factor")?.unwrap_or(0.0);
-    let rotated_dims = if rope_dim > 0 {
-        rope_dim
+    let rope_parameters = object(text, "rope_parameters");
+    // Newer releases (Qwen4-Exp among them) nest both rotary fields under
+    // `rope_parameters`; the top-level spelling is the older form and wins when both appear.
+    let nested_partial = match rope_parameters {
+        Some(value) => optional_f64(value, "partial_rotary_factor")?,
+        None => None,
+    };
+    let partial = optional_f64(text, "partial_rotary_factor")?
+        .or(nested_partial)
+        .unwrap_or(0.0);
+    let rotated_dims = if let Some(dim) = declared_rope_dim {
+        // An explicit `qk_rope_head_dim` wins, including an explicit zero (GLM's NoPE MLA).
+        dim
     } else if partial > 0.0 {
         ((head_dim as f64 * partial).round() as usize).min(head_dim)
     } else {
-        0
+        // No rope declaration is not a request for NoPE: the reference implementations rotate
+        // the whole head unless a release says otherwise.
+        head_dim
     };
     let rope = rope(text, ratio, rotated_dims)?;
 
@@ -721,9 +1187,26 @@ fn attention(
             },
         }
     } else if is_sparse {
+        // A standard dense/GQA configuration carries no learned output gate; the Qwen and GLM
+        // releases either spell one or run a QSA indexer whose gate is part of the arithmetic.
+        let declares_indexer = [
+            "index_n_heads",
+            "indexer_n_heads",
+            "index_head_dim",
+            "indexer_head_dim",
+            "indexer_compress_ratio",
+            "index_kpool",
+        ]
+        .iter()
+        .any(|field| text.get(field).is_some());
+        let output_gate = optional_bool(text, "attn_output_gate")?
+            .or(optional_bool(text, "use_output_gate")?)
+            .unwrap_or_else(|| {
+                optional_string(text, "output_gate_type").is_some() || declares_indexer
+            });
         AttentionKind::Gqa {
             kv_heads: optional_usize(text, "num_key_value_heads")?.unwrap_or(heads),
-            output_gate: true,
+            output_gate,
         }
     } else {
         return Err(invalid(format!(
@@ -733,7 +1216,9 @@ fn attention(
 
     let compression = (ratio > 0).then_some(Compression {
         ratio,
-        owns_keys: true,
+        // The same ownership rule as the indexer: a layer named in `kv_source_layer_ids`
+        // reads another layer's compressed cache rather than allocating its own.
+        owns_keys: schedule.kv_sources.is_empty() || schedule.kv_sources.contains(&index),
         uses_candidate_pool: schedule
             .candidate_pool
             .is_some_and(|pool| index >= pool.source_layer),
@@ -758,6 +1243,24 @@ fn indexer(
     schedule: &Schedule<'_>,
 ) -> Result<Option<Indexer>, ConfigError> {
     if matches!(kind, AttentionKind::Gdn(_) | AttentionKind::Kda(_)) {
+        return Ok(None);
+    }
+    // A standard GQA release declares no indexer arithmetic; an all-"full" schedule is not a
+    // request to invent one.
+    let declares_indexer = [
+        "index_n_heads",
+        "indexer_n_heads",
+        "index_head_dim",
+        "indexer_head_dim",
+        "indexer_compress_ratio",
+        "index_kpool",
+        "index_topk",
+        "indexer_budget",
+        "index_source_layer_ids",
+    ]
+    .iter()
+    .any(|field| text.get(field).is_some());
+    if !declares_indexer {
         return Ok(None);
     }
     let configured = schedule
@@ -886,14 +1389,23 @@ fn residual(text: &Value) -> Result<Residual, ConfigError> {
 
 fn rope(text: &Value, ratio: usize, rotated_dims: usize) -> Result<Rope, ConfigError> {
     let compress_theta = optional_f64(text, "compress_rope_theta")?;
+    let parameters = object(text, "rope_parameters");
+    // Qwen4-Exp stores the base under `rope_parameters`; older releases keep it top-level.
+    let nested_theta = match parameters {
+        Some(value) => optional_f64(value, "rope_theta")?,
+        None => None,
+    };
+    let top_theta = optional_f64(text, "rope_theta")?;
     let theta = if ratio > 0 {
         compress_theta
-            .or(optional_f64(text, "rope_theta")?)
-            .unwrap_or(10_000.0)
+            .or(top_theta)
+            .or(nested_theta)
+            .unwrap_or_else(|| default_rope_theta(text))
     } else {
-        optional_f64(text, "rope_theta")?.unwrap_or(10_000.0)
+        top_theta
+            .or(nested_theta)
+            .unwrap_or_else(|| default_rope_theta(text))
     };
-    let parameters = object(text, "rope_parameters");
     let scaling_json = object(text, "rope_scaling").or(parameters);
     // DeepSeek's ratio-0 layers run plain RoPE; every other release's scaling is global.
     let scaling = if ratio == 0 && text.get("compress_ratios").is_some() {
@@ -935,6 +1447,20 @@ fn rope(text: &Value, ratio: usize, rotated_dims: usize) -> Result<Rope, ConfigE
     })
 }
 
+/// The rotary base of a document that omits one.
+///
+/// Qwen4-Exp's hybrid linear-attention release documents use 10,000,000; a plain transformer
+/// keeps the usual 10,000. This is the one default both the shared architecture and a typed
+/// arm's parser read, so a fine-tune that omits `rope_theta` cannot load with two different
+/// bases depending on which view parsed it.
+fn default_rope_theta(text: &Value) -> f64 {
+    if has_linear_attention(text) {
+        10_000_000.0
+    } else {
+        10_000.0
+    }
+}
+
 fn engram_geometry(text: &Value) -> Result<EngramGeometry, ConfigError> {
     Ok(EngramGeometry {
         tables: usize_list(text.get("engram_num_embeddings"))?,
@@ -967,12 +1493,30 @@ fn mtp(text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
     if stages == 0 {
         return Ok(None);
     }
+    // Qwen4-Exp's nested stage block says `hybrid: true` and the document also carries
+    // `mtp_use_dedicated_embeddings`: at TP>1 its rank config turns the stage off and drafts
+    // with DFlash, so every rank does not own the stage's cache. A nested `mtp.hybrid` alone
+    // is not enough - a GLM-style nested stage block can say `hybrid` while still owning its
+    // cache on every rank - so the Qwen marker (or an explicit `mtp.replicated`) decides, and
+    // the default stays replicated.
+    let replicated = match object(text, "mtp") {
+        Some(nested) => {
+            if let Some(replicated) = optional_bool(nested, "replicated")? {
+                replicated
+            } else {
+                !(optional_bool(nested, "hybrid")?.unwrap_or(false)
+                    && text.get("mtp_use_dedicated_embeddings").is_some())
+            }
+        }
+        None => true,
+    };
     Ok(Some(Mtp {
         stages,
         block_size: optional_usize(text, "dspark_block_size")?,
         target_layers: usize_list(text.get("dspark_target_layer_ids"))?,
         routed_experts: optional_usize(text, "dspark_n_routed_experts")?,
         active_experts: optional_usize(text, "dspark_num_experts_per_tok")?,
+        replicated,
     }))
 }
 
@@ -998,15 +1542,44 @@ fn is_mtp_module(name: &str) -> bool {
     name.starts_with("mtp.") || name.contains(".mtp.")
 }
 
+/// One stored format a ModelOpt table names, with the group width it declares.
+///
+/// The group width belongs to the arithmetic, not to `weight_block_size`: a ModelOpt group
+/// records it in the same `weights` block or `quantized_layers` entry as the algorithm, and a
+/// release that names no top-level block still has a real per-16-element group.
+#[derive(Debug, Clone)]
+struct DeclaredFormat {
+    name: String,
+    group_size: Option<usize>,
+}
+
+impl DeclaredFormat {
+    fn named(name: String) -> Self {
+        Self {
+            name,
+            group_size: None,
+        }
+    }
+
+    /// The format this declaration describes, with its own group width when it has one.
+    fn format(&self, block: Option<usize>, scale: Option<&str>) -> WeightFormat {
+        let format = WeightFormat::from_name(Some(&self.name), block, scale);
+        match (format, self.group_size) {
+            (WeightFormat::NvFp4 { .. }, Some(group_size)) => WeightFormat::NvFp4 { group_size },
+            (format, _) => format,
+        }
+    }
+}
+
 /// The routed experts' format as a ModelOpt `quantization_config` records it.
 ///
 /// `quantized_layers` keys every quantized module to its own `quant_algo`, and the decoder
 /// layers' routed experts are the entries under `.mlp.experts`. A release that omits that table
 /// still names the same arithmetic in `config_groups`, as a bit width and a number type over a
 /// group of targets.
-fn modelopt_expert(config: &Value) -> Option<String> {
+fn modelopt_expert(config: &Value) -> Option<DeclaredFormat> {
     if let Some(layers) = object(config, "quantized_layers").and_then(Value::as_object) {
-        let mut expert: Option<String> = None;
+        let mut expert: Option<DeclaredFormat> = None;
         for (name, spec) in layers {
             if !name.contains(".mlp.experts") || is_mtp_module(name) {
                 continue;
@@ -1014,12 +1587,18 @@ fn modelopt_expert(config: &Value) -> Option<String> {
             let Some(algo) = string(spec, "quant_algo") else {
                 continue;
             };
+            let group_size = optional_usize(spec, "group_size").ok().flatten();
             match &expert {
                 // Experts that disagree are not one stored format, and the plan has no name for
                 // that mix: report none rather than pick one of them.
-                Some(first) if !first.eq_ignore_ascii_case(&algo) => return None,
+                Some(first) if !first.name.eq_ignore_ascii_case(&algo) => return None,
                 Some(_) => {}
-                None => expert = Some(algo),
+                None => {
+                    expert = Some(DeclaredFormat {
+                        name: algo,
+                        group_size,
+                    });
+                }
             }
         }
         if expert.is_some() {
@@ -1052,14 +1631,43 @@ fn modelopt_expert(config: &Value) -> Option<String> {
 }
 
 /// The arithmetic a ModelOpt group's `weights` block describes, by width and number type.
-fn group_format(weights: &Value) -> Option<String> {
+fn group_format(weights: &Value) -> Option<DeclaredFormat> {
     let bits = weights.get("num_bits").and_then(Value::as_u64)?;
     let kind = string(weights, "type")?;
-    match (bits, kind.to_ascii_lowercase().as_str()) {
-        (4, "float") => Some("NVFP4".to_owned()),
-        (8, "float") => Some("FP8".to_owned()),
-        _ => None,
+    let name = match (bits, kind.to_ascii_lowercase().as_str()) {
+        (4, "float") => "NVFP4".to_owned(),
+        (8, "float") => "FP8".to_owned(),
+        _ => return None,
+    };
+    Some(DeclaredFormat {
+        name,
+        group_size: optional_usize(weights, "group_size").ok().flatten(),
+    })
+}
+
+/// The MTP stage's routed-expert format as ModelOpt's `quantized_layers` records it.
+fn modelopt_mtp_expert(config: &Value) -> Option<DeclaredFormat> {
+    let layers = object(config, "quantized_layers")?.as_object()?;
+    let mut expert: Option<DeclaredFormat> = None;
+    for (name, spec) in layers {
+        if !name.contains(".mlp.experts") || !is_mtp_module(name) {
+            continue;
+        }
+        let Some(algo) = string(spec, "quant_algo") else {
+            continue;
+        };
+        match &expert {
+            Some(first) if !first.name.eq_ignore_ascii_case(&algo) => return None,
+            Some(_) => {}
+            None => {
+                expert = Some(DeclaredFormat {
+                    name: algo,
+                    group_size: optional_usize(spec, "group_size").ok().flatten(),
+                });
+            }
+        }
     }
+    expert
 }
 
 fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
@@ -1079,37 +1687,176 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
         .or_else(|| {
             object(config, "mtp_expert_weight").and_then(|value| string(value, "quant_algo"))
         })
+        .map(DeclaredFormat::named)
         .or_else(|| modelopt_expert(config));
     // A producer name is not the arithmetic; ModelOpt records that in quant_algo.
     let method = match optional_string(config, "quant_method") {
         Some(name) if !names_the_producer(&name) => Some(name),
         _ => optional_string(config, "quant_algo"),
     };
+    let mtp_expert = object(config, "mtp_expert_weight")
+        .and_then(|value| string(value, "quant_algo"))
+        .or_else(|| optional_string(config, "mtp_expert_dtype"))
+        .map(DeclaredFormat::named)
+        .or_else(|| modelopt_mtp_expert(config));
+    let scale = optional_string(config, "scale_fmt").or(optional_string(config, "fmt"));
+    let dense_format = WeightFormat::from_name(method.as_deref(), block, scale.as_deref());
+    // A release that names no separate expert format stores the experts in the dense format.
+    // GLM-5.3-Flash is one: its single `fp8` / `e4m3` declaration governs the dense and the
+    // routed weights alike, and reading the missing name as BF16 served FP8 experts as BF16.
+    let expert_format = match &expert {
+        Some(declared) => declared.format(block, scale.as_deref()),
+        None => dense_format,
+    };
+    let mtp_expert_format = mtp_expert
+        .as_ref()
+        .map(|declared| declared.format(block, scale.as_deref()));
     Ok(Quantization {
         method,
         block,
-        scale: optional_string(config, "scale_fmt").or(optional_string(config, "fmt")),
+        scale,
         activation: optional_string(config, "activation_scheme"),
-        expert,
+        expert: expert.map(|declared| declared.name),
+        dense_format,
+        expert_format,
+        mtp_expert_format,
     })
 }
 
-fn vision(root: &Value) -> Result<Option<Vision>, ConfigError> {
+fn vision(root: &Value, language_hidden: usize) -> Result<Option<Vision>, ConfigError> {
     let Some(config) = object(root, "vision_config") else {
         return Ok(None);
     };
+    // One structural parser for both the architecture and the arms' `VisionTowerConfig`. The
+    // language width is passed in because a tower that names no merger output hands the
+    // language model its own width, not the tower's block width.
+    let geometry = VisionGeometry::from_value(config, language_hidden)?;
+    geometry.validate()?;
     Ok(Some(Vision {
-        depth: required_usize(config, "num_hidden_layers", "vision_config")
-            .or_else(|_| required_usize(config, "depth", "vision_config"))?,
-        hidden_size: required_usize(config, "hidden_size", "vision_config")?,
-        heads: required_usize(config, "num_attention_heads", "vision_config")
-            .or_else(|_| required_usize(config, "num_heads", "vision_config"))?,
-        intermediate: required_usize(config, "intermediate_size", "vision_config")?,
-        patch_size: optional_usize(config, "patch_size")?.unwrap_or(0),
-        spatial_merge: optional_usize(config, "spatial_merge_size")?.unwrap_or(1),
-        out_hidden_size: optional_usize(config, "out_hidden_size")?.unwrap_or(0),
-        rope_theta: optional_f64(config, "rope_theta")?.unwrap_or(10_000.0),
+        depth: geometry.depth,
+        hidden_size: geometry.hidden_size,
+        heads: geometry.num_heads,
+        intermediate: geometry.intermediate_size,
+        patch_size: geometry.patch_size,
+        temporal_patch_size: geometry.temporal_patch_size,
+        spatial_merge: geometry.spatial_merge_size,
+        projection_intermediate: geometry.projection_intermediate_size,
+        in_channels: geometry.in_channels,
+        num_position_embeddings: geometry.num_position_embeddings,
+        min_pixels: geometry.min_pixels,
+        max_pixels: geometry.max_pixels,
+        out_hidden_size: geometry.out_hidden_size,
+        rope_theta: geometry.rope_theta,
     }))
+}
+
+/// A DFlash 2 drafter checks its target by width, vocabulary and backbone depth.
+impl From<&Architecture> for crate::dflash2::DraftTarget {
+    fn from(architecture: &Architecture) -> Self {
+        Self {
+            hidden_size: architecture.hidden_size,
+            vocab_size: architecture.vocab_size,
+            num_hidden_layers: architecture.layers.len(),
+        }
+    }
+}
+
+/// One position's absorbed-MLA latent row, in the representation the caller selected.
+///
+/// The FP8 latent stores one E4M3 code a element plus one f32 inverse scale a 128-wide block;
+/// the f32 latent stores four bytes a element. The choice is explicit (`latent_fp8`), never
+/// re-derived from the weight format: the same checkpoint can be served with either cache.
+///
+/// The device's E4M3 latent is allocated in whole 128-wide scale tiles: a narrower
+/// row falls back to f32 however the caller asks (`LatentCache::quantises` applies the same
+/// guard), so a narrow latent has one plan in both modes.
+fn latent_bytes(width: u64, latent_fp8: bool) -> u64 {
+    if !latent_fp8 || !width.is_multiple_of(128) {
+        return width.saturating_mul(4);
+    }
+    let block = 128u64;
+    width.saturating_add(width.div_ceil(block).saturating_mul(4))
+}
+
+/// One position's indexer caches on an MLA layer: the key and gate rows, then the pooled key
+/// amortised over one pool.
+fn mla_indexer_bytes(indexer: &Indexer) -> u64 {
+    let dim = indexer.head_dim as u64;
+    let pool = indexer.pool.max(1) as u64;
+    dim.saturating_mul(8)
+        .saturating_add(dim.saturating_mul(4).div_ceil(pool))
+}
+
+/// The live recurrent state and the spare a verify keeps beside it, one GDN layer.
+fn gdn_state_bytes(gdn: &Gdn, world: u64) -> u64 {
+    let value_heads = ((gdn.value_heads as u64).div_ceil(world)).max(1);
+    let key_dim = gdn.key_dim as u64;
+    let value_dim = gdn.value_dim as u64;
+    value_heads
+        .saturating_mul(key_dim)
+        .saturating_mul(value_dim)
+        .saturating_mul(8)
+}
+
+/// The special-token ids a checkpoint names, preferring the language model's `text_config`.
+fn tokens(root: &Value, text: &Value) -> Result<Tokens, ConfigError> {
+    Ok(Tokens {
+        bos_token_id: optional_u32(text, "bos_token_id")?.or(optional_u32(root, "bos_token_id")?),
+        eos_token_ids: {
+            let mut ids = eos_ids(text)?;
+            ids.extend(eos_ids(root)?);
+            dedup(ids)
+        },
+        pad_token_id: optional_u32(text, "pad_token_id")?.or(optional_u32(root, "pad_token_id")?),
+        image_token_id: optional_u32(text, "image_token_id")?
+            .or(optional_u32(root, "image_token_id")?),
+        video_token_id: optional_u32(text, "video_token_id")?
+            .or(optional_u32(root, "video_token_id")?),
+        vision_start_token_id: optional_u32(text, "vision_start_token_id")?
+            .or(optional_u32(root, "vision_start_token_id")?)
+            .or(optional_u32(text, "image_start_token_id")?)
+            .or(optional_u32(root, "image_start_token_id")?)
+            .or(optional_u32(text, "video_start_token_id")?)
+            .or(optional_u32(root, "video_start_token_id")?),
+        vision_end_token_id: optional_u32(text, "vision_end_token_id")?
+            .or(optional_u32(root, "vision_end_token_id")?)
+            .or(optional_u32(text, "image_end_token_id")?)
+            .or(optional_u32(root, "image_end_token_id")?)
+            .or(optional_u32(text, "video_end_token_id")?)
+            .or(optional_u32(root, "video_end_token_id")?),
+    })
+}
+
+/// A token-id list with its first occurrence of each id kept, in declaration order.
+fn dedup(ids: Vec<u32>) -> Vec<u32> {
+    let mut unique = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !unique.contains(&id) {
+            unique.push(id);
+        }
+    }
+    unique
+}
+
+/// Every end-of-generation id a document names, one or many.
+fn eos_ids(value: &Value) -> Result<Vec<u32>, ConfigError> {
+    let Some(field) = value.get("eos_token_id") else {
+        return Ok(Vec::new());
+    };
+    if field.is_null() {
+        return Ok(Vec::new());
+    }
+    let one: OneOrMany<u32> = serde_json::from_value(field.clone())
+        .map_err(|error| invalid(format!("eos_token_id: {error}")))?;
+    Ok(one.into_vec())
+}
+
+fn optional_u32(value: &Value, name: &str) -> Result<Option<u32>, ConfigError> {
+    optional_usize(value, name)?
+        .map(|number| {
+            u32::try_from(number).map_err(|_| invalid(format!("{name} does not fit a token id")))
+        })
+        .transpose()
 }
 
 fn score(name: Option<&str>) -> Result<Score, ConfigError> {
@@ -1231,6 +1978,440 @@ mod tests {
             .count()
     }
 
+    const STANDARD: &str = r#"{
+        "model_type": "acme_dense_v1",
+        "architectures": ["AcmeForCausalLM"],
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "vocab_size": 512,
+        "max_position_embeddings": 4096,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": true,
+        "eos_token_id": [2, 3],
+        "bos_token_id": 1,
+        "pad_token_id": 0
+    }"#;
+
+    #[test]
+    fn a_standard_dense_gqa_config_needs_no_layer_types() {
+        let architecture = Architecture::from_json(STANDARD).expect("a standard config");
+        assert_eq!(architecture.layers.len(), 2);
+        assert!(architecture.layers.iter().all(|layer| matches!(
+            &layer.attention.kind,
+            AttentionKind::Gqa {
+                kv_heads: 2,
+                output_gate: false
+            }
+        )));
+        assert!(
+            architecture
+                .layers
+                .iter()
+                .all(|layer| matches!(&layer.ffn, Ffn::Dense(mlp) if mlp.intermediate == 256))
+        );
+        assert!(
+            architecture
+                .layers
+                .iter()
+                .all(|layer| layer.attention.indexer.is_none())
+        );
+        assert_eq!(architecture.tokens.eos_token_ids, [2, 3]);
+        assert_eq!(architecture.tokens.bos_token_id, Some(1));
+        assert_eq!(architecture.tokens.pad_token_id, Some(0));
+    }
+
+    #[test]
+    fn an_output_gate_is_read_from_the_checkpoint_not_assumed() {
+        let ungated = Architecture::from_json(STANDARD).expect("a standard config");
+        assert!(matches!(
+            ungated.layers[0].attention.kind,
+            AttentionKind::Gqa {
+                output_gate: false,
+                ..
+            }
+        ));
+        let gated = STANDARD.replace(
+            "\"tie_word_embeddings\": true,",
+            "\"tie_word_embeddings\": true, \"attn_output_gate\": true,",
+        );
+        let gated = Architecture::from_json(&gated).expect("a gated config");
+        assert!(matches!(
+            gated.layers[0].attention.kind,
+            AttentionKind::Gqa {
+                output_gate: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_directory_unions_generation_only_eos_ids() {
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-architecture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(directory.join("config.json"), STANDARD).expect("config.json");
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id": [2, 9, 2], "bos_token_id": 1, "pad_token_id": 0}"#,
+        )
+        .expect("generation_config.json");
+        let architecture =
+            Architecture::from_checkpoint_dir(&directory).expect("the checkpoint directory");
+        assert_eq!(
+            architecture.tokens.eos_token_ids,
+            [2, 3, 9],
+            "the config's ids keep their order; generation_config only adds new ones"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn image_and_video_aliases_supply_the_vision_delimiters() {
+        let architecture = Architecture::from_json(
+            r#"{
+                "model_type": "acme_vl",
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "vocab_size": 256,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 4,
+                    "head_dim": 16
+                },
+                "image_token_id": 10,
+                "image_start_token_id": 11,
+                "image_end_token_id": 12
+            }"#,
+        )
+        .expect("a GLM-shaped generic vision codec document");
+        assert_eq!(architecture.tokens.image_token_id, Some(10));
+        assert_eq!(architecture.tokens.vision_start_token_id, Some(11));
+        assert_eq!(architecture.tokens.vision_end_token_id, Some(12));
+
+        let video = Architecture::from_json(
+            r#"{
+                "model_type": "acme_video",
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "vocab_size": 256,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 4,
+                    "head_dim": 16
+                },
+                "video_start_token_id": 21,
+                "video_end_token_id": 22
+            }"#,
+        )
+        .expect("a video-only delimiter document");
+        assert_eq!(video.tokens.vision_start_token_id, Some(21));
+        assert_eq!(video.tokens.vision_end_token_id, Some(22));
+    }
+
+    #[test]
+    fn the_released_kv_plans_are_read_from_the_architecture() {
+        let qwen = Architecture::from_json(QWEN).expect("the released Qwen config");
+        assert_eq!(
+            qwen.kv_plan(1, false)
+                .expect("Qwen has no compressed cache")
+                .sequence_bytes(262_144),
+            8_078_229_504,
+            "Qwen3.8-Flash-Next's released TP=1 claim"
+        );
+        let glm = Architecture::from_json(GLM).expect("the released GLM config");
+        let fp8 = glm.kv_plan(1, true).expect("GLM has no compressed cache");
+        assert_eq!(
+            fp8.per_token(),
+            20_160,
+            "eleven sparse layers plus the MTP stage, each 528 latent + 1,152 indexer bytes"
+        );
+        // The f32 latent is 4,096 bytes a sparse row and the same in the MTP stage.
+        let f32_latent = glm.kv_plan(1, false).expect("GLM has no compressed cache");
+        assert_eq!(
+            f32_latent.per_token(),
+            38_400,
+            "eleven sparse layers and the MTP stage each move to the f32 latent"
+        );
+        assert_eq!(
+            f32_latent.per_token(),
+            fp8.per_token() + 12 * (4 * 512 - 528)
+        );
+        assert_eq!(fp8.fixed(), f32_latent.fixed());
+        // Two ranks split the two KV heads, so the per-position claim halves and the TP>1
+        // Qwen rank turns the MTP stage off (DFlash drafts instead).
+        assert!(
+            qwen.kv_plan(2, false)
+                .expect("Qwen has no compressed cache")
+                .per_token()
+                < qwen
+                    .kv_plan(1, false)
+                    .expect("Qwen has no compressed cache")
+                    .per_token()
+        );
+    }
+
+    #[test]
+    fn the_released_kv_plan_is_exact_at_each_world_size() {
+        let qwen = Architecture::from_json(QWEN).expect("the released Qwen config");
+        assert!(
+            !qwen.mtp.as_ref().expect("an MTP stage").replicated,
+            "Qwen drafts with DFlash at TP>1 and clears the nested mtp.hybrid stage"
+        );
+        // At TP1 KV heads split across the world, the GDN value heads split the same way, and the
+        // MTP stage follows the last GQA layer. At TP>1 the stage is absent, so the TP2/TP4
+        // claim is the backbone's 15,360 bytes a position.
+        for (world, per_token, fixed) in [
+            (1usize, 29_952u64, 226_492_416u64),
+            (2, 15_360, 113_246_208),
+            (4, 15_360, 56_623_104),
+        ] {
+            let plan = qwen
+                .kv_plan(world, false)
+                .expect("Qwen has no compressed cache");
+            assert_eq!(plan.per_token(), per_token, "Qwen TP{world} per-token");
+            assert_eq!(plan.fixed(), fixed, "Qwen TP{world} fixed");
+        }
+
+        let glm = Architecture::from_json(GLM).expect("the released GLM config");
+        assert!(
+            glm.mtp.as_ref().expect("an MTP stage").replicated,
+            "GLM keeps its MTP cache at every world size"
+        );
+        // The absorbed MLA latent and its indexer are replicated across ranks, so only the KDA
+        // heads split.
+        for (world, fixed) in [(1usize, 295_239_680u64), (2, 147_619_840), (4, 73_809_920)] {
+            let plan = glm
+                .kv_plan(world, true)
+                .expect("GLM has no compressed cache");
+            assert_eq!(plan.per_token(), 20_160, "GLM TP{world} per-token");
+            assert_eq!(plan.fixed(), fixed, "GLM TP{world} fixed");
+        }
+    }
+
+    #[test]
+    fn a_glm_shaped_nested_mtp_block_stays_replicated() {
+        // GLM's backbone is hybrid, so a nested stage block can carry `hybrid: true` without
+        // Qwen's dedicated-embeddings marker. Only the marker means the stage's cache is not on
+        // every rank; the bare hybrid flag must not flip the default.
+        let mut document: Value = serde_json::from_str(GLM).expect("the carried GLM document");
+        document
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .expect("the GLM text configuration")
+            .insert("mtp".to_owned(), serde_json::json!({"hybrid": true}));
+        let glm = Architecture::from_json(&document.to_string()).expect("the nested GLM config");
+        assert!(
+            glm.mtp.as_ref().expect("an MTP stage").replicated,
+            "a nested mtp block without Qwen's marker keeps the replicated default"
+        );
+
+        // The marker is Qwen's, so the same nested block with it clears the replication.
+        document
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .expect("the GLM text configuration")
+            .insert(
+                "mtp_use_dedicated_embeddings".to_owned(),
+                Value::Bool(false),
+            );
+        let qwen_shaped =
+            Architecture::from_json(&document.to_string()).expect("the marker-bearing config");
+        assert!(
+            !qwen_shaped.mtp.as_ref().expect("an MTP stage").replicated,
+            "Qwen's marker identifies a stage every rank does not own"
+        );
+
+        // An explicit field wins over both heuristics.
+        document
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .expect("the GLM text configuration")
+            .insert(
+                "mtp".to_owned(),
+                serde_json::json!({"hybrid": true, "replicated": true}),
+            );
+        let explicit =
+            Architecture::from_json(&document.to_string()).expect("the explicit nested config");
+        assert!(
+            explicit.mtp.as_ref().expect("an MTP stage").replicated,
+            "an explicit mtp.replicated=true is honored"
+        );
+    }
+
+    #[test]
+    fn an_mtp_stage_multiplies_by_the_release_stage_count() {
+        let mut architecture = Architecture::from_json(GLM).expect("the released GLM config");
+        let one = architecture
+            .kv_plan(1, true)
+            .expect("GLM has no compressed cache");
+        architecture.mtp.as_mut().expect("an MTP stage").stages = 3;
+        let three = architecture
+            .kv_plan(1, true)
+            .expect("GLM has no compressed cache");
+        let per_stage = one.per_token() - 11 * (528 + 1_152);
+        assert_eq!(three.per_token(), one.per_token() + 2 * per_stage);
+        assert_eq!(three.fixed(), one.fixed());
+    }
+
+    #[test]
+    fn a_compressed_cache_is_refused_rather_than_miscounted() {
+        let deepseek = Architecture::from_json(DEEPSEEK).expect("the DeepSeek config");
+        let error = deepseek
+            .kv_plan(1, false)
+            .expect_err("CSA2 is not one latent row");
+        assert!(error.to_string().contains("CSA2"), "{error}");
+    }
+
+    #[test]
+    fn an_indexer_that_reads_another_layers_keys_counts_nothing() {
+        let shared = Architecture::from_json(
+            r#"{
+                "model_type": "acme_shared_indexer",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "vocab_size": 256,
+                "max_position_embeddings": 64,
+                "layer_types": ["full_attention", "full_attention"],
+                "kv_source_layer_ids": [0],
+                "index_n_heads": 2,
+                "index_head_dim": 8,
+                "index_topk": 4,
+                "index_kpool": 2
+            }"#,
+        )
+        .expect("a synthetic shared indexer");
+        assert!(
+            shared.layers[0]
+                .attention
+                .indexer
+                .as_ref()
+                .expect("layer 0 owns its indexer")
+                .owns_keys
+        );
+        assert!(
+            !shared.layers[1]
+                .attention
+                .indexer
+                .as_ref()
+                .expect("layer 1 reads layer 0's index")
+                .owns_keys
+        );
+        // Two GQA layers at 128 bytes each, plus layer 0's 8-wide key at two bytes an element.
+        assert_eq!(
+            shared
+                .kv_plan(1, false)
+                .expect("a plain GQA cache")
+                .per_token(),
+            2 * 128 + 16
+        );
+    }
+
+    #[test]
+    fn a_compressed_layer_that_reads_another_layers_cache_does_not_own_keys() {
+        let shared = Architecture::from_json(
+            r#"{
+                "model_type": "acme_shared_compression",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "vocab_size": 256,
+                "max_position_embeddings": 64,
+                "layer_types": ["compressed_attention", "compressed_attention"],
+                "compress_ratios": [4, 4],
+                "kv_source_layer_ids": [0]
+            }"#,
+        )
+        .expect("a synthetic shared compression");
+        assert!(
+            shared.layers[0]
+                .attention
+                .compression
+                .as_ref()
+                .expect("layer 0 owns its cache")
+                .owns_keys
+        );
+        assert!(
+            !shared.layers[1]
+                .attention
+                .compression
+                .as_ref()
+                .expect("layer 1 reads layer 0's cache")
+                .owns_keys
+        );
+    }
+
+    #[test]
+    fn an_mla_latent_counts_its_rope_width() {
+        let mla = Architecture::from_json(
+            r#"{
+                "model_type": "acme_mla",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "head_dim": 64,
+                "kv_lora_rank": 512,
+                "qk_rope_head_dim": 64,
+                "vocab_size": 256,
+                "max_position_embeddings": 64,
+                "layer_types": ["full_attention"]
+            }"#,
+        )
+        .expect("an MLA shape");
+        assert_eq!(mla.layers[0].attention.rope.rotated_dims, 64);
+        assert_eq!(
+            mla.kv_plan(1, false)
+                .expect("a plain MLA cache")
+                .per_token(),
+            4 * 576,
+            "the f32 latent keeps the 64-wide rope part beside the 512-wide latent"
+        );
+    }
+
+    #[test]
+    fn a_vision_config_is_structural_not_a_producer_string() {
+        let geometry = crate::vision_geometry::VisionGeometry::from_value(
+            &serde_json::json!({
+                "model_type": "unregistered_vision",
+                "depth": 3,
+                "hidden_size": 96,
+                "num_heads": 4,
+                "intermediate_size": 192,
+                "patch_size": 16,
+                "temporal_patch_size": 2,
+                "spatial_merge_size": 2,
+                "num_position_embeddings": 16,
+                "rope_theta": 10000.0,
+                "in_channels": 3
+            }),
+            128,
+        )
+        .expect("a structural tower");
+        assert_eq!(
+            geometry.out_hidden_size, 128,
+            "a tower with no merger width hands the language model its own width"
+        );
+        assert_eq!(geometry.patch_size, 16);
+        assert_eq!(geometry.depth, 3);
+        assert!(geometry.validate().is_ok());
+    }
+
     #[test]
     fn a_modelopt_producer_name_does_not_hide_the_expert_format() {
         // The carried Qwen document is the released snapshot's own: the producer is in
@@ -1275,7 +2456,7 @@ mod tests {
             "quant_method": "modelopt",
             "quant_algo": "MIXED_PRECISION",
             "config_groups": {"group_0": {
-                "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                "weights": {"num_bits": 4, "type": "float", "group_size": 32},
                 "targets": [
                     "model.language_model.layers.0.mlp.experts",
                     "model.language_model.layers.1.mlp.experts",
@@ -1285,6 +2466,11 @@ mod tests {
         let architecture =
             Architecture::from_json(&document.to_string()).expect("the released Qwen config");
         assert_eq!(architecture.quantization.expert.as_deref(), Some("NVFP4"));
+        assert_eq!(
+            architecture.quantization.expert_format,
+            WeightFormat::NvFp4 { group_size: 32 },
+            "the group's own group_size, not weight_block_size or a default 16"
+        );
         // A group whose targets are dense projections is not an expert format.
         document["quantization_config"]["config_groups"]["group_0"]["targets"] =
             serde_json::json!(["model.language_model.layers.0.mlp.shared_expert"]);
@@ -1322,6 +2508,18 @@ mod tests {
             "Engram lands on layers 1 and 14"
         );
         assert_eq!(architecture.mtp.as_ref().map(|mtp| mtp.stages), Some(3));
+        let vision = architecture
+            .vision
+            .as_ref()
+            .expect("a released vision tower");
+        assert_eq!(
+            vision.spatial_merge, 3,
+            "DeepSeek's downsample_ratio is the spatial merge factor"
+        );
+        assert_eq!(
+            vision.out_hidden_size, 5120,
+            "a tower with no merger width hands the language model its width"
+        );
         let parts = architecture.parts();
         for part in [
             Part::MlaAttention,
@@ -1425,6 +2623,20 @@ mod tests {
     }
 
     #[test]
+    fn the_released_qwen_rope_is_read_from_rope_parameters() {
+        let architecture = Architecture::from_json(QWEN).expect("Qwen config");
+        let layer = &architecture.layers[0];
+        assert_eq!(
+            layer.attention.rope.theta, 10_000_000.0,
+            "Qwen stores the base under rope_parameters"
+        );
+        assert_eq!(
+            layer.attention.rope.rotated_dims, 64,
+            "partial_rotary_factor 0.25 of a 256-wide head"
+        );
+    }
+
+    #[test]
     fn a_missing_part_is_named_rather_than_guessed() {
         let architecture = Architecture::from_json(GLM).expect("GLM config");
         let available = PartSet::from_iter([Part::MlaAttention, Part::Moe]);
@@ -1449,9 +2661,243 @@ mod tests {
     }
 
     #[test]
-    fn a_document_without_a_schedule_is_refused() {
-        let error = Architecture::from_json(r#"{"model_type":"empty","text_config":{"hidden_size":8,"vocab_size":8,"num_hidden_layers":1,"num_attention_heads":1,"head_dim":8}}"#)
-            .expect_err("no layer_types");
-        assert!(matches!(error, ConfigError::Invalid(_)));
+    fn a_document_without_a_schedule_defaults_to_full_attention() {
+        // No layer_types, no compress_ratios and no full_attention_interval is the plain
+        // dense/GQA release: every layer is full attention, and the parser says so rather than
+        // refusing a document every Llama-shaped checkpoint uses.
+        let architecture = Architecture::from_json(
+            r#"{"model_type":"empty","text_config":{"hidden_size":8,"intermediate_size":16,"vocab_size":8,"num_hidden_layers":1,"num_attention_heads":1,"head_dim":8}}"#,
+        )
+        .expect("an all-full schedule");
+        assert!(matches!(
+            architecture.layers[0].attention.kind,
+            AttentionKind::Gqa { .. }
+        ));
+    }
+
+    #[test]
+    fn a_qwen_shaped_document_defaults_its_interval_to_four() {
+        // No layer_types and no full_attention_interval, but the linear-attention geometry is
+        // present: this is the Qwen shape, and its default interval is 4. The shared parser and
+        // Qwen4ExpConfig::from_json now agree instead of one saying all-full and the other 4.
+        let mut root: Value = serde_json::from_str(QWEN).expect("Qwen config");
+        root["text_config"]
+            .as_object_mut()
+            .expect("a text object")
+            .remove("layer_types");
+        root["text_config"]
+            .as_object_mut()
+            .expect("a text object")
+            .remove("full_attention_interval");
+        let architecture = Architecture::from_value(&root).expect("a Qwen-shaped schedule");
+        assert_eq!(
+            architecture
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer.attention.kind, AttentionKind::Gdn(_)))
+                .count(),
+            36,
+            "three linear layers a block of four"
+        );
+        assert!(matches!(
+            architecture.layers[3].attention.kind,
+            AttentionKind::Gqa { .. }
+        ));
+    }
+
+    #[test]
+    fn a_full_attention_interval_derives_the_reference_schedule() {
+        // The reference rule (also Qwen4ExpConfig's when it has to derive): one-based multiples
+        // of the interval are full/sparse, every other layer is linear.
+        let document = r#"{
+            "model_type": "acme_hybrid_v1",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 512,
+            "max_position_embeddings": 64,
+            "full_attention_interval": 4
+        }"#;
+        let architecture = Architecture::from_json(document).expect("an interval schedule");
+        let full = architecture
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.attention.kind, AttentionKind::Gqa { .. }))
+            .map(|layer| layer.index)
+            .collect::<Vec<_>>();
+        assert_eq!(full, [3, 7], "every fourth layer is full attention");
+        assert_eq!(
+            architecture
+                .layers
+                .iter()
+                .filter(|layer| matches!(layer.attention.kind, AttentionKind::Gdn(_)))
+                .count(),
+            6,
+            "the rest are the reference linear attention, not a silent all-GQA schedule"
+        );
+    }
+
+    #[test]
+    fn a_standard_dense_config_derives_head_dim_and_rotates_the_whole_head() {
+        // A Llama-3-shaped document: no head_dim, no qk_rope_head_dim, no
+        // partial_rotary_factor.
+        let document = r#"{
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 128256,
+            "max_position_embeddings": 8192,
+            "rope_theta": 500000.0,
+            "eos_token_id": 128001
+        }"#;
+        let architecture = Architecture::from_json(document).expect("a Llama-shaped config");
+        let layer = &architecture.layers[0];
+        assert_eq!(layer.attention.head_dim, 128, "4096 / 32");
+        assert_eq!(
+            layer.attention.rope.rotated_dims, 128,
+            "an undeclared rope width rotates the full head, not NoPE"
+        );
+        assert!(matches!(
+            layer.attention.kind,
+            AttentionKind::Gqa { kv_heads: 8, .. }
+        ));
+        assert!(matches!(layer.ffn, Ffn::Dense(_)));
+    }
+
+    #[test]
+    fn a_ragged_or_zero_head_count_refuses_the_derived_width() {
+        let ragged = r#"{
+            "model_type": "ragged",
+            "hidden_size": 100,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 3,
+            "vocab_size": 128,
+            "max_position_embeddings": 16
+        }"#;
+        let error = Architecture::from_json(ragged).expect_err("100 / 3 is not a head width");
+        assert!(error.to_string().contains("divisible"), "{error}");
+
+        let zero = r#"{
+            "model_type": "zero_heads",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 0,
+            "head_dim": 16,
+            "vocab_size": 128,
+            "max_position_embeddings": 16
+        }"#;
+        let error = Architecture::from_json(zero).expect_err("zero query heads");
+        assert!(error.to_string().contains("zero query heads"), "{error}");
+    }
+
+    #[test]
+    fn the_released_weight_formats_are_typed_once() {
+        let deepseek = Architecture::from_json(DEEPSEEK).expect("DeepSeek config");
+        assert!(matches!(
+            deepseek.quantization.dense_format,
+            WeightFormat::MxFp8 { block: 32 }
+        ));
+        assert!(matches!(
+            deepseek.quantization.expert_format,
+            WeightFormat::MxFp4 { block: 32 }
+        ));
+        assert_eq!(deepseek.quantization.mtp_expert_format, None);
+
+        let glm = Architecture::from_json(GLM).expect("GLM config");
+        assert!(matches!(
+            glm.quantization.dense_format,
+            WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                ..
+            }
+        ));
+        assert_eq!(
+            glm.quantization.expert_format, glm.quantization.dense_format,
+            "GLM names no expert format, so its experts are the dense FP8 format"
+        );
+
+        let qwen = Architecture::from_json(QWEN).expect("Qwen config");
+        assert_eq!(qwen.quantization.dense_format, WeightFormat::Bf16);
+        assert!(matches!(
+            qwen.quantization.expert_format,
+            WeightFormat::NvFp4 { group_size: 16 }
+        ));
+        assert!(matches!(
+            qwen.quantization.mtp_expert_format,
+            Some(WeightFormat::Fp8Tile { .. })
+        ));
+    }
+
+    #[test]
+    fn a_ue8m0_scale_selects_the_mx_formats() {
+        assert!(matches!(
+            WeightFormat::from_name(Some("fp8"), Some(32), Some("ue8m0")),
+            WeightFormat::MxFp8 { block: 32 }
+        ));
+        assert!(matches!(
+            WeightFormat::from_name(Some("fp4"), Some(32), Some("ue8m0")),
+            WeightFormat::MxFp4 { block: 32 }
+        ));
+        assert!(matches!(
+            WeightFormat::from_name(Some("fp4"), None, None),
+            WeightFormat::NvFp4 { group_size: 16 }
+        ));
+        assert!(matches!(
+            WeightFormat::from_name(Some("mxfp4"), Some(32), None),
+            WeightFormat::MxFp4 { block: 32 }
+        ));
+        assert!(matches!(
+            WeightFormat::from_name(Some("fp8"), Some(128), Some("e4m3")),
+            WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                scale_dtype: ScaleDType::F32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_vision_config_derives_its_merger_width_and_refuses_a_missing_patch() {
+        let without_out = r#"{
+            "model_type": "acme_vl",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "vocab_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "head_dim": 16
+            },
+            "vision_config": {
+                "depth": 2,
+                "hidden_size": 96,
+                "num_heads": 4,
+                "intermediate_size": 192,
+                "patch_size": 16,
+                "spatial_merge_size": 2
+            }
+        }"#;
+        let architecture = Architecture::from_json(without_out).expect("a structural tower");
+        let vision = architecture.vision.expect("a vision tower");
+        assert_eq!(
+            vision.out_hidden_size, 64,
+            "defaults to the language model's hidden_size, not the tower's"
+        );
+        assert_eq!(vision.patch_size, 16);
+        assert_eq!(vision.spatial_merge, 2);
+
+        let without_patch = without_out.replace("\"patch_size\": 16,", "");
+        let error = Architecture::from_json(&without_patch).expect_err("a missing patch side");
+        assert!(error.to_string().contains("patch_size"), "{error}");
     }
 }

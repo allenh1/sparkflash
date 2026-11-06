@@ -50,7 +50,7 @@ use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
 use crate::config::Glm5NextConfig;
-use crate::device::{CudaHandle, DeviceRank, DeviceSequence};
+use crate::device::{CudaHandle, DeviceRank, DeviceSequence, LatentCache};
 
 /// How a session drafts, once the backend has been told to.
 #[derive(Debug, Clone)]
@@ -229,7 +229,41 @@ impl Glm5NextDeviceBackend {
             BackendError::new("glm5_device", format!("single-rank collective: {error}"))
         })?;
         let gather = BitGatherHandle::new(Box::new(SingleRank));
-        Self::open(cuda, config, checkpoint, layout, tp, gather, context_limit)
+        Self::open_with_cache(
+            cuda,
+            config,
+            checkpoint,
+            tp,
+            gather,
+            context_limit,
+            crate::single_rank_latent(),
+        )
+    }
+
+    /// [Self::open_single_rank] with an explicit latent-cache representation.
+    ///
+    /// The single-node arm always passes [crate::single_rank_latent] (the F32 latent), which
+    /// is the representation [crate::single_rank_kv_plan] admits. A caller that wants another
+    /// cache takes responsibility for admitting it.
+    ///
+    /// # Errors
+    /// As [Self::open_single_rank].
+    pub fn open_single_rank_with_cache(
+        cuda: Arc<CudaHandle>,
+        config: Glm5NextConfig,
+        checkpoint: &Path,
+        context_limit: usize,
+        cache: LatentCache,
+    ) -> Result<Self, BackendError> {
+        let layout = TpLayout {
+            rank: 0,
+            world_size: 1,
+        };
+        let tp = TpRuntime::new(layout, Box::new(SingleRank)).map_err(|error| {
+            BackendError::new("glm5_device", format!("single-rank collective: {error}"))
+        })?;
+        let gather = BitGatherHandle::new(Box::new(SingleRank));
+        Self::open_with_cache(cuda, config, checkpoint, tp, gather, context_limit, cache)
     }
 
     /// [Self::open_single_rank] from an already-built execution plan.
@@ -286,9 +320,48 @@ impl Glm5NextDeviceBackend {
         gather: BitGatherHandle,
         context_limit: usize,
     ) -> Result<Self, BackendError> {
+        if layout.rank != tp.rank() || layout.world_size != tp.world() {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the collective is rank {} of {}, but the layout is rank {} of {}",
+                    tp.rank(),
+                    tp.world(),
+                    layout.rank,
+                    layout.world_size
+                ),
+            ));
+        }
+        Self::open_with_cache(
+            cuda,
+            config,
+            checkpoint,
+            tp,
+            gather,
+            context_limit,
+            LatentCache::Auto,
+        )
+    }
+
+    /// [Self::open] with an explicit latent-cache representation.
+    ///
+    /// The rank layout is the collective's: [Self::from_rank] refuses a mismatch.
+    fn open_with_cache(
+        cuda: Arc<CudaHandle>,
+        config: Glm5NextConfig,
+        checkpoint: &Path,
+        tp: TpRuntime,
+        gather: BitGatherHandle,
+        context_limit: usize,
+        cache: LatentCache,
+    ) -> Result<Self, BackendError> {
         let source = SafeTensorsSource::open(checkpoint, &checkpoint.join(INDEX_NAME))
             .map_err(|error| BackendError::new("glm5_weights", error.to_string()))?;
-        let rank = DeviceRank::load(cuda, &config, &source, layout)?;
+        let layout = TpLayout {
+            rank: tp.rank(),
+            world_size: tp.world(),
+        };
+        let rank = DeviceRank::load_with_cache(cuda, &config, &source, layout, cache)?;
         Self::from_rank(config, rank, tp, gather, context_limit)
     }
 

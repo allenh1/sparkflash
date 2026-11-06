@@ -84,15 +84,10 @@ fn every_rank_of_a_group_derives_the_same_window() {
     .expect("parses");
     let error = pack::pack_context::<QwenArm>(&wide, &read).expect_err("past the window");
     assert!(error.contains("outside 1..="), "{error}");
-    // A GLM checkpoint without a config.json is the carried release; Qwen's is a refusal.
+    // A checkpoint without a config.json is refused rather than served from a carried release.
     let empty = tempfile::tempdir().expect("tempdir");
-    let carried = pack::read_config::<GlmArm>(empty.path()).expect("carried");
-    assert_eq!(
-        carried.max_position_embeddings,
-        sparkflash_model_glm5_next::Glm5NextConfig::glm53_flash()
-            .expect("release")
-            .max_position_embeddings
-    );
+    let error = pack::read_config::<GlmArm>(empty.path()).expect_err("no config");
+    assert!(error.contains("has no config.json"), "{error}");
     let error = pack::read_config::<QwenArm>(empty.path()).expect_err("no config");
     assert!(
         error.contains("cannot read the Qwen3.8-Flash-Next configuration"),

@@ -37,7 +37,6 @@
 //! One MTP layer follows the decoder in the checkpoint.
 
 use serde::Deserialize;
-use sparkflash_model::config::OneOrMany;
 use sparkflash_model::dflash2::DraftTarget;
 use sparkflash_weights::mhc::HcGeometry;
 
@@ -256,8 +255,22 @@ impl Glm5NextConfig {
     /// [ConfigError::Json] for a malformed document and [ConfigError::Invalid] for a shape this
     /// pack cannot serve, or a field on which the two views disagree.
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
-        let json = text;
-        let architecture = crate::architecture::architecture_from_json(json)?;
+        let architecture = crate::architecture::architecture_from_json(text)?;
+        Self::from_json_with_architecture(text, architecture)
+    }
+
+    /// Parse a released document whose shared architecture was already read.
+    ///
+    /// The serving path reads the architecture through
+    /// [sparkflash_model::Architecture::from_checkpoint_dir], so `generation_config.json`
+    /// contributes the stop set, and passes it here instead of parsing a second view.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_json_with_architecture(
+        text: &str,
+        architecture: sparkflash_model::Architecture,
+    ) -> Result<Self, ConfigError> {
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let fp8_block = root
@@ -350,6 +363,7 @@ impl Glm5NextConfig {
                     .to_owned(),
             ));
         }
+        let eos_token_ids = architecture.tokens.eos_token_ids.clone();
         let config = Self {
             architecture,
             hidden_size: text.hidden_size,
@@ -387,7 +401,7 @@ impl Glm5NextConfig {
             hc_eps: text.hc_eps,
             num_nextn_predict_layers: text.num_nextn_predict_layers,
             tie_word_embeddings: root.tie_word_embeddings,
-            eos_token_ids: text.eos_token_id.into_vec(),
+            eos_token_ids,
             pad_token_id: text.pad_token_id,
             image_token_id: root.image_token_id,
             video_token_id: root.video_token_id,
@@ -421,6 +435,21 @@ impl Glm5NextConfig {
         config.validate()?;
         config.cross_check(&config.architecture)?;
         Ok(config)
+    }
+
+    /// Parse a checkpoint directory, merging its `generation_config.json`.
+    ///
+    /// This is the serving path's constructor: the typed profile and the shared architecture
+    /// read the same merged stop set, so the codec and the runtime stop check agree.
+    ///
+    /// # Errors
+    /// A read or parse failure, or a document this pack cannot serve.
+    pub fn from_checkpoint_dir(directory: &std::path::Path) -> Result<Self, ConfigError> {
+        let architecture = sparkflash_model::Architecture::from_checkpoint_dir(directory)?;
+        let path = directory.join("config.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| ConfigError::Json(format!("{}: {error}", path.display())))?;
+        Self::from_json_with_architecture(&text, architecture)
     }
 
     /// A tiny configuration for the reference and device tests.
@@ -531,6 +560,22 @@ impl Glm5NextConfig {
         let layers = self.num_hidden_layers;
         if layers == 0 || self.hidden_size == 0 || self.vocab_size == 0 {
             return invalid("the layer count, hidden width and vocabulary must be nonzero".into());
+        }
+        // A session with no stop id never ends a generation. The serving path reads this list
+        // from the checkpoint's merged configuration, so an empty one is a document that forgot
+        // its EOS, not a release whose generations end at a compiled-in id.
+        if self.eos_token_ids.is_empty() {
+            return invalid(
+                "the configuration must name at least one end-of-generation token".into(),
+            );
+        }
+        for token in &self.eos_token_ids {
+            if (*token as usize) >= self.vocab_size {
+                return invalid(format!(
+                    "eos token {token} is outside the vocabulary of {}",
+                    self.vocab_size
+                ));
+            }
         }
         for (name, length) in [
             ("layer_types", self.layer_types.len()),
@@ -807,7 +852,6 @@ struct TextConfig {
     hc_eps: f64,
     #[serde(default)]
     num_nextn_predict_layers: usize,
-    eos_token_id: OneOrMany<u32>,
     #[serde(default)]
     pad_token_id: Option<u32>,
 }
@@ -895,6 +939,57 @@ impl From<&Glm5NextConfig> for HcGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_checkpoint_directory_stop_set_is_one_source() {
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-glm-stop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(
+            directory.join("config.json"),
+            include_str!("../config/glm53_flash.hf.json"),
+        )
+        .expect("config.json");
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id": [154820, 154829, 154820]}"#,
+        )
+        .expect("generation_config.json");
+        let config = Glm5NextConfig::from_checkpoint_dir(&directory).expect("the checkpoint");
+        assert_eq!(
+            config.eos_token_ids,
+            [154820, 154827, 154829],
+            "the config's ids keep their order; generation_config only adds new ones"
+        );
+        assert_eq!(
+            config.architecture.tokens.eos_token_ids, config.eos_token_ids,
+            "the codec's and the runtime's stop sets are the same list"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_document_without_an_eos_is_refused() {
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../config/glm53_flash.hf.json"))
+                .expect("the carried document");
+        document
+            .get_mut("text_config")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the text configuration")
+            .remove("eos_token_id");
+        let error = Glm5NextConfig::from_json(&document.to_string())
+            .expect_err("a checkpoint with no stop id is not servable");
+        assert!(
+            error
+                .to_string()
+                .contains("at least one end-of-generation token"),
+            "{error}"
+        );
+    }
 
     #[test]
     fn the_released_configuration_parses_to_the_published_geometry() {

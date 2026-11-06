@@ -77,10 +77,11 @@ pub const FAMILY: &str = "glm5-next";
 /// The sparse layers cache the release's E4M3 latent, not an expansion of it
 /// ([crate::device::DeviceRank::dsa_attend]): 512 codes and four f32 block scales a position a
 /// layer, plus the indexer's 128-wide key and gate and its pooled key. That is 1.7 KiB a position
-/// a layer, 18.2 KiB across the eleven sparse layers, so the model's full 1,048,576-position
-/// window costs 18.2 GiB a rank - beside the 82 GB rank on a 121 GiB Spark, with about 18 GiB to
-/// spare. The exact f32 cache ([crate::device::LatentCache::F32]) is 35 KiB a position; at the
-/// full window it leaves 1-2 GiB, so a serve arm that selects it wants a smaller `--context`.
+/// a layer, and the MTP stage allocates the same latent and indexer (its device layer owns one),
+/// so the full 1,048,576-position window costs 19.7 GiB a rank - beside the 82 GB rank on a
+/// 121 GiB Spark, with about 19 GiB to spare. The exact f32 cache
+/// ([crate::device::LatentCache::F32]) is 35 KiB a position; at the full window it leaves 1-2 GiB,
+/// so a serve arm that selects it wants a smaller `--context`.
 pub const DEFAULT_DEVICE_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS;
 
 /// The output ceiling the serving arm advertises for one request.
@@ -100,7 +101,7 @@ pub mod tensor;
 ///
 /// This is not a node limit: the 82 GB rank and its chunk scratch sit beside it. It is the slice
 /// the session caches are allowed to claim at the default window, and it is sized so that exactly
-/// one 1,048,576-position session fits ([DEFAULT_DEVICE_CONTEXT] costs 18.2 GiB at the FP8
+/// one 1,048,576-position session fits ([DEFAULT_DEVICE_CONTEXT] costs 19.7 GiB at the FP8
 /// release) and a second has to come from a shorter `--context`. A node with more room raises it
 /// with `--kv-budget-gib`.
 ///
@@ -119,56 +120,89 @@ pub const fn kv_budget_bytes(gib: usize) -> u64 {
 ///
 /// The two terms come from the geometry [DeviceRank::new_sequence] allocates: a sparse layer's
 /// latent row (the release's E4M3 codes and their f32 block scales, or the f32 latent of a BF16
-/// release), an indexer layer's key, gate and pooled key, the MTP layer's latent when the
-/// checkpoint carries one, and the fixed KDA history, recurrence and verify spare of every linear
-/// layer. The pooled key is counted as if every position added a whole one, so the plan is an
-/// upper bound by at most one pool.
+/// release), an indexer layer's key, gate and pooled key, the MTP stage's latent and its own
+/// indexer when the checkpoint carries the stage, and the fixed KDA history, recurrence and verify
+/// spare of every linear layer. The pooled key is counted as a whole row a position, which is what
+/// the device's `capacity / pool` rows allocate.
 ///
-/// The representation follows [Glm5NextConfig::fp8_block], which is the same signal
-/// [crate::device::LatentCache::Auto] reads on a loaded rank: a block-quantised checkpoint stores
-/// the quantised activation, a BF16 one the f32 latent.
+/// The representation is explicit here, never re-derived inside the architecture:
+/// `latent_fp8 = true` is the release's E4M3 latent, `false` the exact f32 one. The E4M3
+/// choice needs a latent width that is whole 128-wide scale tiles; a narrower row is f32 in
+/// both modes, the condition the device's latent-cache choice applies. A serving profile's
+/// [sparkflash_model::profile::LatentCacheMode] chooses which to pass on the TP=4 path; the
+/// single-node host fixes it with [SINGLE_RANK_LATENT_FP8].
+#[must_use]
+pub fn kv_plan_with_latent(config: &Glm5NextConfig, latent_fp8: bool) -> sparkflash_model::KvPlan {
+    config
+        .architecture
+        .kv_plan(1, latent_fp8)
+        .expect("the carried GLM-5.3 configuration carries no compressed attention")
+}
+
+/// The cache plan the TP=1 host both admits and allocates.
+///
+/// This is the single source the single-node admission check (`GlmArm` in the CLI) and the
+/// single-node rank ([Glm5NextDeviceBackend::open_single_rank]) read, so the plan checked
+/// before the upload is the plan the rank's session caches are sized by: the latent and
+/// indexer rows and the linear-attention state. It is not a byte-for-byte ledger of every
+/// device allocation; the shared [sparkflash_model::Architecture::kv_plan] documents the
+/// caches it leaves outside (Qwen's GDN convolution history and PLE frames, which GLM's KDA
+/// schedule does not have).
+#[must_use]
+pub fn single_rank_kv_plan(config: &Glm5NextConfig) -> sparkflash_model::KvPlan {
+    kv_plan_with_latent(config, SINGLE_RANK_LATENT_FP8)
+}
+
+/// Whether the TP=1 host stores its latent as E4M3: it does not.
+///
+/// The single-node backend opens with the explicit [device::LatentCache::F32], and the
+/// single-node admission check admits the matching 38,400-byte-class row
+/// ([single_rank_kv_plan]). The single-node arm ignores the profile's
+/// `attention.latent_cache`; that choice is the TP=4 arm's (`open_glm_tp4_rank`), which
+/// passes the profile's mode to [device::DeviceRank::load_converted_with_cache].
+///
+/// The representation is deliberately not derived from [Glm5NextConfig::fp8_block]. That flag
+/// is the checkpoint-wide FP8 tiling of the block-scaled projections; `kv_b_proj.weight` is
+/// BF16 in the tensor plan ([crate::tensor]), and the device's [device::LatentCache::Auto]
+/// reads the per-tensor `kv_b` block scales, not the checkpoint flag. Deriving admission from
+/// `fp8_block` selected the 20,160-byte E4M3 row where the rank allocated the 38,400-byte f32
+/// one, an 18,240-byte-a-token under-admission.
+pub const SINGLE_RANK_LATENT_FP8: bool = false;
+
+/// The [device::LatentCache] [SINGLE_RANK_LATENT_FP8] selects for the TP=1 host.
+#[must_use]
+pub const fn single_rank_latent() -> device::LatentCache {
+    if SINGLE_RANK_LATENT_FP8 {
+        device::LatentCache::Fp8
+    } else {
+        device::LatentCache::F32
+    }
+}
+
+/// The checkpoint-wide estimate: E4M3 for a block-quantised release, f32 for a BF16 one.
+///
+/// This reads [Glm5NextConfig::fp8_block], so it describes the block-scaled projections and is
+/// not the device's per-tensor [device::LatentCache::Auto]. The single-node host admits and
+/// allocates [single_rank_kv_plan] instead.
 #[must_use]
 pub fn kv_plan(config: &Glm5NextConfig) -> sparkflash_model::KvPlan {
-    let width = config.kv_lora_rank as u64;
-    let latent = if config.fp8_block.is_some() {
-        // E4M3 codes, then one f32 scale a 128 codes.
-        width + 4 * width.div_ceil(128)
-    } else {
-        4 * width
-    };
-    let index_dim = config.index_head_dim as u64;
-    let pool = config.index_kpool.max(1) as u64;
-    // The indexer's key and gate rows, and its pooled key amortised over one pool of positions.
-    let indexed = 2 * index_dim * 4 + (index_dim * 4).div_ceil(pool);
-    let heads = config.linear_num_heads as u64;
-    let head = config.linear_head_dim as u64;
-    let history = config.linear_conv_kernel_dim.saturating_sub(1) as u64;
-    let mut per_token = 0u64;
-    let mut fixed = 0u64;
-    for (layer, kind) in config.layer_types.iter().enumerate() {
-        match kind {
-            LayerKind::Sparse => {
-                per_token += latent;
-                if config.indexer_types[layer] == IndexerKind::Full {
-                    per_token += indexed;
-                }
-            }
-            LayerKind::Linear => {
-                // The convolution history the kernel keeps, then the recurrence and its spare.
-                fixed += history * 3 * heads * head * 4 + 2 * heads * head * head * 4;
-            }
-        }
-    }
-    if config.num_nextn_predict_layers > 0 {
-        per_token += latent;
-    }
-    sparkflash_model::KvPlan::new(per_token, fixed)
+    kv_plan_with_latent(config, config.fp8_block.is_some())
 }
 
 /// The cache bytes one session allocates at `context` positions.
 #[must_use]
 pub fn sequence_kv_bytes(config: &Glm5NextConfig, context: usize) -> u64 {
     kv_plan(config).sequence_bytes(context)
+}
+
+/// [sequence_kv_bytes] under an explicit latent representation.
+#[must_use]
+pub fn sequence_kv_bytes_with_latent(
+    config: &Glm5NextConfig,
+    context: usize,
+    latent_fp8: bool,
+) -> u64 {
+    kv_plan_with_latent(config, latent_fp8).sequence_bytes(context)
 }
 
 /// The cache bytes `concurrency` sessions allocate at `context` positions.
@@ -207,16 +241,17 @@ mod tests {
     fn the_released_window_costs_the_memory_the_arm_documents() {
         let config = fp8_release();
         let plan = kv_plan(&config);
-        // 1.7 KiB a position across the eleven sparse layers, plus the MTP layer's latent.
+        // 1.7 KiB a position across the eleven sparse layers, plus the MTP stage's latent and
+        // indexer (the device allocator builds the stage with an indexer).
         assert!(
-            (18_000..20_500).contains(&plan.per_token()),
+            (19_000..21_000).contains(&plan.per_token()),
             "per-position claim {}",
             plan.per_token()
         );
         let one = plan.sequence_bytes(DEFAULT_DEVICE_CONTEXT);
         let gib = one as f64 / (1u64 << 30) as f64;
         assert!(
-            (17.0..21.0).contains(&gib),
+            (19.0..21.0).contains(&gib),
             "{gib:.1} GiB at the full window"
         );
     }
@@ -245,13 +280,36 @@ mod tests {
         let fp8 = fp8_release();
         let mut bf16 = fp8.clone();
         bf16.fp8_block = None;
-        // Eleven sparse layers and the MTP layer each move from 528 E4M3 bytes a position to
-        // 2,048 f32 ones.
+        bf16.architecture.quantization.dense_format =
+            sparkflash_model::architecture::WeightFormat::Bf16;
+        // Eleven sparse layers and the MTP layer each move from 528 E4M3 bytes a position (plus
+        // the MTP indexer's 1,152) to 2,048 f32 ones plus the indexer.
+        assert_eq!(
+            kv_plan_with_latent(&fp8, true).per_token(),
+            20_160,
+            "the FP8 latent at TP1"
+        );
+        assert_eq!(
+            kv_plan_with_latent(&fp8, false).per_token(),
+            38_400,
+            "the F32 latent at TP1"
+        );
+        assert_eq!(
+            kv_plan(&fp8).per_token(),
+            kv_plan_with_latent(&fp8, true).per_token(),
+            "the checkpoint default is E4M3 for the FP8 release"
+        );
+        assert_eq!(kv_plan(&bf16).per_token(), 38_400, "the F32 latent at TP1");
         assert_eq!(
             kv_plan(&bf16).per_token(),
             kv_plan(&fp8).per_token() + 12 * (4 * 512 - 528)
         );
         assert_eq!(kv_plan(&bf16).fixed(), kv_plan(&fp8).fixed());
+        assert_eq!(
+            sequence_kv_bytes_with_latent(&fp8, 1, false),
+            sequence_kv_bytes(&bf16, 1),
+            "the explicit F32 plan sizes the same session as the BF16 Auto default"
+        );
     }
 
     #[test]
@@ -259,5 +317,47 @@ mod tests {
         let config = Glm5NextConfig::tiny();
         let one = kv_plan(&config).sequence_bytes(config.max_position_embeddings);
         assert!(one < 64 << 20, "{one} bytes");
+    }
+
+    #[test]
+    fn the_single_rank_host_admits_the_latent_its_rank_allocates() {
+        let tiny = Glm5NextConfig::tiny();
+        // The tiny fixture carries the checkpoint-wide FP8 tiling while its tensor plan stores
+        // `kv_b_proj.weight` BF16: the distinction the old `config.fp8_block` admission missed.
+        assert_eq!(tiny.fp8_block, Some(8));
+        assert_eq!(single_rank_latent(), device::LatentCache::F32);
+        let admitted = single_rank_kv_plan(&tiny);
+        let f32_plan = kv_plan_with_latent(&tiny, false);
+        let fp8_plan = kv_plan_with_latent(&tiny, true);
+        assert_eq!(admitted, f32_plan, "the admitted plan is the allocated one");
+        // The fixture's 16-wide latent is narrower than one 128-wide FP8 tile, so the
+        // allocator's tile guard makes both choices f32; the pack test exercises the
+        // tile-wide boundary where E4M3 and f32 differ.
+        assert_eq!(fp8_plan, f32_plan, "a narrow latent is f32 in both modes");
+        // Two backbone MLA layers and the MTP stage allocate the f32 latent; the first
+        // backbone layer owns an indexer and the device's MTP stage always builds one, even
+        // though the last backbone MLA layer shares a selection and declares none.
+        assert_eq!(
+            admitted.per_token(),
+            3 * (16_u64 * 4) + 2 * (8_u64 * 8 + (8_u64 * 4).div_ceil(2)),
+            "the plan charges the allocator's latent and both indexers"
+        );
+
+        // Auto is the per-tensor choice, and a latent width that is not a whole FP8 tile falls
+        // back to f32 whatever the caller asks.
+        assert!(!device::LatentCache::Fp8.quantises(&tiny, true));
+        // `small` has a 128-wide latent, so its choice turns on kv_b alone.
+        let small = Glm5NextConfig::small();
+        assert_eq!(small.fp8_block, Some(128));
+        assert!(
+            !device::LatentCache::Auto.quantises(&small, false),
+            "Auto reads the per-tensor kv_b, which is BF16, not the checkpoint-wide fp8 flag"
+        );
+        assert!(
+            device::LatentCache::Auto.quantises(&small, true),
+            "a block-scaled kv_b makes Auto the E4M3 latent"
+        );
+        assert!(!device::LatentCache::F32.quantises(&small, true));
+        assert!(device::LatentCache::Fp8.quantises(&small, false));
     }
 }

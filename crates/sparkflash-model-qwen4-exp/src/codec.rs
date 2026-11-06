@@ -29,6 +29,7 @@ use std::sync::Arc;
 use serde_json::Value;
 use sparkflash_model::{PromptCodec, PromptError};
 
+#[cfg(test)]
 use crate::config::{ENDOFTEXT_TOKEN, IM_END_TOKEN};
 use crate::vision::QwenVisionCodec;
 
@@ -77,62 +78,103 @@ impl QwenCodec {
     /// When the file is missing, is not a tokenizer, or does not carry the ChatML special tokens
     /// at the ids the checkpoint's configuration expects.
     pub fn from_path(path: &Path) -> Result<Self, String> {
-        let tokenizer = tokenizers::Tokenizer::from_file(path)
-            .map_err(|error| format!("cannot load tokenizer {}: {error}", path.display()))?;
-        Self::new(tokenizer)
+        let architecture = crate::architecture_from_carried()
+            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
+        Self::from_path_with_architecture(path, &architecture)
     }
 
-    /// Wrap an already loaded tokenizer.
+    /// Load a `tokenizer.json` and validate it against a checkpoint's parsed architecture.
+    ///
+    /// # Errors
+    /// As [Self::new_with_architecture], plus a read/parse failure.
+    pub fn from_path_with_architecture(
+        path: &Path,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| format!("cannot load tokenizer {}: {error}", path.display()))?;
+        Self::new_with_architecture(tokenizer, architecture)
+    }
+
+    /// Wrap an already loaded tokenizer with the released configuration carried in this crate.
+    ///
+    /// # Errors
+    /// As [Self::new_with_architecture].
+    pub fn new(tokenizer: tokenizers::Tokenizer) -> Result<Self, String> {
+        let architecture = crate::architecture_from_carried()
+            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
+        Self::new_with_architecture(tokenizer, &architecture)
+    }
+
+    /// Wrap an already loaded tokenizer and validate it against `architecture`.
+    ///
+    /// The vocabulary, the end-of-generation set and the image delimiters come from the
+    /// checkpoint, not from a compiled-in document, so a fine-tune with a different vocabulary
+    /// or special-token ids serves without editing this crate.
     ///
     /// # Errors
     /// When the tokenizer does not spell `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`,
     /// `<|image_pad|>`, `<|vision_start|>` or `<|vision_end|>`, or when their ids disagree with
     /// the checkpoint configuration. A silently substituted id would produce a prompt the model
     /// reads as ordinary text, which is worse than refusing to serve.
-    pub fn new(tokenizer: tokenizers::Tokenizer) -> Result<Self, String> {
-        let im_start = special_id(&tokenizer, IM_START)?;
-        let im_end = special_id(&tokenizer, IM_END)?;
-        let endoftext = special_id(&tokenizer, "<|endoftext|>")?;
-        let config = crate::Qwen4ExpConfig::qwen38_flash_next_nvfp4()
-            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
-        if endoftext != ENDOFTEXT_TOKEN {
+    pub fn new_with_architecture(
+        tokenizer: tokenizers::Tokenizer,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let vocab = architecture.vocab_size;
+        // Every special id the template writes must be a row of the checkpoint's vocabulary:
+        // an id past it tokenizes, but the model reads it as padding.
+        let special = |spelling: &str| {
+            let id = special_id(&tokenizer, spelling)?;
+            if id as usize >= vocab {
+                return Err(format!(
+                    "the tokenizer's {spelling} is {id}, outside the checkpoint vocabulary {vocab}"
+                ));
+            }
+            Ok(id)
+        };
+        let im_start = special(IM_START)?;
+        let im_end = special(IM_END)?;
+        let endoftext = special("<|endoftext|>")?;
+        let eos = &architecture.tokens.eos_token_ids;
+        if !eos.is_empty() && !eos.contains(&endoftext) {
             return Err(format!(
-                "the tokenizer's <|endoftext|> is {endoftext}, but the checkpoint configuration ends at {ENDOFTEXT_TOKEN}"
+                "the tokenizer's <|endoftext|> is {endoftext}, but the checkpoint configuration ends at {eos:?}"
             ));
         }
-        if im_end != IM_END_TOKEN {
+        // The released template closes every turn with <|im_end|>; the runtime stops on the
+        // checkpoint's set. An id outside that set would render a turn the model cannot end,
+        // which is exactly the remap a fine-tune can introduce.
+        if !eos.is_empty() && !eos.contains(&im_end) {
             return Err(format!(
-                "the tokenizer's <|im_end|> is {im_end}, but the checkpoint configuration stops at {IM_END_TOKEN}"
+                "the tokenizer's <|im_end|> is {im_end}, but the checkpoint configuration ends at {eos:?}"
             ));
         }
-        if im_start >= config.vocab_size as u32 {
+        let image_token = special(IMAGE_PAD)?;
+        if let Some(configured) = architecture.tokens.image_token_id
+            && image_token != configured
+        {
             return Err(format!(
-                "the tokenizer's <|im_start|> is {im_start}, outside the checkpoint vocabulary {}",
-                config.vocab_size
-            ));
-        }
-        let image_token = special_id(&tokenizer, IMAGE_PAD)?;
-        if image_token != config.image_token_id {
-            return Err(format!(
-                "the tokenizer's <|image_pad|> is {image_token}, but the checkpoint configuration names {}",
-                config.image_token_id
+                "the tokenizer's <|image_pad|> is {image_token}, but the checkpoint configuration names {configured}"
             ));
         }
         // The vision codec inserts these two ids directly from the configuration. Validate the
         // spellings as well, or a tokenizer whose delimiters sit at different ids would receive
         // prompts that look right as text but decode to the wrong special tokens.
         for (spelling, configured) in [
-            (VISION_START, config.vision_start_token_id),
-            (VISION_END, config.vision_end_token_id),
+            (VISION_START, architecture.tokens.vision_start_token_id),
+            (VISION_END, architecture.tokens.vision_end_token_id),
         ] {
-            let actual = special_id(&tokenizer, spelling)?;
-            if actual != configured {
+            let actual = special(spelling)?;
+            if let Some(configured) = configured
+                && actual != configured
+            {
                 return Err(format!(
                     "the tokenizer's {spelling} is {actual}, but the checkpoint configuration names {configured}"
                 ));
             }
         }
-        let vision = QwenVisionCodec::from_config(&config);
+        let vision = QwenVisionCodec::from_architecture(architecture)?;
         Ok(Self {
             tokenizer,
             im_start,
@@ -661,6 +703,109 @@ mod tests {
         });
         tokenizers::Tokenizer::from_bytes(document.to_string().as_bytes())
             .expect("the toy tokenizer document parses")
+    }
+
+    fn small_tokenizer() -> tokenizers::Tokenizer {
+        small_tokenizer_with_im_end(9, 14)
+    }
+
+    fn small_tokenizer_with_im_end(im_end: u64, hello: u64) -> tokenizers::Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (token, id) in [
+            ("<|endoftext|>", 8u64),
+            (IM_END, im_end),
+            (IM_START, 10),
+            (IMAGE_PAD, 11),
+            (VISION_START, 12),
+            (VISION_END, 13),
+            ("hello", hello),
+        ] {
+            vocab.insert(token.to_owned(), json!(id));
+        }
+        let added: Vec<Value> = [
+            ("<|endoftext|>", 8u64),
+            (IM_END, im_end),
+            (IM_START, 10),
+            (IMAGE_PAD, 11),
+            (VISION_START, 12),
+            (VISION_END, 13),
+        ]
+        .into_iter()
+        .map(|(token, id)| {
+            json!({
+                "id": id,
+                "content": token,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true,
+            })
+        })
+        .collect();
+        let document = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": Value::Object(vocab), "unk_token": "<|endoftext|>"},
+        });
+        tokenizers::Tokenizer::from_bytes(document.to_string().as_bytes())
+            .expect("the toy tokenizer document parses")
+    }
+
+    fn small_architecture(vocab: usize) -> sparkflash_model::Architecture {
+        sparkflash_model::Architecture::from_json(&format!(
+            r#"{{"model_type":"acme_chat_v1","hidden_size":128,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"vocab_size":{vocab},"max_position_embeddings":64,"rms_norm_eps":1e-6,"eos_token_id":[8,9],"image_token_id":11,"vision_start_token_id":12,"vision_end_token_id":13}}"#
+        ))
+        .expect("a synthetic ChatML architecture")
+    }
+
+    #[test]
+    fn a_codec_takes_its_vocabulary_and_ids_from_the_architecture() {
+        let architecture = small_architecture(1024);
+        let codec = QwenCodec::new_with_architecture(small_tokenizer(), &architecture)
+            .expect("the tokenizer agrees with the synthetic checkpoint");
+        assert_eq!(codec.vocabulary(), 7);
+        let request = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let text = codec.render(&request).expect("the template renders");
+        assert!(text.contains("<|im_start|>user\nhello<|im_end|>"));
+
+        let too_small = small_architecture(9);
+        let error = QwenCodec::new_with_architecture(small_tokenizer(), &too_small)
+            .expect_err("an id past the vocabulary is refused");
+        assert!(
+            error.contains("outside the checkpoint vocabulary"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_remapped_im_end_is_read_from_the_checkpoint_and_must_be_a_stop_id() {
+        // A vocabulary wide enough for the remapped id: the codec takes the tokenizer's id, not
+        // a compiled-in constant, and accepts it when the checkpoint's stop set names it.
+        let remapped = small_tokenizer_with_im_end(20, 21);
+        let architecture = sparkflash_model::Architecture::from_json(
+            r#"{"model_type":"acme_chat_v1","hidden_size":128,"intermediate_size":256,"num_hidden_layers":1,"num_attention_heads":4,"num_key_value_heads":2,"head_dim":32,"vocab_size":1024,"max_position_embeddings":64,"rms_norm_eps":1e-6,"eos_token_id":[8,20],"image_token_id":11,"vision_start_token_id":12,"vision_end_token_id":13}"#,
+        )
+        .expect("a synthetic ChatML architecture");
+        let codec = QwenCodec::new_with_architecture(remapped, &architecture)
+            .expect("the checkpoint names the remapped im_end");
+        let ids = codec
+            .encode_text("<|im_end|>", false)
+            .expect("the remapped special tokenizes");
+        assert_eq!(ids, [20], "the renderer writes the tokenizer's id");
+
+        // The same remap against a checkpoint that still ends at 9 is refused.
+        let remapped = small_tokenizer_with_im_end(20, 21);
+        let architecture = small_architecture(1024);
+        let error = QwenCodec::new_with_architecture(remapped, &architecture)
+            .expect_err("the checkpoint does not stop at the remapped id");
+        assert!(error.contains("im_end"), "{error}");
     }
 
     #[test]

@@ -164,6 +164,48 @@ pub enum LatentCache {
     Fp8,
 }
 
+impl LatentCache {
+    /// Whether a rank with this cache stores its latent as E4M3 codes.
+    ///
+    /// [LatentCache::Auto] is the per-tensor choice: the latent is quantised only when the
+    /// rank's own `kv_b` is block-scaled and the projections quantise their activations. The
+    /// checkpoint-wide `fp8_block` flag names the block width of the other projections and
+    /// says nothing about `kv_b_proj`; the GLM tensor plan stores that weight BF16
+    /// ([crate::tensor]), so Auto is the F32 latent there even for an FP8 checkpoint. A caller
+    /// that must admit the cache before it has read a tensor passes an explicit representation
+    /// instead ([crate::SINGLE_RANK_LATENT_FP8]).
+    ///
+    /// The E4M3 latent needs a latent width that is whole 128-wide scale tiles; a narrower
+    /// width falls back to f32 whatever the caller asked for, which is the same condition
+    /// [crate::kv_plan_with_latent] callers pass.
+    #[must_use]
+    pub fn quantises(self, config: &Glm5NextConfig, kv_b_block_scaled: bool) -> bool {
+        (match self {
+            Self::Auto => config.dynamic_activations && kv_b_block_scaled,
+            Self::F32 => false,
+            Self::Fp8 => true,
+        }) && config.kv_lora_rank.is_multiple_of(FP8_BLOCK)
+    }
+}
+
+/// The latent-cache row one sparse layer allocates a position.
+///
+/// Returns `(latent elements, f32 scale floats)`: the E4M3 latent is one code a element and one
+/// f32 scale a whole [FP8_BLOCK]-wide tile, while the f32 latent is four bytes a element and no
+/// scales. The representation is resolved exactly as [LatentCache::quantises] does it; this is
+/// the allocation [DeviceRank::sparse_state] makes from the same pair.
+fn latent_row(config: &Glm5NextConfig, quantise: bool) -> (usize, usize) {
+    let width = config.kv_lora_rank;
+    (
+        width,
+        if quantise {
+            width.div_ceil(FP8_BLOCK)
+        } else {
+            0
+        },
+    )
+}
+
 /// How the bulk prefill's GEMMs take their f32 activations (SPARKFLASH_GLM_PREFILL_ACTIVATION).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrefillActivation {
@@ -2100,13 +2142,7 @@ impl DeviceRank {
         // The absorbed MLA operands: each sparse layer's kv_b, dequantised once. The latent
         // cache's representation is the caller's ([LatentCache]).
         let (nope, value) = (config.qk_nope_head_dim, config.v_head_dim);
-        let quantise = |dsa: &DeviceDsa| {
-            (match cache {
-                LatentCache::Auto => config.dynamic_activations && dsa.kv_b.scales.is_some(),
-                LatentCache::F32 => false,
-                LatentCache::Fp8 => true,
-            }) && config.kv_lora_rank.is_multiple_of(FP8_BLOCK)
-        };
+        let quantise = |dsa: &DeviceDsa| cache.quantises(config, dsa.kv_b.scales.is_some());
         for layer in &mut layers {
             if let DeviceBranch::Sparse(dsa) = &mut layer.branch {
                 dsa.quantise = quantise(dsa);
@@ -2778,14 +2814,14 @@ impl DeviceRank {
         let index_dim = config.index_head_dim;
         // The latent is the release's E4M3 activation when the projections quantise theirs, and
         // f32 for a BF16 release.
-        let width = config.kv_lora_rank;
+        let (latent_elements, latent_scale_floats) = latent_row(config, dsa.quantise);
         let (latent, latent_scales) = if dsa.quantise {
             (
-                memory.bytes(capacity * width)?,
-                memory.floats(capacity * width.div_ceil(FP8_BLOCK))?,
+                memory.bytes(capacity * latent_elements)?,
+                memory.floats(capacity * latent_scale_floats)?,
             )
         } else {
-            (memory.floats(capacity * width)?, Deviceptr(0))
+            (memory.floats(capacity * latent_elements)?, Deviceptr(0))
         };
         let mut index = |floats: usize| {
             if dsa.indexer.is_some() {
@@ -5761,5 +5797,99 @@ impl Drop for DeviceRank {
             block.draft.free(&self.cuda);
         }
         self.cuda.destroy_run_stream(&self.stream);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sparkflash_model::architecture::AttentionKind;
+
+    /// The per-position sparse caches [DeviceRank::sparse_state] allocates for `config`: every
+    /// backbone MLA layer, each layer that owns an indexer, and the MTP stage (which the device
+    /// always builds with its own indexer).
+    fn allocated_sparse_per_token(config: &Glm5NextConfig, quantise: bool) -> u64 {
+        let (latent_elements, latent_scales) = latent_row(config, quantise);
+        let latent =
+            latent_elements as u64 * if quantise { 1 } else { 4 } + latent_scales as u64 * 4;
+        let index_dim = config.index_head_dim as u64;
+        let indexer = index_dim * 8 + (index_dim * 4).div_ceil(config.index_kpool as u64);
+        let mla_layers: Vec<_> = config
+            .architecture
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
+            .collect();
+        let owns_indexer = mla_layers
+            .iter()
+            .filter(|layer| {
+                layer
+                    .attention
+                    .indexer
+                    .as_ref()
+                    .is_some_and(|indexer| indexer.owns_keys)
+            })
+            .count() as u64;
+        let stages = config
+            .architecture
+            .mtp
+            .as_ref()
+            .map_or(0, |mtp| mtp.stages as u64);
+        mla_layers.len() as u64 * latent + owns_indexer * indexer + stages * (latent + indexer)
+    }
+
+    /// A copy of the tiny fixture whose latent is one whole FP8 scale tile wide.
+    fn tile_wide_tiny() -> Glm5NextConfig {
+        let mut config = Glm5NextConfig::tiny();
+        config.kv_lora_rank = FP8_BLOCK;
+        for layer in &mut config.architecture.layers {
+            if let AttentionKind::Mla { kv_lora_rank, .. } = &mut layer.attention.kind {
+                *kv_lora_rank = FP8_BLOCK;
+            }
+        }
+        config
+    }
+
+    #[test]
+    fn the_single_rank_plan_matches_the_latent_the_allocator_sizes() {
+        // The tiny fixture's tensor plan stores `kv_b_proj.weight` BF16, so Auto (the allocator's
+        // default) is the f32 latent even though `fp8_block` tiles the other projections.
+        let config = Glm5NextConfig::tiny();
+        let auto = LatentCache::Auto.quantises(&config, false);
+        assert!(!auto, "a BF16 kv_b does not select the E4M3 latent");
+        assert_eq!(
+            latent_row(&config, auto),
+            (config.kv_lora_rank, 0),
+            "the allocator sizes the f32 row, not a 128-wide E4M3 one"
+        );
+        assert_eq!(
+            crate::single_rank_kv_plan(&config).per_token(),
+            allocated_sparse_per_token(&config, auto),
+            "the admitted plan and `sparse_state` agree on the tiny fixture"
+        );
+
+        // With a whole-tile latent the per-tensor choice changes the allocation, and the plan
+        // follows the same condition rather than the checkpoint-wide flag.
+        let wide = tile_wide_tiny();
+        let bf16_kv_b = LatentCache::Auto.quantises(&wide, false);
+        let block_kv_b = LatentCache::Auto.quantises(&wide, true);
+        assert!(!bf16_kv_b, "BF16 kv_b keeps the f32 latent");
+        assert!(block_kv_b, "a block-scaled kv_b selects the E4M3 latent");
+        assert_eq!(latent_row(&wide, bf16_kv_b), (FP8_BLOCK, 0));
+        assert_eq!(latent_row(&wide, block_kv_b), (FP8_BLOCK, 1));
+        assert_eq!(
+            crate::single_rank_kv_plan(&wide).per_token(),
+            allocated_sparse_per_token(&wide, bf16_kv_b)
+        );
+        assert_eq!(
+            crate::kv_plan_with_latent(&wide, block_kv_b).per_token(),
+            allocated_sparse_per_token(&wide, block_kv_b)
+        );
+        assert_eq!(
+            allocated_sparse_per_token(&wide, bf16_kv_b)
+                - allocated_sparse_per_token(&wide, block_kv_b),
+            3 * (FP8_BLOCK as u64 * 4 - (FP8_BLOCK as u64 + 4)),
+            "two backbone MLA layers and the MTP stage move to the f32 latent"
+        );
     }
 }

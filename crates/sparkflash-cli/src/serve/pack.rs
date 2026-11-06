@@ -91,13 +91,14 @@ pub(super) trait PackArm {
     fn window(config: &Self::Config) -> usize;
     /// What a group serves over `context` tokens.
     fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor;
-    /// The released prompt seam from a tokenizer file.
-    fn codec(tokenizer: &Path) -> Result<Arc<dyn PromptCodec>, String>;
+    /// The released prompt seam from a tokenizer file and the checkpoint's parsed architecture.
+    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String>;
     /// Refusals the single-node arm makes before it uploads anything.
     fn check_host(
         options: &ServeOptions,
         config: &Self::Config,
         context: usize,
+        profile: &ModelProfile,
     ) -> Result<(), String>;
     /// Opens the single-node backend over `context` tokens.
     fn open_host(
@@ -158,10 +159,12 @@ impl PackArm for QwenArm {
     }
 
     fn read_config(directory: &Path) -> Result<Self::Config, String> {
-        let path = directory.join(CHECKPOINT_CONFIG_NAME);
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        Qwen4ExpConfig::from_json(&text).map_err(|error| format!("{}: {error}", path.display()))
+        Qwen4ExpConfig::from_checkpoint_dir(directory).map_err(|error| {
+            format!(
+                "{}: {error}",
+                directory.join(CHECKPOINT_CONFIG_NAME).display()
+            )
+        })
     }
 
     fn window(config: &Self::Config) -> usize {
@@ -172,19 +175,26 @@ impl PackArm for QwenArm {
         sparkflash_model_qwen4_exp::device::descriptor_for(config, context)
     }
 
-    fn codec(tokenizer: &Path) -> Result<Arc<dyn PromptCodec>, String> {
-        Ok(Arc::new(sparkflash_model_qwen4_exp::QwenCodec::from_path(
-            tokenizer,
-        )?))
+    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
+        Ok(Arc::new(
+            sparkflash_model_qwen4_exp::QwenCodec::from_path_with_architecture(
+                tokenizer,
+                &config.architecture,
+            )?,
+        ))
     }
 
     fn check_host(
         options: &ServeOptions,
-        _config: &Self::Config,
+        config: &Self::Config,
         context: usize,
+        _profile: &ModelProfile,
     ) -> Result<(), String> {
         admit(
-            sparkflash_model_qwen4_exp::kv_plan(),
+            config
+                .architecture
+                .kv_plan(1, false)
+                .map_err(|error| error.to_string())?,
             sparkflash_model_qwen4_exp::CONCURRENCY_KV_BUDGET_BYTES,
             options,
             context,
@@ -271,16 +281,17 @@ impl PackArm for QwenFp8Arm {
         <QwenArm as PackArm>::descriptor(config, context)
     }
 
-    fn codec(tokenizer: &Path) -> Result<Arc<dyn PromptCodec>, String> {
-        <QwenArm as PackArm>::codec(tokenizer)
+    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
+        <QwenArm as PackArm>::codec(tokenizer, config)
     }
 
     fn check_host(
         options: &ServeOptions,
         config: &Self::Config,
         context: usize,
+        profile: &ModelProfile,
     ) -> Result<(), String> {
-        <QwenArm as PackArm>::check_host(options, config, context)
+        <QwenArm as PackArm>::check_host(options, config, context, profile)
     }
 
     fn open_host(
@@ -332,17 +343,18 @@ impl PackArm for GlmArm {
         Ok(config)
     }
 
-    /// The checkpoint's `config.json`, or the carried release configuration when the directory
-    /// has none.
+    /// The checkpoint's `config.json`. A checkpoint without one is refused rather than served
+    /// from a compiled-in release document.
     fn read_config(directory: &Path) -> Result<Self::Config, String> {
         let path = directory.join(CHECKPOINT_CONFIG_NAME);
         if !path.is_file() {
-            return Glm5NextConfig::glm53_flash()
-                .map_err(|error| format!("the carried release configuration: {error}"));
+            return Err(format!(
+                "{} has no {CHECKPOINT_CONFIG_NAME}: a GLM-5.3 checkpoint is read from its own configuration, not the carried release",
+                directory.display()
+            ));
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        Glm5NextConfig::from_json(&text).map_err(|error| format!("{}: {error}", path.display()))
+        Glm5NextConfig::from_checkpoint_dir(directory)
+            .map_err(|error| format!("{}: {error}", path.display()))
     }
 
     fn window(config: &Self::Config) -> usize {
@@ -353,16 +365,20 @@ impl PackArm for GlmArm {
         sparkflash_model_glm5_next::serve::descriptor_for(config, context)
     }
 
-    fn codec(tokenizer: &Path) -> Result<Arc<dyn PromptCodec>, String> {
-        Ok(Arc::new(sparkflash_model_glm5_next::GlmCodec::from_path(
-            tokenizer,
-        )?))
+    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
+        Ok(Arc::new(
+            sparkflash_model_glm5_next::GlmCodec::from_path_with_architecture(
+                tokenizer,
+                &config.architecture,
+            )?,
+        ))
     }
 
     fn check_host(
         options: &ServeOptions,
         config: &Self::Config,
         context: usize,
+        _profile: &ModelProfile,
     ) -> Result<(), String> {
         // The FP8 release is 82 GB a rank over four nodes. One rank holding all four shards is
         // not the served shape, and the server says so before it tries a 328.3 GB upload.
@@ -375,8 +391,18 @@ impl PackArm for GlmArm {
         // Each worker opens its own window: at the 1M default that is 18.8 GiB of caches a
         // session, so a worker count the node cannot hold is refused before the upload rather
         // than at the first request.
+        //
+        // The admitted plan is the one the single-node rank sizes its session caches by:
+        // [Glm5NextDeviceBackend] opens TP=1 with the explicit F32 latent, and
+        // [single_rank_kv_plan] is the same choice. It is the shared plan's cache ledger, not
+        // every device allocation (its documented Qwen GDN/PLE exclusions do not apply here).
+        // The profile's `attention.latent_cache` belongs to the TP=4 arm; the single-node
+        // backend does not read it. The checkpoint-wide `fp8_block` flag must not choose here:
+        // it tiles the block-scaled projections, while `kv_b_proj.weight` is BF16 in the tensor
+        // plan, so deriving E4M3 from it under-admits the f32 latent by 18,240 bytes a token at
+        // the release geometry.
         admit(
-            sparkflash_model_glm5_next::kv_plan(config),
+            sparkflash_model_glm5_next::single_rank_kv_plan(config),
             sparkflash_model_glm5_next::CONCURRENCY_KV_BUDGET_BYTES,
             options,
             context,
@@ -698,6 +724,7 @@ pub(super) fn pack_context<A: PackArm>(
 fn pack_seam<A: PackArm>(
     options: &ServeOptions,
     directory: &Path,
+    config: &A::Config,
 ) -> Result<(PathBuf, Arc<dyn PromptCodec>), String> {
     let tokenizer = options
         .tokenizer
@@ -710,7 +737,7 @@ fn pack_seam<A: PackArm>(
             tokenizer.display()
         ));
     }
-    let seam = A::codec(&tokenizer)?;
+    let seam = A::codec(&tokenizer, config)?;
     Ok((tokenizer, seam))
 }
 
@@ -813,11 +840,11 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
         profile.family.as_deref().unwrap_or("-"),
         profile.weights.as_deref().unwrap_or("-")
     );
-    A::check_host(options, &config, context)?;
+    A::check_host(options, &config, context, &profile)?;
     let released_seam = if options.synthetic {
         None
     } else {
-        Some(pack_seam::<A>(options, &directory)?.1)
+        Some(pack_seam::<A>(options, &directory, &config)?.1)
     };
     let mut backend =
         A::open_host(&directory, config, context, &profile, plan.as_ref()).map_err(|error| {
@@ -928,7 +955,7 @@ fn serve_group<A: PackArm>(
     }
     // The prompt seam and the detokenizer are the same file; load it before the rank upload so a
     // missing tokenizer costs a startup message, not a load.
-    let (tokenizer, seam) = pack_seam::<A>(options, &directory)?;
+    let (tokenizer, seam) = pack_seam::<A>(options, &directory, &config)?;
     let descriptor = A::descriptor(&config, context);
     let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
     rank_config.context = context;
@@ -1052,6 +1079,65 @@ mod tests {
             }
         }
         assert_eq!(Pack::named("example/no-arm"), None);
+    }
+
+    #[test]
+    fn the_glm_host_admits_the_latent_the_single_rank_allocates() {
+        // The fixture's checkpoint-wide FP8 tiling says nothing about `kv_b_proj.weight`, and
+        // the single-node rank allocates the f32 latent. One whole FP8 tile of latent keeps
+        // the E4M3 plan the old admission chose measurably smaller; the fixture's own 16-wide
+        // latent is below a tile and falls back to f32 in both plans.
+        let mut config = Glm5NextConfig::tiny();
+        config.kv_lora_rank = 128;
+        for layer in &mut config.architecture.layers {
+            if let sparkflash_model::architecture::AttentionKind::Mla { kv_lora_rank, .. } =
+                &mut layer.attention.kind
+            {
+                *kv_lora_rank = 128;
+            }
+        }
+        assert_eq!(config.fp8_block, Some(8));
+        let context = 10_000;
+        let budget = sparkflash_model::kv_budget_bytes(1);
+        let f32_plan = sparkflash_model_glm5_next::kv_plan_with_latent(&config, false);
+        let fp8_plan = sparkflash_model_glm5_next::kv_plan_with_latent(&config, true);
+        assert!(
+            f32_plan.concurrency_bytes(context, 64) > budget,
+            "the allocated f32 latent does not fit 1 GiB at 64 sessions"
+        );
+        assert!(
+            fp8_plan.concurrency_bytes(context, 64) <= budget,
+            "the old fp8_block-derived plan fit 1 GiB, the bug"
+        );
+        let options = |concurrency: &str| {
+            ServeOptions::parse(vec![
+                "--model".to_owned(),
+                GlmArm::MODEL_ID.to_owned(),
+                "--synthetic".to_owned(),
+                "--context".to_owned(),
+                context.to_string(),
+                "--concurrency".to_owned(),
+                concurrency.to_owned(),
+                "--kv-budget-gib".to_owned(),
+                "1".to_owned(),
+            ])
+            .expect("the GLM host options parse")
+        };
+        let profile = GlmArm::profile_from(|_| None).expect("the carried profile parses");
+        let over = options("64");
+        let error = GlmArm::check_host(&over, &config, context, &profile)
+            .expect_err("the f32 latent the rank allocates is over 1 GiB at 64 sessions");
+        assert!(error.contains("--concurrency"), "{error}");
+        // One fewer worker fits the same window and budget.
+        GlmArm::check_host(&options("63"), &config, context, &profile)
+            .expect("63 sessions fit the budget");
+        // The profile's choice belongs to the TP=4 arm: even an explicit Fp8 request is
+        // admitted against the single-node f32 latent and is still refused here.
+        let mut fp8_profile = profile.clone();
+        fp8_profile.attention.latent_cache = Some(sparkflash_model::profile::LatentCacheMode::Fp8);
+        let error = GlmArm::check_host(&over, &config, context, &fp8_profile)
+            .expect_err("the single-node arm ignores the profile's latent cache");
+        assert!(error.contains("--concurrency"), "{error}");
     }
 
     #[test]

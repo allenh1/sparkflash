@@ -69,6 +69,102 @@ pub struct VisionGeometry {
 }
 
 impl VisionGeometry {
+    /// Parse a `vision_config` structurally, without matching the producer's `model_type`.
+    ///
+    /// A new tower composed of the same parts names the same structural keys; matching a literal
+    /// `model_type` string forced a new arm for every release. Only the numbers are read here.
+    ///
+    /// # Errors
+    /// A key that is present but not a non-negative number, or a missing `patch_size` (a
+    /// merge cell of zero would plan every image as empty). `out_hidden_size` defaults to the
+    /// language model's width (`language_hidden`), because a tower that names no merger output
+    /// hands the language model its own width rather than the tower's block width.
+    /// `spatial_merge_size` falls back to `downsample_ratio`, then to 1.
+    pub fn from_value(
+        config: &serde_json::Value,
+        language_hidden: usize,
+    ) -> Result<Self, ConfigError> {
+        let number = |name: &str| -> Result<Option<usize>, ConfigError> {
+            match config.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .map(Some)
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(format!("vision_config.{name} is not an integer"))
+                    }),
+            }
+        };
+        let float = |name: &str| -> Result<Option<f64>, ConfigError> {
+            match config.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(value) => value.as_f64().map(Some).ok_or_else(|| {
+                    ConfigError::Invalid(format!("vision_config.{name} is not a number"))
+                }),
+            }
+        };
+        let depth = number("num_hidden_layers")?
+            .or(number("depth")?)
+            .ok_or_else(|| ConfigError::Invalid("vision_config names no depth".to_owned()))?;
+        let hidden_size = number("hidden_size")?
+            .ok_or_else(|| ConfigError::Invalid("vision_config names no hidden_size".to_owned()))?;
+        let num_heads = number("num_attention_heads")?
+            .or(number("num_heads")?)
+            .ok_or_else(|| {
+                ConfigError::Invalid("vision_config names no attention heads".to_owned())
+            })?;
+        let intermediate_size = number("intermediate_size")?.ok_or_else(|| {
+            ConfigError::Invalid("vision_config names no intermediate_size".to_owned())
+        })?;
+        Ok(Self {
+            depth,
+            hidden_size,
+            num_heads,
+            intermediate_size,
+            // The merger hands the language model its own width; a tower that does not name one
+            // hands it the language width, not its own block width.
+            out_hidden_size: number("out_hidden_size")?.unwrap_or(language_hidden),
+            projection_intermediate_size: number("projection_intermediate_size")?.unwrap_or(0),
+            in_channels: number("in_channels")?.unwrap_or(3),
+            // A patch side is geometry, not a default: a missing value would make the merge cell
+            // zero and every planned image empty. An arm that carries a default states it.
+            patch_size: number("patch_size")?.ok_or_else(|| {
+                ConfigError::Invalid("vision_config names no patch_size".to_owned())
+            })?,
+            temporal_patch_size: number("temporal_patch_size")?.unwrap_or(1),
+            // DeepSeek names the same factor `downsample_ratio`.
+            spatial_merge_size: number("spatial_merge_size")?
+                .or(number("downsample_ratio")?)
+                .unwrap_or(1),
+            num_position_embeddings: number("num_position_embeddings")?.unwrap_or(0),
+            rope_theta: float("rope_theta")?.unwrap_or(10_000.0),
+            min_pixels: number("min_pixels")?.unwrap_or(0),
+            max_pixels: number("max_pixels")?.unwrap_or(0),
+        })
+    }
+
+    /// The same geometry from the architecture parser's `Vision` summary.
+    #[must_use]
+    pub fn from_vision(vision: &crate::architecture::Vision) -> Self {
+        Self {
+            depth: vision.depth,
+            hidden_size: vision.hidden_size,
+            num_heads: vision.heads,
+            intermediate_size: vision.intermediate,
+            out_hidden_size: vision.out_hidden_size,
+            projection_intermediate_size: vision.projection_intermediate,
+            in_channels: vision.in_channels,
+            patch_size: vision.patch_size,
+            temporal_patch_size: vision.temporal_patch_size,
+            spatial_merge_size: vision.spatial_merge,
+            num_position_embeddings: vision.num_position_embeddings,
+            rope_theta: vision.rope_theta,
+            min_pixels: vision.min_pixels,
+            max_pixels: vision.max_pixels,
+        }
+    }
+
     /// The width of one attention head.
     ///
     /// # Panics
@@ -137,7 +233,8 @@ impl VisionGeometry {
                 self.num_position_embeddings
             )));
         }
-        if self.min_pixels > self.max_pixels {
+        // A zero maximum is "the arm's own cap", not an inverted window.
+        if self.max_pixels > 0 && self.min_pixels > self.max_pixels {
             return Err(ConfigError::Invalid(format!(
                 "the vision tower's pixel window is inverted: {} is above {}",
                 self.min_pixels, self.max_pixels

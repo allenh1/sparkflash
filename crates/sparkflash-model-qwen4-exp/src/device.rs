@@ -1874,6 +1874,16 @@ impl std::fmt::Debug for Qwen4ExpDeviceBackend {
     }
 }
 
+/// The merged configuration every open path serves from.
+///
+/// [Qwen4ExpConfig::from_checkpoint_dir] reads `config.json` through the shared architecture,
+/// merges `generation_config.json`, and appends the pack's `<|im_end|>`; parsing the config
+/// document alone here is what made a generation-only stop id invisible to the session.
+fn open_config(directory: &Path) -> Result<Qwen4ExpConfig, BackendError> {
+    Qwen4ExpConfig::from_checkpoint_dir(directory)
+        .map_err(|error| BackendError::new("qwen4_config", error.to_string()))
+}
+
 impl Qwen4ExpDeviceBackend {
     /// Open the checkpoint for one device rank and upload every resident weight.
     ///
@@ -2117,14 +2127,7 @@ impl Qwen4ExpDeviceBackend {
         } else {
             checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
         };
-        let text = std::fs::read_to_string(directory.join("config.json")).map_err(|error| {
-            BackendError::new(
-                "qwen4_config",
-                format!("cannot read {}/config.json: {error}", directory.display()),
-            )
-        })?;
-        let mut config = Qwen4ExpConfig::from_json(&text)
-            .map_err(|error| BackendError::new("qwen4_config", error.to_string()))?;
+        let mut config = open_config(&directory)?;
         if let Some(plan) = plan {
             if plan.family() != "qwen4_exp" {
                 return Err(BackendError::new(
@@ -2146,8 +2149,10 @@ impl Qwen4ExpDeviceBackend {
                 ));
             }
             // The boot plan is the layer selection the resolver checked; the typed config keeps
-            // the shapes and weight names.
+            // the shapes and weight names. The plan parsed `config.json` on its own, so put the
+            // merged generation stop set back: the backend and the codec must read one list.
             config.architecture = plan.architecture().clone();
+            config.architecture.tokens.eos_token_ids = config.eos_token_ids.clone();
         }
         let config = Arc::new(config);
         if context_limit == 0 || context_limit > config.max_position_embeddings {
@@ -5403,4 +5408,45 @@ pub fn device_self_test() -> Result<(), BackendError> {
     }
     let _ = (device_input, device_weight, device_output);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_open_config_reads_the_merged_generation_stop_set() {
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-qwen-device-stop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(
+            directory.join("config.json"),
+            include_str!("../config/qwen38_flash_next_nvfp4.hf.json"),
+        )
+        .expect("config.json");
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id": [248099]}"#,
+        )
+        .expect("generation_config.json");
+        let config = open_config(&directory).expect("the checkpoint configuration");
+        assert_eq!(
+            config.eos_token_ids.first(),
+            Some(&248_044),
+            "the config's <|endoftext|> still comes first"
+        );
+        assert!(
+            config.eos_token_ids.contains(&248_099),
+            "the generation-only stop id reaches the open path: {:?}",
+            config.eos_token_ids
+        );
+        assert_eq!(
+            config.architecture.tokens.eos_token_ids, config.eos_token_ids,
+            "the device backend and the codec serve one stop set"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
 }

@@ -202,11 +202,42 @@ fn a_world_that_does_not_divide_a_released_config_is_refused() {
 fn the_quantization_block_selects_the_precision_class() {
     let deepseek = EnginePlan::from_json(DEEPSEEK, Target::Sm121, 4, 0).expect("DeepSeek");
     assert_eq!(deepseek.precision().dense, Precision::MxFp8);
-    assert_eq!(deepseek.precision().experts, Precision::NvFp4);
+    assert_eq!(
+        deepseek.precision().experts,
+        Precision::NvFp4,
+        "\"fp4\" is a 4-bit expert format, not BF16"
+    );
+    assert_eq!(
+        deepseek.precision().mtp,
+        Precision::NvFp4,
+        "an unnamed MTP format uses the backbone experts'"
+    );
 
     let glm = EnginePlan::from_json(GLM, Target::Sm121, 4, 0).expect("GLM");
     assert_eq!(glm.precision().dense, Precision::Fp8E4M3);
-    assert_eq!(glm.precision().experts, Precision::Fp8E4M3);
+    assert_eq!(
+        glm.precision().experts,
+        Precision::Fp8E4M3,
+        "GLM names no expert format, so the dense FP8 block governs"
+    );
+    assert_eq!(glm.precision().mtp, Precision::Fp8E4M3);
+
+    let qwen = EnginePlan::from_json(QWEN, Target::Sm121, 1, 0).expect("Qwen");
+    assert_eq!(qwen.precision().dense, Precision::Bf16);
+    assert_eq!(qwen.precision().experts, Precision::NvFp4);
+    assert_eq!(
+        qwen.precision().mtp,
+        Precision::Fp8E4M3,
+        "the MTP stage keeps its own FP8_PB_WO format"
+    );
+    // The accessor is not the plan: the boot plan's Part::Mtp requirement must carry the MTP
+    // class too, not the backbone experts'.
+    let mtp = qwen
+        .globals()
+        .iter()
+        .find(|requirement| requirement.part == Part::Mtp)
+        .expect("Qwen's boot plan carries an MTP part");
+    assert_eq!(mtp.precision, Precision::Fp8E4M3);
 }
 
 #[test]

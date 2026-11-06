@@ -151,32 +151,33 @@ pub const fn kv_budget_bytes(gib: usize) -> u64 {
 ///
 /// This is the whole set of KV/state caches `DeviceSequence::allocate` claims: the sparse
 /// layers' K/V and indexer keys, the MTP layer's caches, the live Gated DeltaNet recurrent state
-/// and the spare a verify keeps beside it. The spare is allocated whenever a verify checks more
+/// and the spare a verify keeps beside it. The GDN convolution history and the PLE convolution
+/// frames are not part of this plan. The spare is allocated whenever a verify checks more
 /// than one row, which is the default; counting it here makes the admission guard an upper bound
 /// either way. Per-session scratch, prefill buffers and a loaded DFlash drafter's own scratch are
 /// outside this figure.
 #[must_use]
-pub const fn sequence_kv_bytes(context: usize) -> u64 {
+pub fn sequence_kv_bytes(context: usize) -> u64 {
     kv_plan().sequence_bytes(context)
 }
 
 /// KV bytes `concurrency` sessions allocate at `context` tokens.
 #[must_use]
-pub const fn concurrency_kv_bytes(context: usize, concurrency: usize) -> u64 {
+pub fn concurrency_kv_bytes(context: usize, concurrency: usize) -> u64 {
     kv_plan().concurrency_bytes(context, concurrency)
 }
 
-/// This arm's cache claim, as the serving layer's one admission rule reads it.
+/// This arm's cache claim, read from the shared architecture plan.
 ///
-/// The terms are the constants above: the sparse layers' K/V, their indexer keys and the MTP
-/// layer's caches grow with the window, and the Gated DeltaNet recurrence and the verify spare
-/// beside it do not.
+/// The plan sums the sparse layers' K/V, their indexer keys and the MTP layer's caches (which
+/// grow with the window) and the Gated DeltaNet recurrence and verify spare (which do not), so
+/// this arm and every other arm built from the same parts read one arithmetic.
 #[must_use]
-pub const fn kv_plan() -> sparkflash_model::KvPlan {
-    sparkflash_model::KvPlan::new(
-        QSA_KV_BYTES_PER_TOKEN + INDEXER_KV_BYTES_PER_TOKEN + MTP_KV_BYTES_PER_TOKEN,
-        2 * GDN_RECURRENT_BYTES,
-    )
+pub fn kv_plan() -> sparkflash_model::KvPlan {
+    architecture_from_carried()
+        .expect("the carried Qwen3.8 configuration parses")
+        .kv_plan(1, false)
+        .expect("the carried Qwen3.8 configuration carries no compressed attention")
 }
 
 #[cfg(test)]

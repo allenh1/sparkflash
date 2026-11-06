@@ -27,7 +27,7 @@
 use sparkflash_model::ConfigError;
 use sparkflash_model::architecture::{
     Activation, Architecture, Attention, AttentionKind, DenseMlp, Ffn, HyperConnection, Indexer,
-    Kda, Layer, Moe, Mtp, Quantization, Residual, Rope, Score,
+    Kda, Layer, Moe, Mtp, Quantization, Residual, Rope, ScaleDType, Score, WeightFormat,
 };
 
 use crate::config::{Glm5NextConfig, IndexerKind, LayerKind, MODEL_TYPE, MlpKind};
@@ -171,6 +171,20 @@ pub fn tiny_architecture() -> Architecture {
             scale: None,
             activation: Some("dynamic".to_owned()),
             expert: None,
+            dense_format: WeightFormat::Fp8Tile {
+                block_m: 8,
+                block_n: 8,
+                scale_dtype: ScaleDType::F32,
+                dynamic_activations: true,
+            },
+            // GLM names no expert format; its experts are the dense FP8 tiles.
+            expert_format: WeightFormat::Fp8Tile {
+                block_m: 8,
+                block_n: 8,
+                scale_dtype: ScaleDType::F32,
+                dynamic_activations: true,
+            },
+            mtp_expert_format: None,
         },
         vision: None,
         mtp: Some(Mtp {
@@ -179,7 +193,9 @@ pub fn tiny_architecture() -> Architecture {
             target_layers: Vec::new(),
             routed_experts: Some(8),
             active_experts: Some(2),
+            replicated: true,
         }),
+        tokens: sparkflash_model::architecture::Tokens::default(),
     }
 }
 

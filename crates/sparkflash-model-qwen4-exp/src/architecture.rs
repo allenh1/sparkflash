@@ -42,7 +42,22 @@ pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
 /// # Errors
 /// [ConfigError::Json] only if the carried document were edited into an unreadable shape.
 pub fn architecture_from_carried() -> Result<Architecture, ConfigError> {
-    Architecture::from_json(CARRIED_CONFIG)
+    let mut architecture = Architecture::from_json(CARRIED_CONFIG)?;
+    // The Qwen pack stops on <|im_end|> as well as the config's <|endoftext|>; the released
+    // config names only the latter. Apply the pack's stop rule here so a caller that reads the
+    // architecture directly (the codec does) sees the same list the typed config does.
+    if architecture.vocab_size > crate::config::IM_END_TOKEN as usize
+        && !architecture
+            .tokens
+            .eos_token_ids
+            .contains(&crate::config::IM_END_TOKEN)
+    {
+        architecture
+            .tokens
+            .eos_token_ids
+            .push(crate::config::IM_END_TOKEN);
+    }
+    Ok(architecture)
 }
 
 /// The shared architecture a [`Qwen4ExpConfig::tiny`] profile describes.
@@ -160,7 +175,18 @@ pub(crate) fn tiny_architecture() -> Architecture {
             target_layers: Vec::new(),
             routed_experts: None,
             active_experts: None,
+            // The TPC profile drafts with DFlash above TP1, like the released rank config.
+            replicated: false,
         }),
+        tokens: sparkflash_model::architecture::Tokens {
+            bos_token_id: None,
+            eos_token_ids: vec![2],
+            pad_token_id: None,
+            image_token_id: Some(3),
+            video_token_id: None,
+            vision_start_token_id: Some(4),
+            vision_end_token_id: Some(5),
+        },
     }
 }
 
@@ -192,6 +218,19 @@ impl Qwen4ExpConfig {
             self.num_hidden_layers,
             architecture.layers.len(),
         )?;
+
+        let rope = architecture
+            .layers
+            .first()
+            .map(|layer| &layer.attention.rope)
+            .ok_or_else(|| ConfigError::Invalid("the architecture has no layers".to_owned()))?;
+        if (rope.theta - self.rope_theta).abs() > f64::EPSILON {
+            return Err(ConfigError::Invalid(format!(
+                "rope theta: the typed configuration says {}, the shared architecture says {}",
+                self.rope_theta, rope.theta
+            )));
+        }
+        check("rope rotated width", self.rotary_dim(), rope.rotated_dims)?;
 
         let linear = self
             .layer_types
@@ -322,6 +361,19 @@ mod tests {
         architecture.hidden_size += 1;
         let error = config.cross_check(&architecture).expect_err("drift");
         assert!(error.to_string().contains("hidden_size"), "{error}");
+    }
+
+    #[test]
+    fn a_rope_drift_names_the_field() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("typed config");
+        let mut architecture = architecture_from_carried().expect("shared architecture");
+        architecture.layers[0].attention.rope.rotated_dims += 2;
+        let error = config.cross_check(&architecture).expect_err("drift");
+        assert!(error.to_string().contains("rope rotated width"), "{error}");
+        let mut architecture = architecture_from_carried().expect("shared architecture");
+        architecture.layers[0].attention.rope.theta = 1_000.0;
+        let error = config.cross_check(&architecture).expect_err("drift");
+        assert!(error.to_string().contains("rope theta"), "{error}");
     }
 
     #[test]

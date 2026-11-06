@@ -64,7 +64,7 @@ use crate::tp4_host::{logits_sha256, parse_list, tcp_config, tp4_seams};
 use crate::tp4_reduce::{DeviceExchange, open_exchange_reduce};
 
 /// The stage's arguments.
-pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE, the checkpoint's config.json, or the released one; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl, the default where it applies, exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
+pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE or the checkpoint's config.json; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl, the default where it applies, exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
 
 /// One `flag`'s numeric value.
 fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String>
@@ -255,21 +255,19 @@ impl GlmArgs {
         Ok(parsed)
     }
 
-    /// `--config`, else the checkpoint's `config.json`, else the released configuration.
+    /// `--config`, else the checkpoint's `config.json`. A run without either is refused: the
+    /// configuration describes the checkpoint that is actually loaded, not a carried release.
     fn config(&self) -> Result<Glm5NextConfig, String> {
         let path = self
             .config
             .clone()
-            .or_else(|| self.checkpoint.as_ref().map(|dir| dir.join("config.json")));
-        match path {
-            Some(path) => {
-                let text = std::fs::read_to_string(&path)
-                    .map_err(|error| format!("{}: {error}", path.display()))?;
-                Glm5NextConfig::from_json(&text)
-                    .map_err(|error| format!("{}: {error}", path.display()))
-            }
-            None => Glm5NextConfig::glm53_flash().map_err(|error| error.to_string()),
-        }
+            .or_else(|| self.checkpoint.as_ref().map(|dir| dir.join("config.json")))
+            .ok_or_else(|| {
+                "glm-tp4 needs --config FILE or --checkpoint DIR with a config.json".to_owned()
+            })?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        Glm5NextConfig::from_json(&text).map_err(|error| format!("{}: {error}", path.display()))
     }
 }
 
@@ -703,6 +701,11 @@ fn speculate(
 mod tests {
     use super::*;
 
+    fn parsed_from(line: &str) -> GlmArgs {
+        let args: Vec<&str> = line.split_whitespace().collect();
+        GlmArgs::parse(&args).expect("a parseable argument line")
+    }
+
     #[test]
     fn parses_a_rank_and_refuses_what_it_cannot_run() {
         let line = "--tp-rank 2 --tp-world-size 4 --comm-peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
@@ -762,6 +765,12 @@ mod tests {
         let mut adaptive = args.clone();
         adaptive.extend("--streams 1 --draft 0,7 --dflash2 /d --depth adaptive".split_whitespace());
         assert!(GlmArgs::parse(&adaptive).expect("an adaptive run").adaptive);
+        let unconverted = parsed_from("--converted /w --prompt-tokens 3,7,11");
+        let error = unconverted
+            .config()
+            .expect_err("a converted-only run needs --config");
+        assert!(error.contains("--config"), "{error}");
+
         let unprompted: Vec<&str> = args[..args.len() - 6].to_vec();
         let error = GlmArgs::parse(&unprompted).expect_err("no prompt");
         assert!(error.contains("--prompt-tokens"), "{error}");

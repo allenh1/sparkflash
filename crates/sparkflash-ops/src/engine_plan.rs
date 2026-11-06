@@ -32,7 +32,7 @@
 //! [EnginePlan::from_json] is the short form a boot path uses; [EnginePlan::from_architecture]
 //! is the form a test or a synthetic checkpoint uses when it already holds the architecture.
 
-use sparkflash_model::architecture::{AttentionKind, Ffn, Residual, Side};
+use sparkflash_model::architecture::{AttentionKind, Ffn, Residual, Side, WeightFormat};
 use sparkflash_model::{
     Architecture, ConfigError, ModelBackend, Part, StepRole, Target, TpAxis, TpPlan, TpPlanError,
 };
@@ -48,6 +48,8 @@ pub struct PrecisionPolicy {
     pub dense: Precision,
     /// Routed and shared experts.
     pub experts: Precision,
+    /// The MTP stage's experts, when the release stores them differently.
+    pub mtp: Precision,
     /// Attention operands, when they differ from the dense class.
     pub attention: Precision,
 }
@@ -55,50 +57,37 @@ pub struct PrecisionPolicy {
 impl PrecisionPolicy {
     /// Read the policy the released quantization block describes.
     ///
-    /// The mapping is deliberately conservative: an unknown method falls back to BF16 rather
-    /// than guessing a narrower format, and an expert format is read independently of the dense
-    /// format because the two releases already differ.
+    /// The formats are already typed by [Architecture]'s parser; this maps each one through
+    /// [precision_of], so the dense, expert and MTP classes cannot disagree with the names the
+    /// checkpoint declares. An MTP stage that names no separate format uses the backbone experts'
+    /// format, which is what the release means by naming only one.
     #[must_use]
     pub fn from_architecture(architecture: &Architecture) -> Self {
-        let method = architecture
-            .quantization
-            .method
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let scale = architecture
-            .quantization
-            .scale
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let expert = architecture
-            .quantization
-            .expert
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let dense = if method.contains("nvfp4") {
-            Precision::NvFp4
-        } else if method.contains("fp8") || method.contains("mxfp8") {
-            if scale.contains("ue8m0") {
-                Precision::MxFp8
-            } else {
-                Precision::Fp8E4M3
-            }
-        } else {
-            Precision::Bf16
-        };
-        let experts = if expert.contains("fp4") {
-            Precision::NvFp4
-        } else {
-            dense
-        };
+        let quantization = &architecture.quantization;
+        let dense = precision_of(quantization.dense_format);
+        let experts = precision_of(quantization.expert_format);
+        let mtp = quantization.mtp_expert_format.map_or(experts, precision_of);
         Self {
             dense,
             experts,
+            mtp,
             attention: dense,
         }
+    }
+}
+
+/// The operand precision one stored weight format uses.
+///
+/// The two 4-bit formats share [Precision::NvFp4]: the ops library has one 4-bit operand
+/// class (its kernel is named for MXFP4's block but serves both), and the release's format
+/// still selects the loader. Every other format is distinct.
+#[must_use]
+pub const fn precision_of(format: WeightFormat) -> Precision {
+    match format {
+        WeightFormat::Bf16 => Precision::Bf16,
+        WeightFormat::Fp8Tile { .. } => Precision::Fp8E4M3,
+        WeightFormat::MxFp8 { .. } => Precision::MxFp8,
+        WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => Precision::NvFp4,
     }
 }
 
@@ -258,6 +247,18 @@ impl EnginePlan {
         self.tp
     }
 
+    /// The cache claim this plan's architecture makes at this rank's world size.
+    ///
+    /// The caller states the absorbed-MLA latent representation explicitly (`latent_fp8`),
+    /// because the same checkpoint can be served with either cache; the architecture must not
+    /// infer it from the weight format. Every indexer term still comes from the checkpoint.
+    ///
+    /// # Errors
+    /// A checkpoint whose compressed caches [Architecture::kv_plan] does not model.
+    pub fn kv_plan(&self, latent_fp8: bool) -> Result<sparkflash_model::KvPlan, ConfigError> {
+        self.architecture.kv_plan(self.tp.world(), latent_fp8)
+    }
+
     /// The precision policy.
     #[must_use]
     pub const fn precision(&self) -> PrecisionPolicy {
@@ -320,7 +321,8 @@ pub trait EngineBuilder {
 
 fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
     match part {
-        Part::Moe | Part::Mtp => policy.experts,
+        Part::Moe => policy.experts,
+        Part::Mtp => policy.mtp,
         Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::KdaScan => policy.attention,
         Part::Embedding | Part::RmsNorm => Precision::Bf16,
         _ => policy.dense,
@@ -385,7 +387,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: precision.experts,
+            precision: precision.mtp,
         });
     }
     if let Some(vision) = &architecture.vision {

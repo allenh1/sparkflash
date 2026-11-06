@@ -34,7 +34,6 @@
 //! one key per residual stream.
 
 use serde::Deserialize;
-use sparkflash_model::config::OneOrMany;
 
 /// The end-of-text id the chat template and the PLE segment rule use.
 pub const ENDOFTEXT_TOKEN: u32 = 248_044;
@@ -275,9 +274,24 @@ impl Qwen4ExpConfig {
     /// [ConfigError::Json] for a malformed document and [ConfigError::Invalid] for a shape this
     /// pack cannot serve.
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
-        // The shared document is read first, so the arm's typed view and the tree's canonical
-        // architecture are proven to describe the same model before any weight is planned.
         let architecture = crate::architecture::architecture_from_json(text)?;
+        Self::from_json_with_architecture(text, architecture)
+    }
+
+    /// Parse a released HF `config.json` whose shared architecture was already read.
+    ///
+    /// The serving path reads the architecture through
+    /// [sparkflash_model::Architecture::from_checkpoint_dir], so `generation_config.json`
+    /// contributes the stop set, and passes it here rather than letting this function parse a
+    /// second, generation-config-less view.
+    ///
+    /// # Errors
+    /// As [Self::from_json].
+    pub fn from_json_with_architecture(
+        text: &str,
+        architecture: sparkflash_model::Architecture,
+    ) -> Result<Self, ConfigError> {
+        let mut architecture = architecture;
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let text = root.text_config;
@@ -318,10 +332,27 @@ impl Qwen4ExpConfig {
             .or(text.partial_rotary_factor)
             .unwrap_or(1.0);
         let mrope_section = rope.mrope_section.unwrap_or([11, 11, 10]);
-        let mut eos_token_ids = text.eos_token_id.into_vec();
+        // A fine-tune may omit `rope_parameters.rope_theta` and inherit the release's base.
+        // The shared architecture is the one parser that decides that default (10,000,000 for
+        // Qwen's hybrid linear-attention documents, 10,000 otherwise); following it here keeps
+        // the two views equal instead of parsing a second, silent default.
+        let rope_theta = rope.rope_theta.unwrap_or_else(|| {
+            architecture
+                .layers
+                .first()
+                .map_or(10_000.0, |layer| layer.attention.rope.theta)
+        });
+        // One stop set: the checkpoint's. `Architecture::from_checkpoint_dir` has already
+        // unioned `generation_config.json` onto the config's ids, and the config's order is
+        // first. Qwen's own config names only <|endoftext|>; the pack also stops on
+        // <|im_end|>, which the reference appends when the vocabulary can hold it. Push the
+        // same list back into the shared architecture so the runtime and the codec read one
+        // list rather than two stop sets that happen to agree today.
+        let mut eos_token_ids = architecture.tokens.eos_token_ids.clone();
         if text.vocab_size > IM_END_TOKEN as usize && !eos_token_ids.contains(&IM_END_TOKEN) {
             eos_token_ids.push(IM_END_TOKEN);
         }
+        architecture.tokens.eos_token_ids = eos_token_ids.clone();
         let quant = root.quantization_config.unwrap_or_default();
         let expert_quant = ExpertQuant::of(&quant)?;
         let mut ple_layer_ids = text.ple_layer_ids.unwrap_or_default();
@@ -335,7 +366,7 @@ impl Qwen4ExpConfig {
             head_dim: text.head_dim,
             vocab_size: text.vocab_size,
             rms_norm_eps: text.rms_norm_eps,
-            rope_theta: rope.rope_theta.unwrap_or(10_000_000.0),
+            rope_theta,
             partial_rotary_factor,
             mrope_section,
             max_position_embeddings: text.max_position_embeddings,
@@ -412,6 +443,22 @@ impl Qwen4ExpConfig {
         // different mix (say an FP8 checkpoint) would need a different loader.
         quant.validate()?;
         Ok(config)
+    }
+
+    /// Parse a checkpoint directory, merging its `generation_config.json`.
+    ///
+    /// This is the serving path's constructor: the typed profile and the shared architecture
+    /// both read the same merged stop set, so the codec's validation and the runtime's stop
+    /// check cannot disagree about which ids end a generation.
+    ///
+    /// # Errors
+    /// A read or parse failure, or a document this pack cannot serve.
+    pub fn from_checkpoint_dir(directory: &std::path::Path) -> Result<Self, ConfigError> {
+        let architecture = sparkflash_model::Architecture::from_checkpoint_dir(directory)?;
+        let path = directory.join("config.json");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| ConfigError::Json(format!("{}: {error}", path.display())))?;
+        Self::from_json_with_architecture(&text, architecture)
     }
 
     /// The tiny reference configuration, stored as the FP8 checkpoint's experts.
@@ -574,6 +621,21 @@ impl Qwen4ExpConfig {
         // The shared architecture reads the top-level key, so the rendered document carries it
         // or the round trip would describe a different rotary width.
         text["partial_rotary_factor"] = serde_json::json!(self.partial_rotary_factor);
+        // The shared parser reads the stage's per-rank ownership from the nested `mtp.hybrid`
+        // shape plus Qwen's `mtp_use_dedicated_embeddings` marker; render both or a round trip
+        // would turn the Qwen stage back into a replicated one.
+        if self
+            .architecture
+            .mtp
+            .as_ref()
+            .is_some_and(|mtp| !mtp.replicated)
+        {
+            text["mtp"] = serde_json::json!({
+                "hybrid": true,
+                "num_hidden_layers": self.mtp_num_hidden_layers,
+            });
+            text["mtp_use_dedicated_embeddings"] = serde_json::json!(false);
+        }
         if let Some(bos) = self.bos_token_id {
             text["bos_token_id"] = serde_json::json!(bos);
         }
@@ -591,6 +653,9 @@ impl Qwen4ExpConfig {
             "vision_start_token_id": self.vision_start_token_id,
             "vision_end_token_id": self.vision_end_token_id,
         });
+        if let Some(video) = self.architecture.tokens.video_token_id {
+            root["video_token_id"] = serde_json::json!(video);
+        }
         // The document must round-trip the format its plan was built from, so the expert format
         // is written from the typed field rather than re-derived from the shared architecture.
         let mut quant = serde_json::Map::new();
@@ -613,6 +678,12 @@ impl Qwen4ExpConfig {
                     quant.insert(
                         "expert_weight".to_owned(),
                         serde_json::json!({ "quant_algo": expert }),
+                    );
+                }
+                if let Some(mtp) = quantization.mtp_expert_format {
+                    quant.insert(
+                        "mtp_expert_weight".to_owned(),
+                        serde_json::json!({ "quant_algo": mtp.name() }),
                     );
                 }
             }
@@ -1133,8 +1204,6 @@ struct TextConfig {
     #[serde(default)]
     pad_token_id: Option<u32>,
     #[serde(default)]
-    eos_token_id: OneOrMany<u32>,
-    #[serde(default)]
     mtp_num_hidden_layers: usize,
 }
 
@@ -1342,6 +1411,90 @@ mod tests {
         assert_eq!(config.output_gate_type, "sigmoid");
         assert!(config.output_gate_is_sigmoid());
         assert!(config.norm_topk_prob);
+    }
+
+    #[test]
+    fn the_checkpoint_directory_stop_set_is_one_source() {
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-qwen-stop-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(
+            directory.join("config.json"),
+            include_str!("../config/qwen38_flash_next_nvfp4.hf.json"),
+        )
+        .expect("config.json");
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id": [248044, 248099, 248044]}"#,
+        )
+        .expect("generation_config.json");
+        let config = Qwen4ExpConfig::from_checkpoint_dir(&directory).expect("the checkpoint");
+        assert_eq!(
+            config.eos_token_ids,
+            [248044, 248099, IM_END_TOKEN],
+            "the config's id stays first, generation_config adds one, and im_end is appended"
+        );
+        assert_eq!(
+            config.architecture.tokens.eos_token_ids, config.eos_token_ids,
+            "the codec's and the runtime's stop sets are the same list"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_generation_config_cannot_move_the_first_eos() {
+        // Qwen's real generation_config order is [248046, 248044]. Replacing the config's set
+        // would put im_end first, change the PLE segment reset, and change served arithmetic.
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-qwen-eos-order-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(
+            directory.join("config.json"),
+            include_str!("../config/qwen38_flash_next_nvfp4.hf.json"),
+        )
+        .expect("config.json");
+        std::fs::write(
+            directory.join("generation_config.json"),
+            r#"{"eos_token_id": [248046, 248044]}"#,
+        )
+        .expect("generation_config.json");
+        let config = Qwen4ExpConfig::from_checkpoint_dir(&directory).expect("the checkpoint");
+        assert_eq!(config.eos_token_ids.first(), Some(&ENDOFTEXT_TOKEN));
+        assert_eq!(config.eos_token_ids, [ENDOFTEXT_TOKEN, IM_END_TOKEN]);
+        assert_eq!(
+            config.architecture.tokens.eos_token_ids, config.eos_token_ids,
+            "the typed profile and the architecture share one list"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_qwen_document_that_omits_rope_theta_loads_with_one_base() {
+        // A fine-tune may drop `rope_parameters.rope_theta` and inherit the hybrid release's
+        // 10,000,000 base. Before the aligned default, the typed parser invented 10,000,000 while
+        // the shared architecture invented 10,000, and the cross-check refused the document.
+        let mut document: serde_json::Value =
+            serde_json::from_str(include_str!("../config/qwen38_flash_next_nvfp4.hf.json"))
+                .expect("the carried document");
+        document
+            .get_mut("text_config")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|text| text.get_mut("rope_parameters"))
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the released rope block")
+            .remove("rope_theta");
+        let config = Qwen4ExpConfig::from_json(&document.to_string()).expect("the fine-tune loads");
+        assert_eq!(config.rope_theta, 10_000_000.0);
+        assert_eq!(
+            config.architecture.layers[0].attention.rope.theta, config.rope_theta,
+            "the typed profile and the shared architecture agree on the inherited base"
+        );
     }
 
     #[test]

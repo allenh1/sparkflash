@@ -109,6 +109,47 @@ impl VisionTowerConfig {
         }
     }
 
+    /// The shared architecture's structural tower geometry, or None without a tower.
+    ///
+    /// This reads the checkpoint rather than the carried configuration: a fine-tune that changes
+    /// the patch grid or the merge factor keeps the same codec arithmetic.
+    #[must_use]
+    pub fn from_architecture(architecture: &sparkflash_model::Architecture) -> Option<Self> {
+        let geometry = architecture.vision_geometry()?;
+        // A geometry the kernels cannot run is not a tower: refuse it here rather than build a
+        // codec with a zero merge cell or a zero-width merger.
+        geometry.validate().ok()?;
+        Some(Self::from_geometry(&geometry))
+    }
+
+    /// The arm's defaults over one validated structural geometry.
+    #[must_use]
+    fn from_geometry(geometry: &sparkflash_model::VisionGeometry) -> Self {
+        let cell = geometry.patch_size * geometry.spatial_merge_size;
+        Self {
+            depth: geometry.depth,
+            hidden_size: geometry.hidden_size,
+            num_heads: geometry.num_heads,
+            intermediate_size: geometry.intermediate_size,
+            out_hidden_size: geometry.out_hidden_size,
+            patch_size: geometry.patch_size,
+            temporal_patch_size: geometry.temporal_patch_size,
+            spatial_merge_size: geometry.spatial_merge_size,
+            num_position_embeddings: geometry.num_position_embeddings,
+            rope_theta: geometry.rope_theta,
+            min_pixels: if geometry.min_pixels > 0 {
+                geometry.min_pixels
+            } else {
+                65_536
+            },
+            max_pixels: if geometry.max_pixels > 0 {
+                geometry.max_pixels
+            } else {
+                MAX_MERGED_TOKENS.saturating_mul(cell).saturating_mul(cell)
+            },
+        }
+    }
+
     /// The released configuration, or None for a checkpoint without a vision tower.
     #[must_use]
     pub fn from_config(config: &Qwen4ExpConfig) -> Option<Self> {
@@ -117,7 +158,7 @@ impl VisionTowerConfig {
         let patch_size = config.vision_patch_size.unwrap_or(16);
         let spatial_merge_size = config.vision_spatial_merge_size.unwrap_or(2);
         let cell = patch_size * spatial_merge_size;
-        Some(Self {
+        let tower = Self {
             depth,
             hidden_size,
             num_heads: config.vision_num_heads.unwrap_or(16),
@@ -130,7 +171,9 @@ impl VisionTowerConfig {
             rope_theta: config.vision_rope_theta.unwrap_or(10_000.0),
             min_pixels: 65_536,
             max_pixels: MAX_MERGED_TOKENS.saturating_mul(cell).saturating_mul(cell),
-        })
+        };
+        tower.geometry().validate().ok()?;
+        Some(tower)
     }
 
     /// Pixels per side of one merged token (patch * merge).
@@ -260,6 +303,10 @@ impl Qwen4Vision {
     pub fn load(directory: &std::path::Path, config: &Qwen4ExpConfig) -> Result<Self, String> {
         let tower = VisionTowerConfig::from_config(config)
             .ok_or_else(|| "the configuration has no vision tower".to_owned())?;
+        tower
+            .geometry()
+            .validate()
+            .map_err(|error| error.to_string())?;
         let source =
             SafeTensorsSource::open(directory, &directory.join(crate::checkpoint::INDEX_NAME))
                 .map_err(|error| error.to_string())?;
@@ -780,16 +827,56 @@ impl QwenVisionCodec {
         }
     }
 
+    /// The codec a checkpoint's shared architecture names, or None without a vision tower.
+    ///
+    /// # Errors
+    /// When the checkpoint carries a tower but omits any of the three token ids the template
+    /// inserts; a defaulted id would decode to a different token than the one the model expects.
+    pub fn from_architecture(
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Option<Self>, String> {
+        let Some(geometry) = architecture.vision_geometry() else {
+            return Ok(None);
+        };
+        // A tower whose geometry the kernels cannot run is a refusal, not a text-only model.
+        geometry.validate().map_err(|error| error.to_string())?;
+        let tower = VisionTowerConfig::from_geometry(&geometry);
+        let tokens = &architecture.tokens;
+        let image_token_id = tokens
+            .image_token_id
+            .ok_or("the checkpoint carries a vision tower but names no image_token_id")?;
+        let vision_start_token_id = tokens
+            .vision_start_token_id
+            .ok_or("the checkpoint carries a vision tower but names no vision_start_token_id")?;
+        let vision_end_token_id = tokens
+            .vision_end_token_id
+            .ok_or("the checkpoint carries a vision tower but names no vision_end_token_id")?;
+        Ok(Some(Self::new(
+            tower,
+            image_token_id,
+            vision_start_token_id,
+            vision_end_token_id,
+        )))
+    }
+
     /// The codec a checkpoint configuration names, or None without a vision tower.
-    #[must_use]
-    pub fn from_config(config: &Qwen4ExpConfig) -> Option<Self> {
-        let tower = VisionTowerConfig::from_config(config)?;
-        Some(Self::new(
+    ///
+    /// # Errors
+    /// A vision geometry the kernels cannot run.
+    pub fn from_config(config: &Qwen4ExpConfig) -> Result<Option<Self>, String> {
+        let Some(tower) = VisionTowerConfig::from_config(config) else {
+            return Ok(None);
+        };
+        tower
+            .geometry()
+            .validate()
+            .map_err(|error| error.to_string())?;
+        Ok(Some(Self::new(
             tower,
             config.image_token_id,
             config.vision_start_token_id,
             config.vision_end_token_id,
-        ))
+        )))
     }
 
     /// A codec for tests: the same span rules at a small pixel budget.

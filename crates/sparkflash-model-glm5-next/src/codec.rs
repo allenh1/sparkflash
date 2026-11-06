@@ -38,8 +38,6 @@ use std::path::Path;
 use serde_json::Value;
 use sparkflash_model::{PromptCodec, PromptError};
 
-use crate::config::Glm5NextConfig;
-
 /// The serialized special tokens the released template writes.
 pub const GMASK: &str = "[gMASK]";
 /// The start-of-prompt token.
@@ -92,43 +90,69 @@ impl GlmCodec {
     /// When the file is missing, is not a tokenizer, or does not carry the released special tokens
     /// at ids inside the checkpoint's vocabulary.
     pub fn from_path(path: &Path) -> Result<Self, String> {
-        let tokenizer = tokenizers::Tokenizer::from_file(path)
-            .map_err(|error| format!("cannot load tokenizer {}: {error}", path.display()))?;
-        Self::new(tokenizer)
+        let architecture = crate::architecture::architecture_from_carried()
+            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
+        Self::from_path_with_architecture(path, &architecture)
     }
 
-    /// Wrap an already loaded tokenizer.
+    /// Load a `tokenizer.json` and validate it against a checkpoint's parsed architecture.
+    ///
+    /// # Errors
+    /// As [Self::new_with_architecture], plus a read/parse failure.
+    pub fn from_path_with_architecture(
+        path: &Path,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| format!("cannot load tokenizer {}: {error}", path.display()))?;
+        Self::new_with_architecture(tokenizer, architecture)
+    }
+
+    /// Wrap an already loaded tokenizer with the released configuration carried in this crate.
+    ///
+    /// # Errors
+    /// As [Self::new_with_architecture].
+    pub fn new(tokenizer: tokenizers::Tokenizer) -> Result<Self, String> {
+        let architecture = crate::architecture::architecture_from_carried()
+            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
+        Self::new_with_architecture(tokenizer, &architecture)
+    }
+
+    /// Wrap an already loaded tokenizer and validate it against `architecture`.
     ///
     /// # Errors
     /// When the tokenizer does not spell one of the released special tokens, when a spelling's id
     /// is outside the checkpoint's vocabulary, or when the tokenizer's vocabulary is wider than the
     /// model's. A silently substituted id would produce a prompt the model reads as ordinary text,
     /// which is worse than refusing to serve.
-    pub fn new(tokenizer: tokenizers::Tokenizer) -> Result<Self, String> {
-        let config = Glm5NextConfig::glm53_flash()
-            .map_err(|error| format!("cannot read the carried configuration: {error}"))?;
-        if tokenizer.get_vocab_size(true) > config.vocab_size {
+    pub fn new_with_architecture(
+        tokenizer: tokenizers::Tokenizer,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let vocab = architecture.vocab_size;
+        if tokenizer.get_vocab_size(true) > vocab {
             return Err(format!(
-                "the tokenizer holds {} ids, past the checkpoint's vocabulary {}",
-                tokenizer.get_vocab_size(true),
-                config.vocab_size
+                "the tokenizer holds {} ids, past the checkpoint's vocabulary {vocab}",
+                tokenizer.get_vocab_size(true)
             ));
         }
         let special = |spelling: &str| {
             let id = special_id(&tokenizer, spelling)?;
-            if id as usize >= config.vocab_size {
+            if id as usize >= vocab {
                 return Err(format!(
-                    "the tokenizer's {spelling} is {id}, outside the checkpoint vocabulary {}",
-                    config.vocab_size
+                    "the tokenizer's {spelling} is {id}, outside the checkpoint vocabulary {vocab}"
                 ));
             }
             Ok(id)
         };
         let endoftext = special("<|endoftext|>")?;
-        if !config.eos_token_ids.contains(&endoftext) {
+        if architecture.tokens.eos_token_ids.is_empty() {
+            return Err("the checkpoint configuration names no end-of-generation token".to_owned());
+        }
+        if !architecture.tokens.eos_token_ids.contains(&endoftext) {
             return Err(format!(
                 "the tokenizer's <|endoftext|> is {endoftext}, but the checkpoint configuration ends at {:?}",
-                config.eos_token_ids
+                architecture.tokens.eos_token_ids
             ));
         }
         Ok(Self {
@@ -559,6 +583,19 @@ mod tests {
 
     fn codec() -> GlmCodec {
         GlmCodec::new(tiny_tokenizer()).expect("the toy tokenizer carries the specials")
+    }
+
+    #[test]
+    fn a_checkpoint_with_no_eos_is_refused() {
+        let mut architecture =
+            crate::architecture::architecture_from_carried().expect("the carried configuration");
+        architecture.tokens.eos_token_ids.clear();
+        let error = GlmCodec::new_with_architecture(tiny_tokenizer(), &architecture)
+            .expect_err("a codec without a stop id would never end a generation");
+        assert!(
+            error.contains("names no end-of-generation token"),
+            "{error}"
+        );
     }
 
     #[test]
