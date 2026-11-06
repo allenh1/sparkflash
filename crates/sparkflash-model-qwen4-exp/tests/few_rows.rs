@@ -930,6 +930,8 @@ struct Moe {
 const MOE_HIDDEN: usize = 2560;
 const MOE_INTERMEDIATE: usize = 640;
 const MOE_EXPERTS: usize = 12;
+/// The rows one plan item holds, the shared plan's `item_rows` for this arm.
+const MOE_ITEM_ROWS: usize = 32;
 const MOE_TOPK: usize = 10;
 
 impl Moe {
@@ -957,11 +959,21 @@ impl Moe {
             1024,
             &[
                 self.indices.0,
-                slots as u64,
-                MOE_EXPERTS as u64,
                 self.sorted.0,
                 self.items.0,
                 self.item_count.0,
+                0,
+                slots as u64,
+                MOE_EXPERTS as u64,
+                MOE_TOPK as u64,
+                MOE_ITEM_ROWS as u64,
+                (slots.div_ceil(MOE_ITEM_ROWS) + MOE_EXPERTS.min(slots)) as u64,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0,
                 self.partials.0,
                 hidden as u64,
             ],
@@ -1038,7 +1050,6 @@ fn a_few_rows_are_the_bits_the_expert_panel_computes_and_within_the_split_bound(
     };
     let modules: Vec<_> = [
         "q4p_split_bf16",
-        "q4p_moe_plan",
         "q4p_moe_gate_up",
         "q4p_moe_down",
         "q4p_moe_rows_gate_up",
@@ -1047,6 +1058,11 @@ fn a_few_rows_are_the_bits_the_expert_panel_computes_and_within_the_split_bound(
     .into_iter()
     .map(load)
     .collect();
+    // The plan is the shared image's (kernels/moe_plan_sm121.cu), not the prefill image's.
+    let plan = cuda
+        .load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")
+        .unwrap_or_else(|error| panic!("moe_plan: {error}"))
+        .1;
     let kernel = |i: usize| modules[i].1;
     // A cold prefill's chunk (past GEMM_MIN_BATCH, so the panel) and the decode-sized prefixes.
     const TOKENS: usize = 80;
@@ -1100,9 +1116,9 @@ fn a_few_rows_are_the_bits_the_expert_panel_computes_and_within_the_split_bound(
     let slots = TOKENS * topk;
     let moe = Moe {
         split: kernel(0),
-        plan: kernel(1),
-        panel: (kernel(2), kernel(3)),
-        rows: (kernel(4), kernel(5)),
+        plan,
+        panel: (kernel(1), kernel(2)),
+        rows: (kernel(3), kernel(4)),
         table: upload(&cuda, &table),
         scales: upload(&cuda, &f32_bytes(&weight_scale_2)),
         indices: upload(

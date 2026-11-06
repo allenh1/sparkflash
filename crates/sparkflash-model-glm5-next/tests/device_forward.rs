@@ -44,7 +44,7 @@ use sparkflash_model_glm5_next::{
     DeviceRank, DeviceSequence, Glm5NextConfig, Glm5NextWeights, MAX_ROWS,
 };
 use sparkflash_ops::dflash::write_synthetic_drafter;
-use sparkflash_ops::images::qwen4_available as cubin_available;
+use sparkflash_ops::images::{glm_decode_available, qwen4_available};
 use sparkflash_weights::linalg::{self, EngineError, REFERENCE_TENSOR_LIMIT};
 use sparkflash_weights::rank_file::rank_file_name;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -67,8 +67,8 @@ fn stride_tokens(config: &Glm5NextConfig, count: usize, stride: usize, first: us
 
 /// A CUDA context, or why this run cannot have one.
 fn open() -> Option<Arc<CudaHandle>> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
+    if !qwen4_available() || !glm_decode_available() {
+        eprintln!("skipped: this build embeds no Qwen4-Exp or GLM decode cubin");
         return None;
     }
     match Cuda::load() {

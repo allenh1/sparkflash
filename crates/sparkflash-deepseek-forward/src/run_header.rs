@@ -161,7 +161,19 @@ impl RunHeader {
     /// # Errors
     /// As [`Self::decide`].
     pub fn from_env() -> Result<Self, String> {
-        Self::decide(|name| std::env::var(name).ok())
+        let profile = sparkflash_model::active_profile();
+        Self::decide(|name| {
+            if name == LAYER_DEVICE_ENV {
+                return profile.diagnostics.layer_device.clone();
+            }
+            if name == FORWARD_EVIDENCE_ENV {
+                return profile
+                    .diagnostics
+                    .forward_evidence
+                    .map(|value| if value { "1" } else { "0" }.to_owned());
+            }
+            std::env::var(name).ok()
+        })
     }
 
     /// The raw switches and transport variables of one lookup, for a run that refused before a

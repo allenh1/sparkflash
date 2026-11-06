@@ -217,6 +217,73 @@ limitations under the License.
         </div>
       </div>
 
+      <section class="panel form model-panel" id="model-panel" aria-labelledby="model-panel-title">
+        <div class="panel-head padded">
+          <div>
+            <h2 id="model-panel-title">Model</h2>
+            <p class="panel-sub">Choose a checkpoint from this Spark’s cache, or search Hugging Face. The family sets the engine and TP size.</p>
+          </div>
+        </div>
+        <fieldset>
+          <legend>Model and runtime</legend>
+          <div class="fields">
+            <div class="field span-2">
+              <span id="model-id-label">Model <em>Hugging Face ID, from the cache on the lead node</em></span>
+              <div class="input-row">
+                <select id="model-id" aria-labelledby="model-id-label" aria-describedby="model-source"></select>
+                <button id="rescan-models" class="btn btn-icon" type="button" title="Rescan the Hugging Face cache" aria-label="Rescan the Hugging Face cache"><svg><use href="#i-refresh"/></svg></button>
+              </div>
+              <small id="model-source" class="model-source">Reading the Hugging Face cache…</small>
+            </div>
+            <div class="model-browser span-2" aria-label="Browse models">
+              <div id="model-families" class="model-families" role="listbox" aria-label="Model families">
+                <span class="model-family-loading">Reading families…</span>
+              </div>
+              <div class="model-browser-main">
+                <div class="model-search-row">
+                  <input id="model-search" type="search" placeholder="Search Hugging Face models…" aria-label="Search Hugging Face models">
+                  <button id="model-search-button" class="btn btn-sm" type="button"><svg><use href="#i-search"/></svg>Search</button>
+                </div>
+                <div id="model-results" class="model-results" aria-live="polite">
+                  <p class="empty">Pick a family, or search the Hub and this Spark’s cache.</p>
+                </div>
+                <p id="model-browser-note" class="note hidden"></p>
+              </div>
+            </div>
+            <label class="field">
+              <span>Architecture</span>
+              <select id="model-weights" disabled></select>
+              <small>Set from the selected model; not a separate choice.</small>
+            </label>
+            <label class="field">
+              <span>Engine</span>
+              <select id="engine-kind" disabled></select>
+              <small>Set from the selected model: V4.1 and GLM-5.3 are TP=4, Qwen3.8 is TP=1.</small>
+            </label>
+            <label class="field">
+              <span>Max context <em>tokens</em></span>
+              <input id="max-context" type="number" min="1" max="1048576" step="1" required>
+              <div class="chips" aria-label="Context presets">
+                <button class="chip" type="button" data-context="131072">128K</button>
+                <button class="chip" type="button" data-context="262144">256K</button>
+                <button class="chip" type="button" data-context="524288">512K</button>
+                <button class="chip" type="button" data-context="1048576">1M</button>
+              </div>
+            </label>
+            <label class="field">
+              <span>Max concurrency <em>sequences</em></span>
+              <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
+              <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
+            </label>
+          </div>
+        </fieldset>
+        <div class="savebar" id="model-savebar" aria-live="polite">
+          <span class="savebar-text">Unsaved changes</span>
+          <button id="discard-model" class="btn btn-ghost" type="button">Discard</button>
+          <button id="save-model" class="btn btn-primary" type="button">Save configuration</button>
+        </div>
+      </section>
+
       <ol class="guide" id="guide" aria-label="Setup steps">
         <li class="guide-step" id="g-find" data-step="find">
           <div class="guide-head">
@@ -307,45 +374,6 @@ limitations under the License.
           <button id="reload-config" class="btn btn-sm" type="button"><svg><use href="#i-refresh"/></svg>Reload file</button>
         </div>
           <form id="config-form" class="panel form" autocomplete="off" spellcheck="false">
-            <fieldset>
-              <legend>Model and runtime</legend>
-              <div class="fields">
-                <div class="field span-2">
-                  <span id="model-id-label">Model <em>Hugging Face ID, from the cache on the lead node</em></span>
-                  <div class="input-row">
-                    <select id="model-id" aria-labelledby="model-id-label" aria-describedby="model-source"></select>
-                    <button id="rescan-models" class="btn btn-icon" type="button" title="Rescan the Hugging Face cache" aria-label="Rescan the Hugging Face cache"><svg><use href="#i-refresh"/></svg></button>
-                  </div>
-                  <small id="model-source" class="model-source">Reading the Hugging Face cache…</small>
-                </div>
-                <label class="field">
-                  <span>Architecture</span>
-                  <select id="model-weights" disabled></select>
-                  <small>Set from the selected model; not a separate choice.</small>
-                </label>
-                <label class="field">
-                  <span>Engine</span>
-                  <select id="engine-kind" disabled></select>
-                  <small>Set from the selected model: V4.1 and GLM-5.3 are TP=4, Qwen3.8 is TP=1.</small>
-                </label>
-                <label class="field">
-                  <span>Max context <em>tokens</em></span>
-                  <input id="max-context" type="number" min="1" max="1048576" step="1" required>
-                  <div class="chips" aria-label="Context presets">
-                    <button class="chip" type="button" data-context="131072">128K</button>
-                    <button class="chip" type="button" data-context="262144">256K</button>
-                    <button class="chip" type="button" data-context="524288">512K</button>
-                    <button class="chip" type="button" data-context="1048576">1M</button>
-                  </div>
-                </label>
-                <label class="field">
-                  <span>Max concurrency <em>sequences</em></span>
-                  <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
-                  <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
-                </label>
-              </div>
-            </fieldset>
-
             <fieldset>
               <legend>Nodes <small>Rank order is launch order.</small></legend>
               <div class="table-wrap">

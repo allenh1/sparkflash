@@ -22,7 +22,7 @@
 
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
+use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_attn_cubin};
 
 fn open() -> Option<Cuda> {
     if !cubin_available() {
@@ -141,10 +141,10 @@ fn the_block_scores_sum_in_the_block_trees_order() {
     let pooled_on = upload_f32(&cuda, &vec![f32::NAN; pooled_blocks * DIM]);
     let scores_on = upload_f32(&cuda, &vec![f32::NAN; rows * stride]);
     let (_, pool) = cuda
-        .load_named(embedded_cubin(), "q4e_qsa_pool")
+        .load_named(embedded_attn_cubin(), "q4e_qsa_pool")
         .expect("the cubin carries q4e_qsa_pool");
     let (_, score) = cuda
-        .load_named(embedded_cubin(), "q4e_qsa_scores")
+        .load_named(embedded_attn_cubin(), "q4e_qsa_scores")
         .expect("the cubin carries q4e_qsa_scores");
     cuda.launch(
         pool,
@@ -321,7 +321,7 @@ fn the_radix_pick_keeps_what_the_heap_kept() {
     const BUDGET: usize = 512;
     const SELECT_STRIDE: usize = 2304;
     let (_, pick) = cuda
-        .load_named(embedded_cubin(), "q4e_qsa_pick")
+        .load_named(embedded_attn_cubin(), "q4e_qsa_pick")
         .expect("the cubin carries q4e_qsa_pick");
     let mut rng = Lcg(0x7_0b1c);
     // Under a block, across the budget, and far past it; the scores on a coarse grid, so ties

@@ -40,6 +40,7 @@ const S = {
   guideOpen: {},
   guideHtml: {},
   models: null,
+  browser: { family: "", query: "", results: null, error: null, busy: false, timer: null },
   shelfHtml: "",
   autoDiscovered: false,
   firstState: true,
@@ -223,6 +224,7 @@ function showTab(name) {
 function markDirty() {
   S.configDirty = true;
   $("config-form").classList.add("dirty");
+  $("model-panel")?.classList.add("dirty");
   syncContextChips();
 }
 
@@ -230,6 +232,7 @@ function clearDirty() {
   S.configDirty = false;
   S.configSignature = "";
   $("config-form").classList.remove("dirty");
+  $("model-panel")?.classList.remove("dirty");
 }
 
 function requireSaved() {
@@ -479,7 +482,142 @@ async function loadModels(quiet = false) {
     button.classList.remove("busy");
   }
   paintModels();
+  paintFamilies();
   renderShelf();
+  if (S.browser.results === null) searchModels("", true);
+}
+
+/* Model browser: families on the side, Hub and cache results in the middle. */
+
+function modelFamilies() {
+  const families = S.models?.families || [];
+  return [{ label: "All", search: "", world_size: null }, ...families];
+}
+
+function paintFamilies() {
+  const host = $("model-families");
+  if (!host) return;
+  const active = S.browser.family || "";
+  host.innerHTML = modelFamilies().map((family) => {
+    const value = family.label === "All" ? "" : (family.weights || family.label);
+    const selected = value === active;
+    const meta = family.world_size ? (family.world_size === 1 ? "TP=1" : "TP=" + family.world_size) : "";
+    return '<button type="button" role="option" aria-selected="' + selected + '" class="model-family' +
+      (selected ? " active" : "") + '" data-family="' + esc(value) + '">' +
+      '<span>' + esc(family.label) + "</span>" +
+      (meta ? '<small>' + esc(meta) + "</small>" : "") + "</button>";
+  }).join("");
+}
+
+function searchModels(term = $("model-search")?.value || "", quiet = false) {
+  if (S.browser.timer) { clearTimeout(S.browser.timer); S.browser.timer = null; }
+  const family = S.browser.family || "";
+  const query = (term || "").trim();
+  S.browser.query = query;
+  S.browser.busy = true;
+  S.browser.error = null;
+  paintModelResults();
+  const params = new URLSearchParams();
+  params.set("q", query);
+  if (family) params.set("family", family);
+  api("/api/models/search?" + params.toString())
+    .then((result) => {
+      S.browser.results = result.models || [];
+      S.browser.error = result.error || null;
+    })
+    .catch((error) => {
+      S.browser.results = [];
+      S.browser.error = error.message;
+      if (!quiet) toast("Could not search models: " + error.message, true);
+    })
+    .finally(() => {
+      S.browser.busy = false;
+      paintModelResults();
+    });
+}
+
+function paintModelResults() {
+  const host = $("model-results");
+  if (!host) return;
+  if (S.browser.busy) {
+    host.innerHTML = '<p class="empty">Searching Hugging Face and the local cache…</p>';
+    return;
+  }
+  if (S.browser.error) {
+    host.innerHTML = '<p class="empty warn">' + esc(S.browser.error) + "</p>";
+    return;
+  }
+  const results = S.browser.results || [];
+  if (results.length === 0) {
+    host.innerHTML = '<p class="empty">No model matched. Try another name, or download one on this page.</p>';
+    return;
+  }
+  host.innerHTML = results.map((model) => {
+    const notes = [];
+    if (model.family) notes.push(model.family);
+    if (model.downloads) notes.push(formatCount(model.downloads) + " downloads");
+    if (model.cached) notes.push("in cache" + (model.complete ? "" : " (incomplete)"));
+    const badge = model.supported
+      ? '<span class="model-badge ok">runs here</span>'
+      : model.cached
+        ? '<span class="model-badge">unsupported</span>'
+        : '<span class="model-badge muted">not cached</span>';
+    return '<button type="button" class="model-result' + (model.supported ? "" : " dim") +
+      '" data-model-id="' + esc(model.id) + '">' +
+      '<span class="model-result-main"><strong>' + esc(model.id) + "</strong>" +
+      '<span class="model-result-meta">' + esc(notes.join(" · ") || "Hugging Face") + "</span></span>" +
+      badge + "</button>";
+  }).join("");
+}
+
+function formatCount(value) {
+  if (value >= 1e6) return (value / 1e6).toFixed(1) + "M";
+  if (value >= 1e3) return (value / 1e3).toFixed(1) + "k";
+  return String(value);
+}
+
+async function selectBrowsedModel(id) {
+  const found = (S.browser.results || []).find((model) => model.id === id);
+  if (!found) return;
+  let model = found;
+  if (!model.supported && !model.cached) {
+    try {
+      const inspected = await api("/api/models/inspect?id=" + encodeURIComponent(id));
+      if (inspected.error) throw new Error(inspected.error);
+      model = inspected.model;
+    } catch (error) {
+      toast("Could not inspect " + id + ": " + error.message, true);
+      return;
+    }
+  }
+  if (model && model.supported === false) {
+    toast(id + " is not a checkpoint this build can load" + (model.family ? " as " + model.family : "") + ".", true);
+    return;
+  }
+  chooseBrowsedModel(model);
+}
+
+function chooseBrowsedModel(model) {
+  const select = $("model-id");
+  if (!Array.from(select.options).some((option) => option.value === model.id)) {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.id + (model.cached ? "" : " — not downloaded");
+    select.appendChild(option);
+  }
+  select.value = model.id;
+  if (model.weights) $("model-weights").value = model.weights;
+  if (model.engine) $("engine-kind").value = model.engine;
+  if (model.context_tokens) {
+    $("max-context").max = model.context_tokens;
+    if (Number($("max-context").value) > model.context_tokens) {
+      $("max-context").value = model.context_tokens;
+    }
+  }
+  applyModelProfile(model.id);
+  paintModelSource();
+  markDirty();
+  toast(model.id + (model.cached ? " selected from the cache." : " selected; the download step will fetch it."));
 }
 
 function formatSize(bytes) {
@@ -522,10 +660,14 @@ function paintModels(selected) {
   }
   if (current && !options.some((option) => option.value === current)) {
     const cached = cache.find((model) => model.id === current);
-    const why = cached
-      ? (!cached.complete ? "download incomplete" : "unsupported " + (cached.model_type || "model type"))
-      : "not a release this build can run";
-    options.unshift({ value: current, text: current + " — " + why, disabled: true });
+    if (cached) {
+      const why = !cached.complete
+        ? "download incomplete"
+        : "unsupported " + (cached.model_type || "model type");
+      options.unshift({ value: current, text: current + " — " + why, disabled: !cached.complete });
+    } else {
+      options.unshift({ value: current, text: current + " — not downloaded", disabled: false });
+    }
   }
   const signature = JSON.stringify(options);
   if (select.dataset.signature !== signature) {
@@ -850,8 +992,8 @@ function collectConfig() {
 async function saveConfig() {
   const config = collectConfig();
   if (!config) return;
-  const button = $("save-config");
-  button.disabled = true;
+  const buttons = [$("save-config"), $("save-model")].filter(Boolean);
+  buttons.forEach((button) => { button.disabled = true; });
   try {
     await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
     clearDirty();
@@ -862,7 +1004,7 @@ async function saveConfig() {
   } catch (error) {
     toast("Not saved: " + error.message, true);
   } finally {
-    button.disabled = false;
+    buttons.forEach((button) => { button.disabled = false; });
   }
 }
 
@@ -2446,6 +2588,29 @@ function bindEvents() {
 
   $("rescan-models").addEventListener("click", () => loadModels());
   $("shelf-refresh").addEventListener("click", () => loadModels());
+  $("model-families").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-family]");
+    if (!button) return;
+    S.browser.family = button.dataset.family || "";
+    paintFamilies();
+    searchModels($("model-search").value);
+  });
+  $("model-search-button").addEventListener("click", () => searchModels($("model-search").value));
+  $("model-search").addEventListener("input", () => {
+    if (S.browser.timer) clearTimeout(S.browser.timer);
+    S.browser.timer = setTimeout(() => searchModels($("model-search").value), 300);
+  });
+  $("model-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      searchModels($("model-search").value);
+    }
+  });
+  $("model-results").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-model-id]");
+    const id = button && (button.dataset.modelId || button.getAttribute("data-model-id"));
+    if (id) selectBrowsedModel(id);
+  });
   $("model-shelf").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-shelf-act]");
     if (!button || button.disabled || !requireSaved()) return;
@@ -2490,7 +2655,12 @@ function bindEvents() {
   $("model-id").addEventListener("change", () => {
     applyModelProfile();
     paintModelSource();
+    markDirty();
   });
+  $("max-context").addEventListener("input", markDirty);
+  $("max-concurrency").addEventListener("input", markDirty);
+  $("save-model").addEventListener("click", saveConfig);
+  $("discard-model").addEventListener("click", discardConfig);
   $("checkpoint").addEventListener("input", paintModelSource);
 
   const form = $("config-form");

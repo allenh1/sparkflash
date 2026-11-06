@@ -20,6 +20,12 @@ selected_tokens = 2048
 enabled = true
 depth = 3
 
+# The drafter's kernel variants are left unset, which is the set the arm was qualified with:
+# `DrafterProfile` defaults every one of them to true, and `logits` staying unset keeps the tiled
+# head (naming a head-logits kernel turns it off for the untiled tensor-core path). Writing them
+# out named the same kernels the defaults already select, and an arm profile that names an
+# arithmetic switch is a change the numerics gate judges - so they are defaults, not settings.
+
 [sequence]
 parallel = true
 overlap = true

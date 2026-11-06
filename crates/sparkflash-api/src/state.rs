@@ -184,6 +184,8 @@ pub struct AppState {
     build_id: Option<Arc<str>>,
     /// The numerics identity this process claims (docs/NUMERICS.md), for the card.
     numerics: Option<Arc<NumericsIdentity>>,
+    /// The advertised knobs with the values this process resolved, for the card's `settings`.
+    settings: Arc<[sparkflash_model::settings::Resolved]>,
 }
 
 impl AppState {
@@ -210,6 +212,7 @@ impl AppState {
             served_checkpoint: None,
             build_id: None,
             numerics: None,
+            settings: Arc::from(Vec::new()),
         }
     }
 
@@ -262,6 +265,24 @@ impl AppState {
     #[must_use]
     pub fn numerics(&self) -> Option<&NumericsIdentity> {
         self.numerics.as_deref()
+    }
+
+    /// Records the advertised knobs and the values this process resolved.
+    ///
+    /// `sparkflash serve` passes [sparkflash_model::settings::resolve] of the profile it applied,
+    /// so `/v1/models` reports the daemon's own values beside their defaults and their help text
+    /// rather than a client's copy of them.
+    #[must_use]
+    pub fn with_settings(mut self, settings: Vec<sparkflash_model::settings::Resolved>) -> Self {
+        self.settings = Arc::from(settings);
+        self
+    }
+
+    /// The advertised knobs with their resolved values, which is empty when nothing advertised
+    /// one: a weight-free test then renders no `settings` member rather than a made-up default.
+    #[must_use]
+    pub fn settings(&self) -> &[sparkflash_model::settings::Resolved] {
+        &self.settings
     }
 
     /// Adds model ids this server answers to besides its own descriptor id.
@@ -549,6 +570,8 @@ mod tests {
         let descriptor = ModelDescriptor {
             id: "tiny-dense".to_owned(),
             family: "dense".to_owned(),
+            model_type: "dense".to_owned(),
+            label: "Dense".to_owned(),
             weights_id: "tiny-dense".to_owned(),
             context_tokens: 4096,
             max_output_tokens: 1024,

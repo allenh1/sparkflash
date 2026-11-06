@@ -111,6 +111,66 @@ DeepSeek's two-shot uses: each rank sums its quarter of the
 elements in the same rank order and the sums are gathered, so the bits are the one-shot's at half
 the bytes a rank (`SPARKFLASH_TWO_SHOT_ROWS`, default 16, 0 for never).
 
+### Speculation from a served request
+
+#### Served, with the DFlash 2 block drafter
+
+The four-rank serve arm drafts with a DFlash 2 block drafter when the profile names one
+(`SPARKFLASH_GLM_DFLASH2`, the typed `speculation.drafter` field): every rank loads it, a
+request's window is a block-drafting one, and the depth is the shared speculator's
+([D72](../DECISIONS.md)) — adaptive, because the block drafter says how sure it is of each draft,
+weighed against `DFLASH2_STEP_COST`. This is the first served measurement of it (2026-11-05, four
+Sparks, converted ranks, one stream, greedy, 24-token prompt, 200 generated tokens, one run each):
+
+| Drafter | Decode | Time to first token | A step | Tokens a step |
+| :-- | --: | --: | --: | --: |
+| MTP layer, 2 drafts | 51.3 tok/s | 498 ms | ~78 ms | 2.6 |
+| **DFlash 2 block, adaptive depth** | **80.7 tok/s** (1M window) / **82.1** (64k) | 1,378 / 602 ms | 89 / 87 ms | **6.9** |
+
+The request's own counters (28 verify steps for 200 tokens, `dspark_speculative`) say what the
+drafter is worth: **196 drafts proposed, 13 gated by the depth policy, 177 accepted (90.3 %),
+7.32 tokens a verify step**. The drafter is not the problem and a deeper chain would not help —
+the block proposes seven drafts, so eight tokens a step is the ceiling and 86 ms a step puts that
+at 93 tok/s.
+
+#### The gap to 100 tok/s
+
+The target is a **step budget, not a drafter budget**: at 7.3 tokens a step, 100 tok/s needs
+**73 ms** where the arm spends 86-89; at the eight-token ceiling it needs 80.
+
+`SPARKFLASH_GLM_PROF=1` (the typed `diagnostics.profile` field) puts marks around the step's
+stages, and the steady state of a 200-token request at eight verified rows says where the 86 ms
+goes (134.6 ms profiled a step — a mark drains the stream, so each stage is an upper bound):
+
+| stage | profiled | share | scaled to 86 ms |
+| :-- | --: | --: | --: |
+| routed experts (`moe`) | 83.0 ms | 61.7 % | ~53 ms |
+| mHC and the layer's all-reduce (`mhc_in`) | 28.3 ms | 21.0 % | ~18 ms |
+| KDA attention (`attn_kda`) | 13.0 ms | 9.7 % | ~12 ms |
+| sparse attention (`attn_dsa`) | 5.6 ms | 4.1 % | |
+| dense layers (`mlp`) | 2.4 ms | 1.8 % | |
+| head and fold (`tail`) | 0.7 ms | 0.5 % | |
+
+The experts cost what they cost because the decode path reads each *selected pair*: a step of eight
+rows over eight experts a row is 64 expert reads a layer, where a prefill chunk's grouped path
+reads each distinct expert once. That is the lever for the last 20 %: halving the expert reads
+takes the step to about 60 ms, which at 7.3 tokens a step is past 100 tok/s.
+
+The gain is entirely in tokens a step: a verify of seven rows costs 89 ms against the two-row
+MTP step's 78 ms, and 6.9 accepted tokens turn that into 1.6x the rate. A chat request with a
+thinking block measures 59 tok/s, because reasoning accepts fewer drafts.
+
+Two defects this measured, both fixed:
+
+- **A model knob that only rank 0 inherited split the group.** `serve-four-node.sh` forwarded
+  `SPARKFLASH_{PREFILL,BATCH,DECODE,ENGRAM}_*` and now forwards `SPARKFLASH_{GLM,QWEN4,SPEC,DRAFTS}*`
+  too. Before that, rank 0 ran the block drafter and ranks 1-3 the MTP layer, and the group's
+  first collective blocked with no error: 503 after two minutes with `steps=0`.
+- **A block-drafting window cannot be reset in place.** `DeviceRank::reset` refuses one (its
+  drafter context is keyed to the rows the request captured), so a request now replaces the
+  window: the old one is dropped first, because two 18.2 GiB windows do not fit beside the
+  94 GB rank at the 1M default.
+
 Measured on the four Sparks (converted ranks, the 1M window, greedy, one request at a time):
 
 | Collective | Load a rank | Decode a request | 2,204-token prompt: first token, then a step |
@@ -141,7 +201,8 @@ drafting. The drafting window's MTP caches leave the prompt's first-token time a
 
 A prompt of [MIN_PREFILL_ROWS](#the-released-model-at-tp4) (16) rows or more runs in chunks through
 the tensor cores
-(`kernels/glm_prefill_sm121.cu`, embedded in the binary). The release quantises an FP8
+(`kernels/glm_prefill_sm121.cu` for the dense GEMMs and `kernels/glm_moe_sm121.cu` for the
+routed experts, embedded in the binary). The release quantises an FP8
 projection's input to E4M3 codes with an f32 scale per 128 columns, as the decode GEMV does, so
 by default the bulk GEMMs take it the same way: each chunk row is quantised once
 (`glm_quantise_rows`) and an `m16n8k32` E4M3 x E4M3 MMA runs against the block-scaled weight, both

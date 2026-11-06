@@ -355,7 +355,10 @@ impl MoeDeviceBackendImpl {
                 ..MoeDeviceStats::default()
             },
             diagnose_layer0: false,
-            router_twin_enabled: std::env::var("SPARKFLASH_ROUTER_TWIN").is_ok(),
+            router_twin_enabled: sparkflash_model::active_profile()
+                .diagnostics
+                .router_twin
+                .unwrap_or(false),
             router_records: Vec::new(),
             launches_by_layer: vec![0; 64],
             head_certified: Vec::new(),
@@ -1792,8 +1795,10 @@ impl MoeDeviceBackend for MoeDeviceBackendImpl {
             device_text.join(", "),
             best_value.to_bits() == reduce_value.to_bits()
         );
-        let force_host = std::env::var("SPARKFLASH_HEAD_HOST_ASSEMBLY")
-            .is_ok_and(|value| value == "1" || value == "true");
+        let force_host = sparkflash_model::active_profile()
+            .diagnostics
+            .head_host_assembly
+            .unwrap_or(false);
         if reduce_status & !0x7 != 0 {
             return Err(err(
                 "device head reduce",

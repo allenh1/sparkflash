@@ -24,6 +24,7 @@
 //! * plan is the vocabulary: dtypes, layouts, streams, OpPlan and Launch.
 //! * gemm, attention, scan, epilogue and collective are the typed plans.
 //! * images exposes the shared cubins, so no model crate compiles CUDA.
+//! * parts is the per-target catalogue: which image and symbols implement each model part.
 //! * parity is the bring-up harness an arm runs against its host reference.
 //! * gemv, gdn and tp are the shared launch helpers the Qwen, GLM and DeepSeek arms call.
 //!
@@ -58,20 +59,30 @@ pub mod attention;
 pub mod codec;
 pub mod collective;
 pub mod dflash;
+pub mod engine_plan;
 pub mod epilogue;
 pub mod error;
 pub mod gemm;
 pub mod images;
 pub mod parity;
+pub mod parts;
 pub mod plan;
+pub mod resolver;
 pub mod sampler;
 pub mod scan;
 
 pub mod gdn;
 pub mod gemv;
+pub mod tower;
 pub mod tp;
 
-pub use error::OpError;
-pub use plan::{
-    DType, KernelId, Launch, Layout, Matrix, OpKind, OpPlan, Operand, Precision, StreamId,
+pub use engine_plan::{
+    EngineBuilder, EnginePlan, LayerExecution, PartRequirement, PlanError, PrecisionPolicy,
 };
+pub use error::OpError;
+pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
+pub use plan::{
+    DType, KernelId, Launch, Layout, Matrix, OpKind, OpPlan, Operand, PartGeometry, Precision,
+    PrecisionMask, ShapeConstraint, StreamId,
+};
+pub use resolver::{Availability, KernelResolver, ResolveError, ResolvedKernel};

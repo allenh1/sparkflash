@@ -22,21 +22,35 @@
 //! the bytes that could still become the closing marker, so a streamed answer is never truncated
 //! by a marker split across two deltas.
 //!
-//! The GLM tool-call XML is not parsed here yet; it is streamed as content, as the model page says.
+//! The released template wraps a call in `<tool_call>` with a `{name}<arg_key>k</arg_key>
+//! <arg_value>v</arg_value>...</tool_call>` body, which this layer lifts out of the content stream
+//! into [EngineEvent::ToolCallDelta]. The block framing is the shared
+//! [crate::tool_block::BlockSplitter]'s; only the body is GLM's.
 
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use serde_json::{Map, Value};
 
 use crate::engine::{
     Capabilities, ClusterStatsSnapshot, EngineEvent, EngineRequest, FinishReason, InferenceEngine,
     MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
+use crate::tool_block::{Block, BlockSplitter, CALL_CLOSE, CALL_OPEN};
 
 /// The marker that ends the GLM reasoning block.
 const THINK_CLOSE: &str = "</think>";
+
+/// The marker that opens one argument's key.
+const ARG_KEY_OPEN: &str = "<arg_key>";
+/// The marker that closes one argument's key.
+const ARG_KEY_CLOSE: &str = "</arg_key>";
+/// The marker that opens one argument's value.
+const ARG_VALUE_OPEN: &str = "<arg_value>";
+/// The marker that closes one argument's value.
+const ARG_VALUE_CLOSE: &str = "</arg_value>";
 
 /// One parsed GLM answer fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +59,54 @@ pub enum GlmEvent {
     Reasoning(String),
     /// Visible answer text, after `</think>`.
     Content(String),
+    /// A complete tool call, with its arguments as the OpenAI JSON string.
+    ToolCall {
+        /// Position of this call among the answer's calls.
+        index: usize,
+        /// The function the model named.
+        name: String,
+        /// The arguments object, serialised as a JSON string.
+        arguments: String,
+    },
+}
+
+/// One tool call's name and arguments, parsed out of the template's body.
+///
+/// The body is the function's name followed by `<arg_key>`/`<arg_value>` pairs, which is what
+/// the released template renders (`render_tool_call` in the model pack). A value is read as JSON
+/// when it is one and as a string when it is not, which is the reading the released parser uses;
+/// a bare `true`, `5` or `{"a":1}` therefore keeps its type, and a bare word does not.
+///
+/// `None` means the body is not a call this arm can spell: an empty name, or a pair whose key or
+/// value markers do not close.
+#[must_use]
+pub fn parse_tool_call(body: &str) -> Option<(String, String)> {
+    let body = body.trim();
+    let (name, rest) = match body.find(ARG_KEY_OPEN) {
+        Some(index) => (&body[..index], &body[index..]),
+        None => (body, ""),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut arguments = Map::new();
+    let mut rest = rest;
+    while !rest.is_empty() {
+        let rest_after_key = rest.strip_prefix(ARG_KEY_OPEN)?;
+        let (key, rest_after_key) = rest_after_key.split_once(ARG_VALUE_OPEN)?;
+        let key = key.strip_suffix(ARG_KEY_CLOSE)?;
+        let (value, rest_after_value) = rest_after_key.split_once(ARG_VALUE_CLOSE)?;
+        let value = match serde_json::from_str::<Value>(value) {
+            Ok(Value::String(text)) => Value::String(text),
+            Ok(json) => json,
+            Err(_) => Value::String(value.to_owned()),
+        };
+        arguments.insert(key.to_owned(), value);
+        rest = rest_after_value.trim_start();
+    }
+    let arguments = serde_json::to_string(&Value::Object(arguments)).ok()?;
+    Some((name.to_owned(), arguments))
 }
 
 /// The incremental GLM answer parser.
@@ -58,6 +120,10 @@ pub enum GlmEvent {
 pub struct GlmStreamParser {
     reasoning_done: bool,
     buffer: String,
+    /// The content stream after the reasoning block, split into text and tool-call bodies.
+    blocks: BlockSplitter,
+    /// How many complete calls the answer has emitted.
+    calls: usize,
 }
 
 impl GlmStreamParser {
@@ -67,13 +133,47 @@ impl GlmStreamParser {
         Self {
             reasoning_done: !thinking,
             buffer: String::new(),
+            blocks: BlockSplitter::new(),
+            calls: 0,
         }
+    }
+
+    /// How many complete tool calls the answer has emitted.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.calls
+    }
+
+    /// Splits content into text and tool calls, and counts the calls.
+    fn advance(&mut self, text: &str) -> Vec<GlmEvent> {
+        let mut events = Vec::new();
+        for block in self.blocks.feed(text) {
+            match block {
+                Block::Text(text) => events.push(GlmEvent::Content(text)),
+                Block::Call(body) => match parse_tool_call(&body) {
+                    Some((name, arguments)) => {
+                        events.push(GlmEvent::ToolCall {
+                            index: self.calls,
+                            name,
+                            arguments,
+                        });
+                        self.calls += 1;
+                    }
+                    // A block this arm cannot spell stays visible: dropping it would lose the
+                    // model's answer, and inventing a call is worse.
+                    None => {
+                        events.push(GlmEvent::Content(format!("{CALL_OPEN}{body}{CALL_CLOSE}")))
+                    }
+                },
+            }
+        }
+        events
     }
 
     /// Feeds one engine delta, returning the fragments that are now unambiguous.
     pub fn feed(&mut self, text: &str) -> Vec<GlmEvent> {
         if self.reasoning_done {
-            return vec![GlmEvent::Content(text.to_owned())];
+            return self.advance(text);
         }
         self.buffer.push_str(text);
         let Some(index) = self.buffer.find(THINK_CLOSE) else {
@@ -93,23 +193,31 @@ impl GlmStreamParser {
         let content = self.buffer[index + THINK_CLOSE.len()..].to_owned();
         self.buffer.clear();
         self.reasoning_done = true;
-        if !content.is_empty() {
-            events.push(GlmEvent::Content(content));
-        }
+        events.extend(self.advance(&content));
         events
     }
 
     /// Flushes the held-back tail at end of stream.
     pub fn finish(&mut self) -> Vec<GlmEvent> {
-        if self.buffer.is_empty() {
-            return Vec::new();
+        let mut events = Vec::new();
+        if !self.buffer.is_empty() {
+            let text = std::mem::take(&mut self.buffer);
+            if self.reasoning_done {
+                events.extend(self.advance(&text));
+            } else {
+                events.push(GlmEvent::Reasoning(text));
+            }
         }
-        let text = std::mem::take(&mut self.buffer);
-        if self.reasoning_done {
-            vec![GlmEvent::Content(text)]
-        } else {
-            vec![GlmEvent::Reasoning(text)]
+        // A block that never closed stays visible, as the shared splitter reads it.
+        for block in self.blocks.finish() {
+            match block {
+                Block::Text(text) => events.push(GlmEvent::Content(text)),
+                Block::Call(body) => {
+                    events.push(GlmEvent::Content(format!("{CALL_OPEN}{body}{CALL_CLOSE}")))
+                }
+            }
         }
+        events
     }
 
     /// Whether the closing marker has been seen.
@@ -187,6 +295,13 @@ impl InferenceEngine for GlmResponseEngine {
                 yield glm_engine_event(parsed);
             }
             if let Some((finish_reason, usage, stats)) = finished {
+                // A finish reason of `stop` beside a parsed call is what every client reads as
+                // "the answer ended"; the call is what actually ended it.
+                let finish_reason = if parser.calls() > 0 {
+                    FinishReason::ToolCalls
+                } else {
+                    finish_reason
+                };
                 yield EngineEvent::Finished {
                     finish_reason,
                     usage,
@@ -225,6 +340,16 @@ fn glm_engine_event(event: GlmEvent) -> EngineEvent {
     match event {
         GlmEvent::Reasoning(text) => EngineEvent::ReasoningDelta(text),
         GlmEvent::Content(text) => EngineEvent::ContentDelta(text),
+        GlmEvent::ToolCall {
+            index,
+            name,
+            arguments,
+        } => EngineEvent::ToolCallDelta {
+            index,
+            id: Some(format!("call_{index}")),
+            name: Some(name),
+            arguments_delta: arguments,
+        },
     }
 }
 
@@ -233,15 +358,140 @@ mod tests {
     use super::*;
 
     fn collect(events: Vec<GlmEvent>) -> (String, String) {
+        let (reasoning, content, _) = collect_calls(events);
+        (reasoning, content)
+    }
+
+    /// The reasoning, the visible text and each call's `(index, name, arguments)`.
+    fn collect_calls(events: Vec<GlmEvent>) -> (String, String, Vec<(usize, String, String)>) {
         let mut reasoning = String::new();
         let mut content = String::new();
+        let mut calls = Vec::new();
         for event in events {
             match event {
                 GlmEvent::Reasoning(text) => reasoning.push_str(&text),
                 GlmEvent::Content(text) => content.push_str(&text),
+                GlmEvent::ToolCall {
+                    index,
+                    name,
+                    arguments,
+                } => calls.push((index, name, arguments)),
             }
         }
-        (reasoning, content)
+        (reasoning, content, calls)
+    }
+
+    #[test]
+    fn a_tool_call_is_lifted_out_of_the_content() {
+        let mut parser = GlmStreamParser::new(true);
+        let mut events = parser.feed("thinking</think>looking it up");
+        events.extend(parser.feed(
+            "<tool_call>lookup<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+        ));
+        events.extend(parser.finish());
+        let (reasoning, content, calls) = collect_calls(events);
+        assert_eq!(reasoning, "thinking");
+        assert_eq!(content, "looking it up");
+        assert_eq!(
+            calls,
+            [(0, "lookup".to_owned(), r#"{"city":"Paris"}"#.to_owned())]
+        );
+        assert_eq!(parser.calls(), 1);
+    }
+
+    #[test]
+    fn several_calls_keep_their_order_and_their_types() {
+        let mut parser = GlmStreamParser::new(false);
+        let mut events = parser.feed(
+            "<tool_call>a<arg_key>n</arg_key><arg_value>5</arg_value>\
+             <arg_key>on</arg_key><arg_value>true</arg_value>\
+             <arg_key>rest</arg_key><arg_value>{\"k\":1}</arg_value></tool_call>",
+        );
+        events.extend(
+            parser.feed(
+                "<tool_call>b<arg_key>text</arg_key><arg_value>a word</arg_value></tool_call>",
+            ),
+        );
+        let (_, content, calls) = collect_calls(events);
+        assert_eq!(content, "");
+        assert_eq!(
+            calls,
+            [
+                (
+                    0,
+                    "a".to_owned(),
+                    r#"{"n":5,"on":true,"rest":{"k":1}}"#.to_owned()
+                ),
+                (1, "b".to_owned(), r#"{"text":"a word"}"#.to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_call_named_by_the_template_parses_to_its_name_and_no_arguments() {
+        assert_eq!(
+            parse_tool_call("ping"),
+            Some(("ping".to_owned(), "{}".to_owned()))
+        );
+        assert_eq!(parse_tool_call("   "), None);
+        assert_eq!(parse_tool_call("<arg_key>k</arg_key>"), None);
+        // A pair whose value never closes is not a call.
+        assert_eq!(parse_tool_call("f<arg_key>k</arg_key><arg_value>v"), None);
+    }
+
+    #[test]
+    fn the_adapter_emits_a_native_tool_call_and_reports_the_cause() {
+        use crate::engine::MockEngine;
+
+        let engine = MockEngine::new("glm")
+            // The released template writes `thinking{reasoning}</think>{content}` with nothing
+            // between the marker and the answer, so the mock does too.
+            .content(&[
+                "I should look.",
+                "</think>",
+                "Looking.\n\n<tool_call>read<arg_key>path</arg_key>",
+                "<arg_value>src/lib.rs</arg_value></tool_call>",
+            ])
+            .with_finish_reason(FinishReason::Stop);
+        let engine = GlmResponseEngine::new(Arc::new(engine));
+        let request = crate::engine::test_request("glm", true);
+        let events = futures::executor::block_on(engine.generate(request).collect::<Vec<_>>());
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut finish = None;
+        for event in events {
+            match event {
+                EngineEvent::ReasoningDelta(text) => reasoning.push_str(&text),
+                EngineEvent::ContentDelta(text) => content.push_str(&text),
+                EngineEvent::ToolCallDelta {
+                    index,
+                    id,
+                    name,
+                    arguments_delta,
+                } => calls.push((index, id, name, arguments_delta)),
+                EngineEvent::Finished { finish_reason, .. } => finish = Some(finish_reason),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "I should look.");
+        assert_eq!(content, "Looking.\n\n");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 0);
+        assert_eq!(calls[0].1.as_deref(), Some("call_0"));
+        assert_eq!(calls[0].2.as_deref(), Some("read"));
+        assert_eq!(calls[0].3, r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
+    fn an_unterminated_call_stays_visible() {
+        let mut parser = GlmStreamParser::new(false);
+        let mut events = parser.feed("answer<tool_call>g(");
+        events.extend(parser.finish());
+        let (_, content, calls) = collect_calls(events);
+        assert_eq!(content, "answer<tool_call>g(");
+        assert!(calls.is_empty());
     }
 
     #[test]

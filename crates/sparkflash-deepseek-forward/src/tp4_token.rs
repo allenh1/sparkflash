@@ -472,7 +472,10 @@ impl TokenEnvelope {
         }
         // A lean-head run (SPARKFLASH_LEAN_HEAD=1) dumps only the heads that read their logits
         // back: a subset of the token block's positions, never a position outside it.
-        let lean = std::env::var("SPARKFLASH_LEAN_HEAD").as_deref() == Ok("1");
+        let lean = sparkflash_model::active_profile()
+            .diagnostics
+            .lean_head
+            .unwrap_or(false);
         let paired = if lean {
             dump.rows == dump.positions.len()
                 && dump

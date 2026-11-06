@@ -35,7 +35,7 @@ use crate::config::{
     QWEN_WEIGHTS_ID, SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
 };
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
-use crate::hf::{self, CachedModel};
+use crate::hf::{self, CachedModel, RemoteModel};
 use crate::inspect::{self, Check, ProbeResult, SetupReport};
 use crate::jobs::{JobManager, JobStatus, JobSummary};
 use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
@@ -485,6 +485,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/inspect", post(inspect_nodes))
         .route("/api/network/apply", post(apply_network))
         .route("/api/models", get(models))
+        .route("/api/models/search", get(models_search))
+        .route("/api/models/inspect", get(models_inspect))
         .route("/api/series", get(series))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}", get(get_job))
@@ -1003,7 +1005,43 @@ struct ModelsView {
     models: Vec<CachedModel>,
     /// The cached models that can be prepared and swapped from the Overview page.
     shelf: Vec<ShelfModel>,
+    /// The families the browser lists on its side.
+    families: Vec<hf::Family>,
     error: Option<String>,
+}
+
+/// The model-browser search result.
+#[derive(Serialize)]
+struct ModelSearchView {
+    query: String,
+    family: Option<String>,
+    models: Vec<RemoteModel>,
+    error: Option<String>,
+}
+
+/// The selected Hub model's inspected configuration.
+#[derive(Serialize)]
+struct ModelInspectView {
+    model: Option<RemoteModel>,
+    error: Option<String>,
+}
+
+/// The model browser's search parameters.
+#[derive(Deserialize)]
+struct ModelSearchQuery {
+    /// What to search for; empty lists cached models or a family's default term.
+    q: Option<String>,
+    /// The family label or weight selector to filter by.
+    family: Option<String>,
+    /// How many Hub hits to ask for.
+    limit: Option<usize>,
+}
+
+/// The model browser's inspect parameter.
+#[derive(Deserialize)]
+struct ModelInspectQuery {
+    /// The Hugging Face model id to inspect.
+    id: String,
 }
 
 /// One cached model's readiness to be selected without editing the configuration.
@@ -1057,8 +1095,64 @@ async fn models(State(web): State<WebState>) -> Json<ModelsView> {
         cache: cache.map(|dir| dir.display().to_string()),
         models,
         shelf,
+        families: hf::families(),
         error,
     })
+}
+
+/// Search the Hub and the local cache for the model browser.
+async fn models_search(
+    State(web): State<WebState>,
+    Query(query): Query<ModelSearchQuery>,
+) -> Json<ModelSearchView> {
+    let cache = web.config().hub_cache_dir();
+    let text = query.q.unwrap_or_default();
+    let family = query.family.as_deref().and_then(|name| {
+        MODEL_PROFILES.iter().find(|profile| {
+            profile.label.eq_ignore_ascii_case(name)
+                || profile.weights.eq_ignore_ascii_case(name)
+                || profile.model_type.eq_ignore_ascii_case(name)
+        })
+    });
+    let limit = query.limit.unwrap_or(24);
+    let query_text = text.clone();
+    let searched = tokio::task::spawn_blocking(move || {
+        hf::search(cache.as_deref(), &query_text, family, limit)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("the Hub search failed: {error}")));
+    let (models, error) = match searched {
+        Ok(models) => (models, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    Json(ModelSearchView {
+        query: text,
+        family: family.map(|profile| profile.label.to_owned()),
+        models,
+        error,
+    })
+}
+
+/// Inspect one model id for the browser: a cached entry, or its Hub config.json.
+async fn models_inspect(
+    State(web): State<WebState>,
+    Query(query): Query<ModelInspectQuery>,
+) -> Json<ModelInspectView> {
+    let cache = web.config().hub_cache_dir();
+    let id = query.id;
+    let inspected = tokio::task::spawn_blocking(move || hf::inspect(cache.as_deref(), &id))
+        .await
+        .unwrap_or_else(|error| Err(format!("the model inspection failed: {error}")));
+    match inspected {
+        Ok(model) => Json(ModelInspectView {
+            model: Some(model),
+            error: None,
+        }),
+        Err(error) => Json(ModelInspectView {
+            model: None,
+            error: Some(error),
+        }),
+    }
 }
 
 /// The shelf the Overview page draws: every cached model this build can run, with the ranks
@@ -1938,6 +2032,9 @@ mod tests {
         .expect("utf8");
         assert!(html.contains("SparkFlash Control"));
         assert!(html.contains("model-shelf"));
+        assert!(html.contains("id=\"model-panel\""));
+        assert!(html.contains("id=\"model-search\""));
+        assert!(html.contains("id=\"model-families\""));
         assert!(html.contains("prefers-color-scheme") || html.contains("dark"));
         let css = app
             .oneshot(
@@ -2287,6 +2384,10 @@ mod tests {
         assert_eq!(models["models"][0]["supported"], true);
         assert_eq!(models["models"][1]["id"], "org/other");
         assert_eq!(models["models"][1]["supported"], false);
+        let families = models["families"].as_array().expect("families");
+        assert_eq!(families.len(), crate::config::MODEL_PROFILES.len());
+        assert!(families.iter().any(|family| family["label"] == "DeepSeek"));
+        assert!(families.iter().any(|family| family["label"] == "Qwen"));
         let state = body_json(app.clone().oneshot(get("/api/state")).await.expect("state")).await;
         assert_eq!(state["checkpoint"]["from_cache"], true);
         assert_eq!(
@@ -2307,6 +2408,97 @@ mod tests {
         assert!(
             error.contains("already in the Hugging Face cache"),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_model_browser_searches_the_cache_and_inspects_before_selecting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_model(
+            &dir.path().join("hub"),
+            crate::config::DEFAULT_MODEL_ID,
+            "1bae0e1",
+            "deepseek_v41",
+        );
+        let app = test_router(test_state(dir.path()));
+        let get = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request")
+        };
+        // An empty query lists the cache and does not depend on the network.
+        let search = body_json(
+            app.clone()
+                .oneshot(get("/api/models/search?q="))
+                .await
+                .expect("search"),
+        )
+        .await;
+        assert_eq!(search["error"], serde_json::Value::Null);
+        assert_eq!(search["models"][0]["id"], crate::config::DEFAULT_MODEL_ID);
+        assert_eq!(search["models"][0]["cached"], true);
+        assert_eq!(search["models"][0]["family"], "DeepSeek");
+
+        // Selecting a cached model resolves its profile without a network read.
+        let inspected = body_json(
+            app.oneshot(get(&format!(
+                "/api/models/inspect?id={}",
+                crate::config::DEFAULT_MODEL_ID
+            )))
+            .await
+            .expect("inspect"),
+        )
+        .await;
+        assert_eq!(inspected["error"], serde_json::Value::Null);
+        assert_eq!(
+            inspected["model"]["weights"],
+            crate::config::DEFAULT_WEIGHTS_ID
+        );
+        assert_eq!(inspected["model"]["family"], "DeepSeek");
+        assert_eq!(inspected["model"]["cached"], true);
+    }
+
+    #[tokio::test]
+    async fn the_browser_family_side_filters_the_cache_without_the_network() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (id, revision, kind) in [
+            (crate::config::DEFAULT_MODEL_ID, "a", "deepseek_v41"),
+            (crate::config::QWEN_MODEL_ID, "b", "qwen4_exp"),
+            (crate::config::GLM_MODEL_ID, "c", "glm5_next"),
+        ] {
+            crate::hf::tests::cache_model(&dir.path().join("hub"), id, revision, kind);
+        }
+        let app = test_router(test_state(dir.path()));
+        let get = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request")
+        };
+        let qwen = body_json(
+            app.clone()
+                .oneshot(get(&format!(
+                    "/api/models/search?q=&family={}",
+                    crate::config::QWEN_WEIGHTS_ID
+                )))
+                .await
+                .expect("search"),
+        )
+        .await;
+        assert_eq!(qwen["error"], serde_json::Value::Null);
+        assert_eq!(qwen["family"], "Qwen");
+        let ids: Vec<&str> = qwen["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect();
+        assert!(ids.contains(&crate::config::QWEN_MODEL_ID), "{ids:?}");
+        assert!(
+            ids.iter()
+                .all(|id| id.to_ascii_lowercase().contains("qwen")),
+            "{ids:?}"
         );
     }
 

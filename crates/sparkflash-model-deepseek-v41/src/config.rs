@@ -234,12 +234,21 @@ impl ModelConfig {
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| ConfigError::Json(e.to_string()))?;
-        let config = if value.get("text_config").is_some() {
+        let released_document = value.get("text_config").is_some();
+        let architecture = if released_document {
+            Some(crate::architecture::architecture_from_json(text)?)
+        } else {
+            None
+        };
+        let config = if released_document {
             released::from_value(value)?
         } else {
             serde_json::from_value(value).map_err(|e| ConfigError::Json(e.to_string()))?
         };
         config.validate()?;
+        if let Some(architecture) = architecture {
+            config.cross_check(&architecture)?;
+        }
         Ok(config)
     }
 
@@ -258,8 +267,10 @@ impl ModelConfig {
     pub fn from_released_json(text: &str) -> Result<Self, ConfigError> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| ConfigError::Json(e.to_string()))?;
+        let architecture = crate::architecture::architecture_from_json(text)?;
         let config = released::from_value(value)?;
         config.validate()?;
+        config.cross_check(&architecture)?;
         Ok(config)
     }
 

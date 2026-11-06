@@ -1,0 +1,1011 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Qwen3.8-Flash-Next (Qwen4-Exp) routed-expert token kernels, TP=1.
+//
+// This is the decode/token MoE family that used to sit in qwen4_exp_sm121.cu. It is its own
+// translation unit and cubin (Image::Qwen4Moe) so the token image carries only the attention,
+// embedding, norm and dense kernels. The shared attention and dense symbols stay in
+// qwen4_exp_sm121.cu; the arithmetic here is unchanged.
+//
+// The family is: router and top-k, the routed-slot permutation and its run bounds, the NVFP4
+// gate/up and down passes, the MTP layer's 128x128-block-scaled FP8 gate/up and down passes, and
+// the combine that sums the routed partials with the sigmoid-gated shared expert.
+//
+// Attribution (as in qwen4_exp_sm121.cu):
+//   - Model architecture (Qwen4ExpForConditionalGeneration: 512-expert top-10 MoE + sigmoid-gated
+//     shared expert) originates from Qwen/Qwen3.8-Flash-Next by the Qwen team at Alibaba Cloud
+//     and the vLLM reference implementation (https://github.com/vllm-project/vllm, Apache-2.0).
+//   - NVFP4 W4A4 block-scaled quantization layout (packed E2M1 nibbles, per-16-column FP8 E4M3
+//     block scales, FP32 weight_scale_2) originates from NVIDIA's
+//     Qwen3.8-Flash-Next-NVFP4 (NVIDIA TensorRT ModelOpt 0.46).
+//   - SM120/SM121 (DGX Spark GB10) kernel design and local-inference execution patterns draw on
+//     prior art from b12x (https://github.com/local-inference-lab/b12x,
+//     flashinfer/experimental/b12x, Apache-2.0; Luke Alonso @lukealonso, @original-el8, and
+//     contributors) and NVIDIA Flare (https://github.com/NVIDIA/flare-local-inference, Apache-2.0).
+//     See the root NOTICE file for full provenance details.
+//
+// The arithmetic mirrors src/forward.rs, which is the host reference oracle. Each kernel is named
+// q4e_* and is loaded by name from the cubin, so a missing symbol is a load error rather than a
+// silent wrong launch.
+
+#include <cstdint>
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#include "prefetch_sm121.cuh"
+#include "quant_decode_sm121.cuh"
+#include "opt_pdl_sm121.cuh"
+#include "q4e_common_sm121.cuh"
+
+#define Q4E_BLOCK 256
+
+// Static shared-memory and register-tiling bounds. The driver launch path passes a dynamic
+// shared-memory size of zero, so every shared buffer is a fixed array sized for the largest
+// geometry this pack can serve, with a guard that makes an oversized request a no-op rather than
+// a corruption. The host side checks the same bounds and refuses first.
+//
+// The widest matrix row any NVFP4 expert projection stages in shared memory.
+#define Q4E_MAX_ROW 2560
+// Padding each 32-float group by 1 float (stride 33, coprime to 32) eliminates the 32-way
+// shared-memory bank conflict when a warp's 32 lanes read 32-float chunks simultaneously.
+#define Q4E_SMEM_STRIDE 33
+#define Q4E_MAX_ROW_PADDED ((Q4E_MAX_ROW >> 5) * Q4E_SMEM_STRIDE + 32)
+#define Q4E_MAX_EXPERTS 512
+#define Q4E_MAX_TOPK 64
+
+// The decoders are the shared header's; these aliases keep the kernel bodies readable.
+#define q4e_e4m3 spark_fp8_e4m3_decode
+#define q4e_e2m1 spark_fp4_e2m1_decode
+
+__device__ __forceinline__ int q4e_smem_idx(int col) {
+    return col + (col >> 5);
+}
+
+// The sixteen E2M1 codes in a block-shared table, filled once before a kernel's dots run.
+//
+// Decoding one nibble through it costs a shift, a mask and a shared-memory load, where the scalar
+// decoder needs a shift, a mask, a 32-bit table shift, an int-to-float, a scale and a sign-bit
+// insert. The routed experts walk 4.9M packed weights per (layer, slot), so that difference
+// dominates their issue-slot budget. Every code is exactly representable, so the table holds the
+// scalar decoder's own results.
+//
+// It is shared memory rather than a warp-shuffle register table on purpose: the row-dot loops start
+// each lane at a different chunk offset, so on a row that is not a whole number of 32-chunk strides
+// the lanes leave the loop at different counts, and a lane-indexed shuffle would then name lanes
+// that are no longer participating.
+__device__ __forceinline__ void q4e_e2m1_table_fill(float* table) {
+    for (int code = threadIdx.x; code < 16; code += blockDim.x) {
+        table[code] = q4e_e2m1((unsigned char)code);
+    }
+}
+
+// One nibble of a packed word, decoded through the block-shared table.
+__device__ __forceinline__ float q4e_e2m1_at(unsigned int nibble, const float* table) {
+    return table[nibble & 0x0Fu];
+}
+
+// The same table indexed by a whole packed byte: entry `code` holds the low nibble's value in
+// `.x` and the high nibble's in `.y`, so one 64-bit shared load decodes two weights. The entry
+// width is what matters as much as the count - entry `code` occupies words 2*code and 2*code+1,
+// so sixteen distinct codes span all thirty-two banks, where the sixteen-entry table packs every
+// distinct nibble into a 64-byte window and the gathers of a warp run at up to eight-way conflict.
+__device__ __forceinline__ void q4e_e2m1_table_pair_fill(float2* table) {
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        table[code] = make_float2(q4e_e2m1((unsigned char)(code & 15)),
+                                  q4e_e2m1((unsigned char)(code >> 4)));
+    }
+}
+
+__device__ __forceinline__ float2 q4e_e2m1_pair_at(unsigned int word, const float2* table) {
+    return table[word & 0xFFu];
+}
+
+__device__ __forceinline__ float q4e_silu(float value) {
+    return value / (1.0f + __expf(-value));
+}
+
+// Block argmax over (value, index) pairs, with the same tie-break as the host sort.
+__device__ __forceinline__ void q4e_block_best(float* value, int* index, float* shared_value,
+                                               int* shared_index) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q4e_take_better(__shfl_down_sync(0xFFFFFFFFu, *value, offset),
+                        (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)*index, offset), value,
+                        index);
+    }
+    if (lane == 0) {
+        shared_value[warp] = *value;
+        shared_index[warp] = *index;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float best_value = lane < warps ? shared_value[lane] : -INFINITY;
+        int best_index = lane < warps ? shared_index[lane] : 0x7FFFFFFF;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q4e_take_better(
+                __shfl_down_sync(0xFFFFFFFFu, best_value, offset),
+                (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)best_index, offset), &best_value,
+                &best_index);
+        }
+        if (lane == 0) {
+            shared_value[0] = best_value;
+            shared_index[0] = best_index;
+        }
+    }
+    __syncthreads();
+    *value = shared_value[0];
+    *index = shared_index[0];
+}
+
+// Four packed bytes (one 32-bit word): eight E2M1 weights in one 16-column scale group.
+__device__ __forceinline__ float q4e_dot_packed32(unsigned int word, const float* lut,
+                                                   const float* x_chunk) {
+    return q4e_e2m1_at(word, lut) * x_chunk[0] +
+           q4e_e2m1_at(word >> 4, lut) * x_chunk[1] +
+           q4e_e2m1_at(word >> 8, lut) * x_chunk[2] +
+           q4e_e2m1_at(word >> 12, lut) * x_chunk[3] +
+           q4e_e2m1_at(word >> 16, lut) * x_chunk[4] +
+           q4e_e2m1_at(word >> 20, lut) * x_chunk[5] +
+           q4e_e2m1_at(word >> 24, lut) * x_chunk[6] +
+           q4e_e2m1_at(word >> 28, lut) * x_chunk[7];
+}
+
+// Sixteen packed bytes (one uint4): 32 weights across two 16-column scale groups.
+// x_chunk points to the 32 contiguous floats for chunk in padded shared memory
+// (source + chunk * Q4E_SMEM_STRIDE), so all 32 lanes hit 32 distinct banks.
+__device__ __forceinline__ float q4e_dot_packed_chunk(const uint4 packed, const float* lut,
+                                                      const unsigned char* scale_row, float scale2,
+                                                      const float* x_chunk, int group) {
+    const float low = q4e_e4m3(q4e_ldg(&scale_row[group])) * scale2;
+    const float high = q4e_e4m3(q4e_ldg(&scale_row[group + 1])) * scale2;
+    return low * (q4e_dot_packed32(packed.x, lut, x_chunk) +
+                  q4e_dot_packed32(packed.y, lut, x_chunk + 8)) +
+           high * (q4e_dot_packed32(packed.z, lut, x_chunk + 16) +
+                   q4e_dot_packed32(packed.w, lut, x_chunk + 24));
+}
+
+// One warp's partial dot product of a row of an NVFP4 matrix against padded shared memory x.
+__device__ __forceinline__ float q4e_nvfp4_row_dot(const unsigned char* packed_row,
+                                                   const unsigned char* scale_row, float scale2,
+                                                   const float* lut, const float* x, int columns,
+                                                   int lane) {
+    float total = 0.0f;
+    if ((columns & 31) == 0 && ((reinterpret_cast<unsigned long long>(packed_row) & 15u) == 0)) {
+        const int chunks = columns >> 5;
+        int chunk = lane;
+        for (; chunk + 32 < chunks; chunk += 64) {
+            const uint4 first = q4e_ldg(reinterpret_cast<const uint4*>(packed_row + chunk * 16));
+            const uint4 second =
+                q4e_ldg(reinterpret_cast<const uint4*>(packed_row + (chunk + 32) * 16));
+            total += q4e_dot_packed_chunk(first, lut, scale_row, scale2,
+                                          x + chunk * Q4E_SMEM_STRIDE, chunk * 2);
+            total += q4e_dot_packed_chunk(second, lut, scale_row, scale2,
+                                          x + (chunk + 32) * Q4E_SMEM_STRIDE, (chunk + 32) * 2);
+        }
+        for (; chunk < chunks; chunk += 32) {
+            const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(packed_row + chunk * 16));
+            total += q4e_dot_packed_chunk(packed, lut, scale_row, scale2,
+                                          x + chunk * Q4E_SMEM_STRIDE, chunk * 2);
+        }
+        return total;
+    }
+    int packed = (columns + 1) >> 1;
+#pragma unroll 1
+    for (int index = lane; index < packed; index += 32) {
+        const unsigned char byte = q4e_ldg(&packed_row[index]);
+        const float scale = q4e_e4m3(q4e_ldg(&scale_row[index >> 3])) * scale2;
+        const int column = index << 1;
+        const float pair = (column + 1 < columns) ? x[q4e_smem_idx(column + 1)] : 0.0f;
+        total += (q4e_e2m1(byte & 0x0F) * x[q4e_smem_idx(column)] + q4e_e2m1(byte >> 4) * pair) *
+                 scale;
+    }
+    return total;
+}
+
+// How many of a run's members a leader block stages at once. The decode - a table load and a
+// nibble extract per weight - is half the dot product's instructions, and every member of a run
+// reuses the same weight row, so decoding once per group of members instead of once per member
+// measured a third of the routed-expert stage. Four rows of 2672 floats is 43 KiB of staging,
+// which keeps the block inside the 48 KiB of static shared memory every launch may assume.
+#define Q4E_MEMBER_GROUP 2
+
+// Rows one warp owns. Every block that partitions an expert's rows stages the run's activations
+// itself, so the staging traffic divides by the rows a block covers: at one row per warp a run's
+// members were copied into shared memory once per sixteen-row panel, which came to as many bytes
+// as the expert's weights. Two rows also put two weight-row streams in flight per warp.
+#define Q4E_ROWS_PER_WARP 2
+
+// One 32-column chunk of a gate/up row pair, decoded once and multiplied against the staged rows
+// of up to Q4E_MEMBER_GROUP run members.
+__device__ __forceinline__ void q4e_dot_packed_chunk_pair_group(
+    const uint4 g_packed, const uint4 u_packed, float g_low, float g_high, float u_low,
+    float u_high, const float2* lut, const float* base, int count, float* g_total,
+    float* u_total) {
+    const unsigned int g_words[4] = {g_packed.x, g_packed.y, g_packed.z, g_packed.w};
+    const unsigned int u_words[4] = {u_packed.x, u_packed.y, u_packed.z, u_packed.w};
+    float g_lo[Q4E_MEMBER_GROUP] = {};
+    float g_hi[Q4E_MEMBER_GROUP] = {};
+    float u_lo[Q4E_MEMBER_GROUP] = {};
+    float u_hi[Q4E_MEMBER_GROUP] = {};
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        float gate[8];
+        float up[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 g_pair = q4e_e2m1_pair_at(g_words[word] >> (8 * i), lut);
+            const float2 u_pair = q4e_e2m1_pair_at(u_words[word] >> (8 * i), lut);
+            gate[2 * i] = g_pair.x;
+            gate[2 * i + 1] = g_pair.y;
+            up[2 * i] = u_pair.x;
+            up[2 * i + 1] = u_pair.y;
+        }
+#pragma unroll
+        for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+            if (m < count) {
+                const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED + word * 8;
+                float g = 0.0f;
+                float u = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    g += gate[i] * x_chunk[i];
+                    u += up[i] * x_chunk[i];
+                }
+                if (word < 2) {
+                    g_lo[m] += g;
+                    u_lo[m] += u;
+                } else {
+                    g_hi[m] += g;
+                    u_hi[m] += u;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        if (m < count) {
+            g_total[m] += g_low * g_lo[m] + g_high * g_hi[m];
+            u_total[m] += u_low * u_lo[m] + u_high * u_hi[m];
+        }
+    }
+}
+
+// The same for a single matrix, as the down pass has.
+__device__ __forceinline__ void q4e_dot_packed_chunk_group(const uint4 packed, float low,
+                                                           float high, const float2* lut,
+                                                           const float* base, int count,
+                                                           float* out) {
+    const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    float lo[Q4E_MEMBER_GROUP] = {};
+    float hi[Q4E_MEMBER_GROUP] = {};
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+        float weight[8];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 pair = q4e_e2m1_pair_at(words[word] >> (8 * i), lut);
+            weight[2 * i] = pair.x;
+            weight[2 * i + 1] = pair.y;
+        }
+#pragma unroll
+        for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+            if (m < count) {
+                const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED + word * 8;
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    dot += weight[i] * x_chunk[i];
+                }
+                if (word < 2) {
+                    lo[m] += dot;
+                } else {
+                    hi[m] += dot;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        if (m < count) {
+            out[m] += low * lo[m] + high * hi[m];
+        }
+    }
+}
+
+// One warp's partial dot products of a gate/up row pair against the staged rows of `count` run
+// members, `base` being the member-major staging.
+__device__ __forceinline__ void q4e_nvfp4_row_dot_pair_group(
+    const unsigned char* g_row, const unsigned char* g_scale, float g_scale2,
+    const unsigned char* u_row, const unsigned char* u_scale, float u_scale2, const float* lut,
+    const float2* lut_pair, const float* base, int columns, int lane, int count, float* g_out,
+    float* u_out) {
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        g_out[m] = 0.0f;
+        u_out[m] = 0.0f;
+    }
+    if ((columns & 31) == 0 && ((reinterpret_cast<unsigned long long>(g_row) & 15u) == 0) &&
+        ((reinterpret_cast<unsigned long long>(u_row) & 15u) == 0)) {
+        const int chunks = columns >> 5;
+        for (int chunk = lane; chunk < chunks; chunk += 32) {
+            const uint4 g_packed = q4e_ldg(reinterpret_cast<const uint4*>(g_row + chunk * 16));
+            const uint4 u_packed = q4e_ldg(reinterpret_cast<const uint4*>(u_row + chunk * 16));
+            const int group = chunk * 2;
+            const float g_low = q4e_e4m3(q4e_ldg(&g_scale[group])) * g_scale2;
+            const float g_high = q4e_e4m3(q4e_ldg(&g_scale[group + 1])) * g_scale2;
+            const float u_low = q4e_e4m3(q4e_ldg(&u_scale[group])) * u_scale2;
+            const float u_high = q4e_e4m3(q4e_ldg(&u_scale[group + 1])) * u_scale2;
+            q4e_dot_packed_chunk_pair_group(g_packed, u_packed, g_low, g_high, u_low, u_high,
+                                            lut_pair, base + chunk * Q4E_SMEM_STRIDE, count, g_out,
+                                            u_out);
+        }
+        return;
+    }
+    for (int m = 0; m < count; ++m) {
+        g_out[m] = q4e_nvfp4_row_dot(g_row, g_scale, g_scale2, lut,
+                                      base + m * Q4E_MAX_ROW_PADDED, columns, lane);
+        u_out[m] = q4e_nvfp4_row_dot(u_row, u_scale, u_scale2, lut,
+                                      base + m * Q4E_MAX_ROW_PADDED, columns, lane);
+    }
+}
+
+// And for the down pass's single matrix.
+__device__ __forceinline__ void q4e_nvfp4_row_dot_group(const unsigned char* packed_row,
+                                                        const unsigned char* scale_row,
+                                                        float scale2, const float* lut,
+                                                        const float2* lut_pair, const float* base,
+                                                        int columns, int lane, int count,
+                                                        float* out) {
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        out[m] = 0.0f;
+    }
+    if ((columns & 31) == 0 && ((reinterpret_cast<unsigned long long>(packed_row) & 15u) == 0)) {
+        const int chunks = columns >> 5;
+        for (int chunk = lane; chunk < chunks; chunk += 32) {
+            const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(packed_row + chunk * 16));
+            const int group = chunk * 2;
+            const float low = q4e_e4m3(q4e_ldg(&scale_row[group])) * scale2;
+            const float high = q4e_e4m3(q4e_ldg(&scale_row[group + 1])) * scale2;
+            q4e_dot_packed_chunk_group(packed, low, high, lut_pair,
+                                       base + chunk * Q4E_SMEM_STRIDE, count, out);
+        }
+        return;
+    }
+    for (int m = 0; m < count; ++m) {
+        out[m] = q4e_nvfp4_row_dot(packed_row, scale_row, scale2, lut,
+                                    base + m * Q4E_MAX_ROW_PADDED, columns, lane);
+    }
+}
+
+// Rows the down pass's warps own: an expert's down row is a fifth of a gate/up pair's, so a warp
+// holds twice the rows to keep as many weight bytes in flight.
+#define Q4E_DOWN_ROWS_PER_WARP 4
+
+// The warp's first `valid` (at most ROWS) of ROWS consecutive down rows at once, rows `packed`
+// bytes and their scales `groups` bytes apart: each chunk's loads for every row are issued before
+// any of them is decoded, so a lane has ROWS loads in flight instead of one. Each row accumulates
+// its chunks in the one-row form's order, so its partials are q4e_nvfp4_row_dot_group's. (A
+// gate/up pair holds twice the loads per row and spills at ROWS 2 under four blocks an SM.)
+template <int ROWS>
+__device__ __forceinline__ void q4e_nvfp4_rows_dot_group(
+    const unsigned char* row, const unsigned char* scale_row, float scale2, int packed, int groups,
+    int valid, const float* lut, const float2* lut_pair, const float* base, int columns, int lane,
+    int count, float (*out)[Q4E_MEMBER_GROUP]) {
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+#pragma unroll
+        for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+            out[r][m] = 0.0f;
+        }
+    }
+    if ((columns & 31) != 0 || (packed & 15) != 0 ||
+        ((reinterpret_cast<unsigned long long>(row) & 15u) != 0)) {
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (r < valid) {
+                q4e_nvfp4_row_dot_group(row + r * packed, scale_row + r * groups, scale2, lut,
+                                        lut_pair, base, columns, lane, count, out[r]);
+            }
+        }
+        return;
+    }
+    const int chunks = columns >> 5;
+    for (int chunk = lane; chunk < chunks; chunk += 32) {
+        uint4 weights[ROWS];
+        unsigned short codes[ROWS];
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (r < valid) {
+                const int scale = r * groups + chunk * 2;
+                weights[r] = q4e_ldg(reinterpret_cast<const uint4*>(row + r * packed + chunk * 16));
+                codes[r] = q4e_ldg(&scale_row[scale]) | (q4e_ldg(&scale_row[scale + 1]) << 8);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            if (r < valid) {
+                q4e_dot_packed_chunk_group(weights[r], q4e_e4m3(codes[r] & 0xFF) * scale2,
+                                           q4e_e4m3(codes[r] >> 8) * scale2, lut_pair,
+                                           base + chunk * Q4E_SMEM_STRIDE, count, out[r]);
+            }
+        }
+    }
+}
+
+// Softmax over router logits and top-k selection with renormalisation (blockIdx.x = batch token).
+// Note: logits and probabilities may alias the same buffer.
+extern "C" __global__ void q4e_router(const float* logits, float* probabilities, int* indices,
+                                      int experts, int topk) {
+    OPT_PDL_ENTRY();
+    __shared__ float scratch[Q4E_BLOCK];
+    __shared__ int scratch_index[Q4E_BLOCK];
+    __shared__ float probability[Q4E_MAX_EXPERTS];
+    __shared__ int picked[Q4E_MAX_TOPK];
+    __shared__ float chosen[Q4E_MAX_TOPK];
+    if (experts <= 0 || experts > Q4E_MAX_EXPERTS || topk <= 0 || topk > Q4E_MAX_TOPK ||
+        topk > experts) {
+        return;
+    }
+    int b = blockIdx.x;
+    const float* logits_b = logits + (unsigned long long)b * experts;
+    float* probs_b = probabilities + (unsigned long long)b * experts;
+    int* indices_b = indices + (unsigned long long)b * topk;
+    int thread = threadIdx.x;
+    float local_max = -INFINITY;
+    for (int expert = thread; expert < experts; expert += blockDim.x) {
+        local_max = fmaxf(local_max, logits_b[expert]);
+    }
+    // The helper's closing barrier is what lets the sum below reuse scratch: read inline, a slow
+    // warp could take thread 0's partial sum for the maximum and route on skewed probabilities.
+    const float maximum = q4e_block_max(local_max, scratch);
+
+    float local_sum = 0.0f;
+    for (int expert = thread; expert < experts; expert += blockDim.x) {
+        float value = expf(logits_b[expert] - maximum);
+        probability[expert] = value;
+        local_sum += value;
+    }
+    float sum = q4e_block_sum(local_sum, scratch);
+    for (int expert = thread; expert < experts; expert += blockDim.x) {
+        float value = probability[expert] / sum;
+        probability[expert] = value;
+        probs_b[expert] = value;
+    }
+    __syncthreads();
+
+    for (int slot = 0; slot < topk; ++slot) {
+        float best_value = -2.0f;
+        int best = 0x7FFFFFFF;
+        for (int expert = thread; expert < experts; expert += blockDim.x) {
+            if (probability[expert] > -0.5f) {
+                q4e_take_better(probability[expert], expert, &best_value, &best);
+            }
+        }
+        q4e_block_best(&best_value, &best, scratch, scratch_index);
+        if (thread == 0) {
+            picked[slot] = best;
+            chosen[slot] = best_value;
+            probability[best] = -1.0f;
+        }
+        __syncthreads();
+    }
+    if (thread == 0) {
+        float normaliser = 0.0f;
+        for (int slot = 0; slot < topk; ++slot) {
+            normaliser += chosen[slot];
+        }
+        if (normaliser <= 0.0f) {
+            normaliser = 1.0f;
+        }
+        for (int slot = 0; slot < topk; ++slot) {
+            probs_b[slot] = chosen[slot] / normaliser;
+            indices_b[slot] = picked[slot];
+        }
+    }
+}
+
+
+// Routed experts pass one: simultaneous gate + up NVFP4 row dot products with conflict-free
+// shared-memory activation staging (blockIdx.y = slot, blockIdx.z = batch token).
+//
+// One block per expert run, not per slot. Every slot of a run reads the same expert's weight
+// rows, so the block that sorts first in the run recomputes the run's other tokens itself and the
+// rest of the run's blocks exit before their staging loop. The expert's rows are then read from
+// DRAM once per chunk and land in L2 for the run's later members instead of being fetched again.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ indices, const int* __restrict__ perm,
+    const int* __restrict__ run_bounds, const float* __restrict__ x,
+    float* __restrict__ activated, int slots, int hidden, int intermediate) {
+    OPT_PDL_ENTRY();
+    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    __shared__ float lut[16];
+    __shared__ float2 lut_pair[256];
+    if (hidden <= 0 || hidden > Q4E_MAX_ROW) {
+        return;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
+    int first_row = blockIdx.x * rows + warp * Q4E_ROWS_PER_WARP;
+    if (blockIdx.y >= slots) {
+        return;
+    }
+    // blockIdx.y + blockIdx.z * slots is the rank; the run bounds say where its run starts.
+    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
+    const int begin = run_bounds[2 * rank];
+    if (rank != begin) {
+        return;
+    }
+    const int members = run_bounds[2 * rank + 1] - begin + 1;
+    const int expert = indices[perm[begin]];
+    int groups = (hidden + 15) / 16;
+    int packed = (hidden + 1) / 2;
+    // The warp's first gate/up rows and how many of its rows the matrix has.
+    const unsigned char* grow = nullptr;
+    const unsigned char* gsrow = nullptr;
+    const unsigned char* urow = nullptr;
+    const unsigned char* usrow = nullptr;
+    const int valid = max(0, min(Q4E_ROWS_PER_WARP, intermediate - first_row));
+    float g2 = 0.0f;
+    float u2 = 0.0f;
+    if (expert >= 0) {
+        const unsigned long long row = (unsigned long long)first_row;
+        grow = (const unsigned char*)table[expert * 6 + 0] + row * packed;
+        gsrow = (const unsigned char*)table[expert * 6 + 1] + row * groups;
+        urow = (const unsigned char*)table[expert * 6 + 2] + row * packed;
+        usrow = (const unsigned char*)table[expert * 6 + 3] + row * groups;
+        g2 = scales[expert * 3 + 0];
+        u2 = scales[expert * 3 + 1];
+        // The block's panel of both matrices, fetched while the block stages its members.
+        if (threadIdx.x == 0) {
+            const unsigned long long panel = (unsigned long long)blockIdx.x * rows;
+            const long long panel_rows = min((long long)rows, (long long)intermediate - (long long)panel);
+            if (panel_rows > 0) {
+                for (int matrix = 0; matrix < 4; ++matrix) {
+                    const unsigned long long stride = (matrix & 1) ? groups : packed;
+                    spark_prefetch_l2((const unsigned char*)table[expert * 6 + matrix] + panel * stride,
+                                      panel_rows * stride);
+                }
+            }
+        }
+    }
+    q4e_e2m1_table_fill(lut);
+    q4e_e2m1_table_pair_fill(lut_pair);
+    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
+        const int count = min(Q4E_MEMBER_GROUP, members - group);
+        // The block order comes from the shared plan (kernels/moe_plan_sm121.cu): the run's members are consecutive ranks,
+        // and each writes the result back to its own (token, slot) row.
+        for (int m = 0; m < count; ++m) {
+            const int total_slot = perm[begin + group + m];
+            const int b = total_slot / slots;
+            const float* x_b = x + (unsigned long long)b * hidden;
+            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
+                staged[q4e_smem_idx(column)] = x_b[column];
+            }
+        }
+        __syncthreads();
+        if (expert < 0) {
+#pragma unroll
+            for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+                const int row = first_row + r;
+                if (row < intermediate && lane == 0) {
+                    for (int m = 0; m < count; ++m) {
+                        const int total_slot = perm[begin + group + m];
+                        activated[(unsigned long long)total_slot * intermediate + row] = 0.0f;
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+                const int row = first_row + r;
+                if (r >= valid) {
+                    continue;
+                }
+                float g[Q4E_MEMBER_GROUP];
+                float u[Q4E_MEMBER_GROUP];
+                q4e_nvfp4_row_dot_pair_group(grow + r * packed, gsrow + r * groups, g2,
+                                             urow + r * packed, usrow + r * groups, u2, lut,
+                                             lut_pair, source, hidden, lane, count, g, u);
+#pragma unroll
+                for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+                    if (m < count) {
+                        const float gate = q4e_warp_sum(g[m]);
+                        const float up = q4e_warp_sum(u[m]);
+                        if (lane == 0) {
+                            const int total_slot = perm[begin + group + m];
+                            activated[(unsigned long long)total_slot * intermediate + row] =
+                                q4e_silu(gate) * up;
+                        }
+                    }
+                }
+            }
+        }
+        // No thread may still be reading the staging when the next group lands.
+        __syncthreads();
+    }
+}
+
+// Routed experts pass two: down projection with conflict-free shared-memory staging
+// (blockIdx.y = slot, blockIdx.z = batch token). One block per expert run, as in pass one.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ indices, const int* __restrict__ perm,
+    const int* __restrict__ run_bounds, const float* __restrict__ weights,
+    const float* __restrict__ activated, float* __restrict__ partials, int slots, int hidden,
+    int intermediate, int weight_stride) {
+    OPT_PDL_ENTRY();
+    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    __shared__ float lut[16];
+    __shared__ float2 lut_pair[256];
+    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW) {
+        return;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int rows = (blockDim.x >> 5) * Q4E_DOWN_ROWS_PER_WARP;
+    int first_row = blockIdx.x * rows + warp * Q4E_DOWN_ROWS_PER_WARP;
+    if (blockIdx.y >= slots) {
+        return;
+    }
+    // blockIdx.y + blockIdx.z * slots is the rank; the run bounds say where its run starts.
+    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
+    const int begin = run_bounds[2 * rank];
+    if (rank != begin) {
+        return;
+    }
+    const int members = run_bounds[2 * rank + 1] - begin + 1;
+    const int expert = indices[perm[begin]];
+    int groups = (intermediate + 15) / 16;
+    int packed = (intermediate + 1) / 2;
+    // The warp's first down row and how many of its rows the matrix has.
+    const unsigned char* drow = nullptr;
+    const unsigned char* dsrow = nullptr;
+    const int valid = max(0, min(Q4E_DOWN_ROWS_PER_WARP, hidden - first_row));
+    float d2 = 0.0f;
+    if (expert >= 0) {
+        const unsigned long long row = (unsigned long long)first_row;
+        drow = (const unsigned char*)table[expert * 6 + 4] + row * packed;
+        dsrow = (const unsigned char*)table[expert * 6 + 5] + row * groups;
+        d2 = scales[expert * 3 + 2];
+    }
+    q4e_e2m1_table_fill(lut);
+    q4e_e2m1_table_pair_fill(lut_pair);
+    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
+        const int count = min(Q4E_MEMBER_GROUP, members - group);
+        for (int m = 0; m < count; ++m) {
+            const int total_slot = perm[begin + group + m];
+            const float* slot_activated =
+                activated + (unsigned long long)total_slot * intermediate;
+            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            for (int column = threadIdx.x; column < intermediate; column += blockDim.x) {
+                staged[q4e_smem_idx(column)] = slot_activated[column];
+            }
+        }
+        __syncthreads();
+        float value[Q4E_DOWN_ROWS_PER_WARP][Q4E_MEMBER_GROUP];
+        if (expert >= 0) {
+            q4e_nvfp4_rows_dot_group<Q4E_DOWN_ROWS_PER_WARP>(drow, dsrow, d2, packed, groups, valid,
+                                                             lut, lut_pair, source, intermediate,
+                                                             lane, count, value);
+        }
+#pragma unroll
+        for (int r = 0; r < Q4E_DOWN_ROWS_PER_WARP; ++r) {
+            const int row = first_row + r;
+            if (row >= hidden) {
+                continue;
+            }
+#pragma unroll
+            for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+                if (m < count) {
+                    const float sum = expert >= 0 ? q4e_warp_sum(value[r][m]) : 0.0f;
+                    const int total_slot = perm[begin + group + m];
+                    if (lane == 0) {
+                        const int b = total_slot / slots;
+                        const int slot = total_slot % slots;
+                        const float w = weights[(unsigned long long)b * weight_stride + slot];
+                        partials[(unsigned long long)total_slot * hidden + row] = w * sum;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// The MTP layer's routed experts are 128x128-block-scaled FP8 rather than NVFP4: one byte a
+// weight and one BF16 inverse scale per 128x128 tile, with a full-precision activation. The
+// passes are otherwise the same shape as the quantised pair above - one block per expert run,
+// the run's members staged in shared memory - so the bodies mirror them with a different decode:
+// no nibble LUT, no weight_scale_2, and the scale changes once per 128 columns rather than
+// twice per 32.
+__device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float scale,
+                                                     const float* base, int count, float* out) {
+    const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    float weight[16];
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            weight[4 * word + i] =
+                q4e_e4m3((unsigned char)((words[word] >> (8 * i)) & 0xFFu)) * scale;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        if (m < count) {
+            const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED;
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                dot += weight[i] * x_chunk[i];
+            }
+            out[m] += dot;
+        }
+    }
+}
+
+// One warp's partial dots of a single FP8 row against the staged rows of `count` members.
+__device__ __forceinline__ void q4e_fp8_row_dot_group(const unsigned char* row,
+                                                       const __nv_bfloat16* scale_row,
+                                                       const float* base, int columns, int lane,
+                                                       int count, float* out) {
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        out[m] = 0.0f;
+    }
+    // A lane owns sixteen consecutive values, so a 128-column scale tile covers whole lanes and
+    // every load is 16-byte aligned: no straddle, no masked tail, for either 2560 or 640.
+    const int chunks = columns >> 4;
+    for (int chunk = lane; chunk < chunks; chunk += 32) {
+        const int column = chunk * 16;
+        const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(row + column));
+        const float scale = __bfloat162float(q4e_ldg(&scale_row[column >> 7]));
+        q4e_fp8_chunk_group(packed, scale, base + q4e_smem_idx(column), count, out);
+    }
+}
+
+// Pass one of the MTP routed experts: gate and up, SwiGLU'd, into the slot's activated row.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_fp8(
+    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
+    const int* __restrict__ perm, const int* __restrict__ run_bounds,
+    const float* __restrict__ x, float* __restrict__ activated, int slots, int hidden,
+    int intermediate) {
+    OPT_PDL_ENTRY();
+    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    if (hidden <= 0 || hidden > Q4E_MAX_ROW || (hidden & 15) != 0) {
+        return;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
+    int first_row = blockIdx.x * rows + warp * Q4E_ROWS_PER_WARP;
+    if (blockIdx.y >= slots) {
+        return;
+    }
+    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
+    const int begin = run_bounds[2 * rank];
+    if (rank != begin) {
+        return;
+    }
+    const int members = run_bounds[2 * rank + 1] - begin + 1;
+    const int expert = indices[perm[begin]];
+    // 128x128 tiles: the checkpoint's weight_scale_inv is [rows / 128, columns / 128], so one
+    // scale row serves 128 weight rows and holds columns / 128 BF16 values.
+    const int scale_columns = hidden >> 7;
+    const unsigned char* grow[Q4E_ROWS_PER_WARP];
+    const __nv_bfloat16* gsrow[Q4E_ROWS_PER_WARP];
+    const unsigned char* urow[Q4E_ROWS_PER_WARP];
+    const __nv_bfloat16* usrow[Q4E_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+        grow[r] = nullptr;
+        gsrow[r] = nullptr;
+        urow[r] = nullptr;
+        usrow[r] = nullptr;
+    }
+    if (expert >= 0) {
+        const unsigned char* gw = (const unsigned char*)table[expert * 6 + 0];
+        const __nv_bfloat16* gs = (const __nv_bfloat16*)table[expert * 6 + 1];
+        const unsigned char* uw = (const unsigned char*)table[expert * 6 + 2];
+        const __nv_bfloat16* us = (const __nv_bfloat16*)table[expert * 6 + 3];
+#pragma unroll
+        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+            const unsigned long long row = (unsigned long long)(first_row + r);
+            grow[r] = gw + row * hidden;
+            gsrow[r] = gs + (row >> 7) * scale_columns;
+            urow[r] = uw + row * hidden;
+            usrow[r] = us + (row >> 7) * scale_columns;
+        }
+    }
+    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
+        const int count = min(Q4E_MEMBER_GROUP, members - group);
+        for (int m = 0; m < count; ++m) {
+            const int total_slot = perm[begin + group + m];
+            const int b = total_slot / slots;
+            const float* x_b = x + (unsigned long long)b * hidden;
+            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
+                staged[q4e_smem_idx(column)] = x_b[column];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+            const int row = first_row + r;
+            if (row >= intermediate) {
+                continue;
+            }
+            if (expert < 0) {
+                if (lane == 0) {
+                    for (int m = 0; m < count; ++m) {
+                        const int total_slot = perm[begin + group + m];
+                        activated[(unsigned long long)total_slot * intermediate + row] = 0.0f;
+                    }
+                }
+            } else {
+                float g[Q4E_MEMBER_GROUP];
+                float u[Q4E_MEMBER_GROUP];
+                q4e_fp8_row_dot_group(grow[r], gsrow[r], source, hidden, lane, count, g);
+                q4e_fp8_row_dot_group(urow[r], usrow[r], source, hidden, lane, count, u);
+#pragma unroll
+                for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+                    if (m < count) {
+                        const float gate = q4e_warp_sum(g[m]);
+                        const float up = q4e_warp_sum(u[m]);
+                        if (lane == 0) {
+                            const int total_slot = perm[begin + group + m];
+                            activated[(unsigned long long)total_slot * intermediate + row] =
+                                q4e_silu(gate) * up;
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Pass two of the MTP routed experts: the down projection, scattered by the router weight.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down_fp8(
+    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
+    const int* __restrict__ perm, const int* __restrict__ run_bounds,
+    const float* __restrict__ weights, const float* __restrict__ activated,
+    float* __restrict__ partials, int slots, int hidden, int intermediate, int weight_stride) {
+    OPT_PDL_ENTRY();
+    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW || (intermediate & 15) != 0) {
+        return;
+    }
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
+    int first_row = blockIdx.x * rows + warp * Q4E_ROWS_PER_WARP;
+    if (blockIdx.y >= slots) {
+        return;
+    }
+    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
+    const int begin = run_bounds[2 * rank];
+    if (rank != begin) {
+        return;
+    }
+    const int members = run_bounds[2 * rank + 1] - begin + 1;
+    const int expert = indices[perm[begin]];
+    const int scale_columns = intermediate >> 7;
+    const unsigned char* drow[Q4E_ROWS_PER_WARP];
+    const __nv_bfloat16* dsrow[Q4E_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+        drow[r] = nullptr;
+        dsrow[r] = nullptr;
+    }
+    if (expert >= 0) {
+        const unsigned char* dw = (const unsigned char*)table[expert * 6 + 4];
+        const __nv_bfloat16* ds = (const __nv_bfloat16*)table[expert * 6 + 5];
+#pragma unroll
+        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+            const unsigned long long row = (unsigned long long)(first_row + r);
+            drow[r] = dw + row * intermediate;
+            dsrow[r] = ds + (row >> 7) * scale_columns;
+        }
+    }
+    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
+        const int count = min(Q4E_MEMBER_GROUP, members - group);
+        for (int m = 0; m < count; ++m) {
+            const int total_slot = perm[begin + group + m];
+            const float* slot_activated = activated + (unsigned long long)total_slot * intermediate;
+            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            for (int column = threadIdx.x; column < intermediate; column += blockDim.x) {
+                staged[q4e_smem_idx(column)] = slot_activated[column];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+            const int row = first_row + r;
+            if (row >= hidden) {
+                continue;
+            }
+            float value[Q4E_MEMBER_GROUP];
+            if (expert >= 0) {
+                q4e_fp8_row_dot_group(drow[r], dsrow[r], source, intermediate, lane, count, value);
+#pragma unroll
+                for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+                    if (m < count) {
+                        value[m] = q4e_warp_sum(value[m]);
+                    }
+                }
+            } else {
+                for (int m = 0; m < count; ++m) {
+                    value[m] = 0.0f;
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+                if (m < count) {
+                    const int total_slot = perm[begin + group + m];
+                    if (lane == 0) {
+                        const int b = total_slot / slots;
+                        const int slot = total_slot % slots;
+                        const float w = weights[(unsigned long long)b * weight_stride + slot];
+                        partials[(unsigned long long)total_slot * hidden + row] = w * value[m];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// Sum the slots routed-expert partials and add the sigmoid-gated shared expert, plus optional
+// fused residual stream injection when hyper is non-null (blockIdx.y = batch token). A null
+// shared_gate adds the shared expert ungated, GLM-5.3-Flash's form.
+extern "C" __global__ void q4e_moe_combine(
+    float* __restrict__ out, const float* __restrict__ partials, const float* __restrict__ shared,
+    const float* __restrict__ shared_gate, float* __restrict__ hyper,
+    const float* __restrict__ injection, int slots, int hidden, int hc) {
+    OPT_PDL_ENTRY();
+    int b = blockIdx.y;
+    const float* partials_b = partials + (unsigned long long)b * slots * hidden;
+    const float* shared_b = shared + (unsigned long long)b * hidden;
+    float* out_b = out + (unsigned long long)b * hidden;
+    float gate = shared_gate != nullptr ? 1.0f / (1.0f + __expf(-shared_gate[b])) : 1.0f;
+    float* hyper_b = hyper != nullptr ? (hyper + (unsigned long long)b * hc * hidden) : nullptr;
+    const float* injection_b =
+        injection != nullptr ? (injection + (unsigned long long)b * hc) : nullptr;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < hidden;
+         index += blockDim.x * gridDim.x) {
+        float expert = 0.0f;
+        for (int slot = 0; slot < slots; ++slot) {
+            expert += partials_b[(unsigned long long)slot * hidden + index];
+        }
+        float combined = expert + gate * shared_b[index];
+        out_b[index] = combined;
+        if (hyper_b != nullptr && injection_b != nullptr) {
+            for (int s = 0; s < hc; ++s) {
+                hyper_b[s * hidden + index] += combined * injection_b[s];
+            }
+        }
+    }
+}

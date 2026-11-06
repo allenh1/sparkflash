@@ -118,23 +118,15 @@ impl DepthPolicy {
         }
     }
 
-    /// The policy `{prefix}_DEPTH` (adaptive, the default, or fixed) and `{prefix}_MIN_DEPTH`
-    /// name, over chains of up to `k` drafts.
-    ///
-    /// # Errors
-    /// A `{prefix}_DEPTH` that is neither adaptive nor fixed.
-    pub fn from_env(prefix: &str, k: usize, cost: StepCost) -> Result<Self, String> {
-        let depth = format!("{prefix}_DEPTH");
-        let policy = match std::env::var(&depth).as_deref() {
-            Err(_) | Ok("adaptive") => Self::adaptive(k, cost),
-            Ok("fixed") => Self::fixed(k, cost),
-            Ok(other) => return Err(format!("{depth}={other}: adaptive or fixed")),
+    /// The policy the installed profile names, over chains of up to `k` drafts.
+    #[must_use]
+    pub fn from_profile(k: usize, cost: StepCost) -> Self {
+        let speculation = &crate::active_profile().speculation;
+        let policy = match speculation.depth_policy {
+            Some(crate::profile::DepthMode::Fixed) => Self::fixed(k, cost),
+            Some(crate::profile::DepthMode::Adaptive) | None => Self::adaptive(k, cost),
         };
-        let min_depth = std::env::var(format!("{prefix}_MIN_DEPTH"))
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        Ok(policy.with_min_depth(min_depth))
+        policy.with_min_depth(speculation.min_depth.unwrap_or(0))
     }
 
     /// Whether the depth follows the drafts' probabilities; a fixed policy verifies all k.

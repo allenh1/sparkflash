@@ -12,17 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The GLM bulk prefill image: the block-scaled FP8 dense GEMMs (over the f32 activation and over
-//! its dynamic E4M3 codes), the routed-expert plan/MMA/SwiGLU and the skinny BF16 projection
-//! against a host reference, on an sm_121a node.
+//! The GLM bulk prefill and routed-expert (MoE) images: the block-scaled FP8 dense GEMMs (over
+//! the f32 activation and over its dynamic E4M3 codes), the routed-expert plan/MMA/SwiGLU and the
+//! skinny BF16 projection against a host reference, on an sm_121a node. The MoE symbols live in
+//! their own image (kernels/glm_moe_sm121.cu); glm_quantise_rows stays in the prefill image.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_glm_prefill_cubin};
+use sparkflash_model_qwen4_exp::device::{
+    cubin_available, embedded_glm_moe_cubin, embedded_glm_prefill_cubin,
+};
 use sparkflash_weights::quant;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || embedded_glm_prefill_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no GLM prefill cubin");
+    if !cubin_available()
+        || embedded_glm_prefill_cubin().is_empty()
+        || embedded_glm_moe_cubin().is_empty()
+    {
+        eprintln!("skipped: this build embeds no GLM prefill or routed-expert cubin");
         return None;
     }
     match Cuda::load() {
@@ -152,10 +158,19 @@ fn dequantised(x: &[f32]) -> Vec<f32> {
 const Q8_SHARED: u32 = 68_608;
 
 fn launch(cuda: &Cuda, name: &'static str, grid: (u32, u32, u32), threads: u32, args: &[u64]) {
-    let loaded = if name.ends_with("_q8_mma") {
-        cuda.load_named_shared(embedded_glm_prefill_cubin(), name, Q8_SHARED)
+    // The routed-expert family has its own image. glm_quantise_rows stays in the prefill image
+    // because the dense q8 path uses it too.
+    let image = if name == "moe_plan" {
+        sparkflash_kernels::images::moe_plan_cubin()
+    } else if name.starts_with("glm_moe_") {
+        embedded_glm_moe_cubin()
     } else {
-        cuda.load_named(embedded_glm_prefill_cubin(), name)
+        embedded_glm_prefill_cubin()
+    };
+    let loaded = if name.ends_with("_q8_mma") {
+        cuda.load_named_shared(image, name, Q8_SHARED)
+    } else {
+        cuda.load_named(image, name)
     };
     let (_module, kernel) = loaded.unwrap_or_else(|error| panic!("{name}: {error}"));
     cuda.launch(kernel, grid, (threads, 1, 1), args)
@@ -497,19 +512,32 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
     let activated = upload_f32(&cuda, &vec![0.0; moe_rows * width]);
     let route_dev = upload_f32(&cuda, &route);
     let out = upload_f32(&cuda, &vec![0.0; rows * topk * hidden]);
+    // The shared plan (kernels/moe_plan_sm121.cu) writes `sorted` and the item list; the MMA
+    // bodies read an item's slots from `sorted` at the item's first rank.
     launch(
         &cuda,
-        "glm_moe_plan",
+        "moe_plan",
         (1, 1, 1),
         1024,
         &[
             indices.0,
-            (rows * topk) as u64,
-            experts as u64,
             slot_of.0,
             items.0,
             item_count.0,
+            0,
+            (rows * topk) as u64,
+            experts as u64,
+            topk as u64,
+            item_rows as u64,
             max_items as u64,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ],
     );
     let plan_count = download_i32(&cuda, &item_count, 1)[0].max(0) as usize;
@@ -533,8 +561,9 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
             (1..=item_rows).contains(&count),
             "plan item {item} holds {count} slots"
         );
+        let first = plan_items[item * 4 + 1] as usize;
         for k in 0..count {
-            let slot = plan_slots[item * item_rows + k] as usize;
+            let slot = plan_slots[first + k] as usize;
             assert_eq!(
                 picks[slot / topk][slot % topk] as usize,
                 expert,

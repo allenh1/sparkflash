@@ -109,7 +109,7 @@ impl OpPlan for ScanPlan {
             ScanKind::Gdn => "q4p_gdn_scan",
             ScanKind::Kda => "q4p_kda_scan",
         };
-        KernelId::new(Image::Qwen4Prefill, symbol)
+        KernelId::new(Image::Qwen4Scan, symbol)
     }
 
     fn launch(&self) -> Launch {

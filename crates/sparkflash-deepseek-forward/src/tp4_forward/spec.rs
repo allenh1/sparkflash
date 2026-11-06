@@ -65,9 +65,9 @@ pub(super) struct SpecInputs<'s> {
 /// once), so the two cross near 85 rows; below that the exact step is both faster and
 /// bit-identical to M = 1.
 pub(super) fn bulk_min() -> usize {
-    std::env::var("SPARKFLASH_PREFILL_BULK_MIN")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    sparkflash_model::active_profile()
+        .prefill
+        .bulk_min
         .unwrap_or(96)
 }
 
@@ -157,9 +157,9 @@ pub(super) const ENGRAM_AHEAD_THREADS: usize = 8;
 /// Reader threads for a bulk prefill chunk's Engram reads (SPARKFLASH_PREFILL_READ_THREADS): a
 /// chunk issues 96 small random reads a row, far more than a verify step's queue.
 pub(super) fn prefill_read_threads() -> usize {
-    std::env::var("SPARKFLASH_PREFILL_READ_THREADS")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    sparkflash_model::active_profile()
+        .prefill
+        .read_threads
         .unwrap_or(256usize)
         .clamp(1, 512)
 }
@@ -191,14 +191,20 @@ impl EngramReader {
         let compressor =
             sparkflash_engram::compress::TokenizerCompressor::from_tokenizer_json(tokenizer)
                 .map_err(|error| format!("engram reader: {}: {error}", tokenizer.display()))?;
-        let direct = super::on_off_from_env_value(
-            "SPARKFLASH_ENGRAM_DIRECT",
-            std::env::var("SPARKFLASH_ENGRAM_DIRECT").ok().as_deref(),
-        )? != Some(false);
-        let shard = super::on_off_from_env_value(
-            "SPARKFLASH_ENGRAM_SHARD",
-            std::env::var("SPARKFLASH_ENGRAM_SHARD").ok().as_deref(),
-        )? != Some(false);
+        let direct = sparkflash_model::active_profile()
+            .diagnostics
+            .engram_direct
+            .unwrap_or(true);
+        let shard = sparkflash_model::active_profile()
+            .diagnostics
+            .engram_shard
+            .as_deref()
+            .is_none_or(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false" | "no"
+                )
+            });
         let mut align = sparkflash_engram::store::MIN_ALIGN_BYTES;
         let mut region = |name: String| -> Result<(Arc<fs::File>, u64), String> {
             let (file, start, _len) = source
@@ -231,7 +237,10 @@ impl EngramReader {
             direct: direct.then_some(align),
             compressor,
             cache: Mutex::new(std::collections::HashMap::new()),
-            cached: std::env::var("SPARKFLASH_ENGRAM_CACHE").as_deref() != Ok("0"),
+            cached: sparkflash_model::active_profile()
+                .diagnostics
+                .engram_cache
+                .unwrap_or(true),
             shard,
         })
     }
@@ -306,7 +315,11 @@ impl Keepalive {
         reader: &EngramReader,
     ) -> Option<Self> {
         use std::os::unix::fs::FileExt as _;
-        if std::env::var("SPARKFLASH_ENGRAM_KEEPALIVE").as_deref() == Ok("0") {
+        if !sparkflash_model::active_profile()
+            .diagnostics
+            .engram_keepalive
+            .unwrap_or(true)
+        {
             return None;
         }
         let (codes, ..) = reader.slots.first()?;
@@ -1008,8 +1021,11 @@ impl<'r> Reads<'r> {
     where
         'r: 'scope,
     {
-        match (std::env::var("SPARKFLASH_ENGRAM_URING").as_deref() != Ok("0"))
-            .then(UringReads::open)
+        match (sparkflash_model::active_profile()
+            .diagnostics
+            .engram_uring
+            .unwrap_or(true))
+        .then(UringReads::open)
         {
             Some(Ok(uring)) => Self::Uring(Box::new(uring)),
             Some(Err(error)) => {
@@ -1456,7 +1472,10 @@ impl DeviceLayer<'_> {
             chunks.iter().map(|&(rows, _, _, n, _)| (rows, n)).collect();
         let merge = split
             && chunks.len() > 1
-            && std::env::var("SPARKFLASH_PREFILL_MOE_MERGE").as_deref() != Ok("0")
+            && sparkflash_model::active_profile()
+                .prefill
+                .moe_merge
+                .unwrap_or(true)
             && chunks.iter().all(|&(rows, ..)| rows.moe_way.is_some());
         let result: Result<f64, String> = (|| {
             let mut waited = 0.0;
@@ -1567,16 +1586,16 @@ pub(super) fn step_ms(depth: usize) -> f64 {
     STEP_COST.ms(depth)
 }
 
-/// How many of the k drafts a step verifies: the shared [DepthPolicy] over [STEP_COST], from
-/// SPARKFLASH_DSPARK_DEPTH (adaptive, the default, or fixed) and SPARKFLASH_DSPARK_MIN_DEPTH.
+/// How many of the k drafts a step verifies: the shared [DepthPolicy] over [STEP_COST], from the
+/// profile's `speculation.depth_policy` (adaptive, the default, or fixed) and `min_depth`.
 /// Every input (the exchanged probabilities, the acceptances, the static cost model) is the same
 /// on every rank, so every rank picks the same depth and launches the same collectives. At c=1 on
 /// GB10 (k = 5) it took prose at 2K context from 52.0 / 56.8 to 59.9 / 65.3 tok/s and the
 /// explanation prompts from 57.1 / 67.4 to 64.8 / 73.0, and left code at 107-112 (its drafts are
-/// accepted to the full depth); pinned to depth 5 (SPARKFLASH_DSPARK_MIN_DEPTH=5) it ran as fixed,
+/// accepted to the full depth); pinned to depth 5 (`speculation.min_depth = 5`) it ran as fixed,
 /// so the host read of the probabilities costs nothing.
-pub(super) fn depth_policy(k: usize) -> Result<DepthPolicy, String> {
-    DepthPolicy::from_env("SPARKFLASH_DSPARK", k, STEP_COST)
+pub(super) fn depth_policy(k: usize) -> DepthPolicy {
+    DepthPolicy::from_profile(k, STEP_COST)
 }
 
 /// A generation's per-step callback: the step's tokens and whether the request ends with it
@@ -1800,7 +1819,11 @@ fn serve_ticks(
     // Before rank 0 binds HTTP, so the first client does not pay the lazy module loads and
     // first-use collective setup (a warm 2K prompt's prefill is ~0.3 s faster than a cold
     // one's). SPARKFLASH_WARMUP=0 skips it.
-    if std::env::var("SPARKFLASH_WARMUP").as_deref() != Ok("0") {
+    if sparkflash_model::active_profile()
+        .prefill
+        .warmup
+        .unwrap_or(true)
+    {
         let started = std::time::Instant::now();
         batch.warm_up()?;
         if inputs.rank == 0 {
@@ -1815,7 +1838,10 @@ fn serve_ticks(
     }
     // SPARKFLASH_TICK_AHEAD=0: rank 0 decides each tick when the last one ends, and the
     // workers wait for its frame at every step.
-    let send_ahead = std::env::var("SPARKFLASH_TICK_AHEAD").as_deref() != Ok("0");
+    let send_ahead = sparkflash_model::active_profile()
+        .prefill
+        .tick_ahead
+        .unwrap_or(true);
     while let Some(tick) = link.tick(batch.idle(), batch.room(), batch.hold_prefill())? {
         for id in tick.cancel {
             if let Some(outcome) = batch.cancel(id)? {
@@ -1966,7 +1992,12 @@ mod tests {
                     assert_eq!(got, want, "ring, direct {direct:?}");
                 }
                 // The CI runner's seccomp profile forbids io_uring_setup (engram's ring_or_skip).
-                Err(error) if std::env::var_os("SPARKFLASH_REQUIRE_IO_URING").is_none() => {
+                Err(error)
+                    if !sparkflash_model::active_profile()
+                        .diagnostics
+                        .require_io_uring
+                        .unwrap_or(false) =>
+                {
                     eprintln!("skipped the ring's reads ({error}): no io_uring here");
                 }
                 Err(error) => panic!("SPARKFLASH_REQUIRE_IO_URING is set: {error}"),

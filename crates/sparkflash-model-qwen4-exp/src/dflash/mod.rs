@@ -40,7 +40,9 @@ pub const DFLASH2_MODEL_ID: &str = "incoai/Qwen3.8-Flash-Next-DFlash2";
 /// means no drafter is configured, so the MTP head serves instead.
 #[must_use]
 pub fn drafter_directory() -> Option<PathBuf> {
-    resolve_drafter_dir(std::env::var_os("SPARKFLASH_QWEN4_DFLASH2").as_deref())
+    let profile = sparkflash_model::active_profile();
+    let configured = profile.speculation.drafter.as_deref();
+    resolve_drafter_dir(configured.map(OsStr::new))
 }
 
 fn resolve_drafter_dir(value: Option<&OsStr>) -> Option<PathBuf> {

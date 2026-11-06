@@ -508,8 +508,7 @@ pub fn check_operand_bind(
 /// The full per-rank resident plan.
 #[derive(Debug, Clone)]
 pub struct ResidentPlan {
-    rank: usize,
-    world: usize,
+    tp: sparkflash_model::TpPlan,
     shards: Vec<ResidentShard>,
 }
 
@@ -524,16 +523,22 @@ impl ResidentPlan {
         world: usize,
         entries: impl IntoIterator<Item = HeaderEntry>,
     ) -> Result<Self, ShardError> {
-        if world == 0 {
-            return Err(ShardError::Plan(
-                "a TP plan needs at least one rank".to_owned(),
-            ));
-        }
-        if rank >= world {
-            return Err(ShardError::Plan(format!(
-                "rank {rank} is outside a TP world of {world}"
-            )));
-        }
+        let tp = sparkflash_model::TpPlan::new(world, rank)
+            .map_err(|error| ShardError::Plan(error.to_string()))?;
+        Self::plan_with_tp(tp, entries)
+    }
+
+    /// [Self::plan] from the shared tensor-parallel plan.
+    ///
+    /// The resident plan takes its rank and world from [sparkflash_model::TpPlan], the same object
+    /// the execution plan and the boot resolver use, rather than a second pair of integers.
+    ///
+    /// # Errors
+    /// As [Self::plan].
+    pub fn plan_with_tp(
+        tp: sparkflash_model::TpPlan,
+        entries: impl IntoIterator<Item = HeaderEntry>,
+    ) -> Result<Self, ShardError> {
         let mut shards = Vec::new();
         for entry in entries {
             let Some(classification) = classify(&entry.name)? else {
@@ -544,7 +549,7 @@ impl ResidentPlan {
                 None => (0, Vec::new(), 0),
                 Some(rule) => {
                     let (bytes, ranges, shape) =
-                        slice_geometry(world, &entry.name, rule, &entry.shape, stored_bytes)?;
+                        slice_geometry(tp, &entry.name, rule, &entry.shape, stored_bytes)?;
                     (bytes, shape, ranges)
                 }
             };
@@ -570,23 +575,25 @@ impl ResidentPlan {
                 )));
             }
         }
-        Ok(Self {
-            rank,
-            world,
-            shards,
-        })
+        Ok(Self { tp, shards })
+    }
+
+    /// The shared tensor-parallel plan this resident plan follows.
+    #[must_use]
+    pub const fn tp(&self) -> sparkflash_model::TpPlan {
+        self.tp
     }
 
     /// This plan's rank.
     #[must_use]
     pub fn rank(&self) -> usize {
-        self.rank
+        self.tp.rank()
     }
 
     /// This plan's world size.
     #[must_use]
     pub fn world(&self) -> usize {
-        self.world
+        self.tp.world()
     }
 
     /// The planned tensors, in name order.
@@ -702,7 +709,7 @@ impl ResidentPlan {
     /// # Errors
     /// [\`ShardError::Plan\`] if a resident tensor somehow has no rule.
     pub fn shard_plan(&self) -> Result<ShardPlan, ShardError> {
-        let mut plan = ShardPlan::new(self.rank, self.world)?;
+        let mut plan = ShardPlan::from_tp_plan(self.tp)?;
         for shard in &self.shards {
             if shard.placement != Placement::Resident {
                 continue;
@@ -760,12 +767,13 @@ pub struct ReadEvidence {
 /// compares this arithmetic against \`ShardPlan::verify\` on the same synthetic container so the two
 /// cannot drift.
 fn slice_geometry(
-    world: usize,
+    tp: sparkflash_model::TpPlan,
     name: &str,
     rule: ShardRule,
     stored_shape: &[usize],
     stored_bytes: u64,
 ) -> Result<(u64, usize, Vec<usize>), ShardError> {
+    let world = tp.world();
     let rows = stored_shape.first().copied().unwrap_or(0) as u64;
     if rows == 0 || !stored_bytes.is_multiple_of(rows) {
         return Err(ShardError::Plan(format!(
@@ -777,13 +785,15 @@ fn slice_geometry(
     match rule {
         ShardRule::Replicated => Ok((stored_bytes, 1, shard_shape)),
         ShardRule::Column => {
-            if !rows.is_multiple_of(world as u64) {
-                return Err(ShardError::Plan(format!(
-                    "{name}: {rows} stored rows do not divide into {world} ranks"
-                )));
-            }
-            shard_shape[0] /= world;
-            Ok((row_bytes * (rows / world as u64), 1, shard_shape))
+            let split = tp
+                .split(
+                    usize::try_from(rows).unwrap_or(usize::MAX),
+                    sparkflash_model::TpAxis::Tensor,
+                    1,
+                )
+                .map_err(|error| ShardError::Plan(format!("{name}: {error}")))?;
+            shard_shape[0] = split.per_rank;
+            Ok((row_bytes * split.per_rank as u64, 1, shard_shape))
         }
         ShardRule::Row => {
             if stored_shape.len() != 2 {
@@ -791,15 +801,15 @@ fn slice_geometry(
                     "{name}: a row-parallel tensor must be stored two-dimensional, stored shape {stored_shape:?}"
                 )));
             }
-            if !(stored_shape[1] as u64).is_multiple_of(world as u64)
-                || !row_bytes.is_multiple_of(world as u64)
-            {
+            let split = tp
+                .split(stored_shape[1], sparkflash_model::TpAxis::Tensor, 1)
+                .map_err(|error| ShardError::Plan(format!("{name}: {error}")))?;
+            if !row_bytes.is_multiple_of(world as u64) {
                 return Err(ShardError::Plan(format!(
-                    "{name}: {} stored columns do not divide into {world} ranks",
-                    stored_shape[1]
+                    "{name}: {row_bytes} bytes per row do not divide into {world} ranks"
                 )));
             }
-            shard_shape[1] /= world;
+            shard_shape[1] = split.per_rank;
             Ok((
                 row_bytes / world as u64 * rows,
                 usize::try_from(rows).unwrap_or(usize::MAX),

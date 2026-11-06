@@ -1055,6 +1055,40 @@ async fn metrics_round_trip_after_a_request() {
 }
 
 #[tokio::test]
+async fn models_reports_the_settings_with_their_defaults_and_help() {
+    // A card built without an arm's profile renders no settings member at all: it advertises
+    // nothing rather than a default it would not honour.
+    let (status, _, bytes) = send(app(), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body_json(&bytes)["data"][0].get("settings").is_none());
+
+    // With the process's own knobs resolved, every one carries its value, the default it may
+    // have departed from, and the sentence that says what moving it costs.
+    let state = AppState::new(Arc::new(MockEngine::new(MODEL)))
+        .with_fixed_time(FIXED_TIME)
+        .with_settings(sparkflash_model::settings::resolve(&Default::default()));
+    let (status, _, bytes) = send(router(state), get_request("/v1/models")).await;
+    assert_eq!(status, StatusCode::OK);
+    let card = body_json(&bytes);
+    let settings = &card["data"][0]["settings"];
+    let rows = &settings["prefill.chunk_rows"];
+    assert_eq!(rows["value"], json!(4096));
+    assert_eq!(rows["default"], json!(4096));
+    let help = rows["help"].as_str().expect("help is a string");
+    assert!(!help.is_empty(), "the help says what the knob does");
+    assert!(help.ends_with('.'), "the help is a sentence: {help}");
+    let drafting = &settings["prefill.drafting_prompt"];
+    assert_eq!(drafting["value"], json!(false));
+    assert_eq!(drafting["default"], json!(false));
+    assert!(
+        drafting["help"]
+            .as_str()
+            .is_some_and(|help| help.ends_with('.')),
+        "the drafting help is a sentence"
+    );
+}
+
+#[tokio::test]
 async fn models_round_trip() {
     let (status, _, bytes) = send(app(), get_request("/v1/models")).await;
     assert_eq!(status, StatusCode::OK);

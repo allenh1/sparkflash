@@ -27,8 +27,15 @@ selected_tokens = 2304
 
 [speculation]
 enabled = true
-depth = 3
-mtp_fold_scale = 1.0
+# The DFlash 2 block's full width: it proposes block_size - 1 = 7 drafts and the policy decides
+# per step how many of them are worth their rows. Measured at TP=4, one stream, 256 tokens,
+# median of three (sparkDash's DecodeBench protocol, prose / code):
+#
+#   depth 3  52.1 / 66.7      depth 5  56.9 / 72.8      depth 7  59.9 / 78.1
+#
+# Deeper is not free - a fixed depth 7 gives 53.6 on prose - but the adaptive policy backs off
+# when the block's confidences are low, so the ceiling can be the whole block.
+depth = 7
 
 [sequence]
 parallel = true

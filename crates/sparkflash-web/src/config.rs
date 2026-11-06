@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +36,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// "Model" means the weights, not the runtime. Adding another checkpoint is a deliberate
 /// change here, plus the conversion and engine code that knows how to read it.
-pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID, GLM_WEIGHTS_ID];
+pub const SUPPORTED_WEIGHTS: &[&str] = sparkflash_model::WEIGHT_IDS;
 
 /// The engines this build can run the weights with.
 ///
@@ -44,40 +45,40 @@ pub const SUPPORTED_WEIGHTS: &[&str] = &[DEFAULT_WEIGHTS_ID, QWEN_WEIGHTS_ID, GL
 pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID, GLM_ENGINE_ID];
 
 /// The control-plane weight selector for V4.1-Flash.
-pub const DEFAULT_WEIGHTS_ID: &str = "deepseek-v4.1-flash";
+pub const DEFAULT_WEIGHTS_ID: &str = sparkflash_model::DEFAULT_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=4 V4.1 engine.
 pub const DEFAULT_ENGINE_ID: &str = "deepseek-v4.1-flash";
 
 /// The canonical Hugging Face id of the checkpoint the default engine reads.
-pub const DEFAULT_MODEL_ID: &str = "deepseek-ai/DeepSeek-V4.1-Flash";
+pub const DEFAULT_MODEL_ID: &str = sparkflash_model::DEFAULT_MODEL_ID;
 
 /// The control-plane weight selector for Qwen3.8-Flash-Next (NVFP4).
-pub const QWEN_WEIGHTS_ID: &str = "qwen3.8-flash-next-nvfp4";
+pub const QWEN_WEIGHTS_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=1 Qwen pack.
 pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
 
 /// The canonical Hugging Face id of the Qwen3.8-Flash-Next checkpoint.
-pub const QWEN_MODEL_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
+pub const QWEN_MODEL_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
 
 /// The control-plane weight selector for the GLM-5.3-Flash FP8 checkpoint.
-pub const GLM_WEIGHTS_ID: &str = "glm5.3-flash-fp8";
+pub const GLM_WEIGHTS_ID: &str = sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID;
 
 /// The control-plane engine selector for the TP=4 GLM-5.3-Flash pack.
 pub const GLM_ENGINE_ID: &str = "glm5-next";
 
 /// The canonical Hugging Face id of the GLM-5.3-Flash checkpoint.
-pub const GLM_MODEL_ID: &str = "zai-org/GLM-5.3-Flash";
+pub const GLM_MODEL_ID: &str = sparkflash_model::descriptor::GLM53_FLASH_ID;
 
 /// The maximum context window of V4.1-Flash.
-pub const MODEL_CONTEXT_TOKENS: usize = 1_048_576;
+pub const MODEL_CONTEXT_TOKENS: usize = sparkflash_model::V41_CONTEXT_TOKENS;
 
 /// The maximum context window of Qwen3.8-Flash-Next.
-pub const QWEN_CONTEXT_TOKENS: usize = 262_144;
+pub const QWEN_CONTEXT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS;
 
 /// The maximum context window of GLM-5.3-Flash.
-pub const GLM_CONTEXT_TOKENS: usize = 1_048_576;
+pub const GLM_CONTEXT_TOKENS: usize = sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS;
 
 /// The tensor-parallel width of the V4.1 and GLM clusters.
 pub const WORLD_SIZE: usize = 4;
@@ -101,6 +102,14 @@ pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 pub struct ModelProfile {
     /// The `model_type` the checkpoint's `config.json` carries.
     pub model_type: &'static str,
+    /// The family name the model browser shows beside DeepSeek, Qwen and GLM.
+    pub label: &'static str,
+    /// The default Hugging Face search term for this family.
+    pub search: &'static str,
+    /// How many ranks the family runs on.
+    pub world_size: usize,
+    /// The organization most of the family's checkpoints live under.
+    pub org: &'static str,
     /// The control-plane weight selector.
     pub weights: &'static str,
     /// The engine selector that runs those weights.
@@ -115,36 +124,79 @@ pub struct ModelProfile {
     pub requires_cubins: bool,
 }
 
+/// The deployment fields a model profile needs that the model registry does not own.
+struct Deployment {
+    /// The engine selector that runs those weights.
+    engine: &'static str,
+    /// The default Hugging Face search term for this family.
+    search: &'static str,
+    /// How many ranks the family runs on.
+    world_size: usize,
+    /// The organization most of the family's checkpoints live under.
+    org: &'static str,
+    /// Whether launch needs a per-rank converted file.
+    requires_conversion: bool,
+    /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
+    requires_cubins: bool,
+}
+
+/// The deployment fields for the weights selector, or a panic naming the unregistered family.
+fn deployment_for(weights: &str) -> Deployment {
+    match weights {
+        DEFAULT_WEIGHTS_ID => Deployment {
+            engine: DEFAULT_ENGINE_ID,
+            search: "DeepSeek-V4.1",
+            world_size: WORLD_SIZE,
+            org: "deepseek-ai",
+            requires_conversion: true,
+            requires_cubins: true,
+        },
+        QWEN_WEIGHTS_ID => Deployment {
+            engine: QWEN_ENGINE_ID,
+            search: "Qwen3.8-Flash",
+            world_size: SOLO_WORLD_SIZE,
+            org: "Qwen",
+            requires_conversion: true,
+            requires_cubins: false,
+        },
+        GLM_WEIGHTS_ID => Deployment {
+            engine: GLM_ENGINE_ID,
+            search: "GLM-5.3-Flash",
+            world_size: WORLD_SIZE,
+            org: "zai-org",
+            requires_conversion: true,
+            requires_cubins: false,
+        },
+        other => panic!("no web deployment profile for the registry weights {other}"),
+    }
+}
+
 /// Every model family the web control plane can configure.
-pub const MODEL_PROFILES: &[ModelProfile] = &[
-    ModelProfile {
-        model_type: "deepseek_v41",
-        weights: DEFAULT_WEIGHTS_ID,
-        engine: DEFAULT_ENGINE_ID,
-        id: DEFAULT_MODEL_ID,
-        context_tokens: MODEL_CONTEXT_TOKENS,
-        requires_conversion: true,
-        requires_cubins: true,
-    },
-    ModelProfile {
-        model_type: "qwen4_exp",
-        weights: QWEN_WEIGHTS_ID,
-        engine: QWEN_ENGINE_ID,
-        id: QWEN_MODEL_ID,
-        context_tokens: QWEN_CONTEXT_TOKENS,
-        requires_conversion: true,
-        requires_cubins: false,
-    },
-    ModelProfile {
-        model_type: "glm5_next",
-        weights: GLM_WEIGHTS_ID,
-        engine: GLM_ENGINE_ID,
-        id: GLM_MODEL_ID,
-        context_tokens: GLM_CONTEXT_TOKENS,
-        requires_conversion: true,
-        requires_cubins: false,
-    },
-];
+///
+/// The identity fields (model_type, label, id, weights, context) are the model registry's; only
+/// the deployment fields above are the web layer's. A new registry model must add a deployment
+/// entry, and a test holds the two sets to the same entries.
+pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
+    sparkflash_model::MODELS
+        .iter()
+        .map(|model| {
+            let deployment = deployment_for(&model.weights_id);
+            ModelProfile {
+                model_type: &model.model_type,
+                label: &model.label,
+                search: deployment.search,
+                world_size: deployment.world_size,
+                org: deployment.org,
+                weights: &model.weights_id,
+                engine: deployment.engine,
+                id: &model.id,
+                context_tokens: model.context_tokens,
+                requires_conversion: deployment.requires_conversion,
+                requires_cubins: deployment.requires_cubins,
+            }
+        })
+        .collect()
+});
 
 /// The profile for a checkpoint's `config.json` `model_type`, including the text-only Qwen
 /// alias the pack also releases.
@@ -1432,6 +1484,27 @@ pub fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_profiles_take_their_identity_from_the_model_registry() {
+        assert_eq!(MODEL_PROFILES.len(), sparkflash_model::MODELS.len());
+        assert_eq!(SUPPORTED_WEIGHTS, sparkflash_model::WEIGHT_IDS);
+        for model in sparkflash_model::MODELS.iter() {
+            let profile = profile_for_weights(&model.weights_id).unwrap_or_else(|| {
+                panic!(
+                    "the registry weights {} has no web profile",
+                    model.weights_id
+                )
+            });
+            assert_eq!(profile.id, model.id);
+            assert_eq!(profile.weights, model.weights_id);
+            assert_eq!(profile.model_type, model.model_type);
+            assert_eq!(profile.label, model.label);
+            assert_eq!(profile.context_tokens, model.context_tokens);
+            assert_eq!(profile_for_id(&model.id), Some(profile));
+            assert_eq!(profile_for_model_type(&model.model_type), Some(profile));
+        }
+    }
 
     #[test]
     fn names_ssh_would_read_as_options_are_refused() {

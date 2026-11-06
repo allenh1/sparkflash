@@ -85,9 +85,9 @@ const ADOPT_MIN: usize = 64;
 /// Every chunk reads every expert's weights (about a quarter second), so a smaller one stalls the
 /// decoders more often for less prefill: 2048 rows stall them about a second at a time.
 fn busy_chunk() -> usize {
-    std::env::var("SPARKFLASH_PREFILL_CHUNK_BUSY")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    sparkflash_model::active_profile()
+        .prefill
+        .chunk_busy
         .unwrap_or(2048usize)
         .max(1)
 }
@@ -95,9 +95,9 @@ fn busy_chunk() -> usize {
 /// Exact prefill steps (R_MAX rows each) per tick while another sequence decodes
 /// (SPARKFLASH_PREFILL_EXACT_BUSY): one, R_MAX rows.
 fn busy_exact_steps() -> usize {
-    std::env::var("SPARKFLASH_PREFILL_EXACT_BUSY")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    sparkflash_model::active_profile()
+        .prefill
+        .exact_busy
         .unwrap_or(1usize)
         .max(1)
 }
@@ -145,15 +145,11 @@ fn decoder_resume(skip_end: usize, start: usize, target: usize) -> usize {
 /// step (SPARKFLASH_BATCH_SPEC_FLOOR); SPARKFLASH_BATCH_SPEC=0 gives several sequences the plain
 /// step instead.
 fn batch_spec_floor() -> Option<f64> {
-    if std::env::var("SPARKFLASH_BATCH_SPEC").as_deref() == Ok("0") {
+    let profile = sparkflash_model::active_profile();
+    if profile.speculation.batch_spec == Some(false) {
         return None;
     }
-    Some(
-        std::env::var("SPARKFLASH_BATCH_SPEC_FLOOR")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.2),
-    )
+    Some(profile.speculation.batch_spec_floor.unwrap_or(0.2))
 }
 
 /// A prefill with at most this many rows left never waits for the decoders (an agent's turn after
@@ -175,15 +171,10 @@ struct DecodeShare {
 
 impl DecodeShare {
     fn from_env() -> Self {
-        let read = |name: &str, default: f64| -> f64 {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(default)
-        };
+        let profile = sparkflash_model::active_profile();
         Self {
-            most: read("SPARKFLASH_DECODE_SHARE", 0.5).clamp(0.0, 0.9),
-            deadline_ms: read("SPARKFLASH_PREFILL_DEADLINE_MS", 200_000.0),
+            most: profile.prefill.decode_share.unwrap_or(0.5).clamp(0.0, 0.9),
+            deadline_ms: profile.prefill.deadline_ms.unwrap_or(200_000.0),
         }
     }
 
@@ -526,10 +517,22 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             exchange,
             counter: Cell::new(0),
             room,
-            reuse: std::env::var("SPARKFLASH_PREFIX_CACHE").as_deref() != Ok("0"),
-            early: std::env::var("SPARKFLASH_ENGRAM_AHEAD").as_deref() != Ok("0"),
-            exact_prefill: std::env::var("SPARKFLASH_PREFILL_EXACT").as_deref() == Ok("1"),
-            decoder_skip: std::env::var("SPARKFLASH_PREFILL_DECODER_SKIP").as_deref() != Ok("0"),
+            reuse: sparkflash_model::active_profile()
+                .diagnostics
+                .prefix_cache
+                .unwrap_or(true),
+            early: sparkflash_model::active_profile()
+                .diagnostics
+                .engram_ahead
+                .unwrap_or(true),
+            exact_prefill: sparkflash_model::active_profile()
+                .prefill
+                .exact
+                .unwrap_or(false),
+            decoder_skip: sparkflash_model::active_profile()
+                .diagnostics
+                .prefill_decoder_skip
+                .unwrap_or(true),
             busy_chunk: busy_chunk(),
             busy_exact_steps: busy_exact_steps(),
             spec_floor: batch_spec_floor(),
@@ -539,9 +542,16 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             since_chunk_ms: 0.0,
             tick_started: Instant::now(),
             tick_chunk: false,
-            print: inputs.rank == 0 && std::env::var("SPARKFLASH_SPEC_TRACE").as_deref() == Ok("1"),
+            print: inputs.rank == 0
+                && sparkflash_model::active_profile()
+                    .diagnostics
+                    .spec_trace
+                    .unwrap_or(false),
             trace: inputs.rank == 0
-                && std::env::var("SPARKFLASH_BATCH_TRACE").as_deref() == Ok("1"),
+                && sparkflash_model::active_profile()
+                    .diagnostics
+                    .batch_trace
+                    .unwrap_or(false),
             read_wait_ms: 0.0,
             preemptions: 0,
         })
@@ -655,7 +665,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         if self.seqs.iter().any(|seq| seq.id == id) {
             return Err(format!("sequence {id} is already on the device"));
         }
-        let policy = depth_policy(self.k)?;
+        let policy = depth_policy(self.k);
         // A constrained sequence is sampled greedily over the admitted ids: the mask decides every
         // token, so there is no distribution left to sample from.
         let sampler = if constraint.is_some() {

@@ -57,6 +57,10 @@ __device__ __forceinline__ __nv_bfloat16 __float2bfloat16_rn(float value) {
     return out;
 }
 
+__device__ __forceinline__ __nv_bfloat16 __float2bfloat16(float value) {
+    return __float2bfloat16_rn(value);
+}
+
 __device__ __forceinline__ __nv_bfloat16 __ushort_as_bfloat16(unsigned short bits) {
     __nv_bfloat16 out;
     out.__x = bits;
@@ -77,10 +81,29 @@ struct uint4 {
     unsigned int w;
 };
 
+struct uchar4 {
+    unsigned char x;
+    unsigned char y;
+    unsigned char z;
+    unsigned char w;
+};
+
+struct int4 {
+    int x;
+    int y;
+    int z;
+    int w;
+};
+
 struct uint3 {
     unsigned int x;
     unsigned int y;
     unsigned int z;
+};
+
+struct int2 {
+    int x;
+    int y;
 };
 
 struct uint2 {
@@ -170,8 +193,35 @@ __device__ __forceinline__ uint4 make_uint4(unsigned int x, unsigned int y, unsi
     return out;
 }
 
+// vector_functions.h: the signed counterpart (kernels/glm_prefill_sm121.cu carries per-item
+// (expert, ..., count, ...) records as int4).
+__device__ __forceinline__ uchar4 make_uchar4(unsigned char x, unsigned char y, unsigned char z, unsigned char w) {
+    uchar4 out;
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    out.w = w;
+    return out;
+}
+
+__device__ __forceinline__ int4 make_int4(int x, int y, int z, int w) {
+    int4 out;
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    out.w = w;
+    return out;
+}
+
 __device__ __forceinline__ float2 make_float2(float x, float y) {
     float2 out;
+    out.x = x;
+    out.y = y;
+    return out;
+}
+
+__device__ __forceinline__ int2 make_int2(int x, int y) {
+    int2 out;
     out.x = x;
     out.y = y;
     return out;
@@ -210,6 +260,8 @@ __device__ __forceinline__ void __nanosleep(unsigned int ns) { (void)ns; }
 // SwiGLU quantiser to reduce a 32-wide MX block's amax. clang's CUDA frontend carries the shuffles
 // as builtins but only declares them through cuda_runtime.h, which this probe deliberately does
 // not include. A bare declaration is enough for the -fsyntax-only probe; nvcc never sees this file.
+__device__ int __shfl_down_sync(unsigned int mask, int value, unsigned int delta, int width = 32);
+
 __device__ float __shfl_down_sync(unsigned int mask, float value, unsigned int delta, int width = 32);
 __device__ unsigned int __shfl_down_sync(unsigned int mask, unsigned int value, unsigned int delta, int width = 32);
 __device__ float __shfl_xor_sync(unsigned int mask, float value, unsigned int lane_mask, int width = 32);
@@ -218,7 +270,10 @@ __device__ float __shfl_xor_sync(unsigned int mask, float value, unsigned int la
 // provide. Declaring them here lets the ABI probe compile the macros with the trace enabled,
 // which is the only way this host can type-check a kernel's trace call at all. The return
 // values are meaningless; the probe discards them.
+__device__ int atomicMin(int *address, int val);
+
 __device__ unsigned int atomicAdd(unsigned int *address, unsigned int val);
+__device__ int atomicAdd(int *address, int val);
 __device__ float atomicAdd(float *address, float val);
 __device__ unsigned long long atomicAdd(unsigned long long *address, unsigned long long val);
 __device__ int __ffsll(long long value);
@@ -251,6 +306,18 @@ __device__ __forceinline__ float __expf(float value) {
     return 1.0f;
 }
 
+// The fast trigonometric intrinsics the sparse indexer's pooled-key rotation uses. They carry no
+// semantics here; like expf above they exist only so the stub probe can type-check the kernel.
+__device__ __forceinline__ float __cosf(float value) {
+    (void)value;
+    return 1.0f;
+}
+
+__device__ __forceinline__ float __sinf(float value) {
+    (void)value;
+    return 0.0f;
+}
+
 __device__ __forceinline__ float fabsf(float value) {
     return value < 0.0f ? -value : value;
 }
@@ -267,6 +334,14 @@ __device__ __forceinline__ bool isfinite(float value) {
 
 __device__ __forceinline__ float fminf(float a, float b) {
     return a < b ? a : b;
+}
+
+__device__ __forceinline__ float copysignf(float magnitude, float sign) {
+    return sign < 0.0f ? -magnitude : magnitude;
+}
+
+__device__ __forceinline__ bool isnan(float value) {
+    return value != value;
 }
 
 __device__ __forceinline__ float sqrtf(float value) {
@@ -304,6 +379,13 @@ __device__ __forceinline__ float __shfl_sync(unsigned int mask, float value, int
     return value;
 }
 
+__device__ __forceinline__ int __shfl_sync(unsigned int mask, int value, int lane, int width = 32) {
+    (void)mask;
+    (void)lane;
+    (void)width;
+    return value;
+}
+
 __device__ __forceinline__ unsigned int __shfl_sync(unsigned int mask, unsigned int value, int lane, int width = 32) {
     (void)mask;
     (void)lane;
@@ -316,6 +398,11 @@ __device__ __forceinline__ unsigned int __shfl_up_sync(unsigned int mask, unsign
     (void)delta;
     (void)width;
     return value;
+}
+
+__device__ __forceinline__ bool __any_sync(unsigned int mask, bool predicate) {
+    (void)mask;
+    return predicate;
 }
 
 __device__ __forceinline__ bool __all_sync(unsigned int mask, bool predicate) {
@@ -361,6 +448,17 @@ __device__ __forceinline__ unsigned int atomicOr(unsigned int *address, unsigned
 using __nv_fp8x2_storage_t = unsigned short;
 using __nv_fp4x2_storage_t = unsigned char;
 enum __nv_fp8_interpretation_t { __NV_E4M3 = 0, __NV_E5M2 = 1, __NV_E2M1 = 2 };
+enum __nv_saturation_t { __NV_NOSAT = 0, __NV_SATFINITE = 1 };
+using __nv_fp8_storage_t = unsigned char;
+__device__ __forceinline__ __nv_fp8_storage_t __nv_cvt_float_to_fp8(
+    float value,
+    __nv_saturation_t saturation,
+    __nv_fp8_interpretation_t interpretation
+) {
+    (void)saturation;
+    (void)interpretation;
+    return (__nv_fp8_storage_t)value;
+}
 __device__ __forceinline__ __half2_raw __nv_cvt_fp8x2_to_halfraw2(
     __nv_fp8x2_storage_t value,
     __nv_fp8_interpretation_t interpretation

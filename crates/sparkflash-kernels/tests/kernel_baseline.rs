@@ -38,7 +38,7 @@ fn nvcc() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// The forty-two shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
+/// The forty-three shipped cubins, recompiled and compared byte for byte, on a host that has nvcc.
 ///
 /// On a host WITHOUT nvcc the check returns early, and the line it prints is on the test's captured
 /// stdout, so a green `cargo test` run does not show it - libtest only shows it under `--nocapture`.
@@ -68,7 +68,7 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
     let Some(nvcc) = nvcc() else {
         println!(
             "skipping the kernel baseline check: no nvcc on PATH and SPARKFLASH_NVCC is unset or \
-             not a file, so there is nothing to compile the forty-two kernels with. Run it on a CUDA host \
+             not a file, so there is nothing to compile the forty-three kernels with. Run it on a CUDA host \
              or inside nvidia/cuda:13.0.3-devel-ubuntu22.04: /bin/sh \
              crates/sparkflash-kernels/scripts/check-kernel-baseline.sh"
         );
@@ -94,10 +94,10 @@ fn the_kernels_still_compile_to_the_recorded_baseline() {
 }
 
 /// The kernel list in `check-kernel-baseline.sh`, the manifest, the kernels on disk and the build
-/// script's `PROBED_KERNELS` table must name the same forty-two kernels. The script asserts the first
+/// script's `PROBED_KERNELS` table must name the same forty-three kernels. The script asserts the first
 /// two when it runs; this pins all four without nvcc, so a kernel file added under `kernels/` - or a
 /// probe list edited without the baseline - fails here instead of letting the success line mean less
-/// than it says. The four `MODEL_IMAGES` sources and the RoCEnante kernel are the documented
+/// than it says. The ten `MODEL_IMAGES` sources and the RoCEnante kernel are the documented
 /// exceptions: they live under `kernels/` but are compiled by their own probes, not this baseline.
 #[test]
 fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
@@ -115,8 +115,8 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        42,
-        "the list must name every baseline kernel - the forty-two entries: the six Milestone 4 \
+        43,
+        "the list must name every baseline kernel - the forty-three entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
          head's device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry, \
@@ -126,7 +126,8 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
          (Engram gate/write, the two-direction stream conversion cubin, the routed-MoE \
          staging/combine pair), the S1 ratio>0 compressor pooling (the by-name \
          pool_group_f32 symbol), the nine opt decode cubins, \
-         the opt bulk-prefill MMA cubin and the opt vision tower cubin: {listed:?}"
+         the opt bulk-prefill MMA cubin, the opt vision tower cubin and the shared \
+         routed-expert plan: {listed:?}"
     );
 
     let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))
@@ -172,7 +173,7 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
 
     // Every listed kernel is a file under kernels/, and every kernel file there is listed, except the
     // RoCEnante kernel (another milestone, compiled by build.rs's own probe and covered by the syntax
-    // gate) and the four model images (compiled by the per-arm probes, shared here only so
+    // gate) and the ten model images (compiled by the per-arm probes, shared here only so
     // `sparkflash_ops::images` can hand every arm the same bytes).
     let model_images = model_image_files(&build_script)
         .unwrap_or_else(|error| panic!("build.rs MODEL_IMAGES: {error}"));
@@ -214,7 +215,7 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
 /// The model-arm sources named by build.rs's `MODEL_IMAGES` table, with its declared length.
 ///
 /// They are not part of the shared baseline, but they do live under `kernels/`, so the on-disk sweep
-/// has to know about them. Parsing the table (instead of hard-coding four names here) keeps a fifth
+/// has to know about them. Parsing the table (instead of hard-coding the names here) keeps another
 /// model image from appearing as an unexplained unlisted kernel.
 fn model_image_files(build_script: &str) -> Result<Vec<String>, String> {
     let table_start = build_script
@@ -229,10 +230,9 @@ fn model_image_files(build_script: &str) -> Result<Vec<String>, String> {
         .find(']')
         .ok_or("the declared length must be closed")?
         + open;
-    let declared: usize = table[open..close]
-        .trim()
-        .parse()
-        .map_err(|_| "the declared length must be a number".to_owned())?;
+    // An array declares its length (`[(&str, &str, &str); 11]`); a slice does not
+    // (`&[(&str, &str, &str)]`), and then the entries are the length.
+    let declared: Option<usize> = table[open..close].trim().parse().ok();
     let end = table
         .find("];")
         .ok_or("the model-image table must be closed")?;
@@ -249,6 +249,7 @@ fn model_image_files(build_script: &str) -> Result<Vec<String>, String> {
         }
         rest = &after_open[close + 1..];
     }
+    let declared = declared.unwrap_or(names.len());
     if names.len() != declared {
         return Err(format!(
             "the MODEL_IMAGES body names {} sources but its type declares {declared}: {names:?}",
@@ -484,6 +485,7 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             || name == "engram_write_sm121"
             || name == "engram_stream_convert_sm121"
             || name == "moe_routed_device_sm121"
+            || name == "moe_plan_sm121"
             || name == "pool_group_sm121"
             || name.starts_with("opt_")
         {
@@ -497,7 +499,7 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
     }
     assert_eq!(
         checked, 19,
-        "the manifest pins nineteen driver kernels (forty-two entries; flash_mla, the three \
+        "the manifest pins nineteen driver kernels (forty-three entries; flash_mla, the three \
          WS-D/ref_seam M=1 symbols, the layer-seam cubin, the kv-path cubin, the three S1 \
          device-layer cubins, the compressor pooling cubin and the eleven opt cubins have no KernelId)"
     );

@@ -37,6 +37,7 @@ sparkflash-api = { workspace = true }
 # crates are CPU-only-buildable (kernels resolves the driver with dlopen, nothing links libcuda), so
 # the default build stays GPU-free while the M3 contract is testable without the cuda feature.
 sparkflash-engine = { workspace = true }
+sparkflash-model = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-kv = { workspace = true }
 sparkflash-weights = { workspace = true }

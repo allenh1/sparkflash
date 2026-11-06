@@ -196,13 +196,12 @@ impl DeviceSequence {
             self.spec_drafts.push(token);
             self.spec_confidence.push(f32::from_le_bytes(*confidence));
         }
-        if let Some(policy) = self.depth_policy.as_ref() {
-            let depth = policy
-                .depth(&self.spec_confidence)
-                .min(self.spec_drafts.len());
-            self.spec_drafts.truncate(depth);
-            self.spec_confidence.truncate(depth);
-        }
+        // The shared speculator decides how many of the block's drafts are worth their rows.
+        let depth = self
+            .spec
+            .depth(&self.spec_confidence, self.spec_drafts.len());
+        self.spec_drafts.truncate(depth);
+        self.spec_confidence.truncate(depth);
         Ok(())
     }
 }

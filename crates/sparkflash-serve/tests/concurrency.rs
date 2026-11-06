@@ -60,6 +60,8 @@ fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL.to_owned(),
         family: "toy".to_owned(),
+        model_type: "toy".to_owned(),
+        label: "Toy".to_owned(),
         weights_id: "toy".to_owned(),
         context_tokens: 8,
         max_output_tokens: 1,

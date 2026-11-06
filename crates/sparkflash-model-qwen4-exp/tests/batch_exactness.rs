@@ -86,6 +86,15 @@ fn fixture() -> Option<Arc<Path>> {
             return None;
         }
         let temp = tempfile::tempdir().expect("a temporary directory");
+        // The tiny fixture is not the released target the canonical DFlash 2 drafter was trained
+        // for, so an auto-resolved cache snapshot would be refused at open. Point the hub cache at
+        // a directory this fixture's temp tree does not fill: the checkpoint is passed explicitly,
+        // and the drafter then resolves to nothing, which is the configuration these fused-batch
+        // tests are about. HF_HUB_CACHE wins over every other cache variable, so a developer's
+        // HF_HOME cannot put the released drafter back in reach.
+        // SAFETY: only this test binary mutates the environment, and every one of its tests calls
+        // fixture() first, so the others are blocked in the OnceLock while the variable is set.
+        unsafe { std::env::set_var("HF_HUB_CACHE", temp.path().join("hub")) };
         let written = SyntheticCheckpoint::write(temp.path()).expect("the fixture writes");
         let directory = written.directory.clone();
         // The directory has to outlive every backend the lanes open.

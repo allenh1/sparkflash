@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 
 use sparkflash_engine::WeightError;
 use sparkflash_engine::safetensors::SafeTensorsSource;
+use sparkflash_model::TpPlan;
 
 /// The checkpoint axis a tensor shards along under tensor parallelism.
 ///
@@ -148,6 +149,14 @@ impl ShardPlan {
             tp_world,
             rules: BTreeMap::new(),
         })
+    }
+
+    /// [Self::new] from the shared tensor-parallel plan.
+    ///
+    /// # Errors
+    /// [ShardError::Plan] for a zero world or a rank outside it; [TpPlan] already checked both.
+    pub fn from_tp_plan(tp: TpPlan) -> Result<Self, ShardError> {
+        Self::new(tp.rank(), tp.world())
     }
 
     /// The plan for a layer's five attention projections and their scale grids: the set a

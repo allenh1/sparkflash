@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The chunk-wide prefill path on the tensor cores (kernels/qwen4_prefill_sm121.cu).
+//! The chunk-wide prefill path on the tensor cores (kernels/qwen4_prefill_sm121.cu), with its
+//! Gated DeltaNet / Kimi Delta Attention scan in its own image (kernels/qwen4_scan_sm121.cu).
 //!
 //! A prompt chunk runs its dense projections, its routed experts and its Gated DeltaNet recurrence
 //! here, and so do a decode step and a speculative verify ([PrefillPlan::decode], on by default).
@@ -60,10 +61,24 @@ pub fn embedded_prefill_cubin() -> &'static [u8] {
     sparkflash_kernels::images::qwen4_prefill_cubin()
 }
 
+/// The Qwen3.8 scan cubin this build embeds: the Gated DeltaNet and Kimi Delta Attention kernels
+/// that used to sit at the end of the prefill image.
+#[must_use]
+pub fn embedded_scan_cubin() -> &'static [u8] {
+    sparkflash_kernels::images::qwen4_scan_cubin()
+}
+
 /// The GLM bulk prefill cubin this build embeds.
 #[must_use]
 pub fn embedded_glm_prefill_cubin() -> &'static [u8] {
     sparkflash_kernels::images::glm_prefill_cubin()
+}
+
+/// The GLM routed-expert (MoE) cubin this build embeds: the plan, MMA, SwiGLU and q8 kernels
+/// that used to sit in the prefill image.
+#[must_use]
+pub fn embedded_glm_moe_cubin() -> &'static [u8] {
+    sparkflash_kernels::images::glm_moe_cubin()
 }
 
 /// Tokens per layer-major prefill chunk, unless `SPARKFLASH_QWEN4_PREFILL_CHUNK` says otherwise.
@@ -265,17 +280,50 @@ impl PrefillPlan {
     /// A value outside its switch's domain, or `SPARKFLASH_DECODE_MMA=on` where the chunks are
     /// not on the tensor cores (`SPARKFLASH_QWEN4_PREFILL_MMA=0`, or a build without the image).
     pub fn from_env() -> Result<Self, BackendError> {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        Self::from_active()
     }
 
-    /// [Self::from_env] over `lookup` instead of the process environment.
+    /// The serving default from the process's installed profile.
     ///
     /// # Errors
-    /// As [Self::from_env].
+    /// As [Self::from_profile].
+    pub fn from_active() -> Result<Self, BackendError> {
+        Self::from_profile(sparkflash_model::active_profile())
+    }
+
+    /// The plan a typed profile describes.
+    ///
+    /// # Errors
+    /// `decode.tensor_cores = true` with the chunks off the tensor-core image, or a build without
+    /// the prefill image.
+    pub fn from_profile(profile: &sparkflash_model::ModelProfile) -> Result<Self, BackendError> {
+        let tensor_cores =
+            !embedded_prefill_cubin().is_empty() && profile.prefill.tensor_cores.unwrap_or(true);
+        if profile.decode.tensor_cores == Some(true)
+            && profile.prefill.tensor_cores == Some(false)
+            && !tensor_cores
+        {
+            return Err(BackendError::new(
+                "qwen4_config",
+                "decode.tensor_cores=true runs the decode steps on the prefill's tensor-core \
+                 image, which is off here (prefill.tensor_cores=false, or a build without the \
+                 image); unset it or set it to false",
+            ));
+        }
+        let chunk = if tensor_cores {
+            profile.prefill.chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
+        } else {
+            TOKEN_PREFILL_CHUNK
+        };
+        Ok(Self::new(chunk, tensor_cores).with_decode(profile.decode.tensor_cores.unwrap_or(true)))
+    }
+
+    /// [Self::from_env] over `lookup` instead of the installed profile, for a test that pins one
+    /// switch at a time.
+    ///
+    /// # Errors
+    /// As [Self::from_profile].
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, BackendError> {
-        // The typed profile is the source of truth. The environment names are aliases in
-        // sparkflash_model::profile::ENV_OVERRIDES, so an out-of-domain value is refused rather
-        // than silently falling back to a default.
         const SWITCHES: [&str; 3] = [
             "SPARKFLASH_QWEN4_PREFILL_CHUNK",
             "SPARKFLASH_QWEN4_PREFILL_MMA",
@@ -290,26 +338,7 @@ impl PrefillPlan {
         ))
         .map_err(refuse)?;
         profile.apply_env(ours).map_err(refuse)?;
-        let tensor_cores =
-            !embedded_prefill_cubin().is_empty() && profile.prefill.tensor_cores.unwrap_or(true);
-        // What the environment alone asked of the decode steps: an explicit `on` the chunks
-        // cannot honour is refused, where the profile's default follows the chunks.
-        let mut asked = sparkflash_model::profile::ModelProfile::default();
-        asked.apply_env(ours).map_err(refuse)?;
-        if asked.decode.tensor_cores == Some(true) && !tensor_cores {
-            return Err(BackendError::new(
-                "qwen4_config",
-                "SPARKFLASH_DECODE_MMA=on runs the decode steps on the prefill's tensor-core \
-                 image, which is off here (SPARKFLASH_QWEN4_PREFILL_MMA=0, or a build without \
-                 the image); unset it or set it to off",
-            ));
-        }
-        let chunk = if tensor_cores {
-            profile.prefill.chunk.unwrap_or(DEFAULT_PREFILL_CHUNK)
-        } else {
-            TOKEN_PREFILL_CHUNK
-        };
-        Ok(Self::new(chunk, tensor_cores).with_decode(profile.decode.tensor_cores.unwrap_or(true)))
+        Self::from_profile(&profile)
     }
 }
 
@@ -341,8 +370,20 @@ impl PrefillKernels {
                     .to_owned(),
             );
         }
+        if embedded_scan_cubin().is_empty() {
+            return Err(
+                "this build has no Qwen4-Exp scan cubin: rebuild on a host with nvcc so \
+                 the shared sparkflash-kernels build script compiles kernels/qwen4_scan_sm121.cu"
+                    .to_owned(),
+            );
+        }
         let named = |name: &'static str| -> Result<Kernel, String> {
             let (_, kernel) = cuda.load_named(embedded_prefill_cubin(), name)?;
+            Ok(kernel)
+        };
+        // The Gated DeltaNet and Kimi Delta Attention kernels live in the scan image, not here.
+        let scan = |name: &'static str| -> Result<Kernel, String> {
+            let (_, kernel) = cuda.load_named(embedded_scan_cubin(), name)?;
             Ok(kernel)
         };
         Ok(Self {
@@ -351,16 +392,24 @@ impl PrefillKernels {
             gemm_rows: named("q4p_gemm_rows")?,
             epilogue: named("q4p_epilogue")?,
             split_bf16: named("q4p_split_bf16")?,
-            moe_plan: named("q4p_moe_plan")?,
+            // The routed-expert plan is the shared image (kernels/moe_plan_sm121.cu), as the
+            // token path's is: one counting pass, one item layout, four callers.
+            moe_plan: {
+                if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
+                    return Err("this build has no routed-expert plan cubin".to_owned());
+                }
+                cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")?
+                    .1
+            },
             moe_gate_up: named("q4p_moe_gate_up")?,
             moe_down: named("q4p_moe_down")?,
             moe_rows_gate_up: named("q4p_moe_rows_gate_up")?,
             moe_rows_down: named("q4p_moe_rows_down")?,
-            gdn_conv: named("q4p_gdn_conv")?,
-            gdn_conv_state: named("q4p_gdn_conv_state")?,
-            gdn_prep: named("q4p_gdn_prep")?,
-            gdn_scan: named("q4p_gdn_scan")?,
-            gdn_gate: named("q4p_gdn_gate")?,
+            gdn_conv: scan("q4p_gdn_conv")?,
+            gdn_conv_state: scan("q4p_gdn_conv_state")?,
+            gdn_prep: scan("q4p_gdn_prep")?,
+            gdn_scan: scan("q4p_gdn_scan")?,
+            gdn_gate: scan("q4p_gdn_gate")?,
         })
     }
 }
@@ -861,24 +910,40 @@ impl DeviceSequence {
             (256, 1, 1),
             &[mixed.0, scratch.expert_input.0, elements as u64],
         )?;
+        // The most items the plan can write, and the grid's bound: past the count it wrote, a
+        // CTA returns before touching anything.
+        let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
         self.launch(
             kernels.moe_plan,
             (1, 1, 1),
-            (1024, 1, 1),
+            (
+                sparkflash_model::active_profile().plan.block_threads(),
+                1,
+                1,
+            ),
             &[
                 self.expert_indices.0,
-                slots as u64,
-                config.num_experts as u64,
                 self.expert_perm.0,
                 scratch.items.0,
                 scratch.item_count.0,
+                0,
+                slots as u64,
+                config.num_experts as u64,
+                topk as u64,
+                MOE_ROWS as u64,
+                items as u64,
+                0,
+                // A slot routed to no expert is left out of the items, and its partial row
+                // is zeroed so the combine still sums one row per slot.
+                2,
+                0,
+                0,
+                0,
+                0,
                 self.expert_accumulator.0,
                 hidden as u64,
             ],
         )?;
-        // The grid covers the most items the plan can write; past the count it wrote, a CTA
-        // returns before touching anything.
-        let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
         let rows = batch < GEMM_MIN_BATCH
             && hidden.is_multiple_of(MOE_ROWS_K)
             && intermediate.is_multiple_of(MOE_ROWS_K);
@@ -1157,6 +1222,6 @@ mod tests {
         ])
         .expect_err("the decode steps cannot take an image the chunks do not");
         assert_eq!(error.code(), "qwen4_config");
-        assert!(error.message().contains("SPARKFLASH_DECODE_MMA=on"));
+        assert!(error.message().contains("decode.tensor_cores=true"));
     }
 }

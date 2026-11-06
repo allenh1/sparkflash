@@ -430,16 +430,21 @@ fn moe_forward(weights: &MoeWeights, config: &Qwen4ExpConfig, input: &[f32]) -> 
     for value in &mut probabilities {
         *value /= total;
     }
-    let mut ranked: Vec<usize> = (0..probabilities.len()).collect();
-    ranked.sort_unstable_by(|a, b| probabilities[*b].total_cmp(&probabilities[*a]));
-    ranked.truncate(config.num_experts_per_tok);
-    let mut weight_sum: f32 = ranked.iter().map(|expert| probabilities[*expert]).sum();
-    if !config.norm_topk_prob {
-        weight_sum = 1.0;
-    }
+    // The Qwen release is a softmax router with no correction bias and no output scale; that is
+    // the shared noaux selection with a zero bias and a scale of one. Ties then break toward the
+    // lower expert index, as the reference's topk does, instead of following a sort's order.
+    let bias = vec![0.0f32; probabilities.len()];
+    let mut selected = Vec::with_capacity(config.num_experts_per_tok);
+    topk::noaux_top_k(
+        &probabilities,
+        &bias,
+        config.num_experts_per_tok,
+        config.norm_topk_prob,
+        1.0,
+        &mut selected,
+    );
     let mut out = vec![0.0f32; hidden];
-    for expert in ranked {
-        let weight = probabilities[expert] / weight_sum;
+    for (expert, weight) in selected {
         let body = expert_forward(&weights.experts[expert], input);
         for column in 0..hidden {
             out[column] += weight * body[column];

@@ -35,7 +35,7 @@
 //!    * the kernel itself is compiled standalone, so it must be a self-contained translation
 //!      unit;
 //!    * every probed kernel is compiled on its own, so a failure names the file, and then
-//!      all forty-two are compiled together with the trace macros enabled, which is the only
+//!      all forty-three are compiled together with the trace macros enabled, which is the only
 //!      check that can catch a collision BETWEEN kernel files.
 //!
 //!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
@@ -159,7 +159,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The forty-two device kernel sources the crate probes and pins, with the stem used for their PTX
+/// The forty-three device kernel sources the crate probes and pins, with the stem used for their PTX
 /// output.
 ///
 /// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
@@ -189,10 +189,10 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// M=1 and multi-row decode path, the bulk-prefill MMA and the D59 vision tower, loaded by name
 /// from their own cubins, one pin each). They are
 /// device sources this crate ships, the clang/nvcc probes compile them like the others, and
-/// baseline/kernel_baseline.txt records their cubins. Every one of the forty-two is probed on every
+/// baseline/kernel_baseline.txt records their cubins. Every one of the forty-three is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
 /// type-checked, and the CI cuda-tests job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 42] = [
+const PROBED_KERNELS: [(&str, &str); 43] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp8_dense_m1_sm121.cu", "b12x_mxfp8_dense_m1_sm121"),
@@ -250,6 +250,10 @@ const PROBED_KERNELS: [(&str, &str); 42] = [
     ("opt_select_sm121.cu", "opt_select_sm121"),
     ("opt_mma_sm121.cu", "opt_mma_sm121"),
     ("opt_vision_sm121.cu", "opt_vision_sm121"),
+    // The routed-expert plan every arm launches (kernels/moe_plan_sm121.cu). It is also a model
+    // image; probing it here is what type-checks it on every build rather than only where nvcc
+    // happens to compile the images.
+    ("moe_plan_sm121.cu", "moe_plan_sm121"),
 ];
 
 /// The shared header every one of those kernels includes for its model constants, the MX codecs
@@ -257,22 +261,37 @@ const PROBED_KERNELS: [(&str, &str); 42] = [
 /// one include they all share.
 const M4_COMMON_HEADER: &str = "m4_common_sm121.cuh";
 
-/// The four model images that used to be compiled by a model crate's own build script.
+/// The model images that used to be compiled by a model crate's own build script.
 ///
 /// The sources and the cubins now live in the shared stack: a model crate carries no CUDA and no
 /// kernel build script. The paths are exported to this crate so `sparkflash_ops::images` can hand
 /// every arm the same bytes; a CPU-only build exports paths to files that do not exist and gates
 /// every read on `sparkflash_model_cubin`.
-const MODEL_IMAGES: [(&str, &str, &str); 4] = [
+const MODEL_IMAGES: &[(&str, &str, &str)] = &[
     (
         "qwen4_exp_sm121.cu",
         "qwen4_exp_sm121.cubin",
         "SPARKFLASH_QWEN4_CUBIN",
     ),
     (
+        "qwen4_attn_sm121.cu",
+        "qwen4_attn_sm121.cubin",
+        "SPARKFLASH_QWEN4_ATTN_CUBIN",
+    ),
+    (
+        "qwen4_moe_sm121.cu",
+        "qwen4_moe_sm121.cubin",
+        "SPARKFLASH_QWEN4_MOE_CUBIN",
+    ),
+    (
         "qwen4_prefill_sm121.cu",
         "qwen4_prefill_sm121.cubin",
         "SPARKFLASH_QWEN4_PREFILL_CUBIN",
+    ),
+    (
+        "qwen4_scan_sm121.cu",
+        "qwen4_scan_sm121.cubin",
+        "SPARKFLASH_QWEN4_SCAN_CUBIN",
     ),
     (
         "dflash2_sm121.cu",
@@ -284,9 +303,31 @@ const MODEL_IMAGES: [(&str, &str, &str); 4] = [
         "glm_prefill_sm121.cubin",
         "SPARKFLASH_GLM_PREFILL_CUBIN",
     ),
+    (
+        "glm_attention_sm121.cu",
+        "glm_attention_sm121.cubin",
+        "SPARKFLASH_GLM_ATTENTION_CUBIN",
+    ),
+    (
+        "glm_moe_sm121.cu",
+        "glm_moe_sm121.cubin",
+        "SPARKFLASH_GLM_MOE_CUBIN",
+    ),
+    (
+        "glm_decode_sm121.cu",
+        "glm_decode_sm121.cubin",
+        "SPARKFLASH_GLM_DECODE_CUBIN",
+    ),
+    // The one plan kernel every arm's routed experts share, so a change to the counting pass
+    // reaches Qwen's token path, GLM's bulk prefill and DeepSeek's bulk prefill at once.
+    (
+        "moe_plan_sm121.cu",
+        "moe_plan_sm121.cubin",
+        "SPARKFLASH_MOE_PLAN_CUBIN",
+    ),
 ];
 
-/// The combined probe: all forty-two kernel sources in one translation unit with the trace macros
+/// The combined probe: all forty-three kernel sources in one translation unit with the trace macros
 /// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
 /// files defining the same macro to different values, or two identical non-inline symbols), and it
 /// is also the only one that compiles the enabled branch of every trace scope.
@@ -413,7 +454,7 @@ fn main() {
     );
 
     // The probed kernel set. Every kernel is probed individually so that a failure names the file,
-    // and then all forty-two are probed together with the trace macros enabled.
+    // and then all forty-three are probed together with the trace macros enabled.
     if !kernels.join(M4_COMMON_HEADER).is_file() {
         println!(
             "cargo:warning=sparkflash-kernels: {} is missing; skipping every probed-kernel probe",
@@ -442,7 +483,7 @@ fn main() {
     report(
         &nvcc,
         &arch,
-        "the combined probe (all forty-two kernels, trace macros enabled)",
+        "the combined probe (all forty-three kernels, trace macros enabled)",
         check_m4_probe(&nvcc, &arch, kernels),
     );
 }
@@ -642,7 +683,7 @@ fn report_clang_probe(clang: &Path, arch: &str) {
             Ok((checked, missing)) => println!(
                 "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the forty-two \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the forty-three \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
                  epilogue and its weighted routed variant, the task-37 device router, the \
                  task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified head's \
@@ -673,7 +714,7 @@ fn report_clang_probe(clang: &Path, arch: &str) {
     }
 }
 
-/// Parses the forty-two probed kernels and the combined probe with clang. Returns how many kernels were
+/// Parses the forty-three probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
 fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
     let kernels = Path::new("../../kernels");

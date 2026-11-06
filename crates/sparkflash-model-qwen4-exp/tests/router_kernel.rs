@@ -22,7 +22,7 @@
 //! The tests skip - loudly - without an embedded cubin or a CUDA driver, like the parity suite.
 
 use sparkflash_kernels::cuda_driver::Cuda;
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
+use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_moe_cubin};
 
 const MAX_TOPK: usize = 64;
 
@@ -75,7 +75,7 @@ fn route(cuda: &Cuda, logits: &[f32], topk: usize) -> (Vec<i32>, Vec<f32>, Vec<f
     cuda.copy_htod(&indices, &vec![index_bytes; topk * 4])
         .expect("poison indices");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_router")
+        .load_named(embedded_moe_cubin(), "q4e_router")
         .expect("the cubin carries q4e_router");
     cuda.launch(
         kernel,
@@ -214,7 +214,7 @@ fn the_selection_survives_the_accumulator_reset_that_follows_it() {
     let indices = cuda.alloc(topk * 4, &mut total).expect("indices");
     let accumulator = cuda.alloc(10240, &mut total).expect("accumulator");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_router")
+        .load_named(embedded_moe_cubin(), "q4e_router")
         .expect("router");
     cuda.launch(
         kernel,

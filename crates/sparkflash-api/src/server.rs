@@ -7057,6 +7057,18 @@ fn model_card(state: &AppState, created: u64) -> Value {
     if let Some(numerics) = state.numerics() {
         card["numerics"] = numerics.card();
     }
+    // The knobs an operator can move, with the default and the help text beside each value
+    // (sparkflash_model::settings): one declaration, so a control plane reads the daemon's own
+    // answer instead of keeping a copy that drifts from it.
+    let settings = state.settings();
+    if !settings.is_empty() {
+        card["settings"] = Value::Object(
+            settings
+                .iter()
+                .map(|resolved| (resolved.setting.key.to_owned(), resolved.json()))
+                .collect(),
+        );
+    }
     card
 }
 

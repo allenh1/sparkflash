@@ -589,21 +589,22 @@ const REDUCE_SCRATCH_BYTES: usize = REDUCE_PAYLOAD_ELEMENTS * 2;
 
 /// The per-process behaviour switches the bootstrap's agreement word carries.
 ///
-/// These MIRROR the readers in tp4_forward, which use PRESENCE semantics
-/// (std::env::var(...).is_ok()); a per-rank difference here changes arithmetic with no failure, which
-/// is exactly why the word crosses the bootstrap gather and is refused on mismatch. If a reader changes
-/// its acceptance rule, or a new per-process arithmetic switch appears, this word must change with it
-/// in the same edit. (SPARKFLASH_DEVICE_TRACE / _EVENTS belong to the trace reader in the review
-/// branch; they are carried here so a rank with one set cannot silently join a run without it.)
+/// These MIRROR the readers in tp4_forward, which use PRESENCE semantics on the profile field
+/// (`is_some()`); a per-rank difference here changes arithmetic with no failure, which is exactly
+/// why the word crosses the bootstrap gather and is refused on mismatch. If a reader changes its
+/// acceptance rule, or a new per-process arithmetic switch appears, this word must change with it
+/// in the same edit. (The trace switches belong to the trace reader; they are carried here so a
+/// rank with one set cannot silently join a run without it.)
 fn behaviour_toggles() -> u16 {
+    let diagnostics = &sparkflash_model::active_profile().diagnostics;
     let mut word = 0u16;
-    if std::env::var("SPARKFLASH_SEAM_REF_HOST").is_ok() {
+    if diagnostics.seam_ref_host.is_some() {
         word |= 1 << 0;
     }
-    if std::env::var("SPARKFLASH_DEVICE_TRACE").is_ok() {
+    if diagnostics.device_trace.is_some() {
         word |= 1 << 1;
     }
-    if std::env::var("SPARKFLASH_DEVICE_TRACE_EVENTS").is_ok() {
+    if diagnostics.device_trace_events.is_some() {
         word |= 1 << 2;
     }
     word

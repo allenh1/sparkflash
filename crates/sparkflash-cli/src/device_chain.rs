@@ -1341,10 +1341,10 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
     // weight H2D per token. Routed experts and Engram stay staged on one node; the four-rank plan is
     // what makes them resident, so the evidence reports the two H2D classes separately.
     let resident_cuda: Option<sparkflash_kernels::cuda_driver::Cuda> =
-        if std::env::var("SPARKFLASH_RESIDENT_ATTENTION")
-            .ok()
-            .as_deref()
-            == Some("1")
+        if sparkflash_model::active_profile()
+            .diagnostics
+            .resident_attention
+            .unwrap_or(false)
         {
             Some(
                 sparkflash_kernels::cuda_driver::Cuda::load()
@@ -2283,10 +2283,11 @@ fn run_hybrid_lines(args: &StageArgs) -> Result<Vec<String>, String> {
         };
         // Warmup steps are real steps whose cost is reported separately: the cold first steps
         // (module load, first-touch pages, plan upload) must not be averaged into steady state.
-        // SPARKFLASH_WARMUP_STEPS=1 on the device arm separates step 0 from steps 1..N in the ledger.
-        let warmup_steps: usize = std::env::var("SPARKFLASH_WARMUP_STEPS")
-            .ok()
-            .and_then(|raw| raw.parse().ok())
+        // `prefill.warmup_steps = 1` on the device arm separates step 0 from steps 1..N in the
+        // ledger.
+        let warmup_steps = sparkflash_model::active_profile()
+            .prefill
+            .warmup_steps
             .unwrap_or(0);
         for (position, token) in prompt_ids.iter().copied().enumerate() {
             sparkflash_kernels::cuda_driver::stage_timing_set_warm(false);

@@ -59,7 +59,14 @@ EXPECTED_FILES="m4_abi.rs m4_abi/acquire_guard.rs m4_abi/scanner.rs"
 # declares the submodules and re-exports the moved public entry points; the aggregate below is the
 # pinned total after that move. Any later commit that changes the total changes this number in the
 # same diff, cited to a Lead decision, and that diff is the review gate.
-PINNED_LINES=13968
+#
+# Pin 13,968 -> 13,972 (2026-11-05): a test inside acquire_guard.rs asserts that the constructor
+# panics on a hint that is not last. That assertion is a debug_assert!, so a release build does not
+# compile it and the test could only pass in a debug one; the test is now gated with
+# #[cfg(debug_assertions)], which added an attribute, a block and two comment lines. A test-only
+# gate around an existing scanner, cited to D76: no scanner was added and no kernel invariant moved
+# here.
+PINNED_LINES=13972
 
 if [ ! -f "$ROOT_FILE" ]; then
     echo "error: $ROOT_FILE is missing; the frozen Milestone-4 ABI lint cannot be removed silently (D26)" >&2

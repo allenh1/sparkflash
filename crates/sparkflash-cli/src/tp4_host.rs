@@ -428,7 +428,11 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
         record_seams: parsed.record_seams,
         reference_check: parsed.reference_check,
         resident_cache: parsed.resident_cache || parsed.fixture.is_none(),
-        profile: parsed.profile || std::env::var("SPARKFLASH_TP4_PROFILE").as_deref() == Ok("1"),
+        profile: parsed.profile
+            || sparkflash_model::active_profile()
+                .diagnostics
+                .profile
+                .unwrap_or(false),
         bench_steps: parsed.bench_steps,
         tokenizer: parsed.tokenizer.clone(),
     };

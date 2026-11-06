@@ -19,6 +19,46 @@ limitations under the License.
 A model arm is configuration, a layer plan and typed op calls. It owns no CUDA and depends on no
 other model crate. This guide is the bring-up path the parity harness assumes.
 
+## 0. The config is the model
+
+The released Hugging Face `config.json` is the description of the model, not a hint for a Rust
+module. `sparkflash_model::Architecture` (`architecture.rs`) reads it - flat or nested under
+`text_config` - and turns its string fields into typed pieces:
+
+- `layer_types` selects the attention of each layer (`linear_attention`,
+  `deepseek_sparse_attention`, `full_attention`, ...);
+- `mlp_layer_types` and `first_k_dense_replace` select a dense MLP or MoE;
+- `indexer_types` says whether a sparse layer runs its own indexer or reuses one;
+- `hidden_act`, `scoring_func` and `output_gate_type` select activations;
+- `compress_ratios`, `kv_source_layer_ids`, `index_source_layer_ids` and
+  `candidate_source_layer_id` say where CSA2 compression and the HSI pool live;
+- `hc_mult`, `hc_count`, `hc_lowrank` and `mhc` select the residual mixer;
+- `engram_layer_ids` and `ple_layer_ids` place the side lookups.
+
+The result is an [`sparkflash_model::Architecture`] whose `parts()` is the set of named
+`Part`s the run needs. `Part` is the shared vocabulary (`mla_attention`, `csa2_compression`,
+`sparse_indexer`, `moe`, `gdn_scan`, `kda_scan`, `hyper_connection`, ...). A part is
+implemented once per `Target` (`sm100`, `sm120`, `sm121`); every model that names it uses
+the same plan and the same kernel, so the second model on an existing part is configuration only.
+
+`Architecture::missing_on(Target)` is the model-side bring-up list. The per-kernel truth is
+`sparkflash_ops::parts` ([catalogue](parts-catalogue.md)): `CATALOGUE` names the target, image
+and symbols behind every part, `carried(target)` says what this tree has, and
+`missing(&Architecture, target)` is the direct answer for a checkpoint. A checkpoint whose list
+is empty has a serving path without new Rust.
+
+`sparkflash serve --checkpoint DIR` uses this document when `--model` is absent: it reads the
+checkpoint's `config.json`, matches the family, checks the catalogue for the parts the target
+needs, and hands the run to that pack's arm. A missing part is a refusal that names every missing
+part, not a silent fallback.
+
+**DeepSeek is canonical.** Where more than one arm implements a part, the DeepSeek implementation
+is the preferred one: it is the most exercised in this tree. A GLM or Qwen kernel may be listed
+beside it, and may be the only implementation of a part DeepSeek does not have, but it does not
+replace the DeepSeek implementation for a model that can use it. `sparkflash_ops::parts` records
+this with exactly one `canonical` entry per `(part, target)`, and the walk never chooses a kernel
+by model name.
+
 ## 1. The one stack
 
 Kernel sources live in `kernels/` and are built by `sparkflash-kernels/build.rs`. Every cubin is
@@ -26,10 +66,16 @@ exposed through `sparkflash_kernels::images`:
 
 | image | accessor |
 | :-- | :-- |
-| Qwen token/attention/expert | `qwen4_exp_cubin()` |
+| Qwen token/norm/dense/hyper, and the shared tiled decode GEMV body | `qwen4_exp_cubin()` |
+| Qwen attention/sparse indexer/KV cache | `qwen4_attn_cubin()` |
+| Qwen decode/token routed expert (MoE) | `qwen4_moe_cubin()` |
 | Qwen tensor-core bulk prefill | `qwen4_prefill_cubin()` |
+| Qwen Gated DeltaNet / KDA scan | `qwen4_scan_cubin()` |
 | DFlash 2 block drafter | `dflash2_cubin()` |
 | GLM block-scaled bulk prefill | `glm_prefill_cubin()` |
+| GLM bulk routed expert (MoE) | `glm_moe_cubin()` |
+| GLM decode/token (mHC, router, indexer, absorbed MLA, tiled GEMV wrappers) | `glm_decode_cubin()` |
+| GLM sparse MLA attention | `glm_attention_cubin()` |
 
 A model crate may not contain a `.cu` or `.cuh` file and may not carry a build script that
 compiles one. The workspace test `sparkflash-ops/tests/one_stack.rs` enforces both, together with
@@ -77,6 +123,29 @@ The shared launch helpers live beside the plans: `gemv` (tiled decode GEMV and i
 loader). An arm implements `GemvDevice` for its stream and scratch; the drafter's
 `DraftDevice` adds the profiling mark and the TP reduce.
 
+### The execution plan
+
+`sparkflash_ops::EnginePlan` is the object an arm opens from. It reads the released
+`Architecture`, validates the `TpPlan`, and emits one `PartRequirement` per part instance with
+the rank-local `PartGeometry` and `Precision`. `KernelResolver` maps each requirement to a
+loadable `PartKernel` by target, shape and availability. A backend implements `EngineBuilder`;
+it does not parse the configuration again.
+
+The boot sequence is:
+
+```rust
+let plan = EnginePlan::from_json(&text, Target::Sm121, world, rank)?;
+let resolver = KernelResolver::new(Target::Sm121, Availability::Runtime);
+if !resolver.failures(&plan).is_empty() {
+    // refuse by part name before opening a weight
+}
+let backend = MyArm::open(&plan, &weights)?;
+```
+
+See [engine/02-execution-plan.md](engine/02-execution-plan.md). The released-config test in
+`crates/sparkflash-ops/tests/engine_plan.rs` is the executable contract: all three configs must
+plan and resolve at TP=1 and TP=4.
+
 ## 3. Configuration
 
 Every arm has one typed TOML profile:
@@ -104,12 +173,52 @@ prints the resolved values at boot. The environment is an override only; the com
 table is `sparkflash_model::profile::ENV_OVERRIDES`. A value outside a field's domain is refused,
 not silently ignored.
 
+A section groups the switches one mechanism owns. `[drafter]` is the speculative drafter's
+kernel variants, the ones an arm was qualified on:
+
+```toml
+[drafter]
+markov_mma = true
+moe_dedup = true
+head_fp8 = true
+seed_split = true
+row_table = true
+```
+
+Two sections are not per-model facts: `[plan]` holds the shared routed-expert plan's block size
+(`threads`, 512 by default, clamped to one block), which is tuning and not layout — the kernel
+derives every loop bound from `blockDim.x`, so any value in range computes the same plan.
+
+The applier is table-driven: `BOOL_FIELDS`, `COUNT_FIELDS`, `F32_FIELDS`, `F64_FIELDS` and
+`TEXT_FIELDS` map a field name to the struct member it writes, and the closed-set fields
+(`prefill.activation`, `attention.latent_cache`, `diagnostics.probe`, `speculation.depth_policy`,
+`drafter.logits`) parse their variants in `apply_one`. Two tests hold the table to the aliases:
+`every_override_settles_on_one_typed_field` refuses a field with two setters or none, and
+`every_override_moves_its_field` applies each alias and refuses one that leaves its field at the
+default. A new alias needs a table row, not a new `match` arm.
+
 Rules for a new switch:
 
 1. add a typed field to the profile;
-2. add its environment alias to `ENV_OVERRIDES`, or do not read it from the environment at all;
+2. add its environment alias to `ENV_OVERRIDES` (and to a setter table), or do not read it from
+   the environment at all;
 3. document the field and alias in this guide;
 4. never let a behaviour be reachable only through an undocumented variable.
+
+### What still reads the environment directly
+
+Three classes stay raw, and none of them moves a served response's arithmetic:
+
+- **Lookup seams.** `ModelProfile::apply_process_env` and `parts::missing_loadable_with` take a
+  lookup closure; the CLI passes the process environment, and a test passes its own.
+- **Operational identity and transport.** `SPARKFLASH_BUILD_ID`, `SPARKFLASH_BOOT_LOG`,
+  `SPARKFLASH_SERVE_SCRIPT`, `SPARKFLASH_SERVE_KEEP_ALIVE_MS`, `SPARKFLASH_MODEL_ALIASES`,
+  `SPARKFLASH_STALL_SECS`, the allocator kill switch, `SPARKFLASH_CUBIN_DIR`,
+  `SPARKFLASH_CONVERTED_DIR`'s sibling resolvers, `SPARK_COMM_PEERS` and
+  `SPARKFLASH_CHECKPOINT` name *where* the process runs, not what it computes.
+- **Harness-only knobs.** `tp4_host`'s reference-thread, prefill-mode and prompt-logprob probe
+  variables, and `tp4_forward`'s sampler (`SPARKFLASH_DSPARK_TEMPERATURE`, `_TOP_P`, `_TOP_K`,
+  `_SEED`) belong to a diagnostic subcommand, which the profile does not describe.
 
 ## 4. Bring-up parity
 
@@ -135,6 +244,7 @@ the mechanism there; never copy it into the arm.
 
 | mechanism | home |
 | :-- | :-- |
+| a routed-expert plan (count by expert, order the slots, cut items) | `kernels/moe_plan_sm121.cu`, `Image::MoePlan`; every arm launches it rather than carrying its own counting pass |
 | model id to checkpoint (the Hugging Face cache) | `sparkflash_weights::hub` |
 | `--synthetic` prompts without a tokenizer | `sparkflash_ops::codec::ByteCodec` |
 | `config.json` errors and a field that is one value or a list | `sparkflash_model::config::{ConfigError, OneOrMany}` |
@@ -143,10 +253,17 @@ the mechanism there; never copy it into the arm.
 | walk-ordered rank files: placement, index, writer, read-back cursor | `sparkflash_weights::rank_file::{SlotPlan, SlotIndex, SlotFileWriter, SlotCursor, SlotRecords}` |
 | `sparkflash convert` for such a pack (ranks, read-back, refusals) | `SlotPack` in `sparkflash-cli/src/convert.rs` |
 | `sparkflash serve` at TP=1 and in a tensor-parallel group | `PackArm` in `sparkflash-cli/src/serve/pack.rs` |
+| the descriptor a pack reports (window and vocabulary from the checkpoint) | `sparkflash_model::arm::PackIdentity` |
+| a session's KV claim and the `--concurrency`/`--kv-budget-gib` admission | `sparkflash_model::arm::KvPlan`, printed and refused by `pack::admit` |
+| which drafts a verify keeps, the tokens it queues, the depth, the counters | `sparkflash_model::spec::{verdict, Queue, Speculator}` |
+| sessions stepped together as one pass over the weights (`--fuse-batch`) | `sparkflash_model::fused::{FusedArm, FusedEngine}` |
+| splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 
 A served arm implements `PackArm` (its ids, fixture, configuration, descriptor, tokenizer, open
-and response layer) and adds a `Pack` variant. The shared driver then finds the checkpoint
+and response layer) and adds a `Pack` variant. Its descriptor is `PackIdentity`'s, its cache claim
+is a `KvPlan` derived from its own geometry, and its speculative path is `spec`'s: a decode drafts,
+one verify decides what survives, and the queue hands the rest back one token at a time. The shared driver then finds the checkpoint
 (`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
 the same configuration, and refuses at parse time any option the arm does not apply
 (`Pack::unapplied`): a group serves one request at a time, so `--concurrency`, `--fuse-batch` and
@@ -156,6 +273,10 @@ TP=1. A directory of rank files named by an environment variable resolves throug
 
 ## 6. Checklist
 
+- [ ] the released `config.json` parses through `Architecture`, and every string it selects is
+      one this build knows;
+- [ ] the arm's `Architecture::parts()` is a subset of the build's catalogue, or the missing parts
+      are named in the refusal;
 - [ ] the config parses, validates, and its boot summary is in the startup log;
 - [ ] nothing in section 5 is reimplemented in the arm;
 - [ ] no `.cu`/`.cuh` and no kernel build script in the model crate;

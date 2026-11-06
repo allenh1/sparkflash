@@ -20,7 +20,7 @@
 
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
+use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_attn_cubin};
 
 fn open() -> Option<Cuda> {
     if !cubin_available() {
@@ -78,7 +78,7 @@ fn the_flat_cache_store_narrows_every_value_with_rne() {
         .alloc(values.len() * 2, &mut total)
         .expect("cache alloc");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_cache_bf16")
+        .load_named(embedded_attn_cubin(), "q4e_cache_bf16")
         .expect("the cubin carries q4e_cache_bf16");
     cuda.launch(
         kernel,
@@ -120,7 +120,7 @@ fn the_strided_cache_store_honours_the_destination_stride() {
     cuda.copy_htod(&destination, &[0xFFu8; ROWS * DEST_STRIDE * 2])
         .expect("destination sentinel");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_cache_rows_bf16")
+        .load_named(embedded_attn_cubin(), "q4e_cache_rows_bf16")
         .expect("the cubin carries q4e_cache_rows_bf16");
     cuda.launch(
         kernel,

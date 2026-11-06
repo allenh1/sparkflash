@@ -241,12 +241,10 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: this is one of twenty-one
-        // entries.
-        assert!(
-            BASELINE.contains("forty-two baseline kernels"),
-            "the manifest header must say forty-two"
-        );
+        // The entry count and the toolkit are part of the same claim; the count comes from the
+        // entries, not from the words in the header.
+        let pins = crate::baseline::parse_pins(BASELINE).expect("the manifest parses");
+        assert_eq!(pins.len(), 43, "the manifest must pin forty-three kernels");
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));
     }

@@ -3100,14 +3100,18 @@ fn the_constructor_appends_the_hint_exactly_once() {
         "the early return is what keeps the hint from being appended twice"
     );
     // A hint that is not last is a message bug, and in a debug build the constructor says so
-    // instead of shipping a rejection whose hint is buried.
-    let refused = std::panic::catch_unwind(|| {
-        rejection(format!("{CANONICAL_HINT} and then some more message"))
-    });
-    assert!(
-        refused.is_err(),
-        "a message that carries the hint anywhere but at its end must be refused"
-    );
+    // instead of shipping a rejection whose hint is buried. Release builds do not carry the
+    // debug assertion, so this half of the constructor's contract is only observable there.
+    #[cfg(debug_assertions)]
+    {
+        let refused = std::panic::catch_unwind(|| {
+            rejection(format!("{CANONICAL_HINT} and then some more message"))
+        });
+        assert!(
+            refused.is_err(),
+            "a message that carries the hint anywhere but at its end must be refused"
+        );
+    }
 }
 
 /// Round 13 A-1 found a rejection built without the hint, and round 13 answered with a source

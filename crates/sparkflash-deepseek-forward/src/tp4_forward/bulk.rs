@@ -251,8 +251,15 @@ impl BulkState {
             modules.push(module);
             Ok(kernel)
         };
+        // The routed-expert plan is the shared image (kernels/moe_plan_sm121.cu): Qwen's token
+        // path, GLM's bulk prefill and this one count and order their routed slots with one
+        // implementation.
+        if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
+            return Err("bulk: this build embeds no routed-expert plan cubin".to_owned());
+        }
+        let moe_plan = sparkflash_kernels::images::moe_plan_cubin();
         let moe_kernels = [
-            load(&mma, "opt_mma_moe_plan")?,
+            load(moe_plan, "moe_plan")?,
             load(&mma, "opt_mma_moe_gate_up")?,
             load(&mma, "opt_mma_moe_down")?,
             load(&mma, "opt_mma_moe_combine")?,
@@ -310,6 +317,7 @@ impl BulkState {
                 scales: share.scales,
                 slot: share.slot,
                 max_tokens: share.stride * share.ways,
+                plan_threads: sparkflash_model::active_profile().plan.block_threads(),
             },
             None => {
                 let [sorted, items, items_count, codes, scales, slot] = MoeBulk::buffer_bytes(cap);
@@ -325,6 +333,7 @@ impl BulkState {
                     scales: Deviceptr(alloc(scales)?),
                     slot: Deviceptr(alloc(slot)?),
                     max_tokens: cap,
+                    plan_threads: sparkflash_model::active_profile().plan.block_threads(),
                 }
             }
         };

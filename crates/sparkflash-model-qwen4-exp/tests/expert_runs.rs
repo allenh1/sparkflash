@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The routed-expert block order on its own: `q4e_moe_permute`'s permutation and the
-//! `(begin, end)` bounds of the run each rank belongs to.
+//! The routed-expert block order on its own: the shared plan's (`moe_plan`) permutation and
+//! the `(begin, end)` bounds of the run each rank belongs to.
 //!
 //! The expert kernels launch one block per run and let the rest exit, so a wrong bound is either
 //! a slot nobody computes (a missing activation) or a slot computed twice from a stale staging
@@ -23,11 +23,12 @@
 //! The tests skip - loudly - without an embedded cubin or a CUDA driver, like the parity suite.
 
 use sparkflash_kernels::cuda_driver::Cuda;
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
+use sparkflash_kernels::images::moe_plan_cubin;
+use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_moe_cubin};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
+    if !cubin_available() || moe_plan_cubin().is_empty() {
+        eprintln!("skipped: this build embeds no Qwen4-Exp or plan cubin");
         return None;
     }
     match Cuda::load() {
@@ -65,15 +66,37 @@ fn permute(cuda: &Cuda, indices: &[i32]) -> (Vec<i32>, Vec<i32>) {
     let perm = cuda.alloc(slots * 4, &mut total).expect("perm");
     let bounds = cuda.alloc(slots * 2 * 4, &mut total).expect("run bounds");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_moe_permute")
-        .expect("the cubin carries q4e_moe_permute");
-    cuda.launch(
-        kernel,
-        (1, 1, 1),
-        (256, 1, 1),
-        &[index_buffer.0, perm.0, bounds.0, slots as u64],
-    )
-    .expect("permute launch");
+        .load_named(moe_plan_cubin(), "moe_plan")
+        .expect("the plan cubin carries moe_plan");
+    let arguments = [
+        index_buffer.0,
+        perm.0,
+        0,
+        0,
+        bounds.0,
+        slots as u64,
+        // The test's ids are expert ids, so every value below this bound is valid and the
+        // policy for one outside it (MOE_PLAN_INVALID_FIRST) is what keeps a -1 slot in
+        // its own group ahead of expert 0.
+        512,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // zero_stride: this harness keeps no expert-row buffer, so a slot the plan leaves out has
+        // no row of its own to zero. Named here rather than omitted: the launch reads one cell per
+        // parameter, and an argument list that stops early is a read past the end of this array.
+        0,
+    ];
+    cuda.launch(kernel, (1, 1, 1), (256, 1, 1), &arguments)
+        .expect("plan launch");
+    cuda.synchronize().expect("plan synchronize");
     cuda.synchronize().expect("permute synchronize");
     let mut perm_host = vec![0_u8; slots * 4];
     cuda.copy_dtoh(&mut perm_host, &perm).expect("perm back");
@@ -116,9 +139,14 @@ fn the_run_bounds_cover_every_slot_exactly_once() {
     };
     // Ten slots per token over four tokens, with experts repeating the way a trained router
     // makes them repeat: a handful of hot experts carry most of the chunk.
+    //
+    // Expert 0 is in the fixture on purpose. The reserved bucket of MOE_PLAN_INVALID_FIRST sits
+    // ahead of expert 0, so a plan that put an invalid id in expert 0's bucket instead would merge
+    // the -1 slots below into expert 0's run; with no 0 slot in the fixture that merge lands in a
+    // bucket no valid slot occupies and the permutation still looks right.
     let slots_per_token = 10_usize;
     let batch = 4_usize;
-    let hot = [3_i32, 17, 3, 5, 5, 3, 61, 3, 5, 17];
+    let hot = [0_i32, 3, 17, 3, 5, 5, 3, 61, 3, 5];
     let indices: Vec<i32> = (0..batch)
         .flat_map(|token| hot.iter().map(move |expert| expert + token as i32 % 2))
         .collect();
@@ -169,7 +197,7 @@ fn route(cuda: &Cuda, logits: &[f32], tokens: usize, experts: usize, topk: usize
         .expect("probabilities");
     let indices = cuda.alloc(tokens * topk * 4, &mut total).expect("indices");
     let (_, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_router")
+        .load_named(embedded_moe_cubin(), "q4e_router")
         .expect("the cubin carries q4e_router");
     cuda.launch(
         kernel,

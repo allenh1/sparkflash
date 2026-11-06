@@ -18,6 +18,13 @@ use crate::error::OpError;
 use crate::images::Image;
 use crate::plan::{KernelId, Launch, OpKind, OpPlan, Precision, StreamId};
 
+/// The dynamic shared memory `q4e_attn_group` reserves: logits and a reduction block for each
+/// of its four query heads, then the token's selection.
+const GQA_GROUP_SHARED_BYTES: u32 = 45_136;
+
+/// The dynamic shared memory `q4e_attn_group6` reserves: the same layout over six query heads.
+const GQA_GROUP6_SHARED_BYTES: u32 = 63_600;
+
 /// The attention arithmetic a plan runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionKind {
@@ -115,11 +122,15 @@ impl OpPlan for AttentionPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        let (image, symbol) = match self.kind {
-            AttentionKind::Mla => (Image::Deepseek, "flash_mla_csa2_sm121"),
-            AttentionKind::Gqa { .. } => (Image::Qwen4Exp, "q4e_attn_group"),
-            AttentionKind::Sparse { .. } => (Image::Deepseek, "flash_mla_csa2_seq_sm121"),
-            AttentionKind::Csa2 { .. } => (Image::Deepseek, "flash_mla_csa2_ring_sm121"),
+        let symbol = match self.kind {
+            AttentionKind::Mla => "flash_mla_csa2_sm121",
+            AttentionKind::Gqa { .. } => gqa_kernel(self.group_size()).0,
+            AttentionKind::Sparse { .. } => "flash_mla_csa2_seq_sm121",
+            AttentionKind::Csa2 { .. } => "flash_mla_csa2_ring_sm121",
+        };
+        let image = match self.kind {
+            AttentionKind::Gqa { .. } => Image::Qwen4Attn,
+            _ => Image::Deepseek,
         };
         KernelId::new(image, symbol)
     }
@@ -137,7 +148,7 @@ impl OpPlan for AttentionPlan {
             grid: (blocks.div_ceil(4) as u32, 1, 1),
             block: (256, 1, 1),
             shared_bytes: match self.kind {
-                AttentionKind::Gqa { .. } => 45_136,
+                AttentionKind::Gqa { .. } => gqa_kernel(self.group_size()).1,
                 _ => 0,
             },
             stream: self.stream,
@@ -197,6 +208,19 @@ impl OpPlan for AttentionPlan {
             });
         }
         Ok(())
+    }
+}
+
+/// The image symbol and dynamic shared memory a GQA head group runs.
+///
+/// The six-head and four-head grouped kernels are the only specialised variants; every other
+/// group (including the 12-head group a TP=2 Qwen arm holds) runs the per-head `q4e_attn` body,
+/// which needs no dynamic shared reservation.
+fn gqa_kernel(group: usize) -> (&'static str, u32) {
+    match group {
+        6 => ("q4e_attn_group6", GQA_GROUP6_SHARED_BYTES),
+        4 => ("q4e_attn_group", GQA_GROUP_SHARED_BYTES),
+        _ => ("q4e_attn", 0),
     }
 }
 

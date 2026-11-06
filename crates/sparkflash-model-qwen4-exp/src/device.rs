@@ -14,9 +14,9 @@
 
 //! The TP=1 device arm.
 //!
-//! One rank, one CUDA context, one cubin. There is no host forward and no silent fallback: a
-//! build without the cubin, a TP world other than one, or a checkpoint that disagrees with the
-//! plan is a typed refusal.
+//! One rank, one CUDA context and the shared kernel images. There is no host forward and no
+//! silent fallback: a build without the cubin, a TP world other than one, or a checkpoint that
+//! disagrees with the plan is a typed refusal.
 //!
 //! # Attribution
 //!
@@ -44,7 +44,8 @@
 //!
 //! # Arithmetic
 //!
-//! Every kernel in kernels/qwen4_exp_sm121.cu mirrors [crate::forward], which is the oracle:
+//! Every kernel in kernels/qwen4_exp_sm121.cu and kernels/qwen4_attn_sm121.cu mirrors
+//! [crate::forward], which is the oracle:
 //! 256-thread blocks, f32 accumulation and exact BF16 widening, no tensor cores. The NVFP4 expert
 //! kernels dequantise on the fly (E2M1 nibble x E4M3 block scale x per-tensor scale) and use f32
 //! activations: the checkpoint's static input_scale is carried but not applied, because applying
@@ -83,8 +84,8 @@ impl std::ops::Deref for CudaHandle {
     }
 }
 use sparkflash_model::{
-    BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession, Sampling,
-    Speculation, StepOutput,
+    BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
+    PackIdentity, Part as SharedPart, Sampling, Speculation, StepOutput,
 };
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -98,7 +99,7 @@ use crate::tensor::{DEVICE_RESIDENT_BYTES, Role};
 mod batch;
 mod blocks;
 mod dflash;
-mod fused;
+mod fusion;
 mod prefill;
 pub(crate) mod tp;
 
@@ -107,7 +108,8 @@ pub use dflash::embedded_dflash2_cubin;
 pub use prefill::{
     ATTENTION_CHUNK, CONV_HISTORY, DEFAULT_PREFILL_CHUNK, DENSE_ROWS, GDN_KEY, GDN_QK_ROW,
     GDN_VALUE, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK,
-    embedded_glm_prefill_cubin, embedded_prefill_cubin, gdn_scan_shape,
+    embedded_glm_moe_cubin, embedded_glm_prefill_cubin, embedded_prefill_cubin,
+    embedded_scan_cubin, gdn_scan_shape,
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
@@ -118,8 +120,8 @@ pub use tp::{reduce_two_shot, splits_two_shot};
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
 /// that differs names the first buffer whose contents changed between them.
 fn probe_hashing() -> bool {
-    static HASH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *HASH.get_or_init(|| std::env::var("SPARKFLASH_QWEN4_PROBE").as_deref() == Ok("hash"))
+    sparkflash_model::active_profile().diagnostics.probe
+        == Some(sparkflash_model::profile::ProbeMode::Hash)
 }
 
 /// 64-bit FNV-1a over a probed buffer's bytes.
@@ -136,7 +138,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// what turns "decode is slow" into "the router is slow" without a profiler on the node.
 mod prof {
     use std::cell::RefCell;
-    use std::sync::OnceLock;
     use std::time::Instant;
 
     struct State {
@@ -153,8 +154,10 @@ mod prof {
 
     /// Whether `SPARKFLASH_QWEN4_PROF` is set.
     pub fn enabled() -> bool {
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("SPARKFLASH_QWEN4_PROF").is_some())
+        sparkflash_model::active_profile()
+            .diagnostics
+            .profile
+            .unwrap_or(false)
     }
 
     /// Start a token's accounting.
@@ -261,6 +264,7 @@ pub const MAX_INDEXER_HEAD_DIM: usize = 128;
 /// Tokens the token GEMM's tile holds (QG_TOKENS); a wider chunk goes through it in slices.
 const GEMM_TILE_TOKENS: usize = 128;
 
+use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::gemv::tiled_operands;
 pub use sparkflash_ops::gemv::{GEMV_MAX_BATCH, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS};
 
@@ -331,6 +335,24 @@ pub fn cubin_available() -> bool {
 #[must_use]
 pub fn embedded_cubin() -> &'static [u8] {
     sparkflash_kernels::images::qwen4_exp_cubin()
+}
+
+/// The attention, sparse-indexer and KV-cache cubin this build embeds.
+///
+/// The grouped-query attention, the indexer's pool/score/pick kernels and the BF16 cache append
+/// used to live in the token image; they now have their own image.
+#[must_use]
+pub fn embedded_attn_cubin() -> &'static [u8] {
+    sparkflash_kernels::images::qwen4_attn_cubin()
+}
+
+/// The decode/token routed-expert (MoE) cubin this build embeds.
+///
+/// The router, the slot permutation and the expert passes used to live at the end of the token
+/// image; they now have their own image so the token image carries no routed-expert kernel.
+#[must_use]
+pub fn embedded_moe_cubin() -> &'static [u8] {
+    sparkflash_kernels::images::qwen4_moe_cubin()
 }
 
 pub use sparkflash_ops::gemv::{GpuMat, GpuMatE4m3};
@@ -490,7 +512,9 @@ struct Kernels {
     sum_slots: Kernel,
     swiglu: Kernel,
     router: Kernel,
-    moe_permute: Kernel,
+    /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the run order its expert
+    /// kernels read and the run bounds that tell each block where its run starts.
+    moe_plan: Kernel,
     expert_gate_up: Kernel,
     expert_down: Kernel,
     expert_gate_up_fp8: Kernel,
@@ -530,8 +554,35 @@ impl Kernels {
                     .to_owned(),
             );
         }
+        if embedded_attn_cubin().is_empty() {
+            return Err(
+                "this build has no Qwen4-Exp attention cubin: rebuild on a host with nvcc (or set \
+                 SPARKFLASH_NVCC) so build.rs compiles \
+                 kernels/qwen4_attn_sm121.cu"
+                    .to_owned(),
+            );
+        }
+        if embedded_moe_cubin().is_empty() {
+            return Err(
+                "this build has no Qwen4-Exp MoE cubin: rebuild on a host with nvcc (or set \
+                 SPARKFLASH_NVCC) so build.rs compiles \
+                 kernels/qwen4_moe_sm121.cu"
+                    .to_owned(),
+            );
+        }
         fn named(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
             let (_, kernel) = cuda.load_named(embedded_cubin(), name)?;
+            Ok(kernel)
+        }
+        // The attention, indexer and KV-cache family lives in its own image
+        // (kernels/qwen4_attn_sm121.cu).
+        fn attn(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
+            let (_, kernel) = cuda.load_named(embedded_attn_cubin(), name)?;
+            Ok(kernel)
+        }
+        // The routed-expert family lives in its own image (kernels/qwen4_moe_sm121.cu).
+        fn moe(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
+            let (_, kernel) = cuda.load_named(embedded_moe_cubin(), name)?;
             Ok(kernel)
         }
         /// A handle that reserves `shared` bytes of dynamic shared memory per launch, falling back
@@ -568,26 +619,37 @@ impl Kernels {
             inject: named(cuda, "q4e_inject")?,
             sum_slots: named(cuda, "q4e_sum_slots")?,
             swiglu: named(cuda, "q4e_swiglu")?,
-            router: named(cuda, "q4e_router")?,
-            moe_permute: named(cuda, "q4e_moe_permute")?,
-            expert_gate_up: named(cuda, "q4e_expert_gate_up")?,
-            expert_down: named(cuda, "q4e_expert_down")?,
-            expert_gate_up_fp8: named(cuda, "q4e_expert_gate_up_fp8")?,
-            expert_down_fp8: named(cuda, "q4e_expert_down_fp8")?,
+            router: moe(cuda, "q4e_router")?,
+            moe_plan: {
+                if sparkflash_kernels::images::moe_plan_cubin().is_empty() {
+                    return Err(
+                        "this build has no routed-expert plan cubin: rebuild on a host with nvcc \
+                         (or set SPARKFLASH_NVCC) so build.rs compiles kernels/moe_plan_sm121.cu"
+                            .to_owned(),
+                    );
+                }
+                let (_, kernel) =
+                    cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")?;
+                kernel
+            },
+            expert_gate_up: moe(cuda, "q4e_expert_gate_up")?,
+            expert_down: moe(cuda, "q4e_expert_down")?,
+            expert_gate_up_fp8: moe(cuda, "q4e_expert_gate_up_fp8")?,
+            expert_down_fp8: moe(cuda, "q4e_expert_down_fp8")?,
             fold_streams: named(cuda, "q4e_fold_streams")?,
             widen_streams: named(cuda, "q4e_widen_streams")?,
-            moe_combine: named(cuda, "q4e_moe_combine")?,
+            moe_combine: moe(cuda, "q4e_moe_combine")?,
             gdn_conv: named(cuda, "q4e_gdn_conv")?,
             gdn_recur: staged(cuda, "q4e_gdn_recur", gdn_stage_bytes)?,
             rope: named(cuda, "q4e_rope")?,
-            qsa_pool: named(cuda, "q4e_qsa_pool")?,
-            qsa_scores: named(cuda, "q4e_qsa_scores")?,
-            qsa_pick: named(cuda, "q4e_qsa_pick")?,
-            attn: named(cuda, "q4e_attn")?,
+            qsa_pool: attn(cuda, "q4e_qsa_pool")?,
+            qsa_scores: attn(cuda, "q4e_qsa_scores")?,
+            qsa_pick: attn(cuda, "q4e_qsa_pick")?,
+            attn: attn(cuda, "q4e_attn")?,
             // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
             attn_group: ATTN_GROUP_KERNELS.map(|(heads, name)| {
                 let bytes = attn_group_shared_bytes(heads);
-                cuda.load_named_shared(embedded_cubin(), name, bytes)
+                cuda.load_named_shared(embedded_attn_cubin(), name, bytes)
                     .map_err(|error| {
                         eprintln!(
                             "{name}: {bytes} bytes of shared memory refused ({error}); q4e_attn"
@@ -601,8 +663,8 @@ impl Kernels {
             deinterleave: named(cuda, "q4e_deinterleave")?,
             rmsnorm_rows: named(cuda, "q4e_rmsnorm_rows")?,
             copy_flat: named(cuda, "q4e_copy_flat")?,
-            cache_bf16: named(cuda, "q4e_cache_bf16")?,
-            cache_rows_bf16: named(cuda, "q4e_cache_rows_bf16")?,
+            cache_bf16: attn(cuda, "q4e_cache_bf16")?,
+            cache_rows_bf16: attn(cuda, "q4e_cache_rows_bf16")?,
             prefill: PrefillKernels::load(cuda)?,
         })
     }
@@ -1225,10 +1287,20 @@ pub(crate) fn build_shard(
         false,
     )?;
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
-    for (index, kind) in config.layer_types.iter().enumerate() {
+    // The shared walk is the one selection: the attention and FFN a layer runs come from the
+    // typed architecture, not from a second reading of `layer_types`.
+    let steps = config.steps();
+    if steps.len() != config.num_hidden_layers {
+        return Err(format!(
+            "the shared walk names {} layers, and the configuration serves {}",
+            steps.len(),
+            config.num_hidden_layers
+        ));
+    }
+    for (index, step) in steps.iter().enumerate() {
         let prefix = format!("model.language_model.layers.{index}");
-        let branch = match kind {
-            LayerKind::Linear => {
+        let branch = match step.attention {
+            SharedPart::GdnScan => {
                 let prefix = format!("{prefix}.linear_attn");
                 GpuBranch::Linear {
                     in_qkv: uploader.mat_rows(
@@ -1287,7 +1359,7 @@ pub(crate) fn build_shard(
                     )?,
                 }
             }
-            LayerKind::Sparse => {
+            SharedPart::GqaAttention => {
                 let prefix = format!("{prefix}.self_attn");
                 // A query head's rows are its query and its gate, interleaved.
                 GpuBranch::Sparse {
@@ -1344,7 +1416,19 @@ pub(crate) fn build_shard(
                     )?,
                 }
             }
+            other => {
+                return Err(format!(
+                    "layer {index} runs the {} attention, which this pack does not build",
+                    other.name()
+                ));
+            }
         };
+        if step.ffn != SharedPart::Moe {
+            return Err(format!(
+                "layer {index} runs the {} feed-forward, which this pack does not build",
+                step.ffn.name()
+            ));
+        }
         let mlp = format!("{prefix}.mlp");
         let experts = (0..config.num_experts)
             .map(|expert| {
@@ -1648,7 +1732,7 @@ pub struct Qwen4ExpDeviceBackend {
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
     /// session runs its own forward on its own stream, the one-row-a-session path.
-    fused: Option<Arc<fused::FusedEngine>>,
+    fused: Option<Arc<sparkflash_model::FusedEngine<fusion::QwenFusion>>>,
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -1682,7 +1766,50 @@ impl Qwen4ExpDeviceBackend {
         context_limit: usize,
         prefill: PrefillPlan,
     ) -> Result<Self, BackendError> {
-        Self::open_inner(checkpoint, context_limit, prefill, None, None)
+        Self::open_inner(checkpoint, context_limit, prefill, None, None, None)
+    }
+
+    /// [Self::open] from an already-built execution plan.
+    ///
+    /// The plan's architecture replaces the typed configuration's layer schedule, so the weight
+    /// walk reads the same layer selection the boot resolver checked. The typed config still owns
+    /// the tensor shapes and weight names.
+    ///
+    /// # Errors
+    /// Everything [Self::open] refuses, and a plan of another family or layer count.
+    pub fn open_with_plan(
+        checkpoint: &Path,
+        context_limit: usize,
+        plan: &EnginePlan,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env()?,
+            None,
+            None,
+            Some(plan),
+        )
+    }
+
+    /// [Self::open_converted] from an already-built execution plan.
+    ///
+    /// # Errors
+    /// Everything [Self::open_converted] refuses, and a plan of another family or layer count.
+    pub fn open_converted_with_plan(
+        checkpoint: &Path,
+        context_limit: usize,
+        rank_file: &Path,
+        plan: &EnginePlan,
+    ) -> Result<Self, BackendError> {
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            PrefillPlan::from_env()?,
+            Some(rank_file),
+            None,
+            Some(plan),
+        )
     }
 
     /// [Self::open] over a converted rank file instead of the checkpoint's tensors, so the
@@ -1702,6 +1829,7 @@ impl Qwen4ExpDeviceBackend {
             PrefillPlan::from_env()?,
             Some(rank_file),
             None,
+            None,
         )
     }
 
@@ -1715,7 +1843,14 @@ impl Qwen4ExpDeviceBackend {
         prefill: PrefillPlan,
         rank_file: &Path,
     ) -> Result<Self, BackendError> {
-        Self::open_inner(checkpoint, context_limit, prefill, Some(rank_file), None)
+        Self::open_inner(
+            checkpoint,
+            context_limit,
+            prefill,
+            Some(rank_file),
+            None,
+            None,
+        )
     }
 
     /// Open the checkpoint for a world of this size with no collective to sum its partials over.
@@ -1747,6 +1882,7 @@ impl Qwen4ExpDeviceBackend {
             PrefillPlan::from_env()?,
             None,
             None,
+            None,
         )
     }
 
@@ -1772,6 +1908,7 @@ impl Qwen4ExpDeviceBackend {
             PrefillPlan::from_env()?,
             None,
             Some(tp),
+            None,
         )
     }
 
@@ -1795,6 +1932,7 @@ impl Qwen4ExpDeviceBackend {
             PrefillPlan::from_env()?,
             Some(rank_file),
             Some(tp),
+            None,
         )
     }
 
@@ -1816,6 +1954,7 @@ impl Qwen4ExpDeviceBackend {
             prefill,
             Some(rank_file),
             Some(tp),
+            None,
         )
     }
 
@@ -1843,6 +1982,7 @@ impl Qwen4ExpDeviceBackend {
         prefill: PrefillPlan,
         converted: Option<&Path>,
         tp: Option<TpRuntime>,
+        plan: Option<&EnginePlan>,
     ) -> Result<Self, BackendError> {
         let directory = if checkpoint.is_dir() {
             checkpoint.to_path_buf()
@@ -1855,10 +1995,33 @@ impl Qwen4ExpDeviceBackend {
                 format!("cannot read {}/config.json: {error}", directory.display()),
             )
         })?;
-        let config = Arc::new(
-            Qwen4ExpConfig::from_json(&text)
-                .map_err(|error| BackendError::new("qwen4_config", error.to_string()))?,
-        );
+        let mut config = Qwen4ExpConfig::from_json(&text)
+            .map_err(|error| BackendError::new("qwen4_config", error.to_string()))?;
+        if let Some(plan) = plan {
+            if plan.family() != "qwen4_exp" {
+                return Err(BackendError::new(
+                    "qwen4_plan",
+                    format!(
+                        "the execution plan is {}, the Qwen arm is qwen4_exp",
+                        plan.family()
+                    ),
+                ));
+            }
+            if plan.layers().len() != config.num_hidden_layers {
+                return Err(BackendError::new(
+                    "qwen4_plan",
+                    format!(
+                        "the execution plan has {} layers, the Qwen configuration has {}",
+                        plan.layers().len(),
+                        config.num_hidden_layers
+                    ),
+                ));
+            }
+            // The boot plan is the layer selection the resolver checked; the typed config keeps
+            // the shapes and weight names.
+            config.architecture = plan.architecture().clone();
+        }
+        let config = Arc::new(config);
         if context_limit == 0 || context_limit > config.max_position_embeddings {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -2092,11 +2255,12 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
-        self.fused = Some(fused::FusedEngine::start(
+        let arm = Arc::new(fusion::QwenFusion::new(
             Arc::clone(&self.shared),
             self.context_limit,
             capacity,
-        )?);
+        ));
+        self.fused = Some(sparkflash_model::FusedEngine::start(arm, capacity)?);
         Ok(())
     }
 
@@ -2199,19 +2363,29 @@ impl Qwen4ExpDeviceBackend {
     }
 }
 
-/// What the device arm serves over a window of `context` tokens: the text channels the pack
-/// renders, without the vision tower.
+/// This pack's identity in the registry.
+pub const IDENTITY: PackIdentity = PackIdentity {
+    model_id: crate::MODEL_ID,
+    family: crate::FAMILY,
+    model_type: "qwen4_exp",
+    label: "Qwen",
+    weights_id: crate::WEIGHTS_ID,
+    max_output_tokens: crate::MAX_OUTPUT_TOKENS,
+};
+
+/// What this arm can serve of `config` once loaded.
+///
+/// The text channels are the codec's. The vision tower is planned but not loaded, so the channel
+/// is not claimed; a build that loads it returns [Capabilities::ALL_WITH_VISION].
+#[must_use]
+pub fn capabilities(_config: &Qwen4ExpConfig) -> Capabilities {
+    Capabilities::ALL
+}
+
+/// What the device arm serves over a window of `context` tokens.
 #[must_use]
 pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescriptor {
-    ModelDescriptor {
-        id: crate::MODEL_ID.to_owned(),
-        family: crate::FAMILY.to_owned(),
-        weights_id: crate::WEIGHTS_ID.to_owned(),
-        context_tokens: context.min(config.max_position_embeddings),
-        max_output_tokens: crate::MAX_OUTPUT_TOKENS,
-        vocab_size: config.vocab_size,
-        capabilities: Capabilities::ALL,
-    }
+    IDENTITY.descriptor(&config.architecture, context, capabilities(config))
 }
 
 /// A per-session device workspace and cache set.
@@ -2284,9 +2458,9 @@ struct DeviceSequence {
     logits: Deviceptr,
     probabilities: Deviceptr,
     expert_indices: Deviceptr,
-    /// The routed block order q4e_moe_permute writes, so the expert kernels need no inline sort.
+    /// The routed block order the shared plan writes, so the expert kernels need no inline sort.
     expert_perm: Deviceptr,
-    /// [slots][2] First and last rank of each rank's expert run, from q4e_moe_permute.
+    /// [slots][2] First and last rank of each rank's expert run, from the shared plan.
     expert_run: Deviceptr,
     expert_accumulator: Deviceptr,
     /// [slots][intermediate] SwiGLU rows the two expert passes share.
@@ -2346,10 +2520,8 @@ struct DeviceSequence {
     spec_drafts: Vec<u32>,
     /// The DFlash 2 drafter's confidence in each of `spec_drafts`.
     spec_confidence: Vec<f32>,
-    /// How many of a DFlash 2 block's drafts a step verifies, when the drafter is loaded.
-    depth_policy: Option<DepthPolicy>,
-    /// How many proposals a step offers: one, or two when the chain can run.
-    spec_depth: usize,
+    /// How deep to draft and what the drafts were worth: the shared rule's depth and counters.
+    spec: sparkflash_model::Speculator,
     /// What `mtp_folded` is scaled by: a mean over the streams, unless the checkpoint wants the
     /// sum, which `SPARKFLASH_QWEN4_MTP_FOLD=sum` selects.
     mtp_fold_scale: f32,
@@ -2363,8 +2535,6 @@ struct DeviceSequence {
     /// The second stream of a chunk that runs as two halves, made with the first such chunk.
     overlap: Option<tp::Overlap>,
     spec_trace: bool,
-    /// Verify passes and the drafts they offered and kept, which the serving layer reports.
-    speculation: Speculation,
     /// The rows of the forward in flight, so a hash probe can name each row's position.
     probe_rows: usize,
     sampling: Sampling,
@@ -2638,11 +2808,13 @@ impl DeviceSequence {
         pointer: Deviceptr,
         elements: usize,
     ) -> Result<(), BackendError> {
-        use std::sync::OnceLock;
         use std::sync::atomic::{AtomicUsize, Ordering};
         static REPORTED: AtomicUsize = AtomicUsize::new(0);
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var_os("SPARKFLASH_QWEN4_PROBE").is_some()) {
+        if sparkflash_model::active_profile()
+            .diagnostics
+            .probe
+            .is_none()
+        {
             return Ok(());
         }
         let mut bytes = vec![0u8; elements * 4];
@@ -2678,12 +2850,9 @@ impl DeviceSequence {
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         let bad = values.iter().filter(|value| !value.is_finite()).count();
-        static DUMP: OnceLock<bool> = OnceLock::new();
-        if *DUMP.get_or_init(|| {
-            std::env::var("SPARKFLASH_QWEN4_PROBE")
-                .map(|value| value == "dump")
-                .unwrap_or(false)
-        }) && (label == "after_mlp" || label == "logits")
+        if sparkflash_model::active_profile().diagnostics.probe
+            == Some(sparkflash_model::profile::ProbeMode::Dump)
+            && (label == "after_mlp" || label == "logits")
         {
             let head = &values[..values.len().min(4)];
             let min = values.iter().copied().fold(f32::INFINITY, f32::min);
@@ -4084,7 +4253,7 @@ impl DeviceSequence {
             return Ok(());
         };
         self.spec_drafts.push(draft);
-        if self.spec_depth < 2 {
+        if self.spec.max_depth() < 2 {
             return Ok(());
         }
         self.stash_mtp_hyper()?;
@@ -4452,43 +4621,46 @@ impl DeviceSequence {
             spec_queue: Vec::new(),
             spec_drafts: Vec::new(),
             spec_confidence: Vec::new(),
-            depth_policy: shared
-                .dflash
-                .as_ref()
-                .map(|draft| {
-                    DepthPolicy::from_env(
-                        "SPARKFLASH_QWEN4_DFLASH2",
-                        draft.config.block_size - 1,
-                        DFLASH2_STEP_COST,
-                    )
-                })
-                .transpose()
-                .map_err(|error| BackendError::new("qwen4_dflash2", error))?,
-            // One proposal per step is the measured default: the pair's second row is nearly
-            // free, but a third one costs more than the chained draft earns back (16.4-19.7
-            // tok/s against 18.8-22.5 over the benchmark prompts).
-            spec_depth: std::env::var("SPARKFLASH_QWEN4_SPEC_DEPTH")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1)
-                .clamp(1, 2),
+            // The chain is as wide as the drafter that fills it: the MTP pair is two rows by
+            // construction (`draft_chain` stops there), and a DFlash 2 block proposes
+            // `block_size - 1` drafts, which is one verify of the block's own width. The
+            // profile's depth is the ceiling on top of that; the earlier `clamp(1, 2)` was a
+            // TP=1 measurement of the MTP pair, applied to a drafter that offers seven.
+            spec: sparkflash_model::Speculator::new(
+                {
+                    let chain = shared
+                        .dflash
+                        .as_ref()
+                        .map_or(2, |draft| draft.config.block_size.saturating_sub(1));
+                    sparkflash_model::active_profile()
+                        .speculation
+                        .depth
+                        .unwrap_or(chain)
+                        .clamp(1, chain)
+                },
+                shared.dflash.as_ref().map(|draft| {
+                    DepthPolicy::from_profile(draft.config.block_size - 1, DFLASH2_STEP_COST)
+                }),
+            ),
             spec_enabled: (config.mtp_num_hidden_layers > 0 || shared.dflash.is_some())
-                && std::env::var("SPARKFLASH_QWEN4_SPEC")
-                    .map(|v| v != "0")
+                && sparkflash_model::active_profile()
+                    .speculation
+                    .enabled
                     .unwrap_or(true),
-            mtp_fold_scale: if std::env::var("SPARKFLASH_QWEN4_MTP_FOLD")
-                .map(|v| v == "sum")
-                .unwrap_or(false)
-            {
-                1.0
-            } else {
-                1.0 / config.hc_count as f32
-            },
+            // A mean over the hyper-connection streams unless the profile names a scale; `sum`
+            // is the spelling `SPARKFLASH_QWEN4_MTP_FOLD` has always documented for one, and it
+            // arrives here as the number one (crates/sparkflash-model/src/profile.rs).
+            mtp_fold_scale: sparkflash_model::active_profile()
+                .speculation
+                .mtp_fold_scale
+                .unwrap_or(1.0 / config.hc_count as f32),
             own_rows: None,
             window: 0,
             overlap: None,
-            spec_trace: std::env::var_os("SPARKFLASH_QWEN4_SPEC_TRACE").is_some(),
-            speculation: Speculation::default(),
+            spec_trace: sparkflash_model::active_profile()
+                .diagnostics
+                .spec_trace
+                .unwrap_or(false),
             probe_rows: 1,
             ple_host_staging: buffers.ple_host_staging,
             token_staging: buffers.token_staging,
@@ -4496,7 +4668,10 @@ impl DeviceSequence {
             sampling: Sampling::default(),
             sampler: crate::sampling::Sampler::new(),
             eos: config.eos_token_ids.clone(),
-            trace: std::env::var_os("SPARKFLASH_QWEN4_TRACE").is_some(),
+            trace: sparkflash_model::active_profile()
+                .diagnostics
+                .trace
+                .unwrap_or(false),
         })
     }
     /// The per-row activation scratch, in a canonical order.
@@ -4727,17 +4902,8 @@ impl DeviceSequence {
             agreed += 1;
         }
         self.sampler.truncate(history);
+        self.spec.observe(confidence, drafts.len(), agreed + 1);
         {
-            if !drafts.is_empty() {
-                self.speculation.verify_steps += 1;
-            }
-            self.speculation.drafts_proposed += drafts.len();
-            self.speculation.drafts_accepted += agreed;
-            if let Some(policy) = self.depth_policy.as_mut() {
-                // A step the policy gave no drafts is still a step of the drafted sequence: its
-                // cost is the rate the next depth is weighed at.
-                policy.observe(confidence, drafts.len(), agreed);
-            }
             if self.spec_trace && !drafts.is_empty() {
                 // A draft's rank in the model's own row is the quality signal: a proposal that
                 // is always tens of places away points at the MTP's arithmetic, not at its luck.
@@ -4764,8 +4930,14 @@ impl DeviceSequence {
         // Everything the model agreed with stays; the rest of the chain gives its state back so
         // the positions it consumed can be written again by the steps that follow. The verify
         // left the recurrent state untouched, so the kept rows are committed to it whatever the
-        // count.
-        let kept = agreed + 1;
+        // count. The count is the shared rule's ([sparkflash_model::verdict]) and the loop above
+        // must read the same chain: it stops at the first row that disagreed for the same reason.
+        let picks: Vec<u32> = answers
+            .iter()
+            .map(|answer| answer.unwrap_or(u32::MAX))
+            .collect();
+        let kept = sparkflash_model::verdict(rows, &picks);
+        debug_assert_eq!(kept, agreed + 1, "the verify and the shared rule disagree");
         // A verify leaves the live recurrent state as it found it and writes its last row's into
         // the spare, so the kept rows are committed by swapping the two. A plain one-row step
         // wrote the live state itself and must not swap: there is nothing to keep and nothing to
@@ -4844,7 +5016,7 @@ impl ModelBackend for Qwen4ExpDeviceBackend {
 
 impl ModelSession for DeviceSequence {
     fn speculation(&self) -> Speculation {
-        self.speculation
+        self.spec.stats()
     }
 
     /// The tokens this sequence has forwarded, while its caches end exactly where they end.
@@ -4868,7 +5040,7 @@ impl ModelSession for DeviceSequence {
         self.sampler.reset();
         // The adapter calls this once per request, and a kept sequence carries the last one's
         // counts: a request reports its own speculation, not the session's lifetime.
-        self.speculation = Speculation::default();
+        self.spec.reset();
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {

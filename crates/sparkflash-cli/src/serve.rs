@@ -108,10 +108,8 @@
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "tp4-serve")]
-use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::net::SocketAddr;
-#[cfg(feature = "tp4-serve")]
-use std::net::{IpAddr, TcpListener, TcpStream};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -122,8 +120,6 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
-#[cfg(feature = "tp4-serve")]
-use serde::{Deserialize, Serialize};
 use sparkflash_api::device_chain::{ClaimMode, DeviceChainEnvelope};
 use sparkflash_api::device_token::{
     DeviceChainTokenSource, DeviceTokenSource, LiveWindowTokenSource, TokenPieceDecoder,
@@ -161,9 +157,12 @@ use sparkflash_engram::store::{BackendPreference, DirectTable, RowTable, specs_f
 use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_kv::PrefixMatchPlan;
 use sparkflash_model::numerics::{ARCH_HOST, ConfigKey, NumericsIdentity, NumericsProfile};
+use sparkflash_model::{ModelProfile, Target};
 use sparkflash_model_deepseek_v41::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
+use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 
@@ -182,7 +181,11 @@ use crate::run_header::{COMM_REDUCE_ENV, ReducePath};
 #[cfg(feature = "tp4-serve")]
 mod device;
 #[cfg(feature = "tp4-serve")]
+mod tp4_control;
+#[cfg(feature = "tp4-serve")]
 pub use device::DeviceServeOptions;
+#[cfg(feature = "tp4-serve")]
+use tp4_control::*;
 mod pack;
 
 /// The index file a sharded safetensors checkpoint is described by.
@@ -700,9 +703,43 @@ impl ServeOptions {
     /// A message naming the flag that is wrong or missing: `--synthetic` together with
     /// `--checkpoint`, neither of them, or an argument clap cannot parse.
     pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        let cli =
+        let mut cli =
             ServeArgs::try_parse_from(std::iter::once("sparkflash serve".to_owned()).chain(args))
                 .map_err(|error| error.to_string())?;
+        // A packed model's released config names its architecture. When the operator passed a
+        // checkpoint and no --model, read that document before the flag checks below, so a
+        // checkpoint whose parts this build carries is served by its own arm rather than being
+        // mistaken for the V4.1 engine.
+        if cli.model.is_none()
+            && !cli.synthetic
+            && let Some(path) = cli.checkpoint.as_deref()
+        {
+            let directory = pack::checkpoint_directory(path);
+            if let Some(pack) = pack::Pack::detect(&directory) {
+                // The default DeepSeek arm is the V4.1 path, not a PackArm. Its reference
+                // server launches no kernel, so the loadable-image check belongs to the boot
+                // plan check (`check_checkpoint_plan`) and not to detection: a DeepSeek
+                // checkpoint with no SPARKFLASH_CUBINS still serves on the host.
+                if pack == pack::Pack::Deepseek {
+                    // Keep `cli.model` unset so `run` takes the V4.1 reference/TP4 path.
+                } else {
+                    let missing = pack::Pack::missing_parts(&directory);
+                    if !missing.is_empty() {
+                        let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+                        return Err(format!(
+                            "--checkpoint {} names parts this build does not carry for sm121: {}",
+                            directory.display(),
+                            names.join(", ")
+                        ));
+                    }
+                    cli.model = Some(pack.model_id().to_owned());
+                }
+            }
+        }
+        // A registry model name selects a pack; the default DeepSeek arm is a pack identity but
+        // not a PackArm, so the packed-model flag checks below are keyed on `is_arm`.
+        let pack = cli.model.as_deref().and_then(pack::Pack::named);
+        let packed = pack.is_some_and(pack::Pack::is_arm);
         let tokenizer = cli.tokenizer;
         let checkpoint = cli.checkpoint;
         // An empty key would authenticate only an empty bearer token; refuse it at parse time
@@ -803,13 +840,13 @@ impl ServeOptions {
                 sparkflash_serve::host::DEFAULT_QUEUE
             ));
         }
-        if cli.fuse_batch && cli.model.is_none() {
+        if cli.fuse_batch && !packed {
             return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
         }
         if cli.fuse_batch && cli.concurrency < 2 {
             return Err("--fuse-batch needs --concurrency of at least 2".to_owned());
         }
-        if cli.kv_budget_gib.is_some() && cli.model.is_none() {
+        if cli.kv_budget_gib.is_some() && !packed {
             return Err(
                 "--kv-budget-gib is the packed model's knob; the V4.1 engine sizes its own caches"
                     .to_owned(),
@@ -818,7 +855,7 @@ impl ServeOptions {
         if cli.kv_budget_gib == Some(0) {
             return Err("--kv-budget-gib must be at least 1".to_owned());
         }
-        if cli.model.is_none() && cli.concurrency != 1 {
+        if !packed && cli.concurrency != 1 {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -864,7 +901,9 @@ impl ServeOptions {
         // A packed model is served by its own arm. Every flag below describes the V4.1 engine's
         // weights, its device session, its Engram paging or its four-rank group; silently ignoring
         // one would serve something other than what the operator asked for.
-        if let Some(model) = cli.model.as_deref() {
+        if let Some(model) = cli.model.as_deref()
+            && pack != Some(pack::Pack::Deepseek)
+        {
             let mut unsupported: Vec<&str> = Vec::new();
             if cli.engram_dir.is_some() {
                 unsupported.push("--engram-dir");
@@ -1043,11 +1082,12 @@ struct ServeArgs {
     checkpoint: Option<PathBuf>,
     /// Serve a model pack by id instead of the V4.1 engine.
     ///
-    /// The only pack wired today is nvidia/Qwen3.8-Flash-Next-NVFP4 (alias
-    /// qwen3.8-flash-next-nvfp4), which is device-only and TP=1: it needs a GPU whose driver can
-    /// load the embedded cubin plus its canonical Hugging Face cache snapshot. With
-    /// --synthetic it serves the pack's own tiny fixture instead, which is a runnable demo of the
-    /// same code path rather than the V4.1 tiny plan.
+    /// The packs wired today are nvidia/Qwen3.8-Flash-Next-NVFP4 (alias
+    /// qwen3.8-flash-next-nvfp4) and zai-org/GLM-5.3-Flash (alias glm5.3-flash-fp8), each
+    /// device-only and TP=1: they need a GPU whose driver can load the embedded cubin plus a
+    /// checkpoint. With --synthetic a pack serves its own tiny fixture instead, which is a
+    /// runnable demo of the same code path rather than the V4.1 tiny plan. When --model is absent
+    /// and --checkpoint is given, the checkpoint's own config.json names the pack.
     #[arg(long, value_name = "ID")]
     model: Option<String>,
     /// The context window a packed model allocates, in tokens.
@@ -2117,560 +2157,6 @@ fn cluster_snapshot() -> ClusterStatsSnapshot {
         dspark: DSparkStepStats::default(),
         timing: RequestTimingStats::default(),
         max_seq_len: max_seq_len(),
-    }
-}
-
-// ---------------------------------------------------------------------------------------
-// TP=4 serve control channel
-// ---------------------------------------------------------------------------------------
-//
-// The engine collective and the serve control channel are deliberately separate. The engine's
-// TcpTransport carries only its data collective frames (Hello/Data/Shutdown) and its send/recv
-// are not part of the Transport trait; the serve protocol is a small length-prefixed JSON frame
-// stream on its own port. Rank 0 is the hub: it accepts every worker's Hello, sends Ready only
-// after all ranks declared ready, then broadcasts Request/Token/End or an Error. Workers never
-// detokenize and never sample: they receive the prompt ids once per request and the sampled token
-// ids one per step, and each runs the same forward step on its own SequenceState.
-
-/// The largest control frame accepted: a device tick's prompt id lists (rank 0 stops admitting at
-/// [`TP4_TICK_PROMPT_IDS`] ids) and a small error message fit below this. A frame larger than this
-/// is a protocol error, not an allocation request.
-#[cfg(feature = "tp4-serve")]
-const TP4_CONTROL_MAX_FRAME: usize = 8 << 20;
-
-/// The largest canvas a [`Tp4ControlFrame::DevicePixels`] frame carries: the largest span
-/// (`vision_max_n_token` tokens) is about 1024 cells of 42 x 42 RGB pixels, 5.4 MB.
-#[cfg(feature = "tp4-serve")]
-const TP4_CONTROL_MAX_PIXELS: usize = 16 << 20;
-
-/// The prompt ids one device tick's admissions carry at most (about 7 bytes each in JSON): a
-/// request past this joins at the next tick.
-#[cfg(feature = "tp4-serve")]
-pub(crate) const TP4_TICK_PROMPT_IDS: usize = 768 << 10;
-
-/// One message on the serve-owned control channel.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Tp4ControlFrame {
-    /// A worker's first frame: which rank this connection is.
-    Hello {
-        /// The worker rank, 1..world_size.
-        rank: u32,
-    },
-    /// Rank 0 -> worker: every rank has declared ready; requests may start.
-    Ready,
-    /// Rank 0 -> every worker: one request's prompt ids and generation budget.
-    Request {
-        /// The tokens rank 0 rendered (the chat template is already applied).
-        prompt_ids: Vec<u32>,
-        /// The request's clamped generation budget.
-        max_tokens: u32,
-        /// The prompt-logprobs top count the request asked for, when it asked for any.
-        ///
-        /// `None` is "no prompt logprobs"; `Some(0)` is "each prompt position's own token
-        /// only". The whole-vocabulary -1 selection is refused before a job is admitted: the
-        /// bounded candidate exchange cannot carry it.
-        #[serde(default)]
-        prompt_logprobs: Option<u32>,
-        /// Whether the request decodes speculatively ([Tp4Sampling::speculative]): every rank
-        /// takes it from here, so every rank drafts and verifies the same steps.
-        #[serde(default)]
-        speculative: bool,
-    },
-    /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
-    Token {
-        /// The token rank 0 sampled; workers must not sample their own.
-        token_id: u32,
-    },
-    /// Rank 0 -> every worker, before each device scheduler tick: the requests that join and
-    /// the sequences that end there (a stop string matched, or the client left).
-    DeviceTick {
-        /// The new requests, in arrival order.
-        admit: Vec<Tp4DeviceAdmit>,
-        /// The sequence ids that end before the tick runs.
-        cancel: Vec<u64>,
-        /// The tick holds a long prefill back for a decode step (rank 0's clock).
-        #[serde(default)]
-        hold_prefill: bool,
-    },
-    /// Rank 0 -> the vision tower's rank only, before the DeviceTick that admits the request: the
-    /// canvas of image `image` of sequence `seq`, as `bytes` raw RGB bytes that follow the frame on
-    /// the wire (a canvas is megabytes; JSON would triple it).
-    DevicePixels {
-        /// The sequence the image belongs to.
-        seq: u64,
-        /// The image's index in the admission's `images`.
-        image: u32,
-        /// The canvas bytes after the frame.
-        bytes: u64,
-    },
-    /// The request ended normally; every worker leaves the request loop.
-    End,
-    /// The request or the group failed; every worker leaves the process.
-    Error {
-        /// The same code the HTTP error event uses, e.g. engine_gone.
-        code: String,
-        /// An operator-facing message.
-        message: String,
-    },
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4ControlFrame {
-    /// A short name for an unexpected-frame message.
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Hello { .. } => "Hello",
-            Self::Ready => "Ready",
-            Self::Request { .. } => "Request",
-            Self::Token { .. } => "Token",
-            Self::DeviceTick { .. } => "DeviceTick",
-            Self::DevicePixels { .. } => "DevicePixels",
-            Self::End => "End",
-            Self::Error { .. } => "Error",
-        }
-    }
-}
-
-/// One request on the device path, with its sampler, as a device tick admits it.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tp4DeviceAdmit {
-    /// The sequence id rank 0 gave the request: later ticks cancel it by this id.
-    pub seq: u64,
-    /// The tokens rank 0 rendered (the chat template is already applied).
-    pub prompt_ids: Vec<u32>,
-    /// The request's clamped generation budget.
-    pub max_tokens: u32,
-    /// The temperature's f32 bits (0 is greedy); bits keep the frame `Eq`.
-    pub temperature_bits: u32,
-    /// The nucleus threshold's f32 bits.
-    pub top_p_bits: u32,
-    /// The candidate count (0 keeps every token).
-    pub top_k: u32,
-    /// The sampler seed every rank draws its noise from.
-    pub seed: u64,
-    /// The ids that end the request once emitted.
-    pub stop_ids: Vec<u32>,
-    /// The prompt's images in prompt order; the canvases go to the tower rank in
-    /// [`Tp4ControlFrame::DevicePixels`] frames.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<Tp4DeviceImage>,
-    /// The JSON Schema the document must satisfy, when the request asked for structured output.
-    /// Every rank rebuilds the constraint from this, so it is the schema and not a pointer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraint: Option<String>,
-}
-
-/// One image span of an admission: where it sits in the prompt and the canvas it is made from.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tp4DeviceImage {
-    /// The span's first position.
-    pub start: u64,
-    /// Token rows.
-    pub n_llm_h: u32,
-    /// Token columns.
-    pub n_llm_w: u32,
-    /// Canvas height in pixels.
-    pub best_height: u32,
-    /// Canvas width in pixels.
-    pub best_width: u32,
-    /// The canvas's content key, hex.
-    pub key: String,
-}
-
-/// A typed control-channel refusal or transport failure.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug)]
-pub enum Tp4ControlError {
-    /// A socket read/write failed.
-    Io(std::io::Error),
-    /// A frame was not valid JSON.
-    Json(serde_json::Error),
-    /// Rank 0 waited for a rank that never connected.
-    MissingRank {
-        /// The world size the group expected.
-        world: usize,
-        /// How many ranks did connect.
-        joined: usize,
-        /// The deadline rank 0 waited.
-        waited: Duration,
-    },
-    /// A control socket timed out while a specific stage was expected.
-    Timeout {
-        /// The protocol stage that timed out.
-        stage: &'static str,
-    },
-    /// A worker could not reach rank 0's control hub inside the startup budget.
-    ConnectTimeout {
-        /// Rank 0's control address the worker kept trying.
-        address: SocketAddr,
-        /// How long the worker kept retrying before giving up.
-        waited: Duration,
-    },
-    /// A frame was received before the group was Ready.
-    NotReady {
-        /// What the receiver was waiting for.
-        expected: &'static str,
-    },
-    /// A frame arrived that the protocol did not allow at that point.
-    UnexpectedFrame {
-        /// What the receiver expected.
-        expected: &'static str,
-        /// What it got.
-        got: Tp4ControlFrame,
-    },
-    /// A Hello named a rank outside the group or a rank that already joined.
-    BadRank {
-        /// The offending rank.
-        rank: u32,
-        /// The world size.
-        world: usize,
-    },
-    /// A frame declared a payload larger than the protocol cap.
-    FrameTooLarge {
-        /// The declared payload length.
-        bytes: usize,
-    },
-}
-
-#[cfg(feature = "tp4-serve")]
-impl std::fmt::Display for Tp4ControlError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(error) => write!(f, "control I/O: {error}"),
-            Self::Json(error) => write!(f, "control frame is not valid JSON: {error}"),
-            Self::MissingRank {
-                world,
-                joined,
-                waited,
-            } => write!(
-                f,
-                "TP=4 rank 0 waited {waited:?} for {world} ranks and only {joined} joined; the missing rank is a startup refusal, not a single-rank fallback"
-            ),
-            Self::ConnectTimeout { address, waited } => write!(
-                f,
-                "control connect to {address} was still refused after {waited:?}; rank 0's hub was not listening within the TP=4 startup budget"
-            ),
-            Self::Timeout { stage } => write!(f, "control timeout while waiting for {stage}"),
-            Self::NotReady { expected } => {
-                write!(f, "control frame {expected} arrived before Ready")
-            }
-            Self::UnexpectedFrame { expected, got } => {
-                write!(f, "control expected {expected}, got {}", got.kind())
-            }
-            Self::BadRank { rank, world } => {
-                write!(f, "control Hello rank {rank} is outside a world of {world}")
-            }
-            Self::FrameTooLarge { bytes } => {
-                write!(f, "control frame declares {bytes} bytes, above the cap")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "tp4-serve")]
-impl std::error::Error for Tp4ControlError {}
-
-#[cfg(feature = "tp4-serve")]
-impl From<std::io::Error> for Tp4ControlError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error)
-    }
-}
-
-#[cfg(feature = "tp4-serve")]
-impl From<serde_json::Error> for Tp4ControlError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error)
-    }
-}
-
-/// One length-prefixed JSON control frame, as it goes on the wire.
-#[cfg(feature = "tp4-serve")]
-fn control_frame_bytes(frame: &Tp4ControlFrame) -> Result<Vec<u8>, Tp4ControlError> {
-    let payload = serde_json::to_vec(frame)?;
-    let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
-        bytes: payload.len(),
-    })?;
-    let mut bytes = Vec::with_capacity(4 + payload.len());
-    bytes.extend_from_slice(&length.to_be_bytes());
-    bytes.extend_from_slice(&payload);
-    Ok(bytes)
-}
-
-/// Writes one length-prefixed JSON control frame.
-#[cfg(feature = "tp4-serve")]
-fn write_control_frame(
-    stream: &mut TcpStream,
-    frame: &Tp4ControlFrame,
-) -> Result<(), Tp4ControlError> {
-    // One write per frame: with TCP_NODELAY a frame is one segment, not a header the peer
-    // waits on while the payload sits behind Nagle.
-    stream.write_all(&control_frame_bytes(frame)?)?;
-    stream.flush()?;
-    Ok(())
-}
-
-/// A [`Tp4ControlFrame::DevicePixels`] frame and its canvas bytes, as they go on the wire.
-#[cfg(feature = "tp4-serve")]
-fn control_pixels_bytes(seq: u64, image: u32, pixels: &[u8]) -> Result<Vec<u8>, Tp4ControlError> {
-    if pixels.len() > TP4_CONTROL_MAX_PIXELS {
-        return Err(Tp4ControlError::FrameTooLarge {
-            bytes: pixels.len(),
-        });
-    }
-    let frame = Tp4ControlFrame::DevicePixels {
-        seq,
-        image,
-        bytes: pixels.len() as u64,
-    };
-    let mut bytes = control_frame_bytes(&frame)?;
-    bytes.extend_from_slice(pixels);
-    Ok(bytes)
-}
-
-/// Reads the `bytes` canvas bytes that follow a [`Tp4ControlFrame::DevicePixels`] frame.
-#[cfg(feature = "tp4-serve")]
-fn read_control_pixels(stream: &mut TcpStream, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
-    let length = usize::try_from(bytes).unwrap_or(usize::MAX);
-    if length > TP4_CONTROL_MAX_PIXELS {
-        return Err(Tp4ControlError::FrameTooLarge { bytes: length });
-    }
-    let mut pixels = vec![0u8; length];
-    stream.read_exact(&mut pixels)?;
-    Ok(pixels)
-}
-
-/// Whether a control read timed out with no request open, which is an idle wait rather than a
-/// dead peer.
-///
-/// The socket's read timeout is a liveness guard for a stalled step; between requests it fires on
-/// a healthy server that has simply received nothing. Only the timeout kinds mean "try again":
-/// a reset or a broken pipe is still a failure.
-#[cfg(feature = "tp4-serve")]
-fn control_read_is_idle(error: &Tp4ControlError) -> bool {
-    matches!(
-        error,
-        Tp4ControlError::Io(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            )
-    )
-}
-
-/// Reads one length-prefixed JSON control frame.
-#[cfg(feature = "tp4-serve")]
-fn read_control_frame(stream: &mut TcpStream) -> Result<Tp4ControlFrame, Tp4ControlError> {
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
-    let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);
-    if length == 0 || length > TP4_CONTROL_MAX_FRAME {
-        return Err(Tp4ControlError::FrameTooLarge { bytes: length });
-    }
-    let mut payload = vec![0u8; length];
-    stream.read_exact(&mut payload)?;
-    Ok(serde_json::from_slice(&payload)?)
-}
-
-/// Rank 0's end of the control channel: one stream per worker, readiness, and broadcast.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug)]
-struct Tp4ControlHub {
-    /// Index by worker rank; rank 0 is always None (it is the hub itself).
-    streams: Vec<Option<TcpStream>>,
-    /// The number of ranks in the group.
-    world: usize,
-    /// Whether every worker has declared Hello and Ready was sent.
-    ready: bool,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4ControlHub {
-    /// Binds the control listener and waits for every worker's Hello.
-    ///
-    /// The acceptance loop uses a non-blocking listener plus a deadline so a missing rank is a
-    /// typed error with the count that joined, not an indefinite accept. Ready is sent only after
-    /// every rank has connected: that is what makes a Request-before-Ready a protocol violation
-    /// rather than a race.
-    fn start(
-        address: SocketAddr,
-        world: usize,
-        timeout: Duration,
-    ) -> Result<Self, Tp4ControlError> {
-        if world == 0 {
-            return Err(Tp4ControlError::BadRank { rank: 0, world });
-        }
-        let listener = TcpListener::bind(address)?;
-        listener.set_nonblocking(true)?;
-        let deadline = Instant::now() + timeout;
-        let mut streams: Vec<Option<TcpStream>> = (0..world).map(|_| None).collect();
-        let mut joined = 0usize;
-        while joined + 1 < world {
-            if Instant::now() >= deadline {
-                return Err(Tp4ControlError::MissingRank {
-                    world,
-                    joined,
-                    waited: timeout,
-                });
-            }
-            match listener.accept() {
-                Ok((mut stream, _peer)) => {
-                    stream.set_nonblocking(false)?;
-                    stream.set_nodelay(true)?;
-                    stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-                    stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-                    let frame = read_control_frame(&mut stream)?;
-                    let Tp4ControlFrame::Hello { rank } = frame else {
-                        return Err(Tp4ControlError::UnexpectedFrame {
-                            expected: "Hello",
-                            got: frame,
-                        });
-                    };
-                    let rank = usize::try_from(rank).unwrap_or(usize::MAX);
-                    if rank == 0 || rank >= world || streams[rank].is_some() {
-                        return Err(Tp4ControlError::BadRank {
-                            rank: u32::try_from(rank).unwrap_or(u32::MAX),
-                            world,
-                        });
-                    }
-                    streams[rank] = Some(stream);
-                    joined += 1;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => return Err(Tp4ControlError::Io(error)),
-            }
-        }
-        let mut hub = Self {
-            streams,
-            world,
-            ready: false,
-        };
-        for stream in hub.streams.iter_mut().flatten() {
-            write_control_frame(stream, &Tp4ControlFrame::Ready)?;
-        }
-        hub.ready = true;
-        Ok(hub)
-    }
-
-    /// Broadcasts one frame to every worker.
-    fn broadcast(&mut self, frame: &Tp4ControlFrame) -> Result<(), Tp4ControlError> {
-        debug_assert_eq!(self.streams.len(), self.world);
-        if !self.ready {
-            return Err(Tp4ControlError::NotReady {
-                expected: "broadcast",
-            });
-        }
-        for stream in self.streams.iter_mut().flatten() {
-            write_control_frame(stream, frame)?;
-        }
-        Ok(())
-    }
-}
-
-/// One worker's end of the control channel.
-#[cfg(feature = "tp4-serve")]
-struct Tp4ControlWorker {
-    stream: TcpStream,
-    /// This worker's rank.
-    rank: u32,
-    /// The world size, for validation and messages.
-    world: usize,
-    /// Whether rank 0's Ready has been received.
-    ready: bool,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4ControlWorker {
-    /// Connects to rank 0 and sends Hello; Ready is awaited separately by handshake.
-    ///
-    /// Connection-refused is retried with a short fixed pause for the whole startup budget, because
-    /// rank 0 binds its control hub only after its own checkpoint load: a worker whose load finished
-    /// first arrives before the listener exists and must wait for it rather than fail. Any other
-    /// connect error, and the budget running out, still ends the start with a typed error; running
-    /// out names the peer address and the budget in `Tp4ControlError::ConnectTimeout`.
-    fn connect(
-        address: SocketAddr,
-        rank: u32,
-        world: usize,
-        timeout: Duration,
-    ) -> Result<Self, Tp4ControlError> {
-        if rank == 0 || usize::try_from(rank).unwrap_or(usize::MAX) >= world {
-            return Err(Tp4ControlError::BadRank { rank, world });
-        }
-        let deadline = Instant::now() + timeout;
-        let stream = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Tp4ControlError::ConnectTimeout {
-                    address,
-                    waited: timeout,
-                });
-            }
-            match TcpStream::connect_timeout(&address, remaining) {
-                Ok(stream) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    std::thread::sleep(TP4_CONTROL_CONNECT_RETRY.min(remaining));
-                }
-                Err(error) => {
-                    if Instant::now() >= deadline {
-                        return Err(Tp4ControlError::ConnectTimeout {
-                            address,
-                            waited: timeout,
-                        });
-                    }
-                    return Err(Tp4ControlError::Io(error));
-                }
-            }
-        };
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-        stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-        Ok(Self {
-            stream,
-            rank,
-            world,
-            ready: false,
-        })
-    }
-
-    /// Sends Hello and waits for rank 0's Ready.
-    fn handshake(&mut self) -> Result<(), Tp4ControlError> {
-        debug_assert!(usize::try_from(self.rank).unwrap_or(usize::MAX) < self.world);
-        write_control_frame(
-            &mut self.stream,
-            &Tp4ControlFrame::Hello { rank: self.rank },
-        )?;
-        let frame = read_control_frame(&mut self.stream)?;
-        match frame {
-            Tp4ControlFrame::Ready => {
-                self.ready = true;
-                Ok(())
-            }
-            other => Err(Tp4ControlError::UnexpectedFrame {
-                expected: "Ready",
-                got: other,
-            }),
-        }
-    }
-
-    /// Reads the next request-scoped frame. A frame before Ready is a typed refusal.
-    fn next_frame(&mut self) -> Result<Tp4ControlFrame, Tp4ControlError> {
-        if !self.ready {
-            return Err(Tp4ControlError::NotReady {
-                expected: "next frame",
-            });
-        }
-        read_control_frame(&mut self.stream)
-    }
-
-    /// Reads the canvas bytes after a [`Tp4ControlFrame::DevicePixels`] frame.
-    fn next_pixels(&mut self, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
-        read_control_pixels(&mut self.stream, bytes)
     }
 }
 
@@ -4249,6 +3735,15 @@ pub struct Tp4Step {
     /// The tokens the step decoded before `next_token`: a speculative step's kept drafts, which
     /// its verify already ran, so they are emitted and not fed back. Empty for a one-token step.
     pub accepted: Vec<u32>,
+    /// The drafts the step's drafter offered before the depth policy shortened the chain.
+    pub proposed: usize,
+    /// The drafts the depth policy left unverified: `proposed - accepted - (1 if the chain ran)`.
+    pub gated: usize,
+    /// What the rank's own speculator reported for this step, when the session keeps its own
+    /// accounting (`ModelSession::speculation`). A packed arm verifies a chain inside one session
+    /// call and hands the extra tokens back through later calls, so the fields above cannot
+    /// describe the step; this is the step's share of the session's counters instead.
+    pub speculation: Option<sparkflash_model::Speculation>,
 }
 
 /// The request sampler a rank applies before its first step.
@@ -4441,9 +3936,12 @@ impl Tp4RankApi for HostTp4Rank {
             .prefill(prompt)
             .map_err(|error| error.to_string())?;
         Ok(Tp4Step {
+            speculation: None,
             logits: output.logits,
             next_token: output.token,
             accepted: Vec::new(),
+            proposed: 0,
+            gated: 0,
         })
     }
 
@@ -4458,9 +3956,12 @@ impl Tp4RankApi for HostTp4Rank {
             .map_err(|error| error.to_string())?;
         Ok((
             Tp4Step {
+                speculation: None,
                 logits: output.logits,
                 next_token: output.token,
                 accepted: Vec::new(),
+                proposed: 0,
+                gated: 0,
             },
             merged,
         ))
@@ -4469,9 +3970,12 @@ impl Tp4RankApi for HostTp4Rank {
     fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
         let output = self.rank.decode(token).map_err(|error| error.to_string())?;
         Ok(Tp4Step {
+            speculation: None,
             logits: output.logits,
             next_token: output.token,
             accepted: Vec::new(),
+            proposed: 0,
+            gated: 0,
         })
     }
 
@@ -4531,8 +4035,9 @@ struct GlmTp4Rank {
     sampling: sparkflash_model::Sampling,
     /// Whether the request reads each step's logits row ([Tp4Sampling::logits]).
     logits: bool,
-    /// The MTP drafts a speculative step verifies after its token; 0 decodes a token a step.
-    drafts: usize,
+    /// How deep a speculative step drafts, and what its drafts were worth: the shared rule's
+    /// depth and counters ([sparkflash_model::Speculator]).
+    spec: sparkflash_model::Speculator,
     /// Whether the request decodes speculatively ([Tp4Sampling::speculative]) with them.
     speculative: bool,
     eos: Vec<u32>,
@@ -4576,9 +4081,12 @@ impl GlmTp4Rank {
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(Tp4Step {
+            speculation: None,
             logits,
             next_token,
             accepted: Vec::new(),
+            proposed: 0,
+            gated: 0,
         })
     }
 
@@ -4593,8 +4101,8 @@ impl GlmTp4Rank {
             .sequence
             .capacity()
             .saturating_sub(self.sequence.position() + 1);
-        let count = self.drafts.min(room);
-        let drafted = if count == 0 {
+        let count = self.spec.max_depth().min(room);
+        let mut drafted = if count == 0 {
             Vec::new()
         } else {
             let mut batch = [(&mut self.sequence, token)];
@@ -4604,6 +4112,15 @@ impl GlmTp4Rank {
                 .pop()
                 .unwrap_or_default()
         };
+        // A block drafter proposes its whole block and says how sure it is of each draft; the
+        // policy weighs those against a row's cost and shortens the chain (the MTP layer has no
+        // confidences, so this leaves its drafts alone).
+        let confidence = self.sequence.draft_confidence().to_vec();
+        // What the drafter offered, then what the policy thought the rows were worth.
+        let proposed = drafted.len();
+        let depth = self.spec.depth(&confidence, count);
+        drafted.truncate(depth);
+        let gated = proposed - drafted.len();
         let chunk: Vec<u32> = std::iter::once(token).chain(drafted).collect();
         let mut batch = [(&mut self.sequence, chunk.as_slice())];
         let picks = self
@@ -4612,12 +4129,10 @@ impl GlmTp4Rank {
             .map_err(|error| format!("the GLM rank's verify failed: {error}"))?
             .pop()
             .unwrap_or_default();
-        // Row r picks the token after chunk[r], so draft r + 1 is kept while row r picked it.
-        let kept = 1 + chunk[1..]
-            .iter()
-            .zip(&picks)
-            .take_while(|(draft, pick)| draft == pick)
-            .count();
+        // The shared rule decides how much of the chain survives: the leading drafts the model
+        // itself picked, plus the token after them (sparkflash_model::verdict).
+        let kept = sparkflash_model::verdict(&chunk, &picks);
+        self.spec.observe(&confidence, chunk.len() - 1, kept);
         if chunk.len() > 1 {
             self.rank
                 .commit(&mut self.sequence, kept)
@@ -4642,9 +4157,12 @@ impl GlmTp4Rank {
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(Tp4Step {
+            speculation: None,
             logits: Vec::new(),
             next_token,
             accepted,
+            proposed,
+            gated,
         })
     }
 }
@@ -4652,6 +4170,11 @@ impl GlmTp4Rank {
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for GlmTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        // The window is reset and reused, not rebuilt: a fresh one costs every rank about a
+        // second of the request's first token at the 1M default, which rank 0 pays before it
+        // starts the prefill clock and the workers pay inside it. A block-drafting window resets
+        // in place because its drafter's context is bounded by the rows the request captured
+        // ([DeviceSequence]'s `drafter_skip`), so nothing below the position is read.
         self.rank
             .reset(&mut self.sequence)
             .map_err(|error| format!("resetting the GLM sequence: {error}"))?;
@@ -4662,7 +4185,7 @@ impl Tp4RankApi for GlmTp4Rank {
             ..sparkflash_model::Sampling::default()
         };
         self.logits = sampling.logits;
-        self.speculative = sampling.speculative && self.drafts > 0;
+        self.speculative = sampling.speculative && self.spec.max_depth() > 0;
         if self.speculative && (self.logits || !self.sampler.takes_argmax(&self.sampling)) {
             return Err(
                 "a speculative request must take each row's argmax and read no row; this one \
@@ -4692,9 +4215,12 @@ impl Tp4RankApi for GlmTp4Rank {
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(Tp4Step {
+            speculation: None,
             logits,
             next_token,
             accepted: Vec::new(),
+            proposed: 0,
+            gated: 0,
         })
     }
 
@@ -4733,10 +4259,6 @@ impl Tp4RankApi for GlmTp4Rank {
         }
     }
 }
-
-/// The MTP drafts a GLM rank verifies after each token of a greedy request.
-#[cfg(feature = "tp4-serve")]
-const GLM_DRAFTS_ENV: &str = "SPARKFLASH_GLM_DRAFTS";
 
 /// The variable naming a directory of GLM-5.3-Flash rank files (`sparkflash convert`).
 #[cfg(feature = "tp4-serve")]
@@ -4834,20 +4356,35 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
     )?;
     // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
     // f32 for the expansion's exact arithmetic at a smaller window.
-    let latent_cache = match std::env::var("SPARKFLASH_GLM_KV_CACHE").as_deref() {
-        Ok("f32") => sparkflash_model_glm5_next::device::LatentCache::F32,
-        Ok("fp8") | Err(_) => sparkflash_model_glm5_next::device::LatentCache::Fp8,
-        Ok(other) => {
-            return Err(format!(
-                "SPARKFLASH_GLM_KV_CACHE={other} is neither fp8 nor f32"
-            ));
+    //
+    // `attention.latent_cache` is the file's setting and `SPARKFLASH_GLM_LATENT_CACHE` its alias
+    // (the typed profile raises the latter to one of the three modes). `auto` is the release's
+    // own choice, which is the E4M3 latent, and the older `SPARKFLASH_GLM_KV_CACHE` spelling still
+    // selects f32 when the profile leaves the arms of `auto` open.
+    let latent_cache = match sparkflash_model::active_profile().attention.latent_cache {
+        Some(sparkflash_model::profile::LatentCacheMode::F32) => {
+            sparkflash_model_glm5_next::device::LatentCache::F32
+        }
+        Some(sparkflash_model::profile::LatentCacheMode::Fp8) => {
+            sparkflash_model_glm5_next::device::LatentCache::Fp8
+        }
+        Some(sparkflash_model::profile::LatentCacheMode::Auto) | None => {
+            match std::env::var("SPARKFLASH_GLM_KV_CACHE").as_deref() {
+                Ok("f32") => sparkflash_model_glm5_next::device::LatentCache::F32,
+                Ok("fp8") | Err(_) => sparkflash_model_glm5_next::device::LatentCache::Fp8,
+                Ok(other) => {
+                    return Err(format!(
+                        "SPARKFLASH_GLM_KV_CACHE={other} is neither fp8 nor f32"
+                    ));
+                }
+            }
         }
     };
     // The converted rank file is one allocation the arm uploads in place, read with the same
     // parallel direct-I/O path the V4.1 ranks use: the checkpoint path re-reads and re-lays-out
     // every tensor, which is the six-minute startup this replaces. A configured directory that
     // does not hold this rank's file is a refusal, not a silent fallback to the slow path.
-    let (rank, origin) =
+    let (mut rank, origin) =
         match pack::converted_rank_file(GLM_CONVERTED_DIR_ENV, config.rank, config.world_size)? {
             Some(file) => {
                 let rank = DeviceRank::load_converted_with_cache(
@@ -4883,33 +4420,68 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
             config.context, glm_config.max_position_embeddings
         ));
     }
-    // The MTP drafts a greedy request verifies after each token: 2 by default, the harness's best
-    // at one stream; 0 decodes a token a step.
-    let drafts = match std::env::var(GLM_DRAFTS_ENV) {
-        Err(_) => 2,
-        Ok(value) => match value.parse::<usize>() {
-            Ok(drafts) if drafts < sparkflash_model_glm5_next::MAX_ROWS => drafts,
-            _ => {
-                return Err(format!(
-                    "{GLM_DRAFTS_ENV}={value:?} is not a draft count from 0 to {}",
-                    sparkflash_model_glm5_next::MAX_ROWS - 1
-                ));
-            }
-        },
+    // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
+    // token, which is what takes this arm past the MTP layer's two drafts. Its depth is the
+    // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
+    let mut profile = sparkflash_model::ModelProfile::default();
+    profile
+        .apply_process_env()
+        .map_err(|error| error.to_string())?;
+    if let Some(drafter) = profile.speculation.drafter.as_deref() {
+        rank.load_block_drafter(std::path::Path::new(drafter))
+            .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
+        eprintln!(
+            "sparkflash serve: GLM rank {}/{} drafts with the DFlash 2 drafter {drafter}",
+            config.rank, config.world_size
+        );
+    }
+    // The bulk chunk a drafting request takes is a profile knob (`prefill.drafting_prompt`):
+    // its default is the token path, which is the drafter's prompt, and the chunk wins only a
+    // prompt long enough that a decode step a token costs more than the drafts it conditions.
+    rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(false));
+    let block = rank.has_block_drafter();
+    let most = rank.max_drafts();
+    // How many drafts a greedy request verifies after each token: the whole block when a block
+    // drafter is loaded, else the MTP layer's 2 (the harness's best at one stream); 0 decodes a
+    // token a step.
+    let drafts = match profile.speculation.drafts {
+        None if block => most,
+        None => 2.min(most),
+        Some(drafts) if drafts <= most => drafts,
+        Some(drafts) => {
+            return Err(format!(
+                "speculation.drafts={drafts} is not a draft count from 0 to {most}"
+            ));
+        }
     };
+    // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
+    // token, which is what takes this arm past the MTP layer's two drafts. The depth is the
+    // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
     // The window every request resets and reuses. Allocating it per request cost every rank about a
     // second of a short prompt's first token at the 1M default; here a window that does not fit
     // beside the weights is refused at startup, not at the first request. A drafting window also
-    // keeps the MTP layer's caches.
-    let sequence = if drafts > 0 {
+    // keeps the MTP layer's caches, and a block-drafting one the drafter's own.
+    let sequence = if block {
+        rank.new_block_drafting_sequence(config.context)
+            .map_err(|error| format!("the GLM request window: {error}"))?
+    } else if drafts > 0 {
         rank.new_drafting_sequence(config.context)
             .map_err(|error| {
-                format!("the GLM request window: {error} ({GLM_DRAFTS_ENV}=0 drafts nothing)")
+                format!("the GLM request window: {error} (speculation.drafts=0 drafts nothing)")
             })?
     } else {
         rank.new_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
     };
+    let spec = sparkflash_model::Speculator::new(
+        drafts,
+        block.then(|| {
+            sparkflash_model::DepthPolicy::adaptive(
+                drafts,
+                sparkflash_model_glm5_next::DFLASH2_STEP_COST,
+            )
+        }),
+    );
     let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     eprintln!(
         "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}; {} collective",
@@ -4927,7 +4499,7 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         sampler: Sampler::new(),
         sampling: sparkflash_model::Sampling::default(),
         logits: false,
-        drafts,
+        spec,
         speculative: false,
         load_ms,
         steps: 0,
@@ -4971,13 +4543,30 @@ impl QwenTp4Rank {
             .as_deref_mut()
             .ok_or_else(|| "the Qwen rank has no request open".to_owned())?;
         let started = Instant::now();
+        // The session verifies its own draft chain inside the call and hands the extra tokens
+        // back through later ones, so what this step did is what its speculator counted while it
+        // ran. Reading before and after gives this step's share of a per-request total.
+        let before = session.speculation();
         let output = run(session).map_err(|error| format!("the Qwen rank's step: {error}"))?;
+        let after = session.speculation();
+        let counted = sparkflash_model::Speculation {
+            verify_steps: after.verify_steps.saturating_sub(before.verify_steps),
+            drafts_proposed: after.drafts_proposed.saturating_sub(before.drafts_proposed),
+            drafts_accepted: after.drafts_accepted.saturating_sub(before.drafts_accepted),
+        };
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(Tp4Step {
             logits: output.logits,
             next_token: output.next_token,
+            // The verified chain's later tokens are queued in the session and emitted by the
+            // calls that follow, so this step emits one token and reports the chain below.
             accepted: Vec::new(),
+            proposed: counted.drafts_proposed,
+            // The depth a policy withheld is not in the session's counters; zero says "not
+            // reported" rather than inventing a gate count.
+            gated: 0,
+            speculation: Some(counted),
         })
     }
 }
@@ -5610,6 +5199,12 @@ fn run_tp4_request(
     let mut next = prefill.next_token;
     // The last step's kept drafts: its verify ran them, so they are emitted but not fed back.
     let mut accepted = Vec::new().into_iter();
+    // The speculative accounting the request reports (D61): one verify a step, the drafts each
+    // step's drafter offered and the target kept, and the rows the depth policy gated.
+    let mut verify_steps = 0usize;
+    let mut proposed = 0usize;
+    let mut gated = 0usize;
+    let mut kept_drafts = 0usize;
     let mut completion_tokens = 0usize;
     let mut ttft: Option<Duration> = None;
     while completion_tokens < job.max_tokens {
@@ -5678,6 +5273,23 @@ fn run_tp4_request(
         hub.broadcast(&Tp4ControlFrame::Token { token_id: token })
             .map_err(|error| format!("control Token: {error}"))?;
         let step = rank.decode(token)?;
+        // The step's own accounting. A rank that reports its session's speculator counts what it
+        // verified inside the call - a packed arm's chain, whose extra tokens arrive through the
+        // calls that follow - and every other rank claims one verify of the drafts its own
+        // speculator chose.
+        match step.speculation {
+            Some(counted) => {
+                verify_steps += counted.verify_steps;
+                proposed += counted.drafts_proposed;
+                kept_drafts += counted.drafts_accepted;
+            }
+            None => {
+                verify_steps += 1;
+                proposed += step.proposed;
+                gated += step.gated;
+                kept_drafts += step.accepted.len();
+            }
+        }
         logits = step.logits;
         accepted = step.accepted.into_iter();
         next = step.next_token;
@@ -5703,9 +5315,20 @@ fn run_tp4_request(
         completion_tokens,
         finish_reason,
         timing,
-        // The TP=4 driver has no draft source in this slice, so it reports the honest zero:
-        // no MTP draft was proposed, accepted or gated on the four-rank arm.
-        dspark: DSparkStepStats::default(),
+        // What the drafters were worth, from the steps themselves rather than from a model of
+        // them: a step that verified nothing reports zero and reads as no speculation.
+        dspark: DSparkStepStats {
+            target_verify_steps: verify_steps,
+            draft_tokens_proposed: proposed,
+            draft_tokens_confidence_gated: gated,
+            draft_tokens_accepted: kept_drafts,
+            mean_tokens_per_verify_step: if verify_steps > 0 {
+                (verify_steps + kept_drafts) as f64 / verify_steps as f64
+            } else {
+                0.0
+            },
+            acceptance_rate: sparkflash_api::telemetry_types::safe_ratio(kept_drafts, proposed),
+        },
     })));
     Ok(())
 }
@@ -6056,6 +5679,20 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    if let Some(checkpoint) = options.checkpoint.as_deref()
+        && let Err(message) =
+            check_checkpoint_plan(checkpoint, tp4.world_size, Availability::Catalogue)
+    {
+        eprintln!("sparkflash serve: {message}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
+    match load_deepseek_profile() {
+        Ok(profile) => sparkflash_model::install_active(profile),
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+    }
     let rank_config = match tp4_rank_config(options, &tp4, TP4_CONTROL_TIMEOUT) {
         Ok(config) => config,
         Err(message) => {
@@ -6176,6 +5813,7 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
         )
         .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
         .with_numerics(numerics)
+        .with_settings(sparkflash_model::settings::resolve_process_env())
         .with_device_token_source(device_token_source);
     let drain_state = state.clone();
     let router = sparkflash_api::server::router(state);
@@ -6192,6 +5830,55 @@ fn run_tp4(options: &ServeOptions, tp4: Tp4ServeOptions) -> ExitCode {
     runtime.block_on(bind_and_serve(router, drain_state, options.bind))
 }
 
+/// Resolve a DeepSeek checkpoint's execution plan and kernel catalogue before boot.
+///
+/// The reference and host-TP4 arms run no kernel, so `Catalogue` is the honest policy there;
+/// the device arm uses `Runtime`. A missing part is named with every reason before a weight is
+/// read, the same check the packed arms make.
+pub(super) fn check_checkpoint_plan(
+    checkpoint: &Path,
+    world: usize,
+    availability: Availability,
+) -> Result<(), String> {
+    let directory = if checkpoint.is_dir() {
+        checkpoint.to_path_buf()
+    } else {
+        checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
+    };
+    let config = directory.join(CHECKPOINT_CONFIG_NAME);
+    let plan = EnginePlan::from_path(&config, Target::Sm121, world, 0)
+        .map_err(|error| format!("--checkpoint {}: {error}", directory.display()))?;
+    let resolver = KernelResolver::new(Target::Sm121, availability).with_family(plan.family());
+    let failures = resolver.failures(&plan);
+    if failures.is_empty() {
+        eprintln!("sparkflash serve: plan {}", plan.boot_summary());
+        return Ok(());
+    }
+    let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    Err(format!(
+        "--checkpoint {} cannot execute {} at TP{world}: {}",
+        directory.display(),
+        plan.family(),
+        reasons.join("; ")
+    ))
+}
+
+/// Load the default DeepSeek arm's typed profile and apply the declared environment overrides.
+fn load_deepseek_profile() -> Result<ModelProfile, String> {
+    let mut profile = ModelProfile::from_toml(pack::DEEPSEEK_PROFILE_TOML)
+        .map_err(|error| format!("the DeepSeek profile: {error}"))?;
+    profile
+        .apply_process_env()
+        .map_err(|error| format!("the DeepSeek profile: {error}"))?;
+    eprintln!(
+        "sparkflash serve: DeepSeek profile model={} family={} weights={}",
+        profile.model.as_deref().unwrap_or("-"),
+        profile.family.as_deref().unwrap_or("-"),
+        profile.weights.as_deref().unwrap_or("-")
+    );
+    Ok(profile)
+}
+
 /// Entry point main.rs calls: parses arguments, starts the engine, binds the router.
 pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     let options = match ServeOptions::parse(args) {
@@ -6204,7 +5891,12 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     // A packed model is served by its own arm: none of the V4.1 recipe, engine selection or
     // device-chain wiring below describes it, and running through them would serve the wrong model.
     if let Some(model) = options.model.clone() {
-        return serve_pack(&model, &options);
+        // The registry's default DeepSeek identity is served by the existing reference/TP4
+        // path; a packed model is served by its own arm. Any other id is a refusal that names
+        // the ids this binary knows.
+        if pack::Pack::named(&model) != Some(pack::Pack::Deepseek) {
+            return serve_pack(&model, &options);
+        }
     }
     #[cfg(feature = "tp4-serve")]
     if let ServeEngine::Tp4(tp4) = serve_engine(&options) {
@@ -6253,6 +5945,26 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    if !options.synthetic {
+        let availability = if options.engine == EngineChoice::Reference {
+            Availability::Catalogue
+        } else {
+            Availability::Runtime
+        };
+        if let Some(checkpoint) = options.checkpoint.as_deref()
+            && let Err(message) = check_checkpoint_plan(checkpoint, 1, availability)
+        {
+            eprintln!("sparkflash serve: {message}");
+            return ExitCode::from(EXIT_REFUSED);
+        }
+        match load_deepseek_profile() {
+            Ok(profile) => sparkflash_model::install_active(profile),
+            Err(message) => {
+                eprintln!("sparkflash serve: {message}");
+                return ExitCode::from(EXIT_REFUSED);
+            }
+        }
+    }
 
     crate::bootlog::init();
     let role = "APIServer";
@@ -6443,6 +6155,7 @@ fn serve_with_seam(
         .with_served_checkpoint(served_checkpoint)
         .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
         .with_numerics(numerics)
+        .with_settings(sparkflash_model::settings::resolve_process_env())
         .with_device_token_source(device_token_source);
     // A debug-build test seam: a wire test can shorten the keep-alive interval so an idle engine
     // gap produces observable comment frames without waiting the production 15 s. Debug-only, so
@@ -9222,16 +8935,21 @@ mod tests {
         .expect("the Qwen host arm applies both knobs");
         assert!(qwen.fuse_batch);
         assert_eq!(qwen.kv_budget_gib, Some(24));
-        // The GLM-5.3-Flash host arm has neither.
-        for (extra, flag) in [
-            (&["--concurrency", "2", "--fuse-batch"][..], "--fuse-batch"),
-            (&["--kv-budget-gib", "24"][..], "--kv-budget-gib"),
-        ] {
-            let error = parse(sparkflash_model_glm5_next::MODEL_ID, extra)
-                .expect_err("the GLM host arm would ignore the flag");
-            assert!(error.contains(flag), "{error}");
-            assert!(error.contains("at TP=1"), "{error}");
-        }
+        // The GLM-5.3-Flash host arm applies both too: it fuses its sessions and sizes them
+        // against the budget.
+        let glm = parse(
+            sparkflash_model_glm5_next::MODEL_ID,
+            &[
+                "--concurrency",
+                "2",
+                "--fuse-batch",
+                "--kv-budget-gib",
+                "24",
+            ],
+        )
+        .expect("the GLM host arm applies both knobs");
+        assert!(glm.fuse_batch);
+        assert_eq!(glm.kv_budget_gib, Some(24));
         // Concurrency itself is the host driver's, which every pack serves behind.
         assert!(
             parse(
@@ -9250,6 +8968,40 @@ mod tests {
             Some(pack::Pack::Qwen)
         );
         assert_eq!(pack::Pack::named("example/no-arm"), None);
+    }
+
+    #[test]
+    fn every_registry_model_id_and_weights_id_is_accepted_by_the_cli() {
+        for model in sparkflash_model::MODELS.iter() {
+            for id in [model.id.as_str(), model.weights_id.as_str()] {
+                let options = ServeOptions::parse(vec![
+                    "--model".to_owned(),
+                    id.to_owned(),
+                    "--synthetic".to_owned(),
+                ])
+                .unwrap_or_else(|error| panic!("--model {id}: {error}"));
+                assert_eq!(options.model.as_deref(), Some(id));
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_deepseek_id_routes_to_the_default_serve_path() {
+        for id in [
+            sparkflash_model::DEFAULT_MODEL_ID,
+            sparkflash_model::DEFAULT_WEIGHTS_ID,
+        ] {
+            let options = ServeOptions::parse(vec![
+                "--model".to_owned(),
+                id.to_owned(),
+                "--synthetic".to_owned(),
+                "--engine".to_owned(),
+                "device".to_owned(),
+            ])
+            .expect("the default model takes the V4.1 engine flag");
+            assert_eq!(pack::Pack::named(id), Some(pack::Pack::Deepseek));
+            assert_eq!(options.engine, EngineChoice::Device);
+        }
     }
 
     #[test]
@@ -10821,994 +10573,8 @@ mod engram_packed_store {
 }
 
 #[cfg(all(test, feature = "tp4-serve"))]
-mod tp4_serve_tests {
-    use std::collections::BTreeSet;
-    use std::net::{TcpListener, TcpStream};
-    use std::thread;
-
-    use futures::StreamExt;
-
-    use super::*;
-
-    #[test]
-    fn the_glm_and_qwen_packs_may_take_the_group_flags() {
-        for model in [
-            sparkflash_model_glm5_next::MODEL_ID,
-            sparkflash_model_qwen4_exp::MODEL_ID,
-        ] {
-            let options = ServeOptions::parse(tp4_args(&["--model", model]))
-                .expect("the pack takes the group flags");
-            assert_eq!(options.model.as_deref(), Some(model));
-            assert!(options.tp4.is_some());
-        }
-    }
-
-    #[test]
-    fn a_packed_model_without_a_group_arm_still_refuses_the_group_flags() {
-        let error = ServeOptions::parse(tp4_args(&["--model", "example/no-group-arm"]))
-            .expect_err("a pack without a tensor-parallel arm serves TP=1 only");
-        assert!(error.contains("--tp4-rank"), "{error}");
-    }
-
-    #[test]
-    fn a_group_refuses_the_host_drivers_knobs() {
-        for model in [
-            sparkflash_model_glm5_next::MODEL_ID,
-            sparkflash_model_qwen4_exp::MODEL_ID,
-        ] {
-            for (extra, flags) in [
-                (&["--concurrency", "2"][..], &["--concurrency"][..]),
-                (
-                    &["--concurrency", "2", "--fuse-batch"][..],
-                    &["--concurrency", "--fuse-batch"][..],
-                ),
-                (&["--kv-budget-gib", "24"][..], &["--kv-budget-gib"][..]),
-            ] {
-                let mut args = vec!["--model", model];
-                args.extend_from_slice(extra);
-                let error = ServeOptions::parse(tp4_args(&args))
-                    .expect_err("a group serves one request at a time");
-                for flag in flags {
-                    assert!(error.contains(flag), "{model}: {error}");
-                }
-                assert!(error.contains("tensor-parallel group"), "{error}");
-            }
-        }
-    }
-
-    #[test]
-    fn every_rank_of_a_group_derives_the_same_window() {
-        use pack::{GlmArm, PackArm, QwenArm};
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = QwenArm::write_fixture(dir.path()).expect("fixture");
-        // A file in the checkpoint names its directory.
-        let file = dir.path().join(CHECKPOINT_CONFIG_NAME);
-        assert_eq!(pack::checkpoint_directory(&file), dir.path());
-        let read = pack::read_config::<QwenArm>(dir.path()).expect("config");
-        assert_eq!(read.max_position_embeddings, config.max_position_embeddings);
-        assert!(config.max_position_embeddings < QwenArm::DEFAULT_CONTEXT);
-        // Without --context the pack's default is capped by the checkpoint's window, the same
-        // figure on every rank.
-        for rank in 0..2 {
-            let mut options =
-                ServeOptions::parse(tp4_args(&["--model", sparkflash_model_qwen4_exp::MODEL_ID]))
-                    .expect("parses");
-            options.tp4.as_mut().expect("group").rank = rank;
-            assert_eq!(
-                pack::pack_context::<QwenArm>(&options, &read),
-                Ok(config.max_position_embeddings)
-            );
-        }
-        let wide = ServeOptions::parse(tp4_args(&[
-            "--model",
-            sparkflash_model_qwen4_exp::MODEL_ID,
-            "--context",
-            "1000000",
-        ]))
-        .expect("parses");
-        let error = pack::pack_context::<QwenArm>(&wide, &read).expect_err("past the window");
-        assert!(error.contains("outside 1..="), "{error}");
-        // A GLM checkpoint without a config.json is the carried release; Qwen's is a refusal.
-        let empty = tempfile::tempdir().expect("tempdir");
-        let carried = pack::read_config::<GlmArm>(empty.path()).expect("carried");
-        assert_eq!(
-            carried.max_position_embeddings,
-            sparkflash_model_glm5_next::Glm5NextConfig::glm53_flash()
-                .expect("release")
-                .max_position_embeddings
-        );
-        let error = pack::read_config::<QwenArm>(empty.path()).expect_err("no config");
-        assert!(
-            error.contains("cannot read the Qwen3.8-Flash-Next configuration"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn only_a_read_timeout_counts_as_an_idle_control_wait() {
-        let idle = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock));
-        assert!(control_read_is_idle(&idle));
-        let timed_out = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        assert!(control_read_is_idle(&timed_out));
-        let reset = Tp4ControlError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-        assert!(!control_read_is_idle(&reset));
-    }
-
-    #[test]
-    fn the_glm_cluster_snapshot_names_the_model_the_fabric_and_the_served_context() {
-        let snapshot = pack::pack_cluster_snapshot(sparkflash_model_glm5_next::MODEL_ID, 4_096);
-        assert_eq!(snapshot.model, sparkflash_model_glm5_next::MODEL_ID);
-        assert_eq!(snapshot.fabric_mode, "tp4-tcp");
-        assert_eq!(snapshot.max_seq_len, 4_096);
-        assert!(snapshot.nodes.is_empty());
-    }
-
-    fn engine_request(prompt: &[u32], max_tokens: usize) -> EngineRequest {
-        EngineRequest {
-            request_id: "tp4-test".to_owned(),
-            model: MODEL_ID.to_owned(),
-            prompt_tokens: prompt.to_vec(),
-            logprobs: LogprobsRequest::default(),
-            images: Vec::new(),
-            vision: Vec::new(),
-            max_tokens,
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            skip_special_tokens: true,
-            thinking: false,
-            reasoning_effort: None,
-            stop: Vec::new(),
-            seed: Some(0),
-            trace_scopes: 0,
-            trace_steps: 0,
-            constraint: None,
-            forced_tokens: Vec::new(),
-        }
-    }
-
-    fn tp4_args(extra: &[&str]) -> Vec<String> {
-        let mut args = vec![
-            "--tp4-rank",
-            "0",
-            "--tp4-world-size",
-            "2",
-            "--tp4-peers",
-            "127.0.0.1,127.0.0.2",
-            "--checkpoint",
-            "/tmp/tp4-checkpoint",
-            "--tokenizer",
-            "/tmp/tp4-tokenizer.json",
-        ];
-        args.extend_from_slice(extra);
-        args.into_iter().map(str::to_owned).collect()
-    }
-
-    fn keys(value: &serde_json::Value, prefix: &str, out: &mut BTreeSet<String>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                for (key, child) in map {
-                    let path = format!("{prefix}{key}");
-                    out.insert(path.clone());
-                    keys(child, &format!("{path}."), out);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                if let Some(first) = items.first() {
-                    keys(first, &format!("{prefix}[]."), out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn shape(value: &serde_json::Value) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        keys(value, "", &mut out);
-        out
-    }
-
-    #[test]
-    fn tp4_flags_parse_with_defaults() {
-        let options = ServeOptions::parse(tp4_args(&[])).expect("the TP=4 flags parse");
-        let tp4 = options.tp4.expect("the parse selected TP=4");
-        assert_eq!(tp4.rank, 0);
-        assert_eq!(tp4.world_size, 2);
-        assert_eq!(tp4.base_port, TP4_DEFAULT_BASE_PORT);
-        assert_eq!(
-            tp4.control_port,
-            TP4_DEFAULT_BASE_PORT + TP4_CONTROL_PORT_OFFSET
-        );
-        assert_eq!(
-            tp4.peers,
-            vec![
-                "127.0.0.1".parse::<IpAddr>().unwrap(),
-                "127.0.0.2".parse::<IpAddr>().unwrap()
-            ]
-        );
-    }
-
-    #[test]
-    fn tp4_flags_require_checkpoint_and_refuse_synthetic_and_device() {
-        let no_checkpoint = ServeOptions::parse(
-            tp4_args(&[])
-                .into_iter()
-                .filter(|arg| arg != "--checkpoint" && arg != "/tmp/tp4-checkpoint")
-                .collect::<Vec<_>>(),
-        )
-        .expect_err("TP=4 without a checkpoint must be refused");
-        assert!(no_checkpoint.contains("--checkpoint"), "{no_checkpoint}");
-
-        let synthetic = ServeOptions::parse(tp4_args(&["--synthetic"]))
-            .expect_err("TP=4 with the synthetic plan must be refused");
-        assert!(synthetic.contains("--synthetic"), "{synthetic}");
-
-        let device = ServeOptions::parse(tp4_args(&["--engine", "device"]))
-            .expect_err("TP=4 with the device engine must be refused");
-        assert!(device.contains("--engine device"), "{device}");
-    }
-
-    #[test]
-    fn tp4_flags_name_a_missing_rank_or_wrong_peer_count() {
-        let mut no_rank = tp4_args(&[]);
-        let position = no_rank.iter().position(|arg| arg == "--tp4-rank").unwrap();
-        no_rank.drain(position..position + 2);
-        let error = ServeOptions::parse(no_rank).expect_err("the other TP=4 flags need a rank");
-        assert!(error.contains("--tp4-rank"), "{error}");
-
-        let mut wrong_world = tp4_args(&[]);
-        let world_position = wrong_world
-            .iter()
-            .position(|arg| arg == "--tp4-world-size")
-            .unwrap();
-        wrong_world[world_position + 1] = "4".to_owned();
-        let error = ServeOptions::parse(wrong_world)
-            .expect_err("a two-address peer list cannot describe four ranks");
-        assert!(error.contains("--tp4-peers"), "{error}");
-    }
-
-    #[test]
-    fn control_frames_round_trip_on_a_loopback_socket() {
-        let frames = vec![
-            Tp4ControlFrame::Hello { rank: 1 },
-            Tp4ControlFrame::Ready,
-            Tp4ControlFrame::Request {
-                prompt_ids: vec![1, 2, 3],
-                max_tokens: 4,
-                prompt_logprobs: None,
-                speculative: true,
-            },
-            Tp4ControlFrame::Request {
-                prompt_ids: vec![9, 8],
-                max_tokens: 2,
-                prompt_logprobs: Some(3),
-                speculative: false,
-            },
-            Tp4ControlFrame::Token { token_id: 7 },
-            Tp4ControlFrame::End,
-            Tp4ControlFrame::Error {
-                code: "engine_gone".to_owned(),
-                message: "rank stopped".to_owned(),
-            },
-        ];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the listener address");
-        let echoed = frames.clone();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the test client connects");
-            for expected in echoed {
-                let got = read_control_frame(&mut stream).expect("read one frame");
-                assert_eq!(got, expected);
-                write_control_frame(&mut stream, &got).expect("echo one frame");
-            }
-        });
-        let mut client = TcpStream::connect(address).expect("connect to the test server");
-        for frame in &frames {
-            write_control_frame(&mut client, frame).expect("write one frame");
-            let got = read_control_frame(&mut client).expect("read the echo");
-            assert_eq!(&got, frame);
-        }
-        server.join().expect("the test server joins");
-    }
-
-    /// A rank-0 API stub for the control-protocol test: no forward, canned contract values.
-    struct FakeTp4Rank {
-        prompt: Vec<u32>,
-        seen_selection: Option<Option<usize>>,
-    }
-
-    impl Tp4RankApi for FakeTp4Rank {
-        fn begin_request(&mut self, _sampling: Tp4Sampling) -> Result<(), String> {
-            Ok(())
-        }
-
-        fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
-            Ok(Tp4Step {
-                logits: vec![0.0; 8],
-                next_token: Some(500),
-                accepted: Vec::new(),
-            })
-        }
-
-        fn prefill_prompt_logprobs(
-            &mut self,
-            prompt: &[u32],
-            selection: Option<usize>,
-        ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
-            self.seen_selection = Some(selection);
-            assert_eq!(prompt, self.prompt.as_slice());
-            let alternatives = selection.unwrap_or(0);
-            let merged = (0..prompt.len() - 1)
-                .map(|position| MergedPosition {
-                    position,
-                    own_token_id: prompt[position + 1],
-                    own_logprob: -1.25 - position as f32,
-                    own_rank: 1,
-                    alternatives: (0..alternatives)
-                        .map(|slot| sparkflash_engine::prompt_ranks::MergedAlternative {
-                            token_id: 600 + slot as u32,
-                            logprob: -2.5 - slot as f32,
-                        })
-                        .collect(),
-                })
-                .collect();
-            Ok((
-                Tp4Step {
-                    logits: vec![0.0; 8],
-                    next_token: Some(500),
-                    accepted: Vec::new(),
-                },
-                merged,
-            ))
-        }
-
-        fn decode(&mut self, _token: u32) -> Result<Tp4Step, String> {
-            Ok(Tp4Step {
-                logits: vec![0.0; 8],
-                next_token: Some(501),
-                accepted: Vec::new(),
-            })
-        }
-
-        fn metrics(&self) -> Tp4RankMetrics {
-            Tp4RankMetrics {
-                load_ms: 0,
-                resident_cache_bytes: 0,
-                resident_cache_tensors: 0,
-                reduce_calls: 0,
-                reduce_elements: 0,
-                steps: 0,
-                last_step_ms: 0,
-            }
-        }
-    }
-
-    #[test]
-    fn the_prompt_logprob_request_frame_carries_the_selection_and_the_events_lead_with_the_payload()
-    {
-        let prompt = vec![100u32, 200, 300, 400];
-        let tokenizer =
-            load_hf_tokenizer(&sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path())
-                .expect("tokenizer");
-        // Bind a free loopback port, release it, and let the hub take it: the hub does not expose
-        // its bound address, and the race window is a test-only detail.
-        let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
-        let address = probe.local_addr().expect("probe address");
-        drop(probe);
-        let control_address = address;
-        // The worker connects before the hub waits for it: connect retries until the hub binds,
-        // and the hub cannot return until every worker has said Hello.
-        let worker = thread::spawn(move || {
-            let mut control =
-                Tp4ControlWorker::connect(control_address, 1, 2, Duration::from_secs(10))
-                    .expect("worker connect");
-            control.handshake().expect("handshake");
-            let mut requests = Vec::new();
-            while let Ok(frame) = control.next_frame() {
-                match frame {
-                    Tp4ControlFrame::Request {
-                        prompt_ids,
-                        max_tokens,
-                        prompt_logprobs,
-                        ..
-                    } => {
-                        requests.push((prompt_ids, max_tokens, prompt_logprobs));
-                        loop {
-                            match control.next_frame().expect("decode frame") {
-                                Tp4ControlFrame::Token { token_id } => {
-                                    assert_eq!(token_id, 500);
-                                }
-                                Tp4ControlFrame::End => break,
-                                other => panic!("expected Token or End, got {other:?}"),
-                            }
-                        }
-                    }
-                    Tp4ControlFrame::End => break,
-                    other => panic!("expected Request or End, got {other:?}"),
-                }
-            }
-            requests
-        });
-        let mut hub = Tp4ControlHub::start(address, 2, Duration::from_secs(10)).expect("hub");
-        let (replies, mut answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
-        let job = Job {
-            prompt_tokens: prompt.clone(),
-            forced_tokens: Vec::new(),
-            max_tokens: 2,
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            skip_special_tokens: true,
-            seed: 0,
-            logprobs: LogprobsRequest {
-                sample: None,
-                prompt: Some(LogprobSelection::Top(3)),
-                token_ids: Vec::new(),
-            },
-            stop: Vec::new(),
-            enqueued_at: Instant::now(),
-            replies,
-        };
-        let metrics = Metrics::new();
-        let mut rank = FakeTp4Rank {
-            prompt: prompt.clone(),
-            seen_selection: None,
-        };
-        run_tp4_request(&mut rank, &mut hub, &tokenizer, job, &metrics).expect("request runs");
-        assert_eq!(rank.seen_selection, Some(Some(3)));
-        // Closing the hub is what ends the worker loop in the test; the real worker exits with
-        // the process.
-        drop(hub);
-        let requests = worker.join().expect("worker joins");
-        assert_eq!(
-            requests,
-            vec![(prompt.clone(), 2, Some(3u32))],
-            "the Request frame must carry the prompt-logprob selection"
-        );
-        // The first reply is the whole-prompt payload, delivered after prefill and before the
-        // first generated token, exactly where the serial host path delivers it.
-        let first = answers.try_recv().expect("the prompt payload");
-        let Reply::PromptLogprobs(payload) = first else {
-            panic!("expected PromptLogprobs first, got a different reply");
-        };
-        assert_eq!(payload.tokens.len(), prompt.len());
-        assert!(payload.positions[0].is_none());
-        for (index, position) in payload.positions.iter().enumerate().skip(1) {
-            let position = position.as_ref().expect("a scored position");
-            assert_eq!(position.token_id, prompt[index]);
-            assert_eq!(position.top.len(), 4, "own token plus three alternatives");
-            assert_eq!(position.top[0].token_id, prompt[index]);
-            assert_eq!(position.top[0].logprob, position.logprob);
-            assert_eq!(position.top[0].rank, Some(1));
-            for (slot, alternative) in position.top.iter().skip(1).enumerate() {
-                assert_eq!(alternative.rank, Some(u32::try_from(slot + 1).unwrap()));
-            }
-        }
-        // Then the generated-token deltas and the terminal reply.
-        let mut deltas = 0usize;
-        let mut done = false;
-        while let Ok(reply) = answers.try_recv() {
-            match reply {
-                Reply::Delta(_) => deltas += 1,
-                Reply::Done(_) => done = true,
-                _ => panic!("unexpected reply after the payload"),
-            }
-        }
-        assert!(deltas >= 1);
-        assert!(done, "the request must end with the Done summary");
-    }
-
-    /// A rank-0 stub whose every step keeps two drafts: decode(t) decodes t + 1 and t + 2 in its
-    /// verify and picks t + 3.
-    #[derive(Default)]
-    struct SpeculativeFakeRank {
-        speculative: Option<bool>,
-        fed: Vec<u32>,
-    }
-
-    impl Tp4RankApi for SpeculativeFakeRank {
-        fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-            self.speculative = Some(sampling.speculative);
-            Ok(())
-        }
-
-        fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
-            Ok(Tp4Step {
-                next_token: Some(500),
-                ..Tp4Step::default()
-            })
-        }
-
-        fn prefill_prompt_logprobs(
-            &mut self,
-            _prompt: &[u32],
-            _selection: Option<usize>,
-        ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
-            Err("not asked".to_owned())
-        }
-
-        fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
-            self.fed.push(token);
-            Ok(Tp4Step {
-                logits: Vec::new(),
-                next_token: Some(token + 3),
-                accepted: vec![token + 1, token + 2],
-            })
-        }
-
-        fn metrics(&self) -> Tp4RankMetrics {
-            Tp4RankMetrics::default()
-        }
-    }
-
-    #[test]
-    fn a_speculative_steps_kept_drafts_are_emitted_and_only_its_pick_is_fed() {
-        let tokenizer =
-            load_hf_tokenizer(&sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path())
-                .expect("tokenizer");
-        let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
-        let address = probe.local_addr().expect("probe address");
-        drop(probe);
-        let worker = thread::spawn(move || {
-            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(10))
-                .expect("worker connect");
-            control.handshake().expect("handshake");
-            let (mut speculative, mut tokens) = (None, Vec::new());
-            while let Ok(frame) = control.next_frame() {
-                match frame {
-                    Tp4ControlFrame::Request {
-                        speculative: flag, ..
-                    } => speculative = Some(flag),
-                    Tp4ControlFrame::Token { token_id } => tokens.push(token_id),
-                    Tp4ControlFrame::End => {}
-                    other => panic!("unexpected frame {other:?}"),
-                }
-            }
-            (speculative, tokens)
-        });
-        let mut hub = Tp4ControlHub::start(address, 2, Duration::from_secs(10)).expect("hub");
-        let (replies, mut answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
-        let job = Job {
-            prompt_tokens: vec![100, 200],
-            forced_tokens: Vec::new(),
-            max_tokens: 6,
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            skip_special_tokens: true,
-            seed: 0,
-            logprobs: LogprobsRequest {
-                sample: None,
-                prompt: None,
-                token_ids: Vec::new(),
-            },
-            stop: Vec::new(),
-            enqueued_at: Instant::now(),
-            replies,
-        };
-        let mut rank = SpeculativeFakeRank::default();
-        run_tp4_request(&mut rank, &mut hub, &tokenizer, job, &Metrics::new())
-            .expect("request runs");
-        drop(hub);
-        // 500, then 501 502 503 from the step fed 500, then 504 505 from the step fed 503: six
-        // tokens, two steps, and the workers run the same two.
-        assert_eq!(rank.speculative, Some(true));
-        assert_eq!(rank.fed, [500, 503]);
-        assert_eq!(
-            worker.join().expect("worker joins"),
-            (Some(true), vec![500, 503])
-        );
-        let mut completion_tokens = None;
-        while let Ok(reply) = answers.try_recv() {
-            if let Reply::Done(summary) = reply {
-                completion_tokens = Some(summary.completion_tokens);
-            }
-        }
-        assert_eq!(completion_tokens, Some(6));
-    }
-
-    /// A rank-0 stub that always picks 999, drafts only when asked to speculate, and records what
-    /// it was fed.
-    #[derive(Default)]
-    struct StubbornFakeRank {
-        speculative: Option<bool>,
-        fed: Vec<u32>,
-    }
-
-    impl StubbornFakeRank {
-        fn step(&self, token: u32) -> Tp4Step {
-            let mut logits = vec![0.0; 1024];
-            logits[999] = 4.0;
-            Tp4Step {
-                logits,
-                next_token: Some(999),
-                accepted: if self.speculative == Some(true) {
-                    vec![token + 1]
-                } else {
-                    Vec::new()
-                },
-            }
-        }
-    }
-
-    impl Tp4RankApi for StubbornFakeRank {
-        fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-            self.speculative = Some(sampling.speculative);
-            Ok(())
-        }
-
-        fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
-            Ok(self.step(0))
-        }
-
-        fn prefill_prompt_logprobs(
-            &mut self,
-            _prompt: &[u32],
-            _selection: Option<usize>,
-        ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
-            Err("not asked".to_owned())
-        }
-
-        fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
-            self.fed.push(token);
-            Ok(self.step(token))
-        }
-
-        fn metrics(&self) -> Tp4RankMetrics {
-            Tp4RankMetrics::default()
-        }
-    }
-
-    #[test]
-    fn a_forced_tp4_request_emits_scores_and_broadcasts_the_forced_tokens() {
-        let tokenizer =
-            load_hf_tokenizer(&sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path())
-                .expect("tokenizer");
-        let probe = TcpListener::bind("127.0.0.1:0").expect("probe listener");
-        let address = probe.local_addr().expect("probe address");
-        drop(probe);
-        let worker = thread::spawn(move || {
-            let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(10))
-                .expect("worker connect");
-            control.handshake().expect("handshake");
-            let (mut speculative, mut tokens) = (None, Vec::new());
-            while let Ok(frame) = control.next_frame() {
-                match frame {
-                    Tp4ControlFrame::Request {
-                        speculative: flag, ..
-                    } => speculative = Some(flag),
-                    Tp4ControlFrame::Token { token_id } => tokens.push(token_id),
-                    Tp4ControlFrame::End => {}
-                    other => panic!("unexpected frame {other:?}"),
-                }
-            }
-            (speculative, tokens)
-        });
-        let mut hub = Tp4ControlHub::start(address, 2, Duration::from_secs(10)).expect("hub");
-        let (replies, mut answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
-        let forced = vec![300u32, 301, 302];
-        let job = Job {
-            prompt_tokens: vec![100, 200],
-            forced_tokens: forced.clone(),
-            max_tokens: forced.len(),
-            temperature: 0.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            skip_special_tokens: true,
-            seed: 0,
-            logprobs: LogprobsRequest {
-                sample: Some(LogprobSelection::Top(1)),
-                prompt: None,
-                token_ids: Vec::new(),
-            },
-            stop: Vec::new(),
-            enqueued_at: Instant::now(),
-            replies,
-        };
-        let mut rank = StubbornFakeRank::default();
-        run_tp4_request(&mut rank, &mut hub, &tokenizer, job, &Metrics::new())
-            .expect("request runs");
-        drop(hub);
-        // The last token is never fed back, so rank 0 and the workers both decode the first two.
-        assert_eq!(rank.speculative, Some(false));
-        assert_eq!(rank.fed, forced[..2]);
-        assert_eq!(
-            worker.join().expect("worker joins"),
-            (Some(false), forced[..2].to_vec())
-        );
-        let mut scored = Vec::new();
-        let mut completion_tokens = None;
-        while let Ok(reply) = answers.try_recv() {
-            match reply {
-                Reply::TokenLogprobs(entry) => {
-                    assert!(
-                        entry
-                            .top
-                            .iter()
-                            .any(|alternative| alternative.token_id == 999),
-                        "rank 0's own choice stays visible in the alternatives"
-                    );
-                    scored.push(entry.token_id);
-                }
-                Reply::Done(summary) => completion_tokens = Some(summary.completion_tokens),
-                _ => {}
-            }
-        }
-        assert_eq!(scored, forced, "every forced token is emitted and scored");
-        assert_eq!(completion_tokens, Some(forced.len()));
-    }
-
-    #[test]
-    fn the_tp4_prompt_logprobs_payload_matches_the_serial_assembly() {
-        // A fabricated finite log-softmax row and a prompt that walks it: the rank contract's
-        // merged values are derived from the same row the serial formula uses, so the payload the
-        // TP=4 path builds must equal the serial token_logprob assembly exactly, strings and order
-        // included.
-        let prompt: Vec<u32> = vec![2, 5, 8, 13, 21];
-        let row: Vec<f32> = (0..64).map(|index| index as f32 * 0.7 - 6.0).collect();
-        let values = log_softmax(&row);
-        let decode_ids = |ids: &[u32]| -> Result<String, String> {
-            Ok(ids
-                .iter()
-                .map(|token| format!("<{token}>"))
-                .collect::<String>())
-        };
-        for requested in [None, Some(0u32), Some(3u32)] {
-            let selection = requested.map(LogprobSelection::Top);
-            let request = LogprobsRequest {
-                sample: None,
-                prompt: selection,
-                token_ids: Vec::new(),
-            };
-            let alternatives: usize = requested.unwrap_or(0) as usize;
-            let merged: Vec<MergedPosition> = (0..prompt.len() - 1)
-                .map(|index| {
-                    let own_token_id = prompt[index + 1];
-                    let own_logprob = values[own_token_id as usize];
-                    MergedPosition {
-                        position: index,
-                        own_token_id,
-                        own_logprob,
-                        own_rank: competition_rank(&values, own_logprob),
-                        alternatives: top_k_indices(&values, alternatives)
-                            .into_iter()
-                            .map(|token| sparkflash_engine::prompt_ranks::MergedAlternative {
-                                token_id: token as u32,
-                                logprob: values[token],
-                            })
-                            .collect(),
-                    }
-                })
-                .collect();
-            let mut decoder = LogprobDecoder::new(&decode_ids);
-            let payload = tp4_prompt_logprobs_payload(&prompt, &merged, &request, &mut decoder)
-                .expect("the TP=4 payload builds");
-            // The serial assembly of the same request, with the same decoding sequence.
-            let mut serial_decoder = LogprobDecoder::new(&decode_ids);
-            let mut tokens = Vec::new();
-            let mut positions: Vec<Option<TokenLogprob>> = vec![None; prompt.len()];
-            tokens.push(TokenString {
-                token_id: prompt[0],
-                token: serial_decoder.decode(prompt[0]).expect("decode"),
-            });
-            serial_decoder.push(prompt[0]);
-            for index in 0..prompt.len() - 1 {
-                let token_index = index + 1;
-                let token = serial_decoder.decode(prompt[token_index]).expect("decode");
-                tokens.push(TokenString {
-                    token_id: prompt[token_index],
-                    token: token.clone(),
-                });
-                positions[token_index] = Some(
-                    token_logprob(
-                        &values,
-                        prompt[token_index],
-                        token,
-                        selection,
-                        &[],
-                        &mut serial_decoder,
-                    )
-                    .expect("serial token logprob"),
-                );
-                serial_decoder.push(prompt[token_index]);
-            }
-            assert_eq!(
-                payload,
-                PromptLogprobs { tokens, positions },
-                "requested {requested:?} changed the payload"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_rank_is_a_typed_startup_timeout() {
-        let error = Tp4ControlHub::start(
-            SocketAddr::from(([127, 0, 0, 1], 0)),
-            2,
-            Duration::from_millis(80),
-        )
-        .expect_err("a missing rank cannot complete the group");
-        match error {
-            Tp4ControlError::MissingRank {
-                world,
-                joined,
-                waited,
-            } => {
-                assert_eq!(world, 2);
-                assert_eq!(joined, 0);
-                assert_eq!(waited, Duration::from_millis(80));
-            }
-            other => panic!("expected MissingRank, got {other}"),
-        }
-    }
-
-    #[test]
-    fn worker_control_connect_retries_until_the_hub_binds() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the listener address");
-        // Release the port so the worker's early connect attempts are refused, exactly the
-        // rank-0-loads-slower startup race; the hub binds after a short delay.
-        drop(listener);
-        let server = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(250));
-            let listener =
-                TcpListener::bind(address).expect("the hub binds after the worker starts trying");
-            let (mut stream, _) = listener.accept().expect("the retried worker connects");
-            let frame = read_control_frame(&mut stream).expect("read the worker Hello");
-            assert!(
-                matches!(frame, Tp4ControlFrame::Hello { rank: 1 }),
-                "{frame:?}"
-            );
-            write_control_frame(&mut stream, &Tp4ControlFrame::Ready).expect("send Ready");
-        });
-        let mut worker = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-            .expect("the connect retries until the hub is listening");
-        worker
-            .handshake()
-            .expect("the retried connection handshakes");
-        assert!(worker.ready);
-        server.join().expect("the test hub joins");
-    }
-
-    #[test]
-    fn worker_control_connect_names_the_peer_when_the_hub_never_binds() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the listener address");
-        drop(listener);
-        let waited = Duration::from_millis(150);
-        let error = match Tp4ControlWorker::connect(address, 1, 2, waited) {
-            Ok(_) => panic!("a hub that never binds must not report a connected worker"),
-            Err(error) => error,
-        };
-        let display = error.to_string();
-        match error {
-            Tp4ControlError::ConnectTimeout {
-                address: tried,
-                waited: reported,
-            } => {
-                assert_eq!(tried, address);
-                assert_eq!(reported, waited);
-            }
-            other => panic!("expected ConnectTimeout, got {other}"),
-        }
-        assert!(
-            display.contains(&address.to_string()),
-            "the refusal must name the peer: {display}"
-        );
-        assert!(
-            display.contains("150ms"),
-            "the refusal must name the elapsed budget: {display}"
-        );
-    }
-
-    #[test]
-    fn an_idle_control_gap_does_not_take_the_worker_down() {
-        // The real timeout is ten minutes; shrink it so the test does not build a minute of wait
-        // into CI. The worker is the client, and rank 0 stays silent for several timeouts before
-        // it ends the group.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the listener address");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("the test hub connects");
-            thread::sleep(Duration::from_millis(350));
-            write_control_frame(&mut stream, &Tp4ControlFrame::End).expect("write End");
-        });
-        let stream = TcpStream::connect(address).expect("connect to the test hub");
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .expect("a short read timeout");
-        let mut worker = Tp4ControlWorker {
-            stream,
-            rank: 1,
-            world: 2,
-            ready: true,
-        };
-        let mut rank = FakeTp4Rank {
-            prompt: Vec::new(),
-            seen_selection: None,
-        };
-        let started = Instant::now();
-        tp4_worker_loop(&mut rank, &mut worker, 1)
-            .expect("a silent rank 0 is an idle wait, not a dead peer");
-        assert!(
-            started.elapsed() >= Duration::from_millis(300),
-            "the loop must survive more than one read timeout"
-        );
-        server.join().expect("the test hub joins");
-    }
-
-    #[test]
-    fn request_before_ready_is_refused_by_the_worker() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
-        let address = listener.local_addr().expect("the listener address");
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("the test hub connects");
-            let mut worker = Tp4ControlWorker {
-                stream,
-                rank: 1,
-                world: 2,
-                ready: false,
-            };
-            assert!(matches!(
-                worker.next_frame(),
-                Err(Tp4ControlError::NotReady { .. })
-            ));
-        });
-        let _client = TcpStream::connect(address).expect("connect to the test worker");
-        server.join().expect("the test worker joins");
-    }
-
-    #[tokio::test]
-    async fn one_request_guard_refuses_a_second_concurrent_request() {
-        let (jobs, mut queued) = tokio::sync::mpsc::channel(TP4_JOB_QUEUE);
-        let driver = Tp4Driver::for_test(jobs, 4);
-        assert!(
-            !driver.independent_choices(),
-            "the router must refuse n > 1 on the lockstep TP=4 group"
-        );
-        let _first = driver.generate(engine_request(&[1, 2, 3], 2));
-        let second = driver.generate(engine_request(&[1, 2, 3], 2));
-        let events: Vec<EngineEvent> = second.collect().await;
-        assert!(
-            matches!(
-                events.first(),
-                Some(EngineEvent::Error { code, .. }) if code == REFUSED_CODE
-            ),
-            "the second concurrent request must be the existing typed refusal: {events:?}"
-        );
-        let _ = queued.try_recv();
-    }
-
-    #[test]
-    fn tp4_stats_keep_the_reference_shape_and_name_the_fabric() {
-        let timing = RequestTiming::default();
-        let reference = serde_json::to_value(request_stats_with_fabric(3, timing, ""))
-            .expect("the reference stats serialize");
-        let tp4 = serde_json::to_value(request_stats_with_fabric(3, timing, TP4_FABRIC))
-            .expect("the TP=4 stats serialize");
-        assert_eq!(
-            shape(&reference),
-            shape(&tp4),
-            "the stats keys must not drift"
-        );
-        assert_eq!(tp4["transport"]["fabric_mode"], TP4_FABRIC);
-        assert_eq!(reference["transport"]["fabric_mode"], "");
-        assert_eq!(tp4["kv_cache"]["total_prompt_tokens"], 3);
-        assert_eq!(tp4["kv_cache"]["global_kv_cached_tokens"], 0);
-    }
-}
+#[path = "../tests/unit/tp4_serve_tests.rs"]
+mod tp4_serve_tests;
 
 #[cfg(test)]
 mod device_token_serve_tests {
@@ -11867,6 +10633,36 @@ mod device_token_serve_tests {
             options.device_token_dir,
             Some(std::path::PathBuf::from("/tmp/sparkflash-windows"))
         );
+    }
+
+    #[test]
+    fn a_deepseek_checkpoint_still_takes_the_host_path_without_cubins() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        std::fs::write(
+            dir.path().join(CHECKPOINT_CONFIG_NAME),
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        )
+        .expect("the released configuration");
+        let checkpoint = dir.path().to_string_lossy().to_string();
+        let options = ServeOptions::parse(vec!["--checkpoint".to_owned(), checkpoint])
+            .expect("DeepSeek detection must not require a cubin directory");
+        assert_eq!(options.model, None);
+    }
+
+    #[test]
+    fn a_released_deepseek_checkpoint_plans_before_boot() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        std::fs::write(
+            dir.path().join(CHECKPOINT_CONFIG_NAME),
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        )
+        .expect("the released configuration");
+        check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
+            .expect("the released DeepSeek config plans and resolves at TP4");
     }
 
     #[test]

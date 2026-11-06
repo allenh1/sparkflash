@@ -370,7 +370,11 @@ impl RowsState {
             Ok(kernel)
         };
         let seam = load("opt_rows_mhc_seam")?;
-        let seam_split = if std::env::var("SPARKFLASH_SEAM_SPLIT").as_deref() == Ok("0") {
+        let seam_split = if !sparkflash_model::active_profile()
+            .diagnostics
+            .seam_split
+            .unwrap_or(true)
+        {
             None
         } else {
             Some((
@@ -385,7 +389,11 @@ impl RowsState {
         let post = load("opt_rows_mhc_post")?;
         let kv = load("opt_rows_kv")?;
         let attn = load("opt_rows_attn")?;
-        let attn_split = if std::env::var("SPARKFLASH_ATTN_SPLIT").as_deref() == Ok("0") {
+        let attn_split = if !sparkflash_model::active_profile()
+            .diagnostics
+            .attn_split
+            .unwrap_or(true)
+        {
             None
         } else {
             Some([
@@ -404,9 +412,14 @@ impl RowsState {
         let embed_stream = load("opt_rows_embed_stream")?;
         let embed_table = load("opt_rows_embed_table")?;
         let engram_wkv = load("opt_rows_engram_wkv")?;
-        let engram_wkv_staged = match std::env::var("SPARKFLASH_ENGRAM_STAGED").as_deref() {
-            Ok("0") => None,
-            _ => load("opt_rows_engram_wkv_s").ok(),
+        let engram_wkv_staged = if sparkflash_model::active_profile()
+            .diagnostics
+            .engram_staged
+            .unwrap_or(true)
+        {
+            load("opt_rows_engram_wkv_s").ok()
+        } else {
+            None
         };
         let rank_permute = load("opt_rows_rank_permute")?;
         let hostw = [
@@ -414,11 +427,16 @@ impl RowsState {
             load("opt_rows_hostw_bf16w_f32o")?,
             load("opt_rows_hostw_f32w_f32o")?,
         ];
-        let hostw_ring = match std::env::var("SPARKFLASH_ROWS_RING").as_deref() {
-            Ok("0") => None,
-            _ => load("opt_rows_hostw_bf16w_f32o_ring")
+        let hostw_ring = if sparkflash_model::active_profile()
+            .diagnostics
+            .rows_ring
+            .unwrap_or(true)
+        {
+            load("opt_rows_hostw_bf16w_f32o_ring")
                 .and_then(|bf16| Ok([bf16, load("opt_rows_hostw_f32w_f32o_ring")?]))
-                .ok(),
+                .ok()
+        } else {
+            None
         };
         let prefetch_l2 = load("opt_rows_prefetch_l2")?;
         let prologue = load("opt_rows_prologue_bf16")?;
@@ -433,9 +451,12 @@ impl RowsState {
         };
         let engram_embed = load_misc("opt_bulk_engram_embed")?;
         let engram_post = load_misc("opt_rows_engram_post")?;
-        let groups = match std::env::var("SPARKFLASH_ROWS_GROUPS").as_deref() {
-            Ok("0") => None,
-            _ => (|| {
+        let groups = if sparkflash_model::active_profile()
+            .diagnostics
+            .rows_groups
+            .unwrap_or(true)
+        {
+            (|| {
                 Ok::<_, String>(GroupKernels {
                     pool: load_misc("opt_rows_group_pool")?,
                     k_norm: load_misc("opt_k_norm_rows")?,
@@ -443,7 +464,9 @@ impl RowsState {
                     append: load_misc("opt_rows_group_append")?,
                 })
             })()
-            .ok(),
+            .ok()
+        } else {
+            None
         };
         let kernels = RowsKernels {
             _modules: modules,
@@ -620,10 +643,15 @@ impl RowsState {
             group_ratios: Cell::new([0; GROUP_SLOTS]),
             taps: None,
             // A bulk chunk's stages read far more than the L2 holds, so it prefetches nothing.
-            side: match std::env::var("SPARKFLASH_L2_PREFETCH").as_deref() {
-                Ok("0") => None,
-                _ if r > R_MAX => None,
-                _ => Some(cuda.side_stream()?),
+            side: if sparkflash_model::active_profile()
+                .diagnostics
+                .l2_prefetch
+                .unwrap_or(true)
+                && r <= R_MAX
+            {
+                Some(cuda.side_stream()?)
+            } else {
+                None
             },
             cap: r,
             bulk: if r > R_MAX {
@@ -737,6 +765,15 @@ const SELECT_SEG_HEADS: usize = 32;
 const SELECT_SEG_TILE: usize = 32;
 const SELECT_SEG_ROWS: usize = 8;
 const SELECT_SEG_BLOCKS: usize = 96;
+
+/// The segment-select tile cap the active profile asks for.
+fn seg_blocks() -> usize {
+    sparkflash_model::active_profile()
+        .diagnostics
+        .seg_blocks
+        .unwrap_or(SELECT_SEG_BLOCKS)
+        .max(1)
+}
 
 fn span(device: u64, len: usize) -> DeviceSpan {
     DeviceSpan::new(device, len)
@@ -932,7 +969,11 @@ impl DeviceLayer<'_> {
     /// # Errors
     /// The allocation, the copy or the gather failed.
     pub(super) fn replicate_embedding(&mut self, shard: u64) -> Result<(), String> {
-        if std::env::var("SPARKFLASH_EMBED_REPLICA").as_deref() == Ok("0") {
+        if !sparkflash_model::active_profile()
+            .diagnostics
+            .embed_replica
+            .unwrap_or(true)
+        {
             return Ok(());
         }
         let Some((world, rank)) = self.device_exchange() else {
@@ -1647,8 +1688,12 @@ impl DeviceLayer<'_> {
     /// mix weights, wq_a and wkv, then wq_b (off under SPARKFLASH_PREFETCH_WQB=0).
     fn prefetch_attention(&self, rows: &RowsState, layer: usize) -> Result<(), String> {
         static WQB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let wqb =
-            *WQB.get_or_init(|| std::env::var("SPARKFLASH_PREFETCH_WQB").as_deref() != Ok("0"));
+        let wqb = *WQB.get_or_init(|| {
+            sparkflash_model::active_profile()
+                .diagnostics
+                .prefetch_wqb
+                .unwrap_or(true)
+        });
         let Ok(weights) = self.seam_layer(layer, "prefetch") else {
             return Ok(());
         };
@@ -2070,7 +2115,10 @@ impl DeviceLayer<'_> {
             (handle.has_exchange()
                 && world > 1
                 && out_width.is_multiple_of(world * 8)
-                && std::env::var("SPARKFLASH_ENGRAM_SPLIT").as_deref() != Ok("0"))
+                && sparkflash_model::active_profile()
+                    .diagnostics
+                    .engram_split
+                    .unwrap_or(true))
             .then_some((world, rank))
         });
         let Some((world, rank)) = split else {
@@ -2122,7 +2170,12 @@ impl DeviceLayer<'_> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         rows.row_tab_for.borrow_mut().clear();
         rows.group_ratios.set([0; GROUP_SLOTS]);
-        let off = *OFF.get_or_init(|| std::env::var("SPARKFLASH_ROW_TABLE").as_deref() == Ok("0"));
+        let off = *OFF.get_or_init(|| {
+            !sparkflash_model::active_profile()
+                .diagnostics
+                .row_table
+                .unwrap_or(true)
+        });
         let Some(lanes) = self.lanes.as_ref() else {
             return Ok(());
         };
@@ -2498,7 +2551,10 @@ impl DeviceLayer<'_> {
             || !self.is_index_source(layer)
             || self.index_n_heads > 64
             || self.index_head_dim != 128
-            || std::env::var("SPARKFLASH_ROWS_SELECT").as_deref() == Ok("0")
+            || !sparkflash_model::active_profile()
+                .diagnostics
+                .rows_select
+                .unwrap_or(true)
         {
             return false;
         }
@@ -2529,7 +2585,10 @@ impl DeviceLayer<'_> {
             || select.rows_tab.is_none()
             || self.row_table(rows, segs).is_none()
             || self.index_n_heads != SELECT_SEG_HEADS
-            || std::env::var("SPARKFLASH_SELECT_TOGETHER").as_deref() == Ok("0")
+            || !sparkflash_model::active_profile()
+                .diagnostics
+                .select_together
+                .unwrap_or(true)
         {
             return false;
         }
@@ -2587,11 +2646,7 @@ impl DeviceLayer<'_> {
             std::cmp::Ordering::Equal => 2,
             std::cmp::Ordering::Greater => 1,
         };
-        let cap = std::env::var("SPARKFLASH_SEG_BLOCKS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(SELECT_SEG_BLOCKS)
-            .max(1);
+        let cap = seg_blocks();
         let pieces = select_pieces(segs).count();
         self.cuda.launch(
             scores_segs,
@@ -2684,11 +2739,7 @@ impl DeviceLayer<'_> {
         if heads == SELECT_SEG_HEADS && seg.n <= SELECT_SEG_ROWS {
             // The segment's rows share each key tile; a consumed mask skips what no row needs.
             let tiles = reach.div_ceil(SELECT_SEG_TILE);
-            let cap = std::env::var("SPARKFLASH_SEG_BLOCKS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(SELECT_SEG_BLOCKS)
-                .max(1);
+            let cap = seg_blocks();
             let slices = (4 / seg.n).max(1);
             self.cuda.launch(
                 scores_seg,
@@ -2778,7 +2829,10 @@ impl DeviceLayer<'_> {
         if ratio == 0
             || (!kv_source && !index)
             || segs.iter().any(|seg| seg.n + ratio > ring.rows + 1)
-            || std::env::var("SPARKFLASH_ROWS_INDEXER").as_deref() == Ok("0")
+            || !sparkflash_model::active_profile()
+                .diagnostics
+                .rows_indexer
+                .unwrap_or(true)
         {
             return Ok(false);
         }
@@ -3542,7 +3596,11 @@ impl DeviceLayer<'_> {
     /// embedding gathers then stay on the device stream instead of a host round trip each.
     /// SPARKFLASH_DEVICE_GATHER=0 keeps them on the host transport.
     pub(super) fn device_exchange(&self) -> Option<(usize, usize)> {
-        if std::env::var("SPARKFLASH_DEVICE_GATHER").as_deref() == Ok("0") {
+        if !sparkflash_model::active_profile()
+            .diagnostics
+            .device_gather
+            .unwrap_or(true)
+        {
             return None;
         }
         let handle = self.reduce?.0.try_borrow().ok()?;

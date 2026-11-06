@@ -37,3 +37,11 @@ __pycache__/
 
 # M7 harness build output
 out/
+
+# Serving checkouts' artifacts: the converted weights a node serves from
+# (SPARKFLASH_CONVERTED_DIR), a second cargo target directory, and the bind
+# evidence a device arm writes beside the binary.
+/converted/
+/target-cuda/
+/tp4-bind-r*.json
+/tp4-bind-names-r*.txt

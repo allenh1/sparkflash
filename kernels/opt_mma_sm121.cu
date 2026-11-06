@@ -550,7 +550,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 
 // ---- Routed experts: grouped W4A8 GEMMs over a chunk's routed rows.
 //
-// The rows (token * 6 + slot) are grouped by expert (opt_mma_moe_plan), and each block serves one
+// The rows (token * 6 + slot) are grouped by expert (the shared plan, kernels/moe_plan_sm121.cu,
+// which hands back `sorted` and the item list), and each block serves one
 // expert's group of at most 64 rows against one column tile of that expert's slices, so an
 // expert's weights are read about once per chunk instead of once per routed row. The MMA is
 // kind::mxf8f6f4 E4M3 x E2M1: the FP4 weights are spread into the 8-bit containers the MMA reads
@@ -559,11 +560,8 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 // its A registers the matching activation bytes), which leaves every dot product unchanged and
 // lets each lane read its operands as one 4-byte (B) and one 8-byte (A) shared load.
 //
-// opt_mma_moe_plan: one block of 1024 threads. Counts the rows per expert, lays the groups out in
-//   expert order, splits each into items of <= 64 rows and scatters the row ids. items[i] =
-//   (expert, first, count, 0); items_count[0] = the item count. With seg_tokens != 0 the tokens
-//   are segments of seg_tokens (several chunks' rows, each at its segment's start) and only the
-//   first seg_n[s] tokens of segment s are routed: the rest are gaps no item holds.
+//   The plan is the shared `moe_plan` symbol (kernels/moe_plan_sm121.cu), launched with
+//   item_rows = MOE_PLAN_ITEM_ROWS (64, OMM_ROWS below) and this arm's segments.
 // opt_mma_moe_gate_up: grid (576 / 64, max items), 256 threads; block (x, y) = item y, intermediate
 //   columns 64 x .. 64 x + 63, gate and up together. Epilogue: the opt_moe chain (bf16 gate and up,
 //   clamp, SwiGLU, routing weight, bf16, MX quantiser) into codes [rows][576], scales [rows][18].
@@ -616,55 +614,6 @@ __device__ __forceinline__ uint32_t omm_w_off(uint32_t col, uint32_t block) {
     return col * OMM_W_ROW + ((block ^ ((col >> 1) & 3u)) << 4);
 }
 
-#define OMM_MAX_SEGS 4u
-
-extern "C" __global__ void __launch_bounds__(1024) opt_mma_moe_plan(
-    const uint32_t *__restrict__ ids, const uint32_t rows, const uint32_t experts,
-    uint32_t *__restrict__ sorted, uint32_t *__restrict__ items, uint32_t *__restrict__ items_count,
-    const uint32_t seg_tokens, const uint32_t seg_n0, const uint32_t seg_n1, const uint32_t seg_n2,
-    const uint32_t seg_n3) {
-    OPT_PDL_ENTRY();
-    __shared__ uint32_t s_count[512];
-    __shared__ uint32_t s_cursor[512];
-    const uint32_t tid = threadIdx.x;
-    const uint32_t seg_n[OMM_MAX_SEGS] = {seg_n0, seg_n1, seg_n2, seg_n3};
-    auto live = [&](uint32_t r) {
-        if (seg_tokens == 0u) return true;
-        const uint32_t token = r / OMM_TOPK;
-        const uint32_t seg = token / seg_tokens;
-        return seg < OMM_MAX_SEGS && token - seg * seg_tokens < seg_n[seg];
-    };
-    for (uint32_t e = tid; e < 512u; e += blockDim.x) s_count[e] = 0u;
-    __syncthreads();
-    for (uint32_t r = tid; r < rows; r += blockDim.x) {
-        if (!live(r)) continue;
-        const uint32_t id = ids[r] < experts ? ids[r] : 0u;
-        atomicAdd(&s_count[id], 1u);
-    }
-    __syncthreads();
-    if (tid == 0u) {
-        uint32_t offset = 0u, n = 0u;
-        for (uint32_t e = 0u; e < experts; ++e) {
-            const uint32_t count = s_count[e];
-            s_cursor[e] = offset;
-            for (uint32_t s = 0u; s < count; s += OMM_ROWS) {
-                items[4u * n] = e;
-                items[4u * n + 1u] = offset + s;
-                items[4u * n + 2u] = min(OMM_ROWS, count - s);
-                items[4u * n + 3u] = 0u;
-                ++n;
-            }
-            offset += count;
-        }
-        items_count[0] = n;
-    }
-    __syncthreads();
-    for (uint32_t r = tid; r < rows; r += blockDim.x) {
-        if (!live(r)) continue;
-        const uint32_t id = ids[r] < experts ? ids[r] : 0u;
-        sorted[atomicAdd(&s_cursor[id], 1u)] = r;
-    }
-}
 
 extern "C" __global__ void __launch_bounds__(OM_THREADS) opt_mma_moe_gate_up(
     const uint64_t *__restrict__ gate_table, const uint64_t *__restrict__ up_table,

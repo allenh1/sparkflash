@@ -27,21 +27,34 @@
 //! second pack adds a descriptor here (or in a pack crate that registers at startup) without
 //! changing the server, the web control plane, or the CLI dispatcher.
 
+pub mod architecture;
+pub mod arm;
 pub mod backend;
 pub mod capabilities;
+pub mod compose;
 pub mod config;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
+pub mod fused;
 pub mod numerics;
+pub mod parts;
+pub mod prof;
 pub mod profile;
 pub mod prompt;
+pub mod settings;
+pub mod spec;
 pub mod speculation;
 pub mod telemetry;
+pub mod tp_plan;
 pub mod vision;
+pub mod vision_geometry;
 
+pub use architecture::Architecture;
+pub use arm::{Admission, AdmissionRefusal, KvPlan, PackIdentity, gib, kv_budget_bytes};
 pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;
+pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, MODELS, ModelDescriptor, V41_CONTEXT_TOKENS,
@@ -49,10 +62,19 @@ pub use descriptor::{
     find_model_by_weights, model_context_tokens, model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
+pub use fused::{FusedArm, FusedEngine, FusedSession};
 pub use numerics::{ConfigKey, NumericsIdentity, NumericsProfile, NumericsStatus};
-pub use profile::{ModelProfile, ProfileError};
+pub use parts::{Part, PartSet, Target, built, is_built};
+pub use prof::StageProfiler;
+pub use profile::{
+    DepthMode, DraftLogitsKernel, DrafterProfile, ModelProfile, PlanProfile, ProfileError,
+    active as active_profile, install_active,
+};
 pub use prompt::{PromptCodec, PromptError};
+pub use spec::{Pending, Queue, Speculator, verdict};
 pub use speculation::{DepthPolicy, StepCost};
+pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};
 pub use vision::{
     ImageGrid, ImageSpan, PreparedImage, SpanRow, VisionCodec, VisionError, VisionOptions,
 };
+pub use vision_geometry::VisionGeometry;

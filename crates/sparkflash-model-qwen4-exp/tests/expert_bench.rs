@@ -29,7 +29,7 @@
 use std::time::Instant;
 
 use sparkflash_kernels::cuda_driver::Cuda;
-use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
+use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_moe_cubin};
 
 const HIDDEN: usize = 2560;
 const INTER: usize = 640;
@@ -95,22 +95,41 @@ fn run_once(
     warps: usize,
 ) -> f64 {
     let (_, permute) = cuda
-        .load_named(embedded_cubin(), "q4e_moe_permute")
-        .expect("q4e_moe_permute");
+        .load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")
+        .expect("moe_plan");
     let (_, gate_up) = cuda
-        .load_named(embedded_cubin(), "q4e_expert_gate_up")
+        .load_named(embedded_moe_cubin(), "q4e_expert_gate_up")
         .expect("q4e_expert_gate_up");
     let (_, down) = cuda
-        .load_named(embedded_cubin(), "q4e_expert_down")
+        .load_named(embedded_moe_cubin(), "q4e_expert_down")
         .expect("q4e_expert_down");
     let start = Instant::now();
     cuda.launch(
         permute,
         (1, 1, 1),
         (256, 1, 1),
-        &[indices.0, perm.0, runs.0, slots as u64],
+        &[
+            indices.0,
+            perm.0,
+            0,
+            0,
+            runs.0,
+            slots as u64,
+            512,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
     )
-    .expect("permute");
+    .expect("plan");
     cuda.launch(
         gate_up,
         (

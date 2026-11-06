@@ -25,6 +25,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod architecture;
 pub mod config;
 pub mod dtype;
 pub mod encoding;
@@ -44,6 +45,7 @@ pub mod tensor;
 pub mod vision;
 pub mod weights;
 
+pub use architecture::{architecture_from_carried, architecture_from_json};
 pub use config::ModelConfig;
 pub use dtype::DType;
 pub use layer_plan::{

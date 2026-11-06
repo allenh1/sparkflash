@@ -32,9 +32,11 @@ use std::sync::Arc;
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_model::numerics::ConfigKey;
-use sparkflash_model::{ModelBackend, ModelDescriptor, PromptCodec};
+use sparkflash_model::{ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
+use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_weights::rank_file::{find_converted_rank_file, rank_file_name};
 
 use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam};
@@ -49,6 +51,11 @@ use super::{
 /// The variable naming a directory of Qwen3.8-Flash-Next rank files (`sparkflash convert`).
 pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
 
+/// The default DeepSeek arm's carried profile. The arm has no [PackArm] (the reference path
+/// serves it), but its boot still reads the same typed profile as the packed arms.
+pub(super) const DEEPSEEK_PROFILE_TOML: &str =
+    include_str!("../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml");
+
 /// What one pack's serving arm supplies; [`serve_host`] and [`serve_group`] are the rest.
 pub(super) trait PackArm {
     /// The pack's parsed `config.json`.
@@ -58,8 +65,8 @@ pub(super) trait PackArm {
 
     /// The id `/v1/models` reports and the hub cache resolves.
     const MODEL_ID: &'static str;
-    /// The weights id `--model` also takes.
-    const WEIGHTS_ID: &'static str;
+    /// The pack's carried typed profile (the TOML in its own crate).
+    const PROFILE_TOML: &'static str;
     /// The name startup messages use.
     const NAME: &'static str;
     /// The tiny fixture's directory stem: `sparkflash-{FIXTURE}-fixture-{pid}`.
@@ -97,11 +104,32 @@ pub(super) trait PackArm {
         directory: &Path,
         config: Self::Config,
         context: usize,
+        profile: &ModelProfile,
+        plan: Option<&EnginePlan>,
     ) -> Result<Self::Backend, String>;
     /// Pools `concurrency` sessions into one fused batch.
     fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String>;
     /// The pack's response dialect over the driver: its reasoning and tool channels.
     fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
+
+    /// Parse the carried profile and apply the process environment as overrides.
+    ///
+    /// The TOML is the source of truth; the environment only wins where an operator set one of
+    /// [sparkflash_model::profile::ENV_OVERRIDES]. An out-of-domain value is refused by
+    /// [ModelProfile::validate].
+    fn profile_from(lookup: impl Fn(&str) -> Option<String>) -> Result<ModelProfile, String> {
+        let mut profile = ModelProfile::from_toml(Self::PROFILE_TOML)
+            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
+        profile
+            .apply_env(lookup)
+            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
+        Ok(profile)
+    }
+
+    /// [Self::profile_from] over the process environment.
+    fn profile() -> Result<ModelProfile, String> {
+        Self::profile_from(|name| std::env::var(name).ok())
+    }
 }
 
 /// Qwen3.8-Flash-Next, the NVFP4 checkpoint.
@@ -111,12 +139,13 @@ impl PackArm for QwenArm {
     type Config = Qwen4ExpConfig;
     type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
 
-    const MODEL_ID: &'static str = sparkflash_model_qwen4_exp::MODEL_ID;
-    const WEIGHTS_ID: &'static str = sparkflash_model_qwen4_exp::WEIGHTS_ID;
+    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
     const NAME: &'static str = "Qwen3.8-Flash-Next";
     const FIXTURE: &'static str = "qwen4";
-    const MAX_OUTPUT_TOKENS: usize = sparkflash_model_qwen4_exp::MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = sparkflash_model_qwen4_exp::DEFAULT_DEVICE_CONTEXT;
+    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_MAX_OUTPUT_TOKENS;
+    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS;
+    const PROFILE_TOML: &'static str =
+        include_str!("../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.toml");
     const FUSED_BATCH: bool = true;
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
@@ -154,45 +183,35 @@ impl PackArm for QwenArm {
         _config: &Self::Config,
         context: usize,
     ) -> Result<(), String> {
-        // Each worker opens its own full-window KV set. Refuse a worker count whose caches alone
-        // would exceed the documented budget before uploading 77.8 GiB of weights, rather than
-        // failing one request at a time when the node runs out of memory.
-        let budget = options.kv_budget_gib.map_or(
+        admit(
+            sparkflash_model_qwen4_exp::kv_plan(),
             sparkflash_model_qwen4_exp::CONCURRENCY_KV_BUDGET_BYTES,
-            sparkflash_model_qwen4_exp::kv_budget_bytes,
-        );
-        let kv_bytes =
-            sparkflash_model_qwen4_exp::concurrency_kv_bytes(context, options.concurrency);
-        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-        eprintln!(
-            "sparkflash serve: KV cache {:.1} GiB ({concurrency} x {context} tokens), budget {:.0} GiB",
-            gib(kv_bytes),
-            gib(budget),
-            concurrency = options.concurrency,
-        );
-        if kv_bytes > budget {
-            return Err(format!(
-                "--concurrency {} at --context {context} needs {:.1} GiB of KV caches, over the {:.0} GiB budget; lower --concurrency or --context, or raise --kv-budget-gib on a node with more room",
-                options.concurrency,
-                gib(kv_bytes),
-                gib(budget),
-            ));
-        }
-        Ok(())
+            options,
+            context,
+        )
     }
 
     fn open_host(
         directory: &Path,
-        _config: Self::Config,
+        config: Self::Config,
         context: usize,
+        _profile: &ModelProfile,
+        plan: Option<&EnginePlan>,
     ) -> Result<Self::Backend, String> {
         use sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
+        if let Some(plan) = plan {
+            check_backend_plan(plan, "qwen4_exp", config.num_hidden_layers)?;
+        }
         // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
         // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
         let converted = converted_rank_file(QWEN_CONVERTED_DIR_ENV, 0, 1)?;
-        let backend = match &converted {
-            Some(path) => Qwen4ExpDeviceBackend::open_converted(directory, context, path),
-            None => Qwen4ExpDeviceBackend::open(directory, context),
+        let backend = match (&converted, plan) {
+            (Some(path), Some(plan)) => {
+                Qwen4ExpDeviceBackend::open_converted_with_plan(directory, context, path, plan)
+            }
+            (Some(path), None) => Qwen4ExpDeviceBackend::open_converted(directory, context, path),
+            (None, Some(plan)) => Qwen4ExpDeviceBackend::open_with_plan(directory, context, plan),
+            (None, None) => Qwen4ExpDeviceBackend::open(directory, context),
         }
         .map_err(|error| error.to_string())?;
         if let Some(path) = &converted {
@@ -226,14 +245,15 @@ impl PackArm for GlmArm {
     type Config = Glm5NextConfig;
     type Backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend;
 
-    const MODEL_ID: &'static str = sparkflash_model_glm5_next::MODEL_ID;
-    const WEIGHTS_ID: &'static str = sparkflash_model_glm5_next::WEIGHTS_ID;
+    const MODEL_ID: &'static str = sparkflash_model::descriptor::GLM53_FLASH_ID;
     const NAME: &'static str = "GLM-5.3-Flash";
     const FIXTURE: &'static str = "glm53";
-    const MAX_OUTPUT_TOKENS: usize = sparkflash_model_glm5_next::MAX_OUTPUT_TOKENS;
-    const DEFAULT_CONTEXT: usize = sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT;
-    const FUSED_BATCH: bool = false;
-    const KV_BUDGET: bool = false;
+    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
+    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS;
+    const PROFILE_TOML: &'static str =
+        include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.toml");
+    const FUSED_BATCH: bool = true;
+    const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_glm_tp4_rank;
 
@@ -273,9 +293,9 @@ impl PackArm for GlmArm {
     }
 
     fn check_host(
-        _options: &ServeOptions,
+        options: &ServeOptions,
         config: &Self::Config,
-        _context: usize,
+        context: usize,
     ) -> Result<(), String> {
         // The FP8 release is 82 GB a rank over four nodes. One rank holding all four shards is
         // not the served shape, and the server says so before it tries a 328.3 GB upload.
@@ -285,56 +305,146 @@ impl PackArm for GlmArm {
                 Self::MODEL_ID
             ));
         }
-        Ok(())
+        // Each worker opens its own window: at the 1M default that is 18.8 GiB of caches a
+        // session, so a worker count the node cannot hold is refused before the upload rather
+        // than at the first request.
+        admit(
+            sparkflash_model_glm5_next::kv_plan(config),
+            sparkflash_model_glm5_next::CONCURRENCY_KV_BUDGET_BYTES,
+            options,
+            context,
+        )
     }
 
     fn open_host(
         directory: &Path,
         config: Self::Config,
         context: usize,
+        profile: &ModelProfile,
+        plan: Option<&EnginePlan>,
     ) -> Result<Self::Backend, String> {
+        if let Some(plan) = plan {
+            check_backend_plan(plan, "glm5_next", config.num_hidden_layers)?;
+        }
         let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
             .map_err(|error| format!("CUDA: {error}"))?;
-        sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank(
-            Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda)),
-            config,
-            directory,
-            context,
-        )
-        .map_err(|error| error.to_string())
+        let cuda = Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda));
+        let mut backend = match plan {
+            Some(plan) => {
+                sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank_with_plan(
+                    cuda, config, directory, context, plan,
+                )
+            }
+            None => sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank(
+                cuda, config, directory, context,
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        apply_speculation(&mut backend, profile)?;
+        Ok(backend)
     }
 
-    fn fuse(_backend: &mut Self::Backend, _concurrency: usize) -> Result<(), String> {
-        Err(format!("the {} arm has no fused batch", Self::NAME))
+    fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String> {
+        backend
+            .enable_fusion(concurrency)
+            .map_err(|error| error.to_string())
     }
 
     fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
-        // The dialect splits the model's <think> block into reasoning_content; the tool-call XML
-        // is still streamed as content until a GLM tool parser lands.
+        // The dialect splits the model reasoning block into reasoning_content and lifts its
+        // <tool_call> XML into native tool calls (sparkflash_api::glm).
         sparkflash_api::glm::GlmResponseEngine::layer(driver)
     }
 }
 
-/// The packs `--model` can name.
+/// The packs the model registry knows, including the default DeepSeek arm.
+///
+/// The variants are the registry's families; every id, weights selector, model type, label,
+/// context and vocabulary is read from [sparkflash_model::MODELS], never from a second table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pack {
+    /// The default DeepSeek-V4.1-Flash arm, which the reference/TP4 path serves.
+    Deepseek,
     Qwen,
     Glm,
 }
 
 impl Pack {
-    /// The pack `model` names: its model id or its weights id, in any case.
-    pub(super) fn named(model: &str) -> Option<Self> {
-        let names = |id: &str, weights: &str| {
-            model.eq_ignore_ascii_case(id) || model.eq_ignore_ascii_case(weights)
-        };
-        if names(QwenArm::MODEL_ID, QwenArm::WEIGHTS_ID) {
-            Some(Self::Qwen)
-        } else if names(GlmArm::MODEL_ID, GlmArm::WEIGHTS_ID) {
-            Some(Self::Glm)
-        } else {
-            None
+    /// The model registry family this variant serves.
+    const fn family(self) -> &'static str {
+        match self {
+            Self::Deepseek => "deepseek-v4.1",
+            Self::Qwen => "qwen4-exp",
+            Self::Glm => "glm5-next",
         }
+    }
+
+    /// This pack's descriptor in [sparkflash_model::MODELS].
+    ///
+    /// # Panics
+    /// Only if the registry loses the family this binary was built to serve.
+    fn descriptor(self) -> &'static ModelDescriptor {
+        sparkflash_model::MODELS
+            .iter()
+            .find(|model| model.family == self.family())
+            .expect("the model registry carries every pack family")
+    }
+
+    /// The variant serving a registry descriptor, or `None` for a family with no arm here.
+    fn from_descriptor(descriptor: &ModelDescriptor) -> Option<Self> {
+        [Self::Deepseek, Self::Qwen, Self::Glm]
+            .into_iter()
+            .find(|pack| pack.family() == descriptor.family)
+    }
+
+    /// The pack a checkpoint's own `config.json` names, if this build has its arm.
+    ///
+    /// This is what makes `--checkpoint DIR` enough: the released document names its family
+    /// (`model_type`), and the registry maps that family to the identity and arm. This is not a
+    /// substring scan over model names: the three carried released configs are recognized by
+    /// the family their own architecture reports.
+    pub(super) fn detect(directory: &Path) -> Option<Self> {
+        let path = directory.join(CHECKPOINT_CONFIG_NAME);
+        let text = std::fs::read_to_string(path).ok()?;
+        let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
+        let descriptor = sparkflash_model::MODELS
+            .iter()
+            .find(|model| model.model_type.eq_ignore_ascii_case(&architecture.family))?;
+        Self::from_descriptor(descriptor)
+    }
+
+    /// The parts a checkpoint's own `config.json` names that this build cannot load.
+    ///
+    /// The model-side `Architecture` says what the checkpoint is; the ops catalogue says which
+    /// image implements each part, and [sparkflash_ops::parts::missing_loadable] keeps only the
+    /// parts with an image this build can actually load (an embedded image, or the DeepSeek arm's
+    /// run-time cubin directory). An empty list is the whole bring-up condition.
+    /// A document that does not parse names no parts here; [Self::detect] already refused it.
+    pub(super) fn missing_parts(directory: &Path) -> Vec<sparkflash_model::Part> {
+        let path = directory.join(CHECKPOINT_CONFIG_NAME);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(architecture) = sparkflash_model::Architecture::from_json(&text) else {
+            return Vec::new();
+        };
+        sparkflash_ops::parts::missing_loadable(&architecture, sparkflash_model::Target::Sm121)
+    }
+
+    /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
+    pub(super) const fn is_arm(self) -> bool {
+        !matches!(self, Self::Deepseek)
+    }
+
+    /// The served id of this pack.
+    pub(super) fn model_id(self) -> &'static str {
+        self.descriptor().id.as_str()
+    }
+
+    /// The pack `model` names: a registry model id, weights id, family or id leaf, in any case.
+    pub(super) fn named(model: &str) -> Option<Self> {
+        let descriptor = sparkflash_model::find_model(model)?;
+        Self::from_descriptor(descriptor)
     }
 
     /// The flags among those given that this pack's arm would not apply: on one node, the
@@ -350,6 +460,7 @@ impl Pack {
         let (fuses, budgets) = match self {
             Self::Qwen => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
+            Self::Deepseek => (false, false),
         };
         let mut unapplied = Vec::new();
         if group && concurrency != 1 {
@@ -367,6 +478,9 @@ impl Pack {
     /// Serves this pack: its group arm under `--tp4-rank`, else its single-node arm.
     pub(super) fn serve(self, options: &ServeOptions) -> ExitCode {
         let served = match self {
+            Self::Deepseek => {
+                unreachable!("the DeepSeek pack is served by the default reference path")
+            }
             Self::Qwen => serve_arm::<QwenArm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
         };
@@ -404,6 +518,76 @@ pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, Str
 ///
 /// `None` when `var` is unset or empty. A configured directory that does not hold this rank's file
 /// is a refusal, not a silent fallback to the checkpoint's tensors.
+/// Turns the profile's speculation section into the GLM arm's drafter and depth.
+///
+/// The fields are the typed ones ([sparkflash_model::profile::SpeculationProfile]) and the
+/// environment names that set them are declared in [sparkflash_model::profile::ENV_OVERRIDES], so
+/// a switch here is a documented field rather than a new variable read at the point of use: a
+/// block drafter's depth is adaptive (it reports a confidence a draft), the MTP layer's is fixed
+/// (it reports none).
+fn apply_speculation(
+    backend: &mut sparkflash_model_glm5_next::Glm5NextDeviceBackend,
+    profile: &ModelProfile,
+) -> Result<(), String> {
+    let spec = &profile.speculation;
+    if let Some(drafter) = spec.drafter.as_deref() {
+        backend
+            .load_block_drafter(Path::new(drafter))
+            .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
+        eprintln!("sparkflash serve: GLM drafting with the DFlash 2 drafter {drafter}");
+    }
+    if spec.enabled != Some(true) {
+        return Ok(());
+    }
+    // Two drafts is what the former harness default was and what the MTP layer pays for; a block
+    // drafter's block is longer, so a fixed depth is an operator's choice either way.
+    let drafts = spec.depth.unwrap_or(2);
+    let policy = spec.drafter.as_ref().map(|_| {
+        sparkflash_model::DepthPolicy::adaptive(
+            drafts,
+            sparkflash_model_glm5_next::DFLASH2_STEP_COST,
+        )
+    });
+    backend
+        .enable_speculation(drafts, policy)
+        .map_err(|error| error.to_string())?;
+    eprintln!(
+        "sparkflash serve: GLM speculating {drafts} draft(s) a step, {}",
+        if spec.drafter.is_some() {
+            "adaptive depth"
+        } else {
+            "fixed depth"
+        }
+    );
+    Ok(())
+}
+
+/// The one KV admission rule every single-node arm runs before it uploads a weight.
+///
+/// The pack supplies its own [KvPlan](sparkflash_model::KvPlan) out of its own geometry and the
+/// budget it documents; the arithmetic, the announcement and the refusal's wording live in
+/// [sparkflash_model::arm] so two arms cannot disagree about what a window costs.
+pub(super) fn admit(
+    plan: sparkflash_model::KvPlan,
+    default_budget: u64,
+    options: &ServeOptions,
+    context: usize,
+) -> Result<(), String> {
+    let budget = options
+        .kv_budget_gib
+        .map_or(default_budget, sparkflash_model::kv_budget_bytes);
+    let claim = plan
+        .admit(context, options.concurrency, budget)
+        .map_err(|refusal| refusal.message())?;
+    eprintln!(
+        "sparkflash serve: KV cache {} ({concurrency} x {context} tokens), budget {}",
+        sparkflash_model::gib(claim.total),
+        sparkflash_model::gib(claim.budget),
+        concurrency = options.concurrency,
+    );
+    Ok(())
+}
+
 pub(super) fn converted_rank_file(
     var: &str,
     rank: usize,
@@ -497,23 +681,83 @@ fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Co
     Ok((directory, config))
 }
 
+/// Refuse a backend whose typed configuration disagrees with the plan it was opened from.
+///
+/// The plan is the boot contract; the typed config is still the arm's weight recipe. This is the
+/// seam where the two meet, so a family or layer-count drift is named before a weight is read.
+fn check_backend_plan(plan: &EnginePlan, family: &str, layers: usize) -> Result<(), String> {
+    if plan.family() != family {
+        return Err(format!(
+            "the execution plan is {}, the backend is {family}",
+            plan.family()
+        ));
+    }
+    if plan.layers().len() != layers {
+        return Err(format!(
+            "the execution plan has {} layers, the backend has {layers}",
+            plan.layers().len()
+        ));
+    }
+    Ok(())
+}
+
+/// Check the checkpoint's execution plan against the kernel catalogue at `world`.
+///
+/// This is the boot-time use of the model-independent plan: every part instance is resolved
+/// to a loadable image before the arm opens a weight. The check is skipped for the synthetic
+/// fixture, which exercises the serving path without claiming this build's device images.
+fn check_plan<A: PackArm>(directory: &Path, world: usize) -> Result<EnginePlan, String> {
+    let config = directory.join(CHECKPOINT_CONFIG_NAME);
+    let plan = EnginePlan::from_path(&config, Target::Sm121, world, 0)
+        .map_err(|error| format!("cannot plan the {} checkpoint: {error}", A::NAME))?;
+    let resolver =
+        KernelResolver::new(Target::Sm121, Availability::Runtime).with_family(plan.family());
+    let failures = resolver.failures(&plan);
+    if failures.is_empty() {
+        eprintln!("sparkflash serve: {} plan {}", A::NAME, plan.boot_summary());
+        return Ok(plan);
+    }
+    let reasons: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    Err(format!(
+        "{} cannot execute {} at TP{world}: {}",
+        A::NAME,
+        directory.display(),
+        reasons.join("; ")
+    ))
+}
+
 /// A pack's single-node arm: its device backend behind the generic host driver.
 fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     let (directory, config) = host_checkpoint::<A>(options)?;
     let context = pack_context::<A>(options, &config)?;
+    let plan = if options.synthetic {
+        None
+    } else {
+        Some(check_plan::<A>(&directory, 1)?)
+    };
+    let profile = A::profile()?;
+    sparkflash_model::install_active(profile.clone());
+    eprintln!(
+        "sparkflash serve: {} profile model={} family={} weights={}",
+        A::NAME,
+        profile.model.as_deref().unwrap_or("-"),
+        profile.family.as_deref().unwrap_or("-"),
+        profile.weights.as_deref().unwrap_or("-")
+    );
     A::check_host(options, &config, context)?;
     let released_seam = if options.synthetic {
         None
     } else {
         Some(pack_seam::<A>(options, &directory)?.1)
     };
-    let mut backend = A::open_host(&directory, config, context).map_err(|error| {
-        format!(
-            "cannot open {} at {}: {error}",
-            A::NAME,
-            directory.display()
-        )
-    })?;
+    let mut backend =
+        A::open_host(&directory, config, context, &profile, plan.as_ref()).map_err(|error| {
+            format!(
+                "cannot open {} at {}: {error}",
+                A::NAME,
+                directory.display()
+            )
+        })?;
     // One pooled session a concurrent request: the driver opens exactly `concurrency` sessions, so
     // a smaller pool would make a request wait for a slot it asked for at start-up.
     if options.fuse_batch {
@@ -591,6 +835,23 @@ fn serve_group<A: PackArm>(
     // Every rank derives the window from the same configuration, so the group agrees on the
     // sequence width without rank 0 sending it.
     let context = pack_context::<A>(options, &config)?;
+    check_plan::<A>(&directory, tp4.world_size)?;
+    // The pack's carried profile is the source of truth for this arm, exactly as it is on the
+    // single-node path (serve_host installs it). Without this the four-rank arm read
+    // ModelProfile::default() everywhere it asked active_profile(), so every setting the file
+    // makes - the speculation depth, the prefill chunk, the plan's threads - was inert here and
+    // only an environment override had any effect.
+    let profile = A::profile()?;
+    sparkflash_model::install_active(profile.clone());
+    if tp4.rank == 0 {
+        eprintln!(
+            "sparkflash serve: {} profile model={} family={} weights={}",
+            A::NAME,
+            profile.model.as_deref().unwrap_or("-"),
+            profile.family.as_deref().unwrap_or("-"),
+            profile.weights.as_deref().unwrap_or("-")
+        );
+    }
     if tp4.rank != 0 {
         pack_tp4_worker(options, tp4, context, A::OPEN_RANK)
             .map_err(|message| format!("rank {}: {message}", tp4.rank))?;
@@ -633,4 +894,119 @@ fn serve_group<A: PackArm>(
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GLM_CONFIG: &str =
+        include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
+    const QWEN_CONFIG: &str =
+        include_str!("../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+    const DEEPSEEK_CONFIG: &str = include_str!(
+        "../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+    );
+    #[test]
+    fn every_carried_profile_parses_and_keeps_its_registry_identity() {
+        for (name, toml) in [
+            ("DeepSeek-V4.1-Flash", DEEPSEEK_PROFILE_TOML),
+            ("Qwen3.8-Flash-Next", QwenArm::PROFILE_TOML),
+            ("GLM-5.3-Flash", GlmArm::PROFILE_TOML),
+        ] {
+            let profile = ModelProfile::from_toml(toml)
+                .unwrap_or_else(|error| panic!("{name} profile: {error}"));
+            let weights = profile
+                .weights
+                .as_deref()
+                .unwrap_or_else(|| panic!("{name} names no weights"));
+            let descriptor = sparkflash_model::find_model_by_weights(weights)
+                .unwrap_or_else(|| panic!("{name} weights {weights} are not in the registry"));
+            assert_eq!(profile.model.as_deref(), Some(descriptor.id.as_str()));
+            // The two spellings a family is named in differ by punctuation alone: the descriptor
+            // carries the release's dotted name and a profile may carry the architecture's, so
+            // the comparison folds punctuation out rather than forcing one spelling into an arm
+            // profile - an edit there is a served setting the numerics gate judges.
+            let fold = |name: &str| {
+                name.chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>()
+            };
+            assert_eq!(
+                profile.family.as_deref().map(fold),
+                Some(fold(descriptor.family.as_str())),
+                "{name} names a different family than its weights"
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_environment_override_wins_over_the_carried_toml() {
+        let carried = ModelProfile::from_toml(QwenArm::PROFILE_TOML).expect("the carried profile");
+        assert_eq!(carried.prefill.chunk, Some(4096));
+        // The block drafter's whole width: seven drafts, with the adaptive policy choosing how
+        // many of them a step verifies (the measured table is beside the setting).
+        assert_eq!(carried.speculation.depth, Some(7));
+        let overridden = QwenArm::profile_from(|name| match name {
+            "SPARKFLASH_QWEN4_PREFILL_CHUNK" => Some("2048".to_owned()),
+            "SPARKFLASH_QWEN4_SPEC_DEPTH" => Some("5".to_owned()),
+            _ => None,
+        })
+        .expect("an environment override is valid");
+        assert_eq!(overridden.prefill.chunk, Some(2048));
+        assert_eq!(overridden.speculation.depth, Some(5));
+    }
+
+    #[test]
+    fn every_released_config_is_detected_by_its_own_family() {
+        for (config, expected) in [
+            (DEEPSEEK_CONFIG, Pack::Deepseek),
+            (QWEN_CONFIG, Pack::Qwen),
+            (GLM_CONFIG, Pack::Glm),
+        ] {
+            let directory = tempfile::tempdir().expect("a temporary checkpoint");
+            std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), config)
+                .expect("the carried config is written");
+            assert_eq!(Pack::detect(directory.path()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn every_registry_id_and_weights_id_names_its_pack() {
+        for model in sparkflash_model::MODELS.iter() {
+            for id in [model.id.as_str(), model.weights_id.as_str()] {
+                let pack =
+                    Pack::named(id).unwrap_or_else(|| panic!("the registry id {id} names no pack"));
+                assert_eq!(pack.model_id(), model.id);
+                assert_eq!(pack.descriptor().weights_id, model.weights_id);
+            }
+        }
+        assert_eq!(Pack::named("example/no-arm"), None);
+    }
+
+    #[test]
+    fn missing_parts_needs_an_image_this_build_can_load() {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(
+            directory.path().join(CHECKPOINT_CONFIG_NAME),
+            DEEPSEEK_CONFIG,
+        )
+        .expect("the carried config is written");
+        let missing = Pack::missing_parts(directory.path());
+        // The DeepSeek image is loaded from SPARKFLASH_CUBINS at run time. Unless that directory
+        // is configured, a part only DeepSeek implements cannot be loaded, and the catalogue's
+        // answer (which accepts any catalogued image) must not hide it.
+        let discovered = sparkflash_ops::parts::missing(
+            &sparkflash_model::Architecture::from_json(DEEPSEEK_CONFIG).expect("the config"),
+            sparkflash_model::Target::Sm121,
+        );
+        assert!(discovered.is_empty(), "the catalogue carries the parts");
+        if std::env::var_os(sparkflash_ops::parts::CUBIN_DIR_ENV).is_none() {
+            assert!(
+                missing.contains(&sparkflash_model::Part::Csa2Compression),
+                "a run-time-only image is not loadable without its cubin directory: {missing:?}"
+            );
+        }
+    }
 }

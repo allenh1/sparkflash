@@ -59,6 +59,14 @@ fn build(concurrency: usize) -> Option<Router> {
         return None;
     }
     let temp = tempfile::tempdir().expect("a temporary directory");
+    // The tiny fixture is not the released target the canonical DFlash 2 drafter was trained for,
+    // so an auto-resolved cache snapshot is refused at open. Point the hub cache at a directory
+    // this fixture's temp tree does not fill: the checkpoint is passed explicitly, and the drafter
+    // resolves to nothing. HF_HUB_CACHE wins over every other cache variable, so a developer's
+    // HF_HOME cannot put the released drafter back in reach.
+    // SAFETY: this is the first thing the process-wide fixture does, and the backends that follow
+    // are built from it.
+    unsafe { std::env::set_var("HF_HUB_CACHE", temp.path().join("hub")) };
     let fixture = SyntheticCheckpoint::write(temp.path()).expect("the fixture writes");
     // The directory has to outlive the backend: keep the temp path alive by leaking the guard,
     // which is what a test process does with a few kilobytes anyway.

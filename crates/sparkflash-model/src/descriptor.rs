@@ -87,6 +87,11 @@ pub struct ModelDescriptor {
     pub id: String,
     /// The model family, e.g. `deepseek-v4.1`. Used for artifact compatibility checks.
     pub family: String,
+    /// The released `config.json` `model_type`, e.g. `deepseek_v41`. The control plane matches a
+    /// checkpoint document on this value, so the two spellings of a family cannot drift.
+    pub model_type: String,
+    /// The short family label a control surface shows beside the model.
+    pub label: String,
     /// The control-plane weight selector, e.g. `deepseek-v4.1-flash`.
     pub weights_id: String,
     /// The largest context this model can serve.
@@ -107,6 +112,8 @@ impl ModelDescriptor {
         Self {
             id: DEFAULT_MODEL_ID.to_owned(),
             family: "deepseek-v4.1".to_owned(),
+            model_type: "deepseek_v41".to_owned(),
+            label: "DeepSeek".to_owned(),
             weights_id: DEFAULT_WEIGHTS_ID.to_owned(),
             context_tokens: V41_CONTEXT_TOKENS,
             max_output_tokens: V41_MAX_OUTPUT_TOKENS,
@@ -124,6 +131,8 @@ impl ModelDescriptor {
         Self {
             id: QWEN38_FLASH_NEXT_ID.to_owned(),
             family: "qwen4-exp".to_owned(),
+            model_type: "qwen4_exp".to_owned(),
+            label: "Qwen".to_owned(),
             weights_id: QWEN38_FLASH_NEXT_WEIGHTS_ID.to_owned(),
             context_tokens: QWEN38_CONTEXT_TOKENS,
             max_output_tokens: QWEN38_MAX_OUTPUT_TOKENS,
@@ -142,6 +151,8 @@ impl ModelDescriptor {
         Self {
             id: GLM53_FLASH_ID.to_owned(),
             family: "glm5-next".to_owned(),
+            model_type: "glm5_next".to_owned(),
+            label: "GLM".to_owned(),
             weights_id: GLM53_FLASH_WEIGHTS_ID.to_owned(),
             context_tokens: GLM53_CONTEXT_TOKENS,
             max_output_tokens: GLM53_MAX_OUTPUT_TOKENS,

@@ -39,8 +39,12 @@
 //! * [dflash] is the DFlash 2 block drafter's configuration, which the device arm serves as its
 //!   speculative drafter when a drafter checkpoint is configured.
 //!
-//! The MTP stage and the vision tower are planned but not served; the released checkpoint carries
-//! them and the plan's byte total includes them so the identity is exact.
+//! The MTP stage **is** served: the arm loads it ([device]'s `mtp`) and drafts with it when a
+//! request speculates, one proposal a step by default, which is why `speculation.enabled` is the
+//! switch rather than a build flag. The vision tower is planned but not served - the released
+//! checkpoint carries it and the plan's byte total includes it so the identity is exact - so
+//! `Capabilities::ALL` withholds the vision channel rather than advertising a tower that is not
+//! loaded.
 //!
 //! # Attribution
 //!
@@ -59,6 +63,7 @@
 //!   drafter (Apache-2.0), and [SGLang](https://github.com/sgl-project/sglang)'s DFlash support
 //!   (Apache-2.0), read for the arithmetic and the verify protocol; no source is copied.
 
+pub mod architecture;
 pub mod checkpoint;
 pub mod codec;
 pub mod config;
@@ -72,6 +77,7 @@ pub mod sampling;
 pub mod tensor;
 pub mod vision;
 
+pub use architecture::{architecture_from_carried, architecture_from_json};
 pub use checkpoint::{
     CheckpointRows, SyntheticCheckpoint, load_weights, open_ple_table, write_synthetic_checkpoint,
     write_synthetic_checkpoint_sharded,
@@ -81,23 +87,24 @@ pub use config::{ConfigError, LayerKind, Qwen4ExpConfig};
 pub use forward::{ForwardError, Qwen4ExpWeights, ReferenceState, ReferenceWeights};
 pub use ngram::{NgramHead, PleHasher, PleLayout, layer_multipliers};
 pub use ple::{PleCacheCounters, PleTable, RowReader, shard_tensor_name};
+pub use sparkflash_model::{Architecture, LayerStep};
 pub use tensor::{Qwen4ExpTensorPlan, Role};
 pub use vision::{Qwen4Vision, QwenVisionCodec, VisionTowerConfig};
 
 /// The served model id.
-pub const MODEL_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
+pub const MODEL_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID;
 
 /// The control-plane weight selector.
-pub const WEIGHTS_ID: &str = "qwen3.8-flash-next-nvfp4";
+pub const WEIGHTS_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID;
 
 /// The model family, for artifact compatibility checks.
 pub const FAMILY: &str = "qwen4-exp";
 
 /// The largest context the released checkpoint serves.
-pub const CONTEXT_TOKENS: usize = 262_144;
+pub const CONTEXT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS;
 
 /// The protocol upper bound on one request's generated tokens for this build.
-pub const MAX_OUTPUT_TOKENS: usize = 32_768;
+pub const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN38_MAX_OUTPUT_TOKENS;
 
 /// The context window the TP=1 device arm allocates by default.
 ///
@@ -146,15 +153,26 @@ pub const fn kv_budget_bytes(gib: usize) -> u64 {
 /// outside this figure.
 #[must_use]
 pub const fn sequence_kv_bytes(context: usize) -> u64 {
-    (context as u64)
-        * (QSA_KV_BYTES_PER_TOKEN + INDEXER_KV_BYTES_PER_TOKEN + MTP_KV_BYTES_PER_TOKEN)
-        + 2 * GDN_RECURRENT_BYTES
+    kv_plan().sequence_bytes(context)
 }
 
 /// KV bytes `concurrency` sessions allocate at `context` tokens.
 #[must_use]
 pub const fn concurrency_kv_bytes(context: usize, concurrency: usize) -> u64 {
-    sequence_kv_bytes(context) * concurrency as u64
+    kv_plan().concurrency_bytes(context, concurrency)
+}
+
+/// This arm's cache claim, as the serving layer's one admission rule reads it.
+///
+/// The terms are the constants above: the sparse layers' K/V, their indexer keys and the MTP
+/// layer's caches grow with the window, and the Gated DeltaNet recurrence and the verify spare
+/// beside it do not.
+#[must_use]
+pub const fn kv_plan() -> sparkflash_model::KvPlan {
+    sparkflash_model::KvPlan::new(
+        QSA_KV_BYTES_PER_TOKEN + INDEXER_KV_BYTES_PER_TOKEN + MTP_KV_BYTES_PER_TOKEN,
+        2 * GDN_RECURRENT_BYTES,
+    )
 }
 
 #[cfg(test)]

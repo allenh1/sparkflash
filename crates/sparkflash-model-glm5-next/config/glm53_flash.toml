@@ -10,9 +10,20 @@ concurrency = 1
 
 [prefill]
 enabled = true
-chunk = 2048
+# The arm has always run the code default, `DEFAULT_PREFILL_ROWS` = 4096: this file was created
+# as a description of the settings and nothing on the four-rank path installed it until now, so
+# the 2048 here never applied. Measured at TP=4 on a 3740-token prompt, 1M window:
+#
+#   chunk 2048   4.9 GiB scratch   686 tok/s
+#   chunk 4096   9.6 GiB scratch   851 tok/s
+#
+# 4096 is also the documented cap (8,192 does not load), so the file now names it.
+chunk = 4096
 tensor_cores = true
-activation = "split"
+# `activation` is left unset on purpose: this release has dynamic activations, so the arm's
+# default is the FP8 quantiser, and the `split` this file used to name was the other arithmetic.
+# It never applied while the profile was inert, which is why the reference was captured against
+# the default; naming `split` here would change the served prefill with no recapture.
 exact = true
 
 [attention]
@@ -22,7 +33,6 @@ selected_tokens = 2304
 [speculation]
 enabled = true
 depth = 3
-mtp_fold_scale = 1.0
 
 [sequence]
 parallel = true

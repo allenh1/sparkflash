@@ -35,6 +35,7 @@ pub mod schema;
 pub mod server;
 pub mod state;
 pub mod telemetry_types;
+pub mod tool_block;
 pub mod tool_parser;
 pub mod vision;
 pub mod vocab;

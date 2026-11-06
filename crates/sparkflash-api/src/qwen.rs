@@ -38,10 +38,9 @@ use crate::engine::{
     MissingCapability,
 };
 use crate::telemetry_types::{DeepSeekSparkRequestStats, OpenAiUsageWithCache};
+use crate::tool_block::{Block, BlockSplitter, CALL_CLOSE, CALL_OPEN};
 
 const THINK_CLOSE: &str = "</think>";
-const CALL_OPEN: &str = "<tool_call>";
-const CALL_CLOSE: &str = "</tool_call>";
 const FUNCTION_OPEN: &str = "<function=";
 const FUNCTION_CLOSE: &str = "</function>";
 const PARAMETER_OPEN: &str = "<parameter=";
@@ -117,6 +116,8 @@ pub struct QwenStreamParser {
     reasoning_done: bool,
     newlines_after_reasoning: usize,
     buffer: String,
+    /// The content stream, split into text and tool-call bodies by the shared framer.
+    blocks: BlockSplitter,
     calls: usize,
 }
 
@@ -130,6 +131,7 @@ impl QwenStreamParser {
             reasoning_done: !thinking,
             newlines_after_reasoning: 0,
             buffer: String::new(),
+            blocks: BlockSplitter::new(),
             calls: 0,
         }
     }
@@ -185,12 +187,10 @@ impl QwenStreamParser {
         }
         self.skip_after_reasoning();
         events.extend(self.advance_content());
-        if !self.buffer.is_empty() {
-            // An unterminated or malformed call stays visible: dropping it would lose the model's
-            // answer, and inventing a call from a partial block would be worse.
-            let text = std::mem::take(&mut self.buffer);
-            events.push(QwenEvent::Content(text));
-        }
+        // An unterminated or malformed call stays visible: dropping it would lose the model's
+        // answer, and inventing a call from a partial block would be worse.
+        let tail = self.blocks.finish();
+        events.extend(self.emit(tail));
         events
     }
 
@@ -206,43 +206,34 @@ impl QwenStreamParser {
         }
     }
 
+    /// Drains the held-back content into the shared framer.
     fn advance_content(&mut self) -> Vec<QwenEvent> {
+        let text = std::mem::take(&mut self.buffer);
+        let blocks = self.blocks.feed(&text);
+        self.emit(blocks)
+    }
+
+    /// Turns framed blocks into events: text stays visible, a body this arm can spell becomes a
+    /// call, and one it cannot keeps its markers.
+    fn emit(&mut self, blocks: Vec<Block>) -> Vec<QwenEvent> {
         let mut events = Vec::new();
-        loop {
-            if self.buffer.is_empty() {
-                break;
-            }
-            let Some(index) = self.buffer.find(CALL_OPEN) else {
-                let cut = hold_back(&self.buffer, &[CALL_OPEN]);
-                if cut > 0 {
-                    let content = self.buffer[..cut].to_owned();
-                    self.buffer.drain(..cut);
-                    events.push(QwenEvent::Content(content));
-                }
-                break;
-            };
-            if index > 0 {
-                let content = self.buffer[..index].to_owned();
-                self.buffer.drain(..index);
-                events.push(QwenEvent::Content(content));
-            }
-            let Some(relative_end) = self.buffer[CALL_OPEN.len()..].find(CALL_CLOSE) else {
-                break;
-            };
-            let body_end = CALL_OPEN.len() + relative_end;
-            let body = self.buffer[CALL_OPEN.len()..body_end].to_owned();
-            self.buffer.drain(..body_end + CALL_CLOSE.len());
-            match parse_tool_block(&body) {
-                Some((name, arguments)) => {
-                    let index = self.calls;
-                    self.calls += 1;
-                    events.push(QwenEvent::ArgumentFragment {
-                        index,
-                        name,
-                        arguments,
-                    });
-                }
-                None => events.push(QwenEvent::Content(format!("{CALL_OPEN}{body}{CALL_CLOSE}"))),
+        for block in blocks {
+            match block {
+                Block::Text(content) => events.push(QwenEvent::Content(content)),
+                Block::Call(body) => match parse_tool_block(&body) {
+                    Some((name, arguments)) => {
+                        let index = self.calls;
+                        self.calls += 1;
+                        events.push(QwenEvent::ArgumentFragment {
+                            index,
+                            name,
+                            arguments,
+                        });
+                    }
+                    None => {
+                        events.push(QwenEvent::Content(format!("{CALL_OPEN}{body}{CALL_CLOSE}")))
+                    }
+                },
             }
         }
         events
@@ -454,33 +445,10 @@ fn qwen_engine_event(event: QwenEvent) -> EngineEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{EngineRequest, LogprobsRequest, MockEngine};
+    use crate::engine::{EngineRequest, MockEngine};
 
     fn request(thinking: bool) -> EngineRequest {
-        EngineRequest {
-            request_id: "req-qwen".to_owned(),
-            model: "qwen".to_owned(),
-            prompt_tokens: vec![1, 2, 3],
-            logprobs: LogprobsRequest::default(),
-            images: Vec::new(),
-            vision: Vec::new(),
-            max_tokens: 64,
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: 0,
-            repetition_penalty: 1.0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            skip_special_tokens: true,
-            thinking,
-            reasoning_effort: Some(75),
-            stop: Vec::new(),
-            seed: None,
-            trace_scopes: 0,
-            trace_steps: 0,
-            constraint: None,
-            forced_tokens: Vec::new(),
-        }
+        crate::engine::test_request("qwen", thinking)
     }
 
     fn call(name: &str, arguments: &str) -> String {

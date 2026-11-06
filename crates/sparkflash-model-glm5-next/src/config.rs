@@ -75,6 +75,12 @@ pub use sparkflash_model::ConfigError;
 /// The text-model configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Glm5NextConfig {
+    /// The shared canonical description of the same checkpoint.
+    ///
+    /// [Glm5NextConfig::from_json] parses the released document through
+    /// [sparkflash_model::Architecture] once and keeps it here; [Glm5NextConfig::steps] and the
+    /// device uploader's layer selection read this walk rather than the typed lists.
+    pub architecture: sparkflash_model::Architecture,
     /// Hidden width (4,096).
     pub hidden_size: usize,
     /// Decoder layers, the MTP layer excluded (45).
@@ -197,6 +203,32 @@ impl VisionConfig {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_heads
     }
+
+    /// This tower as the shared geometry the device kernels read
+    /// ([sparkflash_model::VisionGeometry]).
+    ///
+    /// The released GLM configuration names no learned position grid, no RoPE base and no pixel
+    /// window, so those keep the shared defaults: the tower ropes only, and the planner uses the
+    /// serving recipe's window rather than one the checkpoint declares.
+    #[must_use]
+    pub fn geometry(&self) -> sparkflash_model::VisionGeometry {
+        sparkflash_model::VisionGeometry {
+            depth: self.depth,
+            hidden_size: self.hidden_size,
+            num_heads: self.num_heads,
+            intermediate_size: self.intermediate_size,
+            out_hidden_size: self.out_hidden_size,
+            projection_intermediate_size: self.projection_intermediate_size,
+            in_channels: self.in_channels,
+            patch_size: self.patch_size,
+            temporal_patch_size: self.temporal_patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            num_position_embeddings: 0,
+            rope_theta: 10_000.0,
+            min_pixels: 0,
+            max_pixels: 0,
+        }
+    }
 }
 
 /// The `model_type` a released GLM-5.3 `config.json` names.
@@ -216,10 +248,16 @@ impl Glm5NextConfig {
 
     /// Parse a released HF `config.json`.
     ///
+    /// The same document is parsed through the shared
+    /// [Architecture](sparkflash_model::Architecture) and cross-checked against this typed view, so
+    /// a change that only one parser follows is refused at load.
+    ///
     /// # Errors
     /// [ConfigError::Json] for a malformed document and [ConfigError::Invalid] for a shape this
-    /// pack cannot serve.
+    /// pack cannot serve, or a field on which the two views disagree.
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
+        let json = text;
+        let architecture = crate::architecture::architecture_from_json(json)?;
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let fp8_block = root
@@ -313,6 +351,7 @@ impl Glm5NextConfig {
             ));
         }
         let config = Self {
+            architecture,
             hidden_size: text.hidden_size,
             num_hidden_layers: layers,
             vocab_size: text.vocab_size,
@@ -380,6 +419,7 @@ impl Glm5NextConfig {
             ));
         }
         config.validate()?;
+        config.cross_check(&config.architecture)?;
         Ok(config)
     }
 
@@ -392,6 +432,7 @@ impl Glm5NextConfig {
     #[must_use]
     pub fn tiny() -> Self {
         Self {
+            architecture: crate::architecture::tiny_architecture(),
             hidden_size: 32,
             num_hidden_layers: 4,
             vocab_size: 64,
@@ -474,6 +515,15 @@ impl Glm5NextConfig {
             fp8_block: Some(128),
             ..Self::tiny()
         }
+    }
+
+    /// The decoder layers as the shared layer walk, in forward order.
+    ///
+    /// This is the plan the device uploader selects each layer's branch and FFN from; it reads
+    /// [Glm5NextConfig::architecture] rather than [Glm5NextConfig::layer_types].
+    #[must_use]
+    pub fn steps(&self) -> Vec<sparkflash_model::LayerStep> {
+        self.architecture.steps()
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -900,6 +950,107 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_walk_matches_the_typed_schedule() {
+        use sparkflash_model::parts::Part;
+
+        let config = Glm5NextConfig::glm53_flash().expect("the carried config parses");
+        let steps = config.steps();
+        assert_eq!(steps.len(), config.num_hidden_layers);
+        for (step, kind) in steps.iter().zip(&config.layer_types) {
+            let expected = match kind {
+                LayerKind::Linear => Part::KdaScan,
+                LayerKind::Sparse => Part::MlaAttention,
+            };
+            assert_eq!(step.attention, expected, "layer {}", step.index);
+        }
+        for (step, kind) in steps.iter().zip(&config.mlp_layer_types) {
+            let expected = match kind {
+                MlpKind::Dense => Part::DenseMlp,
+                MlpKind::Moe => Part::Moe,
+            };
+            assert_eq!(step.ffn, expected, "layer {}", step.index);
+        }
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attention == Part::KdaScan)
+                .count(),
+            config.linear_layers()
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attention == Part::MlaAttention)
+                .count(),
+            config.sparse_layers()
+        );
+        let dense_configured = config
+            .mlp_layer_types
+            .iter()
+            .filter(|kind| **kind == MlpKind::Dense)
+            .count();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.ffn == Part::DenseMlp)
+                .count(),
+            dense_configured
+        );
+        assert_eq!(
+            steps.iter().filter(|step| step.ffn == Part::Moe).count(),
+            config.moe_layers()
+        );
+        assert!(
+            steps[..3].iter().all(|step| step.ffn == Part::DenseMlp),
+            "the three dense layers are the first three"
+        );
+        assert!(steps[3..].iter().all(|step| step.ffn == Part::Moe));
+    }
+
+    #[test]
+    fn the_tiny_architecture_walks_its_typed_schedule() {
+        use sparkflash_model::parts::Part;
+
+        let config = Glm5NextConfig::tiny();
+        let steps = config.steps();
+        assert_eq!(steps.len(), config.num_hidden_layers);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attention == Part::KdaScan)
+                .count(),
+            config.linear_layers()
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.attention == Part::MlaAttention)
+                .count(),
+            config.sparse_layers()
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.ffn == Part::DenseMlp)
+                .count(),
+            1
+        );
+        assert_eq!(
+            steps.iter().filter(|step| step.ffn == Part::Moe).count(),
+            config.moe_layers()
+        );
+        assert_eq!(steps[0].ffn, Part::DenseMlp);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| step.indexer == Some(Part::SparseIndexer))
+                .count(),
+            1,
+            "only the sparse layer that runs its own indexer carries one"
+        );
+    }
+
+    #[test]
     fn the_released_configuration_splits_four_ways_but_not_three() {
         let config = Glm5NextConfig::glm53_flash().expect("the carried config parses");
         config.check_world(1).expect("TP=1");
@@ -992,14 +1143,13 @@ mod tests {
         })
         .expect("the BF16 release's config parses");
         assert_eq!(bf16.fp8_block, None);
+        assert_eq!(bf16.architecture.quantization.block, None);
         let fp8 = Glm5NextConfig::glm53_flash().expect("the carried config parses");
-        assert_eq!(
-            Glm5NextConfig {
-                fp8_block: fp8.fp8_block,
-                ..bf16
-            },
-            fp8
-        );
+        assert_eq!(fp8.architecture.quantization.block, Some(128));
+        let mut same = bf16;
+        same.fp8_block = fp8.fp8_block;
+        same.architecture = fp8.architecture.clone();
+        assert_eq!(same, fp8);
     }
 
     #[test]

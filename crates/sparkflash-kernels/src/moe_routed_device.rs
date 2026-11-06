@@ -116,6 +116,12 @@ pub const TOP_K: usize = 6;
 pub const QUANT_BLOCK: usize = 32;
 /// Matrices per routed expert: gate (w1), up (w3), down (w2).
 pub const ROUTED_MATRICES: usize = 3;
+/// The routed rows the shared plan (kernels/moe_plan_sm121.cu) cuts one item to.
+///
+/// It is the row count the MMA expert body tiles over (`OMM_ROWS` in opt_mma_sm121.cu); the
+/// two must agree or an item's rows would not fill one tile.
+pub const MOE_PLAN_ITEM_ROWS: usize = 64;
+
 /// The routed rows (token-slot pairs) one stage call may hold, i.e. the staging capacity.
 ///
 /// The package brief's "up to 256" table capacity, raised to a 64-row verify step's routed rows. It
@@ -1243,7 +1249,7 @@ impl OptMoeKernels {
 /// caller and sized for `max_tokens`.
 #[derive(Debug, Clone, Copy)]
 pub struct MoeBulk {
-    /// `opt_mma_moe_plan`.
+    /// `moe_plan` (the shared image, kernels/moe_plan_sm121.cu).
     pub plan: Kernel,
     /// `opt_mma_moe_gate_up`.
     pub gate_up: Kernel,
@@ -1265,6 +1271,8 @@ pub struct MoeBulk {
     pub slot: Deviceptr,
     /// The tokens the buffers are sized for.
     pub max_tokens: usize,
+    /// The threads one plan launch runs (the profile's `plan.threads`).
+    pub plan_threads: u32,
 }
 
 /// The most chunks one [MoeRoutedDevice::run_bulk_rows] pass groups (opt_mma_moe_plan's
@@ -1289,7 +1297,7 @@ impl MoeBulk {
     /// The work-item bound for `tokens`: one per expert plus one per 64 routed rows.
     #[must_use]
     pub fn max_items(tokens: usize) -> usize {
-        EXPERTS + tokens * TOP_K / 64 + 1
+        EXPERTS + tokens * TOP_K / MOE_PLAN_ITEM_ROWS + 1
     }
 
     /// The device bytes of each scratch buffer for `tokens`, in field order (sorted, items,
@@ -1690,19 +1698,27 @@ impl MoeRoutedDevice {
         cuda.launch(
             bulk.plan,
             (1, 1, 1),
-            (1024, 1, 1),
+            (bulk.plan_threads, 1, 1),
             &[
                 rows.ids,
-                u64::from(routed),
-                experts as u64,
                 bulk.sorted.0,
                 bulk.items.0,
                 bulk.items_count.0,
+                0,
+                u64::from(routed),
+                experts as u64,
+                u64::from(TOP_K as u32),
+                MOE_PLAN_ITEM_ROWS as u64,
+                max_items as u64,
                 segments,
+                // An id outside the expert range counts as expert 0, the rule this plan had.
+                1,
                 count(0),
                 count(1),
                 count(2),
                 count(3),
+                0,
+                0,
             ],
         )
         .map_err(|error| format!("moe_routed bulk: plan: {error}"))?;

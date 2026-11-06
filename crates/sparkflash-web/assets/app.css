@@ -513,6 +513,77 @@ main {
 .model-source.warn { color: var(--warn); }
 .model-note { display: block; margin-top: 3px; color: var(--warn); font-family: var(--font); font-size: 12px; }
 
+/* The model browser: families on the side, Hub and cache results in the middle. */
+.model-browser {
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.model-families { display: flex; flex-direction: column; gap: 4px; }
+.model-family {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.model-family:hover { background: var(--surface-3); color: var(--text); }
+.model-family.active { border-color: var(--accent); background: var(--surface-3); color: var(--text); }
+.model-family small { color: var(--muted); font-size: 10.5px; font-family: var(--mono); }
+.model-family-loading { color: var(--muted); font-size: 12px; padding: 6px; }
+.model-browser-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.model-search-row { display: flex; gap: 6px; }
+.model-search-row > input { flex: 1; min-width: 0; }
+.model-results { display: flex; flex-direction: column; max-height: 260px; overflow-y: auto; }
+.model-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px 9px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.model-result:first-child { border-top: 0; }
+.model-result:hover { background: var(--surface-3); }
+.model-result.dim { opacity: 0.82; }
+.model-result-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.model-result-main strong { font-family: var(--mono); font-size: 12.5px; font-weight: 500; overflow-wrap: anywhere; }
+.model-result-meta { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
+.model-badge {
+  flex: none;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+.model-badge.ok { border-color: var(--accent); color: var(--accent); }
+.model-badge.muted { color: var(--muted); }
+.model-results .empty { padding: 8px 2px; }
+.model-results .empty.warn { color: var(--warn); }
+
 /* The Overview model shelf */
 
 .shelf-panel { margin-bottom: 20px; }
@@ -608,7 +679,11 @@ input:user-invalid { border-color: rgba(208, 59, 59, 0.6); }
 .savebar #discard-config { visibility: hidden; }
 .form.dirty .savebar { background: var(--surface-2); box-shadow: 0 -1px 0 var(--border-strong); }
 .form.dirty .savebar-text { visibility: visible; color: var(--warn); }
-.form.dirty #discard-config { visibility: visible; }
+.form.dirty #discard-config, .form.dirty #discard-model { visibility: visible; }
+.savebar #discard-model { visibility: hidden; }
+.model-panel { margin-bottom: 20px; }
+.model-panel > .panel-head { padding: 16px 20px 0; }
+.model-panel .savebar { border-top: 1px solid var(--border); }
 
 .codeblock { margin-top: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--input); overflow: hidden; }
 .codeblock-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 6px 6px 12px; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; }
@@ -932,6 +1007,8 @@ footer {
   .kpi-label span { display: block; margin-left: 0; overflow: hidden; text-overflow: ellipsis; }
   .kpi-value { font-size: 22px; }
   .fields, .fields.three { grid-template-columns: minmax(0, 1fr); }
+  .model-browser { grid-template-columns: minmax(0, 1fr); }
+  .model-families { flex-direction: row; flex-wrap: wrap; }
   .page-head .actions { width: 100%; }
   .page-head .actions .btn { flex: 1; }
   .totals { gap: 14px; }

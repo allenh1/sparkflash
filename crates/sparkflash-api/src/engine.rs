@@ -1183,6 +1183,37 @@ pub fn plan_for(
     KvCacheTelemetry::default().plan_request(prompt_tokens, uma_matched, nvme_matched, swa_tail_hit)
 }
 
+/// A request a response-layer test can drive: a short prompt, a model name and nothing set.
+///
+/// The GLM and Qwen response layers both need one, and the two copies had already drifted.
+#[cfg(test)]
+pub fn test_request(model: &str, thinking: bool) -> EngineRequest {
+    EngineRequest {
+        request_id: format!("req-{model}"),
+        model: model.to_owned(),
+        prompt_tokens: vec![1, 2, 3],
+        logprobs: LogprobsRequest::default(),
+        images: Vec::new(),
+        vision: Vec::new(),
+        max_tokens: 64,
+        temperature: 1.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        skip_special_tokens: true,
+        thinking,
+        reasoning_effort: Some(75),
+        stop: Vec::new(),
+        seed: None,
+        trace_scopes: 0,
+        trace_steps: 0,
+        constraint: None,
+        forced_tokens: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

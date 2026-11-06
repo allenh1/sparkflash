@@ -31,9 +31,10 @@
 
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
+use sparkflash_kernels::images::glm_decode_cubin;
 use sparkflash_model_qwen4_exp::device::{
     TILED_GEMV_PARTIALS, cubin_available, embedded_cubin, embedded_prefill_cubin,
-    tiled_gemv_e4m3_splits,
+    embedded_scan_cubin, tiled_gemv_e4m3_splits,
 };
 use sparkflash_weights::linalg::{self, ScaleGrid};
 use sparkflash_weights::linear_attention::{self, Decay};
@@ -455,15 +456,19 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
     };
     let fixture = Fixture::new();
     let device = upload_fixture(&cuda, &fixture);
-    let prefill = embedded_prefill_cubin();
+    if embedded_scan_cubin().is_empty() {
+        eprintln!("skipped: this build embeds no Qwen4-Exp scan cubin");
+        return;
+    }
+    let scan_image = embedded_scan_cubin();
     let (_prep_module, prep) = cuda
-        .load_named(prefill, "q4p_kda_prep")
+        .load_named(scan_image, "q4p_kda_prep")
         .expect("q4p_kda_prep");
     let (_scan_module, scan) = cuda
-        .load_named(prefill, "q4p_kda_scan")
+        .load_named(scan_image, "q4p_kda_scan")
         .expect("q4p_kda_scan");
     let (_gate_module, gate) = cuda
-        .load_named(prefill, "q4p_gdn_gate")
+        .load_named(scan_image, "q4p_gdn_gate")
         .expect("q4p_gdn_gate");
     let qk = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * QK_ROW]);
     let decay_beta = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * 2]);
@@ -627,7 +632,7 @@ fn device_fp8_linear(
     let tiles = rows.div_ceil(GEMV_TILE);
     let splits = tiled_gemv_e4m3_splits(tiles, columns);
     let (_module, kernel) = cuda
-        .load_named(embedded_cubin(), "q4e_gemv_tiled_e4m3_block")
+        .load_named(glm_decode_cubin(), "q4e_gemv_tiled_e4m3_block")
         .expect("q4e_gemv_tiled_e4m3_block");
     let w = upload(cuda, codes);
     let scales = upload_f32(cuda, scales);
@@ -801,7 +806,11 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
     let Some(cuda) = open(false) else {
         return;
     };
-    let load = |name: &'static str| cuda.load_named(embedded_cubin(), name).expect(name).1;
+    if glm_decode_cubin().is_empty() {
+        eprintln!("skipped: this build embeds no GLM decode/token cubin");
+        return;
+    }
+    let load = |name: &'static str| cuda.load_named(glm_decode_cubin(), name).expect(name).1;
     let attend = load("q4e_glm_mla_attend");
     let (scores, softmax, mix, project) = (
         load("q4e_glm_mla_scores"),

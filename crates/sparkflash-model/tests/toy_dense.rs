@@ -115,6 +115,8 @@ fn toy_descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: "toy/tiny-dense".to_owned(),
         family: "toy-dense".to_owned(),
+        model_type: "toy-dense".to_owned(),
+        label: "ToyDense".to_owned(),
         weights_id: "toy-dense".to_owned(),
         context_tokens: 128,
         max_output_tokens: 16,

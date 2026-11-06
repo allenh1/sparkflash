@@ -45,7 +45,11 @@ pub const VISION_CUBIN: &str = "opt_vision_sm121.cubin";
 /// question of the same staged directory, so every rank gives the same answer.
 #[must_use]
 pub fn vision_enabled(cubins: &Path) -> bool {
-    std::env::var("SPARKFLASH_VISION").as_deref() != Ok("0") && cubins.join(VISION_CUBIN).is_file()
+    sparkflash_model::active_profile()
+        .diagnostics
+        .vision
+        .unwrap_or(true)
+        && cubins.join(VISION_CUBIN).is_file()
 }
 
 /// The rank that runs the vision tower: the owner of the image placeholder's embedding row.

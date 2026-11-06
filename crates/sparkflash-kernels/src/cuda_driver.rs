@@ -2266,9 +2266,7 @@ impl Cuda {
         }
         let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
         for (index, record) in records.iter().enumerate() {
-            let mut storage: Vec<[u64; 1]> = record.args.iter().map(|a| [*a]).collect();
-            let mut ptrs: Vec<*mut c_void> =
-                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            let (_storage, mut ptrs) = Cuda::kernel_params(&record.args);
             // SAFETY: the record came from this handle's launch path, every argument is a u64 or a
             // pointer to one that outlives the call, and the function handle is still loaded (the
             // module cache owns it until Drop).
@@ -2348,9 +2346,7 @@ impl Cuda {
                     return Err("graph capture is active without a capture stream".to_string());
                 }
                 let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-                let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-                let mut ptrs: Vec<*mut c_void> =
-                    storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+                let (_storage, mut ptrs) = Cuda::kernel_params(args);
                 // SAFETY: the symbol comes from this context's library, every argument is a u64
                 // or a pointer to one that outlives the call, and the stream is the private
                 // capture stream; the driver records this call into the graph being built.
@@ -4005,6 +4001,29 @@ impl Cuda {
 
     /// Queues one launch on `stream`, with programmatic stream serialization when the kernel
     /// opens with the dependency wait ([programmatic]). The driver's code on failure.
+    /// Builds the `kernelParams` array for `cuLaunchKernel`: one 8-byte cell per argument, plus one
+    /// spare.
+    ///
+    /// The spare is a guard against a caller that under-specifies, not a requirement of the
+    /// toolchain. A compiled kernel carries one parameter per source argument - `cuobjdump -elf` on
+    /// kernels/moe_plan_sm121.cu lists eighteen `EIATTR_KPARAM_INFO` entries and a 0x64-byte
+    /// parameter bank for its eighteen parameters, with no reserved-shared-memory slot - so the
+    /// array is the right length whenever the caller passes the kernel's own count.
+    ///
+    /// What the spare buys is that an under-specified call reads a zero instead of eight bytes past
+    /// the end of the caller's array: the failure it was added for was a test that passed
+    /// seventeen arguments to an eighteen-parameter kernel and faulted inside `cuLaunchKernel`
+    /// with no error code. That caller is fixed (the argument is named there now), and the honest
+    /// reading of the guard is that a launch whose arity is wrong is a bug to fix rather than a
+    /// condition to survive. It stays because it costs one cell a launch and because a silently
+    /// truncated argument list is still better than a segfault from a driver call that reports
+    /// nothing.
+    fn kernel_params(args: &[u64]) -> (Vec<[u64; 1]>, Vec<*mut c_void>) {
+        let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
+        storage.push([0]);
+        let ptrs: Vec<*mut c_void> = storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        (storage, ptrs)
+    }
     fn launch_kernel(
         &self,
         stream: CuStream,
@@ -4013,9 +4032,7 @@ impl Cuda {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
-        let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-        let mut ptrs: Vec<*mut c_void> =
-            storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        let (_storage, mut ptrs) = Cuda::kernel_params(args);
         let r = if programmatic(&kernel) {
             let launch_ex: libloading::Symbol<LaunchExFn> = self.sym(b"cuLaunchKernelEx")?;
             let mut attribute = CuLaunchAttribute {
@@ -4575,9 +4592,7 @@ impl Cuda {
         let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
             self.sym(b"cuStreamWaitEvent")?;
         let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-        let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-        let mut ptrs: Vec<*mut c_void> =
-            storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+        let (_storage, mut ptrs) = Cuda::kernel_params(args);
         // SAFETY: the symbols come from this context's library, the event and stream belong to
         // `side`, `after` is a stream of this context, and every kernel argument is a u64 or a
         // pointer to one that outlives the call.
@@ -4647,9 +4662,7 @@ impl Cuda {
         }
         unsafe {
             let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-            let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-            let mut ptrs: Vec<*mut c_void> =
-                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            let (_storage, mut ptrs) = Cuda::kernel_params(args);
             let timing = stage_timing_enabled();
             let metered = probe_meter_armed();
             let mut start_event: CuEvent = std::ptr::null_mut();
@@ -4785,9 +4798,7 @@ impl Cuda {
                 destroy(stop_event);
                 return Err(format!("cuEventRecord(start) failed: {r}"));
             }
-            let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
-            let mut ptrs: Vec<*mut c_void> =
-                storage.iter_mut().map(|s| s.as_mut_ptr().cast()).collect();
+            let (_storage, mut ptrs) = Cuda::kernel_params(args);
             let r = launch(
                 kernel.function,
                 grid.0,

@@ -299,12 +299,12 @@ mod tests {
             expected,
             "the manifest entry must be the pinned cubin"
         );
-        // The header count and toolkit are part of the same claim: twenty-one entries, this
-        // toolkit.
-        assert!(
-            BASELINE.contains("forty-two baseline kernels"),
-            "the manifest header must say forty-two"
-        );
+        // The entry count and the toolkit are part of the same claim. The count is read from the
+        // manifest's entries rather than from the words in its header: the header said forty-two
+        // while the manifest listed forty-three, and a test that agrees with the prose would have
+        // kept saying so.
+        let pins = crate::baseline::parse_pins(BASELINE).expect("the manifest parses");
+        assert_eq!(pins.len(), 43, "the manifest must pin forty-three kernels");
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));
     }

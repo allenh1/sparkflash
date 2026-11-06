@@ -517,9 +517,12 @@ impl ApiInferenceEngine for DeviceDriver {
             // guarantee on this path rather than an instruction (DECISIONS.md D62/D64). It needs
             // the vocabulary table the tokenizer builds, which every rank installs before it
             // joins the group; a process without one keeps refusing the request.
-            // SPARKFLASH_CONSTRAINED=0 turns it back off for a run without a rebuild.
+            // `runtime.constrained = false` turns it back off for a run without a rebuild.
             constrained: crate::device_link::vocabulary().is_some()
-                && std::env::var("SPARKFLASH_CONSTRAINED").as_deref() != Ok("0"),
+                && sparkflash_model::active_profile()
+                    .runtime
+                    .constrained
+                    .unwrap_or(true),
             ..Capabilities::ALL
         }
     }
@@ -1381,6 +1384,16 @@ pub(super) fn run(
     unsafe {
         std::env::set_var("SPARKFLASH_DSPARK", "1");
         std::env::set_var(MAX_SEQ_LEN_ENV, device.max_model_len.to_string());
+    }
+    if let Some(checkpoint) = options.checkpoint.as_deref()
+        && let Err(message) = super::check_checkpoint_plan(
+            checkpoint,
+            tp4.world_size,
+            sparkflash_ops::resolver::Availability::Runtime,
+        )
+    {
+        eprintln!("sparkflash serve: {message}");
+        return ExitCode::from(EXIT_REFUSED);
     }
     let args = match epoch_args(options, tp4, device) {
         Ok(args) => args,

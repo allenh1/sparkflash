@@ -1,5 +1,5 @@
 {
-  "captured": "2026-11-03",
+  "captured": "2026-11-05",
   "evidence": "logprobs",
   "fingerprint": "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6",
   "forced_from": null,
@@ -16,17 +16,19 @@
       "id": null,
       "version": "0.1.0"
     },
-    "checkpoint": "models--zai-org--GLM-5.3-Flash/snapshots/03eb5366286afd40d2221b1d9c63a6dd1ba4832e",
+    "checkpoint": "models--zai-org--GLM-5.3-Flash/snapshots/690b705278a3a58e538fcb37c2ca8b5f9511213c",
     "numerics": {
       "arch": "sm_121a",
-      "evidence": null,
-      "fingerprint": null,
-      "overrides": [],
+      "evidence": "logprobs",
+      "fingerprint": "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6",
+      "overrides": [
+        "SPARKFLASH_GLM_PREFILL_DRAFTING=1"
+      ],
       "plan": "tp",
       "policy": "docs/NUMERICS.md",
       "profile": "reference",
-      "registered_version": null,
-      "status": "unregistered",
+      "registered_version": 1,
+      "status": "overridden",
       "version": null,
       "world": 4
     }

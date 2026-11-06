@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, set_async_launches};
 use sparkflash_model_qwen4_exp::device::{
-    TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS, cubin_available, embedded_cubin,
+    TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS, cubin_available, embedded_cubin, embedded_moe_cubin,
     tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
 
@@ -56,6 +56,19 @@ fn open() -> Option<Cuda> {
 fn kernel(cuda: &Cuda, name: &'static str) -> Kernel {
     cuda.load_named(embedded_cubin(), name)
         .unwrap_or_else(|error| panic!("{name}: {error}"))
+        .1
+}
+
+fn moe_kernel(cuda: &Cuda, name: &'static str) -> Kernel {
+    cuda.load_named(embedded_moe_cubin(), name)
+        .unwrap_or_else(|error| panic!("{name}: {error}"))
+        .1
+}
+
+/// The shared routed-expert plan, which this bench times ahead of the expert kernels.
+fn plan_kernel(cuda: &Cuda) -> Kernel {
+    cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")
+        .unwrap_or_else(|error| panic!("moe_plan: {error}"))
         .1
 }
 
@@ -433,9 +446,9 @@ fn decode_kernels_at_the_released_shapes() {
     // The routed experts: a layer's 512 NVFP4 experts, ten a token, each launch's experts cold.
     {
         let (hidden, inter, topk, experts) = (2560_usize, 640_usize, 10_usize, 512_usize);
-        let permute = kernel(&cuda, "q4e_moe_permute");
-        let gate_up = kernel(&cuda, "q4e_expert_gate_up");
-        let down = kernel(&cuda, "q4e_expert_down");
+        let permute = plan_kernel(&cuda);
+        let gate_up = moe_kernel(&cuda, "q4e_expert_gate_up");
+        let down = moe_kernel(&cuda, "q4e_expert_down");
         let (gate_bytes, gate_scale_bytes) = (inter * hidden / 2, inter * hidden / 16);
         let (down_bytes, down_scale_bytes) = (hidden * inter / 2, hidden * inter / 16);
         let expert_bytes = 2 * (gate_bytes + gate_scale_bytes) + down_bytes + down_scale_bytes;
@@ -497,9 +510,28 @@ fn decode_kernels_at_the_released_shapes() {
                         permute,
                         (1, 1, 1),
                         block,
-                        &[indices.0, perm.0, runs.0, (batch * topk) as u64],
+                        &[
+                            indices.0,
+                            perm.0,
+                            0,
+                            0,
+                            runs.0,
+                            (batch * topk) as u64,
+                            512,
+                            topk as u64,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ],
                     )
-                    .expect("permute");
+                    .expect("plan");
                     if passes & 1 != 0 {
                         cuda.launch(
                             gate_up,

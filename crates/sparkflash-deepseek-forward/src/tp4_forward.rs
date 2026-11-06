@@ -1939,9 +1939,11 @@ pub fn evidence_record_enabled() -> bool {
 
 /// Selects the evidence mode from the environment at run scope.
 pub fn enable_forward_evidence_from_env() -> bool {
-    set_evidence_record(evidence_enabled_from_env(
-        std::env::var("SPARKFLASH_FORWARD_EVIDENCE").ok().as_deref(),
-    ))
+    let value = sparkflash_model::active_profile()
+        .diagnostics
+        .forward_evidence
+        .map(|value| if value { "1" } else { "0" });
+    set_evidence_record(evidence_enabled_from_env(value))
 }
 
 /// Whether a per-layer device readback exists only to feed the layer-chain evidence record.
@@ -5934,12 +5936,10 @@ fn seam_warm_enabled() -> bool {
     // the clean window never entered that mode.
     //
     // SPARKFLASH_SEAM_WARM=0/off/false/no disables the pass for an investigation row.
-    std::env::var("SPARKFLASH_SEAM_WARM").map_or(true, |value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no"
-        )
-    })
+    sparkflash_model::active_profile()
+        .diagnostics
+        .seam_warm
+        .unwrap_or(true)
 }
 
 /// The device arm of the Engram wkv seam: the already-pinned `engram_wkv_sm121` kernel over the
@@ -6553,7 +6553,11 @@ impl<'a> SeamDevice<'a> {
         }
         // A declined tensor is silent in the arithmetic (the layer falls back to a refusal or the host
         // rule), so the reason is printed on request: which tensor, absent or wrong shape/dtype.
-        if std::env::var_os("SPARKFLASH_SEAM_DEBUG").is_some() {
+        if sparkflash_model::active_profile()
+            .diagnostics
+            .seam_debug
+            .unwrap_or(false)
+        {
             for line in &declines {
                 eprintln!("seam staging decline: {line}");
             }
@@ -10499,7 +10503,11 @@ fn run_layer_mhc_entry(
 /// which slots the kernels write.
 #[cfg(feature = "cuda")]
 fn device_trace_capacity() -> Result<usize, String> {
-    let Some(raw) = std::env::var("SPARKFLASH_DEVICE_TRACE_EVENTS").ok() else {
+    let Some(raw) = sparkflash_model::active_profile()
+        .diagnostics
+        .device_trace_events
+        .clone()
+    else {
         return Ok(sparkflash_kernels::device_trace::DEFAULT_CAPACITY);
     };
     let capacity: usize = raw
@@ -11463,23 +11471,22 @@ struct OptSelect {
     scratch_words: usize,
 }
 
-/// The lanes a DSpark epoch serves from: SPARKFLASH_LANES, else 32 when it serves a link (each
-/// sequence's state in a lane of its own, so several run at once) and none for the harness, which
-/// keeps the single sequence's allocations.
+/// The lanes a DSpark epoch serves from: the profile's `runtime.concurrency`, else 32 when it
+/// serves a link (each sequence's state in a lane of its own, so several run at once) and none for
+/// the harness, which keeps the single sequence's allocations.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn planned_lanes(serving: bool) -> Result<usize, String> {
-    match std::env::var("SPARKFLASH_LANES") {
-        Ok(value) => value
-            .parse::<usize>()
-            .map_err(|_| format!("SPARKFLASH_LANES={value}: not a count")),
-        Err(_) if serving => Ok(32),
-        Err(_) => Ok(0),
+    match sparkflash_model::active_profile().runtime.concurrency {
+        Some(lanes) => Ok(lanes),
+        None if serving => Ok(32),
+        None => Ok(0),
     }
 }
 
 /// The on|off switch `name` set to `raw`: `None` when unset (the caller's default), `Some(true)` for
 /// on|1, `Some(false)` for off|0. Any other value is refused.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[cfg(test)]
 fn on_off_from_env_value(name: &str, raw: Option<&str>) -> Result<Option<bool>, String> {
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
@@ -11721,7 +11728,12 @@ impl<'a> DeviceLayer<'a> {
         // KernelId names either of them, so both go through the by-name loaders; the three landed
         // kernels use their own pinned loaders and their own pins.
         let moe_opt_kernels = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_MOE").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_moe
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_moe_sm121.cubin"))
                     .map_err(|error| format!("layer device opt moe: {error}"))?;
                 Some(sparkflash_kernels::moe_routed_device::OptMoeKernels::load(
@@ -11736,12 +11748,12 @@ impl<'a> DeviceLayer<'a> {
         // opt_gemv_mma_*) under SPARKFLASH_DECODE_MMA: unset, wherever the opt GEMV is installed;
         // on requires it; off keeps the FMA chain, whose greedy output is the one from before the
         // tensor-core forms. Either way a row's bits are one fixed chain whatever the batch.
-        let decode_mma = on_off_from_env_value(
-            "SPARKFLASH_DECODE_MMA",
-            std::env::var("SPARKFLASH_DECODE_MMA").ok().as_deref(),
-        )?;
+        let decode_mma = sparkflash_model::active_profile().decode.tensor_cores;
         if let Some(dir) = kernel_cubin_dir
-            && std::env::var("SPARKFLASH_OPT_GEMV").as_deref() != Ok("0")
+            && sparkflash_model::active_profile()
+                .diagnostics
+                .opt_gemv
+                .unwrap_or(true)
         {
             let (cubin, _sha) = cached_cubin(&dir.join("opt_gemv_sm121.cubin"))
                 .map_err(|error| format!("layer device opt gemv: {error}"))?;
@@ -11758,14 +11770,23 @@ impl<'a> DeviceLayer<'a> {
             );
         }
         let opt_rope = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_MISC").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_misc
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_misc_sm121.cubin"))
                     .map_err(|error| format!("layer device opt misc: {error}"))?;
                 let _ = sparkflash_kernels::rmsnorm_launch::install_opt(cuda, &cubin)?;
                 let _ = sparkflash_kernels::engram_wkv_launch::install_opt(cuda, &cubin)?;
                 let _ = sparkflash_kernels::kv_path_launch::install_opt(cuda, &cubin)?;
                 let _ = sparkflash_kernels::engram_gate_write_launch::install_opt(cuda, &cubin)?;
-                if std::env::var("SPARKFLASH_OPT_HEAD").as_deref() != Ok("0") {
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_head
+                    .unwrap_or(true)
+                {
                     let _ = sparkflash_kernels::cert_lm_head_launch::install_opt(cuda, &cubin)?;
                 }
                 Some(cuda.load_named(&cubin, "opt_rope_heads_bf16")?)
@@ -11773,7 +11794,12 @@ impl<'a> DeviceLayer<'a> {
             _ => None,
         };
         let opt_router = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_ROUTER").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_router
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_router_sm121.cubin"))
                     .map_err(|error| format!("layer device opt router: {error}"))?;
                 let (module, kernel) = cuda.load_named(&cubin, "opt_router_sm121")?;
@@ -11785,7 +11811,12 @@ impl<'a> DeviceLayer<'a> {
             _ => None,
         };
         let opt_seams = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_SEAMS").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_seams
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_seams_sm121.cubin"))
                     .map_err(|error| format!("layer device opt seams: {error}"))?;
                 let (seam_module, seam) = cuda.load_named(&cubin, "opt_mhc_seam")?;
@@ -11803,7 +11834,12 @@ impl<'a> DeviceLayer<'a> {
             _ => None,
         };
         let opt_oneshot = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_ONESHOT").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .oneshot
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_misc_sm121.cubin"))
                     .map_err(|error| format!("layer device opt oneshot: {error}"))?;
                 let (module, kernel) = cuda.load_named(&cubin, "opt_sum_ranks_bf16")?;
@@ -11817,7 +11853,12 @@ impl<'a> DeviceLayer<'a> {
         let two_shot_rows = sparkflash_engine::parallel_tp::two_shot_rows()
             .map_err(|error| format!("layer device: {error}"))?;
         let opt_attn = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_ATTN").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_attn
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_attn_sm121.cubin"))
                     .map_err(|error| format!("layer device opt attention: {error}"))?;
                 Some(cuda.load_named(&cubin, "opt_flash_mla_csa2_seq")?)
@@ -11825,11 +11866,19 @@ impl<'a> DeviceLayer<'a> {
             _ => None,
         };
         let opt_select = match kernel_cubin_dir {
-            Some(dir) if std::env::var("SPARKFLASH_OPT_SELECT").as_deref() != Ok("0") => {
+            Some(dir)
+                if sparkflash_model::active_profile()
+                    .diagnostics
+                    .opt_select
+                    .unwrap_or(true) =>
+            {
                 let (cubin, _sha) = cached_cubin(&dir.join("opt_select_sm121.cubin"))
                     .map_err(|error| format!("layer device opt select: {error}"))?;
                 let (module, scores) = cuda.load_named(&cubin, "opt_select_scores")?;
-                let rank = std::env::var("SPARKFLASH_SELECT_RANK").as_deref() == Ok("1");
+                let rank = sparkflash_model::active_profile()
+                    .diagnostics
+                    .select_rank
+                    .unwrap_or(false);
                 let (name, width, capacity) = if rank {
                     (
                         "opt_ref_select_pre",
@@ -12233,28 +12282,31 @@ impl<'a> DeviceLayer<'a> {
         // trace events into. Host-mapped because the host reads it later with no copy and no
         // synchronize; the kernels only need its device pointer. Off by default, so the launch
         // words stay zero and the run is unchanged unless SPARKFLASH_DEVICE_TRACE=1 asks for it.
-        let (seam_trace, seam_trace_capacity) =
-            if std::env::var("SPARKFLASH_DEVICE_TRACE").ok().as_deref() == Some("1") {
-                let capacity = device_trace_capacity()?;
-                let mut host_total = 0usize;
-                let ring = cuda
-                    .alloc_host_mapped(
-                        sparkflash_kernels::device_trace::ring_bytes(capacity),
-                        &mut host_total,
-                    )
-                    .map_err(|error| format!("layer device: stage trace ring: {error}"))?;
-                ring.write_at(
-                    0,
-                    &sparkflash_kernels::device_trace::header_bytes(
-                        capacity,
-                        sparkflash_kernels::device_trace::SEAM_SCOPE_MASK,
-                    ),
+        let (seam_trace, seam_trace_capacity) = if sparkflash_model::active_profile()
+            .diagnostics
+            .device_trace
+            .unwrap_or(false)
+        {
+            let capacity = device_trace_capacity()?;
+            let mut host_total = 0usize;
+            let ring = cuda
+                .alloc_host_mapped(
+                    sparkflash_kernels::device_trace::ring_bytes(capacity),
+                    &mut host_total,
                 )
-                .map_err(|error| format!("layer device: stage trace header: {error}"))?;
-                (Some(ring), capacity)
-            } else {
-                (None, 0usize)
-            };
+                .map_err(|error| format!("layer device: stage trace ring: {error}"))?;
+            ring.write_at(
+                0,
+                &sparkflash_kernels::device_trace::header_bytes(
+                    capacity,
+                    sparkflash_kernels::device_trace::SEAM_SCOPE_MASK,
+                ),
+            )
+            .map_err(|error| format!("layer device: stage trace header: {error}"))?;
+            (Some(ring), capacity)
+        } else {
+            (None, 0usize)
+        };
         let sinkhorn_iters = u32::try_from(config.hc_sinkhorn_iters).map_err(|_| {
             format!(
                 "layer device: {} Sinkhorn iterations do not fit the seam ABI",
@@ -12348,7 +12400,10 @@ impl<'a> DeviceLayer<'a> {
             moe_opt_kernels,
             tp_rank: plan.map_or(0, |plan| plan.rank()),
             opt_rope,
-            shared_tp: std::env::var("SPARKFLASH_SHARED_TP").as_deref() != Ok("0")
+            shared_tp: sparkflash_model::active_profile()
+                .diagnostics
+                .shared_tp
+                .unwrap_or(true)
                 && sparkflash_kernels::mxfp8_gemv_launch::opt_installed(),
             opt_router,
             opt_seams,
@@ -13143,12 +13198,10 @@ impl<'a> DeviceLayer<'a> {
         if self.bulk_comm.is_some() {
             return Ok(());
         }
-        let ctas: u32 = match std::env::var("SPARKFLASH_BULK_CTAS") {
-            Ok(raw) => raw
-                .parse()
-                .map_err(|_| format!("SPARKFLASH_BULK_CTAS={raw:?} is not a CTA count"))?,
-            Err(_) => 8,
-        };
+        let ctas: u32 = sparkflash_model::active_profile()
+            .prefill
+            .bulk_ctas
+            .map_or(8, |ctas| u32::try_from(ctas).unwrap_or(u32::MAX));
         if let Some(reduce) = self.reduce.filter(|_| ctas > 0) {
             reduce
                 .0
@@ -15968,8 +16021,10 @@ impl crate::layer_device::LayerStages for DeviceLayer<'_> {
         static ROUTE_DUMP: std::sync::OnceLock<Option<std::sync::Mutex<fs::File>>> =
             std::sync::OnceLock::new();
         let dump = ROUTE_DUMP.get_or_init(|| {
-            std::env::var("SPARKFLASH_ROUTE_DUMP")
-                .ok()
+            sparkflash_model::active_profile()
+                .diagnostics
+                .route_dump
+                .clone()
                 .filter(|_| self.tp_rank == 0)
                 .and_then(|path| fs::File::create(path).ok())
                 .map(std::sync::Mutex::new)
@@ -16489,7 +16544,10 @@ fn run_forward_loop(
     // device opens the single sequence's position-sized state small, and the passes before the
     // first step cover the harness prompt only: the epoch gathers each step's embeddings and
     // Engram rows itself, and serving's placeholder ids span the whole 1M-position capacity.
-    let dspark = std::env::var("SPARKFLASH_DSPARK").as_deref() == Ok("1");
+    let dspark = sparkflash_model::active_profile()
+        .speculation
+        .enabled
+        .unwrap_or(false);
     let lanes_planned = dspark && planned_lanes(crate::device_link::installed())? > 0;
     let gathered_positions = if lanes_planned {
         prompt_len.clamp(1, full_positions)
@@ -16665,7 +16723,10 @@ fn run_forward_loop(
     // on the host (the A/B arm). A decline at call time - a layer whose source does not serve the
     // released F8-E4M3 + E8-E8M0 pair - falls back to the engine's host native rule for that layer,
     // never to a third arithmetic.
-    let mut seam_wq_b: Option<SeamDevice<'_>> = if std::env::var("SPARKFLASH_SEAM_REF_HOST").is_ok()
+    let mut seam_wq_b: Option<SeamDevice<'_>> = if sparkflash_model::active_profile()
+        .diagnostics
+        .seam_ref_host
+        .unwrap_or(false)
     {
         None
     } else {
@@ -16846,7 +16907,11 @@ fn run_forward_loop(
     // tensor set the engine capture holds for every position listed in SPARKFLASH_TRACE_POSITIONS
     // (comma separated). The rows are row{L}.{tensor}.f32 under pos{P}/ so a host script can diff
     // them against boundary.blob row by row. Off unless the variable is set.
-    let trace_root = std::env::var_os("SPARKFLASH_BOUNDARY_TRACE").map(std::path::PathBuf::from);
+    let trace_root = sparkflash_model::active_profile()
+        .diagnostics
+        .boundary_trace
+        .as_deref()
+        .map(std::path::PathBuf::from);
     let trace_root = trace_root.map(|root| {
         if root.is_absolute() {
             root
@@ -16854,8 +16919,10 @@ fn run_forward_loop(
             request.evidence_dir.join(root)
         }
     });
-    let trace_positions: Vec<usize> = std::env::var("SPARKFLASH_TRACE_POSITIONS")
-        .ok()
+    let trace_positions: Vec<usize> = sparkflash_model::active_profile()
+        .diagnostics
+        .trace_positions
+        .clone()
         .map(|text| {
             text.split(',')
                 .filter_map(|item| item.trim().parse::<usize>().ok())
@@ -16870,8 +16937,11 @@ fn run_forward_loop(
     // tensor whose device value leaves f32/bf16 noise of the host reference. attention_out is the
     // chain's BF16 all-reduced delta widened to f32: the diff classes already allow the BF16 round
     // for that tensor.
-    let boundary_dir =
-        std::env::var_os("SPARKFLASH_TP4_BOUNDARY_DIR").map(std::path::PathBuf::from);
+    let boundary_dir = sparkflash_model::active_profile()
+        .diagnostics
+        .tp4_boundary_dir
+        .as_deref()
+        .map(std::path::PathBuf::from);
     let boundary_dir = boundary_dir.map(|dir| {
         if dir.is_absolute() {
             dir
@@ -16886,9 +16956,9 @@ fn run_forward_loop(
         fs::create_dir_all(dir)
             .map_err(|error| format!("boundary replay dir {}: {error}", dir.display()))?;
     }
-    let boundary_position: usize = std::env::var("SPARKFLASH_TP4_BOUNDARY_POSITION")
-        .ok()
-        .and_then(|text| text.trim().parse::<usize>().ok())
+    let boundary_position: usize = sparkflash_model::active_profile()
+        .diagnostics
+        .tp4_boundary_position
         .unwrap_or(0);
     let mut boundary_table: Option<BoundaryTable> = match &boundary_dir {
         Some(_) => {
@@ -17018,13 +17088,10 @@ fn run_forward_loop(
     // The multi-row verify step, teacher-forced (SPARKFLASH_ROWS=n): from SPARKFLASH_ROWS_FROM
     // (default the prompt length) every n positions run as one rows step, rank 0 prints each
     // row's argmax and the step's wall, and the run ends after the last row.
-    let rows_n: usize = std::env::var("SPARKFLASH_ROWS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let rows_from: usize = std::env::var("SPARKFLASH_ROWS_FROM")
-        .ok()
-        .and_then(|value| value.parse().ok())
+    let rows_n: usize = sparkflash_model::active_profile().runtime.rows.unwrap_or(0);
+    let rows_from: usize = sparkflash_model::active_profile()
+        .runtime
+        .rows_from
         .unwrap_or(prompt_len);
     // Speculative decoding with the on-device DSpark drafter (SPARKFLASH_DSPARK=1, k drafts per
     // step from SPARKFLASH_DSPARK_K, default 5, verified to the depth spec's DepthPolicy picks):
@@ -17052,14 +17119,27 @@ fn run_forward_loop(
     // previous head's argmax, its embedding row gathered in place of the fixture's. With
     // SPARKFLASH_TAP_DUMP=<file>, rank 0 records each position's input, next token and DSpark taps
     // (the hc-mean of the target layers' inputs, model.py:1262-1266) for the host-twin replay.
-    let generate = std::env::var("SPARKFLASH_GENERATE").as_deref() == Ok("1");
+    let generate = sparkflash_model::active_profile()
+        .diagnostics
+        .generate
+        .unwrap_or(false);
     // The lean head (SPARKFLASH_LEAN_HEAD=1): every head position but the last reads back only the
     // chunk maxima and gathers four words, so it carries no logits and no logit evidence.
-    let lean_head = std::env::var("SPARKFLASH_LEAN_HEAD").as_deref() == Ok("1");
-    let print_argmax = std::env::var("SPARKFLASH_PRINT_ARGMAX").as_deref() == Ok("1");
+    let lean_head = sparkflash_model::active_profile()
+        .diagnostics
+        .lean_head
+        .unwrap_or(false);
+    let print_argmax = sparkflash_model::active_profile()
+        .diagnostics
+        .print_argmax
+        .unwrap_or(false);
     let mut live_tokens: Vec<u32> = request.prompt_tokens.to_vec();
-    let mut tap_dump = match std::env::var("SPARKFLASH_TAP_DUMP") {
-        Ok(path) if request.rank == 0 => {
+    let mut tap_dump = match sparkflash_model::active_profile()
+        .diagnostics
+        .tap_dump
+        .clone()
+    {
+        Some(path) if request.rank == 0 => {
             let mut file = std::io::BufWriter::new(
                 fs::File::create(&path).map_err(|error| format!("tap dump {path}: {error}"))?,
             );
@@ -17129,9 +17209,9 @@ fn run_forward_loop(
         ) else {
             return Err("SPARKFLASH_DSPARK: needs the device arm and the cubins".to_owned());
         };
-        let k: usize = std::env::var("SPARKFLASH_DSPARK_K")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let k: usize = sparkflash_model::active_profile()
+            .speculation
+            .dspark_k
             .unwrap_or(5);
         if k == 0 || k > draft::BLOCK || k + 1 > rows::R_MAX {
             return Err(format!(
@@ -17165,9 +17245,9 @@ fn run_forward_loop(
         // The bulk prefill's rows state, SPARKFLASH_PREFILL_CHUNK rows per chunk (8 or less keeps
         // every prompt on the exact rows step). 4096 by sweep: a 32K prompt takes 15.2 s at 2048,
         // 13.6 s at 4096 (the MoE weights read once for twice the rows) and 13.8 s at 8192.
-        let chunk: usize = std::env::var("SPARKFLASH_PREFILL_CHUNK")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let chunk: usize = sparkflash_model::active_profile()
+            .prefill
+            .chunk
             .unwrap_or(4096);
         // `sparkflash serve --tp4-device` installs a link before the epoch: serve its requests
         // instead of the one-shot generation.
@@ -17191,12 +17271,9 @@ fn run_forward_loop(
         // WAYS=1: one chunk at a time). Their seams split over the ranks by rows unless
         // SPARKFLASH_PREFILL_SP=0, and they share the routed experts' rows, so the chunks' routed
         // experts read each expert's weights once (DeviceLayer::rows_moe_merged).
-        let ways: usize = match std::env::var("SPARKFLASH_PREFILL_PAIR").as_deref() {
-            Ok("0") => 1,
-            _ => std::env::var("SPARKFLASH_PREFILL_WAYS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(3),
+        let ways: usize = match sparkflash_model::active_profile().prefill.pair {
+            Some(0) => 1,
+            _ => sparkflash_model::active_profile().prefill.ways.unwrap_or(3),
         };
         let moe_share = if chunk > rows::R_MAX
             && ways > 1
@@ -17217,7 +17294,11 @@ fn run_forward_loop(
         let mut more_rows = Vec::new();
         if bulk_rows.is_some() && ways > 1 {
             device.open_bulk_comm()?;
-            if std::env::var("SPARKFLASH_PREFILL_SP").as_deref() != Ok("0") {
+            if sparkflash_model::active_profile()
+                .diagnostics
+                .prefill_sp
+                .unwrap_or(true)
+            {
                 device.enable_prefill_sp(request.world)?;
             }
             for way in 1..ways {
@@ -17243,9 +17324,9 @@ fn run_forward_loop(
             bulk_more: &more_rows,
             ..inputs
         };
-        let max_new: usize = std::env::var("SPARKFLASH_DSPARK_STEPS")
-            .ok()
-            .and_then(|value| value.parse().ok())
+        let max_new: usize = sparkflash_model::active_profile()
+            .speculation
+            .dspark_steps
             .unwrap_or(usize::MAX);
         match link {
             Some(mut link) => spec::serve(device, rows, &drafter, &inputs, k, link.as_mut())?,
@@ -17433,7 +17514,10 @@ fn run_forward_loop(
                         "status": "refused",
                         "layer": layer,
                         "position": position,
-                        "tolerance_arm": std::env::var("SPARKFLASH_TOLERANCE_ARM").ok(),
+                        "tolerance_arm": sparkflash_model::active_profile()
+                            .diagnostics
+                            .tolerance_arm
+                            .clone(),
                         "stages_ran": device.runs().stages(),
                         "frontier": device.runs().summary(),
                         "message": error,
@@ -17461,7 +17545,10 @@ fn run_forward_loop(
                         "status": "completed",
                         "layer": layer,
                         "position": position,
-                        "tolerance_arm": std::env::var("SPARKFLASH_TOLERANCE_ARM").ok(),
+                        "tolerance_arm": sparkflash_model::active_profile()
+                            .diagnostics
+                            .tolerance_arm
+                            .clone(),
                         "stages_ran": device.runs().stages(),
                         "frontier": summary,
                         "max_positions": device.max_positions(),
@@ -17483,7 +17570,11 @@ fn run_forward_loop(
                 // canonical ascending-rank reduction can be replayed and compared with both arms'
                 // reduced rows, which separates "the partials differ" from "the reduce order
                 // differs" without a second run.
-                if let Ok(dir) = std::env::var("SPARKFLASH_REDUCE_DUMP") {
+                if let Some(dir) = sparkflash_model::active_profile()
+                    .diagnostics
+                    .reduce_dump
+                    .clone()
+                {
                     std::fs::create_dir_all(&dir)
                         .map_err(|error| format!("reduce dump: {dir}: {error}"))?;
                     // The collectives are queued on stream 0 and deliberately not waited for, so a
@@ -17527,7 +17618,11 @@ fn run_forward_loop(
                         }
                     }
                 }
-                if std::env::var("SPARKFLASH_DEVICE_DIFF").is_err() {
+                if !sparkflash_model::active_profile()
+                    .diagnostics
+                    .device_diff
+                    .unwrap_or(false)
+                {
                     continue;
                 }
             }
@@ -17949,7 +18044,10 @@ fn run_forward_loop(
                         }
                         (worst, differing, worst_rel, sign_cross)
                     };
-                    let dump = std::env::var("SPARKFLASH_DEVICE_DIFF_DUMP").ok();
+                    let dump = sparkflash_model::active_profile()
+                        .diagnostics
+                        .device_diff_dump
+                        .clone();
                     let write_row = |name: &str, host: &[f32], dev: &[f32]| {
                         let Some(dir) = dump.as_deref() else { return };
                         for (tag, values) in [("host", host), ("dev", dev)] {
@@ -18245,7 +18343,10 @@ fn run_forward_loop(
                         },
                     });
                     probe::head(&cuda, "head_total", head_total_timer);
-                    if std::env::var("SPARKFLASH_DEVICE_DIFF").is_err()
+                    if !sparkflash_model::active_profile()
+                        .diagnostics
+                        .device_diff
+                        .unwrap_or(false)
                         && let Err(violation) = step_counters.check(step_bridge)
                     {
                         return Err(format!(
@@ -18564,7 +18665,11 @@ fn run_forward_loop(
             .filter(|(stage, _)| matches!(*stage, "all_reduce" | "all_reduce_moe"))
             .map(|(_, count)| usize::try_from(*count).unwrap_or(usize::MAX))
             .sum();
-        if layer_arm.is_device() && std::env::var("SPARKFLASH_DEVICE_DIFF").is_err() {
+        let device_diff = sparkflash_model::active_profile()
+            .diagnostics
+            .device_diff
+            .unwrap_or(false);
+        if layer_arm.is_device() && !device_diff {
             crate::layer_device::verify_collective_count(
                 expected_collectives,
                 enqueued_collectives,

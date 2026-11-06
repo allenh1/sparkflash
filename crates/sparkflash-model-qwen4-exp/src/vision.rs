@@ -83,6 +83,32 @@ pub struct VisionTowerConfig {
 }
 
 impl VisionTowerConfig {
+    /// This tower as the shared geometry the device kernels read
+    /// ([sparkflash_model::VisionGeometry]).
+    ///
+    /// The two fields the released Qwen tower does not name are the merger's MLP width, which its
+    /// two-layer patch merge does not have, and the image channels, which every release here fixes
+    /// at 3.
+    #[must_use]
+    pub fn geometry(&self) -> sparkflash_model::VisionGeometry {
+        sparkflash_model::VisionGeometry {
+            depth: self.depth,
+            hidden_size: self.hidden_size,
+            num_heads: self.num_heads,
+            intermediate_size: self.intermediate_size,
+            out_hidden_size: self.out_hidden_size,
+            projection_intermediate_size: 0,
+            in_channels: 3,
+            patch_size: self.patch_size,
+            temporal_patch_size: self.temporal_patch_size,
+            spatial_merge_size: self.spatial_merge_size,
+            num_position_embeddings: self.num_position_embeddings,
+            rope_theta: self.rope_theta,
+            min_pixels: self.min_pixels,
+            max_pixels: self.max_pixels,
+        }
+    }
+
     /// The released configuration, or None for a checkpoint without a vision tower.
     #[must_use]
     pub fn from_config(config: &Qwen4ExpConfig) -> Option<Self> {

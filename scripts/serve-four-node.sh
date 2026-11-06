@@ -106,7 +106,10 @@ for rank in ${LOCAL_RANKS[@]+"${LOCAL_RANKS[@]}"}; do
 done
 PEERS="$(IFS=,; printf '%s' "${NODES[*]}")"
 if [ -n "${SPARK_PEERS:-}" ]; then
-    read -r -a PEER_LIST <<< "$SPARK_PEERS"
+    # Both spellings are accepted. The ranks join these into one comma-separated --tp4-peers
+    # value, so an operator who copies that value back here is the common case; it used to be
+    # read as a single address and refused with "got 1".
+    read -r -a PEER_LIST <<< "${SPARK_PEERS//,/ }"
     [ "${#PEER_LIST[@]}" -eq 4 ] || die "SPARK_PEERS needs exactly 4 addresses in rank order, got ${#PEER_LIST[@]}"
     PEERS="$(IFS=,; printf '%s' "${PEER_LIST[*]}")"
 fi
@@ -141,8 +144,13 @@ rank_env() {
     # The scheduler's knobs: every rank runs the same ticks, so a prefill or batching setting
     # that only a local rank 0 inherited would split the group's collectives. Every rank reads
     # its own Engram tables, so their knobs go to every rank too.
+    #
+    # The model's own knobs belong here for the same reason, and their absence was a real hang: a
+    # drafter one rank loads and its peers do not makes every rank a different program, and the
+    # group's first collective blocks with no error instead of disagreeing out loud
+    # (`SPARKFLASH_GLM_DFLASH2` was set for rank 0 only, and a request never produced a step).
     local knob
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM)_' || true); do
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0

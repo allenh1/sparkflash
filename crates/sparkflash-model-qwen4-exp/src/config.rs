@@ -89,6 +89,12 @@ pub struct Qwen4ExpConfig {
     pub max_position_embeddings: usize,
     /// The attention kind of every layer, in order.
     pub layer_types: Vec<LayerKind>,
+    /// The shared architecture this typed profile describes.
+    ///
+    /// [Self::from_json] stores the [sparkflash_model::Architecture] it parses alongside the
+    /// typed fields, so every caller reads the one walk rather than re-deriving the schedule from
+    /// `layer_types`. [Self::steps] is the layer walk the device arm builds from.
+    pub architecture: sparkflash_model::Architecture,
     /// Gated DeltaNet convolution width (4).
     pub linear_conv_kernel_dim: usize,
     /// Gated DeltaNet key head width (128).
@@ -205,6 +211,9 @@ impl Qwen4ExpConfig {
     /// [ConfigError::Json] for a malformed document and [ConfigError::Invalid] for a shape this
     /// pack cannot serve.
     pub fn from_json(text: &str) -> Result<Self, ConfigError> {
+        // The shared document is read first, so the arm's typed view and the tree's canonical
+        // architecture are proven to describe the same model before any weight is planned.
+        let architecture = crate::architecture::architecture_from_json(text)?;
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let text = root.text_config;
@@ -266,6 +275,7 @@ impl Qwen4ExpConfig {
             mrope_section,
             max_position_embeddings: text.max_position_embeddings,
             layer_types,
+            architecture,
             linear_conv_kernel_dim: text.linear_conv_kernel_dim,
             linear_key_head_dim: text.linear_key_head_dim,
             linear_value_head_dim: text.linear_value_head_dim,
@@ -331,6 +341,7 @@ impl Qwen4ExpConfig {
             vision_rope_theta: root.vision_config.as_ref().map(|vision| vision.rope_theta),
         };
         config.validate()?;
+        config.cross_check(&config.architecture)?;
         // The NVFP4 checkpoint is only usable through the quantisation metadata below; a
         // different mix (say an FP8 checkpoint) would need a different loader.
         quant.validate()?;
@@ -357,6 +368,7 @@ impl Qwen4ExpConfig {
             mrope_section: [1, 1, 0],
             max_position_embeddings: 64,
             layer_types: vec![LayerKind::Linear, LayerKind::Sparse],
+            architecture: crate::architecture::tiny_architecture(),
             linear_conv_kernel_dim: 4,
             linear_key_head_dim: 4,
             linear_value_head_dim: 4,
@@ -470,6 +482,9 @@ impl Qwen4ExpConfig {
             "eos_token_id": self.eos_token_ids,
             "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
         });
+        // The shared architecture reads the top-level key, so the rendered document carries it
+        // or the round trip would describe a different rotary width.
+        text["partial_rotary_factor"] = serde_json::json!(self.partial_rotary_factor);
         if let Some(bos) = self.bos_token_id {
             text["bos_token_id"] = serde_json::json!(bos);
         }
@@ -478,12 +493,38 @@ impl Qwen4ExpConfig {
         }
         let mut root = serde_json::json!({
             "model_type": "qwen4_exp",
+            // The shared architecture carries the released architecture name, so the rendered
+            // document names it too and the round trip keeps both parsers in step.
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
             "text_config": text,
             "tie_word_embeddings": self.tie_word_embeddings,
             "image_token_id": self.image_token_id,
             "vision_start_token_id": self.vision_start_token_id,
             "vision_end_token_id": self.vision_end_token_id,
         });
+        let quantization = &self.architecture.quantization;
+        let mut quant = serde_json::Map::new();
+        if let Some(method) = &quantization.method {
+            quant.insert("quant_algo".to_owned(), serde_json::json!(method));
+        }
+        if let Some(block) = quantization.block {
+            quant.insert(
+                "weight_block_size".to_owned(),
+                serde_json::json!([block, block]),
+            );
+        }
+        if let Some(scale) = &quantization.scale {
+            quant.insert("fmt".to_owned(), serde_json::json!(scale));
+        }
+        if let Some(expert) = &quantization.expert {
+            quant.insert(
+                "expert_weight".to_owned(),
+                serde_json::json!({ "quant_algo": expert }),
+            );
+        }
+        if !quant.is_empty() {
+            root["quantization_config"] = serde_json::Value::Object(quant);
+        }
         if self.has_vision {
             root["vision_config"] = serde_json::json!({
                 "hidden_size": self.vision_hidden_size.unwrap_or(0),

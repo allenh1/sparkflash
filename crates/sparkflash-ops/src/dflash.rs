@@ -738,6 +738,15 @@ impl DraftScratch {
         self.drafts
     }
 
+    /// The drafter's context rings as one region, `[layers][keys, values][ring][kv width]` f32,
+    /// and how many floats that is: a sequence reused for a second request clears it, because a
+    /// ring slot is read by position and a fresh window's are zero.
+    #[must_use]
+    pub fn rings_region(&self, config: &Dflash2Config) -> (Deviceptr, usize) {
+        let floats = config.ring_positions() * config.kv_width();
+        (self.rings, config.num_hidden_layers * 2 * floats)
+    }
+
     /// The captured target rows of the last forward.
     #[must_use]
     pub fn features(&self) -> Deviceptr {

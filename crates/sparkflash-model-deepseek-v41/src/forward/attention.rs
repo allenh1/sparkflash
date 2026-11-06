@@ -5471,7 +5471,9 @@ mod tests {
 
     /// Another layer's cache in the channel is a layer-order regression, and the reference asserts
     /// the owner-before-consumer relation at construction (cache_engine.py:160-172); the debug assert
-    /// turns the silent cross-segment read into a fail-fast panic.
+    /// turns the silent cross-segment read into a fail-fast panic in a debug build. Release
+    /// builds omit the assertion, so this test is compiled only where the behaviour exists.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "planned kv source")]
     fn a_consumer_refuses_an_owner_that_is_not_its_planned_source() {

@@ -565,14 +565,10 @@ impl<'a> DeviceLayer<'a> {
             engram.by_row = true;
         }
         let base = cuda.vmm_reserve(stride * count)?.0;
-        let budget_bytes = match std::env::var("SPARKFLASH_LANE_MEMORY_MB") {
-            Ok(text) => {
-                text.parse::<usize>()
-                    .map_err(|_| format!("SPARKFLASH_LANE_MEMORY_MB={text} is not a number"))?
-                    << 20
-            }
-            Err(_) => DEFAULT_BUDGET_BYTES,
-        };
+        let budget_bytes = sparkflash_model::active_profile()
+            .runtime
+            .lane_memory_mb
+            .map_or(DEFAULT_BUDGET_BYTES, |mb| mb << 20);
         let lanes = Lanes {
             cuda,
             base,

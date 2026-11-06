@@ -56,6 +56,14 @@ impl DenseGemmPlan {
         stream: StreamId,
         split_k: usize,
     ) -> Result<Self, OpError> {
+        let (image, symbol) = match (precision, split_k) {
+            (Precision::MxFp8, 1) => (Image::Deepseek, "b12x_mxfp8_dense_sm121"),
+            (Precision::MxFp8, _) => (Image::Deepseek, "b12x_mxfp8_dense_split_k_sm121"),
+            (Precision::NvFp4, _) => (Image::Deepseek, "b12x_mxfp4_moe_sm121"),
+            (Precision::Fp8E4M3, _) => (Image::GlmPrefill, "glm_prefill_fp8b128_mma"),
+            (Precision::Bf16, _) => (Image::GlmPrefill, "glm_prefill_bf16_mma"),
+            (Precision::F32, _) => (Image::Qwen4Exp, "q4e_gemm_bf16"),
+        };
         let plan = Self {
             output,
             k,
@@ -64,15 +72,8 @@ impl DenseGemmPlan {
             stream,
             split_k,
             tile_batched: false,
-            image: Image::Deepseek,
-            symbol: match (precision, split_k) {
-                (Precision::MxFp8, 1) => "b12x_mxfp8_dense_sm121",
-                (Precision::MxFp8, _) => "b12x_mxfp8_dense_split_k_sm121",
-                (Precision::NvFp4, _) => "b12x_mxfp4_moe_sm121",
-                (Precision::Fp8E4M3, _) => "glm_prefill_fp8b128_mma",
-                (Precision::Bf16, _) => "glm_prefill_bf16_mma",
-                (Precision::F32, _) => "q4e_gemm_bf16",
-            },
+            image,
+            symbol,
         };
         plan.validate()?;
         Ok(plan)
@@ -223,14 +224,17 @@ impl OpPlan for GroupedMoeGemmPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        let symbol = match self.precision {
-            Precision::NvFp4 => "b12x_mxfp4_moe_sm121",
-            Precision::MxFp8 => "b12x_bf16a_mxfp8w_dense_sm121",
-            Precision::Fp8E4M3 => "glm_moe_fp8b128_mma",
-            Precision::Bf16 => "glm_moe_fp8b128_mma_bf16a",
-            Precision::F32 => "q4e_expert_gate_up",
+        let (image, symbol) = match self.precision {
+            Precision::NvFp4 => (Image::Deepseek, "b12x_mxfp4_moe_sm121"),
+            // The grouped MXFP8 GEMM is the output-projection kernel: the dense twins
+            // (b12x_mxfp8_dense_sm121 and b12x_bf16a_mxfp8w_dense_sm121) tile one
+            // matrix, not a group axis.
+            Precision::MxFp8 => (Image::Deepseek, "b12x_mxfp8_wo_a_sm121"),
+            Precision::Fp8E4M3 => (Image::GlmMoe, "glm_moe_fp8b128_mma"),
+            Precision::Bf16 => (Image::GlmMoe, "glm_moe_fp8b128_mma_bf16a"),
+            Precision::F32 => (Image::Qwen4Moe, "q4e_expert_gate_up"),
         };
-        KernelId::new(Image::Deepseek, symbol)
+        KernelId::new(image, symbol)
     }
 
     fn launch(&self) -> Launch {
@@ -268,13 +272,18 @@ impl OpPlan for GroupedMoeGemmPlan {
                 format!("top-k {} exceeds {} experts", self.top_k, self.experts),
             ));
         }
+        if self.precision == Precision::MxFp8 {
+            // The only grouped MXFP8 symbol in the tree is the MLA wo_a projection, which takes
+            // attention operands, not expert ids. Refuse rather than name a kernel whose ABI does
+            // not match the plan.
+            return Err(OpError::Unsupported {
+                op: "grouped MoE GEMM",
+                dtype: "mxfp8 (no grouped expert kernel yet)",
+            });
+        }
         if !matches!(
             self.precision,
-            Precision::NvFp4
-                | Precision::MxFp8
-                | Precision::Fp8E4M3
-                | Precision::Bf16
-                | Precision::F32
+            Precision::NvFp4 | Precision::Fp8E4M3 | Precision::Bf16 | Precision::F32
         ) {
             return Err(OpError::Unsupported {
                 op: "grouped MoE GEMM",
@@ -414,7 +423,7 @@ impl OpPlan for ExpertCombinePlan {
     }
 
     fn kernel(&self) -> KernelId {
-        KernelId::new(Image::Deepseek, "b12x_mxfp4_moe_stored_sm121")
+        KernelId::new(Image::Deepseek, "moe_routed_combine_sm121")
     }
 
     fn launch(&self) -> Launch {

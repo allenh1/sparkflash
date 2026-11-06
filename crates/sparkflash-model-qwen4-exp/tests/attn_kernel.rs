@@ -23,7 +23,7 @@ use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model_qwen4_exp::device::{
     ATTN_GROUP_KERNELS, ATTN_GROUP_SELECTED, MAX_SELECTED_TOKENS, attn_group_shared_bytes,
-    cubin_available, embedded_cubin,
+    cubin_available, embedded_attn_cubin,
 };
 
 fn open() -> Option<Cuda> {
@@ -178,7 +178,7 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
         download_bits(&cuda, &out, tokens * width)
     };
     let (_, per_head) = cuda
-        .load_named(embedded_cubin(), "q4e_attn")
+        .load_named(embedded_attn_cubin(), "q4e_attn")
         .expect("the cubin carries q4e_attn");
     let reference = run(per_head, 1);
     assert!(
@@ -192,7 +192,7 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
         }
         checked += 1;
         let (_, kernel) = cuda
-            .load_named_shared(embedded_cubin(), name, attn_group_shared_bytes(group))
+            .load_named_shared(embedded_attn_cubin(), name, attn_group_shared_bytes(group))
             .unwrap_or_else(|error| panic!("the cubin carries {name}: {error}"));
         let grouped = run(kernel, group);
         for (token, &selected) in counts.iter().enumerate() {
@@ -337,7 +337,7 @@ fn bench_the_attention_kernels() {
             .map(|&(group, name)| (group, name, attn_group_shared_bytes(group)));
         for (group, name, shared) in std::iter::once((1, "q4e_attn", 0)).chain(grouped) {
             let (_, kernel) = cuda
-                .load_named_shared(embedded_cubin(), name, shared)
+                .load_named_shared(embedded_attn_cubin(), name, shared)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
             let launch = || {
                 cuda.launch(

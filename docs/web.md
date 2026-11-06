@@ -222,13 +222,17 @@ on the lead node and the resulting path is passed to every rank, so every node n
 at the same cache path. Steps 4 and 5 do that: the lead downloads it once and copies the folder to
 the others. `hf download <id>` as the same user on every node works too.
 
-The **Model** list under **Advanced settings** is the lead node's cache. Each supported model
-shows its size, and a download that is still in progress is marked incomplete. Choosing a model also
+The **Model** panel at the top of **Setup** is the lead node's cache, and its browser searches
+both that cache and the Hugging Face Hub. The left side lists the families this build
+knows (DeepSeek, Qwen, GLM) with their TP size; the search box queries the Hub and folds in cached
+models first. A cached model shows its size and whether its download is still incomplete; a Hub
+result that is not cached is offered so the **Download** step has a target. Choosing a model also
 selects its architecture and engine, so a V4.1 checkpoint cannot be paired with the Qwen engine by
-accident. A cached model whose `config.json` `model_type` this build cannot load is not selectable,
-and saving one is refused by the server as well; the catalog adds the canonical supported releases
-that are not downloaded yet, so **Download** always has a valid target. The line under the list
-shows the snapshot the next launch or conversion will use. A launch or conversion for a model that
+accident; a Hub-only result is inspected through its `config.json` first, and one whose
+`model_type` this build cannot load is refused with the family named. A cached model that a
+different parser cannot load is not selectable, and saving one is refused by the server as well;
+the catalog adds the canonical supported releases that are not downloaded yet. The line under the
+list shows the snapshot the next launch or conversion will use. A launch or conversion for a model that
 is not in the cache is refused with the cache path in the message; stop and status still work. A
 non-empty `model.checkpoint` skips the lookup. Use it for a checkpoint outside the cache, and its
 `config.json` `model_type` is checked the same way.
@@ -399,7 +403,9 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
 | `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
-| `GET /api/models` | Models in the lead's hub cache, plus the swap shelf and each model's prepared ranks |
+| `GET /api/models` | Models in the lead's hub cache, plus the swap shelf, the family list and each model's prepared ranks |
+| `GET /api/models/search?q=&family=` | Hub search folded with the lead's cache; empty `q` lists the cache or the family's default term |
+| `GET /api/models/inspect?id=` | One model's profile: the cached entry, or its Hub `config.json` when it is not cached |
 | `GET /api/series?window_secs=N` | Downsampled graph window |
 | `GET /api/jobs`, `GET /api/jobs/{id}` | Job list and full log |
 | `POST /api/actions/convert` | `{ranks?: [0,1,2,3]}` for the active model; refused while it serves |

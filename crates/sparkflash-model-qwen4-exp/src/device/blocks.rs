@@ -37,8 +37,6 @@ use super::{
     GpuMoe, MAX_SELECTED_TOKENS,
 };
 
-/// The routed slots q4e_moe_permute sorts in shared memory (Q4E_MAX_PERMUTE).
-const MAX_PERMUTE_SLOTS: usize = 4096;
 /// The indexer blocks one q4e_qsa_scores CTA scores for a row (Q4E_QSA_TILE).
 const QSA_TILE: usize = 64;
 
@@ -732,9 +730,8 @@ impl DeviceSequence {
     /// The routed experts on the token kernels: the slots sorted into runs of one expert, then
     /// gate_up and down per run, into `self.expert_accumulator`'s [slot][hidden] partials.
     ///
-    /// q4e_moe_permute sorts at most MAX_PERMUTE_SLOTS slots in shared memory and leaves a wider
-    /// batch unsorted, so a chunk past that runs in slices of whole tokens, each offset into the
-    /// chunk's indices, weights and partials.
+    /// The plan is the shared `moe_plan` (kernels/moe_plan_sm121.cu), so the run bounds the
+    /// expert kernels read come from the same counting pass GLM's and DeepSeek's experts use.
     fn routed_experts(
         &self,
         experts: &GpuExperts,
@@ -754,115 +751,133 @@ impl DeviceSequence {
         const WARPS: usize = 8;
         const ROWS: usize = 2;
         const DOWN_ROWS: usize = 4;
-        let per_slice = (MAX_PERMUTE_SLOTS / topk.max(1)).max(1);
-        let mut base = 0usize;
-        while base < batch {
-            let count = per_slice.min(batch - base);
-            let indices = self.expert_indices.offset(base * topk * 4);
-            let weights = self.probabilities.offset(base * config.num_experts * 4);
-            let input = mixed.offset(base * hidden * 4);
-            let partials = self.expert_accumulator.offset(base * topk * hidden * 4);
+        let count = batch;
+        let indices = self.expert_indices;
+        let weights = self.probabilities;
+        let input = mixed;
+        let partials = self.expert_accumulator;
+        // The plan writes both outputs this path reads: `sorted` (the run order, which its
+        // expert kernels take as `perm`) and the run bounds. Qwen passes no item list and no
+        // segments, so its slice of the shared kernel is the token path's.
+        {
             self.launch(
-                kernels.moe_permute,
+                kernels.moe_plan,
                 (1, 1, 1),
-                (256, 1, 1),
+                (
+                    sparkflash_model::active_profile().plan.block_threads(),
+                    1,
+                    1,
+                ),
                 &[
                     indices.0,
                     self.expert_perm.0,
+                    0,
+                    0,
                     self.expert_run.0,
                     (count * topk) as u64,
+                    config.num_experts as u64,
+                    topk as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 ],
             )?;
-            let gate_up_grid = (
-                intermediate.div_ceil(WARPS * ROWS) as u32,
+        }
+        let gate_up_grid = (
+            intermediate.div_ceil(WARPS * ROWS) as u32,
+            topk as u32,
+            count as u32,
+        );
+        let down_grid = |rows: usize| {
+            (
+                hidden.div_ceil(WARPS * rows) as u32,
                 topk as u32,
                 count as u32,
-            );
-            let down_grid = |rows: usize| {
-                (
-                    hidden.div_ceil(WARPS * rows) as u32,
-                    topk as u32,
-                    count as u32,
-                )
-            };
-            let block = ((WARPS * 32) as u32, 1, 1);
-            match *experts {
-                GpuExperts::Nvfp4 { table, scales } => {
-                    self.launch(
-                        kernels.expert_gate_up,
-                        gate_up_grid,
-                        block,
-                        &[
-                            table.0,
-                            scales.0,
-                            indices.0,
-                            self.expert_perm.0,
-                            self.expert_run.0,
-                            input.0,
-                            self.expert_activated.0,
-                            topk as u64,
-                            hidden as u64,
-                            intermediate as u64,
-                        ],
-                    )?;
-                    self.launch(
-                        kernels.expert_down,
-                        down_grid(DOWN_ROWS),
-                        block,
-                        &[
-                            table.0,
-                            scales.0,
-                            indices.0,
-                            self.expert_perm.0,
-                            self.expert_run.0,
-                            weights.0,
-                            self.expert_activated.0,
-                            partials.0,
-                            topk as u64,
-                            hidden as u64,
-                            intermediate as u64,
-                            config.num_experts as u64,
-                        ],
-                    )?;
-                }
-                GpuExperts::Fp8 { table } => {
-                    self.launch(
-                        kernels.expert_gate_up_fp8,
-                        gate_up_grid,
-                        block,
-                        &[
-                            table.0,
-                            indices.0,
-                            self.expert_perm.0,
-                            self.expert_run.0,
-                            input.0,
-                            self.expert_activated.0,
-                            topk as u64,
-                            hidden as u64,
-                            intermediate as u64,
-                        ],
-                    )?;
-                    self.launch(
-                        kernels.expert_down_fp8,
-                        down_grid(ROWS),
-                        block,
-                        &[
-                            table.0,
-                            indices.0,
-                            self.expert_perm.0,
-                            self.expert_run.0,
-                            weights.0,
-                            self.expert_activated.0,
-                            partials.0,
-                            topk as u64,
-                            hidden as u64,
-                            intermediate as u64,
-                            config.num_experts as u64,
-                        ],
-                    )?;
-                }
+            )
+        };
+        let block = ((WARPS * 32) as u32, 1, 1);
+        match *experts {
+            GpuExperts::Nvfp4 { table, scales } => {
+                self.launch(
+                    kernels.expert_gate_up,
+                    gate_up_grid,
+                    block,
+                    &[
+                        table.0,
+                        scales.0,
+                        indices.0,
+                        self.expert_perm.0,
+                        self.expert_run.0,
+                        input.0,
+                        self.expert_activated.0,
+                        topk as u64,
+                        hidden as u64,
+                        intermediate as u64,
+                    ],
+                )?;
+                self.launch(
+                    kernels.expert_down,
+                    down_grid(DOWN_ROWS),
+                    block,
+                    &[
+                        table.0,
+                        scales.0,
+                        indices.0,
+                        self.expert_perm.0,
+                        self.expert_run.0,
+                        weights.0,
+                        self.expert_activated.0,
+                        partials.0,
+                        topk as u64,
+                        hidden as u64,
+                        intermediate as u64,
+                        config.num_experts as u64,
+                    ],
+                )?;
             }
-            base += count;
+            GpuExperts::Fp8 { table } => {
+                self.launch(
+                    kernels.expert_gate_up_fp8,
+                    gate_up_grid,
+                    block,
+                    &[
+                        table.0,
+                        indices.0,
+                        self.expert_perm.0,
+                        self.expert_run.0,
+                        input.0,
+                        self.expert_activated.0,
+                        topk as u64,
+                        hidden as u64,
+                        intermediate as u64,
+                    ],
+                )?;
+                self.launch(
+                    kernels.expert_down_fp8,
+                    down_grid(ROWS),
+                    block,
+                    &[
+                        table.0,
+                        indices.0,
+                        self.expert_perm.0,
+                        self.expert_run.0,
+                        weights.0,
+                        self.expert_activated.0,
+                        partials.0,
+                        topk as u64,
+                        hidden as u64,
+                        intermediate as u64,
+                        config.num_experts as u64,
+                    ],
+                )?;
+            }
         }
         Ok(())
     }

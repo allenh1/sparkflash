@@ -242,41 +242,41 @@ impl DraftState {
         let logits = load("opt_draft_sm121.cubin", "opt_draft_logits")?;
         let head_quant = load("opt_draft_sm121.cubin", "opt_draft_head_fp8")?;
         let logits_fp8 = load("opt_draft_sm121.cubin", "opt_draft_logits_fp8")?;
-        // The head logits on the tensor cores from LOGITS_MMA_ROWS rows on
-        // (SPARKFLASH_DRAFT_LOGITS_MMA=0: the CUDA-core form at every row count; =fp8: the rows
-        // as E4M3 codes into the block-scaled MMA).
-        let logits_mma = match std::env::var("SPARKFLASH_DRAFT_LOGITS_MMA").as_deref() {
-            Ok("0") => None,
-            Ok("fp8") => Some((
+        let drafter = &sparkflash_model::active_profile().drafter;
+        // The head logits on the tensor cores from the profile's row threshold
+        // ([sparkflash_model::DrafterProfile::min_logits_rows]); [DraftLogitsKernel::Simt] is the
+        // CUDA-core form at every row count, and [DraftLogitsKernel::Fp8] feeds the rows as E4M3
+        // codes into the block-scaled MMA.
+        let logits_mma = match drafter.logits_kernel() {
+            sparkflash_model::DraftLogitsKernel::Simt => None,
+            sparkflash_model::DraftLogitsKernel::Fp8 => Some((
                 load("opt_mma_sm121.cubin", "opt_mma_fp8_rowscale_f32o")?,
                 true,
             )),
-            _ => Some((
+            sparkflash_model::DraftLogitsKernel::Bf16 => Some((
                 load("opt_mma_sm121.cubin", "opt_mma_bf16a_fp8row_f32o")?,
                 false,
             )),
         };
-        let head_tiled = match (
-            std::env::var("SPARKFLASH_DRAFT_LOGITS_MMA").is_ok(),
-            std::env::var("SPARKFLASH_DRAFT_HEAD_TILED").as_deref(),
-        ) {
-            (true, _) | (_, Ok("0")) => None,
-            _ => load("opt_draft_sm121.cubin", "opt_draft_head_fp8t")
+        let head_tiled = if drafter.head_tiled() {
+            load("opt_draft_sm121.cubin", "opt_draft_head_fp8t")
                 .and_then(|quant| {
                     Ok((
                         quant,
                         load("opt_mma_sm121.cubin", "opt_mma_head_fp8t_f32o")?,
                     ))
                 })
-                .ok(),
+                .ok()
+        } else {
+            None
         };
         let markov = load("opt_draft_sm121.cubin", "opt_draft_markov")?;
         let fold_prob = load("opt_draft_sm121.cubin", "opt_draft_fold_prob")?;
         let pick_prob = load("opt_draft_sm121.cubin", "opt_draft_pick_prob")?;
         let embed_blocks = load("opt_draft_sm121.cubin", "opt_draft_embed_blocks")?;
-        // The Markov biases on the tensor cores (SPARKFLASH_DRAFT_MARKOV_MMA=0: a warp sum per
-        // sequence and entry, the one-sequence kernel's bits).
-        let simt = std::env::var("SPARKFLASH_DRAFT_MARKOV_MMA").as_deref() == Ok("0");
+        // The Markov biases on the tensor cores, or a warp sum per sequence and entry, the
+        // one-sequence kernel's bits, when the profile says not.
+        let simt = !drafter.markov_mma();
         let (markov_seqs, pass_seqs) = if simt {
             (
                 load("opt_draft_sm121.cubin", "opt_draft_markov_seqs")?,
@@ -288,23 +288,22 @@ impl DraftState {
                 MAX_SEQS,
             )
         };
-        let pass_seqs = std::env::var("SPARKFLASH_DRAFT_SEQS")
-            .ok()
-            .and_then(|seqs| seqs.parse::<usize>().ok())
+        let pass_seqs = drafter
+            .seqs
             .map_or(pass_seqs, |seqs| seqs.clamp(1, pass_seqs));
         let fold_seqs = load("opt_draft_sm121.cubin", "opt_draft_fold_seqs")?;
         let pick_seqs = load("opt_draft_sm121.cubin", "opt_draft_pick_seqs")?;
         let router = load("opt_router_sm121.cubin", "opt_router_e128k3_sm121")?;
         let gate_up = load("opt_moe_sm121.cubin", "opt_moe_gate_up_k3_sm121")?;
         let down = load("opt_moe_sm121.cubin", "opt_moe_down_combine_k3_sm121")?;
-        let dedup = if std::env::var("SPARKFLASH_DRAFT_MOE_DEDUP").as_deref() == Ok("0") {
-            None
-        } else {
+        let dedup = if drafter.moe_dedup() {
             Some([
                 load("opt_moe_sm121.cubin", "opt_moe_gate_up_dedup_k3_sm121")?,
                 load("opt_moe_sm121.cubin", "opt_moe_down_dedup_sm121")?,
                 load("opt_moe_sm121.cubin", "opt_moe_combine_k3_sm121")?,
             ])
+        } else {
+            None
         };
         let kernels = DraftKernels {
             _modules: modules,
@@ -418,12 +417,12 @@ impl DraftState {
         let chunks = crate::tp4_tail::CHUNKS_PER_RANK;
         let markov_head = ptr("mtp.2.markov_head.head.weight".to_owned())?
             + (device.tp_rank * vocab * MARKOV_RANK * 2) as u64;
-        let head_fp8 = if std::env::var("SPARKFLASH_DSPARK_HEAD_FP8").as_deref() == Ok("0") {
-            None
-        } else {
+        let head_fp8 = if drafter.head_fp8() {
             // Whole 128-entry tiles, for the tiled copy.
             let entries = vocab.next_multiple_of(128);
             Some((alloc(entries * dim)?, alloc(entries * dim / 32)?))
+        } else {
+            None
         };
         let r = R_MAX;
         Ok(Self {
@@ -501,16 +500,11 @@ fn span(device: u64, len: usize) -> DeviceSpan {
     DeviceSpan::new(device, len)
 }
 
-/// The fewest head rows the tensor-core logits serve (SPARKFLASH_DRAFT_LOGITS_MMA_ROWS, default
-/// 16): below it, the CUDA-core form, which one sequence's block reads faster.
+/// The fewest head rows the tensor-core logits serve
+/// ([sparkflash_model::DrafterProfile::min_logits_rows], 16 by default): below it, the
+/// CUDA-core form, which one sequence's block reads faster.
 fn logits_mma_rows() -> usize {
-    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ROWS.get_or_init(|| {
-        std::env::var("SPARKFLASH_DRAFT_LOGITS_MMA_ROWS")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(16)
-    })
+    sparkflash_model::active_profile().drafter.min_logits_rows()
 }
 
 /// [launch_opt] over the drafter's rows: up to [DRAFT_ROWS] stay on the GEMV, so a several-block
@@ -596,13 +590,13 @@ impl DeviceLayer<'_> {
             (draft.main_x, draft.main_codes, draft.main_scales)
         };
         // A decode step's rows split main_proj's columns over the ranks (each reads a quarter of
-        // the 79 MB weight) and exchange the slices; SPARKFLASH_DRAFT_SEED_SPLIT=0 runs it whole on
-        // every rank. The columns' arithmetic is the whole run's.
+        // the 79 MB weight) and exchange the slices; a profile that turns the split off runs it
+        // whole on every rank. The columns' arithmetic is the whole run's.
         let split = match (sp, self.device_exchange()) {
             (None, Some((world, rank)))
                 if n <= R_MAX
                     && dim.is_multiple_of(32 * world)
-                    && std::env::var("SPARKFLASH_DRAFT_SEED_SPLIT").as_deref() != Ok("0") =>
+                    && sparkflash_model::active_profile().drafter.seed_split() =>
             {
                 Some((world, rank))
             }
@@ -1073,11 +1067,9 @@ impl DeviceLayer<'_> {
     /// The pass's row table when `blocks` are several lanes' blocks of one size, back to back from
     /// row 0, whose stage rings all sit at the lane's offset from the first block's: each row's
     /// {lane offset, position} goes to `draft.row_tab`, which no launch still reads (the last pass
-    /// that did was read back). None under SPARKFLASH_DRAFT_TABLE=0.
+    /// that did was read back). None when the profile turns the table off.
     fn draft_row_table(&self, draft: &DraftState, blocks: &[Seg]) -> Result<Option<u64>, String> {
-        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let off =
-            *OFF.get_or_init(|| std::env::var("SPARKFLASH_DRAFT_TABLE").as_deref() == Ok("0"));
+        let off = !sparkflash_model::active_profile().drafter.build_row_table();
         let (Some(lanes), Some(first)) = (self.lanes.as_ref(), blocks.first()) else {
             return Ok(None);
         };

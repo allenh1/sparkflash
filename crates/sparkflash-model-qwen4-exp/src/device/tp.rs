@@ -213,24 +213,6 @@ fn gather_in_place(
         .map_err(collective_error)
 }
 
-/// A switch read from the environment: 0 or 1, on when unset; any other value refuses.
-///
-/// `SPARKFLASH_SEQUENCE_PARALLEL` says whether a prefill chunk's hyper-connections run
-/// sequence-parallel, `SPARKFLASH_SEQUENCE_OVERLAP` whether such a chunk overlaps its collectives
-/// with the other half's compute ([DeviceSequence::overlapped_layers]).
-fn switch(name: &str) -> Result<bool, BackendError> {
-    match std::env::var(name) {
-        Err(std::env::VarError::NotPresent) => Ok(true),
-        Ok(value) if value == "1" => Ok(true),
-        Ok(value) if value == "0" => Ok(false),
-        Ok(value) => Err(BackendError::new(
-            "qwen4_tp",
-            format!("{name}={value:?} is neither 0 nor 1"),
-        )),
-        Err(error) => Err(BackendError::new("qwen4_tp", format!("{name}: {error}"))),
-    }
-}
-
 fn collective_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::new("qwen4_tp", error.to_string())
 }
@@ -291,8 +273,14 @@ impl TensorParallel {
             two_shot_rows,
             slots,
             rows,
-            sequence_parallel: switch("SPARKFLASH_SEQUENCE_PARALLEL")?,
-            overlap: switch("SPARKFLASH_SEQUENCE_OVERLAP")?,
+            sequence_parallel: sparkflash_model::active_profile()
+                .sequence
+                .parallel
+                .unwrap_or(true),
+            overlap: sparkflash_model::active_profile()
+                .sequence
+                .overlap
+                .unwrap_or(true),
         })
     }
 }

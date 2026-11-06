@@ -125,7 +125,12 @@ impl GraphMode {
 fn mode() -> Result<GraphMode, String> {
     static MODE: OnceLock<Result<GraphMode, String>> = OnceLock::new();
     MODE.get_or_init(|| {
-        GraphMode::from_env_value(std::env::var("SPARKFLASH_CUDA_GRAPH").ok().as_deref())
+        GraphMode::from_env_value(
+            sparkflash_model::active_profile()
+                .diagnostics
+                .cuda_graph
+                .as_deref(),
+        )
     })
     .clone()
 }

@@ -17,10 +17,67 @@
 use sparkflash_ops::attention::{AttentionKind, AttentionPlan, SplitKvDecodePlan};
 use sparkflash_ops::collective::{CollectiveKind, CollectivePlan};
 use sparkflash_ops::epilogue::{GatherPlan, NormKind, NormPlan, QuantizePlan};
-use sparkflash_ops::gemm::{DenseGemmPlan, GroupedMoeGemmPlan, MoeRoutingPlan};
+use sparkflash_ops::gemm::{DenseGemmPlan, ExpertCombinePlan, GroupedMoeGemmPlan, MoeRoutingPlan};
+use sparkflash_ops::images::Image;
 use sparkflash_ops::parity::{LayerPlan, ParityReport, Tolerance};
-use sparkflash_ops::plan::{DType, Layout, Matrix, OpKind, OpPlan, Precision, StreamId};
+use sparkflash_ops::plan::{DType, KernelId, Layout, Matrix, OpKind, OpPlan, Precision, StreamId};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
+
+/// Every kernel the typed plans can produce, paired with the image that exports its symbol.
+///
+/// [Image] exposes no symbol list, so this literal table is the pin: a symbol rename that leaves
+/// a plan pointing at another image fails here instead of launching from the wrong cubin.
+const PLAN_KERNELS: &[(Image, &str)] = &[
+    (Image::Deepseek, "b12x_mxfp8_dense_sm121"),
+    (Image::Deepseek, "b12x_mxfp8_dense_split_k_sm121"),
+    (Image::Deepseek, "b12x_mxfp4_moe_sm121"),
+    (Image::GlmPrefill, "glm_prefill_fp8b128_mma"),
+    (Image::GlmPrefill, "glm_prefill_bf16_mma"),
+    (Image::Qwen4Exp, "q4e_gemm_bf16"),
+    (Image::GlmMoe, "glm_moe_fp8b128_mma"),
+    (Image::GlmMoe, "glm_moe_fp8b128_mma_bf16a"),
+    (Image::Qwen4Moe, "q4e_expert_gate_up"),
+    (Image::Deepseek, "moe_router_sm121"),
+    (Image::Deepseek, "moe_routed_combine_sm121"),
+    (Image::Deepseek, "flash_mla_csa2_sm121"),
+    (Image::Qwen4Attn, "q4e_attn"),
+    (Image::Qwen4Attn, "q4e_attn_group"),
+    (Image::Qwen4Attn, "q4e_attn_group6"),
+    (Image::Deepseek, "flash_mla_csa2_seq_sm121"),
+    (Image::Deepseek, "flash_mla_csa2_ring_sm121"),
+    (Image::Deepseek, "opt_attn_sm121"),
+];
+
+fn dense_kernel(precision: Precision, split_k: usize) -> KernelId {
+    let layout = match precision {
+        Precision::MxFp8 => Layout::BlockScaled { block: 32 },
+        Precision::NvFp4 => Layout::BlockScaled { block: 16 },
+        Precision::Fp8E4M3 => Layout::BlockScaled { block: 128 },
+        Precision::F32 | Precision::Bf16 => Layout::RowMajor,
+    };
+    DenseGemmPlan::new(
+        Matrix::new(64, 2560),
+        2560,
+        precision,
+        layout,
+        StreamId(0),
+        split_k,
+    )
+    .expect("a valid dense GEMM")
+    .kernel()
+}
+
+fn grouped_kernel(precision: Precision) -> KernelId {
+    GroupedMoeGemmPlan::new(512, 2560, 1024, 512, 10, precision, StreamId(0))
+        .expect("a valid grouped MoE GEMM")
+        .kernel()
+}
+
+fn attention_kernel(kind: AttentionKind) -> KernelId {
+    AttentionPlan::new(kind, 8, 262_144, 128, Precision::Bf16, StreamId(0))
+        .expect("a valid attention plan")
+        .kernel()
+}
 
 #[test]
 fn a_dense_gemm_names_one_kernel_and_allocates_nothing_at_launch() {
@@ -82,6 +139,168 @@ fn a_grouped_moe_gemm_validates_its_expert_table() {
         GroupedMoeGemmPlan::new(1, 1, 1, 2, 3, Precision::NvFp4, StreamId(0)).is_err(),
         "top-k past the expert count must be refused"
     );
+}
+
+#[test]
+fn grouped_attention_selects_the_kernel_for_its_head_group() {
+    let six = AttentionPlan::new(
+        AttentionKind::Gqa {
+            query_heads: 24,
+            kv_heads: 4,
+        },
+        8,
+        262_144,
+        128,
+        Precision::Bf16,
+        StreamId(0),
+    )
+    .expect("valid");
+    assert_eq!(six.group_size(), 6);
+    assert_eq!(
+        six.kernel(),
+        KernelId::new(Image::Qwen4Attn, "q4e_attn_group6")
+    );
+    assert_eq!(six.launch().shared_bytes, 63_600);
+
+    for (query_heads, kv_heads) in [(24, 6), (32, 8)] {
+        let other = AttentionPlan::new(
+            AttentionKind::Gqa {
+                query_heads,
+                kv_heads,
+            },
+            8,
+            262_144,
+            128,
+            Precision::Bf16,
+            StreamId(0),
+        )
+        .expect("valid");
+        assert_eq!(other.group_size(), 4);
+        assert_eq!(
+            other.kernel(),
+            KernelId::new(Image::Qwen4Attn, "q4e_attn_group")
+        );
+        assert_eq!(other.launch().shared_bytes, 45_136);
+    }
+
+    let twelve = AttentionPlan::new(
+        AttentionKind::Gqa {
+            query_heads: 24,
+            kv_heads: 2,
+        },
+        8,
+        262_144,
+        128,
+        Precision::Bf16,
+        StreamId(0),
+    )
+    .expect("valid");
+    assert_eq!(twelve.group_size(), 12);
+    assert_eq!(twelve.kernel(), KernelId::new(Image::Qwen4Attn, "q4e_attn"));
+    assert_eq!(twelve.launch().shared_bytes, 0);
+}
+
+#[test]
+fn a_grouped_moe_gemm_refuses_mxfp8_until_a_grouped_kernel_exists() {
+    let error = GroupedMoeGemmPlan::new(512, 2560, 1024, 512, 10, Precision::MxFp8, StreamId(0))
+        .expect_err("no grouped MXFP8 expert kernel");
+    assert!(error.to_string().contains("mxfp8"));
+}
+
+#[test]
+fn every_plan_kernel_names_the_image_that_exports_its_symbol() {
+    let decode = AttentionPlan::new(
+        AttentionKind::Mla,
+        8,
+        262_144,
+        128,
+        Precision::Bf16,
+        StreamId(0),
+    )
+    .expect("valid");
+    let produced = [
+        ("dense mxfp8", dense_kernel(Precision::MxFp8, 1)),
+        ("dense mxfp8 split-k", dense_kernel(Precision::MxFp8, 5)),
+        ("dense nvfp4", dense_kernel(Precision::NvFp4, 1)),
+        ("dense e4m3", dense_kernel(Precision::Fp8E4M3, 1)),
+        ("dense bf16", dense_kernel(Precision::Bf16, 1)),
+        ("dense f32", dense_kernel(Precision::F32, 1)),
+        ("grouped nvfp4", grouped_kernel(Precision::NvFp4)),
+        ("grouped e4m3", grouped_kernel(Precision::Fp8E4M3)),
+        ("grouped bf16", grouped_kernel(Precision::Bf16)),
+        ("grouped f32", grouped_kernel(Precision::F32)),
+        (
+            "router",
+            MoeRoutingPlan::new(8, 2560, 512, 10, StreamId(0))
+                .expect("valid")
+                .kernel(),
+        ),
+        (
+            "combine f32",
+            ExpertCombinePlan::new(8, 2560, 10, DType::F32, StreamId(0))
+                .expect("valid")
+                .kernel(),
+        ),
+        (
+            "combine bf16",
+            ExpertCombinePlan::new(8, 2560, 10, DType::Bf16, StreamId(0))
+                .expect("valid")
+                .kernel(),
+        ),
+        ("mla", attention_kernel(AttentionKind::Mla)),
+        (
+            "gqa group 4",
+            attention_kernel(AttentionKind::Gqa {
+                query_heads: 24,
+                kv_heads: 6,
+            }),
+        ),
+        (
+            "gqa group 6",
+            attention_kernel(AttentionKind::Gqa {
+                query_heads: 24,
+                kv_heads: 4,
+            }),
+        ),
+        (
+            "gqa group 12",
+            attention_kernel(AttentionKind::Gqa {
+                query_heads: 24,
+                kv_heads: 2,
+            }),
+        ),
+        (
+            "sparse",
+            attention_kernel(AttentionKind::Sparse {
+                selected: 64,
+                block: 4,
+            }),
+        ),
+        ("csa2", attention_kernel(AttentionKind::Csa2 { ratio: 4 })),
+        (
+            "split-kv decode",
+            SplitKvDecodePlan::new(decode, 4).expect("valid").kernel(),
+        ),
+    ];
+
+    for (name, kernel) in &produced {
+        assert!(
+            PLAN_KERNELS.contains(&(kernel.image, kernel.symbol)),
+            "{name} produces {}::{} which is not in the pinned table",
+            kernel.image.name(),
+            kernel.symbol
+        );
+    }
+    for expected in PLAN_KERNELS {
+        assert!(
+            produced
+                .iter()
+                .any(|(_, kernel)| (kernel.image, kernel.symbol) == *expected),
+            "no plan produces {}::{}",
+            expected.0.name(),
+            expected.1
+        );
+    }
 }
 
 #[test]

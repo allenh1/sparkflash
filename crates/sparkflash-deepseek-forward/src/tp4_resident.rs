@@ -86,7 +86,9 @@ pub struct RankSetup {
 /// caller (`args.source`); this is the setup both the evidence path and the device loop need.
 pub fn load_rank_setup(args: &ResidentArgs) -> Result<RankSetup, String> {
     let (entries, source_kind, tensors_seen) = load_entries(args)?;
-    let plan = ResidentPlan::plan(args.rank, args.world, entries)
+    let tp = sparkflash_model::TpPlan::new(args.world, args.rank)
+        .map_err(|error| format!("plan rank {}: {error}", args.rank))?;
+    let plan = ResidentPlan::plan_with_tp(tp, entries)
         .map_err(|error| format!("plan rank {}: {error}", args.rank))?;
     let shard_plan = plan
         .shard_plan()
@@ -751,10 +753,8 @@ fn check_mem_available_once_for_plan(plan: &ResidentPlan, floor_bytes: u64) -> R
 #[allow(dead_code)] // device-arm scaffolding: called once the loop pre-flight is wired
 fn mem_available_floor_bytes() -> u64 {
     let mut floor = 12u64 << 30;
-    if let Ok(text) = std::env::var("SPARKFLASH_MEM_FLOOR_GIB")
-        && let Ok(gib) = text.trim().parse::<u64>()
-    {
-        floor = gib << 30;
+    if let Some(gib) = sparkflash_model::active_profile().runtime.mem_floor_gib {
+        floor = (gib as u64) << 30;
     }
     floor
 }
@@ -864,16 +864,13 @@ pub fn upload_arena_streaming<T>(
     let before = mem_available_bytes();
     check_mem_available_once_for_plan(plan, floor)?;
 
-    let use_mmap = std::env::var("SPARKFLASH_ARENA_MMAP")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let verify_weights = std::env::var("SPARKFLASH_VERIFY_WEIGHTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let profile = sparkflash_model::active_profile();
+    let use_mmap = profile.runtime.arena_mmap.unwrap_or(false);
+    let verify_weights = profile.runtime.verify_weights.unwrap_or(false);
     // Plain device memory (cuMemAlloc) by default: on GB10 the GPU streams a host-mapped slab at
     // about half the bandwidth of cuMemAlloc memory (measured 113 vs 237 GB/s on the same GEMV),
     // so the resident weights live in device allocations unless SPARKFLASH_ARENA_HOSTMAPPED=1.
-    let host_mapped = std::env::var("SPARKFLASH_ARENA_HOSTMAPPED").as_deref() == Ok("1");
+    let host_mapped = profile.runtime.arena_hostmapped.unwrap_or(false);
     let mode = if use_mmap {
         AllocationMode::MmapRegistered
     } else if host_mapped {
@@ -885,8 +882,10 @@ pub fn upload_arena_streaming<T>(
     // one chunk, not as each tensor is read in).
     let mut allocator = CudaArenaAllocator::with_mode(&cuda, mode);
 
-    let converted_file = std::env::var("SPARKFLASH_CONVERTED_DIR")
-        .ok()
+    let converted_file = profile
+        .runtime
+        .converted_dir
+        .as_deref()
         .map(PathBuf::from)
         .and_then(|dir| {
             sparkflash_device::converted::find_converted_rank_file(&dir, plan.rank(), plan.world())
