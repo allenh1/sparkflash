@@ -30,6 +30,12 @@ pub const QWEN38_FLASH_NEXT_ID: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
 /// The control-plane weight selector for the Qwen3.8-Flash-Next checkpoint.
 pub const QWEN38_FLASH_NEXT_WEIGHTS_ID: &str = "qwen3.8-flash-next-nvfp4";
 
+/// The served id of the official Qwen3.8-Flash-Next FP8 checkpoint.
+pub const QWEN38_FLASH_NEXT_FP8_ID: &str = "Qwen/Qwen3.8-Flash-Next-FP8";
+
+/// The control-plane weight selector for the official FP8 checkpoint.
+pub const QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID: &str = "qwen3.8-flash-next-fp8";
+
 /// The context window of the released Qwen3.8-Flash-Next checkpoint.
 pub const QWEN38_CONTEXT_TOKENS: usize = 262_144;
 
@@ -64,6 +70,7 @@ pub const GLM53_VOCAB_SIZE: usize = 154_880;
 pub const WEIGHT_IDS: &[&str] = &[
     DEFAULT_WEIGHTS_ID,
     QWEN38_FLASH_NEXT_WEIGHTS_ID,
+    QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
     GLM53_FLASH_WEIGHTS_ID,
 ];
 
@@ -141,6 +148,19 @@ impl ModelDescriptor {
         }
     }
 
+    /// The official Qwen3.8-Flash-Next FP8 descriptor.
+    ///
+    /// The architecture is the NVFP4 arm's; only the routed experts' storage differs, so the
+    /// geometry, window and vocabulary are the same and only the identity changes.
+    #[must_use]
+    pub fn qwen38_flash_next_fp8() -> Self {
+        Self {
+            id: QWEN38_FLASH_NEXT_FP8_ID.to_owned(),
+            weights_id: QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID.to_owned(),
+            ..Self::qwen38_flash_next_nvfp4()
+        }
+    }
+
     /// The released zai-org/GLM-5.3-Flash descriptor.
     ///
     /// The vision tower is in the checkpoint but is not loaded, so vision is not declared. The
@@ -190,6 +210,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
     vec![
         ModelDescriptor::v41_flash(),
         ModelDescriptor::qwen38_flash_next_nvfp4(),
+        ModelDescriptor::qwen38_flash_next_fp8(),
         ModelDescriptor::glm53_flash(),
     ]
 });

@@ -89,9 +89,6 @@
 #define q4e_e4m3 spark_fp8_e4m3_decode
 #define q4e_e2m1 spark_fp4_e2m1_decode
 
-__device__ __forceinline__ float q4e_silu(float value) {
-    return value / (1.0f + __expf(-value));
-}
 
 __device__ __forceinline__ float q4e_dot_pair(unsigned int word, float x0, float x1) {
     const float low = __bfloat162float(__ushort_as_bfloat16((unsigned short)(word & 0xFFFFu)));
@@ -276,39 +273,6 @@ __device__ __forceinline__ void q4e_row_dot_bf16_pair(
 }
 
 // Block argmax over (value, index) pairs, with the same tie-break as the host sort.
-__device__ __forceinline__ void q4e_block_best(float* value, int* index, float* shared_value,
-                                               int* shared_index) {
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int warps = (blockDim.x + 31) >> 5;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        q4e_take_better(__shfl_down_sync(0xFFFFFFFFu, *value, offset),
-                        __shfl_down_sync(0xFFFFFFFFu, *index, offset), value, index);
-    }
-    if (lane == 0) {
-        shared_value[warp] = *value;
-        shared_index[warp] = *index;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        float best_value = lane < warps ? shared_value[lane] : -INFINITY;
-        int best_index = lane < warps ? shared_index[lane] : 0x7FFFFFFF;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q4e_take_better(__shfl_down_sync(0xFFFFFFFFu, best_value, offset),
-                            __shfl_down_sync(0xFFFFFFFFu, best_index, offset), &best_value,
-                            &best_index);
-        }
-        if (lane == 0) {
-            shared_value[0] = best_value;
-            shared_index[0] = best_index;
-        }
-    }
-    __syncthreads();
-    *value = shared_value[0];
-    *index = shared_index[0];
-}
 
 
 // Widen one token's BF16 embedding row and replicate it across width = hc * hidden. With a token

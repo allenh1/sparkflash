@@ -63,6 +63,11 @@
 // geometry, not this staging or this combine.
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_moe_routed_round_slot_bits opt_round_slot_bits
+#define spark_moe_routed_narrow_bits opt_narrow_bits
 
 // 256 threads: the staging kernel copies one row per block and the combine kernel owns one 256-wide
 // column tile per block. Both are launch-geometry constants, pinned by the Rust ABI module.
@@ -97,22 +102,11 @@ static_assert(SPARK_MOE_ROUTED_COPY_ALIGN % 4u == 0u,
 // kept (half::bf16::from_f32's rule). For every finite value this equals __float2bfloat16_rn; the
 // integer form is kept because it is the one the reference states, and the NaN arm of the reference
 // is not the intrinsic's.
-__device__ __forceinline__ uint32_t spark_moe_routed_round_slot_bits(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
-        return (bits >> 16) | 0x0040u;
-    }
-    return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
-}
 
 // The host arm's bf16 narrow of the fused f32 total (crates/sparkflash-cli's bf16_le_bytes): the same
 // integer round as above WITHOUT the NaN special case, because the payload path spells
 // `(bits + 0x7fff + lsb) & 0xffff_0000` and that is what the reference computes for every value,
 // including a NaN total. Untyped as a bf16 word so no dtype conversion can reorder the bits.
-__device__ __forceinline__ uint16_t spark_moe_routed_narrow_bits(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
-}
 
 // Copies one staged slice with the widest typed path its size and alignment allow. `bytes == 0` is a
 // no-op (a zero-sized tensor would otherwise loop on a zero count, which is still correct but the

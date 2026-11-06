@@ -34,6 +34,12 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define opt_s_bf16_round opt_bf16_round
+#define opt_s_sigmoid opt_sigmoid
+#define opt_s_warp_sum opt_warp_sum_rn
 #include "m4_activation_quant_sm121.cuh"
 
 #define OPT_S_HIDDEN 5120u
@@ -50,30 +56,8 @@
 
 static_assert(OPT_S_COLS * OPT_S_HC == OPT_S_THREADS, "one stream value per thread");
 
-__device__ __forceinline__ float opt_s_bf16_round(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    if (value != value) {
-        return __uint_as_float((((bits >> 16) | 0x0040u)) << 16);
-    }
-    const uint32_t round = 0x7FFFu + ((bits >> 16) & 1u);
-    return __uint_as_float(((bits + round) >> 16) << 16);
-}
 
-__device__ __forceinline__ float opt_s_sigmoid(float value) {
-    if (value >= 0.0f) {
-        return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
-    }
-    const float exponential = expf(value);
-    return __fdiv_rn(exponential, __fadd_rn(1.0f, exponential));
-}
 
-__device__ __forceinline__ float opt_s_warp_sum(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = __fadd_rn(value, __shfl_down_sync(0xFFFFFFFFu, value, offset));
-    }
-    return value;
-}
 
 __device__ __forceinline__ void opt_s_normalise_columns(float comb[OPT_S_HC][OPT_S_HC], float hc_eps) {
     for (uint32_t column = 0; column < OPT_S_HC; ++column) {

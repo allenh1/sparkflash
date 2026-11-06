@@ -257,7 +257,7 @@ mod tests {
     fn the_kernel_text_clamps_both_branches_the_same_way() {
         // The device kernel must carry the same asymmetry; a source check is what a host test can
         // do about that, and it fails the moment someone tidies the two clamps into one.
-        let source = include_str!("../../../kernels/swiglu_mxfp8_quant_sm121.cu");
+        let source = include_str!("../../../kernels/swiglu_quant_sm121.cuh");
         assert!(
             source.contains("fminf(g, limit)"),
             "the gate branch is clamped on the upper side only"
@@ -274,84 +274,65 @@ mod tests {
 
     #[test]
     fn the_kernel_text_is_traced_in_both_launch_shapes() {
-        // The kernel is launched for two shapes and the telemetry scope follows the shape: cols = 640
-        // is the routed-expert epilogue (MOE_MXFP4 consumer), cols = 2304 the shared-expert path
-        // (DENSE_MXFP8 consumer). One scope expression feeds ENTER and EXIT, so a launch cannot open
-        // under one consumer and close under another. A later edit that hard-codes a scope, or
-        // deletes the instrumentation, fails here - the enabled macro bodies are type-checked by
-        // build.rs but that would not catch the scope being wrong for a shape.
-        let source = include_str!("../../../kernels/swiglu_mxfp8_quant_sm121.cu");
-        // Both entry points are in this one file and they record different scopes: the routed-expert
-        // epilogue (cols = 640) under MOE_MXFP4 and the shared-expert activation quantiser under
-        // DENSE_MXFP8. A "both names appear" check would pass on a comment alone, so the assertions
-        // below pin the ternary arms and the exact macro calls.
+        // The epilogue body is shared (kernels/swiglu_quant_sm121.cuh); the dense activation
+        // quantiser stays in its own entry file. Both carry the trace contract.
+        let body = include_str!("../../../kernels/swiglu_quant_sm121.cuh");
+        let entry = include_str!("../../../kernels/swiglu_mxfp8_quant_sm121.cu");
+        // The scope follows the launch shape: cols = 640 is the routed-expert epilogue
+        // (MOE_MXFP4 consumer), every other width the shared-expert path (DENSE_MXFP8 consumer).
+        // One expression feeds ENTER and EXIT, so a launch cannot open under one consumer and
+        // close under another.
         assert!(
-            source.contains("? TRACE_SCOPE_MOE_MXFP4")
-                && source.contains(": TRACE_SCOPE_DENSE_MXFP8"),
+            body.contains("? TRACE_SCOPE_MOE_MXFP4") && body.contains(": TRACE_SCOPE_DENSE_MXFP8"),
             "the ternary must map cols == 640 to MOE_MXFP4 and every other shape to DENSE_MXFP8"
         );
         assert!(
-            !source.contains("? TRACE_SCOPE_DENSE_MXFP8"),
+            !body.contains("? TRACE_SCOPE_DENSE_MXFP8"),
             "swapped ternary arms would record the shared expert under the FP4 scope"
         );
         assert!(
-            source.contains("const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED"),
+            body.contains("const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED"),
             "the scope must be computed once per launch, from the launch shape"
         );
         assert!(
-            source.contains("SPARK_GPU_TRACE_ENTER(trace_ring, trace_scope, t_enter)"),
+            body.contains("SPARK_GPU_TRACE_ENTER(trace_ring, trace_scope, t_enter)"),
             "the entry event must use the per-launch scope"
         );
         assert!(
-            source
-                .contains("SPARK_GPU_TRACE_EXIT(trace_ring, trace_scope, layer_id, meta, t_enter)"),
+            body.contains("SPARK_GPU_TRACE_EXIT(trace_ring, trace_scope, layer_id, meta, t_enter)"),
             "the exit event must use the same per-launch scope"
         );
-        // The second entry point, mxfp8_quantize_activations_sm121, has no shape ternary: it is the
-        // shared-expert input quantiser and must open AND close under DENSE_MXFP8.
+        // The second entry point, mxfp8_quantize_activations_sm121, has no shape ternary: it is
+        // the shared-expert input quantiser and must open AND close under DENSE_MXFP8.
         assert!(
-            source.contains("SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter)"),
+            entry.contains("SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter)"),
             "the activation quantiser must open under DENSE_MXFP8"
         );
         assert!(
-            source.contains(
+            entry.contains(
                 "SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter)"
             ),
             "the activation quantiser must close under DENSE_MXFP8"
         );
         assert!(
-            !source.contains("(void)trace_ring"),
+            !body.contains("(void)trace_ring") && !entry.contains("(void)trace_ring"),
             "a discarded trace ring means the instrumentation was deleted, not disabled"
         );
-        // payload_meta is the ACTIVE warp count times 32, not blockDim.x. For the real shapes the
-        // reporting block is fully live (8 warps = 256 values), but the clamp is what keeps a
-        // one-block grid from over-reporting idle warps. BOTH entry points carry the same two lines,
-        // so a whole-file contains() accepts a mutation of only one of them; split at the second
-        // entry point and assert the clamp and its use in EACH half, with the wrong forms refused in
-        // each half too.
-        const SECOND_ENTRY: &str = "extern \"C\" __global__ void mxfp8_quantize_activations_sm121";
-        let (routed_half, dense_half) = source
-            .split_once(SECOND_ENTRY)
-            .expect("the source must still have both entry points");
-        // Orient the split before trusting it: the shape ternary exists only in the first entry
-        // point, so a split at the wrong place cannot silently make both halves the same text.
-        assert!(
-            routed_half.contains("const uint64_t trace_scope = cols == SPARK_M4_MOE_WIDTH_PADDED")
-                && !dense_half.contains("trace_scope"),
-            "the split must put the shape ternary in the first half and no scope variable in the second"
-        );
-        for (what, half) in [
-            ("swiglu_mxfp8_quant_sm121", routed_half),
-            ("mxfp8_quantize_activations_sm121", dense_half),
+        // payload_meta is the ACTIVE warp count times 32, not blockDim.x: the clamp is what keeps
+        // a one-block grid from over-reporting idle warps. Both launch shapes carry the same two
+        // lines, so each is checked in its own source.
+        for (what, source) in [
+            ("swiglu_mxfp8_quant_sm121", body),
+            ("mxfp8_quantize_activations_sm121", entry),
         ] {
             assert!(
-                half.contains(
+                source.contains(
                     "remaining < warps_per_block ? (uint32_t)remaining : warps_per_block"
                 ),
                 "{what}: the active warp count must clamp a partly live block"
             );
             assert!(
-                half.contains("const uint32_t meta = active_warps * 32u;"),
+                source.contains("const uint32_t meta = active_warps * 32u;"),
                 "{what}: payload_meta must count the warps that actually quantised a block"
             );
             for wrong in [
@@ -359,7 +340,7 @@ mod tests {
                 "const uint32_t meta = blockDim.x;",
                 "const uint32_t meta = warps_per_block * 32u;",
             ] {
-                assert!(!half.contains(wrong), "{what}: {wrong} must not appear");
+                assert!(!source.contains(wrong), "{what}: {wrong} must not appear");
             }
         }
     }
@@ -615,43 +596,39 @@ mod tests {
         // quantiser, and the quantiser must be the shared activation rule, not a second recipe. The
         // window compares bits; this test keeps the source from quietly changing the order between
         // windows.
+        let body = include_str!("../../../kernels/swiglu_quant_sm121.cuh");
         let source = include_str!("../../../kernels/swiglu_mxfp8_quant_weighted_sm121.cu");
         assert!(
-            source.contains("fminf(g, limit)"),
+            body.contains("fminf(g, limit)"),
             "the weighted gate branch is clamped on the upper side only"
         );
         assert!(
-            source.contains("fminf(fmaxf(u, -limit), limit)"),
+            body.contains("fminf(fmaxf(u, -limit), limit)"),
             "the weighted up branch is clamped on both sides"
         );
-        let body = source
-            .split_once("extern \"C\" __global__ void swiglu_mxfp8_quant_weighted_sm121")
-            .expect("the weighted entry point must exist")
-            .1;
         let weighted = body
-            .find("__float2bfloat16_rn(activated * weights[row])")
+            .find("activated * weights[row]")
+            .expect("the product must be formed");
+        let rounded = body
+            .find("__float2bfloat16_rn(value)")
             .expect("the product must be rounded to bf16");
         let quantise = body
-            .find("spark_weighted_activation_quantize_block(")
+            .find("out_fp8[index] = spark_activation_quantize_block(")
             .expect("the quantiser must be the shared activation rule");
         assert!(
-            weighted < quantise,
+            weighted < rounded && rounded < quantise,
             "the bf16 rounding must happen before the quantiser, as the reference does"
-        );
-        assert!(
-            body.contains("const float weighted = __bfloat162float(__float2bfloat16_rn("),
-            "the rounded value must be widened back to f32 for the block-scale/encode helpers"
         );
         assert!(
             source.contains("const float *__restrict__ weights"),
             "the kernel must take the per-row routing weights as an operand"
         );
         assert!(
-            body.contains("weights[row]"),
-            "each row must be multiplied by its own routing weight"
+            source.contains("swiglu_quant_body<true>"),
+            "the weighted entry must run the shared body"
         );
         assert!(
-            !source.contains("out_fp8[index] = spark_fp8_e4m3_encode("),
+            !body.contains("out_fp8[index] = spark_fp8_e4m3_encode("),
             "the weighted path must quantise through its block helper, not a second inline recipe"
         );
     }

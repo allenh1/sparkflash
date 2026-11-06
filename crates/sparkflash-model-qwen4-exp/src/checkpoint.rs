@@ -368,6 +368,32 @@ impl Reader<'_> {
             .map_err(|error| error.to_string())?;
         Ok(Mat::new(rows, columns, data))
     }
+
+    /// One block-scaled FP8 expert matrix: E4M3 codes and the weight_scale_inv grid, one scale
+    /// a 128x128 tile. The official FP8 checkpoint stores the same experts this way.
+    fn fp8(&self, prefix: &str, rows: usize, columns: usize) -> Result<Mat, String> {
+        let mut weight = sparkflash_weights::linalg::decode_by_name(
+            self.source,
+            &format!("{prefix}.weight"),
+            usize::MAX,
+        )
+        .map_err(|error| error.to_string())?;
+        let scales = sparkflash_weights::linalg::decode_by_name(
+            self.source,
+            &format!("{prefix}.weight_scale_inv"),
+            usize::MAX,
+        )
+        .map_err(|error| error.to_string())?;
+        sparkflash_weights::linalg::apply_scales(
+            &mut weight,
+            rows,
+            columns,
+            &scales,
+            sparkflash_weights::linalg::ScaleGrid::Tile(128),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Mat::new(rows, columns, weight))
+    }
 }
 
 /// Build the host reference weights from a checkpoint source.
@@ -530,22 +556,19 @@ pub fn load_weights(
             experts: (0..config.num_experts)
                 .map(|expert| {
                     let prefix = format!("{mlp}.experts.{expert}");
+                    let decode = |name: &str, rows: usize, columns: usize| match config.expert_quant
+                    {
+                        crate::config::ExpertQuant::Nvfp4 => {
+                            reader.nvfp4(&format!("{prefix}.{name}"), rows, columns)
+                        }
+                        crate::config::ExpertQuant::Fp8Block => {
+                            reader.fp8(&format!("{prefix}.{name}"), rows, columns)
+                        }
+                    };
                     Ok(Expert {
-                        gate: reader.nvfp4(
-                            &format!("{prefix}.gate_proj"),
-                            config.moe_intermediate_size,
-                            hidden,
-                        )?,
-                        up: reader.nvfp4(
-                            &format!("{prefix}.up_proj"),
-                            config.moe_intermediate_size,
-                            hidden,
-                        )?,
-                        down: reader.nvfp4(
-                            &format!("{prefix}.down_proj"),
-                            hidden,
-                            config.moe_intermediate_size,
-                        )?,
+                        gate: decode("gate_proj", config.moe_intermediate_size, hidden)?,
+                        up: decode("up_proj", config.moe_intermediate_size, hidden)?,
+                        down: decode("down_proj", hidden, config.moe_intermediate_size)?,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,

@@ -276,6 +276,10 @@ fn parse_args() -> Args {
     }
 }
 
+#[path = "support/mem.rs"]
+mod mem;
+use mem::mem_available_kb;
+
 fn main() -> Result<(), String> {
     let args = parse_args();
     check_moe_layout(pre_padded_moe_layout()).map_err(|e| format!("layout rejected: {e}"))?;
@@ -575,14 +579,6 @@ type CuEvent = *mut c_void;
 /// MemAvailable in kB, parsed. Interpolating the whole /proc line into a message produced
 /// "...the node has ~MemAvailable: 3768676 kB GB of system memory available...", which is exactly
 /// the kind of unreadable failure text this launcher exists to avoid.
-fn mem_available_kb() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    text.lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-}
-
 /// The cuLaunchKernel signature. The parameter list is long by nature, so it is named once here
 /// rather than spelled out at the one call site.
 type LaunchFn = unsafe extern "C" fn(

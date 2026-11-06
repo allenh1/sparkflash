@@ -7,6 +7,30 @@ block drafter.** The pack is `sparkflash-model-qwen4-exp`, registered as
 forward arm: the model runs on the device or not at all. The current rates are in
 [Where it stands](#where-it-stands); the sections after it record how the arm got there.
 
+## The FP8 checkpoint
+
+The official `Qwen/Qwen3.8-Flash-Next-FP8` release is the same architecture with one storage
+difference: the 24,576 routed experts are **E4M3 codes with one BF16 inverse scale a 128x128
+tile** (`fp8_e4m3fn_b128`) instead of packed E2M1 with E4M3 16-column groups. Every other main-
+model tensor keeps its BF16 or F32 values, and the PLE table is the same FP8 table with one
+per-tensor scale. The pack parses that document into the same typed configuration and records the
+format as `ExpertQuant::Fp8Block`; the tensor plan names `weight_scale_inv` where the NVFP4 plan
+names `weight_scale`/`weight_scale_2`, and the device arm routes the experts through the FP8
+expert kernels the MTP layer already used.
+
+```bash
+sparkflash serve --model qwen3.8-flash-next-fp8 --checkpoint "$FP8_CKPT" --context 262144
+# or, with the checkpoint's own config.json doing the detection:
+sparkflash serve --checkpoint "$FP8_CKPT" --context 262144
+```
+
+The FP8 text model is 121.7 GiB resident (the NVFP4 one is 72.5 GiB); the PLE table still stays
+on the host. TP=1 is the supported configuration: an expert's 640-wide intermediate does not split
+over 2 or 4 ranks into whole 128-wide scale tiles, so `rank_config` refuses a group. The profile
+switches are the NVFP4 profile's, because the arithmetic they select is the same; only the stored
+weight format differs. Prefill currently runs the FP8 experts on the token kernels (the NVFP4
+chunk path is the tensor-core `q4p_moe_*` image); a grouped FP8 expert MMA is the next step.
+
 ## What the checkpoint is
 
 `nvidia/Qwen3.8-Flash-Next-NVFP4` is NVIDIA's ModelOpt 0.46 post-training quantisation of

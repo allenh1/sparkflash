@@ -39,6 +39,7 @@
 
 #include "opt_pdl_sm121.cuh"
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
 #define OPT_MOE_HIDDEN 5120u
@@ -107,18 +108,7 @@ __device__ __forceinline__ float opt_block_partial(uint4 w, uint4 a0, uint4 a1) 
     return opt_dot_halves(ah, wh);
 }
 
-__device__ __forceinline__ uint32_t opt_round_slot_bits(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    if ((bits & 0x7FFFFFFFu) > 0x7F800000u) {
-        return (bits >> 16) | 0x0040u;
-    }
-    return (bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16;
-}
 
-__device__ __forceinline__ uint16_t opt_narrow_bits(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    return (uint16_t)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
-}
 
 template <uint32_t TOPK>
 __device__ __forceinline__ void opt_moe_gate_up_body(

@@ -50,7 +50,7 @@ pub mod tp_plan;
 pub mod vision;
 pub mod vision_geometry;
 
-pub use architecture::Architecture;
+pub use architecture::{Architecture, names_the_producer};
 pub use arm::{Admission, AdmissionRefusal, KvPlan, PackIdentity, gib, kv_budget_bytes};
 pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;

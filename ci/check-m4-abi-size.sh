@@ -66,7 +66,12 @@ EXPECTED_FILES="m4_abi.rs m4_abi/acquire_guard.rs m4_abi/scanner.rs"
 # #[cfg(debug_assertions)], which added an attribute, a block and two comment lines. A test-only
 # gate around an existing scanner, cited to D76: no scanner was added and no kernel invariant moved
 # here.
-PINNED_LINES=13972
+# Pin 13,972 -> 13,989 (2026-11-06): the kernel merge (D90) moved the shared CSA2 attention body
+# and the b12x dense/wo_a bodies out of the entry files into headers those entries include, so the
+# two guards that read those bodies now read entry + header. The seventeen lines are that wiring: a
+# fix to scanners that already existed, cited to D26 and the merge's D90. No scanner was added and no
+# kernel invariant moved here - the cubin baseline still owns the artifact side.
+PINNED_LINES=13989
 
 if [ ! -f "$ROOT_FILE" ]; then
     echo "error: $ROOT_FILE is missing; the frozen Milestone-4 ABI lint cannot be removed silently (D26)" >&2

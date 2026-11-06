@@ -103,6 +103,11 @@
 // achieved bandwidth is measured by the window row, not by this file.
 
 #include "m4_common_sm121.cuh"
+#include "b12x_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_m4_gemv_load128 spark_b12x_load128
+#define spark_m4_gemv_pair_to_f32 spark_b12x_fp8x2_to_f32
 
 // One warp per B12x micro-tile: 32 output columns, 32 threads, one lane per column.
 #define SPARK_M4_GEMV_OUTPUTS_PER_TILE 32u
@@ -128,13 +133,6 @@ static_assert(SPARK_M4_GEMV_PIPELINE >= 1u, "at least one block in flight");
 static_assert(SPARK_M4_GEMV_MAX_INNER % SPARK_M4_QUANT_BLOCK == 0u,
               "the widest reduction is a whole number of MX blocks");
 
-__device__ __forceinline__ uint4 spark_m4_gemv_load128(const uint8_t *p) {
-    uint4 v;
-    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
 // The 16-bit pair of E4M3 codes covering elements 2*pair and 2*pair+1 of a K block.
 __device__ __forceinline__ uint16_t spark_m4_gemv_pair(const uint4 lo, const uint4 hi,
@@ -150,18 +148,6 @@ __device__ __forceinline__ uint16_t spark_m4_gemv_pair(const uint4 lo, const uin
 // E4M3x2 -> f16x2 -> two f32. Every E4M3 value is exactly representable in f16 (3 mantissa bits,
 // exponent range -9..8), so these are the exact f32 values the scalar decoder in the pinned kernel
 // produces, obtained with one packed instruction per pair instead of a branchy scit.
-__device__ __forceinline__ void spark_m4_gemv_pair_to_f32(const uint16_t two, float &lo, float &hi) {
-    asm("{\n\t"
-        ".reg .b32 h2;\n\t"
-        ".reg .b16 l16, h16;\n\t"
-        "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-        "mov.b32 {l16, h16}, h2;\n\t"
-        "cvt.f32.f16 %0, l16;\n\t"
-        "cvt.f32.f16 %1, h16;\n\t"
-        "}"
-        : "=f"(lo), "=f"(hi)
-        : "h"(two));
-}
 
 // One K block for this lane's output column: 32 elements appended to acc in ascending K order, each
 // with the pinned multiply order (w_value = decode * w_scale, rounded once, then accumulated).

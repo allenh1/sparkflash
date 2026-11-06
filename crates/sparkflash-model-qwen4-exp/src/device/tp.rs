@@ -42,6 +42,10 @@ use crate::config::Qwen4ExpConfig;
 /// whole tiles with zero rows and columns, which add nothing to any sum.
 const EXPERT_TILE: usize = 64;
 
+/// The side of an FP8 expert's scale tile: one BF16 inverse scale a 128x128 block, so a rank's
+/// slice of an FP8 expert is a run of whole 128-wide tiles and nothing narrower.
+pub(crate) const FP8_TILE: usize = 128;
+
 /// Which share of each sharded tensor a rank holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Shard {
@@ -86,6 +90,26 @@ impl Shard {
             (intermediate / self.world).next_multiple_of(EXPERT_TILE)
         }
     }
+
+    /// An FP8 expert's tiles as this rank holds them: `(first, count)` of the
+    /// `intermediate / [FP8_TILE]` whole tiles, an even split with the remainder to the first
+    /// ranks.
+    ///
+    /// An FP8 rank cannot take a fraction of a tile: its tile carries one scale covering all 128
+    /// columns, so a slice that starts or ends inside a tile would need that tile's scale twice
+    /// over two different runs. Five tiles over four ranks is therefore 2/1/1/1 and not 1.25
+    /// each; the shares are uneven, the sum over ranks is still the exact expert, and the scale
+    /// grid a rank holds is the same run of the global grid the weight is (`fp8_part`).
+    pub(crate) fn expert_tiles(self, intermediate: usize) -> (usize, usize) {
+        debug_assert!(intermediate.is_multiple_of(FP8_TILE));
+        let total = intermediate / FP8_TILE;
+        let base = total / self.world;
+        let extra = total % self.world;
+        (
+            self.rank * base + self.rank.min(extra),
+            base + usize::from(self.rank < extra),
+        )
+    }
 }
 
 /// The configuration a rank's kernels run with: `config` with every sharded count and width
@@ -122,17 +146,40 @@ pub(crate) fn rank_config(config: &Qwen4ExpConfig, shard: Shard) -> Result<Qwen4
             "{kv} key-value heads neither split over {world} ranks nor are shared by them"
         ));
     }
-    // A share of an NVFP4 row is whole 16-column scale groups and whole 16-byte loads.
     let expert = config.moe_intermediate_size;
-    if !expert.is_multiple_of(world) || !(expert / world).is_multiple_of(32) {
-        return Err(format!(
-            "an expert {expert} wide does not split over {world} ranks into 32-column shares"
-        ));
-    }
-    let width = shard.expert_width(expert);
+    let (width, what) = match config.expert_quant {
+        // A share of an NVFP4 row is whole 16-column scale groups and whole 16-byte loads.
+        crate::config::ExpertQuant::Nvfp4 => {
+            if !expert.is_multiple_of(world) || !(expert / world).is_multiple_of(32) {
+                return Err(format!(
+                    "an expert {expert} wide does not split over {world} ranks into 32-column \
+                     shares"
+                ));
+            }
+            (shard.expert_width(expert), "pads to")
+        }
+        // An FP8 rank takes whole 128-wide tiles ([Shard::expert_tiles]): the width is the run of
+        // tiles it holds, which is a tile narrower or wider than an even split.
+        crate::config::ExpertQuant::Fp8Block => {
+            if !expert.is_multiple_of(FP8_TILE) {
+                return Err(format!(
+                    "an FP8 expert {expert} wide is not whole {FP8_TILE}-column tiles"
+                ));
+            }
+            let (_, tiles) = shard.expert_tiles(expert);
+            if tiles == 0 {
+                return Err(format!(
+                    "an FP8 expert is {} tiles over {world} ranks, so rank {} holds none",
+                    expert / FP8_TILE,
+                    shard.rank
+                ));
+            }
+            (tiles * FP8_TILE, "holds")
+        }
+    };
     if width > MAX_INTERMEDIATE {
         return Err(format!(
-            "a rank's expert share pads to {width}, over the kernels' {MAX_INTERMEDIATE}"
+            "a rank's expert share {what} {width} columns, over the kernels' {MAX_INTERMEDIATE}"
         ));
     }
     Ok(Qwen4ExpConfig {
@@ -773,5 +820,83 @@ mod tests {
         assert_eq!(Shard::WHOLE.expert_width(640), 640);
         assert_eq!(Shard { rank: 0, world: 2 }.expert_width(640), 320);
         assert_eq!(Shard { rank: 3, world: 4 }.expert_width(640), 192);
+    }
+
+    #[test]
+    fn an_fp8_share_is_a_run_of_whole_scale_tiles() {
+        // 640 columns are five 128-wide tiles. Five tiles do not divide into two or four equal
+        // shares, so the remainder goes to the first ranks and every slice stays whole tiles.
+        let four: Vec<(usize, usize)> = (0..4)
+            .map(|rank| Shard { rank, world: 4 }.expert_tiles(640))
+            .collect();
+        assert_eq!(four, vec![(0, 2), (2, 1), (3, 1), (4, 1)]);
+        let two: Vec<(usize, usize)> = (0..2)
+            .map(|rank| Shard { rank, world: 2 }.expert_tiles(640))
+            .collect();
+        assert_eq!(two, vec![(0, 3), (3, 2)]);
+        assert_eq!(Shard::WHOLE.expert_tiles(640), (0, 5));
+        // The shares are a partition: no tile twice, no tile left out.
+        for world in [1, 2, 4, 5] {
+            let mut seen = Vec::new();
+            for rank in 0..world {
+                let (first, count) = Shard { rank, world }.expert_tiles(640);
+                assert_eq!(first, seen.len(), "rank {rank} of {world} starts a gap");
+                seen.extend(first..first + count);
+            }
+            assert_eq!(
+                seen,
+                (0..5).collect::<Vec<_>>(),
+                "a tile is dropped at {world}"
+            );
+        }
+        // The width a rank uploads is its tile run in columns.
+        assert_eq!(
+            Shard { rank: 3, world: 4 }.expert_tiles(640).1 * FP8_TILE,
+            128
+        );
+        assert_eq!(
+            Shard { rank: 0, world: 4 }.expert_tiles(640).1 * FP8_TILE,
+            256
+        );
+        assert_eq!(
+            Shard { rank: 1, world: 2 }.expert_tiles(640).1 * FP8_TILE,
+            256
+        );
+    }
+
+    #[test]
+    fn an_fp8_rank_config_is_its_tile_run() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the released config parses");
+        let widths: Vec<usize> = (0..4)
+            .map(|rank| {
+                rank_config(&config, Shard { rank, world: 4 })
+                    .expect("an FP8 release splits over four ranks")
+                    .moe_intermediate_size
+            })
+            .collect();
+        assert_eq!(widths, vec![256, 128, 128, 128]);
+        assert_eq!(widths.iter().sum::<usize>(), config.moe_intermediate_size);
+        let two: Vec<usize> = (0..2)
+            .map(|rank| {
+                rank_config(&config, Shard { rank, world: 2 })
+                    .expect("an FP8 release splits over two ranks")
+                    .moe_intermediate_size
+            })
+            .collect();
+        assert_eq!(two, vec![384, 256]);
+        // Every rank's width is whole tiles, which is what its scale grid indexes.
+        for width in widths.into_iter().chain(two) {
+            assert_eq!(width % FP8_TILE, 0, "{width} is not whole tiles");
+        }
+    }
+
+    #[test]
+    fn an_fp8_expert_with_fewer_tiles_than_ranks_is_refused() {
+        // The tiny FP8 fixture's expert is one 128-wide tile: at two ranks the second holds none.
+        let config = Qwen4ExpConfig::tiny_fp8();
+        let error = rank_config(&config, Shard { rank: 1, world: 2 })
+            .expect_err("one tile does not split over two ranks");
+        assert!(error.contains("holds none"), "{error}");
+        rank_config(&config, Shard { rank: 0, world: 1 }).expect("one rank holds the whole model");
     }
 }

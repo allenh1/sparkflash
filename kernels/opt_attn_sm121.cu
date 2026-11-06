@@ -33,6 +33,11 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define oa_e4m3x4 opt_e4m3x4
+#define oa_warp_sum opt_warp_sum
 
 #define OA_LATENT 512u
 #define OA_THREADS 256u
@@ -44,20 +49,7 @@
 #define OA_KSCALES 32u
 #define OA_CSA_UNION 2u
 
-__device__ __forceinline__ void oa_e4m3x4(uint32_t w, float *f) {
-    uint32_t h01, h23;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"((uint16_t)(w & 0xffffu)));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"((uint16_t)(w >> 16)));
-    const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&h01));
-    const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&h23));
-    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
-}
 
-__device__ __forceinline__ float oa_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 
 __device__ __forceinline__ float oa_warp_max(float v) {
 #pragma unroll

@@ -49,6 +49,16 @@ __device__ __forceinline__ float q4e_warp_sum(float value) {
     return value;
 }
 
+// A warp's xor butterfly sum: every lane holds the total (the lane-0 form above leaves only
+// lane 0 valid). Used where a whole warp needs the result, as the tiled GEMV and the drafter do.
+__device__ __forceinline__ float q4e_warp_sum_all(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xFFFFFFFFu, value, offset);
+    }
+    return value;
+}
+
 
 
 // Block reduction over shared memory; scratch must hold blockDim.x floats.
@@ -101,5 +111,50 @@ __device__ __forceinline__ void q4e_take_better(float other_value, int other_ind
         *value = other_value;
         *index = other_index;
     }
+}
+
+// The reference SwiGLU gate: x / (1 + e^-x) with the fast exponential. One expression serves every
+// token and prefill image so a gate computes the same value wherever it runs.
+__device__ __forceinline__ float q4e_silu(float value) {
+    return value / (1.0f + __expf(-value));
+}
+
+// Block argmax over (value, index) pairs, with the same tie-break as the host sort: the higher
+// value wins and an equal value prefers the lower index. shared_value and shared_index hold
+// blockDim.x / 32 entries each.
+__device__ __forceinline__ void q4e_block_best(float* value, int* index, float* shared_value,
+                                               int* shared_index) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = (blockDim.x + 31) >> 5;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q4e_take_better(__shfl_down_sync(0xFFFFFFFFu, *value, offset),
+                        (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)*index, offset), value,
+                        index);
+    }
+    if (lane == 0) {
+        shared_value[warp] = *value;
+        shared_index[warp] = *index;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float best_value = lane < warps ? shared_value[lane] : -INFINITY;
+        int best_index = lane < warps ? shared_index[lane] : 0x7FFFFFFF;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            q4e_take_better(
+                __shfl_down_sync(0xFFFFFFFFu, best_value, offset),
+                (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)best_index, offset), &best_value,
+                &best_index);
+        }
+        if (lane == 0) {
+            shared_value[0] = best_value;
+            shared_index[0] = best_index;
+        }
+    }
+    __syncthreads();
+    *value = shared_value[0];
+    *index = shared_index[0];
 }
 

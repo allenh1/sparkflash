@@ -46,6 +46,14 @@
 // instantiation and grid gives the same bits.
 
 #include "opt_pdl_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared streaming load, under the name this image used.
+#define opt_g_ldw opt_ldw_cs
+
+// The shared header's helpers, under the names this image used.
+#define opt_g_fma2_f16 opt_fma2_f16
+#define opt_g_fma2_bf16 opt_fma2_bf16
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
@@ -62,13 +70,6 @@
 #define OPT_A_FP8 1
 #define OPT_A_F32 2
 
-__device__ __forceinline__ uint4 opt_g_ldw(const uint8_t *p) {
-    uint4 v;
-    asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
 // 16 activation bytes from the staged rows (shared memory) or from global memory.
 template <bool STAGED>
@@ -116,11 +117,6 @@ __device__ __forceinline__ uint32_t opt_g_e4m3x2(uint32_t two) {
 }
 
 // c + a.lo * b.lo, then + a.hi * b.hi, on f16x2 pairs: two single-rounding f32 FMAs.
-__device__ __forceinline__ float opt_g_fma2_f16(uint32_t a, uint32_t b, float c) {
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
-    return c;
-}
 
 // The 32 E4M3 activation values of K-block kb of one token row as 16 f16x2 pairs, plus the scale.
 template <bool STAGED>
@@ -459,11 +455,6 @@ OPT_GEMV_ENTRY(opt_gemv_f32a_bf16o_t8, OPT_A_F32, false, 8)
 #define OPT_GR_CHUNK OPT_G_WARPS
 
 // c + a.lo * b.lo, then + a.hi * b.hi, on bf16x2 pairs: two single-rounding f32 FMAs.
-__device__ __forceinline__ float opt_g_fma2_bf16(uint32_t a, uint32_t b, float c) {
-    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
-    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
-    return c;
-}
 
 // Two E4M3 bytes (the low 16 bits) -> bf16x2, the low byte in the low half (E4M3 is exact in bf16).
 __device__ __forceinline__ uint32_t opt_g_e4m3x2_bf16(uint32_t two) {

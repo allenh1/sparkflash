@@ -66,6 +66,10 @@
 #pragma once  // kernels/opt_rows_sm121.cu includes this file for its row-batched form
 
 #include "m4_common_sm121.cuh"
+#include "b12x_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_hw_gemv_load128 spark_b12x_load128
 
 // One warp per B12x micro-tile: 32 output columns, 32 threads, one lane per column.
 #define SPARK_HW_GEMV_OUTPUTS_PER_TILE 32u
@@ -95,13 +99,6 @@ static_assert(SPARK_HW_GEMV_TILE_VALUES == SPARK_B12X_NTILE * SPARK_B12X_KTILE,
               "the tile is 32 outputs x 32 K values");
 
 // One 16-byte load of the lane's contiguous weight values.
-__device__ __forceinline__ uint4 spark_hw_gemv_load128(const void *p) {
-    uint4 v;
-    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
 // One K block for this lane's output column: 32 weight values appended to acc in ascending K order,
 // each as a rounded multiply followed by a rounded add - the engine matmul's own expression.

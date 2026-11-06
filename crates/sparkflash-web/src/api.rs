@@ -2075,14 +2075,15 @@ mod tests {
             body["supported"]["models"][0]["weights"],
             crate::config::DEFAULT_WEIGHTS_ID
         );
-        assert_eq!(
-            body["supported"]["models"][2]["id"],
-            crate::config::GLM_MODEL_ID
-        );
-        assert_eq!(
-            body["supported"]["models"][2]["engine"],
-            crate::config::GLM_ENGINE_ID
-        );
+        // The registry order is not part of the contract; find the family by id.
+        let models = body["supported"]["models"]
+            .as_array()
+            .expect("the supported model list");
+        let glm = models
+            .iter()
+            .find(|model| model["id"] == crate::config::GLM_MODEL_ID)
+            .expect("the GLM model is listed");
+        assert_eq!(glm["engine"], crate::config::GLM_ENGINE_ID);
         assert_eq!(body["config_exists"], false);
     }
 

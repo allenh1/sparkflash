@@ -114,46 +114,8 @@ __device__ __forceinline__ float2 q4e_e2m1_pair_at(unsigned int word, const floa
     return table[word & 0xFFu];
 }
 
-__device__ __forceinline__ float q4e_silu(float value) {
-    return value / (1.0f + __expf(-value));
-}
 
 // Block argmax over (value, index) pairs, with the same tie-break as the host sort.
-__device__ __forceinline__ void q4e_block_best(float* value, int* index, float* shared_value,
-                                               int* shared_index) {
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int warps = (blockDim.x + 31) >> 5;
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        q4e_take_better(__shfl_down_sync(0xFFFFFFFFu, *value, offset),
-                        (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)*index, offset), value,
-                        index);
-    }
-    if (lane == 0) {
-        shared_value[warp] = *value;
-        shared_index[warp] = *index;
-    }
-    __syncthreads();
-    if (warp == 0) {
-        float best_value = lane < warps ? shared_value[lane] : -INFINITY;
-        int best_index = lane < warps ? shared_index[lane] : 0x7FFFFFFF;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q4e_take_better(
-                __shfl_down_sync(0xFFFFFFFFu, best_value, offset),
-                (int)__shfl_down_sync(0xFFFFFFFFu, (unsigned int)best_index, offset), &best_value,
-                &best_index);
-        }
-        if (lane == 0) {
-            shared_value[0] = best_value;
-            shared_index[0] = best_index;
-        }
-    }
-    __syncthreads();
-    *value = shared_value[0];
-    *index = shared_index[0];
-}
 
 // Four packed bytes (one 32-bit word): eight E2M1 weights in one 16-column scale group.
 __device__ __forceinline__ float q4e_dot_packed32(unsigned int word, const float* lut,
@@ -524,23 +486,83 @@ extern "C" __global__ void q4e_router(const float* logits, float* probabilities,
 }
 
 
-// Routed experts pass one: simultaneous gate + up NVFP4 row dot products with conflict-free
+// Routed-experts pass one: simultaneous gate + up row dot products with conflict-free
 // shared-memory activation staging (blockIdx.y = slot, blockIdx.z = batch token).
 //
 // One block per expert run, not per slot. Every slot of a run reads the same expert's weight
 // rows, so the block that sorts first in the run recomputes the run's other tokens itself and the
 // rest of the run's blocks exit before their staging loop. The expert's rows are then read from
 // DRAM once per chunk and land in L2 for the run's later members instead of being fetched again.
-extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
+//
+// QUANT selects the stored expert format and nothing else: the NVFP4 release (packed E2M1 with an
+// E4M3 scale a 16-column group and two per-tensor scales) and the FP8 release (E4M3 with one
+// BF16 inverse scale a 128x128 tile). The run, the staging, the SwiGLU and the write-back are
+// one body; only the row strides and the dot product differ.
+#define Q4E_QUANT_NVFP4 0
+#define Q4E_QUANT_FP8 1
+
+// The bytes one FP8 tile scale takes: an E4M3 weight is a byte and its 128x128 tile scale is a
+// BF16, while the NVFP4 grid's per-tile scale is a single byte. The expert table holds byte
+// addresses for both, so the FP8 branch has to stride its scale rows by two.
+#define Q4E_FP8_SCALE_BYTES 2
+
+// One warp's partial dots of a single FP8 row against the staged rows of 'count' members. A lane
+// owns sixteen consecutive values, so a 128-column scale tile covers whole lanes and every load
+// is 16-byte aligned: no straddle and no masked tail, for either 2560 or 640.
+__device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float scale,
+                                                     const float* base, int count, float* out) {
+    const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
+    float weight[16];
+#pragma unroll
+    for (int word = 0; word < 4; ++word) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            weight[4 * word + i] =
+                q4e_e4m3((unsigned char)((words[word] >> (8 * i)) & 0xFFu)) * scale;
+        }
+    }
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        if (m < count) {
+            const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED;
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                dot += weight[i] * x_chunk[i];
+            }
+            out[m] += dot;
+        }
+    }
+}
+
+__device__ __forceinline__ void q4e_fp8_row_dot_group(const unsigned char* row,
+                                                       const __nv_bfloat16* scale_row,
+                                                       const float* base, int columns, int lane,
+                                                       int count, float* out) {
+#pragma unroll
+    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
+        out[m] = 0.0f;
+    }
+    const int chunks = columns >> 4;
+    for (int chunk = lane; chunk < chunks; chunk += 32) {
+        const int column = chunk * 16;
+        const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(row + column));
+        const float scale = __bfloat162float(q4e_ldg(&scale_row[column >> 7]));
+        q4e_fp8_chunk_group(packed, scale, base + q4e_smem_idx(column), count, out);
+    }
+}
+
+template <int QUANT>
+__device__ __forceinline__ void q4e_expert_gate_up_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ indices, const int* __restrict__ perm,
     const int* __restrict__ run_bounds, const float* __restrict__ x,
     float* __restrict__ activated, int slots, int hidden, int intermediate) {
-    OPT_PDL_ENTRY();
+    constexpr bool FP8 = QUANT == Q4E_QUANT_FP8;
     __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
     __shared__ float lut[16];
     __shared__ float2 lut_pair[256];
-    if (hidden <= 0 || hidden > Q4E_MAX_ROW) {
+    if (hidden <= 0 || hidden > Q4E_MAX_ROW || (FP8 && (hidden & 15) != 0)) {
         return;
     }
     int lane = threadIdx.x & 31;
@@ -558,43 +580,74 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
     }
     const int members = run_bounds[2 * rank + 1] - begin + 1;
     const int expert = indices[perm[begin]];
-    int groups = (hidden + 15) / 16;
-    int packed = (hidden + 1) / 2;
-    // The warp's first gate/up rows and how many of its rows the matrix has.
-    const unsigned char* grow = nullptr;
-    const unsigned char* gsrow = nullptr;
-    const unsigned char* urow = nullptr;
-    const unsigned char* usrow = nullptr;
+    // NVFP4: 16-column scale groups and packed nibbles. FP8: one byte a weight and one BF16
+    // scale row per 128 weight rows.
+    int groups = FP8 ? (hidden >> 7) : ((hidden + 15) / 16);
+    int packed = FP8 ? hidden : ((hidden + 1) / 2);
     const int valid = max(0, min(Q4E_ROWS_PER_WARP, intermediate - first_row));
-    float g2 = 0.0f;
-    float u2 = 0.0f;
+    const unsigned char* grow[Q4E_ROWS_PER_WARP];
+    const void* gsrow[Q4E_ROWS_PER_WARP];
+    const unsigned char* urow[Q4E_ROWS_PER_WARP];
+    const void* usrow[Q4E_ROWS_PER_WARP];
+    float g2 = 1.0f;
+    float u2 = 1.0f;
+#pragma unroll
+    for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+        grow[r] = nullptr;
+        gsrow[r] = nullptr;
+        urow[r] = nullptr;
+        usrow[r] = nullptr;
+    }
     if (expert >= 0) {
-        const unsigned long long row = (unsigned long long)first_row;
-        grow = (const unsigned char*)table[expert * 6 + 0] + row * packed;
-        gsrow = (const unsigned char*)table[expert * 6 + 1] + row * groups;
-        urow = (const unsigned char*)table[expert * 6 + 2] + row * packed;
-        usrow = (const unsigned char*)table[expert * 6 + 3] + row * groups;
-        g2 = scales[expert * 3 + 0];
-        u2 = scales[expert * 3 + 1];
+        const unsigned char* gw = (const unsigned char*)table[expert * 6 + 0];
+        const unsigned char* gs = (const unsigned char*)table[expert * 6 + 1];
+        const unsigned char* uw = (const unsigned char*)table[expert * 6 + 2];
+        const unsigned char* us = (const unsigned char*)table[expert * 6 + 3];
+#pragma unroll
+        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
+            const unsigned long long row = (unsigned long long)(first_row + r);
+            grow[r] = gw + row * packed;
+            urow[r] = uw + row * packed;
+            if constexpr (FP8) {
+                // The table carries byte addresses: an FP8 tile scale is a BF16, so a scale row
+                // advances two bytes an element where the NVFP4 grid's scales are one.
+                gsrow[r] = gs + (row >> 7) * groups * Q4E_FP8_SCALE_BYTES;
+                usrow[r] = us + (row >> 7) * groups * Q4E_FP8_SCALE_BYTES;
+            } else {
+                gsrow[r] = gs + row * groups;
+                usrow[r] = us + row * groups;
+            }
+        }
+        if constexpr (FP8) {
+            g2 = 1.0f;
+            u2 = 1.0f;
+        } else {
+            g2 = scales[expert * 3 + 0];
+            u2 = scales[expert * 3 + 1];
+        }
         // The block's panel of both matrices, fetched while the block stages its members.
-        if (threadIdx.x == 0) {
+        if (!FP8 && threadIdx.x == 0) {
             const unsigned long long panel = (unsigned long long)blockIdx.x * rows;
-            const long long panel_rows = min((long long)rows, (long long)intermediate - (long long)panel);
+            const long long panel_rows =
+                min((long long)rows, (long long)intermediate - (long long)panel);
             if (panel_rows > 0) {
                 for (int matrix = 0; matrix < 4; ++matrix) {
                     const unsigned long long stride = (matrix & 1) ? groups : packed;
-                    spark_prefetch_l2((const unsigned char*)table[expert * 6 + matrix] + panel * stride,
+                    spark_prefetch_l2((const unsigned char*)table[expert * 6 + matrix] +
+                                          panel * stride,
                                       panel_rows * stride);
                 }
             }
         }
     }
-    q4e_e2m1_table_fill(lut);
-    q4e_e2m1_table_pair_fill(lut_pair);
+    if constexpr (!FP8) {
+        q4e_e2m1_table_fill(lut);
+        q4e_e2m1_table_pair_fill(lut_pair);
+    }
     for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
         const int count = min(Q4E_MEMBER_GROUP, members - group);
-        // The block order comes from the shared plan (kernels/moe_plan_sm121.cu): the run's members are consecutive ranks,
-        // and each writes the result back to its own (token, slot) row.
+        // The block order comes from the shared plan (kernels/moe_plan_sm121.cu): the run's
+        // members are consecutive ranks, and each writes the result back to its own (token, slot).
         for (int m = 0; m < count; ++m) {
             const int total_slot = perm[begin + group + m];
             const int b = total_slot / slots;
@@ -625,9 +678,19 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
                 }
                 float g[Q4E_MEMBER_GROUP];
                 float u[Q4E_MEMBER_GROUP];
-                q4e_nvfp4_row_dot_pair_group(grow + r * packed, gsrow + r * groups, g2,
-                                             urow + r * packed, usrow + r * groups, u2, lut,
-                                             lut_pair, source, hidden, lane, count, g, u);
+                if constexpr (FP8) {
+                    q4e_fp8_row_dot_group(grow[r],
+                                           reinterpret_cast<const __nv_bfloat16*>(gsrow[r]),
+                                           source, hidden, lane, count, g);
+                    q4e_fp8_row_dot_group(urow[r],
+                                           reinterpret_cast<const __nv_bfloat16*>(usrow[r]),
+                                           source, hidden, lane, count, u);
+                } else {
+                    q4e_nvfp4_row_dot_pair_group(
+                        grow[r], (const unsigned char*)gsrow[r], g2, urow[r],
+                        (const unsigned char*)usrow[r], u2, lut, lut_pair, source, hidden, lane,
+                        count, g, u);
+                }
 #pragma unroll
                 for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
                     if (m < count) {
@@ -647,19 +710,40 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
     }
 }
 
-// Routed experts pass two: down projection with conflict-free shared-memory staging
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ indices, const int* __restrict__ perm,
+    const int* __restrict__ run_bounds, const float* __restrict__ x,
+    float* __restrict__ activated, int slots, int hidden, int intermediate) {
+    OPT_PDL_ENTRY();
+    q4e_expert_gate_up_body<Q4E_QUANT_NVFP4>(table, scales, indices, perm, run_bounds, x, activated,
+                                             slots, hidden, intermediate);
+}
+
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_fp8(
+    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
+    const int* __restrict__ perm, const int* __restrict__ run_bounds,
+    const float* __restrict__ x, float* __restrict__ activated, int slots, int hidden,
+    int intermediate) {
+    OPT_PDL_ENTRY();
+    q4e_expert_gate_up_body<Q4E_QUANT_FP8>(table, nullptr, indices, perm, run_bounds, x, activated,
+                                           slots, hidden, intermediate);
+}
+
+// Routed-experts pass two: down projection with conflict-free shared-memory staging
 // (blockIdx.y = slot, blockIdx.z = batch token). One block per expert run, as in pass one.
-extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
+template <int QUANT>
+__device__ __forceinline__ void q4e_expert_down_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ indices, const int* __restrict__ perm,
     const int* __restrict__ run_bounds, const float* __restrict__ weights,
     const float* __restrict__ activated, float* __restrict__ partials, int slots, int hidden,
     int intermediate, int weight_stride) {
-    OPT_PDL_ENTRY();
+    constexpr bool FP8 = QUANT == Q4E_QUANT_FP8;
     __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
     __shared__ float lut[16];
     __shared__ float2 lut_pair[256];
-    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW) {
+    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW || (FP8 && (intermediate & 15) != 0)) {
         return;
     }
     int lane = threadIdx.x & 31;
@@ -669,7 +753,6 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
     if (blockIdx.y >= slots) {
         return;
     }
-    // blockIdx.y + blockIdx.z * slots is the rank; the run bounds say where its run starts.
     const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
     const int begin = run_bounds[2 * rank];
     if (rank != begin) {
@@ -677,21 +760,39 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
     }
     const int members = run_bounds[2 * rank + 1] - begin + 1;
     const int expert = indices[perm[begin]];
-    int groups = (intermediate + 15) / 16;
-    int packed = (intermediate + 1) / 2;
-    // The warp's first down row and how many of its rows the matrix has.
-    const unsigned char* drow = nullptr;
-    const unsigned char* dsrow = nullptr;
+    int groups = FP8 ? (intermediate >> 7) : ((intermediate + 15) / 16);
+    int packed = FP8 ? intermediate : ((intermediate + 1) / 2);
     const int valid = max(0, min(Q4E_DOWN_ROWS_PER_WARP, hidden - first_row));
-    float d2 = 0.0f;
-    if (expert >= 0) {
-        const unsigned long long row = (unsigned long long)first_row;
-        drow = (const unsigned char*)table[expert * 6 + 4] + row * packed;
-        dsrow = (const unsigned char*)table[expert * 6 + 5] + row * groups;
-        d2 = scales[expert * 3 + 2];
+    const unsigned char* drow[Q4E_DOWN_ROWS_PER_WARP];
+    const void* dsrow[Q4E_DOWN_ROWS_PER_WARP];
+    float d2 = 1.0f;
+#pragma unroll
+    for (int r = 0; r < Q4E_DOWN_ROWS_PER_WARP; ++r) {
+        drow[r] = nullptr;
+        dsrow[r] = nullptr;
     }
-    q4e_e2m1_table_fill(lut);
-    q4e_e2m1_table_pair_fill(lut_pair);
+    if (expert >= 0) {
+        const unsigned char* dw = (const unsigned char*)table[expert * 6 + 4];
+        const unsigned char* ds = (const unsigned char*)table[expert * 6 + 5];
+#pragma unroll
+        for (int r = 0; r < Q4E_DOWN_ROWS_PER_WARP; ++r) {
+            const unsigned long long row = (unsigned long long)(first_row + r);
+            drow[r] = dw + row * packed;
+            if constexpr (FP8) {
+                // As in pass one: an FP8 tile scale is a BF16 addressed by byte.
+                dsrow[r] = ds + (row >> 7) * groups * Q4E_FP8_SCALE_BYTES;
+            } else {
+                dsrow[r] = ds + row * groups;
+            }
+        }
+        if constexpr (!FP8) {
+            d2 = scales[expert * 3 + 2];
+        }
+    }
+    if constexpr (!FP8) {
+        q4e_e2m1_table_fill(lut);
+        q4e_e2m1_table_pair_fill(lut_pair);
+    }
     for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
         const int count = min(Q4E_MEMBER_GROUP, members - group);
         for (int m = 0; m < count; ++m) {
@@ -706,9 +807,20 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
         __syncthreads();
         float value[Q4E_DOWN_ROWS_PER_WARP][Q4E_MEMBER_GROUP];
         if (expert >= 0) {
-            q4e_nvfp4_rows_dot_group<Q4E_DOWN_ROWS_PER_WARP>(drow, dsrow, d2, packed, groups, valid,
-                                                             lut, lut_pair, source, intermediate,
-                                                             lane, count, value);
+            if constexpr (FP8) {
+#pragma unroll
+                for (int r = 0; r < Q4E_DOWN_ROWS_PER_WARP; ++r) {
+                    if (r < valid) {
+                        q4e_fp8_row_dot_group(
+                            drow[r], reinterpret_cast<const __nv_bfloat16*>(dsrow[r]), source,
+                            intermediate, lane, count, value[r]);
+                    }
+                }
+            } else {
+                q4e_nvfp4_rows_dot_group<Q4E_DOWN_ROWS_PER_WARP>(
+                    drow[0], (const unsigned char*)dsrow[0], d2, packed, groups, valid, lut,
+                    lut_pair, source, intermediate, lane, count, value);
+            }
         }
 #pragma unroll
         for (int r = 0; r < Q4E_DOWN_ROWS_PER_WARP; ++r) {
@@ -734,248 +846,27 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
     }
 }
 
-// The MTP layer's routed experts are 128x128-block-scaled FP8 rather than NVFP4: one byte a
-// weight and one BF16 inverse scale per 128x128 tile, with a full-precision activation. The
-// passes are otherwise the same shape as the quantised pair above - one block per expert run,
-// the run's members staged in shared memory - so the bodies mirror them with a different decode:
-// no nibble LUT, no weight_scale_2, and the scale changes once per 128 columns rather than
-// twice per 32.
-__device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float scale,
-                                                     const float* base, int count, float* out) {
-    const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
-    float weight[16];
-#pragma unroll
-    for (int word = 0; word < 4; ++word) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            weight[4 * word + i] =
-                q4e_e4m3((unsigned char)((words[word] >> (8 * i)) & 0xFFu)) * scale;
-        }
-    }
-#pragma unroll
-    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
-        if (m < count) {
-            const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED;
-            float dot = 0.0f;
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                dot += weight[i] * x_chunk[i];
-            }
-            out[m] += dot;
-        }
-    }
-}
-
-// One warp's partial dots of a single FP8 row against the staged rows of `count` members.
-__device__ __forceinline__ void q4e_fp8_row_dot_group(const unsigned char* row,
-                                                       const __nv_bfloat16* scale_row,
-                                                       const float* base, int columns, int lane,
-                                                       int count, float* out) {
-#pragma unroll
-    for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
-        out[m] = 0.0f;
-    }
-    // A lane owns sixteen consecutive values, so a 128-column scale tile covers whole lanes and
-    // every load is 16-byte aligned: no straddle, no masked tail, for either 2560 or 640.
-    const int chunks = columns >> 4;
-    for (int chunk = lane; chunk < chunks; chunk += 32) {
-        const int column = chunk * 16;
-        const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(row + column));
-        const float scale = __bfloat162float(q4e_ldg(&scale_row[column >> 7]));
-        q4e_fp8_chunk_group(packed, scale, base + q4e_smem_idx(column), count, out);
-    }
-}
-
-// Pass one of the MTP routed experts: gate and up, SwiGLU'd, into the slot's activated row.
-extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_fp8(
-    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
-    const int* __restrict__ perm, const int* __restrict__ run_bounds,
-    const float* __restrict__ x, float* __restrict__ activated, int slots, int hidden,
-    int intermediate) {
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ indices, const int* __restrict__ perm,
+    const int* __restrict__ run_bounds, const float* __restrict__ weights,
+    const float* __restrict__ activated, float* __restrict__ partials, int slots, int hidden,
+    int intermediate, int weight_stride) {
     OPT_PDL_ENTRY();
-    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
-    if (hidden <= 0 || hidden > Q4E_MAX_ROW || (hidden & 15) != 0) {
-        return;
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
-    int first_row = blockIdx.x * rows + warp * Q4E_ROWS_PER_WARP;
-    if (blockIdx.y >= slots) {
-        return;
-    }
-    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
-    const int begin = run_bounds[2 * rank];
-    if (rank != begin) {
-        return;
-    }
-    const int members = run_bounds[2 * rank + 1] - begin + 1;
-    const int expert = indices[perm[begin]];
-    // 128x128 tiles: the checkpoint's weight_scale_inv is [rows / 128, columns / 128], so one
-    // scale row serves 128 weight rows and holds columns / 128 BF16 values.
-    const int scale_columns = hidden >> 7;
-    const unsigned char* grow[Q4E_ROWS_PER_WARP];
-    const __nv_bfloat16* gsrow[Q4E_ROWS_PER_WARP];
-    const unsigned char* urow[Q4E_ROWS_PER_WARP];
-    const __nv_bfloat16* usrow[Q4E_ROWS_PER_WARP];
-#pragma unroll
-    for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-        grow[r] = nullptr;
-        gsrow[r] = nullptr;
-        urow[r] = nullptr;
-        usrow[r] = nullptr;
-    }
-    if (expert >= 0) {
-        const unsigned char* gw = (const unsigned char*)table[expert * 6 + 0];
-        const __nv_bfloat16* gs = (const __nv_bfloat16*)table[expert * 6 + 1];
-        const unsigned char* uw = (const unsigned char*)table[expert * 6 + 2];
-        const __nv_bfloat16* us = (const __nv_bfloat16*)table[expert * 6 + 3];
-#pragma unroll
-        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-            const unsigned long long row = (unsigned long long)(first_row + r);
-            grow[r] = gw + row * hidden;
-            gsrow[r] = gs + (row >> 7) * scale_columns;
-            urow[r] = uw + row * hidden;
-            usrow[r] = us + (row >> 7) * scale_columns;
-        }
-    }
-    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
-        const int count = min(Q4E_MEMBER_GROUP, members - group);
-        for (int m = 0; m < count; ++m) {
-            const int total_slot = perm[begin + group + m];
-            const int b = total_slot / slots;
-            const float* x_b = x + (unsigned long long)b * hidden;
-            float* staged = source + m * Q4E_MAX_ROW_PADDED;
-            for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
-                staged[q4e_smem_idx(column)] = x_b[column];
-            }
-        }
-        __syncthreads();
-#pragma unroll
-        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-            const int row = first_row + r;
-            if (row >= intermediate) {
-                continue;
-            }
-            if (expert < 0) {
-                if (lane == 0) {
-                    for (int m = 0; m < count; ++m) {
-                        const int total_slot = perm[begin + group + m];
-                        activated[(unsigned long long)total_slot * intermediate + row] = 0.0f;
-                    }
-                }
-            } else {
-                float g[Q4E_MEMBER_GROUP];
-                float u[Q4E_MEMBER_GROUP];
-                q4e_fp8_row_dot_group(grow[r], gsrow[r], source, hidden, lane, count, g);
-                q4e_fp8_row_dot_group(urow[r], usrow[r], source, hidden, lane, count, u);
-#pragma unroll
-                for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
-                    if (m < count) {
-                        const float gate = q4e_warp_sum(g[m]);
-                        const float up = q4e_warp_sum(u[m]);
-                        if (lane == 0) {
-                            const int total_slot = perm[begin + group + m];
-                            activated[(unsigned long long)total_slot * intermediate + row] =
-                                q4e_silu(gate) * up;
-                        }
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
+    q4e_expert_down_body<Q4E_QUANT_NVFP4>(table, scales, indices, perm, run_bounds, weights,
+                                          activated, partials, slots, hidden, intermediate,
+                                          weight_stride);
 }
 
-// Pass two of the MTP routed experts: the down projection, scattered by the router weight.
 extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down_fp8(
     const unsigned long long* __restrict__ table, const int* __restrict__ indices,
     const int* __restrict__ perm, const int* __restrict__ run_bounds,
     const float* __restrict__ weights, const float* __restrict__ activated,
     float* __restrict__ partials, int slots, int hidden, int intermediate, int weight_stride) {
     OPT_PDL_ENTRY();
-    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
-    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW || (intermediate & 15) != 0) {
-        return;
-    }
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
-    int first_row = blockIdx.x * rows + warp * Q4E_ROWS_PER_WARP;
-    if (blockIdx.y >= slots) {
-        return;
-    }
-    const int rank = (int)blockIdx.z * slots + (int)blockIdx.y;
-    const int begin = run_bounds[2 * rank];
-    if (rank != begin) {
-        return;
-    }
-    const int members = run_bounds[2 * rank + 1] - begin + 1;
-    const int expert = indices[perm[begin]];
-    const int scale_columns = intermediate >> 7;
-    const unsigned char* drow[Q4E_ROWS_PER_WARP];
-    const __nv_bfloat16* dsrow[Q4E_ROWS_PER_WARP];
-#pragma unroll
-    for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-        drow[r] = nullptr;
-        dsrow[r] = nullptr;
-    }
-    if (expert >= 0) {
-        const unsigned char* dw = (const unsigned char*)table[expert * 6 + 4];
-        const __nv_bfloat16* ds = (const __nv_bfloat16*)table[expert * 6 + 5];
-#pragma unroll
-        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-            const unsigned long long row = (unsigned long long)(first_row + r);
-            drow[r] = dw + row * intermediate;
-            dsrow[r] = ds + (row >> 7) * scale_columns;
-        }
-    }
-    for (int group = 0; group < members; group += Q4E_MEMBER_GROUP) {
-        const int count = min(Q4E_MEMBER_GROUP, members - group);
-        for (int m = 0; m < count; ++m) {
-            const int total_slot = perm[begin + group + m];
-            const float* slot_activated = activated + (unsigned long long)total_slot * intermediate;
-            float* staged = source + m * Q4E_MAX_ROW_PADDED;
-            for (int column = threadIdx.x; column < intermediate; column += blockDim.x) {
-                staged[q4e_smem_idx(column)] = slot_activated[column];
-            }
-        }
-        __syncthreads();
-#pragma unroll
-        for (int r = 0; r < Q4E_ROWS_PER_WARP; ++r) {
-            const int row = first_row + r;
-            if (row >= hidden) {
-                continue;
-            }
-            float value[Q4E_MEMBER_GROUP];
-            if (expert >= 0) {
-                q4e_fp8_row_dot_group(drow[r], dsrow[r], source, intermediate, lane, count, value);
-#pragma unroll
-                for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
-                    if (m < count) {
-                        value[m] = q4e_warp_sum(value[m]);
-                    }
-                }
-            } else {
-                for (int m = 0; m < count; ++m) {
-                    value[m] = 0.0f;
-                }
-            }
-#pragma unroll
-            for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
-                if (m < count) {
-                    const int total_slot = perm[begin + group + m];
-                    if (lane == 0) {
-                        const int b = total_slot / slots;
-                        const int slot = total_slot % slots;
-                        const float w = weights[(unsigned long long)b * weight_stride + slot];
-                        partials[(unsigned long long)total_slot * hidden + row] = w * value[m];
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
+    q4e_expert_down_body<Q4E_QUANT_FP8>(table, nullptr, indices, perm, run_bounds, weights,
+                                        activated, partials, slots, hidden, intermediate,
+                                        weight_stride);
 }
 
 // Sum the slots routed-expert partials and add the sigmoid-gated shared expert, plus optional

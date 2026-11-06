@@ -62,6 +62,56 @@ pub struct NgramHead {
 
 pub use sparkflash_model::ConfigError;
 
+/// The stored format of the routed experts.
+///
+/// The released NVFP4 checkpoint stores them as packed E2M1 with E4M3 block scales and two
+/// per-tensor F32 scales; the official FP8 checkpoint stores the same experts as E4M3 codes with
+/// one BF16 scale a 128x128 tile. Every other tensor of the two checkpoints is BF16 (and the PLE
+/// table is FP8 in both), so the expert format is the whole difference the loader sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertQuant {
+    /// ModelOpt NVFP4: two E2M1 nibbles a byte, one E4M3 scale a 16-column group.
+    #[default]
+    Nvfp4,
+    /// E4M3 with one scale a 128x128 tile ([ScaleGrid::Tile]).
+    Fp8Block,
+}
+
+impl ExpertQuant {
+    /// The format the released quantisation metadata selects.
+    ///
+    /// # Errors
+    /// A mix this pack has no loader for.
+    pub fn of(quant: &QuantizationSpec) -> Result<Self, ConfigError> {
+        // ModelOpt names the producer in `quant_method` and the arithmetic in `quant_algo`; the
+        // released NVFP4 snapshot declares `quant_method: "modelopt"`, so reading the producer as
+        // a format refused it before a weight was touched.
+        let declared = quant.quant_method.as_deref().unwrap_or_default();
+        let method = if declared.is_empty()
+            || sparkflash_model::architecture::names_the_producer(declared)
+        {
+            quant.quant_algo.as_str()
+        } else {
+            declared
+        };
+        match method.to_ascii_lowercase().as_str() {
+            "fp8" | "fp8_block_scales" => {
+                let block = quant.weight_block_size.as_deref().unwrap_or(&[]);
+                if block != [128, 128] {
+                    return Err(ConfigError::Invalid(format!(
+                        "the FP8 checkpoint must declare weight_block_size [128, 128], not {block:?}"
+                    )));
+                }
+                Ok(Self::Fp8Block)
+            }
+            "" | "mixed_precision" | "nvfp4" => Ok(Self::Nvfp4),
+            _ => Err(ConfigError::Invalid(format!(
+                "the pack serves the NVFP4 and FP8 expert checkpoints, not {method:?}"
+            ))),
+        }
+    }
+}
+
 /// The text-model configuration the device arm runs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Qwen4ExpConfig {
@@ -95,6 +145,8 @@ pub struct Qwen4ExpConfig {
     /// typed fields, so every caller reads the one walk rather than re-deriving the schedule from
     /// `layer_types`. [Self::steps] is the layer walk the device arm builds from.
     pub architecture: sparkflash_model::Architecture,
+    /// The stored format of the routed experts.
+    pub expert_quant: ExpertQuant,
     /// Gated DeltaNet convolution width (4).
     pub linear_conv_kernel_dim: usize,
     /// Gated DeltaNet key head width (128).
@@ -194,6 +246,7 @@ pub struct Qwen4ExpConfig {
 }
 
 const CARRIED_CONFIG: &str = include_str!("../config/qwen38_flash_next_nvfp4.hf.json");
+const CARRIED_FP8_CONFIG: &str = include_str!("../config/qwen38_flash_next_fp8.hf.json");
 
 impl Qwen4ExpConfig {
     /// The released `nvidia/Qwen3.8-Flash-Next-NVFP4` configuration carried in this crate.
@@ -203,6 +256,17 @@ impl Qwen4ExpConfig {
     /// crate's own test rules out.
     pub fn qwen38_flash_next_nvfp4() -> Result<Self, ConfigError> {
         Self::from_json(CARRIED_CONFIG)
+    }
+
+    /// The released `Qwen/Qwen3.8-Flash-Next-FP8` configuration carried in this crate.
+    ///
+    /// The architecture is the NVFP4 checkpoint's; only the routed experts' storage differs
+    /// (E4M3 codes with BF16 128x128 tiles rather than packed E2M1 with E4M3 groups).
+    ///
+    /// # Errors
+    /// [ConfigError] only if the carried document were edited into an unsupported shape.
+    pub fn qwen38_flash_next_fp8() -> Result<Self, ConfigError> {
+        Self::from_json(CARRIED_FP8_CONFIG)
     }
 
     /// Parse a released HF `config.json`.
@@ -259,6 +323,7 @@ impl Qwen4ExpConfig {
             eos_token_ids.push(IM_END_TOKEN);
         }
         let quant = root.quantization_config.unwrap_or_default();
+        let expert_quant = ExpertQuant::of(&quant)?;
         let mut ple_layer_ids = text.ple_layer_ids.unwrap_or_default();
         ple_layer_ids.sort_unstable();
         ple_layer_ids.dedup();
@@ -276,6 +341,7 @@ impl Qwen4ExpConfig {
             max_position_embeddings: text.max_position_embeddings,
             layer_types,
             architecture,
+            expert_quant,
             linear_conv_kernel_dim: text.linear_conv_kernel_dim,
             linear_key_head_dim: text.linear_key_head_dim,
             linear_value_head_dim: text.linear_value_head_dim,
@@ -348,6 +414,28 @@ impl Qwen4ExpConfig {
         Ok(config)
     }
 
+    /// The tiny reference configuration, stored as the FP8 checkpoint's experts.
+    ///
+    /// The expert kernels read whole 128-column tiles, so the fixture's widths are the one
+    /// geometry the tiny NVFP4 fixture cannot also supply. Everything else is [Self::tiny].
+    ///
+    /// # Panics
+    /// Only if the rendered document cannot be parsed again, which its own test rules out.
+    #[must_use]
+    pub fn tiny_fp8() -> Self {
+        let mut config = Self::tiny();
+        config.hidden_size = 128;
+        config.moe_intermediate_size = 128;
+        config.shared_expert_intermediate_size = 128;
+        config.ple_embed_dim = 128;
+        config.expert_quant = ExpertQuant::Fp8Block;
+        // The shared architecture must describe the geometry the typed fields now hold; it is
+        // parsed from the document the typed fields render.
+        config.architecture = crate::architecture::architecture_from_json(&config.to_json())
+            .expect("the tiny FP8 document parses");
+        config
+    }
+
     /// A tiny two-layer configuration for the reference tests.
     ///
     /// Every width divides evenly, the first layer is Gated DeltaNet and the second sparse
@@ -369,6 +457,7 @@ impl Qwen4ExpConfig {
             max_position_embeddings: 64,
             layer_types: vec![LayerKind::Linear, LayerKind::Sparse],
             architecture: crate::architecture::tiny_architecture(),
+            expert_quant: ExpertQuant::Nvfp4,
             linear_conv_kernel_dim: 4,
             linear_key_head_dim: 4,
             linear_value_head_dim: 4,
@@ -502,25 +591,39 @@ impl Qwen4ExpConfig {
             "vision_start_token_id": self.vision_start_token_id,
             "vision_end_token_id": self.vision_end_token_id,
         });
-        let quantization = &self.architecture.quantization;
+        // The document must round-trip the format its plan was built from, so the expert format
+        // is written from the typed field rather than re-derived from the shared architecture.
         let mut quant = serde_json::Map::new();
-        if let Some(method) = &quantization.method {
-            quant.insert("quant_algo".to_owned(), serde_json::json!(method));
-        }
-        if let Some(block) = quantization.block {
-            quant.insert(
-                "weight_block_size".to_owned(),
-                serde_json::json!([block, block]),
-            );
-        }
-        if let Some(scale) = &quantization.scale {
-            quant.insert("fmt".to_owned(), serde_json::json!(scale));
-        }
-        if let Some(expert) = &quantization.expert {
-            quant.insert(
-                "expert_weight".to_owned(),
-                serde_json::json!({ "quant_algo": expert }),
-            );
+        match self.expert_quant {
+            ExpertQuant::Nvfp4 => {
+                let quantization = &self.architecture.quantization;
+                if let Some(method) = &quantization.method {
+                    quant.insert("quant_algo".to_owned(), serde_json::json!(method));
+                }
+                if let Some(block) = quantization.block {
+                    quant.insert(
+                        "weight_block_size".to_owned(),
+                        serde_json::json!([block, block]),
+                    );
+                }
+                if let Some(scale) = &quantization.scale {
+                    quant.insert("fmt".to_owned(), serde_json::json!(scale));
+                }
+                if let Some(expert) = &quantization.expert {
+                    quant.insert(
+                        "expert_weight".to_owned(),
+                        serde_json::json!({ "quant_algo": expert }),
+                    );
+                }
+            }
+            ExpertQuant::Fp8Block => {
+                quant.insert("quant_method".to_owned(), serde_json::json!("fp8"));
+                quant.insert("activation_scheme".to_owned(), serde_json::json!("dynamic"));
+                quant.insert(
+                    "weight_block_size".to_owned(),
+                    serde_json::json!([128, 128]),
+                );
+            }
         }
         if !quant.is_empty() {
             root["quantization_config"] = serde_json::Value::Object(quant);
@@ -681,6 +784,16 @@ impl Qwen4ExpConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.expert_quant == ExpertQuant::Fp8Block
+            && (!self.hidden_size.is_multiple_of(128)
+                || !self.moe_intermediate_size.is_multiple_of(128))
+        {
+            return Err(ConfigError::Invalid(format!(
+                "FP8 experts need 128-wide tiles: hidden {} and intermediate {} must both be \
+                 multiples of 128",
+                self.hidden_size, self.moe_intermediate_size
+            )));
+        }
         let require = |condition: bool, message: &str| {
             if condition {
                 Ok(())
@@ -904,21 +1017,20 @@ impl Qwen4ExpConfig {
 /// The quantisation metadata this pack requires of the checkpoint.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QuantizationSpec {
-    /// The mixture name (`MIXED_PRECISION`).
+    /// The mixture name (`MIXED_PRECISION`) of a ModelOpt NVFP4 checkpoint.
     #[serde(default)]
     pub quant_algo: String,
+    /// The method a Qwen FP8 checkpoint declares (`fp8`).
+    #[serde(default)]
+    pub quant_method: Option<String>,
+    /// The weight block a block-scaled FP8 checkpoint declares ([128, 128]).
+    #[serde(default)]
+    pub weight_block_size: Option<Vec<usize>>,
 }
 
 impl QuantizationSpec {
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.quant_algo == "MIXED_PRECISION" || self.quant_algo.is_empty() {
-            Ok(())
-        } else {
-            Err(ConfigError::Invalid(format!(
-                "the pack serves the NVFP4 mixed-precision checkpoint, not {:?}",
-                self.quant_algo
-            )))
-        }
+        ExpertQuant::of(self).map(|_| ())
     }
 }
 
@@ -1161,6 +1273,34 @@ fn default_vision_end() -> u32 {
 mod tests {
     use super::*;
 
+    /// The packed arm resolves a boot plan from the checkpoint's own `config.json` before it reads
+    /// a weight (`check_plan`), so a release that plans at TP1 and not at TP4 is refused at boot
+    /// with the missing part named. This is that check, on the carried FP8 document: the release
+    /// plans at four ranks and every part resolves to a kernel image, which is what makes the
+    /// four-rank FP8 serve a launch and not an experiment.
+    #[test]
+    fn the_fp8_release_plans_at_the_four_rank_width() {
+        use sparkflash_model::Target;
+        use sparkflash_ops::engine_plan::EnginePlan;
+        use sparkflash_ops::resolver::{Availability, KernelResolver};
+        for world in [1, 2, 4] {
+            let plan = EnginePlan::from_json(CARRIED_FP8_CONFIG, Target::Sm121, world, 0)
+                .unwrap_or_else(|error| panic!("the FP8 release at TP{world}: {error}"));
+            let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue)
+                .with_family(plan.family());
+            let failures = resolver.failures(&plan);
+            assert!(
+                failures.is_empty(),
+                "TP{world}: {}",
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+    }
+
     #[test]
     fn the_released_config_parses_to_the_qwen4_exp_shape() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
@@ -1272,6 +1412,7 @@ mod tests {
         for config in [
             Qwen4ExpConfig::tiny(),
             Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses"),
+            Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried FP8 config parses"),
         ] {
             let rendered = config.to_json();
             let parsed = Qwen4ExpConfig::from_json(&rendered).unwrap_or_else(|error| {
@@ -1279,6 +1420,88 @@ mod tests {
             });
             assert_eq!(parsed, config);
         }
+    }
+
+    #[test]
+    fn the_fp8_release_is_the_same_architecture_with_a_different_expert_format() {
+        let nvfp4 = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
+        let fp8 = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried FP8 config parses");
+        assert_eq!(fp8.expert_quant, ExpertQuant::Fp8Block);
+        assert_eq!(nvfp4.expert_quant, ExpertQuant::Nvfp4);
+        assert_eq!(fp8.hidden_size, nvfp4.hidden_size);
+        assert_eq!(fp8.num_hidden_layers, nvfp4.num_hidden_layers);
+        assert_eq!(fp8.num_experts, nvfp4.num_experts);
+        assert_eq!(fp8.moe_intermediate_size, nvfp4.moe_intermediate_size);
+        let again =
+            Qwen4ExpConfig::from_json(&fp8.to_json()).expect("the rendered document parses");
+        assert_eq!(again.expert_quant, ExpertQuant::Fp8Block);
+        // The served identity follows the stored format, so a card cannot report the NVFP4
+        // checkpoint for an FP8 run.
+        assert_eq!(
+            crate::device::descriptor_for(&fp8, 4096).id,
+            "Qwen/Qwen3.8-Flash-Next-FP8"
+        );
+        assert_eq!(
+            crate::device::descriptor_for(&nvfp4, 4096).id,
+            "nvidia/Qwen3.8-Flash-Next-NVFP4"
+        );
+    }
+
+    #[test]
+    fn the_released_modelopt_snapshot_opens_by_its_producer_name() {
+        // The snapshot's own quantization_config, copied field for field: ModelOpt names the
+        // producer, the mixture is MIXED_PRECISION, and every routed expert is NVFP4. The pack
+        // refused this document before a weight was touched, and the carried config hid it by
+        // omitting quant_method.
+        let document = serde_json::json!({
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "producer": {"name": "modelopt", "version": "0.46.0.dev281+g73d778422"},
+            "quantized_layers": {
+                "model.language_model.layers.0.mlp.experts": {
+                    "quant_algo": "NVFP4", "group_size": 16,
+                },
+                "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                    "quant_algo": "FP8",
+                },
+            },
+            "config_groups": {"group_0": {
+                "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                "targets": ["model.language_model.layers.0.mlp.experts"],
+            }},
+        });
+        let spec: QuantizationSpec =
+            serde_json::from_value(document).expect("the released spec parses");
+        assert_eq!(
+            ExpertQuant::of(&spec).expect("the released snapshot opens"),
+            ExpertQuant::Nvfp4
+        );
+        // A producer name still cannot smuggle in an arithmetic the pack has no loader for.
+        let spec = QuantizationSpec {
+            quant_method: Some("modelopt".to_owned()),
+            quant_algo: "AWQ".to_owned(),
+            ..QuantizationSpec::default()
+        };
+        assert!(ExpertQuant::of(&spec).is_err(), "AWQ is still refused");
+    }
+
+    #[test]
+    fn an_unknown_quantisation_is_refused_by_name() {
+        let spec = QuantizationSpec {
+            quant_algo: "AWQ".to_owned(),
+            ..QuantizationSpec::default()
+        };
+        let error = ExpertQuant::of(&spec).expect_err("AWQ is not this pack's format");
+        assert!(error.to_string().contains("AWQ"), "{error}");
+        let spec = QuantizationSpec {
+            quant_method: Some("fp8".to_owned()),
+            weight_block_size: Some(vec![32, 32]),
+            ..QuantizationSpec::default()
+        };
+        assert!(
+            ExpertQuant::of(&spec).is_err(),
+            "a 32-wide FP8 tile is not the release"
+        );
     }
 
     #[test]

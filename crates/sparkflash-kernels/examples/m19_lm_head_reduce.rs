@@ -123,39 +123,15 @@ const CONCENTRATED_PER_RANK: [usize; RANKS] = [1_062, 1_205, 1_215, 1_417];
 /// The concentrated case's declared argmax, preserved by the certificate in m16's windows.
 const CONCENTRATED_TOKEN: usize = 33_865;
 
+#[path = "support/mem.rs"]
+mod mem;
+use mem::check_floor;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("m19_lm_head_reduce: {error}");
         std::process::exit(1);
     }
-}
-
-fn mem_available_kb() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-fn check_floor(floor_gib: u64, point: &str) -> Result<(), String> {
-    let kb = mem_available_kb()
-        .ok_or_else(|| "cannot read MemAvailable from /proc/meminfo".to_owned())?;
-    let bytes = kb.saturating_mul(1024);
-    let floor = floor_gib.saturating_mul(1024 * 1024 * 1024);
-    if bytes < floor {
-        return Err(format!(
-            "MemAvailable at {point} is {kb} kB ({:.2} GiB), below the {floor_gib}-GiB floor: refusing to run",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        ));
-    }
-    println!(
-        "MemAvailable at {point}: {kb} kB ({:.1} GiB), floor {floor_gib} GiB - ok",
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

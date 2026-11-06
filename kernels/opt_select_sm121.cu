@@ -50,29 +50,17 @@
 
 #include "opt_pdl_sm121.cuh"
 #include "m4_common_sm121.cuh"
+#include "select_body_sm121.cuh"
 
 // A named namespace around the whole file, kernels included (extern "C" keeps their symbols): the
 // build's combined probe compiles this beside ref_select_sm121.cu, whose helpers share these names.
 namespace opt_select {
-constexpr int MAX_POS = 4096;
-constexpr int MAX_BLOCKS = 4096;
-constexpr int BLOCK = 256;
-constexpr int MAX_MASK_WORDS = MAX_POS / 32;
-
-__device__ __forceinline__ float round_bf16(float value) {
-    return __bfloat162float(__float2bfloat16_rn(value));
-}
-
-// true when (score_a, id_a) stands before (score_b, id_b): score descending, then id ascending.
-__device__ __forceinline__ bool before(float score_a, uint32_t id_a, float score_b, uint32_t id_b) {
-    if (score_a > score_b) {
-        return true;
-    }
-    if (score_a < score_b) {
-        return false;
-    }
-    return id_a < id_b;
-}
+using spark_select::before;
+using spark_select::round_bf16;
+using spark_select::BLOCK;
+using spark_select::MAX_BLOCKS;
+using spark_select::MAX_MASK_WORDS;
+using spark_select::MAX_POS;
 
 __device__ __forceinline__ void opt_ref_select_body(
     const float* __restrict__ pre_scores,
@@ -94,152 +82,9 @@ __device__ __forceinline__ void opt_ref_select_body(
     uint32_t block_size,
     uint32_t no_index,
     uint32_t flags) {
-    (void)flags;
-    static_assert(BLOCK % 32 == 0, "one whole warp per score-generation step");
-    static_assert(MAX_BLOCKS >= MAX_POS, "the block table covers every position");
-    __shared__ float s_score[MAX_POS];
-    __shared__ uint32_t s_mask[MAX_MASK_WORDS];
-    __shared__ union {
-        float f[MAX_BLOCKS];
-        uint32_t u[MAX_BLOCKS];
-    } scratch;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t n = n_pos < MAX_POS ? n_pos : MAX_POS;
-
-    if (mask_mode == 2u) {
-        for (uint32_t word = tid; word < MAX_MASK_WORDS; word += BLOCK) {
-            s_mask[word] = 0u;
-        }
-    } else if (mask_mode == 1u) {
-        for (uint32_t word = tid; word < MAX_MASK_WORDS; word += BLOCK) {
-            s_mask[word] = mask_in[word];
-        }
-    }
-    __syncthreads();
-
-    // Scores: one position per thread pass, heads ascending and the dot ascending inside a head.
-    // Scores: warp per position, lanes over head_dim; the heads are folded in ascending order as
-    // the reference does, each head's dot is a warp tree instead of a serial scan.
-    if (pre_scores != nullptr) {
-        for (uint32_t position = tid; position < n; position += BLOCK) s_score[position] = pre_scores[position];
-    } else {
-        const uint32_t lane = tid & 31u;
-        const uint32_t warp = tid >> 5;
-        for (uint32_t position = warp; position < n; position += BLOCK / 32u) {
-            const float* key = keys + static_cast<size_t>(position) * head_dim;
-            float sum = 0.0f;
-            for (uint32_t head = 0; head < heads; ++head) {
-                const float* q = q_index + static_cast<size_t>(head) * head_dim;
-                float acc = 0.0f;
-                for (uint32_t d = lane; d < head_dim; d += 32u) {
-                    acc = fmaf(q[d], key[d], acc);
-                }
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-                const float raw = round_bf16(acc);
-                if (raw > 0.0f) {
-                    sum = __fadd_rn(sum, round_bf16(__fmul_rn(raw, weights[head])));
-                }
-            }
-            if (lane == 0u) s_score[position] = round_bf16(sum);
-        }
-    }
-    __syncthreads();
-
-    // Level one: the HSI candidate block mask. Block scores live in the scratch union while this
-    // phase runs; the mask is then written one whole word per thread, so no atomic is needed.
-    if (mask_mode == 2u && block_size != 0u && n != 0u) {
-        const uint32_t num_blocks = (n + block_size - 1u) / block_size;
-        for (uint32_t block = tid; block < num_blocks; block += BLOCK) {
-            const uint32_t start = block * block_size;
-            const uint32_t stop = (start + block_size) < n ? (start + block_size) : n;
-            float best = -__builtin_huge_valf();
-            for (uint32_t position = start; position < stop; ++position) {
-                best = s_score[position] > best ? s_score[position] : best;
-            }
-            scratch.f[block] = best;
-        }
-        __syncthreads();
-        if (reach > 0u) {
-            const uint32_t last = (reach - 1u) / block_size;
-            if (last < num_blocks && tid == 0u) {
-                scratch.f[last] = __builtin_huge_valf();
-            }
-        }
-        __syncthreads();
-        const uint32_t keep = topk_blocks < num_blocks ? topk_blocks : num_blocks;
-        for (uint32_t word = tid; word < MAX_MASK_WORDS; word += BLOCK) {
-            uint32_t bits = 0u;
-            for (uint32_t bit = 0; bit < 32u; ++bit) {
-                const uint32_t position = word * 32u + bit;
-                if (position < n) {
-                    const uint32_t block = position / block_size;
-                    uint32_t rank = 0u;
-                    for (uint32_t other = 0; other < num_blocks; ++other) {
-                        if (other != block && before(scratch.f[other], other, scratch.f[block], block)) {
-                            rank += 1u;
-                        }
-                    }
-                    if (rank < keep && scratch.f[block] > -__builtin_huge_valf()) {
-                        bits |= 1u << bit;
-                    }
-                }
-            }
-            s_mask[word] = bits;
-        }
-        __syncthreads();
-        if (mask_out != nullptr) {
-            for (uint32_t word = tid; word < MAX_MASK_WORDS; word += BLOCK) {
-                mask_out[word] = s_mask[word];
-            }
-        }
-        __syncthreads();
-    }
-    // The masks on this query's own scores: reach first (attention.rs:1610-1616), then a consumed
-    // HSI mask (attention.rs:1640-1647).
-    for (uint32_t position = tid; position < n; position += BLOCK) {
-        if (position >= reach) {
-            s_score[position] = -__builtin_huge_valf();
-        }
-        if (mask_mode == 1u && (mask_in[position >> 5] & (1u << (position & 31u))) == 0u) {
-            s_score[position] = -__builtin_huge_valf();
-        }
-    }
-    __syncthreads();
-
-    if (out_scores != nullptr) {
-        for (uint32_t position = tid; position < n; position += BLOCK) {
-            out_scores[position] = s_score[position];
-        }
-    }
-
-    // Rank by the host's total order; the chosen positions are those with rank < topk. Then the
-    // chosen ones are ordered ascending by position and mapped into the shared index space.
-    const uint32_t keep = topk < n ? topk : n;
-    for (uint32_t position = tid; position < n; position += BLOCK) {
-        uint32_t rank = 0u;
-        for (uint32_t other = 0; other < n; ++other) {
-            if (other != position) {
-                const bool better =
-                    before(s_score[other], other, s_score[position], position);
-                rank += better ? 1u : 0u;
-            }
-        }
-        scratch.u[position] = rank;
-    }
-    __syncthreads();
-    for (uint32_t position = tid; position < n; position += BLOCK) {
-        if (scratch.u[position] < keep) {
-            uint32_t before_it = 0u;
-            for (uint32_t other = 0; other < n; ++other) {
-                if (other != position && scratch.u[other] < keep && other < position) {
-                    before_it += 1u;
-                }
-            }
-            out_ids[before_it] = position < reach ? position + offset : no_index;
-        }
-    }
+    spark_select::body<true>(pre_scores, q_index, keys, weights, out_ids, out_scores, mask_in,
+                             mask_out, n_pos, heads, head_dim, reach, topk, offset, mask_mode,
+                             topk_blocks, block_size, no_index, flags);
 }
 
 #define OPT_SEL_PARAMS                                                                              \

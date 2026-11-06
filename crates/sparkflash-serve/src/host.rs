@@ -671,7 +671,8 @@ fn decode_new(codec: &dyn PromptCodec, previous: &mut String, ids: &[u32]) -> Op
     Some(delta)
 }
 
-fn common_prefix_bytes(left: &str, right: &str) -> usize {
+/// The bytes two decodes share, the common prefix a token's text delta is measured against.
+pub fn common_prefix_bytes(left: &str, right: &str) -> usize {
     left.bytes()
         .zip(right.bytes())
         .take_while(|(a, b)| a == b)
@@ -680,7 +681,7 @@ fn common_prefix_bytes(left: &str, right: &str) -> usize {
 
 /// The holdback buffer for stop strings; the rule is vLLM's: hold up to the longest stop minus
 /// one character so a match split across tokens is still detected.
-struct StopBuffer {
+pub struct StopBuffer {
     sequences: Vec<String>,
     holdback: usize,
     pending: String,
@@ -688,7 +689,8 @@ struct StopBuffer {
 }
 
 impl StopBuffer {
-    fn new(sequences: &[String]) -> Self {
+    /// Builds the buffer for a stop-string set, holding back the longest stop minus one character.
+    pub fn new(sequences: &[String]) -> Self {
         let holdback = sequences
             .iter()
             .map(|sequence| sequence.chars().count())
@@ -703,7 +705,8 @@ impl StopBuffer {
         }
     }
 
-    fn push(&mut self, piece: Option<&str>) -> String {
+    /// Appends the text one token decoded to and returns the part that is safe to emit.
+    pub fn push(&mut self, piece: Option<&str>) -> String {
         if self.matched {
             return String::new();
         }
@@ -739,11 +742,13 @@ impl StopBuffer {
         text
     }
 
-    fn finish(&mut self) -> String {
+    /// Returns the held-back text at end of stream, so a trailing match is not lost.
+    pub fn finish(&mut self) -> String {
         std::mem::take(&mut self.pending)
     }
 
-    fn matched(&self) -> bool {
+    /// Whether a stop string has been seen; the buffer emits nothing after that.
+    pub fn matched(&self) -> bool {
         self.matched
     }
 }

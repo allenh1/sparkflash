@@ -44,6 +44,13 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define od_e4m3x4 opt_e4m3x4
+#define od_warp_sum opt_warp_sum
+#define od_ldw opt_ldw
+#define od_dot8 opt_dot8_bf16
 #include "opt_sample_sm121.cuh"
 #include "m4_activation_quant_sm121.cuh"
 
@@ -54,30 +61,8 @@
 __device__ __forceinline__ float od_bf16lo(uint32_t w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float od_bf16hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
 
-__device__ __forceinline__ uint4 od_ldw(const void *p) {
-    uint4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-        : "l"(p));
-    return v;
-}
 
-__device__ __forceinline__ float od_dot8(uint4 w, uint4 h, float acc) {
-    const uint32_t a[4] = {w.x, w.y, w.z, w.w};
-    const uint32_t b[4] = {h.x, h.y, h.z, h.w};
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        acc = fmaf(od_bf16lo(a[k]), od_bf16lo(b[k]), acc);
-        acc = fmaf(od_bf16hi(a[k]), od_bf16hi(b[k]), acc);
-    }
-    return acc;
-}
 
-__device__ __forceinline__ float od_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 
 // Row y: taps_all + y * 3 * 5120 + tap * 5120 = mean over the hc copies of stream_all + y * 4 * 5120.
 extern "C" __global__ void __launch_bounds__(256) opt_draft_taps(
@@ -149,14 +134,6 @@ extern "C" __global__ void __launch_bounds__(256) opt_draft_norm_quant(
 #define OD_A_MAX_KEYS 160u
 #define OD_A_WSCALES 16u
 
-__device__ __forceinline__ void od_e4m3x4(uint32_t w, float *f) {
-    uint32_t h01, h23;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"((uint16_t)(w & 0xffffu)));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"((uint16_t)(w >> 16)));
-    const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&h01));
-    const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&h23));
-    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
-}
 
 __device__ __forceinline__ void od_row16(const uint8_t *__restrict__ codes_base,
                                          const uint8_t *__restrict__ scales_base, uint32_t slot,

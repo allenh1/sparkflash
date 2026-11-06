@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 pub use sparkflash_model::dflash2::*;
 use sparkflash_weights::hub;
 use sparkflash_weights::safetensors::write_checkpoint;
-use sparkflash_weights::{DType, TensorSpec};
 
 use crate::config::Qwen4ExpConfig;
 
@@ -76,70 +75,9 @@ impl From<&Qwen4ExpConfig> for DraftTarget {
     }
 }
 
-/// Every tensor a drafter of `config` stores, at the released names, shapes and dtype (BF16):
-/// the ones [crate::device::GpuDflash2::load] reads.
-#[must_use]
-pub fn drafter_tensor_specs(config: &Dflash2Config) -> Vec<TensorSpec> {
-    let hidden = config.hidden_size;
-    let spec = |name: String, shape: Vec<usize>| TensorSpec {
-        name,
-        dtype: DType::BF16,
-        shape,
-    };
-    let mut specs = vec![
-        spec(
-            "candidate_selector.hidden_projection.weight".to_owned(),
-            vec![config.selector_rank, hidden],
-        ),
-        spec(
-            "candidate_selector.predecessor_codebook".to_owned(),
-            vec![config.vocab_size, config.selector_rank],
-        ),
-        spec(
-            "candidate_selector.successor_codebook".to_owned(),
-            vec![config.vocab_size, config.selector_rank],
-        ),
-        spec("fc.weight".to_owned(), vec![hidden, config.feature_width()]),
-        spec("hidden_norm.weight".to_owned(), vec![hidden]),
-        spec("norm.weight".to_owned(), vec![hidden]),
-    ];
-    for layer in 0..config.num_hidden_layers {
-        let at = |name: &str| format!("layers.{layer}.{name}");
-        for conv in ["attention_conv", "mlp_conv"] {
-            specs.push(spec(
-                at(&format!("{conv}.base_kernel")),
-                vec![2, config.conv_kernel_size, hidden],
-            ));
-            specs.push(spec(
-                at(&format!("{conv}.kernel_projection.weight")),
-                vec![config.conv_taps_width(), hidden],
-            ));
-        }
-        for norm in ["input_layernorm", "post_attention_layernorm"] {
-            specs.push(spec(at(&format!("{norm}.weight")), vec![hidden]));
-        }
-        for (name, shape) in [
-            ("self_attn.q_proj.weight", vec![config.q_width(), hidden]),
-            ("self_attn.k_proj.weight", vec![config.kv_width(), hidden]),
-            ("self_attn.v_proj.weight", vec![config.kv_width(), hidden]),
-            ("self_attn.o_proj.weight", vec![hidden, config.q_width()]),
-            ("self_attn.q_norm.weight", vec![config.head_dim]),
-            ("self_attn.k_norm.weight", vec![config.head_dim]),
-            (
-                "mlp.gate_proj.weight",
-                vec![config.intermediate_size, hidden],
-            ),
-            ("mlp.up_proj.weight", vec![config.intermediate_size, hidden]),
-            (
-                "mlp.down_proj.weight",
-                vec![hidden, config.intermediate_size],
-            ),
-        ] {
-            specs.push(spec(at(name), shape));
-        }
-    }
-    specs
-}
+/// Every tensor a drafter of config stores, at the released names, shapes and dtype (BF16):
+/// the shared plan in sparkflash_ops::dflash, which the loader and every arm read.
+pub use sparkflash_ops::dflash::drafter_tensor_specs;
 
 /// Write a synthetic drafter into `directory`: `config_json` as its `config.json` and every
 /// tensor of [drafter_tensor_specs] in one `model.safetensors`, valued as the target fixtures

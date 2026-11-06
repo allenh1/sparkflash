@@ -114,6 +114,12 @@
 // the first include: trace_globaltimer_sm121.cuh branches on it at include time.
 #define SPARKFLASH_ENABLE_GPU_TRACE 1
 #include "m4_activation_quant_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_seam_bf16_round opt_bf16_round
+#define spark_seam_sigmoid opt_sigmoid
+#define spark_seam_warp_sum opt_warp_sum_rn
 
 // Per-launch stage codes for the trace record's `payload_meta` word. The Rust mirror is
 // crates/sparkflash-kernels/src/device_trace.rs (STAGE_*), and its test pins both halves to this
@@ -139,33 +145,11 @@ static_assert(SPARK_M4_HIDDEN % SPARK_SEAM_THREADS == 0u,
               "the row loops stride the block size into the hidden width");
 
 // The released BF16 boundary: round to nearest even, NaN kept quiet (quant.rs:157-171).
-__device__ __forceinline__ float spark_seam_bf16_round(float value) {
-    const uint32_t bits = spark_float_bits(value);
-    if (value != value) {
-        return __uint_as_float((((bits >> 16) | 0x0040u)) << 16);
-    }
-    const uint32_t round = 0x7FFFu + ((bits >> 16) & 1u);
-    return __uint_as_float(((bits + round) >> 16) << 16);
-}
 
 // linalg::sigmoid: 1 / (1 + exp(-x)), with the negative branch written the reference's way so the
 // exponential cannot overflow (linalg.rs:1160-1167).
-__device__ __forceinline__ float spark_seam_sigmoid(float value) {
-    if (value >= 0.0f) {
-        return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
-    }
-    const float exponential = expf(value);
-    return __fdiv_rn(exponential, __fadd_rn(1.0f, exponential));
-}
 
 // One warp's tree reduction of 32 lane values.
-__device__ __forceinline__ float spark_seam_warp_sum(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = __fadd_rn(value, __shfl_down_sync(0xFFFFFFFFu, value, offset));
-    }
-    return value;
-}
 
 // The whole block's tree reduction, broadcast to every thread through the shared scratch slot.
 __device__ __forceinline__ float spark_seam_block_sum(float value, float *scratch) {

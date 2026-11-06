@@ -135,7 +135,7 @@ const DENSE_PIN_SHA256: &str = "d751f2b65b076659ff0c4cc37542f8ae4899ec61b7f40c3d
 /// Pinned wi_a cubin size.
 const WO_A_PIN_BYTES: usize = 75_888;
 /// Pinned wo_a cubin sha256.
-const WO_A_PIN_SHA256: &str = "157dffa6d18a55bf67398876c3a19aa7890ceb9a07bd5ec8d6bf6dcb3b2e4d6e";
+const WO_A_PIN_SHA256: &str = "ec2514a20fc6995cf325253cd109920935e2cdd7f34e513493ca417b3f09fd0f";
 /// Both pinned kernels carry no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// The grouped output projection's geometry, from the released kernel and the measured layer-0 table.
@@ -155,39 +155,15 @@ fn control_gap_within_bar(gap: f32, operand_max: f32) -> bool {
     gap <= CONTROL_BAR * operand_max
 }
 
+#[path = "support/mem.rs"]
+mod mem;
+use mem::{check_floor, mem_available_kb};
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("m13_output_projections: {error}");
         std::process::exit(1);
     }
-}
-
-fn mem_available_kb() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-fn check_floor(floor_gib: u64, point: &str) -> Result<(), String> {
-    let kb = mem_available_kb()
-        .ok_or_else(|| "cannot read MemAvailable from /proc/meminfo".to_owned())?;
-    let bytes = kb.saturating_mul(1024);
-    let floor = floor_gib.saturating_mul(1024 * 1024 * 1024);
-    if bytes < floor {
-        return Err(format!(
-            "MemAvailable at {point} is {kb} kB ({:.2} GiB), below the {floor_gib}-GiB floor: refusing to run",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        ));
-    }
-    println!(
-        "MemAvailable at {point}: {kb} kB ({:.1} GiB), floor {floor_gib} GiB - ok",
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    Ok(())
 }
 
 fn admit_memory(floor_gib: u64, planned: u64, point: &str) -> Result<(), String> {

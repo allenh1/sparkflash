@@ -229,6 +229,48 @@ fn a_configuration_past_a_kernel_bound_is_refused() {
 }
 
 #[test]
+fn the_fp8_fixture_writes_the_block_scaled_experts_and_loads_them() {
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    let config = Qwen4ExpConfig::tiny_fp8();
+    write_synthetic_checkpoint(temp.path(), &config, 7).expect("the FP8 fixture writes");
+    let source = open_source(temp.path());
+    let plan = Qwen4ExpTensorPlan::served_and_mtp(&config);
+    plan.conformance(source.names())
+        .expect("the fixture carries exactly the served tensor set");
+    let prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj";
+    assert_eq!(
+        source
+            .spec(&format!("{prefix}.weight"))
+            .expect("the codes")
+            .dtype,
+        sparkflash_weights::DType::F8E4M3
+    );
+    assert_eq!(
+        source
+            .spec(&format!("{prefix}.weight_scale_inv"))
+            .expect("the tile grid")
+            .dtype,
+        sparkflash_weights::DType::BF16
+    );
+    assert!(
+        source.spec(&format!("{prefix}.weight_scale_2")).is_err(),
+        "the FP8 fixture must not carry an NVFP4 per-tensor scale"
+    );
+    let weights = load_weights(&config, &source).expect("the host loader decodes FP8 experts");
+    let expert = &weights.layers[0].moe.experts[0];
+    assert_eq!(expert.gate.rows, config.moe_intermediate_size);
+    assert_eq!(expert.gate.columns, config.hidden_size);
+    assert!(
+        expert
+            .gate
+            .data
+            .iter()
+            .all(|value| value.is_finite() && *value != 0.0),
+        "the fixture's FP8 experts decode to a non-degenerate matrix"
+    );
+}
+
+#[test]
 fn a_tampered_checkpoint_is_refused_rather_than_silently_truncated() {
     let temp = tempfile::tempdir().expect("a temporary directory");
     let fixture = SyntheticCheckpoint::write(temp.path()).expect("the fixture writes");

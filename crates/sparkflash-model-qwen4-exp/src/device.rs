@@ -92,7 +92,7 @@ use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
 use sparkflash_weights::{WeightSource, check_length};
 
-use crate::config::{LayerKind, Qwen4ExpConfig};
+use crate::config::{ExpertQuant, LayerKind, Qwen4ExpConfig};
 use crate::ple::PleTable;
 use crate::tensor::{DEVICE_RESIDENT_BYTES, Role};
 
@@ -1002,6 +1002,80 @@ impl<'a> Uploader<'a> {
         self.sink.borrow_mut().weight(name, len, bytes)
     }
 
+    /// `part` of one block-scaled FP8 expert matrix: the E4M3 codes and the BF16 inverse-scale
+    /// grid, both taken in whole 128-wide tiles.
+    ///
+    /// The tile is the sharing unit: its one BF16 scale covers all 128 of its columns, so a rank
+    /// holds a run of whole tiles and its scale grid is the same run of the global grid. No zeros
+    /// are appended here - [tp::Shard::expert_tiles] hands out whole tiles and nothing narrower -
+    /// so the codes a rank holds are exactly `rows x columns` of the released weight.
+    fn fp8_part(
+        &self,
+        source: &dyn WeightSource,
+        prefix: &str,
+        (rows, columns): (usize, usize),
+        part: Part,
+    ) -> Result<(Deviceptr, Deviceptr), String> {
+        const TILE: usize = 128;
+        let (part_rows, part_columns) = part.shape((rows, columns))?;
+        let (first, count) = match part {
+            Part::Rows(first, count) | Part::Columns(first, count) => (first, count),
+        };
+        if !first.is_multiple_of(TILE) || !count.is_multiple_of(TILE) {
+            return Err(format!(
+                "{part:?} of the FP8 [{rows}, {columns}] at {prefix} splits a 128x128 scale tile"
+            ));
+        }
+        let weight_len = part_rows * part_columns;
+        let scale_len = (part_rows / TILE) * (part_columns / TILE) * 2;
+        let (weight, scales) = if self.wants_bytes() {
+            let weight = source
+                .read(&format!("{prefix}.weight"))
+                .map_err(|error| error.to_string())?;
+            let scales = source
+                .read(&format!("{prefix}.weight_scale_inv"))
+                .map_err(|error| error.to_string())?;
+            if weight.len() != rows * columns {
+                return Err(format!(
+                    "{prefix}.weight is {} bytes, expected {} for an FP8 [{rows}, {columns}]",
+                    weight.len(),
+                    rows * columns
+                ));
+            }
+            let grid = (rows / TILE, columns / TILE);
+            if scales.len() != grid.0 * grid.1 * 2 {
+                return Err(format!(
+                    "{prefix}.weight_scale_inv is {} bytes, expected {} for a {:?} tile grid",
+                    scales.len(),
+                    grid.0 * grid.1 * 2,
+                    grid
+                ));
+            }
+            // One code a weight, so the part of the weight is the part itself; one BF16 a tile,
+            // so the part of the grid is the part in tile units.
+            let tile_part = match part {
+                Part::Rows(first, count) => Part::Rows(first / TILE, count / TILE),
+                Part::Columns(first, count) => Part::Columns(first / TILE, count / TILE),
+            };
+            (
+                part.of(&weight, (rows, columns)).into_owned(),
+                tile_part.of(&scales, grid).into_owned(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let weight_pointer =
+            self.sink
+                .borrow_mut()
+                .weight(&format!("{prefix}.weight"), weight_len, weight)?;
+        let scale_pointer = self.sink.borrow_mut().weight(
+            &format!("{prefix}.weight_scale_inv"),
+            scale_len,
+            scales,
+        )?;
+        Ok((weight_pointer, scale_pointer))
+    }
+
     /// One block-scaled FP8 expert matrix: the codes and the BF16 inverse-scale grid.
     fn fp8(
         &self,
@@ -1229,6 +1303,7 @@ pub(crate) fn build_shard(
     let value_heads = shard.even(config.linear_num_value_heads);
     let expert_share = shard.even(config.moe_intermediate_size);
     let expert_width = shard.expert_width(config.moe_intermediate_size);
+
     let shared = shard.even(config.shared_expert_intermediate_size);
     let rows =
         |(first, count): (usize, usize), width: usize| Part::Rows(first * width, count * width);
@@ -1430,34 +1505,105 @@ pub(crate) fn build_shard(
             ));
         }
         let mlp = format!("{prefix}.mlp");
-        let experts = (0..config.num_experts)
-            .map(|expert| {
-                let prefix = format!("{mlp}.experts.{expert}");
-                Ok(GpuExpert {
-                    gate: uploader.nvfp4_part(
-                        source,
-                        &format!("{prefix}.gate_proj"),
-                        (config.moe_intermediate_size, hidden),
-                        rows(expert_share, 1),
-                        expert_width,
-                    )?,
-                    up: uploader.nvfp4_part(
-                        source,
-                        &format!("{prefix}.up_proj"),
-                        (config.moe_intermediate_size, hidden),
-                        rows(expert_share, 1),
-                        expert_width,
-                    )?,
-                    down: uploader.nvfp4_part(
-                        source,
-                        &format!("{prefix}.down_proj"),
-                        (hidden, config.moe_intermediate_size),
-                        columns(expert_share, 1),
-                        expert_width,
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        // The two released checkpoints differ only in how the routed experts are stored: the same
+        // [experts][2] pointer table either way, which is what lets one expert kernel serve both.
+        let (expert_table, expert_scales) = match config.expert_quant {
+            ExpertQuant::Nvfp4 => {
+                let experts = (0..config.num_experts)
+                    .map(|expert| {
+                        let prefix = format!("{mlp}.experts.{expert}");
+                        Ok(GpuExpert {
+                            gate: uploader.nvfp4_part(
+                                source,
+                                &format!("{prefix}.gate_proj"),
+                                (config.moe_intermediate_size, hidden),
+                                rows(expert_share, 1),
+                                expert_width,
+                            )?,
+                            up: uploader.nvfp4_part(
+                                source,
+                                &format!("{prefix}.up_proj"),
+                                (config.moe_intermediate_size, hidden),
+                                rows(expert_share, 1),
+                                expert_width,
+                            )?,
+                            down: uploader.nvfp4_part(
+                                source,
+                                &format!("{prefix}.down_proj"),
+                                (hidden, config.moe_intermediate_size),
+                                columns(expert_share, 1),
+                                expert_width,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let mut pointers = Vec::with_capacity(experts.len() * 6 * 8);
+                for expert in &experts {
+                    for pointer in [
+                        expert.gate.weight.0,
+                        expert.gate.scales.0,
+                        expert.up.weight.0,
+                        expert.up.scales.0,
+                        expert.down.weight.0,
+                        expert.down.scales.0,
+                    ] {
+                        pointers.extend_from_slice(&pointer.to_le_bytes());
+                    }
+                }
+                let mut scalars = Vec::with_capacity(experts.len() * 3 * 4);
+                for expert in &experts {
+                    for scale in [expert.gate.scale_2, expert.up.scale_2, expert.down.scale_2] {
+                        scalars.extend_from_slice(&scale.to_le_bytes());
+                    }
+                }
+                (pointers, Some(scalars))
+            }
+            ExpertQuant::Fp8Block => {
+                // One E4M3 code a weight and one BF16 inverse scale a 128x128 tile: the MTP
+                // experts' format, which the FP8 release uses for every layer. A rank holds a run
+                // of whole tiles of every expert ([tp::Shard::expert_tiles]), not a fraction of
+                // the width, so its weight and its scale grid are the same run of the global ones.
+                // An FP8 expert's share is a run of whole 128-wide scale tiles, which is uneven
+                // across ranks (640 columns are 2/1/1/1 tiles at TP4) where the NVFP4 share is an
+                // even split padded up to the next 64.
+                let (tile_first, tile_count) = shard.expert_tiles(config.moe_intermediate_size);
+                let fp8_share = (tile_first * tp::FP8_TILE, tile_count * tp::FP8_TILE);
+                let mut pointers = Vec::with_capacity(config.num_experts * 6 * 8);
+                for expert in 0..config.num_experts {
+                    let prefix = format!("{mlp}.experts.{expert}");
+                    for (name, expert_rows, expert_columns, part) in [
+                        (
+                            "gate_proj",
+                            config.moe_intermediate_size,
+                            hidden,
+                            rows(fp8_share, 1),
+                        ),
+                        (
+                            "up_proj",
+                            config.moe_intermediate_size,
+                            hidden,
+                            rows(fp8_share, 1),
+                        ),
+                        (
+                            "down_proj",
+                            hidden,
+                            config.moe_intermediate_size,
+                            columns(fp8_share, 1),
+                        ),
+                    ] {
+                        let (weight, scales) = uploader.fp8_part(
+                            source,
+                            &format!("{prefix}.{name}"),
+                            (expert_rows, expert_columns),
+                            part,
+                        )?;
+                        pointers.extend_from_slice(&weight.0.to_le_bytes());
+                        pointers.extend_from_slice(&scales.0.to_le_bytes());
+                    }
+                }
+                (pointers, None)
+            }
+        };
         let moe = GpuMoe {
             router: uploader.mat(
                 source,
@@ -1489,31 +1635,13 @@ pub(crate) fn build_shard(
                 1,
                 hidden,
             )?,
-            experts: GpuExperts::Nvfp4 {
-                table: {
-                    let mut pointers = Vec::with_capacity(experts.len() * 6 * 8);
-                    for expert in &experts {
-                        for pointer in [
-                            expert.gate.weight.0,
-                            expert.gate.scales.0,
-                            expert.up.weight.0,
-                            expert.up.scales.0,
-                            expert.down.weight.0,
-                            expert.down.scales.0,
-                        ] {
-                            pointers.extend_from_slice(&pointer.to_le_bytes());
-                        }
-                    }
-                    uploader.derived(&format!("{mlp}.experts.table"), &pointers)?
+            experts: match expert_scales {
+                Some(scales) => GpuExperts::Nvfp4 {
+                    table: uploader.derived(&format!("{mlp}.experts.table"), &expert_table)?,
+                    scales: uploader.derived(&format!("{mlp}.experts.scales"), &scales)?,
                 },
-                scales: {
-                    let mut scalars = Vec::with_capacity(experts.len() * 3 * 4);
-                    for expert in &experts {
-                        for scale in [expert.gate.scale_2, expert.up.scale_2, expert.down.scale_2] {
-                            scalars.extend_from_slice(&scale.to_le_bytes());
-                        }
-                    }
-                    uploader.derived(&format!("{mlp}.experts.scales"), &scalars)?
+                None => GpuExperts::Fp8 {
+                    table: uploader.derived(&format!("{mlp}.experts.table"), &expert_table)?,
                 },
             },
         };
@@ -2121,12 +2249,16 @@ impl Qwen4ExpDeviceBackend {
         // form counted those 282 bytes as uploaded and refused the released checkpoint by exactly
         // that much. Checked before the upload, because a plan that overshoots should cost nothing.
         let resident = served.storage_bytes() - served.role_bytes(Role::PleTable);
-        if resident > DEVICE_RESIDENT_BYTES {
+        // The resident total is a property of the stored expert format: the same text model with
+        // FP8 experts is 121.7 GiB where the NVFP4 one is 72.5 GiB.
+        let total = match config.expert_quant {
+            ExpertQuant::Nvfp4 => DEVICE_RESIDENT_BYTES,
+            ExpertQuant::Fp8Block => crate::tensor::FP8_DEVICE_RESIDENT_BYTES,
+        };
+        if resident > total {
             return Err(BackendError::new(
                 "qwen4_device",
-                format!(
-                    "the plan uploads {resident} bytes over the resident total {DEVICE_RESIDENT_BYTES}"
-                ),
+                format!("the plan uploads {resident} bytes over the resident total {total}"),
             ));
         }
         let shard = tp.as_ref().map_or(tp::Shard::WHOLE, |tp| {
@@ -2373,6 +2505,14 @@ pub const IDENTITY: PackIdentity = PackIdentity {
     max_output_tokens: crate::MAX_OUTPUT_TOKENS,
 };
 
+/// The official FP8 checkpoint's identity. The geometry is [IDENTITY]'s; only the served id and
+/// the weight selector name the other quantisation.
+pub const FP8_IDENTITY: PackIdentity = PackIdentity {
+    weights_id: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+    model_id: sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID,
+    ..IDENTITY
+};
+
 /// What this arm can serve of `config` once loaded.
 ///
 /// The text channels are the codec's. The vision tower is planned but not loaded, so the channel
@@ -2385,7 +2525,11 @@ pub fn capabilities(_config: &Qwen4ExpConfig) -> Capabilities {
 /// What the device arm serves over a window of `context` tokens.
 #[must_use]
 pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescriptor {
-    IDENTITY.descriptor(&config.architecture, context, capabilities(config))
+    let identity = match config.expert_quant {
+        ExpertQuant::Nvfp4 => IDENTITY,
+        ExpertQuant::Fp8Block => FP8_IDENTITY,
+    };
+    identity.descriptor(&config.architecture, context, capabilities(config))
 }
 
 /// A per-session device workspace and cache set.

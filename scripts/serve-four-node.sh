@@ -39,6 +39,8 @@
 #                          (default: SPARK_NODES)
 #   SPARKFLASH_NCCL_LIB    directory holding libnccl.so.2 on every node (prepended to LD_LIBRARY_PATH);
 #                          used for V4.1 and for a packed model such as GLM that always runs on device
+#   SPARK_COMM_REDUCE      forwarded to every rank for a packed model (nccl / tcp); a V4.1 device
+#                          image always runs nccl, so it sets this itself
 #   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot)
 #   SPARKFLASH_MODEL       packed model selector, e.g. glm5.3-flash-fp8: adds --model
 #   SPARKFLASH_CONTEXT     packed model context window: adds --context
@@ -130,7 +132,14 @@ rank_env() {
     [ -n "${SPARKFLASH_BUILD_ID:-}" ] && printf ' SPARKFLASH_BUILD_ID=%s' "$SPARKFLASH_BUILD_ID"
     # V4.1's external kernels are the only path that turns on the lean head; a packed model
     # (GLM) carries its kernels in the binary but still needs the NCCL library and fabric values.
-    [ -n "$CUBINS" ] && printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
+    if [ -n "$CUBINS" ]; then
+        printf ' SPARK_COMM_REDUCE=nccl SPARKFLASH_LEAN_HEAD=1'
+    elif [ -n "${SPARK_COMM_REDUCE:-}" ]; then
+        # A packed four-rank arm carries its own kernels, so it sets neither of the two V4.1
+        # device flags above - but it still has to say which collective it wants, and the
+        # operator's choice was the one thing this launcher silently dropped.
+        printf ' SPARK_COMM_REDUCE=%s' "$SPARK_COMM_REDUCE"
+    fi
     if [ -n "$CUBINS" ] || [ -n "$MODEL" ]; then
         [ -n "$NCCL_LIB" ] && printf ' LD_LIBRARY_PATH=%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}' "$NCCL_LIB"
         local var

@@ -235,6 +235,73 @@ impl PackArm for QwenArm {
     }
 }
 
+/// Qwen3.8-Flash-Next, the official FP8 checkpoint: the same arm and profile with the FP8
+/// release's served id, so --model qwen3.8-flash-next-fp8 resolves the FP8 snapshot rather than
+/// the NVFP4 one. The checkpoint's own quantization_config selects the expert format.
+pub(super) struct QwenFp8Arm;
+
+impl PackArm for QwenFp8Arm {
+    type Config = Qwen4ExpConfig;
+    type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
+
+    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID;
+    const NAME: &'static str = "Qwen3.8-Flash-Next (FP8)";
+    const FIXTURE: &'static str = QwenArm::FIXTURE;
+    const MAX_OUTPUT_TOKENS: usize = QwenArm::MAX_OUTPUT_TOKENS;
+    const DEFAULT_CONTEXT: usize = QwenArm::DEFAULT_CONTEXT;
+    const PROFILE_TOML: &'static str = QwenArm::PROFILE_TOML;
+    const FUSED_BATCH: bool = QwenArm::FUSED_BATCH;
+    const KV_BUDGET: bool = QwenArm::KV_BUDGET;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+
+    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
+        <QwenArm as PackArm>::write_fixture(directory)
+    }
+
+    fn read_config(directory: &Path) -> Result<Self::Config, String> {
+        <QwenArm as PackArm>::read_config(directory)
+    }
+
+    fn window(config: &Self::Config) -> usize {
+        <QwenArm as PackArm>::window(config)
+    }
+
+    fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor {
+        <QwenArm as PackArm>::descriptor(config, context)
+    }
+
+    fn codec(tokenizer: &Path) -> Result<Arc<dyn PromptCodec>, String> {
+        <QwenArm as PackArm>::codec(tokenizer)
+    }
+
+    fn check_host(
+        options: &ServeOptions,
+        config: &Self::Config,
+        context: usize,
+    ) -> Result<(), String> {
+        <QwenArm as PackArm>::check_host(options, config, context)
+    }
+
+    fn open_host(
+        directory: &Path,
+        config: Self::Config,
+        context: usize,
+        profile: &ModelProfile,
+        plan: Option<&EnginePlan>,
+    ) -> Result<Self::Backend, String> {
+        <QwenArm as PackArm>::open_host(directory, config, context, profile, plan)
+    }
+
+    fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String> {
+        <QwenArm as PackArm>::fuse(backend, concurrency)
+    }
+
+    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
+        <QwenArm as PackArm>::respond(driver)
+    }
+}
+
 /// GLM-5.3-Flash, the FP8 checkpoint.
 ///
 /// The release is 328.3 GB, so one node holds only the tiny fixture; the release is served by the
@@ -366,35 +433,36 @@ pub(super) enum Pack {
     /// The default DeepSeek-V4.1-Flash arm, which the reference/TP4 path serves.
     Deepseek,
     Qwen,
+    /// The official FP8 release of the same Qwen arm: one family, two weight selectors.
+    QwenFp8,
     Glm,
 }
 
 impl Pack {
-    /// The model registry family this variant serves.
-    const fn family(self) -> &'static str {
-        match self {
-            Self::Deepseek => "deepseek-v4.1",
-            Self::Qwen => "qwen4-exp",
-            Self::Glm => "glm5-next",
-        }
-    }
-
     /// This pack's descriptor in [sparkflash_model::MODELS].
     ///
     /// # Panics
     /// Only if the registry loses the family this binary was built to serve.
     fn descriptor(self) -> &'static ModelDescriptor {
-        sparkflash_model::MODELS
-            .iter()
-            .find(|model| model.family == self.family())
-            .expect("the model registry carries every pack family")
+        let weights = match self {
+            Self::Deepseek => sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID,
+            Self::Qwen => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
+            Self::QwenFp8 => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+            Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
+        };
+        sparkflash_model::find_model_by_weights(weights)
+            .expect("the model registry carries every pack's weight selector")
     }
 
     /// The variant serving a registry descriptor, or `None` for a family with no arm here.
     fn from_descriptor(descriptor: &ModelDescriptor) -> Option<Self> {
-        [Self::Deepseek, Self::Qwen, Self::Glm]
-            .into_iter()
-            .find(|pack| pack.family() == descriptor.family)
+        match descriptor.weights_id.as_str() {
+            sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID => Some(Self::Deepseek),
+            sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID => Some(Self::Qwen),
+            sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID => Some(Self::QwenFp8),
+            sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
+            _ => None,
+        }
     }
 
     /// The pack a checkpoint's own `config.json` names, if this build has its arm.
@@ -458,7 +526,7 @@ impl Pack {
         kv_budget: bool,
     ) -> Vec<&'static str> {
         let (fuses, budgets) = match self {
-            Self::Qwen => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
+            Self::Qwen | Self::QwenFp8 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
             Self::Deepseek => (false, false),
         };
@@ -482,6 +550,7 @@ impl Pack {
                 unreachable!("the DeepSeek pack is served by the default reference path")
             }
             Self::Qwen => serve_arm::<QwenArm>(options),
+            Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
         };
         served.unwrap_or_else(|message| {

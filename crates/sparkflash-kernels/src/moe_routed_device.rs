@@ -2797,10 +2797,15 @@ mod tests {
     fn the_rounding_formula_is_transcribed_from_the_kernel_source() {
         // The kernel's two helpers are the twin's formulas; the source text is the pin that they
         // were not "simplified" into the CUDA intrinsic, which differs on a NaN.
-        assert!(SOURCE.contains("__float_as_uint(value)"));
-        assert!(SOURCE.contains("(bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16"));
-        assert!(SOURCE.contains("(bits & 0x7FFFFFFFu) > 0x7F800000u"));
-        assert!(SOURCE.contains("return (bits >> 16) | 0x0040u;"));
+        // The two narrowing helpers live in the shared opt header; the combine stays here.
+        let source = format!(
+            "{SOURCE}\n{}",
+            include_str!("../../../kernels/opt_common_sm121.cuh")
+        );
+        assert!(source.contains("__float_as_uint(value)"));
+        assert!(source.contains("(bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16"));
+        assert!(source.contains("(bits & 0x7FFFFFFFu) > 0x7F800000u"));
+        assert!(source.contains("return (bits >> 16) | 0x0040u;"));
         assert!(SOURCE.contains("__fadd_rn(total, expert_output)"));
         // No multiply in the combine: the routing weight was consumed by the weighted SwiGLU.
         let combine_body = SOURCE

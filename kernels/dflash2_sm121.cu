@@ -43,6 +43,11 @@
 // no source is copied. See the root NOTICE file.
 
 #include <cuda_bf16.h>
+
+#include "q4e_common_sm121.cuh"
+
+// The shared xor butterfly, under the name the drafter used.
+#define q4d_warp_sum q4e_warp_sum_all
 #include <math_constants.h>
 
 // The drafter's head width; q4d_attn holds one query head in a warp, four floats a lane.
@@ -55,13 +60,6 @@
 #define Q4D_MAX_TOPK 32
 #define Q4D_MAX_RANK 1024
 
-__device__ __forceinline__ float q4d_warp_sum(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_xor_sync(0xFFFFFFFFu, value, offset);
-    }
-    return value;
-}
 
 // Whether (value, id) ranks above (other_value, other_id): the larger value, and on a tie the
 // lower id, so the order is the same however the candidates were split between blocks.

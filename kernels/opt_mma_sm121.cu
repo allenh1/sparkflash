@@ -43,6 +43,10 @@
 #include <stdint.h>
 
 #include "opt_mma_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define oba_ldsm4_t opt_ldsm4_t
 
 // The activation stage is [128 rows][4 chunks of 16 B]; chunk c of row r lives at c ^ ((r / 2) % 4)
 // so the eight rows an ldmatrix phase reads fall in eight bank groups.
@@ -1212,11 +1216,6 @@ __device__ __forceinline__ uint32_t oba_k_off(uint32_t key, uint32_t chunk) {
     return key * (OBA_LATENT * 2u) + ((chunk ^ (key & 7u)) << 4);
 }
 
-__device__ __forceinline__ void oba_ldsm4_t(uint32_t addr, uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(addr));
-}
 
 __device__ __forceinline__ float oba_ue8m0(uint32_t code) {
     if (code == 255u) return __uint_as_float(0x7FC00000u);

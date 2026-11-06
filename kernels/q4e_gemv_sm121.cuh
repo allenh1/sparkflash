@@ -38,6 +38,9 @@
 #include "opt_pdl_sm121.cuh"
 #include "q4e_common_sm121.cuh"
 
+// The shared xor butterfly, under the name the body used.
+#define q4e_tg_fold q4e_warp_sum_all
+
 // Maximum tokens processed in one launch (a layer-major prefill chunk): dense BF16 weights are
 // read once per chunk while every per-token accumulator stays in registers with no stack spill.
 #define Q4E_MAX_BATCH 8
@@ -169,13 +172,6 @@ __device__ __forceinline__ float4 q4e_tg_fp8_activation(const float4 value, cons
                        high.y * scale * block);
 }
 
-__device__ __forceinline__ float q4e_tg_fold(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value += __shfl_xor_sync(0xFFFFFFFFu, value, offset);
-    }
-    return value;
-}
 
 // The body every tiled entry shares. `row_of(tile, warp, r)` names row r of the warp's four
 // (nullptr past the matrix). Lane l of each warp then holds the sum of row l / 8 for token l % 8,

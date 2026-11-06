@@ -42,6 +42,19 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define or_e4m3x4 opt_e4m3x4
+#define or_warp_sum opt_warp_sum
+#define or_warp_sum_rn opt_warp_sum_rn
+#define or_bf16_round opt_bf16_round
+#define or_sigmoid opt_sigmoid
+#define or_ldw opt_ldw
+#define or_ldw_nc opt_ldw
+#define or_fma2_bf16 opt_fma2_bf16
+#define or_es_fma2 opt_fma2_f16
+#define or_dot8 opt_dot8_fma
 #include "m4_activation_quant_sm121.cuh"
 #include "opt_sample_sm121.cuh"
 
@@ -60,22 +73,7 @@
 #define OR_S_PART_STRIDE 32u
 #define OR_S_QBLOCKS (OR_S_HIDDEN / 32u)
 
-__device__ __forceinline__ float or_bf16_round(float value) {
-    const uint32_t bits = __float_as_uint(value);
-    if (value != value) {
-        return __uint_as_float((((bits >> 16) | 0x0040u)) << 16);
-    }
-    const uint32_t round = 0x7FFFu + ((bits >> 16) & 1u);
-    return __uint_as_float(((bits + round) >> 16) << 16);
-}
 
-__device__ __forceinline__ float or_sigmoid(float value) {
-    if (value >= 0.0f) {
-        return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
-    }
-    const float exponential = expf(value);
-    return __fdiv_rn(exponential, __fadd_rn(1.0f, exponential));
-}
 
 // __fdiv_rn(1, x)'s bits without the division's slow-path branch, for |x| in [2^-126, 2^126): the
 // approximate reciprocal and one FMA Newton step, checked against __fdiv_rn for every float in that
@@ -93,13 +91,6 @@ __device__ __forceinline__ float or_ue8m0_inverse(uint8_t code) {
     return __uint_as_float((254u - code) << 23);
 }
 
-__device__ __forceinline__ float or_warp_sum_rn(float value) {
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        value = __fadd_rn(value, __shfl_down_sync(0xFFFFFFFFu, value, offset));
-    }
-    return value;
-}
 
 // or_warp_sum_rn of N addends per lane at once, each sum with its bits, in N/2 + N/4 + ... shuffles
 // instead of 5 N: at each xor level the lane pair splits the slots, the lower lane keeping the first
@@ -1035,20 +1026,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rows_kv(
 #define OR_A_WSCALES 16u
 #define OR_A_KSCALES 32u
 
-__device__ __forceinline__ void or_e4m3x4(uint32_t w, float *f) {
-    uint32_t h01, h23;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"((uint16_t)(w & 0xffffu)));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"((uint16_t)(w >> 16)));
-    const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&h01));
-    const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&h23));
-    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
-}
 
-__device__ __forceinline__ float or_warp_sum(float v) {
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 
 // Eight E2M1 values (the nibbles of `word`, low nibble first) as four f16 pairs, by the hardware
 // conversion: every E2M1 value is exact in f16, so each is spark_fp4_e2m1_decode's float, -0
@@ -1714,29 +1692,10 @@ extern "C" __global__ void opt_rows_inv_rope(
 #define OR_LM_WARPS (OR_LM_THREADS / 32u)
 #define OR_LM_CHUNK 1024u
 
-__device__ __forceinline__ uint4 or_ldw(const void *p) {
-    uint4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-        : "l"(p));
-    return v;
-}
 
 // The mixed-precision FMA takes the bf16 operands as they are: their product is exact in f32, so
 // each step rounds exactly as fmaf on the widened values does (opt_lm_head's), without the widening.
-__device__ __forceinline__ float or_fma2_bf16(uint32_t a, uint32_t b, float c) {
-    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
-    asm("fma.rn.f32.bf16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
-    return c;
-}
 
-__device__ __forceinline__ float or_dot8(uint4 w, uint4 h, float acc) {
-    acc = or_fma2_bf16(w.x, h.x, acc);
-    acc = or_fma2_bf16(w.y, h.y, acc);
-    acc = or_fma2_bf16(w.z, h.z, acc);
-    acc = or_fma2_bf16(w.w, h.w, acc);
-    return acc;
-}
 
 // Block (g, c) scores chunk c's 1024 entries for the OR_LM_ROWS rows g * OR_LM_ROWS ..: every warp
 // row is loaded once and dotted against each row's hidden (staged in shared memory, 10 KB a row), so
@@ -2152,13 +2111,6 @@ extern "C" __global__ void opt_rows_embed_table(const uint2 *__restrict__ table,
 // ---------------------------------------------------------------------------------------------
 // Engram wkv over up to 8 rows (opt_engram_wkv arithmetic per row, one weight read).
 // ---------------------------------------------------------------------------------------------
-__device__ __forceinline__ uint4 or_ldw_nc(const uint8_t *p) {
-    uint4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-        : "l"(p));
-    return v;
-}
 
 // Outputs row_base .. row_end of out_width (a rank's slice when split), written at
 // out_all[y * out_stride + (row - row_base)].
@@ -2259,11 +2211,6 @@ __device__ __forceinline__ uint32_t or_es_e4m3x2(uint32_t two) {
 }
 
 // c + a.lo * b.lo, then + a.hi * b.hi, on f16x2 pairs: two single-rounding f32 FMAs.
-__device__ __forceinline__ float or_es_fma2(uint32_t a, uint32_t b, float c) {
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a & 0xffffu)), "h"((uint16_t)(b & 0xffffu)));
-    asm("fma.rn.f32.f16 %0, %1, %2, %0;" : "+f"(c) : "h"((uint16_t)(a >> 16)), "h"((uint16_t)(b >> 16)));
-    return c;
-}
 
 template <uint32_t OR_ES_ROWS>
 __device__ __forceinline__ void or_engram_wkv_staged(

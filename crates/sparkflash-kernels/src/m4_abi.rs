@@ -883,10 +883,16 @@ pub const COMMON_HEADER: &str = include_str!("../../../kernels/m4_common_sm121.c
 pub const MEGA_MHC: &str = include_str!("../../../kernels/mega_mhc_sm121.cu");
 /// The MXFP8 dense twin of specification 4.1.
 pub const MXFP8_DENSE: &str = include_str!("../../../kernels/b12x_mxfp8_dense_sm121.cu");
+/// The dense and wo_a bodies the two b12x entries share; a source-text guard reads them together.
+pub const B12X_DENSE_HEADER: &str = include_str!("../../../kernels/b12x_dense_sm121.cuh");
 /// The MXFP4 routed-expert MoE combine of specification 2.1.
 pub const MXFP4_MOE: &str = include_str!("../../../kernels/b12x_mxfp4_moe_sm121.cu");
 /// FlashMLA with CSA2 candidate selection of specification 2.3.
 pub const FLASH_MLA_CSA2: &str = include_str!("../../../kernels/flash_mla_csa2_sm121.cu");
+
+/// The body the three CSA2 entries share: the arithmetic text a source-text guard may read.
+pub const FLASH_MLA_CSA2_COMMON: &str =
+    include_str!("../../../kernels/flash_mla_csa2_common_sm121.cuh");
 /// The grouped wo_a output projection, MXFP8 with the same B12x layout.
 pub const MXFP8_WO_A: &str = include_str!("../../../kernels/b12x_mxfp8_wo_a_sm121.cu");
 /// The certified LM head of specification 2.1: a bound screen plus exact dots.
@@ -1904,6 +1910,18 @@ fn the_scope_assigned_to_each_kernel_is_the_one_the_spec_asks_for() {
             .find(|(file, _)| *file == name)
             .map(|(_, source)| *source)
             .unwrap_or_else(|| panic!("{name} is not in the kernel list"));
+        // The dense, wo_a and CSA2 bodies live in shared headers; the entry files carry the
+        // symbol and the entry-specific defines.
+        let combined;
+        let source = if name.starts_with("b12x_mxfp8_") {
+            combined = format!("{source}\n{B12X_DENSE_HEADER}");
+            combined.as_str()
+        } else if name.starts_with("flash_mla_csa2_") {
+            combined = format!("{source}\n{FLASH_MLA_CSA2_COMMON}");
+            combined.as_str()
+        } else {
+            source
+        };
         let enter = format!("SPARK_GPU_TRACE_ENTER(trace_ring, {scope},");
         assert!(
             source.contains(&enter),
@@ -2559,6 +2577,11 @@ fn the_definition_pins_reject_the_reviewed_evasions() {
 ///
 #[test]
 fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
+    // The three entries share one attention body; the source guards read the entry's defines and
+    // the shared arithmetic together.
+    let mla_source = format!("{FLASH_MLA_CSA2}\n{FLASH_MLA_CSA2_COMMON}");
+    let mla: &str = &mla_source;
+
     // The round-1 review found five defects that no test could see. Each of them is now a property
     // of the source text, and each property is paired with the mutation that removes it, so a
     // future edit that reintroduces the defect fails here as well as in the reference tests.
@@ -2573,12 +2596,13 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
             && code.contains("w_fp8[group_weight_base +")
             && code.contains("w_scales[group_scale_base +")
     };
-    assert!(wo_a_has_two_strides(MXFP8_WO_A));
-    let shared_stride = MXFP8_WO_A.replace(
+    let wo_a = format!("{MXFP8_WO_A}\n{B12X_DENSE_HEADER}");
+    assert!(wo_a_has_two_strides(&wo_a));
+    let shared_stride = wo_a.replace(
         "(uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK",
         "(uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK",
     );
-    assert_ne!(shared_stride, MXFP8_WO_A, "the mutation must apply");
+    assert_ne!(shared_stride, wo_a, "the mutation must apply");
     assert!(
         !wo_a_has_two_strides(&shared_stride),
         "the weight stride must not be reused for the scales"
@@ -2593,9 +2617,9 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
             && code.matches("score *= SPARK_M4_MLA_SCORE_SCALE;").count() == 3
             && code.matches("SPARK_M4_MLA_SCORE_SCALE").count() == 3
     };
-    assert!(mla_scales_the_score(FLASH_MLA_CSA2));
-    let unscaled = FLASH_MLA_CSA2.replace("score *= SPARK_M4_MLA_SCORE_SCALE;", "score *= 1.0f;");
-    assert_ne!(unscaled, FLASH_MLA_CSA2, "the mutation must apply");
+    assert!(mla_scales_the_score(mla));
+    let unscaled = mla.replace("score *= SPARK_M4_MLA_SCORE_SCALE;", "score *= 1.0f;");
+    assert_ne!(unscaled, mla, "the mutation must apply");
     assert!(
         !mla_scales_the_score(&unscaled),
         "an unscaled score is the defect the reference used to bless"
@@ -2604,16 +2628,17 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     // A3: the maximum is a per-thread value reduced as a tree, not a shared read-modify-write.
     let mla_reduces_the_max = |source: &str| -> bool {
         let code = crate::c_decl::strip_comments(source);
-        code.contains("local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS)")
-            && code.contains("if (lane == 0u) {\n        s_max = local_max;")
-            && !code.contains("s_max = s_scores[slot] > s_max")
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.contains("local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS)")
+            && flat.contains("if (lane == 0u) { s_max = local_max;")
+            && !flat.contains("s_max = s_scores[slot] > s_max")
     };
-    assert!(mla_reduces_the_max(FLASH_MLA_CSA2));
-    let racy_max = FLASH_MLA_CSA2.replace(
-        "    local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS);\n    if (lane == 0u) {\n        s_max = local_max;\n    }",
-        "    s_max = s_scores[slot] > s_max ? s_scores[slot] : s_max;",
+    assert!(mla_reduces_the_max(mla));
+    let racy_max = mla.replace(
+        "local_max = spark_block_max(local_max, lane, SPARK_M4_MLA_THREADS);",
+        "s_max = s_scores[slot] > s_max ? s_scores[slot] : s_max;",
     );
-    assert_ne!(racy_max, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(racy_max, mla, "the mutation must apply");
     assert!(
         !mla_reduces_the_max(&racy_max),
         "the racy shared accumulation must be rejected"
@@ -2626,12 +2651,12 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
             "const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;",
         ) && code.contains("index_query + (uint64_t)index_head * SPARK_M4_INDEX_HEAD_DIM")
     };
-    assert!(mla_uses_the_index_head(FLASH_MLA_CSA2));
-    let query_head = FLASH_MLA_CSA2.replace(
+    assert!(mla_uses_the_index_head(mla));
+    let query_head = mla.replace(
         "const uint32_t index_head = head / (uint32_t)SPARK_M4_MLA_HEADS_PER_INDEX_HEAD;",
         "const uint32_t index_head = head;",
     );
-    assert_ne!(query_head, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(query_head, mla, "the mutation must apply");
     assert!(
         !mla_uses_the_index_head(&query_head),
         "the query head must not index the indexer query buffer"
@@ -2750,20 +2775,21 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     // must not disturb. Each mutation below asserts it applied and that this helper then fails.
     let mla_guards_the_window_format = |source: &str| -> bool {
         let code = crate::c_decl::strip_comments(source);
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
         code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4 0u")
             && code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8 1u")
             && code.contains("#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 2u")
-            && code.contains("if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {")
+            && code.contains("refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION;")
             && code.contains("__float2bfloat16_rn(__uint_as_float(0x7FC00000u))")
             && !code.contains("static_assert(window_kv_format")
             // The formats 0/1 dispatch text the union branch does not enter: the attended
             // predicate and the two ternary load sites.
             && code.contains("? spark_mla_in_window(position, candidate)")
             && code.contains(": (candidate < window_rows ? 1u : 0u);")
-            && code.contains(
+            && flat.contains(
                 "const float key = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
             )
-            && code.contains(
+            && flat.contains(
                 "const float value = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
             )
             // The union mode's own dispatch: the absolute-position causal predicate, every supplied
@@ -2773,44 +2799,42 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
                 "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)",
             )
             && code.contains("static_assert(SPARK_M4_MLA_MAX_ATTENDED == 640u,")
-            && code.contains("__shared__ float s_scores[SPARK_M4_MLA_MAX_ATTENDED];")
+            && code.contains("__shared__ float s_scores[kMaxAttended];")
             && code.contains("__device__ __forceinline__ uint32_t spark_mla_union_attends(")
             && code.contains("return candidate <= position ? 1u : 0u;")
-            && code.contains("if (window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {")
+            && flat.contains("window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION")
             && code.contains("spark_mla_union_attends(position, candidate) != 0u")
-            && code.contains("spark_mla_load_window_stored(window_codes, window_scales, slot, i)")
+            && code.contains("spark_ue8m0_decode(row_scales[blk])")
+            && code.contains("row_codes[i0]")
             && code.contains("window_rows > (uint32_t)SPARK_M4_SWA_WINDOW")
             && code.contains("selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED")
             && code.contains("window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED")
             // The union branch must END the kernel: deleting its terminal return would fall
-            // through into historical Stage 2 with a format-2 result already written. Pin the
-            // 12-space union trace exit and the exact tail sequence, not just the branch header;
-            // the historical Stage-2 exit has different indentation and must not satisfy these.
-            && code.contains("            SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);")
-            && code.contains(
-                "            (void)heads;\n            (void)step_seq;\n        }\n        (void)t_enter;\n        return;\n    }",
-            )
+            // through into historical Stage 2 with a format-2 result already written. The tail is
+            // checked on whitespace-normalized text so a re-indent does not hide a deletion.
+            && flat.contains("SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);")
+            && flat.contains("(void)heads; (void)step_seq; } (void)t_enter; return; }")
     };
-    assert!(mla_guards_the_window_format(FLASH_MLA_CSA2));
+    assert!(mla_guards_the_window_format(mla));
 
     // The sentinel selector the design rejects: window_rows == 0 cannot express an empty engine
     // window, and it reads badly in the ABI pin because the row count is not a format.
-    let sentinel_format = FLASH_MLA_CSA2.replace(
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
-        "if (window_rows == 0u) {",
+    let sentinel_format = mla.replace(
+        "refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION;",
+        "refuse = window_rows == 0u;",
     );
-    assert_ne!(sentinel_format, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(sentinel_format, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&sentinel_format),
         "a row-count sentinel is exactly the format selector this design rejects"
     );
 
     // The format value itself: renumbering the union mode onto the engine value must fail the pin.
-    let wrong_union_value = FLASH_MLA_CSA2.replace(
+    let wrong_union_value = mla.replace(
         "#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 2u",
         "#define SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION 1u",
     );
-    assert_ne!(wrong_union_value, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(wrong_union_value, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&wrong_union_value),
         "the union format must keep its own value, not alias engine format 1"
@@ -2818,37 +2842,36 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
 
     // Accepting 3 through a too-wide guard, or falling back to the old two-value guard, is the
     // silent-wrong-arithmetic defect: both must fail.
-    let wide_guard = FLASH_MLA_CSA2.replace(
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION + 1u) {",
+    let wide_guard = mla.replace(
+        "refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION;",
+        "refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION + 1u;",
     );
-    assert_ne!(wide_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(wide_guard, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&wide_guard),
         "a fourth format must not pass the entry guard"
     );
-    let two_value_guard = FLASH_MLA_CSA2.replace(
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION) {",
-        "if (window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8) {",
+    let two_value_guard = mla.replace(
+        "refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_CSA_UNION;",
+        "refuse = window_kv_format > SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8;",
     );
-    assert_ne!(two_value_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(two_value_guard, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&two_value_guard),
         "the old two-value guard would hand format 2 to the format-1 branch"
     );
 
     // A refusal that is not visible is worse than no refusal: the poison must stay the NaN output.
-    let no_poison = FLASH_MLA_CSA2.replace("0x7FC00000u", "0x0u");
-    assert_ne!(no_poison, FLASH_MLA_CSA2, "the mutation must apply");
+    let no_poison = mla.replace("0x7FC00000u", "0x0u");
+    assert_ne!(no_poison, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_poison),
         "the refused formats must still poison with NaN"
     );
 
     // The negative pin: a runtime format cannot be a static_assert even when the guard remains.
-    let asserted_format =
-        format!("{FLASH_MLA_CSA2}\nstatic_assert(window_kv_format > 2u, \"format\");\n");
-    assert_ne!(asserted_format, FLASH_MLA_CSA2, "the mutation must apply");
+    let asserted_format = format!("{mla}\nstatic_assert(window_kv_format > 2u, \"format\");\n");
+    assert_ne!(asserted_format, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&asserted_format),
         "a runtime format value cannot be a static_assert"
@@ -2856,20 +2879,20 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
 
     // The formats 0/1 dispatch text: both ternary load sites are pinned, so deleting either one
     // fails even while the other (and the union branch) remains.
-    let no_key_site = FLASH_MLA_CSA2.replace(
-        "const float key = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
-        "const float key = 1u",
+    let no_key_site = mla.replace(
+        "window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+        "window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8",
     );
-    assert_ne!(no_key_site, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(no_key_site, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_key_site),
         "the format-0/1 key load dispatch must stay"
     );
-    let no_value_site = FLASH_MLA_CSA2.replace(
-        "const float value = window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
-        "const float value = 1u",
+    let no_value_site = mla.replace(
+        "window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_FP4",
+        "window_kv_format == SPARK_M4_MLA_WINDOW_KV_FORMAT_ENGINE_FP8",
     );
-    assert_ne!(no_value_site, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(no_value_site, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_value_site),
         "the format-0/1 value load dispatch must stay"
@@ -2878,20 +2901,20 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     // The union rule is a causal predicate, not a window: changing it to the window predicate or
     // to an exclusive comparison would silently drop out-of-window candidates (the Criterion-1
     // gap) or the query's own position.
-    let union_windowed = FLASH_MLA_CSA2.replace(
+    let union_windowed = mla.replace(
         "return candidate <= position ? 1u : 0u;",
         "return candidate <= position && spark_mla_in_window(position, candidate) ? 1u : 0u;",
     );
-    assert_ne!(union_windowed, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(union_windowed, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&union_windowed),
         "an out-of-window selected id must stay attendable in union mode"
     );
-    let union_exclusive = FLASH_MLA_CSA2.replace(
+    let union_exclusive = mla.replace(
         "return candidate <= position ? 1u : 0u;",
         "return candidate < position ? 1u : 0u;",
     );
-    assert_ne!(union_exclusive, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(union_exclusive, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&union_exclusive),
         "an id at the query's own position is attendable"
@@ -2899,38 +2922,38 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
 
     // Capacity: exactly 640 is the union of a full candidate list and a full window; a narrower
     // expression (or no sum guard) would write past s_scores.
-    let shrunk_capacity = FLASH_MLA_CSA2.replace(
+    let shrunk_capacity = mla.replace(
         "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + SPARK_M4_SWA_WINDOW)",
         "#define SPARK_M4_MLA_MAX_ATTENDED (SPARK_M4_MLA_MAX_SELECTED + 64u)",
     );
-    assert_ne!(shrunk_capacity, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(shrunk_capacity, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&shrunk_capacity),
         "the union capacity expression is one candidate list plus one window"
     );
-    let no_capacity_guard = FLASH_MLA_CSA2.replace(
+    let no_capacity_guard = mla.replace(
         "window_rows + selected_count > (uint32_t)SPARK_M4_MLA_MAX_ATTENDED",
         "window_rows + selected_count > (uint32_t)SPARK_M4_MLA_LATENT",
     );
-    assert_ne!(no_capacity_guard, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(no_capacity_guard, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_capacity_guard),
         "a union longer than the score array would be an out-of-bounds write"
     );
-    let no_selected_cap = FLASH_MLA_CSA2.replace(
+    let no_selected_cap = mla.replace(
         "selected_count > (uint32_t)SPARK_M4_MLA_MAX_SELECTED",
         "selected_count > 1024u",
     );
-    assert_ne!(no_selected_cap, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(no_selected_cap, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_selected_cap),
         "the selected list is index_topk long"
     );
-    let no_window_cap = FLASH_MLA_CSA2.replace(
+    let no_window_cap = mla.replace(
         "window_rows > (uint32_t)SPARK_M4_SWA_WINDOW",
         "window_rows > 256u",
     );
-    assert_ne!(no_window_cap, FLASH_MLA_CSA2, "the mutation must apply");
+    assert_ne!(no_window_cap, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&no_window_cap),
         "the union window is at most the sliding window"
@@ -2940,26 +2963,20 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
     // format-2 result already written. The mutation removes the exact tail the pin names, and a
     // second mutation removes only the union trace exit so the historical Stage-2 exit cannot
     // satisfy the pin by itself.
-    let union_falls_through = FLASH_MLA_CSA2.replace(
-        "        (void)t_enter;\n        return;\n    }\n\n    // Stage 2: attention over the selected candidates.",
-        "        (void)t_enter;\n    }\n\n    // Stage 2: attention over the selected candidates.",
+    let union_falls_through = mla.replace(
+        "        (void)t_enter;\n        return;\n    }",
+        "        (void)t_enter;\n    }",
     );
-    assert_ne!(
-        union_falls_through, FLASH_MLA_CSA2,
-        "the mutation must apply"
-    );
+    assert_ne!(union_falls_through, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&union_falls_through),
         "the union branch must return before historical Stage 2"
     );
-    let union_no_trace_exit = FLASH_MLA_CSA2.replace(
+    let union_no_trace_exit = mla.replace(
         "            SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_CSA2_ATTN, layer_id, meta, t_enter);\n",
         "",
     );
-    assert_ne!(
-        union_no_trace_exit, FLASH_MLA_CSA2,
-        "the mutation must apply"
-    );
+    assert_ne!(union_no_trace_exit, mla, "the mutation must apply");
     assert!(
         !mla_guards_the_window_format(&union_no_trace_exit),
         "the union branch's trace exit is part of its terminal sequence"
@@ -2984,7 +3001,7 @@ fn the_reviewed_invariants_are_pinned_in_the_kernel_sources() {
         "the fp4 per-row grid must not collapse into the fp8 per-tile grid"
     );
     assert!(
-        FLASH_MLA_CSA2.contains("SPARK_M4_MLA_HEADS_PER_INDEX_HEAD")
+        mla.contains("SPARK_M4_MLA_HEADS_PER_INDEX_HEAD")
             && COMMON_HEADER.contains("#define SPARK_M4_MLA_HEADS_PER_INDEX_HEAD"),
         "the head mapping must be a header constant used by name"
     );

@@ -27,6 +27,12 @@
 #include <stdint.h>
 
 #include "m4_common_sm121.cuh"
+#include "opt_common_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define opt_m_e4m3x4 opt_e4m3x4
+#define opt_m_ldw opt_ldw
+#define opt_m_dot8 opt_dot8_bf16
 #include "m4_activation_quant_sm121.cuh"
 
 extern "C" __global__ void opt_rope_heads_bf16(
@@ -146,24 +152,7 @@ extern "C" __global__ void __launch_bounds__(256) opt_rmsnorm_bf16(
 #define OPT_LM_WARPS (OPT_LM_THREADS / 32u)
 #define OPT_LM_CHUNK 1024u
 
-__device__ __forceinline__ uint4 opt_m_ldw(const void *p) {
-    uint4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
-__device__ __forceinline__ float opt_m_dot8(uint4 w, uint4 h, float acc) {
-    const uint32_t a[4] = {w.x, w.y, w.z, w.w};
-    const uint32_t b[4] = {h.x, h.y, h.z, h.w};
-#pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        acc = fmaf(opt_m_bf16lo(a[k]), opt_m_bf16lo(b[k]), acc);
-        acc = fmaf(opt_m_bf16hi(a[k]), opt_m_bf16hi(b[k]), acc);
-    }
-    return acc;
-}
 
 extern "C" __global__ void __launch_bounds__(OPT_LM_THREADS) opt_lm_head(
     const __nv_bfloat16 *__restrict__ hidden,
@@ -227,14 +216,6 @@ extern "C" __global__ void __launch_bounds__(OPT_LM_THREADS) opt_lm_head(
 //   reference does before it joins the row sum. Only the summation order differs.
 #include <cuda_fp16.h>
 
-__device__ __forceinline__ void opt_m_e4m3x4(uint32_t w, float *f) {
-    uint32_t h01, h23;
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h01) : "h"((uint16_t)(w & 0xffffu)));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h23) : "h"((uint16_t)(w >> 16)));
-    const float2 a = __half22float2(*reinterpret_cast<const __half2 *>(&h01));
-    const float2 b = __half22float2(*reinterpret_cast<const __half2 *>(&h23));
-    f[0] = a.x; f[1] = a.y; f[2] = b.x; f[3] = b.y;
-}
 
 
 extern "C" __global__ void __launch_bounds__(256) opt_engram_wkv(

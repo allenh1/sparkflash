@@ -56,10 +56,11 @@
 // Every q4p kernel opens with OPT_PDL_ENTRY: the host launches them with programmatic stream
 // serialization, as it does the token cubin's.
 #include "opt_pdl_sm121.cuh"
+#include "q4e_common_sm121.cuh"
 
-__device__ __forceinline__ float q4p_silu(float value) {
-    return value / (1.0f + __expf(-value));
-}
+// The shared header's gate, under the name this image used.
+#define q4p_silu q4e_silu
+
 
 // ---------------------------------------------------------------------------------------------
 // Gated DeltaNet.

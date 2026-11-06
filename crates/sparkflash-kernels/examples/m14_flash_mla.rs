@@ -135,9 +135,9 @@ use sparkflash_kernels::mxfp8_ref;
 /// The kernel name in the baseline manifest.
 const KERNEL: &str = "flash_mla_csa2_sm121";
 /// Pinned cubin size.
-const PIN_BYTES: usize = 69_064;
+const PIN_BYTES: usize = 71_256;
 /// Pinned cubin sha256.
-const PIN_SHA256: &str = "64fc2944d510885490ef1caeb680600f30b1d552c6ec31b0f6ed840ad0f09d2b";
+const PIN_SHA256: &str = "553a8982a06763436a6f2437c6bae8fc2d81f51c4033379c7aee0ea08f894388";
 /// The pinned kernel carries no fence.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// One head per block, 256 threads.
@@ -192,39 +192,15 @@ fn window_gap_within_bar(gap: f32, operand_max: f32) -> bool {
     gap <= CONTROL_BAR * operand_max
 }
 
+#[path = "support/mem.rs"]
+mod mem;
+use mem::check_floor;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("m14_flash_mla: {error}");
         std::process::exit(1);
     }
-}
-
-fn mem_available_kb() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest.split_whitespace().next()?.parse().ok();
-        }
-    }
-    None
-}
-
-fn check_floor(floor_gib: u64, point: &str) -> Result<(), String> {
-    let kb = mem_available_kb()
-        .ok_or_else(|| "cannot read MemAvailable from /proc/meminfo".to_owned())?;
-    let bytes = kb.saturating_mul(1024);
-    let floor = floor_gib.saturating_mul(1024 * 1024 * 1024);
-    if bytes < floor {
-        return Err(format!(
-            "MemAvailable at {point} is {kb} kB ({:.2} GiB), below the {floor_gib}-GiB floor: refusing to run",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        ));
-    }
-    println!(
-        "MemAvailable at {point}: {kb} kB ({:.1} GiB), floor {floor_gib} GiB - ok",
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    Ok(())
 }
 
 struct Args {

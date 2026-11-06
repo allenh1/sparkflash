@@ -315,12 +315,14 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             max_tokens: 4,
             prompt_logprobs: None,
             speculative: true,
+            cached_tokens: 0,
         },
         Tp4ControlFrame::Request {
             prompt_ids: vec![9, 8],
             max_tokens: 2,
             prompt_logprobs: Some(3),
             speculative: false,
+            cached_tokens: 0,
         },
         Tp4ControlFrame::Token { token_id: 7 },
         Tp4ControlFrame::End,
@@ -360,7 +362,7 @@ impl Tp4RankApi for FakeTp4Rank {
         Ok(())
     }
 
-    fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn prefill(&mut self, _prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
         Ok(Tp4Step {
             speculation: None,
             logits: vec![0.0; 8],
@@ -368,6 +370,7 @@ impl Tp4RankApi for FakeTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -401,6 +404,7 @@ impl Tp4RankApi for FakeTp4Rank {
                 accepted: Vec::new(),
                 proposed: 0,
                 gated: 0,
+                cached_tokens: 0,
             },
             merged,
         ))
@@ -414,6 +418,7 @@ impl Tp4RankApi for FakeTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -560,7 +565,7 @@ impl Tp4RankApi for SpeculativeFakeRank {
         Ok(())
     }
 
-    fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn prefill(&mut self, _prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
         Ok(Tp4Step {
             speculation: None,
             next_token: Some(500),
@@ -585,6 +590,7 @@ impl Tp4RankApi for SpeculativeFakeRank {
             accepted: vec![token + 1, token + 2],
             proposed: 2,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -684,6 +690,7 @@ impl StubbornFakeRank {
             },
             proposed: usize::from(self.speculative == Some(true)),
             gated: 0,
+            cached_tokens: 0,
         }
     }
 }
@@ -694,7 +701,7 @@ impl Tp4RankApi for StubbornFakeRank {
         Ok(())
     }
 
-    fn prefill(&mut self, _prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn prefill(&mut self, _prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
         Ok(self.step(0))
     }
 
@@ -1041,9 +1048,9 @@ async fn one_request_guard_refuses_a_second_concurrent_request() {
 #[test]
 fn tp4_stats_keep_the_reference_shape_and_name_the_fabric() {
     let timing = RequestTiming::default();
-    let reference = serde_json::to_value(request_stats_with_fabric(3, timing, ""))
+    let reference = serde_json::to_value(request_stats_with_fabric(3, timing, "", 0))
         .expect("the reference stats serialize");
-    let tp4 = serde_json::to_value(request_stats_with_fabric(3, timing, TP4_FABRIC))
+    let tp4 = serde_json::to_value(request_stats_with_fabric(3, timing, TP4_FABRIC, 0))
         .expect("the TP=4 stats serialize");
     assert_eq!(
         shape(&reference),

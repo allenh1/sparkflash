@@ -27,8 +27,12 @@
 //! * [ple] pages the 51.2 GiB n-gram table on the host with a bounded row cache and a prefetch
 //!   entry point, the same serving shape sparkflash-engram uses for V4.1.
 //!
-//! The NVFP4 experts and the FP8 PLE shards decode through `sparkflash_weights::nvfp4`, which
-//! every ModelOpt checkpoint in the tree shares.
+//! Two released checkpoints are served from this one crate: the NVFP4 release above and
+//! Qwen/Qwen3.8-Flash-Next-FP8, whose routed experts are E4M3 codes with one BF16 inverse scale a
+//! 128x128 tile. [config::ExpertQuant] is the typed difference; every other tensor, the profile
+//! switches and the device step are shared. The NVFP4 experts and the FP8 PLE shards decode
+//! through `sparkflash_weights::nvfp4`, and the FP8 experts through
+//! `sparkflash_weights::linalg`'s tile-scale decode.
 //! * [forward] is the host reference forward at any geometry, including the tiny fixtures.
 //! * [checkpoint] is the shared checkpoint plumbing: the host loader the device arm is compared
 //!   against, the paged PLE reader both sides use, and a synthetic-checkpoint writer so the whole
@@ -83,7 +87,7 @@ pub use checkpoint::{
     write_synthetic_checkpoint_sharded,
 };
 pub use codec::QwenCodec;
-pub use config::{ConfigError, LayerKind, Qwen4ExpConfig};
+pub use config::{ConfigError, ExpertQuant, LayerKind, Qwen4ExpConfig};
 pub use forward::{ForwardError, Qwen4ExpWeights, ReferenceState, ReferenceWeights};
 pub use ngram::{NgramHead, PleHasher, PleLayout, layer_multipliers};
 pub use ple::{PleCacheCounters, PleTable, RowReader, shard_tensor_name};

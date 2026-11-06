@@ -25,7 +25,7 @@ use sparkflash_device::layout_contract::*;
 use sparkflash_device::paged_kv::PagedKvView;
 use sparkflash_device::paged_read::{paged_entry, read_hsi_keys, read_main_rows};
 use sparkflash_kernels::cuda_harness::WindowRingLayout;
-use sparkflash_kernels::m4_abi::FLASH_MLA_CSA2;
+use sparkflash_kernels::m4_abi::{FLASH_MLA_CSA2, FLASH_MLA_CSA2_COMMON};
 use sparkflash_kernels::m4_quant::bf16_bits;
 use sparkflash_kernels::mla_ref::{
     HSI_BLOCK_TOKENS, HSI_BLOCKS, INDEX_HEAD_DIM, MLA_HEADS, MLA_LATENT,
@@ -410,9 +410,11 @@ fn cuda_kernel_defines_are_the_kv_layout() {
     assert_eq!(latent / window_quant, SWA_SLOT_SCALE_BYTES);
     assert_eq!(latent, SWA_SLOT_DATA_BYTES);
 
-    // The kernel's arithmetic is written in terms of the same defines, not fresh literals.
-    assert!(FLASH_MLA_CSA2.contains("#define SPARK_M4_MLA_LATENT SPARK_M4_KV_LORA_RANK"));
-    assert!(FLASH_MLA_CSA2.contains("SPARK_M4_MLA_LATENT / 2u"));
-    assert!(FLASH_MLA_CSA2.contains("SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS"));
-    assert!(FLASH_MLA_CSA2.contains("(SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK)"));
+    // The kernel's arithmetic is written in terms of the same defines, not fresh literals. The
+    // three entries share one body, so the guard reads the entry and its common header together.
+    let source = format!("{FLASH_MLA_CSA2}\n{FLASH_MLA_CSA2_COMMON}");
+    assert!(source.contains("#define SPARK_M4_MLA_LATENT SPARK_M4_KV_LORA_RANK"));
+    assert!(source.contains("SPARK_M4_MLA_LATENT / 2u"));
+    assert!(source.contains("SPARK_M4_MLA_LATENT / SPARK_M4_KV_SCALE_CHANNELS"));
+    assert!(source.contains("(SPARK_M4_MLA_LATENT / SPARK_M4_MLA_WINDOW_QUANT_BLOCK)"));
 }

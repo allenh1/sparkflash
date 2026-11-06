@@ -861,7 +861,10 @@ impl DeviceSequence {
                 )?;
                 self.launch(
                     kernels.expert_down_fp8,
-                    down_grid(ROWS),
+                    // The shared body tiles Q4E_DOWN_ROWS_PER_WARP rows a warp for both formats,
+                    // so this grid is the NVFP4 one; it used to launch ROWS because the FP8 body
+                    // was its own copy with the narrower tile.
+                    down_grid(DOWN_ROWS),
                     block,
                     &[
                         table.0,

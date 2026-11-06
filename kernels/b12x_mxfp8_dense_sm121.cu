@@ -52,6 +52,15 @@
 // has separate spark_b12x_row_* helpers for them.
 
 #include "m4_common_sm121.cuh"
+#include "b12x_common_sm121.cuh"
+#include "b12x_dense_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_m4_dense_load128 spark_b12x_load128
+#define spark_m4_dense_warp_sum spark_b12x_warp_sum
+#define spark_m4_byte spark_b12x_byte
+#define spark_m4_u16_pair spark_b12x_u16_pair
+#define spark_m4_fp8x2_to_f32 spark_b12x_fp8x2_to_f32
 
 // The B12x micro-tile shape and the two index helpers live in m4_common_sm121.cuh, because
 // b12x_mxfp8_wo_a_sm121.cu indexes the same layout. One block computes a 64x64 output tile, and
@@ -87,77 +96,8 @@ extern "C" __global__ void b12x_mxfp8_dense_sm121(
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
     const uint64_t step_seq) {
-    const uint32_t lane = threadIdx.x;
-    const uint32_t row_base = blockIdx.x * SPARK_M4_DENSE_TILE_M +
-                              (lane / SPARK_M4_DENSE_SUBTILES_PER_ROW) *
-                                  SPARK_M4_DENSE_ROWS_PER_THREAD;
-    const uint32_t col_base =
-        blockIdx.y * SPARK_M4_DENSE_TILE_N +
-        (lane % SPARK_M4_DENSE_SUBTILES_PER_ROW) * SPARK_M4_DENSE_COLS_PER_THREAD;
-    const uint32_t k_blocks = inner / SPARK_M4_QUANT_BLOCK;
-
-    uint64_t t_enter = 0u;
-    SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
-
-    // The accumulation order per output is the contract mxfp8_ref.rs implements: K ascending in
-    // 32-value blocks and ascending within a block. The 4x4 sub-tile only decides which outputs a
-    // thread owns; it never reorders a sum, so the reference does not have to model the tiling.
-    for (uint32_t di = 0; di < SPARK_M4_DENSE_ROWS_PER_THREAD; ++di) {
-        const uint32_t row = row_base + di;
-        if (row >= rows) {
-            continue;
-        }
-        const uint8_t *a_row = a_fp8 + (uint64_t)row * inner;
-        const uint8_t *a_scale_row = a_scales + (uint64_t)row * k_blocks;
-        float acc[SPARK_M4_DENSE_COLS_PER_THREAD];
-#pragma unroll
-        for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
-            acc[dj] = 0.0f;
-        }
-        for (uint32_t block = 0; block < k_blocks; ++block) {
-            const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
-            const float a_scale = spark_ue8m0_decode(a_scale_row[block]);
-            float w_scale[SPARK_M4_DENSE_COLS_PER_THREAD];
-#pragma unroll
-            for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
-                const uint32_t col = col_base + dj;
-                w_scale[dj] =
-                    col < cols ? spark_ue8m0_decode(w_scales[spark_b12x_scale_index(col, base, inner)])
-                               : 0.0f;
-            }
-#pragma unroll 8
-            for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-                const float a_value = spark_fp8_e4m3_decode(a_row[base + i]) * a_scale;
-#pragma unroll
-                for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
-                    const uint32_t col = col_base + dj;
-                    if (col < cols) {
-                        const float w_value =
-                            spark_fp8_e4m3_decode(
-                                w_fp8[spark_b12x_weight_index(col, base + i, inner)]) *
-                            w_scale[dj];
-                        acc[dj] += a_value * w_value;
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (uint32_t dj = 0; dj < SPARK_M4_DENSE_COLS_PER_THREAD; ++dj) {
-            const uint32_t col = col_base + dj;
-            if (col < cols) {
-                out[(uint64_t)row * cols + col] = __float2bfloat16_rn(acc[dj]);
-            }
-        }
-    }
-    __syncthreads();
-
-    if (lane == 0u) {
-        // payload_meta: one bf16 per output element of this block's tile.
-        const uint32_t meta = SPARK_M4_DENSE_TILE_M * SPARK_M4_DENSE_TILE_N * 2u;
-        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
-        (void)step_seq;
-    }
-    (void)t_enter;
+    b12x_dense_scalar_body<false>(a_fp8, a_scales, nullptr, w_fp8, w_scales, out, rows, cols,
+                                  inner, trace_ring, layer_id, step_seq);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -187,29 +127,8 @@ static_assert(SPARK_M4_DENSE_WARP_BYTES_PER_LANE == 16u, "a lane load is 16 E4M3
 static_assert(SPARK_M4_DENSE_WARP_GROUP % SPARK_M4_QUANT_BLOCK == 0u,
               "a group ends on an MX block boundary");
 
-__device__ __forceinline__ uint4 spark_m4_dense_load128(const uint8_t *p) {
-    uint4 v;
-    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
-__device__ __forceinline__ float spark_m4_dense_warp_sum(float value) {
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 16u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 8u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 4u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 2u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 1u));
-    return value;
-}
 
-__device__ __forceinline__ uint8_t spark_m4_byte(const uint4 v, uint32_t i) {
-    const uint32_t word = i >> 2;
-    const uint32_t shift = (i & 3u) * 8u;
-    const uint32_t w = word == 0u ? v.x : word == 1u ? v.y : word == 2u ? v.z : v.w;
-    return (uint8_t)((w >> shift) & 0xffu);
-}
 
 extern "C" __global__ void b12x_mxfp8_dense_warp_sm121(
     const uint8_t *__restrict__ a_fp8,
@@ -298,23 +217,7 @@ extern "C" __global__ void b12x_mxfp8_dense_warp_sm121(
     }
     (void)t_enter;
 }
-__device__ __forceinline__ uint16_t spark_m4_u16_pair(const uint4 v, uint32_t i) {
-    const uint32_t word = i < 4u ? v.x : i < 8u ? v.y : i < 12u ? v.z : v.w;
-    return (uint16_t)((word >> ((i & 3u) * 8u)) & 0xffffu);
-}
 
-__device__ __forceinline__ void spark_m4_fp8x2_to_f32(uint16_t two, float &lo, float &hi) {
-    asm("{\n\t"
-        ".reg .b32 h2;\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-        "mov.b32 {lo, hi}, h2;\n\t"
-        "cvt.f32.f16 %0, lo;\n\t"
-        "cvt.f32.f16 %1, hi;\n\t"
-        "}"
-        : "=f"(lo), "=f"(hi)
-        : "h"(two));
-}
 
 // A-reuse tile with one thread per (row, column): 1024 threads = 8 rows x 128 columns. The
 // activation stage is still shared and read once per block; every thread accumulates its own

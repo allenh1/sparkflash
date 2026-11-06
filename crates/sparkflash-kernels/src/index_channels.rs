@@ -268,13 +268,14 @@ mod tests {
 
     #[test]
     fn the_body_reads_bf16_index_keys() {
+        // The three CSA2 entries share one body in the common header.
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../kernels/flash_mla_csa2_ring_sm121.cu"
+            "/../../kernels/flash_mla_csa2_common_sm121.cuh"
         ))
-        .expect("the body kernel source is in the tree");
+        .expect("the shared MLA body is in the tree");
         assert!(
-            source.contains("const __nv_bfloat16 *__restrict__ index_key,     // [hsi_blocks][8][index_head_dim]"),
+            source.contains("const __nv_bfloat16 *__restrict__ index_key,"),
             "the body signature moved: the operand form has to be re-declared"
         );
     }

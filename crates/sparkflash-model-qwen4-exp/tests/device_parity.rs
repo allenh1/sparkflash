@@ -97,6 +97,24 @@ fn compare(stage: &str, host: &[f32], device: &[f32], tolerance: f32) {
     assert_eq!(host_argmax, device_argmax, "{stage}: the argmax moved");
 }
 
+/// Pins the hub cache at one empty directory for the whole test process.
+///
+/// The tiny fixture is not the released target the canonical DFlash 2 drafter was trained for, so
+/// an auto-resolved cache snapshot is refused at open - and a machine that has served the released
+/// arm has that snapshot. [serve_tiny.rs] pins the same variable; this file used to be the one
+/// fixture that read the developer's real cache, so the suite was green on a laptop and red on a
+/// Spark. Nothing here reads a released checkpoint: every fixture is written by this process.
+fn pin_hub_cache() {
+    static EMPTY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| {
+        let dir = std::env::temp_dir().join("sparkflash-device-parity-hub");
+        std::fs::create_dir_all(&dir).expect("an empty hub cache");
+        // SAFETY: the initialiser runs once for the process, before any fixture opens a backend,
+        // so the variable is written once and read from then on.
+        unsafe { std::env::set_var("HF_HUB_CACHE", dir) };
+    });
+}
+
 /// Run the whole TP=1 loop on one configuration and compare it with the host oracle.
 ///
 /// Returns false when this build or machine cannot run the device, so the caller can skip.
@@ -140,6 +158,7 @@ fn parity_on(
         return false;
     }
     config.num_hidden_layers = config.layer_types.len();
+    pin_hub_cache();
     let temp = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(temp.path(), &config, 7).expect("the fixture writes");
     // The context has to hold the prompt plus the decode steps, and a test that prefills more
@@ -265,6 +284,19 @@ fn parity_on(
 #[test]
 fn the_tp1_device_loop_matches_the_host_oracle() {
     let _ = parity(Qwen4ExpConfig::tiny(), "tiny");
+}
+
+/// The FP8 expert format runs the other pair of expert kernels, and this fixture is its geometry:
+/// 128-column tiles and a 128-wide expert, which the NVFP4 fixture cannot also be.
+///
+/// The stored bytes are E4M3 with one BF16 inverse scale a tile, so this is the only test that
+/// reads an FP8 weight through the device arm's own uploader and compares the logits with the host
+/// loader's decode of the same bytes. The MTP layer of every release uses this format, and the
+/// two halves of that statement - the codes and the tile scale - are what a merge of the two expert
+/// bodies can break without touching a single NVFP4 number.
+#[test]
+fn the_fp8_expert_fixture_matches_the_host_oracle() {
+    let _ = parity(Qwen4ExpConfig::tiny_fp8(), "tiny fp8");
 }
 
 /// The converted rank file is the same bits: the device loop over a file the converter wrote must
@@ -517,6 +549,7 @@ fn a_wide_chunk_computes_every_row_as_dense_rows_chunks_do() {
     config.num_experts_per_tok = 4;
     config.max_position_embeddings = 2048;
     config.num_hidden_layers = config.layer_types.len();
+    pin_hub_cache();
     let temp = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(temp.path(), &config, 11).expect("the fixture writes");
     for prompt_len in [3 * DENSE_ROWS + 30, 2 * DENSE_ROWS + 100] {
@@ -551,6 +584,7 @@ fn a_kept_sequence_prefills_only_the_tokens_past_its_prefix() {
         return;
     }
     let config = Qwen4ExpConfig::tiny();
+    pin_hub_cache();
     let temp = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(temp.path(), &config, 7).expect("the fixture writes");
     let backend = match Qwen4ExpDeviceBackend::open_with_prefill(
@@ -663,6 +697,7 @@ fn a_continued_conversation_is_the_bits_of_a_cold_prefill() {
     config.num_experts_per_tok = 10;
     config.max_position_embeddings = 1024;
     config.num_hidden_layers = config.layer_types.len();
+    pin_hub_cache();
     let temp = tempfile::tempdir().expect("a temporary directory");
     write_synthetic_checkpoint(temp.path(), &config, 13).expect("the fixture writes");
     for prompt_len in [73, CHUNK + 100] {

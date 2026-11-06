@@ -105,7 +105,7 @@ const DENSE_PIN_SHA256: &str = "a2e0a63c8b78e3fe9117d7c12b06353bbc46af7c16019cf7
 /// The grouped wo_a BF16-activation cubin name and pin.
 const WOA_KERNEL: &str = "b12x_bf16a_mxfp8w_wo_a_sm121";
 const WOA_PIN_BYTES: usize = 11_568;
-const WOA_PIN_SHA256: &str = "d11a8610ff557617116c437b0bc7a0367f66a8069ccfc97373433ebd99ffd249";
+const WOA_PIN_SHA256: &str = "67dcc6870157f26bd771c7799a2cae2ebf493970be4c9b7afb0099a7f6ba60ce";
 /// Both pinned cubins carry no fence: the scalar projections synchronise only within a block.
 const PIN_MEMBAR_LINES: u32 = 0;
 /// The released hidden width, the layer-0 attention-boundary row width.
@@ -211,6 +211,10 @@ impl Args {
         Ok(args)
     }
 }
+
+#[path = "support/mem.rs"]
+mod mem;
+use mem::check_floor;
 
 fn main() {
     if let Err(error) = run() {
@@ -686,30 +690,6 @@ fn read_u16(cuda: &Cuda, ptr: &Deviceptr, values: usize) -> Result<Vec<u16>, Str
         .iter()
         .map(|pair| u16::from_le_bytes(*pair))
         .collect())
-}
-
-fn check_floor(floor_gib: u64, point: &str) -> Result<(), String> {
-    let text = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| format!("cannot read /proc/meminfo: {error}"))?;
-    let kb = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "cannot parse MemAvailable".to_owned())?;
-    let bytes = kb.saturating_mul(1024);
-    let floor = floor_gib.saturating_mul(1024 * 1024 * 1024);
-    if bytes < floor {
-        return Err(format!(
-            "MemAvailable at {point} is {kb} kB ({:.2} GiB), below the {floor_gib} GiB floor: refusing to run",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        ));
-    }
-    println!(
-        "MemAvailable at {point}: {kb} kB ({:.1} GiB), floor {floor_gib} GiB - ok",
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    Ok(())
 }
 
 /// Reads one cubin and refuses it unless its bytes and sha256 are the pinned compiled form.

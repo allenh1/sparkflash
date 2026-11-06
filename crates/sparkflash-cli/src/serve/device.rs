@@ -743,6 +743,8 @@ impl Live {
                         finish_reason,
                         timing,
                         dspark,
+                        // The driver patches this request's prefix count into the event below.
+                        cached_tokens: 0,
                     },
                     DEVICE_FABRIC,
                 );

@@ -115,6 +115,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use sparkflash_serve::host::{StopBuffer, common_prefix_bytes};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
@@ -1083,9 +1085,10 @@ struct ServeArgs {
     /// Serve a model pack by id instead of the V4.1 engine.
     ///
     /// The packs wired today are nvidia/Qwen3.8-Flash-Next-NVFP4 (alias
-    /// qwen3.8-flash-next-nvfp4) and zai-org/GLM-5.3-Flash (alias glm5.3-flash-fp8), each
-    /// device-only and TP=1: they need a GPU whose driver can load the embedded cubin plus a
-    /// checkpoint. With --synthetic a pack serves its own tiny fixture instead, which is a
+    /// qwen3.8-flash-next-nvfp4), its official FP8 release Qwen/Qwen3.8-Flash-Next-FP8 (alias
+    /// qwen3.8-flash-next-fp8, the same arm with E4M3 experts) and zai-org/GLM-5.3-Flash (alias
+    /// glm5.3-flash-fp8), each device-only and TP=1: they need a GPU whose driver can load the
+    /// embedded cubin plus a checkpoint. With --synthetic a pack serves its own tiny fixture instead, which is a
     /// runnable demo of the same code path rather than the V4.1 tiny plan. When --model is absent
     /// and --checkpoint is given, the checkpoint's own config.json names the pack.
     #[arg(long, value_name = "ID")]
@@ -2051,7 +2054,12 @@ fn finished_event_with_fabric(
 ) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     let dspark = summary.dspark;
-    let mut stats = request_stats_with_fabric(prompt_tokens, summary.timing, fabric_mode);
+    let mut stats = request_stats_with_fabric(
+        prompt_tokens,
+        summary.timing,
+        fabric_mode,
+        summary.cached_tokens,
+    );
     // The reference driver counts the engine's real MTP drafts against the target tokens it
     // actually emitted; the TP=4 driver has no draft source yet and carries the default zero.
     stats.dspark_speculative = dspark;
@@ -2065,8 +2073,8 @@ fn finished_event_with_fabric(
                 // This process has no KV pool and no persistent tier, so nothing was served from a
                 // cache, and the host paths refuse images. These zeros are the state of the world,
                 // not a missing measurement; the device driver sets its prefix and image counts.
-                cached_tokens: 0,
-                uma_cached_tokens: 0,
+                cached_tokens: summary.cached_tokens,
+                uma_cached_tokens: summary.cached_tokens,
                 nvme_cached_tokens: 0,
                 image_tokens: 0,
             },
@@ -2081,8 +2089,8 @@ fn finished_event_with_fabric(
                     .draft_tokens_proposed
                     .saturating_sub(dspark.draft_tokens_accepted),
             },
-            prompt_cache_hit_tokens: 0,
-            prompt_cache_miss_tokens: prompt_tokens,
+            prompt_cache_hit_tokens: summary.cached_tokens,
+            prompt_cache_miss_tokens: prompt_tokens.saturating_sub(summary.cached_tokens),
         },
         stats: Box::new(stats),
     }
@@ -2099,21 +2107,29 @@ fn request_stats_with_fabric(
     prompt_tokens: usize,
     timing: RequestTiming,
     fabric_mode: &str,
+    cached_tokens: usize,
 ) -> DeepSeekSparkRequestStats {
+    // The one tier this process has is the rank's window, which the request found already holding
+    // its leading tokens; there is no second-tier or NVMe copy behind it.
+    let cached = cached_tokens.min(prompt_tokens);
+    let uncached = prompt_tokens - cached;
     DeepSeekSparkRequestStats {
-        // The prompt length is known; every cache tier is zero because no cache exists in this
-        // process, so no prefix was matched and nothing had to be replayed.
         kv_cache: PrefixMatchPlan {
             total_prompt_tokens: prompt_tokens,
-            global_kv_cached_tokens: 0,
-            uma_hit_tokens: 0,
+            global_kv_cached_tokens: cached,
+            uma_hit_tokens: cached,
             nvme_restored_tokens: 0,
             swa_tail_hit: false,
             encoder_swa_replay_tokens: 0,
-            uncached_suffix_tokens: 0,
-            decoder_swa_replay_tokens: 0,
+            uncached_suffix_tokens: uncached,
+            // The window's rows are already cached, so nothing is replayed for them.
+            decoder_swa_replay_tokens: uncached,
         },
-        kv_cache_hit_rate: 0.0,
+        kv_cache_hit_rate: if prompt_tokens == 0 {
+            0.0
+        } else {
+            cached as f64 / prompt_tokens as f64
+        },
         // The forward pass owns its Engram counters and the engine API exposes none of them, so
         // this process cannot report a non-zero one.
         engram_layers: default_engram_layers(),
@@ -2223,6 +2239,9 @@ struct RunSummary {
     timing: RequestTiming,
     /// The real MTP-draft acceptance counters for this request.
     dspark: DSparkStepStats,
+    /// Prompt tokens the request found already in the rank's window. Zero except on the packed
+    /// four-rank path, whose window outlives a request.
+    cached_tokens: usize,
 }
 
 /// Counts the real DSpark acceptance rule over the MTP drafts this driver produced.
@@ -2681,6 +2700,7 @@ impl BatchedRequest {
                 finish_reason,
                 timing,
                 dspark: self.dspark.stats(),
+                cached_tokens: 0,
             })))
             .map_err(|_| "the client stopped reading this response".to_owned())?;
         Ok(BatchAdvance::Done)
@@ -3163,14 +3183,6 @@ impl<'a> LogprobDecoder<'a> {
 }
 
 /// The length in bytes of the longest common prefix of two strings.
-fn common_prefix_bytes(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .map(|(character, _)| character.len_utf8())
-        .sum()
-}
-
 /// Builds one position's [`TokenLogprob`] from its log-softmax row.
 fn token_logprob(
     logprobs: &[f32],
@@ -3436,98 +3448,6 @@ fn prefill_chunked(
 
 /// vLLM's stop-string rule for the reference driver's text stream.
 ///
-/// OpenAI's `stop` is a list of strings that end generation when they are *generated*: the
-/// returned text does not contain them, and `finish_reason` becomes `"stop"`. A stop string can
-/// span token boundaries, so vLLM holds back `max(len(stop)) - 1` characters before emitting
-/// (its `SamplingParams.output_text_buffer_length`) and checks the stop strings against the held
-/// text. This is that rule, byte for byte: a partial stop string is never emitted, a completed one
-/// is removed from the output, and characters still held back when generation ends for another
-/// reason (length/EOS) are flushed rather than dropped.
-///
-/// Matching is on the decoded text and therefore on whole characters, which is what vLLM matches;
-/// a stop string is never split inside a UTF-8 sequence because `str::find` can only match at
-/// character boundaries. An empty stop string is refused by the protocol layer before a request
-/// reaches this buffer.
-struct StopBuffer {
-    /// The stop strings in request order. Empty means "no stop string": then every piece is
-    /// emitted immediately and nothing is held back.
-    sequences: Vec<String>,
-    /// How many characters of the tail can start a stop string, so they cannot be emitted yet.
-    holdback: usize,
-    /// Decoded characters generated but not emitted yet.
-    pending: String,
-    /// Whether a stop string has been matched; the driver stops after this becomes true.
-    matched: bool,
-}
-
-impl StopBuffer {
-    /// Builds the buffer; `holdback` is one less than the longest stop string, as in vLLM.
-    fn new(sequences: &[String]) -> Self {
-        let holdback = sequences
-            .iter()
-            .map(|sequence| sequence.chars().count())
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
-        Self {
-            sequences: sequences.to_vec(),
-            holdback,
-            pending: String::new(),
-            matched: false,
-        }
-    }
-
-    /// Adds one token's decoded text (which may be empty or absent) and returns the characters that
-    /// are safe to emit now. A stop match clears the pending text and truncates the returned text
-    /// at the match, which is vLLM's "the output will not contain the stop strings".
-    fn push(&mut self, piece: Option<&str>) -> String {
-        if self.matched {
-            return String::new();
-        }
-        if let Some(piece) = piece {
-            self.pending.push_str(piece);
-        }
-        if self.sequences.is_empty() {
-            return std::mem::take(&mut self.pending);
-        }
-        if let Some(index) = self
-            .sequences
-            .iter()
-            .filter_map(|sequence| self.pending.find(sequence.as_str()))
-            .min()
-        {
-            self.matched = true;
-            let text = self.pending[..index].to_owned();
-            self.pending.clear();
-            return text;
-        }
-        let chars = self.pending.chars().count();
-        if chars <= self.holdback {
-            return String::new();
-        }
-        let emit_chars = chars - self.holdback;
-        let split = self
-            .pending
-            .char_indices()
-            .nth(emit_chars)
-            .map_or(self.pending.len(), |(index, _)| index);
-        let text = self.pending[..split].to_owned();
-        self.pending.drain(..split);
-        text
-    }
-
-    /// Returns the text still held back when generation ends without a stop match. A matched stop
-    /// has already cleared it, so this is empty on the stop path.
-    fn finish(&mut self) -> String {
-        std::mem::take(&mut self.pending)
-    }
-
-    /// Whether a stop string was matched, i.e. the request must report `"stop"`.
-    fn matched(&self) -> bool {
-        self.matched
-    }
-}
-
 /// Runs one request and sends its events, ending with exactly one terminal reply.
 ///
 /// `Ok(())` means the terminal reply was sent. `Err(message)` means the request failed and the
@@ -3710,6 +3630,7 @@ fn run_request(
             finish_reason,
             timing,
             dspark: dspark.stats(),
+            cached_tokens: 0,
         })))
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     Ok(())
@@ -3739,6 +3660,9 @@ pub struct Tp4Step {
     pub proposed: usize,
     /// The drafts the depth policy left unverified: `proposed - accepted - (1 if the chain ran)`.
     pub gated: usize,
+    /// Prompt tokens this prefill found already in the rank's window, from the previous request.
+    /// Zero for every step but a prefill, and zero when the request could not reuse the window.
+    pub cached_tokens: usize,
     /// What the rank's own speculator reported for this step, when the session keeps its own
     /// accounting (`ModelSession::speculation`). A packed arm verifies a chain inside one session
     /// call and hands the extra tokens back through later calls, so the fields above cannot
@@ -3823,8 +3747,20 @@ pub trait Tp4RankApi: Send {
     /// greedy.
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String>;
 
+    /// The tokens of `prompt` this rank's window already holds and can keep.
+    ///
+    /// Rank 0 asks this before it broadcasts the Request, so the count every rank prefill uses is
+    /// read off one rank rather than inferred four times: two ranks that disagreed would run
+    /// different collectives in the same step.
+    fn plan_prefill(&mut self, _prompt: &[u32]) -> usize {
+        0
+    }
+
     /// Runs the prompt through this rank's forward and returns the last position's step.
-    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String>;
+    ///
+    /// `cached` is the group's decision, from [Self::plan_prefill] on rank 0: those leading tokens
+    /// are already in every rank's window and only `prompt[cached..]` is forwarded.
+    fn prefill(&mut self, prompt: &[u32], cached: usize) -> Result<Tp4Step, String>;
 
     /// Runs the prompt through this rank's forward and returns the last position's step together
     /// with every scored prompt position's merged logprob contract.
@@ -3930,7 +3866,7 @@ impl Tp4RankApi for HostTp4Rank {
             .map_err(|error| error.to_string())
     }
 
-    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn prefill(&mut self, prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
         let output = self
             .rank
             .prefill(prompt)
@@ -3942,6 +3878,7 @@ impl Tp4RankApi for HostTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -3962,6 +3899,7 @@ impl Tp4RankApi for HostTp4Rank {
                 accepted: Vec::new(),
                 proposed: 0,
                 gated: 0,
+                cached_tokens: 0,
             },
             merged,
         ))
@@ -3976,6 +3914,7 @@ impl Tp4RankApi for HostTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -4014,6 +3953,27 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
     Ok(Box::new(HostTp4Rank { rank }))
 }
 
+/// The tokens a request may keep from the rank's window: the previous request's, when this prompt
+/// begins with all of them and continues past them.
+///
+/// The reuse is all-or-nothing on purpose. A Gated DeltaNet layer's convolution history and
+/// recurrent memory are running state, so a window cannot be rewound to an earlier position: a
+/// prompt that diverges from what the window holds, or that ends inside it, is served by a full
+/// prefill. A prompt equal to the window has no new row to run and no row to take logits from, so
+/// it is a full prefill too.
+fn reusable_prefix(held: &[u32], prompt: &[u32]) -> usize {
+    let shared = held
+        .iter()
+        .zip(prompt)
+        .take_while(|(held, asked)| held == asked)
+        .count();
+    if shared == held.len() && held.len() < prompt.len() {
+        held.len()
+    } else {
+        0
+    }
+}
+
 /// One GLM-5.3-Flash rank behind the serve-owned TP=4 control channel.
 ///
 /// The rank mirrors [HostTp4Rank] over the device arm: every rank runs the same prompt and the
@@ -4027,8 +3987,14 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
 #[cfg(feature = "tp4-serve")]
 struct GlmTp4Rank {
     rank: DeviceRank,
-    /// The request window, allocated at load and put back at position 0 by every request.
+    /// The request window, allocated at load. A request whose prompt extends the tokens the last
+    /// one left here keeps them and prefills only its suffix ([Self::prefill]).
     sequence: DeviceSequence,
+    /// The ids `sequence` has consumed, in order: the last request's prompt, the tokens its steps
+    /// fed, and the drafts its verifies kept. The next request reuses the window only when its
+    /// prompt starts with all of them, because a Gated DeltaNet recurrence cannot be rewound to an
+    /// earlier position.
+    held: Vec<u32>,
     tp: TpRuntime,
     gather: BitGatherHandle,
     sampler: Sampler,
@@ -4078,6 +4044,7 @@ impl GlmTp4Rank {
         } else {
             Some(token)
         };
+        self.held.extend_from_slice(rows);
         self.steps += 1;
         self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         Ok(Tp4Step {
@@ -4087,6 +4054,7 @@ impl GlmTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: 0,
         })
     }
 
@@ -4151,6 +4119,9 @@ impl GlmTp4Rank {
                 (decoded, next)
             }
         };
+        // The verify consumed its chain up to the row it kept; the drafts past it were written
+        // and rewound, so they are not in the window and the next request must not inherit them.
+        self.held.extend_from_slice(&chunk[..kept]);
         for &id in &accepted {
             self.sampler.record(id);
         }
@@ -4163,6 +4134,7 @@ impl GlmTp4Rank {
             accepted,
             proposed,
             gated,
+            cached_tokens: 0,
         })
     }
 }
@@ -4175,9 +4147,10 @@ impl Tp4RankApi for GlmTp4Rank {
         // starts the prefill clock and the workers pay inside it. A block-drafting window resets
         // in place because its drafter's context is bounded by the rows the request captured
         // ([DeviceSequence]'s `drafter_skip`), so nothing below the position is read.
-        self.rank
-            .reset(&mut self.sequence)
-            .map_err(|error| format!("resetting the GLM sequence: {error}"))?;
+        //
+        // The reset moved to [Self::prefill]: whether the next request can keep the window at all
+        // depends on its prompt, which this call does not see, and a chat turn's prompt begins with
+        // everything the previous one left in the window.
         self.sampler.reset();
         self.sampling = sparkflash_model::Sampling {
             temperature: sampling.temperature,
@@ -4196,16 +4169,51 @@ impl Tp4RankApi for GlmTp4Rank {
         Ok(())
     }
 
-    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn plan_prefill(&mut self, prompt: &[u32]) -> usize {
+        // A chat turn's prompt begins with the previous turn's prompt and reply, which is exactly
+        // what the window holds, so the rows below the shared prefix need not be run again. The
+        // reuse is all-or-nothing: a Gated DeltaNet layer's convolution history and recurrent
+        // memory are running state, so a window cannot be rewound to an earlier position, and a
+        // prompt that diverges from it or stops inside it is served by a full prefill. A window
+        // whose position and history have drifted apart is not reusable at all.
+        if self.sequence.position() != self.held.len() {
+            return 0;
+        }
+        reusable_prefix(&self.held, prompt)
+    }
+
+    fn prefill(&mut self, prompt: &[u32], cached: usize) -> Result<Tp4Step, String> {
         if prompt.is_empty() {
             return Err("an empty prompt has no logits".to_owned());
+        }
+        // The count is rank 0's, taken from the same window this rank holds. A rank that cannot
+        // honour it is a different program from its peers, and says so instead of running a
+        // prefill the group did not agree to.
+        if cached > 0 && reusable_prefix(&self.held, prompt) != cached {
+            return Err(format!(
+                "the group's {cached}-token prefix is not this rank's: its window holds {} tokens \
+                 and the prompt does not extend them",
+                self.held.len()
+            ));
+        }
+        if cached == 0 {
+            self.rank
+                .reset(&mut self.sequence)
+                .map_err(|error| format!("resetting the GLM sequence: {error}"))?;
+            self.held.clear();
         }
         let started = Instant::now();
         self.sampler.record_prompt(prompt);
         let logits = self
             .rank
-            .forward_prefill(&self.tp, &self.gather, &mut self.sequence, prompt)
+            .forward_prefill(
+                &self.tp,
+                &self.gather,
+                &mut self.sequence,
+                &prompt[cached..],
+            )
             .map_err(|error| format!("the GLM rank's prefill failed: {error}"))?;
+        self.held.extend_from_slice(&prompt[cached..]);
         let token = self.sampler.choose(&logits, &self.sampling);
         let next_token = if self.eos.contains(&token) {
             None
@@ -4221,6 +4229,7 @@ impl Tp4RankApi for GlmTp4Rank {
             accepted: Vec::new(),
             proposed: 0,
             gated: 0,
+            cached_tokens: cached,
         })
     }
 
@@ -4494,6 +4503,7 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         eos: glm_config.eos_token_ids.clone(),
         rank,
         sequence,
+        held: Vec::new(),
         tp,
         gather,
         sampler: Sampler::new(),
@@ -4566,6 +4576,9 @@ impl QwenTp4Rank {
             // The depth a policy withheld is not in the session's counters; zero says "not
             // reported" rather than inventing a gate count.
             gated: 0,
+            // The reference session reports its own reuse through ModelSession::cached_tokens,
+            // not through this step.
+            cached_tokens: 0,
             speculation: Some(counted),
         })
     }
@@ -4596,7 +4609,9 @@ impl Tp4RankApi for QwenTp4Rank {
         Ok(())
     }
 
-    fn prefill(&mut self, prompt: &[u32]) -> Result<Tp4Step, String> {
+    fn prefill(&mut self, prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
+        // This arm's session keeps its own window and reports its own reuse
+        // (`ModelSession::cached_tokens`), so the group's count is not applied here.
         self.step(|session| session.prefill(prompt))
     }
 
@@ -5127,11 +5142,15 @@ fn run_tp4_request(
     };
     rank.begin_request(sampling)?;
     let max_tokens = u32::try_from(job.max_tokens).unwrap_or(u32::MAX);
+    // One rank decides what every rank may keep, and the frame carries the decision: two ranks
+    // that inferred it separately would run different collectives in the same step.
+    let cached = u32::try_from(rank.plan_prefill(&job.prompt_tokens)).unwrap_or(0);
     hub.broadcast(&Tp4ControlFrame::Request {
         prompt_ids: job.prompt_tokens.clone(),
         max_tokens,
         prompt_logprobs: prompt_logprobs_frame,
         speculative: sampling.speculative,
+        cached_tokens: cached,
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
@@ -5167,16 +5186,20 @@ fn run_tp4_request(
             )?;
             (step, Some(payload))
         }
-        None => (rank.prefill(&job.prompt_tokens)?, None),
+        None => (rank.prefill(&job.prompt_tokens, cached as usize)?, None),
     };
+    // How much of the prompt the rank's window already held: the previous request's tokens, when
+    // this prompt began with them.
+    let cached_tokens = prefill.cached_tokens;
     let prefill_elapsed = request_started.elapsed();
     // One line per request so a log reader can check the TTFT identity directly: the host
     // prefill loop runs one decode-shaped forward per prompt token, so TTFT is linear in the
     // prompt length at the step cost. See docs/archive/build/tp4-host-twin.md "TTFT and readiness".
     println!(
-        "sparkflash serve: tp4_prefill rank=0 epoch_ms={} prompt_tokens={} prefill_steps={} prefill_ms={}",
+        "sparkflash serve: tp4_prefill rank=0 epoch_ms={} prompt_tokens={} cached_tokens={} prefill_steps={} prefill_ms={}",
         epoch_millis(),
         job.prompt_tokens.len(),
+        cached_tokens,
         rank.metrics().steps.saturating_sub(prefill_steps_before),
         prefill_elapsed.as_millis()
     );
@@ -5329,6 +5352,9 @@ fn run_tp4_request(
             },
             acceptance_rate: sparkflash_api::telemetry_types::safe_ratio(kept_drafts, proposed),
         },
+        // The window's reuse is real state, not a telemetry default: a chat turn that extends the
+        // last one runs only its new rows.
+        cached_tokens: cached_tokens.min(job.prompt_tokens.len()),
     })));
     Ok(())
 }
@@ -5482,6 +5508,7 @@ fn tp4_worker_loop(
                 max_tokens,
                 prompt_logprobs,
                 speculative,
+                cached_tokens,
             }) => {
                 // Workers do not sample; reset their state with the greedy default. The engine's
                 // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
@@ -5502,7 +5529,9 @@ fn tp4_worker_loop(
                     Some(selection) => rank
                         .prefill_prompt_logprobs(&prompt_ids, selection)
                         .map(|_| ()),
-                    None => rank.prefill(&prompt_ids).map(|_| ()),
+                    None => rank
+                        .prefill(&prompt_ids, cached_tokens as usize)
+                        .map(|_| ()),
                 };
                 if let Err(error) = prefill {
                     if !error.starts_with(crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX) {
@@ -7996,6 +8025,25 @@ mod tests {
     use super::*;
     use sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path;
 
+    #[test]
+    fn a_window_is_reused_only_by_a_prompt_that_extends_all_of_it() {
+        // A chat turn: the previous prompt and reply are the window's contents, and the new turn
+        // continues them, so only its own rows are new.
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
+        // The same prompt with nothing appended has no row to take logits from.
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3]), 0);
+        // A prompt that stops inside the window cannot be served by it: the recurrence is running
+        // state and there is no earlier position to rewind to.
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2]), 0);
+        // An edited history diverges, at the first mismatching token.
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 9, 3, 4]), 0);
+        // A shared prefix that is not the whole window is still no reuse.
+        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 9, 4]), 0);
+        // An empty window, and the first request of a process.
+        assert_eq!(reusable_prefix(&[], &[1, 2]), 0);
+        assert_eq!(reusable_prefix(&[1], &[1, 2]), 1);
+    }
+
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.
     ///
     /// Its random weight bytes decode to all-NaN logits in the tiny plan, which is useful for the
@@ -8966,6 +9014,16 @@ mod tests {
         assert_eq!(
             pack::Pack::named(sparkflash_model_qwen4_exp::WEIGHTS_ID),
             Some(pack::Pack::Qwen)
+        );
+        // The official FP8 release is the same arm: the checkpoint's own quantisation field
+        // selects the expert format, not a second pack.
+        assert_eq!(
+            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID),
+            Some(pack::Pack::QwenFp8)
+        );
+        assert_eq!(
+            pack::Pack::named(sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_ID),
+            Some(pack::Pack::QwenFp8)
         );
         assert_eq!(pack::Pack::named("example/no-arm"), None);
     }

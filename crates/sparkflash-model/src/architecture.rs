@@ -976,6 +976,92 @@ fn mtp(text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
     }))
 }
 
+/// Whether a declared `quant_method` names the producer rather than the arithmetic.
+///
+/// ModelOpt writes its own name in `quant_method` (`"modelopt"`) and records the arithmetic
+/// separately, in `quant_algo` and in the per-module `quantized_layers` table. Read as a format,
+/// the producer name labels an NVFP4 release BF16.
+#[must_use]
+pub fn names_the_producer(method: &str) -> bool {
+    matches!(
+        method.to_ascii_lowercase().as_str(),
+        "modelopt" | "nvidia-modelopt" | "ammo"
+    )
+}
+
+/// Whether a ModelOpt module name belongs to the MTP stage rather than a decoder layer.
+///
+/// The released NVFP4 snapshot stores the backbone's experts as NVFP4 and the MTP stage's as
+/// `FP8_PB_WO`, so the two must not be read as one format: [Quantization::expert] describes the
+/// decoder layers' routed experts, and the MTP stage keeps its own.
+fn is_mtp_module(name: &str) -> bool {
+    name.starts_with("mtp.") || name.contains(".mtp.")
+}
+
+/// The routed experts' format as a ModelOpt `quantization_config` records it.
+///
+/// `quantized_layers` keys every quantized module to its own `quant_algo`, and the decoder
+/// layers' routed experts are the entries under `.mlp.experts`. A release that omits that table
+/// still names the same arithmetic in `config_groups`, as a bit width and a number type over a
+/// group of targets.
+fn modelopt_expert(config: &Value) -> Option<String> {
+    if let Some(layers) = object(config, "quantized_layers").and_then(Value::as_object) {
+        let mut expert: Option<String> = None;
+        for (name, spec) in layers {
+            if !name.contains(".mlp.experts") || is_mtp_module(name) {
+                continue;
+            }
+            let Some(algo) = string(spec, "quant_algo") else {
+                continue;
+            };
+            match &expert {
+                // Experts that disagree are not one stored format, and the plan has no name for
+                // that mix: report none rather than pick one of them.
+                Some(first) if !first.eq_ignore_ascii_case(&algo) => return None,
+                Some(_) => {}
+                None => expert = Some(algo),
+            }
+        }
+        if expert.is_some() {
+            return expert;
+        }
+    }
+    let groups = object(config, "config_groups")?.as_object()?;
+    for group in groups.values() {
+        let targeted = group
+            .get("targets")
+            .and_then(Value::as_array)
+            .is_some_and(|targets| {
+                targets.iter().any(|target| {
+                    target
+                        .as_str()
+                        .is_some_and(|name| name.contains(".mlp.experts") && !is_mtp_module(name))
+                })
+            });
+        if !targeted {
+            continue;
+        }
+        let Some(weights) = object(group, "weights") else {
+            continue;
+        };
+        if let Some(format) = group_format(weights) {
+            return Some(format);
+        }
+    }
+    None
+}
+
+/// The arithmetic a ModelOpt group's `weights` block describes, by width and number type.
+fn group_format(weights: &Value) -> Option<String> {
+    let bits = weights.get("num_bits").and_then(Value::as_u64)?;
+    let kind = string(weights, "type")?;
+    match (bits, kind.to_ascii_lowercase().as_str()) {
+        (4, "float") => Some("NVFP4".to_owned()),
+        (8, "float") => Some("FP8".to_owned()),
+        _ => None,
+    }
+}
+
 fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
     let Some(config) = object(root, "quantization_config") else {
         return Ok(Quantization::default());
@@ -985,15 +1071,22 @@ fn quantization(root: &Value) -> Result<Quantization, ConfigError> {
         .copied();
     // Three releases spell the same facts differently: DeepSeek writes quant_method /
     // scale_fmt / expert_dtype, GLM writes quant_method / fmt, and Qwen nests the expert format
-    // under expert_weight.quant_algo with a top-level quant_algo of MIXED_PRECISION.
+    // under expert_weight.quant_algo with a top-level quant_algo of MIXED_PRECISION. A ModelOpt
+    // release writes neither the expert format nor a format in quant_method at all: the producer
+    // goes in quant_method and the arithmetic in quant_algo / quantized_layers.
     let expert = optional_string(config, "expert_dtype")
         .or_else(|| object(config, "expert_weight").and_then(|value| string(value, "quant_algo")))
         .or_else(|| {
             object(config, "mtp_expert_weight").and_then(|value| string(value, "quant_algo"))
-        });
+        })
+        .or_else(|| modelopt_expert(config));
+    // A producer name is not the arithmetic; ModelOpt records that in quant_algo.
+    let method = match optional_string(config, "quant_method") {
+        Some(name) if !names_the_producer(&name) => Some(name),
+        _ => optional_string(config, "quant_algo"),
+    };
     Ok(Quantization {
-        method: optional_string(config, "quant_method")
-            .or_else(|| optional_string(config, "quant_algo")),
+        method,
         block,
         scale: optional_string(config, "scale_fmt").or(optional_string(config, "fmt")),
         activation: optional_string(config, "activation_scheme"),
@@ -1136,6 +1229,77 @@ mod tests {
             .iter()
             .filter(|layer| predicate(layer))
             .count()
+    }
+
+    #[test]
+    fn a_modelopt_producer_name_does_not_hide_the_expert_format() {
+        // The carried Qwen document is the released snapshot's own: the producer is in
+        // quant_method, the arithmetic is MIXED_PRECISION, the backbone's 48 routed experts are
+        // NVFP4, and the MTP stage's are FP8_PB_WO. Reading the producer as a format left the
+        // plan reporting BF16 experts for an NVFP4 release; letting the MTP stage vote made the
+        // two formats look like one contradiction.
+        let architecture = Architecture::from_json(QWEN).expect("the released Qwen config");
+        assert_eq!(
+            architecture.quantization.method.as_deref(),
+            Some("MIXED_PRECISION"),
+            "the plan reads the arithmetic, not the producer's name"
+        );
+        assert_eq!(architecture.quantization.expert.as_deref(), Some("NVFP4"));
+    }
+
+    #[test]
+    fn the_mtp_stage_keeps_its_own_expert_format() {
+        // The same release with the MTP entry promoted to the only expert entry: the decoder
+        // layers carry no routed experts there, so the plan must not report the MTP format.
+        let mut document: Value = serde_json::from_str(QWEN).expect("the carried Qwen config");
+        let mut layers = serde_json::Map::new();
+        layers.insert(
+            "mtp.layers.0.mlp.experts".to_owned(),
+            serde_json::json!({"quant_algo": "FP8_PB_WO", "group_size": 128}),
+        );
+        document["quantization_config"]["quantized_layers"] = Value::Object(layers);
+        document["quantization_config"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("config_groups");
+        let architecture =
+            Architecture::from_json(&document.to_string()).expect("the released Qwen config");
+        assert_eq!(architecture.quantization.expert, None);
+    }
+
+    #[test]
+    fn a_modelopt_group_still_names_the_experts_without_a_layer_table() {
+        // The same release without quantized_layers: the group's width and number type say it.
+        let mut document: Value = serde_json::from_str(QWEN).expect("the carried Qwen config");
+        document["quantization_config"] = serde_json::json!({
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "config_groups": {"group_0": {
+                "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                "targets": [
+                    "model.language_model.layers.0.mlp.experts",
+                    "model.language_model.layers.1.mlp.experts",
+                ],
+            }},
+        });
+        let architecture =
+            Architecture::from_json(&document.to_string()).expect("the released Qwen config");
+        assert_eq!(architecture.quantization.expert.as_deref(), Some("NVFP4"));
+        // A group whose targets are dense projections is not an expert format.
+        document["quantization_config"]["config_groups"]["group_0"]["targets"] =
+            serde_json::json!(["model.language_model.layers.0.mlp.shared_expert"]);
+        let architecture =
+            Architecture::from_json(&document.to_string()).expect("the released Qwen config");
+        assert_eq!(architecture.quantization.expert, None);
+    }
+
+    #[test]
+    fn a_producer_name_is_not_a_format() {
+        assert!(names_the_producer("modelopt"));
+        assert!(names_the_producer("ModelOpt"));
+        assert!(!names_the_producer("fp8"));
+        assert!(!names_the_producer("nvfp4"));
+        assert!(!names_the_producer(""));
     }
 
     #[test]

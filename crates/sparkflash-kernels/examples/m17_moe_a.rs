@@ -260,6 +260,10 @@ impl Args {
     }
 }
 
+#[path = "support/mem.rs"]
+mod mem;
+use mem::check_floor;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("m17_moe_a: {error}");
@@ -1067,30 +1071,6 @@ fn run() -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------------------------
-
-fn check_floor(floor_gib: u64, point: &str) -> Result<(), String> {
-    let text = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| format!("cannot read /proc/meminfo: {error}"))?;
-    let kb = text
-        .lines()
-        .find_map(|line| line.strip_prefix("MemAvailable:"))
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| "cannot parse MemAvailable".to_owned())?;
-    let bytes = kb.saturating_mul(1024);
-    let floor = floor_gib.saturating_mul(1024 * 1024 * 1024);
-    if bytes < floor {
-        return Err(format!(
-            "MemAvailable at {point} is {kb} kB ({:.2} GiB), below the {floor_gib} GiB floor: refusing to run",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-        ));
-    }
-    println!(
-        "MemAvailable at {point}: {kb} kB ({:.1} GiB), floor {floor_gib} GiB - ok",
-        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
-    Ok(())
-}
 
 fn pinned_cubin(
     dir: &std::path::Path,

@@ -37,7 +37,7 @@
 
 use sparkflash_weights::{DType, TensorPlan};
 
-use crate::config::{LayerKind, Qwen4ExpConfig};
+use crate::config::{ExpertQuant, LayerKind, Qwen4ExpConfig};
 use crate::ngram::PleLayout;
 
 /// The prefix every language-model tensor carries in the released checkpoint.
@@ -61,6 +61,10 @@ pub const VISION_BYTES: u128 = 897_862_112;
 /// The bytes of the text language model the device arm must upload: everything except the PLE
 /// table, which stays host-resident and is paged with the Engram store.
 pub const DEVICE_RESIDENT_BYTES: u128 = TEXT_PLE_BYTES - PLE_TABLE_BYTES;
+
+/// The resident total of the official FP8 checkpoint: the same text model with E4M3 experts
+/// (one byte a weight and two bytes a 128x128 tile) in place of the packed E2M1 ones.
+pub const FP8_DEVICE_RESIDENT_BYTES: u128 = 130_706_097_920;
 
 /// What part of the model a tensor belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,13 +106,17 @@ pub enum Role {
 /// The lookups, byte totals and conformance checks are the shared [TensorPlan]'s, reached through
 /// `Deref`; this type owns only how the configuration becomes names and shapes.
 #[derive(Debug, Clone, Default)]
-pub struct Qwen4ExpTensorPlan(TensorPlan<Role>);
+pub struct Qwen4ExpTensorPlan {
+    inner: TensorPlan<Role>,
+    /// The stored format of the routed experts, which is the only format the checkpoint varies.
+    expert_quant: ExpertQuant,
+}
 
 impl std::ops::Deref for Qwen4ExpTensorPlan {
     type Target = TensorPlan<Role>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
@@ -117,7 +125,10 @@ impl Qwen4ExpTensorPlan {
     /// reader touch.
     #[must_use]
     pub fn served(config: &Qwen4ExpConfig) -> Self {
-        let mut plan = Self::default();
+        let mut plan = Self {
+            expert_quant: config.expert_quant,
+            ..Self::default()
+        };
         plan.push(
             &format!("{LM_PREFIX}.embed_tokens.weight"),
             DType::BF16,
@@ -221,7 +232,7 @@ impl Qwen4ExpTensorPlan {
     }
 
     fn push(&mut self, name: &str, dtype: DType, shape: Vec<usize>, role: Role) {
-        self.0.push(name, dtype, shape, role);
+        self.inner.push(name, dtype, shape, role);
     }
 
     fn push_hyper(&mut self, prefix: &str, config: &Qwen4ExpConfig, inject: bool, role: Role) {
@@ -255,7 +266,14 @@ impl Qwen4ExpTensorPlan {
     }
 
     fn push_expert(&mut self, prefix: &str, rows: usize, columns: usize) {
-        self.0.push_nvfp4(prefix, rows, columns, Role::Experts);
+        match self.expert_quant {
+            ExpertQuant::Nvfp4 => self.inner.push_nvfp4(prefix, rows, columns, Role::Experts),
+            // The official FP8 release keeps one BF16 inverse scale a 128x128 tile.
+            ExpertQuant::Fp8Block => {
+                self.inner
+                    .push_fp8_block(prefix, rows, columns, 128, DType::BF16, Role::Experts)
+            }
+        }
     }
 
     fn push_gated_delta_net(&mut self, prefix: &str, config: &Qwen4ExpConfig) {
@@ -563,7 +581,7 @@ impl Qwen4ExpTensorPlan {
                 ("up_proj", config.moe_intermediate_size, hidden),
                 ("down_proj", hidden, config.moe_intermediate_size),
             ] {
-                self.0.push_fp8_block(
+                self.inner.push_fp8_block(
                     &format!("{layer}.mlp.experts.{expert}.{name}"),
                     rows,
                     columns,
@@ -725,6 +743,47 @@ mod tests {
         assert_eq!(plan.role_bytes(Role::Mtp), MTP_BYTES);
         assert_eq!(plan.role_bytes(Role::Vision), VISION_BYTES);
         assert_eq!(plan.len(), 299_545, "the released index has 299,545 names");
+    }
+
+    #[test]
+    fn the_fp8_release_resident_total_is_measured() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
+        let plan = Qwen4ExpTensorPlan::served(&config);
+        let resident = plan.storage_bytes() - plan.role_bytes(Role::PleTable);
+        assert_eq!(resident, FP8_DEVICE_RESIDENT_BYTES);
+    }
+
+    #[test]
+    fn the_fp8_release_plans_block_scaled_experts() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
+        let plan = Qwen4ExpTensorPlan::served(&config);
+        let prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj";
+        let weight = plan
+            .spec(&format!("{prefix}.weight"))
+            .expect("the FP8 weight is planned");
+        assert_eq!(weight.dtype, DType::F8E4M3);
+        assert_eq!(
+            weight.shape,
+            vec![config.moe_intermediate_size, config.hidden_size]
+        );
+        let scales = plan
+            .spec(&format!("{prefix}.weight_scale_inv"))
+            .expect("the tile grid is planned");
+        assert_eq!(scales.dtype, DType::BF16);
+        assert_eq!(
+            scales.shape,
+            vec![
+                config.moe_intermediate_size.div_ceil(128),
+                config.hidden_size.div_ceil(128)
+            ]
+        );
+        assert!(
+            plan.spec(&format!("{prefix}.weight_scale_2")).is_none(),
+            "the FP8 release has no per-tensor expert scale"
+        );
+        // One byte a weight and two bytes a 128x128 tile, against NVFP4's half a byte.
+        let experts = plan.role_bytes(Role::Experts);
+        assert!(experts > 120_000_000_000, "FP8 experts are {experts} bytes");
     }
 
     #[test]

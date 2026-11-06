@@ -78,6 +78,11 @@ pub enum Tp4ControlFrame {
         /// takes it from here, so every rank drafts and verifies the same steps.
         #[serde(default)]
         speculative: bool,
+        /// Leading prompt tokens every rank's window already holds, from rank 0's plan: the ranks
+        /// prefill only what follows them. One number for the group, because a rank that reused a
+        /// different prefix would run different collectives in the same step.
+        #[serde(default)]
+        cached_tokens: u32,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {

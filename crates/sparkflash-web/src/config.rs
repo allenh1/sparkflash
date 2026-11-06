@@ -56,6 +56,11 @@ pub const DEFAULT_MODEL_ID: &str = sparkflash_model::DEFAULT_MODEL_ID;
 /// The control-plane weight selector for Qwen3.8-Flash-Next (NVFP4).
 pub const QWEN_WEIGHTS_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID;
 
+/// The control-plane weight selector for the official Qwen3.8-Flash-Next FP8 release: the same
+/// pack engine and world, with its own weights id.
+pub const QWEN_FP8_WEIGHTS_ID: &str =
+    sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID;
+
 /// The control-plane engine selector for the TP=1 Qwen pack.
 pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
 
@@ -151,7 +156,7 @@ fn deployment_for(weights: &str) -> Deployment {
             requires_conversion: true,
             requires_cubins: true,
         },
-        QWEN_WEIGHTS_ID => Deployment {
+        QWEN_WEIGHTS_ID | QWEN_FP8_WEIGHTS_ID => Deployment {
             engine: QWEN_ENGINE_ID,
             search: "Qwen3.8-Flash",
             world_size: SOLO_WORLD_SIZE,
@@ -982,7 +987,10 @@ impl SparkConfig {
     /// Whether the selected weights are the TP=1 Qwen pack.
     #[must_use]
     pub fn is_qwen(&self) -> bool {
-        self.model.weights == QWEN_WEIGHTS_ID
+        matches!(
+            self.model.weights.as_str(),
+            QWEN_WEIGHTS_ID | QWEN_FP8_WEIGHTS_ID
+        )
     }
 
     /// Whether the selected weights are the TP=4 GLM-5.3-Flash pack.
@@ -1502,7 +1510,11 @@ mod tests {
             assert_eq!(profile.label, model.label);
             assert_eq!(profile.context_tokens, model.context_tokens);
             assert_eq!(profile_for_id(&model.id), Some(profile));
-            assert_eq!(profile_for_model_type(&model.model_type), Some(profile));
+            // Two releases share the qwen4_exp model_type (NVFP4 and FP8); a checkpoint's own
+            // document names the family, and either release's profile is the family's.
+            let family = profile_for_model_type(&model.model_type)
+                .unwrap_or_else(|| panic!("model_type {} has no profile", model.model_type));
+            assert_eq!(family.model_type, model.model_type);
         }
     }
 

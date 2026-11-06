@@ -36,6 +36,11 @@
 #include <cuda_bf16.h>
 #include <stdint.h>
 
+#include "opt_common_sm121.cuh"
+
+// The shared transposed ldmatrix, under the name this header used.
+#define om_ldsm4_t opt_ldsm4_t
+
 #define OM_THREADS 256u
 #define OM_BM 128u
 #define OM_BN 128u
@@ -70,11 +75,6 @@ __device__ __forceinline__ void om_ldsm4(uint32_t addr, uint32_t &r0, uint32_t &
 
 // ldmatrix of four transposed 8x8 b16 tiles: a [k][n] row-major tile as an MMA's col-major B
 // operand (P x V over keys stored a row a key).
-__device__ __forceinline__ void om_ldsm4_t(uint32_t addr, uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(addr));
-}
 
 // The byte offset of 16-byte chunk `chunk` of row `row` in a tile of `row_bytes`-byte rows whose
 // chunks are XOR-swizzled by the row's low three bits, so the eight row addresses of an ldmatrix

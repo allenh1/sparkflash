@@ -152,11 +152,14 @@ Every arm has one typed TOML profile:
 
 | model | profile |
 | :-- | :-- |
-| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.toml` |
+| Qwen3.8-Flash-Next (NVFP4 and FP8) | `crates/sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.toml` |
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/config/glm53_flash.toml` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml` |
 
-A profile opens with the registry model it configures, beside its family and weights:
+The FP8 release shares that profile: the switches select arithmetic, and the one difference
+between the two Qwen checkpoints is the routed experts' storage (`ExpertQuant`), which the
+checkpoint's own `quantization_config` declares. A profile opens with the registry model it
+configures, beside its family and weights:
 
 ```toml
 model = "zai-org/GLM-5.3-Flash"

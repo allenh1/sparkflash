@@ -43,6 +43,15 @@
 // path is claimed.
 
 #include "m4_common_sm121.cuh"
+#include "b12x_common_sm121.cuh"
+#include "b12x_dense_sm121.cuh"
+
+// The shared header's helpers, under the names this image used.
+#define spark_woa_load128 spark_b12x_load128
+#define spark_woa_byte spark_b12x_byte
+#define spark_woa_warp_sum spark_b12x_warp_sum
+#define spark_woa_u16_pair spark_b12x_u16_pair
+#define spark_woa_fp8x2_to_f32 spark_b12x_fp8x2_to_f32
 
 #define SPARK_M4_WOA_THREADS 256u
 #define SPARK_M4_WOA_TILE 256u
@@ -80,65 +89,10 @@ extern "C" __global__ void b12x_mxfp8_wo_a_sm121(
     GpuTraceRing *__restrict__ trace_ring,
     const uint32_t layer_id,
     const uint64_t step_seq) {
-    const uint32_t group = blockIdx.x;
-    const uint32_t lane = threadIdx.x;
-    const uint32_t column = blockIdx.y * SPARK_M4_WOA_TILE + lane;
-    const uint32_t k_blocks = SPARK_M4_WOA_GROUP_INNER / SPARK_M4_QUANT_BLOCK;
-
-    uint64_t t_enter = 0u;
-    SPARK_GPU_TRACE_ENTER(trace_ring, TRACE_SCOPE_DENSE_MXFP8, t_enter);
-
-    __shared__ uint8_t s_a_row[SPARK_M4_WOA_GROUP_INNER];
-    __shared__ uint8_t s_a_scales[SPARK_M4_WOA_GROUP_INNER / SPARK_M4_QUANT_BLOCK];
-    if (group < groups) {
-        const uint8_t *a_row = attn_fp8 + (uint64_t)group * SPARK_M4_WOA_GROUP_INNER;
-        const uint8_t *a_scale_row = attn_scales + (uint64_t)group * k_blocks;
-        for (uint32_t k = lane; k < (uint32_t)SPARK_M4_WOA_GROUP_INNER;
-             k += SPARK_M4_WOA_THREADS) {
-            s_a_row[k] = a_row[k];
-        }
-        if (lane < k_blocks) {
-            s_a_scales[lane] = a_scale_row[lane];
-        }
-    }
-    __syncthreads();
-
-    if (group < groups && column < (uint32_t)SPARK_M4_O_LORA_RANK) {
-        // Each group owns a weight buffer AND a scale buffer, and the two are different sizes, so
-        // there are two group strides. The offsets inside each buffer come from the same helpers the
-        // dense kernel uses.
-        const uint64_t group_weight_base =
-            (uint64_t)group * spark_b12x_buffer_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
-        const uint64_t group_scale_base =
-            (uint64_t)group * spark_b12x_scale_bytes(SPARK_M4_O_LORA_RANK, SPARK_M4_WOA_GROUP_INNER);
-        float acc = 0.0f;
-        for (uint32_t block = 0; block < k_blocks; ++block) {
-            const uint32_t base = block * SPARK_M4_QUANT_BLOCK;
-            const float a_scale = spark_ue8m0_decode(s_a_scales[block]);
-            const float w_scale =
-                spark_ue8m0_decode(w_scales[group_scale_base +
-                                            spark_b12x_scale_index(column, base, SPARK_M4_WOA_GROUP_INNER)]);
-#pragma unroll 8
-            for (uint32_t i = 0; i < SPARK_M4_QUANT_BLOCK; ++i) {
-                const float a_value = spark_fp8_e4m3_decode(s_a_row[base + i]) * a_scale;
-                const float w_value =
-                    spark_fp8_e4m3_decode(
-                        w_fp8[group_weight_base +
-                              spark_b12x_weight_index(column, base + i, SPARK_M4_WOA_GROUP_INNER)]) *
-                    w_scale;
-                acc += a_value * w_value;
-            }
-        }
-        lo_out[(uint64_t)group * SPARK_M4_O_LORA_RANK + column] = __float2bfloat16_rn(acc);
-    }
-    __syncthreads();
-
-    if (lane == 0u) {
-        const uint32_t meta = SPARK_M4_WOA_TILE * 2u;
-        SPARK_GPU_TRACE_EXIT(trace_ring, TRACE_SCOPE_DENSE_MXFP8, layer_id, meta, t_enter);
-        (void)step_seq;
-    }
-    (void)t_enter;
+    b12x_woa_scalar_body<false, SPARK_M4_WOA_TILE, SPARK_M4_WOA_THREADS,
+                          SPARK_M4_WOA_GROUP_INNER, SPARK_M4_O_LORA_RANK>(
+        attn_fp8, attn_scales, nullptr, w_fp8, w_scales, lo_out, groups, trace_ring, layer_id,
+        step_seq);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -161,29 +115,8 @@ static_assert(SPARK_M4_WOA_WARP_BYTES == 16u, "a wo_a lane load is 16 E4M3 bytes
 static_assert(SPARK_M4_WOA_GROUP_INNER % SPARK_M4_WOA_WARP_GROUP == 0u,
               "the wo_a reduction is whole warp groups");
 
-__device__ __forceinline__ uint4 spark_woa_load128(const uint8_t *p) {
-    uint4 v;
-    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
 
-__device__ __forceinline__ uint8_t spark_woa_byte(const uint4 v, uint32_t i) {
-    const uint32_t word = i >> 2;
-    const uint32_t shift = (i & 3u) * 8u;
-    const uint32_t w = word == 0u ? v.x : word == 1u ? v.y : word == 2u ? v.z : v.w;
-    return (uint8_t)((w >> shift) & 0xffu);
-}
 
-__device__ __forceinline__ float spark_woa_warp_sum(float value) {
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 16u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 8u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 4u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 2u));
-    value = __fadd_rn(value, __shfl_down_sync(0xffffffffu, value, 1u));
-    return value;
-}
 
 extern "C" __global__ void b12x_mxfp8_wo_a_warp_sm121(
     const uint8_t *__restrict__ attn_fp8,
@@ -261,23 +194,7 @@ static_assert(SPARK_M4_WOA_TILE_COLUMNS == SPARK_M4_WOA_TILE_THREADS,
 static_assert(SPARK_M4_WOA_TILE_STAGE == SPARK_M4_WOA_GROUP_INNER,
               "the wo_a group reduction fits one stage");
 
-__device__ __forceinline__ uint16_t spark_woa_u16_pair(const uint4 v, uint32_t i) {
-    const uint32_t word = i < 4u ? v.x : i < 8u ? v.y : i < 12u ? v.z : v.w;
-    return (uint16_t)((word >> ((i & 3u) * 8u)) & 0xffffu);
-}
 
-__device__ __forceinline__ void spark_woa_fp8x2_to_f32(uint16_t two, float &lo, float &hi) {
-    asm("{\n\t"
-        ".reg .b32 h2;\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "cvt.rn.f16x2.e4m3x2 h2, %2;\n\t"
-        "mov.b32 {lo, hi}, h2;\n\t"
-        "cvt.f32.f16 %0, lo;\n\t"
-        "cvt.f32.f16 %1, hi;\n\t"
-        "}"
-        : "=f"(lo), "=f"(hi)
-        : "h"(two));
-}
 
 extern "C" __global__ void b12x_mxfp8_wo_a_tile_sm121(
     const uint8_t *__restrict__ attn_fp8,

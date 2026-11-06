@@ -59,6 +59,16 @@
 //   threads.
 
 #include "opt_pdl_sm121.cuh"
+#include "opt_common_sm121.cuh"
+#include "opt_mma_bf16_sm121.cuh"
+
+// The shared ldmatrix and MMA, under the names this image used.
+#define ov_ldsm4_t opt_ldsm4_t
+#define ov_ldsm4 om_ldsm4
+#define ov_mma ob_mma
+
+// The shared header's helpers, under the names this image used.
+#define ov_ldsm4_t opt_ldsm4_t
 #include <cuda_bf16.h>
 #include <stdint.h>
 
@@ -97,23 +107,8 @@ __device__ __forceinline__ void ov_wait() {
     asm volatile("cp.async.wait_group %0;" ::"n"(N));
 }
 
-__device__ __forceinline__ void ov_ldsm4(uint32_t addr, uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(addr));
-}
 
-__device__ __forceinline__ void ov_ldsm4_t(uint32_t addr, uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                 : "r"(addr));
-}
 
-__device__ __forceinline__ void ov_mma(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
 
 __device__ __forceinline__ uint32_t ov_pack(float lo, float hi) {
     const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
