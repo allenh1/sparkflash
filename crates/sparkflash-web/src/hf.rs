@@ -27,122 +27,66 @@
 //! control plane needs: listing the `models--*` folders, which lists every model a node can serve,
 //! and choosing among them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 pub use sparkflash_weights::hub::{default_cache_dir, is_model_id, repo_folder, resolve};
 use sparkflash_weights::hub::{folder_id, snapshot_of};
 
-use sparkflash_model::{Architecture, Target};
-use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_model::Architecture;
 use sparkflash_ops::parts::{
     host_reference_missing, host_reference_quantization_refusal, host_reference_rope_refusal,
-    host_reference_storage_quantization_refusal, serving, serving_language,
+    host_reference_storage_quantization_refusal,
 };
-use sparkflash_ops::resolver::{Availability, KernelResolver};
 
 use crate::config::{ModelProfile, profile_for_id, profile_for_model_type};
+use crate::fit::{self, Cluster, Evidence, Fit, WeightBytes};
 
 /// The `config.json` `model_type` values the released presets load.
 ///
 /// Kept as documentation for the canonical families; it is no longer the gate. A cached model is
-/// supported when its own configuration plans and resolves (see [support_from_path]).
+/// supported when a device engine serves its own configuration at the width the console launches
+/// its family at (see [fit::launch_check]).
 pub const SUPPORTED_MODEL_TYPES: &[&str] =
     &["deepseek_v41", "qwen4_exp", "qwen4_exp_text", "glm5_next"];
 
-/// What a checkpoint's own configuration says about this build's ability to run it.
-struct Support {
-    /// Whether every served part resolves on sm121.
-    supported: bool,
-    /// The checkpoint's own window.
-    context_tokens: usize,
-    /// The parts/kernels that do not resolve, each named with its geometry and precision.
-    missing_parts: Vec<String>,
-}
-
-/// Plans and resolves a checkpoint's `config.json`.
+/// What the CLI's CPU host reference cannot execute in a checkpoint; empty when it can run it.
 ///
-/// `None` means the document is absent or incomplete (a download in progress), so the caller
-/// falls back to the canonical preset by id; a complete document is judged by its own plan, not
-/// by [SUPPORTED_MODEL_TYPES].
-fn support_from_path(config: &Path) -> Option<Support> {
-    let text = std::fs::read_to_string(config).ok()?;
-    support_from_text_and_checkpoint(&text, config.parent())
-}
-
-fn support_from_text(text: &str) -> Option<Support> {
-    support_from_text_and_checkpoint(text, None)
-}
-
-fn support_from_text_and_checkpoint(text: &str, checkpoint: Option<&Path>) -> Option<Support> {
-    let architecture = Architecture::from_json(text).ok()?;
-    // A released family is supported at the world it is deployed at; a novel checkpoint is
-    // planned at TP1, the dynamic host path's shape.
-    let world =
-        profile_for_model_type(&architecture.family).map_or(1, |profile| profile.world_size);
-    let plan = match EnginePlan::from_json(text, Target::Sm121, world, 0) {
-        Ok(plan) => plan,
+/// The host reference is the dynamic engine's correctness path for small test checkpoints. The
+/// console never offers it as a way to serve a model; this is only the predicate an explicit
+/// `engine.kind = "dynamic"` plan is validated against, so the console refuses what the CLI
+/// would refuse. It is the same check the CLI backend runs: parts, rotary scaling, declared
+/// quantization, and, when the shards are on disk, storage-only quantization.
+fn host_reference_gaps(text: &str, checkpoint: Option<&Path>) -> Vec<String> {
+    let architecture = match Architecture::from_json(text) {
+        Ok(architecture) => architecture,
         Err(error) => {
-            return Some(Support {
-                supported: false,
-                context_tokens: architecture.max_position_embeddings,
-                missing_parts: vec![format!("the execution plan at TP{world}: {error}")],
-            });
+            return vec![format!(
+                "a config.json the host reference can read ({error})"
+            )];
         }
     };
-    // A released family is served by its device arm and judged by the kernel catalogue. Any
-    // other family is served by the CLI's dynamic host reference, whose capability is the shared
-    // HOST_REFERENCE_PARTS list, not the CUDA catalogue: the catalogue would accept a
-    // catalogue-shaped MLA the host cannot execute and reject a host-runnable GQA at a width no
-    // device kernel claims.
-    let dynamic = profile_for_model_type(&architecture.family).is_none();
-    let mut missing_parts: Vec<String> = if dynamic {
-        // The same host-support predicate the CLI backend runs: parts, rotary scaling and
-        // declared quantization. Keep the part entries as bare names (the model browser shows
-        // them as a list) and append the two document-level reasons.
-        let mut missing: Vec<String> = host_reference_missing(&architecture)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        missing.extend(host_reference_rope_refusal(&architecture));
-        missing.extend(host_reference_quantization_refusal(&architecture));
-        // A cached or explicit checkpoint has headers we can read, so the console also refuses
-        // storage-only quantization exactly as the CLI backend does. A Hub-only inspection has no
-        // tensors yet and remains declaration-only.
-        if let Some(directory) = checkpoint
-            && let Ok(source) = sparkflash_weights::safetensors::open_checkpoint(directory)
-        {
-            missing.extend(host_reference_storage_quantization_refusal(
-                &architecture,
-                &source,
-            ));
-        }
-        missing
-    } else {
-        let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
-        let language_only = plan.family() != "deepseek_v41";
-        let served = if language_only {
-            serving_language(Target::Sm121)
-        } else {
-            serving(Target::Sm121)
-        };
-        resolver
-            .boot_check_serving(&plan, &served)
-            .err()
-            .unwrap_or_default()
-            .iter()
-            .map(|failure| format!("{} at {}", failure.part, failure.precision.name()))
-            .collect()
-    };
-    missing_parts.sort();
-    missing_parts.dedup();
-    Some(Support {
-        supported: missing_parts.is_empty(),
-        context_tokens: architecture.max_position_embeddings,
-        missing_parts,
-    })
+    let mut missing: Vec<String> = host_reference_missing(&architecture)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    missing.extend(host_reference_rope_refusal(&architecture));
+    missing.extend(host_reference_quantization_refusal(&architecture));
+    if let Some(directory) = checkpoint
+        && let Ok(source) = sparkflash_weights::safetensors::open_checkpoint(directory)
+    {
+        missing.extend(host_reference_storage_quantization_refusal(
+            &architecture,
+            &source,
+        ));
+    }
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 /// One model found in the cache.
@@ -156,17 +100,18 @@ pub struct CachedModel {
     pub snapshot: String,
     /// `config.json`'s `model_type`, when the snapshot has one.
     pub model_type: Option<String>,
-    /// Whether this build's engine loads the model type.
+    /// Whether a device engine serves the checkpoint at the width the console launches its
+    /// family at. The CPU host reference never makes a model supported.
     pub supported: bool,
-    /// The control-plane weight selector that runs this checkpoint, when supported.
+    /// The control-plane weight selector of the family's device arm.
     pub weights: Option<String>,
-    /// The engine selector that runs this checkpoint, when supported.
+    /// The engine selector of the family's device arm.
     pub engine: Option<String>,
-    /// The checkpoint's context ceiling, when supported.
+    /// The checkpoint's context ceiling.
     pub context_tokens: Option<usize>,
     /// Whether a launch needs per-rank converted weights.
     pub requires_conversion: Option<bool>,
-    /// The parts/kernels this build cannot resolve for the checkpoint, when it is unsupported.
+    /// What the device path is missing at the launch width, when the model is unsupported.
     pub missing_parts: Vec<String>,
     /// Whether the snapshot carries `tokenizer.json`.
     pub has_tokenizer: bool,
@@ -174,6 +119,12 @@ pub struct CachedModel {
     pub bytes: u64,
     /// False while a download left `.incomplete` blobs behind.
     pub complete: bool,
+    /// The cluster fit, when the caller judged one (see [fit_cached]).
+    pub fit: Option<Fit>,
+    /// What the CLI's CPU host reference cannot execute, for a family with no device arm:
+    /// `Some(empty)` when it can. Only an explicit `engine.kind = "dynamic"` plan reads it.
+    #[serde(skip)]
+    pub host_reference: Option<Vec<String>>,
 }
 
 /// Every model in `cache` that has a snapshot, sorted by id.
@@ -182,6 +133,13 @@ pub struct CachedModel {
 ///
 /// A message when the cache directory cannot be read.
 pub fn list(cache: &Path) -> Result<Vec<CachedModel>, String> {
+    scan(cache, |_| true)
+}
+
+/// The cached models whose id `keep` accepts, sorted by id.
+///
+/// The id is read from the folder name, so a model the filter rejects is never opened.
+fn scan(cache: &Path, keep: impl Fn(&str) -> bool) -> Result<Vec<CachedModel>, String> {
     let entries = std::fs::read_dir(cache).map_err(|error| {
         format!(
             "cannot read the Hugging Face cache at {}: {error}",
@@ -194,6 +152,9 @@ pub fn list(cache: &Path) -> Result<Vec<CachedModel>, String> {
         let Some(id) = folder_id(&folder) else {
             continue;
         };
+        if !keep(&id) {
+            continue;
+        }
         if let Some(model) = read_model(&entry.path(), &id) {
             models.push(model);
         }
@@ -251,54 +212,42 @@ pub fn lookup(cache: &Path, id: &str) -> Option<CachedModel> {
 
 fn read_model(repo: &Path, id: &str) -> Option<CachedModel> {
     let snapshot = snapshot_of(repo)?;
-    let config_path = snapshot.path.join("config.json");
-    let model_type = std::fs::read(&config_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    let text = std::fs::read_to_string(snapshot.path.join("config.json")).ok();
+    // A download may have written part of config.json; only a whole JSON document is judged.
+    let document = text
+        .as_deref()
+        .filter(|text| serde_json::from_str::<Value>(text).is_ok());
+    let model_type = document
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
         .and_then(|config| config["model_type"].as_str().map(str::to_owned));
     let (bytes, complete) = blob_totals(&repo.join("blobs"));
     // An in-progress download may not have config.json yet. A canonical repository id still
     // identifies the family, so the selected model does not appear unsupported mid-download; a
-    // complete document is judged by its own plan and kernel resolution.
+    // complete document is judged by the device path at its family's launch width.
     let profile = match model_type.as_deref() {
         Some(kind) => profile_for_model_type(kind),
         None => profile_for_id(id),
     };
-    let support = support_from_path(&config_path);
-    let supported = match &support {
-        Some(support) => support.supported,
+    let check = document.map(fit::launch_check);
+    let supported = match &check {
+        Some(check) => check.gaps.is_empty(),
         None => profile.is_some(),
     };
-    let context_tokens = support
+    let context_tokens = check
         .as_ref()
-        .map(|support| support.context_tokens)
-        .filter(|context| *context > 0)
+        .and_then(|check| check.window)
         .or_else(|| profile.map(|profile| profile.context_tokens));
-    let missing_parts = support
-        .map(|support| support.missing_parts)
-        .unwrap_or_default();
-    // A novel checkpoint the host path can run is selected through the dynamic engine under its
-    // own id; it needs no per-rank conversion, because the host reference reads the checkpoint
-    // directly.
-    let dynamic = profile.is_none();
-    let weights = if supported {
-        Some(profile.map_or_else(|| id.to_owned(), |profile| profile.weights.to_owned()))
-    } else {
-        profile.map(|profile| profile.weights.to_owned())
+    let host_reference = match (profile, document) {
+        (None, Some(text)) => Some(host_reference_gaps(text, Some(&snapshot.path))),
+        _ => None,
     };
     Some(CachedModel {
         supported,
-        weights,
-        engine: profile
-            .map(|profile| profile.engine.to_owned())
-            .or_else(|| (supported && dynamic).then(|| "dynamic".to_owned())),
+        weights: profile.map(|profile| profile.weights.to_owned()),
+        engine: profile.map(|profile| profile.engine.to_owned()),
         context_tokens,
-        requires_conversion: if supported && dynamic {
-            Some(false)
-        } else {
-            profile.map_or(Some(true), |profile| Some(profile.requires_conversion))
-        },
-        missing_parts,
+        requires_conversion: profile.map(|profile| profile.requires_conversion),
+        missing_parts: check.map(|check| check.gaps).unwrap_or_default(),
         has_tokenizer: snapshot.path.join("tokenizer.json").is_file(),
         snapshot: snapshot.path.display().to_string(),
         revision: snapshot.revision,
@@ -306,7 +255,83 @@ fn read_model(repo: &Path, id: &str) -> Option<CachedModel> {
         model_type,
         bytes,
         complete,
+        fit: None,
+        host_reference,
     })
+}
+
+/// The cluster fit of a cached checkpoint, from its own `config.json` and the safetensors bytes
+/// on disk.
+///
+/// A download that has not finished has neither a reliable document nor its final size; its
+/// canonical family (when the id names one) still says which engine would serve it, and the
+/// verdict stays [fit::Verdict::Unknown] until the files land.
+#[must_use]
+pub fn fit_cached(model: &CachedModel, cluster: &Cluster) -> Fit {
+    let snapshot = Path::new(&model.snapshot);
+    let text = std::fs::read_to_string(snapshot.join("config.json")).ok();
+    let document = text
+        .as_deref()
+        .filter(|text| serde_json::from_str::<Value>(text).is_ok());
+    let declared = profile_for_id(&model.id)
+        .filter(|_| document.is_none())
+        .map(|profile| serde_json::json!({ "model_type": profile.model_type }));
+    let weights = safetensors_bytes(snapshot)
+        .filter(|_| model.complete)
+        .map(|bytes| WeightBytes {
+            bytes,
+            measured: true,
+        });
+    let lacks: Vec<String> = if model.complete && document.is_some() && weights.is_none() {
+        vec![NO_SAFETENSORS.to_owned()]
+    } else {
+        Vec::new()
+    };
+    fit::judge(
+        &Evidence {
+            config: document,
+            declared: declared.as_ref(),
+            weights,
+            missing: &lacks,
+        },
+        cluster,
+    )
+}
+
+/// Attaches the cluster fit to every model in `models`.
+pub fn judge_cached(models: &mut [CachedModel], cluster: &Cluster) {
+    for model in models {
+        model.fit = Some(fit_cached(model, cluster));
+    }
+}
+
+/// What a checkpoint with no safetensors shards is missing.
+const NO_SAFETENSORS: &str =
+    "safetensors weights (this build loads safetensors only; the repository has none)";
+
+/// What a gated repository whose `config.json` could not be read is missing.
+const GATED: &str = "access to the gated repository (accept its terms on huggingface.co, then \
+                     set HF_TOKEN for the console)";
+
+/// The bytes of the snapshot's top-level `*.safetensors` files, following the hub's symlinks.
+///
+/// Subfolders (an `original/` export, a drafter) are not what the engine loads, so they are not
+/// counted. `None` when there are no safetensors files.
+fn safetensors_bytes(snapshot: &Path) -> Option<u64> {
+    let entries = std::fs::read_dir(snapshot).ok()?;
+    let mut total = None;
+    for entry in entries.filter_map(Result::ok) {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".safetensors")
+        {
+            continue;
+        }
+        let size = std::fs::metadata(entry.path()).map_or(0, |meta| meta.len());
+        total = Some(total.unwrap_or(0u64).saturating_add(size));
+    }
+    total
 }
 
 /// A model the model browser can offer: one from the local cache, one from the Hub search, or
@@ -323,20 +348,24 @@ pub struct RemoteModel {
     pub cached: bool,
     /// Whether the cached snapshot is complete; false for a Hub-only entry.
     pub complete: bool,
-    /// Whether this build can load the checkpoint.
+    /// Whether a device engine serves it at the width the console launches its family at.
     pub supported: bool,
-    /// The control-plane weight selector, when known.
+    /// The control-plane weight selector, when a device arm serves the family.
     pub weights: Option<String>,
-    /// The engine selector, when known.
+    /// The engine selector, when a device arm serves the family.
     pub engine: Option<String>,
     /// The checkpoint's context ceiling, when known.
     pub context_tokens: Option<usize>,
     /// Whether a launch needs per-rank converted weights, when known.
     pub requires_conversion: Option<bool>,
-    /// The parts/kernels this build cannot resolve, when the model is unsupported.
+    /// What the device path is missing at the launch width, when the model is unsupported.
     pub missing_parts: Vec<String>,
     /// The family label, when the model type is known.
     pub family: Option<String>,
+    /// Whether the Hub gates the repository behind accepted terms.
+    pub gated: bool,
+    /// Whether, where and how it can be served on this cluster.
+    pub fit: Option<Fit>,
 }
 
 /// The families the browser lists on its side, from the build's model profiles.
@@ -352,8 +381,10 @@ pub struct Family {
     pub id: String,
     /// The weight selector that runs it.
     pub weights: String,
-    /// How many ranks the family runs on.
+    /// How many ranks the console launches the family on.
     pub world_size: usize,
+    /// Every tensor-parallel width the family's device arm runs.
+    pub worlds: Vec<usize>,
 }
 
 /// The families this build can configure, in sidebar order.
@@ -368,27 +399,146 @@ pub fn families() -> Vec<Family> {
             id: profile.id.to_owned(),
             weights: profile.weights.to_owned(),
             world_size: profile.world_size,
+            worlds: profile.worlds.to_vec(),
         })
         .collect()
 }
 
-/// A Hub model search result, before the local cache is folded in.
-#[derive(Debug, Deserialize)]
+/// A Hub model, as the search and model endpoints return it with the expanded fields.
+#[derive(Debug, Clone, Deserialize)]
 struct HubHit {
-    #[serde(rename = "modelId")]
     id: String,
     #[serde(default)]
     downloads: u64,
     #[serde(default)]
     likes: u64,
+    /// `false`, or the gating mode (`"auto"`, `"manual"`).
+    #[serde(default)]
+    gated: Value,
+    /// The commit `main` points at.
+    #[serde(default)]
+    sha: Option<String>,
+    /// The `config.json` subset the Hub indexes (`model_type`, `quantization_config`).
+    #[serde(default)]
+    config: Option<Value>,
+    /// Per-dtype parameter counts; absent when the repository has no safetensors.
+    #[serde(default)]
+    safetensors: Option<Value>,
 }
 
-/// Search the Hub and the local cache for models the browser can offer.
+/// The fields every Hub request expands, percent-encoded.
+const HUB_EXPAND: &str = "expand%5B%5D=downloads&expand%5B%5D=likes&expand%5B%5D=gated\
+                          &expand%5B%5D=sha&expand%5B%5D=config&expand%5B%5D=safetensors";
+
+impl HubHit {
+    fn is_gated(&self) -> bool {
+        match &self.gated {
+            Value::Bool(gated) => *gated,
+            Value::String(mode) => !mode.is_empty() && mode != "false",
+            _ => false,
+        }
+    }
+
+    fn declared_model_type(&self) -> Option<&str> {
+        let config = self.config.as_ref()?;
+        config
+            .get("model_type")
+            .or_else(|| {
+                config
+                    .get("text_config")
+                    .and_then(|text| text.get("model_type"))
+            })
+            .and_then(Value::as_str)
+    }
+
+    /// Judges the hit. `fetch_any` fetches `config.json` for any family (an inspection); a
+    /// search fetches it only for a family a device arm serves, since a family with none is
+    /// missing its engine whatever the document says.
+    fn judge(&self, cluster: &Cluster, fetch_any: bool) -> RemoteModel {
+        let profile = self.declared_model_type().and_then(profile_for_model_type);
+        let mut lacks = Vec::new();
+        if self.safetensors.is_none() {
+            lacks.push(NO_SAFETENSORS.to_owned());
+        }
+        let text = if profile.is_some() || fetch_any {
+            match hub_config(&self.id, self.sha.as_deref()) {
+                Ok(text) => Some(text),
+                Err(HttpError {
+                    status: Some(401 | 403),
+                    ..
+                }) => {
+                    lacks.push(GATED.to_owned());
+                    None
+                }
+                Err(HttpError {
+                    status: Some(404), ..
+                }) => {
+                    lacks.push("a config.json in the repository".to_owned());
+                    None
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let weights = self
+            .safetensors
+            .as_ref()
+            .and_then(|safetensors| safetensors.get("parameters"))
+            .and_then(|parameters| fit::hub_weight_bytes(parameters, self.config.as_ref()))
+            .map(|bytes| WeightBytes {
+                bytes,
+                measured: false,
+            });
+        let fit = fit::judge(
+            &Evidence {
+                config: text.as_deref(),
+                declared: self.config.as_ref(),
+                weights,
+                missing: &lacks,
+            },
+            cluster,
+        );
+        let supported = fit
+            .launch()
+            .is_some_and(|launch| launch.engine_ready == Some(true));
+        let missing_parts = if supported {
+            Vec::new()
+        } else {
+            let mut missing = fit.missing.clone();
+            if let Some(launch) = fit.launch() {
+                missing.extend(launch.reasons.iter().cloned());
+            }
+            missing
+        };
+        RemoteModel {
+            id: self.id.clone(),
+            downloads: self.downloads,
+            likes: self.likes,
+            cached: false,
+            complete: false,
+            supported,
+            weights: profile.map(|profile| profile.weights.to_owned()),
+            engine: profile.map(|profile| profile.engine.to_owned()),
+            context_tokens: fit.window,
+            requires_conversion: profile.map(|profile| profile.requires_conversion),
+            missing_parts,
+            family: profile.map(|profile| profile.label.to_owned()),
+            gated: self.is_gated(),
+            fit: Some(fit),
+        }
+    }
+}
+
+/// Search the Hub and the local cache for models the browser can offer, each judged on
+/// `cluster`.
 ///
 /// The local cache is searched first and wins on an id collision, because a cached model has a
-/// real size, completion state and `config.json`. A Hub hit that is not cached is still offered:
-/// selecting it makes the Setup download step its target. When `family` is set, an empty query
-/// searches for that family's default term; a query overrides it.
+/// real size, completion state and `config.json`. A Hub hit that is not cached is judged from
+/// the search's expanded fields; for a family a device arm serves, its `config.json` is fetched
+/// too (in parallel, and remembered by commit), so the plan, the kernels and the caches are
+/// judged on the real document. When `family` is set, an empty query searches for that
+/// family's default term; a query overrides it.
 ///
 /// # Errors
 /// A message only when the Hub request fails and there is no local result to fall back to.
@@ -397,25 +547,30 @@ pub fn search(
     query: &str,
     family: Option<&ModelProfile>,
     limit: usize,
+    cluster: &Cluster,
 ) -> Result<Vec<RemoteModel>, String> {
     let query = query.trim();
-    let local = cache.and_then(|cache| list(cache).ok()).unwrap_or_default();
-    let folded = |model: &CachedModel| -> RemoteModel { cached_remote(model) };
-    let matches = |model: &CachedModel| {
-        let id = model.id.to_ascii_lowercase();
-        let text = query.to_ascii_lowercase();
-        (text.is_empty() || id.contains(&text))
-            && family.is_none_or(|profile| {
-                model.weights.as_deref() == Some(profile.weights)
-                    || model
-                        .id
-                        .to_ascii_lowercase()
-                        .contains(&profile.search.to_ascii_lowercase())
+    let text = query.to_ascii_lowercase();
+    let local = cache
+        .and_then(|cache| {
+            scan(cache, |id| {
+                text.is_empty() || id.to_ascii_lowercase().contains(&text)
             })
+            .ok()
+        })
+        .unwrap_or_default();
+    let in_family = |model: &CachedModel| {
+        family.is_none_or(|profile| {
+            model.weights.as_deref() == Some(profile.weights)
+                || model
+                    .id
+                    .to_ascii_lowercase()
+                    .contains(&profile.search.to_ascii_lowercase())
+        })
     };
     let mut results: BTreeMap<String, RemoteModel> = BTreeMap::new();
-    for model in local.iter().filter(|model| matches(model)) {
-        results.insert(model.id.clone(), folded(model));
+    for model in local.iter().filter(|model| in_family(model)) {
+        results.insert(model.id.clone(), cached_remote(model, cluster));
     }
 
     let term = if query.is_empty() {
@@ -430,30 +585,29 @@ pub fn search(
     }
     match hub_search(term, limit) {
         Ok(hits) => {
-            for hit in hits
+            let fresh: Vec<HubHit> = hits
                 .into_iter()
                 .filter(|hit| family.is_none_or(|profile| family_matches(&hit.id, profile)))
-            {
-                results.entry(hit.id.clone()).or_insert(RemoteModel {
-                    id: hit.id,
-                    downloads: hit.downloads,
-                    likes: hit.likes,
-                    cached: false,
-                    complete: false,
-                    supported: false,
-                    weights: None,
-                    engine: None,
-                    context_tokens: None,
-                    requires_conversion: None,
-                    missing_parts: Vec::new(),
-                    family: None,
-                });
+                .filter(|hit| !results.contains_key(&hit.id))
+                .collect();
+            let judged: Vec<RemoteModel> = std::thread::scope(|scope| {
+                let handles: Vec<_> = fresh
+                    .iter()
+                    .map(|hit| scope.spawn(move || hit.judge(cluster, false)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect()
+            });
+            for model in judged {
+                results.entry(model.id.clone()).or_insert(model);
             }
             let mut out: Vec<RemoteModel> = results.into_values().collect();
             sort_models(&mut out);
             Ok(out)
         }
-        Err(error) if results.is_empty() => Err(error),
+        Err(error) if results.is_empty() => Err(error.to_string()),
         Err(_) => {
             let mut out: Vec<RemoteModel> = results.into_values().collect();
             sort_models(&mut out);
@@ -462,75 +616,32 @@ pub fn search(
     }
 }
 
-/// Inspect one model id: the cached entry when it exists, otherwise its Hub `config.json`.
+/// Inspect one model id on `cluster`: the cached entry when it exists, otherwise its Hub record
+/// and `config.json`, whatever its family.
 ///
-/// This is what the browser calls when the operator selects a Hub-only result, so the form can
-/// set `model.weights` and `engine.kind` from the checkpoint's real `model_type` instead of a
-/// guess from its name.
+/// This is what the browser calls when the operator opens a Hub-only result, so a family with
+/// no device arm still gets its kernel-level gaps, its caches and its window from the real
+/// document.
 ///
 /// # Errors
-/// A message when the id is not a model id, is not cached, and its `config.json` cannot be read.
-pub fn inspect(cache: Option<&Path>, id: &str) -> Result<RemoteModel, String> {
+/// A message when the id is not a model id, is not cached, and the Hub does not know it.
+pub fn inspect(cache: Option<&Path>, id: &str, cluster: &Cluster) -> Result<RemoteModel, String> {
     if let Some(model) = cache.and_then(|cache| lookup(cache, id)) {
-        return Ok(cached_remote(&model));
+        return Ok(cached_remote(&model, cluster));
     }
     if !is_model_id(id) {
         return Err(format!("{id:?} is not a Hugging Face model id"));
     }
     let body = http_get(&format!(
-        "https://huggingface.co/{id}/resolve/main/config.json"
-    ))?;
-    let config: serde_json::Value =
-        serde_json::from_str(&body).map_err(|error| format!("{id} config.json: {error}"))?;
-    let model_type = config
-        .get("model_type")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|text| text.get("model_type"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .ok_or_else(|| format!("{id} config.json names no model_type"))?;
-    let profile = profile_for_model_type(model_type);
-    let support = support_from_text(&body);
-    let supported = support
-        .as_ref()
-        .map_or(profile.is_some(), |support| support.supported);
-    let dynamic = profile.is_none();
-    Ok(RemoteModel {
-        id: id.to_owned(),
-        downloads: 0,
-        likes: 0,
-        cached: false,
-        complete: false,
-        supported,
-        weights: if supported && dynamic {
-            Some(id.to_owned())
-        } else {
-            profile.map(|profile| profile.weights.to_owned())
-        },
-        engine: profile
-            .map(|profile| profile.engine.to_owned())
-            .or_else(|| (supported && dynamic).then(|| "dynamic".to_owned())),
-        context_tokens: support
-            .as_ref()
-            .map(|support| support.context_tokens)
-            .filter(|context| *context > 0)
-            .or_else(|| profile.map(|profile| profile.context_tokens)),
-        requires_conversion: if supported && dynamic {
-            Some(false)
-        } else {
-            profile.map(|profile| profile.requires_conversion)
-        },
-        missing_parts: support
-            .map(|support| support.missing_parts)
-            .unwrap_or_default(),
-        family: profile.map(|profile| profile.label.to_owned()),
-    })
+        "https://huggingface.co/api/models/{id}?{HUB_EXPAND}"
+    ))
+    .map_err(|error| error.to_string())?;
+    let hit: HubHit =
+        serde_json::from_str(&body).map_err(|error| format!("the Hub record for {id}: {error}"))?;
+    Ok(hit.judge(cluster, true))
 }
 
-fn cached_remote(model: &CachedModel) -> RemoteModel {
+fn cached_remote(model: &CachedModel, cluster: &Cluster) -> RemoteModel {
     RemoteModel {
         id: model.id.clone(),
         downloads: 0,
@@ -548,6 +659,13 @@ fn cached_remote(model: &CachedModel) -> RemoteModel {
             .as_deref()
             .and_then(crate::config::profile_for_weights)
             .map(|profile| profile.label.to_owned()),
+        gated: false,
+        fit: Some(
+            model
+                .fit
+                .clone()
+                .unwrap_or_else(|| fit_cached(model, cluster)),
+        ),
     }
 }
 
@@ -567,17 +685,82 @@ fn sort_models(models: &mut [RemoteModel]) {
     });
 }
 
-fn hub_search(term: &str, limit: usize) -> Result<Vec<HubHit>, String> {
+fn hub_search(term: &str, limit: usize) -> Result<Vec<HubHit>, HttpError> {
     let limit = limit.clamp(1, 50);
     let url = format!(
-        "https://huggingface.co/api/models?search={}&limit={limit}&sort=downloads&direction=-1",
+        "https://huggingface.co/api/models?search={}&limit={limit}&sort=downloads&direction=-1&{HUB_EXPAND}",
         encode_query(term)
     );
     let body = http_get(&url)?;
-    serde_json::from_str(&body).map_err(|error| format!("the Hub search response: {error}"))
+    serde_json::from_str(&body).map_err(|error| HttpError {
+        status: None,
+        message: format!("the Hub search response: {error}"),
+    })
 }
 
-fn http_get(url: &str) -> Result<String, String> {
+/// Fetched `config.json` documents by `id@commit`, and the HTTP status of the ones that failed.
+///
+/// A commit's document never changes, so a search does not refetch the documents the last
+/// keystroke already read. A transport failure is not remembered.
+static HUB_CONFIGS: LazyLock<Mutex<HashMap<String, Result<String, u16>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Documents [HUB_CONFIGS] keeps before it starts over.
+const HUB_CONFIG_ENTRIES: usize = 256;
+
+fn hub_config(id: &str, sha: Option<&str>) -> Result<String, HttpError> {
+    let revision = sha.unwrap_or("main");
+    let key = format!("{id}@{revision}");
+    let remembered = HUB_CONFIGS
+        .lock()
+        .ok()
+        .and_then(|memo| memo.get(&key).cloned());
+    let fetched = match remembered {
+        Some(Ok(text)) => return Ok(text),
+        Some(Err(status)) => {
+            return Err(HttpError {
+                status: Some(status),
+                message: format!("{id} config.json returned HTTP {status}"),
+            });
+        }
+        None => http_get(&format!(
+            "https://huggingface.co/{id}/resolve/{revision}/config.json"
+        )),
+    };
+    let remember = match &fetched {
+        Ok(text) => Some(Ok(text.clone())),
+        Err(HttpError {
+            status: Some(status),
+            ..
+        }) => Some(Err(*status)),
+        Err(_) => None,
+    };
+    // `main` moves, so only a pinned commit is remembered.
+    if let Some(entry) = remember.filter(|_| sha.is_some())
+        && let Ok(mut memo) = HUB_CONFIGS.lock()
+    {
+        if memo.len() >= HUB_CONFIG_ENTRIES {
+            memo.clear();
+        }
+        memo.insert(key, entry);
+    }
+    fetched
+}
+
+/// A failed Hub request: its HTTP status when the Hub answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn http_get(url: &str) -> Result<String, HttpError> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
         .build();
@@ -589,11 +772,18 @@ fn http_get(url: &str) -> Result<String, String> {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
     match request.call() {
-        Ok(response) => response
-            .into_string()
-            .map_err(|error| format!("reading {url}: {error}")),
-        Err(ureq::Error::Status(status, _)) => Err(format!("{url} returned HTTP {status}")),
-        Err(ureq::Error::Transport(error)) => Err(format!("{url}: {error}")),
+        Ok(response) => response.into_string().map_err(|error| HttpError {
+            status: None,
+            message: format!("reading {url}: {error}"),
+        }),
+        Err(ureq::Error::Status(status, _)) => Err(HttpError {
+            status: Some(status),
+            message: format!("{url} returned HTTP {status}"),
+        }),
+        Err(ureq::Error::Transport(error)) => Err(HttpError {
+            status: None,
+            message: format!("{url}: {error}"),
+        }),
     }
 }
 
@@ -638,6 +828,30 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// The released document for a family a device arm serves, so a cached fixture is judged on
+    /// the real geometry; any other `model_type` gets a bare document.
+    fn released_document(model_type: &str) -> String {
+        match model_type {
+            "deepseek_v41" => include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            )
+            .to_owned(),
+            "glm5_next" => {
+                include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json")
+                    .to_owned()
+            }
+            "qwen4_exp" => include_str!(
+                "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"
+            )
+            .to_owned(),
+            other => format!("{{\"model_type\": \"{other}\"}}"),
+        }
+    }
+
+    fn nominal() -> Cluster {
+        Cluster::nominal(4)
+    }
+
     /// Writes a cached model the way `huggingface_hub` does, and returns its snapshot path.
     pub(crate) fn cache_model(cache: &Path, id: &str, revision: &str, model_type: &str) -> PathBuf {
         let repo = cache.join(repo_folder(id));
@@ -646,10 +860,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(repo.join("refs")).expect("refs dir");
         std::fs::create_dir_all(repo.join("blobs")).expect("blobs dir");
         std::fs::write(repo.join("refs").join("main"), format!("{revision}\n")).expect("ref");
-        let config = format!("{{\"model_type\": \"{model_type}\"}}");
+        let config = released_document(model_type);
         std::fs::write(repo.join("blobs").join("config-blob"), &config).expect("blob");
         std::fs::write(snapshot.join("config.json"), &config).expect("config");
         std::fs::write(snapshot.join("tokenizer.json"), "{}").expect("tokenizer");
+        std::fs::write(snapshot.join("model.safetensors"), [0u8; 8]).expect("shard");
         snapshot
     }
 
@@ -790,7 +1005,7 @@ pub(crate) mod tests {
             "abc123",
             "deepseek_v41",
         );
-        let models = search(Some(dir.path()), "", None, 10).expect("cache search");
+        let models = search(Some(dir.path()), "", None, 10, &nominal()).expect("cache search");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, crate::config::DEFAULT_MODEL_ID);
         assert!(models[0].cached);
@@ -811,11 +1026,15 @@ pub(crate) mod tests {
             "abc123",
             "glm5_next",
         );
-        let model = inspect(Some(dir.path()), crate::config::GLM_MODEL_ID).expect("cached inspect");
+        let model = inspect(Some(dir.path()), crate::config::GLM_MODEL_ID, &nominal())
+            .expect("cached inspect");
         assert!(model.cached);
         assert!(model.supported);
         assert_eq!(model.family.as_deref(), Some("GLM"));
         assert_eq!(model.engine.as_deref(), Some(crate::config::GLM_ENGINE_ID));
+        let fit = model.fit.expect("an inspection carries its fit");
+        assert_eq!(fit.verdict, fit::Verdict::Runs, "{fit:#?}");
+        assert!(fit.launch().is_some_and(|launch| launch.world == 4));
     }
 
     pub(crate) fn custom_config() -> Value {
@@ -863,21 +1082,26 @@ pub(crate) mod tests {
                 include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
             ),
             (
+                "qwen fp8",
+                include_str!(
+                    "../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
+                ),
+            ),
+            (
                 "deepseek",
                 include_str!(
                     "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
                 ),
             ),
         ] {
-            let support = support_from_text(text)
-                .unwrap_or_else(|| panic!("{name} does not parse into a plan"));
-            assert!(support.supported, "{name}: {:?}", support.missing_parts);
-            assert!(support.context_tokens > 0, "{name} declares no window");
+            let check = fit::launch_check(text);
+            assert!(check.gaps.is_empty(), "{name}: {:?}", check.gaps);
+            assert!(check.window.is_some(), "{name} declares no window");
         }
     }
 
     #[test]
-    fn a_custom_cached_model_is_supported_by_its_own_plan() {
+    fn a_custom_cached_model_is_not_served_by_the_cpu_reference() {
         let dir = tempfile::tempdir().expect("tempdir");
         cache_config(
             dir.path(),
@@ -886,14 +1110,28 @@ pub(crate) mod tests {
             &custom_config(),
         );
         let model = lookup(dir.path(), "acme/Custom-Flash-Test").expect("cache entry");
-        assert!(model.supported);
+        // The host reference can execute it, but that is a test oracle: no device engine serves
+        // the family, so the browser must not offer it.
+        assert!(!model.supported);
+        assert_eq!(model.host_reference.as_deref(), Some(&[][..]));
         assert_eq!(model.model_type.as_deref(), Some("acme_custom_flash"));
         assert_eq!(model.context_tokens, Some(128));
-        assert!(model.missing_parts.is_empty());
-        assert_eq!(model.engine.as_deref(), Some("dynamic"));
+        assert!(
+            model
+                .missing_parts
+                .iter()
+                .any(|part| part.contains("device engine")),
+            "{:?}",
+            model.missing_parts
+        );
+        assert_eq!(model.engine, None);
+        assert_eq!(model.weights, None);
+        let fit = fit_cached(&model, &nominal());
+        assert_eq!(fit.verdict, fit::Verdict::Missing);
+        assert!(fit.summary.contains("device engine"), "{}", fit.summary);
         let models = list(dir.path()).expect("list");
         assert_eq!(models.len(), 1);
-        assert!(models[0].supported);
+        assert!(!models[0].supported);
     }
 
     #[test]
@@ -910,17 +1148,13 @@ pub(crate) mod tests {
         });
         cache_config(dir.path(), "acme/Quantized-Flash", "abc123", &config);
         let model = lookup(dir.path(), "acme/Quantized-Flash").expect("cache entry");
+        assert!(!model.supported);
+        let host = model
+            .host_reference
+            .expect("a novel family is host-checked");
         assert!(
-            !model.supported,
-            "a declared quantized checkpoint is not host-supported"
-        );
-        assert!(
-            model
-                .missing_parts
-                .iter()
-                .any(|part| part.contains("quantized")),
-            "the refusal names quantization: {:?}",
-            model.missing_parts
+            host.iter().any(|part| part.contains("quantized")),
+            "the host refusal names quantization: {host:?}"
         );
     }
 
@@ -950,17 +1184,14 @@ pub(crate) mod tests {
         )
         .expect("the storage-only quantized shard writes");
         let model = lookup(dir.path(), "acme/Storage-Quantized-Flash").expect("cache entry");
+        assert!(!model.supported);
+        let host = model
+            .host_reference
+            .expect("a novel family is host-checked");
         assert!(
-            !model.supported,
-            "a storage-only quantized checkpoint is not host-supported"
-        );
-        assert!(
-            model
-                .missing_parts
-                .iter()
+            host.iter()
                 .any(|part| part.contains("U8") && part.contains("quantized")),
-            "the refusal names the stored dtype: {:?}",
-            model.missing_parts
+            "the host refusal names the stored dtype: {host:?}"
         );
     }
 
@@ -978,19 +1209,18 @@ pub(crate) mod tests {
         });
         cache_config(dir.path(), "acme/Yarn-Flash", "abc123", &config);
         let model = lookup(dir.path(), "acme/Yarn-Flash").expect("cache entry");
-        assert!(!model.supported, "a yarn checkpoint is not host-supported");
+        assert!(!model.supported);
+        let host = model
+            .host_reference
+            .expect("a novel family is host-checked");
         assert!(
-            model
-                .missing_parts
-                .iter()
-                .any(|part| part.contains("rope.scaling")),
-            "the refusal names the rotary rule: {:?}",
-            model.missing_parts
+            host.iter().any(|part| part.contains("rope.scaling")),
+            "the host refusal names the rotary rule: {host:?}"
         );
     }
 
     #[test]
-    fn an_unsupported_custom_part_is_named_in_missing_parts() {
+    fn an_unresolved_custom_kernel_is_named_in_the_fit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = custom_config();
         // MLA at a 2560-wide hidden state: the catalogue's MLA bodies are compiled for 4096 or
@@ -999,13 +1229,15 @@ pub(crate) mod tests {
         cache_config(dir.path(), "acme/Custom-Mla", "abc123", &config);
         let model = lookup(dir.path(), "acme/Custom-Mla").expect("cache entry");
         assert!(!model.supported);
+        let fit = fit_cached(&model, &nominal());
+        let tp1 = &fit.configurations[0];
+        assert_eq!(tp1.world, 1);
         assert!(
-            model
-                .missing_parts
+            tp1.reasons
                 .iter()
-                .any(|part| part.contains("mla_attention")),
-            "missing parts: {:?}",
-            model.missing_parts
+                .any(|reason| reason.contains("mla_attention")),
+            "TP=1 reasons: {:?}",
+            tp1.reasons
         );
     }
 
@@ -1020,28 +1252,119 @@ pub(crate) mod tests {
         cache_config(dir.path(), "acme/Custom-Mla", "abc123", &config);
         let model = lookup(dir.path(), "acme/Custom-Mla").expect("cache entry");
         assert!(!model.supported);
+        let host = model
+            .host_reference
+            .expect("a novel family is host-checked");
         assert!(
-            model
-                .missing_parts
-                .iter()
-                .any(|part| part == "mla_attention"),
-            "missing parts: {:?}",
-            model.missing_parts
+            host.iter().any(|part| part == "mla_attention"),
+            "host gaps: {host:?}"
         );
     }
 
     #[test]
-    fn a_host_runnable_gqa_at_1024_is_supported_even_when_no_kernel_names_it() {
+    fn a_host_runnable_gqa_is_still_not_served() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = custom_config();
         config["hidden_size"] = serde_json::json!(1024);
         cache_config(dir.path(), "acme/Custom-Small", "abc123", &config);
         let model = lookup(dir.path(), "acme/Custom-Small").expect("cache entry");
+        assert!(!model.supported);
+        assert_eq!(model.host_reference.as_deref(), Some(&[][..]));
+        assert_eq!(model.engine, None);
+        assert_eq!(model.weights, None);
+        assert_eq!(model.requires_conversion, None);
+    }
+
+    #[test]
+    fn a_cached_fit_measures_the_shards_and_waits_for_a_download() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = cache_model(
+            dir.path(),
+            "zai-org/GLM-5.3-Flash-Tune",
+            "abc123",
+            "glm5_next",
+        );
+        std::fs::remove_file(snapshot.join("model.safetensors")).expect("fixture shard");
+        std::fs::write(
+            snapshot.join("model-00001-of-00002.safetensors"),
+            [0u8; 300],
+        )
+        .expect("shard");
+        std::fs::write(
+            snapshot.join("model-00002-of-00002.safetensors"),
+            [0u8; 200],
+        )
+        .expect("shard");
+        std::fs::create_dir_all(snapshot.join("original")).expect("subfolder");
+        std::fs::write(snapshot.join("original/model.safetensors"), [0u8; 999]).expect("shard");
+        let model = lookup(dir.path(), "zai-org/GLM-5.3-Flash-Tune").expect("cache entry");
         assert!(model.supported, "{:?}", model.missing_parts);
-        assert!(model.missing_parts.is_empty());
-        assert_eq!(model.engine.as_deref(), Some("dynamic"));
-        assert_eq!(model.weights.as_deref(), Some("acme/Custom-Small"));
-        assert_eq!(model.requires_conversion, Some(false));
+        let fit = fit_cached(&model, &nominal());
+        assert_eq!(fit.weights_bytes, Some(500));
+        assert!(fit.weights_measured);
+        assert_eq!(fit.verdict, fit::Verdict::Runs, "{fit:#?}");
+
+        // Mid-download the canonical family still names its engine, but nothing is claimed.
+        let canonical = cache_model(
+            dir.path(),
+            crate::config::GLM_MODEL_ID,
+            "def456",
+            "glm5_next",
+        );
+        std::fs::remove_file(canonical.join("config.json")).expect("drop config");
+        std::fs::write(
+            dir.path()
+                .join(repo_folder(crate::config::GLM_MODEL_ID))
+                .join("blobs/shard.incomplete"),
+            "xx",
+        )
+        .expect("partial blob");
+        let downloading = lookup(dir.path(), crate::config::GLM_MODEL_ID).expect("cache entry");
+        assert!(downloading.supported);
+        let fit = fit_cached(&downloading, &nominal());
+        assert_eq!(fit.verdict, fit::Verdict::Unknown, "{fit:#?}");
+        assert_eq!(fit.engine.as_deref(), Some(crate::config::GLM_ENGINE_ID));
+        assert_eq!(fit.weights_bytes, None);
+    }
+
+    #[test]
+    fn a_hub_hit_is_judged_from_its_expanded_fields() {
+        // A family with no device arm needs no document fetch to be judged missing its engine,
+        // and the expanded safetensors counts still size it.
+        let hit: HubHit = serde_json::from_value(json!({
+            "id": "meta-llama/Llama-3.1-8B",
+            "downloads": 487_572,
+            "likes": 2764,
+            "gated": "manual",
+            "sha": "d04e592bb4f6aa9cfee91e2e20afa771667e1d4b",
+            "config": {"architectures": ["LlamaForCausalLM"], "model_type": "llama"},
+            "safetensors": {"parameters": {"BF16": 8_030_261_248u64}, "total": 8_030_261_248u64}
+        }))
+        .expect("the Hub record parses");
+        let model = hit.judge(&nominal(), false);
+        assert!(model.gated);
+        assert!(!model.supported);
+        assert!(!model.cached);
+        let fit = model.fit.expect("judged");
+        assert_eq!(fit.verdict, fit::Verdict::Missing);
+        assert_eq!(fit.weights_bytes, Some(16_060_522_496));
+        assert!(!fit.weights_measured);
+        assert!(fit.summary.contains("llama"), "{}", fit.summary);
+
+        // A GGUF-only repository has no safetensors, which is named as missing.
+        let gguf: HubHit = serde_json::from_value(json!({
+            "id": "TheBloke/Llama-2-7B-GGUF",
+            "config": {"model_type": "llama"}
+        }))
+        .expect("the Hub record parses");
+        let fit = gguf.judge(&nominal(), false).fit.expect("judged");
+        assert!(
+            fit.missing
+                .iter()
+                .any(|reason| reason.contains("safetensors")),
+            "{:?}",
+            fit.missing
+        );
     }
 
     #[test]

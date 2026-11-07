@@ -35,6 +35,7 @@ use crate::config::{
     QWEN_WEIGHTS_ID, SUPPORTED_ENGINES, SUPPORTED_WEIGHTS, SparkConfig,
 };
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
+use crate::fit::Cluster;
 use crate::hf::{self, CachedModel, RemoteModel};
 use crate::inspect::{self, Check, ProbeResult, SetupReport};
 use crate::jobs::{JobManager, JobStatus, JobSummary};
@@ -174,6 +175,30 @@ impl WebState {
     #[must_use]
     pub fn config(&self) -> SparkConfig {
         self.config.read().expect("config lock").config.clone()
+    }
+
+    /// The cluster a model is judged against.
+    ///
+    /// Its size is the most Sparks any source names: the plan, the last discovery (configured
+    /// and newly found hosts) or the telemetry, because a TP=1 plan still sits on a larger
+    /// cluster. Each node is sized by the smallest unified-memory total the telemetry reports,
+    /// or the GB10 ceiling before any rank has reported.
+    #[must_use]
+    pub fn cluster(&self, config: &SparkConfig) -> Cluster {
+        let telemetry = self.stats.cluster();
+        let discovered = self
+            .last_discovery
+            .read()
+            .expect("discovery lock")
+            .as_ref()
+            .map_or(0, |report| report.nodes.len());
+        let reported = telemetry.as_ref().map_or(0, |cluster| cluster.nodes.len());
+        let nodes = config.cluster.nodes.len().max(discovered).max(reported);
+        Cluster::nominal(nodes).measured(
+            telemetry
+                .iter()
+                .flat_map(|cluster| cluster.nodes.iter().map(|node| node.uma_total_gib)),
+        )
     }
 
     /// The configuration an action may run with.
@@ -923,14 +948,79 @@ async fn apply_network(State(web): State<WebState>) -> Response {
 }
 
 /// Downloads the configured model into the lead's Hugging Face cache.
-async fn download(State(web): State<WebState>) -> Response {
-    let config = match web.usable_config() {
+/// The download action's optional body.
+#[derive(Debug, Default, Deserialize)]
+struct DownloadRequest {
+    /// A model the browser picked, downloaded without first saving it into the plan.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Downloads the configured model, or the browsed model a body's `id` names, into the lead's
+/// Hugging Face cache.
+///
+/// A browsed id is downloaded only when a device engine serves it: the plan cannot name a model
+/// that is not cached yet, so this is how a Hub pick becomes selectable, and a model this build
+/// cannot serve is refused with what it is missing instead of costing a multi-hundred-gigabyte
+/// transfer.
+async fn download(State(web): State<WebState>, body: axum::body::Bytes) -> Response {
+    let request: DownloadRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        DownloadRequest::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("the download request: {error}"),
+                );
+            }
+        }
+    };
+    let mut config = match web.usable_config() {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
-    // The cache is the source of truth before the download starts. A complete snapshot needs no
-    // network transfer, and saying so is more useful than starting a job that immediately no-ops.
-    if config.model.checkpoint.trim().is_empty() && lead_model_complete(&config) {
+    if let Some(id) = request
+        .id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+    {
+        let cache = config.hub_cache_dir();
+        let cluster = web.cluster(&config);
+        let wanted = id.clone();
+        let inspected =
+            tokio::task::spawn_blocking(move || hf::inspect(cache.as_deref(), &wanted, &cluster))
+                .await
+                .unwrap_or_else(|error| Err(format!("the model inspection failed: {error}")));
+        match inspected {
+            Ok(model) if model.cached && model.complete => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!("{id} is already in the Hugging Face cache; nothing to download"),
+                );
+            }
+            Ok(model) if !model.supported => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{id} is not a model this build can serve; it is missing {}",
+                        if model.missing_parts.is_empty() {
+                            "a device engine".to_owned()
+                        } else {
+                            model.missing_parts.join("; ")
+                        }
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(message) => return api_error(StatusCode::CONFLICT, message),
+        }
+        config.model.id = id;
+        config.model.checkpoint.clear();
+    } else if config.model.checkpoint.trim().is_empty() && lead_model_complete(&config) {
+        // The cache is the source of truth before the download starts. A complete snapshot needs
+        // no network transfer, and saying so is more useful than starting a job that no-ops.
         return api_error(
             StatusCode::CONFLICT,
             format!(
@@ -1006,6 +1096,8 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
 #[derive(Serialize)]
 struct ModelsView {
     cache: Option<String>,
+    /// The cluster every model's fit was judged against.
+    cluster: Cluster,
     models: Vec<CachedModel>,
     /// The cached models that can be prepared and swapped from the Overview page.
     shelf: Vec<ShelfModel>,
@@ -1019,6 +1111,8 @@ struct ModelsView {
 struct ModelSearchView {
     query: String,
     family: Option<String>,
+    /// The cluster every result's fit was judged against.
+    cluster: Cluster,
     models: Vec<RemoteModel>,
     error: Option<String>,
 }
@@ -1026,6 +1120,8 @@ struct ModelSearchView {
 /// The selected Hub model's inspected configuration.
 #[derive(Serialize)]
 struct ModelInspectView {
+    /// The cluster the fit was judged against.
+    cluster: Cluster,
     model: Option<RemoteModel>,
     error: Option<String>,
 }
@@ -1082,10 +1178,16 @@ struct ShelfModel {
 async fn models(State(web): State<WebState>) -> Json<ModelsView> {
     let config = web.config();
     let cache = config.hub_cache_dir();
+    let cluster = web.cluster(&config);
     let listed = match cache.clone() {
-        Some(dir) => tokio::task::spawn_blocking(move || hf::list(&dir))
-            .await
-            .unwrap_or_else(|error| Err(format!("the cache scan failed: {error}"))),
+        Some(dir) => tokio::task::spawn_blocking(move || {
+            hf::list(&dir).map(|mut models| {
+                hf::judge_cached(&mut models, &cluster);
+                models
+            })
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("the cache scan failed: {error}"))),
         None => {
             Err("no Hugging Face cache directory: set HF_HUB_CACHE or model.hub_cache".to_owned())
         }
@@ -1097,6 +1199,7 @@ async fn models(State(web): State<WebState>) -> Json<ModelsView> {
     let shelf = model_shelf(&web, &config, &models).await;
     Json(ModelsView {
         cache: cache.map(|dir| dir.display().to_string()),
+        cluster,
         models,
         shelf,
         families: hf::families(),
@@ -1109,7 +1212,9 @@ async fn models_search(
     State(web): State<WebState>,
     Query(query): Query<ModelSearchQuery>,
 ) -> Json<ModelSearchView> {
-    let cache = web.config().hub_cache_dir();
+    let config = web.config();
+    let cache = config.hub_cache_dir();
+    let cluster = web.cluster(&config);
     let text = query.q.unwrap_or_default();
     let family = query.family.as_deref().and_then(|name| {
         MODEL_PROFILES.iter().find(|profile| {
@@ -1121,7 +1226,7 @@ async fn models_search(
     let limit = query.limit.unwrap_or(24);
     let query_text = text.clone();
     let searched = tokio::task::spawn_blocking(move || {
-        hf::search(cache.as_deref(), &query_text, family, limit)
+        hf::search(cache.as_deref(), &query_text, family, limit, &cluster)
     })
     .await
     .unwrap_or_else(|error| Err(format!("the Hub search failed: {error}")));
@@ -1132,6 +1237,7 @@ async fn models_search(
     Json(ModelSearchView {
         query: text,
         family: family.map(|profile| profile.label.to_owned()),
+        cluster,
         models,
         error,
     })
@@ -1142,17 +1248,22 @@ async fn models_inspect(
     State(web): State<WebState>,
     Query(query): Query<ModelInspectQuery>,
 ) -> Json<ModelInspectView> {
-    let cache = web.config().hub_cache_dir();
+    let config = web.config();
+    let cache = config.hub_cache_dir();
+    let cluster = web.cluster(&config);
     let id = query.id;
-    let inspected = tokio::task::spawn_blocking(move || hf::inspect(cache.as_deref(), &id))
-        .await
-        .unwrap_or_else(|error| Err(format!("the model inspection failed: {error}")));
+    let inspected =
+        tokio::task::spawn_blocking(move || hf::inspect(cache.as_deref(), &id, &cluster))
+            .await
+            .unwrap_or_else(|error| Err(format!("the model inspection failed: {error}")));
     match inspected {
         Ok(model) => Json(ModelInspectView {
+            cluster,
             model: Some(model),
             error: None,
         }),
         Err(error) => Json(ModelInspectView {
+            cluster,
             model: None,
             error: Some(error),
         }),

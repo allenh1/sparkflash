@@ -40,7 +40,7 @@ const S = {
   guideOpen: {},
   guideHtml: {},
   models: null,
-  browser: { family: "", query: "", results: null, error: null, busy: false, timer: null },
+  browser: { family: "", query: "", results: null, error: null, busy: false, timer: null, open: null, cluster: null },
   shelfHtml: "",
   autoDiscovered: false,
   firstState: true,
@@ -501,7 +501,8 @@ function paintFamilies() {
   host.innerHTML = modelFamilies().map((family) => {
     const value = family.label === "All" ? "" : (family.weights || family.label);
     const selected = value === active;
-    const meta = family.world_size ? (family.world_size === 1 ? "TP=1" : "TP=" + family.world_size) : "";
+    const worlds = family.worlds?.length ? family.worlds : (family.world_size ? [family.world_size] : []);
+    const meta = worlds.length ? "TP=" + worlds.join("/") : "";
     return '<button type="button" role="option" aria-selected="' + selected + '" class="model-family' +
       (selected ? " active" : "") + '" data-family="' + esc(value) + '">' +
       '<span>' + esc(family.label) + "</span>" +
@@ -524,6 +525,8 @@ function searchModels(term = $("model-search")?.value || "", quiet = false) {
     .then((result) => {
       S.browser.results = result.models || [];
       S.browser.error = result.error || null;
+      S.browser.cluster = result.cluster || null;
+      if (!S.browser.results.some((model) => model.id === S.browser.open)) S.browser.open = null;
     })
     .catch((error) => {
       S.browser.results = [];
@@ -539,6 +542,7 @@ function searchModels(term = $("model-search")?.value || "", quiet = false) {
 function paintModelResults() {
   const host = $("model-results");
   if (!host) return;
+  paintClusterNote(S.browser.cluster);
   if (S.browser.busy) {
     host.innerHTML = '<p class="empty">Searching Hugging Face and the local cache…</p>';
     return;
@@ -553,21 +557,132 @@ function paintModelResults() {
     return;
   }
   host.innerHTML = results.map((model) => {
+    const open = S.browser.open === model.id;
+    const fit = model.fit;
     const notes = [];
     if (model.family) notes.push(model.family);
+    if (fit?.weights_bytes) notes.push((fit.weights_measured ? "" : "≈") + formatGib(fit.weights_bytes));
     if (model.downloads) notes.push(formatCount(model.downloads) + " downloads");
     if (model.cached) notes.push("in cache" + (model.complete ? "" : " (incomplete)"));
-    const badge = model.supported
-      ? '<span class="model-badge ok">runs here</span>'
-      : model.cached
-        ? '<span class="model-badge">unsupported</span>'
-        : '<span class="model-badge muted">not cached</span>';
-    return '<button type="button" class="model-result' + (model.supported ? "" : " dim") +
-      '" data-model-id="' + esc(model.id) + '">' +
+    if (model.gated) notes.push("gated");
+    return '<div class="model-result' + (fit?.verdict === "runs" ? "" : " dim") + (open ? " open" : "") + '">' +
+      '<button type="button" class="model-result-head" aria-expanded="' + open + '" data-model-id="' + esc(model.id) + '">' +
       '<span class="model-result-main"><strong>' + esc(model.id) + "</strong>" +
-      '<span class="model-result-meta">' + esc(notes.join(" · ") || "Hugging Face") + "</span></span>" +
-      badge + "</button>";
+      '<span class="model-result-meta">' + esc(notes.join(" · ") || "Hugging Face") + "</span>" +
+      fitChips(fit) + "</span>" +
+      fitBadge(model) + "</button>" +
+      (open ? fitDetail(model) : "") + "</div>";
   }).join("");
+}
+
+// What the browser judged against: the node count and the per-rank budget every verdict uses.
+function paintClusterNote(cluster) {
+  const note = $("model-browser-note");
+  if (!note) return;
+  if (!cluster) {
+    note.classList.add("hidden");
+    return;
+  }
+  const budget = cluster.node_bytes - cluster.floor_bytes;
+  note.textContent = "Judged for " + cluster.nodes + (cluster.nodes === 1 ? " Spark" : " Sparks") + ", " +
+    formatGib(budget) + " a rank for weights and cache (" + formatGib(cluster.node_bytes) +
+    (cluster.measured ? " measured" : " nominal") + " less a floor of " + formatGib(cluster.floor_bytes) +
+    "). Sizes marked ≈ are estimates; open a model for the reasons.";
+  note.classList.remove("hidden");
+}
+
+const FIT_LABELS = { runs: "fits", no_room: "too large", missing: "missing parts", unknown: "not judged yet" };
+
+function fitBadge(model) {
+  const fit = model.fit;
+  if (!fit) return '<span class="model-badge muted">not judged</span>';
+  if (fit.verdict === "runs") {
+    const widths = fit.configurations.filter((config) => config.verdict === "runs").map((config) => config.world);
+    return '<span class="model-badge ok">fits TP=' + esc(widths.join("/")) + "</span>";
+  }
+  return '<span class="model-badge ' + esc(fit.verdict) + '">' + esc(FIT_LABELS[fit.verdict] || fit.verdict) + "</span>";
+}
+
+function fitChips(fit) {
+  if (!fit?.configurations?.length) return "";
+  return '<span class="fit-chips">' + fit.configurations.map((config) => {
+    const context = config.verdict === "runs" && config.max_context ? " " + formatTokens(config.max_context) : "";
+    return '<span class="fit-chip ' + esc(config.verdict) + (config.launch ? " launch" : "") +
+      '" title="' + esc(configurationTitle(config)) + '">TP' + config.world + esc(context) + "</span>";
+  }).join("") + '<span class="fit-summary">' + esc(fit.summary) + "</span></span>";
+}
+
+function configurationTitle(config) {
+  const lines = ["TP=" + config.world + ": " + (FIT_LABELS[config.verdict] || config.verdict) +
+    (config.launch ? " (the family's default width)" : "")];
+  if (config.max_context) lines.push("up to " + fmtInt(config.max_context) + " tokens of context");
+  return lines.concat(config.reasons.map((reason) => "needs " + reason), config.notes).join("\n");
+}
+
+function fitDetail(model) {
+  const fit = model.fit;
+  const parts = ['<div class="fit-detail">'];
+  if (!fit) {
+    parts.push('<p class="dim">Not judged yet.</p>');
+  } else {
+    parts.push('<p class="fit-detail-summary ' + esc(fit.verdict) + '">' + esc(fit.summary) + "</p>");
+    const facts = [];
+    if (fit.model_type) facts.push("model_type " + fit.model_type);
+    if (fit.engine) facts.push("engine " + fit.engine);
+    if (fit.window) facts.push(fmtInt(fit.window) + "-token window");
+    if (fit.weights_bytes) {
+      facts.push((fit.weights_measured ? "" : "≈") + formatGib(fit.weights_bytes) +
+        (fit.weights_measured ? " of safetensors in the cache" : " of weights by the Hub's parameter counts"));
+    }
+    if (facts.length) parts.push('<p class="fit-facts">' + esc(facts.join(" · ")) + "</p>");
+    if (fit.missing.length) {
+      parts.push('<p class="fit-missing-head">Missing at every width</p><ul class="fit-missing">' +
+        fit.missing.map((reason) => "<li>" + esc(reason) + "</li>").join("") + "</ul>");
+    }
+    parts.push('<div class="fit-table-wrap"><table class="fit-table"><thead><tr><th>Width</th><th>Verdict</th>' +
+      "<th>Weights a rank</th><th>Cache a token</th><th>Context</th><th>Why</th></tr></thead><tbody>" +
+      fit.configurations.map((config) => {
+        const weights = config.rank_weights_bytes
+          ? (config.rank_weights_planned ? "" : "≈") + formatGib(config.rank_weights_bytes)
+          : "—";
+        const cache = config.kv_bytes_per_token ? fmtInt(config.kv_bytes_per_token) + " B" : "—";
+        const context = config.max_context ? fmtInt(config.max_context) : "—";
+        const why = config.reasons.map((reason) => "<li>needs " + esc(reason) + "</li>")
+          .concat(config.notes.map((note) => '<li class="dim">' + esc(note) + "</li>")).join("");
+        return "<tr><td>TP=" + config.world + (config.launch ? ' <small class="dim">default</small>' : "") + "</td>" +
+          '<td><span class="fit-chip ' + esc(config.verdict) + '">' + esc(FIT_LABELS[config.verdict] || config.verdict) + "</span></td>" +
+          "<td>" + esc(weights) + "</td><td>" + esc(cache) + "</td><td>" + esc(context) + "</td>" +
+          '<td><ul class="fit-why">' + why + "</ul></td></tr>";
+      }).join("") + "</tbody></table></div>");
+  }
+  const actions = [];
+  if (model.supported) {
+    actions.push('<button type="button" class="btn btn-sm btn-primary" data-browse-act="use" data-browse-id="' +
+      esc(model.id) + '">Use this model</button>');
+    if (!(model.cached && model.complete)) {
+      actions.push('<button type="button" class="btn btn-sm" data-browse-act="download" data-browse-id="' +
+        esc(model.id) + '">Download to the lead Spark</button>');
+    }
+  }
+  actions.push('<a class="btn btn-sm" href="https://huggingface.co/' + esc(model.id) +
+    '" target="_blank" rel="noopener noreferrer">Open on Hugging Face</a>');
+  parts.push('<div class="fit-actions">' + actions.join("") + "</div></div>");
+  return parts.join("");
+}
+
+// GiB to one decimal, as the server's reasons print them: 113.7 GiB, 8 GiB, 1404 GiB.
+function formatGib(bytes) {
+  const gib = bytes / 1073741824;
+  if (gib >= 1000) return Math.round(gib) + " GiB";
+  if (gib >= 0.1) return Number(gib.toFixed(1)) + " GiB";
+  return Math.max(1, Math.round(bytes / 1048576)) + " MiB";
+}
+
+// Context sizes the way model cards print them: 262,144 tokens is 256k, 1,048,576 is 1M.
+function formatTokens(tokens) {
+  if (tokens >= 1048576 && tokens % 1048576 === 0) return tokens / 1048576 + "M";
+  if (tokens >= 1024) return Math.round(tokens / 1024) + "k";
+  return String(tokens);
 }
 
 function formatCount(value) {
@@ -576,25 +691,41 @@ function formatCount(value) {
   return String(value);
 }
 
-async function selectBrowsedModel(id) {
-  const found = (S.browser.results || []).find((model) => model.id === id);
-  if (!found) return;
-  let model = found;
-  if (!model.supported && !model.cached) {
-    try {
-      const inspected = await api("/api/models/inspect?id=" + encodeURIComponent(id));
-      if (inspected.error) throw new Error(inspected.error);
-      model = inspected.model;
-    } catch (error) {
-      toast("Could not inspect " + id + ": " + error.message, true);
-      return;
-    }
+// Opening a row shows its fit. A Hub hit judged without its document (a family this build has
+// no engine for, or a search the Hub answered without configs) is inspected first.
+async function toggleBrowsedModel(id) {
+  S.browser.open = S.browser.open === id ? null : id;
+  paintModelResults();
+  const model = browsedModel(id);
+  if (S.browser.open !== id || !model || model.cached || model.inspected) return;
+  if (model.fit && model.fit.verdict !== "unknown") return;
+  try {
+    const inspected = await api("/api/models/inspect?id=" + encodeURIComponent(id));
+    if (inspected.error) throw new Error(inspected.error);
+    if (inspected.model) replaceBrowsedModel({ ...inspected.model, inspected: true });
+  } catch (error) {
+    toast("Could not inspect " + id + ": " + error.message, true);
   }
-  if (model && model.supported === false) {
-    toast(id + " is not a checkpoint this build can load" + (model.family ? " as " + model.family : "") + ".", true);
+}
+
+function browsedModel(id) {
+  return (S.browser.results || []).find((model) => model.id === id) || null;
+}
+
+function replaceBrowsedModel(model) {
+  S.browser.results = (S.browser.results || []).map((entry) => (entry.id === model.id ? model : entry));
+  paintModelResults();
+}
+
+function browseAction(act, id) {
+  const model = browsedModel(id);
+  if (!model) return;
+  if (!model.supported) {
+    toast(id + " is not a model this build can serve: " + (model.fit?.summary || "it has no device engine") + ".", true);
     return;
   }
-  chooseBrowsedModel(model);
+  if (act === "use") chooseBrowsedModel(model);
+  else if (act === "download") postAction("/api/actions/download", { id }, false);
 }
 
 function chooseBrowsedModel(model) {
@@ -617,7 +748,12 @@ function chooseBrowsedModel(model) {
   applyModelProfile(model.id);
   paintModelSource();
   markDirty();
-  toast(model.id + (model.cached ? " selected from the cache." : " selected; the download step will fetch it."));
+  const fit = model.fit;
+  if (fit && fit.verdict !== "runs") {
+    toast(model.id + " selected, but it does not fit yet: " + fit.summary, true);
+  } else {
+    toast(model.id + (model.cached ? " selected from the cache." : " selected; download it before launching."));
+  }
 }
 
 function formatSize(bytes) {
@@ -2607,9 +2743,14 @@ function bindEvents() {
     }
   });
   $("model-results").addEventListener("click", (event) => {
+    const action = event.target.closest("[data-browse-act]");
+    if (action) {
+      browseAction(action.dataset.browseAct, action.dataset.browseId);
+      return;
+    }
     const button = event.target.closest("[data-model-id]");
-    const id = button && (button.dataset.modelId || button.getAttribute("data-model-id"));
-    if (id) selectBrowsedModel(id);
+    const id = button && button.dataset.modelId;
+    if (id) toggleBrowsedModel(id);
   });
   $("model-shelf").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-shelf-act]");

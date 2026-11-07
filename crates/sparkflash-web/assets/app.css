@@ -547,26 +547,28 @@ main {
 .model-browser-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .model-search-row { display: flex; gap: 6px; }
 .model-search-row > input { flex: 1; min-width: 0; }
-.model-results { display: flex; flex-direction: column; max-height: 260px; overflow-y: auto; }
-.model-result {
+.model-results { display: flex; flex-direction: column; max-height: 460px; overflow-y: auto; }
+.model-browser-note { margin: 0; }
+.model-result { border-top: 1px solid var(--border); }
+.model-result:first-child { border-top: 0; }
+.model-result-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
   width: 100%;
   padding: 8px 9px;
   border: 0;
-  border-top: 1px solid var(--border);
   background: transparent;
   color: var(--text);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.model-result:first-child { border-top: 0; }
-.model-result:hover { background: var(--surface-3); }
-.model-result.dim { opacity: 0.82; }
-.model-result-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.model-result-head:hover, .model-result.open .model-result-head { background: var(--surface-3); }
+.model-result-head:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.model-result.dim .model-result-main strong { color: var(--text-2); }
+.model-result-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .model-result-main strong { font-family: var(--mono); font-size: 12.5px; font-weight: 500; overflow-wrap: anywhere; }
 .model-result-meta { color: var(--muted); font-size: 11.5px; overflow-wrap: anywhere; }
 .model-badge {
@@ -579,8 +581,46 @@ main {
   font-family: var(--mono);
   white-space: nowrap;
 }
-.model-badge.ok { border-color: var(--accent); color: var(--accent); }
+.model-badge.ok { border-color: var(--good); color: var(--good-text); }
+.model-badge.no_room { border-color: rgba(208, 59, 59, 0.5); color: var(--bad-text); }
+.model-badge.missing { color: var(--muted); }
+.model-badge.unknown { border-color: rgba(250, 178, 25, 0.45); color: var(--warn); }
 .model-badge.muted { color: var(--muted); }
+
+/* Per-width fit: one chip a tensor-parallel width, colored by its verdict. */
+.fit-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
+.fit-chip {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.fit-chip.runs { border-color: rgba(12, 163, 12, 0.55); background: rgba(12, 163, 12, 0.1); color: var(--good-text); }
+.fit-chip.no_room { border-color: rgba(208, 59, 59, 0.45); background: var(--bad-soft); color: var(--bad-text); }
+.fit-chip.unknown { border-color: rgba(250, 178, 25, 0.4); color: var(--warn); }
+.fit-chip.missing { border-style: dashed; }
+.fit-chip.launch { box-shadow: inset 0 -2px 0 currentColor; }
+.fit-summary { margin-left: 4px; color: var(--text-2); font-size: 11.5px; overflow-wrap: anywhere; }
+.fit-detail { display: flex; flex-direction: column; gap: 8px; padding: 4px 9px 12px; background: var(--surface-3); font-size: 12.5px; }
+.fit-detail p { margin: 0; }
+.fit-detail-summary { font-weight: 500; }
+.fit-detail-summary.runs { color: var(--good-text); }
+.fit-detail-summary.no_room { color: var(--bad-text); }
+.fit-detail-summary.unknown { color: var(--warn); }
+.fit-facts { color: var(--muted); font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.fit-missing-head { color: var(--text-2); font-weight: 500; }
+.fit-missing, .fit-why { margin: 0; padding-left: 16px; }
+.fit-why { padding-left: 14px; }
+.fit-why li + li, .fit-missing li + li { margin-top: 2px; }
+.fit-table-wrap { overflow-x: auto; }
+.fit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.fit-table th { padding: 4px 8px 4px 0; color: var(--muted); font-weight: 500; text-align: left; white-space: nowrap; }
+.fit-table td { padding: 5px 8px 5px 0; border-top: 1px solid var(--border); vertical-align: top; font-variant-numeric: tabular-nums; }
+.fit-table td:nth-child(-n+5) { white-space: nowrap; }
+.fit-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .model-results .empty { padding: 8px 2px; }
 .model-results .empty.warn { color: var(--warn); }
 

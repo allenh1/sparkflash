@@ -224,15 +224,51 @@ the others. `hf download <id>` as the same user on every node works too.
 
 The **Model** panel at the top of **Setup** is the lead node's cache, and its browser searches
 both that cache and the Hugging Face Hub. The left side lists the families this build
-knows (DeepSeek, Qwen, GLM) with their TP size; the search box queries the Hub and folds in cached
-models first. A cached model shows its size and whether its download is still incomplete; a Hub
-result that is not cached is offered so the **Download** step has a target. Choosing a model also
-selects its architecture and engine, so a V4.1 checkpoint cannot be paired with the Qwen engine by
-accident; a Hub-only result is inspected through its `config.json` first, and one whose
-`model_type` this build cannot load is refused with the family named. A cached model that a
-different parser cannot load is not selectable, and saving one is refused by the server as well;
-the catalog adds the canonical supported releases that are not downloaded yet. The line under the
-list shows the snapshot the next launch or conversion will use. A launch or conversion for a model that
+knows (DeepSeek, Qwen, GLM) with the TP widths their device engines run; the search box queries
+the Hub and folds in cached models first. Every result says at a glance whether it fits this
+cluster (see below): a badge (**fits TP=…**, **too large**, **missing parts**, **not judged
+yet**), one chip a width (TP1, TP2, TP4) colored by its verdict with the longest context that
+fits, and a one-line summary. Opening a result shows the detail: per width, the weights a rank,
+the cache a token, the context, and every reason a width fails. A Hub result with a device engine
+offers **Use this model** and **Download to the lead Spark**; the download names the repository
+explicitly, so a fine-tune of a supported family needs no saved `model.id` first. Choosing a model
+also selects its architecture and engine, so a V4.1 checkpoint cannot be paired with the Qwen
+engine by accident. A model no device engine serves is never selectable or downloadable, and
+saving one is refused by the server as well; the catalog adds the canonical supported releases
+that are not downloaded yet. The line under the list shows the snapshot the next launch or
+conversion will use.
+
+### How the browser judges fit
+
+The verdict is a device-engine verdict. The CPU f32 host reference (`engine.kind = "dynamic"`)
+exists to check test checkpoints against the device kernels and never counts as "runs": a family
+outside DeepSeek V4.1, Qwen3.8 and GLM-5.3 is **missing a device engine**, however small. An
+explicit hand-written dynamic plan still validates, but the browser and the cache-driven model
+switch never produce one, and selecting a cached model never rewrites the cluster plan.
+
+Each width is judged from evidence, not names:
+
+- **The engine.** The family's device arm must run at that width (V4.1 is TP=4 only; Qwen and
+  GLM run TP=1, 2 and 4), the execution plan must build, and every part it serves must resolve to
+  an sm121 kernel at the checkpoint's precision. A gap names the part and precision, for example
+  *a sm121 moe kernel at bf16* for the BF16 Qwen3.8 release.
+- **The memory.** Each Spark has 121.7 GiB of unified memory, or the smallest total telemetry
+  reports; less an 8 GiB floor for the OS and runtime, that leaves the per-rank budget the note
+  above the results prints. A rank's weights are the tensor plan's own bytes for that width when
+  the document parses, else the checkpoint split evenly (marked ≈). The KV cache plan's per-token
+  and fixed bytes then give the longest context that fits beside the weights; a width that cannot
+  hold 4,096 tokens is **too large**. V4.1's Engram tables stay on NVMe, so its resident set is
+  not estimated: it fits at its released TP=4 deployment.
+- **The checkpoint.** Weights must be safetensors (a GGUF-only repository is missing them), the
+  repository readable (a gated one names the access it needs), and the document free of features
+  the engines do not model (attention soft-capping, unmodelled quantization methods).
+- **The cluster.** A width needs that many Sparks: the larger of the configured nodes, the last
+  discovery and the nodes reporting telemetry.
+
+Checkpoint sizes come from the shards in the cache, or from the Hub's per-dtype parameter counts
+(packed integer weights charged their declared bits). A Hub result in a family with a device arm
+has its `config.json` read at the pinned revision (and remembered by commit); others are judged
+from the Hub's indexed `model_type` until opened. A launch or conversion for a model that
 is not in the cache is refused with the cache path in the message; stop and status still work. A
 non-empty `model.checkpoint` skips the lookup. Use it for a checkpoint outside the cache, and its
 `config.json` `model_type` is checked the same way.
@@ -403,15 +439,15 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
 | `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
-| `GET /api/models` | Models in the lead's hub cache, plus the swap shelf, the family list and each model's prepared ranks |
-| `GET /api/models/search?q=&family=` | Hub search folded with the lead's cache; empty `q` lists the cache or the family's default term |
-| `GET /api/models/inspect?id=` | One model's profile: the cached entry, or its Hub `config.json` when it is not cached |
+| `GET /api/models` | Models in the lead's hub cache with each one's `fit`, plus the cluster they were judged against, the swap shelf, the family list and each model's prepared ranks |
+| `GET /api/models/search?q=&family=` | Hub search folded with the lead's cache, each result with its per-width `fit`; empty `q` lists the cache or the family's default term |
+| `GET /api/models/inspect?id=` | One model's profile and `fit`: the cached entry, or its Hub `config.json` when it is not cached |
 | `GET /api/series?window_secs=N` | Downsampled graph window |
 | `GET /api/jobs`, `GET /api/jobs/{id}` | Job list and full log |
 | `POST /api/actions/convert` | `{ranks?: [0,1,2,3]}` for the active model; refused while it serves |
 | `POST /api/actions/prepare-model` | `{id}`: shard a cached model in the background while another serves |
 | `POST /api/actions/swap` | `{id}`: verify, stop, select and launch a prepared cached model as one job |
-| `POST /api/actions/download` | Download `model.id` into the lead's hub cache |
+| `POST /api/actions/download` | Download `model.id` (or the body's `{"id": …}`, which must have a device engine) into the lead's hub cache |
 | `POST /api/actions/sync` | `{what: "software" \| "model"}`: copy from the lead to the other nodes |
 | `POST /api/actions/launch`, `/stop`, `/status` | Launcher actions |
 

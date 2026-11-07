@@ -23,6 +23,8 @@
 //!
 //! - [`config`] owns the typed TOML and every derived command-line environment value.
 //! - [`commands`] builds process argument vectors and quotes remote shell fragments.
+//! - [`fit`] judges whether a checkpoint can be served on the cluster at each tensor-parallel
+//!   width, and names what is missing when it cannot.
 //! - [`hf`] resolves a Hugging Face model id to its checkpoint in the hub cache and lists the
 //!   cached models.
 //! - [`discovery`] is DNS-SD plus a `BatchMode=yes` SSH probe behind traits.
@@ -37,6 +39,7 @@ pub mod api;
 pub mod commands;
 pub mod config;
 pub mod discovery;
+pub mod fit;
 pub mod hf;
 pub mod inspect;
 pub mod jobs;

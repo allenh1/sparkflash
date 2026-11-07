@@ -350,12 +350,16 @@ generic `ArchitectureTensorPlan` naming path is the next step; it is a new plan 
 rebase change.
 
 The web control plane evaluates a released family with the same `EnginePlan` +
-`KernelResolver` at the family's deployment world, and a novel family with the shared
-`HOST_REFERENCE_PARTS` set. `supported` and `context_tokens` come from the checkpoint, and
-`missing_parts` names the host-unsupported parts. A cached or explicit checkpoint is also judged
-by its safetensors headers, so storage-only quantization is refused exactly as the CLI refuses it;
-a Hub-only preview remains declaration-level until the shards are downloaded. An explicit
-`model.checkpoint` is authoritative over a cached `model.id` for both the window and support
-decision. A novel host-runnable checkpoint is selectable under its own id with engine `dynamic`;
-it needs no per-rank conversion or cubins, and selecting it from a four-Spark plan moves the
-launch to the single local node.
+`KernelResolver` at every width its device arm runs (`crates/sparkflash-web/src/fit.rs`), and
+sizes each width from the tensor plan and the KV cache plan against the per-rank memory budget
+(`NODE_MEMORY_BUDGET_BYTES` less `MEMORY_FLOOR_BYTES`). `supported` means a device engine serves
+the checkpoint at its launch width; `context_tokens` comes from the checkpoint, and `missing_parts`
+names what is missing. A novel family is never `supported`: it is checked against the shared
+`HOST_REFERENCE_PARTS` set only so an explicit `engine.kind = "dynamic"` plan can be validated
+(`host_reference`), and the browser reports it as missing a device engine. A cached or explicit
+checkpoint is also judged by its safetensors headers, so storage-only quantization is refused
+exactly as the CLI refuses it; a Hub-only preview remains declaration-level until the shards are
+downloaded. An explicit `model.checkpoint` is authoritative over a cached `model.id` for both the
+window and support decision. Selecting a cached model never rewrites the cluster plan. A new
+family's device arm makes it appear: add its `ModelProfile` entry with the widths it runs
+(`worlds`), and the browser judges it from then on.

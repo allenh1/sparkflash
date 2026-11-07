@@ -122,8 +122,10 @@ pub struct ModelProfile {
     pub label: &'static str,
     /// The default Hugging Face search term for this family.
     pub search: &'static str,
-    /// How many ranks the family runs on.
+    /// How many ranks the console launches the family on.
     pub world_size: usize,
+    /// Every tensor-parallel width the family's device arm runs, narrowest first.
+    pub worlds: &'static [usize],
     /// The organization most of the family's checkpoints live under.
     pub org: &'static str,
     /// The control-plane weight selector.
@@ -146,8 +148,10 @@ struct Deployment {
     engine: &'static str,
     /// The default Hugging Face search term for this family.
     search: &'static str,
-    /// How many ranks the family runs on.
+    /// How many ranks the console launches the family on.
     world_size: usize,
+    /// Every tensor-parallel width the family's device arm runs.
+    worlds: &'static [usize],
     /// The organization most of the family's checkpoints live under.
     org: &'static str,
     /// Whether launch needs a per-rank converted file.
@@ -163,6 +167,8 @@ fn deployment_for(weights: &str) -> Deployment {
             engine: DEFAULT_ENGINE_ID,
             search: "DeepSeek-V4.1",
             world_size: WORLD_SIZE,
+            // The V4.1 engine is the four-rank group; it has no narrower arm.
+            worlds: &[WORLD_SIZE],
             org: "deepseek-ai",
             requires_conversion: true,
             requires_cubins: true,
@@ -171,6 +177,8 @@ fn deployment_for(weights: &str) -> Deployment {
             engine: QWEN_ENGINE_ID,
             search: "Qwen3.8-Flash",
             world_size: SOLO_WORLD_SIZE,
+            // The pack's single-node arm and its TP=2/TP=4 group (!205, !207).
+            worlds: &[1, 2, 4],
             org: "Qwen",
             requires_conversion: true,
             requires_cubins: false,
@@ -179,6 +187,9 @@ fn deployment_for(weights: &str) -> Deployment {
             engine: GLM_ENGINE_ID,
             search: "GLM-5.3-Flash",
             world_size: WORLD_SIZE,
+            // The pack's single-node arm (which refuses the released 328 GB on memory, not on
+            // capability) and its TP=2/TP=4 group.
+            worlds: &[1, 2, 4],
             org: "zai-org",
             requires_conversion: true,
             requires_cubins: false,
@@ -202,6 +213,7 @@ pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
                 label: &model.label,
                 search: deployment.search,
                 world_size: deployment.world_size,
+                worlds: deployment.worlds,
                 org: deployment.org,
                 weights: &model.weights_id,
                 engine: deployment.engine,
@@ -951,18 +963,26 @@ impl SparkConfig {
                     self.model.id
                 ))
             })?;
-        if !cached.supported {
-            return Err(ConfigError::new(format!(
-                "{} is not runnable by the dynamic host path: {}",
+        match &cached.host_reference {
+            Some(gaps) if gaps.is_empty() => Ok(()),
+            Some(gaps) => Err(ConfigError::new(format!(
+                "{} is not runnable by the dynamic host reference: {}",
                 cached.id,
-                if cached.missing_parts.is_empty() {
-                    "no supported parts were found".to_owned()
-                } else {
-                    cached.missing_parts.join(", ")
-                }
-            )));
+                gaps.join(", ")
+            ))),
+            None if cached.model_type.is_none() => Err(ConfigError::new(format!(
+                "the cached checkpoint {} has no config.json model_type, so the dynamic host \
+                 reference cannot be checked against it",
+                cached.id
+            ))),
+            None => Err(ConfigError::new(format!(
+                "{} is a {} checkpoint, which its device engine serves; select engine.kind {:?} \
+                 rather than the dynamic host reference",
+                cached.id,
+                cached.model_type.as_deref().unwrap_or_default(),
+                cached.engine.as_deref().unwrap_or_default()
+            ))),
         }
-        Ok(())
     }
 
     /// Saves the configuration atomically: write a sibling temp file, then rename.
@@ -1050,15 +1070,23 @@ impl SparkConfig {
     /// never from the caller. This is the one place the model shelf and the swap action build a
     /// target configuration, so a prepared model cannot be paired with the wrong engine.
     ///
+    /// The cluster plan itself is never rewritten: a target whose family launches at another
+    /// width than this plan names is refused by validation, so the operator changes the plan
+    /// knowingly instead of finding a four-Spark plan saved as one node.
+    ///
     /// # Errors
-    /// When the cache entry is not runnable by this build, or the target cannot share this
-    /// cluster (a TP=1 pack on a four-Spark plan, for example), or its checkpoint does not
-    /// resolve.
+    /// When no device engine serves the cache entry, or the target cannot share this cluster (a
+    /// TP=1 pack on a four-Spark plan, for example), or its checkpoint does not resolve.
     pub fn for_cached_model(&self, model: &crate::hf::CachedModel) -> Result<Self, ConfigError> {
         if !model.supported {
             return Err(ConfigError::new(format!(
-                "{} is not a model type this build can run",
-                model.id
+                "no device engine in this build serves {}: it is missing {}",
+                model.id,
+                if model.missing_parts.is_empty() {
+                    "a device engine for its family".to_owned()
+                } else {
+                    model.missing_parts.join("; ")
+                }
             )));
         }
         if !model.complete {
@@ -1083,14 +1111,6 @@ impl SparkConfig {
         config.model.tokenizer.clear();
         config.model.weights = weights.to_owned();
         config.engine.kind = engine.to_owned();
-        if config.is_dynamic() && !config.is_solo() {
-            // The host reference is TP1; selecting it from a four-Spark plan moves the launch to
-            // this node rather than refusing a model the cache can already serve.
-            let mut node = config.cluster.nodes[0].clone();
-            node.peer.clear();
-            node.local = true;
-            config.cluster.nodes = vec![node];
-        }
         if let Some(context) = model.context_tokens {
             config.runtime.max_context_tokens = config.runtime.max_context_tokens.min(context);
         }
@@ -2167,7 +2187,33 @@ mod tests {
     }
 
     #[test]
-    fn a_host_runnable_cached_checkpoint_is_selectable_with_the_dynamic_engine() {
+    fn a_host_only_cached_checkpoint_is_never_selected_and_the_plan_is_kept() {
+        // The acme fixture is one the CLI's CPU host reference can execute. That is a test
+        // oracle, not a way to serve, so selecting it from the cache is refused with what the
+        // device path lacks, and the four-Spark plan is not rewritten to one node.
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::hf::tests::cache_config(
+            dir.path(),
+            "acme/Custom-Flash-Test",
+            "abc123",
+            &crate::hf::tests::custom_config(),
+        );
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = dir.path().display().to_string();
+        let model = crate::hf::lookup(dir.path(), "acme/Custom-Flash-Test").expect("cache entry");
+        assert!(!model.supported);
+        assert_eq!(model.host_reference.as_deref(), Some(&[][..]));
+        let error = config
+            .for_cached_model(&model)
+            .expect_err("a host-only checkpoint is not served");
+        assert!(error.message.contains("device engine"), "{error}");
+        assert_eq!(config.cluster.nodes.len(), WORLD_SIZE);
+    }
+
+    #[test]
+    fn an_explicit_dynamic_plan_still_validates_against_the_host_reference() {
+        // engine.kind = "dynamic" written by hand is the opt-in the console never offers: it is
+        // checked against the same host predicate the CLI boots with.
         let dir = tempfile::tempdir().expect("tempdir");
         let snapshot = crate::hf::tests::cache_config(
             dir.path(),
@@ -2175,7 +2221,6 @@ mod tests {
             "abc123",
             &crate::hf::tests::custom_config(),
         );
-        // Selecting a cached model resolves its checkpoint, and validation reopens the shards.
         sparkflash_weights::safetensors::write_checkpoint(
             &snapshot,
             &[(
@@ -2189,21 +2234,23 @@ mod tests {
             1,
         )
         .expect("the cached checkpoint shard");
-        let mut config = SparkConfig::default();
-        config.model.hub_cache = dir.path().display().to_string();
-        let model = crate::hf::lookup(dir.path(), "acme/Custom-Flash-Test").expect("cache entry");
-        let selected = config
-            .for_cached_model(&model)
-            .expect("the acme fixture is selectable");
+        let mut selected = SparkConfig::default();
+        selected.model.hub_cache = dir.path().display().to_string();
+        selected.model.id = "acme/Custom-Flash-Test".to_owned();
+        selected.model.weights = "acme/Custom-Flash-Test".to_owned();
+        selected.engine.kind = DYNAMIC_ENGINE_ID.to_owned();
+        let mut node = selected.cluster.nodes[0].clone();
+        node.peer.clear();
+        node.local = true;
+        selected.cluster.nodes = vec![node];
+        selected.runtime.max_context_tokens = 128;
+        selected
+            .validate()
+            .expect("the hand-written dynamic plan is valid");
         assert!(selected.is_dynamic());
-        assert!(selected.is_solo());
-        assert_eq!(selected.model.id, "acme/Custom-Flash-Test");
-        assert_eq!(selected.model.weights, "acme/Custom-Flash-Test");
-        assert_eq!(selected.engine.kind, DYNAMIC_ENGINE_ID);
         assert!(!selected.requires_conversion());
         assert!(!selected.requires_cubins());
         assert!(!selected.requires_conversion_manifest());
-        assert_eq!(selected.runtime.max_context_tokens, 128);
         // The selector has no registry profile, so the ceiling comes from the checkpoint's own
         // 128-token window rather than the V4.1 default. A 129-token window must be refused.
         assert_eq!(selected.max_context_tokens(), 128);
@@ -2214,9 +2261,20 @@ mod tests {
             .expect_err("the checkpoint window caps the runtime");
         assert!(error.message.contains("max_context_tokens"), "{error}");
         assert_eq!(
-            selected.local_launch_env()["SPARKFLASH_MODEL"],
+            selected.resolved().expect("resolves").local_launch_env()["SPARKFLASH_MODEL"],
             "acme/Custom-Flash-Test"
         );
+
+        // A dynamic plan naming a released family is pointed at its device engine instead.
+        crate::hf::tests::cache_model(dir.path(), GLM_MODEL_ID, "def456", "glm5_next");
+        let mut released = selected.clone();
+        released.model.id = GLM_MODEL_ID.to_owned();
+        released.model.weights = GLM_MODEL_ID.to_owned();
+        released.model.context_tokens = None;
+        let error = released
+            .validate()
+            .expect_err("a released family is not run on the host reference");
+        assert!(error.message.contains(GLM_ENGINE_ID), "{error}");
     }
 
     #[test]

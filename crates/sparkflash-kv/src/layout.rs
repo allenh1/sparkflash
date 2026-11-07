@@ -149,16 +149,10 @@ pub const SWA_TAIL_DECODER_BYTES: usize = SWA_DECODER_LAYERS * SWA_SLOTS_PER_TAI
 /// One gibibyte, as u64.
 pub const GIB: u64 = 1 << 30;
 
-/// The task-level per-node unified-memory ceiling: 121.7 GiB.
-pub const NODE_MEMORY_BUDGET_BYTES: u64 = 1217 * GIB / 10;
-
-/// Guard band the pool must leave unallocated: 8 GiB.
-///
-/// The specification's own budget table (spec line 180) books a 9.12 GiB "MemAvailable floor
-/// guard" and the preflight gate wants MemAvailable >= 114 GiB before weights load; the
-/// milestone task states the floor as 8 GiB. Both are exposed so a caller can pick, and the
-/// discrepancy is reported rather than silently reconciled.
-pub const MEMORY_FLOOR_BYTES: u64 = 8 * GIB;
+/// The per-node unified-memory ceiling (121.7 GiB) and the 8 GiB guard band the pool must leave
+/// unallocated. Both are the model crate's, so the KV layout and every other per-node budget
+/// (the web console's fit estimate among them) read one figure.
+pub use sparkflash_model::arm::{MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES};
 
 /// The specification's MemAvailable floor guard, 9.12 GiB.
 pub const SPEC_SAFETY_HEADROOM_BYTES: u64 = 912 * GIB / 100;

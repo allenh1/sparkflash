@@ -201,6 +201,22 @@ pub const fn kv_budget_bytes(gib: usize) -> u64 {
     (gib as u64) << 30
 }
 
+/// The per-node unified-memory ceiling of one DGX Spark: 121.7 GiB.
+///
+/// This is what the GB10 reports as its total after the firmware's reservation, and the figure
+/// every per-node budget in the workspace is taken against: the KV layout's pools, the Engram
+/// placement decision and the web console's fit estimate all read it from here.
+pub const NODE_MEMORY_BUDGET_BYTES: u64 = 1217 * (1 << 30) / 10;
+
+/// Guard band a node must leave unallocated: 8 GiB.
+///
+/// The specification's own budget table (spec line 180) books a 9.12 GiB "MemAvailable floor
+/// guard" and the preflight gate wants MemAvailable >= 114 GiB before weights load; the
+/// milestone task states the floor as 8 GiB. Both are exposed (the 9.12 GiB figure is
+/// `sparkflash_kv::layout::SPEC_SAFETY_HEADROOM_BYTES`) so a caller can pick, and the
+/// discrepancy is reported rather than silently reconciled.
+pub const MEMORY_FLOOR_BYTES: u64 = 8 * (1 << 30);
+
 /// A byte count as the operator-facing gibibytes, to two places.
 #[must_use]
 pub fn gib(bytes: u64) -> String {

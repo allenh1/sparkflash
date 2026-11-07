@@ -668,6 +668,66 @@ impl Architecture {
         })
     }
 
+    /// The declarations in a `config.json` that change the model's arithmetic but that this
+    /// parser does not read, each named for the operator.
+    ///
+    /// [Self::from_value] is deliberately tolerant: it reads the fields it models and ignores the
+    /// rest, so a Gemma-2 document parses into a plain GQA stack and a Mixtral document into a
+    /// dense one. A caller deciding whether a checkpoint can run must not take that parse as the
+    /// whole story; this is the list of what the parse dropped. An empty list means nothing this
+    /// function knows to look for was declared, not that every field was modelled.
+    ///
+    /// It looks for logit soft-capping (attention and final), a routed-expert count under a
+    /// spelling the parser does not read (`num_local_experts`), and a quantization method whose
+    /// format the parser cannot name, which [Self::from_value] reads as BF16.
+    #[must_use]
+    pub fn unmodelled_features(root: &Value) -> Vec<String> {
+        let text = object(root, "text_config").unwrap_or(root);
+        let mut found = Vec::new();
+        for field in ["attn_logit_softcapping", "final_logit_softcapping"] {
+            let declared = text
+                .get(field)
+                .or_else(|| root.get(field))
+                .and_then(Value::as_f64);
+            if let Some(cap) = declared.filter(|cap| *cap > 0.0) {
+                found.push(format!(
+                    "{field} {cap} (logit soft-capping is not modelled)"
+                ));
+            }
+        }
+        let routed_named = ["n_routed_experts", "num_experts"]
+            .iter()
+            .any(|field| text.get(*field).is_some_and(|value| !value.is_null()));
+        if !routed_named
+            && let Some(experts) = text.get("num_local_experts").and_then(Value::as_u64)
+        {
+            found.push(format!(
+                "num_local_experts {experts} (Mixtral-style routed experts are not read; the \
+                 layers would parse as dense MLPs)"
+            ));
+        }
+        if let Some(config) = object(root, "quantization_config") {
+            let declared = optional_string(config, "quant_method")
+                .filter(|name| !names_the_producer(name))
+                .or_else(|| optional_string(config, "quant_algo"));
+            let modelled = quantization(root).is_ok_and(|parsed| {
+                parsed.dense_format != WeightFormat::Bf16
+                    || parsed.expert_format != WeightFormat::Bf16
+            });
+            let plain = declared.as_deref().is_none_or(|name| {
+                matches!(name.to_ascii_lowercase().as_str(), "" | "bf16" | "none")
+            });
+            if !modelled && !plain {
+                found.push(format!(
+                    "quantization method {:?} (not a format this build models; it would be read \
+                     as BF16)",
+                    declared.unwrap_or_default()
+                ));
+            }
+        }
+        found
+    }
+
     /// Re-describe a Qwen FP8 release whose global `fp8` flag quantises only its routed experts.
     ///
     /// The official Qwen3.8-Flash-Next FP8 pack stores the 24,576 routed experts as E4M3 with
@@ -2824,6 +2884,61 @@ mod tests {
             AttentionKind::Gqa { kv_heads: 8, .. }
         ));
         assert!(matches!(layer.ffn, Ffn::Dense(_)));
+    }
+
+    #[test]
+    fn the_declarations_the_parser_drops_are_named() {
+        let llama: Value = serde_json::from_str(
+            r#"{"model_type": "llama", "hidden_size": 64, "intermediate_size": 128,
+                "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 2,
+                "vocab_size": 32}"#,
+        )
+        .expect("JSON");
+        assert!(Architecture::unmodelled_features(&llama).is_empty());
+
+        let mut gemma = llama.clone();
+        gemma["attn_logit_softcapping"] = serde_json::json!(50.0);
+        gemma["final_logit_softcapping"] = serde_json::json!(30.0);
+        let found = Architecture::unmodelled_features(&gemma);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].starts_with("attn_logit_softcapping 50"));
+
+        let mut mixtral = llama.clone();
+        mixtral["num_local_experts"] = serde_json::json!(8);
+        mixtral["num_experts_per_tok"] = serde_json::json!(2);
+        let found = Architecture::unmodelled_features(&mixtral);
+        assert!(found[0].contains("num_local_experts 8"), "{found:?}");
+        // A document that also names the count the parser reads is modelled.
+        mixtral["num_experts"] = serde_json::json!(8);
+        assert!(Architecture::unmodelled_features(&mixtral).is_empty());
+
+        let mut awq = llama.clone();
+        awq["quantization_config"] = serde_json::json!({"quant_method": "awq", "bits": 4});
+        let found = Architecture::unmodelled_features(&awq);
+        assert!(found[0].contains("\"awq\""), "{found:?}");
+
+        let mut fp8 = llama;
+        fp8["quantization_config"] =
+            serde_json::json!({"quant_method": "fp8", "weight_block_size": [128, 128]});
+        assert!(Architecture::unmodelled_features(&fp8).is_empty());
+    }
+
+    #[test]
+    fn the_released_documents_declare_nothing_unmodelled() {
+        for text in [
+            include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json"),
+            include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        ] {
+            let root: Value = serde_json::from_str(text).expect("released JSON");
+            assert!(
+                Architecture::unmodelled_features(&root).is_empty(),
+                "{:?}",
+                Architecture::unmodelled_features(&root)
+            );
+        }
     }
 
     #[test]
