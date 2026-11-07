@@ -292,6 +292,11 @@ impl Qwen4ExpConfig {
         architecture: sparkflash_model::Architecture,
     ) -> Result<Self, ConfigError> {
         let mut architecture = architecture;
+        // The serving path reads the architecture with
+        // [sparkflash_model::Architecture::from_checkpoint_dir], which is the raw document. Apply
+        // the same producer correction [crate::architecture::architecture_from_json] applies, so
+        // a directory load and a text load produce the same typed formats.
+        architecture.experts_only_fp8();
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         let text = root.text_config;
@@ -1352,22 +1357,135 @@ mod tests {
         use sparkflash_model::Target;
         use sparkflash_ops::engine_plan::EnginePlan;
         use sparkflash_ops::resolver::{Availability, KernelResolver};
+        // The production path plans the arm's corrected architecture, not a raw re-parse.
+        let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried FP8 config");
         for world in [1, 2, 4] {
-            let plan = EnginePlan::from_json(CARRIED_FP8_CONFIG, Target::Sm121, world, 0)
-                .unwrap_or_else(|error| panic!("the FP8 release at TP{world}: {error}"));
-            let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue)
-                .with_family(plan.family());
+            let plan =
+                EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, world, 0)
+                    .unwrap_or_else(|error| panic!("the FP8 release at TP{world}: {error}"));
+            assert_eq!(
+                plan.precision().dense,
+                sparkflash_ops::plan::Precision::Bf16,
+                "the FP8 pack stores BF16 dense weights"
+            );
+            assert_eq!(
+                plan.precision().experts,
+                sparkflash_ops::plan::Precision::Fp8E4M3,
+                "the FP8 pack stores FP8 routed experts"
+            );
+            let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
             let failures = resolver.failures(&plan);
+            // The carried document names a 16x16 vision patch and the shared tower is compiled
+            // for 14x14. Every language part must still resolve; the vision tower is an explicit
+            // refusal until a 16-patch body exists, not a silent 14-patch launch.
+            let language: Vec<_> = failures
+                .iter()
+                .filter(|failure| failure.part != sparkflash_model::Part::Vision)
+                .collect();
             assert!(
-                failures.is_empty(),
+                language.is_empty(),
                 "TP{world}: {}",
-                failures
+                language
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
                     .join("; ")
             );
+            assert!(
+                failures
+                    .iter()
+                    .any(|failure| failure.part == sparkflash_model::Part::Vision
+                        && failure.to_string().contains("vision patch 16")),
+                "TP{world}: the 16-patch vision tower must be refused"
+            );
         }
+        // The plan's routed-expert width is rank_config's run of whole 128-wide scale tiles,
+        // not an even 160-column split: five tiles over four ranks are 2/1/1/1 columns.
+        use crate::device::tp::{Shard, rank_config};
+        for (rank, width) in [(0, 256), (1, 128), (2, 128), (3, 128)] {
+            let plan =
+                EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 4, rank)
+                    .unwrap_or_else(|error| panic!("the FP8 release at TP4/{rank}: {error}"));
+            let moe = plan
+                .requirements()
+                .find(|requirement| requirement.part == sparkflash_model::Part::Moe)
+                .expect("a Qwen FP8 MoE requirement");
+            let local =
+                rank_config(&config, Shard { rank, world: 4 }).expect("an FP8 rank configuration");
+            assert_eq!(
+                moe.geometry.intermediate, local.moe_intermediate_size,
+                "rank {rank} plans the width rank_config uploads"
+            );
+            assert_eq!(moe.geometry.intermediate, width, "rank {rank}");
+        }
+    }
+
+    /// The serving constructor, not the text parser, must apply the FP8 correction.
+    ///
+    /// `Qwen4ExpConfig::from_checkpoint_dir` reads the shared architecture as the raw document
+    /// (`Architecture::from_checkpoint_dir`) and hands it to `from_json_with_architecture`,
+    /// which is the serving path's only call to `experts_only_fp8`. A test through
+    /// `qwen38_flash_next_fp8()` cannot see that call: `from_json` applies the correction
+    /// inside `architecture_from_json`, so deleting it from the serving constructor would leave
+    /// the text-path test green while a real checkpoint planned BF16 dense weights as FP8.
+    #[test]
+    fn the_fp8_checkpoint_directory_serves_bf16_dense_and_fp8_experts() {
+        use sparkflash_model::Target;
+        use sparkflash_model::architecture::WeightFormat;
+        use sparkflash_ops::engine_plan::{EnginePlan, PrecisionPolicy};
+        use sparkflash_ops::plan::Precision;
+
+        let directory = tempfile::TempDir::new().expect("a temporary directory");
+        std::fs::write(
+            directory.path().join("config.json"),
+            include_str!("../config/qwen38_flash_next_fp8.hf.json"),
+        )
+        .expect("config.json");
+        std::fs::write(
+            directory.path().join("generation_config.json"),
+            r#"{"eos_token_id": [248044]}"#,
+        )
+        .expect("generation_config.json");
+        let config = Qwen4ExpConfig::from_checkpoint_dir(directory.path()).expect("the checkpoint");
+        assert_eq!(
+            config.architecture.quantization.dense_format,
+            WeightFormat::Bf16,
+            "the serving constructor must apply the Qwen FP8 producer correction"
+        );
+        assert!(
+            matches!(
+                config.architecture.quantization.expert_format,
+                WeightFormat::Fp8Tile {
+                    block_m: 128,
+                    block_n: 128,
+                    ..
+                }
+            ),
+            "the correction must leave the routed experts FP8: {:?}",
+            config.architecture.quantization.expert_format
+        );
+        let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 4, 0)
+            .expect("the FP8 checkpoint plans at TP4");
+        assert_eq!(
+            plan.precision(),
+            PrecisionPolicy::from_architecture(&config.architecture),
+            "the plan reads the corrected architecture, not a raw re-parse"
+        );
+        assert_eq!(
+            plan.precision().dense,
+            Precision::Bf16,
+            "the dense weights are stored BF16"
+        );
+        assert_eq!(
+            plan.precision().experts,
+            Precision::Fp8E4M3,
+            "the routed experts are stored E4M3"
+        );
+        assert_eq!(
+            plan.precision().mtp,
+            Precision::Fp8E4M3,
+            "the MTP stage keeps its own FP8 format"
+        );
     }
 
     #[test]

@@ -164,6 +164,7 @@ use sparkflash_model_deepseek_v41::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_ops::parts::serving;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_scheduler::config::SchedulerConfig;
 use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
@@ -5877,8 +5878,14 @@ pub(super) fn check_checkpoint_plan(
     let config = directory.join(CHECKPOINT_CONFIG_NAME);
     let plan = EnginePlan::from_path(&config, Target::Sm121, world, 0)
         .map_err(|error| format!("--checkpoint {}: {error}", directory.display()))?;
-    let resolver = KernelResolver::new(Target::Sm121, availability).with_family(plan.family());
-    let failures = resolver.failures(&plan);
+    let resolver = KernelResolver::new(Target::Sm121, availability);
+    // The DeepSeek device arm loads and runs the 14-patch tower, so its serving set keeps
+    // Vision: a 16-patch document is still refused at boot. (The Qwen and GLM packs use
+    // [serving_language] instead.) The catalogue's own boot_check still judges the whole plan.
+    let failures = resolver
+        .boot_check_serving(&plan, &serving(Target::Sm121))
+        .err()
+        .unwrap_or_default();
     if failures.is_empty() {
         eprintln!("sparkflash serve: plan {}", plan.boot_summary());
         return Ok(());
@@ -5890,6 +5897,23 @@ pub(super) fn check_checkpoint_plan(
         plan.family(),
         reasons.join("; ")
     ))
+}
+
+/// The V4.1 serving path's kernel-shape boot gate.
+///
+/// Only an engine that launches kernels is gated. The reference engine runs the host twin and
+/// loads no kernel, so the catalogue's rank-local shape rules (DeepSeek's b12x MXFP4 MoE is
+/// compiled for the 576-column TP4 shape) do not describe it. Gating it at TP1 refused the
+/// default `sparkflash serve --checkpoint <released>` path for a run that never launches one.
+/// The device engine keeps the TP1/TP2 refusal.
+fn check_serve_plan(engine: EngineChoice, checkpoint: Option<&Path>) -> Result<(), String> {
+    if engine == EngineChoice::Reference {
+        return Ok(());
+    }
+    let Some(checkpoint) = checkpoint else {
+        return Ok(());
+    };
+    check_checkpoint_plan(checkpoint, 1, Availability::runtime_env())
 }
 
 /// Load the default DeepSeek arm's typed profile and apply the declared environment overrides.
@@ -5975,14 +5999,7 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     };
     if !options.synthetic {
-        let availability = if options.engine == EngineChoice::Reference {
-            Availability::Catalogue
-        } else {
-            Availability::Runtime
-        };
-        if let Some(checkpoint) = options.checkpoint.as_deref()
-            && let Err(message) = check_checkpoint_plan(checkpoint, 1, availability)
-        {
+        if let Err(message) = check_serve_plan(options.engine, options.checkpoint.as_deref()) {
             eprintln!("sparkflash serve: {message}");
             return ExitCode::from(EXIT_REFUSED);
         }
@@ -10710,6 +10727,38 @@ mod device_token_serve_tests {
     }
 
     #[test]
+    fn the_default_reference_serve_is_not_refused_by_a_kernel_shape_rule() {
+        let dir = tempfile::TempDir::new().expect("a temporary directory");
+        std::fs::write(
+            dir.path().join(CHECKPOINT_CONFIG_NAME),
+            include_str!(
+                "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+            ),
+        )
+        .expect("the released configuration");
+        // The production argv: `sparkflash serve --checkpoint <released>`, default engine.
+        let options = ServeOptions::parse(vec![
+            "--checkpoint".to_owned(),
+            dir.path().to_string_lossy().to_string(),
+        ])
+        .expect("the default reference serve parses");
+        assert_eq!(options.engine, EngineChoice::Reference);
+        check_serve_plan(options.engine, options.checkpoint.as_deref()).expect(
+            "the reference engine launches no kernel, so the TP1 kernel-shape gate must not refuse it",
+        );
+        // The skip is the reference engine's alone: the device engine launches kernels and must
+        // still be gated, or the exemption would have removed the TP1 refusal from the arm it was
+        // written for.
+        let error = check_serve_plan(EngineChoice::Device, options.checkpoint.as_deref())
+            .expect_err("the device engine launches kernels and is still gated at TP1");
+        assert!(!error.is_empty(), "the device refusal names no reason");
+        // The resolver's TP1 refusal remains for the kernel path.
+        let error = check_checkpoint_plan(dir.path(), 1, Availability::Catalogue)
+            .expect_err("a kernel launch at TP1 is still refused");
+        assert!(error.contains("does not equal 576"), "{error}");
+    }
+
+    #[test]
     fn a_released_deepseek_checkpoint_plans_before_boot() {
         let dir = tempfile::TempDir::new().expect("a temporary directory");
         std::fs::write(
@@ -10721,6 +10770,52 @@ mod device_token_serve_tests {
         .expect("the released configuration");
         check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
             .expect("the released DeepSeek config plans and resolves at TP4");
+    }
+
+    /// Rewrite every model_type in the document, including the nested text and vision configs.
+    fn unregister_model_type(text: &str) -> String {
+        fn rewrite(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if fields.contains_key("model_type") {
+                        fields.insert(
+                            "model_type".to_owned(),
+                            serde_json::Value::String("unregistered_model_type".to_owned()),
+                        );
+                    }
+                    for child in fields.values_mut() {
+                        rewrite(child);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for child in items {
+                        rewrite(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut value: serde_json::Value = serde_json::from_str(text).expect("json");
+        rewrite(&mut value);
+        value.to_string()
+    }
+
+    #[test]
+    fn the_serve_plan_check_never_reads_the_model_type() {
+        let released = include_str!(
+            "../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+        );
+        for (label, text) in [
+            ("released", released.to_owned()),
+            ("unregistered model_type", unregister_model_type(released)),
+        ] {
+            let dir = tempfile::TempDir::new().expect("a temporary directory");
+            std::fs::write(dir.path().join(CHECKPOINT_CONFIG_NAME), text)
+                .expect("the carried configuration");
+            check_checkpoint_plan(dir.path(), 4, Availability::Catalogue).unwrap_or_else(|error| {
+                panic!("{label}: the serve plan check refused a resolvable config: {error}")
+            });
+        }
     }
 
     #[test]

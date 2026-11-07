@@ -30,30 +30,59 @@
 //!
 //! # Example
 //!
+//!     use sparkflash_model::Part;
+//!     use sparkflash_ops::engine_plan::PartRequirement;
 //!     use sparkflash_ops::gemm::DenseGemmPlan;
-//!     use sparkflash_ops::plan::{Matrix, OpPlan, Precision, Layout, StreamId};
+//!     use sparkflash_ops::plan::{
+//!         Layout, Matrix, OpPlan, PartGeometry, Precision, StreamId,
+//!     };
+//!     use sparkflash_ops::resolver::PlanContext;
 //!
+//!     let context = PlanContext::SM121_CATALOGUE;
+//!     let requirement = PartRequirement {
+//!         part: Part::DenseGemm,
+//!         geometry: PartGeometry {
+//!             rows: 128,
+//!             intermediate: 4096,
+//!             ..PartGeometry::new()
+//!         },
+//!         precision: Precision::MxFp8,
+//!     };
 //!     let plain = DenseGemmPlan::new(
+//!         context,
+//!         &requirement,
 //!         Matrix::new(128, 4096),
-//!         2560,
-//!         Precision::MxFp8,
+//!         5120,
 //!         Layout::BlockScaled { block: 32 },
 //!         StreamId(7),
 //!         1,
 //!     )
 //!     .expect("a valid GEMM");
 //!     let split = DenseGemmPlan::new(
+//!         context,
+//!         &requirement,
 //!         Matrix::new(128, 4096),
-//!         2560,
-//!         Precision::MxFp8,
+//!         5120,
 //!         Layout::BlockScaled { block: 32 },
 //!         StreamId(7),
 //!         4,
 //!     )
 //!     .expect("a valid split-K GEMM");
+//!     // The b12x MXFP8 body is generic over the hidden width, so a 2560-wide arm resolves too.
+//!     let generic = DenseGemmPlan::new(
+//!         context,
+//!         &requirement,
+//!         Matrix::new(8, 2560),
+//!         2560,
+//!         Layout::BlockScaled { block: 32 },
+//!         StreamId(7),
+//!         1,
+//!     )
+//!     .expect("a valid 2560-wide GEMM");
 //!     assert!(!plain.is_split_k());
 //!     assert!(split.is_split_k());
 //!     assert_eq!(split.workspace_floats(), 4 * 128 * 4096);
+//!     assert_eq!(generic.geometry.hidden, 2560);
 
 pub mod attention;
 pub mod codec;
@@ -82,7 +111,7 @@ pub use engine_plan::{
 pub use error::OpError;
 pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
 pub use plan::{
-    DType, KernelId, Launch, Layout, Matrix, OpKind, OpPlan, Operand, PartGeometry, Precision,
-    PrecisionMask, ShapeConstraint, StreamId,
+    DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind, OpPlan, Operand,
+    PartGeometry, Precision, PrecisionMask, ShapeConstraint, StreamId,
 };
-pub use resolver::{Availability, KernelResolver, ResolveError, ResolvedKernel};
+pub use resolver::{Availability, KernelResolver, PlanContext, ResolveError, ResolvedKernel};

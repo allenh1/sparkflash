@@ -36,6 +36,7 @@ use sparkflash_model::{ModelBackend, ModelDescriptor, ModelProfile, PromptCodec,
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_ops::parts::serving_language;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_weights::rank_file::{find_converted_rank_file, rank_file_name};
 
@@ -87,6 +88,9 @@ pub(super) trait PackArm {
     fn write_fixture(directory: &Path) -> Result<Self::Config, String>;
     /// The configuration of the checkpoint in `directory`.
     fn read_config(directory: &Path) -> Result<Self::Config, String>;
+    /// The shared architecture the typed configuration carries, with the producer correction the
+    /// arm's bridge applies. The boot plan is built from this view, not from a raw re-parse.
+    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture;
     /// The checkpoint's window, `max_position_embeddings`.
     fn window(config: &Self::Config) -> usize;
     /// What a group serves over `context` tokens.
@@ -165,6 +169,10 @@ impl PackArm for QwenArm {
                 directory.join(CHECKPOINT_CONFIG_NAME).display()
             )
         })
+    }
+
+    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
+        &config.architecture
     }
 
     fn window(config: &Self::Config) -> usize {
@@ -273,6 +281,10 @@ impl PackArm for QwenFp8Arm {
         <QwenArm as PackArm>::read_config(directory)
     }
 
+    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
+        <QwenArm as PackArm>::architecture(config)
+    }
+
     fn window(config: &Self::Config) -> usize {
         <QwenArm as PackArm>::window(config)
     }
@@ -355,6 +367,10 @@ impl PackArm for GlmArm {
         }
         Glm5NextConfig::from_checkpoint_dir(directory)
             .map_err(|error| format!("{}: {error}", path.display()))
+    }
+
+    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
+        &config.architecture
     }
 
     fn window(config: &Self::Config) -> usize {
@@ -513,6 +529,11 @@ impl Pack {
     /// image implements each part, and [sparkflash_ops::parts::missing_loadable] keeps only the
     /// parts with an image this build can actually load (an embedded image, or the DeepSeek arm's
     /// run-time cubin directory). An empty list is the whole bring-up condition.
+    ///
+    /// The question is about the *served* parts, not every part the document names. The Qwen and
+    /// GLM packs do not stage a vision tower, so a document whose only missing image is the
+    /// tower's DeepSeek cubin (absent without `SPARKFLASH_CUBINS`) must still parse and boot.
+    /// The DeepSeek pack keeps the full set, because its device arm runs the tower.
     /// A document that does not parse names no parts here; [Self::detect] already refused it.
     pub(super) fn missing_parts(directory: &Path) -> Vec<sparkflash_model::Part> {
         let path = directory.join(CHECKPOINT_CONFIG_NAME);
@@ -522,7 +543,18 @@ impl Pack {
         let Ok(architecture) = sparkflash_model::Architecture::from_json(&text) else {
             return Vec::new();
         };
+        let served = match Self::detect(directory) {
+            Some(Self::Deepseek) | None => {
+                sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
+            }
+            Some(Self::Qwen | Self::QwenFp8 | Self::Glm) => {
+                sparkflash_ops::parts::serving_language(sparkflash_model::Target::Sm121)
+            }
+        };
         sparkflash_ops::parts::missing_loadable(&architecture, sparkflash_model::Target::Sm121)
+            .into_iter()
+            .filter(|part| served.contains(*part))
+            .collect()
     }
 
     /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
@@ -799,16 +831,43 @@ fn check_backend_plan(plan: &EnginePlan, family: &str, layers: usize) -> Result<
 
 /// Check the checkpoint's execution plan against the kernel catalogue at `world`.
 ///
-/// This is the boot-time use of the model-independent plan: every part instance is resolved
-/// to a loadable image before the arm opens a weight. The check is skipped for the synthetic
-/// fixture, which exercises the serving path without claiming this build's device images.
-fn check_plan<A: PackArm>(directory: &Path, world: usize) -> Result<EnginePlan, String> {
-    let config = directory.join(CHECKPOINT_CONFIG_NAME);
-    let plan = EnginePlan::from_path(&config, Target::Sm121, world, 0)
-        .map_err(|error| format!("cannot plan the {} checkpoint: {error}", A::NAME))?;
-    let resolver =
-        KernelResolver::new(Target::Sm121, Availability::Runtime).with_family(plan.family());
-    let failures = resolver.failures(&plan);
+/// This is the boot-time use of the model-independent plan: every part instance the arm
+/// executes is resolved to a loadable image before the arm opens a weight. The check is skipped
+/// for the synthetic fixture, which exercises the serving path without claiming this build's
+/// device images.
+fn check_plan<A: PackArm>(
+    directory: &Path,
+    config: &A::Config,
+    world: usize,
+) -> Result<EnginePlan, String> {
+    check_plan_with::<A>(directory, config, world, Availability::runtime_env())
+}
+
+/// [check_plan] under an explicit availability policy.
+///
+/// The gate is serving-aware: it checks the parts the arm executes ([serving]), not the whole
+/// plan, because the Qwen and GLM packs do not load a vision tower (D84): DeepSeek loads and
+/// runs the 14-patch tower, and those two arms do not. The catalogue's own
+/// [KernelResolver::boot_check] still refuses the 16-patch tower on the plan itself, so this
+/// does not weaken the catalogue's patch constraint.
+fn check_plan_with<A: PackArm>(
+    directory: &Path,
+    config: &A::Config,
+    world: usize,
+    availability: Availability,
+) -> Result<EnginePlan, String> {
+    // Plan the architecture the arm parsed, not a second raw view of the document: the Qwen FP8
+    // bridge corrects the producer's global fp8 flag, and the boot plan must see that correction.
+    let plan =
+        EnginePlan::for_architecture(A::architecture(config).clone(), Target::Sm121, world, 0)
+            .map_err(|error| format!("cannot plan the {} checkpoint: {error}", A::NAME))?;
+    let resolver = KernelResolver::new(Target::Sm121, availability);
+    // Prove both passes: a plan that resolves only because a decode symbol was accepted for a
+    // prefill request has not booted, it has half-booted.
+    let failures = resolver
+        .boot_check_serving(&plan, &serving_language(Target::Sm121))
+        .err()
+        .unwrap_or_default();
     if failures.is_empty() {
         eprintln!("sparkflash serve: {} plan {}", A::NAME, plan.boot_summary());
         return Ok(plan);
@@ -829,7 +888,7 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     let plan = if options.synthetic {
         None
     } else {
-        Some(check_plan::<A>(&directory, 1)?)
+        Some(check_plan::<A>(&directory, &config, 1)?)
     };
     let profile = A::profile()?;
     sparkflash_model::install_active(profile.clone());
@@ -931,7 +990,7 @@ fn serve_group<A: PackArm>(
     // Every rank derives the window from the same configuration, so the group agrees on the
     // sequence width without rank 0 sending it.
     let context = pack_context::<A>(options, &config)?;
-    check_plan::<A>(&directory, tp4.world_size)?;
+    check_plan::<A>(&directory, &config, tp4.world_size)?;
     // The pack's carried profile is the source of truth for this arm, exactly as it is on the
     // single-node path (serve_host installs it). Without this the four-rank arm read
     // ModelProfile::default() everywhere it asked active_profile(), so every setting the file
@@ -1161,6 +1220,70 @@ mod tests {
             assert!(
                 missing.contains(&sparkflash_model::Part::Csa2Compression),
                 "a run-time-only image is not loadable without its cubin directory: {missing:?}"
+            );
+        }
+    }
+
+    /// The CLI's real Qwen FP8 boot path: the serving constructor parses the released FP8
+    /// document, the plan is built from its corrected architecture, and the serving boot check
+    /// resolves every language part at TP1 and TP4. The catalogue's whole-plan check still
+    /// refuses the 16-patch tower, so this does not weaken the patch rule.
+    #[test]
+    fn the_released_qwen_fp8_pack_boots_at_tp1_and_tp4() {
+        const QWEN_FP8: &str = include_str!(
+            "../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
+        );
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), QWEN_FP8)
+            .expect("the carried config is written");
+        std::fs::write(
+            directory.path().join("generation_config.json"),
+            r#"{"eos_token_id": [248044]}"#,
+        )
+        .expect("the carried generation config is written");
+        let config =
+            QwenFp8Arm::read_config(directory.path()).expect("the FP8 serving configuration");
+        for world in [1, 4] {
+            let plan = check_plan_with::<QwenFp8Arm>(
+                directory.path(),
+                &config,
+                world,
+                Availability::Catalogue,
+            )
+            .unwrap_or_else(|error| panic!("Qwen FP8 TP{world}: {error}"));
+            assert!(
+                plan.requirements()
+                    .any(|requirement| requirement.part == sparkflash_model::Part::Vision),
+                "the released document still plans the tower"
+            );
+            assert_eq!(
+                plan.precision().experts,
+                sparkflash_ops::plan::Precision::Fp8E4M3,
+                "TP{world}"
+            );
+            if world == 4 {
+                let moe = plan
+                    .requirements()
+                    .find(|requirement| requirement.part == sparkflash_model::Part::Moe)
+                    .expect("a Qwen FP8 MoE requirement");
+                assert_eq!(moe.geometry.intermediate, 256, "rank 0's whole-tile share");
+            }
+            // The catalogue's own boot check (the whole plan) still refuses the tower.
+            let resolver = KernelResolver::new(Target::Sm121, Availability::Catalogue);
+            let errors = resolver
+                .boot_check(&plan)
+                .expect_err("the 16-patch tower is still refused");
+            assert!(
+                errors
+                    .iter()
+                    .all(|error| error.part == sparkflash_model::Part::Vision),
+                "TP{world}: language parts must boot: {errors:?}"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.to_string().contains("vision patch 16")),
+                "TP{world}: {errors:?}"
             );
         }
     }

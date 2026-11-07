@@ -15,9 +15,14 @@
 //! Collectives: one-shot and two-shot all-reduce, reduce-scatter, all-gather and the
 //! overlapped-halves runner.
 
+use sparkflash_model::Part;
+
+use crate::engine_plan::PartRequirement;
 use crate::error::OpError;
-use crate::images::Image;
-use crate::plan::{KernelId, Launch, OpKind, OpPlan, StreamId};
+use crate::plan::{
+    KernelId, KernelPhase, Launch, OpKind, OpPlan, PartGeometry, Precision, StreamId,
+};
+use crate::resolver::PlanContext;
 
 /// The collective a plan runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +39,20 @@ pub enum CollectiveKind {
     OverlappedHalves,
 }
 
+impl CollectiveKind {
+    /// The collective's stable name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OneShot => "one-shot",
+            Self::TwoShot => "two-shot",
+            Self::ReduceScatter => "reduce-scatter",
+            Self::AllGather => "all-gather",
+            Self::OverlappedHalves => "overlapped-halves",
+        }
+    }
+}
+
 /// A collective plan over a typed payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectivePlan {
@@ -47,29 +66,76 @@ pub struct CollectivePlan {
     pub world: usize,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The precision the collective body was resolved at.
+    pub precision: Precision,
+    /// The geometry the kernel was resolved at.
+    pub geometry: PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl CollectivePlan {
-    /// A collective plan.
+    /// A collective plan built from a Collective requirement.
     ///
     /// # Errors
-    /// A zero dimension, a world of one, or a payload that does not split for a two-shot form.
+    /// A zero dimension, a world of one, a payload that does not split for a two-shot form, a
+    /// kind with no catalogued kernel, or no catalogue entry for the given world.
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         kind: CollectiveKind,
         elements: usize,
         element_bytes: usize,
         world: usize,
         stream: StreamId,
     ) -> Result<Self, OpError> {
-        let plan = Self {
+        if requirement.part != Part::Collective {
+            return Err(OpError::Binding(format!(
+                "a collective was built from a {} requirement",
+                requirement.part
+            )));
+        }
+        let plan_inputs = Self {
             kind,
             elements,
             element_bytes,
             world,
             stream,
+            precision: requirement.precision,
+            geometry: PartGeometry {
+                world,
+                ..requirement.geometry
+            },
+            resolved: KernelId::new(context.target(), crate::images::Image::Rocenante, ""),
         };
-        plan.validate()?;
-        Ok(plan)
+        plan_inputs.validate()?;
+        let symbols: &[&'static str] = match kind {
+            CollectiveKind::OneShot => &["rocenante_oneshot_allreduce_bf16_tp4"],
+            CollectiveKind::TwoShot | CollectiveKind::OverlappedHalves => &["q4e_sum_slots"],
+            CollectiveKind::ReduceScatter | CollectiveKind::AllGather => {
+                // Neither form has a catalogued kernel: the names the old hardcoded plan used
+                // were split-K GEMM symbols, not collectives. Refuse rather than misdescribe
+                // them.
+                return Err(OpError::Unsupported {
+                    op: kind.name(),
+                    dtype: "no catalogued collective kernel",
+                });
+            }
+        };
+        let resolved = context.resolve_any(
+            &PartRequirement {
+                part: Part::Collective,
+                geometry: plan_inputs.geometry,
+                precision: requirement.precision,
+            },
+            KernelPhase::Both,
+            symbols,
+        )?;
+        Ok(Self {
+            precision: resolved.precision,
+            resolved: resolved.id(),
+            ..plan_inputs
+        })
     }
 
     /// The bytes the payload moves.
@@ -102,20 +168,7 @@ impl OpPlan for CollectivePlan {
     }
 
     fn kernel(&self) -> KernelId {
-        match self.kind {
-            CollectiveKind::OneShot => {
-                KernelId::new(Image::Rocenante, "rocenante_oneshot_allreduce_bf16_tp4")
-            }
-            CollectiveKind::ReduceScatter => {
-                KernelId::new(Image::Deepseek, "b12x_mxfp8_dense_split_k_sm121")
-            }
-            CollectiveKind::AllGather => {
-                KernelId::new(Image::Deepseek, "b12x_mxfp8_dense_split_k_combine_sm121")
-            }
-            CollectiveKind::TwoShot | CollectiveKind::OverlappedHalves => {
-                KernelId::new(Image::Qwen4Exp, "q4e_sum_slots")
-            }
-        }
+        self.resolved
     }
 
     fn launch(&self) -> Launch {

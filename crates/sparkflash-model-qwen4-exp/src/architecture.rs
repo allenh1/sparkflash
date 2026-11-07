@@ -31,10 +31,20 @@ const CARRIED_CONFIG: &str = include_str!("../config/qwen38_flash_next_nvfp4.hf.
 
 /// Parse the shared architecture from a released Qwen3.8 `config.json`.
 ///
+/// The official FP8 pack writes one global `quant_method: "fp8"` while storing only the routed
+/// experts as E4M3; every other tensor is BF16. [Architecture::experts_only_fp8] applies the
+/// arm's producer correction after the shared parse, so the execution plan's dense/attention
+/// class is BF16 and its expert class is FP8. Only this bridge and
+/// `Qwen4ExpConfig::from_json_with_architecture` call it: the shared operation is Qwen's
+/// correction, not a rule that every FP8-looking document should be rewritten. The NVFP4
+/// document already parses that way, and the operation is a no-op there.
+///
 /// # Errors
 /// As [Architecture::from_json].
 pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
-    Architecture::from_json(text)
+    let mut architecture = Architecture::from_json(text)?;
+    architecture.experts_only_fp8();
+    Ok(architecture)
 }
 
 /// The shared architecture of the released Qwen3.8 checkpoint carried in this crate.
@@ -42,7 +52,7 @@ pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
 /// # Errors
 /// [ConfigError::Json] only if the carried document were edited into an unreadable shape.
 pub fn architecture_from_carried() -> Result<Architecture, ConfigError> {
-    let mut architecture = Architecture::from_json(CARRIED_CONFIG)?;
+    let mut architecture = architecture_from_json(CARRIED_CONFIG)?;
     // The Qwen pack stops on <|im_end|> as well as the config's <|endoftext|>; the released
     // config names only the latter. Apply the pack's stop rule here so a caller that reads the
     // architecture directly (the codec does) sees the same list the typed config does.

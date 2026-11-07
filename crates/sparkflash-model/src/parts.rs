@@ -63,6 +63,26 @@ pub enum Part {
     Mtp,
     /// A vision tower and its aligner.
     Vision,
+    /// A shared dense projection, distinct from the dense MLP block.
+    DenseGemm,
+    /// A fused activation or gated activation epilogue.
+    Activation,
+    /// A rotary embedding epilogue.
+    Rope,
+    /// An on-the-fly quantization epilogue.
+    Quantize,
+    /// Layer normalization, distinct from RMSNorm.
+    LayerNorm,
+    /// Router logits and top-k selection.
+    MoeRouter,
+    /// The routed-expert combine.
+    MoeCombine,
+    /// A grouped GEMM over routed experts.
+    GroupedMoeGemm,
+    /// The routed-expert planning kernel every arm shares.
+    MoePlan,
+    /// A collective (one-shot, two-shot, reduce-scatter or all-gather).
+    Collective,
 }
 
 impl Part {
@@ -85,6 +105,16 @@ impl Part {
         Self::Ple,
         Self::Mtp,
         Self::Vision,
+        Self::DenseGemm,
+        Self::Activation,
+        Self::Rope,
+        Self::Quantize,
+        Self::LayerNorm,
+        Self::MoeRouter,
+        Self::MoeCombine,
+        Self::GroupedMoeGemm,
+        Self::MoePlan,
+        Self::Collective,
     ];
 
     /// The stable name used in diagnostics and configuration.
@@ -108,6 +138,16 @@ impl Part {
             Self::Ple => "ple",
             Self::Mtp => "mtp",
             Self::Vision => "vision",
+            Self::DenseGemm => "dense_gemm",
+            Self::Activation => "activation",
+            Self::Rope => "rope",
+            Self::Quantize => "quantize",
+            Self::LayerNorm => "layer_norm",
+            Self::MoeRouter => "moe_router",
+            Self::MoeCombine => "moe_combine",
+            Self::GroupedMoeGemm => "grouped_moe_gemm",
+            Self::MoePlan => "moe_plan",
+            Self::Collective => "collective",
         }
     }
 

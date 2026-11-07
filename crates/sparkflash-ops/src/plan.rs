@@ -19,6 +19,8 @@
 //! plan, and the caller binds the buffers it already holds. That is what lets a kernel
 //! improvement land in every model without a graph runtime or a host round trip.
 
+use sparkflash_model::Target;
+
 use crate::error::OpError;
 
 /// A scalar type a kernel reads or writes.
@@ -357,9 +359,16 @@ impl OpKind {
     }
 }
 
-/// A kernel's identity in the one stack: the image it lives in and its exported symbol.
+/// A kernel's identity in the one stack: the target, the image it lives in and its exported
+/// symbol.
+///
+/// The target is part of the identity rather than implied by a plan constructor, so a phase-4
+/// [EngineBuilder](crate::engine_plan::EngineBuilder) can prove that the kernel it is about to
+/// load was resolved for the device it opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KernelId {
+    /// The device target the kernel was compiled for.
+    pub target: Target,
     /// The image (a cubin or the shared PTX set).
     pub image: crate::images::Image,
     /// The symbol the driver loads by name.
@@ -367,10 +376,14 @@ pub struct KernelId {
 }
 
 impl KernelId {
-    /// A kernel in an explicit image.
+    /// A kernel in an explicit image on an explicit target.
     #[must_use]
-    pub const fn new(image: crate::images::Image, symbol: &'static str) -> Self {
-        Self { image, symbol }
+    pub const fn new(target: Target, image: crate::images::Image, symbol: &'static str) -> Self {
+        Self {
+            target,
+            image,
+            symbol,
+        }
     }
 }
 
@@ -435,8 +448,10 @@ pub fn even_chunk(count: usize, world: usize) -> Result<usize, OpError> {
 
 /// The pass a kernel implementation belongs to.
 ///
-/// A model can have a prefill body and a decode/token body in different images. The resolver
-/// can select between them; a boot check that must prove both passes calls it once for each.
+/// A model can have a prefill body and a decode/token body in different images. The phase is a
+/// property of the symbol, not of the image: one image can export a prefill body and a decode
+/// body under different names. A boot check that must prove both passes resolves each symbol
+/// once for each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KernelPhase {
     /// Both the bulk prefill and the token/decode pass.
@@ -445,6 +460,96 @@ pub enum KernelPhase {
     Prefill,
     /// The token/decode (few-row) pass.
     Decode,
+}
+
+impl KernelPhase {
+    /// The pass a launch of `rows` rows belongs to.
+    ///
+    /// A one-row (or empty) launch is the token/decode pass; a wider launch is bulk prefill.
+    #[must_use]
+    pub const fn for_rows(rows: usize) -> Self {
+        if rows <= 1 {
+            Self::Decode
+        } else {
+            Self::Prefill
+        }
+    }
+
+    /// Whether a symbol of this phase may serve a request for `requested`.
+    #[must_use]
+    pub const fn serves(self, requested: Self) -> bool {
+        matches!(requested, Self::Both)
+            || matches!(self, Self::Both)
+            || matches!(
+                (self, requested),
+                (Self::Prefill, Self::Prefill) | (Self::Decode, Self::Decode)
+            )
+    }
+
+    /// The stable name used in diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
+}
+
+/// One exported kernel symbol and the arithmetic it accepts.
+///
+/// Precision and phase are per symbol, not per image or per part. An image can export a bf16 GEMM
+/// beside an NVFP4 quantiser, and a part can have a prefill body and a decode body in different
+/// images. The resolver selects a symbol only when this symbol's own mask contains the requested
+/// precision and this symbol's own phase serves the requested pass; there is no fallback to
+/// "the image exports something".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KernelSymbol {
+    /// The name the driver loads.
+    pub name: &'static str,
+    /// The operand precisions this symbol's arithmetic accepts.
+    pub precisions: PrecisionMask,
+    /// The pass this symbol belongs to.
+    pub phase: KernelPhase,
+}
+
+impl KernelSymbol {
+    /// A symbol accepting exactly `precisions` in both passes.
+    #[must_use]
+    pub const fn both(name: &'static str, precisions: &[Precision]) -> Self {
+        Self {
+            name,
+            precisions: PrecisionMask::from_slice(precisions),
+            phase: KernelPhase::Both,
+        }
+    }
+
+    /// A bulk-prefill symbol accepting exactly `precisions`.
+    #[must_use]
+    pub const fn prefill(name: &'static str, precisions: &[Precision]) -> Self {
+        Self {
+            name,
+            precisions: PrecisionMask::from_slice(precisions),
+            phase: KernelPhase::Prefill,
+        }
+    }
+
+    /// A token/decode symbol accepting exactly `precisions`.
+    #[must_use]
+    pub const fn decode(name: &'static str, precisions: &[Precision]) -> Self {
+        Self {
+            name,
+            precisions: PrecisionMask::from_slice(precisions),
+            phase: KernelPhase::Decode,
+        }
+    }
+
+    /// Whether this symbol accepts `precision`.
+    #[must_use]
+    pub const fn accepts(&self, precision: Precision) -> bool {
+        self.precisions.contains(precision)
+    }
 }
 
 /// The set of operand precisions a kernel accepts.
@@ -456,6 +561,18 @@ impl PrecisionMask {
     pub const NONE: Self = Self(0);
     /// Every precision this tree knows.
     pub const ALL: Self = Self(0b1_1111);
+
+    /// The mask naming exactly `precisions`.
+    #[must_use]
+    pub const fn from_slice(precisions: &[Precision]) -> Self {
+        let mut mask = Self::NONE;
+        let mut index = 0;
+        while index < precisions.len() {
+            mask = mask.with(precisions[index]);
+            index += 1;
+        }
+        mask
+    }
 
     /// The bit for one precision.
     #[must_use]
@@ -492,6 +609,28 @@ impl PrecisionMask {
     pub const fn count(self) -> usize {
         self.0.count_ones() as usize
     }
+}
+
+/// The grouped FP8 body an arm's host launches once a batch reaches its grouped threshold.
+///
+/// The bodies are not interchangeable: Qwen's grouped tile takes whole 128-column scale
+/// tiles and its own slot layout, while GLM's block MMA serves three activation forms. Naming
+/// the body, rather than inferring it from a family string or the hidden width, keeps the
+/// plan's symbol priority the host's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupedFp8Body {
+    /// Qwen's grouped 128-tile over E4M3 weights (`q4p_moe_*_fp8`), with its f32
+    /// activations and slot layout.
+    Tiled,
+    /// GLM's dynamic-activation q8 MMA (`glm_moe_q8_mma`): activations quantised per row,
+    /// with the split-activation and BF16-activation block MMAs as its fallbacks.
+    QuantizedActivation,
+    /// GLM's block MMA over an unquantised BF16 activation
+    /// (`glm_moe_fp8b128_mma_bf16a`), selected by `prefill.activation = "bf16"`.
+    Bf16Activation,
+    /// GLM's block MMA over a split bf16 activation (`glm_moe_fp8b128_mma`), the
+    /// `prefill.activation = "split"` body.
+    SplitActivation,
 }
 
 /// The geometry one part runs at on this rank, after the tensor-parallel split.
@@ -558,6 +697,24 @@ pub struct PartGeometry {
     pub window: usize,
     /// Shared-expert intermediate width, rank-local and padded.
     pub shared: usize,
+    /// Tokens in a batch from which the FP8 host takes its grouped body instead of the token
+    /// experts. Zero means the plan applies no token threshold and chooses the pass from the
+    /// token count alone.
+    ///
+    /// The threshold is in tokens, not routed rows: Qwen's host compares its batch against
+    /// `GEMM_MIN_BATCH` (64 tokens), while GLM's counts token rows against `MAX_ROWS` (8)
+    /// and groups from 9 tokens, so a GLM plan sets this to nine.
+    pub grouped_min_tokens: usize,
+    /// Which grouped FP8 body the host launches at or above that threshold.
+    ///
+    /// `None` means the plan has not chosen one. An FP8 grouped GEMM refuses such a
+    /// requirement rather than inheriting another arm's body; [EnginePlan](crate::EnginePlan)
+    /// fills it from the released formats with the released dynamic-activation default. A
+    /// serving profile that overrides the activation form (`bf16` or `split`) is not read by
+    /// [EnginePlan](crate::EnginePlan): the caller constructing the grouped requirement must
+    /// replace this with [GroupedFp8Body::Bf16Activation] or
+    /// [GroupedFp8Body::SplitActivation] itself.
+    pub grouped_fp8_body: Option<GroupedFp8Body>,
     /// The tensors parallel world.
     pub world: usize,
     /// This rank in that world.
@@ -597,6 +754,8 @@ impl PartGeometry {
             groups: 0,
             window: 0,
             shared: 0,
+            grouped_min_tokens: 0,
+            grouped_fp8_body: None,
             world: 0,
             rank: 0,
         }
@@ -632,8 +791,44 @@ pub struct ShapeConstraint {
     pub min_ratio: usize,
     /// The GQA group sizes this kernel implements; empty means any.
     pub gqa_groups: &'static [usize],
-    /// The operand precisions this kernel accepts.
-    pub precisions: PrecisionMask,
+    /// Hidden width that must equal this, when named and nonzero.
+    pub hidden_equals: Option<usize>,
+    /// Intermediate width that must equal this, when named and nonzero.
+    pub intermediate_equals: Option<usize>,
+    /// Expert count that must equal this, when named and nonzero.
+    pub experts_equals: Option<usize>,
+    /// Active-expert count that must equal this, when named and nonzero.
+    pub top_k_equals: Option<usize>,
+    /// Head width that must equal this, when named and nonzero.
+    pub head_dim_equals: Option<usize>,
+    /// Value-head width that must equal this, when named and nonzero.
+    pub v_head_equals: Option<usize>,
+    /// Most experts this implementation addresses.
+    pub max_experts: Option<usize>,
+    /// Most active experts this implementation addresses.
+    pub max_top_k: Option<usize>,
+    /// Most heads this implementation addresses.
+    pub max_heads: Option<usize>,
+    /// Fewest residual streams this implementation accepts.
+    pub min_streams: Option<usize>,
+    /// Most residual streams this implementation accepts.
+    pub max_streams: Option<usize>,
+    /// Fewest convolution/window taps this implementation accepts.
+    pub min_window: Option<usize>,
+    /// Most convolution/window taps this implementation accepts.
+    pub max_window: Option<usize>,
+    /// Fewest output groups this implementation accepts.
+    pub groups_min: Option<usize>,
+    /// Most output groups this implementation accepts.
+    pub groups_max: Option<usize>,
+    /// Vision patch sides this implementation accepts; empty means any.
+    pub patch_sizes: &'static [usize],
+    /// The `(key, value)` head-width template pairs this implementation accepts; empty means any.
+    pub head_pairs: &'static [(usize, usize)],
+    /// The tensor-parallel world this implementation requires, when named.
+    pub world_equals: Option<usize>,
+    /// The smallest tensor-parallel world this implementation addresses.
+    pub world_min: Option<usize>,
 }
 
 impl ShapeConstraint {
@@ -650,7 +845,25 @@ impl ShapeConstraint {
         max_positions: 0,
         min_ratio: 0,
         gqa_groups: &[],
-        precisions: PrecisionMask::ALL,
+        hidden_equals: None,
+        intermediate_equals: None,
+        experts_equals: None,
+        top_k_equals: None,
+        head_dim_equals: None,
+        v_head_equals: None,
+        max_experts: None,
+        max_top_k: None,
+        max_heads: None,
+        min_streams: None,
+        max_streams: None,
+        min_window: None,
+        max_window: None,
+        groups_min: None,
+        groups_max: None,
+        patch_sizes: &[],
+        head_pairs: &[],
+        world_equals: None,
+        world_min: None,
     };
 
     /// Require the hidden width to be a multiple of `multiple`.
@@ -724,21 +937,177 @@ impl ShapeConstraint {
         self
     }
 
-    /// Restrict the operand precisions.
+    /// Require an exact hidden width (ignored when the geometry leaves it at zero).
     #[must_use]
-    pub const fn precisions(mut self, precisions: PrecisionMask) -> Self {
-        self.precisions = precisions;
+    pub const fn hidden_equals(mut self, hidden: usize) -> Self {
+        self.hidden_equals = Some(hidden);
         self
     }
 
-    /// Whether `geometry` at `precision` satisfies this constraint.
+    /// Require an exact intermediate width (ignored when the geometry leaves it at zero).
+    #[must_use]
+    pub const fn intermediate_equals(mut self, intermediate: usize) -> Self {
+        self.intermediate_equals = Some(intermediate);
+        self
+    }
+
+    /// Require an exact expert count (ignored when the geometry leaves it at zero).
+    #[must_use]
+    pub const fn experts_equals(mut self, experts: usize) -> Self {
+        self.experts_equals = Some(experts);
+        self
+    }
+
+    /// Require an exact active-expert count (ignored when the geometry leaves it at zero).
+    #[must_use]
+    pub const fn top_k_equals(mut self, top_k: usize) -> Self {
+        self.top_k_equals = Some(top_k);
+        self
+    }
+
+    /// Require an exact head width (ignored when the geometry leaves it at zero).
+    #[must_use]
+    pub const fn head_dim_equals(mut self, head_dim: usize) -> Self {
+        self.head_dim_equals = Some(head_dim);
+        self
+    }
+
+    /// Require an exact value-head width (ignored when the geometry leaves it at zero).
+    #[must_use]
+    pub const fn v_head_equals(mut self, v_head: usize) -> Self {
+        self.v_head_equals = Some(v_head);
+        self
+    }
+
+    /// Cap the expert count this implementation addresses.
+    #[must_use]
+    pub const fn max_experts(mut self, max: usize) -> Self {
+        self.max_experts = Some(max);
+        self
+    }
+
+    /// Cap the active-expert count this implementation addresses.
+    #[must_use]
+    pub const fn max_top_k(mut self, max: usize) -> Self {
+        self.max_top_k = Some(max);
+        self
+    }
+
+    /// Cap the head count this implementation addresses.
+    #[must_use]
+    pub const fn max_heads(mut self, max: usize) -> Self {
+        self.max_heads = Some(max);
+        self
+    }
+
+    /// Restrict the residual stream count to `min..=max`.
+    #[must_use]
+    pub const fn streams_between(mut self, min: usize, max: usize) -> Self {
+        self.min_streams = Some(min);
+        self.max_streams = Some(max);
+        self
+    }
+
+    /// Restrict the convolution/window taps to `min..=max`.
+    #[must_use]
+    pub const fn window_between(mut self, min: usize, max: usize) -> Self {
+        self.min_window = Some(min);
+        self.max_window = Some(max);
+        self
+    }
+
+    /// Restrict the output-group count to `min..=max`.
+    #[must_use]
+    pub const fn groups_between(mut self, min: usize, max: usize) -> Self {
+        self.groups_min = Some(min);
+        self.groups_max = Some(max);
+        self
+    }
+
+    /// Restrict the vision patch side to these values.
+    #[must_use]
+    pub const fn patch_sizes(mut self, sides: &'static [usize]) -> Self {
+        self.patch_sizes = sides;
+        self
+    }
+
+    /// Restrict the scan to these `(key, value)` head-width pairs.
+    #[must_use]
+    pub const fn head_pairs(mut self, pairs: &'static [(usize, usize)]) -> Self {
+        self.head_pairs = pairs;
+        self
+    }
+
+    /// Require an exact tensor-parallel world.
+    #[must_use]
+    pub const fn world_equals(mut self, world: usize) -> Self {
+        self.world_equals = Some(world);
+        self
+    }
+
+    /// Require a tensor-parallel world of at least `world`.
+    #[must_use]
+    pub const fn world_min(mut self, world: usize) -> Self {
+        self.world_min = Some(world);
+        self
+    }
+
+    /// Whether `geometry` satisfies this constraint.
+    ///
+    /// A constraint that names a field is a proof obligation, not a hint: if the geometry leaves
+    /// that field at zero (the value a plan that does not know the dimension carries), the entry
+    /// is refused. This is what makes a wrong image unrepresentable rather than merely
+    /// improbable: a specific entry cannot win on a plan that did not populate the field the
+    /// entry's kernel was compiled for.
     ///
     /// # Errors
-    /// A message naming the first field that does not match.
-    pub fn accepts(&self, geometry: &PartGeometry, precision: Precision) -> Result<(), String> {
+    /// A message naming the first field that does not match, or is unknown.
+    pub fn accepts(&self, geometry: &PartGeometry) -> Result<(), String> {
         fn multiple(name: &str, value: usize, divisor: usize) -> Result<(), String> {
-            if divisor > 1 && value != 0 && !value.is_multiple_of(divisor) {
+            if divisor <= 1 {
+                return Ok(());
+            }
+            if value == 0 {
+                return Err(format!(
+                    "{name} is unknown (zero) but the kernel needs a multiple of {divisor}"
+                ));
+            }
+            if !value.is_multiple_of(divisor) {
                 return Err(format!("{name} {value} is not a multiple of {divisor}"));
+            }
+            Ok(())
+        }
+        fn equals(name: &str, value: usize, expected: Option<usize>) -> Result<(), String> {
+            if let Some(expected) = expected
+                && value != expected
+            {
+                return Err(format!("{name} {value} does not equal {expected}"));
+            }
+            Ok(())
+        }
+        fn at_most(name: &str, value: usize, max: Option<usize>) -> Result<(), String> {
+            if let Some(max) = max {
+                if value == 0 {
+                    return Err(format!(
+                        "{name} is unknown (zero) but the kernel caps it at {max}"
+                    ));
+                }
+                if value > max {
+                    return Err(format!("{name} {value} exceeds the kernel's {max}"));
+                }
+            }
+            Ok(())
+        }
+        fn at_least(name: &str, value: usize, min: Option<usize>) -> Result<(), String> {
+            if let Some(min) = min {
+                if min > 0 && value == 0 {
+                    return Err(format!(
+                        "{name} is unknown (zero) but the kernel needs at least {min}"
+                    ));
+                }
+                if value < min {
+                    return Err(format!("{name} {value} is below the kernel's {min}"));
+                }
             }
             Ok(())
         }
@@ -753,23 +1122,112 @@ impl ShapeConstraint {
         )?;
         multiple("experts", geometry.experts, self.experts_multiple)?;
         multiple("streams", geometry.streams, self.streams_multiple)?;
-        if self.min_positions > 0 && geometry.positions < self.min_positions {
+        equals("hidden", geometry.hidden, self.hidden_equals)?;
+        equals(
+            "intermediate",
+            geometry.intermediate,
+            self.intermediate_equals,
+        )?;
+        equals("experts", geometry.experts, self.experts_equals)?;
+        equals("top-k", geometry.top_k, self.top_k_equals)?;
+        equals("head width", geometry.head_dim, self.head_dim_equals)?;
+        equals("value head width", geometry.v_head, self.v_head_equals)?;
+        at_most("experts", geometry.experts, self.max_experts)?;
+        at_most("top-k", geometry.top_k, self.max_top_k)?;
+        at_most("heads", geometry.heads, self.max_heads)?;
+        at_least("streams", geometry.streams, self.min_streams)?;
+        at_most("streams", geometry.streams, self.max_streams)?;
+        at_least("window", geometry.window, self.min_window)?;
+        at_most("window", geometry.window, self.max_window)?;
+        at_least("output groups", geometry.groups, self.groups_min)?;
+        if let Some(max) = self.groups_max
+            && geometry.groups > max
+        {
             return Err(format!(
-                "positions {} are below the kernel's {}",
-                geometry.positions, self.min_positions
+                "output groups {} exceed the kernel's {max}",
+                geometry.groups
             ));
         }
-        if self.max_positions > 0 && geometry.positions > self.max_positions {
+        if !self.patch_sizes.is_empty() {
+            if geometry.patch_size == 0 {
+                return Err(format!(
+                    "vision patch is unknown (zero) but the kernel implements {:?}",
+                    self.patch_sizes
+                ));
+            }
+            if !self.patch_sizes.contains(&geometry.patch_size) {
+                return Err(format!(
+                    "vision patch {} is not one of {:?}",
+                    geometry.patch_size, self.patch_sizes
+                ));
+            }
+        }
+        if !self.head_pairs.is_empty() {
+            if geometry.head_dim == 0 || geometry.v_head == 0 {
+                return Err(format!(
+                    "head pair is unknown (zero) but the kernel implements {:?}",
+                    self.head_pairs
+                ));
+            }
+            if !self
+                .head_pairs
+                .iter()
+                .any(|(key, value)| *key == geometry.head_dim && *value == geometry.v_head)
+            {
+                return Err(format!(
+                    "head pair ({}, {}) is not one of {:?}",
+                    geometry.head_dim, geometry.v_head, self.head_pairs
+                ));
+            }
+        }
+        if self.min_positions > 0 || self.max_positions > 0 {
+            if geometry.positions == 0 {
+                return Err("positions are unknown (zero) but the kernel bounds them".to_owned());
+            }
+            if self.min_positions > 0 && geometry.positions < self.min_positions {
+                return Err(format!(
+                    "positions {} are below the kernel's {}",
+                    geometry.positions, self.min_positions
+                ));
+            }
+            if self.max_positions > 0 && geometry.positions > self.max_positions {
+                return Err(format!(
+                    "positions {} exceed the kernel's {}",
+                    geometry.positions, self.max_positions
+                ));
+            }
+        }
+        if self.min_ratio > 0 {
+            if geometry.ratio == 0 {
+                return Err("ratio is unknown (zero) but the kernel requires one".to_owned());
+            }
+            if geometry.ratio < self.min_ratio {
+                return Err(format!(
+                    "ratio {} is below the kernel's {}",
+                    geometry.ratio, self.min_ratio
+                ));
+            }
+        }
+        if let Some(world) = self.world_equals
+            && geometry.world != world
+        {
             return Err(format!(
-                "positions {} exceed the kernel's {}",
-                geometry.positions, self.max_positions
+                "world {} does not equal the kernel's {world}",
+                geometry.world
             ));
         }
-        if self.min_ratio > 0 && geometry.ratio < self.min_ratio {
-            return Err(format!(
-                "ratio {} is below the kernel's {}",
-                geometry.ratio, self.min_ratio
-            ));
+        if let Some(min) = self.world_min {
+            if geometry.world == 0 {
+                return Err(format!(
+                    "world is unknown (zero) but the kernel needs at least {min}"
+                ));
+            }
+            if geometry.world < min {
+                return Err(format!(
+                    "world {} is below the kernel's {min}",
+                    geometry.world
+                ));
+            }
         }
         if !self.gqa_groups.is_empty() {
             if geometry.kv_heads == 0 || geometry.heads == 0 {
@@ -788,9 +1246,6 @@ impl ShapeConstraint {
                     self.gqa_groups
                 ));
             }
-        }
-        if !self.precisions.contains(precision) {
-            return Err(format!("precision {} is not accepted", precision.name()));
         }
         Ok(())
     }

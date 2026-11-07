@@ -252,6 +252,77 @@ impl TpPlan {
         })
     }
 
+    /// One rank's share of `total` as a run of whole `tile`-wide blocks.
+    ///
+    /// This is the split an FP8 expert's weight takes: one BF16 inverse scale covers a whole
+    /// 128-column tile, so a rank holds a whole number of tiles and the remainder goes to the
+    /// first ranks (five tiles over four ranks are 2/1/1/1, not 1.25 each). [Split::padded]
+    /// equals [Split::per_rank] because a tile run is already aligned, and [Split::offset] is in
+    /// elements, not tiles.
+    ///
+    /// # Errors
+    /// A zero total or tile, a total that is not whole tiles, or a rank that holds no tile.
+    pub fn split_tiles(
+        &self,
+        total: usize,
+        tile: usize,
+        axis: TpAxis,
+    ) -> Result<Split, TpPlanError> {
+        if total == 0 {
+            return Err(TpPlanError {
+                axis,
+                detail: "the axis is empty".to_owned(),
+            });
+        }
+        if tile == 0 {
+            return Err(TpPlanError {
+                axis,
+                detail: "the tile width is zero".to_owned(),
+            });
+        }
+        if !total.is_multiple_of(tile) {
+            return Err(TpPlanError {
+                axis,
+                detail: format!("{total} is not whole {tile}-wide tiles"),
+            });
+        }
+        if !axis.is_sharded() || self.world == 1 {
+            return Ok(Split {
+                total,
+                per_rank: total,
+                offset: 0,
+                padded: total,
+                padding: 0,
+                rank: self.rank,
+                world: self.world,
+            });
+        }
+        let tiles = total / tile;
+        let base = tiles / self.world;
+        let extra = tiles % self.world;
+        let count = base + usize::from(self.rank < extra);
+        if count == 0 {
+            return Err(TpPlanError {
+                axis,
+                detail: format!(
+                    "{tiles} tiles over {} ranks leave rank {} none",
+                    self.world, self.rank
+                ),
+            });
+        }
+        let first = self.rank * base + self.rank.min(extra);
+        let per_rank = count * tile;
+        Ok(Split {
+            total,
+            per_rank,
+            offset: first * tile,
+            padded: per_rank,
+            padding: 0,
+            rank: self.rank,
+            world: self.world,
+        })
+    }
+
     /// Validate a plan against a released architecture and return it.
     ///
     /// The check is the model-side one: every axis the arm will shard has to divide under the
@@ -384,6 +455,34 @@ mod tests {
         assert_eq!(split.per_rank, 640);
         assert_eq!(split.padded, 640);
         assert_eq!(split.padding, 0);
+    }
+
+    #[test]
+    fn a_whole_tile_split_keeps_every_rank_on_tile_boundaries() {
+        // Five 128-wide tiles over four ranks are 2/1/1/1, not 160 columns each rounded up to
+        // the alignment: an FP8 expert's scale covers a whole tile, so a slice cannot split one.
+        let shares: Vec<(usize, usize)> = (0..4)
+            .map(|rank| {
+                let split = TpPlan::new(4, rank)
+                    .expect("plan")
+                    .split_tiles(640, 128, TpAxis::Intermediate)
+                    .expect("split");
+                (split.offset, split.per_rank)
+            })
+            .collect();
+        assert_eq!(shares, [(0, 256), (256, 128), (384, 128), (512, 128)]);
+        let whole = TpPlan::new(1, 0)
+            .expect("plan")
+            .split_tiles(640, 128, TpAxis::Intermediate)
+            .expect("split");
+        assert_eq!(whole.per_rank, 640);
+        assert_eq!(whole.padding, 0);
+        // A width that is not whole tiles is refused rather than split inside a scale tile.
+        let error = TpPlan::new(4, 0)
+            .expect("plan")
+            .split_tiles(644, 128, TpAxis::Intermediate)
+            .expect_err("644 is not whole 128-wide tiles");
+        assert!(error.to_string().contains("whole"), "{error}");
     }
 
     #[test]

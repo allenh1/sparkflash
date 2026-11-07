@@ -32,14 +32,17 @@
 //! [EnginePlan::from_json] is the short form a boot path uses; [EnginePlan::from_architecture]
 //! is the form a test or a synthetic checkpoint uses when it already holds the architecture.
 
-use sparkflash_model::architecture::{AttentionKind, Ffn, Residual, Side, WeightFormat};
+use sparkflash_model::architecture::{
+    AttentionKind, Ffn, Quantization, Residual, Side, WeightFormat,
+};
 use sparkflash_model::{
     Architecture, ConfigError, ModelBackend, Part, StepRole, Target, TpAxis, TpPlan, TpPlanError,
 };
 use sparkflash_weights::weights::WeightSource;
 use thiserror::Error;
 
-use crate::plan::{PartGeometry, Precision};
+use crate::gemv::GEMV_MAX_BATCH;
+use crate::plan::{GroupedFp8Body, PartGeometry, Precision};
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +175,26 @@ impl EnginePlan {
         let text = std::fs::read_to_string(path)
             .map_err(|error| PlanError::Io(format!("{}: {error}", path.display())))?;
         Self::from_json(&text, target, world, rank)
+    }
+
+    /// Plan an architecture that is already parsed, at `rank` of `world`.
+    ///
+    /// This is the form an arm uses after its architecture bridge has applied a release's
+    /// producer correction (for example [sparkflash_model::Architecture::experts_only_fp8]):
+    /// the precision policy is read from the corrected typed formats, not from a second parse of
+    /// the raw document.
+    ///
+    /// # Errors
+    /// As [Self::from_architecture].
+    pub fn for_architecture(
+        architecture: Architecture,
+        target: Target,
+        world: usize,
+        rank: usize,
+    ) -> Result<Self, PlanError> {
+        let tp = TpPlan::for_architecture(&architecture, world, rank)?;
+        let precision = PrecisionPolicy::from_architecture(&architecture);
+        Self::from_architecture(architecture, target, tp, precision)
     }
 
     /// Plan an architecture that is already parsed.
@@ -324,7 +347,9 @@ fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
         Part::Moe => policy.experts,
         Part::Mtp => policy.mtp,
         Part::MlaAttention | Part::GqaAttention | Part::GdnScan | Part::KdaScan => policy.attention,
-        Part::Embedding | Part::RmsNorm => Precision::Bf16,
+        // The embedding, both norms and the head are stored and computed at bf16 in every
+        // released arm, including the DeepSeek FP8 checkpoint (its head is not converted).
+        Part::Embedding | Part::RmsNorm | Part::LayerNorm | Part::LmHead => Precision::Bf16,
         _ => policy.dense,
     }
 }
@@ -370,7 +395,7 @@ fn global_requirements(
                 rank: tp.rank(),
                 ..PartGeometry::new()
             },
-            precision: precision.dense,
+            precision: precision_for(Part::LmHead, precision),
         },
     ];
     if let Some(mtp) = &architecture.mtp {
@@ -495,6 +520,9 @@ fn geometry_for(
                 geometry.heads = heads.padded;
                 geometry.head_offset = heads.offset;
                 geometry.head_dim = kda.head_dim;
+                // The shared KDA body is compiled with a 128-wide value head, the same template
+                // as GDN; record it so the head-pair rule can prove the template.
+                geometry.v_head = kda.head_dim;
                 geometry.window = kda.conv_kernel;
             }
             _ => {
@@ -531,8 +559,11 @@ fn geometry_for(
         },
         Part::Moe => match &layer.ffn {
             Ffn::Moe(moe) => {
-                geometry.intermediate =
-                    split(tp, moe.intermediate, TpAxis::Intermediate, 16)?.padded;
+                geometry.intermediate = split_expert(
+                    tp,
+                    moe.intermediate,
+                    architecture.quantization.expert_format,
+                )?;
                 geometry.experts = moe.routed_experts;
                 geometry.top_k = moe.active_experts;
                 geometry.shared_experts = moe.shared_experts;
@@ -547,6 +578,9 @@ fn geometry_for(
                     )?
                     .padded
                 };
+                let (min_tokens, body) = grouped_policy(&architecture.quantization);
+                geometry.grouped_min_tokens = min_tokens;
+                geometry.grouped_fp8_body = body;
             }
             _ => {
                 return Err(PlanError::Invalid(
@@ -615,13 +649,79 @@ fn geometry_for(
             geometry.window = side.conv_kernel;
             geometry.vocab = usize::try_from(side.vocab_base).unwrap_or(usize::MAX);
         }
-        Part::Mtp | Part::Vision | Part::Embedding | Part::RmsNorm | Part::LmHead => {
+        Part::Mtp
+        | Part::Vision
+        | Part::Embedding
+        | Part::RmsNorm
+        | Part::LayerNorm
+        | Part::LmHead
+        | Part::DenseGemm
+        | Part::Activation
+        | Part::Rope
+        | Part::Quantize
+        | Part::MoeRouter
+        | Part::MoeCombine
+        | Part::GroupedMoeGemm
+        | Part::MoePlan
+        | Part::Collective => {
             return Err(PlanError::Invalid(format!(
                 "{part} is a global part, not a layer part"
             )));
         }
     }
     Ok(geometry)
+}
+
+/// The grouped FP8 policy the released formats imply.
+///
+/// The two FP8 packs differ in a typed fact, not a family name. Qwen's pack stores only the
+/// routed experts as E4M3, so the arm's [Architecture::experts_only_fp8] correction leaves the
+/// dense class BF16 and a chunk takes the grouped tile from 64 tokens. GLM's pack stores the
+/// dense and routed weights alike as E4M3, and its dynamic activation scheme drives the q8 MMA;
+/// its host counts token rows, with `MAX_ROWS = GEMV_MAX_BATCH = 8` and the bulk pass starting
+/// at 9 tokens, so the plan sets the grouped threshold to `GEMV_MAX_BATCH + 1` (9 tokens) and
+/// names the q8 body. [GroupedFp8Body::Bf16Activation] and
+/// [GroupedFp8Body::SplitActivation] are the other activation forms a serving profile may
+/// select, but [EnginePlan] names the released dynamic default; a caller constructing a
+/// grouped requirement for an overriding profile must set
+/// [PartGeometry::grouped_fp8_body] to the matching variant itself.
+///
+/// An NVFP4 expert names no FP8 body. A Qwen NVFP4 release still takes its grouped tile from
+/// 64 tokens, while a DeepSeek MXFP4 release keeps the row-count pass.
+fn grouped_policy(quantization: &Quantization) -> (usize, Option<GroupedFp8Body>) {
+    match quantization.expert_format {
+        WeightFormat::Fp8Tile { .. } => {
+            if matches!(quantization.dense_format, WeightFormat::Fp8Tile { .. }) {
+                (
+                    GEMV_MAX_BATCH + 1,
+                    Some(GroupedFp8Body::QuantizedActivation),
+                )
+            } else {
+                (64, Some(GroupedFp8Body::Tiled))
+            }
+        }
+        WeightFormat::NvFp4 { .. } if matches!(quantization.dense_format, WeightFormat::Bf16) => {
+            (64, None)
+        }
+        _ => (0, None),
+    }
+}
+
+/// The rank-local routed-expert intermediate width.
+///
+/// An FP8 expert's inverse scale covers a whole `block_n`-column tile (128 in the released
+/// arms), so the plan splits the expert into whole tiles: five 128-wide tiles over four ranks
+/// are 2/1/1/1 columns, the widths the Qwen host's `rank_config` uploads. Splitting an FP8
+/// width to 16 columns and rounding up would claim 160 columns for every rank, which is not a
+/// run of whole tiles and does not match the weights the rank holds. Every other format keeps
+/// the even split rounded to 16 columns.
+fn split_expert(tp: &TpPlan, total: usize, format: WeightFormat) -> Result<usize, PlanError> {
+    match format {
+        WeightFormat::Fp8Tile { block_n, .. } if block_n > 1 => {
+            Ok(tp.split_tiles(total, block_n, TpAxis::Intermediate)?.padded)
+        }
+        _ => Ok(tp.split(total, TpAxis::Intermediate, 16)?.padded),
+    }
 }
 
 fn split(

@@ -129,10 +129,15 @@ fn a_checkpoint_names_its_pack_from_its_own_config() {
         "--checkpoint".to_owned(),
         qwen.path().display().to_string(),
     ]);
-    let loadable = sparkflash_ops::parts::missing_loadable(
+    // The pack does not stage the vision tower, so the gate's answer is the language parts
+    // only; the tower's DeepSeek-only cubin is not a missing pack part.
+    let loadable: Vec<sparkflash_model::Part> = sparkflash_ops::parts::missing_loadable(
         &sparkflash_model::Architecture::from_json(QWEN).expect("the Qwen config"),
         sparkflash_model::Target::Sm121,
-    );
+    )
+    .into_iter()
+    .filter(|part| *part != sparkflash_model::Part::Vision)
+    .collect();
     match parsed {
         Ok(parsed) => {
             assert!(loadable.is_empty(), "this build can load every part");
@@ -1056,4 +1061,66 @@ fn tp4_stats_keep_the_reference_shape_and_name_the_fabric() {
     assert_eq!(reference["transport"]["fabric_mode"], "");
     assert_eq!(tp4["kv_cache"]["total_prompt_tokens"], 3);
     assert_eq!(tp4["kv_cache"]["global_kv_cached_tokens"], 0);
+}
+
+#[test]
+fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
+    // Qwen and GLM stage no vision tower; DeepSeek's device arm runs the 14-patch one.
+    let cubins = std::env::var_os(sparkflash_ops::parts::CUBIN_DIR_ENV);
+    for (name, text) in [
+        (
+            "Qwen",
+            include_str!(
+                "../../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json"
+            ),
+        ),
+        (
+            "GLM",
+            include_str!("../../../sparkflash-model-glm5-next/config/glm53_flash.hf.json"),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(dir.path().join(CHECKPOINT_CONFIG_NAME), text).expect("the config");
+        // SAFETY: the value is restored before the next document.
+        unsafe { std::env::remove_var(sparkflash_ops::parts::CUBIN_DIR_ENV) };
+        let parsed = ServeOptions::parse(vec![
+            "--checkpoint".to_owned(),
+            dir.path().to_string_lossy().to_string(),
+        ]);
+        if let Some(value) = cubins.as_ref() {
+            unsafe { std::env::set_var(sparkflash_ops::parts::CUBIN_DIR_ENV, value) };
+        }
+        // A CPU-only build embeds no pack image, so the language parts themselves are missing
+        // and the gate names them. What must never be missing is the unserved vision tower.
+        let missing: Vec<sparkflash_model::Part> = sparkflash_ops::parts::missing_loadable(
+            &sparkflash_model::Architecture::from_json(text).expect("the released config"),
+            sparkflash_model::Target::Sm121,
+        )
+        .into_iter()
+        .filter(|part| *part != sparkflash_model::Part::Vision)
+        .collect();
+        if missing.is_empty() {
+            let options =
+                parsed.unwrap_or_else(|error| panic!("{name}: the checkpoint must parse: {error}"));
+            assert!(options.model.is_some(), "{name}: detection selects the arm");
+        } else {
+            let error = parsed.expect_err("an unembedded pack image still refuses");
+            assert!(!error.contains("vision"), "{name}: {error}");
+            for part in missing {
+                assert!(error.contains(&part.to_string()), "{name}: {error}");
+            }
+        }
+    }
+    let released = include_str!(
+        "../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
+    );
+    let dir = tempfile::tempdir().expect("a temporary checkpoint");
+    std::fs::write(
+        dir.path().join(CHECKPOINT_CONFIG_NAME),
+        released.replace("\"patch_size\": 14", "\"patch_size\": 16"),
+    )
+    .expect("the config");
+    let error = check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
+        .expect_err("a 16-patch tower is refused");
+    assert!(error.contains("vision patch 16"), "{error}");
 }

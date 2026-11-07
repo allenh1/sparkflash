@@ -1391,7 +1391,7 @@ pub(super) fn run(
         && let Err(message) = super::check_checkpoint_plan(
             checkpoint,
             tp4.world_size,
-            sparkflash_ops::resolver::Availability::Runtime,
+            sparkflash_ops::resolver::Availability::runtime_env(),
         )
     {
         eprintln!("sparkflash serve: {message}");

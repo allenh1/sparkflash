@@ -14,9 +14,15 @@
 
 //! Fused epilogues and gathers: norms, RoPE, activations, quantization, embeddings and Engram.
 
+use sparkflash_model::Part;
+
+use crate::engine_plan::PartRequirement;
 use crate::error::OpError;
-use crate::images::Image;
-use crate::plan::{DType, KernelId, Launch, Layout, Matrix, OpKind, OpPlan, Operand, StreamId};
+use crate::plan::{
+    DType, KernelId, KernelPhase, Launch, Layout, Matrix, OpKind, OpPlan, Operand, Precision,
+    StreamId,
+};
+use crate::resolver::PlanContext;
 
 /// The norm a plan applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +33,32 @@ pub enum NormKind {
     LayerNorm,
     /// The hyper-connection mix.
     HyperConnection,
+    /// The manifold-constrained hyper-connection mix.
+    ManifoldHyperConnection,
+}
+
+impl NormKind {
+    /// The model-side part the norm belongs to.
+    #[must_use]
+    pub const fn part(self) -> Part {
+        match self {
+            Self::RmsNorm => Part::RmsNorm,
+            Self::LayerNorm => Part::LayerNorm,
+            Self::HyperConnection => Part::HyperConnection,
+            Self::ManifoldHyperConnection => Part::ManifoldHyperConnection,
+        }
+    }
+
+    /// The norm's stable name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RmsNorm => "RMSNorm",
+            Self::LayerNorm => "LayerNorm",
+            Self::HyperConnection => "hyper-connection",
+            Self::ManifoldHyperConnection => "manifold hyper-connection",
+        }
+    }
 }
 
 /// A normalization epilogue over rows of a fixed width.
@@ -42,26 +74,82 @@ pub struct NormPlan {
     pub dtype: DType,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The geometry the kernel was resolved at.
+    pub geometry: crate::plan::PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl NormPlan {
-    /// A norm plan.
+    /// A norm plan built from the requirement's geometry.
     ///
     /// # Errors
-    /// A zero dimension, or a dtype the norm does not take.
+    /// A zero dimension, a dtype the norm does not take, a requirement for a different part, or
+    /// no catalogued implementation. LayerNorm never falls back to an RMSNorm body.
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         kind: NormKind,
         rows: usize,
         width: usize,
         dtype: DType,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        if requirement.part != kind.part() {
+            return Err(OpError::Binding(format!(
+                "{} was built from a {} requirement",
+                kind.name(),
+                requirement.part
+            )));
+        }
+        if rows == 0 || width == 0 {
+            return Err(OpError::shape("norm", "a dimension is zero"));
+        }
+        if !matches!(dtype, DType::F32 | DType::Bf16) {
+            return Err(OpError::Unsupported {
+                op: "norm",
+                dtype: dtype.name(),
+            });
+        }
+        let precision = if dtype == DType::F32 {
+            Precision::F32
+        } else {
+            Precision::Bf16
+        };
+        let mut geometry = requirement.geometry;
+        geometry.rows = rows;
+        geometry.hidden = width;
+        let symbols = match kind {
+            NormKind::RmsNorm => &["rmsnorm_sm121", "opt_rmsnorm_bf16", "q4e_rmsnorm"] as &[_],
+            NormKind::LayerNorm => &["q4e_layer_norm"],
+            NormKind::HyperConnection => &[
+                "mega_mhc_fused_bf16_sm121",
+                "opt_mhc_seam",
+                "opt_mhc_post",
+                "q4e_hyper_mix",
+                "opt_bulk_mhc_tail",
+            ],
+            NormKind::ManifoldHyperConnection => &["q4e_mhc_in", "q4e_mhc_post"],
+        };
+        let resolved = context
+            .resolve(
+                &PartRequirement {
+                    part: kind.part(),
+                    geometry,
+                    precision,
+                },
+                KernelPhase::for_rows(rows),
+                symbols,
+            )?
+            .id();
         let plan = Self {
             kind,
             rows,
             width,
             dtype,
             stream,
+            geometry,
+            resolved,
         };
         plan.validate()?;
         Ok(plan)
@@ -83,12 +171,7 @@ impl OpPlan for NormPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        let symbol = match self.kind {
-            NormKind::RmsNorm => "rmsnorm_sm121",
-            NormKind::LayerNorm => "layer_seams_sm121",
-            NormKind::HyperConnection => "mega_mhc_sm121",
-        };
-        KernelId::new(Image::Deepseek, symbol)
+        self.resolved
     }
 
     fn launch(&self) -> Launch {
@@ -134,14 +217,22 @@ pub struct RopePlan {
     pub position: usize,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The geometry the kernel was resolved at.
+    pub geometry: crate::plan::PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl RopePlan {
-    /// A RoPE plan.
+    /// A RoPE plan built from the requirement's part and hidden width.
     ///
     /// # Errors
-    /// A zero dimension or an even head width that is wider than the row stride.
+    /// A zero dimension, a head width that is not a whole number of pairs or wider than the row
+    /// stride, a requirement for a non-RoPE part, or no catalogue kernel.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         rows: usize,
         heads: usize,
         head_dim: usize,
@@ -149,6 +240,50 @@ impl RopePlan {
         position: usize,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        if requirement.part != Part::Rope {
+            return Err(OpError::Binding(format!(
+                "RoPE was built from a {} requirement",
+                requirement.part
+            )));
+        }
+        if rows == 0 || heads == 0 || head_dim == 0 {
+            return Err(OpError::shape("RoPE", "a dimension is zero"));
+        }
+        if !head_dim.is_multiple_of(2) {
+            return Err(OpError::shape(
+                "RoPE",
+                format!("a head width of {head_dim} is not a whole number of pairs"),
+            ));
+        }
+        if head_dim > row_stride {
+            return Err(OpError::shape(
+                "RoPE",
+                format!("a row stride of {row_stride} cannot hold {head_dim} values"),
+            ));
+        }
+        let mut geometry = requirement.geometry;
+        geometry.rows = rows;
+        geometry.heads = heads;
+        geometry.head_dim = head_dim;
+        // Resolve the plan's own geometry; the schedule's head width is a kernel obligation.
+        let requirement = PartRequirement {
+            geometry,
+            ..*requirement
+        };
+        let resolved = context
+            .resolve(
+                &requirement,
+                KernelPhase::for_rows(rows),
+                &[
+                    "q4e_rope",
+                    "opt_rope_heads_bf16",
+                    "rope_rotate_rows_bf16",
+                    "rope_rotate_bf16",
+                    "kv_norm_rope_bf16",
+                    "opt_rows_inv_rope",
+                ],
+            )?
+            .id();
         let plan = Self {
             rows,
             heads,
@@ -156,6 +291,8 @@ impl RopePlan {
             row_stride,
             position,
             stream,
+            geometry,
+            resolved,
         };
         plan.validate()?;
         Ok(plan)
@@ -172,7 +309,7 @@ impl OpPlan for RopePlan {
     }
 
     fn kernel(&self) -> KernelId {
-        KernelId::new(Image::Qwen4Exp, "q4e_rope")
+        self.resolved
     }
 
     fn launch(&self) -> Launch {
@@ -228,6 +365,19 @@ pub enum ActivationKind {
     Tanh,
 }
 
+impl ActivationKind {
+    /// The activation's stable name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Silu => "SiLU",
+            Self::SwiGlu => "SwiGLU",
+            Self::Sigmoid => "sigmoid",
+            Self::Tanh => "tanh",
+        }
+    }
+}
+
 /// A fused activation epilogue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActivationPlan {
@@ -237,26 +387,74 @@ pub struct ActivationPlan {
     pub rows: usize,
     /// The intermediate width.
     pub width: usize,
+    /// The operand precision the kernel was resolved at.
+    pub precision: Precision,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The geometry the kernel was resolved at.
+    pub geometry: crate::plan::PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl ActivationPlan {
-    /// An activation plan.
+    /// An activation plan built from the requirement's geometry.
     ///
     /// # Errors
-    /// A zero dimension.
+    /// A zero dimension, a requirement for a non-activation part, or no catalogue kernel.
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         kind: ActivationKind,
         rows: usize,
         width: usize,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        if requirement.part != Part::Activation {
+            return Err(OpError::Binding(format!(
+                "an activation was built from a {} requirement",
+                requirement.part
+            )));
+        }
+        if rows == 0 || width == 0 {
+            return Err(OpError::shape("activation", "a dimension is zero"));
+        }
+        let mut geometry = requirement.geometry;
+        geometry.rows = rows;
+        geometry.intermediate = width;
+        let symbols: &[&'static str] = match kind {
+            ActivationKind::SwiGlu | ActivationKind::Silu => &[
+                "swiglu_mxfp8_quant_sm121",
+                "q4e_swiglu",
+                "glm_moe_swiglu",
+                "q4e_swiglu_limited",
+                "glm_moe_swiglu_q8",
+                // The MoE pipeline's fused FP8 gated activation: a Qwen FP8 chunk's gate/up
+                // output is E4M3 at the tile, so its SwiGLU is this body, not a BF16 epilogue.
+                "q4p_moe_swiglu_fp8",
+                "shared_swiglu_f32",
+                "opt_rows_shared_swiglu",
+                "q4p_epilogue",
+            ],
+            ActivationKind::Sigmoid | ActivationKind::Tanh => {
+                &["q4p_epilogue", "q4e_swiglu", "glm_moe_swiglu"]
+            }
+        };
+        // Resolve the plan's own geometry (its row count and intermediate width), not the
+        // requirement's original shape.
+        let requirement = PartRequirement {
+            geometry,
+            ..*requirement
+        };
+        let resolved = context.resolve(&requirement, KernelPhase::for_rows(rows), symbols)?;
         let plan = Self {
             kind,
             rows,
             width,
+            precision: resolved.precision,
             stream,
+            geometry,
+            resolved: resolved.id(),
         };
         plan.validate()?;
         Ok(plan)
@@ -273,7 +471,7 @@ impl OpPlan for ActivationPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        KernelId::new(Image::Deepseek, "swiglu_mxfp8_quant_sm121")
+        self.resolved
     }
 
     fn launch(&self) -> Launch {
@@ -312,28 +510,93 @@ pub struct QuantizePlan {
     pub output_dtype: DType,
     /// The output layout.
     pub layout: Layout,
+    /// The precision of the operand being quantized.
+    pub precision: Precision,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The geometry the kernel was resolved at.
+    pub geometry: crate::plan::PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl QuantizePlan {
-    /// A quantization plan.
+    /// A quantization plan built from the requirement's geometry.
+    ///
+    /// The precision that selects the symbol is the input's, not the output's: a bf16 row is
+    /// quantised by a body that takes bf16, and the float-only 128-block quantiser cannot stand
+    /// in for it.
     ///
     /// # Errors
-    /// A zero dimension, a block-scaled layout whose rows do not divide, or an unsupported pair.
+    /// A zero dimension, a block-scaled layout whose rows do not divide, an unsupported input or
+    /// output dtype, a requirement for a non-quantization part, or no catalogue kernel.
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         output: Matrix,
         input: DType,
         output_dtype: DType,
         layout: Layout,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        if requirement.part != Part::Quantize {
+            return Err(OpError::Binding(format!(
+                "a quantizer was built from a {} requirement",
+                requirement.part
+            )));
+        }
+        Operand::new(output, output_dtype, layout).validate("quantization output")?;
+        if !matches!(output_dtype, DType::NvFp4 | DType::Fp8E4M3 | DType::MxFp8) {
+            return Err(OpError::Unsupported {
+                op: "quantization",
+                dtype: output_dtype.name(),
+            });
+        }
+        let precision = match input {
+            DType::F32 => Precision::F32,
+            DType::Bf16 => Precision::Bf16,
+            DType::Fp8E4M3 => Precision::Fp8E4M3,
+            DType::MxFp8 => Precision::MxFp8,
+            DType::NvFp4 => Precision::NvFp4,
+            DType::I32 | DType::U32 => {
+                return Err(OpError::Unsupported {
+                    op: "quantization",
+                    dtype: input.name(),
+                });
+            }
+        };
+        let symbols: &[&'static str] = match output_dtype {
+            DType::NvFp4 => &["opt_bulk_fp4_pack"],
+            DType::Fp8E4M3 => match input {
+                DType::F32 => &["glm_quantise_rows", "q4e_quantize_e4m3_rows"],
+                _ => &["q4e_quantize_e4m3_rows", "glm_quantise_rows"],
+            },
+            DType::MxFp8 => &["mxfp8_quantize_activations_sm121"],
+            _ => &[],
+        };
+        let mut geometry = requirement.geometry;
+        geometry.rows = output.rows;
+        geometry.intermediate = output.columns;
+        let resolved = context
+            .resolve(
+                &PartRequirement {
+                    part: Part::Quantize,
+                    geometry,
+                    precision,
+                },
+                KernelPhase::for_rows(output.rows),
+                symbols,
+            )?
+            .id();
         let plan = Self {
             output,
             input,
             output_dtype,
             layout,
+            precision,
             stream,
+            geometry,
+            resolved,
         };
         plan.validate()?;
         Ok(plan)
@@ -350,12 +613,7 @@ impl OpPlan for QuantizePlan {
     }
 
     fn kernel(&self) -> KernelId {
-        let symbol = match self.output_dtype {
-            DType::NvFp4 => "q4e_quantize_e2m1_rows",
-            DType::Fp8E4M3 => "q4e_quantize_e4m3_rows",
-            _ => "glm_quantise_rows",
-        };
-        KernelId::new(Image::Qwen4Exp, symbol)
+        self.resolved
     }
 
     fn launch(&self) -> Launch {
@@ -377,7 +635,7 @@ impl OpPlan for QuantizePlan {
             .validate("quantization output")?;
         if !matches!(
             self.output_dtype,
-            DType::NvFp4 | DType::Fp8E4M3 | DType::Bf16
+            DType::NvFp4 | DType::Fp8E4M3 | DType::MxFp8
         ) {
             return Err(OpError::Unsupported {
                 op: "quantization",
@@ -401,26 +659,71 @@ pub struct GatherPlan {
     pub ids_per_row: usize,
     /// The stream the plan launches on.
     pub stream: StreamId,
+    /// The geometry the kernel was resolved at.
+    pub geometry: crate::plan::PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl GatherPlan {
-    /// A gather plan.
+    /// A gather plan built from the requirement's geometry.
     ///
     /// # Errors
-    /// A zero dimension.
+    /// A zero dimension, a requirement for the wrong table part, or no catalogue kernel.
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         engram: bool,
         rows: usize,
         width: usize,
         ids_per_row: usize,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        let part = if engram {
+            Part::Engram
+        } else {
+            Part::Embedding
+        };
+        if requirement.part != part {
+            return Err(OpError::Binding(format!(
+                "a {} gather was built from a {} requirement",
+                if engram { "Engram" } else { "embedding" },
+                requirement.part
+            )));
+        }
+        if rows == 0 || width == 0 || ids_per_row == 0 {
+            return Err(OpError::shape("gather", "a dimension is zero"));
+        }
+        let mut geometry = requirement.geometry;
+        geometry.rows = rows;
+        // The table width is the embedding's hidden row for a plain table and the Engram head
+        // width for an Engram table; each is the field its catalogue entry's rule names.
+        if engram {
+            geometry.head_dim = width;
+        } else {
+            geometry.hidden = width;
+        }
+        let symbols: &[&'static str] = if engram {
+            &["engram_embed_sm121", "opt_bulk_engram_embed"]
+        } else {
+            &["q4e_embed", "opt_rows_embed_own"]
+        };
+        // Resolve the table width the gather launches, not the requirement's original hidden.
+        let requirement = PartRequirement {
+            geometry,
+            ..*requirement
+        };
+        let resolved = context
+            .resolve(&requirement, KernelPhase::for_rows(rows), symbols)?
+            .id();
         let plan = Self {
             engram,
             rows,
             width,
             ids_per_row,
             stream,
+            geometry,
+            resolved,
         };
         plan.validate()?;
         Ok(plan)
@@ -441,11 +744,7 @@ impl OpPlan for GatherPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        if self.engram {
-            KernelId::new(Image::Deepseek, "engram_embed_sm121")
-        } else {
-            KernelId::new(Image::Qwen4Exp, "q4e_embed")
-        }
+        self.resolved
     }
 
     fn launch(&self) -> Launch {

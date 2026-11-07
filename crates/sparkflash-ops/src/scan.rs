@@ -14,9 +14,30 @@
 
 //! Linear-attention scans: Gated DeltaNet and Kimi Delta Attention.
 
+use sparkflash_model::Part;
+
+use crate::engine_plan::PartRequirement;
 use crate::error::OpError;
-use crate::images::Image;
-use crate::plan::{KernelId, Launch, OpKind, OpPlan, Precision, StreamId};
+use crate::plan::{
+    KernelId, KernelPhase, Launch, OpKind, OpPlan, PartGeometry, Precision, StreamId,
+};
+use crate::resolver::PlanContext;
+
+/// The GDN scan symbols for one key/value head template, most specific first.
+///
+/// The scan image instantiates the shared body at the three pairs in the catalogue's
+/// `SCAN_HEAD_PAIRS`; the host launches `q4p_gdn_scan_64_64` and `q4p_gdn_scan_128_256` for the
+/// two that are not the released 128/128 body (D98). Selecting the symbol from the launch's own
+/// head widths is what keeps the plan from always naming the 128/128 template on a 64/64 launch.
+/// Every list keeps `q4p_gdn_scan` and `q4e_gdn_recur` behind the template so an uninstantiated
+/// pair still has the catalogue's reason (it will be refused by the entry's head-pair rule).
+fn gdn_symbols(key_dim: usize, value_dim: usize) -> &'static [&'static str] {
+    match (key_dim, value_dim) {
+        (64, 64) => &["q4p_gdn_scan_64_64", "q4p_gdn_scan", "q4e_gdn_recur"],
+        (128, 256) => &["q4p_gdn_scan_128_256", "q4p_gdn_scan", "q4e_gdn_recur"],
+        _ => &["q4p_gdn_scan", "q4e_gdn_recur"],
+    }
+}
 
 /// The scan's recurrence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +46,17 @@ pub enum ScanKind {
     Gdn,
     /// Kimi Delta Attention.
     Kda,
+}
+
+impl ScanKind {
+    /// The model-side part the recurrence belongs to.
+    #[must_use]
+    pub const fn part(self) -> Part {
+        match self {
+            Self::Gdn => Part::GdnScan,
+            Self::Kda => Part::KdaScan,
+        }
+    }
 }
 
 /// One scan launch over a row batch.
@@ -46,28 +78,81 @@ pub struct ScanPlan {
     pub stream: StreamId,
     /// The recurrence's precision.
     pub precision: Precision,
+    /// The geometry the kernel was resolved at, including the requirement's hidden width and
+    /// convolution window.
+    pub geometry: PartGeometry,
+    /// The catalogue-selected kernel.
+    pub resolved: KernelId,
 }
 
 impl ScanPlan {
-    /// A scan plan.
+    /// A scan plan built from the requirement's geometry.
     ///
-    /// The parameters mirror the kernel's shape one-for-one, so a builder struct would only hide
-    /// the launch contract.
+    /// The parameters mirror the kernel's launch contract; every discriminating field the
+    /// catalogue checks (hidden width, key/value head template, convolution window) comes from
+    /// the requirement, so a plan cannot silently accept the wrong template.
     ///
     /// # Errors
-    /// A zero dimension, a split that leaves no columns or is not a power of two, or an
-    /// unsupported precision.
+    /// A zero dimension, a split that leaves no columns or is not a power of two, an unsupported
+    /// precision, a requirement for the other recurrence, or no catalogue kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        context: PlanContext,
+        requirement: &PartRequirement,
         kind: ScanKind,
         rows: usize,
         heads: usize,
         key_dim: usize,
         value_dim: usize,
         splits: usize,
-        precision: Precision,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        if requirement.part != kind.part() {
+            return Err(OpError::Binding(format!(
+                "{kind:?} scan was built from a {} requirement",
+                requirement.part
+            )));
+        }
+        let precision = requirement.precision;
+        if rows == 0 || heads == 0 || key_dim == 0 || value_dim == 0 {
+            return Err(OpError::shape(
+                "linear-attention scan",
+                "a dimension is zero",
+            ));
+        }
+        if splits == 0 || !splits.is_power_of_two() || !value_dim.is_multiple_of(splits) {
+            return Err(OpError::shape(
+                "linear-attention scan",
+                format!("{value_dim} value columns do not split into {splits} power-of-two slices"),
+            ));
+        }
+        if !matches!(
+            precision,
+            Precision::F32 | Precision::Bf16 | Precision::Fp8E4M3
+        ) {
+            return Err(OpError::Unsupported {
+                op: "linear-attention scan",
+                dtype: precision.name(),
+            });
+        }
+        let mut geometry = requirement.geometry;
+        geometry.rows = rows;
+        geometry.heads = heads;
+        geometry.head_dim = key_dim;
+        geometry.v_head = value_dim;
+        let symbols: &[&'static str] = match kind {
+            ScanKind::Gdn => gdn_symbols(key_dim, value_dim),
+            ScanKind::Kda => &["q4p_kda_scan", "q4e_kda_decay"],
+        };
+        // Resolve the geometry this plan will launch, not the requirement's original one: the
+        // schedule's head widths are the template the kernel must accept.
+        let requirement = PartRequirement {
+            geometry,
+            ..*requirement
+        };
+        let resolved = context
+            .resolve(&requirement, KernelPhase::for_rows(rows), symbols)?
+            .id();
         let plan = Self {
             kind,
             rows,
@@ -77,6 +162,8 @@ impl ScanPlan {
             splits,
             stream,
             precision,
+            geometry,
+            resolved,
         };
         plan.validate()?;
         Ok(plan)
@@ -105,11 +192,7 @@ impl OpPlan for ScanPlan {
     }
 
     fn kernel(&self) -> KernelId {
-        let symbol = match self.kind {
-            ScanKind::Gdn => "q4p_gdn_scan",
-            ScanKind::Kda => "q4p_kda_scan",
-        };
-        KernelId::new(Image::Qwen4Scan, symbol)
+        self.resolved
     }
 
     fn launch(&self) -> Launch {
@@ -146,7 +229,10 @@ impl OpPlan for ScanPlan {
                 ),
             ));
         }
-        if !matches!(self.precision, Precision::F32 | Precision::Bf16) {
+        if !matches!(
+            self.precision,
+            Precision::F32 | Precision::Bf16 | Precision::Fp8E4M3
+        ) {
             return Err(OpError::Unsupported {
                 op: "linear-attention scan",
                 dtype: self.precision.name(),

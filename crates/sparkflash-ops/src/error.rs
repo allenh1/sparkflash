@@ -46,6 +46,13 @@ pub enum OpError {
     /// A plan was asked to bind an operand of the wrong shape or dtype.
     #[error("{0}")]
     Binding(String),
+    /// The kernel catalogue has no implementation for the plan's part, shape, precision and
+    /// pass.
+    #[error(transparent)]
+    Resolve(#[from] crate::resolver::ResolveError),
+    /// A hand-written resolution failure that has no catalogue candidates.
+    #[error("{0}")]
+    Resolution(String),
     /// The device refused the load or launch.
     #[error("{0}")]
     Device(String),

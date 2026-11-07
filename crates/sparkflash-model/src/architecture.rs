@@ -664,6 +664,31 @@ impl Architecture {
         })
     }
 
+    /// Re-describe a Qwen FP8 release whose global `fp8` flag quantises only its routed experts.
+    ///
+    /// The official Qwen3.8-Flash-Next FP8 pack stores the 24,576 routed experts as E4M3 with
+    /// one BF16 inverse scale a 128x128 tile and keeps every other tensor (attention, shared
+    /// experts, router, hyper-connections, embedding, head, MTP non-expert) BF16, but its
+    /// producer still writes one global `quant_method: "fp8"`. Reading that flag as the dense
+    /// format made [crate::Part] requirements dense/attention FP8 when the pack stores BF16.
+    ///
+    /// This is the Qwen4-Exp arm's producer correction and only that arm's bridge calls it
+    /// (`sparkflash-model-qwen4-exp`'s `architecture_from_json` and
+    /// `Qwen4ExpConfig::from_json_with_architecture`); it is not a general rule about FP8
+    /// documents. The guard is narrow but not a proof of the producer: the parsed dense and expert
+    /// formats must both be the same [WeightFormat::Fp8Tile], which a genuinely all-FP8 release
+    /// such as GLM-5.3-Flash also satisfies, and applying it there would silently move that
+    /// document's dense class to BF16. The expert format is left exactly as the document declared
+    /// it; only the dense class moves to BF16.
+    pub fn experts_only_fp8(&mut self) {
+        let quantization = &mut self.quantization;
+        if quantization.dense_format == quantization.expert_format
+            && matches!(quantization.dense_format, WeightFormat::Fp8Tile { .. })
+        {
+            quantization.dense_format = WeightFormat::Bf16;
+        }
+    }
+
     /// Read a checkpoint's `config.json`, merging `generation_config.json` when it sits beside.
     ///
     /// A serving path calls this with the snapshot directory it resolved from the Hugging Face
