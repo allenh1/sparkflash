@@ -141,14 +141,38 @@ const GDN_SCAN_MAX_SPLITS: usize = 16;
 /// split computes the same bits; a rank holding eight heads (TP=4) would otherwise run the scan
 /// on eight of the forty-eight SMs.
 pub fn gdn_scan_shape(heads: usize) -> ((u32, u32, u32), u32) {
+    gdn_scan_shape_for(heads, GDN_VALUE)
+}
+
+/// [gdn_scan_shape] for one value-head width. The block is 4 * value_dim / splits threads, a
+/// multiple of 32 and at most the entry's launch bound; V_DIM 64 caps the splits at 8 (32
+/// threads) and V_DIM 128/256 at 16. The lower split bound is the launch bound: with every head
+/// accounted for, a V_DIM 256 entry still needs two splits to stay inside its 512 threads.
+pub fn gdn_scan_shape_for(heads: usize, value_dim: usize) -> ((u32, u32, u32), u32) {
+    // q4p_gdn_scan_64_64 is launched with a 256-thread bound and the two 128-value entries with
+    // 512; a block past its entry's bound fails the launch.
+    let bound = if value_dim == 64 { 256 } else { 512 };
+    let max_splits = (4 * value_dim / 32).max(1);
     let mut splits = 1;
-    while heads * splits < GDN_SCAN_TARGET_BLOCKS && splits < GDN_SCAN_MAX_SPLITS {
+    while 4 * value_dim / splits.max(1) > bound && splits < max_splits {
+        splits *= 2;
+    }
+    while heads * splits < GDN_SCAN_TARGET_BLOCKS
+        && splits < GDN_SCAN_MAX_SPLITS
+        && splits < max_splits
+    {
         splits *= 2;
     }
     (
         (heads as u32, splits as u32, 1),
-        (4 * GDN_VALUE / splits) as u32,
+        (4 * value_dim / splits) as u32,
     )
+}
+
+/// The floats q4p_gdn_prep stages for one (token, key head): q then k, each key_dim wide with
+/// four padding floats after every 32 (Q4P_GDN_ROW).
+pub fn gdn_qk_row(key_dim: usize) -> usize {
+    2 * (key_dim + key_dim / 8)
 }
 /// The conv history q4p_gdn_conv_state carries in registers (Q4P_CONV_HISTORY).
 pub const CONV_HISTORY: usize = 8;
@@ -354,10 +378,16 @@ pub(super) struct PrefillKernels {
     moe_down: Kernel,
     moe_rows_gate_up: Kernel,
     moe_rows_down: Kernel,
+    /// The block-scaled FP8 grouped prefill MMA (D95), on the shared 128 x 128 tile.
+    moe_gate_up_fp8: Kernel,
+    moe_swiglu_fp8: Kernel,
+    moe_down_fp8: Kernel,
     gdn_conv: Kernel,
     gdn_conv_state: Kernel,
     gdn_prep: Kernel,
     gdn_scan: Kernel,
+    gdn_scan_64_64: Kernel,
+    gdn_scan_128_256: Kernel,
     gdn_gate: Kernel,
 }
 
@@ -405,10 +435,15 @@ impl PrefillKernels {
             moe_down: named("q4p_moe_down")?,
             moe_rows_gate_up: named("q4p_moe_rows_gate_up")?,
             moe_rows_down: named("q4p_moe_rows_down")?,
+            moe_gate_up_fp8: named("q4p_moe_gate_up_fp8")?,
+            moe_swiglu_fp8: named("q4p_moe_swiglu_fp8")?,
+            moe_down_fp8: named("q4p_moe_down_fp8")?,
             gdn_conv: scan("q4p_gdn_conv")?,
             gdn_conv_state: scan("q4p_gdn_conv_state")?,
             gdn_prep: scan("q4p_gdn_prep")?,
             gdn_scan: scan("q4p_gdn_scan")?,
+            gdn_scan_64_64: scan("q4p_gdn_scan_64_64")?,
+            gdn_scan_128_256: scan("q4p_gdn_scan_128_256")?,
             gdn_gate: scan("q4p_gdn_gate")?,
         })
     }
@@ -428,6 +463,9 @@ pub(super) struct PrefillScratch {
     gdn_qk: Deviceptr,
     /// [tokens][value heads] (decay factor, beta).
     gdn_decay_beta: Deviceptr,
+    /// The FP8 routed experts' grouped prefill output: items of 32 rows x 2 * intermediate f32
+    /// columns (gate then up), which q4p_moe_swiglu_fp8 reduces to [slots][intermediate].
+    moe_gate_up: Deviceptr,
 }
 
 impl PrefillScratch {
@@ -444,21 +482,34 @@ impl PrefillScratch {
             items: cuda.alloc(items.max(1) * 16, total)?,
             item_count: cuda.alloc(4, total)?,
             gdn_qk: cuda.alloc(
-                (chunk * config.linear_num_key_heads * GDN_QK_ROW * 4).max(4),
+                (chunk * config.linear_num_key_heads * gdn_qk_row(config.linear_key_head_dim) * 4)
+                    .max(4),
                 total,
             )?,
             gdn_decay_beta: cuda
                 .alloc((chunk * config.linear_num_value_heads * 8).max(4), total)?,
+            // The most items the plan can write is ceil(slots / 32) + experts; each is padded
+            // to the 32-row item and holds gate and up.
+            moe_gate_up: cuda.alloc(
+                ((slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots))
+                    * MOE_ROWS
+                    * 2
+                    * config.moe_intermediate_size
+                    * 4)
+                .max(4),
+                total,
+            )?,
         })
     }
 
-    pub(super) fn pointers(&self) -> [&Deviceptr; 5] {
+    pub(super) fn pointers(&self) -> [&Deviceptr; 6] {
         [
             &self.expert_input,
             &self.items,
             &self.item_count,
             &self.gdn_qk,
             &self.gdn_decay_beta,
+            &self.moe_gate_up,
         ]
     }
 }
@@ -1006,16 +1057,137 @@ impl DeviceSequence {
         Ok(true)
     }
 
+    /// The chunk's block-scaled FP8 routed experts on the shared 128 x 128 tensor-core tile
+    /// (D95). Returns false, launching nothing, when the plan or the shapes do not fit the tile,
+    /// or when the batch is below [GEMM_MIN_BATCH]: a decode step keeps the token FP8 kernels
+    /// (their f32 activation is the exact path), as the NVFP4 arm's few-rows form serves small
+    /// batches.
+    ///
+    /// The token path's FP8 experts are one CTA an expert run on CUDA cores; a prefill chunk
+    /// sorts the same slots into items and runs them through q4p_moe_gate_up_fp8 /
+    /// q4p_moe_down_fp8, which instantiate the shared body with Qwen's BF16 128 x 128 tile
+    /// scales. Gate and up read the item's token row and write its slot row (the plan's
+    /// permutation included) of one [slots][2 * intermediate] f32 buffer, SwiGLU maps those rows
+    /// into [slots][intermediate], and down applies the slot's routing weight from the
+    /// [batch][experts] probability row into the same [slot][hidden] partials the token kernels
+    /// write, so the combine is unchanged.
+    pub(super) fn routed_experts_mma_fp8(
+        &self,
+        table: Deviceptr,
+        mixed: Deviceptr,
+        batch: usize,
+    ) -> Result<bool, BackendError> {
+        let config = &self.backend.config;
+        let hidden = config.hidden_size;
+        let intermediate = config.moe_intermediate_size;
+        // A chunk's grouped tile reads one expert's 128 x 128 weight blocks once for many rows;
+        // a decode step or a short verify has no rows to share, and the token FP8 kernels' f32
+        // activation is the existing exact path (the NVFP4 arm keeps its few-rows form the same
+        // way). Only a real chunk takes the grouped tile.
+        if batch < GEMM_MIN_BATCH
+            || !part("experts")
+            || !hidden.is_multiple_of(128)
+            || !intermediate.is_multiple_of(128)
+            || config.num_experts > MOE_MAX_EXPERTS
+        {
+            return Ok(false);
+        }
+        let kernels = &self.backend.kernels.prefill;
+        let scratch = &self.prefill;
+        let topk = config.num_experts_per_tok;
+        let slots = batch * topk;
+        let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
+        self.launch(
+            kernels.moe_plan,
+            (1, 1, 1),
+            (
+                sparkflash_model::active_profile().plan.block_threads(),
+                1,
+                1,
+            ),
+            &[
+                self.expert_indices.0,
+                self.expert_perm.0,
+                scratch.items.0,
+                scratch.item_count.0,
+                0,
+                slots as u64,
+                config.num_experts as u64,
+                topk as u64,
+                MOE_ROWS as u64,
+                items as u64,
+                0,
+                2,
+                0,
+                0,
+                0,
+                0,
+                self.expert_accumulator.0,
+                hidden as u64,
+            ],
+        )?;
+        // Gate and up share the one gate_up buffer: gate in the first `intermediate` columns,
+        // up in the second.
+        for (matrix, at) in [(0u64, 0usize), (2u64, intermediate)] {
+            self.launch(
+                kernels.moe_gate_up_fp8,
+                ((intermediate / 128) as u32, 1, items),
+                (256, 1, 1),
+                &[
+                    table.0,
+                    scratch.items.0,
+                    mixed.0,
+                    scratch.moe_gate_up.offset(at * 4).0,
+                    intermediate as u64,
+                    hidden as u64,
+                    self.expert_perm.0,
+                    topk as u64,
+                    matrix,
+                ],
+            )?;
+        }
+        self.launch(
+            kernels.moe_swiglu_fp8,
+            (intermediate.div_ceil(256).max(1) as u32, slots as u32, 1),
+            (256, 1, 1),
+            &[
+                scratch.moe_gate_up.0,
+                self.expert_activated.0,
+                slots as u64,
+                intermediate as u64,
+            ],
+        )?;
+        self.launch(
+            kernels.moe_down_fp8,
+            ((hidden / 128) as u32, 1, items),
+            (256, 1, 1),
+            &[
+                table.0,
+                scratch.items.0,
+                self.expert_activated.0,
+                self.probabilities.0,
+                self.expert_accumulator.0,
+                hidden as u64,
+                intermediate as u64,
+                self.expert_perm.0,
+                topk as u64,
+                config.num_experts as u64,
+            ],
+        )?;
+        Ok(true)
+    }
+
     /// Whether this configuration's Gated DeltaNet is the one the scan is compiled for.
     fn gdn_fits(&self) -> bool {
         let config = &self.backend.config;
         let groups = config.value_groups();
+        let key_dim = config.linear_key_head_dim;
+        let value_dim = config.linear_value_head_dim;
         part("gdn")
-            && config.linear_key_head_dim == GDN_KEY
-            && config.linear_value_head_dim == GDN_VALUE
+            && matches!((key_dim, value_dim), (64, 64) | (128, 128) | (128, 256))
             && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim)
             && groups != 0
-            && groups <= GDN_KEY
+            && groups <= key_dim
             && config.linear_num_key_heads * groups == config.linear_num_value_heads
     }
 
@@ -1092,14 +1264,14 @@ impl DeviceSequence {
         self.launch(
             kernels.gdn_gate,
             (heads as u32, batch as u32, 1),
-            (GDN_VALUE as u32, 1, 1),
+            (config.linear_value_head_dim as u32, 1, 1),
             &[
                 self.linear_out.0,
                 self.linear_z.0,
                 norm.0,
                 self.linear_out.0,
                 heads as u64,
-                GDN_VALUE as u64,
+                config.linear_value_head_dim as u64,
                 u64::from((config.rms_norm_eps as f32).to_bits()),
                 u64::from(config.output_gate_is_sigmoid()),
             ],
@@ -1134,7 +1306,7 @@ impl DeviceSequence {
         self.launch(
             kernels.gdn_prep,
             (key_heads as u32, rows as u32, 1),
-            (GDN_KEY as u32, 1, 1),
+            (config.linear_key_head_dim as u32, 1, 1),
             &[
                 conv.0,
                 a.0,
@@ -1146,15 +1318,21 @@ impl DeviceSequence {
                 key_width as u64,
                 key_heads as u64,
                 heads as u64,
-                GDN_VALUE as u64,
+                config.linear_value_head_dim as u64,
                 groups as u64,
             ],
         )?;
-        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
+        let value_dim = config.linear_value_head_dim;
+        let scan = match (config.linear_key_head_dim, value_dim) {
+            (64, 64) => kernels.gdn_scan_64_64,
+            (128, 256) => kernels.gdn_scan_128_256,
+            _ => kernels.gdn_scan,
+        };
+        let (scan_grid, scan_threads) = gdn_scan_shape_for(heads, value_dim);
         // The verify's windows are the conv's snapshot; the recurrent state is replayed rather
         // than saved a row at a time, so the scan writes no snapshot of its own.
         self.launch(
-            kernels.gdn_scan,
+            scan,
             scan_grid,
             (scan_threads, 1, 1),
             &[
@@ -1167,7 +1345,7 @@ impl DeviceSequence {
                 key_width as u64,
                 key_heads as u64,
                 heads as u64,
-                GDN_VALUE as u64,
+                value_dim as u64,
                 groups as u64,
                 rows as u64,
                 0,

@@ -333,7 +333,13 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::Moe,
         Image::Qwen4Prefill,
-        &["q4p_moe_gate_up", "q4p_moe_down"],
+        &[
+            "q4p_moe_gate_up",
+            "q4p_moe_down",
+            "q4p_moe_gate_up_fp8",
+            "q4p_moe_swiglu_fp8",
+            "q4p_moe_down_fp8",
+        ],
         false,
     ),
     sm121(
@@ -435,6 +441,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Deepseek,
         &[
             "opt_vision_patchify",
+            "opt_vision_patchify_16",
             "opt_vision_gemm",
             "opt_vision_rmsnorm",
             "opt_vision_rope",

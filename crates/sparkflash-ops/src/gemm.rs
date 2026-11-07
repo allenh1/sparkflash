@@ -238,11 +238,19 @@ impl OpPlan for GroupedMoeGemmPlan {
     }
 
     fn launch(&self) -> Launch {
+        // The Qwen token expert GEMV stages its activation in dynamic shared memory: two
+        // members of the wider projection, one padded float a column group.
+        let pad = |columns: usize| columns.div_ceil(32) * 33;
+        let shared = if self.precision == Precision::F32 {
+            2 * pad(self.hidden.max(self.intermediate)) * std::mem::size_of::<f32>()
+        } else {
+            0
+        };
         Launch {
             kernel: self.kernel(),
             grid: (self.experts as u32, self.rows.div_ceil(32) as u32, 1),
             block: (256, 1, 1),
-            shared_bytes: 0,
+            shared_bytes: shared as u32,
             stream: self.stream,
         }
     }

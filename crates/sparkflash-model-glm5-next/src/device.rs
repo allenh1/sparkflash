@@ -325,7 +325,9 @@ const MAX_EXPERTS: usize = 512;
 const MAX_TOPK: usize = 64;
 const MAX_HC: usize = 5;
 /// Q4E_MHC_COLUMNS: the columns of every stream copy a thread of q4e_mhc_in holds, so the hidden
-/// width is a multiple of [BLOCK] of at most this many.
+/// width is a multiple of [BLOCK] of at most this many. The kernel's array is 16 columns: a lift
+/// to 32 would add some 224 live floats a thread and a larger cap no released config uses
+/// (D98's correction).
 const MHC_COLUMNS: usize = 16;
 const MAX_POOL: usize = 16;
 const MAX_INDEX_HEADS: usize = 32;
@@ -3810,11 +3812,6 @@ impl DeviceRank {
             self.bulk_attend(dsa, layer, runs, rows)?;
             return self.gemv(&dsa.o, s.attn_out, s.partial, rows);
         }
-        if heads > MLA_HEADS {
-            return Err(refusal(format!(
-                "the decode MLA stages at most {MLA_HEADS} heads a rank, not {heads}"
-            )));
-        }
         // The absorbed form: the query projected into the latent space, then the attention over
         // the latent cache in four launches (glm_decode_sm121.cu's q4e_glm_mla_scores) and kv_b's
         // value rows.
@@ -3847,7 +3844,11 @@ impl DeviceRank {
             let quantise = u64::from(dsa.quantise);
             self.launch(
                 self.kernels.mla_scores,
-                ((MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32, len, 1),
+                (
+                    (MAX_SELECTED_TOKENS / MLA_SCORE_SLOTS) as u32,
+                    len,
+                    heads.div_ceil(MLA_HEADS) as u32,
+                ),
                 BLOCK,
                 &[
                     &[s.q_abs.0][..],
@@ -3935,10 +3936,11 @@ impl DeviceRank {
         let config = &self.config;
         let (heads, nope, value) = (dsa.heads, config.qk_nope_head_dim, config.v_head_dim);
         let latent = config.kv_lora_rank;
-        if latent != GMA_LATENT || heads != GMA_HEADS || !value.is_multiple_of(128) {
+        if latent != GMA_LATENT || heads == 0 || !value.is_multiple_of(128) {
             return Err(refusal(format!(
-                "the bulk MLA takes {GMA_HEADS} heads of a {GMA_LATENT}-wide latent and whole \
-                 128-column value tiles, not {heads} of {latent} and {value}"
+                "the bulk MLA takes a {GMA_LATENT}-wide latent (in {GMA_HEADS}-head tiles, so \
+                 any head count) and whole 128-column value tiles, not latent {latent} and value \
+                 {value} with {heads} heads"
             )));
         }
         let row_tiles = rows.div_ceil(128) as u32;
@@ -3996,7 +3998,7 @@ impl DeviceRank {
             };
             self.launch(
                 attend,
-                (run.len as u32, 1, 1),
+                (run.len as u32, 1, heads.div_ceil(GMA_HEADS) as u32),
                 BLOCK,
                 &[
                     s.q_abs.0,
@@ -4007,6 +4009,7 @@ impl DeviceRank {
                     run.first as u64,
                     MAX_SELECTED_TOKENS as u64,
                     float((nope as f32).sqrt()),
+                    heads as u64,
                 ],
             )?;
         }

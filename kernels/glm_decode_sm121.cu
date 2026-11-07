@@ -51,6 +51,7 @@
 #include "quant_decode_sm121.cuh"
 #include "opt_pdl_sm121.cuh"
 #include "q4e_common_sm121.cuh"
+#include "shared_swiglu_sm121.cuh"
 #include "q4e_gemv_sm121.cuh"
 
 #define Q4E_BLOCK 256
@@ -348,6 +349,8 @@ extern "C" __global__ void q4e_glm_mla_attend(const float* __restrict__ q_abs,
 //
 // The logits are [row][head][Q4E_MAX_SELECTED], the mixed latents [row][head][latent], and the
 // softmax sums [row][head].
+// Heads one blockIdx.z tile stages. A tile size, not a rank cap: the host launches
+// heads.div_ceil(Q4E_GLM_MLA_HEADS) of them and the body masks the last partial tile.
 #define Q4E_GLM_MLA_HEADS 16
 
 // q4e_glm_mla_at in two halves, so a thread's gathers are all in flight before the first is
@@ -379,9 +382,10 @@ __device__ __forceinline__ float q4e_glm_mla_decode(unsigned int word, float sca
 #define Q4E_GLM_MLA_PROJECT_ROWS 8
 #define Q4E_GLM_MLA_PROJECT_AHEAD 32
 
-// The logits: grid (Q4E_MAX_SELECTED / Q4E_GLM_MLA_SCORE_SLOTS, rows), Q4E_BLOCK threads, at most
-// Q4E_GLM_MLA_HEADS heads. A lane sums its columns lane, lane + 32, ... and the warp folds them as
-// the attend kernel's warp does.
+// The logits: grid (Q4E_MAX_SELECTED / Q4E_GLM_MLA_SCORE_SLOTS, rows, ceil(heads /
+// Q4E_GLM_MLA_HEADS)), Q4E_BLOCK threads. blockIdx.z is one Q4E_GLM_MLA_HEADS-head tile, so a
+// rank's head count is not capped at 16. A lane sums its columns lane, lane + 32, ... and the warp
+// folds them as the attend kernel's warp does.
 extern "C" __global__ void q4e_glm_mla_scores(const float* __restrict__ q_abs,
                                               const float* __restrict__ latent_cache,
                                               const unsigned char* __restrict__ codes,
@@ -396,16 +400,20 @@ extern "C" __global__ void q4e_glm_mla_scores(const float* __restrict__ q_abs,
     const int row = base + blockIdx.y;
     const int nsel = selected_count[row];
     const int first = blockIdx.x * Q4E_GLM_MLA_SCORE_SLOTS;
-    if (heads > Q4E_GLM_MLA_HEADS || latent > Q4E_GLM_MAX_LATENT || nsel > Q4E_MAX_SELECTED ||
+    const int head_base = (int)blockIdx.z * Q4E_GLM_MLA_HEADS;
+    const int local_heads =
+        heads > head_base ? min(Q4E_GLM_MLA_HEADS, heads - head_base) : 0;
+    if (local_heads <= 0 || latent > Q4E_GLM_MAX_LATENT || nsel > Q4E_MAX_SELECTED ||
         first >= nsel) {
         return;
     }
     // Every load of the staging in flight at once, and each warp's positions in one load.
-    const float4* q = reinterpret_cast<const float4*>(q_abs + (unsigned long long)row * heads *
-                                                                   latent);
+    const float4* q = reinterpret_cast<const float4*>(
+        q_abs + (unsigned long long)row * heads * latent +
+        (unsigned long long)head_base * latent);
     float4* staged = reinterpret_cast<float4*>(query);
 #pragma unroll 8
-    for (int i = threadIdx.x; i < heads * latent / 4; i += blockDim.x) {
+    for (int i = threadIdx.x; i < local_heads * latent / 4; i += blockDim.x) {
         staged[i] = q[i];
     }
     const int* sel = selected + (unsigned long long)row * select_stride;
@@ -441,7 +449,7 @@ extern "C" __global__ void q4e_glm_mla_scores(const float* __restrict__ q_abs,
                               : 0.0f;
             }
         }
-        for (int head = 0; head < heads; ++head) {
+        for (int head = 0; head < local_heads; ++head) {
             const float* qh = query + head * latent;
             float dot[GROUP];
 #pragma unroll
@@ -464,7 +472,7 @@ extern "C" __global__ void q4e_glm_mla_scores(const float* __restrict__ q_abs,
                 dot[g] = q4e_warp_sum(dot[g]);
                 const int slot = first + warp + warps * (group + g);
                 if (lane == 0 && slot < last) {
-                    out[head * Q4E_MAX_SELECTED + slot] = dot[g] / scale;
+                    out[(head_base + head) * Q4E_MAX_SELECTED + slot] = dot[g] / scale;
                 }
             }
         }
@@ -1157,10 +1165,8 @@ extern "C" __global__ void q4e_swiglu_limited(const float* __restrict__ gate_up,
         return;
     }
     const float* source = gate_up + (unsigned long long)row * 2 * width;
-    const float gate = fminf(source[index], limit);
-    const float up = fminf(fmaxf(source[width + index], -limit), limit);
     out[(unsigned long long)row * width + index] =
-        __fmul_rn(__fmul_rn(gate, q4e_sigmoid_ref(gate)), up);
+        shared_swiglu_value<true, true>(source[index], source[width + index], limit);
 }
 
 // GLM's sigmoid noaux_tc routing over the router's logits ([batch][experts]): each score is
@@ -1176,85 +1182,9 @@ extern "C" __global__ void q4e_noaux_router(const float* __restrict__ logits,
                                             int experts, int topk, int renormalise,
                                             float scaling) {
     OPT_PDL_ENTRY();
-    constexpr int kEach = Q4E_MAX_EXPERTS / 32;
-    static_assert(kEach <= 32, "a lane's taken experts are one word's bits");
-    if (experts <= 0 || experts > Q4E_MAX_EXPERTS || topk <= 0 || topk > Q4E_MAX_TOPK ||
-        topk > experts || threadIdx.x >= 32) {
-        return;
-    }
-    const int b = blockIdx.x;
-    const int lane = threadIdx.x;
-    // Every load first, so they are in flight together.
-    float score[kEach];
-    float signal[kEach];
-#pragma unroll
-    for (int k = 0; k < kEach; ++k) {
-        const int expert = lane + 32 * k;
-        score[k] = expert < experts ? logits[(unsigned long long)b * experts + expert] : 0.0f;
-        signal[k] = expert < experts ? bias[expert] : 0.0f;
-    }
-#pragma unroll
-    for (int k = 0; k < kEach; ++k) {
-        if (lane + 32 * k < experts) {
-            score[k] = q4e_sigmoid_ref(score[k]);
-            signal[k] = __fadd_rn(score[k], signal[k]);
-        }
-    }
-    unsigned int taken = 0;
-    int picked[Q4E_MAX_TOPK];
-    float chosen[Q4E_MAX_TOPK];
-    for (int slot = 0; slot < topk; ++slot) {
-        float best_value = -INFINITY;
-        int best = 0x7FFFFFFF;
-#pragma unroll
-        for (int k = 0; k < kEach; ++k) {
-            if (lane + 32 * k < experts && (taken >> k & 1u) == 0) {
-                q4e_take_better(signal[k], lane + 32 * k, &best_value, &best);
-            }
-        }
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            q4e_take_better(__shfl_xor_sync(0xFFFFFFFFu, best_value, offset),
-                            __shfl_xor_sync(0xFFFFFFFFu, best, offset), &best_value, &best);
-        }
-        float mine = 0.0f;
-#pragma unroll
-        for (int k = 0; k < kEach; ++k) {
-            if (lane + 32 * k == best) {
-                taken |= 1u << k;
-                mine = score[k];
-            }
-        }
-        picked[slot] = best;
-        chosen[slot] = __shfl_sync(0xFFFFFFFFu, mine, best & 31);
-    }
-    if (lane == 0) {
-        float total = 0.0f;
-        for (int slot = 0; slot < topk; ++slot) {
-            total = __fadd_rn(total, chosen[slot]);
-        }
-        const float denominator = __fadd_rn(total, 1e-20f);
-        for (int slot = 0; slot < topk; ++slot) {
-            const float weight = renormalise && topk > 1 ? chosen[slot] / denominator : chosen[slot];
-            chosen[slot] = __fmul_rn(weight, scaling);
-        }
-        // Ascending expert order; the experts are distinct, so the order is total.
-        for (int slot = 1; slot < topk; ++slot) {
-            const int expert = picked[slot];
-            const float weight = chosen[slot];
-            int at = slot;
-            for (; at > 0 && picked[at - 1] > expert; --at) {
-                picked[at] = picked[at - 1];
-                chosen[at] = chosen[at - 1];
-            }
-            picked[at] = expert;
-            chosen[at] = weight;
-        }
-        for (int slot = 0; slot < topk; ++slot) {
-            indices[(unsigned long long)b * topk + slot] = picked[slot];
-            weights[(unsigned long long)b * topk + slot] = chosen[slot];
-        }
-    }
+    shared_moe_router_body<Q4E_ROUTER_SIGMOID, true, true, false, Q4E_MAX_EXPERTS,
+                           Q4E_MAX_TOPK, Q4E_BLOCK>(logits, bias, nullptr, indices, weights,
+                                                    experts, topk, renormalise, scaling);
 }
 
 // LayerNorm with a BF16 weight and bias over rows of `columns` (linalg::layer_norm: the biased
@@ -1309,41 +1239,11 @@ extern "C" __global__ void q4e_glm_pool(const float* __restrict__ keys,
     }
     const int first = position + 1 - pool;
     float* destination = pooled + (unsigned long long)((position + 1) / pool - 1) * dim;
-    for (int channel = threadIdx.x; channel < dim; channel += blockDim.x) {
-        float weight[Q4E_GLM_MAX_POOL];
-        float maximum = -INFINITY;
-#pragma unroll
-        for (int offset = 0; offset < Q4E_GLM_MAX_POOL; ++offset) {
-            if (offset < pool) {
-                weight[offset] =
-                    __fadd_rn(gates[(unsigned long long)(first + offset) * dim + channel],
-                              __bfloat162float(ape[offset * dim + channel]));
-                maximum = fmaxf(maximum, weight[offset]);
-            }
-        }
-        float total = 0.0f;
-#pragma unroll
-        for (int offset = 0; offset < Q4E_GLM_MAX_POOL; ++offset) {
-            if (offset < pool) {
-                weight[offset] = expf(weight[offset] - maximum);
-                total = __fadd_rn(total, weight[offset]);
-            }
-        }
-        float accumulated = 0.0f;
-#pragma unroll
-        for (int offset = 0; offset < Q4E_GLM_MAX_POOL; ++offset) {
-            if (offset < pool) {
-                const float share = !isfinite(maximum) ? 0.0f
-                                    : total > 0.0f    ? weight[offset] / total
-                                                      : weight[offset];
-                accumulated = __fadd_rn(
-                    accumulated,
-                    __fmul_rn(share, keys[(unsigned long long)(first + offset) * dim + channel]));
-            }
-        }
-        destination[channel] = accumulated;
-    }
+    q4e_indexer_pool_body<float, true>(keys + (unsigned long long)first * dim,
+                                       gates + (unsigned long long)first * dim, ape, nullptr,
+                                       destination, dim, pool, 0, 0.0f, 0.0f, first);
 }
+
 
 #define Q4E_GLM_MAX_INDEX_HEADS 32
 #define Q4E_GLM_MAX_INDEX_DIM 128
@@ -1386,32 +1286,15 @@ extern "C" __global__ void q4e_glm_index_scores(const float* __restrict__ query,
     const int warps = blockDim.x >> 5;
     const int last = min(first + Q4E_QSA_TILE, pools);
     for (int block = first + (threadIdx.x >> 5); block < last; block += warps) {
-        const float* key_row = pooled + (unsigned long long)block * dim;
-        float key[Q4E_GLM_MAX_INDEX_DIM / 32];
-#pragma unroll
-        for (int step = 0; step < Q4E_GLM_MAX_INDEX_DIM / 32; ++step) {
-            const int channel = lane + 32 * step;
-            key[step] = channel < dim ? key_row[channel] : 0.0f;
-        }
-        float score = 0.0f;
-        for (int head = 0; head < heads; ++head) {
-            float dot = 0.0f;
-#pragma unroll
-            for (int step = 0; step < Q4E_GLM_MAX_INDEX_DIM / 32; ++step) {
-                const int channel = lane + 32 * step;
-                if (channel < dim) {
-                    dot = fmaf(staged[head * dim + channel], key[step], dot);
-                }
-            }
-            dot = q4e_warp_sum(dot);
-            score = __fadd_rn(score,
-                              __fmul_rn(weight[head], fmaxf(__fmul_rn(dot, score_scale), 0.0f)));
-        }
+        const float score = q4e_indexer_score_body<float, true>(
+            staged, weight, pooled + (unsigned long long)block * dim, heads, dim, score_scale,
+            1.0f, lane);
         if (lane == 0) {
             scores[block] = score;
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------------------------
 // GLM-5.3-Flash: the tiled decode GEMV wrappers this arm loads from its own image.

@@ -40,6 +40,17 @@ __device__ __forceinline__ T q4e_ldg(const T* ptr) {
 }
 #endif
 
+// sparkflash_weights::linalg::sigmoid, which GLM-5.3-Flash's host twin uses everywhere: 1 / (1 +
+// e^-x) at x >= 0 and e^x / (1 + e^x) below, with the accurate exponential. It lives here because
+// the shared SwiGLU epilogue and the token image both need it.
+__device__ __forceinline__ float q4e_sigmoid_ref(float x) {
+    if (x >= 0.0f) {
+        return 1.0f / (1.0f + expf(-x));
+    }
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
 // One row per warp, one lane per 32 columns: the packed weights are read coalesced.
 __device__ __forceinline__ float q4e_warp_sum(float value) {
 #pragma unroll

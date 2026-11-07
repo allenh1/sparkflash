@@ -43,6 +43,7 @@
 #include "opt_mma_common_sm121.cuh"
 #include "opt_mma_bf16_sm121.cuh"
 #include "glm_common_sm121.cuh"
+#include "shared_swiglu_sm121.cuh"
 
 
 // The routed experts: table is the [weight, scales] pointer pairs, items the item list the
@@ -79,9 +80,8 @@ extern "C" __global__ void glm_moe_swiglu(const float *__restrict__ gate_up, int
          index += blockDim.x * gridDim.x) {
         const int row = index / width;
         const int column = index - row * width;
-        const float gate = fminf(gate_up[row * 2 * width + column], limit);
-        const float up = fminf(fmaxf(gate_up[row * 2 * width + width + column], -limit), limit);
-        out[index] = __fmul_rn(gate / (1.0f + __expf(-gate)), up);
+        out[index] = shared_swiglu_value<true, false>(
+            gate_up[row * 2 * width + column], gate_up[row * 2 * width + width + column], limit);
     }
 }
 
@@ -107,12 +107,11 @@ extern "C" __global__ void glm_moe_swiglu_q8(const float *__restrict__ gate_up, 
     const float *src = gate_up + (uint64_t)row * 2u * width + column;
     const float4 g4 = *reinterpret_cast<const float4 *>(src);
     const float4 u4 = *reinterpret_cast<const float4 *>(src + width);
-    auto act = [limit](float g, float u) {
-        const float gate = fminf(g, limit);
-        const float up = fminf(fmaxf(u, -limit), limit);
-        return __fmul_rn(gate / (1.0f + __expf(-gate)), up);
-    };
-    const float4 v = make_float4(act(g4.x, u4.x), act(g4.y, u4.y), act(g4.z, u4.z), act(g4.w, u4.w));
+    const float4 v = make_float4(
+        shared_swiglu_value<true, false>(g4.x, u4.x, limit),
+        shared_swiglu_value<true, false>(g4.y, u4.y, limit),
+        shared_swiglu_value<true, false>(g4.z, u4.z, limit),
+        shared_swiglu_value<true, false>(g4.w, u4.w, limit));
     float scale;
     const uint32_t codes = glm_q8_codes(v, scale);
     *reinterpret_cast<uint32_t *>(q + (uint64_t)row * width + column) = codes;

@@ -299,6 +299,20 @@ fn the_fp8_expert_fixture_matches_the_host_oracle() {
     let _ = parity(Qwen4ExpConfig::tiny_fp8(), "tiny fp8");
 }
 
+/// The same FP8 fixture, but on the grouped tensor-core prefill the D95/D96 path serves: the
+/// token-kernel test above takes `PrefillPlan::new(CHUNK, false)`, so it never launches
+/// q4p_moe_gate_up_fp8 / q4p_moe_down_fp8. This one does, at hidden = intermediate = 128 (the
+/// 128 x 128 tile), and compares the whole loop with the host oracle after the slot-row and
+/// routing-weight fixes.
+#[test]
+fn the_fp8_expert_prefill_on_the_tensor_cores_matches_the_host_oracle() {
+    // A chunk past GEMM_MIN_BATCH takes the grouped tile; the decode steps after it keep the
+    // token FP8 experts, so raise the fixture's 64-position window to hold a 73-token prompt.
+    let mut config = Qwen4ExpConfig::tiny_fp8();
+    config.max_position_embeddings = 128;
+    tensor_core_parity(config, "tiny fp8 tensor cores", 73);
+}
+
 /// The converted rank file is the same bits: the device loop over a file the converter wrote must
 /// produce the checkpoint path's logits, including the NVFP4 scales and the rebuilt expert tables.
 #[test]

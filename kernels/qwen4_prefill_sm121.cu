@@ -67,6 +67,9 @@
 // launches them with programmatic stream serialization, as it does the token cubin's.
 #include "opt_pdl_sm121.cuh"
 #include "q4e_common_sm121.cuh"
+// The 128 x 128 bulk-prefill tile body GLM's dense and routed-expert images launch: Qwen's
+// block-scaled FP8 experts run their grouped prefill MMA on the same body (D95).
+#include "shared_prefill_mma_sm121.cuh"
 
 // The shared header's gate, under the name this image used.
 #define q4p_silu q4e_silu
@@ -1062,3 +1065,65 @@ extern "C" __global__ __launch_bounds__(128) void q4p_moe_rows_down(
     q4p_moe_rows_body<false>(table, scales, sorted, items, item_count, activated, activated_plane,
                              route_weights, partials, 0, topk, hidden, intermediate, weight_stride);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Block-scaled FP8 routed experts on the shared 128 x 128 tile (D95).
+//
+// Qwen's FP8 release stores each expert as an E4M3 gate, up and down matrix with one BF16
+// inverse scale a 128 x 128 tile. The token path reads them one expert run at a time on CUDA
+// cores; a prefill chunk runs the grouped plan's items through the shared bulk-prefill tile,
+// exactly as GLM's FP8 experts do, so a prefill multiplies 128 rows x 128 columns a block on the
+// tensor cores. The weight/scale pointer pairs come from the expert table
+// [gate w, gate s, up w, up s, down w, down s], typed: a BF16 scale is read as a BF16 (D88).
+//
+// The activation stays f32. Gate and up read each item's token row and write its slot row of one
+// [slots][2 * intermediate] f32 buffer (sorted[first + token], so a plan permutation follows the
+// row it names), the SwiGLU kernel maps those rows one to one into [slots][intermediate], and the
+// down pass applies the routing weight - probabilities[(slot / topk) * topk + slot % topk] - on
+// the way to q4e_moe_combine's [slot][hidden] partials. This is a grouped accumulation order, so
+// it is a D67 numerics note against the scalar token path, not a bit-identity claim.
+extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_moe_gate_up_fp8(
+    const unsigned long long* __restrict__ table, const int4* __restrict__ items,
+    const float* __restrict__ a, float* __restrict__ out, unsigned int cols,
+    unsigned int inner, const int* __restrict__ sorted, unsigned int topk, int matrix) {
+    OPT_PDL_ENTRY();
+    if (matrix == 0) {
+        shared_prefill_mma_body<SPM_W_FP8, true, true, __nv_bfloat16, 6, 0, false, true>(
+            a, nullptr, nullptr, table, items, out, cols, inner, Q4P_MOE_ROWS, inner,
+            2ull * cols, 0ull, (unsigned long long)Q4P_MOE_ROWS * 2ull * cols, 0, 0, sorted,
+            topk);
+    } else {
+        shared_prefill_mma_body<SPM_W_FP8, true, true, __nv_bfloat16, 6, 2, false, true>(
+            a, nullptr, nullptr, table, items, out, cols, inner, Q4P_MOE_ROWS, inner,
+            2ull * cols, 0ull, (unsigned long long)Q4P_MOE_ROWS * 2ull * cols, 0, 0, sorted,
+            topk);
+    }
+}
+
+// gate_up's [items][32][2 * intermediate] f32 rows -> the SwiGLU'd [slots][intermediate] f32
+// rows the down pass takes. One slot row per blockIdx.y.
+extern "C" __global__ void q4p_moe_swiglu_fp8(const float* __restrict__ gate_up,
+                                               float* __restrict__ activated, int slots,
+                                               int intermediate) {
+    OPT_PDL_ENTRY();
+    const int slot = blockIdx.y;
+    if (slot >= slots) return;
+    const float* src = gate_up + (unsigned long long)slot * 2u * intermediate;
+    float* dst = activated + (unsigned long long)slot * intermediate;
+    for (int column = blockIdx.x * blockDim.x + threadIdx.x; column < intermediate;
+         column += blockDim.x * gridDim.x) {
+        dst[column] = q4p_silu(src[column]) * src[intermediate + column];
+    }
+}
+
+extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_moe_down_fp8(
+    const unsigned long long* __restrict__ table, const int4* __restrict__ items,
+    const float* __restrict__ a, const float* __restrict__ route, float* __restrict__ out,
+    unsigned int cols, unsigned int inner, const int* __restrict__ sorted, unsigned int topk,
+    unsigned int weight_stride) {
+    OPT_PDL_ENTRY();
+    shared_prefill_mma_body<SPM_W_FP8, true, true, __nv_bfloat16, 6, 4, true>(
+        a, nullptr, nullptr, table, items, out, cols, inner, Q4P_MOE_ROWS, inner, cols, 0ull,
+        0ull, 0, 0, sorted, topk, route, weight_stride);
+}
+

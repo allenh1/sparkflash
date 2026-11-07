@@ -46,6 +46,18 @@ pub const DOWNSAMPLE: usize = 3;
 pub const PATCH_FEATURES: usize = 3 * PATCH * PATCH;
 /// [PATCH_FEATURES] padded to the GEMM's K step; the patch rows and the embedding weight use it.
 pub const PATCH_STRIDE: usize = 608;
+
+/// Features per patch for a patch side (three channels of patch x patch).
+#[must_use]
+pub const fn patch_features(patch: usize) -> usize {
+    3 * patch * patch
+}
+
+/// [patch_features] padded to the GEMM's 32-wide K step.
+#[must_use]
+pub const fn patch_stride(patch: usize) -> usize {
+    patch_features(patch).div_ceil(32) * 32
+}
 /// The LLM's hidden width: one aligner or delimiter row, in bf16 values.
 pub const ROW: usize = 5120;
 
@@ -60,6 +72,8 @@ const GEMM_GELU: u64 = 2;
 /// The patch grid and token grid of one canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisionShape {
+    /// Patch side in pixels this grid was built for.
+    pub patch: usize,
     /// Patch rows.
     pub n_vit_h: usize,
     /// Patch columns.
@@ -71,22 +85,25 @@ pub struct VisionShape {
 }
 
 impl VisionShape {
-    /// The grids of a `height x width` canvas.
+    /// The grids of a height x width canvas for a tower whose patch side is patch (14 for
+    /// DeepSeek's and GLM's, 16 for Qwen's). There is no patch-less form: a tower states its
+    /// patch once, and the grid is derived from it.
     ///
     /// # Errors
-    /// A side that is zero or not a multiple of [PATCH].
-    pub fn of(height: usize, width: usize) -> Result<Self, String> {
+    /// A side that is zero or not a multiple of patch.
+    pub fn of_with_patch(height: usize, width: usize, patch: usize) -> Result<Self, String> {
         if height == 0
             || width == 0
-            || !height.is_multiple_of(PATCH)
-            || !width.is_multiple_of(PATCH)
+            || !height.is_multiple_of(patch)
+            || !width.is_multiple_of(patch)
         {
             return Err(format!(
-                "a {width} x {height} canvas is not a positive multiple of the {PATCH}-pixel patch"
+                "a {width} x {height} canvas is not a positive multiple of the {patch}-pixel patch"
             ));
         }
-        let (n_vit_h, n_vit_w) = (height / PATCH, width / PATCH);
+        let (n_vit_h, n_vit_w) = (height / patch, width / patch);
         Ok(Self {
+            patch,
             n_vit_h,
             n_vit_w,
             n_llm_h: n_vit_h.div_ceil(DOWNSAMPLE),
@@ -168,7 +185,7 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(shape: &VisionShape, canvas_bytes: usize) -> Self {
+    fn of(shape: &VisionShape, canvas_bytes: usize, patch_stride: usize) -> Self {
         let n = shape.patches();
         let rows = shape.rows();
         let mut at = 0;
@@ -181,7 +198,7 @@ impl Layout {
         let x = take(n * DIM * BF16);
         let h = take(n * DIM * BF16);
         let qkv = take(n * QKV * BF16);
-        let g = take(n * (2 * INTER).max(PATCH_STRIDE) * BF16);
+        let g = take(n * (2 * INTER).max(patch_stride) * BF16);
         let unfold = take(rows * UNFOLD * BF16);
         let a1 = take(rows * ROW * BF16);
         Self {
@@ -214,6 +231,9 @@ pub struct VisionTower {
     delimiters: [Deviceptr; 3],
     scratch: Option<(Deviceptr, usize)>,
     layout: Option<Layout>,
+    /// The tower's patch side and its derived GEMM K width.
+    patch: usize,
+    patch_stride: usize,
 }
 
 /// One weight's place in the arena: its checkpoint name, shape, and the row stride it is stored
@@ -233,6 +253,29 @@ impl VisionTower {
     /// A missing symbol, a missing tensor or one whose dtype or shape is not the checkpoint's, or
     /// the driver's allocation or copy failure.
     pub fn load(cuda: &Cuda, cubin: &[u8], source: &dyn WeightSource) -> Result<Self, String> {
+        Self::load_with_patch(cuda, cubin, source, PATCH)
+    }
+
+    /// [VisionTower::load] for a tower whose patch side is 14 or 16. The kernel image carries
+    /// both patchify entry points; the patch-16 one is Qwen's tower (D85).
+    ///
+    /// # Errors
+    /// As [VisionTower::load], plus a patch side the image does not carry.
+    pub fn load_with_patch(
+        cuda: &Cuda,
+        cubin: &[u8],
+        source: &dyn WeightSource,
+        patch: usize,
+    ) -> Result<Self, String> {
+        let patchify_name = match patch {
+            14 => "opt_vision_patchify",
+            16 => "opt_vision_patchify_16",
+            other => {
+                return Err(format!(
+                    "the vision image carries patch 14 and 16, not {other}"
+                ));
+            }
+        };
         let mut modules = Vec::new();
         let mut kernel = |name: &'static str| -> Result<Kernel, String> {
             let (module, kernel) = cuda.load_named(cubin, name)?;
@@ -240,7 +283,7 @@ impl VisionTower {
             Ok(kernel)
         };
         let kernels = Kernels {
-            patchify: kernel("opt_vision_patchify")?,
+            patchify: kernel(patchify_name)?,
             gemm: kernel("opt_vision_gemm")?,
             rmsnorm: kernel("opt_vision_rmsnorm")?,
             rope: kernel("opt_vision_rope")?,
@@ -266,8 +309,8 @@ impl VisionTower {
         };
         let patch_w = place(
             "vision.patch_embed.proj.weight".into(),
-            &[DIM, PATCH_FEATURES],
-            PATCH_STRIDE,
+            &[DIM, patch_features(patch)],
+            patch_stride(patch),
         );
         let patch_b = place("vision.patch_embed.proj.bias".into(), &[DIM], DIM);
         let mut blocks = Vec::with_capacity(LAYERS);
@@ -359,6 +402,8 @@ impl VisionTower {
             delimiters: delimiters.map(ptr),
             scratch: None,
             layout: None,
+            patch,
+            patch_stride: patch_stride(patch),
         })
     }
 
@@ -411,7 +456,7 @@ impl VisionTower {
         layers: usize,
         out: Option<Deviceptr>,
     ) -> Result<VisionShape, String> {
-        let shape = VisionShape::of(height, width)?;
+        let shape = VisionShape::of_with_patch(height, width, self.patch)?;
         if canvas.len() != height * width * 3 {
             return Err(format!(
                 "a {width} x {height} canvas is {} bytes, not {}",
@@ -425,7 +470,7 @@ impl VisionTower {
                 out.is_some()
             ));
         }
-        let layout = Layout::of(&shape, canvas.len());
+        let layout = Layout::of(&shape, canvas.len(), self.patch_stride);
         let base = self.scratch_for(cuda, layout.bytes)?;
         self.layout = Some(layout);
         let at = |offset: usize| base.offset(offset);
@@ -442,7 +487,7 @@ impl VisionTower {
         cuda.copy_htod(&canvas_d, canvas)?;
         cuda.launch(
             k.patchify,
-            (blocks_for(n * PATCH_STRIDE, 256), 1, 1),
+            (blocks_for(n * self.patch_stride, 256), 1, 1),
             (256, 1, 1),
             &[
                 canvas_d.0,
@@ -460,8 +505,8 @@ impl VisionTower {
             x,
             n,
             DIM,
-            PATCH_STRIDE,
-            PATCH_STRIDE,
+            self.patch_stride,
+            self.patch_stride,
             DIM,
             0,
         )?;
@@ -699,4 +744,49 @@ impl VisionTower {
 
 fn blocks_for(threads: usize, block: usize) -> u32 {
     threads.div_ceil(block) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A patch's stride is its three channels of patch x patch features padded to the GEMM's
+    /// 32-wide K step; the tower reads and the patchify kernel writes that one stride.
+    #[test]
+    fn patch_stride_pads_the_features_to_the_gemm_step() {
+        for patch in [PATCH, 16] {
+            let stride = patch_stride(patch);
+            assert_eq!(stride, patch_features(patch).div_ceil(32) * 32);
+            assert!(stride >= patch_features(patch));
+            assert!(stride.is_multiple_of(32));
+        }
+        assert_eq!(PATCH, 14);
+        assert_eq!(patch_stride(PATCH), PATCH_STRIDE);
+        assert_eq!(patch_features(PATCH), 3 * PATCH * PATCH);
+        assert_eq!(patch_stride(16), 3 * 16 * 16);
+    }
+
+    /// The grid of a canvas for either patch side the arms carry: the patch count is the canvas
+    /// over the patch, and the aligner rows are those over the downsample, rounded up.
+    #[test]
+    fn of_with_patch_builds_each_patch_sides_grid() {
+        for (patch, height, width) in [(PATCH, 28, 42), (16, 32, 48)] {
+            let shape = VisionShape::of_with_patch(height, width, patch).expect("a whole canvas");
+            assert_eq!(shape.patch, patch);
+            assert_eq!(
+                (shape.n_vit_h, shape.n_vit_w),
+                (height / patch, width / patch)
+            );
+            assert_eq!(shape.patches(), (height / patch) * (width / patch));
+            assert_eq!(shape.n_llm_h, shape.n_vit_h.div_ceil(DOWNSAMPLE));
+            assert_eq!(shape.n_llm_w, shape.n_vit_w.div_ceil(DOWNSAMPLE));
+            assert_eq!(shape.rows(), shape.n_llm_h * shape.n_llm_w);
+        }
+        // The two patch sides do not share a canvas: a 32 x 48 canvas is not a 14-pixel patch
+        // grid.
+        assert!(VisionShape::of_with_patch(32, 48, PATCH).is_err());
+        assert!(VisionShape::of_with_patch(28, 42, 16).is_err());
+        assert!(VisionShape::of_with_patch(0, 32, 16).is_err());
+        assert!(VisionShape::of_with_patch(32, 48, 0).is_err());
+    }
 }

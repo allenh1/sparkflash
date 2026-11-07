@@ -40,7 +40,7 @@
 use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_kernels::vision_tower::{
-    DIM, Delimiter, PATCH_FEATURES, PATCH_STRIDE, Probe, ROW, VisionShape, VisionTower,
+    DIM, Delimiter, PATCH, PATCH_FEATURES, PATCH_STRIDE, Probe, ROW, VisionShape, VisionTower,
 };
 use sparkflash_vision::{ImageFormat, PrepOptions, prepare};
 use std::path::{Path, PathBuf};
@@ -131,8 +131,9 @@ fn run() -> Result<(), String> {
         let prepared = prepare(&read(&args.images.join(image))?, &PrepOptions::default())
             .map_err(|error| format!("{image}: {error}"))?;
         let (height, width) = (prepared.grid.best_height, prepared.grid.best_width);
-        let shape = VisionShape::of(height, width)?;
+        let shape = VisionShape::of_with_patch(height, width, PATCH)?;
         let expected = VisionShape {
+            patch: sparkflash_kernels::vision_tower::PATCH,
             n_vit_h: field("n_vit_h")?,
             n_vit_w: field("n_vit_w")?,
             n_llm_h: field("n_llm_h")?,

@@ -74,9 +74,13 @@
 
 #define OV_DIM 1024u
 #define OV_QKV (3u * OV_DIM)
+// The patch side is a template parameter of the patchify kernel (D85): 14 for DeepSeek's and
+// GLM's towers, 16 for Qwen's. Its feature count and the GEMM K stride follow from it.
 #define OV_PATCH 14u
-#define OV_PATCH_K 588u
-#define OV_PATCH_KP 608u
+#define OV_PATCH_K (3u * OV_PATCH * OV_PATCH)
+#define OV_PATCH_KP ((OV_PATCH_K + 31u) / 32u * 32u)
+#define OV_PATCH_K_16 (3u * 16u * 16u)
+#define OV_PATCH_KP_16 ((OV_PATCH_K_16 + 31u) / 32u * 32u)
 #define OV_INTER 2816u
 #define OV_UNFOLD (9u * OV_DIM)
 #define OV_ROW 5120u
@@ -125,24 +129,42 @@ __device__ __forceinline__ float ov_silu(float x) {
     return __fdiv_rn(x, 1.0f + expf(-x));
 }
 
-extern "C" __global__ void __launch_bounds__(256) opt_vision_patchify(
+template <uint32_t PATCH>
+__device__ __forceinline__ void opt_vision_patchify_body(
     const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
     const uint32_t width, const uint32_t patches) {
-    OPT_PDL_ENTRY();
+    constexpr uint32_t kFeatures = 3u * PATCH * PATCH;
+    constexpr uint32_t kStride = (kFeatures + 31u) / 32u * 32u;
     const uint64_t t = (uint64_t)blockIdx.x * 256u + threadIdx.x;
-    const uint64_t patch = t / OV_PATCH_KP;
-    const uint32_t f = (uint32_t)(t % OV_PATCH_KP);
+    const uint64_t patch = t / kStride;
+    const uint32_t f = (uint32_t)(t % kStride);
     if (patch >= patches) return;
     float v = 0.0f;
-    if (f < OV_PATCH_K) {
-        const uint32_t c = f / (OV_PATCH * OV_PATCH);
-        const uint32_t r = f % (OV_PATCH * OV_PATCH);
-        const uint64_t y = (patch / n_vit_w) * OV_PATCH + r / OV_PATCH;
-        const uint64_t x = (patch % n_vit_w) * OV_PATCH + r % OV_PATCH;
+    if (f < kFeatures) {
+        const uint32_t c = f / (PATCH * PATCH);
+        const uint32_t r = f % (PATCH * PATCH);
+        const uint64_t y = (patch / n_vit_w) * PATCH + r / PATCH;
+        const uint64_t x = (patch % n_vit_w) * PATCH + r % PATCH;
         const float byte = (float)canvas[(y * width + x) * 3u + c];
         v = __fdiv_rn(__fsub_rn(__fdiv_rn(byte, 255.0f), 0.5f), 0.5f);
     }
     out[t] = __float2bfloat16_rn(v);
+}
+
+// The 14-pixel patch DeepSeek's and GLM's towers declare.
+extern "C" __global__ void __launch_bounds__(256) opt_vision_patchify(
+    const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
+    const uint32_t width, const uint32_t patches) {
+    OPT_PDL_ENTRY();
+    opt_vision_patchify_body<14u>(canvas, out, n_vit_w, width, patches);
+}
+
+// The 16-pixel patch Qwen's tower declares (D85): the same body, its own instantiation.
+extern "C" __global__ void __launch_bounds__(256) opt_vision_patchify_16(
+    const uint8_t *__restrict__ canvas, __nv_bfloat16 *__restrict__ out, const uint32_t n_vit_w,
+    const uint32_t width, const uint32_t patches) {
+    OPT_PDL_ENTRY();
+    opt_vision_patchify_body<16u>(canvas, out, n_vit_w, width, patches);
 }
 
 extern "C" __global__ void __launch_bounds__(256) opt_vision_gemm(

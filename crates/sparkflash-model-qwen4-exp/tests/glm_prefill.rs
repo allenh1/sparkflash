@@ -164,6 +164,8 @@ fn launch(cuda: &Cuda, name: &'static str, grid: (u32, u32, u32), threads: u32, 
         sparkflash_kernels::images::moe_plan_cubin()
     } else if name.starts_with("glm_moe_") {
         embedded_glm_moe_cubin()
+    } else if name.starts_with("glm_prefill_heads_") || name.starts_with("glm_prefill_mla_") {
+        sparkflash_kernels::images::glm_attention_cubin()
     } else {
         embedded_glm_prefill_cubin()
     };
@@ -244,6 +246,81 @@ fn the_bulk_fp8_dense_gemm_matches_the_host_block_scaled_linear() {
     );
     let got = download_f32(&cuda, &out, tokens * cols);
     assert_close("bulk fp8 dense, bf16 activation", &host, &got, 5e-2);
+}
+
+/// The per-head projection groups its weight and scale strides: head h's tile scales start
+/// ws_grp_stride *elements* on, not bytes (D88's regression). Two heads make an f32 stride read
+/// as four times too far, so heads >= 2 read the wrong tile scale; the test holds head 1 to the
+/// host block-scaled linear over its own codes.
+///
+/// The layout is the host's: kv_b's [head][nope + value][latent] rows, the weight pointer at the
+/// first value row, and one f32 scale a 128 x 128 block over the head's key and value blocks.
+#[test]
+fn the_head_tiled_fp8_projection_strides_its_per_head_scales_as_elements() {
+    let Some(cuda) = open() else { return };
+    let (heads, nope, value, latent, tokens) = (2usize, 128usize, 128usize, 512usize, 40usize);
+    let per_head = nope + value;
+    let blocks = latent / 128;
+    let mut rng = Lcg(0x676c_6d68);
+    // kv_b's codes as the checkpoint stores them, every head whole.
+    let codes: Vec<u8> = (0..heads * per_head * latent).map(|_| rng.code()).collect();
+    // One f32 tile scale a 128 x 128 block of each head: the key row block (nope rows) then the
+    // value row block, each with one scale a K block. The host passes the value block of head 0
+    // and an eight-element head stride; a byte stride reads head 1 two elements on instead of
+    // eight, which is the wrong tile scale.
+    let scales: Vec<f32> = (0..heads * 2 * blocks)
+        .map(|index| ((1 + index % 3) as f32 * 0.5 + rng.next().abs()) * 1e-3)
+        .collect();
+    // The absorbed query as [tokens][heads][latent]; the output as [tokens][heads][value].
+    let x = rng.values(tokens * heads * latent);
+    let w = upload(&cuda, &codes);
+    let ws = upload_f32(&cuda, &scales);
+    let a = upload_f32(&cuda, &x);
+    let out = upload_f32(&cuda, &vec![0.0; tokens * heads * value]);
+    launch(
+        &cuda,
+        "glm_prefill_heads_fp8b128_mma",
+        (
+            (value / 128) as u32,
+            tokens.div_ceil(128) as u32,
+            heads as u32,
+        ),
+        256,
+        &[
+            // The host points at the first value row of head 0 and strides whole heads.
+            w.offset(nope * latent).0,
+            ws.offset(4 * (nope / 128) * blocks).0,
+            a.0,
+            out.0,
+            value as u64,
+            latent as u64,
+            tokens as u64,
+            (heads * latent) as u64,
+            (heads * value) as u64,
+            latent as u64,
+            value as u64,
+            (per_head * latent) as u64,
+            ((per_head / 128) * blocks) as u64,
+        ],
+    );
+    let got = download_f32(&cuda, &out, tokens * heads * value);
+    let mut host = vec![0.0f32; tokens * heads * value];
+    for t in 0..tokens {
+        for head in 0..heads {
+            let first = head * 2 * blocks + blocks;
+            for column in 0..value {
+                let row = (head * per_head + nope + column) * latent;
+                let mut sum = 0.0f32;
+                for k in 0..latent {
+                    sum += quant::f8e4m3_to_f32(codes[row + k])
+                        * scales[first + (column / 128) * blocks + k / 128]
+                        * x[(t * heads + head) * latent + k];
+                }
+                host[(t * heads + head) * value + column] = sum;
+            }
+        }
+    }
+    assert_close("head-tiled fp8 projection", &host, &got, 5e-3);
 }
 
 #[test]

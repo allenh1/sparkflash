@@ -682,6 +682,11 @@ impl DeviceSequence {
             GpuExperts::Nvfp4 { table, scales } if chunk => {
                 self.routed_experts_mma(table, scales, mixed, batch)?
             }
+            // The FP8 release's grouped prefill MMA (D95): the same shared 128 x 128 tile
+            // GLM's FP8 experts run, with Qwen's BF16 tile scales.
+            GpuExperts::Fp8 { table } if chunk => {
+                self.routed_experts_mma_fp8(table, mixed, batch)?
+            }
             _ => false,
         };
         if !tensor_cores {

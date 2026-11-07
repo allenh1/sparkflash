@@ -109,7 +109,7 @@ pub use prefill::{
     ATTENTION_CHUNK, CONV_HISTORY, DEFAULT_PREFILL_CHUNK, DENSE_ROWS, GDN_KEY, GDN_QK_ROW,
     GDN_VALUE, MAX_PREFILL_CHUNK, MIN_PREFILL_CHUNK, PrefillPlan, TOKEN_PREFILL_CHUNK,
     embedded_glm_moe_cubin, embedded_glm_prefill_cubin, embedded_prefill_cubin,
-    embedded_scan_cubin, gdn_scan_shape,
+    embedded_scan_cubin, gdn_scan_shape, gdn_scan_shape_for,
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
@@ -545,7 +545,7 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn load(cuda: &Cuda, gdn_stage_bytes: u32) -> Result<Self, String> {
+    fn load(cuda: &Cuda, gdn_stage_bytes: u32, expert_stage_bytes: u32) -> Result<Self, String> {
         if embedded_cubin().is_empty() {
             return Err(
                 "this build has no Qwen4-Exp cubin: rebuild on a host with nvcc (or set \
@@ -580,9 +580,18 @@ impl Kernels {
             let (_, kernel) = cuda.load_named(embedded_attn_cubin(), name)?;
             Ok(kernel)
         }
-        // The routed-expert family lives in its own image (kernels/qwen4_moe_sm121.cu).
+        // The routed-expert family lives in its own image (kernels/qwen4_moe_sm121.cu). Its
+        // activation staging is dynamic shared memory, so every expert launch reserves the
+        // function's size explicitly.
         fn moe(cuda: &Cuda, name: &'static str) -> Result<Kernel, String> {
             let (_, kernel) = cuda.load_named(embedded_moe_cubin(), name)?;
+            Ok(kernel)
+        }
+        fn moe_staged(cuda: &Cuda, name: &'static str, shared: u32) -> Result<Kernel, String> {
+            if shared == 0 {
+                return moe(cuda, name);
+            }
+            let (_, kernel) = cuda.load_named_shared(embedded_moe_cubin(), name, shared)?;
             Ok(kernel)
         }
         /// A handle that reserves `shared` bytes of dynamic shared memory per launch, falling back
@@ -632,10 +641,10 @@ impl Kernels {
                     cuda.load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")?;
                 kernel
             },
-            expert_gate_up: moe(cuda, "q4e_expert_gate_up")?,
-            expert_down: moe(cuda, "q4e_expert_down")?,
-            expert_gate_up_fp8: moe(cuda, "q4e_expert_gate_up_fp8")?,
-            expert_down_fp8: moe(cuda, "q4e_expert_down_fp8")?,
+            expert_gate_up: moe_staged(cuda, "q4e_expert_gate_up", expert_stage_bytes)?,
+            expert_down: moe_staged(cuda, "q4e_expert_down", expert_stage_bytes)?,
+            expert_gate_up_fp8: moe_staged(cuda, "q4e_expert_gate_up_fp8", expert_stage_bytes)?,
+            expert_down_fp8: moe_staged(cuda, "q4e_expert_down_fp8", expert_stage_bytes)?,
             fold_streams: named(cuda, "q4e_fold_streams")?,
             widen_streams: named(cuda, "q4e_widen_streams")?,
             moe_combine: moe(cuda, "q4e_moe_combine")?,
@@ -668,6 +677,26 @@ impl Kernels {
             prefill: PrefillKernels::load(cuda)?,
         })
     }
+}
+
+/// The routed-expert token kernels stage Q4E_MEMBER_GROUP rows of their activation in dynamic
+/// shared memory, one padded float a column group (kernels/qwen4_moe_sm121.cu).
+const MOE_SMEM_STRIDE: usize = 33;
+const MOE_MEMBER_GROUP: usize = 2;
+
+/// The dynamic shared memory a routed-expert token launch reserves: the deeper of its gate/up
+/// (hidden wide) and down (intermediate wide) staging, for the largest geometry the config
+/// serves. The kernel computes the same padded stride from the width it is launched with.
+fn moe_expert_stage_bytes(config: &Qwen4ExpConfig) -> Result<u32, String> {
+    let pad = |columns: usize| columns.div_ceil(32) * MOE_SMEM_STRIDE;
+    let rows = pad(config.hidden_size).max(pad(config.moe_intermediate_size));
+    let bytes = MOE_MEMBER_GROUP * rows * 4;
+    // A reservation past 4 GiB cannot be expressed in cuFuncSetAttribute's int; refusing is the
+    // only honest answer, because a 0 here would load the plain kernel and silently fall back to
+    // the global staging path.
+    u32::try_from(bytes).map_err(|_| {
+        format!("the routed-expert staging reservation of {bytes} bytes does not fit 32 bits")
+    })
 }
 
 fn bytes_f32(bytes: &[u8], name: &str) -> Result<f32, String> {
@@ -2302,7 +2331,15 @@ impl Qwen4ExpDeviceBackend {
         // shared memory turns three global trips per token into three per chunk.
         let stage =
             config.linear_key_head_dim * config.linear_value_head_dim * std::mem::size_of::<f32>();
-        let kernels = Kernels::load(&cuda, u32::try_from(stage).unwrap_or(0))
+        let stage = u32::try_from(stage).map_err(|_| {
+            BackendError::new(
+                "qwen4_device",
+                format!("the GDN recurrence's {stage}-byte shared staging does not fit 32 bits"),
+            )
+        })?;
+        let expert_stage = moe_expert_stage_bytes(&config)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let kernels = Kernels::load(&cuda, stage, expert_stage)
             .map_err(|error| BackendError::new("qwen4_device", format!("kernel load: {error}")))?;
         // A configured drafter that cannot be loaded is refused rather than served without: the
         // caller asked for it by name.
@@ -5352,7 +5389,7 @@ pub fn device_self_test() -> Result<(), BackendError> {
     let cuda = Cuda::load()
         .map_err(|error| BackendError::new("qwen4_device", format!("CUDA: {error}")))?;
     // The self-test has no config; the recurrence streams its state from global memory.
-    let kernels = Kernels::load(&cuda, 0)
+    let kernels = Kernels::load(&cuda, 0, 0)
         .map_err(|error| BackendError::new("qwen4_device", format!("kernel load: {error}")))?;
     let mut total = 0usize;
     let width = 8usize;

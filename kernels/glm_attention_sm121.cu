@@ -79,6 +79,8 @@ extern "C" __global__ __launch_bounds__(OM_THREADS) void glm_prefill_heads_fp8b1
 //
 // Not bit-identical to q4e_glm_mla_attend: the sums run in MMA order.
 // ---------------------------------------------------------------------------------------------
+// Heads one blockIdx.z tile computes. It is a tile size, not a rank cap: the host launches
+// heads.div_ceil(GMA_HEADS) tiles and the body masks the last tile's partial head count.
 #define GMA_HEADS 16u
 #define GMA_LATENT 512u
 #define GMA_TILE 32u
@@ -102,7 +104,7 @@ template <bool LOW>
 __device__ __forceinline__ void glm_mla_attend_body(
     float *q_abs, const uint8_t *__restrict__ codes, const float *__restrict__ scales,
     const int *__restrict__ selected, const int *__restrict__ selected_count, uint32_t base,
-    uint32_t select_stride, float score_div) {
+    uint32_t select_stride, float score_div, uint32_t heads) {
     __shared__ __align__(128) uint8_t s_k[GMA_TILE * GMA_LATENT * 2u];
     __shared__ __align__(8) float s_s[GMA_BLOCKS][GMA_HEADS][GMA_TILE];
     __shared__ __align__(8) float s_p[GMA_HEADS * GMA_P_LD];
@@ -113,13 +115,19 @@ __device__ __forceinline__ void glm_mla_attend_body(
     const uint32_t row = base + blockIdx.x;
     const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5;
     const uint32_t g = lane >> 2, q = lane & 3u;
-    float *io = q_abs + (uint64_t)row * GMA_HEADS * GMA_LATENT;
+    // One blockIdx.z tile is GMA_HEADS heads; a rank may hold more (8, 16, 32, 64), and the
+    // last tile may be partial.
+    const uint32_t head_base = blockIdx.z * GMA_HEADS;
+    const uint32_t local_heads =
+        heads > head_base ? min(GMA_HEADS, heads - head_base) : 0u;
+    float *io = q_abs + (uint64_t)row * heads * GMA_LATENT +
+                (uint64_t)head_base * GMA_LATENT;
     const int *sel = selected + (uint64_t)row * select_stride;
     const int count = selected_count[row];
     if (count <= 0 || count > (int)GMA_MAX_SELECTED) {
         const float fill = count <= 0 ? 0.0f : __uint_as_float(0x7FC00000u);
         __syncthreads();
-        for (uint32_t i = tid; i < GMA_HEADS * GMA_LATENT; i += blockDim.x) io[i] = fill;
+        for (uint32_t i = tid; i < local_heads * GMA_LATENT; i += blockDim.x) io[i] = fill;
         return;
     }
     const uint32_t nsel = (uint32_t)count;
@@ -131,10 +139,19 @@ __device__ __forceinline__ void glm_mla_attend_body(
 #pragma unroll
     for (uint32_t j = 0; j < 8u; ++j) {
         const uint32_t k0 = kd * 128u + j * 16u + 2u * q;
-        const float2 v0 = *reinterpret_cast<const float2 *>(io + g * GMA_LATENT + k0);
-        const float2 v1 = *reinterpret_cast<const float2 *>(io + (g + 8u) * GMA_LATENT + k0);
-        const float2 v2 = *reinterpret_cast<const float2 *>(io + g * GMA_LATENT + k0 + 8u);
-        const float2 v3 = *reinterpret_cast<const float2 *>(io + (g + 8u) * GMA_LATENT + k0 + 8u);
+        const float2 zero = make_float2(0.0f, 0.0f);
+        const float2 v0 = g < local_heads
+                              ? *reinterpret_cast<const float2 *>(io + g * GMA_LATENT + k0)
+                              : zero;
+        const float2 v1 = g + 8u < local_heads
+                              ? *reinterpret_cast<const float2 *>(io + (g + 8u) * GMA_LATENT + k0)
+                              : zero;
+        const float2 v2 = g < local_heads
+                              ? *reinterpret_cast<const float2 *>(io + g * GMA_LATENT + k0 + 8u)
+                              : zero;
+        const float2 v3 = g + 8u < local_heads
+                              ? *reinterpret_cast<const float2 *>(io + (g + 8u) * GMA_LATENT + k0 + 8u)
+                              : zero;
         uint32_t lo[4];
         gma_split(v0.x, v0.y, qh[j][0], lo[0]);
         gma_split(v1.x, v1.y, qh[j][1], lo[1]);
@@ -301,10 +318,14 @@ __device__ __forceinline__ void glm_mla_attend_body(
 #pragma unroll
     for (uint32_t nt = 0; nt < 8u; ++nt) {
         const uint32_t d = warp * 64u + nt * 8u + 2u * q;
-        *reinterpret_cast<float2 *>(io + g * GMA_LATENT + d) =
-            make_float2(acc[nt][0] * inv_lo, acc[nt][1] * inv_lo);
-        *reinterpret_cast<float2 *>(io + (g + 8u) * GMA_LATENT + d) =
-            make_float2(acc[nt][2] * inv_hi, acc[nt][3] * inv_hi);
+        if (g < local_heads) {
+            *reinterpret_cast<float2 *>(io + g * GMA_LATENT + d) =
+                make_float2(acc[nt][0] * inv_lo, acc[nt][1] * inv_lo);
+        }
+        if (g + 8u < local_heads) {
+            *reinterpret_cast<float2 *>(io + (g + 8u) * GMA_LATENT + d) =
+                make_float2(acc[nt][2] * inv_hi, acc[nt][3] * inv_hi);
+        }
     }
 }
 
@@ -312,9 +333,9 @@ __device__ __forceinline__ void glm_mla_attend_body(
 extern "C" __global__ __launch_bounds__(256) void glm_prefill_mla_attend(
     float *q_abs, const uint8_t *__restrict__ codes, const float *__restrict__ scales,
     const int *__restrict__ selected, const int *__restrict__ selected_count, uint32_t base,
-    uint32_t select_stride, float score_div) {
+    uint32_t select_stride, float score_div, uint32_t heads) {
     glm_mla_attend_body<true>(q_abs, codes, scales, selected, selected_count, base,
-                              select_stride, score_div);
+                              select_stride, score_div, heads);
 }
 
 // The same over the bf16 head of the query and the probabilities alone
@@ -322,7 +343,7 @@ extern "C" __global__ __launch_bounds__(256) void glm_prefill_mla_attend(
 extern "C" __global__ __launch_bounds__(256) void glm_prefill_mla_attend_bf16a(
     float *q_abs, const uint8_t *__restrict__ codes, const float *__restrict__ scales,
     const int *__restrict__ selected, const int *__restrict__ selected_count, uint32_t base,
-    uint32_t select_stride, float score_div) {
+    uint32_t select_stride, float score_div, uint32_t heads) {
     glm_mla_attend_body<false>(q_abs, codes, scales, selected, selected_count, base,
-                               select_stride, score_div);
+                               select_stride, score_div, heads);
 }

@@ -50,20 +50,15 @@
 #include "quant_decode_sm121.cuh"
 #include "opt_pdl_sm121.cuh"
 #include "q4e_common_sm121.cuh"
+#include "q4e_gemv_sm121.cuh"
 
 #define Q4E_BLOCK 256
 
-// Static shared-memory and register-tiling bounds. The driver launch path passes a dynamic
-// shared-memory size of zero, so every shared buffer is a fixed array sized for the largest
-// geometry this pack can serve, with a guard that makes an oversized request a no-op rather than
-// a corruption. The host side checks the same bounds and refuses first.
-//
-// The widest matrix row any NVFP4 expert projection stages in shared memory.
-#define Q4E_MAX_ROW 2560
 // Padding each 32-float group by 1 float (stride 33, coprime to 32) eliminates the 32-way
-// shared-memory bank conflict when a warp's 32 lanes read 32-float chunks simultaneously.
+// shared-memory bank conflict when a warp's 32 lanes read 32-float chunks simultaneously. The
+// activation staging itself is dynamic shared memory, sized from the projection's width by the
+// host launch, so a geometry is no longer capped at a compile-time row width.
 #define Q4E_SMEM_STRIDE 33
-#define Q4E_MAX_ROW_PADDED ((Q4E_MAX_ROW >> 5) * Q4E_SMEM_STRIDE + 32)
 #define Q4E_MAX_EXPERTS 512
 #define Q4E_MAX_TOPK 64
 
@@ -199,7 +194,7 @@ __device__ __forceinline__ float q4e_nvfp4_row_dot(const unsigned char* packed_r
 // of up to Q4E_MEMBER_GROUP run members.
 __device__ __forceinline__ void q4e_dot_packed_chunk_pair_group(
     const uint4 g_packed, const uint4 u_packed, float g_low, float g_high, float u_low,
-    float u_high, const float2* lut, const float* base, int count, float* g_total,
+    float u_high, const float2* lut, const float* base, int count, int pad, float* g_total,
     float* u_total) {
     const unsigned int g_words[4] = {g_packed.x, g_packed.y, g_packed.z, g_packed.w};
     const unsigned int u_words[4] = {u_packed.x, u_packed.y, u_packed.z, u_packed.w};
@@ -223,7 +218,7 @@ __device__ __forceinline__ void q4e_dot_packed_chunk_pair_group(
 #pragma unroll
         for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
             if (m < count) {
-                const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED + word * 8;
+                const float* x_chunk = base + m * pad + word * 8;
                 float g = 0.0f;
                 float u = 0.0f;
 #pragma unroll
@@ -253,7 +248,7 @@ __device__ __forceinline__ void q4e_dot_packed_chunk_pair_group(
 // The same for a single matrix, as the down pass has.
 __device__ __forceinline__ void q4e_dot_packed_chunk_group(const uint4 packed, float low,
                                                            float high, const float2* lut,
-                                                           const float* base, int count,
+                                                           const float* base, int count, int pad,
                                                            float* out) {
     const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
     float lo[Q4E_MEMBER_GROUP] = {};
@@ -270,7 +265,7 @@ __device__ __forceinline__ void q4e_dot_packed_chunk_group(const uint4 packed, f
 #pragma unroll
         for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
             if (m < count) {
-                const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED + word * 8;
+                const float* x_chunk = base + m * pad + word * 8;
                 float dot = 0.0f;
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
@@ -297,8 +292,8 @@ __device__ __forceinline__ void q4e_dot_packed_chunk_group(const uint4 packed, f
 __device__ __forceinline__ void q4e_nvfp4_row_dot_pair_group(
     const unsigned char* g_row, const unsigned char* g_scale, float g_scale2,
     const unsigned char* u_row, const unsigned char* u_scale, float u_scale2, const float* lut,
-    const float2* lut_pair, const float* base, int columns, int lane, int count, float* g_out,
-    float* u_out) {
+    const float2* lut_pair, const float* base, int columns, int lane, int count, int pad,
+    float* g_out, float* u_out) {
 #pragma unroll
     for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
         g_out[m] = 0.0f;
@@ -316,16 +311,14 @@ __device__ __forceinline__ void q4e_nvfp4_row_dot_pair_group(
             const float u_low = q4e_e4m3(q4e_ldg(&u_scale[group])) * u_scale2;
             const float u_high = q4e_e4m3(q4e_ldg(&u_scale[group + 1])) * u_scale2;
             q4e_dot_packed_chunk_pair_group(g_packed, u_packed, g_low, g_high, u_low, u_high,
-                                            lut_pair, base + chunk * Q4E_SMEM_STRIDE, count, g_out,
-                                            u_out);
+                                            lut_pair, base + chunk * Q4E_SMEM_STRIDE, count, pad,
+                                            g_out, u_out);
         }
         return;
     }
     for (int m = 0; m < count; ++m) {
-        g_out[m] = q4e_nvfp4_row_dot(g_row, g_scale, g_scale2, lut,
-                                      base + m * Q4E_MAX_ROW_PADDED, columns, lane);
-        u_out[m] = q4e_nvfp4_row_dot(u_row, u_scale, u_scale2, lut,
-                                      base + m * Q4E_MAX_ROW_PADDED, columns, lane);
+        g_out[m] = q4e_nvfp4_row_dot(g_row, g_scale, g_scale2, lut, base + m * pad, columns, lane);
+        u_out[m] = q4e_nvfp4_row_dot(u_row, u_scale, u_scale2, lut, base + m * pad, columns, lane);
     }
 }
 
@@ -334,7 +327,7 @@ __device__ __forceinline__ void q4e_nvfp4_row_dot_group(const unsigned char* pac
                                                         const unsigned char* scale_row,
                                                         float scale2, const float* lut,
                                                         const float2* lut_pair, const float* base,
-                                                        int columns, int lane, int count,
+                                                        int columns, int lane, int count, int pad,
                                                         float* out) {
 #pragma unroll
     for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
@@ -348,13 +341,13 @@ __device__ __forceinline__ void q4e_nvfp4_row_dot_group(const unsigned char* pac
             const float low = q4e_e4m3(q4e_ldg(&scale_row[group])) * scale2;
             const float high = q4e_e4m3(q4e_ldg(&scale_row[group + 1])) * scale2;
             q4e_dot_packed_chunk_group(packed, low, high, lut_pair,
-                                       base + chunk * Q4E_SMEM_STRIDE, count, out);
+                                       base + chunk * Q4E_SMEM_STRIDE, count, pad, out);
         }
         return;
     }
     for (int m = 0; m < count; ++m) {
-        out[m] = q4e_nvfp4_row_dot(packed_row, scale_row, scale2, lut,
-                                    base + m * Q4E_MAX_ROW_PADDED, columns, lane);
+        out[m] = q4e_nvfp4_row_dot(packed_row, scale_row, scale2, lut, base + m * pad, columns,
+                                    lane);
     }
 }
 
@@ -371,7 +364,7 @@ template <int ROWS>
 __device__ __forceinline__ void q4e_nvfp4_rows_dot_group(
     const unsigned char* row, const unsigned char* scale_row, float scale2, int packed, int groups,
     int valid, const float* lut, const float2* lut_pair, const float* base, int columns, int lane,
-    int count, float (*out)[Q4E_MEMBER_GROUP]) {
+    int count, int pad, float (*out)[Q4E_MEMBER_GROUP]) {
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) {
 #pragma unroll
@@ -385,7 +378,7 @@ __device__ __forceinline__ void q4e_nvfp4_rows_dot_group(
         for (int r = 0; r < ROWS; ++r) {
             if (r < valid) {
                 q4e_nvfp4_row_dot_group(row + r * packed, scale_row + r * groups, scale2, lut,
-                                        lut_pair, base, columns, lane, count, out[r]);
+                                        lut_pair, base, columns, lane, count, pad, out[r]);
             }
         }
         return;
@@ -407,7 +400,7 @@ __device__ __forceinline__ void q4e_nvfp4_rows_dot_group(
             if (r < valid) {
                 q4e_dot_packed_chunk_group(weights[r], q4e_e4m3(codes[r] & 0xFF) * scale2,
                                            q4e_e4m3(codes[r] >> 8) * scale2, lut_pair,
-                                           base + chunk * Q4E_SMEM_STRIDE, count, out[r]);
+                                           base + chunk * Q4E_SMEM_STRIDE, count, pad, out[r]);
             }
         }
     }
@@ -418,71 +411,9 @@ __device__ __forceinline__ void q4e_nvfp4_rows_dot_group(
 extern "C" __global__ void q4e_router(const float* logits, float* probabilities, int* indices,
                                       int experts, int topk) {
     OPT_PDL_ENTRY();
-    __shared__ float scratch[Q4E_BLOCK];
-    __shared__ int scratch_index[Q4E_BLOCK];
-    __shared__ float probability[Q4E_MAX_EXPERTS];
-    __shared__ int picked[Q4E_MAX_TOPK];
-    __shared__ float chosen[Q4E_MAX_TOPK];
-    if (experts <= 0 || experts > Q4E_MAX_EXPERTS || topk <= 0 || topk > Q4E_MAX_TOPK ||
-        topk > experts) {
-        return;
-    }
-    int b = blockIdx.x;
-    const float* logits_b = logits + (unsigned long long)b * experts;
-    float* probs_b = probabilities + (unsigned long long)b * experts;
-    int* indices_b = indices + (unsigned long long)b * topk;
-    int thread = threadIdx.x;
-    float local_max = -INFINITY;
-    for (int expert = thread; expert < experts; expert += blockDim.x) {
-        local_max = fmaxf(local_max, logits_b[expert]);
-    }
-    // The helper's closing barrier is what lets the sum below reuse scratch: read inline, a slow
-    // warp could take thread 0's partial sum for the maximum and route on skewed probabilities.
-    const float maximum = q4e_block_max(local_max, scratch);
-
-    float local_sum = 0.0f;
-    for (int expert = thread; expert < experts; expert += blockDim.x) {
-        float value = expf(logits_b[expert] - maximum);
-        probability[expert] = value;
-        local_sum += value;
-    }
-    float sum = q4e_block_sum(local_sum, scratch);
-    for (int expert = thread; expert < experts; expert += blockDim.x) {
-        float value = probability[expert] / sum;
-        probability[expert] = value;
-        probs_b[expert] = value;
-    }
-    __syncthreads();
-
-    for (int slot = 0; slot < topk; ++slot) {
-        float best_value = -2.0f;
-        int best = 0x7FFFFFFF;
-        for (int expert = thread; expert < experts; expert += blockDim.x) {
-            if (probability[expert] > -0.5f) {
-                q4e_take_better(probability[expert], expert, &best_value, &best);
-            }
-        }
-        q4e_block_best(&best_value, &best, scratch, scratch_index);
-        if (thread == 0) {
-            picked[slot] = best;
-            chosen[slot] = best_value;
-            probability[best] = -1.0f;
-        }
-        __syncthreads();
-    }
-    if (thread == 0) {
-        float normaliser = 0.0f;
-        for (int slot = 0; slot < topk; ++slot) {
-            normaliser += chosen[slot];
-        }
-        if (normaliser <= 0.0f) {
-            normaliser = 1.0f;
-        }
-        for (int slot = 0; slot < topk; ++slot) {
-            probs_b[slot] = chosen[slot] / normaliser;
-            indices_b[slot] = picked[slot];
-        }
-    }
+    shared_moe_router_body<Q4E_ROUTER_SOFTMAX, false, false, true, Q4E_MAX_EXPERTS,
+                           Q4E_MAX_TOPK, Q4E_BLOCK>(logits, nullptr, probabilities, indices,
+                                                    probabilities, experts, topk, 1, 1.0f);
 }
 
 
@@ -510,7 +441,8 @@ extern "C" __global__ void q4e_router(const float* logits, float* probabilities,
 // owns sixteen consecutive values, so a 128-column scale tile covers whole lanes and every load
 // is 16-byte aligned: no straddle and no masked tail, for either 2560 or 640.
 __device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float scale,
-                                                     const float* base, int count, float* out) {
+                                                     const float* base, int count, int pad,
+                                                     float* out) {
     const unsigned int words[4] = {packed.x, packed.y, packed.z, packed.w};
     float weight[16];
 #pragma unroll
@@ -524,7 +456,7 @@ __device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float sc
 #pragma unroll
     for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
         if (m < count) {
-            const float* x_chunk = base + m * Q4E_MAX_ROW_PADDED;
+            const float* x_chunk = base + m * pad;
             float dot = 0.0f;
 #pragma unroll
             for (int i = 0; i < 16; ++i) {
@@ -538,7 +470,7 @@ __device__ __forceinline__ void q4e_fp8_chunk_group(const uint4 packed, float sc
 __device__ __forceinline__ void q4e_fp8_row_dot_group(const unsigned char* row,
                                                        const __nv_bfloat16* scale_row,
                                                        const float* base, int columns, int lane,
-                                                       int count, float* out) {
+                                                       int count, int pad, float* out) {
 #pragma unroll
     for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
         out[m] = 0.0f;
@@ -548,7 +480,7 @@ __device__ __forceinline__ void q4e_fp8_row_dot_group(const unsigned char* row,
         const int column = chunk * 16;
         const uint4 packed = q4e_ldg(reinterpret_cast<const uint4*>(row + column));
         const float scale = __bfloat162float(q4e_ldg(&scale_row[column >> 7]));
-        q4e_fp8_chunk_group(packed, scale, base + q4e_smem_idx(column), count, out);
+        q4e_fp8_chunk_group(packed, scale, base + q4e_smem_idx(column), count, pad, out);
     }
 }
 
@@ -559,12 +491,15 @@ __device__ __forceinline__ void q4e_expert_gate_up_body(
     const int* __restrict__ run_bounds, const float* __restrict__ x,
     float* __restrict__ activated, int slots, int hidden, int intermediate) {
     constexpr bool FP8 = QUANT == Q4E_QUANT_FP8;
-    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    extern __shared__ __align__(16) float source[];
     __shared__ float lut[16];
     __shared__ float2 lut_pair[256];
-    if (hidden <= 0 || hidden > Q4E_MAX_ROW || (FP8 && (hidden & 15) != 0)) {
+    if (hidden <= 0 || (FP8 && (hidden & 15) != 0)) {
         return;
     }
+    // The per-member stride: one padded float a column group, the conflict-free layout the
+    // staging writes. The host sizes the dynamic reservation from the same expression.
+    const int pad = ((hidden + 31) >> 5) * Q4E_SMEM_STRIDE;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int rows = (blockDim.x >> 5) * Q4E_ROWS_PER_WARP;
@@ -652,7 +587,7 @@ __device__ __forceinline__ void q4e_expert_gate_up_body(
             const int total_slot = perm[begin + group + m];
             const int b = total_slot / slots;
             const float* x_b = x + (unsigned long long)b * hidden;
-            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            float* staged = source + m * pad;
             for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
                 staged[q4e_smem_idx(column)] = x_b[column];
             }
@@ -681,15 +616,15 @@ __device__ __forceinline__ void q4e_expert_gate_up_body(
                 if constexpr (FP8) {
                     q4e_fp8_row_dot_group(grow[r],
                                            reinterpret_cast<const __nv_bfloat16*>(gsrow[r]),
-                                           source, hidden, lane, count, g);
+                                           source, hidden, lane, count, pad, g);
                     q4e_fp8_row_dot_group(urow[r],
                                            reinterpret_cast<const __nv_bfloat16*>(usrow[r]),
-                                           source, hidden, lane, count, u);
+                                           source, hidden, lane, count, pad, u);
                 } else {
                     q4e_nvfp4_row_dot_pair_group(
                         grow[r], (const unsigned char*)gsrow[r], g2, urow[r],
                         (const unsigned char*)usrow[r], u2, lut, lut_pair, source, hidden, lane,
-                        count, g, u);
+                        count, pad, g, u);
                 }
 #pragma unroll
                 for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
@@ -740,12 +675,14 @@ __device__ __forceinline__ void q4e_expert_down_body(
     const float* __restrict__ activated, float* __restrict__ partials, int slots, int hidden,
     int intermediate, int weight_stride) {
     constexpr bool FP8 = QUANT == Q4E_QUANT_FP8;
-    __shared__ __align__(16) float source[Q4E_MEMBER_GROUP * Q4E_MAX_ROW_PADDED];
+    extern __shared__ __align__(16) float source[];
     __shared__ float lut[16];
     __shared__ float2 lut_pair[256];
-    if (intermediate <= 0 || intermediate > Q4E_MAX_ROW || (FP8 && (intermediate & 15) != 0)) {
+    if (intermediate <= 0 || (FP8 && (intermediate & 15) != 0)) {
         return;
     }
+    // As in pass one, from the intermediate width the down pass stages.
+    const int pad = ((intermediate + 31) >> 5) * Q4E_SMEM_STRIDE;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int rows = (blockDim.x >> 5) * Q4E_DOWN_ROWS_PER_WARP;
@@ -799,7 +736,7 @@ __device__ __forceinline__ void q4e_expert_down_body(
             const int total_slot = perm[begin + group + m];
             const float* slot_activated =
                 activated + (unsigned long long)total_slot * intermediate;
-            float* staged = source + m * Q4E_MAX_ROW_PADDED;
+            float* staged = source + m * pad;
             for (int column = threadIdx.x; column < intermediate; column += blockDim.x) {
                 staged[q4e_smem_idx(column)] = slot_activated[column];
             }
@@ -813,13 +750,13 @@ __device__ __forceinline__ void q4e_expert_down_body(
                     if (r < valid) {
                         q4e_fp8_row_dot_group(
                             drow[r], reinterpret_cast<const __nv_bfloat16*>(dsrow[r]), source,
-                            intermediate, lane, count, value[r]);
+                            intermediate, lane, count, pad, value[r]);
                     }
                 }
             } else {
                 q4e_nvfp4_rows_dot_group<Q4E_DOWN_ROWS_PER_WARP>(
                     drow[0], (const unsigned char*)dsrow[0], d2, packed, groups, valid, lut,
-                    lut_pair, source, intermediate, lane, count, value);
+                    lut_pair, source, intermediate, lane, count, pad, value);
             }
         }
 #pragma unroll

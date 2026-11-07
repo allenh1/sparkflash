@@ -102,40 +102,12 @@ extern "C" __global__ void q4e_qsa_pool(const __nv_bfloat16* index_keys,
     if (index_dim > 128 || blockDim.x < 128) {
         return;
     }
-    __shared__ float pooled[128];
-    __shared__ float scratch[128];
-    const int dim = threadIdx.x;
-    const bool live = dim < index_dim;
-    float value = 0.0f;
-    if (live) {
-        float sum = 0.0f;
-        for (int token = 0; token < ratio; ++token) {
-            sum += __bfloat162float(
-                index_keys[(unsigned long long)(block * ratio + token) * index_dim + dim]);
-        }
-        value = sum / (float)ratio;
-    }
-    const float scale = rsqrtf(q4e_block_sum(value * value, scratch) / (float)index_dim + eps);
-    if (live) {
-        pooled[dim] = value * scale * (1.0f + __bfloat162float(k_weight[dim]));
-    }
-    __syncthreads();
-    const int half = rotary < index_dim ? rotary / 2 : index_dim / 2;
-    if (dim < half) {
-        const float frequency = powf(theta, -2.0f * (float)dim / (float)rotary);
-        const float angle = (float)(block * ratio) * frequency;
-        const float cosine = __cosf(angle);
-        const float sine = __sinf(angle);
-        const float a = pooled[dim];
-        const float b = pooled[dim + half];
-        pooled[dim] = a * cosine - b * sine;
-        pooled[dim + half] = a * sine + b * cosine;
-    }
-    __syncthreads();
-    if (live) {
-        pooled_keys[(unsigned long long)block * index_dim + dim] = pooled[dim];
-    }
+    q4e_indexer_pool_body<__nv_bfloat16, false>(
+        index_keys + (unsigned long long)block * ratio * index_dim, nullptr, nullptr, k_weight,
+        pooled_keys + (unsigned long long)block * index_dim, index_dim, ratio, rotary, theta, eps,
+        block * ratio);
 }
+
 
 #define Q4E_QSA_TILE 64
 #define Q4E_QSA_MAX_HEADS 8
@@ -165,41 +137,22 @@ extern "C" __global__ void q4e_qsa_scores(const float* __restrict__ index_q,
     const int warps = blockDim.x >> 5;
     const float* index_q_t = index_q + (unsigned long long)token_index * index_heads * index_dim;
     float* scores_t = scores + (unsigned long long)token_index * score_stride;
-    float query[Q4E_QSA_MAX_HEADS][4];
-#pragma unroll
-    for (int head = 0; head < Q4E_QSA_MAX_HEADS; ++head) {
-#pragma unroll
-        for (int step = 0; step < 4; ++step) {
-            const int dim = lane + 32 * step;
-            query[head][step] =
-                head < index_heads && dim < index_dim ? index_q_t[head * index_dim + dim] : 0.0f;
-        }
+    // Stage the token's query heads once: the score body reads every head for every block, and
+    // the pre-shared form preloaded them into registers before its block loop.
+    __shared__ float staged[Q4E_QSA_MAX_HEADS * 128];
+    for (int index = threadIdx.x; index < index_heads * index_dim; index += blockDim.x) {
+        staged[index] = index_q_t[index];
     }
+    __syncthreads();
     const int last = first + Q4E_QSA_TILE < blocks ? first + Q4E_QSA_TILE : blocks;
     for (int block = first + warp; block < last; block += warps) {
-        const float* key_row = pooled_keys + (unsigned long long)block * index_dim;
-        float key[4];
-#pragma unroll
-        for (int step = 0; step < 4; ++step) {
-            const int dim = lane + 32 * step;
-            key[step] = dim < index_dim ? key_row[dim] : 0.0f;
-        }
-        float score = 0.0f;
-#pragma unroll
-        for (int head = 0; head < Q4E_QSA_MAX_HEADS; ++head) {
-            if (head < index_heads) {
-                const float low = __fadd_rn(__fmul_rn(query[head][0], key[0]),
-                                            __fmul_rn(query[head][2], key[2]));
-                const float high = __fadd_rn(__fmul_rn(query[head][1], key[1]),
-                                             __fmul_rn(query[head][3], key[3]));
-                score += fmaxf(q4e_warp_sum(__fadd_rn(low, high)), 0.0f);
-            }
-        }
-        if (lane == 0) {
-            scores_t[block] = score / sqrtf((float)index_dim);
-        }
+        const float score = q4e_indexer_score_body<float, false>(
+            staged, nullptr, pooled_keys + (unsigned long long)block * index_dim,
+            index_heads, index_dim, 1.0f, 1.0f, lane);
+        if (lane == 0) scores_t[block] = score;
     }
 }
+
 
 extern "C" __global__ void q4e_qsa_pick(const float* scores, int* selected, int* count,
                                         int position, int ratio, int budget, int score_stride,

@@ -97,11 +97,12 @@ fn run_once(
     let (_, permute) = cuda
         .load_named(sparkflash_kernels::images::moe_plan_cubin(), "moe_plan")
         .expect("moe_plan");
+    let shared = (2 * HIDDEN.max(INTER).div_ceil(32) * 33 * std::mem::size_of::<f32>()) as u32;
     let (_, gate_up) = cuda
-        .load_named(embedded_moe_cubin(), "q4e_expert_gate_up")
+        .load_named_shared(embedded_moe_cubin(), "q4e_expert_gate_up", shared)
         .expect("q4e_expert_gate_up");
     let (_, down) = cuda
-        .load_named(embedded_moe_cubin(), "q4e_expert_down")
+        .load_named_shared(embedded_moe_cubin(), "q4e_expert_down", shared)
         .expect("q4e_expert_down");
     let start = Instant::now();
     cuda.launch(

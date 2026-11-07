@@ -66,22 +66,22 @@
 // Gated DeltaNet.
 // ---------------------------------------------------------------------------------------------
 
-#define Q4P_GDN_KEY 128
-// Tokens staged per pipeline step. Eight keeps a head's block (both buffers) at 26 KiB, so all
-// forty-eight heads are resident at once - the scan is latency-bound, and a second wave would
-// double it.
+// The scan's geometry is a template parameter: (K_DIM, V_DIM) of (64, 64), (128, 128) and
+// (128, 256) are instantiated, so a head geometry is no longer a source edit. The released
+// Qwen configuration is (128, 128). A compile-time stride keeps the state cells a lane owns at
+// immediate offsets from one base pointer, where a runtime stride had ptxas hold hoisted 64-bit
+// addresses and spill.
 #define Q4P_GDN_TILE 8
-// Floats per staged token: q then k, each 128 keys with four floats of padding after every 32,
-// so the four key quarters a warp reads at one offset sit on different banks.
-#define Q4P_GDN_HALF 144
-#define Q4P_GDN_ROW (2 * Q4P_GDN_HALF)
-// The value head width the scan is compiled for (the released configuration's): a compile-time
-// stride keeps the 32 state cells a lane owns at immediate offsets from one base pointer, where a
-// runtime stride had ptxas hold 32 hoisted 64-bit addresses and spill.
-#define Q4P_GDN_VALUE 128
 
+// Four padding floats after every 32 keys, so the key quarters a warp reads at one offset sit on
+// different banks. The staged row is q then k, each padded.
 __device__ __forceinline__ int q4p_gdn_pad(int key) {
     return key + (key >> 5) * 4;
+}
+
+template <int K_DIM>
+__device__ __forceinline__ constexpr int q4p_gdn_half() {
+    return K_DIM + (K_DIM >> 3);
 }
 
 // The causal depthwise conv history a chunk carries (taps - 1 rows); the released configuration
@@ -171,20 +171,20 @@ extern "C" __global__ void q4p_gdn_conv_state(const float* __restrict__ raw,
 // With kChannel (Kimi Delta Attention) the decay is one factor a key channel, which the scan
 // reads from q4e_kda_decay's buffer, so the head's factor is written as 1 and a, a_log and
 // dt_bias are not read.
-template <bool kChannel>
+template <int K_DIM, bool kChannel>
 __device__ __forceinline__ void q4p_gdn_prep_body(
     const float* __restrict__ mixed, const float* __restrict__ a, const float* __restrict__ b,
     const __nv_bfloat16* __restrict__ a_log, const __nv_bfloat16* __restrict__ dt_bias,
     float* __restrict__ qk, float2* __restrict__ decay_beta, int key_width, int key_heads,
     int heads, int value_dim, int groups) {
-    __shared__ float reduce[2][4];
+    __shared__ float reduce[2][K_DIM / 32];
     const int kh = blockIdx.x;
     const int token = blockIdx.y;
     const int key = threadIdx.x;
     const int conv_width = key_width * 2 + heads * value_dim;
     const float* row = mixed + (unsigned long long)token * conv_width;
-    const float q = row[kh * Q4P_GDN_KEY + key];
-    const float k = row[key_width + kh * Q4P_GDN_KEY + key];
+    const float q = row[kh * K_DIM + key];
+    const float k = row[key_width + kh * K_DIM + key];
     float q_sum = q * q;
     float k_sum = k * k;
 #pragma unroll
@@ -197,17 +197,28 @@ __device__ __forceinline__ void q4p_gdn_prep_body(
         reduce[1][key >> 5] = k_sum;
     }
     __syncthreads();
-    q_sum = (reduce[0][0] + reduce[0][1]) + (reduce[0][2] + reduce[0][3]);
-    k_sum = (reduce[1][0] + reduce[1][1]) + (reduce[1][2] + reduce[1][3]);
+    if constexpr (K_DIM == 128) {
+        // The released geometry's pairwise order, preserved bit for bit.
+        q_sum = (reduce[0][0] + reduce[0][1]) + (reduce[0][2] + reduce[0][3]);
+        k_sum = (reduce[1][0] + reduce[1][1]) + (reduce[1][2] + reduce[1][3]);
+    } else {
+        q_sum = reduce[0][0] + reduce[0][1];
+        k_sum = reduce[1][0] + reduce[1][1];
+    }
     const float q_norm = rsqrtf(q_sum + 1e-6f);
     const float k_norm = rsqrtf(k_sum + 1e-6f);
-    float* out = qk + ((unsigned long long)token * key_heads + kh) * Q4P_GDN_ROW;
-    out[q4p_gdn_pad(key)] = q * q_norm * rsqrtf((float)Q4P_GDN_KEY);
-    out[Q4P_GDN_HALF + q4p_gdn_pad(key)] = k * k_norm;
-    if (key < 16) {
-        // The padding is never read; zero it so the staged rows are fully defined.
-        out[(key >> 2) * 36 + 32 + (key & 3)] = 0.0f;
-        out[Q4P_GDN_HALF + (key >> 2) * 36 + 32 + (key & 3)] = 0.0f;
+    constexpr int kHalf = q4p_gdn_half<K_DIM>();
+    constexpr int kRow = 2 * kHalf;
+    float* out = qk + ((unsigned long long)token * key_heads + kh) * kRow;
+    out[q4p_gdn_pad(key)] = q * q_norm * rsqrtf((float)K_DIM);
+    out[kHalf + q4p_gdn_pad(key)] = k * k_norm;
+    // Four pad floats after every 32 keys; zero them so the staged rows are fully defined. A
+    // K of 128 has four groups (the released geometry), a K of 64 two.
+    if (key < (K_DIM / 32) * 4) {
+        const int group = key >> 2;
+        const int within = key & 3;
+        out[group * 36 + 32 + within] = 0.0f;
+        out[kHalf + group * 36 + 32 + within] = 0.0f;
     }
     if (key < groups) {
         const int head = kh * groups + key;
@@ -231,8 +242,15 @@ extern "C" __global__ __launch_bounds__(128) void q4p_gdn_prep(
     float* __restrict__ qk, float2* __restrict__ decay_beta, int key_width, int key_heads,
     int heads, int value_dim, int groups) {
     OPT_PDL_ENTRY();
-    q4p_gdn_prep_body<false>(mixed, a, b, a_log, dt_bias, qk, decay_beta, key_width, key_heads,
-                             heads, value_dim, groups);
+    // key_width is the rank's whole key width; the scan's geometry is one head's, K_DIM.
+    const int key_dim = key_heads > 0 ? key_width / key_heads : key_width;
+    if (key_dim == 128) {
+        q4p_gdn_prep_body<128, false>(mixed, a, b, a_log, dt_bias, qk, decay_beta, key_width,
+                                      key_heads, heads, value_dim, groups);
+    } else if (key_dim == 64) {
+        q4p_gdn_prep_body<64, false>(mixed, a, b, a_log, dt_bias, qk, decay_beta, key_width,
+                                     key_heads, heads, value_dim, groups);
+    }
 }
 
 // Kimi Delta Attention's prep, for q4p_kda_scan: the same grid, beta only beside the q and k.
@@ -241,11 +259,17 @@ extern "C" __global__ __launch_bounds__(128) void q4p_kda_prep(
     float2* __restrict__ decay_beta, int key_width, int key_heads, int heads, int value_dim,
     int groups) {
     OPT_PDL_ENTRY();
-    q4p_gdn_prep_body<true>(mixed, nullptr, b, nullptr, nullptr, qk, decay_beta, key_width,
-                            key_heads, heads, value_dim, groups);
+    const int key_dim = key_heads > 0 ? key_width / key_heads : key_width;
+    if (key_dim == 128) {
+        q4p_gdn_prep_body<128, true>(mixed, nullptr, b, nullptr, nullptr, qk, decay_beta,
+                                     key_width, key_heads, heads, value_dim, groups);
+    } else if (key_dim == 64) {
+        q4p_gdn_prep_body<64, true>(mixed, nullptr, b, nullptr, nullptr, qk, decay_beta,
+                                    key_width, key_heads, heads, value_dim, groups);
+    }
 }
 
-// The recurrence, state in registers. Grid (heads, splits), 4 * Q4P_GDN_VALUE / splits threads (a
+// The recurrence, state in registers. Grid (heads, splits), 4 * V_DIM / splits threads (a
 // multiple of 32): blockIdx.y owns 1 / splits of the head's value columns, warp w of it columns
 // 8w..8w+7 of those, and the four lanes of a column split the 128 keys into quarters of 32, so a
 // column's dot products are 32-term chains plus two shuffles. A value column's recurrence reads no
@@ -260,20 +284,22 @@ extern "C" __global__ __launch_bounds__(128) void q4p_kda_prep(
 // q4e_gdn_recur writes it.
 //
 // With kChannel (Kimi Delta Attention) S decays by one factor a key channel instead: `channel`
-// is [batch][heads][Q4P_GDN_KEY], q4e_kda_decay's factors, staged with the keys' padding so a
+// is [batch][heads][K_DIM], q4e_kda_decay's factors, staged with the keys' padding so a
 // lane's quarter reads them as it reads k.
-template <bool kChannel>
+template <int K_DIM, int V_DIM, bool kChannel>
 __device__ __forceinline__ void q4p_gdn_scan_body(
     const float* __restrict__ qk, const float2* __restrict__ decay_beta,
     const float* __restrict__ channel, const float* __restrict__ mixed, const float* state,
     float* state_out, float* __restrict__ out, int key_width, int key_heads, int heads,
     int value_dim, int groups, int batch, float* __restrict__ snapshot, int snapshot_rows,
     long long region_stride) {
-    __shared__ __align__(16) float s_qk[2][Q4P_GDN_TILE * Q4P_GDN_ROW];
-    __shared__ __align__(16) float s_v[2][Q4P_GDN_TILE * Q4P_GDN_VALUE];
+    constexpr int kHalf = q4p_gdn_half<K_DIM>();
+    constexpr int kRow = 2 * kHalf;
+    __shared__ __align__(16) float s_qk[2][Q4P_GDN_TILE * kRow];
+    __shared__ __align__(16) float s_v[2][Q4P_GDN_TILE * V_DIM];
     __shared__ __align__(16) float2 s_db[2][Q4P_GDN_TILE];
-    __shared__ __align__(16) float s_cd[2][kChannel ? Q4P_GDN_TILE * Q4P_GDN_HALF : 4];
-    if (value_dim != Q4P_GDN_VALUE || (int)(blockDim.x * gridDim.y) != 4 * Q4P_GDN_VALUE ||
+    __shared__ __align__(16) float s_cd[2][kChannel ? Q4P_GDN_TILE * kHalf : 4];
+    if (value_dim != V_DIM || (int)(blockDim.x * gridDim.y) != 4 * V_DIM ||
         (blockDim.x & 31u) != 0u) {
         return;
     }
@@ -285,51 +311,51 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
     const int first_column = blockIdx.y * (blockDim.x >> 2);
     const int column = first_column + (tid >> 5) * 8 + (lane >> 2);
     const int quarter = lane & 3;
-    const int conv_width = key_width * 2 + heads * Q4P_GDN_VALUE;
-    const int val_width = heads * Q4P_GDN_VALUE;
-    const unsigned long long cells = (unsigned long long)Q4P_GDN_KEY * Q4P_GDN_VALUE;
-    // This lane's 32 cells: keys quarter*32 + i of `column`, Q4P_GDN_VALUE floats apart.
-    const unsigned long long lane_cell = (unsigned long long)quarter * 32 * Q4P_GDN_VALUE + column;
+    const int conv_width = key_width * 2 + heads * V_DIM;
+    const int val_width = heads * V_DIM;
+    const unsigned long long cells = (unsigned long long)K_DIM * V_DIM;
+    // This lane's K_DIM / 4 cells: keys quarter*32 + i of `column`, V_DIM floats apart.
+    constexpr int kCells = K_DIM / 4;
+    const int quarter_key = quarter * kCells;
+    const unsigned long long lane_cell = (unsigned long long)quarter_key * V_DIM + column;
     const float* recurrent = state + (unsigned long long)head * cells + lane_cell;
 
-    float s[32];
+    float s[kCells];
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        s[i] = recurrent[i * Q4P_GDN_VALUE];
+    for (int i = 0; i < kCells; ++i) {
+        s[i] = recurrent[i * V_DIM];
     }
 
     // This block's value columns in 16-byte chunks.
     const int v_chunks = blockDim.x >> 4;
     auto stage = [&](int buffer, int t0) {
         const int rows = min(Q4P_GDN_TILE, batch - t0);
-        // q / k: Q4P_GDN_ROW floats a token, in 16-byte chunks.
-        for (int c = tid; c < rows * (Q4P_GDN_ROW / 4); c += blockDim.x) {
-            const int r = c / (Q4P_GDN_ROW / 4);
-            const int within = c - r * (Q4P_GDN_ROW / 4);
+        // q / k: kRow floats a token, in 16-byte chunks.
+        for (int c = tid; c < rows * (kRow / 4); c += blockDim.x) {
+            const int r = c / (kRow / 4);
+            const int within = c - r * (kRow / 4);
             const float* src =
-                qk + ((unsigned long long)(t0 + r) * key_heads + kh) * Q4P_GDN_ROW + within * 4;
-            om_cp16(om_smem(&s_qk[buffer][r * Q4P_GDN_ROW + within * 4]), src, true);
+                qk + ((unsigned long long)(t0 + r) * key_heads + kh) * kRow + within * 4;
+            om_cp16(om_smem(&s_qk[buffer][r * kRow + within * 4]), src, true);
         }
         for (int c = tid; c < rows * v_chunks; c += blockDim.x) {
             const int r = c / v_chunks;
             const int within = c - r * v_chunks;
             const float* src = mixed + (unsigned long long)(t0 + r) * conv_width + key_width * 2 +
-                               head * Q4P_GDN_VALUE + first_column + within * 4;
-            om_cp16(om_smem(&s_v[buffer][r * Q4P_GDN_VALUE + first_column + within * 4]), src,
-                    true);
+                               head * V_DIM + first_column + within * 4;
+            om_cp16(om_smem(&s_v[buffer][r * V_DIM + first_column + within * 4]), src, true);
         }
         if (tid < rows) {
             s_db[buffer][tid] = decay_beta[(unsigned long long)(t0 + tid) * heads + head];
         }
         if constexpr (kChannel) {
-            for (int c = tid; c < rows * (Q4P_GDN_KEY / 4); c += blockDim.x) {
-                const int r = c / (Q4P_GDN_KEY / 4);
-                const int within = c - r * (Q4P_GDN_KEY / 4);
+            for (int c = tid; c < rows * (K_DIM / 4); c += blockDim.x) {
+                const int r = c / (K_DIM / 4);
+                const int within = c - r * (K_DIM / 4);
                 const float* src = channel +
-                                   ((unsigned long long)(t0 + r) * heads + head) * Q4P_GDN_KEY +
+                                   ((unsigned long long)(t0 + r) * heads + head) * K_DIM +
                                    within * 4;
-                om_cp16(om_smem(&s_cd[buffer][r * Q4P_GDN_HALF + q4p_gdn_pad(within * 4)]), src,
-                        true);
+                om_cp16(om_smem(&s_cd[buffer][r * kHalf + q4p_gdn_pad(within * 4)]), src, true);
             }
         }
     };
@@ -346,17 +372,17 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
         __syncthreads();
         const int rows = min(Q4P_GDN_TILE, batch - t0);
         for (int r = 0; r < rows; ++r) {
-            const float* q = &s_qk[buffer][r * Q4P_GDN_ROW + quarter * 36];
-            const float* k = q + Q4P_GDN_HALF;
+            const float* q = &s_qk[buffer][r * kRow + q4p_gdn_pad(quarter_key)];
+            const float* k = q + kHalf;
             const float2 db = s_db[buffer][r];
-            const float v = s_v[buffer][r * Q4P_GDN_VALUE + column];
+            const float v = s_v[buffer][r * V_DIM + column];
             float m[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for (int i = 0; i < 32; i += 4) {
+            for (int i = 0; i < kCells; i += 4) {
                 const float4 kk = *reinterpret_cast<const float4*>(&k[i]);
                 if constexpr (kChannel) {
                     const float4 dd = *reinterpret_cast<const float4*>(
-                        &s_cd[buffer][r * Q4P_GDN_HALF + quarter * 36 + i]);
+                        &s_cd[buffer][r * kHalf + q4p_gdn_pad(quarter_key) + i]);
                     s[i] *= dd.x;
                     s[i + 1] *= dd.y;
                     s[i + 2] *= dd.z;
@@ -378,7 +404,7 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
             const float delta = (v - memory) * db.y;
             float o[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
-            for (int i = 0; i < 32; i += 4) {
+            for (int i = 0; i < kCells; i += 4) {
                 const float4 kk = *reinterpret_cast<const float4*>(&k[i]);
                 const float4 qq = *reinterpret_cast<const float4*>(&q[i]);
                 s[i] += kk.x * delta;
@@ -395,14 +421,14 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
             output += __shfl_xor_sync(0xffffffffu, output, 2);
             const int token = t0 + r;
             if (quarter == 0) {
-                out[(unsigned long long)token * val_width + head * Q4P_GDN_VALUE + column] = output;
+                out[(unsigned long long)token * val_width + head * V_DIM + column] = output;
             }
             if (snapshot != nullptr && token < snapshot_rows) {
                 float* destination = snapshot + (unsigned long long)token * region_stride +
                                      (unsigned long long)head * cells + lane_cell;
 #pragma unroll
-                for (int i = 0; i < 32; ++i) {
-                    destination[i * Q4P_GDN_VALUE] = s[i];
+                for (int i = 0; i < kCells; ++i) {
+                    destination[i * V_DIM] = s[i];
                 }
             }
         }
@@ -412,8 +438,8 @@ __device__ __forceinline__ void q4p_gdn_scan_body(
     }
     float* recurrent_out = state_out + (unsigned long long)head * cells + lane_cell;
 #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        recurrent_out[i * Q4P_GDN_VALUE] = s[i];
+    for (int i = 0; i < kCells; ++i) {
+        recurrent_out[i * V_DIM] = s[i];
     }
 }
 
@@ -425,9 +451,33 @@ extern "C" __global__ __launch_bounds__(512) void q4p_gdn_scan(
     float* __restrict__ out, int key_width, int key_heads, int heads, int value_dim, int groups,
     int batch, float* __restrict__ snapshot, int snapshot_rows, long long region_stride) {
     OPT_PDL_ENTRY();
-    q4p_gdn_scan_body<false>(qk, decay_beta, nullptr, mixed, state, state_out, out, key_width,
-                             key_heads, heads, value_dim, groups, batch, snapshot, snapshot_rows,
-                             region_stride);
+    q4p_gdn_scan_body<128, 128, false>(qk, decay_beta, nullptr, mixed, state, state_out, out,
+                                       key_width, key_heads, heads, value_dim, groups, batch,
+                                       snapshot, snapshot_rows, region_stride);
+}
+
+// The (64, 64) and (128, 256) geometries, each its own entry so its launch bound sizes the
+// register file for the block it actually runs: 256 and 1024 threads at one split.
+extern "C" __global__ __launch_bounds__(256) void q4p_gdn_scan_64_64(
+    const float* __restrict__ qk, const float2* __restrict__ decay_beta,
+    const float* __restrict__ mixed, const float* state, float* state_out,
+    float* __restrict__ out, int key_width, int key_heads, int heads, int value_dim, int groups,
+    int batch, float* __restrict__ snapshot, int snapshot_rows, long long region_stride) {
+    OPT_PDL_ENTRY();
+    q4p_gdn_scan_body<64, 64, false>(qk, decay_beta, nullptr, mixed, state, state_out, out,
+                                     key_width, key_heads, heads, value_dim, groups, batch,
+                                     snapshot, snapshot_rows, region_stride);
+}
+
+extern "C" __global__ __launch_bounds__(512) void q4p_gdn_scan_128_256(
+    const float* __restrict__ qk, const float2* __restrict__ decay_beta,
+    const float* __restrict__ mixed, const float* state, float* state_out,
+    float* __restrict__ out, int key_width, int key_heads, int heads, int value_dim, int groups,
+    int batch, float* __restrict__ snapshot, int snapshot_rows, long long region_stride) {
+    OPT_PDL_ENTRY();
+    q4p_gdn_scan_body<128, 256, false>(qk, decay_beta, nullptr, mixed, state, state_out, out,
+                                       key_width, key_heads, heads, value_dim, groups, batch,
+                                       snapshot, snapshot_rows, region_stride);
 }
 
 // Kimi Delta Attention's scan: one factor a key channel from `channel_decay`, beta from
@@ -439,9 +489,33 @@ extern "C" __global__ __launch_bounds__(512) void q4p_kda_scan(
     int value_dim, int groups, int batch, float* __restrict__ snapshot, int snapshot_rows,
     long long region_stride) {
     OPT_PDL_ENTRY();
-    q4p_gdn_scan_body<true>(qk, decay_beta, channel_decay, mixed, state, state, out, key_width,
-                            key_heads, heads, value_dim, groups, batch, snapshot, snapshot_rows,
-                            region_stride);
+    q4p_gdn_scan_body<128, 128, true>(qk, decay_beta, channel_decay, mixed, state, state, out,
+                                      key_width, key_heads, heads, value_dim, groups, batch,
+                                      snapshot, snapshot_rows, region_stride);
+}
+
+extern "C" __global__ __launch_bounds__(256) void q4p_kda_scan_64_64(
+    const float* __restrict__ qk, const float2* __restrict__ decay_beta,
+    const float* __restrict__ channel_decay, const float* __restrict__ mixed,
+    float* __restrict__ state, float* __restrict__ out, int key_width, int key_heads, int heads,
+    int value_dim, int groups, int batch, float* __restrict__ snapshot, int snapshot_rows,
+    long long region_stride) {
+    OPT_PDL_ENTRY();
+    q4p_gdn_scan_body<64, 64, true>(qk, decay_beta, channel_decay, mixed, state, state, out,
+                                    key_width, key_heads, heads, value_dim, groups, batch,
+                                    snapshot, snapshot_rows, region_stride);
+}
+
+extern "C" __global__ __launch_bounds__(512) void q4p_kda_scan_128_256(
+    const float* __restrict__ qk, const float2* __restrict__ decay_beta,
+    const float* __restrict__ channel_decay, const float* __restrict__ mixed,
+    float* __restrict__ state, float* __restrict__ out, int key_width, int key_heads, int heads,
+    int value_dim, int groups, int batch, float* __restrict__ snapshot, int snapshot_rows,
+    long long region_stride) {
+    OPT_PDL_ENTRY();
+    q4p_gdn_scan_body<128, 256, true>(qk, decay_beta, channel_decay, mixed, state, state, out,
+                                      key_width, key_heads, heads, value_dim, groups, batch,
+                                      snapshot, snapshot_rows, region_stride);
 }
 
 // The gated RMSNorm on the scan's raw head outputs, as q4e_gdn_recur's tail computes it.

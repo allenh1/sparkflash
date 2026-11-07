@@ -60,7 +60,10 @@ fn kernel(cuda: &Cuda, name: &'static str) -> Kernel {
 }
 
 fn moe_kernel(cuda: &Cuda, name: &'static str) -> Kernel {
-    cuda.load_named(embedded_moe_cubin(), name)
+    // The token expert GEMV reserves its activation staging (two members of the wider
+    // projection, one padded float a column group) dynamically.
+    let shared = (2 * 2560_usize.div_ceil(32) * 33 * std::mem::size_of::<f32>()) as u32;
+    cuda.load_named_shared(embedded_moe_cubin(), name, shared)
         .unwrap_or_else(|error| panic!("{name}: {error}"))
         .1
 }

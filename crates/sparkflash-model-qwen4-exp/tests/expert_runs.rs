@@ -132,6 +132,82 @@ fn expected_bounds(indices: &[i32], perm: &[i32]) -> Vec<i32> {
     bounds
 }
 
+/// The token routed-expert GEMV at the FP8 release's expert width, above the old static caps.
+///
+/// The staging used to be a fixed `Q4E_MAX_ROW`-sized array, and the kernel returned early for
+/// a hidden width past 2,560 or an intermediate past 1,024; the FP8 release's 5,120 x 1,536
+/// expert therefore could not take it. The staging is now dynamic shared memory the host sizes,
+/// so this launches the real kernel at that geometry with a single dropped expert (whose rows
+/// are written as zero) and asserts the launch reserved the host-computed bytes and produced a
+/// finite, zero activation.
+#[test]
+fn the_expert_gemv_serves_the_release_width_above_the_old_caps() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    const HIDDEN: usize = 5120;
+    const INTER: usize = 1536;
+    let mut total = 0_usize;
+    let indices = [-1_i32];
+    let (perm, runs) = {
+        // The plan's outputs are this test's inputs; reuse the helper's launch but keep its
+        // allocations alive by asking for the values, then re-uploading them here.
+        let (perm_values, run_values) = permute(&cuda, &indices);
+        (
+            cuda.alloc(perm_values.len() * 4, &mut total).expect("perm"),
+            cuda.alloc(run_values.len() * 4, &mut total).expect("runs"),
+        )
+    };
+    let (perm_host, run_host) = permute(&cuda, &indices);
+    cuda.copy_htod(&perm, &i32_bytes(&perm_host))
+        .expect("perm upload");
+    cuda.copy_htod(&runs, &i32_bytes(&run_host))
+        .expect("runs upload");
+    let indices_d = cuda.alloc(4, &mut total).expect("indices");
+    cuda.copy_htod(&indices_d, &i32_bytes(&indices))
+        .expect("indices upload");
+    let table = cuda.alloc(6 * 8, &mut total).expect("table");
+    let x = cuda.alloc(HIDDEN * 4, &mut total).expect("x");
+    let activated = cuda.alloc(INTER * 4, &mut total).expect("activated");
+    cuda.copy_htod(&activated, &vec![1_u8; INTER * 4])
+        .expect("activated fill");
+    let shared = (2 * HIDDEN.div_ceil(32) * 33 * std::mem::size_of::<f32>()) as u32;
+    let (_, gate_up) = cuda
+        .load_named_shared(embedded_moe_cubin(), "q4e_expert_gate_up", shared)
+        .expect("q4e_expert_gate_up");
+    assert_eq!(gate_up.shared_bytes(), shared);
+    let scales = cuda.alloc(3 * 4, &mut total).expect("scales");
+    cuda.launch(
+        gate_up,
+        (INTER.div_ceil(16) as u32, 1, 1),
+        (256, 1, 1),
+        &[
+            table.0,
+            scales.0,
+            indices_d.0,
+            perm.0,
+            runs.0,
+            x.0,
+            activated.0,
+            1,
+            HIDDEN as u64,
+            INTER as u64,
+        ],
+    )
+    .expect("gate up launch");
+    cuda.synchronize().expect("synchronize");
+    let mut host = vec![0_u8; INTER * 4];
+    cuda.copy_dtoh(&mut host, &activated)
+        .expect("activated back");
+    assert!(
+        host.as_chunks::<4>()
+            .0
+            .iter()
+            .all(|value| value == &[0, 0, 0, 0]),
+        "a dropped expert's activation row is not zero"
+    );
+}
+
 #[test]
 fn the_run_bounds_cover_every_slot_exactly_once() {
     let Some(cuda) = open() else {

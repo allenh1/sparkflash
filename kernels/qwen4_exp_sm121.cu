@@ -70,6 +70,7 @@
 // serialization, so the next kernel's launch overlaps this one's run and stream order holds.
 #include "opt_pdl_sm121.cuh"
 #include "q4e_common_sm121.cuh"
+#include "shared_swiglu_sm121.cuh"
 #include "q4e_gemv_sm121.cuh"
 
 #define Q4E_BLOCK 256
@@ -81,6 +82,10 @@
 // guard that makes an oversized request a no-op rather than a corruption. The host side checks the
 // same bounds and refuses first.
 #define Q4E_MAX_LOWRANK 1024
+// The widest linear-attention head output q4e_gdn_recur holds (linear_value_head_dim). It is
+// not the MoE intermediate: the routed experts staged their width dynamically and carry no cap
+// here. The served value head is 128, so 1024 is a superset of every geometry the scan takes;
+// a wider head would be a scan geometry, not a router/expert bound.
 #define Q4E_MAX_INTERMEDIATE 1024
 #define Q4E_MAX_SELECTED 2304
 #define Q4E_MAX_TOPK 64
@@ -590,9 +595,10 @@ struct Q4eTgHyperUpRows {
     const __nv_bfloat16* up;
     int hidden;
     int lowrank;
+    int hc;
     __device__ const __nv_bfloat16* operator()(int tile, int warp, int r) const {
         const int column = tile * Q4E_TG_WARPS + warp;
-        if (column >= hidden) {
+        if (column >= hidden || r >= hc) {
             return nullptr;
         }
         return up + (unsigned long long)(r * hidden + column) * lowrank;
@@ -604,22 +610,22 @@ struct Q4eTgHyperUpFinish {
     float* mixed;
     int hidden;
     int batch;
+    int hc;
     __device__ void operator()(int tile, int warp, int r, int t, float sum) const {
         const int column = tile * Q4E_TG_WARPS + warp;
         const bool owner = r == 0 && t < batch && column < hidden;
         // Summed from zero a stream at a time, as q4e_hyper_mix sums the prefill's streams.
         float accumulator = 0.0f;
-#pragma unroll
-        for (int stream = 0; stream < Q4E_TG_ROWS; ++stream) {
+        for (int stream = 0; stream < hc; ++stream) {
             const float mix = __shfl_sync(0xFFFFFFFFu, sum, stream * 8 + t);
             if (owner) {
                 accumulator += (1.0f / (1.0f + __expf(-mix))) *
-                               normed[(unsigned long long)t * Q4E_TG_ROWS * hidden +
+                               normed[(unsigned long long)t * hc * hidden +
                                       (unsigned long long)stream * hidden + column];
             }
         }
         if (owner) {
-            mixed[(unsigned long long)t * hidden + column] = accumulator / (float)Q4E_TG_ROWS;
+            mixed[(unsigned long long)t * hidden + column] = accumulator / (float)hc;
         }
     }
 };
@@ -631,12 +637,12 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
                        const float* __restrict__ low, float* __restrict__ mixed, int hc,
                        int hidden, int lowrank, int batch) {
     OPT_PDL_LAUNCH();
-    if (batch > Q4E_MAX_BATCH || hc != Q4E_TG_ROWS || gridDim.y != 1) {
+    if (batch > Q4E_MAX_BATCH || hc <= 0 || hc > Q4E_TG_ROWS || gridDim.y != 1) {
         OPT_PDL_WAIT();
         return;
     }
-    q4e_tiled_gemv<Q4eTgBf16>(Q4eTgHyperUpRows{up, hidden, lowrank},
-                              Q4eTgHyperUpFinish{normed, mixed, hidden, batch}, low, lowrank,
+    q4e_tiled_gemv<Q4eTgBf16>(Q4eTgHyperUpRows{up, hidden, lowrank, hc},
+                              Q4eTgHyperUpFinish{normed, mixed, hidden, batch, hc}, low, lowrank,
                               batch, nullptr, nullptr);
 }
 
@@ -1259,7 +1265,7 @@ extern "C" __global__ void q4e_swiglu(const float* __restrict__ gate, const floa
     OPT_PDL_ENTRY();
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < width;
          index += blockDim.x * gridDim.x) {
-        out[index] = q4e_silu(gate[index]) * up[index];
+        out[index] = shared_swiglu_value<false, false>(gate[index], up[index], 0.0f);
     }
 }
 
