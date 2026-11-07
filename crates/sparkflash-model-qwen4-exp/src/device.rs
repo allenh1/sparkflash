@@ -5316,11 +5316,9 @@ impl ModelSession for DeviceSequence {
         // keeps, so the chunks would find most of them evicted again.
         let forwards = self.backend.prefill.forwards(tokens.len());
         let last_idx = forwards.len() - 1;
-        // The first draft block sits just past the prompt and its anchor row reaches
-        // `window_left` positions back; nothing before that is ever read from the rings.
-        let visible = self.backend.dflash.as_ref().map_or(0, |draft| {
-            (self.position + tokens.len()).saturating_sub(draft.config.window_left)
-        });
+        // The first draft block sits just past the prompt and reaches `window_left` positions
+        // back; nothing before that is ever read from the rings ([Dflash2Config::window_commits]).
+        let end = self.position + tokens.len();
         let mut logits = Vec::new();
         for (idx, rows) in forwards.into_iter().enumerate() {
             let chunk = &tokens[rows];
@@ -5332,10 +5330,14 @@ impl ModelSession for DeviceSequence {
             if self.drafting() {
                 // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
                 // projections split when that was the chunk.
-                for at in (0..chunk.len()).step_by(DENSE_ROWS) {
-                    let rows = DENSE_ROWS.min(chunk.len() - at);
-                    let first = visible.saturating_sub(start + at).min(rows);
-                    self.dflash_commit(at + first, rows - first, start + at + first)?;
+                let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
+                    draft
+                        .config
+                        .window_commits((start, chunk.len()), end, DENSE_ROWS)
+                        .collect()
+                });
+                for (row, rows, position) in commits {
+                    self.dflash_commit(row, rows, position)?;
                 }
                 continue;
             }

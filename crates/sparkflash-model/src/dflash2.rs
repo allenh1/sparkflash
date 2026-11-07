@@ -381,6 +381,30 @@ impl Dflash2Config {
     pub fn ring_positions(&self) -> usize {
         self.window_left + 1 + self.block_size
     }
+
+    /// The commits a forward's captured rows take into the context: `rows` rows at `position`
+    /// onward, of a sequence whose next block follows position `end`. That block's anchor row
+    /// reaches `window_left` positions back, so a row before `end - window_left` is never read
+    /// and is skipped; the rest go in pieces of at most `step` rows, aligned to `step` from the
+    /// forward's first row. Each is `(row, rows, position)`, the row counted from the forward's
+    /// first. A step's forward and a prompt's chunk commit through this alike.
+    pub fn window_commits(
+        &self,
+        (position, rows): (usize, usize),
+        end: usize,
+        step: usize,
+    ) -> impl Iterator<Item = (usize, usize, usize)> {
+        let step = step.max(1);
+        let unread = end
+            .saturating_sub(self.window_left)
+            .saturating_sub(position)
+            .min(rows);
+        (0..rows).step_by(step).filter_map(move |at| {
+            let first = at.max(unread);
+            let last = (at + step).min(rows);
+            (first < last).then(|| (first, last - first, position + first))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +441,75 @@ mod tests {
         assert_eq!(config.kv_width(), 1024);
         assert_eq!(config.target_layer_ids, vec![5, 15, 25, 35, 45]);
         assert!((config.rope_theta - 10_000.0).abs() < f64::EPSILON);
+    }
+
+    /// A forward commits only the rows the next block can read, in pieces aligned to the step
+    /// from the forward's first row, whether it is a step's rows or a prompt's chunk.
+    #[test]
+    fn a_forward_commits_only_the_rows_the_next_block_reads() {
+        let config = Dflash2Config::from_json(RELEASED).expect("the released config parses");
+        let commits = |at, end, step| -> Vec<_> { config.window_commits(at, end, step).collect() };
+        // A short prompt: every row, a step's rows at a time.
+        assert_eq!(
+            commits((0, 40), 40, 16),
+            [(0, 16, 0), (16, 16, 16), (32, 8, 32)]
+        );
+        // A long prompt's chunk: only its last window_left rows, the first piece cut at the window
+        // and the rest still aligned to the chunk's first row.
+        let window = config.window_left;
+        assert_eq!(
+            commits((4096, 4096), 8192, 16).first(),
+            Some(&(4096 - window, window % 16, 8192 - window))
+        );
+        let rows: usize = commits((4096, 4096), 8192, 16).iter().map(|c| c.1).sum();
+        assert_eq!(rows, window);
+        // A chunk wholly before the window commits nothing.
+        assert!(commits((0, 4096), 8192, 16).is_empty());
+        // A step past a long prompt commits every row it ran, as one piece.
+        assert_eq!(commits((9000, 3), 9003, 16), [(0, 3, 9000)]);
+        // A step whose rows straddle the window's start keeps the ones inside it.
+        assert_eq!(commits((100, 16), 100 + window + 4, 16), [(4, 12, 104)]);
+    }
+
+    /// The pieces are the ones the arms committed before they shared this: Qwen's chunk loop (a
+    /// `step`-aligned piece each, its rows before the window cut) and GLM's step (one piece of the
+    /// rows at or past the window), less the empty pieces, which committed nothing.
+    #[test]
+    fn the_window_commits_are_the_arms_former_commits() {
+        let config = Dflash2Config::from_json(RELEASED).expect("the released config parses");
+        let window = config.window_left;
+        for start in [0_usize, 7, 2047, 2048, 4096, 5000] {
+            for rows in [1, 15, 16, 17, 2047, 2048, 4096] {
+                for extra in [0, 1, 40, 5000] {
+                    let end = start + rows + extra;
+                    let visible = end.saturating_sub(window);
+                    for step in [8, 16] {
+                        let former: Vec<_> = (0..rows)
+                            .step_by(step)
+                            .map(|at| {
+                                let piece = step.min(rows - at);
+                                let first = visible.saturating_sub(start + at).min(piece);
+                                (at + first, piece - first, start + at + first)
+                            })
+                            .filter(|&(_, count, _)| count > 0)
+                            .collect();
+                        let shared: Vec<_> =
+                            config.window_commits((start, rows), end, step).collect();
+                        assert_eq!(shared, former, "start {start} rows {rows} end {end}");
+                    }
+                    if rows <= 16 {
+                        let unseen = visible.saturating_sub(start).min(rows);
+                        let former: Vec<_> = (unseen < rows)
+                            .then(|| (unseen, rows - unseen, start + unseen))
+                            .into_iter()
+                            .collect();
+                        let shared: Vec<_> =
+                            config.window_commits((start, rows), end, 16).collect();
+                        assert_eq!(shared, former, "a step at {start} of {rows} to {end}");
+                    }
+                }
+            }
+        }
     }
 
     /// The GLM-5.3-Flash drafter is the same architecture at GLM's geometry: its widths, mask

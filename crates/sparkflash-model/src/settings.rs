@@ -68,9 +68,10 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         key: "prefill.drafting_prompt",
-        default: Value::Flag(false),
-        help: "Whether a request that drafts runs its prompt in bulk. Off, the drafter sees the \
-               prompt and prompt processing runs one decode step a token.",
+        default: Value::Flag(true),
+        help: "Whether a request that drafts runs its prompt in bulk, as every other request does. \
+               Off, its prompt runs a decode step's rows at a time and keeps the token path's \
+               bits; either way the drafter sees the prompt rows it reads.",
     },
 ];
 
@@ -137,7 +138,7 @@ pub fn value(profile: &ModelProfile, key: &str) -> Value {
                     }),
             )
         }
-        "prefill.drafting_prompt" => Value::Flag(profile.prefill.drafting_prompt.unwrap_or(false)),
+        "prefill.drafting_prompt" => Value::Flag(profile.prefill.drafting_prompt.unwrap_or(true)),
         _ => default_of(key),
     }
 }
@@ -168,7 +169,7 @@ mod tests {
         assert_eq!(rows.value, rows.setting.default);
         let drafting = &resolved[1];
         assert_eq!(drafting.setting.key, "prefill.drafting_prompt");
-        assert_eq!(drafting.value, Value::Flag(false));
+        assert_eq!(drafting.value, Value::Flag(true));
         for entry in &resolved {
             let help = entry.setting.help;
             assert!(!help.trim().is_empty(), "{} has help", entry.setting.key);
@@ -188,15 +189,15 @@ mod tests {
         profile
             .apply_env(|name| match name {
                 "SPARKFLASH_GLM_PREFILL_CHUNK" => Some("512".to_owned()),
-                "SPARKFLASH_GLM_PREFILL_DRAFTING" => Some("1".to_owned()),
+                "SPARKFLASH_GLM_PREFILL_DRAFTING" => Some("0".to_owned()),
                 _ => None,
             })
             .expect("the overrides parse");
         let resolved = resolve(&profile);
         assert_eq!(resolved[0].value, Value::Count(512));
         assert_eq!(resolved[0].setting.default, Value::Count(4096));
-        assert_eq!(resolved[1].value, Value::Flag(true));
-        assert_eq!(resolved[1].setting.default, Value::Flag(false));
+        assert_eq!(resolved[1].value, Value::Flag(false));
+        assert_eq!(resolved[1].setting.default, Value::Flag(true));
         for entry in &resolved {
             assert!(
                 entry.setting.help.trim_end().ends_with('.'),

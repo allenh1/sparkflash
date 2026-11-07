@@ -272,8 +272,11 @@ build (2026-11-03); the rates above are from a server already serving.
   token path, and a width past 4,096 is clamped to it rather than refused.
 - The chunk's scratch is allocated only for a configuration the chunk can take: the f32 latent
   cache (whose absorbed MLA stages run at most eight rows) and a shape the bulk MLA does not serve
-  load without it, and their prompts prefill on the token path. The block drafter, which keeps a
-  step's rows of features, also keeps a sequence on the token path when one is attached.
+  load without it, and their prompts prefill on the token path. A DFlash 2 block-drafting
+  request takes the chunk too: the chunk captures the drafter's target rows for the prompt's last
+  `window_left` positions (2,047, the only ones its first block reads) and commits them to the
+  drafter's context a step's rows at a time, as Qwen's chunks do. `SPARKFLASH_GLM_PREFILL_DRAFTING=0`
+  (`prefill.drafting_prompt`) keeps such a prompt on the token path instead.
 - A chunk's output is **not bit-identical** to the token path's: the MMAs sum each output's 128-wide
   K stage in their own order, so a chunk edge and the token path disagree in the last bits and a
   greedy completion can part company a few tokens in (4 of 4 code prompts did, at 6.1k tokens).

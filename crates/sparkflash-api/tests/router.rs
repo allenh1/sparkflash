@@ -1078,8 +1078,8 @@ async fn models_reports_the_settings_with_their_defaults_and_help() {
     assert!(!help.is_empty(), "the help says what the knob does");
     assert!(help.ends_with('.'), "the help is a sentence: {help}");
     let drafting = &settings["prefill.drafting_prompt"];
-    assert_eq!(drafting["value"], json!(false));
-    assert_eq!(drafting["default"], json!(false));
+    assert_eq!(drafting["value"], json!(true));
+    assert_eq!(drafting["default"], json!(true));
     assert!(
         drafting["help"]
             .as_str()

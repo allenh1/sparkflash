@@ -701,6 +701,14 @@ impl DraftScratch {
         })
     }
 
+    /// This scratch with its captured target rows at `features` instead: a prompt chunk's, which
+    /// outnumber a step's. The context path, the rings and the block stay this scratch's, so a
+    /// commit from there takes at most the rows this scratch was allocated for.
+    #[must_use]
+    pub fn with_features(&self, features: Deviceptr) -> Self {
+        Self { features, ..*self }
+    }
+
     /// Every device pointer this chain owns, in the order the later operations expect them.
     pub fn pointers(&self) -> [&Deviceptr; 25] {
         [

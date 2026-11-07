@@ -4205,8 +4205,8 @@ impl Tp4RankApi for GlmTp4Rank {
         // The window is reset and reused, not rebuilt: a fresh one costs every rank about a
         // second of the request's first token at the 1M default, which rank 0 pays before it
         // starts the prefill clock and the workers pay inside it. A block-drafting window resets
-        // in place because its drafter's context is bounded by the rows the request captured
-        // ([DeviceSequence]'s `drafter_skip`), so nothing below the position is read.
+        // in place too: the reset zeroes its drafter's rings, and the prompt refills the rows the
+        // first block reads.
         //
         // The reset moved to [Self::prefill]: whether the next request can keep the window at all
         // depends on its prompt, which this call does not see, and a chat turn's prompt begins with
@@ -4504,10 +4504,9 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
             config.rank, config.world_size
         );
     }
-    // The bulk chunk a drafting request takes is a profile knob (`prefill.drafting_prompt`):
-    // its default is the token path, which is the drafter's prompt, and the chunk wins only a
-    // prompt long enough that a decode step a token costs more than the drafts it conditions.
-    rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(false));
+    // A drafting request's prompt takes the bulk chunk, which captures the rows the drafter's first
+    // block reads, unless the profile keeps it on the token path (`prefill.drafting_prompt`).
+    rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(true));
     let block = rank.has_block_drafter();
     let most = rank.max_drafts();
     // How many drafts a greedy request verifies after each token: the whole block when a block

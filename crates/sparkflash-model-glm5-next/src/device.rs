@@ -1753,10 +1753,6 @@ pub struct DeviceSequence {
     block: Option<DraftScratch>,
     /// The block drafter's confidence in each of the sequence's last drafts.
     confidence: Vec<f32>,
-    /// Positions this sequence ran without the block drafter seeing them, which a bulk prefill
-    /// chunk's rows are (`prefill.drafting_prompt`): its context holds only the rows it captured, so a
-    /// ring read is bounded by `position - drafter_skip`, not by the position.
-    drafter_skip: usize,
     memory: Allocations,
 }
 
@@ -1876,7 +1872,10 @@ struct Run<'s> {
     len: usize,
     verify: bool,
     drafter: Option<&'s SequenceDrafter>,
-    block: Option<&'s DraftScratch>,
+    /// A block-drafting sequence's drafter scratch and the first of the run's rows it captures,
+    /// into its first feature row: 0 for a step's rows, and for a prompt's chunk the first row
+    /// the drafter's next block reads ([DeviceRank::forward_prefill]).
+    block: Option<(&'s DraftScratch, usize)>,
 }
 
 impl DeviceSequence {
@@ -1912,6 +1911,10 @@ struct BlockDrafter {
     exchange_host: HostMapped,
     /// `[MAX_ROWS][2 * block]`: each row's chain and its confidences, which the device writes.
     chains: HostMapped,
+    /// `[rows][feature_width]` A bulk prefill chunk's captured target rows, on a rank with the
+    /// chunk: at most the drafter's `window_left` of a prompt's last rows, the only ones its first
+    /// block reads, or a chunk's width if that is less ([DeviceRank::forward_prefill]).
+    prompt: Option<Deviceptr>,
 }
 
 /// One tensor-parallel rank of GLM-5.3-Flash on one GPU, for decode up to [MAX_ROWS] rows a step.
@@ -1937,8 +1940,7 @@ pub struct DeviceRank {
     block: Option<BlockDrafter>,
     scratch: Scratch,
     /// Whether a block-drafting sequence's prompt runs through the bulk chunk
-    /// (`prefill.drafting_prompt`): the chunk runs with the drafter detached, so its context
-    /// starts at the generation.
+    /// (`prefill.drafting_prompt`, on by default) rather than the token path.
     drafting_prefill: bool,
     /// The bulk prefill's scratch, sized for [DeviceRank::prefill_rows] rows. Swapped in around a
     /// prefill step so the decode scratch's size does not grow with the chunk.
@@ -2167,7 +2169,7 @@ impl DeviceRank {
             block: None,
             scratch,
             prefill,
-            drafting_prefill: false,
+            drafting_prefill: true,
             prefill_rows: prefill_rows.unwrap_or(MAX_ROWS),
             exact_prefill: sparkflash_model::active_profile()
                 .prefill
@@ -2552,9 +2554,8 @@ impl DeviceRank {
     }
 
     /// Whether a block-drafting sequence's prompt runs through the bulk chunk
-    /// (`prefill.drafting_prompt`). The chunk runs with the drafter detached, because the
-    /// drafter keeps one step's target rows: its context then starts at the generation, and the
-    /// first steps' drafts condition on the generation alone.
+    /// (`prefill.drafting_prompt`, on by default) or the token path, which keeps the token path's
+    /// bits. Either way the drafter's context takes the prompt rows its first block reads.
     pub fn set_drafting_prefill(&mut self, drafting: bool) {
         self.drafting_prefill = drafting;
     }
@@ -2576,7 +2577,7 @@ impl DeviceRank {
     /// one in, keeping its window: a server that holds one window between requests skips the
     /// allocation, 18.2 GiB a rank at the 1M default. As in a fresh window, only the convolution
     /// history and the recurrent memory are cleared; the caches are read below the position only,
-    /// and a block drafter's context is read below `position - drafter_skip`, which a reset zeroes.
+    /// and a block drafter's rings are zeroed.
     ///
     /// # Errors
     /// When the device refuses a copy.
@@ -2615,7 +2616,6 @@ impl DeviceRank {
         sequence.pending = None;
         sequence.logits_at = None;
         sequence.confidence.clear();
-        sequence.drafter_skip = 0;
         // A reused window's drafter rings still hold the last request's rows, and a ring slot is
         // read by position: without this a request's first drafts attend to another's positions.
         if let (Some(block), Some(scratch)) = (&self.block, &sequence.block) {
@@ -2669,20 +2669,29 @@ impl DeviceRank {
         let config = draft.config();
         let exchange = self.layout.world_size * MAX_ROWS * Self::candidates(&draft);
         let chains = MAX_ROWS * 2 * config.block_size * 4;
+        // A rank with the bulk chunk captures a drafting prompt's last rows during it.
+        let prompt = self
+            .prefill
+            .is_some()
+            .then(|| config.window_left.min(self.prefill_rows) * config.feature_width());
         let mut buffers = || -> Result<_, BackendError> {
             Ok((
                 self.memory.floats(exchange)?,
                 self.memory.mapped(exchange * 4)?,
                 self.memory.mapped(chains)?,
+                prompt
+                    .map(|floats| self.memory.floats(floats))
+                    .transpose()?,
             ))
         };
         match buffers() {
-            Ok((exchange, exchange_host, chains)) => {
+            Ok((exchange, exchange_host, chains, prompt)) => {
                 self.block = Some(BlockDrafter {
                     draft,
                     exchange,
                     exchange_host,
                     chains,
+                    prompt,
                 });
                 Ok(())
             }
@@ -2767,7 +2776,6 @@ impl DeviceRank {
             drafter,
             block: None,
             confidence: Vec::new(),
-            drafter_skip: 0,
             memory,
         };
         self.clear(&mut sequence)?;
@@ -4519,15 +4527,9 @@ impl DeviceRank {
     }
 
     /// Whether `sequence`'s prompt may run the bulk prefill: the rank's chunk scratch exists only
-    /// for a configuration the chunk can take (see `load`). A block-drafting sequence takes it too:
-    /// the chunk runs with the drafter detached, because the drafter keeps a step's rows of
-    /// features and a chunk's rows would run past those, so a prompt's positions are ones its
-    /// context did not see ([DeviceSequence]'s `drafter_skip`). Its drafts then start from the
-    /// generation, as the MTP layer's context does.
-    ///
-    /// A block-drafting sequence takes it only when the profile asks (`prefill.drafting_prompt`):
-    /// the detach costs the drafter the prompt it conditions on, which is a trade an operator
-    /// makes against a prompt that would otherwise cost a decode step a token.
+    /// for a configuration the chunk can take (see `load`). A block-drafting sequence takes it too
+    /// unless the profile says otherwise (`prefill.drafting_prompt`): the chunk captures the rows
+    /// the drafter's first block reads, as the token path's steps would.
     fn chunk_ready(&self, sequence: &DeviceSequence) -> bool {
         self.prefill.is_some() && (sequence.block.is_none() || self.drafting_prefill)
     }
@@ -4566,18 +4568,41 @@ impl DeviceRank {
         }
         let device_leg = self.collective(tp, gather)?;
         let chunk = self.prefill_rows;
+        // A block drafter's first block reads the prompt's last `window_left` positions: a chunk
+        // captures its rows from the first of those on into the drafter's prompt rows, a scratch
+        // that is otherwise the sequence's, and commits them to its context a step's rows at a
+        // time, as the token path's steps would ([Dflash2Config::window_commits]).
+        let end = sequence.position + tokens.len();
+        let block = match (&self.block, &sequence.block) {
+            (Some(block), Some(scratch)) => {
+                let prompt = block.prompt.ok_or_else(|| {
+                    refusal("the block drafter has no prompt rows for the bulk chunk")
+                })?;
+                Some((scratch.with_features(prompt), block.draft.config().clone()))
+            }
+            _ => None,
+        };
         let mut last = Vec::new();
         for part in tokens.chunks(chunk) {
+            let start = sequence.position;
+            let commits: Vec<(usize, usize, usize)> =
+                block.as_ref().map_or_else(Vec::new, |(_, config)| {
+                    config
+                        .window_commits((start, part.len()), end, MAX_ROWS)
+                        .collect()
+                });
+            let captured = commits.first().map(|&(row, _, _)| row);
             let run = Run {
                 layers: &sequence.layers,
-                position: sequence.position,
+                position: start,
                 first: 0,
                 len: part.len(),
                 verify: false,
                 drafter: sequence.drafter.as_ref(),
-                // A chunk's rows are not the rows a block drafter keeps: it holds one step's, so
-                // the chunk runs with it detached (`prefill.drafting_prompt`).
-                block: None,
+                block: block
+                    .as_ref()
+                    .zip(captured)
+                    .map(|((scratch, _), row)| (scratch, row)),
             };
             self.steps = self.steps.wrapping_add(1);
             let prefill = self
@@ -4596,10 +4621,16 @@ impl DeviceRank {
                 // The chunk's last row is its stash's last ([Self::fill]).
                 drafter.last = Some(part.len().min(MAX_ROWS) - 1);
             }
+            if let (Some(drafter), Some((scratch, _)), Some(captured)) =
+                (&self.block, &block, captured)
+            {
+                for (row, rows, position) in commits {
+                    drafter
+                        .draft
+                        .commit(&*self, scratch, row - captured, rows, position)?;
+                }
+            }
         }
-        // The chunk ran with the block drafter detached, so the prompt's rows are ones its context
-        // does not hold: every ring read after this is offset by them.
-        sequence.drafter_skip += tokens.len();
         Ok(last)
     }
 
@@ -4803,13 +4834,9 @@ impl DeviceRank {
         }
         // The block drafter's context takes the kept rows, which the verify captured.
         if let (Some(block), Some(scratch)) = (&self.block, &sequence.block) {
-            block.draft.commit(
-                self,
-                scratch,
-                0,
-                kept,
-                sequence.position - kept - sequence.drafter_skip,
-            )?;
+            block
+                .draft
+                .commit(self, scratch, 0, kept, sequence.position - kept)?;
         }
         Ok(())
     }
@@ -4870,15 +4897,11 @@ impl DeviceRank {
             .map(|(_, tokens)| Vec::with_capacity(tokens.len()))
             .collect();
         // A block drafter's next block sits just past a sequence's tokens and reaches its window
-        // back, so the rows further back than that are never read and their commits are skipped.
-        let visible: Vec<usize> = batch
+        // back, so the rows further back than that are never read and their commits are skipped
+        // ([Dflash2Config::window_commits]).
+        let ends: Vec<usize> = batch
             .iter()
-            .map(|(sequence, tokens)| {
-                self.block.as_ref().map_or(0, |block| {
-                    (sequence.position - sequence.drafter_skip + tokens.len())
-                        .saturating_sub(block.draft.config().window_left)
-                })
-            })
+            .map(|(sequence, tokens)| sequence.position + tokens.len())
             .collect();
         loop {
             let mut runs = Vec::new();
@@ -4895,7 +4918,7 @@ impl DeviceRank {
                         len: take,
                         verify: verify && take > 1,
                         drafter: sequence.drafter.as_ref(),
-                        block: sequence.block.as_ref(),
+                        block: sequence.block.as_ref().map(|scratch| (scratch, 0)),
                     });
                     tokens.extend_from_slice(&chunk[done..done + take]);
                     members.push((member, take));
@@ -4938,14 +4961,14 @@ impl DeviceRank {
                     });
                 } else if let (Some(block), Some(scratch)) = (&self.block, &sequence.block) {
                     // A verify's rows wait for its commit, which knows how many the model kept.
-                    let unseen = visible[member].saturating_sub(position).min(take);
-                    block.draft.commit(
-                        &*self,
-                        scratch,
-                        unseen,
-                        take - unseen,
-                        position + unseen - sequence.drafter_skip,
-                    )?;
+                    let draft = &block.draft;
+                    for (row, rows, at) in
+                        draft
+                            .config()
+                            .window_commits((position, take), ends[member], MAX_ROWS)
+                    {
+                        draft.commit(&*self, scratch, row, rows, at)?;
+                    }
                 }
             }
         }
@@ -5062,11 +5085,14 @@ impl DeviceRank {
         };
         let (hc, hidden) = (self.config.hc_mult, self.config.hidden_size);
         for run in runs {
-            if let Some(scratch) = run.block {
-                let streams = self.scratch.streams.offset(run.first * hc * hidden * 4);
+            if let Some((scratch, from)) = run.block.filter(|&(_, from)| from < run.len) {
+                let streams = self
+                    .scratch
+                    .streams
+                    .offset((run.first + from) * hc * hidden * 4);
                 block
                     .draft
-                    .capture(self, scratch, index, (streams, hc), 0, run.len)?;
+                    .capture(self, scratch, index, (streams, hc), 0, run.len - from)?;
             }
         }
         Ok(())
@@ -5593,7 +5619,7 @@ impl DeviceRank {
             device_leg,
         };
         for (row, ((sequence, next), scratch)) in batch.iter().zip(&scratches).enumerate() {
-            let at = sequence.position - sequence.drafter_skip;
+            let at = sequence.position;
             draft.score(
                 &scoring,
                 scratch,
