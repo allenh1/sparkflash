@@ -352,40 +352,9 @@ fn q8_inner(columns: usize) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// The CUDA context a rank and its sequences share, owned so a rank outlives the call that opened
-/// it and a sequence can hold the handle for as long as its allocations live.
-///
-/// The driver's context is process-wide and retained by the driver; this wrapper is what makes that
-/// handle `Send`/`Sync` for the serving worker threads, exactly as the Qwen4-Exp arm's
-/// `CudaHandle` does. Every device call goes through it, and its `Deref` keeps the call sites on
-/// the driver API.
-pub struct CudaHandle(Cuda);
-
-impl CudaHandle {
-    /// Takes ownership of an opened context.
-    #[must_use]
-    pub fn new(cuda: Cuda) -> Self {
-        Self(cuda)
-    }
-}
-
-impl std::ops::Deref for CudaHandle {
-    type Target = Cuda;
-
-    fn deref(&self) -> &Cuda {
-        &self.0
-    }
-}
-
-// SAFETY: the handle owns one retained driver context, and the driver's context is process-wide:
-// every method this crate calls on it is a query or a launch on a stream the caller names, and the
-// CUDA driver serialises context access. A session owns its own stream and buffers, and a rank's
-// forward takes `&mut self`, so a `Send` handle cannot be used concurrently for the same rank's
-// state.
-unsafe impl Send for CudaHandle {}
-// SAFETY: as above: the handle itself carries no mutable per-thread state, and the run-scope
-// caches behind it lock internally.
-unsafe impl Sync for CudaHandle {}
+// The shared context handle: one definition in `sparkflash_ops`, so both arms carry the same
+// `Send`/`Sync` wrapper around the driver context.
+pub use sparkflash_ops::gemv::CudaHandle;
 
 pub(crate) fn refusal(detail: impl Into<String>) -> BackendError {
     BackendError::new("glm5_config", detail)

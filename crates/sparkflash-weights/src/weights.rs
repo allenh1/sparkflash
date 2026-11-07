@@ -181,6 +181,15 @@ pub trait WeightSource: Send + Sync {
         None
     }
 
+    /// The checkpoint directory this source reads from, when it reads one.
+    ///
+    /// A converted or in-memory source holds no directory. An arm that boots from a checkpoint
+    /// (config, tokenizer and host-paged tables beside the shards) uses this to find it without
+    /// the caller passing the path twice.
+    fn directory(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Whether the source holds a tensor with that name.
     fn contains(&self, name: &str) -> bool {
         self.spec(name).is_ok()

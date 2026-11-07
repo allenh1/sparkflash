@@ -23,6 +23,7 @@ use sparkflash_ops::plan::{
     GroupedFp8Body, KernelId, KernelPhase, PartGeometry, Precision, StreamId,
 };
 use sparkflash_ops::resolver::{Availability, KernelResolver, PlanContext, ResolvedKernel};
+use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
 
 const DEEPSEEK: &str =
     include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
@@ -994,4 +995,108 @@ fn the_released_qwen_vision_patch_is_refused() {
     assert!(message.contains("vision"), "{message}");
     assert!(message.contains("deepseek_ptx"), "{message}");
     assert!(message.contains("vision patch"), "{message}");
+}
+
+#[test]
+fn an_mxfp4_block_is_carried_in_the_expert_scale_shape() {
+    // MXFP4's released block is 32, not NVFP4's group 16. The plan must use the block it was
+    // given: a 2560-wide expert's inverse scale has 80 columns, not the 160 a 16-group would.
+    let mut architecture =
+        Architecture::from_json(QWEN_NVFP4).expect("the Qwen NVFP4 release parses");
+    architecture.quantization.expert_format =
+        sparkflash_model::architecture::WeightFormat::MxFp4 { block: 32 };
+    let tp = sparkflash_model::TpPlan::new(1, 0).expect("one rank");
+    let plan = sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served(&architecture, tp)
+        .expect("the MXFP4 plan builds");
+    let scale = plan
+        .rank_spec("model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale")
+        .expect("the expert scale is planned");
+    assert_eq!(scale.shape, vec![640, 2560usize.div_ceil(32)]);
+    assert_ne!(scale.shape[1], 2560usize.div_ceil(16));
+    EnginePlan::for_architecture(architecture, Target::Sm121, 1, 0)
+        .expect("the execution plan carries the same format");
+}
+
+#[test]
+fn an_admitted_context_is_capped_by_the_checkpoint_window() {
+    let plan = EnginePlan::from_json(QWEN_NVFP4, Target::Sm121, 1, 0).expect("Qwen plan");
+    let window = plan.architecture().max_position_embeddings;
+    assert_eq!(
+        plan.admitted_context(window / 2).expect("a short context"),
+        window / 2
+    );
+    assert_eq!(
+        plan.admitted_context(window + 1)
+            .expect("a request past the window"),
+        window,
+        "a request past the checkpoint window is capped, not allocated"
+    );
+    assert_eq!(
+        plan.admitted_context(window).expect("the whole window"),
+        window
+    );
+    assert!(
+        plan.admitted_context(0).is_err(),
+        "a zero context is refused"
+    );
+}
+
+#[test]
+fn a_non_replicated_qwen_mtp_is_not_a_tp4_global() {
+    // Qwen4-Exp clears mtp.replicated: its TP>1 rank configuration drafts with DFlash and
+    // sets the MTP layer count to zero, so served_and_mtp omits the stage at TP4. The boot
+    // plan must name the same set; a global the served tensor plan does not carry would claim
+    // a part with no weights.
+    let qwen_tp4 = EnginePlan::from_json(QWEN_NVFP4, Target::Sm121, 4, 0).expect("Qwen TP4");
+    let mtp = qwen_tp4
+        .architecture()
+        .mtp
+        .as_ref()
+        .expect("the Qwen release declares an MTP stage");
+    assert!(!mtp.replicated, "Qwen4-Exp is the non-replicated release");
+    assert!(
+        qwen_tp4
+            .globals()
+            .iter()
+            .all(|requirement| requirement.part != Part::Mtp),
+        "the TP4 boot plan must not name a stage the served set omits"
+    );
+    let tensors = ArchitectureTensorPlan::served_and_mtp(qwen_tp4.architecture(), qwen_tp4.tp())
+        .expect("the Qwen TP4 served plan builds");
+    assert_eq!(
+        tensors.role_bytes(Role::Mtp),
+        0,
+        "the TP4 served set carries no MTP tensor"
+    );
+    assert!(tensors.roles().all(|role| role != Role::Mtp));
+
+    // TP1 still carries the stage: the same release serves it when one rank owns the model.
+    let qwen_tp1 = EnginePlan::from_json(QWEN_NVFP4, Target::Sm121, 1, 0).expect("Qwen TP1");
+    let mtp = qwen_tp1
+        .globals()
+        .iter()
+        .find(|requirement| requirement.part == Part::Mtp)
+        .expect("the TP1 boot plan carries the MTP stage");
+    assert_eq!(mtp.geometry.world, 1);
+    let tensors = ArchitectureTensorPlan::served_and_mtp(qwen_tp1.architecture(), qwen_tp1.tp())
+        .expect("the Qwen TP1 served plan builds");
+    assert!(
+        tensors.roles().any(|role| role == Role::Mtp),
+        "the TP1 served set carries the MTP tensor"
+    );
+
+    // A replicated stage (GLM's default) stays global at TP4, matching its served set.
+    let glm_tp4 = EnginePlan::from_json(GLM, Target::Sm121, 4, 0).expect("GLM TP4");
+    assert!(
+        glm_tp4
+            .architecture()
+            .mtp
+            .as_ref()
+            .is_some_and(|mtp| mtp.replicated)
+    );
+    glm_tp4
+        .globals()
+        .iter()
+        .find(|requirement| requirement.part == Part::Mtp)
+        .expect("the GLM TP4 boot plan carries its replicated MTP stage");
 }

@@ -147,6 +147,7 @@ pub fn tiny_architecture() -> Architecture {
     let full_indexer = Indexer {
         heads: 2,
         head_dim: 8,
+        kv_heads: 1,
         topk: 8,
         owns_keys: true,
         reuse: false,

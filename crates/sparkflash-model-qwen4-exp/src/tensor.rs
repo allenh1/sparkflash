@@ -714,6 +714,8 @@ impl Qwen4ExpTensorPlan {
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_model::TpPlan;
+    use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
     use sparkflash_weights::TensorSpec;
 
     use super::*;
@@ -732,6 +734,78 @@ mod tests {
         assert_eq!(
             plan.role_bytes(Role::Experts),
             48u128 * 512 * 3 * (640 * 1280 + 640 * 160 + 8)
+        );
+    }
+
+    /// The shared architecture plan emits exactly the specs this family plan does.
+    fn assert_shared_plan(
+        shared: &ArchitectureTensorPlan,
+        legacy: &Qwen4ExpTensorPlan,
+        label: &str,
+    ) {
+        assert_eq!(shared.len(), legacy.len(), "{label}: tensor count");
+        let mut mismatched = 0usize;
+        for spec in legacy.specs() {
+            let found = shared
+                .spec(&spec.name)
+                .unwrap_or_else(|| panic!("{label}: {} is missing", spec.name));
+            if found.dtype != spec.dtype || found.shape != spec.shape {
+                mismatched += 1;
+                if mismatched <= 12 {
+                    eprintln!(
+                        "{label}: {} legacy {:?} {:?} shared {:?} {:?}",
+                        spec.name, spec.dtype, spec.shape, found.dtype, found.shape
+                    );
+                }
+            }
+        }
+        assert_eq!(mismatched, 0, "{label}: {mismatched} specs differ");
+        let mut shared_only = 0usize;
+        for spec in shared.specs() {
+            if legacy.spec(&spec.name).is_none() {
+                shared_only += 1;
+                if shared_only <= 12 {
+                    eprintln!(
+                        "{label}: shared-only {} {:?} {:?}",
+                        spec.name, spec.dtype, spec.shape
+                    );
+                }
+            }
+        }
+        assert_eq!(shared_only, 0, "{label}: {shared_only} shared-only specs");
+        assert_eq!(
+            shared.storage_bytes(),
+            legacy.storage_bytes(),
+            "{label}: byte total"
+        );
+    }
+
+    #[test]
+    fn the_shared_architecture_plan_reproduces_the_nvfp4_checkpoint() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
+        let tp = TpPlan::new(1, 0).expect("one rank");
+        let shared = ArchitectureTensorPlan::checkpoint(&config.architecture, tp)
+            .expect("the shared plan builds");
+        assert_shared_plan(&shared, &Qwen4ExpTensorPlan::checkpoint(&config), "nvfp4");
+        let served = ArchitectureTensorPlan::served(&config.architecture, tp)
+            .expect("the shared served plan builds");
+        assert_shared_plan(
+            &served,
+            &Qwen4ExpTensorPlan::served(&config),
+            "nvfp4 served",
+        );
+    }
+
+    #[test]
+    fn the_shared_architecture_plan_reproduces_the_fp8_served_set() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
+        let tp = TpPlan::new(1, 0).expect("one rank");
+        let shared = ArchitectureTensorPlan::served(&config.architecture, tp)
+            .expect("the shared plan builds");
+        assert_shared_plan(&shared, &Qwen4ExpTensorPlan::served(&config), "fp8 served");
+        assert_eq!(
+            shared.storage_bytes() - shared.role_bytes(TensorRole::PleTable),
+            FP8_DEVICE_RESIDENT_BYTES
         );
     }
 
@@ -910,6 +984,27 @@ mod tests {
                 .expect("an expert is planned")
                 .shape,
             vec![8, 32]
+        );
+    }
+
+    #[test]
+    fn the_checkpoint_plan_keeps_mtp_at_tp4() {
+        let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
+        let tp = TpPlan::new(4, 0).expect("rank 0 of four");
+        let plan = ArchitectureTensorPlan::checkpoint(&config.architecture, tp)
+            .expect("the TP4 checkpoint plan builds");
+        let mtp: Vec<_> = plan
+            .specs()
+            .iter()
+            .filter(|spec| {
+                plan.role(plan.index_of(&spec.name).expect("a planned name")) == TensorRole::Mtp
+            })
+            .collect();
+        assert!(!mtp.is_empty(), "the whole checkpoint keeps its MTP stage");
+        assert!(plan.role_bytes(TensorRole::Mtp) > 0, "TP4 MTP bytes");
+        assert!(
+            plan.rank_spec("mtp.fc_embedding.weight").is_some(),
+            "the MTP stage is planned at TP4, not dropped by the served-world gate"
         );
     }
 }

@@ -46,6 +46,7 @@ use sparkflash_model::{
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
+use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
@@ -522,6 +523,52 @@ impl Glm5NextDeviceBackend {
     #[must_use]
     pub fn context_limit(&self) -> usize {
         self.context_limit
+    }
+}
+
+impl sparkflash_ops::EngineBuilder for Glm5NextDeviceBackend {
+    type Backend = sparkflash_ops::PartsDeviceBackend<Self>;
+
+    /// Open the GLM arm from the shared execution plan.
+    ///
+    /// The plan's own target and world gate the open ([EnginePlan::single_rank_context]), the
+    /// shared rank view then validates the checkpoint and proves both passes before a weight is
+    /// uploaded, and the arm opens the same plan for its numeric forward. The TP4 group opens
+    /// its ranks through the pack's `OPEN_RANK` instead.
+    ///
+    /// # Errors
+    /// A plan this build's single-rank arm cannot open, a weight the plan names and the source
+    /// lacks, a part no catalogue kernel serves in either pass, a checkpoint that does not
+    /// parse, or a device that does not open.
+    fn open(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        context: usize,
+    ) -> Result<Self::Backend, sparkflash_ops::PlanError> {
+        let plan_context = plan.single_rank_context()?;
+        // The serve path's admitted `--context`, capped by the checkpoint's own window. The arm
+        // must allocate its caches and advertise its descriptor at this width; the plan's
+        // `max_position_embeddings` is the checkpoint ceiling, not the operator's request.
+        let context = plan.admitted_context(context)?;
+        let rank = sparkflash_ops::PartsDeviceRank::open(plan, weights, plan_context)?;
+        let directory = weights.directory().ok_or_else(|| {
+            sparkflash_ops::PlanError::Invalid(
+                "the GLM arm needs the checkpoint directory beside its weight source".to_owned(),
+            )
+        })?;
+        let config = Glm5NextConfig::from_checkpoint_dir(directory)
+            .map_err(|error| sparkflash_ops::PlanError::Invalid(error.to_string()))?;
+        let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
+            .map_err(|error| sparkflash_ops::PlanError::Invalid(format!("CUDA: {error}")))?;
+        let arm = Self::open_single_rank_with_plan(
+            Arc::new(CudaHandle::new(cuda)),
+            config,
+            directory,
+            context,
+            plan,
+        )
+        .map_err(|error| sparkflash_ops::PlanError::Invalid(error.to_string()))?;
+        Ok(sparkflash_ops::PartsDeviceBackend::new(rank, arm))
     }
 }
 

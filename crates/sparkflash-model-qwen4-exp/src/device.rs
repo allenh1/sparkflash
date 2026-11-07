@@ -60,33 +60,13 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
 
-/// A CUDA context handle that the model contract can carry.
-///
-/// The driver context is a process-wide primary context. The raw pointer inside Cuda is what makes
-/// the compiler refuse Send/Sync. Each session owns a [RunStream] and puts all of its copies and
-/// launches there; the weights and kernel handles shared by those sessions are read-only. Buffer
-/// allocation and free go through the context's own pool mutex.
-struct CudaHandle(Cuda);
-
-// SAFETY: the context is the retained primary context for this process. Sessions use separate
-// streams and separate buffers; the only shared state is immutable weights, immutable kernel
-// handles, and buffers whose lifetime is ordered by each session's stream. The driver's context
-// is current on each worker thread (every entry point calls `make_current`).
-unsafe impl Send for CudaHandle {}
-// SAFETY: as above; the handle is shared, but no mutable context state is reached without the
-// driver's own synchronization or a session-local stream.
-unsafe impl Sync for CudaHandle {}
-
-impl std::ops::Deref for CudaHandle {
-    type Target = Cuda;
-    fn deref(&self) -> &Cuda {
-        &self.0
-    }
-}
+// The shared context handle: one definition in `sparkflash_ops`, so both arms carry the same
+// `Send`/`Sync` wrapper around the driver context.
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Part as SharedPart, Sampling, Speculation, StepOutput,
 };
+pub(crate) use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
@@ -1913,6 +1893,70 @@ fn open_config(directory: &Path) -> Result<Qwen4ExpConfig, BackendError> {
         .map_err(|error| BackendError::new("qwen4_config", error.to_string()))
 }
 
+impl sparkflash_ops::EngineBuilder for Qwen4ExpDeviceBackend {
+    type Backend = sparkflash_ops::PartsDeviceBackend<Self>;
+
+    /// Open the Qwen arm from the shared execution plan.
+    ///
+    /// The plan's own target and world gate the open ([EnginePlan::single_rank_context]), the
+    /// shared rank view then validates the checkpoint and proves both passes before a weight is
+    /// uploaded, and the arm opens the same plan for its numeric forward. A plan at another
+    /// target, at TP>1, or describing a different checkpoint never reaches a kernel launch; the
+    /// TP4 group opens its ranks through the pack's `OPEN_RANK` instead.
+    ///
+    /// # Errors
+    /// A plan this build's single-rank arm cannot open, a weight the plan names and the source
+    /// lacks, a part no catalogue kernel serves in either pass, or an arm-open refusal.
+    fn open(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        context: usize,
+    ) -> Result<Self::Backend, sparkflash_ops::PlanError> {
+        Self::open_plan(plan, weights, None, context)
+    }
+
+    /// [Self::open] over a converted rank file, keeping the same plan gate and boot check.
+    ///
+    /// # Errors
+    /// As [Self::open], and a rank file of another world or rank.
+    fn open_converted(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        converted: &std::path::Path,
+        context: usize,
+    ) -> Result<Self::Backend, sparkflash_ops::PlanError> {
+        Self::open_plan(plan, weights, Some(converted), context)
+    }
+}
+
+impl Qwen4ExpDeviceBackend {
+    fn open_plan(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        converted: Option<&std::path::Path>,
+        requested_context: usize,
+    ) -> Result<sparkflash_ops::PartsDeviceBackend<Self>, sparkflash_ops::PlanError> {
+        let plan_context = plan.single_rank_context()?;
+        // The serve path's admitted `--context`, capped by the checkpoint's own window. The arm
+        // must allocate its caches and advertise its descriptor at this width; opening at
+        // `plan.architecture().max_position_embeddings` silently served the full window whenever
+        // the plan-aware path ran.
+        let context = plan.admitted_context(requested_context)?;
+        let rank = sparkflash_ops::PartsDeviceRank::open(plan, weights, plan_context)?;
+        let directory = weights.directory().ok_or_else(|| {
+            sparkflash_ops::PlanError::Invalid(
+                "the Qwen arm needs the checkpoint directory beside its weight source".to_owned(),
+            )
+        })?;
+        let arm = match converted {
+            Some(path) => Self::open_converted_with_plan(directory, context, path, plan),
+            None => Self::open_with_plan(directory, context, plan),
+        }
+        .map_err(|error| sparkflash_ops::PlanError::Invalid(error.to_string()))?;
+        Ok(sparkflash_ops::PartsDeviceBackend::new(rank, arm))
+    }
+}
+
 impl Qwen4ExpDeviceBackend {
     /// Open the checkpoint for one device rank and upload every resident weight.
     ///
@@ -2382,7 +2426,7 @@ impl Qwen4ExpDeviceBackend {
             );
         }
         let shared = Arc::new(SequenceShared {
-            cuda: CudaHandle(cuda),
+            cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
             config: Arc::new(local),
             weights,

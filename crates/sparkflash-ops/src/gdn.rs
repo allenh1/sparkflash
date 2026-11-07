@@ -41,13 +41,34 @@ const GDN_SCAN_MAX_SPLITS: usize = 16;
 /// The scan grid and block width for heads heads.
 #[must_use]
 pub fn gdn_scan_shape(heads: usize) -> ((u32, u32, u32), u32) {
+    gdn_scan_shape_for(heads, GDN_VALUE)
+}
+
+/// [gdn_scan_shape] for one value-head width.
+///
+/// The block is `4 * value_dim / splits` threads, a multiple of 32 and at most the entry's
+/// launch bound; `V_DIM` 64 caps the splits at 8 (32 threads) and `V_DIM` 128/256 at 16. The
+/// lower split bound is the launch bound: with every head accounted for, a `V_DIM` 256 entry
+/// still needs two splits to stay inside its 512 threads.
+#[must_use]
+pub fn gdn_scan_shape_for(heads: usize, value_dim: usize) -> ((u32, u32, u32), u32) {
+    // q4p_gdn_scan_64_64 is launched with a 256-thread bound and the two 128-value entries
+    // with 512; a block past its entry's bound fails the launch.
+    let bound = if value_dim == 64 { 256 } else { 512 };
+    let max_splits = (4 * value_dim / 32).max(1);
     let mut splits = 1;
-    while heads * splits < GDN_SCAN_TARGET_BLOCKS && splits < GDN_SCAN_MAX_SPLITS {
+    while 4 * value_dim / splits.max(1) > bound && splits < max_splits {
+        splits *= 2;
+    }
+    while heads * splits < GDN_SCAN_TARGET_BLOCKS
+        && splits < GDN_SCAN_MAX_SPLITS
+        && splits < max_splits
+    {
         splits *= 2;
     }
     (
         (heads as u32, splits as u32, 1),
-        (4 * GDN_VALUE / splits) as u32,
+        (4 * value_dim / splits) as u32,
     )
 }
 

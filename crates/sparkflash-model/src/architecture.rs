@@ -230,6 +230,8 @@ pub struct Indexer {
     pub heads: usize,
     /// Indexer head width.
     pub head_dim: usize,
+    /// Indexer key heads (the QSA release runs one).
+    pub kv_heads: usize,
     /// Entries kept per query.
     pub topk: usize,
     /// Whether the layer owns the keys it scores.
@@ -401,6 +403,8 @@ pub struct PleGeometry {
     pub seed: u64,
     /// Checkpoint shards the table is stored in.
     pub split_parts: usize,
+    /// The table's padded row count is a multiple of this.
+    pub vocab_multiple: u64,
 }
 
 /// The MTP/DSpark stages a checkpoint carries.
@@ -1309,6 +1313,9 @@ fn indexer(
         head_dim: optional_usize(text, "index_head_dim")?
             .or(optional_usize(text, "indexer_head_dim")?)
             .unwrap_or(0),
+        kv_heads: optional_usize(text, "indexer_kv_heads")?
+            .or(optional_usize(text, "index_kv_heads")?)
+            .unwrap_or(0),
         topk: optional_usize(text, "index_topk")?
             .or(optional_usize(text, "indexer_budget")?)
             .unwrap_or(0),
@@ -1507,6 +1514,8 @@ fn ple_geometry(text: &Value) -> Result<PleGeometry, ConfigError> {
         vocab_base: optional_usize(text, "ngram_vocab_size_base")?.unwrap_or(0) as u64,
         seed: optional_usize(text, "seed")?.unwrap_or(0) as u64,
         split_parts: optional_usize(text, "split_ngram_parts")?.unwrap_or(1),
+        vocab_multiple: optional_usize(text, "make_ngram_vocab_size_divisible_by")?.unwrap_or(0)
+            as u64,
     })
 }
 

@@ -124,58 +124,16 @@ const MOE_ROWS_GATE_UP_COLUMNS: usize = 32;
 const MOE_ROWS_DOWN_COLUMNS: usize = 64;
 /// The K a q4p_moe_rows lane reads at once: two stages, 16 bytes of a packed row.
 const MOE_ROWS_K: usize = 2 * MOE_K_STAGE;
-/// The key head width the scan is compiled for (Q4P_GDN_KEY).
-pub const GDN_KEY: usize = 128;
-/// The value head width the scan is compiled for (Q4P_GDN_VALUE).
-pub const GDN_VALUE: usize = 128;
-/// Floats per staged (token, key head): q then k, padded (Q4P_GDN_ROW).
-pub const GDN_QK_ROW: usize = 288;
-/// Blocks the scan aims for: one an SM on GB10's forty-eight.
-const GDN_SCAN_TARGET_BLOCKS: usize = 48;
-/// The most a head's value columns split: eight columns, one warp, a block.
-const GDN_SCAN_MAX_SPLITS: usize = 16;
-
-/// q4p_gdn_scan's and q4p_kda_scan's grid and block width for `heads` heads: the fewest
-/// power-of-two splits of a head's value columns that give every SM a block, each split
-/// 4 * GDN_VALUE / splits threads. A value column's recurrence reads no other column, so any
-/// split computes the same bits; a rank holding eight heads (TP=4) would otherwise run the scan
-/// on eight of the forty-eight SMs.
-pub fn gdn_scan_shape(heads: usize) -> ((u32, u32, u32), u32) {
-    gdn_scan_shape_for(heads, GDN_VALUE)
-}
-
-/// [gdn_scan_shape] for one value-head width. The block is 4 * value_dim / splits threads, a
-/// multiple of 32 and at most the entry's launch bound; V_DIM 64 caps the splits at 8 (32
-/// threads) and V_DIM 128/256 at 16. The lower split bound is the launch bound: with every head
-/// accounted for, a V_DIM 256 entry still needs two splits to stay inside its 512 threads.
-pub fn gdn_scan_shape_for(heads: usize, value_dim: usize) -> ((u32, u32, u32), u32) {
-    // q4p_gdn_scan_64_64 is launched with a 256-thread bound and the two 128-value entries with
-    // 512; a block past its entry's bound fails the launch.
-    let bound = if value_dim == 64 { 256 } else { 512 };
-    let max_splits = (4 * value_dim / 32).max(1);
-    let mut splits = 1;
-    while 4 * value_dim / splits.max(1) > bound && splits < max_splits {
-        splits *= 2;
-    }
-    while heads * splits < GDN_SCAN_TARGET_BLOCKS
-        && splits < GDN_SCAN_MAX_SPLITS
-        && splits < max_splits
-    {
-        splits *= 2;
-    }
-    (
-        (heads as u32, splits as u32, 1),
-        (4 * value_dim / splits) as u32,
-    )
-}
+// The scan geometry lives in the shared op library so the Qwen and GLM arms cannot drift.
+pub use sparkflash_ops::gdn::{
+    CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, gdn_scan_shape, gdn_scan_shape_for,
+};
 
 /// The floats q4p_gdn_prep stages for one (token, key head): q then k, each key_dim wide with
 /// four padding floats after every 32 (Q4P_GDN_ROW).
 pub fn gdn_qk_row(key_dim: usize) -> usize {
     2 * (key_dim + key_dim / 8)
 }
-/// The conv history q4p_gdn_conv_state carries in registers (Q4P_CONV_HISTORY).
-pub const CONV_HISTORY: usize = 8;
 /// The dense MMA's token and column tile (OM_BM, OM_BN).
 const DENSE_TILE: usize = 128;
 /// q4p_dense_rows' rows (one m16 tile) and columns (four warps of 8) a CTA, for launches of fewer

@@ -480,6 +480,164 @@ mod tests {
         }
     }
 
+    /// The shared architecture plan's rank slices are the bytes the device walk uploads.
+    #[test]
+    fn the_shared_plan_agrees_with_the_rank_walk() {
+        use sparkflash_model::TpPlan;
+        use sparkflash_ops::tensor_plan::ArchitectureTensorPlan;
+
+        let mut config = tensor_parallel_config();
+        config.architecture = crate::architecture::architecture_from_json(&config.to_json())
+            .expect("the fixture round-trips through the shared parser");
+        config.architecture.quantization.expert_format = match config.expert_quant {
+            crate::config::ExpertQuant::Nvfp4 => {
+                sparkflash_model::architecture::WeightFormat::NvFp4 { group_size: 16 }
+            }
+            crate::config::ExpertQuant::Fp8Block => {
+                sparkflash_model::architecture::WeightFormat::Fp8Tile {
+                    block_m: 128,
+                    block_n: 128,
+                    scale_dtype: sparkflash_model::architecture::ScaleDType::Bf16,
+                    dynamic_activations: true,
+                }
+            }
+        };
+        if config.architecture.mtp.is_some() {
+            config.architecture.quantization.mtp_expert_format =
+                Some(sparkflash_model::architecture::WeightFormat::Fp8Tile {
+                    block_m: 128,
+                    block_n: 128,
+                    scale_dtype: sparkflash_model::architecture::ScaleDType::Bf16,
+                    dynamic_activations: true,
+                });
+        }
+        let checkpoint = tempfile::tempdir().expect("a temporary directory");
+        write_synthetic_checkpoint(checkpoint.path(), &config, 7).expect("the fixture writes");
+        let source =
+            SafeTensorsSource::open(checkpoint.path(), &checkpoint.path().join(INDEX_NAME))
+                .expect("the fixture opens");
+        for (rank, world) in [(0, 1), (0, 2), (1, 2), (0, 4), (3, 4)] {
+            let layout = TpLayout {
+                rank,
+                world_size: world,
+            };
+            let tp = TpPlan::new(world, rank).expect("a rank");
+            let plan = ArchitectureTensorPlan::served_and_mtp(&config.architecture, tp)
+                .expect("the shared plan builds");
+            let mut replay = Plan::default();
+            let _ = build_shard(
+                &Uploader::planning(&mut replay),
+                checkpoint.path(),
+                &source,
+                &config,
+                Shard::of(layout),
+            )
+            .expect("the walk replays");
+            let walk: std::collections::BTreeMap<String, usize> = replay
+                .plan
+                .slots()
+                .iter()
+                .map(|slot| (slot.key.clone(), slot.bytes))
+                .collect();
+            let plan_names: std::collections::BTreeSet<String> =
+                plan.specs().iter().map(|spec| spec.name.clone()).collect();
+            // Name sets. A plan tensor is either a walk slot or one of the two per-matrix
+            // NVFP4 scalars the walk records in [Nvfp4Scalars] rather than as a slot; every
+            // walk-only slot is a derived table the checkpoint does not store. The scalar
+            // count is the second half of the name-set comparison.
+            let scalar_names: Vec<&String> = plan_names
+                .iter()
+                .filter(|name| {
+                    !walk.contains_key(*name)
+                        && (name.ends_with(".weight_scale_2") || name.ends_with(".input_scale"))
+                })
+                .collect();
+            let ple_names: Vec<&String> = plan
+                .specs()
+                .iter()
+                .enumerate()
+                .filter(|(index, spec)| {
+                    !walk.contains_key(&spec.name)
+                        && !scalar_names.contains(&&spec.name)
+                        && plan.role(*index) == sparkflash_ops::tensor_plan::Role::PleTable
+                })
+                .map(|(_, spec)| &spec.name)
+                .collect();
+            let missing: Vec<&String> = plan_names
+                .iter()
+                .filter(|name| {
+                    !walk.contains_key(*name)
+                        && !scalar_names.contains(name)
+                        && !ple_names.contains(name)
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "rank {rank}/{world}: the plan names {missing:?}, the rank walk does not upload them"
+            );
+            assert_eq!(
+                scalar_names.len(),
+                2 * replay.scalars.len(),
+                "rank {rank}/{world}: every NVFP4 matrix the plan names has one scalar record"
+            );
+            for name in walk.keys() {
+                if plan_names.contains(name) {
+                    continue;
+                }
+                assert!(
+                    source.spec(name).is_err(),
+                    "rank {rank}/{world}: the walk uploads {name}, which is a stored tensor the \
+                     plan omitted"
+                );
+            }
+            let mut checked = 0usize;
+            for (index, spec) in plan.specs().iter().enumerate() {
+                let stored = source
+                    .spec(&spec.name)
+                    .unwrap_or_else(|error| panic!("{}: {error}", spec.name));
+                assert_eq!(
+                    (stored.dtype, stored.shape.clone()),
+                    (spec.dtype, spec.shape.clone()),
+                    "{} rank {rank}/{world}: the logical plan differs from the checkpoint",
+                    spec.name
+                );
+                let rank_spec = plan.rank_spec_at(index);
+                assert_eq!(
+                    rank_spec.dtype, stored.dtype,
+                    "{} rank {rank}/{world}: the rank slice changes dtype",
+                    spec.name
+                );
+                match walk.get(&spec.name) {
+                    Some(bytes) => assert_eq!(
+                        rank_spec.storage_bytes() as usize,
+                        *bytes,
+                        "{} rank {rank}/{world}: plan {:?} vs walk {bytes}",
+                        spec.name,
+                        rank_spec.shape
+                    ),
+                    None => assert!(
+                        scalar_names.contains(&&spec.name) || ple_names.contains(&&spec.name),
+                        "{} rank {rank}/{world}: neither a slot, an NVFP4 scalar nor a host-paged \
+                         PLE table tensor",
+                        spec.name
+                    ),
+                }
+                checked += 1;
+            }
+            assert!(
+                checked > 20,
+                "rank {rank}/{world}: only {checked} slots checked"
+            );
+            if world == 1 {
+                assert_eq!(
+                    checked,
+                    plan.len(),
+                    "rank {rank}/{world}: a TP1 walk covers every planned tensor"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_world_the_model_does_not_split_over_is_refused() {
         let config = tensor_parallel_config();
@@ -515,5 +673,68 @@ mod tests {
         )
         .expect_err("rank 2 is not a rank of 2");
         assert!(error.contains("not a rank"), "{error}");
+    }
+
+    #[test]
+    fn the_qwen_loader_cannot_read_a_plan_order_slot_pack() {
+        use serde::{Deserialize, Serialize};
+        use sparkflash_ops::slot_pack::SlotPack;
+        use sparkflash_weights::rank_file::SlotRecords;
+
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        struct Extra {
+            label: u32,
+            nvfp4_scalars: Vec<[u32; 2]>,
+        }
+        impl SlotRecords for Extra {
+            const MODEL: &'static str = "slot-pack-test";
+        }
+
+        struct PlanBytes(Vec<sparkflash_weights::TensorSpec>);
+        impl WeightSource for PlanBytes {
+            fn names(&self) -> Vec<String> {
+                self.0.iter().map(|spec| spec.name.clone()).collect()
+            }
+            fn spec(
+                &self,
+                name: &str,
+            ) -> Result<sparkflash_weights::TensorSpec, sparkflash_weights::WeightError>
+            {
+                self.0
+                    .iter()
+                    .find(|spec| spec.name == name)
+                    .cloned()
+                    .ok_or_else(|| sparkflash_weights::WeightError::Missing {
+                        name: name.to_owned(),
+                    })
+            }
+            fn read(&self, name: &str) -> Result<Vec<u8>, sparkflash_weights::WeightError> {
+                Ok(vec![0; self.spec(name)?.storage_bytes() as usize])
+            }
+        }
+
+        let mut config = tensor_parallel_config();
+        config.architecture = crate::architecture::architecture_from_json(&config.to_json())
+            .expect("the fixture round-trips through the shared parser");
+        let tp = sparkflash_model::TpPlan::new(1, 0).expect("one rank");
+        let plan =
+            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served(&config.architecture, tp)
+                .expect("the shared plan builds");
+        let source = PlanBytes(plan.specs().to_vec());
+        let pack = SlotPack::new(
+            &plan,
+            Extra {
+                label: 3,
+                nvfp4_scalars: Vec::new(),
+            },
+        )
+        .expect("a TP1 plan packs");
+        let out = tempfile::tempdir().expect("an output directory");
+        let written = pack
+            .write(&source, out.path(), TP1, "slot-pack")
+            .expect("the pack writes");
+        let error = ConvertedIndex::read(&written.path, TP1)
+            .expect_err("the Qwen walk loader does not read plan order");
+        assert!(error.contains("not qwen4-exp"), "{error}");
     }
 }

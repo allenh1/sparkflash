@@ -985,6 +985,10 @@ impl SafeTensorsSource {
 }
 
 impl WeightSource for SafeTensorsSource {
+    fn directory(&self) -> Option<&std::path::Path> {
+        Some(&self.dir)
+    }
+
     fn read_ranges(
         &self,
         name: &str,

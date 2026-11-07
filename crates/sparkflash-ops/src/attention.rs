@@ -111,6 +111,70 @@ impl AttentionPlan {
         head_dim: usize,
         stream: StreamId,
     ) -> Result<Self, OpError> {
+        let (requirement, geometry) = Self::shape(requirement, kind, rows, context_len, head_dim)?;
+        let symbols = match kind {
+            AttentionKind::Gqa {
+                query_heads,
+                kv_heads,
+            } => gqa_symbols(query_heads / kv_heads),
+            _ => symbols_for(kind, requirement.precision),
+        };
+        let phase = KernelPhase::for_rows(rows);
+        // Resolve the geometry the plan will launch: the schedule owns the row count, context
+        // and head width, and a kernel must accept those, not the requirement's original values.
+        let resolved = context.resolve(&requirement, phase, symbols)?.id();
+        Self::finish(Self {
+            kind,
+            rows,
+            context: context_len,
+            head_dim,
+            stream,
+            precision: requirement.precision,
+            geometry,
+            resolved,
+        })
+    }
+
+    /// The same plan around an already-resolved kernel.
+    ///
+    /// A caller that has resolved the part instance once (the shared rank's launcher) must not
+    /// re-resolve a second, possibly different symbol here: the descriptor's kernel and the
+    /// body the arm launches have to be the same. The shape and validation are those of
+    /// [Self::new]; only the catalogue lookup is skipped.
+    ///
+    /// # Errors
+    /// A requirement for another part, a zero dimension, a head count that does not divide, an
+    /// unsupported precision, or a shape the kind refuses.
+    pub fn with_resolved(
+        requirement: &PartRequirement,
+        kind: AttentionKind,
+        rows: usize,
+        context_len: usize,
+        head_dim: usize,
+        stream: StreamId,
+        resolved: KernelId,
+    ) -> Result<Self, OpError> {
+        let (_requirement, geometry) = Self::shape(requirement, kind, rows, context_len, head_dim)?;
+        Self::finish(Self {
+            kind,
+            rows,
+            context: context_len,
+            head_dim,
+            stream,
+            precision: requirement.precision,
+            geometry,
+            resolved,
+        })
+    }
+
+    /// The schedule-adjusted requirement and geometry both constructors share.
+    fn shape(
+        requirement: &PartRequirement,
+        kind: AttentionKind,
+        rows: usize,
+        context_len: usize,
+        head_dim: usize,
+    ) -> Result<(PartRequirement, PartGeometry), OpError> {
         if requirement.part != kind.part() {
             return Err(OpError::Binding(format!(
                 "{} attention was built from a {} requirement",
@@ -144,31 +208,16 @@ impl AttentionPlan {
         if let AttentionKind::Csa2 { ratio } = kind {
             geometry.ratio = ratio;
         }
-        let symbols = match kind {
-            AttentionKind::Gqa {
-                query_heads,
-                kv_heads,
-            } => gqa_symbols(query_heads / kv_heads),
-            _ => symbols_for(kind, precision),
-        };
-        let phase = KernelPhase::for_rows(rows);
-        // Resolve the geometry the plan will launch: the schedule owns the row count, context
-        // and head width, and a kernel must accept those, not the requirement's original values.
-        let requirement = PartRequirement {
+        Ok((
+            PartRequirement {
+                geometry,
+                ..*requirement
+            },
             geometry,
-            ..*requirement
-        };
-        let resolved = context.resolve(&requirement, phase, symbols)?.id();
-        let plan = Self {
-            kind,
-            rows,
-            context: context_len,
-            head_dim,
-            stream,
-            precision,
-            geometry,
-            resolved,
-        };
+        ))
+    }
+
+    fn finish(plan: Self) -> Result<Self, OpError> {
         plan.validate()?;
         Ok(plan)
     }

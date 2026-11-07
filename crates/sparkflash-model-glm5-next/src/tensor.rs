@@ -721,9 +721,94 @@ impl Glm5NextTensorPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sparkflash_ops::tensor_plan::ArchitectureTensorPlan;
 
     fn released() -> Glm5NextConfig {
         Glm5NextConfig::glm53_flash().expect("the carried config parses")
+    }
+
+    fn assert_shared_plan(
+        shared: &ArchitectureTensorPlan,
+        legacy: &Glm5NextTensorPlan,
+        label: &str,
+    ) {
+        assert_eq!(shared.len(), legacy.len(), "{label}: tensor count");
+        assert_eq!(
+            shared.storage_bytes(),
+            legacy.storage_bytes(),
+            "{label}: byte total"
+        );
+        for spec in legacy.specs() {
+            let found = shared
+                .spec(&spec.name)
+                .unwrap_or_else(|| panic!("{label}: {} is missing", spec.name));
+            assert_eq!(found.dtype, spec.dtype, "{label}: {} dtype", spec.name);
+            assert_eq!(found.shape, spec.shape, "{label}: {} shape", spec.name);
+        }
+    }
+
+    #[test]
+    fn the_shared_architecture_plan_reproduces_the_released_checkpoint() {
+        let config = released();
+        let architecture = crate::architecture::architecture_from_carried()
+            .expect("the shared architecture parses");
+        let tp = sparkflash_model::TpPlan::new(1, 0).expect("one rank");
+        let shared =
+            ArchitectureTensorPlan::checkpoint(&architecture, tp).expect("the shared plan builds");
+        assert_shared_plan(&shared, &Glm5NextTensorPlan::checkpoint(&config), "fp8");
+        let served = ArchitectureTensorPlan::served_and_mtp(&architecture, tp)
+            .expect("the shared served plan builds");
+        assert_shared_plan(
+            &served,
+            &Glm5NextTensorPlan::served_and_mtp(&config),
+            "fp8 served",
+        );
+    }
+
+    #[test]
+    fn the_shared_architecture_plan_reproduces_every_rank_slice() {
+        let config = released();
+        let architecture = crate::architecture::architecture_from_carried()
+            .expect("the shared architecture parses");
+        let legacy = Glm5NextTensorPlan::served_and_mtp(&config);
+        for world in [1usize, 2, 4] {
+            for rank in 0..world {
+                let tp = sparkflash_model::TpPlan::new(world, rank).expect("a rank");
+                let shared = ArchitectureTensorPlan::served_and_mtp(&architecture, tp)
+                    .expect("the shared plan builds");
+                for index in 0..legacy.len() {
+                    let expected = legacy
+                        .rank_spec(index, world)
+                        .expect("the released plan splits");
+                    let found = shared
+                        .rank_spec(&expected.name)
+                        .unwrap_or_else(|| panic!("{} is missing", expected.name));
+                    assert_eq!(found.dtype, expected.dtype, "{} dtype", expected.name);
+                    assert_eq!(
+                        found.shape, expected.shape,
+                        "{} rank {rank}/{world}",
+                        expected.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_shared_architecture_plan_reproduces_the_bf16_checkpoint() {
+        let config = Glm5NextConfig {
+            fp8_block: None,
+            ..released()
+        };
+        let mut architecture = crate::architecture::architecture_from_carried()
+            .expect("the shared architecture parses");
+        architecture.quantization.dense_format = sparkflash_model::architecture::WeightFormat::Bf16;
+        architecture.quantization.expert_format =
+            sparkflash_model::architecture::WeightFormat::Bf16;
+        let tp = sparkflash_model::TpPlan::new(1, 0).expect("one rank");
+        let shared =
+            ArchitectureTensorPlan::checkpoint(&architecture, tp).expect("the shared plan builds");
+        assert_shared_plan(&shared, &Glm5NextTensorPlan::checkpoint(&config), "bf16");
     }
 
     #[test]

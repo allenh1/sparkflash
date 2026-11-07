@@ -194,57 +194,9 @@ pub(crate) fn rank_config(config: &Qwen4ExpConfig, shard: Shard) -> Result<Qwen4
     })
 }
 
-/// Whether `count` floats split over `world` ranks into whole float4 chunks, as the two-shot
-/// all-reduce ([reduce_two_shot]) and q4e_sum_slots need.
-#[must_use]
-pub fn splits_two_shot(count: usize, world: usize) -> bool {
-    world > 1 && count.is_multiple_of(4 * world)
-}
-
-/// The two-shot device all-reduce of `count` floats at `partial`, in place.
-///
-/// Every rank's chunk `rank` of each peer's partial lands in `slots` ([TpRuntime::scatter_on_device]),
-/// `sum` adds them into this rank's own chunk (q4e_sum_slots: ascending rank order from 0.0, the
-/// one-shot fold), and the summed chunks are gathered back in place, half the one-shot's bytes.
-/// `sum` is handed this rank's chunk and its length in floats; [splits_two_shot] says when
-/// `count` splits.
-///
-/// # Errors
-/// A collective failure, or whatever `sum` reports.
-pub fn reduce_two_shot(
-    tp: &TpRuntime,
-    stream: u64,
-    partial: Deviceptr,
-    slots: Deviceptr,
-    count: usize,
-    sum: impl FnOnce(Deviceptr, usize) -> Result<(), BackendError>,
-) -> Result<(), BackendError> {
-    let chunk = count / tp.world();
-    let mine = reduce_scatter(tp, stream, partial, slots, count, sum)?;
-    gather_in_place(tp, stream, partial, mine, chunk * 4)
-}
-
-/// The two-shot all-reduce's first half: this rank's chunk of `count` floats at `partial`
-/// (chunk `rank` of `world` equal ones) summed over the world in place, as [reduce_two_shot]
-/// sums it. Returns the chunk; the rest of `partial` is left as this rank's own partial.
-///
-/// # Errors
-/// A collective failure, or whatever `sum` reports.
-pub fn reduce_scatter(
-    tp: &TpRuntime,
-    stream: u64,
-    partial: Deviceptr,
-    slots: Deviceptr,
-    count: usize,
-    sum: impl FnOnce(Deviceptr, usize) -> Result<(), BackendError>,
-) -> Result<Deviceptr, BackendError> {
-    let chunk = count / tp.world();
-    let mine = partial.offset(tp.rank() * chunk * 4);
-    tp.scatter_on_device(stream, partial.0, slots.0, count * 4)
-        .map_err(collective_error)?;
-    sum(mine, chunk)?;
-    Ok(mine)
-}
+// The two-shot collective is the shared one ([sparkflash_ops::tp]); the arm keeps only its
+// device-leg switch and the error type its other collectives use.
+pub use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
 /// Every rank's `bytes` at `mine`, which is its own slot of `base` (`base + rank * bytes`),
 /// exchanged into the peers' slots of `base` in rank order; the own slot is left as it is.

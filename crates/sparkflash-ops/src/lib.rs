@@ -93,12 +93,16 @@ pub mod epilogue;
 pub mod error;
 pub mod gemm;
 pub mod images;
+pub mod launchers;
 pub mod parity;
 pub mod parts;
+pub mod parts_backend;
 pub mod plan;
 pub mod resolver;
 pub mod sampler;
 pub mod scan;
+pub mod slot_pack;
+pub mod tensor_plan;
 
 pub mod gdn;
 pub mod gemv;
@@ -110,8 +114,11 @@ pub use engine_plan::{
 };
 pub use error::OpError;
 pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
+pub use parts_backend::{PartsDeviceBackend, PartsDeviceRank, PartsLayer};
 pub use plan::{
     DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind, OpPlan, Operand,
     PartGeometry, Precision, PrecisionMask, ShapeConstraint, StreamId,
 };
 pub use resolver::{Availability, KernelResolver, PlanContext, ResolveError, ResolvedKernel};
+pub use slot_pack::{PackSlot, SlotPack};
+pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};

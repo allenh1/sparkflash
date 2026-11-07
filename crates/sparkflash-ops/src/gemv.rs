@@ -39,6 +39,39 @@ pub const TILED_GEMV_E4M3_ROUND: usize = 512;
 /// The narrowest activation row the plain decode GEMV goes tiled at.
 pub const TILED_GEMV_MIN_COLUMNS: usize = 4096;
 
+/// A CUDA context handle that the model contract can carry.
+///
+/// The driver context is a process-wide primary context. The raw pointer inside [`Cuda`] is what
+/// makes the compiler refuse `Send`/`Sync`. Each session owns a [`sparkflash_kernels::cuda_driver::RunStream`]
+/// and puts all of its copies and launches there; the weights and kernel handles shared by those
+/// sessions are read-only. Buffer allocation and free go through the context's own pool mutex.
+pub struct CudaHandle(Cuda);
+
+impl CudaHandle {
+    /// Takes ownership of an opened context.
+    #[must_use]
+    pub fn new(cuda: Cuda) -> Self {
+        Self(cuda)
+    }
+}
+
+impl std::ops::Deref for CudaHandle {
+    type Target = Cuda;
+
+    fn deref(&self) -> &Cuda {
+        &self.0
+    }
+}
+
+// SAFETY: the handle owns one retained driver context, and the driver's context is process-wide:
+// every method this crate calls on it is a query or a launch on a stream the caller names, and the
+// CUDA driver serialises context access. A session owns its own stream and buffers, so a `Send`
+// handle cannot be used concurrently for the same session's state.
+unsafe impl Send for CudaHandle {}
+// SAFETY: as above: the handle itself carries no mutable per-thread state, and the run-scope
+// caches behind it lock internally.
+unsafe impl Sync for CudaHandle {}
+
 /// One uploaded BF16 matrix, rows by columns, row-major.
 #[derive(Debug, Clone, Copy)]
 pub struct GpuMat {

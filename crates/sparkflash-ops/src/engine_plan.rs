@@ -43,6 +43,7 @@ use thiserror::Error;
 
 use crate::gemv::GEMV_MAX_BATCH;
 use crate::plan::{GroupedFp8Body, PartGeometry, Precision};
+use crate::resolver::PlanContext;
 
 /// The operand precision this run uses for each class of weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +265,52 @@ impl EnginePlan {
         self.target
     }
 
+    /// The window a device arm opens and advertises for a requested context.
+    ///
+    /// The requested context is the operator's `--context` (or the pack's default); the
+    /// checkpoint's own `max_position_embeddings` is the hard ceiling. A request above it is
+    /// capped rather than allowed to allocate past the checkpoint's window, which is what an
+    /// [EngineBuilder] arm did when it reopened from the plan and silently used the full window.
+    ///
+    /// # Errors
+    /// A zero context, which would allocate an unusable sequence.
+    pub fn admitted_context(&self, requested: usize) -> Result<usize, PlanError> {
+        if requested == 0 {
+            return Err(PlanError::Invalid(
+                "the requested context is zero".to_owned(),
+            ));
+        }
+        Ok(requested.min(self.architecture.max_position_embeddings))
+    }
+
+    /// The single-rank plan context a device arm's [EngineBuilder] opens.
+    ///
+    /// The Qwen and GLM single-node arms are compiled for [Target::Sm121] and hold one whole
+    /// rank; a plan at another target or at a world larger than one belongs to the TP4 group,
+    /// which opens each rank through its own pack path. Returning the context instead of a
+    /// second `SM121_CATALOGUE` constant is what makes the builder read the plan's own target.
+    ///
+    /// # Errors
+    /// A plan this build's single-rank arms cannot open, naming the target or world it does.
+    pub fn single_rank_context(&self) -> Result<PlanContext, PlanError> {
+        if self.target != Target::Sm121 {
+            return Err(PlanError::Invalid(format!(
+                "the single-rank device arms are compiled for {}; this plan targets {}",
+                Target::Sm121,
+                self.target
+            )));
+        }
+        if self.tp.world() != 1 || self.tp.rank() != 0 {
+            return Err(PlanError::Invalid(format!(
+                "the single-rank builder opens TP1/rank0; this plan is TP{}/rank{} (the TP4 \
+                 group opens each rank through PackArm::OPEN_RANK, not EngineBuilder::open)",
+                self.tp.world(),
+                self.tp.rank()
+            )));
+        }
+        Ok(PlanContext::catalogue(self.target))
+    }
+
     /// The tensor-parallel plan.
     #[must_use]
     pub const fn tp(&self) -> TpPlan {
@@ -335,11 +382,39 @@ pub trait EngineBuilder {
     /// The backend this builder produces.
     type Backend: ModelBackend;
 
-    /// Open the backend for this plan and weight source.
+    /// Open the backend for this plan and weight source over `context` tokens.
+    ///
+    /// `context` is the window the serve path admitted (`--context`, capped by the checkpoint's
+    /// own `max_position_embeddings`). A builder must open its sequence caches and descriptor at
+    /// this window, not at the plan's full architecture window: the plan describes the
+    /// checkpoint, while the operator chose how much of it to allocate.
     ///
     /// # Errors
-    /// A shape, weight or device refusal.
-    fn open(plan: &EnginePlan, weights: &dyn WeightSource) -> Result<Self::Backend, PlanError>;
+    /// A shape, weight or device refusal, or a zero context.
+    fn open(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        context: usize,
+    ) -> Result<Self::Backend, PlanError>;
+
+    /// Open the backend from a converted rank file of the same plan, over `context` tokens.
+    ///
+    /// A converted file is one arm-level storage optimisation, not a second plan: the default
+    /// opens from the weight source exactly as [Self::open] does, and an arm that can read a
+    /// converted rank file overrides this to use it. The plan gate and the context are the same
+    /// call.
+    ///
+    /// # Errors
+    /// As [Self::open], and a rank file the arm refuses.
+    fn open_converted(
+        plan: &EnginePlan,
+        weights: &dyn WeightSource,
+        converted: &std::path::Path,
+        context: usize,
+    ) -> Result<Self::Backend, PlanError> {
+        let _ = converted;
+        Self::open(plan, weights, context)
+    }
 }
 
 fn precision_for(part: Part, policy: PrecisionPolicy) -> Precision {
@@ -398,7 +473,13 @@ fn global_requirements(
             precision: precision_for(Part::LmHead, precision),
         },
     ];
-    if let Some(mtp) = &architecture.mtp {
+    // A non-replicated stage is not loaded by a multi-rank serve: the shared tensor plan's
+    // `served_and_mtp` omits it at TP>1, so the boot plan must not name a part the served set
+    // does not carry. Qwen4-Exp is the release that clears `replicated`; GLM and DeepSeek keep
+    // the stage on every rank.
+    if let Some(mtp) = &architecture.mtp
+        && (mtp.replicated || tp.world() == 1)
+    {
         globals.push(PartRequirement {
             part: Part::Mtp,
             geometry: PartGeometry {

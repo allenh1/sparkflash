@@ -146,6 +146,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
                     vocab_base: 1_000,
                     seed: 1_234,
                     split_parts: 2,
+                    vocab_multiple: 8,
                 })],
             },
             Layer {
@@ -163,6 +164,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
                     indexer: Some(Indexer {
                         heads: 2,
                         head_dim: 4,
+                        kv_heads: 1,
                         topk: 4,
                         owns_keys: true,
                         reuse: false,

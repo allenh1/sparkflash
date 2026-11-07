@@ -156,8 +156,13 @@ for Qwen and GLM, and `serve.rs::check_checkpoint_plan` for the DeepSeek host-TP
 paths. The DeepSeek reference engine runs the host twin and loads no kernel, so it is not gated
 by the catalogue's rank-local shape rules: a TP1 reference serve of the released TP4-shaped
 checkpoint is legal. The DeepSeek profile is loaded from its carried TOML in the same startup.
-Step 4 is the remaining integration: the Qwen and GLM backends still parse their own typed
-configuration before opening, and the DeepSeek device arm still builds its own shard plan.
+
+Step 4 is on the single-rank serving path: Qwen and GLM `open_host` call their arm's
+`EngineBuilder::open` (or `EngineBuilder::open_converted` for a Qwen converted rank file),
+which gates on `plan.target()`/`plan.tp()`, runs the phase-aware serving boot check for both
+passes through `PartsDeviceRank::open`, and only then opens the arm. The single-rank builder
+refuses a plan at another target or at TP>1; the TP4 group keeps its own per-rank
+`PackArm::OPEN_RANK` path. The DeepSeek device arm still builds its own shard plan.
 
 ## What the released configs resolve at
 

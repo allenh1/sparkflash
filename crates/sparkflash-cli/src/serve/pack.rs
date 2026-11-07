@@ -35,10 +35,12 @@ use sparkflash_model::numerics::ConfigKey;
 use sparkflash_model::{ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
+use sparkflash_ops::EngineBuilder;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::parts::serving_language;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_weights::rank_file::{find_converted_rank_file, rank_file_name};
+use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 
 use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam};
 #[cfg(feature = "tp4-serve")]
@@ -223,15 +225,28 @@ impl PackArm for QwenArm {
         // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
         // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
         let converted = converted_rank_file(QWEN_CONVERTED_DIR_ENV, 0, 1)?;
-        let backend = match (&converted, plan) {
-            (Some(path), Some(plan)) => {
-                Qwen4ExpDeviceBackend::open_converted_with_plan(directory, context, path, plan)
+        let backend = match (converted.as_deref(), plan) {
+            // The plan-aware open is the arm's EngineBuilder, so the plan's target/world gate
+            // and the shared rank boot check run before the arm uploads a weight. The converted
+            // file is the same builder's arm-level storage path, not a second open.
+            (converted, Some(plan)) => {
+                let source = SafeTensorsSource::open(directory, &directory.join(INDEX_NAME))
+                    .map_err(|error| error.to_string())?;
+                match converted {
+                    Some(path) => <Qwen4ExpDeviceBackend as EngineBuilder>::open_converted(
+                        plan, &source, path, context,
+                    ),
+                    None => <Qwen4ExpDeviceBackend as EngineBuilder>::open(plan, &source, context),
+                }
+                .map(|backend| backend.into_arm())
+                .map_err(|error| error.to_string())
             }
-            (Some(path), None) => Qwen4ExpDeviceBackend::open_converted(directory, context, path),
-            (None, Some(plan)) => Qwen4ExpDeviceBackend::open_with_plan(directory, context, plan),
-            (None, None) => Qwen4ExpDeviceBackend::open(directory, context),
-        }
-        .map_err(|error| error.to_string())?;
+            (Some(path), None) => Qwen4ExpDeviceBackend::open_converted(directory, context, path)
+                .map_err(|error| error.to_string()),
+            (None, None) => {
+                Qwen4ExpDeviceBackend::open(directory, context).map_err(|error| error.to_string())
+            }
+        }?;
         if let Some(path) = &converted {
             eprintln!(
                 "sparkflash serve: {} weights from converted {}",
@@ -435,20 +450,28 @@ impl PackArm for GlmArm {
         if let Some(plan) = plan {
             check_backend_plan(plan, "glm5_next", config.num_hidden_layers)?;
         }
-        let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
-            .map_err(|error| format!("CUDA: {error}"))?;
-        let cuda = Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda));
         let mut backend = match plan {
+            // The plan-aware open is the arm's EngineBuilder: its plan gate and the shared rank
+            // boot check run before the arm opens a device.
             Some(plan) => {
-                sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank_with_plan(
-                    cuda, config, directory, context, plan,
+                let source = SafeTensorsSource::open(directory, &directory.join(INDEX_NAME))
+                    .map_err(|error| error.to_string())?;
+                <sparkflash_model_glm5_next::Glm5NextDeviceBackend as EngineBuilder>::open(
+                    plan, &source, context,
                 )
+                .map(|backend| backend.into_arm())
+                .map_err(|error| error.to_string())
             }
-            None => sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank(
-                cuda, config, directory, context,
-            ),
-        }
-        .map_err(|error| error.to_string())?;
+            None => {
+                let cuda = sparkflash_kernels::cuda_driver::Cuda::load()
+                    .map_err(|error| format!("CUDA: {error}"))?;
+                let cuda = Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda));
+                sparkflash_model_glm5_next::Glm5NextDeviceBackend::open_single_rank(
+                    cuda, config, directory, context,
+                )
+                .map_err(|error| error.to_string())
+            }
+        }?;
         apply_speculation(&mut backend, profile)?;
         Ok(backend)
     }
@@ -1286,5 +1309,138 @@ mod tests {
                 "TP{world}: {errors:?}"
             );
         }
+    }
+
+    /// The plan-aware single-rank open is the arm's EngineBuilder, not the old direct
+    /// open_with_plan/open_single_rank_with_plan call. A TP2 plan is refused by the builder's
+    /// own world gate before either arm opens a device, so the test needs no GPU and fails if the
+    /// direct path is restored (which would accept the plan and try the device).
+    #[test]
+    fn the_single_rank_serve_open_uses_the_engine_builder() {
+        let qwen_directory = tempfile::tempdir().expect("a temporary Qwen checkpoint");
+        let qwen_config = <QwenArm as PackArm>::write_fixture(qwen_directory.path())
+            .expect("the Qwen fixture writes");
+        let qwen_plan =
+            EnginePlan::for_architecture(qwen_config.architecture.clone(), Target::Sm121, 2, 0)
+                .expect("the tiny Qwen architecture plans at TP2");
+        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the Qwen profile");
+        let error = <QwenArm as PackArm>::open_host(
+            qwen_directory.path(),
+            qwen_config,
+            qwen_plan.architecture().max_position_embeddings,
+            &profile,
+            Some(&qwen_plan),
+        )
+        .expect_err("the builder refuses a TP2 plan");
+        assert!(
+            error.contains("single-rank builder opens TP1/rank0") && error.contains("TP2/rank0"),
+            "the Qwen open did not reach the builder: {error}"
+        );
+
+        let glm_directory = tempfile::tempdir().expect("a temporary GLM checkpoint");
+        let glm_config = <GlmArm as PackArm>::write_fixture(glm_directory.path())
+            .expect("the GLM fixture writes");
+        let glm_plan =
+            EnginePlan::for_architecture(glm_config.architecture.clone(), Target::Sm121, 2, 0)
+                .expect("the tiny GLM architecture plans at TP2");
+        let profile = <GlmArm as PackArm>::profile_from(|_| None).expect("the GLM profile");
+        let error = <GlmArm as PackArm>::open_host(
+            glm_directory.path(),
+            glm_config,
+            glm_plan.architecture().max_position_embeddings,
+            &profile,
+            Some(&glm_plan),
+        )
+        .expect_err("the builder refuses a TP2 plan");
+        assert!(
+            error.contains("single-rank builder opens TP1/rank0") && error.contains("TP2/rank0"),
+            "the GLM open did not reach the builder: {error}"
+        );
+    }
+
+    /// The plan-aware Qwen open is the serve path's `--checkpoint` arm, not `--synthetic`: it
+    /// receives the admitted `--context` and must open (and advertise) exactly that window. The
+    /// builder used to reopen from `architecture.max_position_embeddings`, so a 32-token request
+    /// allocated and advertised the fixture's whole 64-token window.
+    #[test]
+    fn the_plan_aware_qwen_open_keeps_the_requested_context() {
+        if sparkflash_kernels::cuda_driver::Cuda::load().is_err()
+            || !sparkflash_model_qwen4_exp::device::cubin_available()
+        {
+            eprintln!("skipped: no Qwen CUDA image");
+            return;
+        }
+        let directory = tempfile::tempdir().expect("a temporary Qwen checkpoint");
+        let config =
+            <QwenArm as PackArm>::write_fixture(directory.path()).expect("the Qwen fixture writes");
+        let window = <QwenArm as PackArm>::window(&config);
+        let context = window / 2;
+        assert!(context < window);
+        let options = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            QwenArm::MODEL_ID.to_owned(),
+            "--checkpoint".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+            "--context".to_owned(),
+            context.to_string(),
+        ])
+        .expect("the Qwen serve options parse");
+        let admitted = pack_context::<QwenArm>(&options, &config).expect("the context is admitted");
+        assert_eq!(admitted, context);
+        let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+            .expect("the tiny Qwen architecture plans");
+        let profile = <QwenArm as PackArm>::profile_from(|_| None).expect("the Qwen profile");
+        let backend = <QwenArm as PackArm>::open_host(
+            directory.path(),
+            config,
+            admitted,
+            &profile,
+            Some(&plan),
+        )
+        .expect("the plan-aware Qwen open serves the fixture");
+        assert_eq!(backend.descriptor().context_tokens, context);
+        assert_eq!(backend.context_limit(), context);
+    }
+
+    /// The same regression on the GLM arm: its plan-aware open must carry the admitted window
+    /// into `open_single_rank_with_plan`, not reopen at the architecture's full window.
+    #[test]
+    fn the_plan_aware_glm_open_keeps_the_requested_context() {
+        if sparkflash_kernels::cuda_driver::Cuda::load().is_err()
+            || !sparkflash_model_glm5_next::cubin_available()
+        {
+            eprintln!("skipped: no GLM CUDA image");
+            return;
+        }
+        let directory = tempfile::tempdir().expect("a temporary GLM checkpoint");
+        let config =
+            <GlmArm as PackArm>::write_fixture(directory.path()).expect("the GLM fixture writes");
+        let window = <GlmArm as PackArm>::window(&config);
+        let context = window / 2;
+        assert!(context < window);
+        let options = ServeOptions::parse(vec![
+            "--model".to_owned(),
+            GlmArm::MODEL_ID.to_owned(),
+            "--checkpoint".to_owned(),
+            directory.path().to_string_lossy().into_owned(),
+            "--context".to_owned(),
+            context.to_string(),
+        ])
+        .expect("the GLM serve options parse");
+        let admitted = pack_context::<GlmArm>(&options, &config).expect("the context is admitted");
+        assert_eq!(admitted, context);
+        let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+            .expect("the tiny GLM architecture plans");
+        let profile = <GlmArm as PackArm>::profile_from(|_| None).expect("the GLM profile");
+        let backend = <GlmArm as PackArm>::open_host(
+            directory.path(),
+            config.clone(),
+            admitted,
+            &profile,
+            Some(&plan),
+        )
+        .expect("the plan-aware GLM open serves the fixture");
+        assert_eq!(backend.descriptor().context_tokens, context);
+        assert_eq!(backend.context_limit(), context);
     }
 }
