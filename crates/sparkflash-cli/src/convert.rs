@@ -28,25 +28,36 @@
 //! into the same container, one walk-ordered file a rank of the `--tp-world-size` world holding
 //! that rank's share ([sparkflash_weights::rank_file::SlotIndex]); one path converts and inspects
 //! both. `--inspect` tells the three apart by the model a file's index names.
+//!
+//! `--model ORG/REPO` resolves the snapshot through the hub cache. Dispatch is the checkpoint's
+//! own `Architecture`/`EnginePlan`: a released family keeps its pack converter, DeepSeek keeps
+//! the B12x converter, and any other resolved architecture goes to the generic dynamic writer
+//! (raw tensors in `Architecture` walk order through the same rank-file container). That writer
+//! is the phase-4 placeholder documented in `docs/adding-a-model.md` section 7.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sparkflash_device::converted::{
     ConvertOptions, ConvertedPreamble, convert_checkpoint, inspect_converted_rank, read_index,
     verify_converted_file,
 };
 use sparkflash_engine::parallel_tp::TpLayout;
-use sparkflash_engine::safetensors::{INDEX_NAME, SafeTensorsSource};
+use sparkflash_engine::safetensors::SafeTensorsSource;
+use sparkflash_model::{Architecture, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
 use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_model_qwen4_exp::convert::{Nvfp4Scalars, convert_rank as qwen_convert_rank};
-use sparkflash_weights::rank_file::{SlotIndex, SlotRecords, WrittenRank};
+use sparkflash_ops::engine_plan::EnginePlan;
+use sparkflash_weights::rank_file::{
+    SlotFileWriter, SlotIndex, SlotPlan, SlotRecords, WrittenRank,
+};
 
 /// Prints one job-progress line for the web control plane and flushes it so the reader sees it
 /// while the conversion is still running.
@@ -58,7 +69,7 @@ fn emit_progress(done: u64, total: u64, detail: &str) {
 }
 
 /// Usage string for `sparkflash convert`.
-pub const USAGE: &str = "sparkflash convert --checkpoint DIR [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
+pub const USAGE: &str = "sparkflash convert (--checkpoint DIR | --model ORG/REPO) [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
 
 /// Entry point called by `main.rs`.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -81,6 +92,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 /// Runs `sparkflash convert` and returns output lines.
 pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let mut checkpoint: Option<PathBuf> = None;
+    let mut model: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
     // The V4.1 and GLM packs are four-rank; a Qwen4-Exp checkpoint is TP=1 unless the world is
     // asked for, so its command from before the sharded converter still writes one file.
@@ -102,6 +114,7 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         };
         match flag {
             "--checkpoint" => checkpoint = Some(PathBuf::from(take("--checkpoint")?)),
+            "--model" => model = Some(take("--model")?),
             "--output-dir" | "-o" => output_dir = Some(PathBuf::from(take(flag)?)),
             "--tp-world-size" | "--world-size" => {
                 let raw = take(flag)?;
@@ -149,13 +162,40 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         return inspect_file(&path, verify_weights);
     }
 
-    let checkpoint_dir =
-        checkpoint.ok_or_else(|| format!("--checkpoint DIR is required (usage: {USAGE})"))?;
-    let out_dir = output_dir.unwrap_or_else(|| checkpoint_dir.clone());
+    let checkpoint_dir = match (checkpoint, model.as_deref()) {
+        (Some(path), _) => path,
+        (None, Some(model)) => resolve_convert_model(model)?,
+        (None, None) => {
+            return Err(format!(
+                "--checkpoint DIR or --model ORG/REPO is required (usage: {USAGE})"
+            ));
+        }
+    };
+    let out_dir = output_dir.unwrap_or_else(|| default_output_dir(&checkpoint_dir));
     if let Some((model_type, text)) = checkpoint_config(&checkpoint_dir)? {
         let unparsed =
             |error: String| format!("{}: {error}", checkpoint_dir.join("config.json").display());
-        if matches!(model_type.as_str(), "qwen4_exp" | "qwen4_exp_text") {
+        // The plan is the dispatch: the checkpoint's own architecture decides which converter
+        // runs, not two hard-coded model_type strings. A document that does not parse is a
+        // refusal naming the file, never a silent fall-through to DeepSeek's loader.
+        let architecture = Architecture::from_checkpoint_dir(&checkpoint_dir)
+            .map_err(|error| unparsed(error.to_string()))?;
+        let world = world_size.unwrap_or_else(|| default_convert_world(&architecture.family));
+        let released = matches!(
+            architecture.family.as_str(),
+            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41"
+        );
+        if !released && world != 1 {
+            return Err(format!(
+                "{} (model_type {:?}) is a dynamic host checkpoint, whose raw walk order is TP1; --tp-world-size {world} would write {world} whole copies, not a shard",
+                checkpoint_dir.display(),
+                architecture.family
+            ));
+        }
+        let config_path = checkpoint_dir.join("config.json");
+        let _plan = EnginePlan::from_path(&config_path, Target::Sm121, world, 0)
+            .map_err(|error| unparsed(format!("the execution plan: {error}")))?;
+        if matches!(architecture.family.as_str(), "qwen4_exp" | "qwen4_exp_text") {
             let config =
                 Qwen4ExpConfig::from_json(&text).map_err(|error| unparsed(error.to_string()))?;
             let slot_pack = SlotPack {
@@ -164,12 +204,13 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 ranks: &ranks,
                 pad_moe_640,
                 verify,
+                allows_no_pad: false,
             };
             return slot_pack.convert::<Nvfp4Scalars>(&checkpoint_dir, |source, layout, label| {
                 qwen_convert_rank(source, &config, layout, &checkpoint_dir, &out_dir, label)
             });
         }
-        if model_type == GLM_MODEL_TYPE {
+        if architecture.family == GLM_MODEL_TYPE || model_type == GLM_MODEL_TYPE {
             let config =
                 Glm5NextConfig::from_json(&text).map_err(|error| unparsed(error.to_string()))?;
             let slot_pack = SlotPack {
@@ -178,11 +219,58 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 ranks: &ranks,
                 pad_moe_640,
                 verify,
+                allows_no_pad: false,
             };
             return slot_pack.convert::<WalkSpecs>(&checkpoint_dir, |source, layout, label| {
                 glm_convert_rank(source, &config, layout, &out_dir, label)
                     .map_err(|error| error.to_string())
             });
+        }
+        if architecture.family != "deepseek_v41" {
+            // A novel architecture composed of supported parts: convert it through the shared
+            // architecture walk and the existing walk-ordered rank-file writer. Phase 4's
+            // ArchitectureTensorPlan is merged, but its builder names the released Qwen/GLM
+            // families; a novel family still needs this raw-tensor form: every tensor the
+            // dynamic host path reads, in walk order, in the rank file container. The
+            // limitation is stated in docs/adding-a-model.md section 7.
+            let unsupported = crate::dynamic::unsupported_parts(&architecture);
+            if !unsupported.is_empty() {
+                let names: Vec<String> = unsupported.iter().map(ToString::to_string).collect();
+                return Err(format!(
+                    "{} (model_type {:?}) names parts the dynamic converter does not support: {}",
+                    checkpoint_dir.display(),
+                    architecture.family,
+                    names.join(", ")
+                ));
+            }
+            if world != 1 {
+                return Err(format!(
+                    "{} (model_type {:?}) is a dynamic host checkpoint, whose raw walk order is TP1; --tp-world-size {world} would write {world} whole copies, not a shard",
+                    checkpoint_dir.display(),
+                    architecture.family
+                ));
+            }
+            let slot_pack = SlotPack {
+                name: "dynamic",
+                world_size: 1,
+                ranks: &ranks,
+                pad_moe_640,
+                verify,
+                allows_no_pad: true,
+            };
+            return slot_pack.convert::<DynamicRecords>(
+                &checkpoint_dir,
+                |source, layout, label| {
+                    convert_dynamic_rank(
+                        source,
+                        &architecture,
+                        layout,
+                        &checkpoint_dir,
+                        &out_dir,
+                        label,
+                    )
+                },
+            );
         }
     }
     let world_size = world_size.unwrap_or(4);
@@ -219,6 +307,113 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
             .display()
     ));
     Ok(lines)
+}
+
+/// The output directory a conversion gets when the operator names none.
+///
+/// Writing beside the checkpoint used to put rank files inside the Hugging Face cache (and, for a
+/// snapshot, inside the read-only revision directory). The default is a sibling in the current
+/// working directory, named after the repository (or the checkpoint directory for an explicit
+/// path), so a cache is never modified by a conversion.
+fn default_output_dir(checkpoint: &Path) -> PathBuf {
+    let checkpoint_name = checkpoint.file_name().map_or_else(
+        || "checkpoint".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let scope = match checkpoint
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+    {
+        // A hub snapshot: name the output after models--org--repo, not the revision hash.
+        Some("snapshots") => checkpoint
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .map_or(checkpoint_name.clone(), |name| {
+                name.to_string_lossy().into_owned()
+            }),
+        _ => checkpoint_name,
+    };
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(format!("{scope}-converted"))
+}
+
+/// The checkpoint a `--model ORG/REPO` selects, through the one hub resolver.
+fn resolve_convert_model(model: &str) -> Result<PathBuf, String> {
+    let id = sparkflash_model::find_model(model)
+        .map_or_else(|| model.to_owned(), |descriptor| descriptor.id.clone());
+    sparkflash_weights::hub::cached_model_dir(&id).ok_or_else(|| match
+        sparkflash_weights::hub::default_cache_dir()
+    {
+        Some(cache) => format!(
+            "{id} is not in the Hugging Face cache at {}; run hf download {id} or pass --checkpoint DIR",
+            cache.display()
+        ),
+        None => format!(
+            "{id} is not in the Hugging Face cache (HF_HUB_CACHE is unset); run hf download {id} or pass --checkpoint DIR"
+        ),
+    })
+}
+
+/// The world a family converts at when the operator names none.
+fn default_convert_world(family: &str) -> usize {
+    match family {
+        "deepseek_v41" | GLM_MODEL_TYPE => 4,
+        _ => 1,
+    }
+}
+
+/// What a dynamic rank file records beside its slots. It stores raw checkpoint tensors in
+/// architecture-walk order, so there are no pack-specific scalars to record yet. A family the
+/// shared [sparkflash_ops::tensor_plan::ArchitectureTensorPlan] names uses that plan's
+/// [sparkflash_ops::slot_pack::SlotPack] instead; a novel family does not, yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DynamicRecords {}
+
+impl SlotRecords for DynamicRecords {
+    const MODEL: &'static str = "dynamic";
+}
+
+impl ShownRecords for DynamicRecords {
+    fn shown(&self) -> String {
+        String::new()
+    }
+}
+
+/// Converts one rank of a novel architecture by writing every tensor the dynamic host path reads,
+/// in the shared architecture's forward order.
+///
+/// Phase 4 is merged, but [ArchitectureTensorPlan](sparkflash_ops::tensor_plan::ArchitectureTensorPlan)
+/// names only the released Qwen and GLM families, and [SlotPack](sparkflash_ops::slot_pack::SlotPack)
+/// is plan-order TP1. This writer therefore records raw checkpoint bytes in walk order through
+/// [SlotPlan]/[SlotFileWriter]: [crate::dynamic::resolve] decides the names and the shared
+/// [Architecture] decides the order. A world above one writes the same complete tensor set for
+/// each rank; the dynamic serving path is TP=1, the shape the zero-code acceptance test uses.
+fn convert_dynamic_rank(
+    source: &dyn sparkflash_weights::WeightSource,
+    architecture: &Architecture,
+    layout: TpLayout,
+    _directory: &Path,
+    output_dir: &Path,
+    label: &str,
+) -> Result<WrittenRank, String> {
+    let names = crate::dynamic::resolve(architecture, source)?;
+    let tensors = crate::dynamic::walk(&names);
+    let mut plan = SlotPlan::default();
+    let mut payloads = Vec::with_capacity(tensors.len());
+    for name in tensors {
+        let bytes = source.read(&name).map_err(|error| error.to_string())?;
+        plan.place(&name, bytes.len());
+        payloads.push((name, bytes));
+    }
+    let index = plan.into_index(layout, label, DynamicRecords {});
+    let mut writer = SlotFileWriter::create(output_dir, index)?;
+    for (name, bytes) in payloads {
+        writer.put(&name, bytes.len(), &bytes)?;
+    }
+    writer.finish()
 }
 
 /// The checkpoint's `config.json` and the model type it names, or `None` when it has none. A
@@ -267,6 +462,9 @@ struct SlotPack<'a> {
     ranks: &'a [usize],
     pad_moe_640: bool,
     verify: bool,
+    /// Whether the pack has no 640-padded layout, so `--no-pad-moe-640` is meaningful rather
+    /// than a DeepSeek layout this pack does not implement.
+    allows_no_pad: bool,
 }
 
 impl SlotPack<'_> {
@@ -279,7 +477,7 @@ impl SlotPack<'_> {
         dir: &Path,
         convert: impl Fn(&SafeTensorsSource, TpLayout, &str) -> Result<WrittenRank, String>,
     ) -> Result<Vec<String>, String> {
-        if !self.pad_moe_640 {
+        if !self.pad_moe_640 && !self.allows_no_pad {
             return Err(format!(
                 "--no-pad-moe-640 is DeepSeek's routed-expert layout, and this checkpoint is {}",
                 self.name
@@ -288,7 +486,7 @@ impl SlotPack<'_> {
         let world_size = self.world_size;
         let ranks = TpLayout::selected_ranks(world_size, self.ranks)
             .map_err(|error| format!("{}: {error}", self.name))?;
-        let source = SafeTensorsSource::open(dir, &dir.join(INDEX_NAME))
+        let source = sparkflash_weights::safetensors::open_checkpoint(dir)
             .map_err(|error| format!("{}: {error}", dir.display()))?;
         let label = dir.file_name().map_or_else(
             || dir.display().to_string(),
@@ -363,6 +561,9 @@ fn inspect_file(path: &Path, verify_weights: bool) -> Result<Vec<String>, String
     }
     if model == Some(Nvfp4Scalars::MODEL) {
         return inspect_slot_file::<Nvfp4Scalars>(path, preamble, verify_weights);
+    }
+    if model == Some(DynamicRecords::MODEL) {
+        return inspect_slot_file::<DynamicRecords>(path, preamble, verify_weights);
     }
     let (preamble, header) = inspect_converted_rank(path)?;
     if verify_weights {
@@ -592,8 +793,13 @@ mod tests {
             2,
         )
         .expect("the fixture writes");
-        let source = SafeTensorsSource::open(fixture.path(), &fixture.path().join(INDEX_NAME))
-            .expect("the fixture opens");
+        let source = SafeTensorsSource::open(
+            fixture.path(),
+            &fixture
+                .path()
+                .join(sparkflash_weights::safetensors::INDEX_NAME),
+        )
+        .expect("the fixture opens");
         let out = tempfile::tempdir().expect("out");
         let layout = TpLayout {
             rank: 1,

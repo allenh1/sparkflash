@@ -43,6 +43,10 @@ const CARRIED_CONFIG: &str = include_str!("../config/qwen38_flash_next_nvfp4.hf.
 /// As [Architecture::from_json].
 pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
     let mut architecture = Architecture::from_json(text)?;
+    // A text-only release names its root `model_type` qwen4_exp_text while the arm and its
+    // plan are qwen4_exp. Normalize through the one registry helper so the typed profile and
+    // the boot plan cannot disagree about the family they execute.
+    architecture.family = sparkflash_model::canonical_model_type(&architecture.family).to_owned();
     architecture.experts_only_fp8();
     Ok(architecture)
 }

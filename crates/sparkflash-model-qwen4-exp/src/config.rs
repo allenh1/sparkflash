@@ -295,11 +295,23 @@ impl Qwen4ExpConfig {
         // The serving path reads the architecture with
         // [sparkflash_model::Architecture::from_checkpoint_dir], which is the raw document. Apply
         // the same producer correction [crate::architecture::architecture_from_json] applies, so
-        // a directory load and a text load produce the same typed formats.
+        // a directory load and a text load produce the same typed formats. The family alias is
+        // normalized here too: a text-only checkpoint's root `model_type` is `qwen4_exp_text`
+        // while the arm, its profile and its plan are `qwen4_exp`.
+        architecture.family =
+            sparkflash_model::canonical_model_type(&architecture.family).to_owned();
         architecture.experts_only_fp8();
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
-        let text = root.text_config;
+        // A text-only release writes the text configuration at the document root, with no
+        // `text_config` wrapper; the multimodal releases nest it. Accept both schemas: the
+        // shared architecture already reads either, and the typed profile must agree with it.
+        let text = match root.text_config {
+            Some(text) => text,
+            None => {
+                serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?
+            }
+        };
         let layer_types = match text.layer_types {
             Some(types) if !types.is_empty() => types
                 .iter()
@@ -1112,7 +1124,8 @@ impl QuantizationSpec {
 
 #[derive(Debug, Deserialize)]
 struct RootConfig {
-    text_config: TextConfig,
+    #[serde(default)]
+    text_config: Option<TextConfig>,
     #[serde(default)]
     vision_config: Option<VisionConfig>,
     #[serde(default)]
@@ -1486,6 +1499,29 @@ mod tests {
             Precision::Fp8E4M3,
             "the MTP stage keeps its own FP8 format"
         );
+    }
+
+    /// A text-only release writes the text configuration at the document root with
+    /// `model_type: "qwen4_exp_text"` and no `text_config` wrapper. Both the typed profile and
+    /// the shared architecture must read it, and the family must normalize to the arm's name.
+    #[test]
+    fn a_flat_text_only_document_parses_and_normalizes_its_family() {
+        let nested: serde_json::Value =
+            serde_json::from_str(&Qwen4ExpConfig::tiny().to_json()).expect("the tiny document");
+        let mut flat = nested["text_config"].clone();
+        flat["model_type"] = serde_json::json!("qwen4_exp_text");
+        flat["architectures"] = serde_json::json!(["Qwen4ExpTextForCausalLM"]);
+        flat["tie_word_embeddings"] = nested["tie_word_embeddings"].clone();
+        flat["image_token_id"] = nested["image_token_id"].clone();
+        flat["vision_start_token_id"] = nested["vision_start_token_id"].clone();
+        flat["vision_end_token_id"] = nested["vision_end_token_id"].clone();
+        let text = flat.to_string();
+        let config = Qwen4ExpConfig::from_json(&text).expect("the flat text-only document");
+        assert_eq!(config.architecture.family, "qwen4_exp");
+        assert!(!config.has_vision);
+        assert_eq!(config.hidden_size, 32);
+        assert_eq!(config.num_hidden_layers, 2);
+        assert_eq!(config.max_position_embeddings, 64);
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub mod bootlog;
 pub use sparkflash_deepseek_forward::chain_timing;
 pub mod convert;
 pub mod device_chain;
+pub mod dynamic;
 pub use sparkflash_deepseek_forward::device_counters;
 pub use sparkflash_deepseek_forward::device_link;
 pub use sparkflash_deepseek_forward::doctor;

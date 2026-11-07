@@ -1452,7 +1452,12 @@ fn rope(text: &Value, ratio: usize, rotated_dims: usize) -> Result<Rope, ConfigE
                         .is_some_and(|length| length > 0)
             })
             .map(|value| RopeScaling {
-                kind: optional_string(value, "rope_type").unwrap_or_else(|| "default".to_owned()),
+                // A historical document spells the rule as `type`; the nested
+                // `rope_parameters` form uses `rope_type`. Treat them as one field, or a YaRN
+                // checkpoint parses as "default" and the host serves it unscaled.
+                kind: optional_string(value, "rope_type")
+                    .or_else(|| optional_string(value, "type"))
+                    .unwrap_or_else(|| "default".to_owned()),
                 factor: optional_f64(value, "factor").ok().flatten().unwrap_or(1.0),
                 original_seq_len: optional_usize(value, "original_max_position_embeddings")
                     .ok()
@@ -2668,6 +2673,23 @@ mod tests {
             layer.attention.rope.rotated_dims, 64,
             "partial_rotary_factor 0.25 of a 256-wide head"
         );
+    }
+
+    #[test]
+    fn a_legacy_type_key_selects_the_rope_rule() {
+        let document = STANDARD.replace(
+            "\"rope_theta\": 10000.0,",
+            "\"rope_theta\": 10000.0, \"rope_scaling\": {\"type\": \"yarn\", \"factor\": 4.0, \"original_max_position_embeddings\": 2048},",
+        );
+        let architecture = Architecture::from_json(&document).expect("a legacy yarn document");
+        let scaling = architecture.layers[0]
+            .attention
+            .rope
+            .scaling
+            .as_ref()
+            .expect("the scaling is parsed");
+        assert_eq!(scaling.kind, "yarn", "the historical type key is the rule");
+        assert_eq!(scaling.factor, 4.0);
     }
 
     #[test]

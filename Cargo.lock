@@ -2660,6 +2660,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sparkflash-model",
+ "sparkflash-ops",
  "sparkflash-weights",
  "tempfile",
  "tokio",

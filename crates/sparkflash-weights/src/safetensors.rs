@@ -1227,6 +1227,64 @@ fn file_label(path: &Path) -> String {
 /// The file that describes a sharded checkpoint: its total size and which shard holds each tensor.
 pub const INDEX_NAME: &str = "model.safetensors.index.json";
 
+/// A single-file checkpoint's shard name. Hugging Face writes one of these when a release is not
+/// sharded, and a hand-made fixture often does too.
+pub const SINGLE_FILE_NAME: &str = "model.safetensors";
+
+/// The index for a checkpoint directory, synthesizing one when the directory holds a lone
+/// `model.safetensors` and no [INDEX_NAME].
+///
+/// A single-file checkpoint is a complete checkpoint: its header already maps every tensor to
+/// the one file and its data length is the total size. Requiring an index beside it made both
+/// serving and conversion refuse a layout Hugging Face itself writes.
+///
+/// # Errors
+/// [WeightError::Io] when neither file can be opened, or the shard header's own errors.
+pub fn checkpoint_index(dir: &Path) -> Result<CheckpointIndex, WeightError> {
+    let index_path = dir.join(INDEX_NAME);
+    if index_path.is_file() {
+        return CheckpointIndex::load(&index_path);
+    }
+    let single = dir.join(SINGLE_FILE_NAME);
+    if !single.is_file() {
+        return Err(WeightError::Io {
+            name: file_label(dir),
+            detail: format!(
+                "neither {} nor {} exists",
+                index_path.display(),
+                single.display()
+            ),
+        });
+    }
+    let header = SafeTensorsHeader::read(&single)?;
+    let weight_map = header
+        .tensors
+        .keys()
+        .map(|name| (name.clone(), SINGLE_FILE_NAME.to_owned()))
+        .collect();
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        TOTAL_SIZE_KEY.to_owned(),
+        serde_json::Value::from(header.data_len()),
+    );
+    Ok(CheckpointIndex {
+        weight_map,
+        metadata,
+    })
+}
+
+/// Opens a checkpoint directory as a [WeightSource], accepting either a sharded index or a lone
+/// `model.safetensors`.
+///
+/// # Errors
+/// As [checkpoint_index].
+pub fn open_checkpoint(dir: &Path) -> Result<SafeTensorsSource, WeightError> {
+    Ok(SafeTensorsSource::new(
+        dir.to_path_buf(),
+        checkpoint_index(dir)?,
+    ))
+}
+
 /// Writes tensors as a sharded safetensors checkpoint: the shard files and [INDEX_NAME].
 ///
 /// The tensors are dealt round-robin over `shards` files in the order given, so a fixture with

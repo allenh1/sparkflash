@@ -23,6 +23,7 @@ description = "Lead-node web control plane for SparkFlash"
 [dependencies]
 sparkflash-weights = { workspace = true }
 sparkflash-model = { workspace = true }
+sparkflash-ops = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

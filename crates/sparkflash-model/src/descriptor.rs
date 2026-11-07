@@ -181,6 +181,64 @@ impl ModelDescriptor {
         }
     }
 
+    /// A descriptor for any checkpoint whose shared architecture parsed, under the id it is
+    /// served as.
+    ///
+    /// This is the dynamic path's constructor: every identity field the released presets hard-code
+    /// (family, model type, window, vocabulary) comes from the checkpoint's own document, so a
+    /// fine-tune or a previously unknown hybrid advertises what it actually is on `/v1/models`
+    /// without an entry in this registry. `context` is the window the run allocated, capped by the
+    /// checkpoint's own `max_position_embeddings`; zero means the document declares no window
+    /// and the allocated context stands.
+    ///
+    /// The registry (`MODELS`) stays the list of canonical presets, not a closed gate: a descriptor
+    /// built here carries the canonical `weights_id` when the id names one, and otherwise the id
+    /// itself, which is what keeps a novel model honestly `unregistered` in the numerics registry
+    /// (D67).
+    #[must_use]
+    pub fn from_architecture(
+        id: impl Into<String>,
+        architecture: &crate::Architecture,
+        context: usize,
+        capabilities: Capabilities,
+    ) -> Self {
+        let id = id.into();
+        let canonical = find_model(&id);
+        let declared = architecture.max_position_embeddings;
+        let context_tokens = match (context, declared) {
+            (0, 0) => 0,
+            (0, window) => window,
+            (context, 0) => context,
+            (context, window) => context.min(window),
+        };
+        let family = architecture.family.clone();
+        // A registry preset's family spelling is the control plane's; a novel architecture's is
+        // its own `model_type`. Both are data from the checkpoint, never a match on this list.
+        Self {
+            id: id.clone(),
+            family: canonical.map_or_else(|| family.clone(), |model| model.family.clone()),
+            model_type: canonical.map_or_else(|| family.clone(), |model| model.model_type.clone()),
+            label: canonical.map_or_else(
+                || {
+                    id.rsplit('/')
+                        .next()
+                        .unwrap_or(&id)
+                        .split(['-', '_'])
+                        .next()
+                        .unwrap_or(&id)
+                        .to_owned()
+                },
+                |model| model.label.clone(),
+            ),
+            weights_id: canonical.map_or_else(|| id.clone(), |model| model.weights_id.clone()),
+            context_tokens,
+            max_output_tokens: canonical
+                .map_or(V41_MAX_OUTPUT_TOKENS, |model| model.max_output_tokens),
+            vocab_size: architecture.vocab_size,
+            capabilities,
+        }
+    }
+
     /// The V4.1-Flash shape under a caller-supplied id.
     ///
     /// This is what a weight-free test or a synthetic server uses when it names a model that is
@@ -224,7 +282,24 @@ pub fn default_model() -> &'static ModelDescriptor {
     MODELS.first().expect("the model registry is not empty")
 }
 
-/// Look up a descriptor by served id, weight selector, family, or the leaf of a Hugging Face id.
+/// The canonical family spelling of a checkpoint's `model_type`.
+///
+/// A text-only release of a multimodal family names itself `<family>_text` at the document root
+/// while the arm and registry descriptor are the multimodal family. Normalize that one alias
+/// here so every caller (the registry lookup, pack detection, the boot plan check and the typed
+/// Qwen bridge) agrees about which family the checkpoint is.
+#[must_use]
+pub fn canonical_model_type(model_type: &str) -> &str {
+    let model_type = model_type.trim();
+    if model_type.eq_ignore_ascii_case("qwen4_exp_text") {
+        "qwen4_exp"
+    } else {
+        model_type
+    }
+}
+
+/// Look up a descriptor by served id, weight selector, family, `model_type`, or the leaf of a
+/// Hugging Face id.
 ///
 /// Ids are matched case-insensitively, mirroring the HTTP router's `model_matches`.
 #[must_use]
@@ -233,13 +308,24 @@ pub fn find_model(query: &str) -> Option<&'static ModelDescriptor> {
     if query.is_empty() {
         return None;
     }
+    let canonical = canonical_model_type(query);
     let query_leaf = query.rsplit('/').next().unwrap_or(query);
     MODELS.iter().find(|model| {
         query.eq_ignore_ascii_case(&model.id)
             || query.eq_ignore_ascii_case(&model.weights_id)
             || query.eq_ignore_ascii_case(&model.family)
+            || canonical.eq_ignore_ascii_case(&model.model_type)
             || query_leaf.eq_ignore_ascii_case(model.id.rsplit('/').next().unwrap_or(&model.id))
     })
+}
+
+/// Look up a descriptor by the checkpoint's `model_type`, with the text-only alias folded.
+#[must_use]
+pub fn find_model_by_type(model_type: &str) -> Option<&'static ModelDescriptor> {
+    let canonical = canonical_model_type(model_type);
+    MODELS
+        .iter()
+        .find(|model| canonical.eq_ignore_ascii_case(&model.model_type))
 }
 
 /// Look up a descriptor by the control plane's weight selector.
@@ -307,6 +393,64 @@ mod tests {
         }
         assert!(find_model("llama-3.2-1b").is_none());
         assert!(find_model("   ").is_none());
+    }
+
+    #[test]
+    fn the_text_only_qwen_model_type_resolves_to_its_multimodal_family() {
+        assert_eq!(canonical_model_type("qwen4_exp_text"), "qwen4_exp");
+        assert_eq!(canonical_model_type("QWEN4_EXP_TEXT"), "qwen4_exp");
+        assert_eq!(canonical_model_type("glm5_next"), "glm5_next");
+        for query in ["qwen4_exp", "qwen4_exp_text", "QWEN4_EXP_TEXT"] {
+            let found = find_model(query).unwrap_or_else(|| panic!("{query} should resolve"));
+            assert_eq!(found.weights_id, QWEN38_FLASH_NEXT_WEIGHTS_ID);
+        }
+        assert_eq!(
+            find_model_by_type("qwen4_exp_text").map(|model| model.weights_id.as_str()),
+            Some(QWEN38_FLASH_NEXT_WEIGHTS_ID)
+        );
+    }
+
+    #[test]
+    fn from_architecture_reads_the_checkpoint_instead_of_the_registry() {
+        let architecture = crate::Architecture::from_json(
+            r#"{"model_type":"acme_custom_flash","hidden_size":2560,"intermediate_size":16,"vocab_size":256,"max_position_embeddings":128,"num_hidden_layers":1,"num_attention_heads":1,"head_dim":16,"layer_types":["full_attention"]}"#,
+        )
+        .expect("a custom architecture");
+        let descriptor = ModelDescriptor::from_architecture(
+            "acme/Custom-Flash-Test",
+            &architecture,
+            64,
+            Capabilities::ALL,
+        );
+        assert_eq!(descriptor.id, "acme/Custom-Flash-Test");
+        assert_eq!(descriptor.family, "acme_custom_flash");
+        assert_eq!(descriptor.model_type, "acme_custom_flash");
+        assert_eq!(descriptor.weights_id, "acme/Custom-Flash-Test");
+        assert_eq!(descriptor.context_tokens, 64);
+        assert_eq!(descriptor.vocab_size, 256);
+        // A novel id is not in the canonical registry, which is what keeps the numerics key
+        // unregistered (D67) rather than borrowing a released model's claim.
+        assert!(find_model(&descriptor.weights_id).is_none());
+    }
+
+    #[test]
+    fn from_architecture_keeps_a_canonical_presets_identity_and_caps_its_window() {
+        let architecture = crate::Architecture::from_json(
+            r#"{"model_type":"qwen4_exp","hidden_size":2560,"intermediate_size":16,"vocab_size":248320,"max_position_embeddings":262144,"num_hidden_layers":1,"num_attention_heads":1,"head_dim":256,"layer_types":["full_attention"]}"#,
+        )
+        .expect("a canonical-shaped architecture");
+        let descriptor = ModelDescriptor::from_architecture(
+            QWEN38_FLASH_NEXT_FP8_ID,
+            &architecture,
+            1_000_000,
+            Capabilities::ALL,
+        );
+        assert_eq!(descriptor.weights_id, QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID);
+        assert_eq!(descriptor.family, "qwen4-exp");
+        assert_eq!(descriptor.model_type, "qwen4_exp");
+        assert_eq!(descriptor.context_tokens, QWEN38_CONTEXT_TOKENS);
+        assert_eq!(descriptor.vocab_size, QWEN38_VOCAB_SIZE);
+        assert!(find_model_by_weights(&descriptor.weights_id).is_some());
     }
 
     #[test]

@@ -42,7 +42,18 @@ pub const SUPPORTED_WEIGHTS: &[&str] = sparkflash_model::WEIGHT_IDS;
 ///
 /// V4.1-Flash and GLM-5.3-Flash are tensor-parallel-4 packs. Qwen3.8-Flash-Next is the TP=1
 /// pack engine: it converts its checkpoint into one rank file and boots from that file.
-pub const SUPPORTED_ENGINES: &[&str] = &[DEFAULT_ENGINE_ID, QWEN_ENGINE_ID, GLM_ENGINE_ID];
+pub const SUPPORTED_ENGINES: &[&str] = &[
+    DEFAULT_ENGINE_ID,
+    QWEN_ENGINE_ID,
+    GLM_ENGINE_ID,
+    DYNAMIC_ENGINE_ID,
+];
+
+/// The control-plane engine selector for a checkpoint the dynamic host reference serves.
+///
+/// The weights selector is the checkpoint's own Hugging Face id: a novel family has no registry
+/// entry, so the id is the only stable selector it has.
+pub const DYNAMIC_ENGINE_ID: &str = "dynamic";
 
 /// The control-plane weight selector for V4.1-Flash.
 pub const DEFAULT_WEIGHTS_ID: &str = sparkflash_model::DEFAULT_WEIGHTS_ID;
@@ -300,6 +311,16 @@ pub struct ModelConfig {
     pub converted_dir: String,
     /// The cubin directory built by `scripts/build-cubins.sh`.
     pub cubins: String,
+    /// The checkpoint's own window, stored when a cached model is selected.
+    ///
+    /// A dynamic checkpoint has no registry profile to carry its ceiling, so
+    /// [`SparkConfig::max_context_tokens`] falls back to this value instead of the V4.1 default.
+    /// It is the last resort, not the first: an explicit `model.checkpoint`'s document wins,
+    /// then the cached `model.id`'s document, and only then this stored value. `None` means no
+    /// selection has stored one yet; the ceiling is derived from the checkpoint at
+    /// `checkpoint` or in the cache when that document is available.
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
 }
 
 impl Default for ModelConfig {
@@ -312,6 +333,7 @@ impl Default for ModelConfig {
             tokenizer: String::new(),
             converted_dir: "~/sparkflash/converted".to_owned(),
             cubins: "target/cubins".to_owned(),
+            context_tokens: None,
         }
     }
 }
@@ -569,7 +591,8 @@ impl SparkConfig {
     /// # Errors
     /// Returns a message naming the first field that is wrong.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !SUPPORTED_WEIGHTS.contains(&self.model.weights.as_str()) {
+        let dynamic = self.is_dynamic();
+        if !dynamic && !SUPPORTED_WEIGHTS.contains(&self.model.weights.as_str()) {
             return Err(ConfigError::new(format!(
                 "model.weights {:?} is not supported by this build (supported: {})",
                 self.model.weights,
@@ -583,13 +606,19 @@ impl SparkConfig {
                 SUPPORTED_ENGINES.join(", ")
             )));
         }
-        let expected_engine = profile_for_weights(&self.model.weights)
-            .map_or(DEFAULT_ENGINE_ID, |profile| profile.engine);
-        if self.engine.kind != expected_engine {
-            return Err(ConfigError::new(format!(
-                "model.weights {:?} runs with engine.kind {expected_engine:?}, not {:?}",
-                self.model.weights, self.engine.kind
-            )));
+        if !dynamic {
+            let expected_engine = profile_for_weights(&self.model.weights)
+                .map_or(DEFAULT_ENGINE_ID, |profile| profile.engine);
+            if self.engine.kind != expected_engine {
+                return Err(ConfigError::new(format!(
+                    "model.weights {:?} runs with engine.kind {expected_engine:?}, not {:?}",
+                    self.model.weights, self.engine.kind
+                )));
+            }
+        } else if self.model.weights.trim().is_empty() {
+            return Err(ConfigError::new(
+                "a dynamic engine needs model.weights (the checkpoint id it serves)",
+            ));
         }
         if self.model.id.trim().is_empty() {
             return Err(ConfigError::new("model.id must not be empty"));
@@ -623,13 +652,10 @@ impl SparkConfig {
                 self.runtime.max_concurrency
             )));
         }
-        let expected_nodes = if self.is_qwen() {
-            SOLO_WORLD_SIZE
-        } else {
-            WORLD_SIZE
-        };
+        let solo = self.is_qwen() || self.is_dynamic();
+        let expected_nodes = if solo { SOLO_WORLD_SIZE } else { WORLD_SIZE };
         if self.cluster.nodes.len() != expected_nodes {
-            let topology = if self.is_qwen() {
+            let topology = if solo {
                 "one node at TP=1".to_owned()
             } else {
                 format!("{WORLD_SIZE} nodes at TP={WORLD_SIZE}")
@@ -670,7 +696,7 @@ impl SparkConfig {
                 )));
             }
             if node.peer.trim().is_empty() {
-                if !self.is_qwen() {
+                if !solo {
                     return Err(ConfigError::new(format!(
                         "cluster.nodes[{rank}].peer must name the fast-network address"
                     )));
@@ -690,7 +716,7 @@ impl SparkConfig {
                 }
             }
         }
-        if self.is_qwen() && !self.cluster.nodes[0].local {
+        if solo && !self.cluster.nodes[0].local {
             return Err(ConfigError::new(
                 "cluster.nodes[0].local must be true: the TP=1 node runs on this Spark",
             ));
@@ -767,6 +793,9 @@ impl SparkConfig {
     /// `config.json`. A model that is neither cached nor an explicit directory must be one of
     /// the canonical releases, so the download step cannot be pointed at an arbitrary repository.
     fn validate_model_family(&self) -> Result<(), ConfigError> {
+        if self.is_dynamic() {
+            return self.validate_dynamic_family();
+        }
         let model_type = if !self.model.checkpoint.trim().is_empty() {
             let path = self.node_path(&self.model.checkpoint).join("config.json");
             match std::fs::read_to_string(&path) {
@@ -861,6 +890,81 @@ impl SparkConfig {
         Ok(())
     }
 
+    /// Refuses a dynamic checkpoint the host reference cannot execute.
+    ///
+    /// An explicit `model.checkpoint` comes first: its `config.json` is parsed and checked
+    /// against the same `HOST_REFERENCE_PARTS` set the CLI uses, and its shards are inspected
+    /// for storage-only quantization. Otherwise the cached entry for `model.id` answers. There
+    /// is no profile-family check: a dynamic checkpoint is deliberately one the registry does
+    /// not name.
+    fn validate_dynamic_family(&self) -> Result<(), ConfigError> {
+        if !self.model.checkpoint.trim().is_empty() {
+            let directory = self.node_path(&self.model.checkpoint);
+            let path = directory.join("config.json");
+            let text = std::fs::read_to_string(&path).map_err(|error| {
+                ConfigError::new(format!(
+                    "cannot read the dynamic checkpoint configuration {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let architecture =
+                sparkflash_model::Architecture::from_json(&text).map_err(|error| {
+                    ConfigError::new(format!(
+                        "{} is not a usable architecture: {error}",
+                        path.display()
+                    ))
+                })?;
+            if let Some(reason) = sparkflash_ops::parts::host_reference_refusal(&architecture) {
+                return Err(ConfigError::new(format!(
+                    "the checkpoint's model_type {:?}: {reason}",
+                    architecture.family
+                )));
+            }
+            // The declared-format gate above needs only the document. The storage half needs
+            // the tensor headers, exactly as the CLI backend reads them, so an explicit
+            // checkpoint is judged on its shards too rather than only on its declaration.
+            let source =
+                sparkflash_weights::safetensors::open_checkpoint(&directory).map_err(|error| {
+                    ConfigError::new(format!(
+                        "cannot read the dynamic checkpoint shards in {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+            if let Some(reason) = sparkflash_ops::parts::host_reference_storage_quantization_refusal(
+                &architecture,
+                &source,
+            ) {
+                return Err(ConfigError::new(format!(
+                    "the checkpoint's model_type {:?}: {reason}",
+                    architecture.family
+                )));
+            }
+            return Ok(());
+        }
+        let cached = self
+            .hub_cache_dir()
+            .as_deref()
+            .and_then(|cache| crate::hf::lookup(cache, &self.model.id))
+            .ok_or_else(|| {
+                ConfigError::new(format!(
+                    "model.id {:?} is not in the Hugging Face cache; download it or set model.checkpoint",
+                    self.model.id
+                ))
+            })?;
+        if !cached.supported {
+            return Err(ConfigError::new(format!(
+                "{} is not runnable by the dynamic host path: {}",
+                cached.id,
+                if cached.missing_parts.is_empty() {
+                    "no supported parts were found".to_owned()
+                } else {
+                    cached.missing_parts.join(", ")
+                }
+            )));
+        }
+        Ok(())
+    }
+
     /// Saves the configuration atomically: write a sibling temp file, then rename.
     ///
     /// # Errors
@@ -925,6 +1029,7 @@ impl SparkConfig {
             return None;
         }
         self.model.id = preferred.id.clone();
+        self.model.context_tokens = preferred.context_tokens;
         if let Some(weights) = preferred.weights.as_deref() {
             self.model.weights = weights.to_owned();
         }
@@ -973,15 +1078,30 @@ impl SparkConfig {
         })?;
         let mut config = self.clone();
         config.model.id = model.id.clone();
+        config.model.context_tokens = model.context_tokens;
         config.model.checkpoint.clear();
         config.model.tokenizer.clear();
         config.model.weights = weights.to_owned();
         config.engine.kind = engine.to_owned();
+        if config.is_dynamic() && !config.is_solo() {
+            // The host reference is TP1; selecting it from a four-Spark plan moves the launch to
+            // this node rather than refusing a model the cache can already serve.
+            let mut node = config.cluster.nodes[0].clone();
+            node.peer.clear();
+            node.local = true;
+            config.cluster.nodes = vec![node];
+        }
         if let Some(context) = model.context_tokens {
             config.runtime.max_context_tokens = config.runtime.max_context_tokens.min(context);
         }
         config.validate()?;
         config.resolved()
+    }
+
+    /// Whether this plan runs the dynamic host reference under a checkpoint's own id.
+    #[must_use]
+    pub fn is_dynamic(&self) -> bool {
+        self.engine.kind == DYNAMIC_ENGINE_ID
     }
 
     /// Whether the selected weights are the TP=1 Qwen pack.
@@ -1022,10 +1142,73 @@ impl SparkConfig {
     }
 
     /// The context ceiling of the selected weights.
+    ///
+    /// A registry profile carries its family's ceiling. A dynamic checkpoint has no profile;
+    /// its ceiling is the document's own `max_position_embeddings`, read in that precedence:
+    /// an explicit `model.checkpoint` first, then the cached `model.id`, then the value a
+    /// selection stored in [`ModelConfig::context_tokens`]. Falling back to the V4.1 default
+    /// would let the web accept a window the CLI refuses and show a limit the checkpoint does
+    /// not have.
     #[must_use]
     pub fn max_context_tokens(&self) -> usize {
+        if self.is_dynamic() {
+            // An explicit checkpoint is authoritative: it is the directory launch and validation
+            // read, so a stored selection's ceiling or a cached id must not outvote it.
+            if let Some(context) = self.explicit_checkpoint_context() {
+                return context;
+            }
+            if let Some(context) = self
+                .hub_cache_dir()
+                .as_deref()
+                .and_then(|cache| crate::hf::lookup(cache, &self.model.id))
+                .and_then(|model| model.context_tokens)
+                .filter(|context| *context > 0)
+            {
+                return context;
+            }
+            if let Some(context) = self.model.context_tokens.filter(|context| *context > 0) {
+                return context;
+            }
+            return MODEL_CONTEXT_TOKENS;
+        }
         profile_for_weights(&self.model.weights)
             .map_or(MODEL_CONTEXT_TOKENS, |profile| profile.context_tokens)
+    }
+
+    /// The window an explicit `model.checkpoint`'s own `config.json` declares.
+    fn explicit_checkpoint_context(&self) -> Option<usize> {
+        if self.model.checkpoint.trim().is_empty() {
+            return None;
+        }
+        let path = self.node_path(&self.model.checkpoint).join("config.json");
+        let text = std::fs::read_to_string(path).ok()?;
+        let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
+        (architecture.max_position_embeddings > 0).then_some(architecture.max_position_embeddings)
+    }
+
+    /// Clears a stored selection ceiling that no longer describes the selected checkpoint.
+    ///
+    /// The selection is `model.checkpoint` first, then a cached `model.id`. If that source's
+    /// document names a different window, the stored `context_tokens` came from an earlier
+    /// selection and must not be used as the ceiling. The next [Self::max_context_tokens] reads
+    /// the authoritative document instead.
+    pub fn discard_stale_context_tokens(&mut self) {
+        if !self.is_dynamic() {
+            return;
+        }
+        let authoritative = if self.model.checkpoint.trim().is_empty() {
+            self.hub_cache_dir()
+                .as_deref()
+                .and_then(|cache| crate::hf::lookup(cache, &self.model.id))
+                .and_then(|model| model.context_tokens)
+        } else {
+            self.explicit_checkpoint_context()
+        };
+        if let Some(context) = authoritative.filter(|context| *context > 0)
+            && self.model.context_tokens != Some(context)
+        {
+            self.model.context_tokens = None;
+        }
     }
 
     /// Whether launch must run the one-time per-rank conversion first.
@@ -1035,12 +1218,20 @@ impl SparkConfig {
     /// alone is the completion marker.
     #[must_use]
     pub fn requires_conversion(&self) -> bool {
+        if self.is_dynamic() {
+            // The dynamic host reference reads the checkpoint's safetensors directly. A rank
+            // file can be written with `sparkflash convert`, but launch does not need one.
+            return false;
+        }
         profile_for_weights(&self.model.weights).is_none_or(|profile| profile.requires_conversion)
     }
 
     /// Whether the engine needs the external cubin directory.
     #[must_use]
     pub fn requires_cubins(&self) -> bool {
+        if self.is_dynamic() {
+            return false;
+        }
         self.engine.device
             && profile_for_weights(&self.model.weights)
                 .is_none_or(|profile| profile.requires_cubins)
@@ -1052,7 +1243,7 @@ impl SparkConfig {
     /// completion marker. V4.1 writes a manifest after each rank file.
     #[must_use]
     pub fn requires_conversion_manifest(&self) -> bool {
-        !(self.is_glm() || self.is_qwen())
+        !(self.is_glm() || self.is_qwen() || self.is_dynamic())
     }
 
     /// The single-node launcher script, next to the four-node one.
@@ -1973,6 +2164,162 @@ mod tests {
         assert_eq!(config.cluster.nodes.len(), WORLD_SIZE);
         assert!(text.contains("max_concurrency"));
         assert!(text.contains("_sparkflash._tcp.local."));
+    }
+
+    #[test]
+    fn a_host_runnable_cached_checkpoint_is_selectable_with_the_dynamic_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let snapshot = crate::hf::tests::cache_config(
+            dir.path(),
+            "acme/Custom-Flash-Test",
+            "abc123",
+            &crate::hf::tests::custom_config(),
+        );
+        // Selecting a cached model resolves its checkpoint, and validation reopens the shards.
+        sparkflash_weights::safetensors::write_checkpoint(
+            &snapshot,
+            &[(
+                sparkflash_weights::TensorSpec {
+                    name: "model.embed_tokens.weight".to_owned(),
+                    dtype: sparkflash_weights::DType::BF16,
+                    shape: vec![1],
+                },
+                vec![0; 2],
+            )],
+            1,
+        )
+        .expect("the cached checkpoint shard");
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = dir.path().display().to_string();
+        let model = crate::hf::lookup(dir.path(), "acme/Custom-Flash-Test").expect("cache entry");
+        let selected = config
+            .for_cached_model(&model)
+            .expect("the acme fixture is selectable");
+        assert!(selected.is_dynamic());
+        assert!(selected.is_solo());
+        assert_eq!(selected.model.id, "acme/Custom-Flash-Test");
+        assert_eq!(selected.model.weights, "acme/Custom-Flash-Test");
+        assert_eq!(selected.engine.kind, DYNAMIC_ENGINE_ID);
+        assert!(!selected.requires_conversion());
+        assert!(!selected.requires_cubins());
+        assert!(!selected.requires_conversion_manifest());
+        assert_eq!(selected.runtime.max_context_tokens, 128);
+        // The selector has no registry profile, so the ceiling comes from the checkpoint's own
+        // 128-token window rather than the V4.1 default. A 129-token window must be refused.
+        assert_eq!(selected.max_context_tokens(), 128);
+        let mut too_wide = selected.clone();
+        too_wide.runtime.max_context_tokens = 129;
+        let error = too_wide
+            .validate()
+            .expect_err("the checkpoint window caps the runtime");
+        assert!(error.message.contains("max_context_tokens"), "{error}");
+        assert_eq!(
+            selected.local_launch_env()["SPARKFLASH_MODEL"],
+            "acme/Custom-Flash-Test"
+        );
+    }
+
+    #[test]
+    fn an_explicit_checkpoint_window_beats_a_cached_id_and_stored_ceiling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("hub");
+        std::fs::create_dir_all(&cache).expect("cache");
+        let mut cached = crate::hf::tests::custom_config();
+        cached["max_position_embeddings"] = serde_json::json!(262_144);
+        crate::hf::tests::cache_config(&cache, "acme/Wide-Cached", "abc123", &cached);
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir_all(&explicit).expect("explicit checkpoint");
+        std::fs::write(
+            explicit.join("config.json"),
+            serde_json::to_vec(&crate::hf::tests::custom_config()).expect("config JSON"),
+        )
+        .expect("config");
+        sparkflash_weights::safetensors::write_checkpoint(
+            &explicit,
+            &[(
+                sparkflash_weights::TensorSpec {
+                    name: "model.embed_tokens.weight".to_owned(),
+                    dtype: sparkflash_weights::DType::BF16,
+                    shape: vec![1],
+                },
+                vec![0; 2],
+            )],
+            1,
+        )
+        .expect("the explicit checkpoint shard");
+
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = cache.display().to_string();
+        config.model.id = "acme/Wide-Cached".to_owned();
+        config.model.weights = "acme/Wide-Cached".to_owned();
+        config.model.checkpoint = explicit.display().to_string();
+        config.model.context_tokens = Some(262_144);
+        config.engine.kind = DYNAMIC_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = 200_000;
+        config.cluster.nodes = vec![NodeConfig::new("this-spark.local", "", true)];
+
+        // The explicit checkpoint declares 128 positions. The cached id and the stored field
+        // still say 262144; the directory launch and validation read must win.
+        assert_eq!(config.max_context_tokens(), 128);
+        let error = config
+            .validate()
+            .expect_err("200000 exceeds the explicit checkpoint's 128-token window");
+        assert!(error.message.contains("max_context_tokens"), "{error}");
+
+        config.discard_stale_context_tokens();
+        assert_eq!(
+            config.model.context_tokens, None,
+            "a ceiling from the cached id is stale under an explicit checkpoint"
+        );
+        config.runtime.max_context_tokens = 128;
+        config
+            .validate()
+            .expect("the runtime window fits the explicit checkpoint");
+    }
+
+    #[test]
+    fn an_explicit_storage_only_quantized_checkpoint_is_refused() {
+        // The explicit branch used to run only the document-level gate, so a checkpoint whose
+        // config.json omits quantization_config while its shards store U8 codes validated and
+        // saved in the console even though the CLI refused it. The explicit branch must open the
+        // shards and fold in the same storage predicate the cached branch uses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint = dir.path().join("checkpoint");
+        std::fs::create_dir_all(&checkpoint).expect("explicit checkpoint");
+        std::fs::write(
+            checkpoint.join("config.json"),
+            serde_json::to_vec(&crate::hf::tests::custom_config()).expect("config JSON"),
+        )
+        .expect("config");
+        sparkflash_weights::safetensors::write_checkpoint(
+            &checkpoint,
+            &[(
+                sparkflash_weights::TensorSpec {
+                    name: "model.embed_tokens.weight".to_owned(),
+                    dtype: sparkflash_weights::DType::U8,
+                    shape: vec![16],
+                },
+                vec![0x21; 16],
+            )],
+            1,
+        )
+        .expect("the storage-only quantized shard writes");
+
+        let mut config = SparkConfig::default();
+        config.model.hub_cache = dir.path().join("hub").display().to_string();
+        config.model.id = "acme/Explicit-Storage-Quantized".to_owned();
+        config.model.weights = config.model.id.clone();
+        config.model.checkpoint = checkpoint.display().to_string();
+        config.engine.kind = DYNAMIC_ENGINE_ID.to_owned();
+        config.cluster.nodes = vec![NodeConfig::new("this-spark.local", "", true)];
+
+        let error = config
+            .validate()
+            .expect_err("a storage-only quantized explicit checkpoint is refused");
+        assert!(
+            error.message.contains("U8") && error.message.contains("quantized"),
+            "the refusal names the stored dtype: {error}"
+        );
     }
 
     #[test]

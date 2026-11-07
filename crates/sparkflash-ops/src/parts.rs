@@ -52,6 +52,7 @@
 
 use sparkflash_kernels::images::Image;
 use sparkflash_model::Architecture;
+use sparkflash_model::architecture::WeightFormat;
 
 use crate::plan::{KernelSymbol, Precision, ShapeConstraint};
 use sparkflash_model::Part;
@@ -1361,6 +1362,235 @@ pub fn loadable(target: Target, lookup: impl Fn(&str) -> Option<String>) -> Part
         .collect()
 }
 
+/// The parts the dynamic host reference backend executes.
+///
+/// This is the one capability set for a checkpoint served on the CPU by
+/// `sparkflash-cli/src/serve/dynamic_host.rs`. A novel family can run exactly these parts; the
+/// device catalogue is a different question and must not decide whether the host path accepts a
+/// checkpoint. Both the CLI dynamic path and the web control plane read this list, so a model
+/// the console calls supported is one the host path can actually execute.
+///
+/// [Part::Mtp] is deliberately absent: the host forward does not run the MTP stage, so a
+/// checkpoint that declares one is judged on its backbone (see [host_reference_missing]).
+pub const HOST_REFERENCE_PARTS: &[Part] = &[
+    Part::Embedding,
+    Part::RmsNorm,
+    Part::GqaAttention,
+    Part::GdnScan,
+    Part::DenseMlp,
+    Part::Moe,
+    Part::LmHead,
+];
+
+/// The parts `architecture` names that the host reference backend does not execute.
+///
+/// MTP is optional for this backend: [Architecture::parts] inserts [Part::Mtp] whenever the
+/// document declares a stage, but the host forward never executes it. Refusing the backbone
+/// over a stage the host deliberately ignores would keep the dynamic path from serving an
+/// MTP-bearing document it runs correctly, so the stage is dropped from the missing set. The
+/// storage walk applies the same rule through [host_reference_serves_tensor].
+#[must_use]
+pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
+    let mut available = PartSet::new();
+    for part in HOST_REFERENCE_PARTS {
+        available.insert(*part);
+    }
+    architecture
+        .missing(&available)
+        .into_iter()
+        .filter(|part| *part != Part::Mtp)
+        .collect()
+}
+
+/// Why the host reference backend cannot execute `architecture`, if it cannot.
+///
+/// This is the one boot-support predicate the CLI host backend and the web control plane share.
+/// It covers everything that is cheap to decide from the checkpoint document alone: a part the
+/// host does not execute, a rotary scaling rule the reference forward does not apply, and a
+/// declared quantized weight format the reference's BF16/F32 decode would serve dishonestly.
+/// Both callers additionally inspect tensor headers for quantization the document did not
+/// declare, through [host_reference_storage_quantization_refusal]. A Hub-only web inspection has
+/// no shards yet, so that preview remains declaration-only.
+#[must_use]
+pub fn host_reference_refusal(architecture: &Architecture) -> Option<String> {
+    host_reference_structure_refusal(architecture)
+        .or_else(|| host_reference_quantization_refusal(architecture))
+}
+
+/// The document-level host refusal that needs no tensor inspection.
+///
+/// This is the half both backends run before they resolve a weight; their storage check then
+/// inspects the actual tensor headers, so a `U8` checkpoint is named as such rather than only by
+/// the declaration. The web gate uses [host_reference_refusal], which also folds in the declared
+/// formats.
+#[must_use]
+pub fn host_reference_structure_refusal(architecture: &Architecture) -> Option<String> {
+    let missing = host_reference_missing(architecture);
+    if !missing.is_empty() {
+        let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        return Some(format!(
+            "the checkpoint names parts the dynamic host path does not execute: {}",
+            names.join(", ")
+        ));
+    }
+    host_reference_rope_refusal(architecture)
+}
+
+/// The first layer whose rotary scaling rule the host reference does not apply.
+///
+/// The host forward applies plain RoPE and a positive `linear` factor only. A `yarn`, `dynamic`
+/// or other rule is accepted by the shared architecture and the plan, but the reference
+/// arithmetic would silently compute unscaled positions; refuse it at boot instead of failing
+/// the first request inside `HostSession::forward`.
+#[must_use]
+pub fn host_reference_rope_refusal(architecture: &Architecture) -> Option<String> {
+    for layer in &architecture.layers {
+        let rope = &layer.attention.rope;
+        // The forward skips a layer whose rotation is narrower than one pair (GLM's NoPE MLA).
+        // Its scaling rule is inert there, so a yarn declaration on such a layer is not a
+        // mismatch: the host and the forward both ignore it.
+        if rope.rotated_dims < 2 {
+            continue;
+        }
+        let Some(scaling) = &rope.scaling else {
+            continue;
+        };
+        let kind = scaling.kind.to_ascii_lowercase();
+        match kind.as_str() {
+            // The released documents spell plain RoPE both ways; treat them the same as the
+            // forward does.
+            "" => {}
+            "default" => {
+                if scaling.factor != 1.0 {
+                    return Some(format!(
+                        "layer {} declares rope.scaling default with factor {}, which the dynamic host path ignores; use factor 1 or a positive linear rope, or serve with a device pack",
+                        layer.index, scaling.factor
+                    ));
+                }
+            }
+            "linear" if scaling.factor > 0.0 => {}
+            "linear" => {
+                return Some(format!(
+                    "layer {} declares rope.scaling linear with factor {}, which is not positive",
+                    layer.index, scaling.factor
+                ));
+            }
+            other => {
+                return Some(format!(
+                    "layer {} declares rope.scaling {other:?}, which the dynamic host path does not apply; use a plain or linear rope, or serve with a device pack",
+                    layer.index
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Whether the dynamic host reference decodes a tensor with this name.
+///
+/// The host resolves the backbone's own tensors. The MTP stage and the vision tower/aligner are
+/// stored beside them but the reference forward never executes them, so a quantized tensor under
+/// either belongs to a stage the host ignores rather than to the arithmetic it serves. An MTP
+/// stage can also be stored as an ordinary extra decoder layer, which has no `mtp.` prefix and
+/// needs the architecture; [is_extra_layer] covers that spelling. The storage walk uses this
+/// predicate to judge only the tensors the host actually decodes; the structure gate separately
+/// ignores [Part::Mtp] in [host_reference_missing].
+#[must_use]
+pub fn host_reference_serves_tensor(name: &str) -> bool {
+    let mtp = name.starts_with("mtp.") || name.contains(".mtp.");
+    let vision = name.starts_with("vision.")
+        || name.starts_with("model.visual")
+        || name.starts_with("aligner.")
+        || name.starts_with("model.aligner");
+    !(mtp || vision)
+}
+
+/// Whether `name` addresses a decoder layer beyond the architecture's backbone.
+///
+/// A GLM-style MTP stage is stored as an ordinary extra layer at
+/// `model.language_model.layers.<num_hidden_layers>.*` (or `model.layers.N`), not under an
+/// `mtp.` prefix, so [host_reference_serves_tensor] cannot tell it apart by name alone. The
+/// storage walk consults the document instead: when it declares an MTP stage, layers at or
+/// beyond `architecture.layers.len()` are the stage's, which the host forward never reads.
+fn is_extra_layer(name: &str, architecture: &Architecture) -> bool {
+    if architecture.mtp.is_none() {
+        return false;
+    }
+    const LAYER_PREFIXES: [&str; 3] = ["model.language_model.layers.", "model.layers.", "layers."];
+    LAYER_PREFIXES.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|rest| {
+            rest.split('.')
+                .next()
+                .and_then(|index| index.parse::<usize>().ok())
+                .is_some_and(|index| index >= architecture.layers.len())
+        })
+    })
+}
+
+/// The stored weight format the host reference cannot decode honestly, if any.
+///
+/// A document can omit `quantization_config` while its shards store `U8`, packed FP4 or FP8
+/// codes beside scale tensors. The host decodes BF16/F32 per tensor and never applies a block
+/// scale, so the first such tensor is named from its safetensors header. The CLI and the web
+/// control plane both call this over the checkpoint source they already opened, so a storage-only
+/// quantized checkpoint cannot be supported by one and refused by the other.
+///
+/// Only tensors [host_reference_serves_tensor] accepts are inspected: a quantized `mtp.*` or
+/// vision tensor is not part of the forward the host runs, so it must not refuse the backbone.
+/// `architecture` supplies the layer count [is_extra_layer] needs to skip a GLM-style MTP stage
+/// stored as an extra decoder layer.
+#[must_use]
+pub fn host_reference_storage_quantization_refusal(
+    architecture: &Architecture,
+    source: &dyn sparkflash_weights::WeightSource,
+) -> Option<String> {
+    for name in source.names() {
+        if !host_reference_serves_tensor(&name) || is_extra_layer(&name, architecture) {
+            continue;
+        }
+        let Ok(spec) = source.spec(&name) else {
+            continue;
+        };
+        if matches!(
+            spec.dtype,
+            sparkflash_weights::DType::U8
+                | sparkflash_weights::DType::F4E2M1
+                | sparkflash_weights::DType::F8E4M3
+                | sparkflash_weights::DType::F8E8M0
+        ) {
+            return Some(format!(
+                "the checkpoint stores quantized tensor {name} ({}); the dynamic host reference decodes BF16/F32 tensors and does not apply block scales, so it cannot serve storage-only quantized weights honestly - convert or serve with its device pack",
+                spec.dtype.name()
+            ));
+        }
+    }
+    None
+}
+
+/// The declared weight format the host reference cannot decode honestly, if any.
+///
+/// The host path decodes BF16/F32 per tensor and does not apply block scales. A document that
+/// declares an FP8/NVFP4 dense or expert class would be served as if it were quantized
+/// arithmetic while the reference decodes the codes as plain values, so it is refused at boot.
+#[must_use]
+pub fn host_reference_quantization_refusal(architecture: &Architecture) -> Option<String> {
+    let quantization = &architecture.quantization;
+    // The host does not execute the MTP stage, so an MTP-only quantized format is not a reason
+    // to refuse the backbone the host does run. Only the dense and expert formats the host
+    // decodes belong in this predicate.
+    if quantization.dense_format == WeightFormat::Bf16
+        && quantization.expert_format == WeightFormat::Bf16
+    {
+        return None;
+    }
+    Some(format!(
+        "the checkpoint declares quantized weights (method={:?}, dense={:?}, experts={:?}); the dynamic host reference decodes BF16/F32 tensors and does not apply block scales, so it cannot serve NVFP4/FP8 weights honestly - convert or serve it with its device pack, or use an unquantized checkpoint",
+        quantization.method,
+        quantization.dense_format.name(),
+        quantization.expert_format.name(),
+    ))
+}
+
 /// The parts a serving process that stages the checkpoint's vision tower launches for target.
 ///
 /// The DeepSeek arm loads and runs the 14-patch tower, so [Vision](Part::Vision) stays in its
@@ -1661,5 +1891,319 @@ mod tests {
             with.is_empty(),
             "the DeepSeek arm is complete with cubins: {with:?}"
         );
+    }
+
+    /// The host does not execute the MTP stage, so an MTP-only quantized format must not refuse
+    /// the BF16 backbone the host actually decodes. The web predicate reads this same function.
+    #[test]
+    fn an_mtp_only_quantized_format_does_not_refuse_the_backbone() {
+        // A host-runnable document (dense MLP, GQA, no vision/PLE/hyper-connection/indexer)
+        // that still declares an MTP stage. Making the premise explicit matters: the released
+        // Qwen document also carries stages the host deliberately refuses, so it cannot show
+        // that the MTP declaration alone is ignored.
+        let document = serde_json::json!({
+            "model_type": "acme_mtp",
+            "architectures": ["AcmeMtpForCausalLM"],
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 512,
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "eos_token_id": 2,
+            "layer_types": ["full_attention"],
+            "mtp_num_hidden_layers": 1,
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": "FP8_PB_WO",
+                        "group_size": 128
+                    }
+                }
+            }
+        });
+        let architecture =
+            Architecture::from_json(&document.to_string()).expect("the MTP-only document parses");
+        assert!(
+            architecture.mtp.is_some(),
+            "the premise: the document declares an MTP stage"
+        );
+        assert!(
+            architecture.quantization.mtp_expert_format.is_some(),
+            "the MTP format is still recorded"
+        );
+        assert_eq!(
+            host_reference_quantization_refusal(&architecture),
+            None,
+            "the host does not run MTP, so its format is not a backbone refusal"
+        );
+        assert!(
+            host_reference_refusal(&architecture).is_none(),
+            "the host must serve the backbone of an MTP-bearing document: {:?}",
+            host_reference_refusal(&architecture)
+        );
+
+        // The storage half must apply the same rule: a quantized MTP tensor, and a quantized
+        // vision tensor the reference never executes, are skipped. A quantized tensor the host
+        // does decode still names its dtype, so the filter is not a blanket amnesty.
+        let directory = tempfile::tempdir().expect("tempdir");
+        sparkflash_weights::safetensors::write_checkpoint(
+            directory.path(),
+            &[
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "model.embed_tokens.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::BF16,
+                        shape: vec![1],
+                    },
+                    vec![0; 2],
+                ),
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "mtp.layers.0.mlp.experts.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::U8,
+                        shape: vec![1],
+                    },
+                    vec![0x21],
+                ),
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "model.visual.blocks.0.attn.wqkv.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::U8,
+                        shape: vec![1],
+                    },
+                    vec![0x21],
+                ),
+            ],
+            1,
+        )
+        .expect("the MTP/vision quantized shard writes");
+        let source = sparkflash_weights::safetensors::open_checkpoint(directory.path())
+            .expect("the MTP/vision shard opens");
+        assert_eq!(
+            host_reference_storage_quantization_refusal(&architecture, &source),
+            None,
+            "quantized MTP and vision tensors are not part of the host forward"
+        );
+
+        let served = tempfile::tempdir().expect("tempdir");
+        sparkflash_weights::safetensors::write_checkpoint(
+            served.path(),
+            &[(
+                sparkflash_weights::TensorSpec {
+                    name: "model.layers.0.self_attn.q_proj.weight".to_owned(),
+                    dtype: sparkflash_weights::DType::U8,
+                    shape: vec![1],
+                },
+                vec![0x21],
+            )],
+            1,
+        )
+        .expect("the served quantized shard writes");
+        let served = sparkflash_weights::safetensors::open_checkpoint(served.path())
+            .expect("the served shard opens");
+        let refusal = host_reference_storage_quantization_refusal(&architecture, &served)
+            .expect("a served U8 tensor is still refused");
+        assert!(
+            refusal.contains("q_proj") && refusal.contains("U8"),
+            "{refusal}"
+        );
+    }
+
+    /// A GLM-style MTP stage is an ordinary extra layer at
+    /// `model.language_model.layers.<num_hidden_layers>.*`, so the prefix-only storage filter
+    /// misses it. The walk must use the document's layer count instead, and still refuse a
+    /// quantized tensor on a backbone layer.
+    #[test]
+    fn an_extra_layer_mtp_stage_is_not_a_served_tensor() {
+        let document = serde_json::json!({
+            "model_type": "acme_extra_layer_mtp",
+            "architectures": ["AcmeExtraLayerMtpForCausalLM"],
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 512,
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "eos_token_id": 2,
+            "layer_types": ["full_attention"],
+            "num_nextn_predict_layers": 1
+        });
+        let architecture = Architecture::from_json(&document.to_string())
+            .expect("the extra-layer MTP document parses");
+        assert_eq!(architecture.layers.len(), 1);
+        assert!(
+            architecture.mtp.is_some(),
+            "the premise: the document declares an MTP stage"
+        );
+        assert!(
+            host_reference_refusal(&architecture).is_none(),
+            "the host must serve the backbone: {:?}",
+            host_reference_refusal(&architecture)
+        );
+
+        // The stage is spelled both ways: the canonical `model.layers.N` and the nested
+        // `model.language_model.layers.N`. Neither is part of the forward the host runs.
+        let directory = tempfile::tempdir().expect("tempdir");
+        sparkflash_weights::safetensors::write_checkpoint(
+            directory.path(),
+            &[
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "model.layers.0.mlp.down_proj.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::BF16,
+                        shape: vec![1],
+                    },
+                    vec![0; 2],
+                ),
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "model.layers.1.mlp.down_proj.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::U8,
+                        shape: vec![1],
+                    },
+                    vec![0x21],
+                ),
+                (
+                    sparkflash_weights::TensorSpec {
+                        name: "model.language_model.layers.1.mlp.down_proj.weight".to_owned(),
+                        dtype: sparkflash_weights::DType::U8,
+                        shape: vec![1],
+                    },
+                    vec![0x21],
+                ),
+            ],
+            1,
+        )
+        .expect("the extra-layer MTP shard writes");
+        let source = sparkflash_weights::safetensors::open_checkpoint(directory.path())
+            .expect("the extra-layer MTP shard opens");
+        assert_eq!(
+            host_reference_storage_quantization_refusal(&architecture, &source),
+            None,
+            "the MTP layer is stored as an extra decoder layer the host never reads"
+        );
+
+        // The filter is by layer index, not a blanket amnesty for a layer-shaped name.
+        for name in [
+            "model.layers.0.mlp.down_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+        ] {
+            let served = tempfile::tempdir().expect("tempdir");
+            sparkflash_weights::safetensors::write_checkpoint(
+                served.path(),
+                &[(
+                    sparkflash_weights::TensorSpec {
+                        name: name.to_owned(),
+                        dtype: sparkflash_weights::DType::U8,
+                        shape: vec![1],
+                    },
+                    vec![0x21],
+                )],
+                1,
+            )
+            .expect("the served quantized shard writes");
+            let served = sparkflash_weights::safetensors::open_checkpoint(served.path())
+                .expect("the served shard opens");
+            let refusal = host_reference_storage_quantization_refusal(&architecture, &served)
+                .unwrap_or_else(|| panic!("a served U8 tensor {name} is still refused"));
+            assert!(
+                refusal.contains(name) && refusal.contains("U8"),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// A historical document spells the rule as `type`, not `rope_type`. The shared parser must
+    /// still see yarn, and the host gate must refuse it instead of running the host unscaled.
+    #[test]
+    fn a_legacy_type_yarn_is_refused_by_the_host_gate() {
+        let document = r#"{
+            "model_type": "acme_yarn",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 512,
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"type": "yarn", "factor": 4.0},
+            "tie_word_embeddings": true,
+            "eos_token_id": 2
+        }"#;
+        let architecture = Architecture::from_json(document).expect("the legacy document parses");
+        let refusal = host_reference_rope_refusal(&architecture).expect("yarn is refused");
+        assert!(refusal.contains("rope.scaling"), "{refusal}");
+        assert!(refusal.contains("yarn"), "{refusal}");
+    }
+
+    /// The forward skips a layer with fewer than two rotated dimensions, so a yarn declaration
+    /// on a NoPE MLA layer is inert rather than a mismatch. The boot predicate must mirror that
+    /// and not refuse a document the host executes correctly.
+    #[test]
+    fn a_nope_layer_accepts_an_inert_yarn_declaration() {
+        let document = r#"{
+            "model_type": "acme_nope",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "qk_rope_head_dim": 0,
+            "vocab_size": 512,
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"type": "yarn", "factor": 4.0},
+            "tie_word_embeddings": true,
+            "eos_token_id": 2
+        }"#;
+        let architecture = Architecture::from_json(document).expect("the NoPE document parses");
+        assert_eq!(architecture.layers[0].attention.rope.rotated_dims, 0);
+        assert_eq!(
+            host_reference_rope_refusal(&architecture),
+            None,
+            "an inert scaling on a NoPE layer must not refuse the host"
+        );
+    }
+
+    /// A default rule with a non-unit factor is not the forward's plain RoPE: the forward
+    /// ignores the factor, so the host would silently run a different position scale.
+    #[test]
+    fn a_default_rope_with_a_non_unit_factor_is_refused() {
+        let document = r#"{
+            "model_type": "acme_default_factor",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "vocab_size": 512,
+            "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"rope_type": "default", "factor": 4.0},
+            "tie_word_embeddings": true,
+            "eos_token_id": 2
+        }"#;
+        let architecture = Architecture::from_json(document).expect("the document parses");
+        let refusal =
+            host_reference_rope_refusal(&architecture).expect("a non-unit default is refused");
+        assert!(refusal.contains("default with factor 4"), "{refusal}");
     }
 }

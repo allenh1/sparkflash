@@ -59,6 +59,20 @@ pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
 pub(super) const DEEPSEEK_PROFILE_TOML: &str =
     include_str!("../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml");
 
+/// The carried profile a checkpoint family serves, when this build carries one.
+///
+/// A dynamic checkpoint whose `model_type` names a released family still reads that family's
+/// typed profile; a novel family gets `ModelProfile::default()` plus the declared environment
+/// overrides, which is the documented fallback (issue #17 step 2.2).
+pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "deepseek_v41" => Some(DEEPSEEK_PROFILE_TOML),
+        "qwen4_exp" | "qwen4_exp_text" => Some(QwenArm::PROFILE_TOML),
+        "glm5_next" => Some(GlmArm::PROFILE_TOML),
+        _ => None,
+    }
+}
+
 /// What one pack's serving arm supplies; [`serve_host`] and [`serve_group`] are the rest.
 pub(super) trait PackArm {
     /// The pack's parsed `config.json`.
@@ -540,9 +554,7 @@ impl Pack {
         let path = directory.join(CHECKPOINT_CONFIG_NAME);
         let text = std::fs::read_to_string(path).ok()?;
         let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
-        let descriptor = sparkflash_model::MODELS
-            .iter()
-            .find(|model| model.model_type.eq_ignore_ascii_case(&architecture.family))?;
+        let descriptor = sparkflash_model::find_model_by_type(&architecture.family)?;
         Self::from_descriptor(descriptor)
     }
 
@@ -821,12 +833,19 @@ fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Co
     }
     let directory = match options.checkpoint.as_deref() {
         Some(path) => checkpoint_directory(path),
-        None => sparkflash_weights::hub::cached_model_dir(A::MODEL_ID).ok_or_else(|| {
-            format!(
-                "{id} is not in the Hugging Face cache; run hf download {id} or pass --checkpoint DIR",
-                id = A::MODEL_ID
-            )
-        })?,
+        None => {
+            // The caller's id, not the arm's compile-time one: a cached fine-tune named on the
+            // command line must load its own snapshot (issue #17). A canonical weight selector
+            // still maps to its registry id, so the alias and the served id resolve alike.
+            let requested = options.model.as_deref().unwrap_or(A::MODEL_ID);
+            let id = sparkflash_model::find_model(requested)
+                .map_or_else(|| requested.to_owned(), |model| model.id.clone());
+            sparkflash_weights::hub::cached_model_dir(&id).ok_or_else(|| {
+                format!(
+                    "{id} is not in the Hugging Face cache; run hf download {id} or pass --checkpoint DIR"
+                )
+            })?
+        }
     };
     let config = read_config::<A>(&directory)?;
     Ok((directory, config))
@@ -837,7 +856,12 @@ fn host_checkpoint<A: PackArm>(options: &ServeOptions) -> Result<(PathBuf, A::Co
 /// The plan is the boot contract; the typed config is still the arm's weight recipe. This is the
 /// seam where the two meet, so a family or layer-count drift is named before a weight is read.
 fn check_backend_plan(plan: &EnginePlan, family: &str, layers: usize) -> Result<(), String> {
-    if plan.family() != family {
+    // A text-only release names its family `<family>_text` at the document root while the arm
+    // and its plan use the multimodal spelling. Fold the alias on both sides so a flat
+    // text-only checkpoint is not refused after detection accepts it.
+    if !sparkflash_model::canonical_model_type(plan.family())
+        .eq_ignore_ascii_case(sparkflash_model::canonical_model_type(family))
+    {
         return Err(format!(
             "the execution plan is {}, the backend is {family}",
             plan.family()
@@ -974,6 +998,96 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     ))
 }
 
+/// Wraps an arm's backend so the driver advertises a dynamically resolved identity.
+///
+/// The released arms hard-code their served id in their descriptor. A fine-tune in the cache is
+/// the same arithmetic under another id: this wrapper keeps the backend's capabilities and
+/// sessions and replaces only the identity the HTTP surface reports.
+struct DescriptorBackend<B> {
+    inner: B,
+    descriptor: ModelDescriptor,
+}
+
+impl<B: ModelBackend> ModelBackend for DescriptorBackend<B> {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn capabilities(&self) -> sparkflash_model::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn open_session(
+        &self,
+    ) -> Result<Box<dyn sparkflash_model::ModelSession>, sparkflash_model::BackendError> {
+        self.inner.open_session()
+    }
+}
+
+/// Serves a preset family's arm under a checkpoint's own identity.
+///
+/// This is the dynamic path for a cached fine-tune whose `model_type` is a released family: the
+/// arm's arithmetic and profile are used, while the descriptor, context and tokenizer are the
+/// checkpoint's. `respond` is the arm's response dialect (`A::respond`).
+pub(super) fn serve_arm_identity<A: PackArm>(
+    options: &ServeOptions,
+    directory: PathBuf,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    context: usize,
+    respond: fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>,
+) -> Result<ExitCode, String> {
+    let config = read_config::<A>(&directory)?;
+    let window = A::window(&config);
+    if context == 0 || context > window {
+        return Err(format!(
+            "context limit {context} is outside 1..={window} for {}",
+            descriptor.id
+        ));
+    }
+    let plan = check_plan::<A>(&directory, &config, 1)?;
+    let profile = A::profile()?;
+    sparkflash_model::install_active(profile.clone());
+    A::check_host(options, &config, context, &profile)?;
+    let mut backend =
+        A::open_host(&directory, config, context, &profile, Some(&plan)).map_err(|error| {
+            format!(
+                "cannot open {} at {}: {error}",
+                A::NAME,
+                directory.display()
+            )
+        })?;
+    if options.fuse_batch {
+        A::fuse(&mut backend, options.concurrency)
+            .map_err(|error| format!("cannot fuse the batch: {error}"))?;
+    }
+    let backend = DescriptorBackend {
+        inner: backend,
+        descriptor: descriptor.clone(),
+    };
+    let driver = sparkflash_serve::HostDriver::start(
+        Box::new(backend),
+        Arc::clone(&seam),
+        sparkflash_serve::HostOptions {
+            max_tokens: options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+            concurrency: options.concurrency,
+            ..sparkflash_serve::HostOptions::default()
+        },
+    )?;
+    let metrics = driver.metrics();
+    println!(
+        "sparkflash serve: {} ({}) at TP=1 on {}, context {context}",
+        descriptor.id,
+        descriptor.weights_id,
+        directory.display()
+    );
+    let engine = respond(Arc::new(driver));
+    let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
+    Ok(serve_with_seam(
+        engine, metrics, seam, None, options, descriptor, numerics,
+    ))
+}
+
 /// The cluster telemetry a pack's group can state: its fabric mode, not a node list or a rail.
 #[cfg(feature = "tp4-serve")]
 pub(super) fn pack_cluster_snapshot(model: &str, context: usize) -> ClusterStatsSnapshot {
@@ -1004,11 +1118,22 @@ fn serve_group<A: PackArm>(
     options: &ServeOptions,
     tp4: &Tp4ServeOptions,
 ) -> Result<ExitCode, String> {
-    let checkpoint = options
-        .checkpoint
-        .as_deref()
-        .ok_or_else(|| format!("--model {} --tp4-rank needs --checkpoint DIR", A::MODEL_ID))?;
-    let directory = checkpoint_directory(checkpoint);
+    // Every rank must resolve the same checkpoint. A `--checkpoint` names it directly; a
+    // `--model` id resolves the one cached snapshot through the shared hub resolver, so
+    // `--model`/the rank flags reach every worker as identically as `--checkpoint` did (D74).
+    let directory = match options.checkpoint.as_deref() {
+        Some(checkpoint) => checkpoint_directory(checkpoint),
+        None => {
+            let requested = options.model.as_deref().unwrap_or(A::MODEL_ID);
+            let id = sparkflash_model::find_model(requested)
+                .map_or_else(|| requested.to_owned(), |model| model.id.clone());
+            sparkflash_weights::hub::cached_model_dir(&id).ok_or_else(|| {
+                format!(
+                    "--model {id} --tp4-rank needs --checkpoint DIR or a cached snapshot; run hf download {id}"
+                )
+            })?
+        }
+    };
     let config = read_config::<A>(&directory)?;
     // Every rank derives the window from the same configuration, so the group agrees on the
     // sequence width without rank 0 sending it.
@@ -1148,6 +1273,30 @@ mod tests {
                 .expect("the carried config is written");
             assert_eq!(Pack::detect(directory.path()), Some(expected));
         }
+    }
+
+    #[test]
+    fn a_flat_text_only_qwen_checkpoint_detects_as_the_qwen_pack() {
+        // The released text-only Qwen writes the language configuration at the document root
+        // and names itself `qwen4_exp_text`. Detection must fold that alias to the Qwen arm,
+        // otherwise ServeOptions::parse gates it against the host part set and refuses it
+        // before the Qwen dispatch can run.
+        let nested: serde_json::Value = serde_json::from_str(QWEN_CONFIG).expect("the Qwen config");
+        let mut flat = nested["text_config"].clone();
+        flat["model_type"] = serde_json::json!("qwen4_exp_text");
+        flat["architectures"] = serde_json::json!(["Qwen4ExpTextForCausalLM"]);
+        flat["tie_word_embeddings"] = nested["tie_word_embeddings"].clone();
+        flat["image_token_id"] = nested["image_token_id"].clone();
+        flat["vision_start_token_id"] = nested["vision_start_token_id"].clone();
+        flat["vision_end_token_id"] = nested["vision_end_token_id"].clone();
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(
+            directory.path().join(CHECKPOINT_CONFIG_NAME),
+            flat.to_string(),
+        )
+        .expect("the text-only config is written");
+        assert_eq!(Pack::detect(directory.path()), Some(Pack::Qwen));
+        assert_eq!(Pack::named("qwen4_exp_text"), Some(Pack::Qwen));
     }
 
     #[test]

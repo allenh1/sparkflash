@@ -58,8 +58,9 @@ pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, MODELS, ModelDescriptor, V41_CONTEXT_TOKENS,
-    V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, default_model, find_model,
-    find_model_by_weights, model_context_tokens, model_max_output_tokens,
+    V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, canonical_model_type, default_model,
+    find_model, find_model_by_type, find_model_by_weights, model_context_tokens,
+    model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
 pub use fused::{FusedArm, FusedEngine, FusedSession};

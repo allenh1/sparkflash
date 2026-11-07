@@ -159,7 +159,7 @@ use sparkflash_engram::store::{BackendPreference, DirectTable, RowTable, specs_f
 use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_kv::PrefixMatchPlan;
 use sparkflash_model::numerics::{ARCH_HOST, ConfigKey, NumericsIdentity, NumericsProfile};
-use sparkflash_model::{ModelProfile, Target};
+use sparkflash_model::{Architecture, ModelProfile, Target};
 use sparkflash_model_deepseek_v41::encoding::{
     HfTokenizerEncoder, TokenizerSeam, load_hf_tokenizer, resolve_reference_tokenizer,
 };
@@ -189,6 +189,8 @@ mod tp4_control;
 pub use device::DeviceServeOptions;
 #[cfg(feature = "tp4-serve")]
 use tp4_control::*;
+pub(crate) mod dynamic;
+mod dynamic_host;
 mod pack;
 
 /// The index file a sharded safetensors checkpoint is described by.
@@ -737,6 +739,35 @@ impl ServeOptions {
                     }
                     cli.model = Some(pack.model_id().to_owned());
                 }
+            } else if directory.join(CHECKPOINT_CONFIG_NAME).is_file() {
+                // No preset arm, but the checkpoint has a configuration: parse and plan it now.
+                // A malformed document is a refusal naming the file, never a silent fall-through
+                // to the DeepSeek loader. The shared Architecture reads both the nested
+                // `text_config` schema and the flat one.
+                let config = directory.join(CHECKPOINT_CONFIG_NAME);
+                let text = std::fs::read_to_string(&config)
+                    .map_err(|error| format!("--checkpoint {}: {error}", config.display()))?;
+                let architecture = Architecture::from_json(&text).map_err(|error| {
+                    format!(
+                        "--checkpoint {}: {} is not a usable architecture: {error}",
+                        directory.display(),
+                        config.display()
+                    )
+                })?;
+                let plan = EnginePlan::from_path(&config, Target::Sm121, 1, 0)
+                    .map_err(|error| format!("--checkpoint {}: {error}", directory.display()))?;
+                let parts = crate::dynamic::unsupported_parts(&architecture);
+                if !parts.is_empty() {
+                    let names: Vec<String> = parts.iter().map(ToString::to_string).collect();
+                    return Err(format!(
+                        "--checkpoint {} (model_type {:?}) names parts the dynamic host path does not execute: {}",
+                        directory.display(),
+                        architecture.family,
+                        names.join(", ")
+                    ));
+                }
+                let _ = plan;
+                cli.model = Some(dynamic::directory_id(&directory));
             }
         }
         // A registry model name selects a pack; the default DeepSeek arm is a pack identity but
@@ -744,7 +775,35 @@ impl ServeOptions {
         let pack = cli.model.as_deref().and_then(pack::Pack::named);
         let packed = pack.is_some_and(pack::Pack::is_arm);
         let tokenizer = cli.tokenizer;
-        let checkpoint = cli.checkpoint;
+        let mut checkpoint = cli.checkpoint;
+        // A model id names its snapshot through the hub cache. Resolve it before the
+        // exactly-one-weight-source check, so `--model org/FineTune` serves the cached
+        // `models--org--FineTune` rather than failing as "no weights". A canonical preset with a
+        // cache miss is left to its arm's own message; a non-preset id must resolve now.
+        if !cli.synthetic && checkpoint.is_none() {
+            let requested = cli
+                .model
+                .as_deref()
+                .unwrap_or(sparkflash_model::descriptor::DEFAULT_MODEL_ID);
+            let id = dynamic::served_id_for(requested);
+            match sparkflash_weights::hub::cached_model_dir(&id) {
+                Some(directory) => checkpoint = Some(directory),
+                None => {
+                    if cli.model.is_some() && pack.is_none() {
+                        let cache = sparkflash_weights::hub::default_cache_dir();
+                        return Err(match cache {
+                            Some(cache) => format!(
+                                "{id} is not in the Hugging Face cache at {}; run hf download {id} or pass --checkpoint DIR",
+                                cache.display()
+                            ),
+                            None => format!(
+                                "{id} is not in the Hugging Face cache (HF_HUB_CACHE is unset); run hf download {id} or pass --checkpoint DIR"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         // An empty key would authenticate only an empty bearer token; refuse it at parse time
         // instead of turning the server into something neither open nor protected.
         if cli
@@ -5945,10 +6004,14 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
     // device-chain wiring below describes it, and running through them would serve the wrong model.
     if let Some(model) = options.model.clone() {
         // The registry's default DeepSeek identity is served by the existing reference/TP4
-        // path; a packed model is served by its own arm. Any other id is a refusal that names
-        // the ids this binary knows.
+        // path; a packed model is served by its own arm. Any other id is either a dynamic
+        // checkpoint or a refusal naming what this build can resolve.
         if pack::Pack::named(&model) != Some(pack::Pack::Deepseek) {
-            return serve_pack(&model, &options);
+            // A cached fine-tune of the released DeepSeek family is still the reference
+            // engine's arithmetic: its checkpoint was already resolved into `options`.
+            if !dynamic::names_deepseek(&options) {
+                return serve_pack(&model, &options);
+            }
         }
     }
     #[cfg(feature = "tp4-serve")]
@@ -6104,15 +6167,34 @@ fn serve_pack(model: &str, options: &ServeOptions) -> ExitCode {
     if let Some(pack) = pack::Pack::named(model) {
         return pack.serve(options);
     }
-    let known: Vec<&str> = sparkflash_model::MODELS
-        .iter()
-        .map(|model| model.id.as_str())
-        .collect();
-    eprintln!(
-        "sparkflash serve: --model {model:?} has no serving arm in this build; known model ids: {}",
-        known.join(", ")
-    );
-    ExitCode::from(EXIT_REFUSED)
+    // Not a preset: resolve the checkpoint through the hub, plan it and serve it from its own
+    // configuration. This is the zero-code path; `MODELS` stays the canonical preset list, not a
+    // gate a cached model has to pass.
+    match dynamic::serve(options) {
+        Ok(code) => code,
+        Err(message) => {
+            eprintln!("sparkflash serve: {message}");
+            ExitCode::from(EXIT_REFUSED)
+        }
+    }
+}
+
+/// The descriptor the reference engine advertises.
+///
+/// The arithmetic is the released V4.1 forward whichever fine-tune is loaded, but the identity is
+/// the checkpoint's: a DeepSeek-family fine-tune served through `--model ORG/FineTune` reports
+/// that id, not the canonical release's. A registry selector still maps to the canonical id, so
+/// `--model deepseek-v4.1-flash` is unchanged.
+fn reference_descriptor(model: Option<&str>) -> sparkflash_model::ModelDescriptor {
+    let mut descriptor = sparkflash_model::default_model().clone();
+    if let Some(requested) = model {
+        let served =
+            sparkflash_model::find_model(requested).map_or(requested, |known| known.id.as_str());
+        if served != descriptor.id {
+            descriptor.id = served.to_owned();
+        }
+    }
+    descriptor
 }
 
 /// Loads the tokenizer seam, builds the app state and serves the router until stopped.
@@ -6143,7 +6225,7 @@ fn serve_with_engine(
             return ExitCode::from(EXIT_REFUSED);
         }
     };
-    let descriptor = sparkflash_model::default_model().clone();
+    let descriptor = reference_descriptor(options.model.as_deref());
     // The reference engine and the M1 fake session run on the host; only the M2 session with a
     // cubin launches kernels.
     let arch = match (options.engine, options.device_cubin.is_some()) {
@@ -10816,6 +10898,23 @@ mod device_token_serve_tests {
                 panic!("{label}: the serve plan check refused a resolvable config: {error}")
             });
         }
+    }
+
+    #[test]
+    fn a_deepseek_fine_tune_advertises_its_own_id() {
+        let fine_tune = "acme/DeepSeek-V4.1-Flash-heretic";
+        let descriptor = reference_descriptor(Some(fine_tune));
+        assert_eq!(descriptor.id, fine_tune);
+        assert_eq!(descriptor.weights_id, sparkflash_model::DEFAULT_WEIGHTS_ID);
+        // A registry selector still reports the canonical id.
+        assert_eq!(
+            reference_descriptor(Some(sparkflash_model::DEFAULT_WEIGHTS_ID)).id,
+            sparkflash_model::DEFAULT_MODEL_ID
+        );
+        assert_eq!(
+            reference_descriptor(None).id,
+            sparkflash_model::DEFAULT_MODEL_ID
+        );
     }
 
     #[test]

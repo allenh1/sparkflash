@@ -85,7 +85,7 @@ the rule that no model crate depends on another model crate.
 
 DeepSeek's device forward is model code and lives in crates/sparkflash-deepseek-forward, not in
 sparkflash-cli. The move kept the module names and crate:: paths, so it is numerically inert; the
-CLI is a dispatcher over the forward crate and is under the 30k-line gate. The forward crate
+CLI is a dispatcher over the forward crate and is under the 34k-line gate. The forward crate
 depends on the V4.1 model pack and the shared kernel stack, never on the CLI.
 
 ## 2. Typed ops
@@ -292,3 +292,70 @@ TP=1. A directory of rank files named by an environment variable resolves throug
       arithmetic or neutral, and each configuration it serves has a captured reference in
       `numerics/registry.toml` ([NUMERICS.md](NUMERICS.md));
 - [ ] the arm's profile names its registry model (`model`, section 3).
+
+## 7. The dynamic Hugging Face path (no new arm)
+
+A checkpoint does not need a new `PackArm` to convert or serve. `sparkflash serve --model
+ORG/REPO` and `sparkflash serve --checkpoint DIR` resolve the snapshot through
+`sparkflash_weights::hub`, parse its `config.json` with the shared `Architecture`, plan it with
+`EnginePlan`, and check every requirement with `KernelResolver`. The descriptor is
+`ModelDescriptor::from_architecture`, the prompt codec is detected from `tokenizer.json`
+(GLm's `[gMASK]`/`<sop>`, ChatML's `<|im_start|>`/`<|im_end|>`), and the profile is the
+canonical preset for a released family or `ModelProfile::default()` plus the declared environment
+overrides for a novel one. `MODELS` remains the canonical preset list, not a closed gate.
+
+`sparkflash convert --model ORG/REPO` dispatches from the same plan: a released Qwen/GLM
+checkpoint goes to its pack converter, DeepSeek goes to the B12x converter, and any other
+resolved architecture goes to the generic dynamic writer.
+
+**Phase-4 status.** `EngineBuilder`, `ArchitectureTensorPlan` and `SlotPack` are merged,
+but their reach is deliberately narrow: the released Qwen and GLM arms implement `EngineBuilder`
+(`PartsDeviceBackend`), `ArchitectureTensorPlan` names only the `qwen4_exp` and `glm5_next`
+families, and `SlotPack` is plan-order TP1. A novel family has neither a plan builder nor a
+device arm, so:
+
+- a novel family is served by the CPU reference backend in
+  `sparkflash-cli/src/serve/dynamic_host.rs`, which executes the parts in
+  `sparkflash-cli/src/dynamic.rs::DYNAMIC_PARTS` (embedding, RMSNorm, GQA, Gated DeltaNet,
+  dense SwiGLU, routed/shared MoE, LM head, plain residual) with canonical Hugging Face tensor
+  names and f32 arithmetic. That list is
+  `sparkflash_ops::parts::HOST_REFERENCE_PARTS`, and it is the capability gate for both the CLI
+  and the web control plane: the CUDA catalogue answers a different question. The GQA arithmetic
+  follows Hugging Face: `rotate_half` RoPE pairs dimension `i` with `i + head_dim/2`, an
+  `attn_output_gate` query projection interleaves query and gate per head, and optional
+  `q_norm`/`k_norm` weights run before RoPE. A declared `rope.scaling` is applied for
+  `default`/`linear` and refused by name for any other rule. It is a bring-up path, not a
+  throughput claim, and it plans at TP1;
+- a novel family's rank file is the same `SlotPlan`/`SlotFileWriter` container holding the raw
+  checkpoint tensors in architecture-walk order (`DynamicRecords` in `convert.rs`), not a device
+  layout. The generic writer is TP1: a world above one is refused rather than writing several
+  whole copies labelled as shards. `convert --inspect` recognises the `dynamic` rank file and
+  verifies it, and a conversion with no `--output-dir` writes beside the working directory,
+  never inside the Hugging Face cache. A family `ArchitectureTensorPlan` names can use
+  `SlotPack` directly; the novel path cannot yet;
+- a family this backend does not execute (MLA, KDA, CSA2, an indexer, a hyper-connection, PLE,
+  Engram or vision) is refused with the exact host-part list before a kernel is consulted. An MTP
+  stage is optional: the host ignores it and runs the backbone, and a quantized tensor belonging
+  to the stage (under `mtp.*`, or stored as an extra decoder layer) does not refuse the
+  backbone;
+- `--tokenizer FILE` wins over `<checkpoint>/tokenizer.json`, and a tokenizer carrying neither
+  GLM's nor ChatML's markers is refused instead of falling back to `ByteCodec`;
+- a single-file `model.safetensors` is accepted without an index: the header synthesizes the
+  weight map. A quantized checkpoint (ModelOpt `U8` + scales, or a declared FP8/NVFP4 format)
+  is refused at boot with the format and scale names, because this path does not yet apply block
+  scales;
+
+Replacing the remaining novel-family host walk with a shared device `EngineBuilder` and adding a
+generic `ArchitectureTensorPlan` naming path is the next step; it is a new plan builder, not a
+rebase change.
+
+The web control plane evaluates a released family with the same `EnginePlan` +
+`KernelResolver` at the family's deployment world, and a novel family with the shared
+`HOST_REFERENCE_PARTS` set. `supported` and `context_tokens` come from the checkpoint, and
+`missing_parts` names the host-unsupported parts. A cached or explicit checkpoint is also judged
+by its safetensors headers, so storage-only quantization is refused exactly as the CLI refuses it;
+a Hub-only preview remains declaration-level until the shards are downloaded. An explicit
+`model.checkpoint` is authoritative over a cached `model.id` for both the window and support
+decision. A novel host-runnable checkpoint is selectable under its own id with engine `dynamic`;
+it needs no per-rank conversion or cubins, and selecting it from a four-Spark plan moves the
+launch to the single local node.

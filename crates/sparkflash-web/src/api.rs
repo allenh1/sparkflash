@@ -761,6 +761,8 @@ async fn put_config(State(web): State<WebState>, Json(body): Json<serde_json::Va
 
 /// Validates, saves and adopts `config`, answering with the saved view.
 fn store_config(web: &WebState, config: SparkConfig) -> Response {
+    let mut config = config;
+    config.discard_stale_context_tokens();
     if let Err((status, message)) = save_and_adopt(web, config.clone()) {
         return api_error(status, message);
     }
@@ -777,6 +779,8 @@ fn store_config(web: &WebState, config: SparkConfig) -> Response {
 /// response to build. The error keeps the status `store_config` should answer with: a bad value
 /// is the caller's, a failed write is ours.
 fn save_and_adopt(web: &WebState, config: SparkConfig) -> Result<(), (StatusCode, String)> {
+    let mut config = config;
+    config.discard_stale_context_tokens();
     config
         .validate()
         .map_err(|error| (StatusCode::BAD_REQUEST, error.message))?;
