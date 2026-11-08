@@ -68,6 +68,7 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
     match family {
         "deepseek_v41" => Some(DEEPSEEK_PROFILE_TOML),
         "qwen4_exp" | "qwen4_exp_text" => Some(QwenArm::PROFILE_TOML),
+        "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Qwen36Arm::PROFILE_TOML),
         "glm5_next" => Some(GlmArm::PROFILE_TOML),
         _ => None,
     }
@@ -109,8 +110,9 @@ pub(super) trait PackArm {
     fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture;
     /// The checkpoint's window, `max_position_embeddings`.
     fn window(config: &Self::Config) -> usize;
-    /// What a group serves over `context` tokens.
-    fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor;
+    /// What a group serves over `context` tokens, or the arm's refusal of a release it has no
+    /// identity for.
+    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String>;
     /// The released prompt seam from a tokenizer file and the checkpoint's parsed architecture.
     fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String>;
     /// Refusals the single-node arm makes before it uploads anything.
@@ -195,7 +197,7 @@ impl PackArm for QwenArm {
         config.max_position_embeddings
     }
 
-    fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor {
+    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
         sparkflash_model_qwen4_exp::device::descriptor_for(config, context)
     }
 
@@ -234,7 +236,7 @@ impl PackArm for QwenArm {
     ) -> Result<Self::Backend, String> {
         use sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
         if let Some(plan) = plan {
-            check_backend_plan(plan, "qwen4_exp", config.num_hidden_layers)?;
+            check_backend_plan(plan, config.family(), config.num_hidden_layers)?;
         }
         // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
         // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
@@ -318,7 +320,87 @@ impl PackArm for QwenFp8Arm {
         <QwenArm as PackArm>::window(config)
     }
 
-    fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor {
+    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
+        <QwenArm as PackArm>::descriptor(config, context)
+    }
+
+    fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
+        <QwenArm as PackArm>::codec(tokenizer, config)
+    }
+
+    fn check_host(
+        options: &ServeOptions,
+        config: &Self::Config,
+        context: usize,
+        profile: &ModelProfile,
+    ) -> Result<(), String> {
+        <QwenArm as PackArm>::check_host(options, config, context, profile)
+    }
+
+    fn open_host(
+        directory: &Path,
+        config: Self::Config,
+        context: usize,
+        profile: &ModelProfile,
+        plan: Option<&EnginePlan>,
+    ) -> Result<Self::Backend, String> {
+        <QwenArm as PackArm>::open_host(directory, config, context, profile, plan)
+    }
+
+    fn fuse(backend: &mut Self::Backend, concurrency: usize) -> Result<(), String> {
+        <QwenArm as PackArm>::fuse(backend, concurrency)
+    }
+
+    fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine> {
+        <QwenArm as PackArm>::respond(driver)
+    }
+}
+
+/// Qwen3.6-35B-A3B, the official FP8 checkpoint: the Qwen arm's device backend over the
+/// Qwen3.5-MoE family (plain residual, full gated attention, E4M3 128x128-tile dense and expert
+/// weights). The family and stored formats select the kernels; [identity_for] refuses a release
+/// of the family this build has no kernel or identity for.
+///
+/// [identity_for]: sparkflash_model_qwen4_exp::device::identity_for
+pub(super) struct Qwen36Arm;
+
+impl PackArm for Qwen36Arm {
+    type Config = Qwen4ExpConfig;
+    type Backend = sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
+
+    const MODEL_ID: &'static str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
+    const NAME: &'static str = "Qwen3.6-35B-A3B (FP8)";
+    const FIXTURE: &'static str = "qwen36";
+    const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::QWEN36_MAX_OUTPUT_TOKENS;
+    const DEFAULT_CONTEXT: usize = sparkflash_model::descriptor::QWEN36_CONTEXT_TOKENS;
+    const PROFILE_TOML: &'static str =
+        include_str!("../../../sparkflash-model-qwen4-exp/config/qwen36_35b_a3b_fp8.toml");
+    const FUSED_BATCH: bool = QwenArm::FUSED_BATCH;
+    const KV_BUDGET: bool = QwenArm::KV_BUDGET;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+
+    fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
+        let config = Qwen4ExpConfig::tiny_qwen35_moe(
+            sparkflash_model_qwen4_exp::config::DenseQuant::Fp8Block,
+        );
+        sparkflash_model_qwen4_exp::write_synthetic_checkpoint(directory, &config, 7)?;
+        Ok(config)
+    }
+
+    fn read_config(directory: &Path) -> Result<Self::Config, String> {
+        <QwenArm as PackArm>::read_config(directory)
+    }
+
+    fn architecture(config: &Self::Config) -> &sparkflash_model::Architecture {
+        <QwenArm as PackArm>::architecture(config)
+    }
+
+    fn window(config: &Self::Config) -> usize {
+        <QwenArm as PackArm>::window(config)
+    }
+
+    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
         <QwenArm as PackArm>::descriptor(config, context)
     }
 
@@ -406,8 +488,10 @@ impl PackArm for GlmArm {
         config.max_position_embeddings
     }
 
-    fn descriptor(config: &Self::Config, context: usize) -> ModelDescriptor {
-        sparkflash_model_glm5_next::serve::descriptor_for(config, context)
+    fn descriptor(config: &Self::Config, context: usize) -> Result<ModelDescriptor, String> {
+        Ok(sparkflash_model_glm5_next::serve::descriptor_for(
+            config, context,
+        ))
     }
 
     fn codec(tokenizer: &Path, config: &Self::Config) -> Result<Arc<dyn PromptCodec>, String> {
@@ -503,6 +587,19 @@ impl PackArm for GlmArm {
     }
 }
 
+/// Whether the Qwen3.5-MoE checkpoint in `directory` is one the device arm serves.
+///
+/// The family is many releases and formats; the device arm takes the ones it has kernels and an
+/// identity for ([identity_for]), and the rest (the BF16 release) stay on the dynamic host path
+/// that served the family before the arm.
+///
+/// [identity_for]: sparkflash_model_qwen4_exp::device::identity_for
+pub(super) fn qwen35_on_device(directory: &Path) -> bool {
+    Qwen4ExpConfig::from_checkpoint_dir(directory)
+        .ok()
+        .is_some_and(|config| sparkflash_model_qwen4_exp::device::identity_for(&config).is_ok())
+}
+
 /// The packs the model registry knows, including the default DeepSeek arm.
 ///
 /// The variants are the registry's families; every id, weights selector, model type, label,
@@ -514,6 +611,8 @@ pub(super) enum Pack {
     Qwen,
     /// The official FP8 release of the same Qwen arm: one family, two weight selectors.
     QwenFp8,
+    /// Qwen3.6-35B-A3B FP8, the Qwen arm over the Qwen3.5-MoE family.
+    Qwen36,
     Glm,
 }
 
@@ -527,6 +626,7 @@ impl Pack {
             Self::Deepseek => sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID,
             Self::Qwen => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID,
             Self::QwenFp8 => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+            Self::Qwen36 => sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
             Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
         };
         sparkflash_model::find_model_by_weights(weights)
@@ -539,6 +639,7 @@ impl Pack {
             sparkflash_model::descriptor::DEFAULT_WEIGHTS_ID => Some(Self::Deepseek),
             sparkflash_model::descriptor::QWEN38_FLASH_NEXT_WEIGHTS_ID => Some(Self::Qwen),
             sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID => Some(Self::QwenFp8),
+            sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID => Some(Self::Qwen36),
             sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
             _ => None,
         }
@@ -555,7 +656,11 @@ impl Pack {
         let text = std::fs::read_to_string(path).ok()?;
         let architecture = sparkflash_model::Architecture::from_json(&text).ok()?;
         let descriptor = sparkflash_model::find_model_by_type(&architecture.family)?;
-        Self::from_descriptor(descriptor)
+        let pack = Self::from_descriptor(descriptor)?;
+        if pack == Self::Qwen36 && !qwen35_on_device(directory) {
+            return None;
+        }
+        Some(pack)
     }
 
     /// The parts a checkpoint's own `config.json` names that this build cannot load.
@@ -582,7 +687,7 @@ impl Pack {
             Some(Self::Deepseek) | None => {
                 sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
             }
-            Some(Self::Qwen | Self::QwenFp8 | Self::Glm) => {
+            Some(Self::Qwen | Self::QwenFp8 | Self::Qwen36 | Self::Glm) => {
                 sparkflash_ops::parts::serving_language(sparkflash_model::Target::Sm121)
             }
         };
@@ -619,7 +724,7 @@ impl Pack {
         kv_budget: bool,
     ) -> Vec<&'static str> {
         let (fuses, budgets) = match self {
-            Self::Qwen | Self::QwenFp8 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
+            Self::Qwen | Self::QwenFp8 | Self::Qwen36 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
             Self::Deepseek => (false, false),
         };
@@ -644,6 +749,7 @@ impl Pack {
             }
             Self::Qwen => serve_arm::<QwenArm>(options),
             Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
+            Self::Qwen36 => serve_arm::<Qwen36Arm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
         };
         served.unwrap_or_else(|message| {
@@ -1163,7 +1269,7 @@ fn serve_group<A: PackArm>(
     // The prompt seam and the detokenizer are the same file; load it before the rank upload so a
     // missing tokenizer costs a startup message, not a load.
     let (tokenizer, seam) = pack_seam::<A>(options, &directory, &config)?;
-    let descriptor = A::descriptor(&config, context);
+    let descriptor = A::descriptor(&config, context)?;
     let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
     rank_config.context = context;
     let spec = Tp4EngineSpec {
@@ -1300,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn every_registry_id_and_weights_id_names_its_pack() {
+    fn every_registry_id_names_its_pack_or_the_dynamic_host() {
         for model in sparkflash_model::MODELS.iter() {
             for id in [model.id.as_str(), model.weights_id.as_str()] {
                 let pack =
@@ -1309,6 +1415,11 @@ mod tests {
                 assert_eq!(pack.descriptor().weights_id, model.weights_id);
             }
         }
+        // Qwen3.6-35B-A3B FP8 is the Qwen arm's device backend over the Qwen3.5-MoE family.
+        assert_eq!(
+            Pack::named(sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID),
+            Some(Pack::Qwen36)
+        );
         assert_eq!(Pack::named("example/no-arm"), None);
     }
 
@@ -1458,6 +1569,39 @@ mod tests {
                 "TP{world}: {errors:?}"
             );
         }
+    }
+
+    /// The CLI's real Qwen3.6 boot path: the released FP8 document parses as the Qwen pack's
+    /// configuration, and the serving boot check resolves every language part at TP1, the routed
+    /// experts on the Qwen images at the second published routed shape.
+    #[test]
+    fn the_released_qwen36_fp8_pack_boots_at_tp1() {
+        const QWEN36_FP8: &str =
+            include_str!("../../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), QWEN36_FP8)
+            .expect("the carried config is written");
+        std::fs::write(
+            directory.path().join("generation_config.json"),
+            r#"{"eos_token_id": [248046, 248044]}"#,
+        )
+        .expect("the carried generation config is written");
+        let config =
+            Qwen36Arm::read_config(directory.path()).expect("the Qwen3.6 serving configuration");
+        sparkflash_model_qwen4_exp::device::identity_for(&config)
+            .expect("the FP8 release has a device identity");
+        let plan =
+            check_plan_with::<Qwen36Arm>(directory.path(), &config, 1, Availability::Catalogue)
+                .unwrap_or_else(|error| panic!("Qwen3.6 FP8 TP1: {error}"));
+        assert_eq!(
+            plan.precision().experts,
+            sparkflash_ops::plan::Precision::Fp8E4M3
+        );
+        let moe = plan
+            .requirements()
+            .find(|requirement| requirement.part == sparkflash_model::Part::Moe)
+            .expect("a Qwen3.6 MoE requirement");
+        assert_eq!(moe.geometry.intermediate, 512, "TP1 holds the whole expert");
     }
 
     /// The plan-aware single-rank open is the arm's EngineBuilder, not the old direct

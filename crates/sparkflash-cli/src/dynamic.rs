@@ -38,15 +38,16 @@ pub(crate) const DYNAMIC_PARTS: &[Part] = sparkflash_ops::parts::HOST_REFERENCE_
 
 /// The parts `architecture` names that the dynamic host path does not execute.
 ///
-/// MTP is optional here, exactly as in [sparkflash_ops::parts::host_reference_missing]: the
-/// architecture lists an MTP stage when the document declares one, but the host forward never
-/// runs it and must still serve the backbone.
+/// MTP and vision are optional here, exactly as in
+/// [sparkflash_ops::parts::host_reference_missing]: the architecture lists a stage or tower when
+/// the document declares one, but the host forward never runs either and must still serve the
+/// backbone.
 #[must_use]
 pub(crate) fn unsupported_parts(architecture: &Architecture) -> Vec<Part> {
     architecture
         .parts()
         .iter()
-        .filter(|part| *part != Part::Mtp && !DYNAMIC_PARTS.contains(part))
+        .filter(|part| !matches!(part, Part::Mtp | Part::Vision) && !DYNAMIC_PARTS.contains(part))
         .collect()
 }
 

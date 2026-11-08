@@ -51,7 +51,8 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
 
 use super::{
-    DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat, split_tickets,
+    DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
+    GpuMatE4m3Tile, split_tickets,
 };
 use crate::config::Qwen4ExpConfig;
 
@@ -145,25 +146,22 @@ const DENSE_TARGET_CTAS: usize = 96;
 /// The thinnest K slice a split takes, in 32-column blocks.
 const DENSE_MIN_SLICE_BLOCKS: usize = 8;
 
-/// The partials and tickets a q4p_dense_rows launch of `group` over `batch` rows split
-/// `segments` ways takes: none unsplit, where every CTA stores its own finished outputs.
-fn dense_rows_need(
-    group: &[(&GpuMat, Deviceptr)],
-    batch: usize,
-    segments: usize,
-) -> (usize, usize) {
-    if segments == 1 {
-        return (0, 0);
-    }
-    group
-        .iter()
-        .fold((0, 0), |(partials, tickets), (matrix, _)| {
+/// One matrix of a q4p_dense_rows launch: `matrix` into `output`, split `segments` ways.
+type DenseRows<'a> = (&'a GpuMat, Deviceptr, usize);
+
+/// The partials and tickets a q4p_dense_rows launch of `group` over `batch` rows takes: none for
+/// an unsplit matrix, whose CTAs store their own finished outputs.
+fn dense_rows_need(group: &[DenseRows], batch: usize) -> (usize, usize) {
+    group.iter().filter(|(_, _, segments)| *segments > 1).fold(
+        (0, 0),
+        |(partials, tickets), (matrix, _, segments)| {
             (
                 partials + segments * batch * matrix.rows,
                 tickets
                     + matrix.rows.div_ceil(DENSE_ROWS_COLUMNS) * batch.div_ceil(DENSE_ROWS_TILE),
             )
-        })
+        },
+    )
 }
 
 /// One projection of a [DeviceSequence::gemm_group]: `matrix` into `output`, finished by the
@@ -327,7 +325,11 @@ impl PrefillPlan {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefillKernels {
     dense_mma: Kernel,
+    /// The FP8 release's block-scaled dense projections on the shared 128 x 128 tile.
+    dense_fp8: Kernel,
     dense_rows: Kernel,
+    /// The hyper connection's up projection and stream mix for a few rows, in one launch.
+    hyper_up_rows: Kernel,
     pub(super) gemm_rows: Kernel,
     epilogue: Kernel,
     split_bf16: Kernel,
@@ -376,7 +378,9 @@ impl PrefillKernels {
         };
         Ok(Self {
             dense_mma: named("q4p_dense_mma")?,
+            dense_fp8: named("q4p_dense_fp8")?,
             dense_rows: named("q4p_dense_rows")?,
+            hyper_up_rows: named("q4p_hyper_up_rows")?,
             gemm_rows: named("q4p_gemm_rows")?,
             epilogue: named("q4p_epilogue")?,
             split_bf16: named("q4p_split_bf16")?,
@@ -564,6 +568,49 @@ impl DeviceSequence {
         Ok(true)
     }
 
+    /// A block-scaled FP8 projection over the chunk on the shared 128 x 128 tensor-core tile
+    /// (q4p_dense_fp8), the tile GLM's FP8 projections run, with Qwen's BF16 tile scales. Returns
+    /// false, launching nothing, when the plan keeps chunks off the tensor cores or the shape does
+    /// not fit the tile (rows of 32, whole 128-column tiles, 16-byte aligned operands); the caller
+    /// then runs the block-scaled GEMV. A row's sums are that row's alone in an order fixed by the
+    /// matrix, so a row has the same bits at any row count.
+    pub(super) fn dense_fp8_mma(
+        &self,
+        matrix: &GpuMatE4m3Tile,
+        input: Deviceptr,
+        output: Deviceptr,
+        batch: usize,
+    ) -> Result<bool, BackendError> {
+        const TILE: usize = sparkflash_ops::gemv::E4M3_TILE;
+        if !self.backend.prefill.tensor_cores
+            || !part("dense")
+            || !matrix.rows.is_multiple_of(32)
+            || !matrix.columns.is_multiple_of(TILE)
+            || ![matrix.weight, input, output].into_iter().all(aligned)
+        {
+            return Ok(false);
+        }
+        self.launch(
+            self.backend.kernels.prefill.dense_fp8,
+            (
+                matrix.rows.div_ceil(TILE) as u32,
+                batch.div_ceil(TILE) as u32,
+                1,
+            ),
+            (256, 1, 1),
+            &[
+                matrix.weight.0,
+                matrix.scales.0,
+                input.0,
+                output.0,
+                matrix.rows as u64,
+                matrix.columns as u64,
+                batch as u64,
+            ],
+        )?;
+        Ok(true)
+    }
+
     /// Whether `batch` rows of `matrix` from `input` into `output` take the dense MMA.
     fn dense_fits(
         &self,
@@ -591,20 +638,21 @@ impl DeviceSequence {
 
     /// Projections of one `input` over `batch` rows, each into its own output.
     ///
-    /// A few rows on the tensor cores put the matrices whose splits and epilogues agree in one
-    /// q4p_dense_rows launch, up to four, as many as the partials and tickets hold, and up to two
-    /// matrices off the tile ride along on the first as q4p_gemm_rows CTAs: a layer's projections
-    /// of one input then cost one launch where they cost one each, and every output has the bits
-    /// its own launch gives it. Everything else - a wide chunk, the token kernels, a rider past
-    /// what the partials hold - is [Self::gemm] a matrix at a time.
+    /// A few rows on the tensor cores put the matrices whose epilogues agree in one
+    /// q4p_dense_rows launch, up to four, each at its own split, as many as the partials and
+    /// tickets hold, and up to two matrices off the tile ride along on the first as
+    /// q4p_gemm_rows CTAs: a layer's projections of one input then cost one launch where they
+    /// cost one each, and every output has the bits its own launch gives it. Everything else - a
+    /// wide chunk, the token kernels, a rider past what the partials hold - is [Self::gemm] a
+    /// matrix at a time.
     pub(super) fn gemm_group(
         &self,
         projections: &[Projection],
         input: Deviceptr,
         batch: usize,
     ) -> Result<(), BackendError> {
-        // (split, epilogue, scale bits) and the matrices launched together under them.
-        type Group<'a> = ((usize, u32, u32), Vec<(&'a GpuMat, Deviceptr)>);
+        // (epilogue, scale bits) and the matrices launched together under them.
+        type Group<'a> = ((u32, u32), Vec<DenseRows<'a>>);
         let mut grouped: Vec<Group> = Vec::new();
         let mut off_tile = Vec::new();
         for projection in projections {
@@ -624,31 +672,24 @@ impl DeviceSequence {
                 off_tile.push(projection);
                 continue;
             }
-            let key = (
-                self.dense_split(matrix, batch),
-                projection.epilogue,
-                projection.scale.to_bits(),
-            );
-            let segments = key.0;
+            let key = (projection.epilogue, projection.scale.to_bits());
+            let entry = (matrix, output, self.dense_split(matrix, batch));
             let joins = grouped.iter_mut().find(|(at, group)| {
-                let (partials, tickets) = dense_rows_need(group, batch, segments);
+                let (partials, tickets) = dense_rows_need(group, batch);
+                let (more, counters) = dense_rows_need(&[entry], batch);
                 *at == key
                     && group.len() < 4
-                    && (segments == 1
-                        || (partials + segments * batch * matrix.rows <= GEMM_PARTIAL_FLOATS
-                            && tickets
-                                + matrix.rows.div_ceil(DENSE_ROWS_COLUMNS)
-                                    * batch.div_ceil(DENSE_ROWS_TILE)
-                                <= GEMM_SPLIT_TICKETS))
+                    && partials + more <= GEMM_PARTIAL_FLOATS
+                    && tickets + counters <= GEMM_SPLIT_TICKETS
             });
             match joins {
-                Some((_, group)) => group.push((matrix, output)),
-                None => grouped.push((key, vec![(matrix, output)])),
+                Some((_, group)) => group.push(entry),
+                None => grouped.push((key, vec![entry])),
             }
         }
         let mut riders = Vec::new();
-        if let Some(((segments, _, _), group)) = grouped.first() {
-            let (mut partials, mut tickets) = dense_rows_need(group, batch, *segments);
+        if let Some((_, group)) = grouped.first() {
+            let (mut partials, mut tickets) = dense_rows_need(group, batch);
             for projection in &off_tile {
                 let (more, counters) = self.rider_need(projection.matrix, batch);
                 if riders.len() == 2
@@ -672,19 +713,67 @@ impl DeviceSequence {
                 projection.scale,
             )?;
         }
-        for (index, ((segments, epilogue, scale), group)) in grouped.into_iter().enumerate() {
+        for (index, ((epilogue, scale), group)) in grouped.into_iter().enumerate() {
             let riding: &[Projection] = if index == 0 { &riders } else { &[] };
             self.dense_rows_launch(
                 &group,
                 input,
                 batch,
-                segments,
                 epilogue,
                 f32::from_bits(scale),
                 riding,
             )?;
         }
         Ok(())
+    }
+
+    /// The hyper connection's up projection of `low` and its mix of the `normed` streams into
+    /// `mixed` over a few rows, as one q4p_hyper_up_rows launch: the bits [Self::gemm] of `up`
+    /// and q4e_hyper_mix give, without the raw sums' round trip or the mix's launch. Returns
+    /// false, launching nothing, where that pair does not run as one q4p_dense_rows launch and the
+    /// mix (a wide chunk, the token kernels, a split up projection, a shape off the tile) or the
+    /// streams are more than its four warps; the caller then runs the pair.
+    pub(super) fn hyper_up_rows(
+        &self,
+        up: &GpuMat,
+        low: Deviceptr,
+        normed: Deviceptr,
+        mixed: Deviceptr,
+        batch: usize,
+    ) -> Result<bool, BackendError> {
+        let config = &self.backend.config;
+        let (hidden, hc) = (config.hidden_size, config.hc_count);
+        if batch >= GEMM_MIN_BATCH
+            || !self.dense_fits(up, low, normed, batch)
+            || !aligned(mixed)
+            || hc > 4
+            || up.rows != hc * hidden
+            || up.columns != config.hc_lowrank
+            || !hidden.is_multiple_of(8)
+            || self.dense_split(up, batch) != 1
+        {
+            return Ok(false);
+        }
+        self.launch(
+            self.backend.kernels.prefill.hyper_up_rows,
+            (
+                hidden.div_ceil(8) as u32,
+                batch.div_ceil(DENSE_ROWS_TILE) as u32,
+                1,
+            ),
+            (128, 1, 1),
+            &[
+                low.0,
+                up.pointer.0,
+                normed.0,
+                mixed.0,
+                up.columns as u64,
+                hidden as u64,
+                hc as u64,
+                batch as u64,
+            ],
+        )?;
+        Ok(true)
     }
 
     /// The partials and tickets a q4p_gemm_rows launch of `matrix` over `batch` rows takes.
@@ -698,37 +787,36 @@ impl DeviceSequence {
         }
     }
 
-    /// One q4p_dense_rows launch of `group` over `batch` rows split `segments` ways, and the
-    /// `riders` (at most two) that run beside it, each as its own q4p_gemm_rows launch would: its
-    /// split and epilogue, its slices and counters in the partials region past the group's.
-    #[allow(clippy::too_many_arguments)]
+    /// One q4p_dense_rows launch of `group` over `batch` rows, each matrix at its own split, and
+    /// the `riders` (at most two) that run beside it, each as its own q4p_gemm_rows launch would:
+    /// its split and epilogue, its slices and counters in the partials region past the group's.
     fn dense_rows_launch(
         &self,
-        group: &[(&GpuMat, Deviceptr)],
+        group: &[DenseRows],
         input: Deviceptr,
         batch: usize,
-        segments: usize,
         epilogue: u32,
         scale: f32,
         riders: &[Projection],
     ) -> Result<(), BackendError> {
         let mut columns = 0usize;
-        let mut matrices = [0u64; 16];
+        let mut matrices = [0u64; 20];
         let (mut partials, mut tiles) = (0usize, 0usize);
-        for (slot, &(matrix, output)) in group.iter().enumerate() {
+        for (slot, &(matrix, output, segments)) in group.iter().enumerate() {
             let target = if segments > 1 {
                 self.gemm_partials.offset(partials * 4)
             } else {
                 output
             };
-            matrices[slot * 4..slot * 4 + 4].copy_from_slice(&[
+            matrices[slot * 5..slot * 5 + 5].copy_from_slice(&[
                 matrix.pointer.0,
                 target.0,
                 output.0,
                 matrix.rows as u64,
+                segments as u64,
             ]);
-            columns += matrix.rows.div_ceil(DENSE_ROWS_COLUMNS);
-            let (more, counters) = dense_rows_need(&[(matrix, output)], batch, segments);
+            columns += matrix.rows.div_ceil(DENSE_ROWS_COLUMNS) * segments;
+            let (more, counters) = dense_rows_need(&[(matrix, output, segments)], batch);
             partials += more;
             tiles += counters;
         }
@@ -761,21 +849,20 @@ impl DeviceSequence {
             return Err(BackendError::new(
                 "qwen4_prefill",
                 format!(
-                    "a q4p_dense_rows launch of {} matrices and {} riders over {batch} rows split \
-                     {segments} ways needs {partials} partials and {tiles} tickets, past the \
-                     {GEMM_PARTIAL_FLOATS} and {GEMM_SPLIT_TICKETS} there are",
+                    "a q4p_dense_rows launch of {} matrices and {} riders over {batch} rows needs \
+                     {partials} partials and {tiles} tickets, past the {GEMM_PARTIAL_FLOATS} and \
+                     {GEMM_SPLIT_TICKETS} there are",
                     group.len(),
                     riders.len()
                 ),
             ));
         }
-        // The riders' CTAs, numbered over every (y, z) of the grid past the dense tiles.
-        let planes = batch.div_ceil(DENSE_ROWS_TILE) * segments;
+        // The riders' CTAs, numbered over every y of the grid past the dense tiles.
+        let planes = batch.div_ceil(DENSE_ROWS_TILE);
         let mut args = vec![
             input.0,
             group[0].0.columns as u64,
             batch as u64,
-            segments as u64,
             split_tickets(self.gemm_partials).0,
             u64::from(epilogue),
             u64::from(scale.to_bits()),
@@ -789,7 +876,7 @@ impl DeviceSequence {
             (
                 (columns + ctas.div_ceil(planes)) as u32,
                 batch.div_ceil(DENSE_ROWS_TILE) as u32,
-                segments as u32,
+                1,
             ),
             (128, 1, 1),
             &args,
@@ -820,10 +907,9 @@ impl DeviceSequence {
         // tile's slices and applies the epilogue itself.
         if batch < GEMM_MIN_BATCH {
             return self.dense_rows_launch(
-                &[(matrix, output)],
+                &[(matrix, output, segments)],
                 input,
                 batch,
-                segments,
                 epilogue,
                 scale,
                 &[],

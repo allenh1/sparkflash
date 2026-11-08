@@ -157,6 +157,23 @@ impl GpuMatE4m3 {
     }
 }
 
+/// One matrix as E4M3 codes with one BF16 inverse scale a 128 x 128 tile, as the Qwen3.5/3.6 FP8
+/// release stores its dense projections (`weight` and `weight_scale_inv`).
+#[derive(Debug, Clone, Copy)]
+pub struct GpuMatE4m3Tile {
+    /// The matrix's E4M3 codes on the device, a byte a value.
+    pub weight: Deviceptr,
+    /// The `[ceil(rows / 128)][ceil(columns / 128)]` BF16 inverse scales.
+    pub scales: Deviceptr,
+    /// Output rows the matrix holds.
+    pub rows: usize,
+    /// Values in a row.
+    pub columns: usize,
+}
+
+/// Columns a block-scaled E4M3 tile spans.
+pub const E4M3_TILE: usize = 128;
+
 /// The launch and scratch a tiled GEMV needs from an arm.
 pub trait GemvDevice {
     /// Launch a kernel on the arm's stream.
@@ -231,6 +248,56 @@ pub fn gemv_e4m3(
             "gemv_e4m3",
             format!(
                 "no E4M3 GEMV of {rows} rows over a [{}, {}] matrix",
+                matrix.rows, matrix.columns
+            ),
+        ));
+    }
+    let tiles = matrix.rows.div_ceil(32);
+    let (partials, counters) = device.tiled_scratch();
+    device.launch(
+        kernel,
+        (
+            tiles as u32,
+            tiled_gemv_e4m3_splits(tiles, matrix.columns) as u32,
+            1,
+        ),
+        (256, 1, 1),
+        &[
+            matrix.weight.0,
+            matrix.scales.0,
+            input.0,
+            output.0,
+            matrix.rows as u64,
+            matrix.columns as u64,
+            rows as u64,
+            partials.0,
+            counters.0,
+        ],
+    )
+}
+
+/// output = matrix input over a block-scaled E4M3 matrix for up to GEMV_MAX_BATCH rows, the
+/// activations kept f32 (q4e_gemv_tiled_e4m3_tile).
+///
+/// # Errors
+/// When there are more rows than the kernel takes, the columns are not whole 128-column tiles,
+/// the operands are not 16-byte rows, or the device refuses the launch.
+pub fn gemv_e4m3_tile(
+    device: &impl GemvDevice,
+    kernel: Kernel,
+    matrix: &GpuMatE4m3Tile,
+    input: Deviceptr,
+    output: Deviceptr,
+    rows: usize,
+) -> Result<(), BackendError> {
+    if rows > GEMV_MAX_BATCH
+        || !matrix.columns.is_multiple_of(E4M3_TILE)
+        || !tiled_operands(&[matrix.weight, input], matrix.columns)
+    {
+        return Err(BackendError::new(
+            "gemv_e4m3_tile",
+            format!(
+                "no block-scaled E4M3 GEMV of {rows} rows over a [{}, {}] matrix",
                 matrix.rows, matrix.columns
             ),
         ));

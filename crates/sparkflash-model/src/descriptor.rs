@@ -45,6 +45,25 @@ pub const QWEN38_MAX_OUTPUT_TOKENS: usize = 32_768;
 /// The vocabulary of the released Qwen3.8-Flash-Next checkpoint (padded).
 pub const QWEN38_VOCAB_SIZE: usize = 248_320;
 
+/// The served id of the official Qwen3.6-35B-A3B FP8 checkpoint.
+///
+/// This is the Qwen3.5-MoE family: hybrid Gated DeltaNet/full attention, 256 routed experts with
+/// a shared expert, no hyper-connections, no PLE and no indexer. Its parts are all in the shared
+/// catalogue; it has no device arm, so it is served by the dynamic host reference.
+pub const QWEN36_FLASH_35B_A3B_FP8_ID: &str = "Qwen/Qwen3.6-35B-A3B-FP8";
+
+/// The control-plane weight selector for Qwen3.6-35B-A3B (FP8).
+pub const QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID: &str = "qwen3.6-35b-a3b-fp8";
+
+/// The context window of Qwen3.6-35B-A3B.
+pub const QWEN36_CONTEXT_TOKENS: usize = 262_144;
+
+/// The output ceiling this build serves for Qwen3.6-35B-A3B.
+pub const QWEN36_MAX_OUTPUT_TOKENS: usize = 32_768;
+
+/// The vocabulary of Qwen3.6-35B-A3B (padded).
+pub const QWEN36_VOCAB_SIZE: usize = 248_320;
+
 /// The served id of the Z.ai GLM-5.3-Flash checkpoint.
 pub const GLM53_FLASH_ID: &str = "zai-org/GLM-5.3-Flash";
 
@@ -71,6 +90,7 @@ pub const WEIGHT_IDS: &[&str] = &[
     DEFAULT_WEIGHTS_ID,
     QWEN38_FLASH_NEXT_WEIGHTS_ID,
     QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
+    QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
     GLM53_FLASH_WEIGHTS_ID,
 ];
 
@@ -158,6 +178,27 @@ impl ModelDescriptor {
             id: QWEN38_FLASH_NEXT_FP8_ID.to_owned(),
             weights_id: QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID.to_owned(),
             ..Self::qwen38_flash_next_nvfp4()
+        }
+    }
+
+    /// The official Qwen3.6-35B-A3B FP8 descriptor.
+    ///
+    /// The Qwen pack's device arm serves this release at TP=1 (plain residual, full attention,
+    /// 128x128-tile E4M3 experts and dense projections); the dynamic engine launches it, and a
+    /// BF16 checkpoint of the family stays on the host reference. The registry entry makes the
+    /// family selectable and gives the browser its identity.
+    #[must_use]
+    pub fn qwen36_flash_35b_a3b_fp8() -> Self {
+        Self {
+            id: QWEN36_FLASH_35B_A3B_FP8_ID.to_owned(),
+            family: "qwen3.6".to_owned(),
+            model_type: "qwen3_5_moe".to_owned(),
+            label: "Qwen".to_owned(),
+            weights_id: QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID.to_owned(),
+            context_tokens: QWEN36_CONTEXT_TOKENS,
+            max_output_tokens: QWEN36_MAX_OUTPUT_TOKENS,
+            vocab_size: QWEN36_VOCAB_SIZE,
+            capabilities: Capabilities::ALL,
         }
     }
 
@@ -269,6 +310,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
         ModelDescriptor::v41_flash(),
         ModelDescriptor::qwen38_flash_next_nvfp4(),
         ModelDescriptor::qwen38_flash_next_fp8(),
+        ModelDescriptor::qwen36_flash_35b_a3b_fp8(),
         ModelDescriptor::glm53_flash(),
     ]
 });
@@ -293,6 +335,8 @@ pub fn canonical_model_type(model_type: &str) -> &str {
     let model_type = model_type.trim();
     if model_type.eq_ignore_ascii_case("qwen4_exp_text") {
         "qwen4_exp"
+    } else if model_type.eq_ignore_ascii_case("qwen3_5_moe_text") {
+        "qwen3_5_moe"
     } else {
         model_type
     }
@@ -408,6 +452,22 @@ mod tests {
             find_model_by_type("qwen4_exp_text").map(|model| model.weights_id.as_str()),
             Some(QWEN38_FLASH_NEXT_WEIGHTS_ID)
         );
+    }
+
+    #[test]
+    fn qwen36_is_registered_by_its_own_model_type() {
+        let model = find_model_by_type("qwen3_5_moe").expect("the Qwen3.6 family");
+        assert_eq!(model.id, QWEN36_FLASH_35B_A3B_FP8_ID);
+        assert_eq!(model.weights_id, QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID);
+        assert_eq!(model.family, "qwen3.6");
+        assert_eq!(model.label, "Qwen");
+        // The text-only spelling folds to the same family; a checkpoint's text_config carries it.
+        assert_eq!(canonical_model_type("qwen3_5_moe_text"), "qwen3_5_moe");
+        assert_eq!(
+            find_model_by_type("qwen3_5_moe_text").map(|model| model.weights_id.as_str()),
+            Some(QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID)
+        );
+        assert_eq!(WEIGHT_IDS.len(), MODELS.len());
     }
 
     #[test]

@@ -38,11 +38,11 @@
 // A caller may pass null for any output it does not read, and 0 for item_rows/max_items.
 //
 // Determinism: the order is stable (expert, then slot), which the counting pass alone does not
-// give. Each expert's positions are filled by one thread walking the ranks in ascending order,
-// so the layout a run produces is the same on every launch and on every rank. Two of the four
-// predecessors used an atomic cursor and were not stable; the routing is bit-neutral either way
-// (every slot's row is written independently), but a stable plan is a plan two traces can be
-// diffed against, and it costs one pass over the rank list per expert.
+// give. One warp walks the ranks in ascending order 32 at a time and places each at its expert's
+// cursor, lanes of one expert in lane order, so the layout a run produces is the same on every
+// launch and on every rank. Two of the four predecessors used an atomic cursor and were not
+// stable; the routing is bit-neutral either way (every slot's row is written independently), but a
+// stable plan is a plan two traces can be diffed against, and it costs one pass over the ranks.
 //
 // Segments: a bulk prefill may run several sequences in one launch and needs only the ranks of
 // live tokens counted and ordered. `seg_tokens` > 0 names the token stride of up to four
@@ -232,22 +232,25 @@ extern "C" __global__ void moe_plan(
         }
     }
 
-    // The stable half: one thread per bucket walks the ranks in ascending order and fills that
-    // bucket's positions. The token is tracked incrementally so the inner loop divides nothing.
-    for (int bucket = tid; bucket < buckets; bucket += span) {
-        const int count = s_count[bucket];
-        if (count <= 0) continue;
-        int at = s_base[bucket];
-        int token = 0;
-        int lane = 0;
-        bool is_live = live_token(0);
-        for (int rank = 0; rank < rows; ++rank) {
-            if (lane == 0) is_live = live_token(token);
-            if (is_live && bucket_of(rank) == bucket) sorted[at++] = rank;
-            if (++lane == stride) {
-                lane = 0;
-                ++token;
+    // The stable half: warp 0 walks the ranks 32 at a time in ascending order. The lanes of a
+    // bucket rank among themselves by lane (__match_any_sync), take their positions from the
+    // bucket's cursor, and the lowest of them moves the cursor past them, so every bucket's
+    // positions hold its ranks in ascending order. s_base is that cursor from here on: nothing
+    // after this reads it. One thread a bucket walking every rank, as this did, ran a 4,096-token
+    // GLM chunk's 32,768 slots in ~2.5 ms, a launch a layer on a prefill chunk's critical path.
+    if (tid < 32) {
+        const unsigned int below = (1u << tid) - 1u;
+        for (int first = 0; first < rows; first += 32) {
+            const int rank = first + tid;
+            const int bucket = rank < rows && live(rank) ? bucket_of(rank) : -1;
+            const unsigned int same = __match_any_sync(0xFFFFFFFFu, bucket);
+            const int at = bucket >= 0 ? s_base[bucket] + __popc(same & below) : 0;
+            __syncwarp();
+            if (bucket >= 0) {
+                if ((same & below) == 0u) s_base[bucket] = at + __popc(same);
+                sorted[at] = rank;
             }
+            __syncwarp();
         }
     }
 }

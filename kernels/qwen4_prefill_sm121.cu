@@ -97,6 +97,21 @@ extern "C" __global__ __launch_bounds__(256) void q4p_dense_mma(
         slice, (unsigned long long)slice * 2ull, 0, (unsigned long long)tokens * cols, inner >> 5);
 }
 
+// out[t][c] = sum_i a[t][i] * w[c][i] for the Qwen3.5/3.6 FP8 release's dense projections: an
+// E4M3 [cols][inner] matrix with one BF16 inverse scale a 128 x 128 tile ([cols / 128][inner /
+// 128]), on the shared bulk-prefill tile GLM's FP8 projections run (the scale typed, D88). The
+// grid is (cols / 128, tokens / 128) rounded up, 256 threads; cols must be a multiple of 32, inner
+// of 128, and the operands 16-byte aligned (the host checks). A row's sum is that row's alone, in
+// an order fixed by the matrix, so it has the same bits at any row count.
+extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_dense_fp8(
+    const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ ws,
+    const float* __restrict__ a, float* __restrict__ out, unsigned int cols, unsigned int inner,
+    unsigned int tokens) {
+    OPT_PDL_ENTRY();
+    shared_prefill_mma_body<SPM_W_FP8, false, true, __nv_bfloat16>(
+        a, w, ws, nullptr, nullptr, out, cols, inner, tokens, inner, cols, 0, 0);
+}
+
 // A weight load for a stream read once: no L1 line, and the L2 fetches the 256 bytes around it,
 // so a lane's 16 bytes and its neighbours' come from DRAM as one burst.
 __device__ __forceinline__ uint4 q4p_stream16(const void* p) {
@@ -303,121 +318,44 @@ extern "C" __global__ __launch_bounds__(128) void q4p_gemm_rows(
 // in different banks.
 #define Q4P_ROWS_STRIDE (Q4P_ROWS_ROUND * 64u + 16u)
 
-// q4p_dense_mma for a few rows - a decode step, a speculative verify, a short chunk - to the same
-// bits. An output is the same chain of MMAs in both: its slice's 32-column K blocks in order, each
-// two 16-column steps of a head MMA and then a remainder MMA, into an f32 accumulator that starts
-// at zero, with the head and remainder rounded as opt_mma_bf16_body rounds them, and every weight
-// and activation in the MMA slot it has there. Only the tile differs. The 128-row tile computes
-// 127 zero rows for one and keeps one K block in flight; here a warp is one m16 tile of rows by 8
-// columns, and a round is one 512-byte load of each of its eight weight rows - a lane 16 bytes,
-// eight K blocks, the stream a plain GEMV reads - staged in the warp's own shared tile and taken
-// back out with ldmatrix into the B fragments the 128-row tile's ldmatrix fills. The next round
-// streams while this one computes, and the activations come from L1.
+// One warp's m16 x n8 tile of q4p_dense_rows (described below) is weight rows n0 to n0 + 7 of `w`
+// against activation rows m0 to m0 + 15 of `a`, over the `k_blocks` 32-column K blocks from column
+// `k_at`. A kernel that runs one starts the warp's weight stream at q4p_rows_row, requests the
+// first round with q4p_rows_fetch, waits for the previous grid (OPT_PDL_WAIT: the weights are
+// constant, the activations are not), and then runs q4p_rows_tile. Every kernel that takes a tile
+// runs this one chain, so a tile has the same bits in each.
 //
-// One launch takes up to four matrices of the same inner dimension over the same rows - a layer's
-// projections of one input - laid end to end along x, `count` of them: matrix m is `w[m]`, its
-// `cols[m]` columns, its slices `out[m]` and its finished outputs `y[m]`, and a CTA computes 32
-// columns of one of them exactly as a launch of that matrix alone would. The grid is
-// (sum of cols[m] / 32, tokens / 16, segments) rounded up, 128 threads, under q4p_dense_mma's
-// constraints, every matrix split `segments` ways.
-//
-// One slice (`segments` 1) stores finish(sum) to `out[m]`. A split stores slice s's sums to
-// out[m][s] as q4p_dense_mma does, and the tile's last CTA to land adds the slices in order into
-// `y[m]` and finishes them, as q4e_gemm_reduce would: `tickets` holds a zeroed counter for each of
-// the launch's tiles, matrix by matrix, each matrix's (cols[m] / 32) * (tokens / 16) of them.
-//
-// The matrices of the same input whose shape the tile does not take - the GDN gates beside the
-// in-projections, the injection beside the hyper-connection's down projection, the shared-expert
-// gate beside the router - ride along instead of taking a launch each: up to two `riders`, each
-// q4p_gemm_rows's arguments over `a` (`inner` its columns, `tokens` its batch, its own split,
-// epilogue, partials and tickets). The CTAs past the `dense_x` along x of every (y, z) are
-// numbered in order and run rider 0's grid (rows * tokens / 128 rounded up, split, 1), then rider
-// 1's, each CTA exactly as q4p_gemm_rows runs it.
-extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
-    const float* __restrict__ a, unsigned int inner, unsigned int tokens, unsigned int segments,
-    unsigned int* __restrict__ tickets, int epilogue, float scale, unsigned int count,
-    const __nv_bfloat16* w0, float* out0, float* y0, unsigned int cols0,
-    const __nv_bfloat16* w1, float* out1, float* y1, unsigned int cols1,
-    const __nv_bfloat16* w2, float* out2, float* y2, unsigned int cols2,
-    const __nv_bfloat16* w3, float* out3, float* y3, unsigned int cols3, unsigned int dense_x,
-    unsigned int riders, const __nv_bfloat16* rw0, float* ry0, int rows0, int epilogue0,
-    float scale0, int split0, float* partials0, unsigned int* tickets0,
-    const __nv_bfloat16* rw1, float* ry1, int rows1, int epilogue1, float scale1, int split1,
-    float* partials1, unsigned int* tickets1) {
-    __shared__ __align__(16) unsigned char stage[4][8u * Q4P_ROWS_STRIDE];
-    static_assert(sizeof(stage) >= Q4P_GEMM_ROWS_STAGE * sizeof(__nv_bfloat16),
-                  "a rider stages its weights in the dense tile's stage");
-    if (blockIdx.x >= dense_x) {
-        unsigned int cta =
-            blockIdx.x - dense_x + (gridDim.x - dense_x) * (blockIdx.y + gridDim.y * blockIdx.z);
-        OPT_PDL_ENTRY();
-        const auto ride = [&](const __nv_bfloat16* rw, float* ry, int rows, int rider_epilogue,
-                              float rider_scale, int split, float* partials,
-                              unsigned int* rider_tickets) {
-            const unsigned int blocks = ((unsigned int)rows * tokens + 127u) / 128u;
-            if (cta >= blocks * (unsigned int)split) {
-                cta -= blocks * (unsigned int)split;
-                return false;
-            }
-            q4p_gemm_rows_cta(rw, a, ry, rows, (int)inner, (int)tokens, rider_epilogue,
-                              rider_scale, split, partials, rider_tickets, cta % blocks,
-                              cta / blocks, 0u, blocks, reinterpret_cast<__nv_bfloat16*>(stage));
-            return true;
-        };
-        if (riders > 0u && !ride(rw0, ry0, rows0, epilogue0, scale0, split0, partials0, tickets0) &&
-            riders > 1u) {
-            ride(rw1, ry1, rows1, epilogue1, scale1, split1, partials1, tickets1);
-        }
-        return;
-    }
-    // This CTA's matrix: the one whose run of tiles along x holds blockIdx.x.
-    const __nv_bfloat16* w = w0;
-    float* out = out0;
-    float* y = y0;
-    unsigned int cols = cols0;
-    unsigned int first = 0;
-    unsigned int across = (cols0 + 31u) / 32u;
-    const auto pick = [&](unsigned int m, const __nv_bfloat16* wm, float* om, float* ym,
-                          unsigned int cm) {
-        if (count > m && blockIdx.x >= first + across) {
-            first += across;
-            w = wm;
-            out = om;
-            y = ym;
-            cols = cm;
-            across = (cm + 31u) / 32u;
-        }
-    };
-    pick(1u, w1, out1, y1, cols1);
-    pick(2u, w2, out2, y2, cols2);
-    pick(3u, w3, out3, y3, cols3);
-    const unsigned int bx = blockIdx.x - first;
-    // The weights are constant: the first round streams while the previous kernel finishes.
-    OPT_PDL_LAUNCH();
+// Lane l's 16 bytes of a row's 512 a round are part l % 4 of the round's K block l / 4; a warp that
+// is not `live` reads nothing and computes zeros.
+__device__ __forceinline__ const __nv_bfloat16* q4p_rows_row(const __nv_bfloat16* w,
+                                                            unsigned int inner, unsigned int n0,
+                                                            bool live, unsigned long long k_at) {
+    return w + (unsigned long long)(live ? n0 : 0u) * inner + k_at + 8u * (threadIdx.x & 31u);
+}
+
+// The round of K blocks from kb0: 512 bytes of each of the warp's eight rows, zeros past the slice.
+__device__ __forceinline__ void q4p_rows_fetch(const __nv_bfloat16* row, unsigned int inner,
+                                               unsigned int kb0, unsigned int k_blocks, bool live,
+                                               uint4 next[8]) {
     const unsigned int lane = threadIdx.x & 31u;
-    const unsigned int warp = threadIdx.x >> 5;
+#pragma unroll
+    for (unsigned int i = 0; i < 8u; ++i) {
+        next[i] = live && kb0 + (lane >> 2) < k_blocks
+                      ? q4p_stream16(row + (unsigned long long)i * inner + kb0 * 32u)
+                      : make_uint4(0u, 0u, 0u, 0u);
+    }
+}
+
+// The tile's MMA chain from the first round in `next`, into the C fragment `acc` - rows g and
+// g + 8, columns 2q and 2q + 1. `tile` is the warp's own 8 x Q4P_ROWS_STRIDE shared stage.
+__device__ __forceinline__ void q4p_rows_tile(const __nv_bfloat16* row, const float* __restrict__ a,
+                                              unsigned int inner, unsigned int tokens, bool live,
+                                              unsigned int m0, unsigned long long k_at,
+                                              unsigned int k_blocks, unsigned char* tile,
+                                              uint4 next[8], float acc[4]) {
+    const unsigned int lane = threadIdx.x & 31u;
     const unsigned int g = lane >> 2;
     const unsigned int q = lane & 3u;
-    const unsigned int n0 = (bx * 4u + warp) * 8u;
-    const bool live = n0 < cols;
-    const unsigned int m0 = blockIdx.y * 16u;
-    const unsigned int slice = inner / segments;
-    const unsigned int k_blocks = slice >> 5;
-    const unsigned long long k_at = (unsigned long long)blockIdx.z * slice;
-    // Lane l's 16 bytes of a row's 512 a round are part l % 4 of the round's K block l / 4.
-    const __nv_bfloat16* row = w + (unsigned long long)(live ? n0 : 0u) * inner + k_at + 8u * lane;
-    uint4 next[8];
-    auto fetch = [&](unsigned int kb0) {
-#pragma unroll
-        for (unsigned int i = 0; i < 8u; ++i) {
-            next[i] = live && kb0 + (lane >> 2) < k_blocks
-                          ? q4p_stream16(row + (unsigned long long)i * inner + kb0 * 32u)
-                          : make_uint4(0u, 0u, 0u, 0u);
-        }
-    };
-    fetch(0);
-    OPT_PDL_WAIT();
-    unsigned char* tile = stage[warp];
     const bool low = m0 + g < tokens;
     const bool high = m0 + g + 8u < tokens;
     const float* a_low = a + (unsigned long long)(m0 + g) * inner + k_at + 2u * q;
@@ -425,7 +363,8 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
     // ldmatrix's row addresses: lane l points its matrix l / 8 - the 16-byte part j of a K block,
     // columns 8j to 8j + 7 - at staged row l % 8, so b[j] is word q of row g's part j.
     const uint32_t parts = om_smem(tile + (lane & 7u) * Q4P_ROWS_STRIDE + 16u * (lane >> 3));
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned int r = 0; r < 4u; ++r) acc[r] = 0.0f;
     for (unsigned int kb0 = 0; kb0 < k_blocks; kb0 += Q4P_ROWS_ROUND) {
         __syncwarp();
 #pragma unroll
@@ -433,7 +372,9 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
             *reinterpret_cast<uint4*>(tile + i * Q4P_ROWS_STRIDE + 16u * lane) = next[i];
         }
         __syncwarp();
-        if (kb0 + Q4P_ROWS_ROUND < k_blocks) fetch(kb0 + Q4P_ROWS_ROUND);
+        if (kb0 + Q4P_ROWS_ROUND < k_blocks) {
+            q4p_rows_fetch(row, inner, kb0 + Q4P_ROWS_ROUND, k_blocks, live, next);
+        }
 #pragma unroll
         for (unsigned int u = 0; u < Q4P_ROWS_ROUND; ++u) {
             if (kb0 + u >= k_blocks) break;
@@ -466,6 +407,123 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
             }
         }
     }
+}
+
+// q4p_dense_mma for a few rows - a decode step, a speculative verify, a short chunk - to the same
+// bits. An output is the same chain of MMAs in both: its slice's 32-column K blocks in order, each
+// two 16-column steps of a head MMA and then a remainder MMA, into an f32 accumulator that starts
+// at zero, with the head and remainder rounded as opt_mma_bf16_body rounds them, and every weight
+// and activation in the MMA slot it has there. Only the tile differs. The 128-row tile computes
+// 127 zero rows for one and keeps one K block in flight; here a warp is one m16 tile of rows by 8
+// columns, and a round is one 512-byte load of each of its eight weight rows - a lane 16 bytes,
+// eight K blocks, the stream a plain GEMV reads - staged in the warp's own shared tile and taken
+// back out with ldmatrix into the B fragments the 128-row tile's ldmatrix fills. The next round
+// streams while this one computes, and the activations come from L1.
+//
+// One launch takes up to four matrices of the same inner dimension over the same rows - a layer's
+// projections of one input - laid end to end along x, `count` of them: matrix m is `w[m]`, its
+// `cols[m]` columns split `segments[m]` ways, its slices `out[m]` and its finished outputs `y[m]`,
+// and a CTA computes one K slice of 32 columns of one of them exactly as a launch of that matrix
+// alone would. Matrix m takes (cols[m] / 32 rounded up) * segments[m] CTAs along x, a tile's
+// slices next to each other, so matrices of different splits (the attention's wide query beside
+// its narrow keys, values and indexer) share a launch. The grid is (sum of those, tokens / 16, 1)
+// rounded up, 128 threads, under q4p_dense_mma's constraints.
+//
+// One slice (`segments[m]` 1) stores finish(sum) to `out[m]`. A split stores slice s's sums to
+// out[m][s] as q4p_dense_mma does, and the tile's last CTA to land adds the slices in order into
+// `y[m]` and finishes them, as q4e_gemm_reduce would: `tickets` holds a zeroed counter for each of
+// the launch's split tiles, matrix by matrix, each split matrix's (cols[m] / 32) * (tokens / 16)
+// of them; an unsplit matrix takes none.
+//
+// The matrices of the same input whose shape the tile does not take - the GDN gates beside the
+// in-projections, the injection beside the hyper-connection's down projection, the shared-expert
+// gate beside the router - ride along instead of taking a launch each: up to two `riders`, each
+// q4p_gemm_rows's arguments over `a` (`inner` its columns, `tokens` its batch, its own split,
+// epilogue, partials and tickets). The CTAs past the `dense_x` along x of every y are numbered in
+// order and run rider 0's grid (rows * tokens / 128 rounded up, split, 1), then rider 1's, each
+// CTA exactly as q4p_gemm_rows runs it.
+extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
+    const float* __restrict__ a, unsigned int inner, unsigned int tokens,
+    unsigned int* __restrict__ tickets, int epilogue, float scale, unsigned int count,
+    const __nv_bfloat16* w0, float* out0, float* y0, unsigned int cols0, unsigned int segments0,
+    const __nv_bfloat16* w1, float* out1, float* y1, unsigned int cols1, unsigned int segments1,
+    const __nv_bfloat16* w2, float* out2, float* y2, unsigned int cols2, unsigned int segments2,
+    const __nv_bfloat16* w3, float* out3, float* y3, unsigned int cols3, unsigned int segments3,
+    unsigned int dense_x, unsigned int riders, const __nv_bfloat16* rw0, float* ry0, int rows0,
+    int epilogue0, float scale0, int split0, float* partials0, unsigned int* tickets0,
+    const __nv_bfloat16* rw1, float* ry1, int rows1, int epilogue1, float scale1, int split1,
+    float* partials1, unsigned int* tickets1) {
+    __shared__ __align__(16) unsigned char stage[4][8u * Q4P_ROWS_STRIDE];
+    static_assert(sizeof(stage) >= Q4P_GEMM_ROWS_STAGE * sizeof(__nv_bfloat16),
+                  "a rider stages its weights in the dense tile's stage");
+    if (blockIdx.x >= dense_x) {
+        unsigned int cta = blockIdx.x - dense_x + (gridDim.x - dense_x) * blockIdx.y;
+        OPT_PDL_ENTRY();
+        const auto ride = [&](const __nv_bfloat16* rw, float* ry, int rows, int rider_epilogue,
+                              float rider_scale, int split, float* partials,
+                              unsigned int* rider_tickets) {
+            const unsigned int blocks = ((unsigned int)rows * tokens + 127u) / 128u;
+            if (cta >= blocks * (unsigned int)split) {
+                cta -= blocks * (unsigned int)split;
+                return false;
+            }
+            q4p_gemm_rows_cta(rw, a, ry, rows, (int)inner, (int)tokens, rider_epilogue,
+                              rider_scale, split, partials, rider_tickets, cta % blocks,
+                              cta / blocks, 0u, blocks, reinterpret_cast<__nv_bfloat16*>(stage));
+            return true;
+        };
+        if (riders > 0u && !ride(rw0, ry0, rows0, epilogue0, scale0, split0, partials0, tickets0) &&
+            riders > 1u) {
+            ride(rw1, ry1, rows1, epilogue1, scale1, split1, partials1, tickets1);
+        }
+        return;
+    }
+    // This CTA's matrix: the one whose run of CTAs along x holds blockIdx.x. `first` counts the
+    // CTAs before it, `counted` the split tiles before it along one y (its tickets' offset).
+    const __nv_bfloat16* w = w0;
+    float* out = out0;
+    float* y = y0;
+    unsigned int cols = cols0;
+    unsigned int segments = segments0;
+    unsigned int first = 0;
+    unsigned int counted = 0;
+    unsigned int across = (cols0 + 31u) / 32u;
+    const auto pick = [&](unsigned int m, const __nv_bfloat16* wm, float* om, float* ym,
+                          unsigned int cm, unsigned int sm) {
+        if (count > m && blockIdx.x >= first + across * segments) {
+            first += across * segments;
+            counted += segments > 1u ? across : 0u;
+            w = wm;
+            out = om;
+            y = ym;
+            cols = cm;
+            segments = sm;
+            across = (cm + 31u) / 32u;
+        }
+    };
+    pick(1u, w1, out1, y1, cols1, segments1);
+    pick(2u, w2, out2, y2, cols2, segments2);
+    pick(3u, w3, out3, y3, cols3, segments3);
+    const unsigned int bx = (blockIdx.x - first) / segments;
+    const unsigned int z = blockIdx.x - first - bx * segments;
+    // The weights are constant: the first round streams while the previous kernel finishes.
+    OPT_PDL_LAUNCH();
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int g = lane >> 2;
+    const unsigned int q = lane & 3u;
+    const unsigned int n0 = (bx * 4u + warp) * 8u;
+    const bool live = n0 < cols;
+    const unsigned int m0 = blockIdx.y * 16u;
+    const unsigned int slice = inner / segments;
+    const unsigned int k_blocks = slice >> 5;
+    const unsigned long long k_at = (unsigned long long)z * slice;
+    const __nv_bfloat16* row = q4p_rows_row(w, inner, n0, live, k_at);
+    uint4 next[8];
+    q4p_rows_fetch(row, inner, 0u, k_blocks, live, next);
+    OPT_PDL_WAIT();
+    float acc[4];
+    q4p_rows_tile(row, a, inner, tokens, live, m0, k_at, k_blocks, stage[warp], next, acc);
     const unsigned long long plane = (unsigned long long)tokens * cols;
 #pragma unroll
     for (unsigned int half = 0; half < 2u; ++half) {
@@ -475,11 +533,11 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
         if (segments == 1u) {
             pair = make_float2(q4p_finish(pair.x, epilogue, scale), q4p_finish(pair.y, epilogue, scale));
         }
-        *reinterpret_cast<float2*>(out + blockIdx.z * plane + (unsigned long long)token * cols + n0 +
-                                   2u * q) = pair;
+        *reinterpret_cast<float2*>(out + z * plane + (unsigned long long)token * cols + n0 + 2u * q) =
+            pair;
     }
     if (segments == 1u ||
-        !q4p_last_slice(tickets + first * gridDim.y + blockIdx.y * across + bx, segments)) {
+        !q4p_last_slice(tickets + counted * gridDim.y + blockIdx.y * across + bx, segments)) {
         return;
     }
     // The tile's 32 columns of its tokens, four outputs a thread.
@@ -494,6 +552,54 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
         }
         y[at] = q4p_finish(value, epilogue, scale);
     }
+}
+
+// The hyper-connection's up projection and stream mix for a few rows, in one launch: the raw sums
+// a q4p_dense_rows launch of the up projection gives (one slice, no epilogue), mixed as
+// q4e_hyper_mix mixes them, to the same bits. Warp s of CTA b takes the n8 tile of stream s's rows
+// s * hidden + 8b to 8b + 7 - one of the tiles the plain launch runs, the same MMA chain - and the
+// CTA then mixes its eight columns of every stream: summed from zero a stream at a time,
+// sigmoid(raw) * normed, over hc. The grid is (hidden / 8, tokens / 16, 1) rounded up, 128
+// threads, hc at most 4, `lowrank` whole 32-column K blocks; `low` is the down projection's
+// [tokens][lowrank] and `normed` the [tokens][hc][hidden] streams.
+extern "C" __global__ __launch_bounds__(128) void q4p_hyper_up_rows(
+    const float* __restrict__ low, const __nv_bfloat16* __restrict__ up,
+    const float* __restrict__ normed, float* __restrict__ mixed, unsigned int lowrank,
+    unsigned int hidden, unsigned int hc, unsigned int tokens) {
+    __shared__ __align__(16) unsigned char stage[4][8u * Q4P_ROWS_STRIDE];
+    __shared__ float raw[4][16][8];
+    OPT_PDL_LAUNCH();
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int g = lane >> 2;
+    const unsigned int q = lane & 3u;
+    const unsigned int column0 = blockIdx.x * 8u;
+    const unsigned int m0 = blockIdx.y * 16u;
+    const bool live = warp < hc && column0 < hidden;
+    const unsigned int k_blocks = lowrank >> 5;
+    const __nv_bfloat16* row = q4p_rows_row(up, lowrank, warp * hidden + column0, live, 0ull);
+    uint4 next[8];
+    q4p_rows_fetch(row, lowrank, 0u, k_blocks, live, next);
+    OPT_PDL_WAIT();
+    float acc[4];
+    q4p_rows_tile(row, low, lowrank, tokens, live, m0, 0ull, k_blocks, stage[warp], next, acc);
+    raw[warp][g][2u * q] = acc[0];
+    raw[warp][g][2u * q + 1u] = acc[1];
+    raw[warp][g + 8u][2u * q] = acc[2];
+    raw[warp][g + 8u][2u * q + 1u] = acc[3];
+    __syncthreads();
+    const unsigned int t = threadIdx.x >> 3;
+    const unsigned int c = threadIdx.x & 7u;
+    const unsigned int token = m0 + t;
+    const unsigned int column = column0 + c;
+    if (token >= tokens || column >= hidden) return;
+    const unsigned long long base = (unsigned long long)token * hc * hidden + column;
+    float accumulator = 0.0f;
+    for (unsigned int stream = 0; stream < hc; ++stream) {
+        const unsigned long long at = base + (unsigned long long)stream * hidden;
+        accumulator += (1.0f / (1.0f + __expf(-raw[stream][t][c]))) * normed[at];
+    }
+    mixed[(unsigned long long)token * hidden + column] = accumulator / (float)hc;
 }
 
 // The token GEMM's two epilogues, applied in place after the MMA has written the raw dot

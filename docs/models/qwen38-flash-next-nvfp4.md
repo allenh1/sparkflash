@@ -139,6 +139,15 @@ rows in one bulk call, 64 `pread` workers over disjoint ranges, and decodes each
 the warm-up pass is gone. On a DGX Spark (TP=1), prefill went from 625, 586 and 578 tok/s to
 1,012, 1,009 and 985 at 2.2k, 8.6k and 17.1k tokens.
 
+The workers are the process's own now, started on the first read of more than one piece and
+kept, rather than scoped threads spawned for each call. A decode step reads its tokens' 16 rows a
+token, one shard and so one piece each, and in the serving process, under its memory pressure,
+`pthread_create` measured 0.1 to 2.3 ms a thread: about 3 ms of host time in a DFlash 2 step
+against 0.08 ms of `pread`, which an nsys trace with OS-runtime calls showed as the device idle
+between layer 0 and the rest of the step. The pool's workers wait on one queue and the caller
+takes pieces from it too; `tests/checkpoint_roundtrip.rs` holds a pooled read to each shard's own
+bytes in request order, from four threads at once.
+
 | variable | effect |
 | :-- | :-- |
 | `SPARKFLASH_QWEN4_PREFILL_MMA=0` | every chunk on the token kernels, at their 128-token chunk |
@@ -187,20 +196,31 @@ lane's slice and the overlap stream's copy. A decode step drops a reduce or epil
 nearly every projection it makes.
 
 Projections of one input go out as one `q4p_dense_rows` launch (`gemm_group`): up to four
-matrices the dense tile takes, with the same split, and up to two it does not, which ride the
+matrices the dense tile takes, each at its own split, and up to two it does not, which ride the
 launch as `q4p_gemm_rows` CTAs past the dense ones. A Gated DeltaNet layer's in-projection is one
-launch (q, k and v with z; the b and a gates riding), the MoE block's router, shared expert and
-shared up another (the shared expert's one-row gate riding), and the hyper connection's down
-projection carries its four-row injection. Each CTA finds its matrix or its rider from its column
-block, so a matrix's rows see exactly the work they would alone, and a rider runs the same device
-function on the same split as its own `q4p_gemm_rows` launch; the grouping fills the 48 SMs a
-narrow matrix leaves idle and takes the small launches out of the step. `tests/few_rows.rs` holds
-each twin to its tile for every row of a 1..=63-row launch, slices and finished outputs both, a
-grouped launch to each matrix's own and a rider to its own launch, and the dense and expert forms
-to an f64 bound; `device_parity`'s `a_continued_conversation_is_the_bits_of_a_cold_prefill` holds
-the whole forward to it. Every `q4p_` kernel now also launches with programmatic dependent
-launch, as the token kernels do; `crates/sparkflash-kernels/tests/pdl_entry.rs` holds each one to
-the dependency wait.
+launch (q, k and v with z; the b and a gates riding), attention's is another (q unsplit, its k, v
+and indexer projections in five slices), the MoE block's router, shared expert and shared up a
+third (the shared expert's one-row gate riding), and the hyper connection's down projection
+carries its four-row injection. Each CTA finds its matrix or its rider from its column block and
+its slice of K from that matrix's own split, so a matrix's rows see exactly the work they would
+alone, and a rider runs the same device function on the same split as its own `q4p_gemm_rows`
+launch; the grouping fills the 48 SMs a narrow matrix leaves idle and takes the small launches
+out of the step. `tests/few_rows.rs` holds each twin to its tile for every row of a 1..=63-row
+launch, slices and finished outputs both, a grouped launch to each matrix's own (matrices at
+different splits included) and a rider to its own launch, and the dense and expert forms to an
+f64 bound; `device_parity`'s `a_continued_conversation_is_the_bits_of_a_cold_prefill` holds the
+whole forward to it. Every `q4p_` kernel now also launches with programmatic dependent launch, as
+the token kernels do; `crates/sparkflash-kernels/tests/pdl_entry.rs` holds each one to the
+dependency wait.
+
+The hyper connection's up projection and its stream mix are one launch, `q4p_hyper_up_rows`. Warp
+s of a CTA runs the n8 tile of stream s's rows that the projection's own launch runs, the same MMA
+chain over the 320-wide low-rank input, into shared memory, and the CTA then mixes its eight
+columns of every stream as `q4e_hyper_mix` does: summed from zero a stream at a time, the sigmoid
+of the raw sum times the normed stream, over `hc`. It takes the unsplit projection of up to four
+streams, which is the release's (320 columns is ten K blocks); anything else runs the pair, and
+`tests/few_rows.rs` holds the launch to the pair's bits at 1, 5, 16 and 63 rows, on the release's
+shape and two smaller ones.
 
 Why a bf16 head and remainder rather than f32: the token kernels are f32 FMA chains, the host
 oracle's arithmetic, and f32 costs nothing in a step that is bound by reading weights. The tensor
@@ -229,8 +249,26 @@ critical-path split of a step and the `SPARKFLASH_QWEN4_PROF` stages put the dif
 at parity (the LM head 5.45 against 5.31 ms) and attention's q/k/v projection is faster. In the
 order of what they cost: the hyper connection's down and up projections (about 1.8 ms of a 52 ms
 step; 147 and 188 GB/s against the tiled GEMVs' 200 and 220), the Gated DeltaNet in-projection (0.9
-ms, 372 against 347 us a layer), attention's in-projection, whose four matrices take two splits and
+ms, 372 against 347 us a layer), attention's in-projection, whose four matrices took two splits and
 so two launches (0.45 ms), and the MoE block's group (0.3 ms).
+
+Since then the PLE read pool ([Prefill on the tensor cores](#prefill-on-the-tensor-cores); both
+paths), attention's in-projection as one launch and the fused hyper up (the tensor cores only)
+measure, at TP=1 over two alternating rounds of the same completions (TP=4 not re-measured):
+
+| | tensor cores (default) | token kernels |
+| :-- | ---: | ---: |
+| TP=1, no drafter (`SPARKFLASH_QWEN4_SPEC=0`) | 19.7 tok/s | 20.6 to 20.7 tok/s |
+| TP=1, DFlash 2 (`SPARKFLASH_QWEN4_SPEC=1`) | 30.4 to 30.5 tok/s | 30.3 to 31.2 tok/s |
+
+With the drafter the two are level within the runs' spread; without it the token kernels are 4.5%
+faster, about 2.3 ms of a 50.8 ms step. What is left is the short split launches. In isolation on
+DRAM-resident weights, a 640 x 2,560 matrix in five slices takes 23.5 us in `q4p_dense_rows`
+against a plain GEMV's 17.3, and 1,280 x 2,560 in two 38.6 against 30.6, where the larger shapes
+are within 3-7% of it (19,456 x 2,560: 435 against 423 us). Their splits are the wide chunk's, so
+the bits pin them. An L2 bulk prefetch ahead of the register stream (one, two or four rounds
+ahead, or a row's whole slice at entry) measured 0-12% slower on every one of those shapes, so the
+stream stays as it is.
 
 ### Speculative decode with DFlash 2
 

@@ -42,4 +42,57 @@ impl TensorSpec {
     pub fn storage_bytes(&self) -> u128 {
         self.dtype.storage_bytes(self.elements() as usize) as u128
     }
+
+    /// Whether `stored`, a tensor as its container reports it, holds this logical spec.
+    ///
+    /// That is the same dtype and shape, or, for an FP4 E2M1 spec, the NVFP4 packing of it:
+    /// ModelOpt stores the codes as `U8` ([crate::nvfp4::NVFP4_STORED_DTYPE]) with the last
+    /// dimension halved, the same bytes. A container that already reports the logical FP4 view
+    /// (the safetensors source does for `I8`) matches as itself. Anything else is a different
+    /// tensor.
+    pub fn is_stored_as(&self, stored: &TensorSpec) -> bool {
+        if self.dtype == stored.dtype && self.shape == stored.shape {
+            return true;
+        }
+        if self.dtype != DType::F4E2M1 || stored.dtype != crate::nvfp4::NVFP4_STORED_DTYPE {
+            return false;
+        }
+        match (self.shape.split_last(), stored.shape.split_last()) {
+            (Some((&logical, leading)), Some((&packed, stored_leading))) => {
+                leading == stored_leading && packed.checked_mul(2) == Some(logical)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(dtype: DType, shape: &[usize]) -> TensorSpec {
+        TensorSpec {
+            name: "experts.0.gate_proj.weight".to_owned(),
+            dtype,
+            shape: shape.to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_fp4_spec_is_stored_as_itself_or_as_modelopt_packs_it() {
+        let logical = spec(DType::F4E2M1, &[640, 2560]);
+        assert!(logical.is_stored_as(&logical));
+        // The released NVFP4 checkpoint: U8, two codes a byte along the last axis.
+        assert!(logical.is_stored_as(&spec(DType::U8, &[640, 1280])));
+        // Not the packing: the logical width as U8, a halved leading axis, another dtype.
+        assert!(!logical.is_stored_as(&spec(DType::U8, &[640, 2560])));
+        assert!(!logical.is_stored_as(&spec(DType::U8, &[320, 2560])));
+        assert!(!logical.is_stored_as(&spec(DType::F8E4M3, &[640, 1280])));
+        // Only FP4 has a packed form: a U8 spec is matched exactly, and so is every other dtype.
+        let bytes = spec(DType::U8, &[640, 1280]);
+        assert!(bytes.is_stored_as(&bytes));
+        assert!(!bytes.is_stored_as(&spec(DType::U8, &[640, 640])));
+        let bf16 = spec(DType::BF16, &[640, 2560]);
+        assert!(!bf16.is_stored_as(&spec(DType::U8, &[640, 1280])));
+    }
 }

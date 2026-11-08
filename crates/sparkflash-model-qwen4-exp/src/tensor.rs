@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The tensor plan of the released NVFP4 checkpoint.
+//! The tensor plan of a configuration this pack serves.
 //!
-//! The plan is derived from the configuration, not transcribed from the index, so the comparison
-//! is a real check: a shape this pack believes can disagree with the shard headers. The full
-//! checkpoint has 299,545 tensor names; this plan describes every one of them, because the byte
-//! total is only meaningful if it is complete.
+//! The names and shapes are the shared [ArchitectureTensorPlan]'s: the Qwen3.8 (`qwen4_exp`) and
+//! Qwen3.5/3.6 (`qwen3_5_moe`) walks live there beside GLM's, so the converter, the web console's
+//! fit and this arm read one plan. This module owns the released Qwen3.8 byte totals the tests pin
+//! and the step from a typed configuration to that plan.
 //!
-//! # Storage rules of this checkpoint (NVIDIA ModelOpt 0.46, `quant_algo: MIXED_PRECISION`)
+//! The plan is derived from the configuration, not transcribed from an index, so comparing it with
+//! a checkpoint is a real check: a shape this pack believes can disagree with the shard headers.
+//! The Qwen3.8 checkpoint has 299,545 tensor names and this plan describes every one of them,
+//! because a byte total is only meaningful if it is complete.
+//!
+//! # Storage rules of the Qwen3.8 checkpoint (NVIDIA ModelOpt 0.46, `quant_algo: MIXED_PRECISION`)
 //!
 //! * The 48 x 512 routed experts are **NVFP4**: a logical `[out, in]` weight is stored as
 //!   `U8 [out, in / 2]` (two E2M1 nibbles per byte), with `F8_E4M3 [out, in / 16]` block
@@ -31,14 +36,17 @@
 //! * Everything else (attention, shared experts, router, hyper-connections, embeddings, lm_head,
 //!   MTP non-expert) is BF16.
 //!
-//! The plan keeps the **logical** shape and lets `DType` imply packing, exactly as the V4.1 plan
-//! does, except that ModelOpt's NVFP4 weight is spelled `F4E2M1` here: the container reports
-//! `U8` with a halved last dimension, and the loader maps that to this logical spec.
+//! The plan keeps the **logical** shape and lets `DType` imply packing, except that ModelOpt's
+//! NVFP4 weight is spelled `F4E2M1`: the container reports `U8` with a halved last dimension, and
+//! the loader maps that to this logical spec.
 
-use sparkflash_weights::{DType, TensorPlan};
+use sparkflash_model::{Architecture, TpPlan};
+use sparkflash_ops::engine_plan::PlanError;
+use sparkflash_ops::tensor_plan::ArchitectureTensorPlan;
+pub use sparkflash_ops::tensor_plan::Role;
+use sparkflash_weights::TensorPlan;
 
-use crate::config::{ExpertQuant, LayerKind, Qwen4ExpConfig};
-use crate::ngram::PleLayout;
+use crate::config::{ConfigError, Qwen4ExpConfig};
 
 /// The prefix every language-model tensor carries in the released checkpoint.
 pub const LM_PREFIX: &str = "model.language_model";
@@ -66,50 +74,13 @@ pub const DEVICE_RESIDENT_BYTES: u128 = TEXT_PLE_BYTES - PLE_TABLE_BYTES;
 /// (one byte a weight and two bytes a 128x128 tile) in place of the packed E2M1 ones.
 pub const FP8_DEVICE_RESIDENT_BYTES: u128 = 130_706_097_920;
 
-/// What part of the model a tensor belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Role {
-    /// The token embedding table.
-    Embedding,
-    /// The (untied) LM head.
-    LmHead,
-    /// The final hyper-connection mixer that folds four streams into one.
-    HyperMixer,
-    /// A layer's attention hyper-connection (norm, bottleneck mixer, injection).
-    AttnHyper,
-    /// A layer's MLP hyper-connection.
-    MlpHyper,
-    /// The routed-expert router (BF16 `[512, 2560]`).
-    Router,
-    /// The shared expert and its sigmoid gate.
-    SharedExpert,
-    /// One routed expert's NVFP4 triple (weight, block scale, per-tensor scales).
-    Experts,
-    /// A Gated DeltaNet branch.
-    GatedDeltaNet,
-    /// A Qwen Sparse Attention branch (projections and norms).
-    SparseAttention,
-    /// The QSA indexer.
-    QsaIndexer,
-    /// The PLE projections, norms, convolution and hash constants.
-    PleAux,
-    /// The hashed PLE embedding table shards.
-    PleTable,
-    /// The MTP stage (planned, not served).
-    Mtp,
-    /// The vision tower (planned, not served).
-    Vision,
-}
-
-/// The tensor plan for one configuration.
+/// The single-rank tensor plan of one configuration.
 ///
 /// The lookups, byte totals and conformance checks are the shared [TensorPlan]'s, reached through
-/// `Deref`; this type owns only how the configuration becomes names and shapes.
-#[derive(Debug, Clone, Default)]
+/// `Deref`.
+#[derive(Debug, Clone)]
 pub struct Qwen4ExpTensorPlan {
     inner: TensorPlan<Role>,
-    /// The stored format of the routed experts, which is the only format the checkpoint varies.
-    expert_quant: ExpertQuant,
 }
 
 impl std::ops::Deref for Qwen4ExpTensorPlan {
@@ -120,595 +91,54 @@ impl std::ops::Deref for Qwen4ExpTensorPlan {
     }
 }
 
+type Planner = fn(&Architecture, TpPlan) -> Result<ArchitectureTensorPlan, PlanError>;
+
 impl Qwen4ExpTensorPlan {
     /// Plan the text language model and the PLE table: everything the device arm and the PLE
     /// reader touch.
-    #[must_use]
-    pub fn served(config: &Qwen4ExpConfig) -> Self {
-        let mut plan = Self {
-            expert_quant: config.expert_quant,
-            ..Self::default()
-        };
-        plan.push(
-            &format!("{LM_PREFIX}.embed_tokens.weight"),
-            DType::BF16,
-            vec![config.vocab_size, config.hidden_size],
-            Role::Embedding,
-        );
-        plan.push(
-            "lm_head.weight",
-            DType::BF16,
-            vec![config.vocab_size, config.hidden_size],
-            Role::LmHead,
-        );
-        plan.push_hyper(
-            &format!("{LM_PREFIX}.hyper_connection_mixer"),
-            config,
-            false,
-            Role::HyperMixer,
-        );
-        for layer in 0..config.num_hidden_layers {
-            let prefix = format!("{LM_PREFIX}.layers.{layer}");
-            plan.push_hyper(
-                &format!("{prefix}.attn_hyper_connection"),
-                config,
-                true,
-                Role::AttnHyper,
-            );
-            plan.push_hyper(
-                &format!("{prefix}.mlp_hyper_connection"),
-                config,
-                true,
-                Role::MlpHyper,
-            );
-            plan.push(
-                &format!("{prefix}.mlp.gate.weight"),
-                DType::BF16,
-                vec![config.num_experts, config.hidden_size],
-                Role::Router,
-            );
-            for name in ["gate_proj", "up_proj"] {
-                plan.push(
-                    &format!("{prefix}.mlp.shared_expert.{name}.weight"),
-                    DType::BF16,
-                    vec![config.shared_expert_intermediate_size, config.hidden_size],
-                    Role::SharedExpert,
-                );
-            }
-            plan.push(
-                &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
-                DType::BF16,
-                vec![config.hidden_size, config.shared_expert_intermediate_size],
-                Role::SharedExpert,
-            );
-            plan.push(
-                &format!("{prefix}.mlp.shared_expert_gate.weight"),
-                DType::BF16,
-                vec![1, config.hidden_size],
-                Role::SharedExpert,
-            );
-            for expert in 0..config.num_experts {
-                for (name, rows, columns) in [
-                    (
-                        "gate_proj",
-                        config.moe_intermediate_size,
-                        config.hidden_size,
-                    ),
-                    ("up_proj", config.moe_intermediate_size, config.hidden_size),
-                    (
-                        "down_proj",
-                        config.hidden_size,
-                        config.moe_intermediate_size,
-                    ),
-                ] {
-                    plan.push_expert(
-                        &format!("{prefix}.mlp.experts.{expert}.{name}"),
-                        rows,
-                        columns,
-                    );
-                }
-            }
-            match config.layer_types[layer] {
-                LayerKind::Linear => plan.push_gated_delta_net(&prefix, config),
-                LayerKind::Sparse => plan.push_sparse_attention(&prefix, config),
-            }
-            if config.ple_layer_ids.contains(&(layer + 1)) {
-                plan.push_ple(&prefix, config);
-            }
-        }
-        plan
+    ///
+    /// # Errors
+    /// A configuration the shared plan does not name.
+    pub fn served(config: &Qwen4ExpConfig) -> Result<Self, ConfigError> {
+        Self::build(config, ArchitectureTensorPlan::served)
+    }
+
+    /// Plan the served set plus the MTP stage, when the configuration names one.
+    ///
+    /// The synthetic checkpoint is written through this, so a fixture whose configuration names an
+    /// MTP layer actually ships its tensors.
+    ///
+    /// # Errors
+    /// As [Self::served].
+    pub fn served_and_mtp(config: &Qwen4ExpConfig) -> Result<Self, ConfigError> {
+        Self::build(config, ArchitectureTensorPlan::served_and_mtp)
     }
 
     /// Plan the whole checkpoint, adding the MTP stage and the vision tower.
     ///
     /// The byte total of this plan is the identity the tests pin against the released
     /// `model.safetensors.index.json`'s `metadata.total_size`.
-    #[must_use]
-    pub fn checkpoint(config: &Qwen4ExpConfig) -> Self {
-        let mut plan = Self::served(config);
-        plan.push_mtp(config);
-        plan.push_vision(config);
-        plan
-    }
-
-    fn push(&mut self, name: &str, dtype: DType, shape: Vec<usize>, role: Role) {
-        self.inner.push(name, dtype, shape, role);
-    }
-
-    fn push_hyper(&mut self, prefix: &str, config: &Qwen4ExpConfig, inject: bool, role: Role) {
-        let width = config.hyper_width();
-        self.push(
-            &format!("{prefix}.hc_norm.weight"),
-            DType::BF16,
-            vec![width],
-            role,
-        );
-        self.push(
-            &format!("{prefix}.input_mix_weight_down.weight"),
-            DType::BF16,
-            vec![config.hc_lowrank, width],
-            role,
-        );
-        self.push(
-            &format!("{prefix}.input_mix_weight_up.weight"),
-            DType::BF16,
-            vec![width, config.hc_lowrank],
-            role,
-        );
-        if inject {
-            self.push(
-                &format!("{prefix}.block_inject_weight.weight"),
-                DType::BF16,
-                vec![config.hc_count, width],
-                role,
-            );
-        }
-    }
-
-    fn push_expert(&mut self, prefix: &str, rows: usize, columns: usize) {
-        match self.expert_quant {
-            ExpertQuant::Nvfp4 => self.inner.push_nvfp4(prefix, rows, columns, Role::Experts),
-            // The official FP8 release keeps one BF16 inverse scale a 128x128 tile.
-            ExpertQuant::Fp8Block => {
-                self.inner
-                    .push_fp8_block(prefix, rows, columns, 128, DType::BF16, Role::Experts)
-            }
-        }
-    }
-
-    fn push_gated_delta_net(&mut self, prefix: &str, config: &Qwen4ExpConfig) {
-        let prefix = format!("{prefix}.linear_attn");
-        let hidden = config.hidden_size;
-        self.push(
-            &format!("{prefix}.in_proj_qkv.weight"),
-            DType::BF16,
-            vec![config.linear_conv_width(), hidden],
-            Role::GatedDeltaNet,
-        );
-        self.push(
-            &format!("{prefix}.in_proj_z.weight"),
-            DType::BF16,
-            vec![config.linear_value_width(), hidden],
-            Role::GatedDeltaNet,
-        );
-        for name in ["in_proj_a", "in_proj_b"] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![config.linear_num_value_heads, hidden],
-                Role::GatedDeltaNet,
-            );
-        }
-        self.push(
-            &format!("{prefix}.out_proj.weight"),
-            DType::BF16,
-            vec![hidden, config.linear_value_width()],
-            Role::GatedDeltaNet,
-        );
-        self.push(
-            &format!("{prefix}.conv1d.weight"),
-            DType::BF16,
-            vec![config.linear_conv_width(), 1, config.linear_conv_kernel_dim],
-            Role::GatedDeltaNet,
-        );
-        self.push(
-            &format!("{prefix}.A_log"),
-            DType::BF16,
-            vec![config.linear_num_value_heads],
-            Role::GatedDeltaNet,
-        );
-        self.push(
-            &format!("{prefix}.dt_bias"),
-            DType::BF16,
-            vec![config.linear_num_value_heads],
-            Role::GatedDeltaNet,
-        );
-        self.push(
-            &format!("{prefix}.norm.weight"),
-            DType::BF16,
-            vec![config.linear_value_head_dim],
-            Role::GatedDeltaNet,
-        );
-    }
-
-    fn push_sparse_attention(&mut self, prefix: &str, config: &Qwen4ExpConfig) {
-        let prefix = format!("{prefix}.self_attn");
-        let hidden = config.hidden_size;
-        self.push(
-            &format!("{prefix}.q_proj.weight"),
-            DType::BF16,
-            vec![config.q_proj_width(), hidden],
-            Role::SparseAttention,
-        );
-        for name in ["k_proj", "v_proj"] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![config.kv_proj_width(), hidden],
-                Role::SparseAttention,
-            );
-        }
-        self.push(
-            &format!("{prefix}.o_proj.weight"),
-            DType::BF16,
-            vec![hidden, config.attn_out_width()],
-            Role::SparseAttention,
-        );
-        for name in ["q_norm", "k_norm"] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![config.head_dim],
-                Role::SparseAttention,
-            );
-        }
-        self.push(
-            &format!("{prefix}.indexer.index_qk_proj.weight"),
-            DType::BF16,
-            vec![
-                (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim,
-                hidden,
-            ],
-            Role::QsaIndexer,
-        );
-        for name in ["q_layernorm", "k_layernorm"] {
-            self.push(
-                &format!("{prefix}.indexer.{name}.weight"),
-                DType::BF16,
-                vec![config.indexer_head_dim],
-                Role::QsaIndexer,
-            );
-        }
-    }
-
-    fn push_ple(&mut self, prefix: &str, config: &Qwen4ExpConfig) {
-        let prefix = format!("{prefix}.ple");
-        let width = config.hyper_width();
-        self.push(
-            &format!("{prefix}.key_proj.weight"),
-            DType::BF16,
-            vec![width, config.ple_embed_dim],
-            Role::PleAux,
-        );
-        self.push(
-            &format!("{prefix}.value_proj.weight"),
-            DType::BF16,
-            vec![config.hidden_size, config.ple_embed_dim],
-            Role::PleAux,
-        );
-        for name in ["norm_key", "norm_query", "norm_conv"] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![width],
-                Role::PleAux,
-            );
-        }
-        self.push(
-            &format!("{prefix}.conv1d.weight"),
-            DType::BF16,
-            vec![width, 1, config.ple_conv_kernel_size],
-            Role::PleAux,
-        );
-        self.push(
-            &format!("{prefix}.ple_embedding.layer_multipliers"),
-            DType::I64,
-            vec![config.ngram_size],
-            Role::PleTable,
-        );
-        self.push(
-            &format!("{prefix}.ple_embedding.ngram_heads_offsets"),
-            DType::I64,
-            vec![config.ngram_heads()],
-            Role::PleTable,
-        );
-        self.push(
-            &format!("{prefix}.ple_embedding.ngram_heads_vocab_sizes"),
-            DType::I64,
-            vec![config.ngram_heads()],
-            Role::PleTable,
-        );
-        self.push(
-            &format!("{prefix}.ple_embedding.ngram_embedding.weight_scale"),
-            DType::BF16,
-            vec![1],
-            Role::PleTable,
-        );
-        let rows = PleLayout::new(config).padded_rows;
-        let per_shard = rows / config.split_ngram_parts as u64;
-        for shard in 0..config.split_ngram_parts {
-            self.push(
-                &format!("{prefix}.ple_embedding.ngram_embedding.shard_{shard}.weight"),
-                DType::F8E4M3,
-                vec![per_shard as usize, config.ngram_head_dim()],
-                Role::PleTable,
-            );
-        }
-    }
-
-    /// The served plan, plus the MTP stage when the configuration carries one.
     ///
-    /// The synthetic checkpoint is written through this, so a fixture whose configuration names an
-    /// MTP layer actually ships its tensors.
-    #[must_use]
-    pub fn served_and_mtp(config: &Qwen4ExpConfig) -> Self {
-        let mut plan = Self::served(config);
-        if config.mtp_num_hidden_layers > 0 {
-            plan.push_mtp(config);
-        }
-        plan
+    /// # Errors
+    /// As [Self::served].
+    pub fn checkpoint(config: &Qwen4ExpConfig) -> Result<Self, ConfigError> {
+        Self::build(config, ArchitectureTensorPlan::checkpoint)
     }
 
-    fn push_mtp(&mut self, config: &Qwen4ExpConfig) {
-        // One MTP layer, a sparse-attention + MoE block with its own hyper-connections, plus the
-        // embedding/hidden fusion projections and the pre-norms.
-        let hidden = config.hidden_size;
-        let prefix = "mtp";
-        for name in ["fc_embedding", "fc_hidden"] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![hidden, hidden],
-                Role::Mtp,
-            );
-        }
-        self.push_hyper(
-            &format!("{prefix}.hyper_connection_mixer"),
-            config,
-            false,
-            Role::Mtp,
-        );
-        self.push(
-            &format!("{prefix}.pre_fc_norm_embedding.weight"),
-            DType::BF16,
-            vec![hidden],
-            Role::Mtp,
-        );
-        self.push(
-            &format!("{prefix}.pre_fc_norm_hidden.weight"),
-            DType::BF16,
-            vec![config.hyper_width()],
-            Role::Mtp,
-        );
-        let layer = format!("{prefix}.layers.0");
-        self.push_hyper(
-            &format!("{layer}.attn_hyper_connection"),
-            config,
-            true,
-            Role::Mtp,
-        );
-        self.push_hyper(
-            &format!("{layer}.mlp_hyper_connection"),
-            config,
-            true,
-            Role::Mtp,
-        );
-        self.push(
-            &format!("{layer}.self_attn.q_proj.weight"),
-            DType::BF16,
-            vec![config.q_proj_width(), hidden],
-            Role::Mtp,
-        );
-        for name in ["k_proj", "v_proj"] {
-            self.push(
-                &format!("{layer}.self_attn.{name}.weight"),
-                DType::BF16,
-                vec![config.kv_proj_width(), hidden],
-                Role::Mtp,
-            );
-        }
-        self.push(
-            &format!("{layer}.self_attn.o_proj.weight"),
-            DType::BF16,
-            vec![hidden, config.attn_out_width()],
-            Role::Mtp,
-        );
-        for name in ["q_norm", "k_norm"] {
-            self.push(
-                &format!("{layer}.self_attn.{name}.weight"),
-                DType::BF16,
-                vec![config.head_dim],
-                Role::Mtp,
-            );
-        }
-        self.push(
-            &format!("{layer}.self_attn.indexer.index_qk_proj.weight"),
-            DType::BF16,
-            vec![
-                (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim,
-                hidden,
-            ],
-            Role::Mtp,
-        );
-        for name in ["q_layernorm", "k_layernorm"] {
-            self.push(
-                &format!("{layer}.self_attn.indexer.{name}.weight"),
-                DType::BF16,
-                vec![config.indexer_head_dim],
-                Role::Mtp,
-            );
-        }
-        self.push(
-            &format!("{layer}.mlp.gate.weight"),
-            DType::BF16,
-            vec![config.num_experts, hidden],
-            Role::Mtp,
-        );
-        for name in ["gate_proj", "up_proj"] {
-            self.push(
-                &format!("{layer}.mlp.shared_expert.{name}.weight"),
-                DType::BF16,
-                vec![config.shared_expert_intermediate_size, hidden],
-                Role::Mtp,
-            );
-        }
-        self.push(
-            &format!("{layer}.mlp.shared_expert.down_proj.weight"),
-            DType::BF16,
-            vec![hidden, config.shared_expert_intermediate_size],
-            Role::Mtp,
-        );
-        self.push(
-            &format!("{layer}.mlp.shared_expert_gate.weight"),
-            DType::BF16,
-            vec![1, hidden],
-            Role::Mtp,
-        );
-        // The MTP routed experts are FP8 with BF16 scales on 128x128 tiles, not NVFP4.
-        for expert in 0..config.num_experts {
-            for (name, rows, columns) in [
-                ("gate_proj", config.moe_intermediate_size, hidden),
-                ("up_proj", config.moe_intermediate_size, hidden),
-                ("down_proj", hidden, config.moe_intermediate_size),
-            ] {
-                self.inner.push_fp8_block(
-                    &format!("{layer}.mlp.experts.{expert}.{name}"),
-                    rows,
-                    columns,
-                    128,
-                    DType::BF16,
-                    Role::Mtp,
-                );
-            }
-        }
-    }
-
-    fn push_vision(&mut self, config: &Qwen4ExpConfig) {
-        let width = config.vision_hidden_size.unwrap_or(1152);
-        let depth = config.vision_depth.unwrap_or(27);
-        let prefix = "model.visual";
-        self.push(
-            &format!("{prefix}.patch_embed.proj.weight"),
-            DType::BF16,
-            vec![width, 3 * 2 * 16 * 16],
-            Role::Vision,
-        );
-        self.push(
-            &format!("{prefix}.patch_embed.proj.bias"),
-            DType::BF16,
-            vec![width],
-            Role::Vision,
-        );
-        self.push(
-            &format!("{prefix}.pos_embed.weight"),
-            DType::BF16,
-            vec![2304, width],
-            Role::Vision,
-        );
-        for block in 0..depth {
-            let prefix = format!("{prefix}.blocks.{block}");
-            for name in ["norm1", "norm2"] {
-                self.push(
-                    &format!("{prefix}.{name}.weight"),
-                    DType::BF16,
-                    vec![width],
-                    Role::Vision,
-                );
-                self.push(
-                    &format!("{prefix}.{name}.bias"),
-                    DType::BF16,
-                    vec![width],
-                    Role::Vision,
-                );
-            }
-            self.push(
-                &format!("{prefix}.attn.qkv.weight"),
-                DType::BF16,
-                vec![3 * width, width],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.attn.qkv.bias"),
-                DType::BF16,
-                vec![3 * width],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.attn.proj.weight"),
-                DType::BF16,
-                vec![width, width],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.attn.proj.bias"),
-                DType::BF16,
-                vec![width],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.mlp.linear_fc1.weight"),
-                DType::BF16,
-                vec![4304, width],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.mlp.linear_fc1.bias"),
-                DType::BF16,
-                vec![4304],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.mlp.linear_fc2.weight"),
-                DType::BF16,
-                vec![width, 4304],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.mlp.linear_fc2.bias"),
-                DType::BF16,
-                vec![width],
-                Role::Vision,
-            );
-        }
-        for (name, rows, columns) in [
-            ("merger.linear_fc1", 4608, 4608),
-            ("merger.linear_fc2", 2560, 4608),
-        ] {
-            self.push(
-                &format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![rows, columns],
-                Role::Vision,
-            );
-            self.push(
-                &format!("{prefix}.{name}.bias"),
-                DType::BF16,
-                vec![rows],
-                Role::Vision,
-            );
-        }
-        self.push(
-            &format!("{prefix}.merger.norm.weight"),
-            DType::BF16,
-            vec![1152],
-            Role::Vision,
-        );
-        self.push(
-            &format!("{prefix}.merger.norm.bias"),
-            DType::BF16,
-            vec![1152],
-            Role::Vision,
-        );
+    /// The plan of the document the typed configuration renders.
+    ///
+    /// The typed fields are what the arm executes, so they are what is planned: a fixture that
+    /// edits a width plans the edited width, and a released configuration renders back to the
+    /// architecture it was parsed from (the tests pin that for every carried release).
+    fn build(config: &Qwen4ExpConfig, planner: Planner) -> Result<Self, ConfigError> {
+        let architecture = crate::architecture::architecture_from_json(&config.to_json())?;
+        let tp = TpPlan::new(1, 0)
+            .map_err(|error| ConfigError::Invalid(format!("a one-rank plan: {error}")))?;
+        let plan = planner(&architecture, tp)
+            .map_err(|error| ConfigError::Invalid(format!("the tensor plan: {error}")))?;
+        Ok(Self {
+            inner: plan.into_plan(),
+        })
     }
 }
 
@@ -716,14 +146,14 @@ impl Qwen4ExpTensorPlan {
 mod tests {
     use sparkflash_model::TpPlan;
     use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
-    use sparkflash_weights::TensorSpec;
+    use sparkflash_weights::{DType, TensorSpec};
 
     use super::*;
 
     #[test]
     fn the_served_plan_matches_the_released_text_and_ple_bytes() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         assert_eq!(plan.storage_bytes(), TEXT_PLE_BYTES);
         assert_eq!(plan.role_bytes(Role::PleTable), PLE_TABLE_BYTES);
         assert_eq!(
@@ -737,7 +167,8 @@ mod tests {
         );
     }
 
-    /// The shared architecture plan emits exactly the specs this family plan does.
+    /// The released document's plan and the plan of the document its typed configuration renders
+    /// are the same specs: the arm plans what it parsed.
     fn assert_shared_plan(
         shared: &ArchitectureTensorPlan,
         legacy: &Qwen4ExpTensorPlan,
@@ -781,28 +212,36 @@ mod tests {
     }
 
     #[test]
-    fn the_shared_architecture_plan_reproduces_the_nvfp4_checkpoint() {
+    fn the_rendered_nvfp4_document_plans_the_released_checkpoint() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
         let tp = TpPlan::new(1, 0).expect("one rank");
         let shared = ArchitectureTensorPlan::checkpoint(&config.architecture, tp)
             .expect("the shared plan builds");
-        assert_shared_plan(&shared, &Qwen4ExpTensorPlan::checkpoint(&config), "nvfp4");
+        assert_shared_plan(
+            &shared,
+            &Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds"),
+            "nvfp4",
+        );
         let served = ArchitectureTensorPlan::served(&config.architecture, tp)
             .expect("the shared served plan builds");
         assert_shared_plan(
             &served,
-            &Qwen4ExpTensorPlan::served(&config),
+            &Qwen4ExpTensorPlan::served(&config).expect("the plan builds"),
             "nvfp4 served",
         );
     }
 
     #[test]
-    fn the_shared_architecture_plan_reproduces_the_fp8_served_set() {
+    fn the_rendered_fp8_document_plans_the_released_served_set() {
         let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
         let tp = TpPlan::new(1, 0).expect("one rank");
         let shared = ArchitectureTensorPlan::served(&config.architecture, tp)
             .expect("the shared plan builds");
-        assert_shared_plan(&shared, &Qwen4ExpTensorPlan::served(&config), "fp8 served");
+        assert_shared_plan(
+            &shared,
+            &Qwen4ExpTensorPlan::served(&config).expect("the plan builds"),
+            "fp8 served",
+        );
         assert_eq!(
             shared.storage_bytes() - shared.role_bytes(TensorRole::PleTable),
             FP8_DEVICE_RESIDENT_BYTES
@@ -810,9 +249,27 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_qwen36_document_plans_the_released_checkpoint() {
+        let config = Qwen4ExpConfig::from_json(include_str!(
+            "../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json"
+        ))
+        .expect("the carried Qwen3.6 document parses");
+        assert_eq!(config.family(), "qwen3_5_moe");
+        assert_eq!(config.dense_quant, crate::config::DenseQuant::Fp8Block);
+        assert_eq!(config.expert_quant, crate::config::ExpertQuant::Fp8Block);
+        let tp = TpPlan::new(1, 0).expect("one rank");
+        let shared = ArchitectureTensorPlan::checkpoint(&config.architecture, tp)
+            .expect("the shared plan builds");
+        let rendered = Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds");
+        assert_shared_plan(&shared, &rendered, "qwen3.6 fp8");
+        // The released index: 64,196 names.
+        assert_eq!(rendered.len(), 64_196);
+    }
+
+    #[test]
     fn the_full_plan_matches_the_released_index_total() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::checkpoint(&config);
+        let plan = Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds");
         assert_eq!(plan.storage_bytes(), FULL_CHECKPOINT_BYTES);
         assert_eq!(plan.role_bytes(Role::Mtp), MTP_BYTES);
         assert_eq!(plan.role_bytes(Role::Vision), VISION_BYTES);
@@ -822,7 +279,7 @@ mod tests {
     #[test]
     fn the_fp8_release_resident_total_is_measured() {
         let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         let resident = plan.storage_bytes() - plan.role_bytes(Role::PleTable);
         assert_eq!(resident, FP8_DEVICE_RESIDENT_BYTES);
     }
@@ -830,7 +287,7 @@ mod tests {
     #[test]
     fn the_fp8_release_plans_block_scaled_experts() {
         let config = Qwen4ExpConfig::qwen38_flash_next_fp8().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         let prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj";
         let weight = plan
             .spec(&format!("{prefix}.weight"))
@@ -863,8 +320,8 @@ mod tests {
     #[test]
     fn the_served_plan_accepts_the_released_checkpoints_unserved_tensors() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let served = Qwen4ExpTensorPlan::served(&config);
-        let full = Qwen4ExpTensorPlan::checkpoint(&config);
+        let served = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
+        let full = Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds");
         // The released checkpoint is a superset of the served set: the MTP stage and the vision
         // tower are in the file and not in the arm. 299,545 - 296,111 = 3,434 of them.
         let accepted = served
@@ -878,7 +335,7 @@ mod tests {
     #[test]
     fn the_ple_table_role_is_the_shards_plus_their_metadata() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         // The device arm's upload set is everything except the PLE table role, and that role is
         // more than the 128 shards: three I64 hash vectors and a BF16 scale ride with them. A
         // loader that subtracts only the shards overshoots the resident total by these 282 bytes.
@@ -898,8 +355,8 @@ mod tests {
     #[test]
     fn a_tensor_neither_plan_names_is_refused() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let served = Qwen4ExpTensorPlan::served(&config);
-        let full = Qwen4ExpTensorPlan::checkpoint(&config);
+        let served = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
+        let full = Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds");
         let mut names: Vec<String> = full.names().map(str::to_owned).collect();
         names.push("model.visual.not_a_tensor.weight".to_owned());
         let refused = served
@@ -911,8 +368,8 @@ mod tests {
     #[test]
     fn a_missing_served_tensor_is_refused() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let served = Qwen4ExpTensorPlan::served(&config);
-        let full = Qwen4ExpTensorPlan::checkpoint(&config);
+        let served = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
+        let full = Qwen4ExpTensorPlan::checkpoint(&config).expect("the plan builds");
         let dropped = "lm_head.weight";
         let names: Vec<String> = full
             .names()
@@ -928,7 +385,7 @@ mod tests {
     #[test]
     fn the_served_plan_names_the_tensors_the_device_arm_reads() {
         let config = Qwen4ExpConfig::qwen38_flash_next_nvfp4().expect("the carried config parses");
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         assert_eq!(
             plan.spec("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
                 .expect("the first linear projection is planned")
@@ -971,7 +428,7 @@ mod tests {
     #[test]
     fn the_tiny_plan_is_small_but_complete() {
         let config = Qwen4ExpConfig::tiny();
-        let plan = Qwen4ExpTensorPlan::served(&config);
+        let plan = Qwen4ExpTensorPlan::served(&config).expect("the plan builds");
         assert!(plan.len() > 80);
         assert_eq!(
             plan.spec("model.language_model.layers.1.self_attn.q_proj.weight")

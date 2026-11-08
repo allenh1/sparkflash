@@ -501,6 +501,7 @@ mod tests {
                     dynamic_activations: true,
                 }
             }
+            crate::config::ExpertQuant::Bf16 => sparkflash_model::architecture::WeightFormat::Bf16,
         };
         if config.architecture.mtp.is_some() {
             config.architecture.quantization.mtp_expert_format =

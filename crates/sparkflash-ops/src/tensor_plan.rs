@@ -210,7 +210,7 @@ impl ArchitectureTensorPlan {
             experts
         };
         match architecture.family.as_str() {
-            "qwen4_exp" => builder.qwen(architecture, mtp)?,
+            "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
             "glm5_next" => builder.glm(architecture, mtp)?,
             other => {
                 return Err(PlanError::Invalid(format!(
@@ -303,6 +303,12 @@ impl ArchitectureTensorPlan {
     pub const fn plan(&self) -> &TensorPlan<Role> {
         &self.plan
     }
+
+    /// The logical plan by value, for a caller that keeps only the names, shapes and roles.
+    #[must_use]
+    pub fn into_plan(self) -> TensorPlan<Role> {
+        self.plan
+    }
 }
 
 impl std::ops::Deref for ArchitectureTensorPlan {
@@ -317,6 +323,8 @@ impl std::ops::Deref for ArchitectureTensorPlan {
 enum LinearSplit {
     Whole,
     Rows,
+    /// Rows split by key/value head, which a world wider than the KV heads replicates.
+    KvRows,
     Columns,
 }
 
@@ -556,11 +564,13 @@ impl Builder {
                     vec![hidden.div_ceil(block), local.div_ceil(block)]
                 };
                 // The inverse scale covers a whole tile, so its run is the weight's run in
-                // tiles: the same offset and count, divided by the block width.
+                // tiles: the same offset and count, divided by the block width. A rank starts on
+                // a tile edge; one rank holding the whole axis may end in a partial tile, which
+                // still has its scale.
                 let scale_run = run.map(|run| RankRun {
                     offset: run.offset / block,
-                    count: run.count / block,
-                    total: run.total / block,
+                    count: run.count.div_ceil(block),
+                    total: run.total.div_ceil(block),
                 });
                 self.push(
                     format!("{prefix}.weight_scale_inv"),
@@ -631,28 +641,29 @@ impl Builder {
             } if block_n > 0 => {
                 let block = block_n.max(1);
                 let scale = scale_dtype_of(scale_dtype);
-                let split = match split {
+                let axis = match split {
                     LinearSplit::Whole => None,
-                    LinearSplit::Rows => Some(self.tp.split(rows, TpAxis::Heads, 1)?),
+                    LinearSplit::Rows => Some((true, self.tp.split(rows, TpAxis::Heads, 1)?)),
+                    LinearSplit::KvRows => Some((true, self.tp.split(rows, TpAxis::KvHeads, 1)?)),
                     LinearSplit::Columns => {
-                        Some(self.tp.split(columns, TpAxis::Intermediate, 1)?)
+                        Some((false, self.tp.split(columns, TpAxis::Intermediate, 1)?))
                     }
                 };
                 let scale_shape = [rows.div_ceil(block), columns.div_ceil(block)];
-                let weight_rank = match (split, split) {
-                    (Some(split), _) if split.total == rows => vec![split.padded, columns],
-                    (Some(split), _) => vec![rows, split.padded],
-                    (None, _) => vec![rows, columns],
+                // The split's axis is the one the caller named, never inferred from the totals:
+                // a square projection's row and column totals are equal.
+                let (weight_rank, scale_rank) = match axis {
+                    Some((true, split)) => (
+                        vec![split.padded, columns],
+                        vec![split.padded.div_ceil(block), scale_shape[1]],
+                    ),
+                    Some((false, split)) => (
+                        vec![rows, split.padded],
+                        vec![scale_shape[0], split.padded.div_ceil(block)],
+                    ),
+                    None => (vec![rows, columns], scale_shape.to_vec()),
                 };
-                let scale_rank = match (split, split) {
-                    (Some(split), _) if split.total == rows => {
-                        vec![split.padded.div_ceil(block), scale_shape[1]]
-                    }
-                    (Some(split), _) => {
-                        vec![scale_shape[0], split.padded.div_ceil(block)]
-                    }
-                    (None, _) => scale_shape.to_vec(),
-                };
+                let split = axis.map(|(_, split)| split);
                 let run = split.map(RankRun::even);
                 let scale_run = split.map(|split| RankRun {
                     offset: split.offset / block,
@@ -693,6 +704,14 @@ impl Builder {
                         role,
                     )?;
                 }
+                LinearSplit::KvRows => {
+                    self.kv_rows(
+                        format!("{prefix}.weight"),
+                        DType::BF16,
+                        [rows, columns],
+                        role,
+                    )?;
+                }
                 LinearSplit::Columns => {
                     self.columns(
                         format!("{prefix}.weight"),
@@ -713,8 +732,13 @@ impl Builder {
                 "the architecture has no layers".to_owned(),
             ));
         };
-        let hyper = hyper_of(reference)?;
-        let hyper_width = hyper.streams * hidden;
+        // Qwen3.8 mixes several hyper-connection streams; Qwen3.5/3.6 keep one plain residual
+        // stream with a pre-norm on each branch and a final norm. Every other tensor carries the
+        // same name in the two families, so one walk plans both.
+        let hyper = hyper_or_plain(reference);
+        let hyper_width = hyper.map_or(hidden, |hyper| hyper.streams * hidden);
+        let dense = qwen_dense_format(self.dense_format);
+        let experts = qwen_expert_format(self.expert_format);
         self.whole(
             format!("{LM_PREFIX}.embed_tokens.weight"),
             DType::BF16,
@@ -727,187 +751,62 @@ impl Builder {
             vec![arch.vocab_size, hidden],
             Role::LmHead,
         );
-        self.qwen_hyper(
-            &format!("{LM_PREFIX}.hyper_connection_mixer"),
-            hyper,
-            hidden,
-            false,
-            Role::Hyper,
-        );
+        match hyper {
+            Some(hyper) => self.qwen_hyper(
+                &format!("{LM_PREFIX}.hyper_connection_mixer"),
+                hyper,
+                hidden,
+                false,
+                Role::Hyper,
+            ),
+            None => self.whole(
+                format!("{LM_PREFIX}.norm.weight"),
+                DType::BF16,
+                vec![hidden],
+                Role::Norm,
+            ),
+        }
         for layer in &arch.layers {
             let prefix = format!("{LM_PREFIX}.layers.{}", layer.index);
-            let layer_hyper = hyper_of(layer)?;
-            self.qwen_hyper(
-                &format!("{prefix}.attn_hyper_connection"),
-                layer_hyper,
-                hidden,
-                true,
-                Role::Hyper,
-            );
-            self.qwen_hyper(
-                &format!("{prefix}.mlp_hyper_connection"),
-                layer_hyper,
-                hidden,
-                true,
-                Role::Hyper,
-            );
+            match (&layer.residual, hyper) {
+                (Residual::Hyper(layer_hyper), Some(_)) => {
+                    for branch in ["attn", "mlp"] {
+                        self.qwen_hyper(
+                            &format!("{prefix}.{branch}_hyper_connection"),
+                            layer_hyper,
+                            hidden,
+                            true,
+                            Role::Hyper,
+                        );
+                    }
+                }
+                (Residual::Plain, None) => self.qwen_branch_norms(&prefix, hidden, Role::Norm),
+                _ => {
+                    return Err(PlanError::Invalid(format!(
+                        "Qwen layer {} changes the residual kind layer {} set",
+                        layer.index, reference.index
+                    )));
+                }
+            }
             let Ffn::Moe(moe) = &layer.ffn else {
                 return Err(PlanError::Invalid(format!(
                     "Qwen layer {} is not a MoE layer",
                     layer.index
                 )));
             };
-            self.whole(
-                format!("{prefix}.mlp.gate.weight"),
-                DType::BF16,
-                vec![moe.routed_experts, hidden],
-                Role::Router,
-            );
-            for name in ["gate_proj", "up_proj"] {
-                self.rows(
-                    format!("{prefix}.mlp.shared_expert.{name}.weight"),
-                    DType::BF16,
-                    [moe.shared_intermediate, hidden],
-                    Role::SharedExpert,
-                )?;
-            }
-            self.columns(
-                format!("{prefix}.mlp.shared_expert.down_proj.weight"),
-                DType::BF16,
-                [hidden, moe.shared_intermediate],
-                Role::SharedExpert,
-            )?;
-            self.whole(
-                format!("{prefix}.mlp.shared_expert_gate.weight"),
-                DType::BF16,
-                vec![1, hidden],
-                Role::SharedExpert,
-            );
-            // Qwen's official FP8 release stores one BF16 inverse scale a 128x128 expert tile,
-            // whatever scale dtype the ModelOpt table names for the same arithmetic.
-            let expert_format = match ExpertFormat::of(arch.quantization.expert_format) {
-                ExpertFormat::Fp8 { block, .. } => ExpertFormat::Fp8 {
-                    block,
-                    scale: DType::BF16,
-                },
-                other => other,
-            };
-            for expert in 0..moe.routed_experts {
-                for (name, rows) in [("gate_proj", true), ("up_proj", true), ("down_proj", false)] {
-                    self.expert(
-                        &format!("{prefix}.mlp.experts.{expert}.{name}"),
-                        moe.intermediate,
-                        hidden,
-                        expert_format,
-                        rows,
-                        Role::Experts,
-                    )?;
-                }
-            }
+            self.qwen_moe(&format!("{prefix}.mlp"), moe, hidden, dense, experts, None)?;
             match &layer.attention.kind {
                 AttentionKind::Gdn(gdn) => {
-                    let p = format!("{prefix}.linear_attn");
-                    let key_width = gdn.key_heads * gdn.key_dim;
-                    let value_width = gdn.value_heads * gdn.value_dim;
-                    let conv_width = 2 * key_width + value_width;
-                    self.rows(
-                        format!("{p}.in_proj_qkv.weight"),
-                        DType::BF16,
-                        [conv_width, hidden],
-                        Role::Attention,
-                    )?;
-                    self.rows(
-                        format!("{p}.in_proj_z.weight"),
-                        DType::BF16,
-                        [value_width, hidden],
-                        Role::Attention,
-                    )?;
-                    for name in ["in_proj_a", "in_proj_b"] {
-                        self.rows(
-                            format!("{p}.{name}.weight"),
-                            DType::BF16,
-                            [gdn.value_heads, hidden],
-                            Role::Attention,
-                        )?;
-                    }
-                    self.columns(
-                        format!("{p}.out_proj.weight"),
-                        DType::BF16,
-                        [hidden, value_width],
-                        Role::Attention,
-                    )?;
-                    self.conv_rows(
-                        format!("{p}.conv1d.weight"),
-                        DType::BF16,
-                        conv_width,
-                        gdn.conv_kernel,
-                        Role::Attention,
-                    )?;
-                    for name in ["A_log", "dt_bias"] {
-                        self.row_vector(
-                            format!("{p}.{name}"),
-                            DType::BF16,
-                            gdn.value_heads,
-                            Role::Attention,
-                        )?;
-                    }
-                    self.whole(
-                        format!("{p}.norm.weight"),
-                        DType::BF16,
-                        vec![gdn.value_dim],
-                        Role::Attention,
-                    );
+                    self.qwen_gdn(&format!("{prefix}.linear_attn"), gdn, hidden, dense)?;
                 }
-                AttentionKind::Gqa { kv_heads, .. } => {
-                    let p = format!("{prefix}.self_attn");
-                    let q_width = layer.attention.heads * layer.attention.head_dim * 2;
-                    let kv_width = kv_heads * layer.attention.head_dim;
-                    self.rows(
-                        format!("{p}.q_proj.weight"),
-                        DType::BF16,
-                        [q_width, hidden],
-                        Role::Attention,
-                    )?;
-                    for name in ["k_proj", "v_proj"] {
-                        self.kv_rows(
-                            format!("{p}.{name}.weight"),
-                            DType::BF16,
-                            [kv_width, hidden],
-                            Role::Attention,
-                        )?;
-                    }
-                    self.columns(
-                        format!("{p}.o_proj.weight"),
-                        DType::BF16,
-                        [hidden, layer.attention.heads * layer.attention.head_dim],
-                        Role::Attention,
-                    )?;
-                    for name in ["q_norm", "k_norm"] {
-                        self.whole(
-                            format!("{p}.{name}.weight"),
-                            DType::BF16,
-                            vec![layer.attention.head_dim],
-                            Role::Attention,
-                        );
-                    }
-                    if let Some(indexer) = &layer.attention.indexer {
-                        let width = (indexer.heads + indexer.kv_heads) * indexer.head_dim;
-                        self.whole(
-                            format!("{p}.indexer.index_qk_proj.weight"),
-                            DType::BF16,
-                            vec![width, hidden],
-                            Role::Indexer,
-                        );
-                        for name in ["q_layernorm", "k_layernorm"] {
-                            self.whole(
-                                format!("{p}.indexer.{name}.weight"),
-                                DType::BF16,
-                                vec![indexer.head_dim],
-                                Role::Indexer,
-                            );
-                        }
-                    }
-                }
+                AttentionKind::Gqa { kv_heads, .. } => self.qwen_gqa(
+                    &format!("{prefix}.self_attn"),
+                    layer,
+                    *kv_heads,
+                    hidden,
+                    dense,
+                    None,
+                )?,
                 other => {
                     return Err(PlanError::Invalid(format!(
                         "Qwen layer {} runs {other:?}",
@@ -990,7 +889,7 @@ impl Builder {
                 || self.tp.world() == 1
                 || arch.mtp.as_ref().is_some_and(|mtp| mtp.replicated))
         {
-            self.qwen_mtp(arch, hidden, hyper_width)?;
+            self.qwen_mtp(arch, hidden, hyper_width, dense)?;
         }
         if self.vision {
             self.qwen_vision(arch)?;
@@ -998,6 +897,265 @@ impl Builder {
         Ok(())
     }
 
+    /// A plain-residual layer's two pre-norms.
+    fn qwen_branch_norms(&mut self, prefix: &str, hidden: usize, role: Role) {
+        for name in ["input_layernorm", "post_attention_layernorm"] {
+            self.whole(
+                format!("{prefix}.{name}.weight"),
+                DType::BF16,
+                vec![hidden],
+                role,
+            );
+        }
+    }
+
+    /// A Qwen MoE block: the router, the gated shared expert and the routed experts.
+    ///
+    /// `stage` is the MTP role: an MTP block keeps every tensor whole, because a multi-rank
+    /// serve replicates the stage rather than splitting it.
+    fn qwen_moe(
+        &mut self,
+        prefix: &str,
+        moe: &Moe,
+        hidden: usize,
+        dense: WeightFormat,
+        experts: ExpertFormat,
+        stage: Option<Role>,
+    ) -> Result<(), PlanError> {
+        let (router, shared, routed) = stage
+            .map_or((Role::Router, Role::SharedExpert, Role::Experts), |role| {
+                (role, role, role)
+            });
+        let (rows, columns) = if stage.is_some() {
+            (LinearSplit::Whole, LinearSplit::Whole)
+        } else {
+            (LinearSplit::Rows, LinearSplit::Columns)
+        };
+        self.whole(
+            format!("{prefix}.gate.weight"),
+            DType::BF16,
+            vec![moe.routed_experts, hidden],
+            router,
+        );
+        for name in ["gate_proj", "up_proj"] {
+            self.dense_linear(
+                &format!("{prefix}.shared_expert.{name}"),
+                moe.shared_intermediate,
+                hidden,
+                dense,
+                shared,
+                rows,
+            )?;
+        }
+        self.dense_linear(
+            &format!("{prefix}.shared_expert.down_proj"),
+            hidden,
+            moe.shared_intermediate,
+            dense,
+            shared,
+            columns,
+        )?;
+        self.whole(
+            format!("{prefix}.shared_expert_gate.weight"),
+            DType::BF16,
+            vec![1, hidden],
+            shared,
+        );
+        if experts == ExpertFormat::Bf16 {
+            return self.qwen_fused_experts(prefix, moe, hidden, routed);
+        }
+        for expert in 0..moe.routed_experts {
+            for (name, rows) in [("gate_proj", true), ("up_proj", true), ("down_proj", false)] {
+                self.expert(
+                    &format!("{prefix}.experts.{expert}.{name}"),
+                    moe.intermediate,
+                    hidden,
+                    experts,
+                    rows,
+                    routed,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Qwen3.5/3.6's BF16 experts: every expert's gate and up rows fused in one
+    /// `[experts, 2 * intermediate, hidden]` tensor (gate first) and the down projections in one
+    /// `[experts, hidden, intermediate]`, both without a `.weight` suffix.
+    ///
+    /// A rank's share of the fused gate/up axis is two runs (its gate rows and its up rows), not
+    /// one, so that tensor reports no run; the down projection's share is one run of columns.
+    fn qwen_fused_experts(
+        &mut self,
+        prefix: &str,
+        moe: &Moe,
+        hidden: usize,
+        role: Role,
+    ) -> Result<(), PlanError> {
+        let (local, run) = self.expert_width(moe.intermediate, ExpertFormat::Bf16)?;
+        let experts = moe.routed_experts;
+        self.push(
+            format!("{prefix}.experts.gate_up_proj"),
+            DType::BF16,
+            vec![experts, 2 * moe.intermediate, hidden],
+            vec![experts, 2 * local, hidden],
+            None,
+            role,
+        );
+        self.push(
+            format!("{prefix}.experts.down_proj"),
+            DType::BF16,
+            vec![experts, hidden, moe.intermediate],
+            vec![experts, hidden, local],
+            run,
+            role,
+        );
+        Ok(())
+    }
+
+    /// A Gated DeltaNet branch. The three wide projections take the dense format; the decay and
+    /// beta projections, the convolution and the norms stay BF16 in every release.
+    fn qwen_gdn(
+        &mut self,
+        p: &str,
+        gdn: &sparkflash_model::architecture::Gdn,
+        hidden: usize,
+        dense: WeightFormat,
+    ) -> Result<(), PlanError> {
+        let key_width = gdn.key_heads * gdn.key_dim;
+        let value_width = gdn.value_heads * gdn.value_dim;
+        let conv_width = 2 * key_width + value_width;
+        self.dense_linear(
+            &format!("{p}.in_proj_qkv"),
+            conv_width,
+            hidden,
+            dense,
+            Role::Attention,
+            LinearSplit::Rows,
+        )?;
+        self.dense_linear(
+            &format!("{p}.in_proj_z"),
+            value_width,
+            hidden,
+            dense,
+            Role::Attention,
+            LinearSplit::Rows,
+        )?;
+        for name in ["in_proj_a", "in_proj_b"] {
+            self.rows(
+                format!("{p}.{name}.weight"),
+                DType::BF16,
+                [gdn.value_heads, hidden],
+                Role::Attention,
+            )?;
+        }
+        self.dense_linear(
+            &format!("{p}.out_proj"),
+            hidden,
+            value_width,
+            dense,
+            Role::Attention,
+            LinearSplit::Columns,
+        )?;
+        self.conv_rows(
+            format!("{p}.conv1d.weight"),
+            DType::BF16,
+            conv_width,
+            gdn.conv_kernel,
+            Role::Attention,
+        )?;
+        for name in ["A_log", "dt_bias"] {
+            self.row_vector(
+                format!("{p}.{name}"),
+                DType::BF16,
+                gdn.value_heads,
+                Role::Attention,
+            )?;
+        }
+        self.whole(
+            format!("{p}.norm.weight"),
+            DType::BF16,
+            vec![gdn.value_dim],
+            Role::Attention,
+        );
+        Ok(())
+    }
+
+    /// A gated GQA branch: the query projection carries the sigmoid gate interleaved with each
+    /// head, so it is twice the attention width. Qwen3.8's sparse layers add the QSA indexer.
+    ///
+    /// `stage` is the MTP role, under which every tensor stays whole.
+    fn qwen_gqa(
+        &mut self,
+        p: &str,
+        layer: &Layer,
+        kv_heads: usize,
+        hidden: usize,
+        dense: WeightFormat,
+        stage: Option<Role>,
+    ) -> Result<(), PlanError> {
+        let (attention, indexer_role) =
+            stage.map_or((Role::Attention, Role::Indexer), |role| (role, role));
+        let (rows, kv_rows, columns) = if stage.is_some() {
+            (LinearSplit::Whole, LinearSplit::Whole, LinearSplit::Whole)
+        } else {
+            (LinearSplit::Rows, LinearSplit::KvRows, LinearSplit::Columns)
+        };
+        let width = layer.attention.heads * layer.attention.head_dim;
+        let kv_width = kv_heads * layer.attention.head_dim;
+        self.dense_linear(
+            &format!("{p}.q_proj"),
+            2 * width,
+            hidden,
+            dense,
+            attention,
+            rows,
+        )?;
+        for name in ["k_proj", "v_proj"] {
+            self.dense_linear(
+                &format!("{p}.{name}"),
+                kv_width,
+                hidden,
+                dense,
+                attention,
+                kv_rows,
+            )?;
+        }
+        self.dense_linear(
+            &format!("{p}.o_proj"),
+            hidden,
+            width,
+            dense,
+            attention,
+            columns,
+        )?;
+        for name in ["q_norm", "k_norm"] {
+            self.whole(
+                format!("{p}.{name}.weight"),
+                DType::BF16,
+                vec![layer.attention.head_dim],
+                attention,
+            );
+        }
+        if let Some(indexer) = &layer.attention.indexer {
+            let width = (indexer.heads + indexer.kv_heads) * indexer.head_dim;
+            self.whole(
+                format!("{p}.indexer.index_qk_proj.weight"),
+                DType::BF16,
+                vec![width, hidden],
+                indexer_role,
+            );
+            for name in ["q_layernorm", "k_layernorm"] {
+                self.whole(
+                    format!("{p}.indexer.{name}.weight"),
+                    DType::BF16,
+                    vec![indexer.head_dim],
+                    indexer_role,
+                );
+            }
+        }
+        Ok(())
+    }
     fn qwen_hyper(
         &mut self,
         prefix: &str,
@@ -1041,6 +1199,7 @@ impl Builder {
         arch: &Architecture,
         hidden: usize,
         hyper_width: usize,
+        dense: WeightFormat,
     ) -> Result<(), PlanError> {
         let Some(mtp) = &arch.mtp else { return Ok(()) };
         if mtp.stages == 0 {
@@ -1054,7 +1213,7 @@ impl Builder {
             .ok_or_else(|| PlanError::Invalid("the architecture has no layers".to_owned()))?;
         let AttentionKind::Gqa { kv_heads, .. } = &reference.attention.kind else {
             return Err(PlanError::Invalid(
-                "the Qwen MTP stage needs a sparse-attention layer".to_owned(),
+                "the Qwen MTP stage needs a full- or sparse-attention layer".to_owned(),
             ));
         };
         let Some(moe) = arch.layers.iter().find_map(|layer| match &layer.ffn {
@@ -1065,154 +1224,98 @@ impl Builder {
                 "the Qwen MTP stage needs a MoE layer".to_owned(),
             ));
         };
-        let Some(indexer) = &reference.attention.indexer else {
-            return Err(PlanError::Invalid(
-                "the Qwen MTP stage needs a sparse indexer".to_owned(),
-            ));
-        };
-        let hyper = hyper_of(reference)?;
-        let prefix = "mtp";
-        for name in ["fc_embedding", "fc_hidden"] {
-            self.whole(
-                format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![hidden, hidden],
-                Role::Mtp,
-            );
-        }
-        self.qwen_hyper(
-            &format!("{prefix}.hyper_connection_mixer"),
-            hyper,
-            hidden,
-            false,
-            Role::Mtp,
-        );
-        for (name, width) in [
-            ("pre_fc_norm_embedding", hidden),
-            ("pre_fc_norm_hidden", hyper_width),
-        ] {
-            self.whole(
-                format!("{prefix}.{name}.weight"),
-                DType::BF16,
-                vec![width],
-                Role::Mtp,
-            );
-        }
-        let layer = format!("{prefix}.layers.0");
-        self.qwen_hyper(
-            &format!("{layer}.attn_hyper_connection"),
-            hyper,
-            hidden,
-            true,
-            Role::Mtp,
-        );
-        self.qwen_hyper(
-            &format!("{layer}.mlp_hyper_connection"),
-            hyper,
-            hidden,
-            true,
-            Role::Mtp,
-        );
-        let p = format!("{layer}.self_attn");
-        let q_width = reference.attention.heads * reference.attention.head_dim * 2;
-        let kv_width = kv_heads * reference.attention.head_dim;
-        self.whole(
-            format!("{p}.q_proj.weight"),
-            DType::BF16,
-            vec![q_width, hidden],
-            Role::Mtp,
-        );
-        for name in ["k_proj", "v_proj"] {
-            self.whole(
-                format!("{p}.{name}.weight"),
-                DType::BF16,
-                vec![kv_width, hidden],
-                Role::Mtp,
-            );
-        }
-        self.whole(
-            format!("{p}.o_proj.weight"),
-            DType::BF16,
-            vec![
-                hidden,
-                reference.attention.heads * reference.attention.head_dim,
-            ],
-            Role::Mtp,
-        );
-        for name in ["q_norm", "k_norm"] {
-            self.whole(
-                format!("{p}.{name}.weight"),
-                DType::BF16,
-                vec![reference.attention.head_dim],
-                Role::Mtp,
-            );
-        }
-        let width = (indexer.heads + indexer.kv_heads) * indexer.head_dim;
-        self.whole(
-            format!("{p}.indexer.index_qk_proj.weight"),
-            DType::BF16,
-            vec![width, hidden],
-            Role::Mtp,
-        );
-        for name in ["q_layernorm", "k_layernorm"] {
-            self.whole(
-                format!("{p}.indexer.{name}.weight"),
-                DType::BF16,
-                vec![indexer.head_dim],
-                Role::Mtp,
-            );
-        }
-        let m = format!("{layer}.mlp");
-        self.whole(
-            format!("{m}.gate.weight"),
-            DType::BF16,
-            vec![moe.routed_experts, hidden],
-            Role::Mtp,
-        );
-        for name in ["gate_proj", "up_proj"] {
-            self.whole(
-                format!("{m}.shared_expert.{name}.weight"),
-                DType::BF16,
-                vec![moe.shared_intermediate, hidden],
-                Role::Mtp,
-            );
-        }
-        self.whole(
-            format!("{m}.shared_expert.down_proj.weight"),
-            DType::BF16,
-            vec![hidden, moe.shared_intermediate],
-            Role::Mtp,
-        );
-        self.whole(
-            format!("{m}.shared_expert_gate.weight"),
-            DType::BF16,
-            vec![1, hidden],
-            Role::Mtp,
-        );
-        // The released Qwen MTP stage stores its experts as E4M3 with a BF16 inverse scale a
-        // 128x128 tile, whichever scale dtype the ModelOpt table records for the backbone.
-        let expert_format = match ExpertFormat::of(
+        // The released Qwen MTP stages store their experts in the format the quantization table
+        // records for them, falling back to the backbone's.
+        let experts = qwen_expert_format(
             arch.quantization
                 .mtp_expert_format
-                .unwrap_or(arch.quantization.expert_format),
-        ) {
-            ExpertFormat::Fp8 { block, .. } => ExpertFormat::Fp8 {
-                block,
-                scale: DType::BF16,
-            },
-            other => other,
-        };
-        for expert in 0..moe.routed_experts {
-            for (name, rows) in [("gate_proj", true), ("up_proj", true), ("down_proj", false)] {
-                self.expert(
-                    &format!("{m}.experts.{expert}.{name}"),
-                    moe.intermediate,
+                .unwrap_or(self.expert_format),
+        );
+        let prefix = "mtp";
+        let layer = format!("{prefix}.layers.0");
+        match &reference.residual {
+            Residual::Hyper(hyper) => {
+                // Qwen3.8: the embedding and the hidden streams each get a square projection,
+                // and the stage carries its own mixer and per-branch hyper-connections.
+                for name in ["fc_embedding", "fc_hidden"] {
+                    self.whole(
+                        format!("{prefix}.{name}.weight"),
+                        DType::BF16,
+                        vec![hidden, hidden],
+                        Role::Mtp,
+                    );
+                }
+                self.qwen_hyper(
+                    &format!("{prefix}.hyper_connection_mixer"),
+                    hyper,
                     hidden,
-                    expert_format,
-                    rows,
+                    false,
                     Role::Mtp,
-                )?;
+                );
+                for (name, width) in [
+                    ("pre_fc_norm_embedding", hidden),
+                    ("pre_fc_norm_hidden", hyper_width),
+                ] {
+                    self.whole(
+                        format!("{prefix}.{name}.weight"),
+                        DType::BF16,
+                        vec![width],
+                        Role::Mtp,
+                    );
+                }
+                for branch in ["attn", "mlp"] {
+                    self.qwen_hyper(
+                        &format!("{layer}.{branch}_hyper_connection"),
+                        hyper,
+                        hidden,
+                        true,
+                        Role::Mtp,
+                    );
+                }
             }
+            Residual::Plain => {
+                // Qwen3.5/3.6: one `[hidden, 2 * hidden]` projection of the normed embedding
+                // and hidden state, concatenated, then an ordinary pre-norm layer.
+                self.whole(
+                    format!("{prefix}.fc.weight"),
+                    DType::BF16,
+                    vec![hidden, 2 * hidden],
+                    Role::Mtp,
+                );
+                for name in ["pre_fc_norm_embedding", "pre_fc_norm_hidden"] {
+                    self.whole(
+                        format!("{prefix}.{name}.weight"),
+                        DType::BF16,
+                        vec![hidden],
+                        Role::Mtp,
+                    );
+                }
+                self.qwen_branch_norms(&layer, hidden, Role::Mtp);
+            }
+        }
+        self.qwen_gqa(
+            &format!("{layer}.self_attn"),
+            reference,
+            *kv_heads,
+            hidden,
+            dense,
+            Some(Role::Mtp),
+        )?;
+        self.qwen_moe(
+            &format!("{layer}.mlp"),
+            moe,
+            hidden,
+            dense,
+            experts,
+            Some(Role::Mtp),
+        )?;
+        if matches!(reference.residual, Residual::Plain) {
+            self.whole(
+                format!("{prefix}.norm.weight"),
+                DType::BF16,
+                vec![hidden],
+                Role::Mtp,
+            );
         }
         Ok(())
     }
@@ -1891,6 +1994,45 @@ impl Builder {
         push!("merger.up_proj.weight", vec![projection, out]);
         push!("merger.down_proj.weight", vec![out, projection]);
         Ok(())
+    }
+}
+
+/// A layer's hyper-connection, or `None` for a plain residual stream.
+fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::HyperConnection> {
+    match &layer.residual {
+        Residual::Hyper(hyper) => Some(hyper),
+        Residual::Plain => None,
+    }
+}
+
+/// Qwen's official FP8 releases store one BF16 inverse scale a 128x128 tile, for the dense
+/// projections and the experts alike, whatever scale dtype the quantization table names for the
+/// same arithmetic.
+fn qwen_dense_format(format: WeightFormat) -> WeightFormat {
+    match format {
+        WeightFormat::Fp8Tile {
+            block_m,
+            block_n,
+            dynamic_activations,
+            ..
+        } => WeightFormat::Fp8Tile {
+            block_m,
+            block_n,
+            scale_dtype: ScaleDType::Bf16,
+            dynamic_activations,
+        },
+        other => other,
+    }
+}
+
+/// The routed experts' stored format, with Qwen's BF16 tile scale.
+fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
+    match ExpertFormat::of(format) {
+        ExpertFormat::Fp8 { block, .. } => ExpertFormat::Fp8 {
+            block,
+            scale: DType::BF16,
+        },
+        other => other,
     }
 }
 

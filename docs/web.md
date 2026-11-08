@@ -228,13 +228,15 @@ the others. `hf download <id>` as the same user on every node works too.
 
 The **Model** panel at the top of **Setup** is the lead node's cache, and its browser searches
 both that cache and the Hugging Face Hub. The left side lists the families this build
-knows (DeepSeek, Qwen, GLM) with the TP widths their device engines run; the search box queries
+knows (DeepSeek, Qwen, GLM, and Qwen3.6-35B-A3B) with the TP widths their
+engines run; the search box queries
 the Hub and folds in cached models first. Every result says at a glance whether it fits this
 cluster (see below): a badge (**fits TP=…**, **too large**, **missing parts**, **not judged
 yet**), one chip a width (TP1, TP2, TP4) colored by its verdict with the longest context that
 fits, and a one-line summary. Opening a result shows the detail: per width, the weights a rank,
-the cache a token, the context, and every reason a width fails. A Hub result with a device engine
-offers **Use this model** and **Download to the lead Spark**; the download names the repository
+the cache a token, the context, and every reason a width fails. A Hub result with an engine
+that serves it (a device arm or the registered host reference) offers **Use this model** and
+**Download to the lead Spark**; the download names the repository
 explicitly, so a fine-tune of a supported family needs no saved `model.id` first. Choosing a model
 also selects its architecture and engine, so a V4.1 checkpoint cannot be paired with the Qwen
 engine by accident. A model no device engine serves is never selectable or downloadable, and
@@ -244,11 +246,17 @@ conversion will use.
 
 ### How the browser judges fit
 
-The verdict is a device-engine verdict. The CPU f32 host reference (`engine.kind = "dynamic"`)
-exists to check test checkpoints against the device kernels and never counts as "runs": a family
-outside DeepSeek V4.1, Qwen3.8 and GLM-5.3 is **missing a device engine**, however small. An
-explicit hand-written dynamic plan still validates, but the browser and the cache-driven model
-switch never produce one, and selecting a cached model never rewrites the cluster plan.
+The verdict is an engine verdict. A family with a device arm is judged by the kernel catalogue
+(DeepSeek V4.1, Qwen3.8 and GLM-5.3). A family registered with `engine = "dynamic"` is judged
+the same way when a device arm reads its stored formats, and by the shared CPU host reference
+when none does. The rule is `sparkflash_ops::parts::dynamic_device_arm`, the one the CLI's
+dynamic route applies. Qwen3.6-35B-A3B (`qwen3_5_moe`) is the first such family: its FP8 release
+(128x128 E4M3 experts and dense projections) runs on the Qwen device arm at TP=1, while a BF16
+checkpoint of the family, whose fused experts no device kernel reads yet, runs on the host
+reference. A host result is labelled "on the CPU host reference", so a host run is never
+mistaken for a device engine. A family neither arm serves is **missing a device engine**, however small. An explicit
+hand-written dynamic plan still validates, and selecting a cached model never rewrites the
+cluster plan.
 
 Each width is judged from evidence, not names:
 

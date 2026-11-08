@@ -29,11 +29,12 @@
 
 use std::sync::Arc;
 
-use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, Score, WeightFormat};
+use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, Score};
 use sparkflash_model::{
     Architecture, BackendError, ModelBackend, ModelDescriptor, ModelSession, Sampling, StepOutput,
 };
-use sparkflash_weights::linalg::decode_by_name;
+use sparkflash_weights::DType;
+use sparkflash_weights::linalg::{ScaleGrid, apply_scales, decode_by_name};
 use sparkflash_weights::linear_attention::{
     Decay, advance_conv_history, causal_conv, delta_rule_step, l2_normalise, rms_norm_gated,
 };
@@ -98,20 +99,68 @@ fn validate_quantization(
     source: &dyn WeightSource,
 ) -> Result<(), String> {
     let quantization = &architecture.quantization;
-    let declared = quantization.dense_format != WeightFormat::Bf16
-        || quantization.expert_format != WeightFormat::Bf16;
+    let declared = sparkflash_ops::parts::host_reference_quantization_refusal(architecture);
     let storage =
         sparkflash_ops::parts::host_reference_storage_quantization_refusal(architecture, source);
-    if declared || storage.is_some() {
-        let storage = storage.unwrap_or_else(|| "a declared quantized format".to_owned());
+    // The storage check names the actual tensor and dtype; prefer it over the declaration when
+    // both refuse, so an operator sees what the shard holds.
+    if let Some(refusal) = storage.or(declared) {
         return Err(format!(
-            "the checkpoint is quantized (method={:?}, dense={:?}, experts={:?}, storage={storage}); the dynamic host reference decodes BF16/F32 tensors and does not apply block scales, so it cannot serve NVFP4/FP8 weights honestly - convert or serve it with its device pack, or use an unquantized checkpoint",
+            "the checkpoint is quantized (method={:?}, dense={:?}, experts={:?}): {refusal}",
             quantization.method,
             quantization.dense_format.name(),
             quantization.expert_format.name(),
         ));
     }
     Ok(())
+}
+
+/// Decodes one host tensor, applying an E4M3 weight's 128x128 inverse-scale tile.
+///
+/// An FP8 checkpoint stores E4M3 codes beside `<weight>_scale_inv`, a grid of
+/// `ceil(rows/128) x ceil(cols/128)` values that multiplies the decoded code. Every other
+/// tensor is BF16/F32 and decodes as before. A scale-less E4M3 tensor is refused rather than
+/// served as raw codes.
+fn decode_host_tensor(
+    source: &dyn WeightSource,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<f32>, sparkflash_weights::EngineError> {
+    let spec = source.spec(name)?;
+    let mut values = decode_by_name(source, name, limit)?;
+    if spec.dtype != DType::F8E4M3 {
+        return Ok(values);
+    }
+    let scale_name = format!("{name}_scale_inv");
+    let scale_spec =
+        source
+            .spec(&scale_name)
+            .map_err(|_| sparkflash_weights::EngineError::Shape {
+                what: "fp8 weight".to_owned(),
+                detail: format!("{name} is E4M3 but the checkpoint has no {scale_name}"),
+            })?;
+    let [rows, cols] = match spec.shape.as_slice() {
+        [rows, cols] => [*rows, *cols],
+        shape => {
+            return Err(sparkflash_weights::EngineError::Shape {
+                what: "fp8 weight".to_owned(),
+                detail: format!("{name} is {shape:?}, not a two-dimensional weight"),
+            });
+        }
+    };
+    if scale_spec.shape != ScaleGrid::Tile(128).shape(rows, cols) {
+        return Err(sparkflash_weights::EngineError::Shape {
+            what: "fp8 scale grid".to_owned(),
+            detail: format!(
+                "{scale_name} is {:?}, expected {:?} for {rows}x{cols}",
+                scale_spec.shape,
+                ScaleGrid::Tile(128).shape(rows, cols)
+            ),
+        });
+    }
+    let scales = decode_by_name(source, &scale_name, limit)?;
+    apply_scales(&mut values, rows, cols, &scales, ScaleGrid::Tile(128))?;
+    Ok(values)
 }
 
 /// The shapes [DynamicHostBackend] allocates against, checked from headers before a weight is
@@ -371,12 +420,14 @@ impl HostSession {
             ));
         }
         let hidden = architecture.hidden_size;
+        let zero_centered = architecture.zero_centered_norms();
         let mut x = embedding_row(shared.source.as_ref(), &shared.names.embed, token, hidden)?;
         for (index, layer) in architecture.layers.iter().enumerate() {
             let names = &shared.names.layers[index];
-            let norm = decode_by_name(shared.source.as_ref(), &names.input_norm, ELEMENT_LIMIT)
+            let norm = decode_host_tensor(shared.source.as_ref(), &names.input_norm, ELEMENT_LIMIT)
                 .map_err(|error| error.to_string())?;
-            let attention_input = rms_norm(&x, &norm, architecture.norm_epsilon as f32);
+            let attention_input =
+                rms_norm(&x, &norm, architecture.norm_epsilon as f32, zero_centered);
             let attention = match &layer.attention.kind {
                 AttentionKind::Gqa {
                     kv_heads,
@@ -395,6 +446,7 @@ impl HostSession {
                         cache,
                         self.position,
                         architecture.norm_epsilon as f32,
+                        zero_centered,
                     )?
                 }
                 AttentionKind::Gdn(gdn) => {
@@ -420,9 +472,9 @@ impl HostSession {
             for (value, update) in x.iter_mut().zip(&attention) {
                 *value += update;
             }
-            let norm = decode_by_name(shared.source.as_ref(), &names.post_norm, ELEMENT_LIMIT)
+            let norm = decode_host_tensor(shared.source.as_ref(), &names.post_norm, ELEMENT_LIMIT)
                 .map_err(|error| error.to_string())?;
-            let ffn_input = rms_norm(&x, &norm, architecture.norm_epsilon as f32);
+            let ffn_input = rms_norm(&x, &norm, architecture.norm_epsilon as f32, zero_centered);
             let ffn = match &layer.ffn {
                 Ffn::Dense(dense) => dense_ffn(
                     shared.source.as_ref(),
@@ -438,9 +490,9 @@ impl HostSession {
                 *value += update;
             }
         }
-        let norm = decode_by_name(shared.source.as_ref(), &shared.names.norm, ELEMENT_LIMIT)
+        let norm = decode_host_tensor(shared.source.as_ref(), &shared.names.norm, ELEMENT_LIMIT)
             .map_err(|error| error.to_string())?;
-        let final_hidden = rms_norm(&x, &norm, architecture.norm_epsilon as f32);
+        let final_hidden = rms_norm(&x, &norm, architecture.norm_epsilon as f32, zero_centered);
         let (vocab, columns, head) =
             matrix(shared.source.as_ref(), &shared.names.head, &final_hidden)?;
         if columns != hidden || vocab != architecture.vocab_size {
@@ -515,7 +567,8 @@ fn embedding_row(
     if spec.shape.len() != 2 || spec.shape[1] != hidden {
         return Err(format!("{name} is {:?}, not [vocab, {hidden}]", spec.shape));
     }
-    let values = decode_by_name(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+    let values =
+        decode_host_tensor(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
     let start = token as usize * hidden;
     values
         .get(start..start + hidden)
@@ -540,7 +593,8 @@ fn matrix(
             vector.len()
         ));
     }
-    let values = decode_by_name(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+    let values =
+        decode_host_tensor(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
     if values.len() != rows * columns {
         return Err(format!(
             "{name} decodes to {} values, its {rows}x{columns} shape needs {}",
@@ -560,14 +614,17 @@ fn matrix(
     Ok((rows, columns, out))
 }
 
-fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
+fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32, zero_centered: bool) -> Vec<f32> {
     let width = input.len();
     let mean_square = input.iter().map(|value| value * value).sum::<f32>() / width as f32;
     let scale = 1.0 / (mean_square + epsilon).sqrt();
     input
         .iter()
         .zip(weight)
-        .map(|(value, weight)| value * scale * weight)
+        .map(|(value, weight)| {
+            let weight = if zero_centered { 1.0 + weight } else { *weight };
+            value * scale * weight
+        })
         .collect()
 }
 
@@ -620,6 +677,7 @@ fn gqa_attention(
     cache: &mut KvCache,
     position: usize,
     epsilon: f32,
+    zero_centered: bool,
 ) -> Result<Vec<f32>, String> {
     let ResolvedAttention::Gqa {
         q,
@@ -672,7 +730,7 @@ fn gqa_attention(
     let mut keys = key;
     if let Some(q_norm) = q_norm {
         let weights =
-            decode_by_name(source, q_norm, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+            decode_host_tensor(source, q_norm, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
         if weights.len() != head_dim {
             return Err(format!(
                 "{q_norm} holds {} values, expected {head_dim}",
@@ -680,13 +738,13 @@ fn gqa_attention(
             ));
         }
         for head in queries.chunks_mut(head_dim) {
-            let normalized = rms_norm(head, &weights, epsilon);
+            let normalized = rms_norm(head, &weights, epsilon, zero_centered);
             head.copy_from_slice(&normalized);
         }
     }
     if let Some(k_norm) = k_norm {
         let weights =
-            decode_by_name(source, k_norm, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+            decode_host_tensor(source, k_norm, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
         if weights.len() != head_dim {
             return Err(format!(
                 "{k_norm} holds {} values, expected {head_dim}",
@@ -694,7 +752,7 @@ fn gqa_attention(
             ));
         }
         for head in keys.chunks_mut(head_dim) {
-            let normalized = rms_norm(head, &weights, epsilon);
+            let normalized = rms_norm(head, &weights, epsilon, zero_centered);
             head.copy_from_slice(&normalized);
         }
     }
@@ -841,7 +899,7 @@ fn gdn_attention(
         ));
     }
     let conv_kernel =
-        decode_by_name(source, conv, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+        decode_host_tensor(source, conv, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
     if conv_kernel.len() != width * gdn.conv_kernel {
         return Err(format!(
             "{conv} holds {} values, expected [{width}, 1, {}]",
@@ -978,7 +1036,8 @@ fn matrix_or_vector(
     name: &str,
 ) -> Result<(usize, usize, Vec<f32>), String> {
     let spec = source.spec(name).map_err(|error| error.to_string())?;
-    let values = decode_by_name(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
+    let values =
+        decode_host_tensor(source, name, ELEMENT_LIMIT).map_err(|error| error.to_string())?;
     match spec.shape.len() {
         1 => Ok((1, spec.shape[0], values)),
         2 => Ok((spec.shape[0], spec.shape[1], values)),
@@ -1189,6 +1248,29 @@ mod tests {
                     name: name.to_owned(),
                 })
         }
+    }
+
+    #[test]
+    fn an_e4m3_weight_is_scaled_by_its_inverse_tile() {
+        let mut source = Memory::new();
+        source.0.insert(
+            "w.weight".to_owned(),
+            (
+                TensorSpec {
+                    name: "w.weight".to_owned(),
+                    dtype: DType::F8E4M3,
+                    shape: vec![1, 2],
+                },
+                vec![0x38, 0x40], // E4M3 1.0, 2.0
+            ),
+        );
+        source.push("w.weight_scale_inv", &[1, 1], |_| 2.0);
+        let decoded = decode_host_tensor(&source, "w.weight", ELEMENT_LIMIT)
+            .expect("a tile-scaled E4M3 weight decodes");
+        assert_eq!(decoded, vec![2.0, 4.0]);
+        // Without its scale the codes would be served as if they were the weights.
+        source.0.remove("w.weight_scale_inv");
+        assert!(decode_host_tensor(&source, "w.weight", ELEMENT_LIMIT).is_err());
     }
 
     fn values(source: &Memory, name: &str) -> Vec<f32> {
@@ -1410,6 +1492,7 @@ mod tests {
         for (position, input) in inputs.iter().enumerate() {
             produced = gqa_attention(
                 &source, &layer, &attention, kv_heads, true, input, &mut cache, position, 1e-5,
+                false,
             )
             .expect("gqa computes");
         }

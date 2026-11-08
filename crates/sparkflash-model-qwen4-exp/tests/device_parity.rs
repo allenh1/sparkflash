@@ -23,11 +23,13 @@
 //! does not downgrade a wrong answer to a skip: once the device opens, a mismatch fails the test.
 
 use sparkflash_model::ModelBackend;
+use sparkflash_model_qwen4_exp::config::DenseQuant;
 use sparkflash_model_qwen4_exp::device::{
     DENSE_ROWS, PrefillPlan, Qwen4ExpDeviceBackend, cubin_available, embedded_prefill_cubin,
 };
 use sparkflash_model_qwen4_exp::{
-    LayerKind, PleHasher, Qwen4ExpConfig, load_weights, open_ple_table, write_synthetic_checkpoint,
+    CheckpointRows, LayerKind, PleHasher, PleTable, Qwen4ExpConfig, load_weights, open_ple_table,
+    write_synthetic_checkpoint,
 };
 use sparkflash_weights::safetensors::SafeTensorsSource;
 
@@ -113,6 +115,22 @@ fn pin_hub_cache() {
         // so the variable is written once and read from then on.
         unsafe { std::env::set_var("HF_HUB_CACHE", dir) };
     });
+}
+
+/// A PLE model's table and n-gram hasher; the Qwen3.5/3.6 family has neither.
+type Ple = Option<(PleTable<CheckpointRows>, PleHasher)>;
+
+/// The PLE rows `tokens` read, or `None` with no PLE, for the host forward.
+fn ple_rows(ple: &mut Ple, tokens: &[u32]) -> Option<Vec<Vec<f32>>> {
+    ple.as_mut().map(|(table, hasher)| {
+        hasher
+            .push(tokens, None)
+            .expect("the hash rows")
+            .iter()
+            .map(|row| table.embedding(row))
+            .collect::<Result<_, String>>()
+            .expect("the table serves every row")
+    })
 }
 
 /// Run the whole TP=1 loop on one configuration and compare it with the host oracle.
@@ -208,9 +226,12 @@ fn parity_on(
     let source = SafeTensorsSource::open(temp.path(), &temp.path().join(INDEX))
         .expect("the fixture index opens");
     let host = load_weights(&config, &source).expect("the host loader decodes the checkpoint");
-    let layer = config.ple_layer_indices()[0];
-    let mut table = open_ple_table(temp.path(), &config, layer).expect("the PLE table opens");
-    let mut hasher = PleHasher::new(&config, 0).expect("the hasher builds");
+    let mut ple: Ple = config.ple_layer_indices().first().map(|&layer| {
+        (
+            open_ple_table(temp.path(), &config, layer).expect("the PLE table opens"),
+            PleHasher::new(&config, 0).expect("the hasher builds"),
+        )
+    });
     let mut state = host.new_state();
     let mut session = backend.open_session().expect("a device session opens");
 
@@ -218,14 +239,9 @@ fn parity_on(
     let prompt: Vec<u32> = (0..prompt_len)
         .map(|index| 3 + (index % 9) as u32)
         .collect();
-    let rows = hasher.push(&prompt, None).expect("the hash rows");
-    let embeddings: Vec<Vec<f32>> = rows
-        .iter()
-        .map(|row| table.embedding(row))
-        .collect::<Result<_, String>>()
-        .expect("the table serves every row");
+    let embeddings = ple_rows(&mut ple, &prompt);
     let host_logits = host
-        .forward(&mut state, &prompt, None, Some(&embeddings))
+        .forward(&mut state, &prompt, None, embeddings.as_deref())
         .expect("the host prefill runs");
     let prefill = session.prefill(&prompt).expect("the device prefill runs");
     compare(
@@ -236,10 +252,9 @@ fn parity_on(
     );
 
     for token in [25u32, 27, 29] {
-        let rows = hasher.push(&[token], None).expect("the hash rows");
-        let embedding = table.embedding(&rows[0]).expect("the table serves the row");
+        let embedding = ple_rows(&mut ple, &[token]);
         let host_logits = host
-            .forward(&mut state, &[token], None, Some(&[embedding]))
+            .forward(&mut state, &[token], None, embedding.as_deref())
             .expect("the host decode runs");
         let step = session.decode(token).expect("the device decode runs");
         compare(
@@ -253,21 +268,18 @@ fn parity_on(
     // A prompt with an end-of-generation id in the middle: Qwen's PLE segment rule restarts the
     // n-gram window there, so the two hashers have to agree on which tokens contribute and which
     // are replaced by EOS. The logits only match if the rows they read match.
-    let mut hasher = PleHasher::new(&config, 0).expect("the hasher builds");
+    if let Some((_, hasher)) = ple.as_mut() {
+        *hasher = PleHasher::new(&config, 0).expect("the hasher builds");
+    }
     let mut state = host.new_state();
     let mut session = backend
         .open_session()
         .expect("a second device session opens");
     let eos = config.eos_token_ids[0];
     let segmented = [3u32, 5, 7, eos, 9, 11, 13];
-    let rows = hasher.push(&segmented, None).expect("the hash rows");
-    let embeddings: Vec<Vec<f32>> = rows
-        .iter()
-        .map(|row| table.embedding(row))
-        .collect::<Result<_, String>>()
-        .expect("the table serves every row");
+    let embeddings = ple_rows(&mut ple, &segmented);
     let host_logits = host
-        .forward(&mut state, &segmented, None, Some(&embeddings))
+        .forward(&mut state, &segmented, None, embeddings.as_deref())
         .expect("the host segmented prefill runs");
     let prefill = session
         .prefill(&segmented)
@@ -311,6 +323,57 @@ fn the_fp8_expert_prefill_on_the_tensor_cores_matches_the_host_oracle() {
     let mut config = Qwen4ExpConfig::tiny_fp8();
     config.max_position_embeddings = 128;
     tensor_core_parity(config, "tiny fp8 tensor cores", 73);
+}
+
+/// Qwen3.5/3.6-MoE, the FP8 release's formats: a plain residual, full gated attention over every
+/// cached position, and every wide dense projection and expert E4M3 with a BF16 scale a 128x128
+/// tile. The token kernels: the tiled FP8 GEMV for the dense projections and the FP8 experts.
+#[test]
+fn the_qwen35_moe_fp8_fixture_matches_the_host_oracle() {
+    let _ = parity(
+        Qwen4ExpConfig::tiny_qwen35_moe(DenseQuant::Fp8Block),
+        "qwen3.5-moe fp8",
+    );
+}
+
+/// The same fixture over a prompt that spans the full attention's 256-key tiles and several of
+/// its splits, on the token kernels, so the split partials and their combine are exercised.
+#[test]
+fn the_qwen35_moe_full_attention_across_splits_matches_the_host_oracle() {
+    let mut config = Qwen4ExpConfig::tiny_qwen35_moe(DenseQuant::Fp8Block);
+    config.max_position_embeddings = 2048;
+    let _ = parity_with(config, "qwen3.5-moe fp8 splits", 700);
+}
+
+/// The FP8 fixture on the tensor-core prefill: a chunk past GEMM_MIN_BATCH takes q4p_dense_fp8
+/// for the dense projections and the grouped FP8 expert tiles.
+#[test]
+fn the_qwen35_moe_fp8_prefill_on_the_tensor_cores_matches_the_host_oracle() {
+    let mut config = Qwen4ExpConfig::tiny_qwen35_moe(DenseQuant::Fp8Block);
+    config.max_position_embeddings = 128;
+    tensor_core_parity(config, "qwen3.5-moe fp8 tensor cores", 73);
+}
+
+/// BF16 routed experts have no device kernel yet, so the arm refuses the BF16 release at open
+/// rather than serving it some other way.
+#[test]
+fn the_qwen35_moe_bf16_release_is_refused_at_open() {
+    if !cubin_available() {
+        eprintln!("skipping the BF16 refusal: this build has no Qwen4-Exp cubin");
+        return;
+    }
+    pin_hub_cache();
+    let config = Qwen4ExpConfig::tiny_qwen35_moe(DenseQuant::Bf16);
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    write_synthetic_checkpoint(temp.path(), &config, 7).expect("the fixture writes");
+    match Qwen4ExpDeviceBackend::open_with_prefill(temp.path(), 32, PrefillPlan::new(CHUNK, false))
+    {
+        Ok(_) => panic!("the device arm accepted BF16 routed experts"),
+        Err(error) if error.message().contains("CUDA:") => {
+            eprintln!("skipping the BF16 refusal: {error}");
+        }
+        Err(error) => assert!(error.message().contains("BF16 routed experts"), "{error}"),
+    }
 }
 
 /// The converted rank file is the same bits: the device loop over a file the converter wrote must

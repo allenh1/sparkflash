@@ -825,6 +825,9 @@ pub struct ShapeConstraint {
     pub patch_sizes: &'static [usize],
     /// The `(key, value)` head-width template pairs this implementation accepts; empty means any.
     pub head_pairs: &'static [(usize, usize)],
+    /// The routed-expert `(hidden, experts, top-k)` shapes this implementation is published at;
+    /// empty means any.
+    pub routed_shapes: &'static [(usize, usize, usize)],
     /// The tensor-parallel world this implementation requires, when named.
     pub world_equals: Option<usize>,
     /// The smallest tensor-parallel world this implementation addresses.
@@ -862,6 +865,7 @@ impl ShapeConstraint {
         groups_max: None,
         patch_sizes: &[],
         head_pairs: &[],
+        routed_shapes: &[],
         world_equals: None,
         world_min: None,
     };
@@ -1038,6 +1042,13 @@ impl ShapeConstraint {
         self
     }
 
+    /// Restrict the routed experts to these `(hidden, experts, top-k)` shapes.
+    #[must_use]
+    pub const fn routed_shapes(mut self, shapes: &'static [(usize, usize, usize)]) -> Self {
+        self.routed_shapes = shapes;
+        self
+    }
+
     /// Require an exact tensor-parallel world.
     #[must_use]
     pub const fn world_equals(mut self, world: usize) -> Self {
@@ -1177,6 +1188,22 @@ impl ShapeConstraint {
                 return Err(format!(
                     "head pair ({}, {}) is not one of {:?}",
                     geometry.head_dim, geometry.v_head, self.head_pairs
+                ));
+            }
+        }
+        if !self.routed_shapes.is_empty() {
+            let shape = (geometry.hidden, geometry.experts, geometry.top_k);
+            if shape.0 == 0 || shape.1 == 0 || shape.2 == 0 {
+                return Err(format!(
+                    "routed shape (hidden, experts, top-k) {shape:?} is unknown (zero) but the \
+                     kernel is published at {:?}",
+                    self.routed_shapes
+                ));
+            }
+            if !self.routed_shapes.contains(&shape) {
+                return Err(format!(
+                    "routed shape (hidden, experts, top-k) {shape:?} is not one of {:?}",
+                    self.routed_shapes
                 ));
             }
         }

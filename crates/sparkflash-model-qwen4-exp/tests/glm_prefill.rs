@@ -14,8 +14,10 @@
 
 //! The GLM bulk prefill and routed-expert (MoE) images: the block-scaled FP8 dense GEMMs (over
 //! the f32 activation and over its dynamic E4M3 codes), the routed-expert plan/MMA/SwiGLU and the
-//! skinny BF16 projection against a host reference, on an sm_121a node. The MoE symbols live in
-//! their own image (kernels/glm_moe_sm121.cu); glm_quantise_rows stays in the prefill image.
+//! skinny BF16 projection against a host reference, the wide BF16 GEMM against the 128-column
+//! one, and the bulk indexer scores and the exact projection against the decode step's kernels,
+//! on an sm_121a node. The MoE symbols live in their own image
+//! (kernels/glm_moe_sm121.cu); glm_quantise_rows stays in the prefill image.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_model_qwen4_exp::device::{
@@ -156,6 +158,8 @@ fn dequantised(x: &[f32]) -> Vec<f32> {
 
 /// The E4M3 x E4M3 GEMMs' dynamic shared memory (GLM_Q8_SHARED).
 const Q8_SHARED: u32 = 68_608;
+/// The wide BF16 GEMM's dynamic shared memory (GLM_WIDE_SHARED).
+const WIDE_SHARED: u32 = 98_304;
 
 fn launch(cuda: &Cuda, name: &'static str, grid: (u32, u32, u32), threads: u32, args: &[u64]) {
     // The routed-expert family has its own image. glm_quantise_rows stays in the prefill image
@@ -164,13 +168,20 @@ fn launch(cuda: &Cuda, name: &'static str, grid: (u32, u32, u32), threads: u32, 
         sparkflash_kernels::images::moe_plan_cubin()
     } else if name.starts_with("glm_moe_") {
         embedded_glm_moe_cubin()
-    } else if name.starts_with("glm_prefill_heads_") || name.starts_with("glm_prefill_mla_") {
+    } else if name.starts_with("glm_prefill_heads_")
+        || name.starts_with("glm_prefill_mla_")
+        || name == "glm_prefill_index_scores"
+    {
         sparkflash_kernels::images::glm_attention_cubin()
+    } else if name.starts_with("q4e_glm_") || name == "q4e_gemv_tiled_bf16_parts" {
+        sparkflash_kernels::images::glm_decode_cubin()
     } else {
         embedded_glm_prefill_cubin()
     };
     let loaded = if name.ends_with("_q8_mma") {
         cuda.load_named_shared(image, name, Q8_SHARED)
+    } else if name.starts_with("glm_prefill_bf16_wide") {
+        cuda.load_named_shared(image, name, WIDE_SHARED)
     } else {
         cuda.load_named(image, name)
     };
@@ -449,6 +460,31 @@ fn the_skinny_bf16_projection_matches_the_host() {
         );
         let got = download_f32(&cuda, &out, rows * outs);
         assert_close(&format!("skinny bf16, {outs} outputs"), &host, &got, 1e-5);
+        // And the kernel's own chain to the bit: lane l's fmaf over its eight columns of each
+        // 256-column round in column order from 0.0, then the xor butterfly, output j from lane j.
+        for r in 0..rows {
+            for j in 0..outs {
+                let mut lanes = [0.0f32; 32];
+                for (l, sum) in lanes.iter_mut().enumerate() {
+                    for k in (l * 8..columns).step_by(256) {
+                        for c in k..k + 8 {
+                            *sum = widened(j * columns + c).mul_add(x[r * columns + c], *sum);
+                        }
+                    }
+                }
+                for offset in [16, 8, 4, 2, 1] {
+                    let before = lanes;
+                    for (l, sum) in lanes.iter_mut().enumerate() {
+                        *sum = before[l] + before[l ^ offset];
+                    }
+                }
+                assert_eq!(
+                    got[r * outs + j].to_bits(),
+                    lanes[j].to_bits(),
+                    "skinny bf16, {outs} outputs: row {r} output {j} is not the lane chain"
+                );
+            }
+        }
     }
 }
 
@@ -805,4 +841,370 @@ fn the_bulk_swiglu_reads_gate_and_up_halves() {
         .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
         .collect();
     assert_close("bulk swiglu", &want, &got, 1e-5);
+}
+
+/// The decode step's index score of one row against one pool, as q4e_glm_index_scores computes
+/// it: lane l's fmaf chain over channels l, l + 32, l + 64, l + 96 from 0.0, q4e_warp_sum's
+/// shuffle-down fold (lane 0's value), and the head-ordered sum of w_h max(dot * score_scale, 0).
+fn decode_index_score(
+    query: &[f32],
+    weights: &[f32],
+    key: &[f32],
+    score_scale: f32,
+    head_scale: f32,
+) -> f32 {
+    let mut score = 0.0f32;
+    for head in 0..32 {
+        let q = &query[head * 128..head * 128 + 128];
+        let mut lanes = [0.0f32; 32];
+        for (l, part) in lanes.iter_mut().enumerate() {
+            for step in 0..4 {
+                *part = q[l + 32 * step].mul_add(key[l + 32 * step], *part);
+            }
+        }
+        for offset in [16, 8, 4, 2, 1] {
+            let before = lanes;
+            for (l, part) in lanes.iter_mut().enumerate().take(32 - offset) {
+                *part = before[l] + before[l + offset];
+            }
+        }
+        let weight = (weights[head] * head_scale) * 1.0;
+        score += weight * (lanes[0] * score_scale).max(0.0);
+    }
+    score
+}
+
+#[test]
+fn the_bulk_index_scores_are_the_decode_kernels_bit_for_bit() {
+    let Some(cuda) = open() else { return };
+    if sparkflash_kernels::images::glm_attention_cubin().is_empty()
+        || sparkflash_kernels::images::glm_decode_cubin().is_empty()
+    {
+        eprintln!("skipped: this build embeds no GLM attention or decode cubin");
+        return;
+    }
+    let (heads, dim, pool) = (32usize, 128usize, 4usize);
+    let score_scale = 1.0 / (dim as f32).sqrt();
+    let head_scale = 1.0 / (heads as f32).sqrt();
+    let mut rng = Lcg(0x676c_6978);
+    // A first chunk (the triangle, a partial row tile), a run starting off a pool boundary over
+    // a partial pool tile, and a short run behind a long context.
+    for (position, rows) in [(0usize, 77usize), (4093, 300), (1000, 33)] {
+        let pools = (position + rows) / pool;
+        // Past the last pool, keys the kernels must not read into a score.
+        let mut keys = rng.values((pools + 70) * dim);
+        let mut query = rng.values(rows * heads * dim);
+        let weights = rng.values(rows * heads);
+        // Signed zeros, whose sums the chain order decides.
+        for (i, value) in query.iter_mut().enumerate().step_by(97) {
+            *value = if i % 2 == 0 { 0.0 } else { -0.0 };
+        }
+        for value in keys.iter_mut().step_by(89) {
+            *value = -0.0;
+        }
+        let score_stride = pools + 70;
+        let sentinel = f32::from_bits(0x7FC0_1234);
+        let (q, w, k) = (
+            upload_f32(&cuda, &query),
+            upload_f32(&cuda, &weights),
+            upload_f32(&cuda, &keys),
+        );
+        let decode = upload_f32(&cuda, &vec![sentinel; rows * score_stride]);
+        let bulk = upload_f32(&cuda, &vec![sentinel; rows * score_stride]);
+        launch(
+            &cuda,
+            "q4e_glm_index_scores",
+            (pools.div_ceil(64).max(1) as u32, rows as u32, 1),
+            256,
+            &[
+                q.0,
+                w.0,
+                k.0,
+                decode.0,
+                position as u64,
+                heads as u64,
+                dim as u64,
+                pool as u64,
+                u64::from(score_scale.to_bits()),
+                u64::from(head_scale.to_bits()),
+                score_stride as u64,
+            ],
+        );
+        launch(
+            &cuda,
+            "glm_prefill_index_scores",
+            (
+                pools.div_ceil(64).max(1) as u32,
+                rows.div_ceil(32) as u32,
+                1,
+            ),
+            128,
+            &[
+                q.0,
+                w.0,
+                k.0,
+                bulk.0,
+                position as u64,
+                pool as u64,
+                u64::from(score_scale.to_bits()),
+                u64::from(head_scale.to_bits()),
+                score_stride as u64,
+                rows as u64,
+            ],
+        );
+        let expected = download_f32(&cuda, &decode, rows * score_stride);
+        let got = download_f32(&cuda, &bulk, rows * score_stride);
+        for row in 0..rows {
+            let own = (position + row + 1) / pool;
+            for p in 0..score_stride {
+                let at = row * score_stride + p;
+                assert_eq!(
+                    got[at].to_bits(),
+                    expected[at].to_bits(),
+                    "position {position}: row {row} pool {p} (of {own}) is {} against {}",
+                    got[at],
+                    expected[at]
+                );
+                if p >= own {
+                    assert_eq!(
+                        got[at].to_bits(),
+                        sentinel.to_bits(),
+                        "row {row} wrote pool {p}"
+                    );
+                }
+            }
+            // And the decode kernel's own order, on a sample of the row's pools.
+            for p in (row % 7..own).step_by(53) {
+                let host = decode_index_score(
+                    &query[row * heads * dim..(row + 1) * heads * dim],
+                    &weights[row * heads..(row + 1) * heads],
+                    &keys[p * dim..(p + 1) * dim],
+                    score_scale,
+                    head_scale,
+                );
+                assert_eq!(
+                    got[row * score_stride + p].to_bits(),
+                    host.to_bits(),
+                    "position {position}: row {row} pool {p} is not the decode order"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_wide_bf16_gemm_is_the_128_column_tiles_bit_for_bit() {
+    let Some(cuda) = open() else { return };
+    // Whole and partial 256-column tiles (a 128-column remainder, a 96-column part), partial row
+    // tiles and a 17-row chunk, each with the split activation and its head alone.
+    let mut rng = Lcg(0x7769_6465);
+    for (rows, outs, columns) in [
+        (300usize, 384usize, 512usize),
+        (130, 96, 256),
+        (17, 2048, 128),
+        (513, 640, 1024),
+    ] {
+        // Rows spanning magnitudes, so the remainder is often far below the head, and signed
+        // zeros among them.
+        let mut x: Vec<f32> = (0..rows * columns)
+            .map(|i| rng.next() * f32::powi(2.0, (i / columns % 41) as i32 - 20))
+            .collect();
+        for (i, value) in x.iter_mut().enumerate().step_by(97) {
+            *value = if i % 2 == 0 { 0.0 } else { -0.0 };
+        }
+        let weights: Vec<u16> = (0..outs * columns)
+            .map(|_| ((rng.next() * 0.05).to_bits() >> 16) as u16)
+            .collect();
+        let w = upload(
+            &cuda,
+            &weights
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let input = upload_f32(&cuda, &x);
+        let sentinel = f32::from_bits(0x7FC0_4321);
+        for (narrow, wide) in [
+            ("glm_prefill_bf16_mma", "glm_prefill_bf16_wide"),
+            ("glm_prefill_bf16_mma_bf16a", "glm_prefill_bf16_wide_bf16a"),
+        ] {
+            // A row past the last, which neither kernel may write.
+            let expected = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+            let got = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+            let args = |out: &Deviceptr| {
+                [
+                    w.0,
+                    input.0,
+                    out.0,
+                    outs as u64,
+                    columns as u64,
+                    rows as u64,
+                ]
+            };
+            launch(
+                &cuda,
+                narrow,
+                (outs.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1),
+                256,
+                &args(&expected),
+            );
+            launch(
+                &cuda,
+                wide,
+                (outs.div_ceil(256) as u32, rows.div_ceil(128) as u32, 1),
+                256,
+                &args(&got),
+            );
+            let expected = download_f32(&cuda, &expected, (rows + 1) * outs);
+            let got = download_f32(&cuda, &got, (rows + 1) * outs);
+            assert!(
+                expected[..rows * outs]
+                    .iter()
+                    .any(|v| *v != 0.0 && v.is_finite()),
+                "{narrow} {rows} x {outs} x {columns}: no output"
+            );
+            for (at, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{wide} {rows} x {outs} x {columns}: row {} output {} is {got} against \
+                     {expected}",
+                    at / outs,
+                    at % outs
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_exact_projection_is_the_tiled_gemvs_bit_for_bit() {
+    let Some(cuda) = open() else { return };
+    if sparkflash_kernels::images::glm_decode_cubin().is_empty() {
+        eprintln!("skipped: this build embeds no GLM decode cubin");
+        return;
+    }
+    use sparkflash_ops::gemv::{TILED_GEMV_ROUND, tiled_gemv_splits};
+    // The router's shape, a partial output tile over four rounds, and one round (no split sum).
+    // Each is a shape the tiled GEMV splits one round a block, the only one the kernel takes;
+    // 600 rows run the tiled GEMV as a 512-row group and a partial one, as gemv_chunked does.
+    let rows = 600usize;
+    let mut rng = Lcg(0x676c_6578);
+    for (outs, columns) in [(288usize, 4096usize), (40, 1024), (32, 256)] {
+        let tiles = outs.div_ceil(32);
+        let rounds = columns / TILED_GEMV_ROUND;
+        assert_eq!(
+            tiled_gemv_splits(tiles, columns),
+            rounds,
+            "{outs} x {columns}"
+        );
+        let mut x = rng.values(rows * columns);
+        for (i, value) in x.iter_mut().enumerate().step_by(101) {
+            *value = if i % 2 == 0 { 0.0 } else { -0.0 };
+        }
+        let mut weights: Vec<u16> = (0..outs * columns)
+            .map(|_| (rng.next().to_bits() >> 16) as u16)
+            .collect();
+        for value in weights.iter_mut().step_by(83) {
+            *value = 0x8000;
+        }
+        let widened = |i: usize| f32::from_bits(u32::from(weights[i]) << 16);
+        let w = upload(
+            &cuda,
+            &weights
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let input = upload_f32(&cuda, &x);
+        let sentinel = f32::from_bits(0x7FC0_1234);
+        // A row past the last, which neither kernel may write.
+        let tiled = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+        let exact = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+        let groups = 64usize;
+        let mut total = 0;
+        let partials = cuda
+            .alloc(groups * rounds * 8 * tiles * 32 * 4, &mut total)
+            .expect("alloc");
+        let counters = upload(&cuda, &vec![0u8; groups * tiles * 4]);
+        for done in (0..rows).step_by(512) {
+            let count = 512.min(rows - done);
+            launch(
+                &cuda,
+                "q4e_gemv_tiled_bf16_parts",
+                (tiles as u32, rounds as u32, count.div_ceil(8) as u32),
+                256,
+                &[
+                    w.0,
+                    input.0 + (done * columns * 4) as u64,
+                    tiled.0 + (done * outs * 4) as u64,
+                    outs as u64,
+                    columns as u64,
+                    count as u64,
+                    partials.0,
+                    counters.0,
+                    outs as u64,
+                    outs as u64,
+                    outs as u64,
+                ],
+            );
+        }
+        launch(
+            &cuda,
+            "glm_prefill_exact_bf16",
+            (tiles as u32, rows.div_ceil(32) as u32, 1),
+            128,
+            &[
+                w.0,
+                input.0,
+                exact.0,
+                outs as u64,
+                columns as u64,
+                rows as u64,
+            ],
+        );
+        let expected = download_f32(&cuda, &tiled, (rows + 1) * outs);
+        let got = download_f32(&cuda, &exact, (rows + 1) * outs);
+        for (at, (got, expected)) in got.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "{outs} x {columns}: row {} output {} is {got} against {expected}",
+                at / outs,
+                at % outs
+            );
+        }
+        assert!(
+            got[rows * outs..]
+                .iter()
+                .all(|v| v.to_bits() == sentinel.to_bits()),
+            "{outs} x {columns}: a write past the last row"
+        );
+        // And the tiled GEMV's own chain on a sample: lane l's fmaf over its eight columns of a
+        // round from 0.0, the xor butterfly, and the rounds' partials added in order from 0.0.
+        for at in (0..rows * outs).step_by(173) {
+            let (r, j) = (at / outs, at % outs);
+            let mut sum = 0.0f32;
+            for round in 0..rounds {
+                let mut lanes = [0.0f32; 32];
+                for (l, lane) in lanes.iter_mut().enumerate() {
+                    for c in round * 256 + l * 8..round * 256 + l * 8 + 8 {
+                        *lane = widened(j * columns + c).mul_add(x[r * columns + c], *lane);
+                    }
+                }
+                for offset in [16, 8, 4, 2, 1] {
+                    let before = lanes;
+                    for (l, lane) in lanes.iter_mut().enumerate() {
+                        *lane = before[l] + before[l ^ offset];
+                    }
+                }
+                sum = if rounds > 1 { sum + lanes[0] } else { lanes[0] };
+            }
+            assert_eq!(
+                got[at].to_bits(),
+                sum.to_bits(),
+                "{outs} x {columns}: row {r} output {j} is not the tiled chain"
+            );
+        }
+    }
 }

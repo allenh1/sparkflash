@@ -63,10 +63,10 @@ pub use sparkflash_model::ConfigError;
 
 /// The stored format of the routed experts.
 ///
-/// The released NVFP4 checkpoint stores them as packed E2M1 with E4M3 block scales and two
-/// per-tensor F32 scales; the official FP8 checkpoint stores the same experts as E4M3 codes with
-/// one BF16 scale a 128x128 tile. Every other tensor of the two checkpoints is BF16 (and the PLE
-/// table is FP8 in both), so the expert format is the whole difference the loader sees.
+/// The released Qwen3.8 NVFP4 checkpoint stores them as packed E2M1 with E4M3 block scales and
+/// two per-tensor F32 scales; the official FP8 checkpoints (Qwen3.8 and Qwen3.5/3.6) store them as
+/// E4M3 codes with one BF16 scale a 128x128 tile; an unquantised Qwen3.5/3.6 release stores them
+/// as BF16, every expert of a layer in one fused 3-D tensor per projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExpertQuant {
     /// ModelOpt NVFP4: two E2M1 nibbles a byte, one E4M3 scale a 16-column group.
@@ -74,25 +74,56 @@ pub enum ExpertQuant {
     Nvfp4,
     /// E4M3 with one scale a 128x128 tile ([ScaleGrid::Tile]).
     Fp8Block,
+    /// BF16, as `mlp.experts.gate_up_proj` `[experts, 2 * intermediate, hidden]` and
+    /// `mlp.experts.down_proj` `[experts, hidden, intermediate]`.
+    Bf16,
 }
 
+/// The stored format of the dense projections: attention, Gated DeltaNet, the shared expert and
+/// a dense MLP.
+///
+/// The Qwen3.8 releases keep every dense projection BF16 (the FP8 one quantises only its routed
+/// experts, despite one global `quant_method`). Qwen3.5/3.6 FP8 releases also store the dense
+/// projections as 128x128-tile E4M3, leaving the router, the shared-expert gate, the Gated
+/// DeltaNet's narrow `in_proj_a`/`in_proj_b`, the norms, the embedding and the head BF16 - which
+/// tensor is which is read from each tensor's stored dtype, not from a module list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DenseQuant {
+    /// Every dense projection is BF16.
+    #[default]
+    Bf16,
+    /// The wide dense projections are E4M3 with one scale a 128x128 tile.
+    Fp8Block,
+}
+
+/// The family whose release carries hyper-connections, the PLE and the QSA indexer.
+pub const HYPER_FAMILY: &str = "qwen4_exp";
+
+/// The families this pack serves: Qwen3.8 (`qwen4_exp`) and Qwen3.5/3.6 MoE (`qwen3_5_moe`).
+pub const SERVED_FAMILIES: &[&str] = &[HYPER_FAMILY, "qwen3_5_moe"];
+
 impl ExpertQuant {
+    /// The format the released quantisation metadata selects.
+    ///
+    /// A document with no quantisation method is the Qwen3.8 NVFP4 fixture schema when it is
+    /// the hyper-connected family; any other family stores BF16 experts then.
+    ///
+    /// # Errors
+    /// A mix this pack has no loader for.
+    pub fn of_family(quant: &QuantizationSpec, family: &str) -> Result<Self, ConfigError> {
+        let method = quant.method();
+        if method.is_empty() && family != HYPER_FAMILY {
+            return Ok(Self::Bf16);
+        }
+        Self::of(quant)
+    }
+
     /// The format the released quantisation metadata selects.
     ///
     /// # Errors
     /// A mix this pack has no loader for.
     pub fn of(quant: &QuantizationSpec) -> Result<Self, ConfigError> {
-        // ModelOpt names the producer in `quant_method` and the arithmetic in `quant_algo`; the
-        // released NVFP4 snapshot declares `quant_method: "modelopt"`, so reading the producer as
-        // a format refused it before a weight was touched.
-        let declared = quant.quant_method.as_deref().unwrap_or_default();
-        let method = if declared.is_empty()
-            || sparkflash_model::architecture::names_the_producer(declared)
-        {
-            quant.quant_algo.as_str()
-        } else {
-            declared
-        };
+        let method = quant.method();
         match method.to_ascii_lowercase().as_str() {
             "fp8" | "fp8_block_scales" => {
                 let block = quant.weight_block_size.as_deref().unwrap_or(&[]);
@@ -146,6 +177,8 @@ pub struct Qwen4ExpConfig {
     pub architecture: sparkflash_model::Architecture,
     /// The stored format of the routed experts.
     pub expert_quant: ExpertQuant,
+    /// The stored format of the dense projections.
+    pub dense_quant: DenseQuant,
     /// Gated DeltaNet convolution width (4).
     pub linear_conv_kernel_dim: usize,
     /// Gated DeltaNet key head width (128).
@@ -170,9 +203,11 @@ pub struct Qwen4ExpConfig {
     pub hidden_act: String,
     /// Output gate activation of Gated DeltaNet (sigmoid).
     pub output_gate_type: String,
-    /// Residual streams per hyper-connection (4).
+    /// Residual streams per hyper-connection (4). One is the plain additive residual of the
+    /// Qwen3.5/3.6 releases: the branch reads the stream's zero-centred norm and adds its output
+    /// back with weight one.
     pub hc_count: usize,
-    /// Bottleneck rank of the hyper-connection input mixer (320).
+    /// Bottleneck rank of the hyper-connection input mixer (320; zero with no mixer).
     pub hc_lowrank: usize,
     /// One-indexed decoder layers that carry the n-gram PLE ([2]).
     pub ple_layer_ids: Vec<usize>,
@@ -300,7 +335,13 @@ impl Qwen4ExpConfig {
         // while the arm, its profile and its plan are `qwen4_exp`.
         architecture.family =
             sparkflash_model::canonical_model_type(&architecture.family).to_owned();
-        architecture.experts_only_fp8();
+        if !SERVED_FAMILIES.contains(&architecture.family.as_str()) {
+            return Err(ConfigError::Invalid(format!(
+                "the Qwen pack serves the {SERVED_FAMILIES:?} families, not {:?}",
+                architecture.family
+            )));
+        }
+        crate::architecture::correct_release_formats(&mut architecture);
         let root: RootConfig =
             serde_json::from_str(text).map_err(|error| ConfigError::Json(error.to_string()))?;
         // A text-only release writes the text configuration at the document root, with no
@@ -371,7 +412,44 @@ impl Qwen4ExpConfig {
         }
         architecture.tokens.eos_token_ids = eos_token_ids.clone();
         let quant = root.quantization_config.unwrap_or_default();
-        let expert_quant = ExpertQuant::of(&quant)?;
+        let family = architecture.family.clone();
+        let expert_quant = ExpertQuant::of_family(&quant, &family)?;
+        // The dense format is the shared architecture's after the release correction above: the
+        // Qwen3.8 FP8 pack's dense class is BF16, the Qwen3.5/3.6 FP8 pack's is the 128x128 tile.
+        let dense_quant = match architecture.quantization.dense_format {
+            sparkflash_model::architecture::WeightFormat::Bf16 => DenseQuant::Bf16,
+            sparkflash_model::architecture::WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                ..
+            } => DenseQuant::Fp8Block,
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "the Qwen pack reads BF16 or 128x128-tile E4M3 dense projections, not {}",
+                    other.name()
+                )));
+            }
+        };
+        if text.attn_output_gate == Some(false) {
+            return Err(ConfigError::Invalid(
+                "this pack implements the gated attention output (attn_output_gate = true)"
+                    .to_owned(),
+            ));
+        }
+        // The residual's width is the shared parser's reading of the document, so an absent
+        // `hc_count` is the plain residual the Qwen3.5/3.6 releases run rather than a guessed
+        // Qwen3.8 default; a document that names the fields keeps them, and the cross check
+        // below refuses a pair that disagrees with the shared walk.
+        let (streams, lowrank) =
+            architecture
+                .layers
+                .first()
+                .map_or((1, 0), |layer| match &layer.residual {
+                    sparkflash_model::architecture::Residual::Plain => (1, 0),
+                    sparkflash_model::architecture::Residual::Hyper(hyper) => {
+                        (hyper.streams, hyper.lowrank.unwrap_or(0))
+                    }
+                });
         let mut ple_layer_ids = text.ple_layer_ids.unwrap_or_default();
         ple_layer_ids.sort_unstable();
         ple_layer_ids.dedup();
@@ -390,6 +468,7 @@ impl Qwen4ExpConfig {
             layer_types,
             architecture,
             expert_quant,
+            dense_quant,
             linear_conv_kernel_dim: text.linear_conv_kernel_dim,
             linear_key_head_dim: text.linear_key_head_dim,
             linear_value_head_dim: text.linear_value_head_dim,
@@ -402,8 +481,8 @@ impl Qwen4ExpConfig {
             norm_topk_prob: text.norm_topk_prob,
             hidden_act: text.hidden_act,
             output_gate_type: text.output_gate_type.unwrap_or_else(|| "silu".to_owned()),
-            hc_count: text.hc_count,
-            hc_lowrank: text.hc_lowrank,
+            hc_count: text.hc_count.unwrap_or(streams),
+            hc_lowrank: text.hc_lowrank.unwrap_or(lowrank),
             ple_layer_ids,
             ple_embed_dim: text.ple_embed_dim.unwrap_or(text.hidden_size),
             ple_conv_kernel_size: text.ple_conv_kernel_size,
@@ -458,7 +537,7 @@ impl Qwen4ExpConfig {
         config.cross_check(&config.architecture)?;
         // The NVFP4 checkpoint is only usable through the quantisation metadata below; a
         // different mix (say an FP8 checkpoint) would need a different loader.
-        quant.validate()?;
+        quant.validate(&family)?;
         Ok(config)
     }
 
@@ -500,6 +579,88 @@ impl Qwen4ExpConfig {
         config
     }
 
+    /// A tiny Qwen3.5/3.6-MoE (`qwen3_5_moe`) configuration: no hyper-connections, no PLE, no
+    /// indexer, and every dense projection and expert stored as `format`.
+    ///
+    /// Three Gated DeltaNet layers and one full-attention layer, the release's 3:1 schedule, at
+    /// widths the device kernels take: every inner dimension is a whole 128-column tile, so the
+    /// FP8 fixture's projections are the tile-scaled kind, and the attention head is 32 wide.
+    ///
+    /// # Panics
+    /// Only if the rendered document cannot be parsed again, which its own test rules out.
+    #[must_use]
+    pub fn tiny_qwen35_moe(format: DenseQuant) -> Self {
+        let mut config = Self::tiny();
+        config.hidden_size = 128;
+        config.num_hidden_layers = 4;
+        config.layer_types = vec![
+            LayerKind::Linear,
+            LayerKind::Linear,
+            LayerKind::Linear,
+            LayerKind::Sparse,
+        ];
+        config.num_attention_heads = 4;
+        config.num_key_value_heads = 2;
+        config.head_dim = 32;
+        config.partial_rotary_factor = 0.25;
+        config.mrope_section = [2, 1, 1];
+        config.vocab_size = 256;
+        config.max_position_embeddings = 512;
+        config.linear_key_head_dim = 32;
+        config.linear_value_head_dim = 32;
+        config.linear_num_key_heads = 2;
+        config.linear_num_value_heads = 4;
+        config.moe_intermediate_size = 128;
+        config.shared_expert_intermediate_size = 128;
+        config.output_gate_type = "silu".to_owned();
+        config.hc_count = 1;
+        config.hc_lowrank = 0;
+        config.ple_layer_ids = Vec::new();
+        config.indexer_n_heads = 0;
+        config.indexer_kv_heads = 0;
+        config.indexer_head_dim = 0;
+        config.indexer_budget = 0;
+        config.indexer_compress_ratio = 0;
+        config.mtp_num_hidden_layers = 0;
+        // The renderer reads the family to pick the Qwen3.5 schema.
+        config.architecture.family = "qwen3_5_moe".to_owned();
+        config.architecture.mtp = None;
+        (config.expert_quant, config.dense_quant) = match format {
+            DenseQuant::Bf16 => (ExpertQuant::Bf16, DenseQuant::Bf16),
+            DenseQuant::Fp8Block => (ExpertQuant::Fp8Block, DenseQuant::Fp8Block),
+        };
+        config.architecture = crate::architecture::architecture_from_json(&config.to_json())
+            .expect("the tiny Qwen3.5-MoE document parses");
+        config
+    }
+
+    /// Whether the device builds and drafts with the checkpoint's MTP stage. Qwen3.5/3.6's
+    /// (`mtp.fc` over a plain residual) is planned but not served yet; Qwen3.8's is.
+    #[must_use]
+    pub fn serves_mtp(&self) -> bool {
+        self.mtp_num_hidden_layers > 0 && !self.plain_residual()
+    }
+
+    /// Whether the residual is the plain additive one (`hc_count = 1`): no hyper-connection mixer,
+    /// no injection weights.
+    #[must_use]
+    pub fn plain_residual(&self) -> bool {
+        self.hc_count == 1
+    }
+
+    /// Whether the attention layers attend over every cached position rather than the QSA
+    /// indexer's selection.
+    #[must_use]
+    pub fn full_attention(&self) -> bool {
+        self.indexer_n_heads == 0
+    }
+
+    /// The family the document names, after the text alias folds onto it.
+    #[must_use]
+    pub fn family(&self) -> &str {
+        &self.architecture.family
+    }
+
     /// A tiny two-layer configuration for the reference tests.
     ///
     /// Every width divides evenly, the first layer is Gated DeltaNet and the second sparse
@@ -522,6 +683,7 @@ impl Qwen4ExpConfig {
             layer_types: vec![LayerKind::Linear, LayerKind::Sparse],
             architecture: crate::architecture::tiny_architecture(),
             expert_quant: ExpertQuant::Nvfp4,
+            dense_quant: DenseQuant::Bf16,
             linear_conv_kernel_dim: 4,
             linear_key_head_dim: 4,
             linear_value_head_dim: 4,
@@ -635,6 +797,45 @@ impl Qwen4ExpConfig {
             "eos_token_id": self.eos_token_ids,
             "mtp_num_hidden_layers": self.mtp_num_hidden_layers,
         });
+        // A Qwen3.5/3.6 document names none of the hyper-connection, PLE or indexer fields, and
+        // states its gated attention output; render that schema, not zeros the shared parser
+        // would read as a one-stream hyper-connection or an empty indexer.
+        if let Some(fields) = text.as_object_mut() {
+            if self.plain_residual() {
+                fields.remove("hc_count");
+                fields.remove("hc_lowrank");
+            }
+            if self.ple_layer_ids.is_empty() {
+                for key in [
+                    "ple_layer_ids",
+                    "ple_embed_dim",
+                    "ple_conv_kernel_size",
+                    "ngram_size",
+                    "heads_per_ngram",
+                    "ngram_vocab_size_base",
+                    "make_ngram_vocab_size_divisible_by",
+                    "seed",
+                    "split_ngram_parts",
+                ] {
+                    fields.remove(key);
+                }
+            }
+            if self.full_attention() {
+                for key in [
+                    "indexer_n_heads",
+                    "indexer_kv_heads",
+                    "indexer_head_dim",
+                    "indexer_budget",
+                    "indexer_compress_ratio",
+                ] {
+                    fields.remove(key);
+                }
+            }
+            if self.family() != HYPER_FAMILY {
+                fields.insert("attn_output_gate".to_owned(), serde_json::json!(true));
+                fields.insert("full_attention_interval".to_owned(), serde_json::json!(4));
+            }
+        }
         // The shared architecture reads the top-level key, so the rendered document carries it
         // or the round trip would describe a different rotary width.
         text["partial_rotary_factor"] = serde_json::json!(self.partial_rotary_factor);
@@ -659,11 +860,16 @@ impl Qwen4ExpConfig {
         if let Some(pad) = self.pad_token_id {
             text["pad_token_id"] = serde_json::json!(pad);
         }
+        let (model_type, class) = if self.family() == HYPER_FAMILY {
+            (HYPER_FAMILY, "Qwen4ExpForConditionalGeneration")
+        } else {
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration")
+        };
         let mut root = serde_json::json!({
-            "model_type": "qwen4_exp",
+            "model_type": model_type,
             // The shared architecture carries the released architecture name, so the rendered
             // document names it too and the round trip keeps both parsers in step.
-            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "architectures": [class],
             "text_config": text,
             "tie_word_embeddings": self.tie_word_embeddings,
             "image_token_id": self.image_token_id,
@@ -712,6 +918,8 @@ impl Qwen4ExpConfig {
                     serde_json::json!([128, 128]),
                 );
             }
+            // An unquantised Qwen3.5/3.6 release has no quantisation block at all.
+            ExpertQuant::Bf16 => {}
         }
         if !quant.is_empty() {
             root["quantization_config"] = serde_json::Value::Object(quant);
@@ -899,8 +1107,29 @@ impl Qwen4ExpConfig {
             self.layer_types.len() == self.num_hidden_layers,
             "layer_types must have one entry per hidden layer",
         )?;
-        require(self.hc_count > 1, "Qwen4-Exp requires hc_count > 1")?;
-        require(self.hc_lowrank > 0, "hc_lowrank must be positive")?;
+        require(self.hc_count >= 1, "hc_count must be positive")?;
+        if self.family() == HYPER_FAMILY {
+            require(self.hc_count > 1, "Qwen4-Exp requires hc_count > 1")?;
+        }
+        if self.plain_residual() {
+            // One stream has nothing to mix: its branch input is the zero-centred norm.
+            require(
+                self.hc_lowrank == 0,
+                "a plain residual (hc_count = 1) has no hyper-connection mixer, so hc_lowrank must be unset",
+            )?;
+            require(
+                self.ple_layer_ids.is_empty(),
+                "the n-gram PLE writes per-stream keys, so it needs hyper-connections (hc_count > 1)",
+            )?;
+        } else {
+            require(self.hc_lowrank > 0, "hc_lowrank must be positive")?;
+        }
+        if self.dense_quant == DenseQuant::Fp8Block {
+            require(
+                self.hidden_size.is_multiple_of(128),
+                "FP8 dense projections read whole 128-column tiles, so hidden_size must be a multiple of 128",
+            )?;
+        }
         require(
             self.moe_intermediate_size > 0 && self.shared_expert_intermediate_size > 0,
             "expert intermediate widths must be positive",
@@ -956,23 +1185,32 @@ impl Qwen4ExpConfig {
                 self.indexer_budget,
                 self.indexer_compress_ratio,
             ];
-            require(
-                qsa.iter().all(|value| *value > 0),
-                "QSA is enabled by this configuration, so every indexer field must be positive",
-            )?;
-            require(
-                self.indexer_kv_heads == 1,
-                "Qwen4-Exp QSA requires indexer_kv_heads=1",
-            )?;
-            require(
-                self.indexer_budget
-                    .is_multiple_of(self.indexer_compress_ratio),
-                "indexer_budget must be divisible by indexer_compress_ratio",
-            )?;
-            require(
-                rotary <= self.indexer_head_dim,
-                "the attention rotary width must fit inside the QSA index head",
-            )?;
+            if self.full_attention() {
+                // No indexer: every attention layer reads every cached position. A document that
+                // names some indexer fields but not the head count is not that schema.
+                require(
+                    qsa.iter().all(|value| *value == 0),
+                    "an indexer field is set without indexer_n_heads; QSA needs every field and full attention none",
+                )?;
+            } else {
+                require(
+                    qsa.iter().all(|value| *value > 0),
+                    "QSA is enabled by this configuration, so every indexer field must be positive",
+                )?;
+                require(
+                    self.indexer_kv_heads == 1,
+                    "Qwen4-Exp QSA requires indexer_kv_heads=1",
+                )?;
+                require(
+                    self.indexer_budget
+                        .is_multiple_of(self.indexer_compress_ratio),
+                    "indexer_budget must be divisible by indexer_compress_ratio",
+                )?;
+                require(
+                    rotary <= self.indexer_head_dim,
+                    "the attention rotary width must fit inside the QSA index head",
+                )?;
+            }
         }
         if self.linear_layers() > 0 {
             require(
@@ -1117,8 +1355,22 @@ pub struct QuantizationSpec {
 }
 
 impl QuantizationSpec {
-    fn validate(&self) -> Result<(), ConfigError> {
-        ExpertQuant::of(self).map(|_| ())
+    /// The arithmetic the metadata names.
+    ///
+    /// ModelOpt names the producer in `quant_method` and the arithmetic in `quant_algo`; the
+    /// released NVFP4 snapshot declares `quant_method: "modelopt"`, so reading the producer as a
+    /// format refused it before a weight was touched.
+    fn method(&self) -> &str {
+        let declared = self.quant_method.as_deref().unwrap_or_default();
+        if declared.is_empty() || sparkflash_model::architecture::names_the_producer(declared) {
+            self.quant_algo.as_str()
+        } else {
+            declared
+        }
+    }
+
+    fn validate(&self, family: &str) -> Result<(), ConfigError> {
+        ExpertQuant::of_family(self, family).map(|_| ())
     }
 }
 
@@ -1183,10 +1435,12 @@ struct TextConfig {
     hidden_act: String,
     #[serde(default)]
     output_gate_type: Option<String>,
-    #[serde(default = "default_hc_count")]
-    hc_count: usize,
-    #[serde(default = "default_hc_lowrank")]
-    hc_lowrank: usize,
+    #[serde(default)]
+    hc_count: Option<usize>,
+    #[serde(default)]
+    hc_lowrank: Option<usize>,
+    #[serde(default)]
+    attn_output_gate: Option<bool>,
     #[serde(default)]
     ple_layer_ids: Option<Vec<usize>>,
     #[serde(default)]
@@ -1318,12 +1572,6 @@ fn default_true() -> bool {
 }
 fn default_hidden_act() -> String {
     "silu".to_owned()
-}
-fn default_hc_count() -> usize {
-    4
-}
-fn default_hc_lowrank() -> usize {
-    320
 }
 fn default_ple_conv() -> usize {
     4
@@ -1745,11 +1993,15 @@ mod tests {
         // The served identity follows the stored format, so a card cannot report the NVFP4
         // checkpoint for an FP8 run.
         assert_eq!(
-            crate::device::descriptor_for(&fp8, 4096).id,
+            crate::device::descriptor_for(&fp8, 4096)
+                .expect("a registered release")
+                .id,
             "Qwen/Qwen3.8-Flash-Next-FP8"
         );
         assert_eq!(
-            crate::device::descriptor_for(&nvfp4, 4096).id,
+            crate::device::descriptor_for(&nvfp4, 4096)
+                .expect("a registered release")
+                .id,
             "nvidia/Qwen3.8-Flash-Next-NVFP4"
         );
     }

@@ -42,7 +42,7 @@ pub(super) fn load_dflash_from_env(
     target: &Qwen4ExpConfig,
     head: &GpuMat,
 ) -> Result<Option<GpuDflash2>, BackendError> {
-    let Some(directory) = crate::dflash::drafter_directory() else {
+    let Some(directory) = crate::dflash::drafter_directory(target) else {
         return Ok(None);
     };
     let loaded = cuda

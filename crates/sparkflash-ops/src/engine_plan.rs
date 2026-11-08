@@ -755,13 +755,16 @@ fn geometry_for(
 
 /// The grouped FP8 policy the released formats imply.
 ///
-/// The two FP8 packs differ in a typed fact, not a family name. Qwen's pack stores only the
-/// routed experts as E4M3, so the arm's [Architecture::experts_only_fp8] correction leaves the
-/// dense class BF16 and a chunk takes the grouped tile from 64 tokens. GLM's pack stores the
-/// dense and routed weights alike as E4M3, and its dynamic activation scheme drives the q8 MMA;
-/// its host counts token rows, with `MAX_ROWS = GEMV_MAX_BATCH = 8` and the bulk pass starting
-/// at 9 tokens, so the plan sets the grouped threshold to `GEMV_MAX_BATCH + 1` (9 tokens) and
-/// names the q8 body. [GroupedFp8Body::Bf16Activation] and
+/// The FP8 packs differ in a typed fact, not a family name: whether the dense class quantizes
+/// its activations. GLM's pack stores the dense and routed weights alike as E4M3, and its
+/// dynamic activation scheme drives the q8 MMA; its host counts token rows, with `MAX_ROWS =
+/// GEMV_MAX_BATCH = 8` and the bulk pass starting at 9 tokens, so the plan sets the grouped
+/// threshold to `GEMV_MAX_BATCH + 1` (9 tokens) and names the q8 body. Every other FP8 expert
+/// release is a Qwen arm's, whose chunk takes the BF16-activation grouped tile from 64 tokens.
+/// Qwen3.8's pack stores only the routed experts as E4M3, so the arm's
+/// [Architecture::experts_only_fp8] correction leaves the dense class BF16. Qwen3.5/3.6 stores
+/// the dense projections as GLM's tiles, but the arm computes them weight-only, so its
+/// [Architecture::weight_only_fp8] correction clears the dynamic scheme. [GroupedFp8Body::Bf16Activation] and
 /// [GroupedFp8Body::SplitActivation] are the other activation forms a serving profile may
 /// select, but [EnginePlan] names the released dynamic default; a caller constructing a
 /// grouped requirement for an overriding profile must set
@@ -772,7 +775,13 @@ fn geometry_for(
 fn grouped_policy(quantization: &Quantization) -> (usize, Option<GroupedFp8Body>) {
     match quantization.expert_format {
         WeightFormat::Fp8Tile { .. } => {
-            if matches!(quantization.dense_format, WeightFormat::Fp8Tile { .. }) {
+            if matches!(
+                quantization.dense_format,
+                WeightFormat::Fp8Tile {
+                    dynamic_activations: true,
+                    ..
+                }
+            ) {
                 (
                     GEMV_MAX_BATCH + 1,
                     Some(GroupedFp8Body::QuantizedActivation),

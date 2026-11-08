@@ -33,6 +33,11 @@
 //! through that reduce (or, unsplit, through q4p_epilogue), at every row count, on one set of
 //! arrival counters the launches must leave zeroed for the next.
 //!
+//! A grouped launch gives each matrix the bits of its own launch, at one split or at several (the
+//! attention's unsplit query beside its split keys, values and indexer), and the hyper
+//! connection's fused up projection and mix (q4p_hyper_up_rows) gives the bits of the up
+//! projection's own launch followed by q4e_hyper_mix.
+//!
 //! The token GEMM's twin is held to the first claim, epilogue and reduce included, at the off-grid
 //! shapes it serves, and so is each of its CTAs riding a dense launch; its accuracy is the f32 FMA
 //! chain the token kernels' own tests bound. The experts' twin is held to both at the release's
@@ -124,12 +129,11 @@ fn launch(
         launch_rows(
             cuda,
             kernels.1,
-            &[(w, out, finish.y, cols)],
+            &[(w, out, finish.y, cols, segments)],
             &[],
             a,
             inner,
             tokens,
-            segments,
             finish,
         );
         return;
@@ -170,26 +174,24 @@ struct Rider {
     tickets: Deviceptr,
 }
 
-/// One q4p_dense_rows launch of up to four matrices `(w, out, y, cols)` of one input, each split
-/// `segments` ways, their tickets end to end from `finish.tickets` (whose `y` is unused), and up
-/// to two `riders`.
+/// One q4p_dense_rows launch of up to four matrices `(w, out, y, cols, segments)` of one input,
+/// each split its own `segments` ways, the split ones' tickets end to end from `finish.tickets`
+/// (whose `y` is unused), and up to two `riders`.
 #[allow(clippy::too_many_arguments)]
 fn launch_rows(
     cuda: &Cuda,
     kernel: Kernel,
-    matrices: &[(Deviceptr, Deviceptr, Deviceptr, usize)],
+    matrices: &[(Deviceptr, Deviceptr, Deviceptr, usize, usize)],
     riders: &[Rider],
     a: Deviceptr,
     inner: usize,
     tokens: usize,
-    segments: usize,
     finish: Finish,
 ) {
     let mut args = vec![
         a.0,
         inner as u64,
         tokens as u64,
-        segments as u64,
         finish.tickets.0,
         u64::from(finish.epilogue),
         u64::from(finish.scale.to_bits()),
@@ -198,11 +200,11 @@ fn launch_rows(
     let mut tiles = 0;
     for slot in 0..4 {
         match matrices.get(slot) {
-            Some(&(w, out, y, cols)) => {
-                args.extend_from_slice(&[w.0, out.0, y.0, cols as u64]);
-                tiles += cols.div_ceil(32);
+            Some(&(w, out, y, cols, segments)) => {
+                args.extend_from_slice(&[w.0, out.0, y.0, cols as u64, segments as u64]);
+                tiles += cols.div_ceil(32) * segments;
             }
-            None => args.extend_from_slice(&[0; 4]),
+            None => args.extend_from_slice(&[0; 5]),
         }
     }
     args.extend_from_slice(&[tiles as u64, riders.len() as u64]);
@@ -225,13 +227,13 @@ fn launch_rows(
             None => args.extend_from_slice(&[0; 8]),
         }
     }
-    let planes = tokens.div_ceil(16) * segments;
+    let planes = tokens.div_ceil(16);
     cuda.launch(
         kernel,
         (
             (tiles + ctas.div_ceil(planes)) as u32,
             tokens.div_ceil(16) as u32,
-            segments as u32,
+            1,
         ),
         (128, 1, 1),
         &args,
@@ -571,31 +573,20 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
                 launch_rows(
                     &cuda,
                     rows_kernel,
-                    &[(weights[i], out, y, shapes[i])],
+                    &[(weights[i], out, y, shapes[i], segments)],
                     &[],
                     a,
                     INNER,
                     count,
-                    segments,
                     finish,
                 );
             }
             let group: Vec<_> = together
                 .iter()
                 .enumerate()
-                .map(|(i, &(out, y))| (weights[i], out, y, shapes[i]))
+                .map(|(i, &(out, y))| (weights[i], out, y, shapes[i], segments))
                 .collect();
-            launch_rows(
-                &cuda,
-                rows_kernel,
-                &group,
-                &[],
-                a,
-                INNER,
-                count,
-                segments,
-                finish,
-            );
+            launch_rows(&cuda, rows_kernel, &group, &[], a, INNER, count, finish);
             for (i, cols) in shapes.iter().enumerate() {
                 // An unsplit launch finishes into `out`; a split one into `y`.
                 let pick = |(out, y): (Deviceptr, Deviceptr)| if segments > 1 { y } else { out };
@@ -609,6 +600,196 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
         }
     }
     eprintln!("a launch of four matrices gives each the bits of its own launch");
+}
+
+#[test]
+fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
+    let Some(cuda) = open() else { return };
+    let (_rows_module, rows_kernel) = cuda
+        .load_named(embedded_prefill_cubin(), "q4p_dense_rows")
+        .expect("q4p_dense_rows");
+    const TOKENS: usize = 63;
+    const INNER: usize = 2560;
+    // The attention's projections of one input, as the release splits them: the wide query
+    // unsplit beside the keys, values and indexer split five ways, and both orders of the two.
+    let shapes = [(1024usize, 1usize), (512, 5), (512, 5), (640, 5)];
+    let mut rng = Lcg(0x5917);
+    let a = upload(
+        &cuda,
+        &(0..TOKENS * INNER)
+            .flat_map(|_| rng.next().to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let weights: Vec<Deviceptr> = shapes
+        .iter()
+        .map(|(cols, _)| {
+            upload(
+                &cuda,
+                &(0..cols * INNER)
+                    .flat_map(|_| bf16_bits(rng.next() * 0.05).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let tickets = upload(&cuda, &vec![0u8; 256 * 4 * 4]);
+    let finish = Finish {
+        y: Deviceptr(0),
+        tickets,
+        epilogue: 0,
+        scale: 1.0,
+    };
+    for order in [[0usize, 1, 2, 3], [3, 1, 0, 2]] {
+        for count in [1, 7, 16, 63] {
+            let buffers = || -> Vec<(Deviceptr, Deviceptr)> {
+                shapes
+                    .iter()
+                    .map(|(cols, segments)| {
+                        (
+                            upload(&cuda, &vec![0u8; segments * count * cols * 4]),
+                            upload(&cuda, &vec![0u8; count * cols * 4]),
+                        )
+                    })
+                    .collect()
+            };
+            let (alone, together) = (buffers(), buffers());
+            for (i, &(out, y)) in alone.iter().enumerate() {
+                let (cols, segments) = shapes[i];
+                launch_rows(
+                    &cuda,
+                    rows_kernel,
+                    &[(weights[i], out, y, cols, segments)],
+                    &[],
+                    a,
+                    INNER,
+                    count,
+                    finish,
+                );
+            }
+            let group: Vec<_> = order
+                .iter()
+                .map(|&i| {
+                    let (out, y) = together[i];
+                    (weights[i], out, y, shapes[i].0, shapes[i].1)
+                })
+                .collect();
+            launch_rows(&cuda, rows_kernel, &group, &[], a, INNER, count, finish);
+            for (i, &(cols, segments)) in shapes.iter().enumerate() {
+                let pick = |(out, y): (Deviceptr, Deviceptr)| if segments > 1 { y } else { out };
+                assert_eq!(
+                    download_bits(&cuda, &pick(together[i]), count * cols),
+                    download_bits(&cuda, &pick(alone[i]), count * cols),
+                    "matrix {i} ({cols} x {INNER}, split {segments}) in order {order:?}, {count} \
+                     rows"
+                );
+            }
+            // Every split tile's counter is back at zero for the next launch.
+            assert!(
+                download_bits(&cuda, &tickets, 256 * 4)
+                    .iter()
+                    .all(|c| *c == 0),
+                "a launch of mixed splits left its tickets set"
+            );
+        }
+    }
+    eprintln!("a launch of mixed splits gives each matrix the bits of its own launch");
+}
+
+#[test]
+fn the_hyper_up_launch_is_the_bits_of_the_projection_and_the_mix() {
+    let Some(cuda) = open() else { return };
+    let load = |name| {
+        cuda.load_named(embedded_prefill_cubin(), name)
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+    };
+    let (_rows_module, rows_kernel) = load("q4p_dense_rows");
+    let (_hyper_module, hyper_kernel) = load("q4p_hyper_up_rows");
+    let (_mix_module, mix_kernel) = cuda
+        .load_named(embedded_cubin(), "q4e_hyper_mix")
+        .expect("q4e_hyper_mix");
+    const TOKENS: usize = 63;
+    // The release's hyper connection (2560 hidden, four streams, rank 320) and smaller ones.
+    for (hidden, hc, lowrank) in [(2560usize, 4usize, 320usize), (256, 3, 64), (64, 2, 32)] {
+        let mut rng = Lcg((hidden * 7 + hc * 3 + lowrank) as u64);
+        let rows = hc * hidden;
+        let up = upload(
+            &cuda,
+            &(0..rows * lowrank)
+                .flat_map(|_| bf16_bits(rng.next() * 0.1).to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let low = upload(
+            &cuda,
+            &(0..TOKENS * lowrank)
+                .flat_map(|_| rng.next().to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let normed = upload(
+            &cuda,
+            &(0..TOKENS * rows)
+                .flat_map(|_| rng.next().to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let raw = upload(&cuda, &vec![0u8; TOKENS * rows * 4]);
+        let (want, got) = (
+            upload(&cuda, &vec![0u8; TOKENS * hidden * 4]),
+            upload(&cuda, &vec![0u8; TOKENS * hidden * 4]),
+        );
+        let finish = Finish {
+            y: Deviceptr(0),
+            tickets: Deviceptr(0),
+            epilogue: 0,
+            scale: 1.0,
+        };
+        for count in [1, 5, 16, 63] {
+            launch_rows(
+                &cuda,
+                rows_kernel,
+                &[(up, raw, raw, rows, 1)],
+                &[],
+                low,
+                lowrank,
+                count,
+                finish,
+            );
+            cuda.launch(
+                mix_kernel,
+                ((count * hidden).div_ceil(256) as u32, 1, 1),
+                (256, 1, 1),
+                &[
+                    raw.0,
+                    normed.0,
+                    want.0,
+                    hidden as u64,
+                    hc as u64,
+                    count as u64,
+                ],
+            )
+            .expect("q4e_hyper_mix");
+            poison(&cuda, got, count * hidden);
+            cuda.launch(
+                hyper_kernel,
+                (hidden.div_ceil(8) as u32, count.div_ceil(16) as u32, 1),
+                (128, 1, 1),
+                &[
+                    low.0,
+                    up.0,
+                    normed.0,
+                    got.0,
+                    lowrank as u64,
+                    hidden as u64,
+                    hc as u64,
+                    count as u64,
+                ],
+            )
+            .expect("q4p_hyper_up_rows");
+            assert_eq!(
+                download_bits(&cuda, &got, count * hidden),
+                download_bits(&cuda, &want, count * hidden),
+                "hidden {hidden}, {hc} streams, rank {lowrank}: {count} rows"
+            );
+        }
+    }
+    eprintln!("the hyper up launch is the bits of the up projection and q4e_hyper_mix");
 }
 
 #[test]
@@ -685,7 +866,7 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                     buffers
                         .iter()
                         .enumerate()
-                        .map(|(i, &(out, y))| (dense_weights[i], out, y, dense[i]))
+                        .map(|(i, &(out, y))| (dense_weights[i], out, y, dense[i], segments))
                         .collect()
                 };
                 let mine = pair.map(|slot| rider(slot, count));
@@ -702,7 +883,6 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                     a,
                     INNER,
                     count,
-                    segments,
                     finish,
                 );
                 for rider in riding {
@@ -716,7 +896,6 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                     a,
                     INNER,
                     count,
-                    segments,
                     finish,
                 );
                 for (i, cols) in dense.iter().enumerate() {

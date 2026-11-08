@@ -12,6 +12,7 @@
 | [DECISIONS.md](DECISIONS.md) | The decision register: one row per hard-to-reverse choice, cited from source comments as `Dnn` |
 | [models/qwen38-flash-next-nvfp4.md](models/qwen38-flash-next-nvfp4.md) | Qwen3.8-Flash-Next (NVFP4): architecture, quantisation, the PLE n-gram table on the Engram paging path, and the TP=1 device arm |
 | [models/glm53-flash.md](models/glm53-flash.md) | GLM-5.3-Flash (FP8, TP=4): the released architecture, its serving frontend (backend, prompt codec, descriptor), the tiny-fixture run, and what the arm does not serve yet |
+| [models/qwen36-35b-a3b-fp8.md](models/qwen36-35b-a3b-fp8.md) | Qwen3.6-35B-A3B (FP8): the Qwen3.5-MoE hybrid on the generalised Qwen device arm at TP=1 (plain residual, full attention, FP8 dense), and what it still refuses |
 | [../crates/sparkflash-model-glm5-next/](../crates/sparkflash-model-glm5-next/) | GLM-5.3-Flash: the pack's tensor plan, host reference, device arm and rank-file converter, documented in its crate root |
 | [../crates/sparkflash-deepseek-forward/](../crates/sparkflash-deepseek-forward/) | The V4.1 device forward, moved out of sparkflash-cli and composed from the model pack and the shared kernel stack |
 | [architecture/](architecture/) | The model: CSA2 attention, mHC, MoE, Engram, DSpark, vision, prompt encoding, KV footprint |

@@ -33,6 +33,13 @@
 //! switches and the device step are shared. The NVFP4 experts and the FP8 PLE shards decode
 //! through `sparkflash_weights::nvfp4`, and the FP8 experts through
 //! `sparkflash_weights::linalg`'s tile-scale decode.
+//!
+//! The same arm also serves the Qwen3.5/3.6 MoE family (`qwen3_5_moe`, Qwen/Qwen3.6-35B-A3B-FP8)
+//! at TP=1, as branches on the configuration rather than a second arm: a plain residual
+//! (`hc_count = 1`, zero-centred norms) instead of hyper-connections, full causal attention
+//! instead of the QSA indexer, no PLE, and 128x128-tile E4M3 dense projections
+//! ([config::DenseQuant]) beside the FP8 experts. A BF16 Qwen3.5 checkpoint's fused experts have
+//! no device kernel yet and are refused at load, to the host reference.
 //! * [forward] is the host reference forward at any geometry, including the tiny fixtures.
 //! * [checkpoint] is the shared checkpoint plumbing: the host loader the device arm is compared
 //!   against, the paged PLE reader both sides use, and a synthetic-checkpoint writer so the whole

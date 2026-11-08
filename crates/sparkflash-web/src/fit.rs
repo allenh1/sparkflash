@@ -18,10 +18,12 @@
 //! which configurations, and if not, what is missing?* The answer is a [Fit]: one
 //! [Configuration] a width in [WORLDS], each judged on three things in this order.
 //!
-//! 1. **A device engine.** The checkpoint's family must have a device arm that runs at the width,
-//!    its `config.json` must plan there, and every served part must resolve a sm121 kernel. The
-//!    CPU host reference the CLI keeps for test checkpoints is never counted: it is a
-//!    correctness oracle, not a way to serve.
+//! 1. **An engine.** A family with a device arm must run at the width, its `config.json` must
+//!    plan there, and every served part must resolve a sm121 kernel. A family registered with
+//!    `engine = "dynamic"` is judged the same way when a device arm reads its stored formats
+//!    ([sparkflash_ops::parts::dynamic_device_arm]: the Qwen3.6 FP8 release), and by the shared
+//!    CPU host reference otherwise, whose summary says so; an unregistered family is missing an
+//!    engine.
 //! 2. **Sparks.** The width cannot exceed the Sparks the cluster has.
 //! 3. **Memory.** The rank's weights plus the caches of one session must fit one node's budget,
 //!    which is its unified memory less the [MEMORY_FLOOR_BYTES] guard band. The rank's weights
@@ -46,7 +48,9 @@ use sparkflash_ops::parts::{serving, serving_language};
 use sparkflash_ops::resolver::{Availability, KernelResolver};
 use sparkflash_ops::tensor_plan::{ArchitectureTensorPlan, Role};
 
-use crate::config::{DEFAULT_WEIGHTS_ID, MODEL_PROFILES, ModelProfile, profile_for_model_type};
+use crate::config::{
+    DEFAULT_WEIGHTS_ID, DYNAMIC_ENGINE_ID, MODEL_PROFILES, ModelProfile, profile_for_model_type,
+};
 
 /// The tensor-parallel widths a checkpoint is judged at: every width a device arm runs.
 pub const WORLDS: [usize; 3] = [1, 2, 4];
@@ -191,6 +195,9 @@ pub struct Fit {
     pub family: Option<String>,
     /// The engine selector of that arm.
     pub engine: Option<String>,
+    /// Whether the CPU host reference, not a device arm, executes it: a family registered on the
+    /// dynamic engine whose stored formats no device arm reads.
+    pub host_reference: bool,
     /// The checkpoint's own window.
     pub window: Option<usize>,
     /// The checkpoint's stored weights.
@@ -224,15 +231,21 @@ impl Fit {
 ///
 /// The Qwen arm's bridge canonicalizes the text-only alias and applies its FP8 producer
 /// correction ([Architecture::experts_only_fp8]); without it the plan would ask for FP8 dense
-/// kernels the release does not store. Every other family is read as the shared parser reads it.
+/// kernels the release does not store. On a Qwen3.5/3.6 release it applies
+/// [Architecture::weight_only_fp8], the arm's W8A16 arithmetic. Every other family is read as
+/// the shared parser reads it.
 ///
 /// # Errors
 /// The shared parser's message.
 pub fn architecture(text: &str) -> Result<Architecture, String> {
     let mut architecture = Architecture::from_json(text).map_err(|error| error.to_string())?;
-    if canonical_model_type(&architecture.family) == "qwen4_exp" {
-        architecture.family = "qwen4_exp".to_owned();
-        architecture.experts_only_fp8();
+    match canonical_model_type(&architecture.family) {
+        "qwen4_exp" => {
+            architecture.family = "qwen4_exp".to_owned();
+            architecture.experts_only_fp8();
+        }
+        "qwen3_5_moe" => architecture.weight_only_fp8(),
+        _ => {}
     }
     Ok(architecture)
 }
@@ -257,6 +270,13 @@ pub fn engine_gaps(architecture: &Architecture, world: usize) -> Result<(), Vec<
             widths(profile.worlds)
         ));
         return Err(gaps);
+    }
+    // A checkpoint no device arm reads may still be executable by the shared CPU host
+    // reference. It is judged by that backend's own gate, not by the kernel catalogue: the
+    // catalogue answers what a device kernel exists for, which is a different question.
+    if on_host_reference(profile, Some(architecture)) {
+        return sparkflash_ops::parts::host_reference_refusal(architecture)
+            .map_or(Ok(()), |reason| Err(vec![reason]));
     }
     match EnginePlan::for_architecture(architecture.clone(), Target::Sm121, world, 0) {
         Ok(plan) => {
@@ -289,6 +309,16 @@ pub fn engine_gaps(architecture: &Architecture, world: usize) -> Result<(), Vec<
 }
 
 /// What a family with no device arm is missing.
+/// Whether the shared CPU host reference executes a checkpoint under its family's profile: a
+/// family registered on the dynamic engine whose stored formats no device arm reads. A document
+/// not read yet is judged by its profile alone.
+fn on_host_reference(profile: Option<&ModelProfile>, architecture: Option<&Architecture>) -> bool {
+    profile.is_some_and(|profile| profile.engine == DYNAMIC_ENGINE_ID)
+        && architecture.is_none_or(|architecture| {
+            sparkflash_ops::parts::dynamic_device_arm(architecture).is_err()
+        })
+}
+
 fn no_engine(model_type: &str) -> String {
     let mut served: Vec<&str> = MODEL_PROFILES
         .iter()
@@ -409,6 +439,7 @@ pub fn judge(evidence: &Evidence<'_>, cluster: &Cluster) -> Fit {
         model_type,
         family: profile.map(|profile| profile.label.to_owned()),
         engine: profile.map(|profile| profile.engine.to_owned()),
+        host_reference: on_host_reference(profile, architecture),
         window,
         weights_bytes: evidence.weights.map(|weights| weights.bytes),
         weights_measured: evidence.weights.is_some_and(|weights| weights.measured),
@@ -444,6 +475,21 @@ fn configuration(
         None if blocked || profile.is_none() => Some(false),
         None => None,
     };
+    if on_host_reference(profile, architecture) {
+        notes.push(
+            "the shared CPU host reference executes it (f32, one rank); it is a correctness \
+             bring-up path, not a throughput claim"
+                .to_owned(),
+        );
+    } else if let Some(arm) = profile
+        .filter(|profile| profile.engine == DYNAMIC_ENGINE_ID)
+        .and(architecture)
+        .and_then(|architecture| sparkflash_ops::parts::dynamic_device_arm(architecture).ok())
+    {
+        notes.push(format!(
+            "{arm} executes it on the GPU; the dynamic engine launches it from the checkpoint"
+        ));
+    }
     if world > cluster.nodes {
         reasons.push(format!(
             "{world} Sparks (the cluster has {})",
@@ -663,9 +709,17 @@ fn summary(fit: &Fit) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             let longest = running.iter().filter_map(|entry| entry.max_context).max();
+            let engine = if fit.host_reference {
+                " on the CPU host reference"
+            } else {
+                ""
+            };
             match longest {
-                Some(tokens) => format!("Runs at {worlds}, up to {} tokens", thousands(tokens)),
-                None => format!("Runs at {worlds}"),
+                Some(tokens) => format!(
+                    "Runs{engine} at {worlds}, up to {} tokens",
+                    thousands(tokens)
+                ),
+                None => format!("Runs{engine} at {worlds}"),
             }
         }
         Verdict::NoRoom => {
@@ -771,6 +825,8 @@ mod tests {
 
     const QWEN: &str =
         include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+    const QWEN36: &str =
+        include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
     const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
     const DEEPSEEK: &str =
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
@@ -842,6 +898,79 @@ mod tests {
         assert!(
             tp4.reasons.iter().any(|reason| reason.contains("4 Sparks")),
             "{tp4:#?}"
+        );
+    }
+
+    #[test]
+    fn qwen36_fp8_runs_on_its_device_arm_at_one_spark() {
+        let fit = judge(
+            &Evidence {
+                config: Some(QWEN36),
+                weights: Some(WeightBytes {
+                    bytes: 37_500_000_000,
+                    measured: false,
+                }),
+                ..Evidence::default()
+            },
+            &Cluster::nominal(1),
+        );
+        // The FP8 release's experts and dense projections are the 128x128 E4M3 tiles the
+        // Qwen3.5-MoE device arm reads, so it is judged by the kernel catalogue and runs on the
+        // GPU; the dynamic engine still launches it, straight from the checkpoint.
+        assert_eq!(fit.verdict, Verdict::Runs, "{fit:#?}");
+        assert_eq!(fit.family.as_deref(), Some("Qwen"));
+        assert_eq!(
+            fit.engine.as_deref(),
+            Some(crate::config::DYNAMIC_ENGINE_ID)
+        );
+        assert!(!fit.host_reference);
+        assert!(fit.missing.is_empty(), "{:?}", fit.missing);
+        let tp1 = of(&fit, 1);
+        assert!(tp1.launch);
+        assert!(
+            tp1.notes.iter().any(|note| note.contains("device arm")),
+            "{tp1:#?}"
+        );
+        assert!(!fit.summary.contains("host reference"), "{}", fit.summary);
+        // The family's device arm runs at one rank only.
+        assert_eq!(of(&fit, 2).verdict, Verdict::Missing);
+    }
+
+    #[test]
+    fn a_bf16_qwen36_runs_on_the_host_reference_at_one_spark() {
+        // The same family with no quantization block stores BF16 routed experts, which no
+        // device kernel reads yet: the profile's dynamic engine runs it on the host reference,
+        // and the browser says so.
+        let mut document: Value = serde_json::from_str(QWEN36).expect("the carried document");
+        document
+            .as_object_mut()
+            .expect("an object")
+            .remove("quantization_config");
+        let text = document.to_string();
+        let fit = judge(
+            &Evidence {
+                config: Some(&text),
+                weights: Some(WeightBytes {
+                    bytes: 70_000_000_000,
+                    measured: false,
+                }),
+                ..Evidence::default()
+            },
+            &Cluster::nominal(1),
+        );
+        assert_eq!(fit.verdict, Verdict::Runs, "{fit:#?}");
+        assert!(fit.host_reference);
+        let tp1 = of(&fit, 1);
+        assert!(
+            tp1.notes
+                .iter()
+                .any(|note| note.contains("CPU host reference")),
+            "{tp1:#?}"
+        );
+        assert!(
+            fit.summary.contains("CPU host reference"),
+            "{}",
+            fit.summary
         );
     }
 

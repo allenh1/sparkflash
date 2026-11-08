@@ -176,6 +176,9 @@ pub(crate) fn rank_config(config: &Qwen4ExpConfig, shard: Shard) -> Result<Qwen4
             }
             (tiles * FP8_TILE, "holds")
         }
+        crate::config::ExpertQuant::Bf16 => {
+            return Err("BF16 routed experts have no device kernel yet".to_owned());
+        }
     };
     if width > MAX_INTERMEDIATE {
         return Err(format!(

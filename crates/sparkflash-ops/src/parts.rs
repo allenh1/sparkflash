@@ -104,6 +104,15 @@ const KDA_SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(128, 128)];
 /// that asks for one is refused rather than booted against a 14-patch tower.
 const VISION_PATCH_SIZES: &[usize] = &[14];
 
+/// The routed-expert `(hidden, experts, top-k)` shapes the Qwen MoE images are published at.
+///
+/// The token and grouped expert bodies are runtime-shaped (up to Q4E_MAX_TOPK = 64 active of
+/// Q4P_MAX_EXPERTS = 512, on 128-column E4M3 tiles or 16-column NVFP4 groups), but the resolver
+/// picks an image by shape alone. An open rule would claim GLM-5.3's 4096-wide FP8 experts here,
+/// ahead of the GLM images that are their proven body, so the list is the releases the Qwen arm
+/// serves: Qwen3.8 (2560, 512, 10) and Qwen3.5/3.6-35B-A3B (2048, 256, 8).
+const QWEN_ROUTED_SHAPES: &[(usize, usize, usize)] = &[(2560, 512, 10), (2048, 256, 8)];
+
 /// The grouped-query attention group sizes this tree has a proven body for.
 ///
 /// q4e_attn is generic, and q4e_attn_group / q4e_attn_group6 specialise four and six. The
@@ -198,10 +207,8 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .top_k_equals(6)
             .positions(0, 1 << 21),
         (Part::Moe, Image::Qwen4Moe | Image::Qwen4Prefill) => ShapeConstraint::ANY
-            .hidden_equals(2560)
+            .routed_shapes(QWEN_ROUTED_SHAPES)
             .intermediate_multiple(16)
-            .experts_equals(512)
-            .top_k_equals(10)
             .max_experts(512)
             .max_top_k(64),
         (Part::Moe, Image::GlmMoe | Image::GlmDecode) => ShapeConstraint::ANY
@@ -257,10 +264,8 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .experts_equals(384)
             .top_k_equals(6),
         (Part::GroupedMoeGemm, Image::Qwen4Moe | Image::Qwen4Prefill) => ShapeConstraint::ANY
-            .hidden_equals(2560)
+            .routed_shapes(QWEN_ROUTED_SHAPES)
             .intermediate_multiple(16)
-            .experts_equals(512)
-            .top_k_equals(10)
             .max_experts(512)
             .max_top_k(64),
         (Part::GroupedMoeGemm, Image::GlmMoe | Image::GlmDecode) => ShapeConstraint::ANY
@@ -527,6 +532,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("q4e_attn", &[Precision::Bf16, Precision::Fp8E4M3]),
             sym("q4e_attn_group", &[Precision::Bf16, Precision::Fp8E4M3]),
             sym("q4e_attn_group6", &[Precision::Bf16, Precision::Fp8E4M3]),
+            // Every causal position, split over the context: a layer with no sparse indexer.
+            sym("q4e_attn_full", &[Precision::Bf16, Precision::Fp8E4M3]),
+            sym(
+                "q4e_attn_full_combine",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
         ],
         true,
     ),
@@ -631,6 +642,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             pre("glm_prefill_bf16_mma", &[Precision::Bf16]),
             pre("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
+            pre("glm_prefill_bf16_wide", &[Precision::Bf16]),
+            pre("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
             pre("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
             pre("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
             pre("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
@@ -646,6 +659,7 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::PREFILL,
         &[
             pre("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
+            pre("q4p_dense_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_epilogue", &[Precision::Bf16]),
         ],
         false,
@@ -662,6 +676,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             dec("q4e_quantize_e4m3_rows", &[Precision::Bf16]),
             dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
             dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
+            // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
+            dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -707,8 +723,11 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::PREFILL,
         &[
             pre("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
+            pre("q4p_dense_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_dense_rows", &[Precision::Bf16]),
             pre("q4p_gemm_rows", &[Precision::Bf16]),
+            // The hyper connection's up projection and stream mix for a few rows.
+            pre("q4p_hyper_up_rows", &[Precision::Bf16]),
             pre("q4p_split_bf16", &[Precision::Bf16]),
         ],
         false,
@@ -719,6 +738,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             pre("glm_prefill_bf16_mma", &[Precision::Bf16]),
             pre("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
+            pre("glm_prefill_bf16_wide", &[Precision::Bf16]),
+            pre("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
             pre("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
             pre("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
             pre("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
@@ -734,6 +755,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             dec("q4e_gemv4_bf16", &[Precision::Bf16]),
             dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
             dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
+            // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
+            dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -1384,11 +1407,12 @@ pub const HOST_REFERENCE_PARTS: &[Part] = &[
 
 /// The parts `architecture` names that the host reference backend does not execute.
 ///
-/// MTP is optional for this backend: [Architecture::parts] inserts [Part::Mtp] whenever the
-/// document declares a stage, but the host forward never executes it. Refusing the backbone
-/// over a stage the host deliberately ignores would keep the dynamic path from serving an
-/// MTP-bearing document it runs correctly, so the stage is dropped from the missing set. The
-/// storage walk applies the same rule through [host_reference_serves_tensor].
+/// MTP and vision are optional for this backend: [Architecture::parts] inserts [Part::Mtp]
+/// whenever the document declares a stage and [Part::Vision] whenever it declares a tower, but
+/// the host forward executes neither. Refusing the backbone over a stage or tower the host
+/// deliberately ignores would keep the dynamic path from serving an MTP- or vision-bearing
+/// document it runs correctly, so both are dropped from the missing set. The storage walk
+/// applies the same rule through [host_reference_serves_tensor].
 #[must_use]
 pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
     let mut available = PartSet::new();
@@ -1398,8 +1422,54 @@ pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
     architecture
         .missing(&available)
         .into_iter()
-        .filter(|part| *part != Part::Mtp)
+        .filter(|part| !matches!(part, Part::Mtp | Part::Vision))
         .collect()
+}
+
+/// The device arm that serves a checkpoint of a family registered on the dynamic engine.
+///
+/// Some families' device arms read only some of their releases, and the rest stay on the host
+/// reference: the Qwen3.5/3.6-MoE (`qwen3_5_moe`) arm reads the FP8 release, whose routed experts
+/// and wide dense projections are E4M3 on 128x128 tiles, but not the BF16 release's fused
+/// `mlp.experts.gate_up_proj`, which no device kernel reads yet. This is the one rule the CLI's
+/// dynamic route, the arm's own load and the web browser agree on.
+///
+/// # Errors
+/// Why no device arm serves the checkpoint, so the host reference is its executor.
+pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, String> {
+    let family = sparkflash_model::canonical_model_type(&architecture.family);
+    if family != "qwen3_5_moe" {
+        return Err(format!(
+            "this build has no device arm for the {family} family"
+        ));
+    }
+    let tile = |format: WeightFormat| {
+        matches!(
+            format,
+            WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                ..
+            }
+        )
+    };
+    let quantization = &architecture.quantization;
+    if quantization.expert_format == WeightFormat::Bf16 {
+        return Err(
+            "BF16 routed experts (mlp.experts.gate_up_proj) have no device kernel yet; \
+                    serve the FP8 release, or this checkpoint on the host reference"
+                .to_owned(),
+        );
+    }
+    if !tile(quantization.expert_format) || !tile(quantization.dense_format) {
+        return Err(format!(
+            "the Qwen3.5-MoE device arm reads 128x128-tile E4M3 experts and dense projections, \
+             not {} experts with {} dense projections",
+            quantization.expert_format.name(),
+            quantization.dense_format.name()
+        ));
+    }
+    Ok("the Qwen3.5-MoE device arm")
 }
 
 /// Why the host reference backend cannot execute `architecture`, if it cannot.
@@ -1494,7 +1564,7 @@ pub fn host_reference_rope_refusal(architecture: &Architecture) -> Option<String
 /// stage can also be stored as an ordinary extra decoder layer, which has no `mtp.` prefix and
 /// needs the architecture; [is_extra_layer] covers that spelling. The storage walk uses this
 /// predicate to judge only the tensors the host actually decodes; the structure gate separately
-/// ignores [Part::Mtp] in [host_reference_missing].
+/// ignores [Part::Mtp] and [Part::Vision] in [host_reference_missing].
 #[must_use]
 pub fn host_reference_serves_tensor(name: &str) -> bool {
     let mtp = name.starts_with("mtp.") || name.contains(".mtp.");
@@ -1527,13 +1597,46 @@ fn is_extra_layer(name: &str, architecture: &Architecture) -> bool {
     })
 }
 
+/// The inverse-scale tensor beside an E4M3 tile-quantized weight, if the checkpoint stores one.
+///
+/// Qwen and GLM append `_scale_inv` to the weight name. It addresses a grid of
+/// `ceil(rows / 128) x ceil(cols / 128)` values, which the host applies as a tile scale.
+#[must_use]
+fn fp8_tile_scale(source: &dyn sparkflash_weights::WeightSource, name: &str) -> Option<String> {
+    if !name.ends_with(".weight") {
+        return None;
+    }
+    let candidate = format!("{name}_scale_inv");
+    source
+        .spec(&candidate)
+        .ok()
+        .filter(|spec| {
+            matches!(
+                spec.dtype,
+                sparkflash_weights::DType::F32 | sparkflash_weights::DType::BF16
+            )
+        })
+        .map(|_| candidate)
+}
+
+/// Whether a tensor name is a quantization scale rather than a weight.
+#[must_use]
+fn is_scale_tensor(name: &str) -> bool {
+    name.ends_with("_scale_inv")
+        || name.ends_with("_scale")
+        || name.ends_with("weight_scale")
+        || name.ends_with("weight_scale_2")
+        || name.ends_with("input_scale")
+}
+
 /// The stored weight format the host reference cannot decode honestly, if any.
 ///
 /// A document can omit `quantization_config` while its shards store `U8`, packed FP4 or FP8
-/// codes beside scale tensors. The host decodes BF16/F32 per tensor and never applies a block
-/// scale, so the first such tensor is named from its safetensors header. The CLI and the web
-/// control plane both call this over the checkpoint source they already opened, so a storage-only
-/// quantized checkpoint cannot be supported by one and refused by the other.
+/// codes beside scale tensors. The host decodes BF16/F32 per tensor and applies one 128x128
+/// inverse-scale tile to an E4M3 weight, so the first tensor it cannot decode is named from its
+/// safetensors header. The CLI and the web control plane both call this over the checkpoint
+/// source they already opened, so a storage-only quantized checkpoint cannot be supported by one
+/// and refused by the other.
 ///
 /// Only tensors [host_reference_serves_tensor] accepts are inspected: a quantized `mtp.*` or
 /// vision tensor is not part of the forward the host runs, so it must not refuse the backbone.
@@ -1551,6 +1654,16 @@ pub fn host_reference_storage_quantization_refusal(
         let Ok(spec) = source.spec(&name) else {
             continue;
         };
+        if spec.dtype == sparkflash_weights::DType::F8E4M3 {
+            // E4M3 with a tile inverse scale is decodable: the host multiplies each element by
+            // its 128x128 block's scale on the way in. Only an unscaled code tensor is opaque.
+            if fp8_tile_scale(source, &name).is_some() {
+                continue;
+            }
+        } else if is_scale_tensor(&name) {
+            // A scale beside a supported weight is metadata, not a weight of its own.
+            continue;
+        }
         if matches!(
             spec.dtype,
             sparkflash_weights::DType::U8
@@ -1559,7 +1672,7 @@ pub fn host_reference_storage_quantization_refusal(
                 | sparkflash_weights::DType::F8E8M0
         ) {
             return Some(format!(
-                "the checkpoint stores quantized tensor {name} ({}); the dynamic host reference decodes BF16/F32 tensors and does not apply block scales, so it cannot serve storage-only quantized weights honestly - convert or serve with its device pack",
+                "the checkpoint stores quantized tensor {name} ({}); the dynamic host reference decodes BF16/F32 tensors and applies one tile scale to an E4M3 weight but no other quantized storage, so it cannot serve this tensor honestly - convert or serve with its device pack",
                 spec.dtype.name()
             ));
         }
@@ -1569,22 +1682,31 @@ pub fn host_reference_storage_quantization_refusal(
 
 /// The declared weight format the host reference cannot decode honestly, if any.
 ///
-/// The host path decodes BF16/F32 per tensor and does not apply block scales. A document that
-/// declares an FP8/NVFP4 dense or expert class would be served as if it were quantized
-/// arithmetic while the reference decodes the codes as plain values, so it is refused at boot.
+/// The host path decodes BF16/F32 per tensor and applies one 128x128 inverse-scale tile to an
+/// E4M3 weight. A document that declares NVFP4, MXFP8 or another block size would be served
+/// with the wrong arithmetic, so it is refused at boot; a 128x128 FP8 tile is accepted.
 #[must_use]
 pub fn host_reference_quantization_refusal(architecture: &Architecture) -> Option<String> {
     let quantization = &architecture.quantization;
     // The host does not execute the MTP stage, so an MTP-only quantized format is not a reason
     // to refuse the backbone the host does run. Only the dense and expert formats the host
     // decodes belong in this predicate.
-    if quantization.dense_format == WeightFormat::Bf16
-        && quantization.expert_format == WeightFormat::Bf16
-    {
+    let host_decodes = |format: &WeightFormat| {
+        matches!(format, WeightFormat::Bf16)
+            || matches!(
+                format,
+                WeightFormat::Fp8Tile {
+                    block_m: 128,
+                    block_n: 128,
+                    ..
+                }
+            )
+    };
+    if host_decodes(&quantization.dense_format) && host_decodes(&quantization.expert_format) {
         return None;
     }
     Some(format!(
-        "the checkpoint declares quantized weights (method={:?}, dense={:?}, experts={:?}); the dynamic host reference decodes BF16/F32 tensors and does not apply block scales, so it cannot serve NVFP4/FP8 weights honestly - convert or serve it with its device pack, or use an unquantized checkpoint",
+        "the checkpoint declares quantized weights (method={:?}, dense={:?}, experts={:?}); the dynamic host reference decodes BF16/F32 tensors and applies one 128x128 tile scale to an E4M3 weight, so it cannot serve other quantized formats honestly - convert or serve it with its device pack, or use an unquantized checkpoint",
         quantization.method,
         quantization.dense_format.name(),
         quantization.expert_format.name(),
@@ -1890,6 +2012,62 @@ mod tests {
         assert!(
             with.is_empty(),
             "the DeepSeek arm is complete with cubins: {with:?}"
+        );
+    }
+
+    /// The Qwen3.6 FP8 release is the Qwen3.5-MoE device arm's; the same document with no
+    /// quantization block (BF16 fused experts) and every other family are not.
+    #[test]
+    fn only_the_tile_quantized_qwen35_release_has_a_dynamic_device_arm() {
+        const QWEN36: &str =
+            include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
+        let fp8 = Architecture::from_json(QWEN36).expect("the Qwen3.6 document parses");
+        assert!(
+            dynamic_device_arm(&fp8).is_ok(),
+            "{:?}",
+            dynamic_device_arm(&fp8)
+        );
+        let mut document: serde_json::Value =
+            serde_json::from_str(QWEN36).expect("the Qwen3.6 document");
+        document
+            .as_object_mut()
+            .expect("an object")
+            .remove("quantization_config");
+        let bf16 = Architecture::from_json(&document.to_string()).expect("the BF16 twin parses");
+        let refusal = dynamic_device_arm(&bf16).expect_err("BF16 experts stay on the host");
+        assert!(refusal.contains("BF16 routed experts"), "{refusal}");
+        let mut other = fp8.clone();
+        other.family = "novel_family".to_owned();
+        assert!(dynamic_device_arm(&other).is_err());
+    }
+
+    /// Qwen3.6-35B-A3B is a covered host family: its vision tower and MTP stage are stored but
+    /// not executed, and its 128x128 E4M3 weights are tile-scaled rather than opaque codes.
+    #[test]
+    fn qwen36_is_a_host_reference_family() {
+        const QWEN36: &str =
+            include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
+        let architecture = Architecture::from_json(QWEN36).expect("the Qwen3.6 document parses");
+        assert_eq!(architecture.family, "qwen3_5_moe");
+        assert!(
+            architecture.parts().contains(Part::Vision),
+            "the premise: the document carries a tower"
+        );
+        assert!(
+            host_reference_missing(&architecture).is_empty(),
+            "the host ignores the tower: {:?}",
+            host_reference_missing(&architecture)
+        );
+        assert_eq!(
+            host_reference_quantization_refusal(&architecture),
+            None,
+            "128x128 E4M3 tiles are decoded by the host"
+        );
+        assert_eq!(
+            host_reference_refusal(&architecture),
+            None,
+            "the family is host-runnable: {:?}",
+            host_reference_refusal(&architecture)
         );
     }
 

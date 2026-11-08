@@ -260,8 +260,12 @@ impl TpPlan {
     /// equals [Split::per_rank] because a tile run is already aligned, and [Split::offset] is in
     /// elements, not tiles.
     ///
+    /// A single rank, or an axis that is not sharded, holds the whole total, a partial last tile
+    /// included, since nothing is cut.
+    ///
     /// # Errors
-    /// A zero total or tile, a total that is not whole tiles, or a rank that holds no tile.
+    /// A zero total or tile, a sharded total that is not whole tiles, or a rank that holds no
+    /// tile.
     pub fn split_tiles(
         &self,
         total: usize,
@@ -280,12 +284,7 @@ impl TpPlan {
                 detail: "the tile width is zero".to_owned(),
             });
         }
-        if !total.is_multiple_of(tile) {
-            return Err(TpPlanError {
-                axis,
-                detail: format!("{total} is not whole {tile}-wide tiles"),
-            });
-        }
+        // One rank holds the whole axis, a partial last tile included: nothing is cut.
         if !axis.is_sharded() || self.world == 1 {
             return Ok(Split {
                 total,
@@ -295,6 +294,12 @@ impl TpPlan {
                 padding: 0,
                 rank: self.rank,
                 world: self.world,
+            });
+        }
+        if !total.is_multiple_of(tile) {
+            return Err(TpPlanError {
+                axis,
+                detail: format!("{total} is not whole {tile}-wide tiles"),
             });
         }
         let tiles = total / tile;
@@ -477,6 +482,12 @@ mod tests {
             .expect("split");
         assert_eq!(whole.per_rank, 640);
         assert_eq!(whole.padding, 0);
+        // One rank holds a partial last tile whole: nothing is cut inside a scale tile.
+        let partial = TpPlan::new(1, 0)
+            .expect("plan")
+            .split_tiles(8, 128, TpAxis::Intermediate)
+            .expect("one rank holds the partial tile");
+        assert_eq!((partial.offset, partial.per_rank), (0, 8));
         // A width that is not whole tiles is refused rather than split inside a scale tile.
         let error = TpPlan::new(4, 0)
             .expect("plan")

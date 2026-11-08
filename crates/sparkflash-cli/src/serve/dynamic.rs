@@ -280,9 +280,14 @@ fn codec(
 }
 
 /// Whether a checkpoint family is served by a released device arm (rather than the host
-/// reference), and therefore judged by the kernel catalogue.
-fn device_family(family: &str) -> bool {
-    matches!(family, "qwen4_exp" | "qwen4_exp_text" | "glm5_next")
+/// reference), and therefore judged by the kernel catalogue. A Qwen3.5-MoE checkpoint is when
+/// the device arm has its formats ([pack::qwen35_on_device]).
+fn device_family(family: &str, directory: &Path) -> bool {
+    match family {
+        "qwen4_exp" | "qwen4_exp_text" | "glm5_next" => true,
+        "qwen3_5_moe" | "qwen3_5_moe_text" => pack::qwen35_on_device(directory),
+        _ => false,
+    }
 }
 
 /// The typed profile a family serves: its carried preset when one exists, else the default with
@@ -317,7 +322,8 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         );
     }
     let checkpoint = resolve(options)?;
-    let unresolved = if device_family(&checkpoint.architecture.family) {
+    let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
+    let unresolved = if on_device {
         failures(&checkpoint.plan, Availability::Catalogue)
     } else {
         // The host reference is the executor for a novel family. The CUDA catalogue answers a
@@ -387,6 +393,16 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             super::pack::QwenArm::respond,
         ),
+        "qwen3_5_moe" | "qwen3_5_moe_text" if on_device => {
+            super::pack::serve_arm_identity::<super::pack::Qwen36Arm>(
+                options,
+                checkpoint.directory,
+                descriptor,
+                seam,
+                context,
+                super::pack::Qwen36Arm::respond,
+            )
+        }
         "glm5_next" => super::pack::serve_arm_identity::<super::pack::GlmArm>(
             options,
             checkpoint.directory,
@@ -459,9 +475,28 @@ mod tests {
 
     #[test]
     fn the_qwen_text_alias_dispatches_to_the_qwen_arm() {
-        assert!(device_family("qwen4_exp"));
-        assert!(device_family("qwen4_exp_text"));
-        assert!(device_family("glm5_next"));
-        assert!(!device_family("acme_custom_flash"));
+        let nowhere = std::path::Path::new("/nonexistent/checkpoint");
+        assert!(device_family("qwen4_exp", nowhere));
+        assert!(device_family("qwen4_exp_text", nowhere));
+        assert!(device_family("glm5_next", nowhere));
+        assert!(!device_family("acme_custom_flash", nowhere));
+        // A Qwen3.5-MoE checkpoint is the device arm's only when its formats are.
+        assert!(!device_family("qwen3_5_moe", nowhere));
+    }
+
+    #[test]
+    fn a_qwen35_checkpoint_goes_to_the_device_by_its_formats() {
+        use sparkflash_model_qwen4_exp::config::{DenseQuant, Qwen4ExpConfig};
+        for (format, on_device) in [(DenseQuant::Fp8Block, true), (DenseQuant::Bf16, false)] {
+            let directory = tempfile::tempdir().expect("a temporary checkpoint");
+            let config = Qwen4ExpConfig::tiny_qwen35_moe(format);
+            std::fs::write(directory.path().join("config.json"), config.to_json())
+                .expect("the configuration is written");
+            assert_eq!(
+                device_family("qwen3_5_moe", directory.path()),
+                on_device,
+                "{format:?}"
+            );
+        }
     }
 }

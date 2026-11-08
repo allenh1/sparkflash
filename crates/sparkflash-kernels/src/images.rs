@@ -204,6 +204,7 @@ impl Image {
                 "q4e_gemv_bf16",
                 "q4e_gemv_tiled_bf16",
                 "q4e_gemv_tiled_e4m3",
+                "q4e_gemv_tiled_e4m3_tile",
                 "q4e_hyper_down",
                 "q4e_hyper_down_tiled",
                 "q4e_hyper_inject",
@@ -226,6 +227,8 @@ impl Image {
             ],
             Self::Qwen4Attn => &[
                 "q4e_attn",
+                "q4e_attn_full",
+                "q4e_attn_full_combine",
                 "q4e_attn_group",
                 "q4e_attn_group6",
                 "q4e_cache_bf16",
@@ -243,10 +246,12 @@ impl Image {
                 "q4e_router",
             ],
             Self::Qwen4Prefill => &[
+                "q4p_dense_fp8",
                 "q4p_dense_mma",
                 "q4p_dense_rows",
                 "q4p_epilogue",
                 "q4p_gemm_rows",
+                "q4p_hyper_up_rows",
                 "q4p_moe_down",
                 "q4p_moe_down_fp8",
                 "q4p_moe_gate_up",
@@ -282,6 +287,8 @@ impl Image {
             Self::GlmPrefill => &[
                 "glm_prefill_bf16_mma",
                 "glm_prefill_bf16_mma_bf16a",
+                "glm_prefill_bf16_wide",
+                "glm_prefill_bf16_wide_bf16a",
                 "glm_prefill_fp8b128_mma",
                 "glm_prefill_fp8b128_mma_bf16a",
                 "glm_prefill_q8_mma",

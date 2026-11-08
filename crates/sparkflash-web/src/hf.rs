@@ -51,8 +51,14 @@ use crate::fit::{self, Cluster, Evidence, Fit, WeightBytes};
 /// Kept as documentation for the canonical families; it is no longer the gate. A cached model is
 /// supported when a device engine serves its own configuration at the width the console launches
 /// its family at (see [fit::launch_check]).
-pub const SUPPORTED_MODEL_TYPES: &[&str] =
-    &["deepseek_v41", "qwen4_exp", "qwen4_exp_text", "glm5_next"];
+pub const SUPPORTED_MODEL_TYPES: &[&str] = &[
+    "deepseek_v41",
+    "qwen4_exp",
+    "qwen4_exp_text",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "glm5_next",
+];
 
 /// What the CLI's CPU host reference cannot execute in a checkpoint; empty when it can run it.
 ///
@@ -100,8 +106,9 @@ pub struct CachedModel {
     pub snapshot: String,
     /// `config.json`'s `model_type`, when the snapshot has one.
     pub model_type: Option<String>,
-    /// Whether a device engine serves the checkpoint at the width the console launches its
-    /// family at. The CPU host reference never makes a model supported.
+    /// Whether an engine serves the checkpoint at the width the console launches its family at.
+    /// A registered host-reference family (`engine = "dynamic"`) counts, because its profile
+    /// names the one width that engine runs; it is labelled in the fit summary.
     pub supported: bool,
     /// The control-plane weight selector of the family's device arm.
     pub weights: Option<String>,
@@ -238,7 +245,12 @@ fn read_model(repo: &Path, id: &str) -> Option<CachedModel> {
         .and_then(|check| check.window)
         .or_else(|| profile.map(|profile| profile.context_tokens));
     let host_reference = match (profile, document) {
+        // A family with no arm, and a registered host-reference family (engine "dynamic"), are
+        // both judged by the host predicate so an explicit dynamic plan can be validated.
         (None, Some(text)) => Some(host_reference_gaps(text, Some(&snapshot.path))),
+        (Some(profile), Some(text)) if profile.engine == crate::config::DYNAMIC_ENGINE_ID => {
+            Some(host_reference_gaps(text, Some(&snapshot.path)))
+        }
         _ => None,
     };
     Some(CachedModel {

@@ -92,7 +92,7 @@ use std::time::Instant;
 
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, HostMapped, Kernel,
-    RunStream, SideStream,
+    RunStream, SideStream, StreamEvent,
 };
 use sparkflash_kernels::images;
 use sparkflash_model::{BackendError, Part, StepCost};
@@ -105,7 +105,7 @@ use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
-use sparkflash_ops::tp::{reduce_two_shot, splits_two_shot};
+use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
 fn cubin_available() -> bool {
     !images::qwen4_exp_cubin().is_empty() && !images::glm_decode_cubin().is_empty()
@@ -273,6 +273,11 @@ const FP8_BLOCK: usize = 128;
 /// The dynamic shared memory of the bulk E4M3 x E4M3 GEMMs in the prefill and MoE images
 /// (GLM_Q8_SHARED): their cp.async stages and a column tile's weight scales.
 const Q8_SHARED: u32 = 68_608;
+/// The dynamic shared memory of the bulk BF16 GEMM's wide tile (GLM_WIDE_SHARED): three cp.async
+/// stages of a 128-row f32 activation tile and a 256-row BF16 weight tile, 32 K each.
+const WIDE_SHARED: u32 = 98_304;
+/// The output columns of that tile (GLM_WIDE_BN).
+const WIDE_COLUMNS: usize = 256;
 /// The widest inner those GEMMs take (GLM_Q8_BLOCKS 128-column blocks): the kernel holds a column
 /// tile's weight scales in shared memory and does nothing for a wider one.
 const Q8_MAX_INNER: usize = 128 * FP8_BLOCK;
@@ -297,6 +302,18 @@ const GEMV_GROUPS: usize = GEMV_GROUP_ROWS / MAX_ROWS;
 const MHC_FUSED_PAIRS: usize = 8 * 12;
 /// Pools a block of q4e_glm_index_scores scores (Q4E_QSA_TILE).
 const SCORE_TILE: usize = 64;
+/// glm_prefill_exact_bf16's geometry (GPE_OUTS, GPE_ROWS, GPE_THREADS): the outputs and rows a
+/// block computes.
+const EXACT_OUTS: usize = 32;
+const EXACT_ROWS: usize = 32;
+const EXACT_THREADS: u32 = 128;
+/// glm_prefill_index_scores' geometry (GPI_HEADS, GPI_DIM, GPI_POOLS, GPI_ROWS, GPI_THREADS): the
+/// indexer shape it is compiled for, and the pools and rows a block scores.
+const INDEX_RUN_HEADS: usize = 32;
+const INDEX_RUN_DIM: usize = 128;
+const INDEX_RUN_POOLS: usize = 64;
+const INDEX_RUN_ROWS: usize = 32;
+const INDEX_RUN_THREADS: u32 = 128;
 /// glm_prefill_mla_attend's geometry (GMA_HEADS, GMA_LATENT): a rank's heads as one MMA's M, over
 /// the latent's four 128-column scale blocks.
 const GMA_HEADS: usize = 16;
@@ -482,8 +499,9 @@ struct Kernels {
     fold: Kernel,
     prefetch_l2: Kernel,
     /// The bulk prefill image (kernels/glm_prefill_sm121.cu): dense block-scaled FP8 and BF16
-    /// GEMMs, and the skinny projections. The padded routed-expert plan and its
-    /// gather/SwiGLU/scatter are in the MoE image (kernels/glm_moe_sm121.cu).
+    /// GEMMs (the BF16 one over the 128 x 256 tile, [WIDE_SHARED]), and the skinny projections.
+    /// The padded routed-expert plan and its gather/SwiGLU/scatter are in the MoE image
+    /// (kernels/glm_moe_sm121.cu).
     prefill_dense_bf16: Kernel,
     prefill_dense_fp8: Kernel,
     /// The same two GEMMs over the bf16 head of each activation alone, and the routed one.
@@ -504,11 +522,15 @@ struct Kernels {
     prefill_moe_q8: Kernel,
     /// A BF16 part of at most 8 (i + 1) rows ([DeviceRank::bulk_gemm]'s mixers and gates).
     prefill_skinny: [Kernel; 4],
+    /// The tiled GEMV's floats for a BF16 part it splits one round a block (the exact prefill's
+    /// router and indexer parts, [DeviceRank::gemv_chunked]).
+    prefill_exact: Kernel,
     /// The chunk's MLA ([DeviceRank::bulk_attend]) from the bulk attention image
     /// (kernels/glm_attention_sm121.cu): the tensor-core sparse attention over the E4M3 latent
     /// (and over its bf16 heads alone), and the per-head GEMM of the absorbed query and the
     /// value projection.
     prefill_mla_attend: Kernel,
+    prefill_index_scores: Kernel,
     prefill_mla_attend_bf16a: Kernel,
     prefill_heads_bf16: Kernel,
     prefill_heads_fp8: Kernel,
@@ -538,6 +560,10 @@ impl Kernels {
         };
         let prefill_q8 = |name| {
             cuda.load_named_shared(embedded_glm_prefill_cubin(), name, Q8_SHARED)
+                .map(|(_, kernel)| kernel)
+        };
+        let prefill_wide = |name| {
+            cuda.load_named_shared(embedded_glm_prefill_cubin(), name, WIDE_SHARED)
                 .map(|(_, kernel)| kernel)
         };
         if embedded_glm_moe_cubin().is_empty() {
@@ -629,9 +655,9 @@ impl Kernels {
             combine: moe("q4e_moe_combine")?,
             prefetch_l2: decode("q4e_prefetch_l2")?,
             fold: named("q4e_fold_streams")?,
-            prefill_dense_bf16: prefill("glm_prefill_bf16_mma")?,
+            prefill_dense_bf16: prefill_wide("glm_prefill_bf16_wide")?,
             prefill_dense_fp8: prefill("glm_prefill_fp8b128_mma")?,
-            prefill_dense_bf16_bf16a: prefill("glm_prefill_bf16_mma_bf16a")?,
+            prefill_dense_bf16_bf16a: prefill_wide("glm_prefill_bf16_wide_bf16a")?,
             prefill_dense_fp8_bf16a: prefill("glm_prefill_fp8b128_mma_bf16a")?,
             prefill_moe_mma_bf16a: glm_moe("glm_moe_fp8b128_mma_bf16a")?,
             prefill_moe_plan: plan("moe_plan")?,
@@ -649,7 +675,9 @@ impl Kernels {
                 prefill("glm_prefill_skinny_bf16_3")?,
                 prefill("glm_prefill_skinny_bf16_4")?,
             ],
+            prefill_exact: prefill("glm_prefill_exact_bf16")?,
             prefill_mla_attend: attention("glm_prefill_mla_attend")?,
+            prefill_index_scores: attention("glm_prefill_index_scores")?,
             prefill_mla_attend_bf16a: attention("glm_prefill_mla_attend_bf16a")?,
             prefill_heads_bf16: attention("glm_prefill_heads_bf16_mma")?,
             prefill_heads_fp8: attention("glm_prefill_heads_fp8b128_mma")?,
@@ -1698,6 +1726,12 @@ struct Scratch {
     /// drafts follow, iteration `i + 1` the argmax of iteration `i`'s logits, which the device
     /// writes and the next iteration's embedding reads with no host round trip.
     drafted: HostMapped,
+    /// A step's token ids, a u32 a row, which its one embedding launch reads in place
+    /// ([DeviceRank::embed_rows]).
+    step_tokens: HostMapped,
+    /// The MTP layer's token ids of a step's drafting runs ([DeviceRank::fill]), as
+    /// [Self::step_tokens].
+    mtp_tokens: HostMapped,
     /// `[MAX_ROWS]` tokens: a greedy step's picks, which the device writes ([DeviceRank::picks]).
     picks: HostMapped,
     /// The tiled GEMVs' split sums and per-tile counters, which each launch leaves zeroed.
@@ -1878,6 +1912,35 @@ struct Run<'s> {
     block: Option<(&'s DraftScratch, usize)>,
 }
 
+/// This rank's rows of a sequence-parallel step ([DeviceRank::sequence_parallel]).
+#[derive(Clone, Copy)]
+struct Share<'t> {
+    tp: &'t TpRuntime,
+    /// The first of this rank's rows: its rank times `count`.
+    first: usize,
+    /// Rows a rank: the step's over the world, rounded up. The collectives move this many; the
+    /// last rank's past the step's are padding no kernel reads.
+    count: usize,
+    /// This rank's rows of the step's: `count`, but fewer on the last rank when padded.
+    live: usize,
+}
+
+impl Share<'_> {
+    /// Every rank's rows of `width` floats gathered into `base`, from `mine`, this rank's rows of
+    /// it, in place.
+    fn gather(
+        self,
+        rank: &DeviceRank,
+        mine: Deviceptr,
+        base: Deviceptr,
+        width: usize,
+    ) -> Result<(), BackendError> {
+        self.tp
+            .exchange_on_device(rank.stream.raw(), mine.0, base.0, self.count * width * 4)
+            .map_err(weights_error)
+    }
+}
+
 impl DeviceSequence {
     /// Positions this sequence has consumed, a verify's rows too until its commit gives back the
     /// ones it does not keep.
@@ -1953,6 +2016,9 @@ pub struct DeviceRank {
     prefill_activation: PrefillActivation,
     /// The fewest rows a device-leg all-reduce takes in two shots ([Self::reduce_into]).
     two_shot_rows: usize,
+    /// Whether a bulk step's hyper-connections run on each rank's own rows
+    /// (`sequence.parallel`, [Self::sequence_parallel]).
+    sequence_parallel: bool,
     /// What the hyper-connection fold multiplies its summed streams by
     /// (`speculation.mtp_fold_scale`): the mean over them unless the profile names a scale.
     fold_scale: f32,
@@ -1963,8 +2029,19 @@ pub struct DeviceRank {
     heads: AtomicU64,
     /// The side stream [Self::prefetch] warms the L2 from, unless SPARKFLASH_L2_PREFETCH=0.
     prefetch: Option<Prefetch>,
+    /// Recorded after each embedding launch that reads a token slab ([Self::embed_rows]).
+    tokens_staged: TokenFence,
     memory: Allocations,
 }
+
+/// The event a rank records after each launch that reads one of its token slabs. Launches are
+/// queued, so the host reaches the next step's embedding (or a prefill's next chunk) while the
+/// last one may still be queued; a slab is rewritten only once every launch that read it has run.
+struct TokenFence(StreamEvent);
+
+// SAFETY: an event handle of the rank's own context, recorded on the rank's stream and waited on
+// by the thread that holds the rank. A `Send` rank moves the event with it; nothing shares it.
+unsafe impl Send for TokenFence {}
 
 /// A side stream that pulls the weights the next kernels read into the L2 while the rank's stream
 /// waits in an exchange or runs latency-bound kernels, and the bytes it asks for a wait.
@@ -2153,6 +2230,7 @@ impl DeviceRank {
         }
         let scratch = Self::scratch(config, layout, MAX_ROWS, &stream, &mut memory, false)?;
         let prefetch = Prefetch::new(&cuda)?;
+        let tokens_staged = TokenFence(cuda.stream_event().map_err(cuda_error)?);
         let mut rank = Self {
             cuda,
             stream,
@@ -2180,6 +2258,10 @@ impl DeviceRank {
                 sparkflash_model::active_profile(),
             )?,
             two_shot_rows: sparkflash_weights::tp::two_shot_rows().map_err(weights_error)?,
+            sequence_parallel: sparkflash_model::active_profile()
+                .sequence
+                .parallel
+                .unwrap_or(true),
             fold_scale: sparkflash_model::active_profile()
                 .speculation
                 .mtp_fold_scale
@@ -2190,6 +2272,7 @@ impl DeviceRank {
             prof: Mutex::new(sparkflash_model::StageProfiler::new(
                 Self::profile_enabled()?
             )),
+            tokens_staged,
             memory,
         };
         if rank.mtp.is_some() && rank.lm_head.scales.is_none() {
@@ -2505,6 +2588,8 @@ impl DeviceRank {
             logits: memory.floats(world * rows * (config.vocab_size / world))?,
             logits_host: memory.mapped(world * rows * (config.vocab_size / world) * 4)?,
             drafted: memory.mapped(rows * rows * 4)?,
+            step_tokens: memory.mapped(rows * 4)?,
+            mtp_tokens: memory.mapped(rows * 4)?,
             picks: memory.mapped(rows * 4)?,
             partials: memory.floats(TILED_GEMV_PARTIALS * groups)?,
             counters: memory.zeroed(stream, TILED_GEMV_BLOCKS * groups * 4)?,
@@ -2975,7 +3060,7 @@ impl DeviceRank {
                 )?,
                 None => self.launch(
                     bf16,
-                    grid,
+                    (part_rows.div_ceil(WIDE_COLUMNS) as u32, grid.1, 1),
                     BLOCK,
                     &[
                         weight.0,
@@ -3036,7 +3121,9 @@ impl DeviceRank {
     }
 
     /// The token GEMV over a batch larger than its eight-row tile: up to [GEMV_GROUP_ROWS] rows a
-    /// launch, each part on its own past that.
+    /// launch, each part on its own past that. A BF16 part the tiled GEMV splits one 256-column
+    /// round a block takes glm_prefill_exact_bf16 over every row instead, which computes the same
+    /// floats, up to 2.5 times as fast.
     fn gemv_chunked(
         &self,
         linear: &DeviceLinear,
@@ -3073,7 +3160,34 @@ impl DeviceRank {
                 columns,
                 parts: [part_rows; 3],
             };
-            self.gemv_grouped(&row, input, output.offset(rows * first * 4), rows)?;
+            let out = output.offset(rows * first * 4);
+            let rounds = columns / TILED_GEMV_ROUND;
+            if row.scales.is_none()
+                && columns.is_multiple_of(TILED_GEMV_ROUND)
+                && input.0.is_multiple_of(16)
+                && row.weight.0.is_multiple_of(16)
+                && tiled_gemv_splits(part_rows.div_ceil(TILE_ROWS), columns) == rounds
+            {
+                self.launch(
+                    self.kernels.prefill_exact,
+                    (
+                        part_rows.div_ceil(EXACT_OUTS) as u32,
+                        rows.div_ceil(EXACT_ROWS) as u32,
+                        1,
+                    ),
+                    EXACT_THREADS,
+                    &[
+                        row.weight.0,
+                        input.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?;
+                continue;
+            }
+            self.gemv_grouped(&row, input, out, rows)?;
         }
         Ok(())
     }
@@ -3228,40 +3342,104 @@ impl DeviceRank {
     /// `collapsed`: two blocks a row, the input's beside the coefficients'. With `fused` the
     /// `q4e_mhc_post` before left `hyper`'s projection of the streams in `mix_parts`, and its GEMV
     /// does not run.
+    ///
+    /// With `share`, a sequence-parallel step's ([Self::sequence_parallel]), the mixer runs over
+    /// this rank's own rows only and the ranks then gather every row's normed input.
     fn mix_in(
         &self,
         hyper: &DeviceHyper,
         norm: Deviceptr,
         rows: usize,
         fused: bool,
+        share: Option<Share<'_>>,
     ) -> Result<(), BackendError> {
         let s = &self.scratch;
         let geometry = self.geometry;
         let (hc, hidden) = (geometry.hc_mult, geometry.dim);
-        if !fused {
-            self.gemv(&hyper.projection, s.streams, s.raw, rows)?;
+        let mixes = geometry.hc_mix_count();
+        let (first, count) = share.map_or((0, rows), |share| (share.first, share.live));
+        let row = |base: Deviceptr, width: usize| base.offset(first * width * 4);
+        let (streams, raw) = (row(s.streams, hc * hidden), row(s.raw, mixes));
+        let collapsed = row(s.collapsed, hidden);
+        if share.is_some() {
+            // The step's rows take the bulk projection ([Self::gemv]), so a share of them takes
+            // it too: its rows are the step's own floats.
+            self.bulk_gemm(&hyper.projection, streams, raw, count)?;
+        } else if !fused {
+            self.gemv(&hyper.projection, streams, raw, rows)?;
         }
         self.launch(
             self.kernels.mhc_in,
-            (rows as u32, 2, 1),
+            (2, count as u32, 1),
             BLOCK,
             &[
-                s.raw.0,
-                s.streams.0,
+                raw.0,
+                streams.0,
                 hyper.scale.0,
                 hyper.base.0,
-                s.coeffs.0,
+                row(s.coeffs, mixes).0,
                 norm.0,
-                s.collapsed.0,
+                collapsed.0,
                 hidden as u64,
                 hc as u64,
                 geometry.hc_sinkhorn_iters as u64,
                 float(geometry.hc_eps),
                 float(geometry.norm_eps),
                 float(self.config.rms_norm_eps as f32),
-                if fused { s.mix_parts.0 } else { 0 },
+                if fused && share.is_none() {
+                    s.mix_parts.0
+                } else {
+                    0
+                },
             ],
-        )
+        )?;
+        match share {
+            Some(share) => share.gather(self, collapsed, s.collapsed, hidden),
+            None => Ok(()),
+        }
+    }
+
+    /// This rank's share of a `rows`-row step whose hyper-connections run sequence-parallel, else
+    /// None.
+    ///
+    /// The mixers, the stream updates and the final fold are replicated work: every rank mixes
+    /// every row, about a sixth of a bulk prefill chunk. Sequence-parallel, each rank runs them
+    /// over its own `rows / world` rows: the branch partials are reduce-scattered (the two-shot
+    /// all-reduce's first shot), so a rank sums and folds only its own rows, and the ranks gather
+    /// the normed rows each branch reads, where the two-shot reduce gathered the sums. The bytes
+    /// moved are the two-shot reduce's. Every kernel involved computes a row from that row alone,
+    /// so each row keeps its bits. A step of rows the world does not divide is padded to the next
+    /// multiple for the collectives; the padding rows are never computed or read.
+    ///
+    /// Only a bulk step the two-shot reduce takes, on the device leg, whose padded rows fit the
+    /// prefill scratch, and none of whose runs captures rows for the block drafter, which reads
+    /// every row's streams.
+    fn sequence_parallel<'t>(
+        &self,
+        tp: &'t TpRuntime,
+        runs: &[Run<'_>],
+        rows: usize,
+        device_leg: bool,
+    ) -> Option<Share<'t>> {
+        let world = self.layout.world_size;
+        let captures = runs
+            .iter()
+            .any(|run| run.block.is_some_and(|(_, from)| from < run.len));
+        let count = rows.div_ceil(world);
+        let first = self.layout.rank * count;
+        (self.sequence_parallel
+            && device_leg
+            && rows > MAX_ROWS
+            && count * world <= self.prefill_rows
+            && first < rows
+            && self.two_shot(count * world)
+            && !captures)
+            .then(|| Share {
+                tp,
+                first,
+                count,
+                live: count.min(rows - first),
+            })
     }
 
     /// `hyper`'s `fn` projection when `q4e_mhc_post` can work it out of the streams it writes: a
@@ -3292,6 +3470,8 @@ impl DeviceRank {
     /// cross the host. With `next`, the mixer that reads the streams next, `q4e_mhc_post` also
     /// works out its `fn` projection where it can ([Self::fused_projection]); returns whether it
     /// did.
+    ///
+    /// With `share` ([Self::sequence_parallel]) a rank sums and mixes its own rows only.
     fn mix_out(
         &self,
         tp: &TpRuntime,
@@ -3299,6 +3479,7 @@ impl DeviceRank {
         next: Option<&DeviceHyper>,
         rows: usize,
         device_leg: bool,
+        share: Option<Share<'_>>,
     ) -> Result<bool, BackendError> {
         // The fused mixer writes one tiled GEMV's split partials; a prefill chunk takes the bulk
         // GEMM instead, whose 128-row tiles the mixer's 24-row projection does not feed.
@@ -3307,8 +3488,96 @@ impl DeviceRank {
         } else {
             next.and_then(|hyper| self.fused_projection(hyper))
         };
-        self.reduce_into(tp, self.scratch.partial, residual, next, rows, device_leg)?;
+        let partial = self.scratch.partial;
+        match share {
+            Some(share) => self.reduce_share(partial, residual, rows, share)?,
+            None => self.reduce_into(tp, partial, residual, next, rows, device_leg)?,
+        }
         Ok(next.is_some())
+    }
+
+    /// `q4e_sum_slots` of this rank's `count` floats at `mine` and the peers' in `slots`: the
+    /// two-shot reduce's sum, in rank order from 0.0 as `q4e_mhc_post` folds the one-shot's.
+    fn sum_slots(&self, mine: Deviceptr, count: usize) -> Result<(), BackendError> {
+        self.launch(
+            self.kernels.sum_slots,
+            (blocks(count / 4), 1, 1),
+            BLOCK,
+            &[
+                mine.0,
+                self.scratch.slots.0,
+                count as u64,
+                self.layout.rank as u64,
+                self.layout.world_size as u64,
+            ],
+        )
+    }
+
+    /// [Self::mix_out] of a sequence-parallel step: the partials reduce-scattered, so this rank
+    /// holds the sum of its own rows, and those rows' streams mixed.
+    fn reduce_share(
+        &self,
+        partial: Deviceptr,
+        (streams, coeffs, hc): (Deviceptr, Deviceptr, usize),
+        rows: usize,
+        share: Share<'_>,
+    ) -> Result<(), BackendError> {
+        let hidden = self.geometry.dim;
+        let padded = share.count * share.tp.world();
+        debug_assert!(padded >= rows);
+        let mine = reduce_scatter(
+            share.tp,
+            self.stream.raw(),
+            partial,
+            self.scratch.slots,
+            padded * hidden,
+            |mine, count| self.sum_slots(mine, count),
+        )?;
+        let row = |base: Deviceptr, width: usize| base.offset(share.first * width * 4);
+        if mine != row(partial, hidden) {
+            return Err(refusal(
+                "the reduce-scatter's chunk is not this rank's share of the rows",
+            ));
+        }
+        self.post(
+            (row(streams, hc * hidden), mine, row(coeffs, (2 + hc) * hc)),
+            hc,
+            share.live,
+            1,
+            None,
+        )
+    }
+
+    /// `q4e_mhc_post` over `rows` rows: each row's summed branch (with `world > 1` this rank's
+    /// partial, the peers' in `slots`) mixed into its `hc` streams by its `coeffs`.
+    fn post(
+        &self,
+        (streams, branch, coeffs): (Deviceptr, Deviceptr, Deviceptr),
+        hc: usize,
+        rows: usize,
+        world: usize,
+        next: Option<&DeviceLinear>,
+    ) -> Result<(), BackendError> {
+        let s = &self.scratch;
+        let hidden = self.geometry.dim;
+        self.launch(
+            self.kernels.mhc_post,
+            (blocks(hidden), rows as u32, 1),
+            BLOCK,
+            &[
+                streams.0,
+                branch.0,
+                coeffs.0,
+                hidden as u64,
+                hc as u64,
+                s.slots.0,
+                self.layout.rank as u64,
+                world as u64,
+                next.map_or(0, |linear| linear.weight.0),
+                if next.is_some() { s.mix_parts.0 } else { 0 },
+                next.map_or(0, |linear| linear.rows as u64),
+            ],
+        )
     }
 
     /// Whether a device-leg all-reduce of `rows` rows takes two shots: at least
@@ -3343,20 +3612,7 @@ impl DeviceRank {
                 partial,
                 s.slots,
                 rows * hidden,
-                |mine, count| {
-                    self.launch(
-                        self.kernels.sum_slots,
-                        (blocks(count / 4), 1, 1),
-                        BLOCK,
-                        &[
-                            mine.0,
-                            s.slots.0,
-                            count as u64,
-                            self.layout.rank as u64,
-                            world as u64,
-                        ],
-                    )
-                },
+                |mine, count| self.sum_slots(mine, count),
             )?;
             1
         } else if device_leg {
@@ -3377,24 +3633,7 @@ impl DeviceRank {
                 .map_err(cuda_error)?;
             1
         };
-        self.launch(
-            self.kernels.mhc_post,
-            (blocks(hidden), rows as u32, 1),
-            BLOCK,
-            &[
-                streams.0,
-                partial.0,
-                coeffs.0,
-                hidden as u64,
-                hc as u64,
-                s.slots.0,
-                self.layout.rank as u64,
-                world as u64,
-                next.map_or(0, |linear| linear.weight.0),
-                if next.is_some() { s.mix_parts.0 } else { 0 },
-                next.map_or(0, |linear| linear.rows as u64),
-            ],
-        )
+        self.post((streams, partial, coeffs), hc, rows, world, next)
     }
 
     /// The rows through KDA layer `layer`'s slice, their partial outputs into `partial`: the
@@ -4135,28 +4374,57 @@ impl DeviceRank {
             let (row, position) = (run.first, run.position);
             // The last row scores the most pools; a block past a row's own pools is a no-op.
             let last_pools = (position + run.len) / pool;
-            self.launch(
-                self.kernels.index_scores,
-                (
-                    last_pools.div_ceil(SCORE_TILE).max(1) as u32,
-                    run.len as u32,
-                    1,
-                ),
-                BLOCK,
-                &[
-                    s.index_query.offset(floats(row * heads * dim)).0,
-                    head_weights.offset(floats(row * heads)).0,
-                    pooled.0,
-                    s.scores.offset(floats(row * score_stride)).0,
-                    position as u64,
-                    heads as u64,
-                    dim as u64,
-                    pool as u64,
-                    float(inverse_sqrt(dim)),
-                    float(inverse_sqrt(heads)),
-                    score_stride as u64,
-                ],
-            )?;
+            let query = s.index_query.offset(floats(row * heads * dim)).0;
+            let weights = head_weights.offset(floats(row * heads)).0;
+            let scores = s.scores.offset(floats(row * score_stride)).0;
+            if run.len > MAX_ROWS && heads == INDEX_RUN_HEADS && dim == INDEX_RUN_DIM {
+                // A prefill run's rows share their pooled keys: glm_prefill_index_scores keeps a
+                // tile of them while it walks the rows, and computes the decode kernel's floats.
+                self.launch(
+                    self.kernels.prefill_index_scores,
+                    (
+                        last_pools.div_ceil(INDEX_RUN_POOLS).max(1) as u32,
+                        run.len.div_ceil(INDEX_RUN_ROWS) as u32,
+                        1,
+                    ),
+                    INDEX_RUN_THREADS,
+                    &[
+                        query,
+                        weights,
+                        pooled.0,
+                        scores,
+                        position as u64,
+                        pool as u64,
+                        float(inverse_sqrt(dim)),
+                        float(inverse_sqrt(heads)),
+                        score_stride as u64,
+                        run.len as u64,
+                    ],
+                )?;
+            } else {
+                self.launch(
+                    self.kernels.index_scores,
+                    (
+                        last_pools.div_ceil(SCORE_TILE).max(1) as u32,
+                        run.len as u32,
+                        1,
+                    ),
+                    BLOCK,
+                    &[
+                        query,
+                        weights,
+                        pooled.0,
+                        scores,
+                        position as u64,
+                        heads as u64,
+                        dim as u64,
+                        pool as u64,
+                        float(inverse_sqrt(dim)),
+                        float(inverse_sqrt(heads)),
+                        score_stride as u64,
+                    ],
+                )?;
+            }
             self.launch(
                 self.kernels.pick,
                 (run.len as u32, 1, 1),
@@ -4992,15 +5260,22 @@ impl DeviceRank {
         let config = &self.config;
         let (hc, hidden) = (config.hc_mult, config.hidden_size);
         let rows = tokens.len();
-        for (row, &token) in tokens.iter().enumerate() {
-            self.embed_row(token, s.streams.offset(row * hc * hidden * 4), hc)?;
-        }
+        // A sequence-parallel step widens, mixes and folds this rank's rows alone.
+        let share = self.sequence_parallel(tp, runs, rows, device_leg);
+        let (first, count) = share.map_or((0, rows), |share| (share.first, share.live));
+        let row = |base: Deviceptr, width: usize| base.offset(first * width * 4);
+        self.embed_rows(
+            &s.step_tokens,
+            &tokens[first..first + count],
+            row(s.streams, hc * hidden),
+            hc,
+        )?;
         self.prof_mark("embed");
         let streams = (s.streams, s.coeffs, hc);
         let mut linear = s.linear.iter();
         let mut fused = false;
         for (index, layer) in self.layers.iter().enumerate() {
-            self.mix_in(&layer.attn_hc, layer.input_norm, rows, fused)?;
+            self.mix_in(&layer.attn_hc, layer.input_norm, rows, fused, share)?;
             self.prof_mark("mhc_in");
             match &layer.branch {
                 DeviceBranch::Linear(kda) => {
@@ -5014,8 +5289,8 @@ impl DeviceRank {
                 }
             }
             self.prefetch(&layer.ffn_reads())?;
-            fused = self.mix_out(tp, streams, Some(&layer.ffn_hc), rows, device_leg)?;
-            self.mix_in(&layer.ffn_hc, layer.post_norm, rows, fused)?;
+            fused = self.mix_out(tp, streams, Some(&layer.ffn_hc), rows, device_leg, share)?;
+            self.mix_in(&layer.ffn_hc, layer.post_norm, rows, fused, share)?;
             match &layer.ffn {
                 DeviceFfn::Dense(mlp) => {
                     self.mlp(mlp, s.partial, rows)?;
@@ -5031,31 +5306,39 @@ impl DeviceRank {
                 Some(next) => self.prefetch(&next.attention_reads())?,
                 None => self.prefetch(&[self.lm_head.span()])?,
             }
-            fused = self.mix_out(tp, streams, next.map(|n| &n.attn_hc), rows, device_leg)?;
+            fused = self.mix_out(
+                tp,
+                streams,
+                next.map(|n| &n.attn_hc),
+                rows,
+                device_leg,
+                share,
+            )?;
             self.capture(index, runs)?;
         }
         self.prof_mark("tail");
         self.launch(
             self.kernels.fold,
-            (blocks(rows * hidden), 1, 1),
+            (blocks(count * hidden), 1, 1),
             BLOCK,
             &[
-                s.streams.0,
-                s.head.0,
+                row(s.streams, hc * hidden).0,
+                row(s.head, hidden).0,
                 hidden as u64,
                 hc as u64,
-                rows as u64,
+                count as u64,
                 float(self.fold_scale),
             ],
         )?;
+        let normed = row(s.head_normed, hidden);
         self.launch(
             self.kernels.rmsnorm,
-            (rows as u32, 1, 1),
+            (count as u32, 1, 1),
             BLOCK,
             &[
-                s.head.0,
+                row(s.head, hidden).0,
                 self.norm.0,
-                s.head_normed.0,
+                normed.0,
                 hidden as u64,
                 hidden as u64,
                 float(config.rms_norm_eps as f32),
@@ -5063,6 +5346,10 @@ impl DeviceRank {
                 0,
             ],
         )?;
+        // The LM head and the MTP layer's caches read every row's normed hidden.
+        if let Some(share) = share {
+            share.gather(self, normed, s.head_normed, hidden)?;
+        }
         let logits = match head_rows {
             HeadRows::All => R::head(self, (tp, gather), s.head_normed, rows, device_leg)?,
             HeadRows::Last => R::head(
@@ -5232,22 +5519,41 @@ impl DeviceRank {
         )
     }
 
-    /// Token `token`'s embedding into `copies` copies at `out`.
-    fn embed_row(&self, token: u32, out: Deviceptr, copies: usize) -> Result<(), BackendError> {
+    /// The embeddings of `tokens`, one a row from `out`, each row `copies` copies of it: one
+    /// launch, grid row `t` widening `tokens[t]`, over the ids staged in `slab`, which it reads in
+    /// place. A launch a token cost a prefill chunk 4,096 launches of a few microseconds each.
+    fn embed_rows(
+        &self,
+        slab: &HostMapped,
+        tokens: &[u32],
+        out: Deviceptr,
+        copies: usize,
+    ) -> Result<(), BackendError> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
         let hidden = self.config.hidden_size;
+        self.cuda
+            .host_wait(&self.tokens_staged.0)
+            .map_err(cuda_error)?;
+        slab.write_at(0, bytemuck::cast_slice(tokens))
+            .map_err(cuda_error)?;
         self.launch(
             self.kernels.embed,
-            (blocks(copies * hidden), 1, 1),
+            (blocks(copies * hidden), tokens.len() as u32, 1),
             BLOCK,
             &[
                 self.embed.0,
                 out.0,
-                u64::from(token),
+                0,
                 hidden as u64,
                 (copies * hidden) as u64,
-                0,
+                slab.device().0,
             ],
-        )
+        )?;
+        self.cuda
+            .record_event_on(&self.stream, &self.tokens_staged.0)
+            .map_err(cuda_error)
     }
 
     /// The MTP layer's input embeddings of a draft's iteration `iteration`, one a row of `rows`,
@@ -5349,17 +5655,15 @@ impl DeviceRank {
         let floats = |count: usize| count * 4;
         let mut filled = Vec::new();
         let mut rows = 0;
+        // The runs' MTP rows one after another, each run's tokens past the first it has no hidden
+        // for: their embeddings are one launch once the runs are laid out.
+        let mut ids = Vec::new();
         for run in runs {
             let Some(drafter) = run.drafter else {
                 continue;
             };
             let skip = usize::from(drafter.last.is_none());
-            for (row, &token) in tokens[run.first + skip..run.first + run.len]
-                .iter()
-                .enumerate()
-            {
-                self.embed_row(token, s.mtp_embed.offset(floats((rows + row) * hidden)), 1)?;
-            }
+            ids.extend_from_slice(&tokens[run.first + skip..run.first + run.len]);
             if let Some(last) = drafter.last {
                 self.mtp_hidden(mtp, drafter.hidden.offset(floats(last * hidden)), rows, 1)?;
             }
@@ -5383,6 +5687,7 @@ impl DeviceRank {
             }
         }
         if rows > 0 {
+            self.embed_rows(&s.mtp_tokens, &ids, s.mtp_embed, 1)?;
             self.mtp_input(mtp, rows)?;
             self.dsa_cache(&mtp.dsa, 0, &filled, rows)?;
         }
@@ -5514,7 +5819,7 @@ impl DeviceRank {
             let residual = (s.mtp_x, s.mtp_coeffs, 1);
             self.dsa(&mtp.dsa, 0, &runs, rows)?;
             self.prefetch(&mtp.moe.reads())?;
-            self.mix_out(tp, residual, None, rows, device_leg)?;
+            self.mix_out(tp, residual, None, rows, device_leg, None)?;
             self.norm_rows(
                 (s.mtp_x, hidden),
                 mtp.post_norm,
@@ -5526,7 +5831,7 @@ impl DeviceRank {
                 Some(head) => self.prefetch(&[(head.weight, head.rows * head.columns)])?,
                 None => self.prefetch(&[self.lm_head.span()])?,
             }
-            self.mix_out(tp, residual, None, rows, device_leg)?;
+            self.mix_out(tp, residual, None, rows, device_leg, None)?;
             self.norm_rows((s.mtp_x, hidden), mtp.head_norm, (s.mtp_out, hidden), rows)?;
             if device_leg {
                 self.lm_head(tp, s.mtp_out, rows, (true, true))?;
@@ -5788,6 +6093,7 @@ impl Drop for DeviceRank {
     fn drop(&mut self) {
         let _ = self.cuda.make_current();
         let _ = self.cuda.synchronize_stream(&self.stream);
+        self.cuda.destroy_event(&self.tokens_staged.0);
         if let Some(prefetch) = &self.prefetch {
             self.cuda.destroy_side_stream(&prefetch.side);
         }

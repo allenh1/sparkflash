@@ -49,7 +49,9 @@ pub const SUPPORTED_ENGINES: &[&str] = &[
     DYNAMIC_ENGINE_ID,
 ];
 
-/// The control-plane engine selector for a checkpoint the dynamic host reference serves.
+/// The control-plane engine selector for a checkpoint launched under its own id: the dynamic
+/// route opens a device arm when one reads its stored formats
+/// (`sparkflash_ops::parts::dynamic_device_arm`), and the CPU host reference otherwise.
 ///
 /// The weights selector is the checkpoint's own Hugging Face id: a novel family has no registry
 /// entry, so the id is the only stable selector it has.
@@ -71,6 +73,13 @@ pub const QWEN_WEIGHTS_ID: &str = sparkflash_model::descriptor::QWEN38_FLASH_NEX
 /// pack engine and world, with its own weights id.
 pub const QWEN_FP8_WEIGHTS_ID: &str =
     sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID;
+
+/// The control-plane weight selector for Qwen3.6-35B-A3B (FP8).
+pub const QWEN36_WEIGHTS_ID: &str =
+    sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID;
+
+/// The canonical Hugging Face id of the Qwen3.6-35B-A3B checkpoint.
+pub const QWEN36_MODEL_ID: &str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
 
 /// The control-plane engine selector for the TP=1 Qwen pack.
 pub const QWEN_ENGINE_ID: &str = "qwen4-exp";
@@ -183,6 +192,18 @@ fn deployment_for(weights: &str) -> Deployment {
             requires_conversion: true,
             requires_cubins: false,
         },
+        QWEN36_WEIGHTS_ID => Deployment {
+            // The dynamic engine launches Qwen3.5-MoE from the checkpoint: the FP8 release on
+            // the Qwen pack's device arm, a BF16 one on the shared CPU host reference, both at
+            // one rank (sparkflash_ops::parts::dynamic_device_arm decides which).
+            engine: DYNAMIC_ENGINE_ID,
+            search: "Qwen3.6",
+            world_size: SOLO_WORLD_SIZE,
+            worlds: &[SOLO_WORLD_SIZE],
+            org: "Qwen",
+            requires_conversion: false,
+            requires_cubins: false,
+        },
         GLM_WEIGHTS_ID => Deployment {
             engine: GLM_ENGINE_ID,
             search: "GLM-5.3-Flash",
@@ -230,10 +251,7 @@ pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
 /// alias the pack also releases.
 #[must_use]
 pub fn profile_for_model_type(model_type: &str) -> Option<&'static ModelProfile> {
-    let wanted = match model_type {
-        "qwen4_exp" | "qwen4_exp_text" => "qwen4_exp",
-        other => other,
-    };
+    let wanted = sparkflash_model::canonical_model_type(model_type);
     MODEL_PROFILES
         .iter()
         .find(|profile| profile.model_type == wanted)
@@ -1280,8 +1298,9 @@ impl SparkConfig {
     #[must_use]
     pub fn requires_conversion(&self) -> bool {
         if self.is_dynamic() {
-            // The dynamic host reference reads the checkpoint's safetensors directly. A rank
-            // file can be written with `sparkflash convert`, but launch does not need one.
+            // The dynamic engine reads the checkpoint's safetensors directly, on the host
+            // reference or on a device arm that reads its formats. A rank file can be written
+            // with `sparkflash convert`, but launch does not need one.
             return false;
         }
         profile_for_weights(&self.model.weights).is_none_or(|profile| profile.requires_conversion)
@@ -1770,6 +1789,22 @@ mod tests {
 
     /// SHA-256 of the bytes the binary-adoption fixtures write.
     const RUNNING_SHA256: &str = "c071cf5f5ed6f884cc70155b6f05f755fd46a302d05e4261b7e92ce878bbfed8";
+
+    #[test]
+    fn qwen36_launches_on_the_dynamic_engine_at_one_rank() {
+        let profile = profile_for_weights(QWEN36_WEIGHTS_ID).expect("the Qwen3.6 profile");
+        assert_eq!(profile.model_type, "qwen3_5_moe");
+        assert_eq!(profile.engine, DYNAMIC_ENGINE_ID);
+        assert_eq!(profile.world_size, 1);
+        assert_eq!(profile.worlds, &[1]);
+        assert!(!profile.requires_conversion);
+        assert!(!profile.requires_cubins);
+        // The text-only spelling the checkpoint's text_config carries resolves to the same entry.
+        assert_eq!(
+            profile_for_model_type("qwen3_5_moe_text").map(|profile| profile.weights),
+            Some(QWEN36_WEIGHTS_ID)
+        );
+    }
 
     #[test]
     fn model_profiles_take_their_identity_from_the_model_registry() {

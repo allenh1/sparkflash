@@ -501,6 +501,27 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
                               counters);
 }
 
+// y = W x for the Qwen3.5/3.6 FP8 release's dense projections: W is E4M3 with one BF16 inverse
+// scale a 128 x 128 tile (weight_scale_inv, [ceil(rows / 128)][columns / 128]), and x stays f32 -
+// the W8A16 product of the dequantised weight, as the host oracle and the FP8 experts' token
+// kernels compute it, not the checkpoint's dynamic activation scheme. Grid (ceil(rows / 32),
+// splits), Q4E_TG_THREADS threads, columns a multiple of 128 and the operands 16-byte aligned.
+extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
+    q4e_gemv_tiled_e4m3_tile(const unsigned char* __restrict__ w,
+                             const __nv_bfloat16* __restrict__ scales,
+                             const float* __restrict__ x, float* __restrict__ y, int rows,
+                             int columns, int batch, float* __restrict__ partials,
+                             unsigned int* __restrict__ counters) {
+    OPT_PDL_LAUNCH();
+    if (batch > Q4E_MAX_BATCH || columns % Q4E_FP8_BLOCK != 0) {
+        OPT_PDL_WAIT();
+        return;
+    }
+    q4e_tiled_gemv<Q4eTgE4m3Block>(
+        Q4eTgBlockRowsOf<__nv_bfloat16>{{w, rows, columns}, scales, 0},
+        Q4eTgStore{y, nullptr, rows, batch}, x, columns, batch, partials, counters);
+}
+
 // A BF16 [rows, columns] matrix as E4M3 with one f32 scale a row, a warp a row: the scale maps the
 // row's largest magnitude to 448, E4M3's largest finite value, and each weight over it rounds to
 // the nearest code. A row of zeros takes the scale 1.

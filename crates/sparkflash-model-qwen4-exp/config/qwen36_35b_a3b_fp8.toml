@@ -1,0 +1,37 @@
+# Qwen3.6-35B-A3B-FP8 runtime profile.
+#
+# The typed source of truth for this arm. A field left unset takes the arm's default; the
+# environment variables listed in sparkflash_model::profile::ENV_OVERRIDES remain overrides and
+# are documented in docs/adding-a-model.md.
+
+model = "Qwen/Qwen3.6-35B-A3B-FP8"
+family = "qwen3.6"
+weights = "qwen3.6-35b-a3b-fp8"
+
+[runtime]
+context_tokens = 262144
+concurrency = 1
+
+[prefill]
+enabled = true
+chunk = 4096
+tensor_cores = true
+exact = false
+
+[decode]
+tensor_cores = true
+
+[speculation]
+# The release's MTP stage (`mtp.fc` over a plain residual) is planned but not served on the
+# device yet, and no draft head is published for this model, so there is nothing to draft with.
+# The arm refuses `enabled = true` rather than running without a drafter.
+enabled = false
+
+[sequence]
+parallel = true
+overlap = true
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

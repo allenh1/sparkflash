@@ -261,6 +261,81 @@ fn an_unresolvable_served_part_fails_the_boot_gate_in_both_passes() {
     );
 }
 
+const QWEN38_NVFP4: &str =
+    include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+
+/// A source that reports each planned tensor as a container stores it, by name.
+struct Stored(std::collections::HashMap<String, TensorSpec>);
+
+impl Stored {
+    fn of(plan: &ArchitectureTensorPlan, store: impl Fn(&TensorSpec) -> TensorSpec) -> Self {
+        Self(
+            plan.specs()
+                .iter()
+                .map(|spec| (spec.name.clone(), store(spec)))
+                .collect(),
+        )
+    }
+}
+
+impl WeightSource for Stored {
+    fn names(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.0
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WeightError::Missing {
+                name: name.to_owned(),
+            })
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        Ok(vec![0; self.spec(name)?.storage_bytes() as usize])
+    }
+}
+
+#[test]
+fn the_released_nvfp4_checkpoint_opens_as_modelopt_stores_it() {
+    // ModelOpt writes NVFP4 codes as U8 with the last axis halved; the plan keeps the logical
+    // F4E2M1 shape. The shared rank's conformance check must take one for the other, or the
+    // released Qwen3.8 checkpoint cannot open on the plan-aware serve path at all.
+    let mut architecture = Architecture::from_json(QWEN38_NVFP4).expect("Qwen3.8 NVFP4");
+    architecture.experts_only_fp8();
+    let tp = TpPlan::new(1, 0).expect("one rank");
+    let tensors =
+        ArchitectureTensorPlan::served_and_mtp(&architecture, tp).expect("the released plan");
+    assert!(
+        tensors
+            .specs()
+            .iter()
+            .any(|spec| spec.dtype == DType::F4E2M1),
+        "the released document plans FP4 experts"
+    );
+    let plan = EnginePlan::for_architecture(architecture, Target::Sm121, 1, 0)
+        .expect("the released execution plan");
+    let packed = |spec: &TensorSpec, halve: bool| {
+        let mut stored = spec.clone();
+        if stored.dtype == DType::F4E2M1 {
+            stored.dtype = DType::U8;
+            if let Some(last) = stored.shape.last_mut().filter(|_| halve) {
+                *last /= 2;
+            }
+        }
+        stored
+    };
+    let modelopt = Stored::of(&tensors, |spec| packed(spec, true));
+    PartsDeviceRank::open(&plan, &modelopt, PlanContext::SM121_CATALOGUE)
+        .expect("the ModelOpt packing is the planned FP4 tensor");
+    // A U8 tensor at the logical width is twice the bytes: not the packing.
+    let unpacked = Stored::of(&tensors, |spec| packed(spec, false));
+    let error = PartsDeviceRank::open(&plan, &unpacked, PlanContext::SM121_CATALOGUE)
+        .expect_err("a U8 tensor at the logical width is refused");
+    assert!(error.to_string().contains("is stored as U8"), "{error}");
+}
+
 fn released_family() -> Architecture {
     Architecture::from_json(
         r#"{"model_type":"qwen4_exp","text_config":{"hidden_size":2560,"vocab_size":248320,"num_hidden_layers":1,"num_attention_heads":24,"num_key_value_heads":2,"head_dim":256,"linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,"layer_types":["linear_attention"],"num_experts":4,"num_experts_per_tok":2,"moe_intermediate_size":640,"shared_expert_intermediate_size":640,"hc_count":4,"hc_lowrank":320,"indexer_n_heads":4,"indexer_kv_heads":1,"indexer_head_dim":128,"indexer_budget":2048,"indexer_compress_ratio":4}}"#,
@@ -517,4 +592,112 @@ fn an_attention_launcher_describes_the_resolved_symbol() {
     // Four rows over a 4:1 query/KV group is 16 row-heads, four blocks of four.
     assert_eq!(launcher.launch.grid, (4, 1, 1));
     assert_eq!(launcher.launch.block, (256, 1, 1));
+}
+
+/// The carried Qwen3.6-35B-A3B-FP8 document. The BF16 release is the same document without its
+/// `quantization_config`.
+fn qwen36(fp8: bool) -> Architecture {
+    let mut architecture = Architecture::from_json(include_str!(
+        "../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json"
+    ))
+    .expect("the carried Qwen3.6 document parses");
+    if !fp8 {
+        architecture.quantization.dense_format = WeightFormat::Bf16;
+        architecture.quantization.expert_format = WeightFormat::Bf16;
+        architecture.quantization.mtp_expert_format = None;
+    }
+    architecture
+}
+
+#[test]
+fn the_qwen36_bf16_plan_is_the_released_index() {
+    // Qwen/Qwen3.6-35B-A3B: 1,045 names and `metadata.total_size` 71,903,645,408. The plan
+    // reproduced the index's name set exactly when this was written; the count and the byte
+    // total pin it.
+    let tp = TpPlan::new(1, 0).expect("one rank");
+    let plan = ArchitectureTensorPlan::checkpoint(&qwen36(false), tp).expect("the plan builds");
+    assert_eq!(plan.len(), 1_045);
+    assert_eq!(plan.storage_bytes(), 71_903_645_408);
+    let fused = plan
+        .spec("model.language_model.layers.0.mlp.experts.gate_up_proj")
+        .expect("the fused gate/up experts");
+    assert_eq!(fused.shape, vec![256, 1024, 2048]);
+    let down = plan
+        .spec("model.language_model.layers.0.mlp.experts.down_proj")
+        .expect("the fused down experts");
+    assert_eq!(down.shape, vec![256, 2048, 512]);
+    assert_eq!(
+        plan.spec("mtp.fc.weight")
+            .expect("the MTP projection")
+            .shape,
+        vec![2048, 4096]
+    );
+    for name in [
+        "model.language_model.norm.weight",
+        "model.language_model.layers.3.input_layernorm.weight",
+        "model.language_model.layers.3.post_attention_layernorm.weight",
+    ] {
+        assert_eq!(plan.spec(name).expect(name).shape, vec![2048], "{name}");
+    }
+    assert!(
+        plan.spec("model.language_model.layers.3.self_attn.indexer.index_qk_proj.weight")
+            .is_none(),
+        "full attention has no indexer"
+    );
+}
+
+#[test]
+fn the_qwen36_fp8_plan_is_the_released_index() {
+    // Qwen/Qwen3.6-35B-A3B-FP8: 64,196 names; the 42 shards are 8,872,688 bytes over the plan,
+    // which is their safetensors headers.
+    let tp = TpPlan::new(1, 0).expect("one rank");
+    let plan = ArchitectureTensorPlan::checkpoint(&qwen36(true), tp).expect("the plan builds");
+    assert_eq!(plan.len(), 64_196);
+    assert_eq!(plan.storage_bytes(), 37_454_789_472);
+    let layer = "model.language_model.layers.0";
+    for (name, dtype, shape) in [
+        (
+            format!("{layer}.linear_attn.in_proj_qkv.weight"),
+            DType::F8E4M3,
+            vec![8192, 2048],
+        ),
+        (
+            format!("{layer}.linear_attn.in_proj_qkv.weight_scale_inv"),
+            DType::BF16,
+            vec![64, 16],
+        ),
+        (
+            format!("{layer}.linear_attn.in_proj_a.weight"),
+            DType::BF16,
+            vec![32, 2048],
+        ),
+        (
+            format!("{layer}.mlp.shared_expert.down_proj.weight_scale_inv"),
+            DType::BF16,
+            vec![16, 4],
+        ),
+        (
+            format!("{layer}.mlp.experts.7.gate_proj.weight"),
+            DType::F8E4M3,
+            vec![512, 2048],
+        ),
+        (
+            "model.language_model.layers.3.self_attn.q_proj.weight_scale_inv".to_owned(),
+            DType::BF16,
+            vec![64, 16],
+        ),
+        (
+            "mtp.layers.0.self_attn.o_proj.weight".to_owned(),
+            DType::F8E4M3,
+            vec![2048, 4096],
+        ),
+        ("mtp.fc.weight".to_owned(), DType::BF16, vec![2048, 4096]),
+    ] {
+        let spec = plan
+            .spec(&name)
+            .unwrap_or_else(|| panic!("{name} is planned"));
+        assert_eq!((spec.dtype, &spec.shape), (dtype, &shape), "{name}");
+    }
+    let served = ArchitectureTensorPlan::served(&qwen36(true), tp).expect("the served plan");
+    assert_eq!(served.storage_bytes(), 35_707_978_496);
 }

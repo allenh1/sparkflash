@@ -928,13 +928,15 @@ __device__ __forceinline__ void q4e_mhc_warp_mixes(const Q4eMhcLane& in, float s
     }
 }
 
-// A sublayer's mixer: grid (batch, 2), Q4E_BLOCK threads, two blocks a token that run side by
-// side. Block (t, 1) writes token t's coefficients [batch][pre (hc) | post (hc) | comb (hc x hc)]
-// from its fn projection and its streams' sum of squares. Block (t, 0) works out only the pre
+// A sublayer's mixer: grid (2, batch), Q4E_BLOCK threads, two blocks a token that run side by
+// side. Block (1, t) writes token t's coefficients [batch][pre (hc) | post (hc) | comb (hc x hc)]
+// from its fn projection and its streams' sum of squares. Block (0, t) works out only the pre
 // coefficients, and from them the normed sublayer input `out`: sum_c pre[c] x[c][j] from zero in
 // copy order (mhc::hc_pre), then RMSNorm with the sublayer's BF16 weight (linalg::rms_norm). So
 // the input never waits on the comb's 2 * iters normalisations. Only the sums of squares are
-// reassociated (block trees).
+// reassociated (block trees). A token's two blocks are adjacent in launch order, so the second
+// to read its streams finds them in the L2: a 4,096-row prefill chunk took 2.51 ms with the token
+// on x (every token's first block, then every second) and takes 1.45 ms.
 //
 // A thread keeps the stream values it squares (q4e_mhc_hold): they are the very columns its pre
 // sums read. The mixer's parameters and the norm weight it reads before waiting on the launch
@@ -959,7 +961,7 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
         columns > Q4E_MHC_COLUMNS) {
         return;
     }
-    const int t = blockIdx.x;
+    const int t = blockIdx.y;
     const int lane = threadIdx.x;
     const int mixes = (2 + hc) * hc;
     const float* raw_t = raw + (unsigned long long)t * mixes;
@@ -970,7 +972,7 @@ extern "C" __global__ void q4e_mhc_in(const float* __restrict__ raw,
     float held[Q4E_MHC_MAX_HC][Q4E_MHC_COLUMNS];
     float gate = 0.0f;
     float cell = 0.0f;
-    if (blockIdx.y != 0) {
+    if (blockIdx.x != 0) {
         Q4eMhcLane in = q4e_mhc_lane(scale, base, hc, 2 * hc, true);
         OPT_PDL_WAIT();
         q4e_mhc_lane_raw(in, raw_t, parts_t, splits, hc, 2 * hc, true);
@@ -1299,29 +1301,14 @@ extern "C" __global__ void q4e_glm_index_scores(const float* __restrict__ query,
 // ---------------------------------------------------------------------------------------------
 // GLM-5.3-Flash: the tiled decode GEMV wrappers this arm loads from its own image.
 //
-// q4e_tiled_gemv, its formats and Q4eTgRows are the shared header's; what follows is this
-// arm's block-scaled format, its grouped launch and the epilogues that read it. The Qwen token
+// q4e_tiled_gemv, its formats (the block-scaled one included) and Q4eTgRows are the shared
+// header's; what follows is this arm's grouped launch and the epilogues that read it. The Qwen token
 // image instantiates the same body for q4e_gemv_tiled_bf16 and q4e_gemv_tiled_e4m3, so a
 // retile reaches both without a second copy here.
 // ---------------------------------------------------------------------------------------------
 
-// E4M3 with one f32 scale a 128 x 128 block (GLM-5.3-Flash's FP8 projections).
-struct Q4eTgE4m3Block : Q4eTgE4m3 {
-    static constexpr bool kBlockScaled = true;
-};
-
-// Q4eTgRows of an E4M3 matrix with its block scales, [ceil(rows / 128)][ceil(columns / 128)].
-// `quantise` is the release's dynamic activation scheme; clear, the f32 activations multiply the
-// block scale unquantised (a configuration built in code, never a release's).
-struct Q4eTgBlockRows : Q4eTgRows<unsigned char> {
-    const float* scales;
-    int quantise;
-    __device__ float block_scale(int tile, int column) const {
-        const int blocks = (columns + Q4E_FP8_BLOCK - 1) / Q4E_FP8_BLOCK;
-        return q4e_ldg(&scales[(tile * Q4E_TG_TILE / Q4E_FP8_BLOCK) * blocks +
-                               column / Q4E_FP8_BLOCK]);
-    }
-};
+// The block-scaled E4M3 format and its rows (Q4eTgE4m3Block, Q4eTgBlockRows) are the shared
+// header's: Qwen's FP8 release reads the same tile with BF16 scales.
 
 // Q4eTgStore for a matrix of up to four parts stacked by rows, which start at 0, second, third and
 // fourth (0 <= second <= third <= fourth <= rows): part p's outputs land as one [batch][its rows]

@@ -30,26 +30,35 @@ use crate::config::Qwen4ExpConfig;
 /// The drafter's canonical Hugging Face repository id.
 pub const DFLASH2_MODEL_ID: &str = "incoai/Qwen3.8-Flash-Next-DFlash2";
 
-/// The drafter directory the device arm should load.
+/// The drafter directory the device arm should load for `target`.
 ///
 /// `SPARKFLASH_QWEN4_DFLASH2` still wins when set: a path that exists is used as-is, and a repo id
 /// or a missing path is looked up in the Hugging Face cache. When it is unset, the canonical
-/// `incoai/Qwen3.8-Flash-Next-DFlash2` snapshot in the cache is used. That keeps the normal case
-/// to `hf download incoai/Qwen3.8-Flash-Next-DFlash2` with no path in the environment; `None`
-/// means no drafter is configured, so the MTP head serves instead.
+/// `incoai/Qwen3.8-Flash-Next-DFlash2` snapshot in the cache is used, but only for the Qwen3.8
+/// family (`qwen4_exp`) it drafts for. That keeps the normal case to
+/// `hf download incoai/Qwen3.8-Flash-Next-DFlash2` with no path in the environment, and keeps a
+/// cached Qwen3.8 drafter away from a Qwen3.5/3.6 target, which would refuse its width at load.
+/// `None` means no drafter is configured, so the MTP head serves instead.
 #[must_use]
-pub fn drafter_directory() -> Option<PathBuf> {
+pub fn drafter_directory(target: &Qwen4ExpConfig) -> Option<PathBuf> {
     let profile = sparkflash_model::active_profile();
     let configured = profile.speculation.drafter.as_deref();
-    resolve_drafter_dir(configured.map(OsStr::new))
+    let canonical = target.family() == crate::config::HYPER_FAMILY;
+    resolve_drafter_dir(configured.map(OsStr::new), canonical)
 }
 
-fn resolve_drafter_dir(value: Option<&OsStr>) -> Option<PathBuf> {
+fn resolve_drafter_dir(value: Option<&OsStr>, canonical: bool) -> Option<PathBuf> {
     let cache = hub::default_cache_dir();
-    resolve_drafter_dir_in(cache.as_deref(), value)
+    resolve_drafter_dir_in(cache.as_deref(), value, canonical)
 }
 
-fn resolve_drafter_dir_in(cache: Option<&Path>, value: Option<&OsStr>) -> Option<PathBuf> {
+/// `canonical` is whether the target is the model the canonical snapshot drafts for; a drafter
+/// configured by name resolves either way, and a mismatched one is refused at load.
+fn resolve_drafter_dir_in(
+    cache: Option<&Path>,
+    value: Option<&OsStr>,
+    canonical: bool,
+) -> Option<PathBuf> {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
         if path.exists() {
@@ -61,6 +70,9 @@ fn resolve_drafter_dir_in(cache: Option<&Path>, value: Option<&OsStr>) -> Option
             return Some(snapshot);
         }
         return Some(path);
+    }
+    if !canonical {
+        return None;
     }
     cache.and_then(|cache| hub::cached_model_in(cache, DFLASH2_MODEL_ID))
 }
@@ -143,29 +155,46 @@ mod tests {
         std::fs::create_dir_all(repo.join("refs")).expect("refs");
         std::fs::write(repo.join("refs").join("main"), "rev").expect("ref");
         assert_eq!(
-            resolve_drafter_dir_in(Some(dir.path()), None),
+            resolve_drafter_dir_in(Some(dir.path()), None, true),
             Some(snapshot.clone())
         );
 
         let custom = dir.path().join("custom-drafter");
         std::fs::create_dir_all(&custom).expect("custom");
         assert_eq!(
-            resolve_drafter_dir_in(Some(dir.path()), Some(custom.as_os_str())),
+            resolve_drafter_dir_in(Some(dir.path()), Some(custom.as_os_str()), true),
+            Some(custom.clone())
+        );
+        assert_eq!(
+            resolve_drafter_dir_in(
+                Some(dir.path()),
+                Some(std::ffi::OsStr::new(DFLASH2_MODEL_ID)),
+                true
+            ),
+            Some(snapshot.clone())
+        );
+
+        let missing = dir.path().join("not-there");
+        assert_eq!(
+            resolve_drafter_dir_in(Some(dir.path()), Some(missing.as_os_str()), true),
+            Some(missing)
+        );
+        assert_eq!(resolve_drafter_dir_in(None, None, true), None);
+
+        // Another family the arm serves (Qwen3.5/3.6) never picks up the cached Qwen3.8 drafter,
+        // but a drafter configured by name still resolves, and its load checks the width.
+        assert_eq!(resolve_drafter_dir_in(Some(dir.path()), None, false), None);
+        assert_eq!(
+            resolve_drafter_dir_in(Some(dir.path()), Some(custom.as_os_str()), false),
             Some(custom)
         );
         assert_eq!(
             resolve_drafter_dir_in(
                 Some(dir.path()),
-                Some(std::ffi::OsStr::new(DFLASH2_MODEL_ID))
+                Some(std::ffi::OsStr::new(DFLASH2_MODEL_ID)),
+                false
             ),
             Some(snapshot)
         );
-
-        let missing = dir.path().join("not-there");
-        assert_eq!(
-            resolve_drafter_dir_in(Some(dir.path()), Some(missing.as_os_str())),
-            Some(missing)
-        );
-        assert_eq!(resolve_drafter_dir_in(None, None), None);
     }
 }

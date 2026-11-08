@@ -333,17 +333,20 @@ device arm, so:
   verifies it, and a conversion with no `--output-dir` writes beside the working directory,
   never inside the Hugging Face cache. A family `ArchitectureTensorPlan` names can use
   `SlotPack` directly; the novel path cannot yet;
-- a family this backend does not execute (MLA, KDA, CSA2, an indexer, a hyper-connection, PLE,
-  Engram or vision) is refused with the exact host-part list before a kernel is consulted. An MTP
-  stage is optional: the host ignores it and runs the backbone, and a quantized tensor belonging
-  to the stage (under `mtp.*`, or stored as an extra decoder layer) does not refuse the
-  backbone;
+- a family this backend does not execute (MLA, KDA, CSA2, an indexer, a hyper-connection, PLE
+  or Engram) is refused with the exact host-part list before a kernel is consulted. An MTP stage
+  and a vision tower are optional: the host ignores both and runs the backbone, and a quantized
+  tensor belonging to either (under `mtp.*`, `model.visual.*`, or an extra decoder layer) does
+  not refuse the backbone;
+- the host decodes BF16/F32 tensors and 128x128 tile-quantized E4M3 weights. An E4M3 weight
+  needs its `<name>_scale_inv` grid beside it, and the decoder multiplies every element by its
+  block's inverse scale. NVFP4, MXFP8 and unscaled FP8 storage are still refused;
 - `--tokenizer FILE` wins over `<checkpoint>/tokenizer.json`, and a tokenizer carrying neither
   GLM's nor ChatML's markers is refused instead of falling back to `ByteCodec`;
 - a single-file `model.safetensors` is accepted without an index: the header synthesizes the
-  weight map. A quantized checkpoint (ModelOpt `U8` + scales, or a declared FP8/NVFP4 format)
-  is refused at boot with the format and scale names, because this path does not yet apply block
-  scales;
+  weight map. A checkpoint whose quantized storage this path cannot decode (ModelOpt `U8` +
+  scales, NVFP4, or an E4M3 tensor without its `_scale_inv` grid) is refused at boot with the
+  format and tensor name;
 
 Replacing the remaining novel-family host walk with a shared device `EngineBuilder` and adding a
 generic `ArchitectureTensorPlan` naming path is the next step; it is a new plan builder, not a
@@ -354,9 +357,15 @@ The web control plane evaluates a released family with the same `EnginePlan` +
 sizes each width from the tensor plan and the KV cache plan against the per-rank memory budget
 (`NODE_MEMORY_BUDGET_BYTES` less `MEMORY_FLOOR_BYTES`). `supported` means a device engine serves
 the checkpoint at its launch width; `context_tokens` comes from the checkpoint, and `missing_parts`
-names what is missing. A novel family is never `supported`: it is checked against the shared
-`HOST_REFERENCE_PARTS` set only so an explicit `engine.kind = "dynamic"` plan can be validated
-(`host_reference`), and the browser reports it as missing a device engine. A cached or explicit
+names what is missing. A novel family with no registry entry is never `supported`: it is
+checked against the shared `HOST_REFERENCE_PARTS` set only so an explicit
+`engine.kind = "dynamic"` plan can be validated (`host_reference`), and the browser reports it
+as missing a device engine. A family registered with a `ModelProfile` whose `engine` is
+`dynamic` is judged by the kernel catalogue when a device arm reads its stored formats
+(`sparkflash_ops::parts::dynamic_device_arm`, the same rule the CLI's dynamic route and the
+arm's load apply), and otherwise by the host-reference gate, reported as running on the CPU host
+reference. Qwen3.6-35B-A3B is the first such entry: its FP8 release runs on the Qwen device arm,
+a BF16 checkpoint of the family on the host. A cached or explicit
 checkpoint is also judged by its safetensors headers, so storage-only quantization is refused
 exactly as the CLI refuses it; a Hub-only preview remains declaration-level until the shards are
 downloaded. An explicit `model.checkpoint` is authoritative over a cached `model.id` for both the

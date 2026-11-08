@@ -33,8 +33,8 @@ use sparkflash_model::BackendError;
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
-    ATTN_GROUP_SELECTED, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts,
-    GpuMoe, MAX_SELECTED_TOKENS,
+    ATTN_GROUP_SELECTED, Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch,
+    GpuExperts, GpuMoe, MAX_SELECTED_TOKENS, full_attention_splits,
 };
 
 /// The indexer blocks one q4e_qsa_scores CTA scores for a row (Q4E_QSA_TILE).
@@ -91,16 +91,10 @@ impl DeviceSequence {
         let kernels = &*self.backend.kernels;
         let kv_width = config.kv_proj_width();
         let attn_width = config.attn_out_width();
-        self.gemv4(
-            q_proj,
-            k_proj,
-            v_proj,
-            index_qk,
+        self.dense4(
+            [*q_proj, *k_proj, *v_proj, Dense::Bf16(*index_qk)],
             mixed,
-            self.qg,
-            self.kv_row,
-            self.value_row,
-            self.index_row,
+            [self.qg, self.kv_row, self.value_row, self.index_row],
             batch,
         )?;
         let deint_blocks = attn_width.div_ceil(256).max(1) as u32;
@@ -230,6 +224,12 @@ impl DeviceSequence {
                 kv_elems as u64,
             ],
         )?;
+        if config.full_attention() {
+            self.probe_finite(slot, "sparse_query", self.query, batch * attn_width)?;
+            self.probe_finite(slot, "sparse_keys", self.kv_row, batch * kv_width)?;
+            self.prof_mark("sparse_kv")?;
+            return self.full_attention(keys, values, position, batch);
+        }
         // The indexer's query is the leading slice of the wider per-token index
         // row, so it is normed with an explicit source stride, then rotated in place.
         self.launch(
@@ -390,6 +390,61 @@ impl DeviceSequence {
         Ok(())
     }
 
+    /// Gated attention over every causal position, for a configuration with no sparse indexer
+    /// (Qwen3.5/3.6): q4e_attn_full splits each row's context over up to FULL_ATTENTION_SPLITS
+    /// CTAs a head into `self.qsa_block_scores`, and q4e_attn_full_combine folds the splits and
+    /// applies the sigmoid gate into `self.attention_out`. A row's split count is a function of
+    /// its own position alone, so its bits do not depend on the chunk it is in.
+    fn full_attention(
+        &self,
+        keys: Deviceptr,
+        values: Deviceptr,
+        position: usize,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let config = &self.backend.config;
+        let kernels = &*self.backend.kernels;
+        let attn_width = config.attn_out_width();
+        let heads = config.num_attention_heads as u32;
+        let mut base = 0usize;
+        while base < batch {
+            let rows = ATTENTION_CHUNK.min(batch - base);
+            let at = position + base;
+            self.launch(
+                kernels.attn_full,
+                (heads, rows as u32, full_attention_splits(at + rows) as u32),
+                (256, 1, 1),
+                &[
+                    self.query.offset(base * attn_width * 4).0,
+                    keys.0,
+                    values.0,
+                    self.qsa_block_scores.0,
+                    at as u64,
+                    config.num_attention_heads as u64,
+                    config.num_key_value_heads as u64,
+                    config.head_dim as u64,
+                    config.query_groups() as u64,
+                ],
+            )?;
+            self.launch(
+                kernels.attn_full_combine,
+                (heads, rows as u32, 1),
+                (256, 1, 1),
+                &[
+                    self.qsa_block_scores.0,
+                    self.gate.offset(base * attn_width * 4).0,
+                    self.attention_out.offset(base * attn_width * 4).0,
+                    at as u64,
+                    config.num_attention_heads as u64,
+                    config.head_dim as u64,
+                ],
+            )?;
+            self.prof_mark("sparse_attn")?;
+            base += rows;
+        }
+        Ok(())
+    }
+
     /// The row-independent tail of a sparse block: the output projection of `attention_out` into
     /// `self.branch`, over `batch` rows.
     pub(super) fn sparse_output(
@@ -412,7 +467,7 @@ impl DeviceSequence {
             self.attention_out,
             batch * attn_width,
         )?;
-        self.gemv(o_proj, self.attention_out, self.branch, batch)?;
+        self.dense(o_proj, self.attention_out, self.branch, batch)?;
         self.probe_finite(
             slot,
             "attention_branch",
@@ -446,16 +501,10 @@ impl DeviceSequence {
                 "a linear block was given a sparse-attention layer",
             ));
         };
-        self.gemv4(
-            in_qkv,
-            in_z,
-            in_b,
-            in_a,
+        self.dense4(
+            [*in_qkv, *in_z, Dense::Bf16(*in_b), Dense::Bf16(*in_a)],
             mixed,
-            self.linear_qkv,
-            self.linear_z,
-            b_out,
-            a_out,
+            [self.linear_qkv, self.linear_z, b_out, a_out],
             batch,
         )?;
         self.prof_mark("gdn_proj")
@@ -594,7 +643,7 @@ impl DeviceSequence {
                 "a linear block was given a sparse-attention layer",
             ));
         };
-        self.gemv(out_proj, self.linear_out, self.branch, batch)?;
+        self.dense(out_proj, self.linear_out, self.branch, batch)?;
         self.prof_mark("gdn_branch")?;
         self.probe_finite(
             index,
@@ -645,20 +694,42 @@ impl DeviceSequence {
         // same rows of `mixed`, so a few rows take them in one launch; each output keeps the bits
         // its own launch gives it ([Self::gemm_group]).
         let grouped = batch >= GEMM_MIN_BATCH || self.chunk_path(batch);
-        if grouped {
-            self.gemm_group(
+        match (&moe.shared, &moe.shared_up) {
+            (Dense::Bf16(shared), Dense::Bf16(shared_up)) if grouped => self.gemm_group(
                 &[
                     Projection::plain(&moe.router, self.probabilities),
-                    Projection::plain(&moe.shared, self.shared_hidden),
-                    Projection::plain(&moe.shared_up, self.shared_up),
+                    Projection::plain(shared, self.shared_hidden),
+                    Projection::plain(shared_up, self.shared_up),
                     Projection::plain(&moe.shared_gate, self.expert_gate),
                 ],
                 mixed,
                 batch,
-            )?;
-        } else {
-            self.gemv(&moe.router, mixed, self.probabilities, batch)?;
+            )?,
+            (Dense::Bf16(_), Dense::Bf16(_)) => {
+                self.gemv(&moe.router, mixed, self.probabilities, batch)?;
+            }
+            // The FP8 release's shared expert has no fused gate/up kernel: its two block-scaled
+            // projections run beside the BF16 router and sigmoid gate at every row count, and
+            // [Self::shared_expert] takes them as projected.
+            _ => {
+                if grouped {
+                    self.gemm_group(
+                        &[
+                            Projection::plain(&moe.router, self.probabilities),
+                            Projection::plain(&moe.shared_gate, self.expert_gate),
+                        ],
+                        mixed,
+                        batch,
+                    )?;
+                } else {
+                    self.gemv(&moe.router, mixed, self.probabilities, batch)?;
+                    self.gemv(&moe.shared_gate, mixed, self.expert_gate, batch)?;
+                }
+                self.dense(&moe.shared, mixed, self.shared_hidden, batch)?;
+                self.dense(&moe.shared_up, mixed, self.shared_up, batch)?;
+            }
         }
+        let projected = grouped || matches!(moe.shared, Dense::Fp8(_));
         self.probe_finite(
             layer,
             "router_logits",
@@ -699,7 +770,7 @@ impl DeviceSequence {
             batch * config.num_experts_per_tok * config.hidden_size,
         )?;
         self.prof_mark("experts")?;
-        self.shared_expert(moe, mixed, batch, grouped)?;
+        self.shared_expert(moe, mixed, batch, projected)?;
         self.prof_mark("shared")?;
         // One rank's combination is its share of the sum: it is summed over the world before it
         // is injected, so the combine only writes it ([Self::inject_branch]).
@@ -922,6 +993,8 @@ impl DeviceSequence {
             // Same register-accumulator bound as the hyper passes: one launch per group of
             // GEMV_MAX_BATCH tokens, offset into the chunk's staging rows.
             const WARPS: usize = 8;
+            let shared = moe.shared.bf16("the fused shared-expert gate/up")?;
+            let shared_up = moe.shared_up.bf16("the fused shared-expert gate/up")?;
             let mut base = 0usize;
             while base < batch {
                 let count = GEMV_MAX_BATCH.min(batch - base);
@@ -930,8 +1003,8 @@ impl DeviceSequence {
                     ((intermediate + 1).div_ceil(WARPS) as u32, 1, 1),
                     ((WARPS * 32) as u32, 1, 1),
                     &[
-                        moe.shared.pointer.0,
-                        moe.shared_up.pointer.0,
+                        shared.pointer.0,
+                        shared_up.pointer.0,
                         moe.shared_gate.pointer.0,
                         mixed.offset(base * config.hidden_size * 4).0,
                         self.shared_up.offset(base * intermediate * 4).0,
@@ -944,6 +1017,6 @@ impl DeviceSequence {
                 base += count;
             }
         }
-        self.gemv(&moe.shared_down, self.shared_up, self.shared_out, batch)
+        self.dense(&moe.shared_down, self.shared_up, self.shared_out, batch)
     }
 }

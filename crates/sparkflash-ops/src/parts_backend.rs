@@ -60,8 +60,11 @@ impl PartsDeviceRank {
     /// The phase-aware serving boot check runs first, for both prefill and decode: an arm must
     /// not start uploading weights for a plan whose parts have no body in one of the passes. The
     /// weight source is then checked against the plan before any kernel is resolved: every
-    /// logical tensor must be present with the planned dtype and shape, so an arm that later
-    /// slices it has the bytes it expects.
+    /// logical tensor must be present with the planned dtype and shape, or stored as its NVFP4
+    /// packing ([TensorSpec::is_stored_as]), so an arm that later slices it has the bytes it
+    /// expects.
+    ///
+    /// [TensorSpec::is_stored_as]: sparkflash_weights::TensorSpec::is_stored_as
     ///
     /// # Errors
     /// Every served part instance with no catalogue kernel in either pass, aggregated; then a
@@ -92,7 +95,7 @@ impl PartsDeviceRank {
                     spec.name
                 ))
             })?;
-            if stored.dtype != spec.dtype || stored.shape != spec.shape {
+            if !spec.is_stored_as(&stored) {
                 return Err(PlanError::Invalid(format!(
                     "{} is stored as {:?} {:?}, the plan expects {:?} {:?}",
                     spec.name, stored.dtype, stored.shape, spec.dtype, spec.shape

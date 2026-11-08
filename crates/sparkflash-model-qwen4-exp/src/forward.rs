@@ -117,13 +117,15 @@ impl Mat {
 /// One hyper-connection (gated residual) block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HyperBlock {
-    /// The per-stream norm weight, [hc * hidden].
+    /// The per-stream norm weight, [hc * hidden]. On a plain residual this is the branch's
+    /// pre-norm (`input_layernorm` / `post_attention_layernorm`, or the final `norm`).
     pub norm: Vec<f32>,
-    /// The bottleneck down projection, [lowrank, hc * hidden].
+    /// The bottleneck down projection, [lowrank, hc * hidden]; empty on a plain residual.
     pub down: Mat,
-    /// The bottleneck up projection, [hc * hidden, lowrank].
+    /// The bottleneck up projection, [hc * hidden, lowrank]; empty on a plain residual.
     pub up: Mat,
-    /// The per-stream injection weight, [hc, hc * hidden]; absent on the final mixer.
+    /// The per-stream injection weight, [hc, hc * hidden]; absent on the final mixer and on a
+    /// plain residual, whose injection is one.
     pub inject: Option<Mat>,
 }
 
@@ -375,6 +377,11 @@ fn hyper_mix(
     let hc = config.hc_count;
     let hidden = config.hidden_size;
     let normed = rms_norm(hyper_input, &block.norm, hidden, config.rms_norm_eps as f32);
+    if config.plain_residual() {
+        // Qwen3.5/3.6: the branch reads the stream's pre-norm and its output is added back with
+        // weight one. The final "mixer" is the model's last norm.
+        return (normed, if inject { vec![1.0] } else { Vec::new() });
+    }
     let down = block.down.matvec(&normed);
     let down: Vec<f32> = down.iter().map(|value| silu(value / hc as f32)).collect();
     let up = block.up.matvec(&down);
@@ -582,7 +589,6 @@ fn sparse_attention(
     let heads = config.num_attention_heads;
     let kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
-    let groups = config.query_groups();
     let rotary = config.rotary_dim();
     let theta = config.rope_theta as f32;
     let eps = config.rms_norm_eps as f32;
@@ -630,6 +636,12 @@ fn sparse_attention(
         state.keys.push(keys.clone());
         state.values.push(values.clone());
 
+        // Full attention (Qwen3.5/3.6) attends every cached position; there is no indexer.
+        if config.full_attention() {
+            let selected: Vec<usize> = (0..=position).collect();
+            out.push(o_proj.matvec(&gated_attention(&queries, &gates, state, &selected, config)));
+            continue;
+        }
         // The indexer: project, normalise each query head, rope the query at its own position,
         // store the raw key, then pool complete 4-token blocks and rope the pooled keys at the
         // block start.
@@ -691,41 +703,53 @@ fn sparse_attention(
         // incomplete block the query sits in.
         let mut selected: Vec<usize> = Vec::new();
         topk::top_pools(&scores, ratio, block_budget, position, true, &mut selected);
-        // The sparse attention itself: GQA over the selected keys, softmax in f32, then the
-        // sigmoid output gate.
-        let mut attended = vec![0.0f32; heads * head_dim];
-        for head in 0..heads {
-            let kv_head = head / groups;
-            let mut logits = Vec::with_capacity(selected.len());
-            for token in &selected {
-                let key = &state.keys[*token][kv_head * head_dim..(kv_head + 1) * head_dim];
-                let query = &queries[head * head_dim..(head + 1) * head_dim];
-                let mut dot = 0.0f32;
-                for dim in 0..head_dim {
-                    dot += query[dim] * key[dim];
-                }
-                logits.push(dot / (head_dim as f32).sqrt());
-            }
-            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut weights: Vec<f32> = logits.iter().map(|value| (value - max).exp()).collect();
-            let total: f32 = weights.iter().sum();
-            for value in &mut weights {
-                *value /= total;
-            }
-            for (slot, token) in selected.iter().enumerate() {
-                let value = &state.values[*token][kv_head * head_dim..(kv_head + 1) * head_dim];
-                for dim in 0..head_dim {
-                    attended[head * head_dim + dim] += weights[slot] * value[dim];
-                }
-            }
-            for dim in 0..head_dim {
-                let index = head * head_dim + dim;
-                attended[index] *= sigmoid(gates[index]);
-            }
-        }
-        out.push(o_proj.matvec(&attended));
+        out.push(o_proj.matvec(&gated_attention(&queries, &gates, state, &selected, config)));
     }
     out
+}
+
+/// GQA over the `selected` cached positions, softmax in f32, then the sigmoid output gate.
+fn gated_attention(
+    queries: &[f32],
+    gates: &[f32],
+    state: &SparseState,
+    selected: &[usize],
+    config: &Qwen4ExpConfig,
+) -> Vec<f32> {
+    let heads = config.num_attention_heads;
+    let head_dim = config.head_dim;
+    let groups = config.query_groups();
+    let mut attended = vec![0.0f32; heads * head_dim];
+    for head in 0..heads {
+        let kv_head = head / groups;
+        let mut logits = Vec::with_capacity(selected.len());
+        for token in selected {
+            let key = &state.keys[*token][kv_head * head_dim..(kv_head + 1) * head_dim];
+            let query = &queries[head * head_dim..(head + 1) * head_dim];
+            let mut dot = 0.0f32;
+            for dim in 0..head_dim {
+                dot += query[dim] * key[dim];
+            }
+            logits.push(dot / (head_dim as f32).sqrt());
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut weights: Vec<f32> = logits.iter().map(|value| (value - max).exp()).collect();
+        let total: f32 = weights.iter().sum();
+        for value in &mut weights {
+            *value /= total;
+        }
+        for (slot, token) in selected.iter().enumerate() {
+            let value = &state.values[*token][kv_head * head_dim..(kv_head + 1) * head_dim];
+            for dim in 0..head_dim {
+                attended[head * head_dim + dim] += weights[slot] * value[dim];
+            }
+        }
+        for dim in 0..head_dim {
+            let index = head * head_dim + dim;
+            attended[index] *= sigmoid(gates[index]);
+        }
+    }
+    attended
 }
 
 /// Dilated depthwise causal convolution with SiLU (the PLE short convolution).
@@ -1166,7 +1190,8 @@ impl Rng {
             norm: vec![0.0; width],
             down: self.mat(config.hc_lowrank, width, 0.05),
             up: self.mat(width, config.hc_lowrank, 0.05),
-            inject: inject.then(|| self.mat(config.hc_count, width, 0.05)),
+            inject: (inject && !config.plain_residual())
+                .then(|| self.mat(config.hc_count, width, 0.05)),
         }
     }
 

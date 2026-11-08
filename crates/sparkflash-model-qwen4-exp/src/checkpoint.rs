@@ -168,43 +168,172 @@ impl CheckpointRows {
             out.copy_from_slice(&bytes);
             return Ok(());
         };
-        use std::os::unix::fs::FileExt;
-        let mut cursor = 0usize;
-        for &(offset, len) in ranges {
-            let end = offset
-                .checked_add(len as u64)
-                .ok_or_else(|| format!("PLE shard {shard} range overflow"))?;
-            if end > resolved.byte_len {
-                return Err(format!(
-                    "PLE shard {shard} range {offset}..{end} exceeds shard length {}",
-                    resolved.byte_len
-                ));
+        check_ranges(shard, resolved, ranges)?;
+        read_resolved(shard, resolved, ranges, out)
+    }
+}
+
+/// Refuse a range past the end of its shard before any read is made.
+fn check_ranges(
+    shard: usize,
+    resolved: &ResolvedShard,
+    ranges: &[(u64, usize)],
+) -> Result<(), String> {
+    for &(offset, len) in ranges {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| format!("PLE shard {shard} range overflow"))?;
+        if end > resolved.byte_len {
+            return Err(format!(
+                "PLE shard {shard} range {offset}..{end} exceeds shard length {}",
+                resolved.byte_len
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One resolved shard's checked ranges, read into `out` (their lengths summed) in order.
+fn read_resolved(
+    shard: usize,
+    resolved: &ResolvedShard,
+    ranges: &[(u64, usize)],
+    out: &mut [u8],
+) -> Result<(), String> {
+    use std::os::unix::fs::FileExt;
+    let mut cursor = 0usize;
+    for &(offset, len) in ranges {
+        if len > 0 {
+            resolved
+                .file
+                .read_exact_at(
+                    &mut out[cursor..cursor + len],
+                    resolved.data_offset + offset,
+                )
+                .map_err(|error| format!("PLE shard {shard} pread: {error}"))?;
+        }
+        cursor += len;
+    }
+    Ok(())
+}
+
+/// Ranges one pread worker takes at a time, and the workers the process keeps for them. A token's
+/// sixteen rows are sixteen shards and so sixteen pieces, as before; a prefill chunk's 65,536
+/// rows are about a thousand, and the deeper queue is what lets the NVMe answer them in parallel
+/// rather than 512 serial reads per shard.
+const PLE_READ_PIECE: usize = 64;
+const PLE_READ_WORKERS: usize = 64;
+
+/// A pread worker's stack: a worker only loops over `read_exact_at`.
+const PLE_READ_STACK: usize = 256 << 10;
+
+/// One piece of a [CheckpointRows::read_shards] call on a [ReadPool] worker: a resolved shard's
+/// checked ranges, whose bytes land in `slot` of the call's [PieceBatch].
+struct PieceRead {
+    shard: usize,
+    resolved: ResolvedShard,
+    ranges: Vec<(u64, usize)>,
+    slot: usize,
+    batch: Arc<PieceBatch>,
+}
+
+/// A piece's bytes or error, once it is read.
+type PieceResult = Option<Result<Vec<u8>, String>>;
+
+/// The pieces of one call still out, and each one's bytes or error by slot.
+struct PieceBatch {
+    state: std::sync::Mutex<(usize, Vec<PieceResult>)>,
+    done: std::sync::Condvar,
+}
+
+impl PieceRead {
+    fn run(self) {
+        let bytes = self.ranges.iter().map(|(_, len)| *len).sum();
+        let mut out = vec![0u8; bytes];
+        let result =
+            read_resolved(self.shard, &self.resolved, &self.ranges, &mut out).map(|()| out);
+        // A poisoned batch is a caller that already panicked: nothing waits for the bytes.
+        if let Ok(mut state) = self.batch.state.lock() {
+            state.1[self.slot] = Some(result);
+            state.0 -= 1;
+            if state.0 == 0 {
+                self.batch.done.notify_all();
             }
-            if len > 0 {
-                resolved
-                    .file
-                    .read_exact_at(
-                        &mut out[cursor..cursor + len],
-                        resolved.data_offset + offset,
-                    )
-                    .map_err(|error| format!("PLE shard {shard} pread: {error}"))?;
+        }
+    }
+}
+
+/// The process's PLE pread workers, started on the first read of more than one piece and kept.
+///
+/// A decode step reads a few dozen rows, a piece each. Spawning a scoped thread a piece cost more
+/// than the reads: in the serving process, under its memory pressure, `pthread_create` measured
+/// 0.1 to 2.3 ms a thread, about 3 ms of host time a Qwen3.8 DFlash 2 step against 0.08 ms of
+/// `pread`, and the device idled through all of it after the first layer. The workers instead
+/// wait on one queue, and the caller takes pieces from it too while it waits.
+struct ReadPool {
+    queue: std::sync::Mutex<std::collections::VecDeque<PieceRead>>,
+    ready: std::sync::Condvar,
+}
+
+impl ReadPool {
+    fn shared() -> Result<&'static Self, String> {
+        static POOL: std::sync::OnceLock<Result<ReadPool, String>> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| {
+            for index in 0..PLE_READ_WORKERS {
+                std::thread::Builder::new()
+                    .name(format!("qwen4-ple-read-{index}"))
+                    .stack_size(PLE_READ_STACK)
+                    .spawn(|| {
+                        let Ok(pool) = Self::shared() else { return };
+                        while let Some(piece) = pool.wait() {
+                            piece.run();
+                        }
+                    })
+                    .map_err(|error| {
+                        format!("the PLE read worker {index} did not start: {error}")
+                    })?;
             }
-            cursor += len;
+            Ok(Self {
+                queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                ready: std::sync::Condvar::new(),
+            })
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+    }
+
+    /// The next piece, waiting for one; None once the queue is poisoned.
+    fn wait(&self) -> Option<PieceRead> {
+        let mut queue = self.queue.lock().ok()?;
+        loop {
+            if let Some(piece) = queue.pop_front() {
+                return Some(piece);
+            }
+            queue = self.ready.wait(queue).ok()?;
+        }
+    }
+
+    /// The next piece, if one is queued.
+    fn take(&self) -> Option<PieceRead> {
+        self.queue.lock().ok()?.pop_front()
+    }
+
+    fn submit(&self, pieces: Vec<PieceRead>) -> Result<(), String> {
+        let count = pieces.len();
+        self.queue
+            .lock()
+            .map_err(|_| "the PLE read queue is poisoned".to_owned())?
+            .extend(pieces);
+        if count >= PLE_READ_WORKERS {
+            self.ready.notify_all();
+        } else {
+            for _ in 0..count {
+                self.ready.notify_one();
+            }
         }
         Ok(())
     }
 }
-
-/// Ranges one pread worker takes at a time, and the most workers a read keeps in flight. A
-/// token's sixteen rows are sixteen shards and so sixteen pieces, as before; a prefill chunk's
-/// 65,536 rows are about a thousand, and the deeper queue is what lets the NVMe answer them in
-/// parallel rather than 512 serial reads per shard.
-const PLE_READ_PIECE: usize = 64;
-const PLE_READ_WORKERS: usize = 64;
-
-/// One read of [CheckpointRows::read_shards]: a shard, a group of its byte ranges and the slice of
-/// the request's output they fill.
-type ShardPiece<'a> = (usize, &'a [(u64, usize)], &'a mut [u8]);
 
 impl RowReader for CheckpointRows {
     fn read_rows(&self, shard: usize, ranges: &[(u64, usize)]) -> Result<Vec<u8>, String> {
@@ -217,54 +346,71 @@ impl RowReader for CheckpointRows {
         &self,
         requests: &[(usize, Vec<(u64, usize)>)],
     ) -> Result<Vec<(usize, Vec<u8>)>, String> {
+        // Each request's ranges in pieces, in order: (request, ranges).
+        let mut pieces: Vec<(usize, &[(u64, usize)])> = Vec::new();
+        for (request, (_, ranges)) in requests.iter().enumerate() {
+            pieces.extend(ranges.chunks(PLE_READ_PIECE).map(|group| (request, group)));
+        }
         let mut outputs: Vec<Vec<u8>> = requests
             .iter()
-            .map(|(_, ranges)| vec![0u8; ranges.iter().map(|(_, len)| *len).sum()])
+            .map(|(_, ranges)| Vec::with_capacity(ranges.iter().map(|(_, len)| *len).sum()))
             .collect();
-        // Every piece owns a disjoint slice of its request's output, so the workers write in place.
-        let mut pieces: Vec<ShardPiece> = Vec::new();
-        for ((shard, ranges), out) in requests.iter().zip(outputs.iter_mut()) {
-            let mut rest: &mut [u8] = out;
-            for group in ranges.chunks(PLE_READ_PIECE) {
-                let bytes = group.iter().map(|(_, len)| *len).sum();
-                let (head, tail) = std::mem::take(&mut rest).split_at_mut(bytes);
-                pieces.push((*shard, group, head));
-                rest = tail;
-            }
-        }
+        let read_here = |request: usize, group: &[(u64, usize)]| {
+            let mut out = vec![0u8; group.iter().map(|(_, len)| *len).sum()];
+            self.read_into(requests[request].0, group, &mut out)
+                .map(|()| out)
+        };
         if pieces.len() <= 1 {
-            for (shard, group, out) in pieces {
-                self.read_into(shard, group, out)?;
+            for (request, group) in pieces {
+                outputs[request].extend_from_slice(&read_here(request, group)?);
             }
         } else {
-            let workers = pieces.len().min(PLE_READ_WORKERS);
-            let queue = std::sync::Mutex::new(pieces.into_iter());
-            let failure = std::sync::Mutex::new(None::<String>);
-            std::thread::scope(|scope| {
-                for _ in 0..workers {
-                    scope.spawn(|| {
-                        loop {
-                            let next = match queue.lock() {
-                                Ok(mut queue) => queue.next().ok_or(None),
-                                Err(_) => Err(Some("the PLE read queue is poisoned".to_owned())),
-                            };
-                            let result = match next {
-                                Ok((shard, group, out)) => self.read_into(shard, group, out),
-                                Err(None) => break,
-                                Err(Some(error)) => Err(error),
-                            };
-                            if let Err(error) = result {
-                                if let Ok(mut failure) = failure.lock() {
-                                    failure.get_or_insert(error);
-                                }
-                                break;
-                            }
-                        }
-                    });
-                }
+            // The resolved shards' pieces go to the workers; a shard the index did not resolve is
+            // read here, through the source, which the workers do not share.
+            let mut queued = Vec::with_capacity(pieces.len());
+            let mut here = Vec::new();
+            let batch = Arc::new(PieceBatch {
+                state: std::sync::Mutex::new((0, vec![None; pieces.len()])),
+                done: std::sync::Condvar::new(),
             });
-            if let Some(error) = failure.into_inner().map_err(|error| error.to_string())? {
-                return Err(error);
+            for (slot, &(request, group)) in pieces.iter().enumerate() {
+                let shard = requests[request].0;
+                let Some(Some(resolved)) = self.shards.get(shard) else {
+                    here.push(slot);
+                    continue;
+                };
+                check_ranges(shard, resolved, group)?;
+                queued.push(PieceRead {
+                    shard,
+                    resolved: resolved.clone(),
+                    ranges: group.to_vec(),
+                    slot,
+                    batch: Arc::clone(&batch),
+                });
+            }
+            let poisoned = || "the PLE read batch is poisoned".to_owned();
+            batch.state.lock().map_err(|_| poisoned())?.0 = queued.len();
+            let pool = ReadPool::shared()?;
+            pool.submit(queued)?;
+            let mut read = Vec::with_capacity(here.len());
+            for &slot in &here {
+                let (request, group) = pieces[slot];
+                read.push((slot, read_here(request, group)));
+            }
+            while let Some(piece) = pool.take() {
+                piece.run();
+            }
+            let mut state = batch.state.lock().map_err(|_| poisoned())?;
+            while state.0 > 0 {
+                state = batch.done.wait(state).map_err(|_| poisoned())?;
+            }
+            let mut results = std::mem::take(&mut state.1);
+            drop(state);
+            for (slot, result) in read {
+                results[slot] = Some(result);
+            }
+            for (&(request, _), result) in pieces.iter().zip(results) {
+                outputs[request].extend_from_slice(&result.ok_or_else(poisoned)??);
             }
         }
         Ok(requests
@@ -369,8 +515,24 @@ impl Reader<'_> {
         Ok(Mat::new(rows, columns, data))
     }
 
-    /// One block-scaled FP8 expert matrix: E4M3 codes and the weight_scale_inv grid, one scale
-    /// a 128x128 tile. The official FP8 checkpoint stores the same experts this way.
+    /// A dense projection in the configuration's dense format: BF16 `{prefix}.weight`, or the
+    /// Qwen3.5/3.6 FP8 release's 128x128-tile E4M3 codes and BF16 inverse scales.
+    fn linear(
+        &self,
+        prefix: &str,
+        rows: usize,
+        columns: usize,
+        quant: crate::config::DenseQuant,
+    ) -> Result<Mat, String> {
+        match quant {
+            crate::config::DenseQuant::Bf16 => self.mat(&format!("{prefix}.weight"), rows, columns),
+            crate::config::DenseQuant::Fp8Block => self.fp8(prefix, rows, columns),
+        }
+    }
+
+    /// One block-scaled FP8 matrix: E4M3 codes and the weight_scale_inv grid, one scale a
+    /// 128x128 tile. The official FP8 checkpoints store their experts (and, for Qwen3.5/3.6, the
+    /// dense projections) this way.
     fn fp8(&self, prefix: &str, rows: usize, columns: usize) -> Result<Mat, String> {
         let mut weight = sparkflash_weights::linalg::decode_by_name(
             self.source,
@@ -410,6 +572,17 @@ pub fn load_weights(
     let reader = Reader { source };
     let hidden = config.hidden_size;
     let width = config.hyper_width();
+    let dense = config.dense_quant;
+    // A plain residual's "hyper-connection" is the branch's pre-norm alone: no mixer, and an
+    // injection of one (see forward::hyper_mix).
+    let plain = |name: &str| -> Result<HyperBlock, String> {
+        Ok(HyperBlock {
+            norm: reader.vector(name, hidden)?,
+            down: Mat::zeros(0, hidden),
+            up: Mat::zeros(hidden, 0),
+            inject: None,
+        })
+    };
     let hyper = |prefix: &str, inject: bool| -> Result<HyperBlock, String> {
         Ok(HyperBlock {
             norm: reader.vector(&format!("{prefix}.hc_norm.weight"), width)?,
@@ -440,7 +613,11 @@ pub fn load_weights(
         hidden,
     )?;
     let lm_head = reader.mat("lm_head.weight", config.vocab_size, hidden)?;
-    let mixer = hyper("model.language_model.hyper_connection_mixer", false)?;
+    let mixer = if config.plain_residual() {
+        plain("model.language_model.norm.weight")?
+    } else {
+        hyper("model.language_model.hyper_connection_mixer", false)?
+    };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for (index, kind) in config.layer_types.iter().enumerate() {
         let prefix = format!("model.language_model.layers.{index}");
@@ -448,15 +625,17 @@ pub fn load_weights(
             crate::config::LayerKind::Linear => {
                 let prefix = format!("{prefix}.linear_attn");
                 BranchWeights::Linear {
-                    in_qkv: reader.mat(
-                        &format!("{prefix}.in_proj_qkv.weight"),
+                    in_qkv: reader.linear(
+                        &format!("{prefix}.in_proj_qkv"),
                         config.linear_conv_width(),
                         hidden,
+                        dense,
                     )?,
-                    in_z: reader.mat(
-                        &format!("{prefix}.in_proj_z.weight"),
+                    in_z: reader.linear(
+                        &format!("{prefix}.in_proj_z"),
                         config.linear_value_width(),
                         hidden,
+                        dense,
                     )?,
                     in_b: reader.mat(
                         &format!("{prefix}.in_proj_b.weight"),
@@ -468,10 +647,11 @@ pub fn load_weights(
                         config.linear_num_value_heads,
                         hidden,
                     )?,
-                    out_proj: reader.mat(
-                        &format!("{prefix}.out_proj.weight"),
+                    out_proj: reader.linear(
+                        &format!("{prefix}.out_proj"),
                         hidden,
                         config.linear_value_width(),
+                        dense,
                     )?,
                     conv: reader.vector(
                         &format!("{prefix}.conv1d.weight"),
@@ -490,88 +670,100 @@ pub fn load_weights(
             crate::config::LayerKind::Sparse => {
                 let prefix = format!("{prefix}.self_attn");
                 BranchWeights::Sparse {
-                    q_proj: reader.mat(
-                        &format!("{prefix}.q_proj.weight"),
+                    q_proj: reader.linear(
+                        &format!("{prefix}.q_proj"),
                         config.q_proj_width(),
                         hidden,
+                        dense,
                     )?,
-                    k_proj: reader.mat(
-                        &format!("{prefix}.k_proj.weight"),
+                    k_proj: reader.linear(
+                        &format!("{prefix}.k_proj"),
                         config.kv_proj_width(),
                         hidden,
+                        dense,
                     )?,
-                    v_proj: reader.mat(
-                        &format!("{prefix}.v_proj.weight"),
+                    v_proj: reader.linear(
+                        &format!("{prefix}.v_proj"),
                         config.kv_proj_width(),
                         hidden,
+                        dense,
                     )?,
-                    o_proj: reader.mat(
-                        &format!("{prefix}.o_proj.weight"),
+                    o_proj: reader.linear(
+                        &format!("{prefix}.o_proj"),
                         hidden,
                         config.attn_out_width(),
+                        dense,
                     )?,
                     q_norm: reader.vector(&format!("{prefix}.q_norm.weight"), config.head_dim)?,
                     k_norm: reader.vector(&format!("{prefix}.k_norm.weight"), config.head_dim)?,
-                    index_qk: reader.mat(
-                        &format!("{prefix}.indexer.index_qk_proj.weight"),
-                        (config.indexer_n_heads + config.indexer_kv_heads)
-                            * config.indexer_head_dim,
-                        hidden,
-                    )?,
-                    index_q_norm: reader.vector(
-                        &format!("{prefix}.indexer.q_layernorm.weight"),
-                        config.indexer_head_dim,
-                    )?,
-                    index_k_norm: reader.vector(
-                        &format!("{prefix}.indexer.k_layernorm.weight"),
-                        config.indexer_head_dim,
-                    )?,
+                    // Full attention carries no indexer; its three fields stay empty.
+                    index_qk: if config.full_attention() {
+                        Mat::zeros(0, hidden)
+                    } else {
+                        reader.mat(
+                            &format!("{prefix}.indexer.index_qk_proj.weight"),
+                            (config.indexer_n_heads + config.indexer_kv_heads)
+                                * config.indexer_head_dim,
+                            hidden,
+                        )?
+                    },
+                    index_q_norm: if config.full_attention() {
+                        Vec::new()
+                    } else {
+                        reader.vector(
+                            &format!("{prefix}.indexer.q_layernorm.weight"),
+                            config.indexer_head_dim,
+                        )?
+                    },
+                    index_k_norm: if config.full_attention() {
+                        Vec::new()
+                    } else {
+                        reader.vector(
+                            &format!("{prefix}.indexer.k_layernorm.weight"),
+                            config.indexer_head_dim,
+                        )?
+                    },
                 }
             }
         };
         let mlp = format!("{prefix}.mlp");
         let shared = |name: &str, rows: usize, columns: usize| -> Result<Mat, String> {
-            reader.mat(&format!("{mlp}.shared_expert.{name}"), rows, columns)
+            reader.linear(&format!("{mlp}.shared_expert.{name}"), rows, columns, dense)
         };
         let moe = MoeWeights {
             router: reader.mat(&format!("{mlp}.gate.weight"), config.num_experts, hidden)?,
             shared: Expert {
-                gate: shared(
-                    "gate_proj.weight",
-                    config.shared_expert_intermediate_size,
-                    hidden,
-                )?,
-                up: shared(
-                    "up_proj.weight",
-                    config.shared_expert_intermediate_size,
-                    hidden,
-                )?,
-                down: shared(
-                    "down_proj.weight",
-                    hidden,
-                    config.shared_expert_intermediate_size,
-                )?,
+                gate: shared("gate_proj", config.shared_expert_intermediate_size, hidden)?,
+                up: shared("up_proj", config.shared_expert_intermediate_size, hidden)?,
+                down: shared("down_proj", hidden, config.shared_expert_intermediate_size)?,
             },
             shared_gate: reader.mat(&format!("{mlp}.shared_expert_gate.weight"), 1, hidden)?,
-            experts: (0..config.num_experts)
-                .map(|expert| {
-                    let prefix = format!("{mlp}.experts.{expert}");
-                    let decode = |name: &str, rows: usize, columns: usize| match config.expert_quant
-                    {
-                        crate::config::ExpertQuant::Nvfp4 => {
-                            reader.nvfp4(&format!("{prefix}.{name}"), rows, columns)
-                        }
-                        crate::config::ExpertQuant::Fp8Block => {
-                            reader.fp8(&format!("{prefix}.{name}"), rows, columns)
-                        }
-                    };
-                    Ok(Expert {
-                        gate: decode("gate_proj", config.moe_intermediate_size, hidden)?,
-                        up: decode("up_proj", config.moe_intermediate_size, hidden)?,
-                        down: decode("down_proj", hidden, config.moe_intermediate_size)?,
+            experts: if config.expert_quant == crate::config::ExpertQuant::Bf16 {
+                fused_experts(&reader, config, &mlp)?
+            } else {
+                (0..config.num_experts)
+                    .map(|expert| {
+                        let prefix = format!("{mlp}.experts.{expert}");
+                        let decode =
+                            |name: &str, rows: usize, columns: usize| match config.expert_quant {
+                                crate::config::ExpertQuant::Nvfp4 => {
+                                    reader.nvfp4(&format!("{prefix}.{name}"), rows, columns)
+                                }
+                                crate::config::ExpertQuant::Fp8Block => {
+                                    reader.fp8(&format!("{prefix}.{name}"), rows, columns)
+                                }
+                                crate::config::ExpertQuant::Bf16 => {
+                                    unreachable!("BF16 experts are read fused above")
+                                }
+                            };
+                        Ok(Expert {
+                            gate: decode("gate_proj", config.moe_intermediate_size, hidden)?,
+                            up: decode("up_proj", config.moe_intermediate_size, hidden)?,
+                            down: decode("down_proj", hidden, config.moe_intermediate_size)?,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>, String>>()?,
+                    .collect::<Result<Vec<_>, String>>()?
+            },
         };
         let ple = if config.ple_layer_ids.contains(&(index + 1)) {
             let prefix = format!("{prefix}.ple");
@@ -599,8 +791,16 @@ pub fn load_weights(
         };
         layers.push(LayerWeights {
             branch,
-            attn_hyper: hyper(&format!("{prefix}.attn_hyper_connection"), true)?,
-            mlp_hyper: hyper(&format!("{prefix}.mlp_hyper_connection"), true)?,
+            attn_hyper: if config.plain_residual() {
+                plain(&format!("{prefix}.input_layernorm.weight"))?
+            } else {
+                hyper(&format!("{prefix}.attn_hyper_connection"), true)?
+            },
+            mlp_hyper: if config.plain_residual() {
+                plain(&format!("{prefix}.post_attention_layernorm.weight"))?
+            } else {
+                hyper(&format!("{prefix}.mlp_hyper_connection"), true)?
+            },
             moe,
             ple,
         });
@@ -612,6 +812,41 @@ pub fn load_weights(
         mixer,
         layers,
     })
+}
+
+/// Qwen3.5/3.6's BF16 experts, split out of the fused `[experts, 2 * intermediate, hidden]`
+/// gate/up tensor (gate rows first) and the `[experts, hidden, intermediate]` down tensor.
+fn fused_experts(
+    reader: &Reader<'_>,
+    config: &Qwen4ExpConfig,
+    mlp: &str,
+) -> Result<Vec<Expert>, String> {
+    let hidden = config.hidden_size;
+    let intermediate = config.moe_intermediate_size;
+    let experts = config.num_experts;
+    let gate_up = reader.vector(
+        &format!("{mlp}.experts.gate_up_proj"),
+        experts * 2 * intermediate * hidden,
+    )?;
+    let down = reader.vector(
+        &format!("{mlp}.experts.down_proj"),
+        experts * hidden * intermediate,
+    )?;
+    let block = intermediate * hidden;
+    Ok((0..experts)
+        .map(|expert| {
+            let gate_up = &gate_up[expert * 2 * block..(expert + 1) * 2 * block];
+            Expert {
+                gate: Mat::new(intermediate, hidden, gate_up[..block].to_vec()),
+                up: Mat::new(intermediate, hidden, gate_up[block..].to_vec()),
+                down: Mat::new(
+                    hidden,
+                    intermediate,
+                    down[expert * block..(expert + 1) * block].to_vec(),
+                ),
+            }
+        })
+        .collect())
 }
 
 /// The value a synthetic tensor entry carries.
@@ -773,7 +1008,7 @@ pub fn write_synthetic_checkpoint_sharded(
     seed: u64,
     shards: usize,
 ) -> Result<(), String> {
-    let plan = Qwen4ExpTensorPlan::served_and_mtp(config);
+    let plan = Qwen4ExpTensorPlan::served_and_mtp(config).map_err(|error| error.to_string())?;
     let tensors = plan
         .specs()
         .iter()

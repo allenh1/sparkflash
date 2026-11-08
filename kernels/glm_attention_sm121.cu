@@ -347,3 +347,180 @@ extern "C" __global__ __launch_bounds__(256) void glm_prefill_mla_attend_bf16a(
     glm_mla_attend_body<false>(q_abs, codes, scales, selected, selected_count, base,
                                select_stride, score_div, heads);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The indexer's scores over a run of rows.
+//
+// q4e_glm_index_scores (glm_decode_sm121.cu, the decode step's) scores a row a block and a pool a
+// warp: a lane's part of a head's dot is the fmaf chain over channels lane, lane + 32, lane + 64
+// and lane + 96, q4e_warp_sum folds the 32 parts by shuffle, and the score sums
+// w_h max(dot_h * score_scale, 0) in head order. Five shuffles for every four multiplies made it
+// shuffle-bound over a prefill chunk: 20.7 ms for a 2,798-row run over 1,723 pools.
+//
+// This computes the same floats with a thread holding whole dots. Thread (hl, pl) of a warp
+// (hl = lane & 7, pl = lane >> 3) owns heads 4 hl .. 4 hl + 3 and pools pl, pl + 4, pl + 8 and
+// pl + 12 of the warp's sixteen. It evaluates each of a dot's 32 lane chains itself, in the same
+// order, and adds the chains as the fold does: q4e_warp_sum leaves lane 0 with
+// ((a0 + a16) + (a8 + a24)) + ((a4 + a20) + (a12 + a28)) + ..., the balanced pairwise sum of the
+// chains in bit-reversed lane order, which a five-level carry over the chains in that order
+// reproduces. The head-ordered sum then runs across a pool's eight head lanes by shuffle.
+//
+// A block keeps GPI_POOLS pooled keys in shared memory while it walks up to GPI_ROWS rows, each
+// row's query heads staged from registers loaded during the previous row's dots. Both tiles hold
+// a channel's chain as one float4, (c, c + 32, c + 64, c + 96) at [row][c ^ swizzle], the swizzle
+// keeping a warp's eight head (or four pool) reads in distinct banks.
+#define GPI_HEADS 32
+#define GPI_DIM 128
+#define GPI_POOLS 64
+#define GPI_ROWS 32
+#define GPI_THREADS 128
+
+// The shuffle fold's leaf order: the j-th chain the fold adds is lane gpi_leaf(j)'s.
+__device__ __forceinline__ constexpr int gpi_leaf(int j) {
+    return ((j & 1) << 4) | ((j & 2) << 2) | (j & 4) | ((j & 8) >> 2) | ((j & 16) >> 4);
+}
+
+// Grid (ceil(pools of the run's last row / GPI_POOLS), ceil(rows / GPI_ROWS)), GPI_THREADS
+// threads. Row y of the run is at `position` + y; its query heads are GPI_HEADS x GPI_DIM floats
+// at query + y * GPI_HEADS * GPI_DIM, its head weights GPI_HEADS floats at
+// head_weights + y * GPI_HEADS, and its scores at scores + y * score_stride, one a whole pool,
+// the layout q4e_glm_pick reads. Every pool a row has is written; none past it.
+extern "C" __global__ __launch_bounds__(GPI_THREADS, 2) void glm_prefill_index_scores(
+    const float *__restrict__ query, const float *__restrict__ head_weights,
+    const float *__restrict__ pooled, float *__restrict__ scores, int position, int pool,
+    float score_scale, float head_scale, int score_stride, int rows) {
+    constexpr int kWarpPools = 16;
+    constexpr int kStaged = GPI_HEADS * 32 / GPI_THREADS;
+    static_assert(GPI_POOLS == (GPI_THREADS / 32) * kWarpPools, "a warp scores 16 pools");
+    __shared__ __align__(16) float4 heads[GPI_HEADS * 32];
+    __shared__ __align__(16) float4 keys[GPI_POOLS * 32];
+    const int first = (int)blockIdx.x * GPI_POOLS;
+    // A row before (first + 1) * pool - 1 - position has no pool in this tile.
+    const int row_end = min(rows, ((int)blockIdx.y + 1) * GPI_ROWS);
+    const int row_begin = max((int)blockIdx.y * GPI_ROWS, (first + 1) * pool - 1 - position);
+    if (row_begin >= row_end) {
+        return;
+    }
+    const int pools_last = (position + row_end) / pool;
+    for (int index = threadIdx.x; index < GPI_POOLS * 32; index += GPI_THREADS) {
+        const int p = index >> 5;
+        const int c = index & 31;
+        float4 value = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (first + p < pools_last) {
+            const float *key = pooled + (unsigned long long)(first + p) * GPI_DIM + c;
+            value = make_float4(key[0], key[32], key[64], key[96]);
+        }
+        keys[p * 32 + (c ^ (p & 7))] = value;
+    }
+    float4 staged[kStaged];
+    auto load_row = [&](int row) {
+        const float *source = query + (unsigned long long)row * GPI_HEADS * GPI_DIM;
+#pragma unroll
+        for (int e = 0; e < kStaged; ++e) {
+            const int entry = threadIdx.x + e * GPI_THREADS;
+            const float *at = source + (entry >> 5) * GPI_DIM + (entry & 31);
+            staged[e] = make_float4(at[0], at[32], at[64], at[96]);
+        }
+    };
+    load_row(row_begin);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int hl = lane & 7;
+    const int pl = lane >> 3;
+    for (int row = row_begin; row < row_end; ++row) {
+        __syncthreads();
+#pragma unroll
+        for (int e = 0; e < kStaged; ++e) {
+            const int entry = threadIdx.x + e * GPI_THREADS;
+            const int h = entry >> 5;
+            heads[h * 32 + ((entry & 31) ^ (h >> 2))] = staged[e];
+        }
+        // q4e_glm_index_scores stages head_weights[h] * head_scale and its score body multiplies
+        // that by its own head_scale argument, 1.0f.
+        float weight[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            weight[i] = __fmul_rn(
+                __fmul_rn(head_weights[(unsigned long long)row * GPI_HEADS + 4 * hl + i],
+                          head_scale),
+                1.0f);
+        }
+        __syncthreads();
+        if (row + 1 < row_end) {
+            load_row(row + 1);
+        }
+        float pending[5][4][4];
+        float dot[4][4];
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const int c = gpi_leaf(j);
+            float4 q[4];
+            float4 k[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                q[i] = heads[(4 * hl + i) * 32 + (c ^ hl)];
+            }
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const int p = warp * kWarpPools + pl + 4 * kk;
+                k[kk] = keys[p * 32 + (c ^ (p & 7))];
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int kk = 0; kk < 4; ++kk) {
+                    float chain = fmaf(q[i].x, k[kk].x, 0.0f);
+                    chain = fmaf(q[i].y, k[kk].y, chain);
+                    chain = fmaf(q[i].z, k[kk].z, chain);
+                    chain = fmaf(q[i].w, k[kk].w, chain);
+                    // Chain j closes every level its low set bits name, as the fold pairs them.
+                    int level = 0;
+#pragma unroll
+                    for (; level < 5; ++level) {
+                        if (((j >> level) & 1) == 0) {
+                            break;
+                        }
+                        chain = pending[level][i][kk] + chain;
+                    }
+                    if (level < 5) {
+                        pending[level][i][kk] = chain;
+                    } else {
+                        dot[i][kk] = chain;
+                    }
+                }
+            }
+        }
+        float score[4];
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            score[kk] = 0.0f;
+        }
+        // Heads 4 hl .. 4 hl + 3 in order, then on to lane hl + 1: every lane ends with the sum.
+#pragma unroll
+        for (int step = 0; step < 8; ++step) {
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                if (hl == step) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        score[kk] = __fadd_rn(
+                            score[kk],
+                            __fmul_rn(weight[i],
+                                      fmaxf(__fmul_rn(dot[i][kk], score_scale), 0.0f)));
+                    }
+                }
+                score[kk] = __shfl_sync(0xFFFFFFFFu, score[kk], step + 8 * pl);
+            }
+        }
+        const int pools = (position + row + 1) / pool;
+        if (hl == 0) {
+#pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const int p = first + warp * kWarpPools + pl + 4 * kk;
+                if (p < pools) {
+                    scores[(unsigned long long)row * score_stride + p] = score[kk];
+                }
+            }
+        }
+    }
+}

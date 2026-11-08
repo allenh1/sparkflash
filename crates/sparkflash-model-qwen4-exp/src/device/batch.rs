@@ -32,7 +32,8 @@ use sparkflash_kernels::cuda_driver::{Deviceptr, RunStream, StreamEvent};
 use sparkflash_model::{BackendError, StepOutput};
 
 use super::{
-    DeviceSequence, GpuBranch, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared, zero_split_tickets,
+    DeviceSequence, GpuBranch, INJECTION_SLOT, PARTIALS_SLOT, SCRATCH_SLOTS, SequenceShared,
+    fill_plain_injection, zero_split_tickets,
 };
 
 /// The most sessions one batch steps together.
@@ -101,6 +102,8 @@ impl BatchBuffers {
             rows,
         )
         .map_err(|error| BackendError::new("qwen4_batch", error))?;
+        fill_plain_injection(cuda, &shared.config, combined[INJECTION_SLOT], rows)
+            .map_err(|error| BackendError::new("qwen4_batch", error))?;
         let mut enters = Vec::with_capacity(MAX_BATCH);
         for _ in 0..MAX_BATCH {
             enters.push(

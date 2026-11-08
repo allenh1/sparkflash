@@ -32,6 +32,8 @@ const QWEN_NVFP4: &str =
     include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
 const QWEN_FP8: &str =
     include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_fp8.hf.json");
+const QWEN36_FP8: &str =
+    include_str!("../../sparkflash-model/config/qwen36_flash_35b_a3b_fp8.hf.json");
 
 /// The GLM release with its quantization block removed: the same architecture at BF16.
 fn glm_bf16() -> String {
@@ -61,8 +63,9 @@ struct Released {
     /// Worlds whose kernels this document resolves. Empty means the document is an explicit
     /// boot-check refusal: GLM BF16 has no BF16 routed-expert body in either pass.
     worlds: &'static [usize],
-    /// The arm's architecture correction. A no-op for every document but Qwen FP8, whose global
-    /// `fp8` flag quantises only the routed experts.
+    /// The arm's architecture correction. A no-op for every document but the Qwen FP8 ones:
+    /// Qwen3.8's global `fp8` flag quantises only the routed experts, and the Qwen arm computes
+    /// Qwen3.6's E4M3 tiles weight-only.
     correct: fn(&mut Architecture),
 }
 
@@ -107,6 +110,13 @@ fn released() -> Vec<Released> {
             // The Qwen FP8 arm's bridge calls this; ops cannot depend on a model crate, so the
             // shared operation is applied here too and the plan sees the release's real formats.
             correct: Architecture::experts_only_fp8,
+        },
+        Released {
+            name: "Qwen3.6 FP8",
+            text: QWEN36_FP8.to_owned(),
+            // The device arm serves one rank; the family's TP group is not wired yet.
+            worlds: &[1],
+            correct: Architecture::weight_only_fp8,
         },
     ]
 }
@@ -800,6 +810,58 @@ fn the_catalogue_picks_the_image_by_shape_precision_and_pass() {
         resolver.resolve(head).expect("head").image,
         Image::Qwen4Exp,
         "GLM's token/head kernels are the shared token image"
+    );
+
+    // Qwen3.6-35B-A3B is the second published Qwen routed shape (2048, 256, 8): its E4M3 experts
+    // resolve to the Qwen token and grouped bodies, while GLM's 4096-wide FP8 experts above stay
+    // on the GLM images.
+    let qwen36 = plan_for(&document("Qwen3.6 FP8"), 1);
+    let moe = qwen36
+        .requirements()
+        .find(|requirement| requirement.part == Part::Moe)
+        .expect("a Qwen3.6 MoE requirement");
+    assert_eq!(
+        (
+            moe.geometry.hidden,
+            moe.geometry.experts,
+            moe.geometry.top_k
+        ),
+        (2048, 256, 8)
+    );
+    for phase in [KernelPhase::Prefill, KernelPhase::Decode] {
+        assert_eq!(
+            resolver.resolve_for(moe, phase).expect("Qwen3.6 MoE").image,
+            Image::Qwen4Moe,
+            "{phase:?}: the token FP8 experts serve both passes, as on Qwen3.8 FP8"
+        );
+    }
+    let grouped = PartRequirement {
+        part: Part::GroupedMoeGemm,
+        ..*moe
+    };
+    // The arm computes the E4M3 tiles weight-only, so the grouped policy is Qwen's (the
+    // BF16-activation tile from 64 tokens), not the q8 MMA GLM's identical formats select.
+    assert_eq!(grouped.geometry.grouped_min_tokens, 64);
+    assert_eq!(
+        grouped.geometry.grouped_fp8_body,
+        Some(GroupedFp8Body::Tiled)
+    );
+    let chunk = GroupedMoeGemmPlan::new(PlanContext::SM121_CATALOGUE, &grouped, 64, StreamId(0))
+        .unwrap_or_else(|error| panic!("Qwen3.6 grouped prefill: {error}"));
+    assert_eq!(
+        chunk.kernel(),
+        KernelId::new(Target::Sm121, Image::Qwen4Prefill, "q4p_moe_gate_up_fp8"),
+        "a Qwen3.6 chunk is the grouped FP8 tile"
+    );
+    // A routed shape neither release has is refused by the Qwen images, not claimed.
+    let mut novel = *moe;
+    novel.geometry.top_k = 6;
+    let error = resolver
+        .resolve_for(&novel, KernelPhase::Decode)
+        .expect_err("an unpublished routed shape");
+    assert!(
+        error.to_string().contains("routed shape"),
+        "the refusal names the published shapes: {error}"
     );
 
     let deepseek = EnginePlan::from_json(DEEPSEEK, Target::Sm121, 4, 0).expect("DeepSeek");

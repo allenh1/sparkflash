@@ -23,6 +23,8 @@
 //     scores and budget selection.
 //   - q4e_attn / q4e_attn_group / q4e_attn_group6: grouped-query attention over the selected
 //     keys with the sigmoid output gate.
+//   - q4e_attn_full / q4e_attn_full_combine: the same gated attention over every causal
+//     position, split over the context (the Qwen3.5/3.6 layers that have no indexer).
 //
 // The reductions and the indexer's block selection are the shared headers' (q4e_common and
 // q4e_gemv); none of them is an exported symbol, so the cubins do not disagree over a global.
@@ -249,6 +251,146 @@ extern "C" __global__ void q4e_attn(const float* __restrict__ q, const float* __
         }
         outh[dim] = gh != nullptr ? accumulator / total / (1.0f + __expf(-gh[dim]))
                                   : accumulator / total;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Full causal attention (Qwen3.5/3.6's gated GQA, no sparse indexer).
+//
+// Row r of a chunk that starts at `position` sees the positions 0..=position + r. q4e_attn_full
+// splits those over up to Q4E_FULL_SPLITS CTAs a (head, row): split s takes a contiguous run,
+// walks it Q4E_FULL_TILE keys at a time with the running maximum, sum and value accumulator of an
+// online softmax, and leaves (maximum, sum, accumulator[head_dim]) in its partial slot.
+// q4e_attn_full_combine rescales the splits to their common maximum, adds them in split order,
+// normalises and applies the sigmoid output gate. A row's split count is a function of its own
+// visible length (q4e_full_splits), so its bits do not depend on the chunk it is in or on the
+// launch's grid. The dot products and the softmax's exponent are q4e_attn's.
+// ---------------------------------------------------------------------------------------------
+#define Q4E_FULL_TILE 256
+#define Q4E_FULL_SPLITS 16
+
+// The splits a row that sees `visible` positions takes: one a tile, at most Q4E_FULL_SPLITS.
+__device__ __forceinline__ int q4e_full_splits(int visible) {
+    return min(Q4E_FULL_SPLITS, (visible + Q4E_FULL_TILE - 1) / Q4E_FULL_TILE);
+}
+
+// grid (heads, rows, max over the rows of q4e_full_splits), Q4E_BLOCK threads, head_dim at most
+// Q4E_BLOCK. q and the caches as q4e_attn's; `partials` holds [rows][heads][Q4E_FULL_SPLITS]
+// slots of head_dim + 2 floats.
+extern "C" __global__ void q4e_attn_full(const float* __restrict__ q,
+                                         const __nv_bfloat16* __restrict__ keys,
+                                         const __nv_bfloat16* __restrict__ values,
+                                         float* __restrict__ partials, int position, int heads,
+                                         int kv_heads, int head_dim, int groups) {
+    OPT_PDL_ENTRY();
+    __shared__ float logits[Q4E_FULL_TILE];
+    __shared__ float reduce[Q4E_BLOCK];
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int split = blockIdx.z;
+    const int visible = position + row + 1;
+    const int splits = q4e_full_splits(visible);
+    if (split >= splits || head_dim <= 0 || head_dim > Q4E_BLOCK) {
+        return;
+    }
+    const int span = (visible + splits - 1) / splits;
+    const int first = split * span;
+    const int last = min(visible, first + span);
+    const int kv_head = head / groups;
+    const float* qh = q + ((unsigned long long)row * heads + head) * head_dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const float scale = sqrtf((float)head_dim);
+    const unsigned long long kv_row = (unsigned long long)kv_heads * head_dim;
+    float maximum = -INFINITY;
+    float sum = 0.0f;
+    float accumulator = 0.0f;
+    for (int base = first; base < last; base += Q4E_FULL_TILE) {
+        const int count = min(Q4E_FULL_TILE, last - base);
+        for (int slot = warp; slot < count; slot += warps) {
+            const __nv_bfloat16* krow =
+                keys + (unsigned long long)(base + slot) * kv_row + kv_head * head_dim;
+            float dot = 0.0f;
+            for (int dim = lane; dim < head_dim; dim += 32) {
+                dot += qh[dim] * __bfloat162float(krow[dim]);
+            }
+            dot = q4e_warp_sum(dot);
+            if (lane == 0) {
+                logits[slot] = dot / scale;
+            }
+        }
+        __syncthreads();
+        float local_max = -INFINITY;
+        for (int slot = threadIdx.x; slot < count; slot += blockDim.x) {
+            local_max = fmaxf(local_max, logits[slot]);
+        }
+        const float next = fmaxf(maximum, q4e_block_max(local_max, reduce));
+        // exp(-inf) is zero: the first tile scales the empty running values by nothing.
+        const float rescale = __expf(maximum - next);
+        float local_sum = 0.0f;
+        for (int slot = threadIdx.x; slot < count; slot += blockDim.x) {
+            const float weight = __expf(logits[slot] - next);
+            logits[slot] = weight;
+            local_sum += weight;
+        }
+        sum = sum * rescale + q4e_block_sum(local_sum, reduce);
+        if (threadIdx.x < head_dim) {
+            float tile = 0.0f;
+            for (int slot = 0; slot < count; ++slot) {
+                tile += logits[slot] *
+                        __bfloat162float(values[(unsigned long long)(base + slot) * kv_row +
+                                                kv_head * head_dim + threadIdx.x]);
+            }
+            accumulator = accumulator * rescale + tile;
+        }
+        maximum = next;
+        // The next tile's logits overwrite this one's weights.
+        __syncthreads();
+    }
+    float* part = partials +
+                  (((unsigned long long)row * heads + head) * Q4E_FULL_SPLITS + split) *
+                      (head_dim + 2);
+    if (threadIdx.x == 0) {
+        part[0] = maximum;
+        part[1] = sum;
+    }
+    if (threadIdx.x < head_dim) {
+        part[2 + threadIdx.x] = accumulator;
+    }
+}
+
+// out = (sum of the splits rescaled to their common maximum) / (their rescaled sums), times
+// sigmoid(gate): grid (heads, rows), Q4E_BLOCK threads. An empty split (maximum -inf, sum 0)
+// adds nothing.
+extern "C" __global__ void q4e_attn_full_combine(const float* __restrict__ partials,
+                                                 const float* __restrict__ gate,
+                                                 float* __restrict__ out, int position,
+                                                 int heads, int head_dim) {
+    OPT_PDL_ENTRY();
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int splits = q4e_full_splits(position + row + 1);
+    const int stride = head_dim + 2;
+    const float* part =
+        partials + ((unsigned long long)row * heads + head) * Q4E_FULL_SPLITS * stride;
+    float maximum = -INFINITY;
+    for (int split = 0; split < splits; ++split) {
+        maximum = fmaxf(maximum, part[split * stride]);
+    }
+    float total = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        total += part[split * stride + 1] * __expf(part[split * stride] - maximum);
+    }
+    const unsigned long long at = ((unsigned long long)row * heads + head) * head_dim;
+    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+        float accumulator = 0.0f;
+        for (int split = 0; split < splits; ++split) {
+            accumulator +=
+                part[split * stride + 2 + dim] * __expf(part[split * stride] - maximum);
+        }
+        const float value = accumulator / total;
+        out[at + dim] = gate != nullptr ? value / (1.0f + __expf(-gate[at + dim])) : value;
     }
 }
 

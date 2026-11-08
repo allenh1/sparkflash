@@ -503,6 +503,37 @@ struct Q4eTgRows {
     }
 };
 
+// E4M3 with one scale a 128 x 128 block: GLM-5.3-Flash's FP8 projections and the Qwen3.5/3.6
+// FP8 release's dense projections.
+struct Q4eTgE4m3Block : Q4eTgE4m3 {
+    static constexpr bool kBlockScaled = true;
+};
+
+// A block scale as f32, typed by the dtype the release stores it in: GLM's E4M3 release keeps one
+// f32 a 128 x 128 block, Qwen's FP8 release one __nv_bfloat16 (D88; never read by byte).
+__device__ __forceinline__ float q4e_block_scale(const float* scale) { return q4e_ldg(scale); }
+__device__ __forceinline__ float q4e_block_scale(const __nv_bfloat16* scale) {
+    return __bfloat162float(q4e_ldg(scale));
+}
+
+// Q4eTgRows of an E4M3 matrix with its block scales, [ceil(rows / 128)][ceil(columns / 128)].
+// `quantise` is GLM's release's dynamic activation scheme; clear, the f32 activations multiply
+// the block scale unquantised (the W8A16 product of the dequantised weight, which the Qwen FP8
+// arm takes).
+template <typename ScaleT>
+struct Q4eTgBlockRowsOf : Q4eTgRows<unsigned char> {
+    const ScaleT* scales;
+    int quantise;
+    __device__ float block_scale(int tile, int column) const {
+        const int blocks = (columns + Q4E_FP8_BLOCK - 1) / Q4E_FP8_BLOCK;
+        return q4e_block_scale(&scales[(tile * Q4E_TG_TILE / Q4E_FP8_BLOCK) * blocks +
+                                       column / Q4E_FP8_BLOCK]);
+    }
+};
+
+// GLM's f32-scaled rows, under the name its entries use.
+using Q4eTgBlockRows = Q4eTgBlockRowsOf<float>;
+
 // ---------------------------------------------------------------------------------------------
 // The indexer's block selection: the score key, the block scan, and the top-budget emission.
 // ---------------------------------------------------------------------------------------------

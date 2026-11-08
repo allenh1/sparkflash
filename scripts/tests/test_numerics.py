@@ -454,18 +454,26 @@ class DeclarationTests(unittest.TestCase):
         self.assertIn('note = "kept"', snippet)
         self.assertIn(f'fingerprint = "{flipped["fingerprint"]}"', snippet)
 
-    def test_every_arm_profile_names_a_registered_model(self):
+    def test_every_arm_profile_names_a_model(self):
         # Which model a profile names is held to its weights' descriptor by sparkflash-model's
-        # `every_arm_profile_names_the_model_its_weights_select`.
+        # `every_arm_profile_names_the_model_its_weights_select`. The registry names the models
+        # with a captured reference; a profile may serve a model that has none yet (Qwen3.6 is
+        # unregistered), so membership is not required - only a name, and a registered model
+        # must have a profile.
         repo = NUMERICS.REPO
         on_disk = sorted(repo.glob(NUMERICS.PROFILE_GLOB))
         self.assertGreaterEqual(len(on_disk), 3)
         registry = NUMERICS.parse_registry((repo / NUMERICS.REGISTRY).read_text(), NUMERICS.REGISTRY)
         models = {entry["model"] for entry in registry["config"]}
+        profiled = set()
         for path in on_disk:
             relative = str(path.relative_to(repo))
             self.assertTrue(NUMERICS.is_profile(relative), relative)
-            self.assertIn(NUMERICS.profile_settings(path.read_bytes(), relative).get("model"), models, relative)
+            model = NUMERICS.profile_settings(path.read_bytes(), relative).get("model")
+            self.assertIsInstance(model, str, relative)
+            self.assertTrue(model, relative)
+            profiled.add(model)
+        self.assertLessEqual(models, profiled, "a registered model has no arm profile")
         neutral = NUMERICS.neutral_fields((repo / NUMERICS.CLASSIFICATION).read_bytes())
         self.assertIn("runtime.concurrency", neutral)
         self.assertNotIn("decode.tensor_cores", neutral)

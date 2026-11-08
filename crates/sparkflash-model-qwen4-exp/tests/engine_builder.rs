@@ -16,6 +16,7 @@
 
 use sparkflash_model::{ModelBackend, Target};
 use sparkflash_model_qwen4_exp::checkpoint::write_synthetic_checkpoint;
+use sparkflash_model_qwen4_exp::config::DenseQuant;
 use sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
 use sparkflash_model_qwen4_exp::{Qwen4ExpConfig, architecture_from_carried};
 use sparkflash_ops::tensor_plan::ArchitectureTensorPlan;
@@ -119,6 +120,35 @@ fn a_tiny_checkpoint_opens_through_the_engine_builder() {
         .expect("the direct prefill runs");
     assert_eq!(first.logits, expected.logits);
     assert_eq!(first.next_token, expected.next_token);
+}
+
+/// A Qwen3.5/3.6 MoE plan opens the arm. The serve route hands the arm its plan, and the plan's
+/// family gate once named Qwen3.8's family alone, so the released Qwen3.6 FP8 checkpoint was
+/// refused at load while every plan-less parity test passed. The hub cache is left as it is: a
+/// cached Qwen3.8 DFlash 2 drafter must not be picked up for this family (its width is refused).
+/// The tiny fixture is below the catalogue's serving shapes, so this opens the arm directly with
+/// the plan rather than through the builder's boot check.
+#[test]
+fn a_qwen35_moe_plan_opens_the_arm() {
+    if sparkflash_kernels::cuda_driver::Cuda::load().is_err() {
+        eprintln!("skipped: no CUDA driver");
+        return;
+    }
+    let config = Qwen4ExpConfig::tiny_qwen35_moe(DenseQuant::Fp8Block);
+    let checkpoint = tempfile::tempdir().expect("a temporary directory");
+    write_synthetic_checkpoint(checkpoint.path(), &config, 7).expect("the fixture writes");
+    let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
+        .expect("the tiny Qwen3.5-MoE plan builds");
+    assert_eq!(plan.family(), "qwen3_5_moe");
+    let backend = Qwen4ExpDeviceBackend::open_with_plan(
+        checkpoint.path(),
+        plan.architecture().max_position_embeddings,
+        &plan,
+    )
+    .expect("the arm opens from a Qwen3.5-MoE plan");
+    let mut session = backend.open_session().expect("a session opens");
+    let first = session.prefill(&[1, 2, 3, 4]).expect("a prefill runs");
+    assert_eq!(first.logits.len(), config.vocab_size);
 }
 
 #[test]

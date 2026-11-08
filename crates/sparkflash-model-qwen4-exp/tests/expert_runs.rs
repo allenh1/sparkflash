@@ -356,3 +356,152 @@ fn a_single_expert_for_the_whole_chunk_is_one_run() {
         assert_eq!((bounds[2 * r], bounds[2 * r + 1]), (0, 11));
     }
 }
+
+/// One plan launch that cuts items and drops the ids no expert owns (MOE_PLAN_DROP, GLM's and
+/// Qwen's bulk prefill), over `seg` = (token stride, four widths) or every token: `sorted` up to
+/// the live slots, the items, and the item count.
+fn plan_items(
+    cuda: &Cuda,
+    indices: &[i32],
+    experts: usize,
+    topk: usize,
+    item_rows: usize,
+    seg: Option<(usize, [usize; 4])>,
+) -> (Vec<i32>, Vec<[i32; 4]>, i32) {
+    let mut total = 0_usize;
+    let slots = indices.len();
+    let max_items = slots.div_ceil(item_rows) + experts;
+    let index_buffer = cuda.alloc(slots * 4, &mut total).expect("indices");
+    cuda.copy_htod(&index_buffer, &i32_bytes(indices))
+        .expect("upload indices");
+    let sorted = cuda.alloc(slots * 4, &mut total).expect("sorted");
+    cuda.copy_htod(&sorted, &i32_bytes(&vec![-7; slots]))
+        .expect("poison sorted");
+    let items = cuda.alloc(max_items * 16, &mut total).expect("items");
+    let count = cuda.alloc(4, &mut total).expect("item count");
+    let (_, kernel) = cuda
+        .load_named(moe_plan_cubin(), "moe_plan")
+        .expect("the plan cubin carries moe_plan");
+    let (stride, widths) = seg.unwrap_or((0, [0; 4]));
+    let arguments = [
+        index_buffer.0,
+        sorted.0,
+        items.0,
+        count.0,
+        0,
+        slots as u64,
+        experts as u64,
+        topk as u64,
+        item_rows as u64,
+        max_items as u64,
+        stride as u64,
+        2,
+        widths[0] as u64,
+        widths[1] as u64,
+        widths[2] as u64,
+        widths[3] as u64,
+        0,
+        0,
+    ];
+    cuda.launch(kernel, (1, 1, 1), (512, 1, 1), &arguments)
+        .expect("plan launch");
+    cuda.synchronize().expect("plan synchronize");
+    let mut bytes = vec![0_u8; slots * 4];
+    cuda.copy_dtoh(&mut bytes, &sorted).expect("sorted back");
+    let sorted = as_i32(&bytes);
+    let mut bytes = vec![0_u8; max_items * 16];
+    cuda.copy_dtoh(&mut bytes, &items).expect("items back");
+    let items = as_i32(&bytes)
+        .chunks(4)
+        .map(|item| [item[0], item[1], item[2], item[3]])
+        .collect();
+    let mut bytes = vec![0_u8; 4];
+    cuda.copy_dtoh(&mut bytes, &count).expect("count back");
+    (sorted, items, as_i32(&bytes)[0])
+}
+
+#[test]
+fn a_prefill_chunk_plan_is_the_stable_expert_order_and_its_items() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    // GLM-5.3-Flash's 4,096-row chunk: eight picks a token over 288 experts, a few ids no
+    // expert owns, which MOE_PLAN_DROP leaves out, and segments that leave tokens out.
+    const EXPERTS: usize = 288;
+    const TOPK: usize = 8;
+    const TOKENS: usize = 4096;
+    const ITEM_ROWS: usize = 128;
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut indices = Vec::with_capacity(TOKENS * TOPK);
+    for _ in 0..TOKENS {
+        // Skewed toward a hot set, as a trained router is.
+        let mut picks: Vec<i32> = Vec::new();
+        while picks.len() < TOPK {
+            let draw = next();
+            let expert = if draw % 3 == 0 {
+                draw % 24
+            } else {
+                draw % EXPERTS as u64
+            } as i32;
+            if !picks.contains(&expert) {
+                picks.push(expert);
+            }
+        }
+        picks.sort_unstable();
+        indices.extend(picks);
+    }
+    indices[5] = -1;
+    indices[4097] = EXPERTS as i32;
+    indices[32_767] = -3;
+    for seg in [None, Some((1024, [1000, 0, 512, 1024]))] {
+        let live = |rank: usize| match seg {
+            None => true,
+            Some((stride, widths)) => {
+                let token = rank / TOPK;
+                token % stride < widths[token / stride]
+            }
+        };
+        let mut order: Vec<usize> = (0..indices.len())
+            .filter(|&rank| live(rank) && (0..EXPERTS as i32).contains(&indices[rank]))
+            .collect();
+        order.sort_by_key(|&rank| (indices[rank], rank));
+        let mut items = Vec::new();
+        let mut at = 0_usize;
+        while at < order.len() {
+            let expert = indices[order[at]];
+            let run = order[at..]
+                .iter()
+                .take_while(|&&rank| indices[rank] == expert)
+                .count();
+            for first in (0..run).step_by(ITEM_ROWS) {
+                let n = items.len() as i32;
+                items.push([
+                    expert,
+                    (at + first) as i32,
+                    (run - first).min(ITEM_ROWS) as i32,
+                    n,
+                ]);
+            }
+            at += run;
+        }
+        let (sorted, got, count) = plan_items(&cuda, &indices, EXPERTS, TOPK, ITEM_ROWS, seg);
+        let expected: Vec<i32> = order.iter().map(|&rank| rank as i32).collect();
+        assert_eq!(count as usize, items.len(), "item count, segments {seg:?}");
+        assert_eq!(&got[..items.len()], &items[..], "items, segments {seg:?}");
+        assert_eq!(
+            &sorted[..expected.len()],
+            &expected[..],
+            "the sorted slots are not the stable expert order, segments {seg:?}"
+        );
+        assert!(
+            sorted[expected.len()..].iter().all(|&slot| slot == -7),
+            "the plan wrote past its live slots, segments {seg:?}"
+        );
+    }
+}

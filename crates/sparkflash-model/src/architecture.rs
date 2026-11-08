@@ -753,6 +753,36 @@ impl Architecture {
         }
     }
 
+    /// The Qwen device arm's arithmetic on a Qwen3.5/3.6 FP8 release: weight-only E4M3.
+    ///
+    /// The release declares `activation_scheme: "dynamic"`, which the shared parser reads as an
+    /// [WeightFormat::Fp8Tile] with `dynamic_activations`. The Qwen arm never quantizes an
+    /// activation: it multiplies the f32 activation by the dequantised weight (W8A16), as its
+    /// host oracle does. This clears the flag on every E4M3 class so the execution plan describes
+    /// that arithmetic. A grouped chunk is then the BF16-activation tile from 64 tokens, not the
+    /// q8 MMA that GLM-5.3-Flash's identical stored formats select through its dynamic scheme.
+    ///
+    /// Like [Self::experts_only_fp8], this is one arm's correction, called by the Qwen arm's
+    /// bridge (and the web fit, which plans the document as that bridge does), not a rule about
+    /// FP8 documents. The stored formats (codes, tiles, scale dtype) are unchanged.
+    pub fn weight_only_fp8(&mut self) {
+        let quantization = &mut self.quantization;
+        let formats = [
+            Some(&mut quantization.dense_format),
+            Some(&mut quantization.expert_format),
+            quantization.mtp_expert_format.as_mut(),
+        ];
+        for format in formats.into_iter().flatten() {
+            if let WeightFormat::Fp8Tile {
+                dynamic_activations,
+                ..
+            } = format
+            {
+                *dynamic_activations = false;
+            }
+        }
+    }
+
     /// Read a checkpoint's `config.json`, merging `generation_config.json` when it sits beside.
     ///
     /// A serving path calls this with the snapshot directory it resolved from the Hugging Face
@@ -964,6 +994,22 @@ impl Architecture {
     #[must_use]
     pub fn vision_geometry(&self) -> Option<VisionGeometry> {
         self.vision.as_ref().map(VisionGeometry::from_vision)
+    }
+
+    /// Whether the checkpoint's RMSNorm weights are zero-centred.
+    ///
+    /// Qwen's hybrid releases store `weight` around zero and compute `norm(x) * (1 + weight)`;
+    /// a plain `weight` multiply would scale the residual stream to near zero. The Gated
+    /// DeltaNet's gated norm is a separate, conventionally centred tensor and is not covered.
+    ///
+    /// This is a family fact the released document does not spell out: the Transformers config
+    /// classes hard-code `Qwen3_5MoeRMSNorm`/`Qwen4ExpRMSNorm` with a zero-initialised weight.
+    #[must_use]
+    pub fn zero_centered_norms(&self) -> bool {
+        matches!(
+            self.family.as_str(),
+            "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen4_exp" | "qwen4_exp_text"
+        )
     }
 
     /// The parts a run of this architecture needs.
@@ -2068,6 +2114,36 @@ mod tests {
     const GLM: &str = include_str!("../../sparkflash-model-glm5-next/config/glm53_flash.hf.json");
     const QWEN: &str =
         include_str!("../../sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.hf.json");
+
+    #[test]
+    fn weight_only_fp8_clears_only_the_activation_scheme() {
+        let text = include_str!("../config/qwen36_flash_35b_a3b_fp8.hf.json");
+        let declared = Architecture::from_json(text).expect("Qwen3.6 FP8");
+        let tile = |dynamic_activations| WeightFormat::Fp8Tile {
+            block_m: 128,
+            block_n: 128,
+            scale_dtype: ScaleDType::F32,
+            dynamic_activations,
+        };
+        assert_eq!(declared.quantization.dense_format, tile(true));
+        assert_eq!(declared.quantization.expert_format, tile(true));
+        let mut computed = declared.clone();
+        computed.weight_only_fp8();
+        assert_eq!(computed.quantization.dense_format, tile(false));
+        assert_eq!(computed.quantization.expert_format, tile(false));
+        let mut rest = computed.clone();
+        rest.quantization = declared.quantization.clone();
+        assert_eq!(rest, declared, "nothing but the scheme moves");
+        // Only the E4M3 classes move: Qwen3.8 NVFP4 keeps its BF16 dense and NVFP4 experts, and
+        // only its FP8 MTP experts lose the scheme.
+        let mut nvfp4 = Architecture::from_json(QWEN).expect("Qwen3.8 NVFP4");
+        let mut before = nvfp4.clone();
+        assert_eq!(before.quantization.mtp_expert_format, Some(tile(true)));
+        nvfp4.weight_only_fp8();
+        assert_eq!(nvfp4.quantization.mtp_expert_format, Some(tile(false)));
+        before.quantization.mtp_expert_format = Some(tile(false));
+        assert_eq!(nvfp4, before);
+    }
 
     fn count<F: Fn(&Layer) -> bool>(architecture: &Architecture, predicate: F) -> usize {
         architecture

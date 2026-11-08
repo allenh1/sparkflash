@@ -38,7 +38,9 @@
 //
 // The tile geometry is a tuning decision the dense GEMM, the routed experts and the sparse MLA
 // attention share, so it is stated once here. GLM's images and Qwen's prefill include this
-// header and instantiate the body; none carries a second staging loop.
+// header and instantiate the body; none carries a second staging loop. Two more bodies live
+// here with it: the q8 body (E4M3 activation codes into an E4M3 MMA) and the wide body (a dense
+// BF16 weight over a 128 x 256 tile, the 128 x 128 body's bits).
 
 #pragma once
 
@@ -69,6 +71,14 @@
 #define GLM_Q8_BLOCKS 128u
 #define GLM_Q8_STAGE_BYTES (GLM_BM * 64u + GLM_BN * 64u + GLM_BM * 4u)
 #define GLM_Q8_SHARED (GLM_Q8_STAGES * GLM_Q8_STAGE_BYTES + GLM_BM * 4u + GLM_Q8_BLOCKS * 4u)
+
+// The wide body's tile (128 rows x GLM_WIDE_BN columns), its cp.async stages and its dynamic
+// shared memory: a stage's f32 activation tile (128 rows x 32 K) and BF16 weight tile
+// (GLM_WIDE_BN rows x 32 K).
+#define GLM_WIDE_BN 256u
+#define GLM_WIDE_STAGES 3u
+#define GLM_WIDE_STAGE_BYTES (GLM_BM * 128u + GLM_WIDE_BN * 64u)
+#define GLM_WIDE_SHARED (GLM_WIDE_STAGES * GLM_WIDE_STAGE_BYTES)
 
 // The weight formats the tile body serves.
 #define SPM_W_BF16 0
@@ -119,6 +129,14 @@ __device__ __forceinline__ uint32_t glm_q8_codes(const float4 v, float &scale) {
 // weights ~40% slower (126 against 205 GB/s on a routed expert's shape).
 __device__ __forceinline__ uint32_t glm_q8_off(uint32_t row, uint32_t chunk) {
     return row * 64u + ((chunk ^ ((row >> 1) & 3u)) << 4);
+}
+
+
+// A stage's f32 activation tile is [128 rows][8 chunks of 16 B] (32 K), the chunks XOR-swizzled
+// by twice the row's low two bits: a fragment load reads two adjacent chunks of eight rows, and
+// each half-warp's four rows then fall on eight distinct chunks, every bank once.
+__device__ __forceinline__ uint32_t glm_wide_a_off(uint32_t row, uint32_t chunk) {
+    return row * 128u + ((chunk ^ ((row & 3u) << 1)) << 4);
 }
 
 
@@ -406,6 +424,165 @@ __device__ __forceinline__ void shared_prefill_mma_body(
                 if (scaled) v = make_float2(__fmul_rn(v.x, weight), __fmul_rn(v.y, weight));
                 *reinterpret_cast<float2 *>(out + o) = v;
             }
+        }
+    }
+}
+
+
+// A bf16x2 of two f32 (lo in the low half), each rounded as __float2bfloat16_rn rounds it, and
+// the two halves of one back as f32.
+__device__ __forceinline__ uint32_t glm_bf16x2(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t *>(&v);
+}
+__device__ __forceinline__ float glm_bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float glm_bf16_hi(uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); }
+
+
+// The dense BF16-weight projection over a wider tile: one block 128 token rows x GLM_WIDE_BN
+// output columns (eight warps of 64 x 64), the f32 activation and BF16 weight tiles through
+// GLM_WIDE_STAGES cp.async stages. shared_prefill_mma_body's 128 x 128 tile reads each f32
+// activation tile once a 128 columns, and on GLM's KDA projections that traffic, not the tensor
+// cores, sets its time; read once a 256 columns, the 6144 x 4096 projection over 4,096 rows takes
+// 4.4 ms instead of 5.5.
+//
+// The arithmetic is shared_prefill_mma_body's for a dense BF16 weight, element for element: a
+// fragment splits each f32 into the bf16 head and the bf16 of what the head leaves, as that body
+// splits it when staging the tile, and every output's chain is the same MMA sequence, each 16-K
+// step's head and then (kLow) its remainder, ascending K, so the outputs are its bits. The grid
+// is (cols / GLM_WIDE_BN, rows / 128); cols and inner are multiples of 32.
+template <bool kLow>
+__device__ __forceinline__ void shared_prefill_wide_body(const __nv_bfloat16 *__restrict__ w,
+                                                         const float *__restrict__ a,
+                                                         float *__restrict__ out, uint32_t cols,
+                                                         uint32_t inner, uint32_t tokens) {
+    extern __shared__ __align__(128) uint8_t glm_wide_shared[];
+    auto s_a = [&](uint32_t buf) { return glm_wide_shared + buf * GLM_WIDE_STAGE_BYTES; };
+    auto s_w = [&](uint32_t buf) { return s_a(buf) + GLM_BM * 128u; };
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5;
+    const uint2 place = glm_raster();
+    const uint32_t n0 = place.x * GLM_WIDE_BN;
+    const uint32_t m0 = place.y * GLM_BM;
+    const uint32_t stages = inner >> 5;
+    const uint32_t col_tiles = min(GLM_WIDE_BN / 32u, (cols - n0) >> 5);
+
+    // A stage's tiles: eight 16-byte chunks of each activation row (zero past the tokens) and
+    // four of each weight row (zero past the columns).
+    auto issue = [&](uint32_t stage, uint32_t buf) {
+        const uint32_t k0 = stage * 32u;
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; ++i) {
+            const uint32_t idx = tid + i * OM_THREADS;
+            const uint32_t row = idx >> 3;
+            const uint32_t chunk = idx & 7u;
+            const bool valid = m0 + row < tokens;
+            const float *src = valid ? a + (uint64_t)(m0 + row) * inner + k0 + chunk * 4u : a;
+            om_cp16(om_smem(s_a(buf) + glm_wide_a_off(row, chunk)), src, valid);
+        }
+#pragma unroll
+        for (uint32_t i = 0; i < 4u; ++i) {
+            const uint32_t idx = tid + i * OM_THREADS;
+            const uint32_t row = idx >> 2;
+            const uint32_t chunk = idx & 3u;
+            const bool valid = (row >> 5) < col_tiles;
+            const __nv_bfloat16 *src =
+                valid ? w + (uint64_t)(n0 + row) * inner + k0 + chunk * 8u : w;
+            om_cp16(om_smem(s_w(buf) + glm_q8_off(row, chunk)), src, valid);
+        }
+    };
+
+    const uint32_t wm = warp & 1u;
+    const uint32_t wn = warp >> 1;
+    // A warp's 64 columns are two 32-column tiles, live while the first is; its 16-row tiles
+    // that hold a token, the rest zero rows that skip their MMAs.
+    const bool active = 2u * wn < col_tiles && m0 + wm * 64u < tokens;
+    const uint32_t nt_live = active ? min(8u, (col_tiles - 2u * wn) * 4u) : 0u;
+    const uint32_t mt_live = active ? min(4u, (tokens - m0 - wm * 64u + 15u) >> 4) : 0u;
+    const uint32_t g = lane >> 2;
+    const uint32_t q = lane & 3u;
+
+    float acc[4][8][4];
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i)
+#pragma unroll
+        for (uint32_t j = 0; j < 8; ++j)
+#pragma unroll
+            for (uint32_t e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+#pragma unroll
+    for (uint32_t stage = 0; stage + 1u < GLM_WIDE_STAGES; ++stage) {
+        if (stage < stages) issue(stage, stage);
+        om_commit();
+    }
+    for (uint32_t stage = 0; stage < stages; ++stage) {
+        // This stage's group is in once at most the stages after it are still in flight; the
+        // barrier also ends every warp's reads of the buffer the next issue overwrites.
+        om_wait<GLM_WIDE_STAGES - 2u>();
+        __syncthreads();
+        const uint32_t next = stage + GLM_WIDE_STAGES - 1u;
+        if (next < stages) issue(next, next % GLM_WIDE_STAGES);
+        om_commit();
+        if (!active) continue;
+        const uint8_t *tile_a = s_a(stage % GLM_WIDE_STAGES);
+        const uint8_t *tile_w = s_w(stage % GLM_WIDE_STAGES);
+        // Two adjacent f32 of row `row` from K offset `k` of the stage.
+        auto pair = [&](uint32_t row, uint32_t k) {
+            return *reinterpret_cast<const float2 *>(tile_a + glm_wide_a_off(row, k >> 2) +
+                                                     (k & 3u) * 4u);
+        };
+#pragma unroll
+        for (uint32_t step = 0; step < 2u; ++step) {
+            const uint32_t k0 = step * 16u;
+            uint32_t b[8][2];
+#pragma unroll
+            for (uint32_t p = 0; p < 4u; ++p) {
+                const uint32_t n = wn * 64u + p * 16u + (lane & 7u) + 8u * (lane >> 4);
+                const uint32_t chunk = (k0 >> 3) + ((lane >> 3) & 1u);
+                om_ldsm4(om_smem(tile_w + glm_q8_off(n, chunk)), b[2 * p][0], b[2 * p][1],
+                         b[2 * p + 1][0], b[2 * p + 1][1]);
+            }
+#pragma unroll
+            for (uint32_t mt = 0; mt < 4u; ++mt) {
+                if (mt >= mt_live) break;
+                const uint32_t r = wm * 64u + mt * 16u + g;
+                const float2 x[4] = {pair(r, k0 + 2u * q), pair(r + 8u, k0 + 2u * q),
+                                     pair(r, k0 + 8u + 2u * q), pair(r + 8u, k0 + 8u + 2u * q)};
+                uint32_t head[4];
+#pragma unroll
+                for (uint32_t i = 0; i < 4u; ++i) head[i] = glm_bf16x2(x[i].x, x[i].y);
+#pragma unroll
+                for (uint32_t nt = 0; nt < 8u; ++nt)
+                    if (nt < nt_live) ob_mma(acc[mt][nt], head, b[nt][0], b[nt][1]);
+                if constexpr (kLow) {
+                    uint32_t low[4];
+#pragma unroll
+                    for (uint32_t i = 0; i < 4u; ++i)
+                        low[i] = glm_bf16x2(x[i].x - glm_bf16_lo(head[i]),
+                                            x[i].y - glm_bf16_hi(head[i]));
+#pragma unroll
+                    for (uint32_t nt = 0; nt < 8u; ++nt)
+                        if (nt < nt_live) ob_mma(acc[mt][nt], low, b[nt][0], b[nt][1]);
+                }
+            }
+        }
+    }
+
+    if (!active) return;
+#pragma unroll
+    for (uint32_t mt = 0; mt < 4u; ++mt) {
+#pragma unroll
+        for (uint32_t half = 0; half < 2u; ++half) {
+            const uint32_t token = m0 + wm * 64u + mt * 16u + g + 8u * half;
+            if (token >= tokens) continue;
+            const uint64_t base = (uint64_t)token * cols + n0 + wn * 64u + 2u * q;
+#pragma unroll
+            for (uint32_t nt = 0; nt < 8u; ++nt)
+                if (nt < nt_live)
+                    *reinterpret_cast<float2 *>(out + base + nt * 8u) =
+                        make_float2(acc[mt][nt][2u * half], acc[mt][nt][2u * half + 1u]);
         }
     }
 }

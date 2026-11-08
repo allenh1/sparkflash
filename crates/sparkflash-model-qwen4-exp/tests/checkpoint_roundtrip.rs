@@ -24,8 +24,8 @@ use std::path::Path;
 
 use sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend;
 use sparkflash_model_qwen4_exp::{
-    PleHasher, Qwen4ExpConfig, Qwen4ExpTensorPlan, SyntheticCheckpoint, load_weights,
-    open_ple_table, write_synthetic_checkpoint, write_synthetic_checkpoint_sharded,
+    CheckpointRows, PleHasher, Qwen4ExpConfig, Qwen4ExpTensorPlan, RowReader, SyntheticCheckpoint,
+    load_weights, open_ple_table, write_synthetic_checkpoint, write_synthetic_checkpoint_sharded,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::SafeTensorsSource;
@@ -43,7 +43,7 @@ fn the_fixture_write_reopen_load_and_run_agree_with_the_plan() {
     let config = fixture.config.clone();
 
     // The checkpoint is exactly the served plan, not merely a superset or an approximation of it.
-    let plan = Qwen4ExpTensorPlan::served_and_mtp(&config);
+    let plan = Qwen4ExpTensorPlan::served_and_mtp(&config).expect("the plan builds");
     let source = open_source(&fixture.directory);
     plan.conformance(source.names())
         .expect("the fixture carries exactly the served tensor set");
@@ -116,6 +116,65 @@ fn the_fixture_write_reopen_load_and_run_agree_with_the_plan() {
     // scale the checkpoint carries is what the table applies.
     assert!(table.scale() > 0.0);
     assert!(table.counters().reads > 0, "no PLE row was read");
+}
+
+/// The PLE reader's batched read hands its pieces to the process's pread workers. Whatever the
+/// split - a decode step's rows a piece each across the shards, a prefill's runs of more than one
+/// piece a shard, several calls at once from different threads - every request gets exactly the
+/// bytes a one-shard read of its ranges gives, in request order.
+#[test]
+fn the_pooled_shard_read_is_every_shards_own_bytes_in_request_order() {
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    let fixture = SyntheticCheckpoint::write(temp.path()).expect("the fixture writes");
+    let config = fixture.config.clone();
+    let layer = config.ple_layer_indices()[0];
+    let rows = CheckpointRows::open(&fixture.directory, &config, layer).expect("the rows open");
+    let row_bytes = config.ple_embed_dim / config.ngram_heads();
+    let shard_rows = rows.shard_rows();
+    let request = |shard: usize, count: usize, stride: u64| {
+        let ranges: Vec<(u64, usize)> = (0..count as u64)
+            .map(|index| {
+                (
+                    ((index * stride + shard as u64) % shard_rows) * row_bytes as u64,
+                    row_bytes,
+                )
+            })
+            .collect();
+        (shard, ranges)
+    };
+    // One row a shard (a decode step), then 200 rows of one shard and 70 of the other - more than
+    // one piece each, and the pieces out of row order.
+    let calls = [
+        vec![request(0, 1, 1), request(1, 1, 1)],
+        vec![request(1, 200, 37), request(0, 70, 11), request(1, 3, 5)],
+    ];
+    let check = |requests: &Vec<(usize, Vec<(u64, usize)>)>| {
+        let read = rows.read_shards(requests).expect("the batched read");
+        assert_eq!(read.len(), requests.len());
+        for ((shard, ranges), (read_shard, bytes)) in requests.iter().zip(&read) {
+            assert_eq!(shard, read_shard);
+            let own = rows.read_rows(*shard, ranges).expect("the one-shard read");
+            assert_eq!(&own, bytes, "shard {shard}: the pooled bytes differ");
+        }
+    };
+    for requests in &calls {
+        check(requests);
+    }
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for requests in calls.iter().cycle().take(6) {
+                    check(requests);
+                }
+            });
+        }
+    });
+    // A range past its shard is refused, not read short.
+    let past = vec![
+        (0usize, vec![(shard_rows * row_bytes as u64, row_bytes)]),
+        request(1, 2, 1),
+    ];
+    assert!(rows.read_shards(&past).is_err());
 }
 
 fn load(directory: &Path) -> sparkflash_model_qwen4_exp::Qwen4ExpWeights {
@@ -234,7 +293,7 @@ fn the_fp8_fixture_writes_the_block_scaled_experts_and_loads_them() {
     let config = Qwen4ExpConfig::tiny_fp8();
     write_synthetic_checkpoint(temp.path(), &config, 7).expect("the FP8 fixture writes");
     let source = open_source(temp.path());
-    let plan = Qwen4ExpTensorPlan::served_and_mtp(&config);
+    let plan = Qwen4ExpTensorPlan::served_and_mtp(&config).expect("the plan builds");
     plan.conformance(source.names())
         .expect("the fixture carries exactly the served tensor set");
     let prefix = "model.language_model.layers.0.mlp.experts.0.gate_proj";
@@ -281,6 +340,7 @@ fn a_tampered_checkpoint_is_refused_rather_than_silently_truncated() {
     let mut names = source.names();
     names.retain(|name| !name.contains("mlp.experts.0.gate_proj"));
     let error = Qwen4ExpTensorPlan::served_and_mtp(&config)
+        .expect("the plan builds")
         .conformance(names)
         .expect_err("a missing expert is a conformance failure");
     assert!(error.contains("mlp.experts.0.gate_proj"), "{error}");

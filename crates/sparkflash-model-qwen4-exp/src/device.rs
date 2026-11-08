@@ -72,7 +72,7 @@ use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
 use sparkflash_weights::{WeightSource, check_length};
 
-use crate::config::{ExpertQuant, LayerKind, Qwen4ExpConfig};
+use crate::config::{DenseQuant, ExpertQuant, LayerKind, Qwen4ExpConfig};
 use crate::ple::PleTable;
 use crate::tensor::{DEVICE_RESIDENT_BYTES, Role};
 
@@ -94,6 +94,7 @@ pub use prefill::{
 use prefill::{PrefillKernels, PrefillScratch, Projection};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
+use sparkflash_ops::gemv::gemv_e4m3_tile;
 pub use tp::{reduce_two_shot, splits_two_shot};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
@@ -200,9 +201,44 @@ const SCRATCH_SLOTS: usize = 48;
 
 /// The slot of [DeviceSequence::scratch_pointers] that is `gemm_partials`.
 const PARTIALS_SLOT: usize = 42;
+/// The injection weights' slot of the scratch ([DeviceSequence::scratch_pointers]).
+const INJECTION_SLOT: usize = 3;
+
+/// A plain residual (Qwen3.5/3.6) adds each branch back with weight one, so its injection rows
+/// are ones, which the shared inject and MoE-combine kernels read as they read a
+/// hyper-connection's. Nothing writes them afterwards: on that path
+/// [DeviceSequence::hyper_rows] only norms.
+pub(super) fn fill_plain_injection(
+    cuda: &Cuda,
+    config: &Qwen4ExpConfig,
+    pointer: Deviceptr,
+    rows: usize,
+) -> Result<(), String> {
+    if !config.plain_residual() {
+        return Ok(());
+    }
+    let ones: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), rows * config.hc_count)
+        .flatten()
+        .collect();
+    cuda.copy_htod(&pointer, &ones)
+}
 
 /// The query heads q4e_attn_group computes together (Q4E_ATTN_GROUP).
 pub const ATTN_GROUP_HEADS: usize = 4;
+
+/// Keys a q4e_attn_full CTA takes a pass (Q4E_FULL_TILE).
+pub const FULL_ATTENTION_TILE: usize = 256;
+
+/// The most CTAs q4e_attn_full splits one row's context over (Q4E_FULL_SPLITS).
+pub const FULL_ATTENTION_SPLITS: usize = 16;
+
+/// The splits a row that sees `visible` positions takes (q4e_full_splits).
+#[must_use]
+pub fn full_attention_splits(visible: usize) -> usize {
+    visible
+        .div_ceil(FULL_ATTENTION_TILE)
+        .clamp(1, FULL_ATTENTION_SPLITS)
+}
 
 /// The selected tokens q4e_attn_group stages in shared memory (Q4E_ATTN_GROUP_SELECTED); a
 /// configuration that selects more attends through q4e_attn.
@@ -335,7 +371,42 @@ pub fn embedded_moe_cubin() -> &'static [u8] {
     sparkflash_kernels::images::qwen4_moe_cubin()
 }
 
-pub use sparkflash_ops::gemv::{GpuMat, GpuMatE4m3};
+pub use sparkflash_ops::gemv::{GpuMat, GpuMatE4m3, GpuMatE4m3Tile};
+
+/// A dense projection's weights: BF16, or the Qwen3.5/3.6 FP8 release's E4M3 codes with one BF16
+/// inverse scale a 128 x 128 tile.
+///
+/// Every launch matches on the kind, so a kernel with no FP8 form refuses an FP8 projection
+/// ([Dense::bf16]) instead of reading its codes as BF16 weights.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Dense {
+    Bf16(GpuMat),
+    Fp8(GpuMatE4m3Tile),
+}
+
+impl Dense {
+    /// Output rows.
+    pub(crate) fn rows(&self) -> usize {
+        match self {
+            Self::Bf16(matrix) => matrix.rows,
+            Self::Fp8(matrix) => matrix.rows,
+        }
+    }
+
+    /// The BF16 matrix, or why a BF16-only path cannot take this one.
+    pub(crate) fn bf16(&self, what: &str) -> Result<&GpuMat, BackendError> {
+        match self {
+            Self::Bf16(matrix) => Ok(matrix),
+            Self::Fp8(matrix) => Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "{what} has no block-scaled FP8 form, and was given a [{}, {}] FP8 matrix",
+                    matrix.rows, matrix.columns
+                ),
+            )),
+        }
+    }
+}
 
 /// One uploaded NVFP4 expert matrix and its two per-tensor scales.
 #[derive(Debug, Clone, Copy)]
@@ -361,20 +432,28 @@ struct GpuExpert {
     down: GpuNvfp4,
 }
 
+/// A residual block's read of the stream: the norm, then on a hyper-connection the bottleneck
+/// that folds the widened streams and the injection weights that spread the branch back.
 #[derive(Debug)]
 struct GpuHyper {
     norm: Deviceptr,
+    /// `None` on a plain residual (Qwen3.5/3.6): the branch reads the normed stream itself.
+    mix: Option<GpuHyperMix>,
+    inject: Option<GpuMat>,
+}
+
+#[derive(Debug)]
+struct GpuHyperMix {
     down: GpuMat,
     up: GpuMat,
-    inject: Option<GpuMat>,
 }
 
 #[derive(Debug)]
 struct GpuMoe {
     router: GpuMat,
-    shared: GpuMat,
-    shared_up: GpuMat,
-    shared_down: GpuMat,
+    shared: Dense,
+    shared_up: Dense,
+    shared_down: Dense,
     shared_gate: GpuMat,
     experts: GpuExperts,
 }
@@ -397,21 +476,21 @@ enum GpuExperts {
 #[derive(Debug)]
 enum GpuBranch {
     Linear {
-        in_qkv: GpuMat,
-        in_z: GpuMat,
+        in_qkv: Dense,
+        in_z: Dense,
         in_b: GpuMat,
         in_a: GpuMat,
-        out_proj: GpuMat,
+        out_proj: Dense,
         conv: Deviceptr,
         a_log: Deviceptr,
         dt_bias: Deviceptr,
         norm: Deviceptr,
     },
     Sparse {
-        q_proj: GpuMat,
-        k_proj: GpuMat,
-        v_proj: GpuMat,
-        o_proj: GpuMat,
+        q_proj: Dense,
+        k_proj: Dense,
+        v_proj: Dense,
+        o_proj: Dense,
         q_norm: Deviceptr,
         k_norm: Deviceptr,
         index_qk: GpuMat,
@@ -474,6 +553,8 @@ struct Kernels {
     embed: Kernel,
     gemv_bf16: Kernel,
     gemv_tiled_bf16: Kernel,
+    /// The FP8 release's block-scaled dense projections at decode ([Dense::Fp8]).
+    gemv_tiled_e4m3_tile: Kernel,
     gemv4_bf16: Kernel,
     gemm_bf16: Kernel,
     gemm_reduce: Kernel,
@@ -512,6 +593,10 @@ struct Kernels {
     /// q4e_attn for several query heads of a KV head at once, bit-identical per head: the
     /// [ATTN_GROUP_KERNELS] the device grants their shared memory, with their head counts.
     attn_group: [Option<(usize, Kernel)>; ATTN_GROUP_KERNELS.len()],
+    /// Every causal position, split over the context, and the splits' fold: the attention of a
+    /// configuration with no sparse indexer ([Qwen4ExpConfig::full_attention]).
+    attn_full: Kernel,
+    attn_full_combine: Kernel,
     ple_gate: Kernel,
     ple_conv: Kernel,
     deinterleave: Kernel,
@@ -592,6 +677,7 @@ impl Kernels {
             embed: named(cuda, "q4e_embed")?,
             gemv_bf16: named(cuda, "q4e_gemv_bf16")?,
             gemv_tiled_bf16: named(cuda, "q4e_gemv_tiled_bf16")?,
+            gemv_tiled_e4m3_tile: named(cuda, "q4e_gemv_tiled_e4m3_tile")?,
             gemv4_bf16: named(cuda, "q4e_gemv4_bf16")?,
             gemm_bf16: named(cuda, "q4e_gemm_bf16")?,
             gemm_reduce: named(cuda, "q4e_gemm_reduce")?,
@@ -647,6 +733,8 @@ impl Kernels {
                     .ok()
                     .map(|(_, kernel)| (heads, kernel))
             }),
+            attn_full: attn(cuda, "q4e_attn_full")?,
+            attn_full_combine: attn(cuda, "q4e_attn_full_combine")?,
             ple_gate: named(cuda, "q4e_ple_gate")?,
             ple_conv: named(cuda, "q4e_ple_conv")?,
             deinterleave: named(cuda, "q4e_deinterleave")?,
@@ -880,6 +968,109 @@ impl<'a> Uploader<'a> {
         })
     }
 
+    /// `part` of the dense projection `prefix` (`[rows, columns]`) as `quant` stores it: the BF16
+    /// `{prefix}.weight`, or the FP8 release's E4M3 codes and BF16 tile scales, a rank's share in
+    /// whole 128-wide tiles ([Self::fp8_part]).
+    fn dense_part(
+        &self,
+        source: &dyn WeightSource,
+        prefix: &str,
+        shape: (usize, usize),
+        part: Part,
+        quant: DenseQuant,
+    ) -> Result<Dense, String> {
+        match quant {
+            DenseQuant::Bf16 => Ok(Dense::Bf16(self.mat_part(
+                source,
+                &format!("{prefix}.weight"),
+                shape,
+                part,
+            )?)),
+            DenseQuant::Fp8Block => {
+                let (rows, columns) = part.shape(shape)?;
+                let (weight, scales) = self.fp8_part(source, prefix, shape, part)?;
+                Ok(Dense::Fp8(GpuMatE4m3Tile {
+                    weight,
+                    scales,
+                    rows,
+                    columns,
+                }))
+            }
+        }
+    }
+
+    /// The row runs `ranges` of the dense projection `prefix` as `quant` stores it, one after
+    /// another ([Self::mat_rows]); an FP8 run is whole 128-row tiles, its scale rows the same run
+    /// of the tile grid.
+    fn dense_rows(
+        &self,
+        source: &dyn WeightSource,
+        prefix: &str,
+        (rows, columns): (usize, usize),
+        ranges: &[(usize, usize)],
+        quant: DenseQuant,
+    ) -> Result<Dense, String> {
+        let name = format!("{prefix}.weight");
+        if quant == DenseQuant::Bf16 {
+            return Ok(Dense::Bf16(self.mat_rows(
+                source,
+                &name,
+                (rows, columns),
+                ranges,
+            )?));
+        }
+        let ranges = merge_runs(ranges);
+        if let [(first, count)] = ranges.as_slice() {
+            return self.dense_part(
+                source,
+                prefix,
+                (rows, columns),
+                Part::Rows(*first, *count),
+                quant,
+            );
+        }
+        const TILE: usize = sparkflash_ops::gemv::E4M3_TILE;
+        if !rows.is_multiple_of(TILE)
+            || !columns.is_multiple_of(TILE)
+            || ranges
+                .iter()
+                .any(|(first, count)| !first.is_multiple_of(TILE) || !count.is_multiple_of(TILE))
+        {
+            return Err(format!(
+                "the row runs {ranges:?} of the FP8 [{rows}, {columns}] at {prefix} split a \
+                 128x128 scale tile"
+            ));
+        }
+        let tile_ranges: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|(first, count)| (first / TILE, count / TILE))
+            .collect();
+        let scale_name = format!("{prefix}.weight_scale_inv");
+        let codes = self.rows_of(source, &name, (rows, columns), &ranges)?;
+        let scales = self.rows_of(
+            source,
+            &scale_name,
+            (rows / TILE, columns / TILE * 2),
+            &tile_ranges,
+        )?;
+        let part_rows: usize = ranges.iter().map(|(_, count)| count).sum();
+        let weight = self
+            .sink
+            .borrow_mut()
+            .weight(&name, part_rows * columns, codes)?;
+        let scales = self.sink.borrow_mut().weight(
+            &scale_name,
+            part_rows / TILE * (columns / TILE) * 2,
+            scales,
+        )?;
+        Ok(Dense::Fp8(GpuMatE4m3Tile {
+            weight,
+            scales,
+            rows: part_rows,
+            columns,
+        }))
+    }
+
     /// The row runs `ranges` of the tensor `name`, `rows` rows of `row_bytes` each, one after
     /// another; nothing when the sink wants no bytes.
     fn rows_of(
@@ -1011,8 +1202,8 @@ impl<'a> Uploader<'a> {
         self.sink.borrow_mut().weight(name, len, bytes)
     }
 
-    /// `part` of one block-scaled FP8 expert matrix: the E4M3 codes and the BF16 inverse-scale
-    /// grid, both taken in whole 128-wide tiles.
+    /// `part` of one block-scaled FP8 matrix (an expert, or a Qwen3.5/3.6 dense projection): the
+    /// E4M3 codes and the BF16 inverse-scale grid, both taken in whole 128-wide tiles.
     ///
     /// The tile is the sharing unit: its one BF16 scale covers all 128 of its columns, so a rank
     /// holds a run of whole tiles and its scale grid is the same run of the global grid. No zeros
@@ -1027,16 +1218,20 @@ impl<'a> Uploader<'a> {
     ) -> Result<(Deviceptr, Deviceptr), String> {
         const TILE: usize = 128;
         let (part_rows, part_columns) = part.shape((rows, columns))?;
-        let (first, count) = match part {
-            Part::Rows(first, count) | Part::Columns(first, count) => (first, count),
+        let (first, count, total) = match part {
+            Part::Rows(first, count) => (first, count, rows),
+            Part::Columns(first, count) => (first, count, columns),
         };
-        if !first.is_multiple_of(TILE) || !count.is_multiple_of(TILE) {
+        // A part starts on a tile edge and holds whole tiles; only the part that ends the axis
+        // may end inside the axis's partial last tile (a 64-row k_proj at one rank), whose one
+        // scale it then owns alone.
+        if !first.is_multiple_of(TILE) || (!count.is_multiple_of(TILE) && first + count != total) {
             return Err(format!(
                 "{part:?} of the FP8 [{rows}, {columns}] at {prefix} splits a 128x128 scale tile"
             ));
         }
         let weight_len = part_rows * part_columns;
-        let scale_len = (part_rows / TILE) * (part_columns / TILE) * 2;
+        let scale_len = part_rows.div_ceil(TILE) * part_columns.div_ceil(TILE) * 2;
         let (weight, scales) = if self.wants_bytes() {
             let weight = source
                 .read(&format!("{prefix}.weight"))
@@ -1051,7 +1246,7 @@ impl<'a> Uploader<'a> {
                     rows * columns
                 ));
             }
-            let grid = (rows / TILE, columns / TILE);
+            let grid = (rows.div_ceil(TILE), columns.div_ceil(TILE));
             if scales.len() != grid.0 * grid.1 * 2 {
                 return Err(format!(
                     "{prefix}.weight_scale_inv is {} bytes, expected {} for a {:?} tile grid",
@@ -1063,8 +1258,8 @@ impl<'a> Uploader<'a> {
             // One code a weight, so the part of the weight is the part itself; one BF16 a tile,
             // so the part of the grid is the part in tile units.
             let tile_part = match part {
-                Part::Rows(first, count) => Part::Rows(first / TILE, count / TILE),
-                Part::Columns(first, count) => Part::Columns(first / TILE, count / TILE),
+                Part::Rows(first, count) => Part::Rows(first / TILE, count.div_ceil(TILE)),
+                Part::Columns(first, count) => Part::Columns(first / TILE, count.div_ceil(TILE)),
             };
             (
                 part.of(&weight, (rows, columns)).into_owned(),
@@ -1273,6 +1468,19 @@ impl<'a> Uploader<'a> {
     }
 }
 
+/// `ranges` with each run that starts where the one before it ends folded into it: a whole
+/// world's runs of a stacked projection are the whole matrix.
+fn merge_runs(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(first, count) in ranges {
+        match merged.last_mut() {
+            Some((at, run)) if *at + *run == first => *run += count,
+            _ => merged.push((first, count)),
+        }
+    }
+    merged
+}
+
 impl GpuWeights {
     /// Upload every resident weight from the checkpoint into its own allocation.
     pub(crate) fn upload(
@@ -1305,6 +1513,8 @@ pub(crate) fn build_shard(
     shard: tp::Shard,
 ) -> Result<GpuWeights, String> {
     let hidden = config.hidden_size;
+    // The dense projections' storage: BF16, or the Qwen3.5/3.6 FP8 release's tile-scaled E4M3.
+    let dense = config.dense_quant;
     // Each share as (first, count) in heads or columns, and the parts of a matrix they name.
     let heads = shard.even(config.num_attention_heads);
     let kv_heads = shard.kv_heads(config.num_key_value_heads);
@@ -1335,18 +1545,20 @@ pub(crate) fn build_shard(
     let hyper = |prefix: String, inject: bool| -> Result<GpuHyper, String> {
         Ok(GpuHyper {
             norm: uploader.vector(source, &format!("{prefix}.hc_norm.weight"), width)?,
-            down: uploader.mat(
-                source,
-                &format!("{prefix}.input_mix_weight_down.weight"),
-                config.hc_lowrank,
-                width,
-            )?,
-            up: uploader.mat(
-                source,
-                &format!("{prefix}.input_mix_weight_up.weight"),
-                width,
-                config.hc_lowrank,
-            )?,
+            mix: Some(GpuHyperMix {
+                down: uploader.mat(
+                    source,
+                    &format!("{prefix}.input_mix_weight_down.weight"),
+                    config.hc_lowrank,
+                    width,
+                )?,
+                up: uploader.mat(
+                    source,
+                    &format!("{prefix}.input_mix_weight_up.weight"),
+                    width,
+                    config.hc_lowrank,
+                )?,
+            }),
             inject: if inject {
                 Some(uploader.mat(
                     source,
@@ -1359,6 +1571,15 @@ pub(crate) fn build_shard(
             },
         })
     };
+    // A plain residual's block is its pre-norm alone ([GpuHyper::mix]); the checkpoint reader
+    // names the same tensors (crate::checkpoint).
+    let plain = |name: String| -> Result<GpuHyper, String> {
+        Ok(GpuHyper {
+            norm: uploader.vector(source, &name, width)?,
+            mix: None,
+            inject: None,
+        })
+    };
     let embed = uploader.mat(
         source,
         "model.language_model.embed_tokens.weight",
@@ -1366,10 +1587,14 @@ pub(crate) fn build_shard(
         hidden,
     )?;
     let lm_head = uploader.mat(source, "lm_head.weight", config.vocab_size, hidden)?;
-    let mixer = hyper(
-        "model.language_model.hyper_connection_mixer".to_owned(),
-        false,
-    )?;
+    let mixer = if config.plain_residual() {
+        plain("model.language_model.norm.weight".to_owned())?
+    } else {
+        hyper(
+            "model.language_model.hyper_connection_mixer".to_owned(),
+            false,
+        )?
+    };
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     // The shared walk is the one selection: the attention and FFN a layer runs come from the
     // typed architecture, not from a second reading of `layer_types`.
@@ -1387,17 +1612,19 @@ pub(crate) fn build_shard(
             SharedPart::GdnScan => {
                 let prefix = format!("{prefix}.linear_attn");
                 GpuBranch::Linear {
-                    in_qkv: uploader.mat_rows(
+                    in_qkv: uploader.dense_rows(
                         source,
-                        &format!("{prefix}.in_proj_qkv.weight"),
+                        &format!("{prefix}.in_proj_qkv"),
                         (config.linear_conv_width(), hidden),
                         &qkv_rows,
+                        dense,
                     )?,
-                    in_z: uploader.mat_part(
+                    in_z: uploader.dense_part(
                         source,
-                        &format!("{prefix}.in_proj_z.weight"),
+                        &format!("{prefix}.in_proj_z"),
                         (config.linear_value_width(), hidden),
                         rows(value_heads, value_dim),
+                        dense,
                     )?,
                     in_b: uploader.mat_part(
                         source,
@@ -1411,11 +1638,12 @@ pub(crate) fn build_shard(
                         (config.linear_num_value_heads, hidden),
                         rows(value_heads, 1),
                     )?,
-                    out_proj: uploader.mat_part(
+                    out_proj: uploader.dense_part(
                         source,
-                        &format!("{prefix}.out_proj.weight"),
+                        &format!("{prefix}.out_proj"),
                         (hidden, config.linear_value_width()),
                         columns(value_heads, value_dim),
+                        dense,
                     )?,
                     // A channel's taps are a row of the depthwise filter.
                     conv: uploader.vector_rows(
@@ -1447,29 +1675,33 @@ pub(crate) fn build_shard(
                 let prefix = format!("{prefix}.self_attn");
                 // A query head's rows are its query and its gate, interleaved.
                 GpuBranch::Sparse {
-                    q_proj: uploader.mat_part(
+                    q_proj: uploader.dense_part(
                         source,
-                        &format!("{prefix}.q_proj.weight"),
+                        &format!("{prefix}.q_proj"),
                         (config.q_proj_width(), hidden),
                         rows(heads, 2 * config.head_dim),
+                        dense,
                     )?,
-                    k_proj: uploader.mat_part(
+                    k_proj: uploader.dense_part(
                         source,
-                        &format!("{prefix}.k_proj.weight"),
+                        &format!("{prefix}.k_proj"),
                         (config.kv_proj_width(), hidden),
                         rows(kv_heads, config.head_dim),
+                        dense,
                     )?,
-                    v_proj: uploader.mat_part(
+                    v_proj: uploader.dense_part(
                         source,
-                        &format!("{prefix}.v_proj.weight"),
+                        &format!("{prefix}.v_proj"),
                         (config.kv_proj_width(), hidden),
                         rows(kv_heads, config.head_dim),
+                        dense,
                     )?,
-                    o_proj: uploader.mat_part(
+                    o_proj: uploader.dense_part(
                         source,
-                        &format!("{prefix}.o_proj.weight"),
+                        &format!("{prefix}.o_proj"),
                         (hidden, config.attn_out_width()),
                         columns(heads, config.head_dim),
+                        dense,
                     )?,
                     q_norm: uploader.vector(
                         source,
@@ -1481,23 +1713,41 @@ pub(crate) fn build_shard(
                         &format!("{prefix}.k_norm.weight"),
                         config.head_dim,
                     )?,
-                    index_qk: uploader.mat(
-                        source,
-                        &format!("{prefix}.indexer.index_qk_proj.weight"),
-                        (config.indexer_n_heads + config.indexer_kv_heads)
-                            * config.indexer_head_dim,
-                        hidden,
-                    )?,
-                    index_q_norm: uploader.vector(
-                        source,
-                        &format!("{prefix}.indexer.q_layernorm.weight"),
-                        config.indexer_head_dim,
-                    )?,
-                    index_k_norm: uploader.vector(
-                        source,
-                        &format!("{prefix}.indexer.k_layernorm.weight"),
-                        config.indexer_head_dim,
-                    )?,
+                    // Full attention stores no indexer: an empty projection, which dense4
+                    // skips, and no norms, which only the QSA selection reads.
+                    index_qk: if config.full_attention() {
+                        GpuMat {
+                            pointer: Deviceptr(0),
+                            rows: 0,
+                            columns: hidden,
+                        }
+                    } else {
+                        uploader.mat(
+                            source,
+                            &format!("{prefix}.indexer.index_qk_proj.weight"),
+                            (config.indexer_n_heads + config.indexer_kv_heads)
+                                * config.indexer_head_dim,
+                            hidden,
+                        )?
+                    },
+                    index_q_norm: if config.full_attention() {
+                        Deviceptr(0)
+                    } else {
+                        uploader.vector(
+                            source,
+                            &format!("{prefix}.indexer.q_layernorm.weight"),
+                            config.indexer_head_dim,
+                        )?
+                    },
+                    index_k_norm: if config.full_attention() {
+                        Deviceptr(0)
+                    } else {
+                        uploader.vector(
+                            source,
+                            &format!("{prefix}.indexer.k_layernorm.weight"),
+                            config.indexer_head_dim,
+                        )?
+                    },
                 }
             }
             other => {
@@ -1612,6 +1862,10 @@ pub(crate) fn build_shard(
                 }
                 (pointers, None)
             }
+            // [identity_for] refuses these before the upload starts.
+            ExpertQuant::Bf16 => {
+                return Err("BF16 routed experts have no device kernel yet".to_owned());
+            }
         };
         let moe = GpuMoe {
             router: uploader.mat(
@@ -1620,23 +1874,26 @@ pub(crate) fn build_shard(
                 config.num_experts,
                 hidden,
             )?,
-            shared: uploader.mat_part(
+            shared: uploader.dense_part(
                 source,
-                &format!("{mlp}.shared_expert.gate_proj.weight"),
+                &format!("{mlp}.shared_expert.gate_proj"),
                 (config.shared_expert_intermediate_size, hidden),
                 rows(shared, 1),
+                dense,
             )?,
-            shared_up: uploader.mat_part(
+            shared_up: uploader.dense_part(
                 source,
-                &format!("{mlp}.shared_expert.up_proj.weight"),
+                &format!("{mlp}.shared_expert.up_proj"),
                 (config.shared_expert_intermediate_size, hidden),
                 rows(shared, 1),
+                dense,
             )?,
-            shared_down: uploader.mat_part(
+            shared_down: uploader.dense_part(
                 source,
-                &format!("{mlp}.shared_expert.down_proj.weight"),
+                &format!("{mlp}.shared_expert.down_proj"),
                 (hidden, config.shared_expert_intermediate_size),
                 columns(shared, 1),
+                dense,
             )?,
             shared_gate: uploader.mat(
                 source,
@@ -1697,43 +1954,51 @@ pub(crate) fn build_shard(
         };
         layers.push(GpuLayer {
             branch,
-            attn_hyper: hyper(format!("{prefix}.attn_hyper_connection"), true)?,
-            mlp_hyper: hyper(format!("{prefix}.mlp_hyper_connection"), true)?,
+            attn_hyper: if config.plain_residual() {
+                plain(format!("{prefix}.input_layernorm.weight"))?
+            } else {
+                hyper(format!("{prefix}.attn_hyper_connection"), true)?
+            },
+            mlp_hyper: if config.plain_residual() {
+                plain(format!("{prefix}.post_attention_layernorm.weight"))?
+            } else {
+                hyper(format!("{prefix}.mlp_hyper_connection"), true)?
+            },
             moe,
             ple,
         });
     }
     // No rank holds a share of the MTP layer ([tp::rank_config]); a sharded rank drafts with the
     // DFlash 2 head or not at all.
-    let mtp = if config.mtp_num_hidden_layers > 0 && shard.world == 1 {
+    let mtp = if config.serves_mtp() && shard.world == 1 {
         let prefix = "mtp";
         let layer = format!("{prefix}.layers.0");
         let attn_prefix = format!("{layer}.self_attn");
         let attn = GpuBranch::Sparse {
-            q_proj: uploader.mat(
+            q_proj: Dense::Bf16(uploader.mat(
                 source,
                 &format!("{attn_prefix}.q_proj.weight"),
                 config.q_proj_width(),
                 hidden,
-            )?,
-            k_proj: uploader.mat(
+            )?),
+            k_proj: Dense::Bf16(uploader.mat(
                 source,
                 &format!("{attn_prefix}.k_proj.weight"),
                 config.kv_proj_width(),
                 hidden,
-            )?,
-            v_proj: uploader.mat(
+            )?),
+            v_proj: Dense::Bf16(uploader.mat(
                 source,
                 &format!("{attn_prefix}.v_proj.weight"),
                 config.kv_proj_width(),
                 hidden,
-            )?,
-            o_proj: uploader.mat(
+            )?),
+            o_proj: Dense::Bf16(uploader.mat(
                 source,
                 &format!("{attn_prefix}.o_proj.weight"),
                 hidden,
                 config.attn_out_width(),
-            )?,
+            )?),
             q_norm: uploader.vector(
                 source,
                 &format!("{attn_prefix}.q_norm.weight"),
@@ -1821,24 +2086,24 @@ pub(crate) fn build_shard(
                     config.num_experts,
                     hidden,
                 )?,
-                shared: uploader.mat(
+                shared: Dense::Bf16(uploader.mat(
                     source,
                     &format!("{mlp}.shared_expert.gate_proj.weight"),
                     config.shared_expert_intermediate_size,
                     hidden,
-                )?,
-                shared_up: uploader.mat(
+                )?),
+                shared_up: Dense::Bf16(uploader.mat(
                     source,
                     &format!("{mlp}.shared_expert.up_proj.weight"),
                     config.shared_expert_intermediate_size,
                     hidden,
-                )?,
-                shared_down: uploader.mat(
+                )?),
+                shared_down: Dense::Bf16(uploader.mat(
                     source,
                     &format!("{mlp}.shared_expert.down_proj.weight"),
                     hidden,
                     config.shared_expert_intermediate_size,
-                )?,
+                )?),
                 shared_gate: uploader.mat(
                     source,
                     &format!("{mlp}.shared_expert_gate.weight"),
@@ -2202,12 +2467,18 @@ impl Qwen4ExpDeviceBackend {
         };
         let mut config = open_config(&directory)?;
         if let Some(plan) = plan {
-            if plan.family() != "qwen4_exp" {
+            // The arm serves every family in SERVED_FAMILIES and the typed config has already
+            // refused the rest, so the plan must name the checkpoint's own family. A text-only
+            // release spells it `<family>_text`; fold that alias on both sides.
+            if !sparkflash_model::canonical_model_type(plan.family()).eq_ignore_ascii_case(
+                sparkflash_model::canonical_model_type(&config.architecture.family),
+            ) {
                 return Err(BackendError::new(
                     "qwen4_plan",
                     format!(
-                        "the execution plan is {}, the Qwen arm is qwen4_exp",
-                        plan.family()
+                        "the execution plan is {}, the Qwen configuration is {}",
+                        plan.family(),
+                        config.architecture.family
                     ),
                 ));
             }
@@ -2277,6 +2548,19 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
+        // Before anything uploads: a family or format with no registered release or no kernel.
+        identity_for(&config).map_err(|error| BackendError::new("qwen4_device", error))?;
+        // q4e_attn_full holds a head's accumulator a thread of its 256.
+        if config.full_attention() && config.head_dim > FULL_ATTENTION_TILE {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "head_dim {} exceeds the full attention kernel's {FULL_ATTENTION_TILE} \
+                     threads",
+                    config.head_dim
+                ),
+            ));
+        }
         if config.indexer_head_dim > MAX_INDEXER_HEAD_DIM
             || config.indexer_n_heads > MAX_INDEXER_HEADS
         {
@@ -2311,8 +2595,11 @@ impl Qwen4ExpDeviceBackend {
         // deliberately not served by this text-only arm. Their presence is not a mismatch; a name
         // neither plan knows still is. Compared as sets, because the plan is in plan order and the
         // index is in whatever order the weight map sorts to.
-        let served = crate::tensor::Qwen4ExpTensorPlan::served(&config);
-        let full = crate::tensor::Qwen4ExpTensorPlan::checkpoint(&config);
+        let plan_error = |error: crate::config::ConfigError| {
+            BackendError::new("qwen4_weights", format!("the tensor plan: {error}"))
+        };
+        let served = crate::tensor::Qwen4ExpTensorPlan::served(&config).map_err(plan_error)?;
+        let full = crate::tensor::Qwen4ExpTensorPlan::checkpoint(&config).map_err(plan_error)?;
         served
             .conformance_with_unserved(source.names(), &full)
             .map_err(|detail| {
@@ -2327,13 +2614,20 @@ impl Qwen4ExpDeviceBackend {
         // form counted those 282 bytes as uploaded and refused the released checkpoint by exactly
         // that much. Checked before the upload, because a plan that overshoots should cost nothing.
         let resident = served.storage_bytes() - served.role_bytes(Role::PleTable);
-        // The resident total is a property of the stored expert format: the same text model with
-        // FP8 experts is 121.7 GiB where the NVFP4 one is 72.5 GiB.
-        let total = match config.expert_quant {
-            ExpertQuant::Nvfp4 => DEVICE_RESIDENT_BYTES,
-            ExpertQuant::Fp8Block => crate::tensor::FP8_DEVICE_RESIDENT_BYTES,
+        // The Qwen3.8 resident total is a property of the stored expert format: the same text
+        // model with FP8 experts is 121.7 GiB where the NVFP4 one is 72.5 GiB. The Qwen3.5/3.6
+        // family is many sizes, each release's plan pinned by the shared tensor-plan tests, so its
+        // bound is the device's memory alone.
+        let total = match (config.family(), config.expert_quant) {
+            (crate::config::HYPER_FAMILY, ExpertQuant::Nvfp4) => Some(DEVICE_RESIDENT_BYTES),
+            (crate::config::HYPER_FAMILY, ExpertQuant::Fp8Block) => {
+                Some(crate::tensor::FP8_DEVICE_RESIDENT_BYTES)
+            }
+            _ => None,
         };
-        if resident > total {
+        if let Some(total) = total
+            && resident > total
+        {
             return Err(BackendError::new(
                 "qwen4_device",
                 format!("the plan uploads {resident} bytes over the resident total {total}"),
@@ -2390,7 +2684,7 @@ impl Qwen4ExpDeviceBackend {
         let dflash = dflash::load_dflash_from_env(&cuda, &config, &weights.lm_head)?;
         // One line, because a run that silently drafts nothing is indistinguishable from one whose
         // drafter failed to resolve: the flag and the cache are the two knobs that decide it.
-        match (&dflash, crate::dflash::drafter_directory()) {
+        match (&dflash, crate::dflash::drafter_directory(&config)) {
             (Some(draft), directory) => eprintln!(
                 "qwen4: draft head {} (block {}) from {}",
                 crate::dflash::DFLASH2_MODEL_ID,
@@ -2398,13 +2692,31 @@ impl Qwen4ExpDeviceBackend {
                 directory.map_or_else(|| "?".to_owned(), |path| path.display().to_string())
             ),
             (None, directory) => eprintln!(
-                "qwen4: no draft head (SPARKFLASH_QWEN4_DFLASH2 is unset and the cache has no {} snapshot); directory {}",
+                "qwen4: no draft head (SPARKFLASH_QWEN4_DFLASH2 is unset and the cache has no {} snapshot for a {} target); directory {}",
                 crate::dflash::DFLASH2_MODEL_ID,
+                config.family(),
                 directory.map_or_else(
                     || "unresolved".to_owned(),
                     |path| path.display().to_string()
                 )
             ),
+        }
+        // A profile that asks for speculation with no drafter to give it is refused rather than
+        // run without one: the Qwen3.5/3.6 MTP stage is planned, not served ([serves_mtp]).
+        //
+        // [serves_mtp]: Qwen4ExpConfig::serves_mtp
+        if !config.serves_mtp()
+            && dflash.is_none()
+            && sparkflash_model::active_profile().speculation.enabled == Some(true)
+        {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "speculation is enabled, and this {} checkpoint has no MTP stage the device \
+                     serves and no draft head; disable speculation in the profile",
+                    config.family()
+                ),
+            ));
         }
         let verify_rows = dflash.as_ref().map_or(MTP_VERIFY_ROWS, |draft| {
             draft.config.block_size.max(MTP_VERIFY_ROWS)
@@ -2438,7 +2750,8 @@ impl Qwen4ExpDeviceBackend {
         });
         let _ = DeviceSequence::allocate(Arc::clone(&shared), context_limit)?;
         Ok(Self {
-            descriptor: descriptor_for(&config, context_limit),
+            descriptor: descriptor_for(&config, context_limit)
+                .map_err(|error| BackendError::new("qwen4_device", error))?,
             shared,
             context_limit,
             fused: None,
@@ -2608,14 +2921,46 @@ pub fn capabilities(_config: &Qwen4ExpConfig) -> Capabilities {
     Capabilities::ALL
 }
 
+/// The official Qwen3.6-35B-A3B FP8 checkpoint's identity: the registry's one Qwen3.5-MoE
+/// release ([sparkflash_model::descriptor::ModelDescriptor::qwen36_flash_35b_a3b_fp8]).
+pub const QWEN36_FP8_IDENTITY: PackIdentity = PackIdentity {
+    model_id: sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID,
+    family: "qwen3.6",
+    model_type: "qwen3_5_moe",
+    label: "Qwen",
+    weights_id: sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
+    max_output_tokens: sparkflash_model::descriptor::QWEN36_MAX_OUTPUT_TOKENS,
+};
+
+/// The registered release `config` is, from its family and stored formats, as the registry
+/// resolves a `model_type`. A family and format with no registered release is refused rather
+/// than reported under another release's id. Which Qwen3.5/3.6 checkpoints the device serves is
+/// the shared [sparkflash_ops::parts::dynamic_device_arm] rule the CLI route and the web browser
+/// also apply: the FP8 release, not the BF16 one's fused experts (the host reference serves it).
+///
+/// # Errors
+/// A family, expert format or dense format this arm has no release or kernel for.
+pub fn identity_for(config: &Qwen4ExpConfig) -> Result<PackIdentity, String> {
+    if config.family() != crate::config::HYPER_FAMILY {
+        sparkflash_ops::parts::dynamic_device_arm(&config.architecture)?;
+        return Ok(QWEN36_FP8_IDENTITY);
+    }
+    match (config.expert_quant, config.dense_quant) {
+        (ExpertQuant::Nvfp4, DenseQuant::Bf16) => Ok(IDENTITY),
+        (ExpertQuant::Fp8Block, DenseQuant::Bf16) => Ok(FP8_IDENTITY),
+        (experts, dense) => Err(format!(
+            "no registered {} release stores {experts:?} experts with {dense:?} dense projections",
+            config.family()
+        )),
+    }
+}
+
 /// What the device arm serves over a window of `context` tokens.
-#[must_use]
-pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> ModelDescriptor {
-    let identity = match config.expert_quant {
-        ExpertQuant::Nvfp4 => IDENTITY,
-        ExpertQuant::Fp8Block => FP8_IDENTITY,
-    };
-    identity.descriptor(&config.architecture, context, capabilities(config))
+///
+/// # Errors
+/// A configuration [identity_for] refuses.
+pub fn descriptor_for(config: &Qwen4ExpConfig, context: usize) -> Result<ModelDescriptor, String> {
+    Ok(identity_for(config)?.descriptor(&config.architecture, context, capabilities(config)))
 }
 
 /// A per-session device workspace and cache set.
@@ -3405,6 +3750,72 @@ impl DeviceSequence {
         )
     }
 
+    /// output = matrix input over `batch` rows for a dense projection in either storage.
+    ///
+    /// A BF16 matrix is [Self::gemv]. An FP8 one takes the shared 128 x 128 tensor-core tile
+    /// over a chunk of GEMM_MIN_BATCH rows or more ([Self::dense_fp8_mma]) and the block-scaled
+    /// tiled GEMV a group of GEMV_MAX_BATCH rows below it. The GEMV gives every row the chain a
+    /// one-row step gives it, so a decode step and a verify agree bit for bit; a chunk's rows are
+    /// within the D67 tolerance of them, as the FP8 routed experts' are.
+    pub(super) fn dense(
+        &self,
+        matrix: &Dense,
+        input: Deviceptr,
+        output: Deviceptr,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        let matrix = match matrix {
+            Dense::Bf16(matrix) => return self.gemv(matrix, input, output, batch),
+            Dense::Fp8(matrix) => matrix,
+        };
+        if batch >= GEMM_MIN_BATCH && self.dense_fp8_mma(matrix, input, output, batch)? {
+            return Ok(());
+        }
+        let mut base = 0usize;
+        while base < batch {
+            let count = GEMV_MAX_BATCH.min(batch - base);
+            gemv_e4m3_tile(
+                self,
+                self.backend.kernels.gemv_tiled_e4m3_tile,
+                matrix,
+                input.offset(base * matrix.columns * 4),
+                output.offset(base * matrix.rows * 4),
+                count,
+            )?;
+            base += count;
+        }
+        Ok(())
+    }
+
+    /// Four projections of one input: [Self::gemv4] when all four are BF16 and none is empty,
+    /// otherwise each through [Self::dense], an empty one (a full-attention layer's absent
+    /// indexer) skipped.
+    pub(super) fn dense4(
+        &self,
+        matrices: [Dense; 4],
+        input: Deviceptr,
+        outputs: [Deviceptr; 4],
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        if let [
+            Dense::Bf16(m0),
+            Dense::Bf16(m1),
+            Dense::Bf16(m2),
+            Dense::Bf16(m3),
+        ] = &matrices
+            && matrices.iter().all(|matrix| matrix.rows() > 0)
+        {
+            let [y0, y1, y2, y3] = outputs;
+            return self.gemv4(m0, m1, m2, m3, input, y0, y1, y2, y3, batch);
+        }
+        for (matrix, output) in matrices.iter().zip(outputs) {
+            if matrix.rows() > 0 {
+                self.dense(matrix, input, output, batch)?;
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn gemv4(
         &self,
@@ -3517,6 +3928,25 @@ impl DeviceSequence {
     ) -> Result<(Deviceptr, Option<Deviceptr>), BackendError> {
         let config = &self.backend.config;
         let width = config.hyper_width();
+        let Some(mix) = &block.mix else {
+            // A plain residual (Qwen3.5/3.6): the branch reads the stream's zero-centred pre-norm,
+            // and its output goes back with the injection's weight of one, the rows
+            // [fill_plain_injection] left.
+            let mixed = self.mixed.offset(first * config.hidden_size * 4);
+            self.norm(
+                input.offset(first * width * 4),
+                block.norm,
+                mixed,
+                width,
+                config.hidden_size,
+                true,
+                false,
+                batch,
+            )?;
+            self.prof_mark("hyper_norm")?;
+            let injection = self.injection.offset(first * config.hc_count * 4);
+            return Ok((mixed, inject.then_some(injection)));
+        };
         const WARPS: usize = 8;
         let (inject_ptr, down_rows) = if inject {
             let weights = block
@@ -3553,7 +3983,7 @@ impl DeviceSequence {
             // The injection reads the same normed rows as the down projection: a few rows take it
             // beside that launch ([Self::gemm_group]).
             let mut projections = vec![Projection {
-                matrix: &block.down,
+                matrix: &mix.down,
                 output: low,
                 epilogue: 1,
                 scale: hc,
@@ -3571,7 +4001,14 @@ impl DeviceSequence {
             }
             self.gemm_group(&projections, normed, batch)?;
             self.prof_mark("hyper_low")?;
-            self.gemm(&block.up, low, raw, batch, 0, 1.0)?;
+            // A few rows take the up projection and the mix as one launch, to the same bits.
+            if self.hyper_up_rows(&mix.up, low, normed, mixed, batch)? {
+                self.prof_mark("hyper_raw")?;
+                self.prof_mark("hyper_down")?;
+                self.prof_mark("hyper_up")?;
+                return Ok((mixed, inject.then_some(injection)));
+            }
+            self.gemm(&mix.up, low, raw, batch, 0, 1.0)?;
             self.prof_mark("hyper_raw")?;
             self.launch(
                 self.backend.kernels.hyper_mix,
@@ -3605,8 +4042,8 @@ impl DeviceSequence {
         // The tiled passes take four streams, a warp's four rows; the shape alone decides, so a
         // verify's rows and the one-token step always go the same way.
         let tiled = config.hc_count == 4
-            && tiled_operands(&[block.down.pointer, block.up.pointer], width)
-            && tiled_operands(&[block.up.pointer], config.hc_lowrank)
+            && tiled_operands(&[mix.down.pointer, mix.up.pointer], width)
+            && tiled_operands(&[mix.up.pointer], config.hc_lowrank)
             && block
                 .inject
                 .as_ref()
@@ -3636,7 +4073,7 @@ impl DeviceSequence {
                     (256, 1, 1),
                     &[
                         normed.0,
-                        block.down.pointer.0,
+                        mix.down.pointer.0,
                         inject_ptr,
                         low.0,
                         injection.0,
@@ -3654,7 +4091,7 @@ impl DeviceSequence {
                     (256, 1, 1),
                     &[
                         normed.0,
-                        block.up.pointer.0,
+                        mix.up.pointer.0,
                         low.0,
                         mixed.0,
                         config.hc_count as u64,
@@ -3672,7 +4109,7 @@ impl DeviceSequence {
                 ((WARPS * 32) as u32, 1, 1),
                 &[
                     normed.0,
-                    block.down.pointer.0,
+                    mix.down.pointer.0,
                     inject_ptr,
                     low.0,
                     injection.0,
@@ -3688,7 +4125,7 @@ impl DeviceSequence {
                 ((WARPS * 32) as u32, 1, 1),
                 &[
                     normed.0,
-                    block.up.pointer.0,
+                    mix.up.pointer.0,
                     low.0,
                     mixed.0,
                     config.hc_count as u64,
@@ -4530,6 +4967,13 @@ impl DeviceSequence {
         // feeds, are kept.
         let rows = shared.prefill.chunk;
         let attention_rows = rows.min(ATTENTION_CHUNK);
+        // A row's indexer block scores; with no indexer, q4e_attn_full's split partials. The
+        // batch's combined rows take the same stride ([BatchBuffers::new]).
+        let score_stride = if config.full_attention() {
+            config.num_attention_heads * FULL_ATTENTION_SPLITS * (config.head_dim + 2)
+        } else {
+            context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1
+        };
         let zero_gpu = |pointer: Deviceptr, elements: usize| -> Result<(), BackendError> {
             let blocks = elements.div_ceil(256).max(1) as u32;
             cuda.launch_on(
@@ -4580,15 +5024,18 @@ impl DeviceSequence {
         } else {
             let mut total = 0usize;
             let f32_bytes = |elements: usize| elements * 4;
+            // A buffer a configuration does not use (a full-attention model's indexer keys, a
+            // plain residual's mixer rows) is zero elements; it gets the 4-byte placeholder the
+            // weight sink gives an empty tensor, since the driver refuses a zero-byte request.
             macro_rules! alloc {
                 ($elements:expr) => {
-                    cuda.alloc(f32_bytes($elements), &mut total)
+                    cuda.alloc(f32_bytes($elements).max(4), &mut total)
                         .map_err(|error| BackendError::new("qwen4_device", error))
                 };
             }
             macro_rules! alloc_bf16 {
                 ($elements:expr) => {
-                    cuda.alloc(($elements) * 2, &mut total)
+                    cuda.alloc((($elements) * 2).max(4), &mut total)
                         .map_err(|error| BackendError::new("qwen4_device", error))
                 };
             }
@@ -4604,8 +5051,9 @@ impl DeviceSequence {
                     LayerKind::Sparse => {
                         keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
                         values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                        index_keys
-                            .push(Some(alloc_bf16!(context_limit * config.indexer_head_dim)?));
+                        index_keys.push(Some(alloc_bf16!(
+                            (context_limit * config.indexer_head_dim).max(1)
+                        )?));
                         gdn_conv.push(None);
                         gdn_recurrent.push(None);
                         gdn_spare.push(None);
@@ -4637,7 +5085,7 @@ impl DeviceSequence {
                     ple_conv.push(None);
                 }
             }
-            if config.mtp_num_hidden_layers > 0 {
+            if config.serves_mtp() {
                 // The drafted layer has its own attention, so its keys, values and indexer keys
                 // are one more entry in the same lists the per-layer caches live in.
                 keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
@@ -4662,16 +5110,15 @@ impl DeviceSequence {
                 alloc!(rows * config.kv_proj_width())?,
                 alloc!(rows * config.kv_proj_width())?,
                 alloc!(
-                    rows * (config.indexer_n_heads + config.indexer_kv_heads)
-                        * config.indexer_head_dim
+                    (rows
+                        * (config.indexer_n_heads + config.indexer_kv_heads)
+                        * config.indexer_head_dim)
+                        .max(1)
                 )?,
-                alloc!(rows * config.indexer_n_heads * config.indexer_head_dim)?,
+                alloc!((rows * config.indexer_n_heads * config.indexer_head_dim).max(1))?,
                 alloc!(attention_rows * MAX_SELECTED_TOKENS)?,
                 alloc!(attention_rows)?,
-                alloc!(
-                    attention_rows
-                        * (context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1)
-                )?,
+                alloc!(attention_rows * score_stride)?,
                 alloc!(rows * config.linear_conv_width())?,
                 alloc!(rows * config.linear_conv_width())?,
                 alloc!(rows * config.linear_value_width())?,
@@ -4708,8 +5155,9 @@ impl DeviceSequence {
                 alloc!(TILED_GEMV_BLOCKS)?,
                 alloc!(linear_layers.max(1) * replay_stride)?,
                 alloc!(
-                    (context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1)
-                        * config.indexer_head_dim
+                    ((context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1)
+                        * config.indexer_head_dim)
+                        .max(1)
                 )?,
             ];
             let ple_host_staging = cuda
@@ -4761,6 +5209,8 @@ impl DeviceSequence {
         }
         let s = buffers.scratch;
         zero_gpu(s[49], TILED_GEMV_BLOCKS)?;
+        fill_plain_injection(cuda, &config, s[INJECTION_SLOT], rows)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
         zero_gpu(split_tickets(s[42]), GEMM_SPLIT_TICKETS)?;
         let mut linear_at = 0usize;
         let gdn_replay = buffers
@@ -4773,7 +5223,6 @@ impl DeviceSequence {
                 })
             })
             .collect();
-        let score_stride = context_limit.div_ceil(config.indexer_compress_ratio.max(1)) + 1;
         Ok(Self {
             backend: Arc::clone(&shared),
             stream,
@@ -4872,7 +5321,7 @@ impl DeviceSequence {
                     DepthPolicy::from_profile(draft.config.block_size - 1, DFLASH2_STEP_COST)
                 }),
             ),
-            spec_enabled: (config.mtp_num_hidden_layers > 0 || shared.dflash.is_some())
+            spec_enabled: (config.serves_mtp() || shared.dflash.is_some())
                 && sparkflash_model::active_profile()
                     .speculation
                     .enabled

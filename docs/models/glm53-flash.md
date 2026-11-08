@@ -197,6 +197,15 @@ above. MTP speculation, one request at a time, same texts as without it:
 A sampled request and a logprobs request decode a token a step, with the same text as without
 drafting. The drafting window's MTP caches leave the prompt's first-token time as it was.
 
+A CUDA-only trace of today's decode step (2026-11-08, about 50 ms untraced) puts it at the DRAM
+floor: about 80 % of the step streams weights (the routed experts 24 ms, the KDA projections,
+BF16 in the checkpoint, 11.6 ms) and the collectives take 4.6 ms. The tiled GEMVs read at
+223-241 GB/s against the 242 GB/s a plain streaming read measures on a Spark; a double-buffered
+and a direct-activation variant of `q4e_tiled_gemv`, both bit-identical, were 2-8 % slower. A
+faster step reads fewer bytes (fewer selected expert pairs, above), not the same bytes faster.
+Trace with `--trace cuda` alone: the OS-runtime trace adds enough memory pressure on rank 0 to
+stretch its launches, a slow tail that is the tracer's.
+
 ### Bulk prefill
 
 A prompt of [MIN_PREFILL_ROWS](#the-released-model-at-tp4) (16) rows or more runs in chunks through
@@ -208,11 +217,23 @@ by default the bulk GEMMs take it the same way: each chunk row is quantised once
 (`glm_quantise_rows`) and an `m16n8k32` E4M3 x E4M3 MMA runs against the block-scaled weight, both
 scales folded into a per-block partial sum after every 128 K columns. A BF16 weight (the KDA
 projections) takes its f32 activation as a bf16 head and remainder, two `m16n8k16` chains a
-stage. The output tile is 128x128; the dense GEMMs visit their tiles in groups of eight output
+stage. The FP8 output tile is 128x128; the dense GEMMs visit their tiles in groups of eight output
 columns, so the blocks running at once share their weight tiles in L2 (a 6,144 x 4,096 x 4,096
 FP8 GEMM went from 8.49 to 2.15 ms, 96 TFLOP/s). A tile lands in shared memory row-major with a
 swizzle, so a weight row's 64 bytes stay together: split over two 32-column halves, as the first
 version stored them, the expert stream held at about 126 GB/s against 205 GB/s for a plain copy.
+
+The BF16 GEMMs are bound by moving the f32 activation tile into the SMs, not by the MMAs:
+dropping the remainder chain, half the MMAs, still leaves three quarters of the time. So they run
+over a 128 x 256 tile (`glm_prefill_bf16_wide`, three cp.async stages in 96 KB of shared memory)
+that reads each activation tile once for twice the output columns. Each output's chain is the
+128-column kernel's: head, then remainder, for every 16 K in ascending order into one f32
+accumulator. The bits are therefore the same, and a GPU test (`tests/glm_prefill.rs`) compares
+the two kernels over ragged shapes with both activation splits. On an 8.2k prompt, the KDA qkv
+GEMM went from 5.98 to 4.57 ms a call, o_proj from 2.10 to 1.67, and the BF16 GEMMs together from
+688 to 532 ms. Alternating builds gave 1,514-1,555 against 1,412-1,505 tok/s at 17.9k (6.6k:
+1,371-1,452 against 1,349-1,438). The registered check and the long-suite logprob capture match
+the 128-column build's.
 
 The routed experts are grouped by expert into items of up to 128 sorted slots: each item gathers
 its rows, runs the same MMA body over the expert's gate/up slice once, SwiGLUs, runs the down
@@ -224,7 +245,8 @@ chunk in one launch each, with the Qwen3.8 arm's prefill kernels (`q4p_gdn_conv`
 instead of a row at a time (the scan splits each head's value columns over blocks until the heads
 fill the 48 SMs, `gdn_scan_shape`; a column's recurrence is the same in any split, so the bits
 are too); the mHC's narrow projections (24 or fewer outputs) have a kernel of
-their own that reads the chunk's rows once. A chunk's sublayer partials are summed with the
+their own that reads the chunk's rows once and stages each round's weights in shared memory once
+a block. A chunk's sublayer partials are summed with the
 two-shot all-reduce past 16 rows ([TP=4](#the-released-model-at-tp4)), half the bytes a rank
 of the one-shot exchange.
 
@@ -262,6 +284,73 @@ mostly that, since the split attention is the decode path's:
 | row-major weight tiles | 851 | 910 | 824 | 762 |
 | KDA recurrence over the chunk | 893 | 974 | 888 | 797 |
 | **KDA convolution over the chunk, split decode attention ([Context](#context)): the default** | **1,013** | **1,114** | **1,040** | **915** |
+
+Three launches a layer then sat on the chunk's critical path well under the DRAM rate, and each
+now computes the same bits faster (2026-11-08):
+
+- the mHC projection (24 outputs over 16,384 columns) loaded each 256-column round of its weights
+  once a warp through L1, moving eight times the activations' bytes from L2; a block now stages
+  the round in shared memory once (3.16 to 1.12 ms for a 4,096-row chunk);
+- `q4e_mhc_in` runs two blocks a token, and with the token on the grid's x every token's first
+  block launched before any second one; with the pair adjacent the second block finds the
+  streams in L2 (2.51 to 1.45 ms);
+- the shared `moe_plan` placed the ranks with one thread a bucket walking every rank (~2.5 ms for
+  a chunk's 32,768 slots); one warp now places 32 ranks at a time in the same stable order.
+
+Alternating the two builds on one prompt set, two rounds each: 1,144-1,158 against 1,048-1,092
+tok/s at 6.6k tokens and 1,067-1,073 against 999-1,019 at 17.9k (5-9 %), every greedy text the
+same and decode unchanged.
+
+The chunk's indexer scores then ran on the decode step's kernel, a row a block and a pool a warp,
+with five shuffles folding every four multiplies: shuffle-bound, it took 20.7 ms for a 2,798-row
+run over 1,723 pools and grew with the prompt. `glm_prefill_index_scores` takes 32 rows and 64
+pools a block. A thread holds four heads of four pools, evaluates each lane chain the decode
+kernel's lane would, and adds the 32 chains in the shuffle fold's order, so every score is the
+decode kernel's float (a test holds the two to each other over every pool, bit for bit). The run
+above takes 3.04 ms, and a 5,600-row run at position 12,288 16.7 ms against 116. Alternating the
+two builds, two rounds each: 1,152-1,219 against 1,128-1,186 tok/s at 6.6k and 1,270-1,285 against
+1,084-1,085 at 17.9k (time to first token 16.5 to 13.9-14.1 s), every greedy text the same, decode
+unchanged and the registered numerics check passing (fingerprint 827ec5f6).
+
+The exact router and indexer projections ran on the tiled GEMV in 512-row groups, five shuffles
+for every eight multiplies: 3.46 ms of a 4,096-row chunk for the router alone. Their shapes are
+ones the tiled GEMV splits one 256-column round a block, and for those `glm_prefill_exact_bf16`
+computes the same floats with a thread holding whole sums: each lane chain evaluated in the
+butterfly's leaf order, folded by the same carry as the index scores, and the rounds' partials
+added in split order (a test holds it to the tiled GEMV, bit for bit). The router takes 1.14-1.37
+ms and a 128-row indexer part 0.64 against 1.51. `wq_b` (two splits of three rounds) stays on the
+tiled GEMV, where this form is slower. Alternating the two builds, two rounds each: 1,295-1,296
+against 1,254-1,256 tok/s at 17.9k (3 %); at 6.6k the arms overlap (1,248-1,337 against
+1,288-1,294). Every greedy text is the same, decode is unchanged and the numerics check passes
+(fingerprint 827ec5f6).
+
+A step embedded its rows one launch a token (14,627 launches and 82 ms of kernel time in a 7.3k
+prompt); it now stages the step's tokens in a mapped slab and embeds them in one launch, as the
+drafting rows' embeds do. The launches were hidden behind the GPU, so the rate does not move
+(1,314-1,355 against 1,313-1,338 tok/s at 17.9k), and every text is the same.
+
+The hyper-connections were replicated work: every rank mixed, updated and folded every row of a
+chunk, about a sixth of its time (`q4e_mhc_post` 2.41 ms, `q4e_mhc_in` 1.59 and the mixer's
+projection 1.30 a sublayer of a 7.7k prompt). A bulk chunk now runs them sequence-parallel, as
+Qwen3.8's TP arm does: the branch partials are reduce-scattered, so each rank sums and mixes
+its own quarter of the rows, and the ranks gather the normed rows each branch reads where the
+two-shot all-reduce gathered the sums, the same bytes. A chunk the world does not divide is
+padded for the collectives. Each kernel computes a row from that row alone, so the bits are
+the replicated path's: the registered check passes, and logprob captures of 5.8k, 9.5k and
+2.4k-token prompts (full chunks and padded remainders) are the same with it on, off and before
+it. The three kernels take 0.58, 0.36 and 0.31 ms, the 7.7k prompt's trace 5.69 s to 4.75, and
+alternating builds, 1,460-1,485 against 1,299-1,349 tok/s at 17.9k (at 6.6k the arms overlap,
+1,307-1,379 against 1,294-1,346). `SPARKFLASH_SEQUENCE_PARALLEL=0` turns it off. A chunk that
+captures rows for the block drafter, which reads every row's streams, stays replicated.
+
+Qwen3.8's overlapped halves were tried here too and not kept. Halving the MoE would read each
+expert's weights twice a chunk, so only the attention ran as two halves, the second on an
+urgent stream while the first half's collectives ran, with the MoE over the whole chunk. The
+bits did not move, but the time did not fall. Alternating builds gave 1,414-1,474 against
+1,444-1,482 tok/s at 17.9k. On the same 8.2k prompt, one binary spans 6.09 s with the overlap
+off and 6.61 s with it on. Half-width projections run less efficiently (the KDA qkv GEMM costs
+1.76x in halves), the two streams contend for the same DRAM, and twice the collectives meet
+twice the occasional stalled collective.
 
 vLLM serving the same checkpoint on the same four Sparks prefills one request at 647 tok/s.
 

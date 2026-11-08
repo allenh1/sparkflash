@@ -21,7 +21,7 @@
 
 use sparkflash_model::architecture::{
     Activation, Attention, AttentionKind, Ffn, Gdn, HyperConnection, Indexer, Layer, Moe, Mtp,
-    PleGeometry, Quantization, Residual, Rope, Score, Side,
+    PleGeometry, Quantization, Residual, Rope, ScaleDType, Score, Side, WeightFormat,
 };
 use sparkflash_model::{Architecture, LayerStep};
 
@@ -47,8 +47,24 @@ pub fn architecture_from_json(text: &str) -> Result<Architecture, ConfigError> {
     // plan are qwen4_exp. Normalize through the one registry helper so the typed profile and
     // the boot plan cannot disagree about the family they execute.
     architecture.family = sparkflash_model::canonical_model_type(&architecture.family).to_owned();
-    architecture.experts_only_fp8();
+    correct_release_formats(&mut architecture);
     Ok(architecture)
+}
+
+/// The arm's correction of the declared formats, by family.
+///
+/// Only the Qwen3.8 FP8 release declares one global `quant_method: "fp8"` while storing its dense
+/// projections BF16, so only that family's dense class is rewritten to BF16. A Qwen3.5/3.6 FP8
+/// release stores the dense projections as the same 128x128 tiles its document declares and keeps
+/// its BF16 modules in `modules_to_not_convert`, so its stored formats are read as declared. Its
+/// `activation_scheme: "dynamic"` is not what the arm computes, though: the arm runs those tiles
+/// weight-only (W8A16), so [Architecture::weight_only_fp8] clears the scheme.
+pub(crate) fn correct_release_formats(architecture: &mut Architecture) {
+    if architecture.family == crate::config::HYPER_FAMILY {
+        architecture.experts_only_fp8();
+    } else {
+        architecture.weight_only_fp8();
+    }
 }
 
 /// The shared architecture of the released Qwen3.8 checkpoint carried in this crate.
@@ -183,7 +199,21 @@ pub(crate) fn tiny_architecture() -> Architecture {
                 sides: Vec::new(),
             },
         ],
-        quantization: Quantization::default(),
+        // The fixture's experts are the NVFP4 release's, declared the way the Qwen schema names
+        // them, so the shared plan of its rendered document carries their scales.
+        quantization: Quantization {
+            expert: Some("NVFP4".to_owned()),
+            expert_format: WeightFormat::NvFp4 { group_size: 16 },
+            // The release's MTP experts are FP8 on 128x128 tiles, declared FP8_PB_WO; the parser
+            // reads that name's scale as F32, and the Qwen plan stores the BF16 the release does.
+            mtp_expert_format: Some(WeightFormat::Fp8Tile {
+                block_m: 128,
+                block_n: 128,
+                scale_dtype: ScaleDType::F32,
+                dynamic_activations: true,
+            }),
+            ..Quantization::default()
+        },
         vision: None,
         mtp: Some(Mtp {
             stages: 1,
@@ -290,6 +320,26 @@ impl Qwen4ExpConfig {
             .filter(|layer| layer.sides.iter().any(|side| matches!(side, Side::Ple(_))))
             .count();
         check("PLE layers", self.ple_layer_ids.len(), ple)?;
+        // The residual width and the indexer are read by both parsers; a typed default that
+        // differs from the shared walk would build the other model's blocks.
+        for layer in &architecture.layers {
+            let streams = match &layer.residual {
+                Residual::Plain => 1,
+                Residual::Hyper(hyper) => hyper.streams,
+            };
+            check("residual streams", self.hc_count, streams)?;
+            if matches!(layer.attention.kind, AttentionKind::Gqa { .. }) {
+                check(
+                    "indexer heads",
+                    self.indexer_n_heads,
+                    layer
+                        .attention
+                        .indexer
+                        .as_ref()
+                        .map_or(0, |indexer| indexer.heads),
+                )?;
+            }
+        }
         check(
             "mtp stages",
             self.mtp_num_hidden_layers,
@@ -362,7 +412,8 @@ mod tests {
         );
         assert!(architecture.parts().contains(sparkflash_model::Part::Ple));
         let descriptor =
-            crate::device::descriptor_for(&config, architecture.max_position_embeddings);
+            crate::device::descriptor_for(&config, architecture.max_position_embeddings)
+                .expect("a registered release");
         assert_eq!(descriptor.vocab_size, architecture.vocab_size);
         assert_eq!(
             descriptor.context_tokens,
