@@ -123,6 +123,18 @@ class PrintPlanTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("--tp4-control-port 31100"), 4, result.stdout)
 
+    def test_cubin_directory_reaches_every_rank(self) -> None:
+        """The boot gate reads SPARKFLASH_CUBINS; --tp4-device alone is not enough over ssh."""
+        result = run_script("print", env=base_env(SPARKFLASH_CUBINS="/opt/cubins"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("--tp4-device /opt/cubins"), 4, result.stdout)
+        self.assertEqual(result.stdout.count("SPARKFLASH_CUBINS=/opt/cubins"), 4, result.stdout)
+
+    def test_cubin_environment_is_absent_when_no_device_directory_is_set(self) -> None:
+        result = run_script("print")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("SPARKFLASH_CUBINS=", result.stdout)
+
     def test_drain_knobs_are_exported_per_rank(self) -> None:
         result = run_script(
             "print",

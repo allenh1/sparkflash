@@ -2659,6 +2659,7 @@ dependencies = [
  "mdns-sd",
  "serde",
  "serde_json",
+ "sha2",
  "sparkflash-model",
  "sparkflash-ops",
  "sparkflash-weights",

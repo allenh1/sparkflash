@@ -12,8 +12,10 @@ and no fast network: step 1 offers **Run on this Spark only**, and the console d
 checkpoint and starts one local server.
 
 It starts from the checkout with one command. There is no separate setup script to run first:
-the process adopts the binary cargo just built, prepares the local GPU kernels and NCCL library
-when they are missing, and copies that same binary to any Spark whose copy differs.
+the process compares its own SHA-256 with `paths.binary` and adopts the binary cargo just built
+when the configured path is missing or names different bytes (a stale debug or release copy).
+It prepares the local GPU kernels and NCCL library when they are missing, and copies that same
+binary to any Spark whose copy differs.
 
 ```bash
 cargo run --bin sparkflash -- --web
@@ -84,8 +86,10 @@ released checkpoint directly and has no collectives. The target model and the op
 drafter are both resolved from their canonical Hugging Face cache snapshots; downloading the
 drafter repository makes it available without another path setting.
 
-After a job that changes a node, and on every **Check again**, the console verifies the binary by
-SHA-256 on every Spark and starts the software copy itself when a copy is missing or older. The
+At startup the console verifies the binary by SHA-256 on every Spark. It reuses that report
+until a software job (`bootstrap-cubins`, `bootstrap-nccl`, `sync-software`) finishes or the
+saved configuration changes, so the hash is a boot cost, not a poll. **Check again** always
+re-runs it. The console starts the software copy itself when a copy is missing or older. The
 **Deploy now** button is only a retry after a failure.
 
 With an existing four-Spark configuration, the same button is offered on step 1 and asks before it

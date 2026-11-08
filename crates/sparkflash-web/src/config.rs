@@ -564,6 +564,25 @@ impl Default for StatsConfig {
     }
 }
 
+/// The identity of the executable running the control plane, and the configured server path.
+///
+/// The web process is the build that just ran `cargo run`; the spawned server must be the same
+/// bytes. `adopted` is true when `paths.binary` was changed to point at `path`; when the
+/// configured file already has the same SHA-256 it is kept, even if its path differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningBinary {
+    /// The path `paths.binary` named before adoption.
+    pub configured: PathBuf,
+    /// That file's SHA-256, or `None` when it did not exist or could not be read.
+    pub configured_sha256: Option<String>,
+    /// The effective server path after adoption.
+    pub path: PathBuf,
+    /// The running executable's SHA-256.
+    pub sha256: String,
+    /// Whether `paths.binary` was replaced.
+    pub adopted: bool,
+}
+
 impl SparkConfig {
     /// Reads and validates a TOML file.
     ///
@@ -1008,26 +1027,48 @@ impl SparkConfig {
         })
     }
 
-    /// Point `paths.binary` at the executable that is running this control plane when the
-    /// configured path does not exist.
+    /// Point `paths.binary` at the executable that is running this control plane whenever the
+    /// configured path is missing or names different bytes.
     ///
     /// This is what makes `cargo run --bin sparkflash -- --web` self-contained: the debug (or
-    /// release) binary cargo just built is the one the Install step copies, instead of a
-    /// `target/release/sparkflash` that was never built. An explicitly built path that exists is
-    /// left alone.
-    pub fn adopt_running_binary(&mut self, executable: &Path) -> bool {
-        if self.binary_path().is_file() || !executable.is_file() {
-            return false;
+    /// release) binary cargo just built is the one the Install step copies, instead of a stale
+    /// `target/release/sparkflash` or a debug path saved by an earlier run. The comparison is by
+    /// SHA-256 rather than path or mtime, so a hard link or a copied binary that matches the
+    /// running process is left where the operator put it.
+    ///
+    /// Returns the running binary's identity, or `None` when the executable cannot be read.
+    pub fn adopt_running_binary(&mut self, executable: &Path) -> Option<RunningBinary> {
+        if !executable.is_file() {
+            return None;
         }
-        self.paths.binary = executable.display().to_string();
-        if let Some(root) = executable
-            .ancestors()
-            .skip(1)
-            .find(|directory| directory.join("Cargo.toml").is_file())
-        {
-            self.paths.repo_root = root.display().to_string();
+        let sha256 = sha256_file(executable).ok()?;
+        let configured = self.binary_path();
+        let configured_sha256 = if configured == executable {
+            Some(sha256.clone())
+        } else {
+            configured
+                .is_file()
+                .then(|| sha256_file(&configured).ok())
+                .flatten()
+        };
+        let adopted = configured_sha256.as_deref() != Some(sha256.as_str());
+        if adopted {
+            self.paths.binary = executable.display().to_string();
+            if let Some(root) = executable
+                .ancestors()
+                .skip(1)
+                .find(|directory| directory.join("Cargo.toml").is_file())
+            {
+                self.paths.repo_root = root.display().to_string();
+            }
         }
-        true
+        Some(RunningBinary {
+            configured,
+            configured_sha256,
+            path: self.binary_path(),
+            sha256,
+            adopted,
+        })
     }
 
     /// If the selected model is not a complete cache snapshot, switch to the best complete cached
@@ -1600,6 +1641,29 @@ impl SparkConfig {
     }
 }
 
+/// Streaming SHA-256 of a file, as lower-case hex.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let mut digest = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(digest, "{byte:02x}");
+    }
+    Ok(digest)
+}
+
 /// Make a model id or directory name safe as one path component.
 /// A stable short digest for a path used as one converted-weights directory component.
 fn short_hash(value: &str) -> String {
@@ -1703,6 +1767,9 @@ pub fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA-256 of the bytes the binary-adoption fixtures write.
+    const RUNNING_SHA256: &str = "c071cf5f5ed6f884cc70155b6f05f755fd46a302d05e4261b7e92ce878bbfed8";
 
     #[test]
     fn model_profiles_take_their_identity_from_the_model_registry() {
@@ -2162,18 +2229,71 @@ mod tests {
         std::fs::write(dir.path().join("Cargo.toml"), "[workspace]").expect("manifest");
         let executable = dir.path().join("target/debug/sparkflash");
         std::fs::create_dir_all(executable.parent().expect("parent")).expect("target");
-        std::fs::write(&executable, "binary").expect("binary");
+        std::fs::write(&executable, "running").expect("binary");
         let mut config = SparkConfig::default();
-        config.paths.binary = dir
-            .path()
-            .join("target/release/sparkflash")
-            .display()
-            .to_string();
+        let configured = dir.path().join("target/release/sparkflash");
+        config.paths.binary = configured.display().to_string();
         config.paths.repo_root = "/not/the/checkout".to_owned();
-        assert!(config.adopt_running_binary(&executable));
+        let binary = config
+            .adopt_running_binary(&executable)
+            .expect("the running binary is readable");
+        assert!(binary.adopted);
+        assert_eq!(binary.sha256, RUNNING_SHA256);
+        assert_eq!(binary.configured, configured);
+        assert_eq!(binary.configured_sha256, None);
         assert_eq!(config.binary_path(), executable);
         assert_eq!(config.repo_root(), dir.path());
-        assert!(!config.adopt_running_binary(&executable));
+        let again = config
+            .adopt_running_binary(&executable)
+            .expect("the adopted binary is readable");
+        assert!(!again.adopted);
+        assert_eq!(again.path, executable);
+        assert_eq!(again.configured_sha256.as_deref(), Some(RUNNING_SHA256));
+    }
+
+    #[test]
+    fn a_stale_configured_binary_is_replaced_by_the_running_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("target/debug/sparkflash");
+        std::fs::create_dir_all(executable.parent().expect("parent")).expect("target");
+        std::fs::write(&executable, "running").expect("debug binary");
+        let configured = dir.path().join("target/release/sparkflash");
+        std::fs::create_dir_all(configured.parent().expect("parent")).expect("target");
+        std::fs::write(&configured, "different").expect("stale release binary");
+        let mut config = SparkConfig::default();
+        config.paths.binary = configured.display().to_string();
+        let binary = config
+            .adopt_running_binary(&executable)
+            .expect("the running binary is readable");
+        assert!(binary.adopted);
+        assert_eq!(binary.sha256, RUNNING_SHA256);
+        assert_eq!(binary.configured, configured);
+        assert_eq!(
+            binary.configured_sha256.as_deref(),
+            Some("9d6f965ac832e40a5df6c06afe983e3b449c07b843ff51ce76204de05c690d11")
+        );
+        assert_eq!(config.binary_path(), executable);
+    }
+
+    #[test]
+    fn a_byte_identical_configured_binary_keeps_its_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let executable = dir.path().join("target/debug/sparkflash");
+        std::fs::create_dir_all(executable.parent().expect("parent")).expect("target");
+        std::fs::write(&executable, "running").expect("debug binary");
+        let configured = dir.path().join("target/release/sparkflash");
+        std::fs::create_dir_all(configured.parent().expect("parent")).expect("target");
+        std::fs::write(&configured, "running").expect("release binary");
+        let mut config = SparkConfig::default();
+        config.paths.binary = configured.display().to_string();
+        let binary = config
+            .adopt_running_binary(&executable)
+            .expect("the running binary is readable");
+        assert!(!binary.adopted, "the bytes match, so the path is kept");
+        assert_eq!(binary.path, configured);
+        assert_eq!(binary.sha256, RUNNING_SHA256);
+        assert_eq!(binary.configured_sha256.as_deref(), Some(RUNNING_SHA256));
+        assert_eq!(config.binary_path(), configured);
     }
 
     #[test]

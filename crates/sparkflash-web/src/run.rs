@@ -112,15 +112,32 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
         }
     }
     // The binary cargo just built is the one this process is running. Adopt it when the
-    // configured path is not there, so the first Install copies a real server instead of asking
-    // for scripts/setup.sh.
+    // configured path is missing or holds different bytes, so the first Install copies a real
+    // server and a stale debug/release path cannot shadow the build the operator just made.
     if let Ok(executable) = std::env::current_exe()
-        && config.adopt_running_binary(&executable)
+        && let Some(binary) = config.adopt_running_binary(&executable)
     {
-        println!(
-            "sparkflash web: using the running binary {}",
-            executable.display()
-        );
+        if binary.adopted {
+            match binary.configured_sha256.as_deref() {
+                Some(previous) => println!(
+                    "sparkflash web: using the running binary {} (sha256 {}), replacing {} (sha256 {previous})",
+                    binary.path.display(),
+                    binary.sha256,
+                    binary.configured.display()
+                ),
+                None => println!(
+                    "sparkflash web: using the running binary {} (sha256 {})",
+                    binary.path.display(),
+                    binary.sha256
+                ),
+            }
+        } else {
+            println!(
+                "sparkflash web: server binary {} matches this process (sha256 {})",
+                binary.path.display(),
+                binary.sha256
+            );
+        }
     }
     let bind_text = cli.bind.clone().unwrap_or_else(|| config.web.bind.clone());
     let bind: SocketAddr = match bind_text.parse() {

@@ -135,6 +135,9 @@ pub struct WebState {
     last_discovery: Arc<RwLock<Option<DiscoveryReport>>>,
     discovery_lock: Arc<tokio::sync::Mutex<()>>,
     last_inspect: Arc<RwLock<Option<SetupReport>>>,
+    /// The configuration the cached report was taken for. A saved change makes the automatic
+    /// provisioner inspect once, instead of reusing a report that describes other nodes or paths.
+    last_inspect_config: Arc<RwLock<Option<SparkConfig>>>,
     inspect_lock: Arc<tokio::sync::Mutex<()>>,
     advertised: Option<String>,
     hostname: String,
@@ -165,6 +168,7 @@ impl WebState {
             last_discovery: Arc::new(RwLock::new(None)),
             discovery_lock: Arc::new(tokio::sync::Mutex::new(())),
             last_inspect: Arc::new(RwLock::new(None)),
+            last_inspect_config: Arc::new(RwLock::new(None)),
             inspect_lock: Arc::new(tokio::sync::Mutex::new(())),
             advertised: init.advertised,
             hostname: local_hostname(),
@@ -265,10 +269,12 @@ impl WebState {
         let _guard = self.inspect_lock.lock().await;
         let config = self.usable_config()?;
         let probe = Arc::clone(&self.ssh);
+        let inspected_for = config.clone();
         let result = tokio::task::spawn_blocking(move || run_inspect(&config, probe.as_ref()))
             .await
             .map_err(|error| format!("the node check failed: {error}"))?;
         *self.last_inspect.write().expect("inspect lock") = Some(result.clone());
+        *self.last_inspect_config.write().expect("inspect lock") = Some(inspected_for);
         Ok(result)
     }
 
@@ -343,21 +349,22 @@ impl WebState {
             }
         }
 
-        // A check taken moments ago is enough; the UI refreshes the same report.
-        let recent = self
-            .last_inspect
-            .read()
-            .expect("inspect lock")
-            .as_ref()
-            .is_some_and(|report| now_ms().saturating_sub(report.checked_ms) < 15_000);
-        let report = if recent {
-            self.last_inspect
+        // The check hashes the server binary, the cubin tree and NCCL on every Spark. Do that
+        // once at boot and reuse the report until a software job changes something or the saved
+        // configuration changes; otherwise this ten-second loop puts a SHA-256 pass over a
+        // several-hundred-megabyte binary on the CPU forever.
+        let cached = {
+            let report = self.last_inspect.read().expect("inspect lock").clone();
+            let inspected_for = self
+                .last_inspect_config
                 .read()
                 .expect("inspect lock")
-                .clone()
-                .expect("recent report")
-        } else {
-            self.inspect_now().await?
+                .clone();
+            report.filter(|_| inspected_for.as_ref() == Some(&config))
+        };
+        let report = match cached {
+            Some(report) if !software_changed_since(&jobs, report.checked_ms) => report,
+            _ => self.inspect_now().await?,
         };
         let lead_ready = report
             .nodes
@@ -452,6 +459,21 @@ impl WebState {
     pub fn telemetry(&self) -> Arc<TelemetrySource> {
         Arc::clone(&self.telemetry.read().expect("telemetry lock"))
     }
+}
+
+/// Whether a job that changes the local software finished after `checked_ms`.
+///
+/// The automatic provisioner re-runs the node check only for these jobs. A cached report is
+/// otherwise reused, so the SHA-256 pass over the server binary is a startup cost, not a poll.
+fn software_changed_since(jobs: &[JobSummary], checked_ms: u64) -> bool {
+    jobs.iter().any(|job| {
+        matches!(
+            job.kind.as_str(),
+            "bootstrap-cubins" | "bootstrap-nccl" | "sync-software"
+        ) && job
+            .finished_ms
+            .is_some_and(|finished| finished > checked_ms)
+    })
 }
 
 /// Whether `directory` holds at least one `.cubin` file.
@@ -2284,6 +2306,82 @@ mod tests {
         assert!(!state.config_exists());
         state.provision_once().await.expect("a no-op");
         assert!(state.jobs().list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn automatic_provisioning_reuses_the_boot_node_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with(dir.path(), true, None);
+        {
+            let mut config = state.config();
+            config.model.weights = crate::config::GLM_WEIGHTS_ID.to_owned();
+            config.engine.kind = crate::config::GLM_ENGINE_ID.to_owned();
+            config.paths.binary = "/bin/true".to_owned();
+            config.paths.nccl_lib.clear();
+            state.config.write().expect("config lock").config = config;
+        }
+        state.provision_once().await.expect("the first check");
+        let checked = state
+            .last_inspect
+            .read()
+            .expect("inspect lock")
+            .as_ref()
+            .expect("report")
+            .checked_ms;
+        // Age the report: the next pass must still reuse it, because no software job changed
+        // anything. The hash pass is a startup cost, not a poll.
+        state
+            .last_inspect
+            .write()
+            .expect("inspect lock")
+            .as_mut()
+            .expect("report")
+            .checked_ms = 1;
+        state.provision_once().await.expect("the cached check");
+        assert_eq!(
+            state
+                .last_inspect
+                .read()
+                .expect("inspect lock")
+                .as_ref()
+                .expect("report")
+                .checked_ms,
+            1,
+            "the second pass re-ran the node check"
+        );
+        assert!(checked > 1);
+    }
+
+    #[test]
+    fn a_finished_software_job_invalidates_the_cached_node_check() {
+        let job = JobSummary {
+            id: 1,
+            kind: "sync-software".to_owned(),
+            label: String::new(),
+            command: String::new(),
+            status: JobStatus::Succeeded,
+            started_ms: 10,
+            finished_ms: Some(20),
+            exit_code: Some(0),
+            last_line: None,
+            progress: None,
+        };
+        assert!(software_changed_since(std::slice::from_ref(&job), 10));
+        assert!(!software_changed_since(&[job], 20));
+        let mut other = JobSummary {
+            id: 2,
+            kind: "download".to_owned(),
+            label: String::new(),
+            command: String::new(),
+            status: JobStatus::Succeeded,
+            started_ms: 10,
+            finished_ms: Some(20),
+            exit_code: Some(0),
+            last_line: None,
+            progress: None,
+        };
+        other.finished_ms = Some(30);
+        assert!(!software_changed_since(&[other], 10));
     }
 
     #[tokio::test]

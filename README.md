@@ -109,7 +109,8 @@ cd ~/sparkflash
 cargo run --bin sparkflash -- --web
 ```
 
-That one command starts the console. It adopts the binary cargo just built, prepares the local GPU
+That one command starts the console. It checks its own SHA-256 against `paths.binary` and
+adopts the binary cargo just built when the configured path is stale, prepares the local GPU
 kernels and NCCL library when they are missing, and copies the same binary to any Spark whose copy
 is missing or older. It prints the console address, for example:
 
