@@ -31,7 +31,7 @@ use sparkflash_api::engine::{Capabilities, ClusterStatsSnapshot, MockEngine};
 use sparkflash_api::server::router;
 use sparkflash_api::state::AppState;
 use sparkflash_model_deepseek_v41::encoding::{
-    CaseError, TokenizerSeam, TokenizerSeamError, reference_tokenizer_path,
+    TokenizerSeam, TokenizerSeamError, reference_tokenizer_path,
 };
 use tower::ServiceExt as _;
 
@@ -308,34 +308,35 @@ fn chat_template_refuses_unsupported_content_parts_loudly() {
 }
 
 #[test]
-fn developer_role_matches_the_released_encoder() {
-    // vLLM's normaliser accepts developer. The encoder then either drops the message in
-    // thinking mode (drop_thinking only keeps known roles) or refuses it in chat mode. We match
-    // the encoder rather than silently rendering a prompt the reference server would not.
-    let seam = seam();
-    seam.encode_chat(&json!({
-        "messages": [
-            {"role": "developer", "content": "be nice"},
-            {"role": "user", "content": "hi"}
-        ]
-    }))
-    .expect("thinking mode drops the developer message, as the encoder does");
-    let error = seam
-        .encode_chat(&json!({
-            "messages": [
-                {"role": "developer", "content": "be nice"},
-                {"role": "user", "content": "hi"}
-            ],
-            "chat_template_kwargs": {"thinking": false}
-        }))
-        .expect_err("chat mode must refuse the developer message");
-    assert!(
-        matches!(
-            error,
-            TokenizerSeamError::Render(CaseError::UnknownRole(ref role)) if role == "developer"
-        ),
-        "{error:?}"
-    );
+fn a_developer_role_folds_onto_the_system_role() {
+    // The normaliser accepts the OpenAI spelling, but the released encoder drops a developer
+    // message in thinking mode and the renderer refuses it in chat mode, so a client that sends
+    // its instructions as developer loses them in the default mode and gets a typed 400 in the
+    // other. `/v1/responses` already folds the role onto system for that reason
+    // (`responses_message_item`); folding it at the seam makes every route agree, and the ids are
+    // then the system message's in both modes.
+    for thinking in [true, false] {
+        let kwargs = json!({"thinking": thinking});
+        let system = seam()
+            .encode_chat(&json!({
+                "messages": [
+                    {"role": "system", "content": "be nice"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "chat_template_kwargs": kwargs,
+            }))
+            .expect("the system body renders");
+        let developer = seam()
+            .encode_chat(&json!({
+                "messages": [
+                    {"role": "developer", "content": "be nice"},
+                    {"role": "user", "content": "hi"},
+                ],
+                "chat_template_kwargs": kwargs,
+            }))
+            .expect("the developer body renders");
+        assert_eq!(developer, system, "thinking={thinking}");
+    }
 }
 
 const PLACEHOLDER: &str = "<｜deepseek_image｜>";

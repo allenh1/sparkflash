@@ -85,12 +85,11 @@
 //!   template now renders, but echoing the final message changes the
 //!   generation assembly, not the prompt seam, and is deferred with the
 //!   logprob protocol work.
-//! * A developer role is accepted by vLLM's normaliser and then handled by
-//!   the encoder's drop_thinking filter: in thinking mode (the default) the
-//!   message is dropped, exactly as the released server drops it, and in chat
-//!   mode the renderer refuses it with its typed UnknownRole error. Any role
-//!   outside system/user/assistant/tool is refused as Invalid role: <role>,
-//!   the exact vLLM text.
+//! * A developer role is accepted by vLLM's normaliser and folded onto the system role: the
+//!   released encoder drops the spelling in thinking mode (the default) and the renderer refuses
+//!   it in chat mode, so folding is what keeps the instruction in the prompt. `/v1/responses`
+//!   applies the same fold (`responses_message_item`). Any role outside
+//!   system/user/assistant/tool is refused as Invalid role: <role>, the exact vLLM text.
 //! * Only an image content part becomes the image placeholder's id. vLLM
 //!   tokenizes the rendered string, so the placeholder's spelling anywhere in
 //!   the conversation (a tool result showing source code that names it, say)
@@ -457,6 +456,17 @@ fn normalize_message(
         });
     }
     let role = role_text.unwrap_or_default();
+    // A developer message is folded onto the system role. The normaliser accepts the OpenAI
+    // spelling (vLLM does), but the released encoder drops it in thinking mode and the renderer
+    // refuses it in chat mode (its typed UnknownRole), so a client that sends its instructions as
+    // developer loses them in one mode and gets a 400 in the other. `/v1/responses` already folds
+    // it for the same reason (`responses_message_item`); every other route reaches the seam
+    // directly, so the fold belongs here.
+    let role = if role == "developer" {
+        "system".to_owned()
+    } else {
+        role
+    };
 
     let content = match object.get("content") {
         None | Some(Value::Null) => None,
