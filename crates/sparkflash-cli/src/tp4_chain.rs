@@ -252,12 +252,16 @@ impl ChainArgs {
                 "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
+                    // SAFETY: `std::env::set_var` is unsafe in edition 2024 because it can race a concurrent reader; this
+                    // runs in `parse_args` before any thread is spawned, so this process is the only reader.
                     unsafe {
                         std::env::set_var("SPARKFLASH_VERIFY_WEIGHTS", "1");
                     }
                 }
                 "--mmap" => {
                     #[allow(unused_unsafe)]
+                    // SAFETY: `std::env::set_var` is unsafe in edition 2024 because it can race a concurrent reader; this
+                    // runs in `parse_args` before any thread is spawned, so this process is the only reader.
                     unsafe {
                         std::env::set_var("SPARKFLASH_ARENA_MMAP", "1");
                     }

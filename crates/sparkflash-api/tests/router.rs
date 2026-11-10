@@ -1575,6 +1575,7 @@ async fn trace_dump_includes_the_gpu_ring_and_reports_it_unmapped() {
     // SAFETY: same single-writer contract as push.
     unsafe { ring.clear() };
     assert!(
+        // SAFETY: the writer has stopped, so the read races nothing.
         unsafe { ring.collect() }.is_empty(),
         "ring must be left empty"
     );

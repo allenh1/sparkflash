@@ -45,3 +45,6 @@ axum = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

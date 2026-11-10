@@ -1277,14 +1277,16 @@ impl ResidentArgs {
                 "--upload" => upload = true,
                 "--verify-weights" => {
                     // Propagate to the arena loader in this process.
-                    // SAFETY: CLI argument parsing happens single-threaded before worker threads start.
                     #[allow(unused_unsafe)]
+                    // SAFETY: CLI argument parsing happens single-threaded, before any worker thread
+                    // that could read the environment is spawned.
                     unsafe {
                         std::env::set_var("SPARKFLASH_VERIFY_WEIGHTS", "1");
                     }
                 }
                 "--mmap" => {
                     #[allow(unused_unsafe)]
+                    // SAFETY: as for `--verify-weights`: still in the single-threaded argument parse.
                     unsafe {
                         std::env::set_var("SPARKFLASH_ARENA_MMAP", "1");
                     }

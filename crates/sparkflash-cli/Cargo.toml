@@ -90,3 +90,6 @@ io-uring = { workspace = true, optional = true }
 tempfile = { workspace = true }
 # The device-token window tests write a synthetic four-rank envelope: paper records, UNMEASURED.
 sparkflash-api = { workspace = true, features = ["device-token-fixtures"] }
+
+[lints]
+workspace = true

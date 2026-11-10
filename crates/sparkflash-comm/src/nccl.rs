@@ -729,7 +729,7 @@ impl NcclApi {
         // SAFETY: the symbol resolved as ncclGetVersion and the out-pointer is valid for the call.
         let result = unsafe {
             let function: GetVersionFn = std::mem::transmute(self.raw.get_version);
-            function(&mut version)
+            function(&raw mut version)
         };
         if result == NCCL_SUCCESS {
             Ok(version)
@@ -802,7 +802,7 @@ impl NcclApi {
         // async_error is a valid out-parameter for it.
         let result = unsafe {
             let function: CommGetAsyncErrorFn = std::mem::transmute(symbol);
-            function(handle, &mut async_error)
+            function(handle, &raw mut async_error)
         };
         if result != NCCL_SUCCESS {
             return Err(self.call_error(ASYNC_ERROR_SYMBOL, result));
@@ -835,7 +835,7 @@ impl NcclApi {
         // SAFETY: the symbol resolved as ncclGetUniqueId and id is a valid out-parameter.
         let result = unsafe {
             let function: GetUniqueIdFn = std::mem::transmute(self.raw.get_unique_id);
-            function(&mut id)
+            function(&raw mut id)
         };
         if result == NCCL_SUCCESS {
             Ok(id)
@@ -898,7 +898,7 @@ impl NcclApi {
         let result = unsafe {
             let function: CommInitRankConfigFn =
                 std::mem::transmute(self.raw.comm_init_rank_config);
-            function(&mut handle, world, unique_id, index, ptr::null_mut())
+            function(&raw mut handle, world, unique_id, index, ptr::null_mut())
         };
         if result != NCCL_SUCCESS {
             return Err(self.call_error("ncclCommInitRankConfig", result));
@@ -952,7 +952,7 @@ impl NcclApi {
                 parent,
                 0,
                 key,
-                &mut handle,
+                &raw mut handle,
                 (&raw mut config).cast::<c_void>(),
             )
         };
@@ -1019,7 +1019,7 @@ impl NcclApi {
         // out-parameter for ncclCommRegister.
         let result = unsafe {
             let function: CommRegisterFn = std::mem::transmute(self.raw.comm_register);
-            function(handle, buffer, bytes, &mut registration)
+            function(handle, buffer, bytes, &raw mut registration)
         };
         if result != NCCL_SUCCESS {
             return Err(self.call_error("ncclCommRegister", result));
@@ -1473,7 +1473,7 @@ mod tests {
         }
     }
 
-    unsafe extern "C" fn fake_error_string(code: c_int) -> *const c_char {
+    extern "C" fn fake_error_string(code: c_int) -> *const c_char {
         match code {
             2 => c"simulated asynchronous system error".as_ptr(),
             _ => c"simulated nccl error".as_ptr(),
@@ -1481,6 +1481,8 @@ mod tests {
     }
 
     unsafe extern "C" fn async_ok(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        // SAFETY: `out` is the non-null pointer every NCCL `ncclCommGetAsyncError`-shaped call passes, which
+        // the shim's signature requires and the caller allocates on its own stack.
         unsafe {
             *out = NCCL_SUCCESS;
         }
@@ -1488,6 +1490,8 @@ mod tests {
     }
 
     unsafe extern "C" fn async_in_progress(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        // SAFETY: `out` is the non-null pointer every NCCL `ncclCommGetAsyncError`-shaped call passes, which
+        // the shim's signature requires and the caller allocates on its own stack.
         unsafe {
             *out = NCCL_IN_PROGRESS;
         }
@@ -1495,13 +1499,15 @@ mod tests {
     }
 
     unsafe extern "C" fn async_system_failure(_handle: NcclCommHandle, out: *mut c_int) -> c_int {
+        // SAFETY: `out` is the non-null pointer every NCCL `ncclCommGetAsyncError`-shaped call passes, which
+        // the shim's signature requires and the caller allocates on its own stack.
         unsafe {
             *out = 2;
         }
         NCCL_SUCCESS
     }
 
-    unsafe extern "C" fn async_query_fails(_handle: NcclCommHandle, _out: *mut c_int) -> c_int {
+    extern "C" fn async_query_fails(_handle: NcclCommHandle, _out: *mut c_int) -> c_int {
         3
     }
 
@@ -1654,8 +1660,8 @@ mod tests {
         assert_eq!(unsafe { api.check_async_failure(handle) }, Ok(()));
 
         let api = api_with_async(fake_entry(async_in_progress));
-        // SAFETY: the fake ignores the handle.
         assert_eq!(
+            // SAFETY: the fake ignores the handle.
             unsafe { api.check_async_failure(handle) },
             Ok(()),
             "ncclInProgress means work is in flight, not that it failed"
@@ -1791,13 +1797,15 @@ mod tests {
         _bytes: usize,
         out: *mut *mut c_void,
     ) -> c_int {
+        // SAFETY: `out` is the non-null pointer the registration shim's signature requires, and the value
+        // written is a marker address never dereferenced.
         unsafe {
             *out = ptr::without_provenance_mut(0x5150);
         }
         NCCL_SUCCESS
     }
 
-    unsafe extern "C" fn register_refused(
+    extern "C" fn register_refused(
         _comm: NcclCommHandle,
         _buffer: *mut c_void,
         _bytes: usize,
@@ -1806,7 +1814,7 @@ mod tests {
         3
     }
 
-    unsafe extern "C" fn register_null(
+    extern "C" fn register_null(
         _comm: NcclCommHandle,
         _buffer: *mut c_void,
         _bytes: usize,
@@ -1815,7 +1823,7 @@ mod tests {
         NCCL_SUCCESS
     }
 
-    unsafe extern "C" fn deregister_ok(_comm: NcclCommHandle, _registration: *mut c_void) -> c_int {
+    extern "C" fn deregister_ok(_comm: NcclCommHandle, _registration: *mut c_void) -> c_int {
         NCCL_SUCCESS
     }
 

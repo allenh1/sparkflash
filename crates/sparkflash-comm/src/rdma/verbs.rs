@@ -227,10 +227,10 @@ impl Verbs {
     /// Returns [`CommError::FabricUnavailable`] when the library returns no device list.
     #[cfg(test)]
     pub(crate) fn device_names(&self) -> Result<Vec<String>, CommError> {
+        let mut count: c_int = 0;
         // SAFETY: ibv_get_device_list writes the count and returns a null-terminated array that
         // ibv_free_device_list releases; the pointers are read only inside the list's lifetime.
-        let mut count: c_int = 0;
-        let list = unsafe { (self.fns.get_device_list)(&mut count) };
+        let list = unsafe { (self.fns.get_device_list)(&raw mut count) };
         if list.is_null() {
             return Err(CommError::FabricUnavailable(
                 "libibverbs returned no device list: the RDMA subsystem is not visible to this process (check /dev/infiniband access and the rdma-core kernel modules)".to_owned(),
@@ -259,6 +259,8 @@ impl Verbs {
             }
         }
         // SAFETY: `list` came from ibv_get_device_list and is freed exactly once here.
+        // SAFETY: `list` came from the ibv_get_device_list above and is released exactly once here,
+        // after every pointer it carries has been read.
         unsafe { (self.fns.free_device_list)(list) };
         Ok(names)
     }
@@ -269,9 +271,9 @@ impl Verbs {
     /// Returns [`CommError::FabricUnavailable`] naming the devices that do exist when `name` is not
     /// among them, and [`CommError::Verbs`] when `ibv_open_device` refuses.
     pub(crate) fn open_device(&self, name: &str) -> Result<Context, CommError> {
-        // SAFETY: as in device_names; the list stays alive until the device is opened.
         let mut count: c_int = 0;
-        let list = unsafe { (self.fns.get_device_list)(&mut count) };
+        // SAFETY: as in device_names; the list stays alive until the device is opened.
+        let list = unsafe { (self.fns.get_device_list)(&raw mut count) };
         if list.is_null() {
             return Err(CommError::FabricUnavailable(
                 "libibverbs returned no device list while opening an RDMA device".to_owned(),
@@ -445,7 +447,7 @@ impl Context {
         let mut attr: IbvPortAttr = unsafe { std::mem::zeroed() };
         // SAFETY: `raw` is a live context and `port` is the 1-based port number the caller
         // validated against the device's port count.
-        let code = unsafe { (self.fns.query_port)(self.raw, port, &mut attr) };
+        let code = unsafe { (self.fns.query_port)(self.raw, port, &raw mut attr) };
         if code != 0 {
             return Err(verbs_error("ibv_query_port", code));
         }
@@ -465,7 +467,7 @@ impl Context {
         let mut gid = IbvGid::default();
         // SAFETY: `raw` is a live context, the port is validated by the caller, and `gid` is a
         // writable union buffer.
-        let code = unsafe { (self.fns.query_gid)(self.raw, port, index, &mut gid) };
+        let code = unsafe { (self.fns.query_gid)(self.raw, port, index, &raw mut gid) };
         if code != 0 {
             return Err(verbs_error("ibv_query_gid", code));
         }
@@ -568,7 +570,7 @@ impl Pd {
         };
         // SAFETY: `raw` is a live protection domain, the CQs outlive the QP in the owning
         // backend, and `attr` is a fully initialised struct.
-        let raw = unsafe { (self.fns.create_qp)(self.raw, &mut attr) };
+        let raw = unsafe { (self.fns.create_qp)(self.raw, &raw mut attr) };
         if raw.is_null() {
             return Err(CommError::verbs(
                 "ibv_create_qp",
@@ -694,7 +696,7 @@ impl Qp {
     pub(crate) fn post_send(&self, wr: &mut IbvSendWr) -> Result<(), CommError> {
         let mut bad: *mut IbvSendWr = ptr::null_mut();
         // SAFETY: `raw` is a live QP in RTS state; `wr` is a fully initialised head of a chain.
-        let code = unsafe { (self.fns.post_send)(self.raw, wr, &mut bad) };
+        let code = unsafe { (self.fns.post_send)(self.raw, wr, &raw mut bad) };
         if code != 0 {
             return Err(CommError::verbs(
                 "ibv_post_send",
@@ -704,6 +706,8 @@ impl Qp {
                     if bad.is_null() {
                         "not reported".to_owned()
                     } else {
+                        // SAFETY: `bad` was checked for null just above, and libibverbs sets it to point at the send work
+                        // request inside the chain `post_send` was given, which is still alive at this call.
                         format!("wr_id {:#x}", unsafe { (*bad).wr_id })
                     }
                 ),
@@ -719,7 +723,7 @@ impl Qp {
     pub(crate) fn post_recv(&self, wr: &mut IbvRecvWr) -> Result<(), CommError> {
         let mut bad: *mut IbvRecvWr = ptr::null_mut();
         // SAFETY: `raw` is a live QP whose RQ has room; `wr` is a fully initialised chain.
-        let code = unsafe { (self.fns.post_recv)(self.raw, wr, &mut bad) };
+        let code = unsafe { (self.fns.post_recv)(self.raw, wr, &raw mut bad) };
         if code != 0 {
             return Err(CommError::verbs(
                 "ibv_post_recv",
@@ -729,6 +733,8 @@ impl Qp {
                     if bad.is_null() {
                         "not reported".to_owned()
                     } else {
+                        // SAFETY: `bad` was checked for null just above, and libibverbs sets it to point at the receive work
+                        // request inside the chain `post_recv` was given, which is still alive at this call.
                         format!("wr_id {:#x}", unsafe { (*bad).wr_id })
                     }
                 ),

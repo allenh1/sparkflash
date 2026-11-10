@@ -77,3 +77,6 @@ serde_json = { workspace = true }
 # front end the server uses, so the patches it checks are the served ones. Dev-only: the library
 # takes a canvas and never decodes an image.
 sparkflash-vision = { workspace = true }
+
+[lints]
+workspace = true

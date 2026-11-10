@@ -36,3 +36,6 @@ mdns-sd = { version = "0.21", default-features = false }
 tower = { workspace = true }
 http-body-util = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -64,3 +64,6 @@ sha2 = { workspace = true }
 name = "write_device_window"
 # The synthetic window writers live behind the fixtures feature; the default build has no example.
 required-features = ["device-token-fixtures"]
+
+[lints]
+workspace = true

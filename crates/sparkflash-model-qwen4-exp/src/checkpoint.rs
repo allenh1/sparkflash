@@ -109,6 +109,8 @@ impl CheckpointRows {
                 } else {
                     let opened = std::fs::File::open(source.shard_path(shard_file)).ok()?;
                     #[cfg(target_os = "linux")]
+                    // SAFETY: `posix_fadvise` takes a descriptor this call just opened and a zero offset and length, which
+                    // the POSIX contract reads as the whole file; the advice is a hint and cannot fault.
                     unsafe {
                         use std::os::unix::io::AsRawFd;
                         unsafe extern "C" {

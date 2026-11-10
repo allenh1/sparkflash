@@ -634,6 +634,9 @@ impl Cuda {
     /// run on the node returned. The primary context is retained (refcounted, shared with anything
     /// else driving the device) and made current for this thread.
     fn load() -> Result<Self, String> {
+        // SAFETY: `libcuda.so.1` is loaded through `libloading`, which is unsafe because it runs the library's
+        // initialisers; every symbol is then cast to the signature the CUDA driver API documents for
+        // it, and `cuInit` is called before any other driver entry point.
         unsafe {
             let lib = libloading::Library::new("libcuda.so.1")
                 .map_err(|e| format!("libcuda.so.1: {e}"))?;
@@ -649,7 +652,7 @@ impl Cuda {
             {
                 let f: libloading::Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> =
                     lib.get(b"cuDeviceGetCount").map_err(|e| e.to_string())?;
-                let r = f(&mut count);
+                let r = f(&raw mut count);
                 if r != 0 {
                     return Err(format!("cuDeviceGetCount failed: {}", name(r)));
                 }
@@ -658,7 +661,7 @@ impl Cuda {
             {
                 let get: libloading::Symbol<unsafe extern "C" fn(*mut i32, i32) -> CuResult> =
                     lib.get(b"cuDeviceGet").map_err(|e| e.to_string())?;
-                let r = get(&mut dev, 0);
+                let r = get(&raw mut dev, 0);
                 if r != 0 {
                     return Err(format!("cuDeviceGet(0) failed: {}", name(r)));
                 }
@@ -676,7 +679,7 @@ impl Cuda {
                     let mut total: u64 = 0;
                     let t: libloading::Symbol<unsafe extern "C" fn(*mut u64, i32) -> CuResult> =
                         lib.get(b"cuDeviceTotalMem_v2").map_err(|e| e.to_string())?;
-                    let _ = t(&mut total, dev);
+                    let _ = t(&raw mut total, dev);
                     println!(
                         "device 0: {device_name} of {count} (total {} MiB, MemAvailable {} MiB)",
                         total / (1024 * 1024),
@@ -699,7 +702,7 @@ impl Cuda {
                 > = lib
                     .get(b"cuDevicePrimaryCtxRetain")
                     .map_err(|e| e.to_string())?;
-                let r = retain(&mut ctx, dev);
+                let r = retain(&raw mut ctx, dev);
                 if r != 0 {
                     // One alternative route, tried exactly once - not a retry loop. Retaining the
                     // primary context is the normal route for a process that does not own the
@@ -709,7 +712,7 @@ impl Cuda {
                     let create: libloading::Symbol<
                         unsafe extern "C" fn(*mut *mut c_void, u32, i32) -> CuResult,
                     > = lib.get(b"cuCtxCreate_v2").map_err(|e| e.to_string())?;
-                    let r2 = create(&mut alt, 0x10, dev);
+                    let r2 = create(&raw mut alt, 0x10, dev);
                     // Nothing is left half-initialised: no context was retained, no device memory
                     // was allocated, and this condition is not retried. If a context IS created and
                     // a later step fails, Drop releases it.
@@ -744,6 +747,8 @@ impl Cuda {
     }
 
     fn sym<T>(&self, name: &[u8]) -> Result<libloading::Symbol<'_, T>, String> {
+        // SAFETY: `self.lib` is the handle `load` opened and the example keeps alive for its whole run, so
+        // every symbol it hands out stays valid while the returned `Symbol` borrows it.
         unsafe {
             self.lib
                 .get(name)
@@ -752,11 +757,13 @@ impl Cuda {
     }
 
     fn alloc(&self, bytes: usize, total: &mut usize) -> Result<Deviceptr, String> {
+        // SAFETY: `cuMemAlloc_v2` is the signature the driver documents; the only pointer given is the local
+        // `p` it fills, and the returned `CuResult` is checked before `p` is used.
         unsafe {
             let f: libloading::Symbol<unsafe extern "C" fn(*mut CuDeviceptr, usize) -> CuResult> =
                 self.sym(b"cuMemAlloc_v2")?;
             let mut p: CuDeviceptr = 0;
-            let r = f(&mut p, bytes);
+            let r = f(&raw mut p, bytes);
             if r != 0 {
                 return Err(format!("cuMemAlloc({bytes}) failed: {r}"));
             }
@@ -766,6 +773,8 @@ impl Cuda {
     }
 
     fn copy_htod(&self, dst: &Deviceptr, src: &[u8]) -> Result<(), String> {
+        // SAFETY: `cuMemcpyHtoD_v2` is the signature the driver documents; `dst` is a device allocation this
+        // example made and `src` is a Rust slice whose length is the copy size.
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(CuDeviceptr, *const c_void, usize) -> CuResult,
@@ -779,6 +788,8 @@ impl Cuda {
     }
 
     fn copy_dtoh(&self, dst: &mut [u8], src: &Deviceptr) -> Result<(), String> {
+        // SAFETY: `cuMemcpyDtoH_v2` is the signature the driver documents; `src` is a device allocation this
+        // example made and `dst` is a Rust slice whose length is the copy size.
         unsafe {
             let f: libloading::Symbol<
                 unsafe extern "C" fn(*mut c_void, CuDeviceptr, usize) -> CuResult,
@@ -792,12 +803,14 @@ impl Cuda {
     }
 
     fn load_function(&self, cubin: &[u8], name: &str) -> Result<(CuModule, CuFunction), String> {
+        // SAFETY: `cuModuleLoadData` is the signature the driver documents; the image is a Rust slice whose
+        // length the driver reads from its own header.
         unsafe {
             let load: libloading::Symbol<
                 unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
             > = self.sym(b"cuModuleLoadData")?;
             let mut module: CuModule = std::ptr::null_mut();
-            let r = load(&mut module, cubin.as_ptr().cast());
+            let r = load(&raw mut module, cubin.as_ptr().cast());
             if r != 0 {
                 return Err(format!("cuModuleLoadData failed: {r}"));
             }
@@ -806,7 +819,7 @@ impl Cuda {
             > = self.sym(b"cuModuleGetFunction")?;
             let cname = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
             let mut func: CuFunction = std::ptr::null_mut();
-            let r = get(&mut func, module, cname.as_ptr().cast());
+            let r = get(&raw mut func, module, cname.as_ptr().cast());
             if r != 0 {
                 return Err(format!("cuModuleGetFunction({name}) failed: {r}"));
             }
@@ -821,6 +834,8 @@ impl Cuda {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), String> {
+        // SAFETY: `cuLaunchKernel` is the signature the driver documents; `storage` keeps one `u64` argument
+        // word per parameter alive and 8-byte aligned across the call.
         unsafe {
             let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
             let mut storage: Vec<[u64; 1]> = args.iter().map(|a| [*a]).collect();
@@ -865,6 +880,8 @@ impl Cuda {
         args: &[u64],
         repeat: usize,
     ) -> Result<(Vec<f64>, f64), String> {
+        // SAFETY: the event calls are the signatures the driver documents and every handle is one this example
+        // created, recorded and destroyed in matching pairs.
         unsafe {
             let create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
                 self.sym(b"cuEventCreate")?;
@@ -879,11 +896,11 @@ impl Cuda {
                 self.sym(b"cuEventDestroy")?;
             let mut start: CuEvent = std::ptr::null_mut();
             let mut stop: CuEvent = std::ptr::null_mut();
-            let r = create(&mut start, 0);
+            let r = create(&raw mut start, 0);
             if r != 0 {
                 return Err(format!("cuEventCreate failed: {r}"));
             }
-            let r = create(&mut stop, 0);
+            let r = create(&raw mut stop, 0);
             if r != 0 {
                 return Err(format!("cuEventCreate failed: {r}"));
             }
@@ -911,7 +928,7 @@ impl Cuda {
                     return Err(format!("cuEventSynchronize failed: {r}"));
                 }
                 let mut ms: f32 = 0.0;
-                let r = elapsed(&mut ms, start, stop);
+                let r = elapsed(&raw mut ms, start, stop);
                 if r != 0 {
                     return Err(format!("cuEventElapsedTime failed: {r}"));
                 }
@@ -933,7 +950,7 @@ impl Cuda {
                 return Err(format!("cuEventSynchronize failed: {r}"));
             }
             let mut total: f32 = 0.0;
-            let r = elapsed(&mut total, start, stop);
+            let r = elapsed(&raw mut total, start, stop);
             if r != 0 {
                 return Err(format!("cuEventElapsedTime failed: {r}"));
             }
@@ -944,6 +961,8 @@ impl Cuda {
     }
 
     fn free(&self, module: CuModule, ptrs: &[Deviceptr]) {
+        // SAFETY: the pointer came from this example's `cuMemAlloc_v2` and the module from its
+        // `cuModuleLoadData`; nothing is queued, so a synchronous free cannot race a launch.
         unsafe {
             if let Ok(f) =
                 self.sym::<unsafe extern "C" fn(CuDeviceptr) -> CuResult>(b"cuMemFree_v2")
@@ -969,6 +988,8 @@ impl Drop for Cuda {
         if self.ctx.is_null() {
             return;
         }
+        // SAFETY: `cuDevicePrimaryCtxRelease` is the signature the driver documents and `ctx` is the
+        // refcounted primary context this example retained in `load`.
         unsafe {
             if let Ok(f) = self
                 .sym::<unsafe extern "C" fn(*mut c_void) -> CuResult>(b"cuDevicePrimaryCtxRelease")

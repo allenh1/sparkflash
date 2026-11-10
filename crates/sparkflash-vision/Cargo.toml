@@ -28,3 +28,6 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 zune-core = "0.5"
 zune-jpeg = "0.5"
+
+[lints]
+workspace = true
