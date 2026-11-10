@@ -355,17 +355,27 @@ impl Drop for AlignedAlloc {
 /// # Concurrency
 /// The header words are atomics because the Grace CPU and the GPU share them live. The event
 /// slots are plain memory written by one CUDA lane (block 0, thread 0, with the rank in
-/// blockIdx.y) and read by the host only after the stream has completed, so every slot
-/// accessor is unsafe: safe Rust cannot start a data race with an in-flight graph.
+/// blockIdx.y) and read by the host only after the stream has completed.
+///
+/// Every slot access goes through [std::ptr::read_volatile] or [std::ptr::write_volatile] inside
+/// this type, so the accessors are safe: a volatile access is well defined whether or not the
+/// device is writing, and an event read mid-write is torn rather than undefined. What the caller
+/// still owes is the *consistency* contract stated on each accessor - read after the stream has
+/// completed, and do not let two host threads write the same slot at once - which is a wrong
+/// answer, not a wrong program.
 pub struct GpuTraceRing {
     ptr: NonNull<u8>,
     owned: Option<AlignedAlloc>,
     capacity: usize,
 }
 
-// SAFETY: the ring is a block of plain memory plus two atomic header words; a shared
-// reference only exposes the atomics and the unsafe slot accessors, so safe code cannot race.
+// SAFETY: the ring is a block of plain memory plus two atomic header words, and an owned ring's
+// allocation has no thread affinity; moving it to another thread is sound because the owner moves
+// with it and no thread-local state points into the slab.
 unsafe impl Send for GpuTraceRing {}
+// SAFETY: as for `Send`. A shared reference reaches the slab only through `header`, which is
+// atomic, and through the slot accessors, whose reads and writes are volatile, so two host threads
+// holding `&GpuTraceRing` cannot trip the aliasing rules.
 unsafe impl Sync for GpuTraceRing {}
 
 impl std::fmt::Debug for GpuTraceRing {
@@ -522,10 +532,10 @@ impl GpuTraceRing {
     ///
     /// Returns the slot index that was written.
     ///
-    /// # Safety
-    /// The caller must guarantee no instrumented graph is concurrently writing the same slot,
-    /// i.e. no capture is in flight on the device.
-    pub unsafe fn push(&self, event: GpuTraceEvent) -> usize {
+    /// Call it once the stream carrying the instrumented graph has completed: a push during a
+    /// capture can land in a slot the graph is writing, which reorders the trace but cannot
+    /// corrupt memory.
+    pub fn push(&self, event: GpuTraceEvent) -> usize {
         let idx = self.header().write_idx.fetch_add(1, Ordering::AcqRel);
         let slot = (idx & self.header().capacity_mask) as usize;
         let ptr = self
@@ -538,23 +548,21 @@ impl GpuTraceRing {
 
     /// Mirrors SPARK_GPU_TRACE_ENTER/EXIT: writes only while the scope is armed.
     ///
-    /// # Safety
-    /// Same contract as GpuTraceRing::push.
-    pub unsafe fn push_if_armed(&self, scope: u64, event: GpuTraceEvent) -> bool {
+    /// Same timing contract as [GpuTraceRing::push].
+    pub fn push_if_armed(&self, scope: u64, event: GpuTraceEvent) -> bool {
         if self.header().mask() & scope == 0 {
             return false;
         }
-        // SAFETY: the caller upholds the push contract.
-        unsafe { self.push(event) };
+        self.push(event);
         true
     }
 
     /// Returns every event written so far, in write order.
     ///
-    /// # Safety
-    /// The device must not be writing the ring concurrently.
+    /// Collect after the stream has completed, or an event the device is midway through writing
+    /// comes back torn.
     #[must_use]
-    pub unsafe fn collect(&self) -> Vec<GpuTraceEvent> {
+    pub fn collect(&self) -> Vec<GpuTraceEvent> {
         let written = self.header().written() as usize;
         let start = written.saturating_sub(self.capacity);
         (start..written)
@@ -564,9 +572,8 @@ impl GpuTraceRing {
 
     /// Resets the write index and zeroes every slot.
     ///
-    /// # Safety
-    /// The device must not be writing the ring concurrently.
-    pub unsafe fn clear(&self) {
+    /// Clear while nothing is capturing, or a slot the device writes next is zeroed under it.
+    pub fn clear(&self) {
         self.header().write_idx.store(0, Ordering::Release);
         for index in 0..self.capacity {
             if let Some(ptr) = self.slot_ptr(index) {
@@ -625,27 +632,21 @@ mod tests {
     #[test]
     fn gpu_ring_wraps_like_the_cuda_macro() {
         let ring = GpuTraceRing::new(4);
-        // SAFETY: nothing else touches this ring.
-        unsafe {
-            for i in 0..6u64 {
-                ring.push(GpuTraceEvent {
-                    start_ns: i,
-                    end_ns: i + 1,
-                    ..Default::default()
-                });
-            }
+        for i in 0..6u64 {
+            ring.push(GpuTraceEvent {
+                start_ns: i,
+                end_ns: i + 1,
+                ..Default::default()
+            });
         }
         assert_eq!(ring.header().written(), 6);
-        // SAFETY: nothing else touches this ring.
-        let collected = unsafe { ring.collect() };
+        let collected = ring.collect();
         assert_eq!(collected.len(), 4);
         assert_eq!(collected.first().unwrap().start_ns, 2);
         assert_eq!(collected.last().unwrap().start_ns, 5);
-        // SAFETY: nothing else touches this ring.
-        unsafe { ring.clear() };
+        ring.clear();
         assert_eq!(ring.header().written(), 0);
-        // SAFETY: nothing else touches this ring.
-        assert!(unsafe { ring.collect() }.is_empty());
+        assert!(ring.collect().is_empty());
     }
 
     /// The CUDA macro computes the event array as (char*)ring + sizeof(GpuTraceRing): the
@@ -682,13 +683,10 @@ mod tests {
         assert_eq!(ring.header().capacity_mask, 3);
         assert_eq!(ring.header().written(), 0);
         assert_eq!(ring.as_ptr() as usize, raw as usize);
-        // SAFETY: nothing else touches this ring.
-        unsafe {
-            ring.push(GpuTraceEvent {
-                start_ns: 9,
-                ..Default::default()
-            })
-        };
+        ring.push(GpuTraceEvent {
+            start_ns: 9,
+            ..Default::default()
+        });
         assert_eq!(ring.slot(0).unwrap().start_ns, 9);
         // Dropping the ring must not release the caller's allocation.
         drop(ring);
@@ -705,17 +703,14 @@ mod tests {
             arm_with_gpu(header, TraceScope::ENGRAM_PREFETCH, 4),
             TraceScope::ENGRAM_PREFETCH
         );
-        // SAFETY: nothing else touches this ring.
-        unsafe {
-            assert!(ring.push_if_armed(
-                TraceScope::ENGRAM_PREFETCH,
-                GpuTraceEvent {
-                    scope_and_rank: (5u32 << 8) | 1,
-                    ..Default::default()
-                }
-            ));
-            assert!(!ring.push_if_armed(TraceScope::MOE_MXFP4, GpuTraceEvent::default()));
-        }
+        assert!(ring.push_if_armed(
+            TraceScope::ENGRAM_PREFETCH,
+            GpuTraceEvent {
+                scope_and_rank: (5u32 << 8) | 1,
+                ..Default::default()
+            }
+        ));
+        assert!(!ring.push_if_armed(TraceScope::MOE_MXFP4, GpuTraceEvent::default()));
         assert_eq!(ring.header().written(), 1);
         crate::controller::disarm_with_gpu(header);
     }

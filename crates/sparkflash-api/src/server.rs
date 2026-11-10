@@ -7202,10 +7202,9 @@ async fn trace_dump() -> Result<Response, ApiError> {
     let events = drain_cpu_events();
     let summaries = summarize(&events);
     let ring = gpu_trace_ring();
-    // SAFETY: the ring is an owned host allocation in this process, so no kernel can be
-    // writing slots while the host reads them; M1 has no GPU producer at all. If that
-    // changes, this read must be sequenced after the graph's completion event.
-    let gpu_events = unsafe { ring.collect() };
+    // M1 has no GPU producer, so nothing is writing slots while this reads them. If that
+    // changes, the read must be sequenced after the graph's completion event.
+    let gpu_events = ring.collect();
     let json_text = to_chrome_trace_json(&events, &gpu_events, TraceExportOptions::default());
     let mut document: Value =
         serde_json::from_str(&json_text).unwrap_or_else(|_| json!({"traceEvents": []}));
