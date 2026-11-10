@@ -1581,10 +1581,9 @@ async fn trace_dump_includes_the_gpu_ring_and_reports_it_unmapped() {
         layer_id: 3,
         payload_meta: 7,
     };
-    // SAFETY: M1 has no GPU producer, so this test is the only writer of the ring; it
-    // pushes and clears on one thread while holding the trace lock, so no capture can be
-    // in flight concurrently.
-    unsafe { ring.push(event) };
+    // M1 has no GPU producer, so this test is the only writer of the ring; it pushes and
+    // clears on one thread while holding the trace lock, so no capture is in flight.
+    ring.push(event);
 
     let (status, _, bytes) = send(app(), get_request("/v1/admin/trace/dump")).await;
     assert_eq!(status, StatusCode::OK);
@@ -1606,12 +1605,9 @@ async fn trace_dump_includes_the_gpu_ring_and_reports_it_unmapped() {
     assert_eq!(document["metadata"]["gpu_ring"]["events_included"], 1);
     assert_eq!(document["metadata"]["gpu_ring"]["mapped"], false);
 
-    // SAFETY: same single-writer contract as push.
-    unsafe { ring.clear() };
-    assert!(
-        unsafe { ring.collect() }.is_empty(),
-        "ring must be left empty"
-    );
+    // Same single-writer contract as push.
+    ring.clear();
+    assert!(ring.collect().is_empty(), "ring must be left empty");
 }
 
 #[tokio::test]
