@@ -22,6 +22,8 @@
 //! The first adapter is the generic host driver. The V4.1 reference driver still lives in the CLI
 //! until the next move; it can migrate onto this crate without changing the HTTP contract.
 
+#![forbid(unsafe_code)]
+
 pub mod host;
 
 pub use host::{HostDriver, HostOptions};

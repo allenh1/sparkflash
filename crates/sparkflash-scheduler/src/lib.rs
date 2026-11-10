@@ -26,6 +26,7 @@
 //! [NVIDIA Flare](https://github.com/NVIDIA/flare-local-inference)
 //! (`helios/src/scheduler/speculation.rs`, `cost.rs`, `learning.rs`). See the root `NOTICE` file.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use serde::{Deserialize, Serialize};

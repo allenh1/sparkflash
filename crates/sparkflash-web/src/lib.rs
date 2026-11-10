@@ -33,6 +33,8 @@
 //!   only while the cluster is idle.
 //! - [`api`] is the axum router and the embedded single-page dark UI.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
 pub mod commands;
 pub mod config;
