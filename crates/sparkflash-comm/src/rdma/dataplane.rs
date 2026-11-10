@@ -394,9 +394,9 @@ pub(crate) fn plan_writes(
 /// A zeroed `ibv_qp_attr`: every field is an integer or an integer array, so zero is a valid
 /// value and the transitions below set only the fields their mask announces.
 fn zeroed_attr() -> IbvQpAttr {
-    // SAFETY: IbvQpAttr contains only integers, arrays of integers, and the AhAttr/Grh structs,
-    // all of which are valid when zeroed; the layout is asserted in abi.rs.
-    unsafe { std::mem::zeroed() }
+    // `Default` is the derived all-zero value: no field of the mirror is a pointer or a union, so
+    // zero is a valid bit pattern for each and the derive is the same bytes as `zeroed()`.
+    IbvQpAttr::default()
 }
 
 /// The INIT transition: state, P_Key index, port and the access flags a peer's RDMA write needs.
@@ -732,8 +732,7 @@ impl DataPlane {
 
 /// A zeroed completion entry: every field is an integer, so zero is a valid value.
 fn zeroed_wc() -> IbvWc {
-    // SAFETY: IbvWc contains only integers and arrays of integers.
-    unsafe { std::mem::zeroed() }
+    IbvWc::default()
 }
 
 impl DataPlane {

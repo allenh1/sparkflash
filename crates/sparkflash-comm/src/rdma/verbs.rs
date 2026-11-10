@@ -442,7 +442,7 @@ impl Context {
     pub(crate) fn query_port(&self, port: u8) -> Result<PortInfo, CommError> {
         // SAFETY: the struct is all integers and the library writes every field it has; a zeroed
         // buffer is a valid value for it.
-        let mut attr: IbvPortAttr = unsafe { std::mem::zeroed() };
+        let mut attr = IbvPortAttr::default();
         // SAFETY: `raw` is a live context and `port` is the 1-based port number the caller
         // validated against the device's port count.
         let code = unsafe { (self.fns.query_port)(self.raw, port, &mut attr) };

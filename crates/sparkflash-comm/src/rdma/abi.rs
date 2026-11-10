@@ -334,7 +334,7 @@ pub struct IbvRecvWr {
 
 /// `struct ibv_wc`: one completion queue entry.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct IbvWc {
     /// Work-request tag set by the poster.
     pub wr_id: u64,
@@ -373,6 +373,7 @@ pub struct IbvWc {
 /// pinned by the static assertions below, so a library with a different shape is a build failure
 /// here rather than a silent read of the wrong field.
 #[repr(C)]
+#[derive(Default)]
 pub struct IbvPortAttr {
     /// `enum ibv_port_state`: 4 is ACTIVE.
     pub state: c_int,
@@ -500,6 +501,7 @@ pub struct IbvQpInitAttr {
 /// offsets match; the trailing space covers `rate_limit` and `rate_limit_attr`, which newer
 /// rdma-core versions appended.
 #[repr(C)]
+#[derive(Default)]
 pub struct IbvQpAttr {
     /// `enum ibv_qp_state` to transition to (1 INIT, 2 RTR, 3 RTS).
     pub qp_state: c_int,
