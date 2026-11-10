@@ -32,3 +32,6 @@ sparkflash-model-deepseek-v41 = { workspace = true }
 tempfile = { workspace = true }
 # The 2A pin test that the engine layer plan and the kv CED schedule agree on all 40 layers.
 sparkflash-kv = { workspace = true }
+
+[lints]
+workspace = true

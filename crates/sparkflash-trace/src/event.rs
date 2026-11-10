@@ -363,9 +363,12 @@ pub struct GpuTraceRing {
     capacity: usize,
 }
 
-// SAFETY: the ring is a block of plain memory plus two atomic header words; a shared
-// reference only exposes the atomics and the unsafe slot accessors, so safe code cannot race.
+// SAFETY: the ring is a block of plain memory plus two atomic header words, and an owned ring's
+// allocation has no thread affinity; moving it to another thread is sound because the owner moves
+// with it and no thread-local state points into the slab.
 unsafe impl Send for GpuTraceRing {}
+// SAFETY: as for `Send`, and a shared reference only exposes the atomics through `header` plus the
+// slot accessors, which are themselves unsafe or volatile, so safe code cannot start a race.
 unsafe impl Sync for GpuTraceRing {}
 
 impl std::fmt::Debug for GpuTraceRing {

@@ -33,3 +33,6 @@ anyhow = { workspace = true }
 tokenizers = "0.23"
 deepseek-recipe-core = { workspace = true }
 deepseek-recipe-encoding = { workspace = true }
+
+[lints]
+workspace = true

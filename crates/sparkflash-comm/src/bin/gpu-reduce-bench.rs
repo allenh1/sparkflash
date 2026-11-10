@@ -139,6 +139,9 @@ mod cuda {
             // SAFETY: dlopen with RTLD_NOW on a soname; the handle is owned by Api.
             let library = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) };
             if library.is_null() {
+                // SAFETY: `dlopen` just failed and returned null, so `dlerror` reports that one
+                // failure; the returned pointer is either null or a NUL-terminated string owned by
+                // libc and valid until the next `dlerror`.
                 let detail = unsafe { CStr::from_ptr(libc::dlerror()) }
                     .to_string_lossy()
                     .into_owned();
@@ -202,10 +205,10 @@ mod cuda {
             unsafe {
                 check((api.cu_init)(0), "cuInit")?;
                 let mut device: CuDevice = 0;
-                check((api.cu_device_get)(&mut device, 0), "cuDeviceGet")?;
+                check((api.cu_device_get)(&raw mut device, 0), "cuDeviceGet")?;
                 let mut context: CuContext = ptr::null_mut();
                 check(
-                    (api.cu_device_primary_ctx_retain)(&mut context, device),
+                    (api.cu_device_primary_ctx_retain)(&raw mut context, device),
                     "cuDevicePrimaryCtxRetain",
                 )?;
                 check((api.cu_ctx_set_current)(context), "cuCtxSetCurrent")?;
@@ -219,7 +222,12 @@ mod cuda {
         pub fn malloc(&self, bytes: usize) -> Result<u64> {
             let mut pointer: u64 = 0;
             // SAFETY: out-parameter for cuMemAlloc.
-            unsafe { check((self.api.cu_mem_alloc)(&mut pointer, bytes), "cuMemAlloc")? };
+            unsafe {
+                check(
+                    (self.api.cu_mem_alloc)(&raw mut pointer, bytes),
+                    "cuMemAlloc",
+                )?
+            };
             Ok(pointer)
         }
 
@@ -255,7 +263,7 @@ mod cuda {
             // SAFETY: out-parameter for cuStreamCreate; 0 is the default flags value.
             unsafe {
                 check(
-                    (self.api.cu_stream_create)(&mut stream, 0),
+                    (self.api.cu_stream_create)(&raw mut stream, 0),
                     "cuStreamCreate",
                 )?
             };

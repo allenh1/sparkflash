@@ -81,6 +81,7 @@ pub fn tune() -> Tuning {
         // SAFETY: mallopt only changes process-wide glibc allocator tunables. The caller invokes
         // this at startup, before model allocations, thread pools or signal handlers exist.
         let mmap_threshold = unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, THRESHOLD) != 0 };
+        // SAFETY: as above; the second tunable is process-wide and set at the same startup point.
         let trim_threshold = unsafe { libc::mallopt(libc::M_TRIM_THRESHOLD, THRESHOLD) != 0 };
         Tuning {
             enabled: true,

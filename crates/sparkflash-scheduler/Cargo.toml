@@ -28,3 +28,6 @@ sparkflash-kv = { workspace = true }
 sparkflash-engram = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
+
+[lints]
+workspace = true

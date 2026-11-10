@@ -77,3 +77,6 @@ path = "src/bin/gpu-reduce-bench.rs"
 # on every rank. Used by the comm reduce workstream; it touches no GPU and no node config.
 name = "comm-reduce-bench"
 path = "src/bin/comm-reduce-bench.rs"
+
+[lints]
+workspace = true

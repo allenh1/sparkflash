@@ -29,3 +29,6 @@ sparkflash-trace = { workspace = true }
 
 [dev-dependencies]
 sparkflash-weights = { workspace = true }
+
+[lints]
+workspace = true

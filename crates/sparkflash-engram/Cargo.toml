@@ -54,3 +54,6 @@ tempfile = { workspace = true }
 [[bin]]
 name = "pack-engram"
 path = "src/bin/pack_engram.rs"
+
+[lints]
+workspace = true

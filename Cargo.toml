@@ -44,6 +44,15 @@ license = "Apache-2.0"
 authors = ["Hunter L. Allen <hunter@allen-software.com>"]
 rust-version = "1.88"
 
+# The unsafe surface is the dlopen boundary of the CUDA driver, libibverbs and NCCL, plus the
+# trace ring's mapped slots. Nothing in that set is self-evident, so every block states why it is
+# sound and a new one without that statement fails the build instead of merging on trust.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
 [workspace.dependencies]
 sparkflash-trace = { path = "crates/sparkflash-trace" }
 sparkflash-model = { path = "crates/sparkflash-model" }

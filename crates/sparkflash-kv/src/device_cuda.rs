@@ -72,7 +72,7 @@ impl CudaMemory {
             let get_count: libloading::Symbol<unsafe extern "C" fn(*mut i32) -> CuResult> = lib
                 .get(b"cuDeviceGetCount")
                 .map_err(|error| StoreError::Backend(format!("cuDeviceGetCount: {error}")))?;
-            let result = get_count(&mut count);
+            let result = get_count(&raw mut count);
             if result != 0 || count <= 0 {
                 return Err(StoreError::Backend(format!(
                     "no CUDA device: {} devices, {}",
@@ -84,7 +84,7 @@ impl CudaMemory {
             let get: libloading::Symbol<unsafe extern "C" fn(*mut i32, i32) -> CuResult> = lib
                 .get(b"cuDeviceGet")
                 .map_err(|error| StoreError::Backend(format!("cuDeviceGet: {error}")))?;
-            let result = get(&mut device, 0);
+            let result = get(&raw mut device, 0);
             if result != 0 {
                 return Err(StoreError::Backend(driver_error("cuDeviceGet", result)));
             }
@@ -111,7 +111,7 @@ impl CudaMemory {
             > = lib.get(b"cuDevicePrimaryCtxRetain").map_err(|error| {
                 StoreError::Backend(format!("cuDevicePrimaryCtxRetain: {error}"))
             })?;
-            let result = retain(&mut ctx, device);
+            let result = retain(&raw mut ctx, device);
             if result != 0 {
                 return Err(StoreError::Backend(driver_error(
                     "cuDevicePrimaryCtxRetain",
@@ -180,7 +180,7 @@ impl CudaMemory {
                     .map_err(|error| StoreError::Backend(format!("cuMemGetInfo_v2: {error}")))?;
             let mut free = 0u64;
             let mut total = 0u64;
-            let result = symbol(&mut free, &mut total);
+            let result = symbol(&raw mut free, &raw mut total);
             if result != 0 {
                 return Err(StoreError::Backend(driver_error("cuMemGetInfo_v2", result)));
             }
@@ -218,7 +218,7 @@ impl StoreMemory for CudaMemory {
                 .get(b"cuMemAlloc_v2")
                 .map_err(|error| StoreError::Backend(format!("cuMemAlloc_v2: {error}")))?;
             let mut address: CuDeviceptr = 0;
-            let result = symbol(&mut address, bytes);
+            let result = symbol(&raw mut address, bytes);
             if result != 0 {
                 return Err(StoreError::Backend(driver_error("cuMemAlloc_v2", result)));
             }

@@ -956,6 +956,8 @@ pub fn execute(plan: &PackPlan, options: &PackOptions) -> Result<PackReport> {
         let scale_info = validate_tensor(&header, &layer.scale, &shard_path)?;
         let file = File::open(&shard_path)
             .with_context(|| format!("open source shard {}", shard_path.display()))?;
+        // SAFETY: `memmap2` requires a read-only mapping of a file nobody writes behind it, which is the
+        // converted-weight shard this packer opened and keeps alive in `SourceLayer.map`.
         let map = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap source shard {}", shard_path.display()))?;
         map.advise(Advice::Sequential)
@@ -1274,6 +1276,8 @@ pub fn verify(plan: &PackPlan, manifest: &PackManifest) -> Result<(usize, u64)> 
         let scale_info = validate_tensor(&header, &layer_plan.scale, &source_path)?;
         let file = File::open(&source_path)
             .with_context(|| format!("open source shard {}", source_path.display()))?;
+        // SAFETY: `memmap2` requires a read-only mapping of a file nobody writes behind it, which is the
+        // source shard this packer opened and keeps alive in `SourceLayer.map`.
         let map = unsafe { Mmap::map(&file) }
             .with_context(|| format!("mmap source shard {}", source_path.display()))?;
         let source = SourceLayer {
@@ -1389,7 +1393,11 @@ pub fn mem_available_bytes() -> Result<u64> {
         }
     }
     // Fallback for a kernel without /proc.
+    // SAFETY: `sysconf` reads a kernel constant from a name this call passes as a constant; it touches no
+    // memory the caller owns, so no precondition is left to the caller.
     let pages = unsafe { libc::sysconf(libc::_SC_AVPHYS_PAGES) };
+    // SAFETY: `sysconf` reads a kernel constant from a name this call passes as a constant; it touches no
+    // memory the caller owns, so no precondition is left to the caller.
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     ensure!(
         pages > 0 && page_size > 0,
