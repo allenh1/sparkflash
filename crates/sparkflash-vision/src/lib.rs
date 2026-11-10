@@ -37,6 +37,8 @@
 //!
 //! [`span`] lays out the image token span the language model sees and the type of each position.
 
+#![forbid(unsafe_code)]
+
 pub mod decode;
 pub mod plan;
 pub mod prep;

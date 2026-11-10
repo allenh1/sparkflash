@@ -27,6 +27,8 @@
 //! second pack adds a descriptor here (or in a pack crate that registers at startup) without
 //! changing the server, the web control plane, or the CLI dispatcher.
 
+#![forbid(unsafe_code)]
+
 pub mod backend;
 pub mod capabilities;
 pub mod config;
