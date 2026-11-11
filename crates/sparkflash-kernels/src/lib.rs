@@ -59,6 +59,7 @@ pub mod engram_wkv_launch;
 pub mod engram_write_launch;
 pub mod flash_mla_csa2_ring_launch;
 pub mod flash_mla_csa2_seq_launch;
+pub mod head_screen_ref;
 pub mod hostw_gemv_launch;
 pub mod hostw_gemv_ref;
 pub mod images;

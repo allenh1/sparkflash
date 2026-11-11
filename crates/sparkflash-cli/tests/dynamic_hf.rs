@@ -889,8 +889,13 @@ impl Server {
 fn exchange(base: &str, method: &str, path: &str, body: Option<&str>) -> Response {
     let address = base.trim_start_matches("http://");
     let mut stream = TcpStream::connect(address).expect("connect");
+    // Ten minutes, not two. This read waits for a server this test spawned, and on a shared runner
+    // several of these tests convert and boot at once: the same nine tests take 99 s one at a time
+    // and took 203 s three-wide on the runner that first failed here, which put a single request
+    // past a two-minute budget that has nothing to do with what the test asserts. Nothing in this
+    // file is a latency measurement, so the wait only has to outlast a loaded conversion.
     stream
-        .set_read_timeout(Some(Duration::from_secs(120)))
+        .set_read_timeout(Some(Duration::from_secs(600)))
         .expect("timeout");
     let body = body.unwrap_or("");
     let request = format!(

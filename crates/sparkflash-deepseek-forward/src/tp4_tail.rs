@@ -209,7 +209,8 @@ mod device {
         W_BLOCK_MAX_BYTES, cubin_path, join_f32_words, split_f32_words,
     };
     use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
-    use sparkflash_kernels::{cert_lm_head_launch, lm_head_ref, rmsnorm_launch};
+    use sparkflash_kernels::{cert_lm_head_launch, head_screen_ref, lm_head_ref, rmsnorm_launch};
+    use std::cell::Cell;
     use std::path::{Path, PathBuf};
 
     /// The per-rank device buffers one tail stage owns.
@@ -248,6 +249,535 @@ mod device {
         pub block_argmax: Vec<u32>,
     }
 
+    /// Whether the rows head is screened when the profile does not say
+    /// (`diagnostics.head_screen`).
+    const HEAD_SCREEN_DEFAULT: bool = true;
+    /// The tiles of int8 codes a rank's head slice fills (kernels/opt_rows_sm121.cu, OHS_TILE).
+    const SCREEN_TILES: usize = VOCAB_PER_RANK.div_ceil(head_screen_ref::TILE);
+    /// The most hidden rows a step screens: the rows head's R_MAX.
+    const SCREEN_ROWS: usize = 64;
+    /// The rows the self test screens: two row blocks, the second partly filled.
+    const SCREEN_TEST_ROWS: usize = 41;
+
+    /// opt_rows_lm_head's noise arguments, in its order: the temperature's inverse as f32 bits (zero
+    /// for greedy rows), the seed, the first row's position, the rank's first id and the per-row
+    /// parameter buffer (zero when the scalars cover every row).
+    pub(crate) type HeadNoise = [u64; 5];
+
+    /// What the checked steps saw (`diagnostics.head_screen_check`).
+    #[derive(Debug, Clone, Copy, Default)]
+    struct ScreenTally {
+        steps: u64,
+        rows: u64,
+        scored: u64,
+        most: u32,
+    }
+
+    /// The rows head's screen (kernels/opt_rows_sm121.cu, opt_head_screen_*): an int8 copy of
+    /// the rank's head slice whose integer dot products bound every logit from both sides, so
+    /// opt_rows_lm_head's arithmetic runs only over the entries a bound cannot rule out. The
+    /// arg-max and its value are that kernel's bits. One a rank, built once when the tail opens.
+    pub struct HeadScreen {
+        modules: Vec<Module>,
+        rows: Kernel,
+        mma: Kernel,
+        exact: Kernel,
+        /// The codes, `[SCREEN_TILES][160][128][32]` int8.
+        codes: Deviceptr,
+        /// `[SCREEN_TILES * 128][4]` f32: each entry's scale and its two error coefficients.
+        coef: Deviceptr,
+        /// A step's hidden rows as two int8 digits each, `[2 * SCREEN_ROWS][HIDDEN]`.
+        act: Deviceptr,
+        /// `[SCREEN_ROWS][4]` f32: each row's scale and its two norms.
+        meta: Deviceptr,
+        /// `[SCREEN_ROWS][VOCAB_PER_RANK]` f32: every logit's upper bound.
+        upper: Deviceptr,
+        /// `[SCREEN_ROWS][SCREEN_TILES]` f32: each tile's best lower bound.
+        tile_lo: Deviceptr,
+        /// `[SCREEN_ROWS]` u32: the entries scored for each row (checked steps only).
+        counts: Deviceptr,
+        /// Whether every screened step also runs the full head and is compared with it.
+        pub check: bool,
+        tally: Cell<ScreenTally>,
+    }
+
+    impl HeadScreen {
+        /// Loads the screen's kernels, builds the table from the bound head slice and waits for
+        /// it (a step's screen reads the codes before it waits on its predecessor, so they have
+        /// to be there before the first step). `shard` is the slice's bytes, which the caller
+        /// has already read; with `check` the device's table and a screen of made-up rows are
+        /// compared with the host reference before anything is served.
+        fn open(
+            cuda: &Cuda,
+            kernel_dir: &Path,
+            head: Deviceptr,
+            shard: &[u8],
+            check: bool,
+            allocated: &mut usize,
+        ) -> Result<Self, String> {
+            let (cubin, _sha) =
+                crate::tp4_forward::cached_cubin(&kernel_dir.join("opt_rows_sm121.cubin"))
+                    .map_err(|error| format!("head screen: {error}"))?;
+            let mut modules = Vec::new();
+            let mut load = |name: &'static str| -> Result<Kernel, String> {
+                let (module, kernel) = cuda.load_named(&cubin, name)?;
+                modules.push(module);
+                Ok(kernel)
+            };
+            let build = load("opt_head_screen_build")?;
+            let rows = load("opt_head_screen_rows")?;
+            let mma = load("opt_head_screen_mma")?;
+            let exact = load("opt_head_screen_exact")?;
+            let mut alloc = |bytes: usize, what: &str| {
+                cuda.alloc(bytes, allocated)
+                    .map_err(|error| format!("head screen {what}: {error}"))
+            };
+            let entries = SCREEN_TILES * head_screen_ref::TILE;
+            let screen = Self {
+                codes: alloc(head_screen_ref::table_bytes(VOCAB_PER_RANK), "codes")?,
+                coef: alloc(entries * 16, "coefficients")?,
+                act: alloc(2 * SCREEN_ROWS * HIDDEN, "digits")?,
+                meta: alloc(SCREEN_ROWS * 16, "row scales")?,
+                upper: alloc(SCREEN_ROWS * VOCAB_PER_RANK * 4, "upper bounds")?,
+                tile_lo: alloc(SCREEN_ROWS * SCREEN_TILES * 4, "tile bounds")?,
+                counts: alloc(SCREEN_ROWS * 4, "counts")?,
+                modules,
+                rows,
+                mma,
+                exact,
+                check,
+                tally: Cell::new(ScreenTally::default()),
+            };
+            cuda.launch(
+                build,
+                (entries as u32, 1, 1),
+                (256, 1, 1),
+                &[head.0, screen.codes.0, screen.coef.0, VOCAB_PER_RANK as u64],
+            )?;
+            // The read waits for the build. An entry the bound does not cover (a value that is
+            // not finite, or squares that sum past the kernel's cut) is always scored, which is
+            // still exact; a head holding one is not a head this path was measured on, so say so
+            // rather than serve it.
+            let coef = screen.read_f32(cuda, screen.coef, entries * 4)?;
+            if let Some(entry) = (0..VOCAB_PER_RANK).find(|&entry| {
+                coef[entry * 4..entry * 4 + 3]
+                    .iter()
+                    .any(|value| !value.is_finite())
+            }) {
+                return Err(format!(
+                    "head screen: entry {entry} of this rank's head slice is not finite or too \
+                     large for the screen's bound; serve it with SPARKFLASH_HEAD_SCREEN=0"
+                ));
+            }
+            // The self test runs whenever the screen is in use, not only when the diagnostic
+            // switch is set. The screen decides which logits the certified head is allowed not to
+            // compute, so an under-estimated bound silently skips the true arg-max and changes a
+            // token with no other symptom. The test is one grid over this rank's slice and a host
+            // comparison of forty-one rows, paid once at open; a diagnostic switch that defaults to
+            // off cannot be the only thing standing between the default serving path and an
+            // unsound bound.
+            screen.self_test(cuda, shard, &coef).map_err(|error| {
+                format!(
+                    "{error} (SPARKFLASH_HEAD_SCREEN_CHECK=1 runs this test on its own; SPARKFLASH_HEAD_SCREEN=0 serves the full head)"
+                )
+            })?;
+            // What the screen costs, where an operator watching memory will find it: the int8
+            // code table is the large part (~158 MiB a rank at 32 320 x 5 120), and until this line
+            // existed nothing in the logs or the docs said so.
+            eprintln!(
+                "sparkflash serve: head screen on over {} x {} int8 codes: {} bytes of codes, {} of bounds for {} rows; self test passed{}",
+                VOCAB_PER_RANK,
+                HIDDEN,
+                head_screen_ref::table_bytes(VOCAB_PER_RANK),
+                SCREEN_ROWS * (VOCAB_PER_RANK + SCREEN_TILES) * 4,
+                SCREEN_ROWS,
+                if check {
+                    " (diagnostic check also armed)"
+                } else {
+                    ""
+                }
+            );
+            Ok(screen)
+        }
+
+        fn read_f32(&self, cuda: &Cuda, from: Deviceptr, count: usize) -> Result<Vec<f32>, String> {
+            let mut bytes = vec![0u8; count * 4];
+            cuda.copy_dtoh(&mut bytes, &from)
+                .map_err(|error| format!("head screen read: {error}"))?;
+            Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| f32::from_le_bytes(*word))
+                .collect())
+        }
+
+        /// Queues the screen of `(hidden, n)`, `n` rows of bf16 `[n][HIDDEN]`, and the exact pass over
+        /// what it keeps, which writes the rows' chunk maxima where opt_rows_lm_head writes them.
+        /// `noise` is that kernel's `(inv_t bits, seed, first position, id base, row parameters)`,
+        /// all zero for a greedy step. With `count` the entries scored for each row are left in
+        /// the count buffer.
+        pub(crate) fn launch(
+            &self,
+            cuda: &Cuda,
+            (hidden, n): (u64, usize),
+            head: Deviceptr,
+            (block_max, block_arg): (u64, u64),
+            noise: HeadNoise,
+            count: bool,
+        ) -> Result<(), String> {
+            if n == 0 || n > SCREEN_ROWS {
+                return Err(format!(
+                    "head screen: {n} rows are outside 1..={SCREEN_ROWS}"
+                ));
+            }
+            cuda.launch(
+                self.rows,
+                (n as u32, 1, 1),
+                (256, 1, 1),
+                &[hidden, self.act.0, self.meta.0],
+            )?;
+            cuda.launch(
+                self.mma,
+                (n.div_ceil(32) as u32, SCREEN_TILES as u32, 1),
+                (256, 1, 1),
+                &[
+                    self.act.0,
+                    self.meta.0,
+                    self.codes.0,
+                    self.coef.0,
+                    self.upper.0,
+                    self.tile_lo.0,
+                    VOCAB_PER_RANK as u64,
+                    n as u64,
+                    noise[0],
+                    noise[1],
+                    noise[2],
+                    noise[3],
+                    noise[4],
+                ],
+            )?;
+            if count {
+                cuda.copy_htod(&self.counts, &[0u8; SCREEN_ROWS * 4])
+                    .map_err(|error| format!("head screen count reset: {error}"))?;
+            }
+            cuda.launch(
+                self.exact,
+                (n.div_ceil(4) as u32, CHUNKS_PER_RANK as u32, 1),
+                (512, 1, 1),
+                &[
+                    hidden,
+                    head.0,
+                    self.upper.0,
+                    self.tile_lo.0,
+                    block_max,
+                    block_arg,
+                    VOCAB_PER_RANK as u64,
+                    n as u64,
+                    SCREEN_TILES as u64,
+                    if count { self.counts.0 } else { 0 },
+                    noise[0],
+                    noise[1],
+                    noise[2],
+                    noise[3],
+                    noise[4],
+                ],
+            )
+        }
+
+        /// Adds a checked step's rows to the tally (the entries the exact pass scored for each)
+        /// and reports it every so often: the check's evidence is its count of compared rows.
+        pub(crate) fn tally_checked(&self, cuda: &Cuda, n: usize) -> Result<(), String> {
+            let mut bytes = vec![0u8; n * 4];
+            cuda.copy_dtoh(&mut bytes, &self.counts)
+                .map_err(|error| format!("head screen count read: {error}"))?;
+            let mut tally = self.tally.get();
+            tally.steps += 1;
+            for word in bytes.as_chunks::<4>().0 {
+                let scored = u32::from_le_bytes(*word);
+                tally.rows += 1;
+                tally.scored += u64::from(scored);
+                tally.most = tally.most.max(scored);
+            }
+            self.tally.set(tally);
+            if tally.steps.is_multiple_of(1024) {
+                self.report();
+            }
+            Ok(())
+        }
+
+        fn report(&self) {
+            let tally = self.tally.get();
+            if tally.rows != 0 {
+                eprintln!(
+                    "head screen check: {} steps and {} rows agree with the full head; {:.1} of \
+                     {VOCAB_PER_RANK} entries scored a row, {} at most",
+                    tally.steps,
+                    tally.rows,
+                    tally.scored as f64 / tally.rows as f64,
+                    tally.most
+                );
+            }
+        }
+
+        /// Compares what the device built and what its screen computes with the host reference
+        /// (sparkflash_kernels::head_screen_ref): every entry's codes and scale to the bit and
+        /// its coefficients on the safe side, then, for rows that fill two row blocks (plain rows
+        /// at several scales, a sparse one and three the bound does not cover), every digit to
+        /// the bit and every upper bound and tile bound against the exact integer dot product.
+        fn self_test(&self, cuda: &Cuda, shard: &[u8], coef: &[f32]) -> Result<(), String> {
+            let refuse = |what: String| Err(format!("head screen self test: {what}"));
+            let words = |bytes: &[u8]| -> Vec<u16> {
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|word| u16::from_le_bytes(*word))
+                    .collect()
+            };
+            // Within `slack` above the exact value, and never below it.
+            let safe = |device: f32, exact: f64, slack: f64| {
+                f64::from(device) >= exact && f64::from(device) <= exact * slack + 2e-17
+            };
+            let mut device_codes = vec![0u8; head_screen_ref::table_bytes(VOCAB_PER_RANK)];
+            cuda.copy_dtoh(&mut device_codes, &self.codes)
+                .map_err(|error| format!("head screen codes read: {error}"))?;
+            let mut codes = vec![0i8; VOCAB_PER_RANK * HIDDEN];
+            for entry in 0..VOCAB_PER_RANK {
+                let host = head_screen_ref::entry_codes(&words(
+                    &shard[entry * HIDDEN * 2..][..HIDDEN * 2],
+                ));
+                let c = &coef[entry * 4..entry * 4 + 4];
+                if c[0].to_bits() != host.scale.to_bits()
+                    || !safe(c[1], host.a_floor(), 1.02)
+                    || !safe(c[2], host.coded_norm, 1.02)
+                {
+                    return refuse(format!(
+                        "entry {entry}: the device holds scale {} and coefficients {} {}, the \
+                         reference {} {} {}",
+                        c[0],
+                        c[1],
+                        c[2],
+                        host.scale,
+                        host.a_floor(),
+                        host.coded_norm
+                    ));
+                }
+                for block in 0..head_screen_ref::K_BLOCKS {
+                    let at = head_screen_ref::code_offset(entry, block * 32);
+                    let device = &device_codes[at..at + 32];
+                    let expect = &host.codes[block * 32..block * 32 + 32];
+                    if device.iter().zip(expect).any(|(&d, &e)| d as i8 != e) {
+                        return refuse(format!(
+                            "entry {entry}: the codes of K block {block} differ"
+                        ));
+                    }
+                }
+                codes[entry * HIDDEN..(entry + 1) * HIDDEN].copy_from_slice(&host.codes);
+            }
+            drop(device_codes);
+
+            // The made-up rows: a reproducible stream at scales 1/16 .. 16, then the special ones.
+            let n = SCREEN_TEST_ROWS;
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            let mut unit = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            };
+            let bf16 = sparkflash_kernels::m4_quant::bf16_bits;
+            let mut hidden = vec![0u16; n * HIDDEN];
+            for (row, values) in hidden.chunks_mut(HIDDEN).enumerate() {
+                let scale = 2.0f32.powi(row as i32 % 9 - 4);
+                for (k, value) in values.iter_mut().enumerate() {
+                    let v = (unit() + unit() + unit() + unit()) * 0.5 * scale;
+                    *value = match row {
+                        // All zero; one value not a number; too large for the bound; sparse.
+                        37 => 0,
+                        38 if k == 1234 => 0x7fc0,
+                        39 => bf16(3.0e16),
+                        40 if k % 61 != 0 => 0,
+                        _ => bf16(v),
+                    };
+                }
+            }
+            let bytes: Vec<u8> = hidden.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let mut scratch = 0usize;
+            let staged = cuda
+                .alloc(bytes.len(), &mut scratch)
+                .map_err(|error| format!("head screen self test rows: {error}"))?;
+            let outcome = (|| {
+                cuda.copy_htod(&staged, &bytes)?;
+                cuda.launch(
+                    self.rows,
+                    (n as u32, 1, 1),
+                    (256, 1, 1),
+                    &[staged.0, self.act.0, self.meta.0],
+                )?;
+                cuda.launch(
+                    self.mma,
+                    (n.div_ceil(32) as u32, SCREEN_TILES as u32, 1),
+                    (256, 1, 1),
+                    &[
+                        self.act.0,
+                        self.meta.0,
+                        self.codes.0,
+                        self.coef.0,
+                        self.upper.0,
+                        self.tile_lo.0,
+                        VOCAB_PER_RANK as u64,
+                        n as u64,
+                        // Greedy rows: the bounds are the logit's own.
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                )?;
+                let mut act = vec![0u8; 2 * SCREEN_ROWS * HIDDEN];
+                cuda.copy_dtoh(&mut act, &self.act)?;
+                Ok::<_, String>((
+                    act,
+                    self.read_f32(cuda, self.meta, n * 4)?,
+                    self.read_f32(cuda, self.upper, n * VOCAB_PER_RANK)?,
+                    self.read_f32(cuda, self.tile_lo, n * SCREEN_TILES)?,
+                ))
+            })();
+            cuda.free_buffers(&[&staged]);
+            let (act, meta, upper, tile_lo) = outcome?;
+
+            let check_row = |row: usize| -> Result<(), String> {
+                let host = head_screen_ref::row_digits(&hidden[row * HIDDEN..(row + 1) * HIDDEN]);
+                let m = &meta[row * 4..row * 4 + 4];
+                let upper = &upper[row * VOCAB_PER_RANK..(row + 1) * VOCAB_PER_RANK];
+                let tile_lo = &tile_lo[row * SCREEN_TILES..(row + 1) * SCREEN_TILES];
+                if host.usable != matches!(row, 0..=36 | 40) {
+                    return Err(format!(
+                        "row {row}: the reference's own cut is not the expected one"
+                    ));
+                }
+                if m[0].to_bits() != host.scale.to_bits() {
+                    return Err(format!("row {row}: scale {} for {}", m[0], host.scale));
+                }
+                for k in 0..HIDDEN {
+                    let (p0, p1) = host.pair(k);
+                    let lo = act[head_screen_ref::digit_row(row, 0) * HIDDEN + k] as i8;
+                    let hi = act[head_screen_ref::digit_row(row, 1) * HIDDEN + k] as i8;
+                    if (lo, hi) != (p0, p1) {
+                        return Err(format!("row {row}: the digits at {k} differ"));
+                    }
+                }
+                if !host.usable {
+                    // Never ruled out: every upper bound is +infinity and no tile has a bound.
+                    return if m[1] == f32::INFINITY
+                        && upper.iter().all(|&value| value == f32::INFINITY)
+                        && tile_lo.iter().all(|&value| value == f32::NEG_INFINITY)
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "row {row}: a row the bound does not cover was screened"
+                        ))
+                    };
+                }
+                if !safe(m[1], host.norm, 1.002) || !safe(m[2], host.dropped_norm, 1.002) {
+                    return Err(format!(
+                        "row {row}: the device took norms {} {}, the reference {} {}",
+                        m[1], m[2], host.norm, host.dropped_norm
+                    ));
+                }
+                let mut best = vec![(f32::NEG_INFINITY, 0.0f32); SCREEN_TILES];
+                for entry in 0..VOCAB_PER_RANK {
+                    let c = &coef[entry * 4..entry * 4 + 4];
+                    let dot = head_screen_ref::integer_dot(
+                        &codes[entry * HIDDEN..(entry + 1) * HIDDEN],
+                        &host.digits,
+                    );
+                    let p = head_screen_ref::proxy(c[0], m[0], dot);
+                    let half = head_screen_ref::half_width(c[1], c[2], m[1], m[2], p);
+                    // The device may fuse the half width's operations: a few units in the last
+                    // place of it, against an integer dot product that is exact.
+                    let slack = 1e-5 * (p.abs() + half);
+                    let off = (upper[entry] - (p + half)).abs();
+                    if off.is_nan() || off > slack {
+                        return Err(format!(
+                            "row {row}, entry {entry}: upper bound {} for {} + {}",
+                            upper[entry], p, half
+                        ));
+                    }
+                    let tile = &mut best[entry / head_screen_ref::TILE];
+                    if p - half > tile.0 {
+                        *tile = (p - half, slack);
+                    }
+                }
+                for (tile, &(lower, slack)) in best.iter().enumerate() {
+                    let off = (tile_lo[tile] - lower).abs();
+                    if off.is_nan() || off > slack {
+                        return Err(format!(
+                            "row {row}, tile {tile}: lower bound {} for {lower}",
+                            tile_lo[tile]
+                        ));
+                    }
+                }
+                Ok(())
+            };
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let workers =
+                std::thread::available_parallelism().map_or(4, |count| count.get().min(16));
+            let failure = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            loop {
+                                let row = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if row >= n {
+                                    return Ok(());
+                                }
+                                check_row(row)?;
+                            }
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| match handle.join() {
+                        Ok(result) => result.err(),
+                        Err(_) => Some("a checker thread panicked".to_owned()),
+                    })
+                    .next()
+            });
+            if let Some(what) = failure {
+                return refuse(what);
+            }
+            eprintln!(
+                "head screen self test: {VOCAB_PER_RANK} entries' codes and {n} rows' bounds match \
+                 the reference"
+            );
+            Ok(())
+        }
+
+        fn close(self, cuda: &Cuda) {
+            if self.check {
+                self.report();
+            }
+            let ptrs = [
+                &self.codes,
+                &self.coef,
+                &self.act,
+                &self.meta,
+                &self.upper,
+                &self.tile_lo,
+                &self.counts,
+            ];
+            cuda.free_buffers(&ptrs);
+            for module in self.modules {
+                cuda.free(module, &[]);
+            }
+        }
+    }
+
     /// The loaded, ready-to-screen serving tail of one rank.
     pub struct TailStage {
         /// The directory the two cubins came from (evidence).
@@ -264,6 +794,8 @@ mod device {
         pub head_weight: Deviceptr,
         /// The per-rank buffers.
         pub buffers: TailBuffers,
+        /// The rows head's screen (`diagnostics.head_screen`), when the profile has it on.
+        pub head_screen: Option<HeadScreen>,
         rmsnorm_module: Module,
         rmsnorm: Kernel,
         head_module: Module,
@@ -336,6 +868,26 @@ mod device {
 
             let (rmsnorm_module, rmsnorm) = rmsnorm_launch::load(cuda, &rmsnorm_bytes)?;
             let (head_module, head) = cert_lm_head_launch::load(cuda, &head_bytes)?;
+            let diagnostics = &sparkflash_model::active_profile().diagnostics;
+            let check = diagnostics.head_screen_check.unwrap_or(false);
+            let head_screen = if diagnostics.head_screen.unwrap_or(HEAD_SCREEN_DEFAULT) {
+                Some(HeadScreen::open(
+                    cuda,
+                    kernel_dir,
+                    bind.tail.head,
+                    &shard,
+                    check,
+                    &mut allocated,
+                )?)
+            } else if check {
+                return Err(
+                    "head screen check: SPARKFLASH_HEAD_SCREEN_CHECK is set but the screen is \
+                     off (SPARKFLASH_HEAD_SCREEN=0), so there is nothing to check"
+                        .to_owned(),
+                );
+            } else {
+                None
+            };
             Ok(Self {
                 kernel_dir: kernel_dir.to_path_buf(),
                 eps,
@@ -353,6 +905,7 @@ mod device {
                     block_max,
                     block_argmax,
                 },
+                head_screen,
                 rmsnorm_module,
                 rmsnorm,
                 head_module,
@@ -632,6 +1185,9 @@ mod device {
                 buffers.block_argmax,
             ];
             cuda.free_buffers(&ptrs.iter().collect::<Vec<_>>());
+            if let Some(screen) = self.head_screen {
+                screen.close(cuda);
+            }
             cuda.free(self.rmsnorm_module, &[]);
             cuda.free(self.head_module, &[]);
         }

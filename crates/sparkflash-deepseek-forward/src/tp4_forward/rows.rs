@@ -41,7 +41,7 @@ use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt, launch
 /// sequences' steps fill it: the more rows a step holds, the more of them share the experts they
 /// read, and the step's fixed part (the dense weights, the head, the collectives) is spread over
 /// more of them.
-pub(super) const R_MAX: usize = 64;
+pub(crate) const R_MAX: usize = 64;
 // The Engram post takes a step's live rows as one 64-bit launch word.
 const _: () = assert!(R_MAX <= 64);
 
@@ -1329,8 +1329,9 @@ impl DeviceLayer<'_> {
     }
 
     /// The routed experts of several bulk chunks' rows (`(state, rows)` of ways of one
-    /// [super::bulk::MoeShare]) as one pass over the expert weights, then each chunk's combine
-    /// over its shared expert. Every row's values are the ones its chunk's own pass gives.
+    /// [super::bulk::MoeShare]) as one pass over the expert weights. Each chunk's combine over its
+    /// shared expert follows ([Self::rows_moe_merged_combine]), and every row's values are the
+    /// ones its chunk's own pass gives.
     pub(super) fn rows_moe_merged(
         &mut self,
         chunks: &[(&RowsState, usize)],
@@ -1372,23 +1373,43 @@ impl DeviceLayer<'_> {
             share.stride,
             &counts[..used],
             &share.base,
-        )?;
-        for &(state, n) in chunks {
-            let b = state.b;
-            let way = state.moe_way.map_or(0, |way| way.way);
-            device.set_addend(b.shared_out);
-            // Only the bf16 sums go on (to the reduce): no f32 copy.
-            device.combine_bulk(
-                self.cuda,
-                &bulk.moe,
-                way * share.stride,
-                n,
-                b.moe_ids,
-                0,
-                b.delta_bf16,
-            )?;
-        }
-        Ok(())
+        )
+    }
+
+    /// One chunk's combine after [Self::rows_moe_merged]: its `n` rows' routed partials and its
+    /// shared expert into its bf16 sums. A combine a chunk, so that the caller can queue the
+    /// chunk's reduce right behind it: the collective stream starts a collective once everything
+    /// queued on the run's stream so far is done, and a reduce queued after the last chunk's
+    /// combine left the wire idle under the other chunks' combines and the run's stream idle
+    /// behind the collectives afterwards.
+    pub(super) fn rows_moe_merged_combine(
+        &mut self,
+        rows: &RowsState,
+        n: usize,
+    ) -> Result<(), String> {
+        let device = self
+            .moe_routed_device
+            .as_ref()
+            .ok_or("rows: no routed device")?;
+        let way = rows
+            .moe_way
+            .ok_or("rows merged moe: not a shared bulk state")?;
+        let bulk = rows
+            .bulk
+            .as_ref()
+            .ok_or("rows merged moe: not a bulk state")?;
+        let b = rows.b;
+        device.set_addend(b.shared_out);
+        // Only the bf16 sums go on (to the reduce): no f32 copy.
+        device.combine_bulk(
+            self.cuda,
+            &bulk.moe,
+            way.way * way.stride,
+            n,
+            b.moe_ids,
+            0,
+            b.delta_bf16,
+        )
     }
 
     /// [Self::run_layer_ffn_rest] past the routed experts: the queued MoE reduce and the post.
@@ -2127,19 +2148,9 @@ impl DeviceLayer<'_> {
         let chunk = out_width / world;
         let mine = b.engram_slices + (rank * n * chunk * 2) as u64;
         wkv(rank * chunk, (rank + 1) * chunk, mine, chunk)?;
-        let reduce = self.reduce.ok_or("rows engram: no reduce handle")?;
-        let mut handle = reduce
-            .0
-            .try_borrow_mut()
-            .map_err(|_| "rows engram: the reduce handle is already borrowed".to_owned())?;
-        // SAFETY: the slices buffer holds world * n * chunk bf16 values (R_MAX rows carved), this
-        // rank's slice is the send buffer and every peer's lands in its own slot; stream 0 is the
-        // stream every launch of this run uses.
-        unsafe { handle.exchange_bf16(mine, b.engram_slices, n * chunk, 0) }
-            .map_err(|error| format!("rows engram: slice exchange: {error}"))?;
-        drop(handle);
-        self.collectives_in_flight
-            .set(self.collectives_in_flight.get().saturating_add(1));
+        // The slices buffer holds world * n * chunk bf16 values (R_MAX rows carved); this rank's
+        // slice is the send slot and every peer's lands in its own.
+        self.exchange_slots(b.engram_slices, n * chunk, rank, "rows engram: slice")?;
         let vecs = (chunk * 2 / 16) as u32;
         self.cuda.launch(
             rows.kernels.rank_permute,
@@ -3624,6 +3635,34 @@ impl DeviceLayer<'_> {
             .0
             .try_borrow_mut()
             .map_err(|_| format!("{what}: the reduce handle is already borrowed"))?;
+        // The direct-RDMA exchange when the run selected it: the same bits in the same slots.
+        #[cfg(all(feature = "cuda", feature = "rdma"))]
+        {
+            let (world, _) = handle.world_rank();
+            if self.slots_through_exchange(gather, count * 2, rank, world, what)? {
+                return Ok(());
+            }
+            // The exchange declined this slot, and the group carries it below. A slot wider than a
+            // round is the documented fall-through: the width comes from the step's shape, the same
+            // on every rank, so every rank declines together and none is left waiting. Refusing
+            // here made the first wide Engram slice - a prefill's rows times its share of the
+            // projection - an error on a path the exchange never claimed, so it is reported once
+            // instead, and the run still says which collective did not go through the exchange.
+            // The one way a carryable slot reaches here. A zero-length slot is not one of them:
+            // the group refuses a zero count outright, so there is nothing a zero-length slot could
+            // quietly fall through to. Nor is an unopened exchange: under a switch that demands it,
+            // `shared` returns the open's error rather than standing down, and that error was
+            // propagated above - except on a single rank, which has nothing to exchange and so
+            // never opens one. So the note speaks for a run that opened the exchange and asked it
+            // to carry a slot wider than a round.
+            let bytes = count * 2;
+            if bytes > crate::rdma_exchange::row_cap() && crate::rdma_exchange::is_open() {
+                crate::rdma_exchange::note_fall_through(
+                    what,
+                    "the slot is wider than a round carries",
+                );
+            }
+        }
         let mine = gather + (rank * count * 2) as u64;
         // SAFETY: the caller's gather buffer holds world * count bf16 values; this rank's slot is the
         // send buffer and every peer's lands in its own slot; stream 0 is the stream every launch of
@@ -3769,6 +3808,35 @@ impl DeviceLayer<'_> {
         self.head_rows_multi_c(rows, tail, transport, samplers, &[])
     }
 
+    /// The rows' chunk maxima folded on this rank and read back: (value bits, index) a row. The
+    /// screen's check compares two of these; the step's own fold is not this one.
+    fn head_fold(&self, rows: &RowsState, n: usize) -> Result<Vec<(u32, u32)>, String> {
+        let b = rows.b;
+        self.cuda.launch(
+            rows.kernels.fold,
+            (n as u32, 1, 1),
+            (32, 1, 1),
+            &[
+                b.lm_block_max,
+                b.lm_block_arg,
+                crate::tp4_tail::CHUNKS_PER_RANK as u64,
+                b.lm_value,
+                b.lm_index,
+            ],
+        )?;
+        let mut values = vec![0u8; n * 4];
+        let mut indices = vec![0u8; n * 4];
+        self.cuda.copy_dtoh(&mut values, &Deviceptr(b.lm_value))?;
+        self.cuda.copy_dtoh(&mut indices, &Deviceptr(b.lm_index))?;
+        Ok(values
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(indices.as_chunks::<4>().0)
+            .map(|(value, index)| (u32::from_le_bytes(*value), u32::from_le_bytes(*index)))
+            .collect())
+    }
+
     /// [`Self::head_rows_multi`] with a structured-output constraint per row.
     ///
     /// A constrained row is sampled greedily over the ids its automaton admits: the rank reads its
@@ -3856,31 +3924,74 @@ impl DeviceLayer<'_> {
             rows.head_params.device().0
         };
         let id_base = self.device_exchange().map_or(0, |(_, rank)| rank * vocab);
+        // The head's noise arguments, the screen's too (tp4_tail.rs HeadNoise).
+        let noise = [inv_t, seed, index0 as u64, id_base as u64, params];
         // One launch: HEAD_ROWS rows a block, the row groups' blocks of a chunk reading its weight
         // rows from L2 after the first.
-        self.cuda.launch(
-            rows.kernels.lm_head,
-            (n.div_ceil(HEAD_ROWS) as u32, chunks as u32, 1),
-            (512, 1, 1),
-            &[
-                b.lm_normed,
-                tail.head_weight.0,
-                b.lm_block_max,
-                b.lm_block_arg,
-                vocab as u64,
-                n as u64,
-                if any_truncated || any_constrained {
-                    b.logits
-                } else {
-                    0
-                },
-                inv_t,
-                seed,
-                index0 as u64,
-                id_base as u64,
-                params,
-            ],
-        )?;
+        let full_head = || {
+            self.cuda.launch(
+                rows.kernels.lm_head,
+                (n.div_ceil(HEAD_ROWS) as u32, chunks as u32, 1),
+                (512, 1, 1),
+                &[
+                    b.lm_normed,
+                    tail.head_weight.0,
+                    b.lm_block_max,
+                    b.lm_block_arg,
+                    vocab as u64,
+                    n as u64,
+                    if any_truncated || any_constrained {
+                        b.logits
+                    } else {
+                        0
+                    },
+                    noise[0],
+                    noise[1],
+                    noise[2],
+                    noise[3],
+                    noise[4],
+                ],
+            )
+        };
+        // A step with no constrained or truncated row wants only each row's best score (the
+        // logit, or for a temperature-sampled row the logit through its noise), so the screen
+        // leaves the head's arithmetic to the entries a bound cannot rule out (tp4_tail.rs
+        // HeadScreen): the chunk maxima fold to the same value and index. Every other step needs
+        // the raw logits and takes the head whole.
+        match tail
+            .head_screen
+            .as_ref()
+            .filter(|_| !any_truncated && !any_constrained)
+        {
+            Some(screen) => {
+                let maxima = (b.lm_block_max, b.lm_block_arg);
+                screen.launch(
+                    self.cuda,
+                    (b.lm_normed, n),
+                    tail.head_weight,
+                    maxima,
+                    noise,
+                    screen.check,
+                )?;
+                if screen.check {
+                    // The checked step: fold the screened maxima, then run the head whole over
+                    // the same buffers and fold again. The step goes on from the full head's
+                    // maxima, so a checked run's output is the unscreened path's by construction.
+                    let screened = self.head_fold(rows, n)?;
+                    screen.tally_checked(self.cuda, n)?;
+                    full_head()?;
+                    let whole = self.head_fold(rows, n)?;
+                    if let Some(row) = (0..n).find(|&row| screened[row] != whole[row]) {
+                        return Err(format!(
+                            "head screen check: row {row} of {n} folds to {:?} behind the screen \
+                             and to {:?} without it (value bits, index)",
+                            screened[row], whole[row]
+                        ));
+                    }
+                }
+            }
+            None => full_head()?,
+        }
         if any_constrained {
             // The head was queued on the run's stream, so the copy below is ordered behind it.
             // Masked greedy: this rank keeps the best admitted logit inside its own vocabulary
@@ -3996,6 +4107,12 @@ impl DeviceLayer<'_> {
             self.exchange_slots(b.topc_gather, n * words * 2, rank, "top-p gather")?;
             let mut bytes = vec![0u8; world * n * words * 4];
             self.cuda.copy_dtoh(&mut bytes, &Deviceptr(b.topc_gather))?;
+            // The drain above is also what lets an aborted round through: a kernel whose peers never
+            // published leaves its wait without folding and the copy hands back whatever is in the
+            // buffer. Checked here, before a token is picked from it, because the head is the last
+            // thing a step does and a later check would be no check at all.
+            #[cfg(all(feature = "cuda", feature = "rdma"))]
+            crate::rdma_exchange::check()?;
             let slots: Vec<u32> = bytes
                 .as_chunks::<4>()
                 .0
@@ -4021,6 +4138,12 @@ impl DeviceLayer<'_> {
                     .to_owned(),
             );
         }
+        // No refusal here. This fold reads the group's gather: it is the head's path on every run
+        // whose reduce handle carries no device exchange (the device-gather arm is off, which is
+        // the serving deployment's default), and the exchange has never claimed it - the exchange
+        // replaces the per-layer one-shot all-reduce and the step's slot exchanges, not this. A
+        // refusal keyed on the switch alone would fail the first step of every such run, which is
+        // the arm the deployment asked for being reported as an error.
         if let Some((world, rank)) = self.device_exchange() {
             let picks = self.argmax_on_device(
                 rows,
@@ -4033,6 +4156,9 @@ impl DeviceLayer<'_> {
             )?;
             let mut words = vec![0u8; n * 8];
             self.cuda.copy_dtoh(&mut words, &Deviceptr(picks))?;
+            // As above: the copy drained, so an aborted round is visible now and not later.
+            #[cfg(all(feature = "cuda", feature = "rdma"))]
+            crate::rdma_exchange::check()?;
             let word = |at: usize| {
                 u32::from_le_bytes([words[at], words[at + 1], words[at + 2], words[at + 3]])
             };

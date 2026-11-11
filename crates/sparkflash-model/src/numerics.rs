@@ -177,6 +177,8 @@ pub const NEUTRAL_FIELDS: &[&str] = &[
     "diagnostics.engram_split",
     "diagnostics.rows_ring",
     "diagnostics.rows_groups",
+    "diagnostics.head_screen",
+    "diagnostics.head_screen_check",
     "diagnostics.embed_replica",
     "diagnostics.prefetch_wqb",
     "diagnostics.rows_select",

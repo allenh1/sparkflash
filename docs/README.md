@@ -9,6 +9,7 @@
 | [web.md](web.md) | The `sparkflash --web` lead-node control plane: TOML, mDNS/SSH discovery, launch/convert actions and live graphs |
 | [adding-a-model.md](adding-a-model.md) | The one-stack bring-up path: typed ops, per-model profiles, the environment override table, and the parity harness |
 | [agent-setup.md](agent-setup.md) | Step-by-step instructions for an AI agent to build, configure, stage and launch a four-node cluster (or one local Qwen server) |
+| [rdma-exchange.md](rdma-exchange.md) | The direct-RDMA exchange: the hardware gate, the four-rank measurements, the two wait bugs, the A/B that returned 2% and not 20%, and why |
 | [DECISIONS.md](DECISIONS.md) | The decision register: one row per hard-to-reverse choice, cited from source comments as `Dnn` |
 | [models/qwen38-flash-next-nvfp4.md](models/qwen38-flash-next-nvfp4.md) | Qwen3.8-Flash-Next (NVFP4): architecture, quantisation, the PLE n-gram table on the Engram paging path, and the TP=1 device arm |
 | [models/glm53-flash.md](models/glm53-flash.md) | GLM-5.3-Flash (FP8, TP=4): the released architecture, its serving frontend (backend, prompt codec, descriptor), the tiny-fixture run, and what the arm does not serve yet |

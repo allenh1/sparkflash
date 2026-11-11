@@ -6493,6 +6493,8 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
                 "sparkflash serve: serve_timeline phase=drain_complete epoch_ms={}",
                 epoch_millis()
             );
+            print_stage_timing_ledger();
+            print_exchange_stats();
             serve_result(result)
         }
         Err(_) => {
@@ -6500,10 +6502,139 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
                 "sparkflash serve: serve_timeline phase=drain_timeout epoch_ms={} forced_exit=1",
                 epoch_millis()
             );
+            print_stage_timing_ledger();
+            print_exchange_stats();
             ExitCode::FAILURE
         }
     }
 }
+
+/// Prints what the direct-RDMA exchange's pump did, when this process opened the exchange.
+///
+/// One line as a rank leaves: how many per-layer collectives went through the exchange, what a
+/// round cost the pump to post, and how long it was from the posts to the last peer's arrival flag
+/// and to each peer's. It is the in-situ counterpart of the four-rank probe's number, and it is
+/// the only place a serving run says how many collectives a step really made. Every rank prints
+/// it, because the per-peer figures only mean something side by side: a rank that rings late is
+/// the largest entry in every other rank's line and has the smallest figures in its own.
+#[cfg(feature = "cuda")]
+fn print_exchange_stats() {
+    let Some(stats) = sparkflash_deepseek_forward::rdma_exchange::stats() else {
+        return;
+    };
+    let rounds = stats.rounds.max(1) as f64;
+    let arrivals = stats.arrivals.max(1) as f64;
+    let peers: Vec<String> = stats
+        .peer_arrival_ns
+        .iter()
+        .map(|ns| format!("{:.2}", *ns as f64 / 1e3 / arrivals))
+        .collect();
+    println!(
+        "sparkflash serve: rdma_exchange rank={} rounds={} mean_row_bytes={:.0} post_us={:.2} arrivals={} arrival_us={:.2} arrival_max_us={:.2} peer_arrival_us=[{}] parks={}",
+        stats.rank,
+        stats.rounds,
+        stats.bytes as f64 / rounds,
+        stats.post_ns as f64 / 1e3 / rounds,
+        stats.arrivals,
+        stats.arrival_ns as f64 / 1e3 / arrivals,
+        stats.arrival_max_ns as f64 / 1e3,
+        peers.join(", "),
+        stats.parks,
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+fn print_exchange_stats() {}
+
+/// Prints the per-kernel event ledger when `SPARKFLASH_STAGE_TIMING=1` armed it.
+///
+/// The ledger is the one `device-chain --timing-json` writes into its timing file (schema
+/// `sparkflash-stage-timing/1`): CUDA events around every launch, attributed to a (phase, kernel)
+/// scope, plus one row a step carrying that step's bracketed device time, its phase and its rows.
+/// Serving recorded it but had no way to read it, so a question about where a decode step's time
+/// goes could only be answered by the harness rather than by the binary that served the requests.
+/// Silent when the recorder was never armed, and it changes no launch: the brackets are the only
+/// difference.
+#[cfg(feature = "cuda")]
+fn print_stage_timing_ledger() {
+    let Some(report) = sparkflash_kernels::cuda_driver::stage_timing_report() else {
+        return;
+    };
+    let mut rows: Vec<&sparkflash_kernels::cuda_driver::KernelTimingRow> =
+        report.kernels.iter().collect();
+    rows.sort_by_key(|row| std::cmp::Reverse(row.total_ns));
+    let total_ns: u128 = rows.iter().map(|row| u128::from(row.total_ns)).sum();
+    let calls: u64 = rows.iter().map(|row| row.calls).sum();
+    println!(
+        "sparkflash serve: stage_timing kernels={} calls={} total_ns={total_ns} steps={} dropped={}",
+        rows.len(),
+        calls,
+        report.steps.len(),
+        report.dropped_names
+    );
+    // A kernel's mean call is a mean over steps of different sizes, so the row that answers "what
+    // did this cost" is the time a row: total over the rows of the steps it ran in.
+    for row in rows.iter().take(30) {
+        let ns_per_row = row.total_ns.checked_div(row.rows).unwrap_or(0);
+        println!(
+            "sparkflash serve: stage_timing   phase={} kernel={} calls={} steps={} rows={} total_ns={} mean_ns={} ns_per_row={ns_per_row} max_ns={}",
+            row.phase,
+            row.kernel,
+            row.calls,
+            row.steps,
+            row.rows,
+            row.total_ns,
+            row.mean_ns,
+            row.max_ns
+        );
+    }
+    // Per phase, the three numbers a run-to-run comparison needs: how many forwards, how many rows
+    // they served, and the kernel time a row. Without the row count the same ledger reads 2.6x
+    // apart between a one-lane and a sixteen-lane run of the same binary.
+    let mut phases: Vec<(&'static str, usize, usize, u128)> = Vec::new();
+    for step in report.steps.iter().filter(|step| !step.warm) {
+        match phases.iter_mut().find(|entry| entry.0 == step.phase) {
+            Some(entry) => {
+                entry.1 += 1;
+                entry.2 += step.rows;
+                entry.3 += u128::from(step.kernel_ns);
+            }
+            None => phases.push((step.phase, 1, step.rows, u128::from(step.kernel_ns))),
+        }
+    }
+    for (phase, forwards, phase_rows, kernel_ns) in phases {
+        let forwards = forwards as u128;
+        let phase_rows = phase_rows as u128;
+        println!(
+            "sparkflash serve: stage_timing phase={phase} forwards={forwards} rows={phase_rows} rows_per_forward={} kernel_ns_per_forward={} kernel_ns_per_row={}",
+            phase_rows.checked_div(forwards).unwrap_or(0),
+            kernel_ns.checked_div(forwards).unwrap_or(0),
+            kernel_ns.checked_div(phase_rows).unwrap_or(0)
+        );
+    }
+    // Steady-state steps only: a cold step pays first launches and first touches of scratch, and
+    // averaging it in is what makes two runs of the same binary disagree.
+    let steady: Vec<&sparkflash_kernels::cuda_driver::StepTimingRow> =
+        report.steps.iter().filter(|step| !step.warm).collect();
+    if let (1, Some(first)) = (steady.len(), steady.first()) {
+        println!(
+            "sparkflash serve: stage_timing step={} phase={} rows={} launches={} kernel_ns={}",
+            first.step, first.phase, first.rows, first.launches, first.kernel_ns
+        );
+        return;
+    }
+    let steps = steady.len() as u128;
+    let step_ns: u128 = steady.iter().map(|step| u128::from(step.kernel_ns)).sum();
+    let step_launches: u128 = steady.iter().map(|step| u128::from(step.launches)).sum();
+    println!(
+        "sparkflash serve: stage_timing steady_steps={steps} mean_kernel_ns_per_step={} mean_launches_per_step={}",
+        step_ns / steps.max(1),
+        step_launches / steps.max(1)
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+fn print_stage_timing_ledger() {}
 
 /// Maps the server future's result to the process exit code.
 fn serve_result(result: Result<(), std::io::Error>) -> ExitCode {

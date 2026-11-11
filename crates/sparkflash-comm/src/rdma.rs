@@ -55,6 +55,7 @@ mod abi;
 mod dataplane;
 mod qpinfo;
 mod verbs;
+mod write_exchange;
 
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -71,6 +72,7 @@ use crate::telemetry::{CommTelemetry, CommTelemetrySnapshot};
 use crate::transport::Transport;
 use dataplane::{DataPlane, ReadyRail, RemoteRail, SlotLayout};
 pub use verbs::{ShimMode, shim_mode};
+pub use write_exchange::{ExchangeStats, SlabLayout, WriteExchange};
 
 use qpinfo::{ControlConfig, RailEndpoint, RankEndpoints, exchange_endpoints};
 use verbs::Verbs;
@@ -99,9 +101,16 @@ pub struct RdmaConfig {
     pub world_size: usize,
     /// Rank this process serves.
     pub rank: usize,
-    /// Control-plane addresses in rank order. The live cluster uses the rail-1 address table:
-    /// 198.51.100.80 (node0), .84 (node1), .68 (node2), .59 (node3). The deployed vLLM container
-    /// instead sees a mixed rail-2 table; see docs/archive/build/rdma-backend.md before "fixing" either.
+    /// Control-plane addresses in rank order, one per rank, of the interface the control plane can
+    /// reach on that node.
+    ///
+    /// The addresses are deployment data and deliberately not written down here: this file named a
+    /// rail-1 table that no script in the tree used, so an operator copying the hint configured
+    /// ranks from the wrong rail and it "worked" anyway, because the star only ever dials entry 0
+    /// (rank 0 is the only listener; every other rank connects to it and posts back over the same
+    /// stream). A table whose entry 0 is right and whose other entries are wrong is accepted, and
+    /// that is a property of the star, not of this field: a backend that fans out to every rank
+    /// would need every entry. The launcher is the single source of truth for the table.
     pub peers: Vec<String>,
     /// Port rank 0 listens on and every rank connects to.
     pub control_port: u16,
@@ -173,7 +182,7 @@ impl RdmaConfig {
         }
         if world_size > 1 && peers.len() != world_size {
             return Err(CommError::InvalidLayout(format!(
-                "SPARK_COMM_PEERS must name one control-plane address per rank for world {world_size}, got {} ({peers:?}). The rail-1 table is 198.51.100.80,198.51.100.84,198.51.100.68,198.51.100.59 in rank order",
+                "SPARK_COMM_PEERS must name one control-plane address per rank, in rank order, for world {world_size}; got {} ({peers:?}). Entry 0 is the address the control plane dials on rank 0, so it is the one entry a wrong table cannot survive; the launch script prints the table it uses",
                 peers.len()
             )));
         }
@@ -277,6 +286,177 @@ pub fn select_rails_from_live_fabric() -> Result<RailSelection, CommError> {
     RailSelection::resolve(&view, pinned.as_ref())
 }
 
+/// One rail's device, opened and found able to carry RoCEv2 traffic.
+pub(crate) struct OpenedRail {
+    /// `@ibv_get_device_name` of the opened device.
+    pub(crate) name: String,
+    /// Netdev behind the device, for the bring-up report.
+    pub(crate) netdev: String,
+    /// The device context every other object of the rail is created from.
+    pub(crate) context: verbs::Context,
+    /// The port's negotiated `enum ibv_mtu`.
+    pub(crate) active_mtu: std::ffi::c_int,
+    /// This rank's GID on the rail, at the configured index.
+    pub(crate) gid: abi::IbvGid,
+}
+
+/// Opens rail `rail_index` of `selection` and refuses a device that could not carry the traffic: a
+/// port that is not ACTIVE Ethernet, an MTU the backend does not know, or a GID that is not a
+/// RoCEv2 IPv4 one. A QP built on any of those connects, accepts posts and never delivers, which
+/// from the outside is a lost packet.
+///
+/// # Errors
+/// Returns [`CommError::FabricUnavailable`] for each of the refusals above and
+/// [`CommError::Verbs`] when the library refuses a query.
+pub(crate) fn open_rail(
+    verbs: &Verbs,
+    selection: &RailSelection,
+    config: &RdmaConfig,
+    rail_index: usize,
+) -> Result<OpenedRail, CommError> {
+    let selected = selection.rail(rail_index).ok_or_else(|| {
+        CommError::FabricUnavailable(format!(
+            "rail {rail_index} was requested but the fabric resolved only {} rails",
+            selection.rails.len()
+        ))
+    })?;
+    let name = selected.name().to_owned();
+    let netdev = selected.netdev().to_owned();
+    let context = verbs.open_device(&name).map_err(|error| {
+        CommError::FabricUnavailable(format!("rail {rail_index} device {name}: {error}"))
+    })?;
+    let port_info = context.query_port(config.port)?;
+    if port_info.state != port_state::ACTIVE {
+        return Err(CommError::FabricUnavailable(format!(
+            "rail {rail_index} device {name} port {} is not ACTIVE (enum {}); refusing to register a rail that cannot carry traffic",
+            config.port, port_info.state
+        )));
+    }
+    if port_info.link_layer != LinkLayer::Ethernet as u8 {
+        return Err(CommError::FabricUnavailable(format!(
+            "rail {rail_index} device {name} reports link layer {} instead of Ethernet: the backend speaks RoCEv2 only",
+            port_info.link_layer
+        )));
+    }
+    let _mtu_bytes = mtu::bytes(port_info.active_mtu).ok_or_else(|| {
+        CommError::FabricUnavailable(format!(
+            "rail {rail_index} device {name} reports unknown active_mtu enum {}",
+            port_info.active_mtu
+        ))
+    })?;
+    let gid = context.query_gid(config.port, i32::from(config.gid_index))?;
+    match gid.kind() {
+        abi::GidKind::Unspecified => {
+            return Err(CommError::FabricUnavailable(format!(
+                "rail {rail_index} device {name} has an all-zero GID at index {}: the RoCEv2 GID table entry is not configured (the deployed vLLM recipe uses GID index 3)",
+                config.gid_index
+            )));
+        }
+        abi::GidKind::RoceV2Ipv4(octets) => {
+            // The index is trusted only as far as this check: a GID table whose order differs from
+            // the last host puts the QP on the wrong SGID, and the failure is silent - the QP
+            // connects, accepts posts and never delivers. The rail's netdev names the address the
+            // GID has to be, so a mismatch is refused here instead of debugged on the wire.
+            match netdev_ipv4(&netdev) {
+                Some(bound) if bound != octets => {
+                    return Err(CommError::FabricUnavailable(format!(
+                        "rail {rail_index} device {name}: GID index {} is {}.{}.{}.{}, but {netdev} carries {}.{}.{}.{}: the index names another interface's address, which builds a queue pair that connects and never delivers (point SPARK_COMM_GID_INDEX at this rail's IPv4 GID)",
+                        config.gid_index,
+                        octets[0],
+                        octets[1],
+                        octets[2],
+                        octets[3],
+                        bound[0],
+                        bound[1],
+                        bound[2],
+                        bound[3]
+                    )));
+                }
+                Some(_) => {}
+                None => {
+                    // Nothing to compare against. Not fatal - an IPv6-only or unnumbered interface
+                    // is legal here - but the check is what turns a wrong index into a refusal, so
+                    // the run should say that it did not run.
+                    eprintln!(
+                        "sparkflash rdma: rail {rail_index} device {name}: {netdev} has no IPv4 address to check GID index {} against, so a wrong index on this rail would build a queue pair that connects and never delivers",
+                        config.gid_index
+                    );
+                }
+            }
+        }
+        abi::GidKind::OtherIpv6 => {
+            // Refused rather than guessed at: the backend builds RoCEv2 IPv4 AH
+            // attributes (hop limit, is_global, sgid_index), and a different GID family
+            // would produce a QP that connects but never carries a packet.
+            return Err(CommError::FabricUnavailable(format!(
+                "rail {rail_index} device {name} GID index {} is an IPv6 GID ({}); this backend builds RoCEv2 IPv4 address vectors only (the deployed vLLM recipe uses GID index 3, the ::ffff:a.b.c.d form)",
+                config.gid_index,
+                gid.describe()
+            )));
+        }
+    }
+    Ok(OpenedRail {
+        name,
+        netdev,
+        context,
+        active_mtu: port_info.active_mtu,
+        gid,
+    })
+}
+
+/// The IPv4 address bound to `netdev`, if it has one.
+///
+/// A small `getifaddrs` walk rather than a shell-out: this runs once per rail at open, but it is
+/// the only cross-check between a GID index and the interface it is supposed to name.
+fn netdev_ipv4(netdev: &str) -> Option<[u8; 4]> {
+    // SAFETY: getifaddrs fills a list this function walks and frees; every pointer it reads is
+    // checked for null and the address family before it is cast.
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 || list.is_null() {
+            return None;
+        }
+        let mut found = None;
+        let mut node = list;
+        while !node.is_null() {
+            let entry = &*node;
+            if !entry.ifa_addr.is_null()
+                && (*entry.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
+                && !entry.ifa_name.is_null()
+                && std::ffi::CStr::from_ptr(entry.ifa_name).to_string_lossy() == netdev
+            {
+                let socket = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
+                let octets = socket.sin_addr.s_addr.to_ne_bytes();
+                found = Some(octets);
+                break;
+            }
+            node = entry.ifa_next;
+        }
+        libc::freeifaddrs(list);
+        found
+    }
+}
+
+/// Refuses a registration whose base is not the address it was asked to cover: every remote offset
+/// is computed from that address, so a registration that moved would send writes somewhere else.
+///
+/// # Errors
+/// Returns [`CommError::Unsupported`] naming both addresses.
+pub(crate) fn registered_at(
+    mr: &verbs::Mr,
+    base: u64,
+    rail_index: usize,
+    what: &str,
+) -> Result<(), CommError> {
+    if mr.addr() != base {
+        return Err(CommError::Unsupported(format!(
+            "rail {rail_index} registered MR address {:#x} does not cover the {what} at {base:#x}",
+            mr.addr()
+        )));
+    }
+    Ok(())
+}
+
 /// The real dual-rail RoCEnante transport.
 ///
 /// One handle belongs to one rank; [`crate::transport::Transport`] requires it to be shareable, so the
@@ -322,56 +502,13 @@ impl RdmaTransport {
         let mut ready: Vec<ReadyRail> = Vec::with_capacity(config.rail_count);
         let mut owned: [Option<RailEndpoint>; 2] = [None, None];
         for (rail_index, owned_slot) in owned.iter_mut().enumerate().take(config.rail_count) {
-            let selected = selection.rail(rail_index).ok_or_else(|| {
-                CommError::FabricUnavailable(format!(
-                    "rail {rail_index} was requested but the fabric resolved only {} rails",
-                    selection.rails.len()
-                ))
-            })?;
-            let name = selected.name().to_owned();
-            let netdev = selected.netdev().to_owned();
-            let context = verbs.open_device(&name).map_err(|error| {
-                CommError::FabricUnavailable(format!("rail {rail_index} device {name}: {error}"))
-            })?;
-            let port_info = context.query_port(config.port)?;
-            if port_info.state != port_state::ACTIVE {
-                return Err(CommError::FabricUnavailable(format!(
-                    "rail {rail_index} device {name} port {} is not ACTIVE (enum {}); refusing to register a rail that cannot carry traffic",
-                    config.port, port_info.state
-                )));
-            }
-            if port_info.link_layer != LinkLayer::Ethernet as u8 {
-                return Err(CommError::FabricUnavailable(format!(
-                    "rail {rail_index} device {name} reports link layer {} instead of Ethernet: the backend speaks RoCEv2 only",
-                    port_info.link_layer
-                )));
-            }
-            let _mtu_bytes = mtu::bytes(port_info.active_mtu).ok_or_else(|| {
-                CommError::FabricUnavailable(format!(
-                    "rail {rail_index} device {name} reports unknown active_mtu enum {}",
-                    port_info.active_mtu
-                ))
-            })?;
-            let gid = context.query_gid(config.port, i32::from(config.gid_index))?;
-            match gid.kind() {
-                abi::GidKind::Unspecified => {
-                    return Err(CommError::FabricUnavailable(format!(
-                        "rail {rail_index} device {name} has an all-zero GID at index {}: the RoCEv2 GID table entry is not configured (the deployed vLLM recipe uses GID index 3)",
-                        config.gid_index
-                    )));
-                }
-                abi::GidKind::RoceV2Ipv4(_octets) => {}
-                abi::GidKind::OtherIpv6 => {
-                    // Refused rather than guessed at: the backend builds RoCEv2 IPv4 AH
-                    // attributes (hop limit, is_global, sgid_index), and a different GID family
-                    // would produce a QP that connects but never carries a packet.
-                    return Err(CommError::FabricUnavailable(format!(
-                        "rail {rail_index} device {name} GID index {} is an IPv6 GID ({}); this backend builds RoCEv2 IPv4 address vectors only (the deployed vLLM recipe uses GID index 3, the ::ffff:a.b.c.d form)",
-                        config.gid_index,
-                        gid.describe()
-                    )));
-                }
-            }
+            let OpenedRail {
+                name,
+                netdev,
+                context,
+                active_mtu,
+                gid,
+            } = open_rail(&verbs, &selection, &config, rail_index)?;
             let pd = context.alloc_pd()?;
             let cqe = i32::try_from(config.world_size * 4 + 16).map_err(|_| {
                 CommError::InvalidLayout(
@@ -385,13 +522,7 @@ impl RdmaTransport {
                 staging.len(),
                 access::LOCAL_WRITE | access::REMOTE_WRITE | access::REMOTE_READ,
             )?;
-            if mr.addr() != staging.as_ptr() as u64 {
-                return Err(CommError::Unsupported(format!(
-                    "rail {rail_index} registered MR address {:#x} does not cover the staging buffer at {:#x}",
-                    mr.addr(),
-                    staging.as_ptr() as u64
-                )));
-            }
+            registered_at(&mr, staging.as_ptr() as u64, rail_index, "staging buffer")?;
             let cap = IbvQpCap {
                 max_send_wr: 64,
                 max_recv_wr: 64,
@@ -407,11 +538,10 @@ impl RdmaTransport {
             *owned_slot = Some(RailEndpoint {
                 gid,
                 gid_index: config.gid_index,
-                active_mtu: u16::try_from(port_info.active_mtu).map_err(|_| CommError::Verbs {
+                active_mtu: u16::try_from(active_mtu).map_err(|_| CommError::Verbs {
                     call: "ibv_query_port",
                     detail: format!(
-                        "active_mtu {} does not fit the two-byte field of the control-plane record",
-                        port_info.active_mtu
+                        "active_mtu {active_mtu} does not fit the two-byte field of the control-plane record"
                     ),
                 })?,
                 mr_addr: staging.as_ptr() as u64,
@@ -423,7 +553,7 @@ impl RdmaTransport {
                 netdev,
                 gid,
                 gid_index: config.gid_index,
-                active_mtu: port_info.active_mtu,
+                active_mtu,
                 qps,
                 staging,
                 mr,
@@ -457,6 +587,7 @@ impl RdmaTransport {
                     "rail count does not fit the control-plane geometry field".to_owned(),
                 )
             })?,
+            arm: crate::rdma::qpinfo::ARM_TRANSPORT,
             rails: [
                 owned[0]
                     .take()

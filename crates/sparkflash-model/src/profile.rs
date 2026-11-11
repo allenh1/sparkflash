@@ -410,6 +410,10 @@ pub struct DiagnosticsProfile {
     pub rows_ring: Option<bool>,
     /// Use the grouped rows kernels.
     pub rows_groups: Option<bool>,
+    /// Screen the greedy head with the int8 table: score only the entries a bound cannot rule out.
+    pub head_screen: Option<bool>,
+    /// Run every screened head through the full head as well and refuse a step that differs.
+    pub head_screen_check: Option<bool>,
     /// Replicate the embedding table on every rank.
     pub embed_replica: Option<bool>,
     /// Prefetch the wq_b weights.
@@ -638,6 +642,11 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_ENGRAM_SPLIT", "diagnostics.engram_split"),
     ("SPARKFLASH_ROWS_RING", "diagnostics.rows_ring"),
     ("SPARKFLASH_ROWS_GROUPS", "diagnostics.rows_groups"),
+    ("SPARKFLASH_HEAD_SCREEN", "diagnostics.head_screen"),
+    (
+        "SPARKFLASH_HEAD_SCREEN_CHECK",
+        "diagnostics.head_screen_check",
+    ),
     ("SPARKFLASH_EMBED_REPLICA", "diagnostics.embed_replica"),
     ("SPARKFLASH_PREFETCH_WQB", "diagnostics.prefetch_wqb"),
     ("SPARKFLASH_ROWS_SELECT", "diagnostics.rows_select"),
@@ -793,6 +802,12 @@ const BOOL_FIELDS: &[(&str, BoolField)] = &[
     ("diagnostics.rows_ring", |p| &mut p.diagnostics.rows_ring),
     ("diagnostics.rows_groups", |p| {
         &mut p.diagnostics.rows_groups
+    }),
+    ("diagnostics.head_screen", |p| {
+        &mut p.diagnostics.head_screen
+    }),
+    ("diagnostics.head_screen_check", |p| {
+        &mut p.diagnostics.head_screen_check
     }),
     ("diagnostics.embed_replica", |p| {
         &mut p.diagnostics.embed_replica

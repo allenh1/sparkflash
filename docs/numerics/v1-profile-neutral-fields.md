@@ -111,6 +111,11 @@ file regions. Gate:
 `tp4_forward::spec::tests::direct_windows_land_the_same_bytes_as_reads_through_the_cache`
 (`spec.rs:1934`) and `pooled_engram_reads_land_every_task_s_bytes` (`spec.rs:2019`).
 
+### `diagnostics.head_screen`, `diagnostics.head_screen_check`
+
+The argument for these two fields, and the gates that hold it, are in
+[v1-head-screen-neutral.md](v1-head-screen-neutral.md).
+
 ### `diagnostics.lean_head`
 
 Read at `crates/sparkflash-deepseek-forward/src/tp4_forward.rs:17128` and used at `:18291`.

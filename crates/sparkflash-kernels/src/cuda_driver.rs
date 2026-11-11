@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 type CuResult = i32;
 
@@ -810,7 +810,7 @@ pub fn cubin_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     ))
 }
 
-/// The chain scope a launch is attributed to: phase, step, layer and position.
+/// The chain scope a launch is attributed to: phase, step, layer, position and rows.
 ///
 /// The harness sets it at its position/step loop; every launch until the next set is attributed to
 /// that scope. All fields default to 0 (and the phase to "stage") so an unwired arm still produces
@@ -825,6 +825,13 @@ pub struct StageScope {
     pub layer: usize,
     /// The absolute token position.
     pub position: usize,
+    /// The rows this step serves.
+    ///
+    /// Rows are the independent variable of every serving question - the time a row, the bytes a
+    /// row, the kernels a row - and a ledger that carries only call counts cannot divide by them:
+    /// the same kernel's mean call is a different amount of work at one row and at sixty. A caller
+    /// that counts its rows sets this once a step; 0 means "not known", never an estimate.
+    pub rows: usize,
 }
 
 /// One kernel's aggregated device time in one phase.
@@ -840,6 +847,14 @@ pub struct KernelTimingRow {
     pub total_ns: u64,
     /// The mean event time, nanoseconds.
     pub mean_ns: u64,
+    /// The rows the steps this kernel ran in served, counted once a step.
+    ///
+    /// A kernel launches several times a step, so summing the scope's rows per call would count a
+    /// step's rows once per launch; this counts them once per step instead, which is the
+    /// denominator `total_ns / rows` wants.
+    pub rows: u64,
+    /// How many distinct steps this kernel ran in.
+    pub steps: u64,
     /// The shortest launch, nanoseconds.
     pub min_ns: u64,
     /// The longest launch, nanoseconds.
@@ -864,8 +879,12 @@ pub struct StepLaunchRow {
 pub struct StepTimingRow {
     /// The step index the scope reported.
     pub step: usize,
+    /// The phase the step's launches were attributed to.
+    pub phase: &'static str,
     /// True when the caller marked this step as warmup (cold-vs-steady separation).
     pub warm: bool,
+    /// The rows the step served, as its scope reported them (0 when it did not say).
+    pub rows: usize,
     /// How many launches were bracketed.
     pub launches: u64,
     /// The summed event time, nanoseconds.
@@ -881,12 +900,74 @@ pub struct StageTimingReport {
     pub kernels: Vec<KernelTimingRow>,
     /// The per-step rows, in step order.
     pub steps: Vec<StepTimingRow>,
-    /// How many distinct kernel names beyond the 128-name cap were dropped.
+    /// How many launches' distinct names beyond [STAGE_TIMING_KERNEL_CAP] were dropped.
     pub dropped_names: usize,
 }
 
+/// Resolves one drained pool of brackets, recording each launch's kernel time.
+///
+/// The pool is drained before anything is read, so a failed read costs its own row and the events
+/// of that pair, not the pool: every pair is destroyed either way, and the rows after it still
+/// record. Split out of [Cuda::resolve_stage_brackets] so the bookkeeping is testable without a
+/// device, with the two driver calls passed in.
+fn resolve_pool(
+    pool: &Mutex<StageBracketPool>,
+    mut elapsed_ns: impl FnMut(usize, usize) -> Result<u64, i32>,
+) -> Result<(), String> {
+    let brackets: Vec<StageBracket> = {
+        let mut pool = match pool.lock() {
+            Ok(pool) => pool,
+            Err(error) => error.into_inner(),
+        };
+        std::mem::take(&mut pool.pending)
+    };
+    let mut reads = Vec::with_capacity(brackets.len());
+    let mut failure: Option<String> = None;
+    for bracket in brackets {
+        let read = elapsed_ns(bracket.start, bracket.stop);
+        if let Err(r) = read {
+            failure.get_or_insert_with(|| {
+                format!("cuEventElapsedTime for a pooled bracket failed: {r}")
+            });
+        }
+        reads.push((bracket, read));
+    }
+    // Every pair goes back before any row records, so a failed read cannot cost the ring: the
+    // events are reusable the moment their elapsed time has been asked for.
+    let released: Vec<(usize, usize)> = reads.iter().map(|(b, _)| (b.start, b.stop)).collect();
+    {
+        let mut pool = match pool.lock() {
+            Ok(pool) => pool,
+            Err(error) => error.into_inner(),
+        };
+        pool.free.extend(released);
+    }
+    for (bracket, read) in reads {
+        if let Ok(ns) = read {
+            record_launch(bracket.kernel, ns);
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// How many launches one pooled bracket carries before it is resolved.
+///
+/// The synchronise is the whole cost, and it costs a *sequence* of them: a forward launches about
+/// fifteen hundred kernels at c1 and sixteen hundred at c16, so a pool of sixty-four drained the
+/// device twenty-three times a forward and waited out the queue each time - which was 35 ms of a
+/// 75 ms forward, and looked exactly like a per-launch overhead. At this size a forward resolves
+/// its pool once, and only if the run never observes the device in between.
+const STAGE_BRACKET_POOL: usize = 2048;
+
 /// The distinct-kernel cap, so a run cannot grow the ledger without bound.
-const STAGE_TIMING_KERNEL_CAP: usize = 128;
+///
+/// A serving run names more kernels than the harness does: a 128-name cap dropped 14% of a
+/// sixteen-lane run's launches, and those launches are a share of the step the ledger then cannot
+/// attribute. The cap is wide enough for the serving binary and still bounds the ledger.
+const STAGE_TIMING_KERNEL_CAP: usize = 512;
 
 #[derive(Default)]
 struct KernelRow {
@@ -895,12 +976,18 @@ struct KernelRow {
     min_ns: u64,
     max_ns: u64,
     first_order: usize,
+    rows: u64,
+    steps: u64,
+    /// The last step whose rows were counted, so a step's rows are added once, not once a launch.
+    last_step: Option<usize>,
 }
 
 #[derive(Default)]
 struct StepRow {
+    phase: &'static str,
     launches: u64,
     kernel_ns: u64,
+    rows: usize,
     kernels: BTreeMap<&'static str, (u64, u64)>,
     warm: bool,
 }
@@ -921,6 +1008,7 @@ impl Default for StageRecorder {
                 step: 0,
                 layer: 0,
                 position: 0,
+                rows: 0,
             },
             order: 0,
             dropped: 0,
@@ -938,6 +1026,9 @@ static STAGE_RECORDER: Mutex<Option<StageRecorder>> = Mutex::new(None);
 /// Set by the device arm before its dummy steps; read when a step row is first touched.
 static WARM_STEP: AtomicBool = AtomicBool::new(false);
 
+/// The step index [stage_timing_forward] hands out: one forward pass, one step.
+static FORWARD_STEP: AtomicUsize = AtomicUsize::new(0);
+
 /// Whether SPARKFLASH_STAGE_TIMING=1 armed the bracket. Off by default: no events, no allocations
 /// and a byte-identical run when it is unset.
 pub fn stage_timing_enabled() -> bool {
@@ -945,22 +1036,17 @@ pub fn stage_timing_enabled() -> bool {
 }
 
 /// Sets the scope every following launch is attributed to. A no-op when the recorder is off.
+///
+/// The row count is kept: a caller that knows it says so once a step with
+/// [stage_timing_set_rows], and a per-token scope set that did not mention rows must not erase
+/// what the forward that opened the step said.
 pub fn stage_timing_scope(phase: &'static str, step: usize, layer: usize, position: usize) {
-    if !stage_timing_enabled() {
-        return;
-    }
-    let Ok(mut guard) = STAGE_RECORDER.lock() else {
-        return;
-    };
-    let Some(recorder) = guard.as_mut() else {
-        return;
-    };
-    recorder.scope = StageScope {
-        phase,
-        step,
-        layer,
-        position,
-    };
+    update_scope(|scope| {
+        scope.phase = phase;
+        scope.step = step;
+        scope.layer = layer;
+        scope.position = position;
+    });
 }
 
 /// Marks subsequent steps as warmup steps until cleared. The device arm sets this for its dummy
@@ -970,8 +1056,9 @@ pub fn stage_timing_set_warm(warm: bool) {
     WARM_STEP.store(warm, Ordering::Relaxed);
 }
 
-/// Updates only the layer of the current scope (the chain's per-layer loop calls this).
-pub fn stage_timing_set_layer(layer: usize) {
+/// Updates only one field of the current scope. Off, unarmed and poisoned all mean "no-op": the
+/// scope is a probe, and a probe never fails a run.
+fn update_scope(update: impl FnOnce(&mut StageScope)) {
     if !stage_timing_enabled() {
         return;
     }
@@ -979,8 +1066,43 @@ pub fn stage_timing_set_layer(layer: usize) {
         return;
     };
     if let Some(recorder) = guard.as_mut() {
-        recorder.scope.layer = layer;
+        update(&mut recorder.scope);
     }
+}
+
+/// Updates only the layer of the current scope (the chain's per-layer loop calls this).
+pub fn stage_timing_set_layer(layer: usize) {
+    update_scope(|scope| scope.layer = layer);
+}
+
+/// Updates only the phase of the current scope (prefill, decode or a stage-arm name).
+pub fn stage_timing_set_phase(phase: &'static str) {
+    update_scope(|scope| scope.phase = phase);
+}
+
+/// Updates only the step of the current scope: one forward pass, when the caller counts them.
+pub fn stage_timing_set_step(step: usize) {
+    update_scope(|scope| scope.step = step);
+}
+
+/// Updates only the row count of the current scope: what the per-kernel ledger divides by.
+pub fn stage_timing_set_rows(rows: usize) {
+    update_scope(|scope| scope.rows = rows);
+}
+
+/// Opens one forward pass in the ledger: its phase, a fresh step index and its rows.
+///
+/// A serving arm that counts its rows calls this once a pass over the weights, so one step is one
+/// forward and the ledger's per-kernel time divides by the rows that pass actually carried. The
+/// step index comes from a counter here rather than from the caller, because the caller's own
+/// counter is the sequence's and several sequences share a pass.
+pub fn stage_timing_forward(phase: &'static str, rows: usize) {
+    // The counter moves inside the update, so a run with the probe off leaves it where it was.
+    update_scope(|scope| {
+        scope.phase = phase;
+        scope.step = FORWARD_STEP.fetch_add(1, Ordering::Relaxed);
+        scope.rows = rows;
+    });
 }
 
 /// Records one bracketed launch. Called by [Cuda::launch] only.
@@ -988,11 +1110,19 @@ fn record_launch(kernel: &'static str, elapsed_ns: u64) {
     let Ok(mut guard) = STAGE_RECORDER.lock() else {
         return;
     };
+    // The recorder is installed by the first bracketed launch. Nothing else ever arms it: the
+    // tests install their own, and no production path did, so a run with SPARKFLASH_STAGE_TIMING=1
+    // paid the bracket's per-launch drain and recorded nothing at all - the ledger
+    // `device_chain --timing-json` documents was always empty outside the tests.
+    if guard.is_none() {
+        *guard = Some(StageRecorder::default());
+    }
     let Some(recorder) = guard.as_mut() else {
         return;
     };
     let phase = recorder.scope.phase;
     let step = recorder.scope.step;
+    let rows = recorder.scope.rows;
     let order = recorder.order;
     recorder.order += 1;
     let known = recorder.kernels.contains_key(&(phase, kernel));
@@ -1013,8 +1143,17 @@ fn record_launch(kernel: &'static str, elapsed_ns: u64) {
     row.total_ns = row.total_ns.saturating_add(elapsed_ns);
     row.min_ns = row.min_ns.min(elapsed_ns);
     row.max_ns = row.max_ns.max(elapsed_ns);
+    // A kernel launches several times a step, so the step's rows are counted once: the row is this
+    // kernel's row and its last step says whether this step's rows are already in.
+    if row.last_step != Some(step) {
+        row.last_step = Some(step);
+        row.steps += 1;
+        row.rows = row.rows.saturating_add(rows.try_into().unwrap_or(u64::MAX));
+    }
     let step_row = recorder.steps.entry(step).or_default();
+    step_row.phase = phase;
     step_row.warm = WARM_STEP.load(Ordering::Relaxed);
+    step_row.rows = rows;
     step_row.launches += 1;
     step_row.kernel_ns = step_row.kernel_ns.saturating_add(elapsed_ns);
     let entry = step_row.kernels.entry(kernel).or_insert((0, 0));
@@ -1035,6 +1174,8 @@ pub fn stage_timing_report() -> Option<StageTimingReport> {
             calls: row.calls,
             total_ns: row.total_ns,
             mean_ns: row.total_ns.checked_div(row.calls).unwrap_or(0),
+            rows: row.rows,
+            steps: row.steps,
             min_ns: row.min_ns,
             max_ns: row.max_ns,
             first_launch_order: row.first_order,
@@ -1046,7 +1187,9 @@ pub fn stage_timing_report() -> Option<StageTimingReport> {
         .iter()
         .map(|(step, row)| StepTimingRow {
             step: *step,
+            phase: row.phase,
             warm: row.warm,
+            rows: row.rows,
             launches: row.launches,
             kernel_ns: row.kernel_ns,
             kernels: row
@@ -1478,12 +1621,14 @@ pub fn enable_forward_async_launches() -> bool {
 ///
 /// The launch path and the device-to-device stage copy share this one decision: both are invisible
 /// to the host, and both are made safe by the next observation point (a stream-ordered
-/// [Cuda::copy_dtoh] or an explicit [Cuda::synchronize]). Either bracket consumer - the stage-timing
-/// ledger or the probe meter - reads a post-drain elapsed time, so its presence puts both calls
-/// back on the drained path.
+/// [Cuda::copy_dtoh] or an explicit [Cuda::synchronize]). The probe meter reads a post-drain
+/// elapsed time, so its presence puts both calls back on the drained path. The stage ledger does
+/// not: it brackets without draining, so it leaves this switch alone, and leaving it alone was
+/// worth more than the bracket - a drained run's stage copy is a blocking cuMemcpyDtoD, and forty
+/// of those a forward were most of what the ledger used to cost the wall.
 #[must_use]
 fn queued_dispatch_wanted() -> bool {
-    !stage_timing_enabled() && !probe_meter_armed() && async_launches()
+    !probe_meter_armed() && async_launches()
 }
 
 /// One run's cubin images and their loaded modules.
@@ -1877,6 +2022,33 @@ pub struct Cuda {
     graph: Mutex<GraphControl>,
     /// 0 direct, 1 capture, 2 record. One relaxed load at the top of every launch.
     graph_mode: AtomicU8,
+    /// The stage ledger's launch brackets: event pairs that are recorded again, not recreated.
+    stage_brackets: Mutex<StageBracketPool>,
+}
+
+/// The ledger's launch brackets: a ring of event pairs that are reused, and the launches waiting
+/// for their pair to be read.
+///
+/// Creating and destroying a pair per launch was an allocation a launch, and at c1 fifteen hundred
+/// launches carry a forward, so it was most of what the probe cost - the per-launch drain was only
+/// the other half. A resolved pair goes back to the free list instead. The pairs are driver events
+/// belonging to the context and are never destroyed: the context releases them whole.
+#[derive(Default)]
+struct StageBracketPool {
+    /// Pairs that have been read and can be recorded again.
+    free: Vec<(usize, usize)>,
+    /// Launches whose pair has not been read yet.
+    pending: Vec<StageBracket>,
+}
+
+/// One launch's event pair, waiting for [Cuda::flush_stage_brackets].
+///
+/// The handles are kept as usize so the pool is a plain Send container, the way the probe meter's
+/// deferred queue keeps its own ([DEFERRED_EVENTS]).
+struct StageBracket {
+    kernel: &'static str,
+    start: usize,
+    stop: usize,
 }
 
 impl Cuda {
@@ -1930,7 +2102,9 @@ impl Cuda {
         // released up to the current launch counter.
         self.completed
             .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
-        Ok(())
+        // The ledger's brackets are complete now: resolve them while the context is idle, so a
+        // run that observes the device also gets its last pool of kernel times.
+        self.resolve_stage_brackets()
     }
 
     /// The refusal a non-launch operation gets while a graph segment is active, or `None`.
@@ -2532,6 +2706,7 @@ impl Cuda {
                 completed: AtomicU64::new(0),
                 graph: Mutex::new(GraphControl::default()),
                 graph_mode: AtomicU8::new(GRAPH_DIRECT),
+                stage_brackets: Mutex::new(StageBracketPool::default()),
             })
         }
     }
@@ -3166,9 +3341,9 @@ impl Cuda {
             return Err(refusal.to_string());
         }
         // A stage copy is invisible to the host: its consumers are the kernels the caller launches
-        // next, so the queued path is the same switch as [Cuda::launch]'s. Both bracket consumers
-        // (stage timing, the probe meter) need the drained call's post-drain elapsed time and keep
-        // the synchronous path.
+        // next, so the queued path is the same switch as [Cuda::launch]'s. The probe meter needs
+        // the drained call's post-drain elapsed time and keeps the synchronous path; the stage
+        // ledger brackets without draining and does not.
         if queued_dispatch_wanted() {
             return self.copy_dtod_async(dst, src, bytes);
         }
@@ -4627,11 +4802,13 @@ impl Cuda {
 
     /// Launches one non-flash_mla kernel, draining the context unless the run selected async.
     ///
-    /// With SPARKFLASH_STAGE_TIMING=1, or with the probe meter armed, the launch is bracketed by
-    /// one cuEventCreate pair recorded
-    /// immediately around cuLaunchKernel and resolved after the existing cuCtxSynchronize; the
+    /// With SPARKFLASH_STAGE_TIMING=1 the launch is bracketed by one cuEventCreate pair recorded
+    /// immediately around cuLaunchKernel, and the pairs are resolved a pool at a time behind one
+    /// cuCtxSynchronize ([Cuda::launch_bracketed]), so the ledger neither drains nor changes the
+    /// overlap between kernels. With the probe meter armed the launch is bracketed the same way and
+    /// resolved after the existing cuCtxSynchronize, because the meter times that drain. The
     /// bracketed launches are the same launches in the same order and nothing else changes. Without
-    /// the variable no event is created, no allocation happens and the launch path is unchanged.
+    /// either switch no event is created, no allocation happens and the launch path is unchanged.
     ///
     /// The forward perf probe arms the same bracket through [probe_meter_arm] instead: the event
     /// elapsed time feeds the probe's per-block kernel_ns and the cuCtxSynchronize call feeds its
@@ -4655,7 +4832,16 @@ impl Cuda {
         if probe_meter_deferred() {
             return self.launch_deferred(kernel, grid, block, args);
         }
-        // The bracket consumers need the drain that follows each launch, so they always take the
+        // The ledger alone takes the pooled bracket: its event pair is read a pool at a time, so
+        // the launch does not have to drain and the kernels keep overlapping each other. The
+        // meter alone still needs the drain that follows each launch, for its host-sync bucket,
+        // and a run that asked for sync launches keeps the drained path below, which brackets.
+        let timing = stage_timing_enabled();
+        let metered = probe_meter_armed();
+        if timing && !metered && async_launches() {
+            return self.launch_bracketed(kernel, grid, block, args);
+        }
+        // The meter's bracket needs the drain that follows each launch, so it takes the
         // synchronous path. Everything else takes the async path when the run selected it.
         if queued_dispatch_wanted() {
             return self.launch_async(kernel, grid, block, args);
@@ -4663,8 +4849,6 @@ impl Cuda {
         unsafe {
             let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
             let (_storage, mut ptrs) = Cuda::kernel_params(args);
-            let timing = stage_timing_enabled();
-            let metered = probe_meter_armed();
             let mut start_event: CuEvent = std::ptr::null_mut();
             let mut stop_event: CuEvent = std::ptr::null_mut();
             // One bracket serves both consumers: the stage ledger and the probe meter.
@@ -4751,6 +4935,149 @@ impl Cuda {
             }
             Ok(())
         }
+    }
+
+    /// Launches one kernel bracketed for the stage ledger, without draining and without allocating
+    /// an event pair.
+    ///
+    /// The pair is recorded around exactly the cuLaunchKernel, as on the drained path, but nothing
+    /// is read: a pool of pairs is resolved at once after one cuCtxSynchronize, and each pair goes
+    /// back to the pool to be recorded again. Both halves matter. The per-launch drain was the
+    /// ledger's 2.8-4x wall, and creating and destroying a pair per launch was a driver allocation
+    /// a launch, which across fifteen hundred launches a forward was the rest of it: the kernel
+    /// therefore overlaps its neighbours the way it does with no probe at all, and its elapsed time
+    /// is its own duration in situ rather than its duration alone on an idle device.
+    fn launch_bracketed(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        let (start, stop) = self.take_stage_pair()?;
+        unsafe {
+            let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, *mut c_void) -> CuResult> =
+                self.sym(b"cuEventRecord")?;
+            // SAFETY: the pair belongs to this context and the stream is the one the launch below
+            // uses, so it brackets exactly that launch.
+            let r = record(start as CuEvent, std::ptr::null_mut());
+            if r != 0 {
+                self.release_stage_pair(start, stop);
+                return Err(format!("cuEventRecord(start) failed: {r}"));
+            }
+            if let Err(error) = self.launch_kernel(std::ptr::null_mut(), kernel, grid, block, args)
+            {
+                self.release_stage_pair(start, stop);
+                return Err(error);
+            }
+            let r = record(stop as CuEvent, std::ptr::null_mut());
+            if r != 0 {
+                self.release_stage_pair(start, stop);
+                return Err(format!("cuEventRecord(stop) failed: {r}"));
+            }
+        }
+        let full = {
+            let mut pool = self.lock_stage_brackets();
+            pool.pending.push(StageBracket {
+                kernel: kernel.name,
+                start,
+                stop,
+            });
+            pool.pending.len() >= STAGE_BRACKET_POOL
+        };
+        if full {
+            self.flush_stage_brackets()?;
+        }
+        Ok(())
+    }
+
+    fn lock_stage_brackets(&self) -> std::sync::MutexGuard<'_, StageBracketPool> {
+        match self.stage_brackets.lock() {
+            Ok(pool) => pool,
+            Err(error) => error.into_inner(),
+        }
+    }
+
+    /// Takes an event pair, creating one only while the pool is still growing.
+    fn take_stage_pair(&self) -> Result<(usize, usize), String> {
+        if let Some(pair) = self.lock_stage_brackets().free.pop() {
+            return Ok(pair);
+        }
+        let create: libloading::Symbol<unsafe extern "C" fn(*mut CuEvent, u32) -> CuResult> =
+            self.sym(b"cuEventCreate")?;
+        let mut start: CuEvent = std::ptr::null_mut();
+        let mut stop: CuEvent = std::ptr::null_mut();
+        // SAFETY: the out-pointers are valid for the call and the flags are the documented default
+        // event flags.
+        let mut r = unsafe { create(&mut start, 0) };
+        if r == 0 {
+            r = unsafe { create(&mut stop, 0) };
+        }
+        if r != 0 {
+            if !start.is_null() {
+                self.destroy_raw_event(start);
+            }
+            if !stop.is_null() {
+                self.destroy_raw_event(stop);
+            }
+            return Err(format!("cuEventCreate for the pooled bracket failed: {r}"));
+        }
+        Ok((start as usize, stop as usize))
+    }
+
+    fn release_stage_pair(&self, start: usize, stop: usize) {
+        self.lock_stage_brackets().free.push((start, stop));
+    }
+
+    fn destroy_raw_event(&self, event: CuEvent) {
+        if let Ok(destroy) =
+            self.sym::<unsafe extern "C" fn(CuEvent) -> CuResult>(b"cuEventDestroy")
+        {
+            // SAFETY: the handle is an event this handle created.
+            unsafe {
+                destroy(event);
+            }
+        }
+    }
+
+    /// Resolves the queued brackets, assuming the context has already been observed.
+    fn resolve_stage_brackets(&self) -> Result<(), String> {
+        if self.lock_stage_brackets().pending.is_empty() {
+            return Ok(());
+        }
+        let elapsed: libloading::Symbol<
+            unsafe extern "C" fn(*mut f32, CuEvent, CuEvent) -> CuResult,
+        > = self.sym(b"cuEventElapsedTime")?;
+        resolve_pool(&self.stage_brackets, |start, stop| {
+            let mut ms: f32 = 0.0;
+            // SAFETY: both handles are events this handle created for one launch, the out-pointer
+            // is valid for the call, and the caller has proven the work complete.
+            let r = unsafe { elapsed(&mut ms, start as CuEvent, stop as CuEvent) };
+            if r == 0 {
+                Ok((f64::from(ms) * 1_000_000.0) as u64)
+            } else {
+                Err(r)
+            }
+        })
+    }
+
+    /// Resolves the queued brackets behind one synchronise: the ledger's batch drain.
+    fn flush_stage_brackets(&self) -> Result<(), String> {
+        if self.lock_stage_brackets().pending.is_empty() {
+            return Ok(());
+        }
+        let sync: libloading::Symbol<unsafe extern "C" fn() -> CuResult> =
+            self.sym(b"cuCtxSynchronize")?;
+        // SAFETY: the symbol was resolved from this context's own library and takes no arguments.
+        let r = unsafe { sync() };
+        if r != 0 {
+            return Err(format!(
+                "cuCtxSynchronize for the pooled bracket failed: {r}"
+            ));
+        }
+        self.completed
+            .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.resolve_stage_brackets()
     }
 
     /// Launches one kernel on the no-sync probe path: queued, bracketed by one event pair, and
@@ -5126,6 +5453,16 @@ mod stage_timing_tests {
     }
 
     fn scope(phase: &'static str, step: usize, layer: usize, position: usize) {
+        scope_with_rows(phase, step, layer, position, 0);
+    }
+
+    fn scope_with_rows(
+        phase: &'static str,
+        step: usize,
+        layer: usize,
+        position: usize,
+        rows: usize,
+    ) {
         let mut guard = STAGE_RECORDER.lock().expect("lock");
         let recorder = guard.as_mut().expect("armed");
         recorder.scope = StageScope {
@@ -5133,6 +5470,7 @@ mod stage_timing_tests {
             step,
             layer,
             position,
+            rows,
         };
     }
 
@@ -5162,6 +5500,162 @@ mod stage_timing_tests {
         *STAGE_RECORDER.lock().expect("lock") = None;
     }
 
+    /// Rows are the denominator every serving question divides by, and a kernel launches several
+    /// times a step: counting the scope's rows a launch would inflate the denominator by the
+    /// launch count, which is exactly the mistake that made two runs' ns-a-row disagree.
+    #[test]
+    fn a_steps_rows_are_counted_once_per_step_not_once_per_launch() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        reset();
+        scope_with_rows("decode", 0, 0, 0, 8);
+        record_launch("opt_moe_gate_up_dedup_sm121", 1_000);
+        record_launch("opt_moe_gate_up_dedup_sm121", 1_000);
+        record_launch("moe_router_sm121", 100);
+        scope_with_rows("decode", 1, 0, 0, 24);
+        record_launch("opt_moe_gate_up_dedup_sm121", 3_000);
+        record_launch("moe_router_sm121", 100);
+        let report = stage_timing_report().expect("report");
+        let gate_up = report
+            .kernels
+            .iter()
+            .find(|row| row.kernel == "opt_moe_gate_up_dedup_sm121")
+            .expect("the gate/up row");
+        assert_eq!(gate_up.calls, 3, "three launches across two steps");
+        assert_eq!(gate_up.steps, 2, "two steps, not three launches");
+        assert_eq!(gate_up.rows, 32, "8 + 24, each step counted once");
+        assert_eq!(
+            gate_up.total_ns / gate_up.rows,
+            156,
+            "5_000 ns over 32 rows, not over 3 launches' 64"
+        );
+        let router = report
+            .kernels
+            .iter()
+            .find(|row| row.kernel == "moe_router_sm121")
+            .expect("the router row");
+        assert_eq!(router.steps, 2);
+        assert_eq!(router.rows, 32);
+        assert_eq!(report.steps[0].rows, 8);
+        assert_eq!(report.steps[1].rows, 24);
+        *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+
+    /// A scope that did not say how many rows it served reports 0 rather than a guess: a consumer
+    /// that divided by it would be dividing by an invented number. The setters are the other half
+    /// of that: with the probe off they must not touch the scope at all, or the ledger would have
+    /// two sources of truth for the same field and a run without the bracket would report rows.
+    #[test]
+    fn an_unsaid_row_count_is_zero_and_the_setters_are_inert_while_the_probe_is_off() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        assert!(
+            !stage_timing_enabled(),
+            "the test runs without SPARKFLASH_STAGE_TIMING"
+        );
+        reset();
+        scope("decode", 0, 0, 0);
+        stage_timing_set_phase("prefill");
+        stage_timing_set_step(7);
+        stage_timing_set_rows(12);
+        stage_timing_forward("decode", 64);
+        record_launch("moe_router_sm121", 100);
+        let report = stage_timing_report().expect("report");
+        assert_eq!(
+            report.kernels[0].rows, 0,
+            "an unsaid row count stays unsaid"
+        );
+        assert_eq!(report.steps[0].rows, 0);
+        assert_eq!(
+            report.steps[0].step, 0,
+            "the scope's step, not the setter's"
+        );
+        assert_eq!(report.steps[0].phase, "decode");
+        *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+
+    /// The pooled bracket is the ledger's whole cost model now: it must resolve every pair once,
+    /// destroy both handles, and lose only the row it could not read.
+    #[test]
+    fn a_pool_resolves_every_pair_once_and_loses_only_the_row_it_cannot_read() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        reset();
+        let pool = Mutex::new(StageBracketPool {
+            free: Vec::new(),
+            pending: vec![
+                StageBracket {
+                    kernel: "opt_moe_gate_up_dedup_sm121",
+                    start: 1,
+                    stop: 2,
+                },
+                StageBracket {
+                    kernel: "moe_router_sm121",
+                    start: 3,
+                    stop: 4,
+                },
+            ],
+        });
+        let read = resolve_pool(&pool, |start, _stop| {
+            Ok(if start == 1 { 1_000 } else { 3_000 })
+        });
+        assert!(read.is_ok(), "both rows read");
+        {
+            let pool = pool.lock().expect("lock");
+            assert!(pool.pending.is_empty(), "the pending list is drained");
+            assert_eq!(pool.free, vec![(1, 2), (3, 4)], "every pair is reusable");
+        }
+        let report = stage_timing_report().expect("report");
+        let gate_up = report
+            .kernels
+            .iter()
+            .find(|row| row.kernel == "opt_moe_gate_up_dedup_sm121")
+            .expect("the gate/up row");
+        assert_eq!(gate_up.total_ns, 1_000);
+        assert_eq!(gate_up.calls, 1, "one pair, one call");
+        let router = report
+            .kernels
+            .iter()
+            .find(|row| row.kernel == "moe_router_sm121")
+            .expect("the router row");
+        assert_eq!(router.total_ns, 3_000);
+        assert_eq!(router.first_launch_order, 1, "launch order is the pool's");
+
+        // A read that fails costs its own row: the next pair still records, and both are destroyed.
+        let pool = Mutex::new(StageBracketPool {
+            free: Vec::new(),
+            pending: vec![
+                StageBracket {
+                    kernel: "opt_moe_down_dedup_sm121",
+                    start: 5,
+                    stop: 6,
+                },
+                StageBracket {
+                    kernel: "opt_rows_lm_head",
+                    start: 7,
+                    stop: 8,
+                },
+            ],
+        });
+        let read = resolve_pool(
+            &pool,
+            |start, _stop| {
+                if start == 5 { Err(3) } else { Ok(2_000) }
+            },
+        );
+        assert!(read.is_err(), "the failure is reported");
+        assert_eq!(
+            pool.lock().expect("lock").free,
+            vec![(5, 6), (7, 8)],
+            "a rejected read still returns its pair"
+        );
+        let report = stage_timing_report().expect("report");
+        let head = report
+            .kernels
+            .iter()
+            .find(|row| row.kernel == "opt_rows_lm_head")
+            .expect("the head row, after the failed read");
+        assert_eq!(head.total_ns, 2_000);
+        *STAGE_RECORDER.lock().expect("lock") = None;
+    }
+
     #[test]
     fn the_ledger_caps_the_distinct_kernel_names() {
         let _serial = TEST_LOCK.lock().expect("test lock");
@@ -5185,6 +5679,26 @@ mod stage_timing_tests {
         *STAGE_RECORDER.lock().expect("lock") = None;
         assert!(stage_timing_report().is_none());
         assert_eq!(stage_timing_launches(), 0);
+    }
+
+    /// The regression this pins: nothing outside these tests ever installed the recorder, so a run
+    /// with `SPARKFLASH_STAGE_TIMING=1` paid the bracket's per-launch drain and recorded nothing -
+    /// both readers, `device-chain --timing-json` and `serve`, saw an empty ledger. The first
+    /// bracketed launch now installs it; a run that never brackets still reports nothing, which
+    /// `the_ledger_is_absent_until_armed_and_the_bracket_is_off_by_default` pins.
+    #[test]
+    fn the_first_bracketed_launch_installs_the_recorder() {
+        let _serial = TEST_LOCK.lock().expect("test lock");
+        *STAGE_RECORDER.lock().expect("lock") = None;
+        assert!(stage_timing_report().is_none(), "nothing has armed it yet");
+        record_launch("moe_router_sm121", 1_000);
+        let report = stage_timing_report().expect("the first launch installs the recorder");
+        assert_eq!(report.kernels.len(), 1);
+        assert_eq!(report.kernels[0].kernel, "moe_router_sm121");
+        assert_eq!(report.kernels[0].calls, 1);
+        assert_eq!(report.kernels[0].total_ns, 1_000);
+        assert_eq!(report.steps.len(), 1, "the default scope's step row");
+        *STAGE_RECORDER.lock().expect("lock") = None;
     }
 
     #[test]

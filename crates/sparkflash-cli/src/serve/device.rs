@@ -1177,6 +1177,9 @@ impl DeviceLink for WorkerLink {
             }
             Ok(Tp4ControlFrame::End) => {
                 LEADER_ENDED.store(true, Ordering::SeqCst);
+                // Here and not after the epoch: releasing the weights takes seconds, and whoever
+                // stopped rank 0 is usually about to stop this rank too.
+                super::print_exchange_stats();
                 Ok(None)
             }
             Ok(Tp4ControlFrame::Error { code, message }) => {
@@ -1269,6 +1272,7 @@ fn watch_leader(stream: &TcpStream, rank: usize) -> Result<(), String> {
                         eprintln!(
                             "sparkflash serve: rank {rank}: rank 0 closed the control channel, exiting"
                         );
+                        super::print_exchange_stats();
                         exit_now(1);
                     }
                 }

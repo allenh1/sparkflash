@@ -1330,6 +1330,9 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<f64, String> {
+        // One pass over the weights, one ledger step: this is the only place a decode pass's row
+        // count is known, and it is the denominator the ledger's per-kernel times divide by.
+        sparkflash_kernels::cuda_driver::stage_timing_forward("decode", n);
         let mut waited = 0.0;
         // The submit issues every miss inline, so it runs under the first layer (the device would
         // otherwise idle through it) unless that layer reads Engram entries itself.
@@ -1391,6 +1394,7 @@ impl DeviceLayer<'_> {
         n: usize,
         then: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<f64, String> {
+        sparkflash_kernels::cuda_driver::stage_timing_forward("prefill", n);
         let mut waited = 0.0;
         if let Some((task, _)) = task {
             self.engram_apply(&task.gather)?;
@@ -1446,6 +1450,11 @@ impl DeviceLayer<'_> {
         if !self.bulk_comm_open() || chunks.is_empty() {
             return Err("paired prefill: no collective stream or no chunk".to_owned());
         }
+        // The chunks' layers interleave, so the pass is one ledger step carrying all of their rows.
+        sparkflash_kernels::cuda_driver::stage_timing_forward(
+            "prefill",
+            chunks.iter().map(|&(_, _, _, n, _)| n).sum(),
+        );
         if encoder_only > chunks.len() || staged.len() < ENCODER_LAYERS {
             return Err(format!(
                 "paired prefill: {encoder_only} encoder-only chunks of {} over {} layers",
@@ -1525,8 +1534,10 @@ impl DeviceLayer<'_> {
                         self.ffn_rest_inputs(rows, layer, n)?;
                     }
                     self.rows_moe_merged(merged, layer)?;
+                    // A chunk's reduce goes out behind its own combine, under the next chunk's.
                     for &(rows, lane, _, n, _) in chunks {
                         self.enter_lane(lane)?;
+                        self.rows_moe_merged_combine(rows, n)?;
                         self.ffn_rest_tail(rows, layer, n)?;
                     }
                     continue;
@@ -1563,6 +1574,7 @@ impl DeviceLayer<'_> {
         p0: usize,
         n: usize,
     ) -> Result<(), String> {
+        sparkflash_kernels::cuda_driver::stage_timing_forward("prefill", n);
         for (layer, weights) in staged.iter().enumerate() {
             self.set_seam_weights(*weights);
             self.run_layer_rows(rows, layer, p0, n)?;

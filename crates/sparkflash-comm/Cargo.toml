@@ -72,6 +72,13 @@ name = "gpu-reduce-bench"
 path = "src/bin/gpu-reduce-bench.rs"
 
 [[bin]]
+# Four-rank smoke test of the direct-RDMA exchange on the real fabric: the control plane, the QP
+# mesh, the writes and the arrival flags, with the row staged on the host so no GPU is needed.
+name = "write-exchange-smoke"
+path = "src/bin/write-exchange-smoke.rs"
+required-features = ["rdma"]
+
+[[bin]]
 # Isolated host-only per-call measurement of the served 10 KiB reduce over TCP: sync total,
 # and in async mode the post and wait halves separately, with the canonical reference checked
 # on every rank. Used by the comm reduce workstream; it touches no GPU and no node config.

@@ -115,6 +115,16 @@ if [ -n "${SPARK_PEERS:-}" ]; then
     [ "${#PEER_LIST[@]}" -eq 4 ] || die "SPARK_PEERS needs exactly 4 addresses in rank order, got ${#PEER_LIST[@]}"
     PEERS="$(IFS=,; printf '%s' "${PEER_LIST[*]}")"
 fi
+# The exchange's control plane reads its own table. Derived after the collectives' table so the
+# two cannot drift: with SPARK_PEERS set - which is the case where the NCCL bootstrap lives on
+# different addresses, as the deployed launcher does - deriving this earlier gave the exchange a
+# table the operator never chose, and only entry 0 is ever dialled. A launch that names SPARK_NODES
+# and nothing else used to configure no exchange at all, so every rank stood down together and the
+# "default" arm was never the arm that ran.
+if [ -z "${SPARK_COMM_PEERS:-}" ]; then
+    SPARK_COMM_PEERS="$PEERS"
+    export SPARK_COMM_PEERS
+fi
 
 # The environment every rank starts with. The drain knobs only matter on rank 0, which owns the
 # HTTP surface, but exporting them uniformly keeps the four command lines identical apart from the
@@ -150,6 +160,20 @@ rank_env() {
             printf ' %s=%s' "$var" "${!var}"
         done
     fi
+    # The collective's own knobs. A rank started over ssh inherits only what this function
+    # prints, so an exchange configured on the launching shell and not here reaches rank 0 alone -
+    # which is exactly what happened: rank 0 opened the exchange and waited for three peers that
+    # had stood down to the NCCL group. Forwarded wholesale because the set grows with the backend.
+    #
+    # SPARK_COMM_REDUCE is the one exception: the V4.1 device path above pins it to nccl on
+    # purpose, and the last assignment on the command line wins, so forwarding the operator's copy
+    # here would silently undo that pin. The packed arm keeps its own branch above.
+    local var
+    for var in $(compgen -e | grep -E '^SPARK_COMM_' || true); do
+        [ "$var" = "SPARK_COMM_REDUCE" ] && continue
+        printf ' %s=%q' "$var" "${!var}"
+    done
+    [ -n "${SPARKFLASH_EXCHANGE:-}" ] && printf ' SPARKFLASH_EXCHANGE=%q' "$SPARKFLASH_EXCHANGE"
     # V4.1 reads the generic name; GLM reads its own. Setting both lets the same plan start
     # either model without the launcher having to guess which arm will read it.
     [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s SPARKFLASH_GLM_CONVERTED_DIR=%s' "$CONVERTED_DIR" "$CONVERTED_DIR"
@@ -162,7 +186,12 @@ rank_env() {
     # group's first collective blocks with no error instead of disagreeing out loud
     # (`SPARKFLASH_GLM_DFLASH2` was set for rank 0 only, and a request never produced a step).
     local knob
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS)' || true); do
+    #
+    # The collective topology belongs here too: SPARKFLASH_RAIL_DEVICES picks the devices the
+    # exchange opens, and SPARKFLASH_DEVICE_GATHER and SPARKFLASH_TWO_SHOT_ROWS choose whether a
+    # rank takes the exchange's slot path at all. A value that reaches rank 0 alone makes one rank
+    # a different program from its peers, which is the same split as a rank that stood down.
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0

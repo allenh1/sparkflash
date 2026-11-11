@@ -241,6 +241,20 @@ Most later wins share one shape: several consumers of the same bytes, made to sh
   released shapes.
 * **Template on the format, keep the old instantiation's code.** The drafter's E4M3 GEMV is the
   BF16 GEMV body templated on the weight format; the BF16 instantiation compiles to what it was.
+* **Where only an arg-max is served, bound first and compute what the bound cannot rule out.**
+  DeepSeek's verify head read 331 MB of BF16 a rank to return one index a row. An int8 copy of the
+  head (half the bytes) through the integer tensor cores gives an exact integer dot product, and
+  a proven interval around it contains the head's own f32 logit (the entry's quantisation
+  residual, the row's, the rounding of the head's 165 additions; every stored norm on the safe
+  side, a NaN or an uncovered row never ruled out). The entries whose upper bound reaches the best
+  lower bound, a handful of 32,320, then get the head's unchanged arithmetic, tie rules included,
+  so the answer is the full head's bits. A temperature-sampled row works the same way because
+  its score is a monotone function of the logit (`fmaf(logit, inv_t, noise)`): the function goes
+  on both ends of the interval. The proxy never reaches the output, so it needs a proof and a
+  check (a host reference, a self test at load, a mode that runs both heads on live traffic),
+  not a tolerance. The technique needs a consumer that wants an order statistic, a proxy at well
+  under the bytes, and a bound tight against the gaps in the data: the drafter's E4M3 copy of
+  the head was too coarse a proxy here.
 
 ### 2.4 Resources
 
@@ -298,6 +312,22 @@ round trips, and a float4 grid-stride read at working sets from 1 MiB to 4 GiB):
   of the 273 GB/s peak as the minimum for a single-row kernel.
 * **DRAM is shared.** Prefetching weights during collective waits made the next kernels faster
   and the overlapped send/receive slower (3.87 to 5.00 ms a step) from contention.
+
+**Tensor cores.** A loop of the block-scaled FP8 MMA on register operands (`kind::mxf8f6f4`
+m16n8k32, E4M3 x E2M1 and E4M3 x E4M3 alike; no loads, no barriers) runs at 30.4 G MMA/s:
+3.8 SM-cycles an MMA at 2.4 GHz, 249 TFLOPS, and the same from 8 to 48 warps an SM and from one
+to eight accumulators a warp.
+
+* **A GEMM whose operands come from memory is nowhere near it, so count its bytes before its
+  MMAs.** DeepSeek's routed-expert prefill GEMMs (a third of a long prompt's prefill) were run
+  with every MMA issued twice, the second into a scratch accumulator, so the output stays the
+  same: `opt_mma_moe_gate_up` 1,148 to 1,200 ms over an 8K and a 32K prompt (+4.5%),
+  `opt_mma_moe_down` 906 to 939 (+3.7%). Every stage's loads issued twice cost +20% and +6%.
+* **Their floor is the weights a pass and the slot values a token.** A merged expert pass reads
+  each routed expert's slices once whatever the rows behind it (384 experts of 4.57 MB a rank,
+  1.75 GB when every expert is routed to), `down` writes 61 KB of slot values a token and layer,
+  and the combine reads them back. Rows a pass is the lever that is left: a 32K prompt is 82
+  passes at three chunks a tick and 61 at four.
 
 **Launches and round trips.**
 
@@ -467,6 +497,8 @@ bit-identical (row hashes, parity tests and generated texts).
 | in a tick of several chunks, a prompt's rows before its last 2,541 a chunk of their own | per-tick prefill times on 4-32K prompts | 4,125 tokens 1,316 to 1,018 ms, 7,914 1,636 to 1,515, 32,494 4,881 to 4,713; the bulk path's last bits for an idle prompt over ~2.6K tokens move with the chunk boundary |
 | 256 prefill reader threads, then the earliest Engram layer's reads of every chunk first | first-tick times, two fresh servers an arm | threads: 7,914 tokens 1,527 to 1,462 ms, 15,913 1,706 to 1,600; order: 1,457 to 1,421 and 1,598 to 1,544 |
 | prompts whose rest is one chunk prefilled in one tick | rank 0's prefill ticks at eight concurrent uncached 800-token prompts: one prompt a tick, ~390 ms each | two a tick in 573-654 ms; time to first token median 2,457 to 1,944 ms, p99 3,931 to 3,137; 221 to 230 tok/s. Sixteen 256-token streams: median 4,467 to 3,393-3,673 ms, 211 to 230-233 tok/s |
+| the verify head behind an int8 tensor-core screen: bounds from an exact integer dot product, then the head's own arithmetic on the entries no bound rules out (section 2.3) | the stage ledger at one stream: `opt_rows_lm_head` 1.40 ms a step for 331 MB of BF16 a rank, where the drafter's 165 MB E4M3 copy takes 0.73 ms | a greedy step scores 3-18 of a rank's 32,320 entries a row (1,554 at most over 17,285 checked rows). One binary, three launches an arm, alternated: one stream 37.73 to 37.09 ms a step (103.7 to 105.5 tok/s), eight 92.23 to 91.21 (156.6 to 159.0), sixteen 137.07 to 134.39 (200.3 to 203.2); same tokens. Temperature-sampled steps (the server's default request) take the screen too: one stream at 0.7, 37.58 to 36.93 ms (99.0 to 100.7 tok/s), eight 93.36 to 92.20, the same seeded tokens. Top-k, top-p and constrained rows keep the whole head. +175 MB a rank |
+| a merged expert pass's chunks: each chunk's reduce queued behind its own combine, not behind the last chunk's | the collective stream starts a reduce once everything queued on the run's stream is done: the wire sat idle under the other chunks' combines, and the run's stream behind the collectives afterwards | cold prompts, three launches an arm, alternated: 8K 1,537 to 1,531 ms, 16K 2,602 to 2,588, 32K (median) 4,636 to 4,607; same text |
 
 ### Measured and not kept
 

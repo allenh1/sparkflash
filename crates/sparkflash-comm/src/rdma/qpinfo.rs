@@ -22,7 +22,12 @@
 //! Topology: a star with rank 0 at the centre. Every rank sends its endpoint record to rank 0;
 //! rank 0 assembles the table in rank order and broadcasts the assembled table to all ranks, so
 //! every rank ends the call holding the same table and the call is a barrier as well as an
-//! exchange. A full mesh of TCP connections would need no coordinator, but the star keeps one
+//! exchange. The table says where every peer's queue pairs are, not that they are connected: each
+//! rank connects its own after it has the table, at its own pace. A caller whose first act on the
+//! fabric is a write to a peer therefore keeps the star open ([`open_star`]) and meets the other
+//! ranks once more when its queue pairs are connected ([`Star::ready`]).
+//!
+//! A full mesh of TCP connections would need no coordinator, but the star keeps one
 //! listener and one deterministic assembly order, which is what makes the merged table verifiable:
 //! the decoder rejects a table that is not in ascending rank order, has a repeated or missing rank,
 //! or carries a zero QP number, an unknown MTU or an all-zero GID.
@@ -40,11 +45,25 @@ use crate::error::CommError;
 /// Magic ("SQPI" little-endian) opening every control message.
 pub(crate) const QPINFO_MAGIC: u32 = 0x5351_5049;
 /// Format version; a mismatched node is rejected rather than reinterpreted.
-pub(crate) const QPINFO_VERSION: u16 = 1;
+///
+/// Bumped to 2 when the endpoint record's third reserved byte became the arm: a rolling restart
+/// against a version-1 rank now fails as a version mismatch instead of as "non-zero reserved
+/// bytes", which is the message an operator can act on.
+pub(crate) const QPINFO_VERSION: u16 = 2;
 /// Fixed part of the control header: magic, version, kind, reserved, body length.
 pub(crate) const QPINFO_HEADER_BYTES: usize = 12;
 /// Control message kind carried in the header.
 pub(crate) const QPINFO_KIND_ENDPOINTS: u8 = 1;
+/// Control message kind: the sending rank has connected its queue pairs.
+pub(crate) const QPINFO_KIND_READY: u8 = 2;
+/// Control message kind: every rank has, so the fabric may carry traffic.
+pub(crate) const QPINFO_KIND_GO: u8 = 3;
+/// The arm a record belongs to: the general-purpose transport backend.
+pub(crate) const ARM_TRANSPORT: u8 = 0;
+/// The arm a record belongs to: the direct-RDMA exchange (`write_exchange`).
+pub(crate) const ARM_EXCHANGE: u8 = 1;
+/// Body of a ready or go message: the rank that sent it.
+const SIGNAL_BODY_BYTES: usize = 4;
 /// Largest control message this codec will allocate for (the table is small; the cap is a guard).
 const MAX_CONTROL_MESSAGE_BYTES: usize = 1 << 20;
 
@@ -82,6 +101,14 @@ pub(crate) struct RankEndpoints {
     pub(crate) slot_bytes: u64,
     /// Rails this rank actually opened (1 or 2). Unused rail records are all-zero.
     pub(crate) rail_count: u8,
+    /// Which collective backs this table, so a mixed deployment is refused instead of waited on.
+    ///
+    /// The staging geometry is already checked across ranks; the arm was not, and that is the one
+    /// disagreement that cannot be detected afterwards: a rank that stands down to the NCCL group
+    /// after the rendezvous is a different collective from its peers, and the only symptom is a
+    /// peer waiting for an arrival flag that nobody will ever write. Publishing the arm makes that
+    /// a refusal at open, naming the rank.
+    pub(crate) arm: u8,
     /// Rail 0 and rail 1; entries at or above `rail_count` are placeholders and must be zero.
     pub(crate) rails: [RailEndpoint; 2],
 }
@@ -257,17 +284,20 @@ fn encode_message(world: usize, entries: &[RankEndpoints]) -> Result<Vec<u8>, Co
             if entry.frame_cap != first.frame_cap
                 || entry.slot_bytes != first.slot_bytes
                 || entry.rail_count != first.rail_count
+                || entry.arm != first.arm
             {
                 return Err(CommError::Protocol(format!(
-                    "rank {} publishes geometry (cap {}, slot {}, {} rails) but rank {} publishes ({}, {}, {}): every rank must agree on the staging layout",
+                    "rank {} publishes geometry (cap {}, slot {}, {} rails) on arm {} but rank {} publishes ({}, {}, {}, arm {}): every rank must agree on the staging layout and on which collective is running",
                     entry.rank,
                     entry.frame_cap,
                     entry.slot_bytes,
                     entry.rail_count,
+                    entry.arm,
                     first.rank,
                     first.frame_cap,
                     first.slot_bytes,
-                    first.rail_count
+                    first.rail_count,
+                    first.arm
                 )));
             }
         }
@@ -283,7 +313,8 @@ fn encode_message(world: usize, entries: &[RankEndpoints]) -> Result<Vec<u8>, Co
         out.extend_from_slice(&entry.frame_cap.to_le_bytes());
         out.extend_from_slice(&entry.slot_bytes.to_le_bytes());
         out.push(entry.rail_count);
-        out.extend_from_slice(&[0u8; 3]);
+        out.push(entry.arm);
+        out.extend_from_slice(&[0u8; 2]);
         for rail_index in 0..2 {
             let rail = entry.rails.get(rail_index).ok_or_else(|| {
                 CommError::Protocol(format!("rank {} is missing rail {rail_index}", entry.rank))
@@ -396,7 +427,7 @@ fn decode_message(
         )));
     }
     let mut entries = Vec::with_capacity(count);
-    let mut geometry: Option<(u32, u64, u8)> = None;
+    let mut geometry: Option<(u32, u64, u8, u8)> = None;
     for index in 0..count {
         let rank = read_u32(body, &mut cursor)? as usize;
         if count == world && rank != index {
@@ -412,10 +443,16 @@ fn decode_message(
         let frame_cap = read_u32(body, &mut cursor)?;
         let slot_bytes = read_u64(body, &mut cursor)?;
         let rail_count = read_bytes(body, &mut cursor, 1)?[0];
-        let reserved = read_bytes(body, &mut cursor, 3)?;
-        if reserved != [0u8; 3] {
+        let arm = read_bytes(body, &mut cursor, 1)?[0];
+        let reserved = read_bytes(body, &mut cursor, 2)?;
+        if reserved != [0u8; 2] {
             return Err(CommError::Protocol(format!(
                 "rank {rank} record has non-zero reserved bytes in its geometry header"
+            )));
+        }
+        if arm > ARM_EXCHANGE {
+            return Err(CommError::Protocol(format!(
+                "rank {rank} publishes arm {arm}, which this build does not know"
             )));
         }
         if !matches!(rail_count, 1 | 2) {
@@ -429,11 +466,11 @@ fn decode_message(
             )));
         }
         match geometry {
-            None => geometry = Some((frame_cap, slot_bytes, rail_count)),
-            Some(expected) if expected != (frame_cap, slot_bytes, rail_count) => {
+            None => geometry = Some((frame_cap, slot_bytes, rail_count, arm)),
+            Some(expected) if expected != (frame_cap, slot_bytes, rail_count, arm) => {
                 return Err(CommError::Protocol(format!(
-                    "rank {rank} publishes geometry (frame cap {frame_cap}, slot {slot_bytes}, {rail_count} rails) but an earlier record publishes ({}, {}, {}): every rank must agree on the staging layout",
-                    expected.0, expected.1, expected.2
+                    "rank {rank} publishes geometry (frame cap {frame_cap}, slot {slot_bytes}, {rail_count} rails) on arm {arm} but an earlier record publishes ({}, {}, {}, arm {}): every rank must agree on the staging layout and on which collective is running",
+                    expected.0, expected.1, expected.2, expected.3
                 )));
             }
             Some(_) => {}
@@ -499,6 +536,7 @@ fn decode_message(
             frame_cap,
             slot_bytes,
             rail_count,
+            arm,
             rails: [rail0, rail1],
         });
     }
@@ -571,6 +609,111 @@ pub(crate) struct ControlConfig {
 /// How the star exchange retries a peer that has not reached its listener yet.
 const CONNECT_RETRY: Duration = Duration::from_millis(25);
 
+/// The control connections of a finished star exchange, kept so the ranks can meet once more.
+///
+/// A queue pair that is not connected yet does not answer, so a rank that writes to its peers as
+/// soon as its own queue pairs are connected is racing theirs. [`Star::ready`] is the meeting that
+/// ends the race: no rank leaves it before every rank has entered it.
+#[derive(Debug)]
+pub(crate) struct Star {
+    rank: usize,
+    world: usize,
+    timeout: Duration,
+    /// Rank 0 holds one stream per peer; every other rank holds its stream to rank 0.
+    streams: Vec<TcpStream>,
+}
+
+impl Star {
+    /// Tells the other ranks this one has acted on the table, and returns once every rank has.
+    ///
+    /// Every other rank reports to rank 0 and waits for its answer; rank 0 answers when it has
+    /// heard from all of them and is here itself.
+    ///
+    /// # Errors
+    /// Returns [`CommError::Timeout`] when a rank does not report before the deadline and
+    /// [`CommError::Protocol`] for a message that is not the one this meeting expects.
+    pub(crate) fn ready(mut self) -> Result<(), CommError> {
+        if self.rank == 0 {
+            let mut heard = vec![false; self.world];
+            heard[0] = true;
+            for stream in &mut self.streams {
+                let message = read_message(stream, self.timeout).map_err(|error| {
+                    control_error(
+                        error,
+                        "rank 0 failed to read a peer's ready message: a rank that never reached this barrier has stood down to the collective group, and its own log names the reason (the arm published in the endpoint table says which collective each rank is in)".to_owned(),
+                    )
+                })?;
+                let rank = decode_signal(&message, QPINFO_KIND_READY, self.world)?;
+                if std::mem::replace(&mut heard[rank], true) {
+                    return Err(CommError::Protocol(format!(
+                        "rank {rank} reported ready twice, or claimed to be rank 0"
+                    )));
+                }
+            }
+            let go = encode_signal(QPINFO_KIND_GO, 0);
+            for stream in &mut self.streams {
+                write_message(stream, &go)?;
+            }
+            return Ok(());
+        }
+        let timeout = self.timeout;
+        let rank = self.rank;
+        let stream = self.streams.first_mut().ok_or_else(|| {
+            CommError::Protocol(format!("rank {rank} holds no control stream to rank 0"))
+        })?;
+        write_message(stream, &encode_signal(QPINFO_KIND_READY, rank))?;
+        let message = read_message(stream, timeout).map_err(|error| {
+            control_error(
+                error,
+                format!(
+                    "rank {rank} failed to read rank 0's go message: rank 0 may have refused the table (its log names the rank that published a different arm or geometry)"
+                ),
+            )
+        })?;
+        decode_signal(&message, QPINFO_KIND_GO, self.world)?;
+        Ok(())
+    }
+}
+
+/// Encodes a ready or go message from `rank`.
+fn encode_signal(kind: u8, rank: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(QPINFO_HEADER_BYTES + SIGNAL_BODY_BYTES);
+    out.extend_from_slice(&QPINFO_MAGIC.to_le_bytes());
+    out.extend_from_slice(&QPINFO_VERSION.to_le_bytes());
+    out.push(kind);
+    out.push(0);
+    out.extend_from_slice(&(SIGNAL_BODY_BYTES as u32).to_le_bytes());
+    out.extend_from_slice(&(rank as u32).to_le_bytes());
+    out
+}
+
+/// Decodes a ready or go message, which must be of `kind`, and returns the rank that sent it.
+fn decode_signal(bytes: &[u8], kind: u8, world: usize) -> Result<usize, CommError> {
+    if bytes.len() != QPINFO_HEADER_BYTES + SIGNAL_BODY_BYTES
+        || bytes[0..4] != QPINFO_MAGIC.to_le_bytes()
+        || bytes[4..6] != QPINFO_VERSION.to_le_bytes()
+        || bytes[8..12] != (SIGNAL_BODY_BYTES as u32).to_le_bytes()
+    {
+        return Err(CommError::Protocol(format!(
+            "expected a control message of kind {kind} and got {} bytes that are not one",
+            bytes.len()
+        )));
+    }
+    if bytes[6] != kind {
+        return Err(CommError::Protocol(format!(
+            "expected a control message of kind {kind} and got kind {}",
+            bytes[6]
+        )));
+    }
+    let rank = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
+    if rank >= world {
+        return Err(CommError::Protocol(format!(
+            "a control message of kind {kind} claims rank {rank} in a world of {world}"
+        )));
+    }
+    Ok(rank)
+}
+
 /// Runs the star exchange and returns the merged endpoint table.
 ///
 /// Rank 0 listens, collects one record per peer, merges them in rank order and broadcasts the
@@ -587,6 +730,17 @@ pub(crate) fn exchange_endpoints(
     config: &ControlConfig,
     own: RankEndpoints,
 ) -> Result<QpTable, CommError> {
+    open_star(config, own).map(|(table, _)| table)
+}
+
+/// [`exchange_endpoints`], keeping the control connections for [`Star::ready`].
+///
+/// # Errors
+/// As [`exchange_endpoints`].
+pub(crate) fn open_star(
+    config: &ControlConfig,
+    own: RankEndpoints,
+) -> Result<(QpTable, Star), CommError> {
     if config.world == 0 || config.rank >= config.world {
         return Err(CommError::RankOutOfRange {
             rank: config.rank,
@@ -599,11 +753,18 @@ pub(crate) fn exchange_endpoints(
             config.rank, own.rank
         )));
     }
+    let star = |streams| Star {
+        rank: config.rank,
+        world: config.world,
+        timeout: config.timeout,
+        streams,
+    };
     if config.world == 1 {
-        return Ok(QpTable {
+        let table = QpTable {
             world: 1,
             entries: vec![own],
-        });
+        };
+        return Ok((table, star(Vec::new())));
     }
     if config.peers.len() != config.world {
         return Err(CommError::InvalidLayout(format!(
@@ -617,18 +778,20 @@ pub(crate) fn exchange_endpoints(
     let deadline = Instant::now() + config.timeout;
     if config.rank == 0 {
         collect_and_broadcast(config, own, root, deadline)
+            .map(|(table, streams)| (table, star(streams)))
     } else {
-        join_as_peer(config, own, root, deadline)
+        join_as_peer(config, own, root, deadline).map(|(table, stream)| (table, star(vec![stream])))
     }
 }
 
-/// Rank 0: accepts every peer, merges the records and broadcasts the table.
+/// Rank 0: accepts every peer, merges the records and broadcasts the table. Returns the table and
+/// the peers' streams.
 fn collect_and_broadcast(
     config: &ControlConfig,
     own: RankEndpoints,
     root: SocketAddr,
     deadline: Instant,
-) -> Result<QpTable, CommError> {
+) -> Result<(QpTable, Vec<TcpStream>), CommError> {
     let listener = TcpListener::bind(root)?;
     listener.set_nonblocking(true)?;
     let mut streams = Vec::with_capacity(config.world - 1);
@@ -676,16 +839,17 @@ fn collect_and_broadcast(
     for stream in &mut streams {
         write_message(stream, &encoded)?;
     }
-    Ok(table)
+    Ok((table, streams))
 }
 
-/// Rank r > 0: connects to rank 0, sends this rank's record and reads the merged table.
+/// Rank r > 0: connects to rank 0, sends this rank's record and reads the merged table. Returns
+/// the table and the stream to rank 0.
 fn join_as_peer(
     config: &ControlConfig,
     own: RankEndpoints,
     root: SocketAddr,
     deadline: Instant,
-) -> Result<QpTable, CommError> {
+) -> Result<(QpTable, TcpStream), CommError> {
     let mut stream = connect_retry(root, deadline, config.timeout)?;
     stream.set_read_timeout(Some(config.timeout))?;
     stream.set_write_timeout(Some(config.timeout))?;
@@ -707,7 +871,7 @@ fn join_as_peer(
             "the broadcast table does not contain this rank's own record: sent {own:?}, got {echoed:?}"
         )));
     }
-    Ok(table)
+    Ok((table, stream))
 }
 
 /// Resolves a control-plane address (host name or IP) plus the port.
@@ -859,6 +1023,7 @@ mod tests {
             frame_cap: 2 * 1024 * 1024,
             slot_bytes: 24 + 2 * 1024 * 1024,
             rail_count: 2,
+            arm: ARM_EXCHANGE,
             rails: [rail(0), rail(1)],
         }
     }
@@ -1065,6 +1230,65 @@ mod tests {
         let mut polluted = single.clone();
         patch(&mut polluted, base + 67, &[1u8]);
         refuse(&polluted, "rail 1");
+    }
+
+    #[test]
+    fn no_rank_leaves_the_ready_meeting_before_every_rank_has_entered_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|error| panic!("{error}"));
+        let port = probe
+            .local_addr()
+            .unwrap_or_else(|error| panic!("{error}"))
+            .port();
+        drop(probe);
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for rank in 0..4_usize {
+            let entered = Arc::clone(&entered);
+            handles.push(std::thread::spawn(move || {
+                let config = ControlConfig {
+                    rank,
+                    world: 4,
+                    peers: vec!["127.0.0.1".to_owned(); 4],
+                    port,
+                    timeout: Duration::from_secs(10),
+                };
+                let (_, star) = open_star(&config, endpoint(rank, 4))
+                    .unwrap_or_else(|error| panic!("rank {rank}: {error}"));
+                // Each rank takes a different time to act on the table; rank 0 is the slowest, so
+                // the peers would all be through first if the meeting let them.
+                std::thread::sleep(Duration::from_millis(20 * (4 - rank as u64)));
+                entered.fetch_add(1, Ordering::SeqCst);
+                star.ready()
+                    .unwrap_or_else(|error| panic!("rank {rank}: {error}"));
+                entered.load(Ordering::SeqCst)
+            }));
+        }
+        for handle in handles {
+            let seen = handle.join().unwrap_or_else(|_| panic!("a rank panicked"));
+            assert_eq!(
+                seen, 4,
+                "a rank left the meeting with {seen} of 4 ranks in it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ready_or_go_message_is_refused_as_anything_else() {
+        let ready = encode_signal(QPINFO_KIND_READY, 2);
+        assert_eq!(
+            decode_signal(&ready, QPINFO_KIND_READY, 4).unwrap_or_else(|error| panic!("{error}")),
+            2
+        );
+        // The wrong kind, a rank outside the world, and a table where a signal was expected.
+        assert!(decode_signal(&ready, QPINFO_KIND_GO, 4).is_err());
+        assert!(decode_signal(&ready, QPINFO_KIND_READY, 2).is_err());
+        let record = encode_rank_message(4, &endpoint(1, 4))
+            .unwrap_or_else(|error| panic!("encode: {error}"));
+        assert!(decode_signal(&record, QPINFO_KIND_READY, 4).is_err());
     }
 
     #[test]

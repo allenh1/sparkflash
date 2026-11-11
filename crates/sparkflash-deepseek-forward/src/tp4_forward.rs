@@ -59,7 +59,7 @@ mod draft;
 #[cfg(feature = "cuda")]
 mod lanes;
 #[cfg(feature = "cuda")]
-mod rows;
+pub(crate) mod rows;
 // Pure host code, built (and tested) without the device too; only the device path uses it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 mod sample;
@@ -11182,6 +11182,13 @@ struct DeviceLayer<'a> {
     /// every row in rank order, then the chunks are shared), which moves half the one-shot
     /// exchange's bytes for the same bits. SPARKFLASH_TWO_SHOT_ROWS, 0 for never.
     two_shot_rows: usize,
+    /// The cubin directory this run was opened with, kept so the direct-RDMA exchange can load its
+    /// staging kernel on the first collective. The exchange is opened lazily rather than here
+    /// because its rank only comes from the run's reduce handle, and it is opened once per process
+    /// rather than once per step because a registration and a QP mesh per step would cost more than
+    /// the collective it replaces.
+    #[cfg(all(feature = "cuda", feature = "rdma"))]
+    cubin_dir: Option<std::path::PathBuf>,
     /// The indexer select (opt_select_sm121.cubin): a grid-wide score pass then the one-block
     /// select over the scores, unless SPARKFLASH_OPT_SELECT=0.
     opt_select: Option<OptSelect>,
@@ -11553,6 +11560,11 @@ impl<'a> DeviceLayer<'a> {
         native_mhc: bool,
         lanes_planned: bool,
     ) -> Result<Self, String> {
+        // Refuse a misspelled exchange switch at bring-up rather than at the first collective that
+        // happens to reach that path: with the exchange as the default, most steps never read the
+        // variable at all, and a typo would leave a run measuring the arm it meant to replace.
+        #[cfg(all(feature = "cuda", feature = "rdma"))]
+        crate::rdma_exchange::validate()?;
         // The device arm's collectives are the four-rank chain's; a single-rank device run has no
         // communicator to reduce with, and failing here names the real reason instead of failing
         // later inside all_reduce with a message that blames the bootstrap. Host arm: unaffected.
@@ -12410,6 +12422,8 @@ impl<'a> DeviceLayer<'a> {
             opt_attn,
             opt_oneshot,
             two_shot_rows,
+            #[cfg(all(feature = "cuda", feature = "rdma"))]
+            cubin_dir: kernel_cubin_dir.map(std::path::Path::to_path_buf),
             opt_select,
             moe_routed_device: None,
             moe_router_seen: 0,
@@ -12950,6 +12964,175 @@ impl<'a> DeviceLayer<'a> {
         self.reduce_rows(stage, input, output, 1)
     }
 
+    /// The per-layer all-reduce through the direct-RDMA exchange instead of the NCCL group.
+    ///
+    /// Two launches and no host wait: the exchange kernel copies this rank's row into the pinned
+    /// slab, rings the doorbell and waits on the device until every peer's row has arrived, while
+    /// the exchange's pump thread posts the writes the doorbell asks for; the sum kernel is queued
+    /// behind it and folds the rows out of the slab in rank order. That is the group arm's fold
+    /// over the same rows in the same order, so the bits are the group's. Like the group's
+    /// collective it is enqueued and not waited for; [Self::wait_collectives] drains it and
+    /// reports a round that could not complete.
+    ///
+    /// Returns `Ok(false)` when the run did not select the exchange, so the caller falls through
+    /// to the group. A run that asked for it and cannot have it is an error, never a silent
+    /// fallback to the arm the switch was meant to replace.
+    #[cfg(all(feature = "cuda", feature = "rdma"))]
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_rows_through_exchange(
+        &self,
+        sum_kernel: sparkflash_kernels::cuda_driver::Kernel,
+        input: crate::layer_device::DeviceSpan,
+        output: crate::layer_device::DeviceSpan,
+        count: usize,
+        rank: usize,
+        world: usize,
+        stage: &'static str,
+    ) -> Result<bool, String> {
+        let row_bytes = count
+            .checked_mul(2)
+            .ok_or_else(|| format!("layer device stage {stage}: the row byte width overflows"))?;
+        let taken =
+            self.exchange_round(input.device, row_bytes, rank, world, stage, |round, _| {
+                // One round's rows are compact inside their row set, so the sum kernel's
+                // gather + peer * count * 2 addressing is the group arm's addressing.
+                let pairs = (count / 2) as u32;
+                self.cuda.launch(
+                    sum_kernel,
+                    (pairs.div_ceil(256), 1, 1),
+                    (256, 1, 1),
+                    &[
+                        round.set,
+                        input.device,
+                        output.device,
+                        count as u64,
+                        rank as u64,
+                        world as u64,
+                    ],
+                )
+            })?;
+        if taken {
+            probe::count(stage);
+        }
+        Ok(taken)
+    }
+
+    /// A one-shot slot exchange through the direct-RDMA exchange instead of the NCCL group: this
+    /// rank's `bytes` at `slots + rank * bytes` go to every peer's copy of that slot, and every
+    /// peer's slot lands in this rank's copy of `slots`. It is [Self::reduce_rows_through_exchange]
+    /// with a copy where that has the fold: a round's row set holds every rank's row at
+    /// `rank * bytes`, which is the slot layout, so `opt_exchange_collect` copies the peers'
+    /// slots across. Bits are moved and nothing is summed.
+    ///
+    /// A step makes about nine of these beside its per-layer all-reduces (the argmax, embedding,
+    /// Engram and draft gathers). They are small, and most are queued right after the host has
+    /// read the previous step back, which is where the group's collective is slowest to start.
+    ///
+    /// Returns `Ok(false)` when the run did not select the exchange or the slot is larger than a
+    /// round carries, so the caller falls through to the group; every rank decides the same way,
+    /// because the selection and the slot size are the same on every rank.
+    #[cfg(all(feature = "cuda", feature = "rdma"))]
+    pub(super) fn slots_through_exchange(
+        &self,
+        slots: u64,
+        bytes: usize,
+        rank: usize,
+        world: usize,
+        what: &str,
+    ) -> Result<bool, String> {
+        let mine = slots + (rank * bytes) as u64;
+        self.exchange_round(mine, bytes, rank, world, what, |round, collect| {
+            // The sixteen-byte copy when both buffers and the slot are aligned for it.
+            let unit = if (round.set | slots | bytes as u64) & 15 == 0 {
+                16usize
+            } else {
+                1
+            };
+            let blocks = (world * bytes / unit).div_ceil(256) as u32;
+            self.cuda.launch(
+                collect,
+                (blocks, 1, 1),
+                (256, 1, 1),
+                &[
+                    round.set,
+                    slots,
+                    bytes as u64,
+                    rank as u64,
+                    world as u64,
+                    unit as u64,
+                ],
+            )
+        })
+    }
+
+    /// One round of the direct-RDMA exchange: submits it, launches the exchange kernel over the
+    /// `row_bytes` at `row`, and then `after`, which launches whatever reads the round's row set
+    /// (it is handed the round and the collect kernel). Both launches happen under the exchange's
+    /// lock, so rounds reach the stream in the order they were submitted.
+    ///
+    /// Returns `Ok(false)` without submitting anything when the run did not select the exchange
+    /// or the row is larger than a round carries.
+    #[cfg(all(feature = "cuda", feature = "rdma"))]
+    fn exchange_round(
+        &self,
+        row: u64,
+        row_bytes: usize,
+        rank: usize,
+        world: usize,
+        stage: &str,
+        after: impl FnOnce(
+            &crate::rdma_exchange::Round,
+            sparkflash_kernels::cuda_driver::Kernel,
+        ) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let Some(shared) =
+            crate::rdma_exchange::shared(self.cuda, world, rank, self.cubin_dir.as_deref())?
+        else {
+            return Ok(false);
+        };
+        let mut state = shared.lock().map_err(|_| {
+            format!(
+                "layer device stage {stage}: the direct-RDMA exchange is poisoned by an earlier panic"
+            )
+        })?;
+        if row_bytes == 0 || row_bytes > state.row_cap() {
+            return Ok(false);
+        }
+        let round = state.submit(row_bytes).map_err(|error| {
+            format!("layer device stage {stage}: direct-RDMA exchange: {error}")
+        })?;
+        // A launch that fails here leaves the round reserved and its doorbell un-rung. Telling the
+        // exchange is not optional: without it the pump posts the skipped round from whatever
+        // bytes are in the row, and the peers fold them.
+        if let Err(error) = self.cuda.launch(
+            state.kernel(),
+            (1, 1, 1),
+            (1024, 1, 1),
+            &[
+                row,
+                round.row,
+                row_bytes as u64,
+                round.control,
+                rank as u64,
+                world as u64,
+                round.seq,
+                round.rails,
+                round.lengths,
+                round.length_ring,
+            ],
+        ) {
+            state.fail(&format!(
+                "layer device stage {stage}: the exchange kernel for round {} did not launch: {error}",
+                round.seq
+            ));
+            return Err(error.to_string());
+        }
+        after(&round, state.collect())?;
+        self.collectives_in_flight
+            .set(self.collectives_in_flight.get().saturating_add(1));
+        Ok(true)
+    }
+
     /// [`Self::reduce_row`] over `rows` rows back to back (a verify step): one grouped collective
     /// per row, so every element is summed in the single-row call's order.
     fn reduce_rows(
@@ -12993,6 +13176,17 @@ impl<'a> DeviceLayer<'a> {
             return Ok(());
         }
         if rows > 1 && !(self.opt_oneshot.is_some() && handle.has_exchange()) {
+            // No predicate here, on purpose. `has_exchange` above is libnccl's symbol check
+            // (ncclSend and ncclRecv resolved), not the direct-RDMA exchange, so it is not the
+            // question this branch is about; and asking whether the exchange is *open* is narrower
+            // than the promise, because a run that demanded the exchange has not necessarily opened
+            // it on the step that lands here. A run that named the exchange and does this
+            // collective on the group is measuring neither arm, which is exactly what
+            // `refusal_here` reports, and it passes every other selection.
+            #[cfg(all(feature = "cuda", feature = "rdma"))]
+            if let Some(reason) = crate::rdma_exchange::refusal_here() {
+                return Err(format!("layer device stage {stage}: {reason}"));
+            }
             // SAFETY: as below, over rows * count values (checked above).
             unsafe { handle.reduce_bf16_rows(0, input.device, output.device, count, rows) }
                 .map_err(|error| format!("layer device stage {stage}: {error}"))?;
@@ -13011,6 +13205,20 @@ impl<'a> DeviceLayer<'a> {
                 // The rows travel as one block: the sum is per element in rank order, so each
                 // row's arithmetic is the single-row exchange's.
                 let count = count * rows;
+                // SPARKFLASH_EXCHANGE=rdma replaces the group with one write per peer. It is
+                // checked here, at the first collective, because the rank comes from the handle.
+                #[cfg(all(feature = "cuda", feature = "rdma"))]
+                if self.reduce_rows_through_exchange(
+                    sum_kernel, input, output, count, rank, world, stage,
+                )? {
+                    return Ok(());
+                }
+                // The one-shot arm above is the only path that can take the exchange. A run that
+                // named it and lands here would report an arm it never used.
+                #[cfg(all(feature = "cuda", feature = "rdma"))]
+                if let Some(reason) = crate::rdma_exchange::refusal_here() {
+                    return Err(reason);
+                }
                 if self.two_shot_rows > 0
                     && rows >= self.two_shot_rows
                     && world > 1
@@ -13067,6 +13275,12 @@ impl<'a> DeviceLayer<'a> {
                 )?;
             }
             _ => {
+                // The one-shot arm is the only one that can take the exchange, so a run that named
+                // it and lands here would report an arm it never used.
+                #[cfg(all(feature = "cuda", feature = "rdma"))]
+                if let Some(reason) = crate::rdma_exchange::refusal_here() {
+                    return Err(format!("layer device stage {stage}: {reason}"));
+                }
                 // SAFETY: the spans are the layer's carved device rows with at least count bf16
                 // values each (checked above), stream 0 is the stream every launch of this run
                 // uses, and the handle was opened for this run's world and rank by the bootstrap.
@@ -13275,12 +13489,25 @@ impl<'a> DeviceLayer<'a> {
     fn wait_collectives(&self) -> Result<bool, String> {
         let in_flight = self.collectives_in_flight.get();
         if in_flight == 0 {
+            // Nothing was queued, but the exchange's verdict is not a property of this step's
+            // count: a round that failed while the counter was already zero would otherwise be
+            // reported by whichever later step happened to enqueue one.
+            #[cfg(feature = "rdma")]
+            crate::rdma_exchange::check().map_err(|error| {
+                format!("layer device: a queued collective did not complete: {error}")
+            })?;
             return Ok(false);
         }
         self.cuda.synchronize().map_err(|error| {
             format!("layer device: waiting for {in_flight} queued collective(s): {error}")
         })?;
         self.collectives_in_flight.set(0);
+        // The exchange's kernel leaves its wait without folding when its round was given up, so a
+        // drained device is not yet a finished collective: the exchange has to agree.
+        #[cfg(feature = "rdma")]
+        crate::rdma_exchange::check().map_err(|error| {
+            format!("layer device: a queued collective did not complete: {error}")
+        })?;
         Ok(true)
     }
 

@@ -3809,6 +3809,9 @@ fn attach_stage_timing_ledger(path: &std::path::Path) -> Result<(), String> {
                 "calls": row.calls,
                 "total_ns": row.total_ns,
                 "mean_ns": row.mean_ns,
+                "rows": row.rows,
+                "steps": row.steps,
+                "ns_per_row": row.total_ns.checked_div(row.rows).unwrap_or(0),
                 "min_ns": row.min_ns,
                 "max_ns": row.max_ns,
                 "first_launch_order": row.first_launch_order,
@@ -3834,9 +3837,12 @@ fn attach_stage_timing_ledger(path: &std::path::Path) -> Result<(), String> {
                 .collect();
             serde_json::json!({
                 "step": row.step,
+                "phase": row.phase,
                 "warm": row.warm,
+                "rows": row.rows,
                 "launches": row.launches,
                 "kernel_ns": row.kernel_ns,
+                "ns_per_row": row.kernel_ns.checked_div(u64::try_from(row.rows).unwrap_or(u64::MAX)).unwrap_or(0),
                 "kernels": per_kernel,
             })
         })

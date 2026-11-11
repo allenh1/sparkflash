@@ -33,6 +33,8 @@
 //   opt_rows_hostw_*      b12x_hostw_gemv_m1 per row (grid cols/32 x rows); the _ring forms write
 //                         each row's compressor ring row, every lane's in one launch.
 //   opt_rows_argmax_pick  the cross-rank argmax over exchanged folds (the host gather's rule).
+//   opt_head_screen_*     the arg-max head behind an int8 tensor-core screen: opt_rows_lm_head's
+//                         arithmetic over the entries a bound cannot rule out.
 //   opt_rows_topc         a row's slice statistics for the truncated (top-k / top-p) sampler.
 //   opt_rows_embed_*      the rows' embedding streams from device ids, over the exchange.
 
@@ -43,6 +45,7 @@
 
 #include "m4_common_sm121.cuh"
 #include "opt_common_sm121.cuh"
+#include "opt_mma_common_sm121.cuh"
 
 // The shared header's helpers, under the names this image used.
 #define or_e4m3x4 opt_e4m3x4
@@ -1851,6 +1854,514 @@ extern "C" __global__ void opt_rows_argmax_pick(
     }
     ids_out[r] = index;
     if (values_out != nullptr) values_out[r] = best;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The arg-max head behind a screen
+// ---------------------------------------------------------------------------------------------
+// The verify head behind a screen (crates/sparkflash-deepseek-forward/src/tp4_forward/rows.rs,
+// head_rows_multi_c). A greedy step wants only the arg-max of the rank's 32,320 logits per row (a
+// temperature-sampled one the arg-max of its noised scores: see "Sampled rows" below), but
+// opt_rows_lm_head reads the whole bf16 head (331 MB a rank) to get it. Here an int8 copy of the head
+// (half the bytes) goes through the integer tensor cores and bounds every logit from both sides; the
+// few entries whose upper bound reaches the best lower bound are then scored by opt_rows_lm_head's
+// own arithmetic. The arg-max and its value are that kernel's bits: nothing the screen computes
+// reaches the output except the decision of which entries need not be scored.
+//
+//   opt_head_screen_build  once: the head slice as int8 codes in 128-entry tiles, and per entry its
+//                          scale and the two error coefficients (grid entries rounded up to 128).
+//   opt_head_screen_rows   a step's hidden rows as two int8 digits each, with the row's scale, its
+//                          norm and the norm of what the digits drop (grid rows).
+//   opt_head_screen_mma    every (row, entry) proxy logit as an exact integer dot product on
+//                          mma.sync m16n8k32 s8 x s8, its upper bound, and each tile's best lower
+//                          bound (grid ceil(rows / 32) x tiles).
+//   opt_head_screen_exact  opt_rows_lm_head over the entries the bounds do not rule out (grid
+//                          ceil(rows / 4) x chunks).
+//
+// The bound. Write E for the logit opt_rows_lm_head computes for (row h, entry w): 160 FMAs a lane
+// from zero and a five-level lane sum, every product exact (bf16 x bf16). With u = 2^-24,
+//     |E - w.h| <= gamma_165 * sum |w_j h_j| <= 1e-5 * |w| |h|                       (gamma_165 = 165 u / (1 - 165 u)).
+// The codes are q (int8) with one scale s per entry, and the row's digits are an integer H = 128 p1
+// + p0 with one scale t per row. The screen's value is P = fl(fl(s t) * fl(q.H)), q.H an exact
+// integer (|q.p| <= 5120 * 127 * 127 < 2^31 per digit; the digits are combined in 64 bits), so
+//     |P - s t (q.H)| <= 3 u |P| (1 + 3 u),
+//     |s t (q.H) - w.h| = |(s q - w).h + (s q).(t H - h)| <= |w - s q| |h| + |s q| |h - t H|.
+// So |P - E| <= a |h| + b |h - t H| + 3.1 u |P| with a = |w - s q| + 1e-5 |w| and b = |s q|, 2-norms.
+// The kernels store a and b 1% high and take the row norms 0.05% high (their own f32 sums are
+// accurate to far better than that, and an absolute 1e-17 covers squares that underflow), and add
+// 1e-6 |P| + 1e-30, which also covers the rounding of P +- bound and anything that underflows.
+// The first line assumes no partial sum overflows: a row whose squares sum to 1e30 or more, and an
+// entry whose squares do, are never ruled out (an infinite norm, an infinite a), so everywhere a
+// bound is used |w| |h| < 1e30. Every comparison is written so that a NaN keeps the entry: a row
+// with a non-finite or all-zero hidden state gets an infinite norm, hence every entry, hence
+// opt_rows_lm_head's result for it.
+//
+// Why the result is opt_rows_lm_head's. Let M be the row's best E on this rank and T the best lower
+// bound; T <= M. Every entry with E = M has an upper bound >= M >= T, so it is scored. In the chunk
+// that holds the lowest such entry the scored set contains every entry that ties the maximum and
+// nothing above it, so the chunk's (value, lowest index) is the full kernel's; every other chunk
+// reports a value <= M, and < M before that chunk, or -infinity when nothing in it was scored. The
+// fold (opt_rows_argmax_fold: first chunk, then strictly greater) therefore returns the same pair.
+//
+// Sampled rows. opt_rows_lm_head's score of a temperature-sampled row is fmaf(E, inv_t, G) with G the
+// entry's noise (opt_sample_sm121.cuh), a function of (seed, position, id) only. A correctly rounded
+// FMA is monotone in its first argument for inv_t > 0, so fmaf(P - bound, inv_t, G) and fmaf(P +
+// bound, inv_t, G) bound the score from both sides with no further slack, and the paragraph above
+// holds with the score in place of E (an infinite score keeps its entry: its upper bound is infinite
+// too). A row whose inv_t is not a positive finite number gets infinite bounds, hence every entry.
+// The noise arguments are opt_rows_lm_head's own (the scalar triple, or row_params per row).
+//
+// Attribution: the mma.sync / ldmatrix / cp.async tiling follows kernels/opt_mma_sm121.cu's tiled
+// head (opt_mma_head_fp8t_f32o) and uses kernels/opt_mma_common_sm121.cuh's primitives; see that
+// header's attribution (b12x and NVIDIA Flare, Apache-2.0) and the root NOTICE file.
+
+#define OHS_HIDDEN 5120u
+#define OHS_KB (OHS_HIDDEN / 32u)     // K blocks of 32
+#define OHS_TILE 128u                 // entries a tile
+#define OHS_ROWS 32u                  // hidden rows a screen block (two MMA rows each)
+#define OHS_STAGES 4u
+#define OHS_W_BYTES (OHS_TILE * 32u)  // a stage's codes
+#define OHS_A_BYTES (OHS_ROWS * 2u * 32u)
+#define OHS_DIGIT 16256.0f            // |H| <= 127 * 128
+#define OHS_INF __uint_as_float(0x7f800000u)
+#define OHS_SS_MAX 1e30f              // a sum of squares the bound's no-overflow premise allows
+
+__device__ __forceinline__ float ohs_bf16(const __nv_bfloat16 *p) {
+    return __uint_as_float((uint32_t)(*reinterpret_cast<const uint16_t *>(p)) << 16);
+}
+
+// The block's maximum (NaN-free inputs) or sum of one value per thread, 256 threads.
+__device__ __forceinline__ float ohs_block_max(float v, float *s_red) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    if ((threadIdx.x & 31u) == 0u) s_red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float m = s_red[0];
+#pragma unroll
+    for (uint32_t k = 1; k < 8u; ++k) m = fmaxf(m, s_red[k]);
+    __syncthreads();
+    return m;
+}
+__device__ __forceinline__ float ohs_block_sum(float v, float *s_red) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if ((threadIdx.x & 31u) == 0u) s_red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float m = s_red[0];
+#pragma unroll
+    for (uint32_t k = 1; k < 8u; ++k) m += s_red[k];
+    __syncthreads();
+    return m;
+}
+
+// Entry v of w (bf16 [vocab][5120]) as int8 codes q = rint(w / s), s = max |w| / 127, in the screen's
+// tiles: K block b of entry v at ((v / 128 * 160 + b) * 128 + v % 128) * 32. coef[4 v] = {s, a, b, 0}
+// (the header's a and b, 1% high; a is infinite, or a NaN, for an entry the bound does not cover).
+// Entries past the slice get zero codes and coefficients. Grid vocab rounded up to 128, 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_head_screen_build(
+    const __nv_bfloat16 *__restrict__ w, int8_t *__restrict__ codes, float *__restrict__ coef,
+    const uint32_t vocab) {
+    OPT_PDL_ENTRY();
+    __shared__ float s_red[8];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint64_t row = blockIdx.x;
+    const uint64_t tile = row >> 7;
+    const uint32_t col = (uint32_t)row & 127u;
+    if (row >= vocab) {
+        for (uint32_t b = warp; b < OHS_KB; b += 8u) codes[((tile * OHS_KB + b) * OHS_TILE + col) * 32u + lane] = 0;
+        if (threadIdx.x == 0u) *reinterpret_cast<float4 *>(coef + 4u * row) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    const __nv_bfloat16 *src = w + row * OHS_HIDDEN;
+    float amax = 0.0f;
+    for (uint32_t b = warp; b < OHS_KB; b += 8u) amax = fmaxf(amax, fabsf(ohs_bf16(src + b * 32u + lane)));
+    amax = ohs_block_max(amax, s_red);
+    const float scale = amax / 127.0f;
+    const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+    float ss_r = 0.0f, ss_q = 0.0f, ss_w = 0.0f;
+    for (uint32_t b = warp; b < OHS_KB; b += 8u) {
+        const float v = ohs_bf16(src + b * 32u + lane);
+        const float q = fminf(fmaxf(rintf(v * inv), -127.0f), 127.0f);
+        const float r = fmaf(-scale, q, v);
+        const float wq = scale * q;
+        ss_r = fmaf(r, r, ss_r);
+        ss_q = fmaf(wq, wq, ss_q);
+        ss_w = fmaf(v, v, ss_w);
+        codes[((tile * OHS_KB + b) * OHS_TILE + col) * 32u + lane] = (int8_t)(int)q;
+    }
+    ss_r = ohs_block_sum(ss_r, s_red);
+    ss_q = ohs_block_sum(ss_q, s_red);
+    ss_w = ohs_block_sum(ss_w, s_red);
+    if (threadIdx.x == 0u) {
+        // !(x < max) is also true of a NaN.
+        const float a = !(ss_w < OHS_SS_MAX) ? OHS_INF : 1.01f * (sqrtf(ss_r) + 1e-5f * sqrtf(ss_w)) + 1e-17f;
+        const float b = 1.01f * sqrtf(ss_q) + 1e-17f;
+        *reinterpret_cast<float4 *>(coef + 4u * row) = make_float4(scale, a, b, 0.0f);
+    }
+}
+
+// The MMA row of digit d of hidden row y: rows 0 .. 7 of a 16-row MMA tile are the low digits of
+// eight hidden rows and rows 8 .. 15 their high digits, so one lane's accumulators hold both.
+__device__ __forceinline__ uint32_t ohs_act_row(uint32_t y, uint32_t digit) {
+    return (y >> 3) * 16u + digit * 8u + (y & 7u);
+}
+
+// Hidden row y (bf16 [rows][5120]) as H = rint(h / t), t = max |h| / 16256, split into int8 digits
+// H = 128 p1 + p0 (p0 in [-64, 63]) at act[ohs_act_row(y, digit)][5120]. meta[4 y] = {t, |h| high,
+// |h - t H| high, 0}; a row that is all zero, not finite or too large for the bound gets t = 0, zero
+// digits and an infinite norm, which keeps every entry. Grid rows, 256 threads.
+extern "C" __global__ void __launch_bounds__(256) opt_head_screen_rows(
+    const __nv_bfloat16 *__restrict__ hidden, int8_t *__restrict__ act, float *__restrict__ meta) {
+    OPT_PDL_ENTRY();
+    __shared__ float s_red[8];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t y = blockIdx.x;
+    const __nv_bfloat16 *src = hidden + (uint64_t)y * OHS_HIDDEN;
+    float amax = 0.0f;
+    float ss_h = 0.0f;
+    for (uint32_t b = warp; b < OHS_KB; b += 8u) {
+        const float v = ohs_bf16(src + b * 32u + lane);
+        amax = fmaxf(amax, fabsf(v));
+        ss_h = fmaf(v, v, ss_h);
+    }
+    amax = ohs_block_max(amax, s_red);
+    ss_h = ohs_block_sum(ss_h, s_red);
+    // ss_h is NaN when any value is, and infinite when the squares overflow.
+    const bool usable = amax > 0.0f && ss_h < OHS_SS_MAX;
+    const float t = usable ? amax / OHS_DIGIT : 0.0f;
+    const float inv = usable ? 1.0f / t : 0.0f;
+    int8_t *lo = act + (uint64_t)ohs_act_row(y, 0u) * OHS_HIDDEN;
+    int8_t *hi = act + (uint64_t)ohs_act_row(y, 1u) * OHS_HIDDEN;
+    float ss_d = 0.0f;
+    for (uint32_t b = warp; b < OHS_KB; b += 8u) {
+        const float v = usable ? ohs_bf16(src + b * 32u + lane) : 0.0f;
+        const float hf = fminf(fmaxf(rintf(v * inv), -OHS_DIGIT), OHS_DIGIT);
+        const float r = fmaf(-t, hf, v);
+        ss_d = fmaf(r, r, ss_d);
+        const int h = (int)hf;
+        const int p1 = (h + 64) >> 7;
+        lo[b * 32u + lane] = (int8_t)(h - p1 * 128);
+        hi[b * 32u + lane] = (int8_t)p1;
+    }
+    ss_d = ohs_block_sum(ss_d, s_red);
+    if (threadIdx.x == 0u) {
+        const float hn = usable ? sqrtf(ss_h * 1.001f) * 1.0001f + 1e-17f : OHS_INF;
+        const float dn = sqrtf(ss_d * 1.001f) * 1.0001f + 1e-17f;
+        *reinterpret_cast<float4 *>(meta + 4u * y) = make_float4(t, hn, dn, 0.0f);
+    }
+}
+
+// Row y's noise arguments, as opt_rows_lm_head reads them: the scalar triple at position pos0 + y, or
+// {inv_t bits, position, seed low, seed high} from row_params[4 y ..].
+struct OhsNoise {
+    float inv_t;
+    uint32_t pos;
+    uint64_t seed;
+};
+__device__ __forceinline__ OhsNoise ohs_noise(
+    uint32_t y, float inv_t, uint64_t seed, uint32_t pos0, const uint32_t *row_params) {
+    OhsNoise n;
+    if (row_params != nullptr) {
+        const uint32_t *p = row_params + 4u * y;
+        n.inv_t = __uint_as_float(p[0]);
+        n.pos = p[1];
+        n.seed = (uint64_t)p[2] | ((uint64_t)p[3] << 32);
+    } else {
+        n.inv_t = inv_t;
+        n.pos = pos0 + y;
+        n.seed = seed;
+    }
+    return n;
+}
+
+// A stage is [rows][32 bytes]; half h of row r lives at h ^ ((r / 4) % 2), so the eight rows of an
+// ldmatrix phase fall in distinct banks (opt_mma_sm121.cu's om_w_off).
+__device__ __forceinline__ uint32_t ohs_off(uint32_t row, uint32_t half) {
+    return row * 32u + ((half ^ ((row >> 2) & 1u)) << 4);
+}
+
+// D += A x B over int8: the fragment layout of the E4M3 m16n8k32 form (om_mma_e4m3).
+__device__ __forceinline__ void ohs_mma(int32_t d[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+                 : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Block (g, tile): the screen of hidden rows 32 g .. against the tile's 128 entries. upper[row][v]
+// (row stride `vocab`) takes the score's upper bound for every entry below `vocab` (P + bound, and
+// for a sampled row that through the row's noise); tile_lo[row][tile] the row's best lower bound in
+// the tile (-infinity when it has none that is a number). A cp.async pipeline
+// keeps OHS_STAGES - 1 K blocks of codes and digits in flight, as opt_mma_head_fp8t_f32o's does; a
+// stage's 4 KB of codes are one contiguous read. Warp w owns entries 16 w .. 16 w + 15 of every
+// 16-row MMA tile the block's rows reach. Grid (ceil(rows / 32), tiles), 256 threads: a tile's row
+// blocks are adjacent in launch order.
+extern "C" __global__ void __launch_bounds__(256) opt_head_screen_mma(
+    const int8_t *__restrict__ act, const float *__restrict__ meta, const int8_t *__restrict__ codes,
+    const float *__restrict__ coef, float *__restrict__ upper, float *__restrict__ tile_lo,
+    const uint32_t vocab, const uint32_t rows,
+    const float inv_t, const uint64_t seed, const uint32_t pos0, const uint32_t id_base,
+    const uint32_t *__restrict__ row_params) {   // opt_rows_lm_head's noise arguments
+    OPT_PDL_LAUNCH();
+    __shared__ __align__(16) uint8_t s_w[OHS_STAGES][OHS_W_BYTES];
+    __shared__ __align__(16) uint8_t s_a[OHS_STAGES][OHS_A_BYTES];
+    __shared__ float s_lo[8][OHS_ROWS];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5;
+    const uint32_t y0 = blockIdx.x * OHS_ROWS;
+    const uint32_t tile = blockIdx.y;
+    const uint32_t tiles = gridDim.y;
+    const uint32_t n0 = tile * OHS_TILE;
+    const uint32_t live = min(OHS_ROWS, rows - y0);
+    const uint32_t row_tiles = (live + 7u) >> 3;   // 16-row MMA tiles with a live hidden row
+    const int8_t *w_tile = codes + (uint64_t)tile * OHS_KB * OHS_W_BYTES;
+
+    // Thread t copies 16 bytes of codes (entry t / 2, half t % 2) and, for t < 128, 16 bytes of MMA
+    // row t / 2 (zero past the last hidden row).
+    const uint32_t c_row = tid >> 1;
+    const uint32_t c_half = tid & 1u;
+    const uint32_t a_hidden = y0 + (c_row >> 4) * 8u + (c_row & 7u);
+    const bool a_live = tid < OHS_ROWS * 4u && a_hidden < rows;
+    const int8_t *a_src = act + (uint64_t)(a_live ? blockIdx.x * (OHS_ROWS * 2u) + c_row : 0u) * OHS_HIDDEN + c_half * 16u;
+    auto load_w = [&](uint32_t kb) {
+        om_cp16(om_smem(&s_w[kb % OHS_STAGES][ohs_off(c_row, c_half)]), w_tile + (uint64_t)kb * OHS_W_BYTES + tid * 16u, true);
+    };
+    auto load_a = [&](uint32_t kb) {
+        if (tid < OHS_ROWS * 4u) om_cp16(om_smem(&s_a[kb % OHS_STAGES][ohs_off(c_row, c_half)]), a_src + kb * 32u, a_live);
+    };
+
+    int32_t acc[4][2][4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0;
+
+    // The codes are constant once the tail stage has built them (it waits for the build before any
+    // step runs), so their first stages stream while the previous grid (the rows' digits) finishes;
+    // the digits are read only after the wait. Commit group i completes stage i: the first holds the
+    // early codes and stage 0's digits, each later one a whole stage.
+#pragma unroll
+    for (uint32_t kb = 0; kb + 1u < OHS_STAGES; ++kb) load_w(kb);
+    OPT_PDL_WAIT();
+#pragma unroll
+    for (uint32_t kb = 0; kb + 1u < OHS_STAGES; ++kb) {
+        load_a(kb);
+        om_commit();
+    }
+    for (uint32_t kb = 0; kb < OHS_KB; ++kb) {
+        om_wait<OHS_STAGES - 2u>();
+        // Behind this barrier stage kb is visible to every thread and the slot refilled next (stage
+        // kb - 1's) has been read by all of them.
+        __syncthreads();
+        if (kb + OHS_STAGES - 1u < OHS_KB) {
+            load_w(kb + OHS_STAGES - 1u);
+            load_a(kb + OHS_STAGES - 1u);
+        }
+        om_commit();
+        const uint32_t slot = kb % OHS_STAGES;
+        uint32_t b[2][2];
+        {
+            const uint32_t n = warp * 16u + 8u * (lane >> 4) + (lane & 7u);
+            om_ldsm4(om_smem(&s_w[slot][ohs_off(n, (lane >> 3) & 1u)]), b[0][0], b[0][1], b[1][0], b[1][1]);
+        }
+#pragma unroll
+        for (uint32_t mt = 0; mt < 4u; ++mt) {
+            if (mt < row_tiles) {
+                const uint32_t row = mt * 16u + (lane & 7u) + ((lane >> 3) & 1u) * 8u;
+                uint32_t af[4];
+                om_ldsm4(om_smem(&s_a[slot][ohs_off(row, lane >> 4)]), af[0], af[1], af[2], af[3]);
+#pragma unroll
+                for (uint32_t nt = 0; nt < 2u; ++nt) ohs_mma(acc[mt][nt], af, b[nt][0], b[nt][1]);
+            }
+        }
+    }
+    om_wait<0>();
+
+    // Lane l holds, for MMA tile mt and entry tile nt, row l / 4 (low digit sums in [0], [1], high
+    // digit sums in [2], [3]) at entries 2 (l % 4) and 2 (l % 4) + 1.
+    const uint32_t g = lane >> 2;
+    const uint32_t q = lane & 3u;
+    const uint32_t v0 = n0 + warp * 16u + 2u * q;   // this lane's entries: v0 + 8 nt + e
+    float4 c[2][2];
+#pragma unroll
+    for (uint32_t nt = 0; nt < 2u; ++nt)
+#pragma unroll
+        for (uint32_t e = 0; e < 2u; ++e) {
+            const uint32_t v = v0 + nt * 8u + e;
+            c[nt][e] = v < vocab ? __ldg(reinterpret_cast<const float4 *>(coef) + v) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    float best[4];
+#pragma unroll
+    for (uint32_t mt = 0; mt < 4u; ++mt) {
+        best[mt] = -OHS_INF;
+        const uint32_t y = y0 + mt * 8u + g;
+        if (mt >= row_tiles || y >= rows) continue;
+        const float4 row_meta = *reinterpret_cast<const float4 *>(meta + 4u * y);
+        const OhsNoise noise = ohs_noise(y, inv_t, seed, pos0, row_params);
+        // A NaN is not tempered either.
+        const bool tempered = noise.inv_t > 0.0f && noise.inv_t < OHS_INF;
+#pragma unroll
+        for (uint32_t nt = 0; nt < 2u; ++nt) {
+#pragma unroll
+            for (uint32_t e = 0; e < 2u; ++e) {
+                const uint32_t v = v0 + nt * 8u + e;
+                if (v >= vocab) continue;
+                const long long dot = (long long)acc[mt][nt][2u + e] * 128ll + (long long)acc[mt][nt][e];
+                const float p = (c[nt][e].x * row_meta.x) * __ll2float_rn(dot);
+                const float bound = c[nt][e].y * row_meta.y + c[nt][e].z * row_meta.z + 1e-6f * fabsf(p) + 1e-30f;
+                float hi = p + bound;
+                float lower = p - bound;
+                if (noise.inv_t != 0.0f) {
+                    if (tempered) {
+                        const float g = opt_sample_gumbel(noise.seed, noise.pos, id_base + v);
+                        hi = fmaf(hi, noise.inv_t, g);
+                        lower = fmaf(lower, noise.inv_t, g);
+                    } else {
+                        hi = OHS_INF;
+                        lower = -OHS_INF;
+                    }
+                }
+                upper[(uint64_t)y * vocab + v] = hi;
+                if (lower > best[mt]) best[mt] = lower;
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t mt = 0; mt < 4u; ++mt) {
+#pragma unroll
+        for (int o = 1; o < 4; o <<= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best[mt], o);
+            if (other > best[mt]) best[mt] = other;
+        }
+        if (q == 0u) s_lo[warp][mt * 8u + g] = best[mt];
+    }
+    __syncthreads();
+    if (tid < live) {
+        float m = s_lo[0][tid];
+#pragma unroll
+        for (uint32_t k = 1; k < 8u; ++k)
+            if (s_lo[k][tid] > m) m = s_lo[k][tid];
+        tile_lo[(uint64_t)(y0 + tid) * tiles + tile] = m;
+    }
+}
+
+// opt_rows_lm_head over the entries the screen keeps: block (g, chunk) scores entry v of the chunk
+// for row y only where !(upper[y][v] < T_y), T_y the best of tile_lo[y][..]. A score is that
+// kernel's (the same loads, FMA order, lane sum and noise), and so are the per-warp and cross-warp
+// tie rules; a chunk with nothing scored for a row reports -infinity and index 0. With
+// counts non-null, counts[y] gains the entries scored for row y. Grid (ceil(rows / 4), chunks), 512
+// threads.
+extern "C" __global__ void __launch_bounds__(OR_LM_THREADS) opt_head_screen_exact(
+    const __nv_bfloat16 *__restrict__ hidden_all,    // [rows][5120]
+    const __nv_bfloat16 *__restrict__ w,
+    const float *__restrict__ upper,                 // [rows][vocab]
+    const float *__restrict__ tile_lo,               // [rows][tiles]
+    float *__restrict__ block_max_all,               // [rows][chunks]
+    uint32_t *__restrict__ block_argmax_all,         // [rows][chunks]
+    const uint32_t vocab,
+    const uint32_t rows,
+    const uint32_t tiles,
+    uint32_t *__restrict__ counts,                   // [rows] or null
+    const float inv_t,                               // opt_rows_lm_head's noise arguments
+    const uint64_t seed,
+    const uint32_t pos0,
+    const uint32_t id_base,
+    const uint32_t *__restrict__ row_params) {
+    OPT_PDL_ENTRY();
+    __shared__ float s_best[OR_LM_ROWS][OR_LM_WARPS];
+    __shared__ uint32_t s_best_i[OR_LM_ROWS][OR_LM_WARPS];
+    __shared__ float s_thr[OR_LM_ROWS];
+    __shared__ float s_inv_t[OR_LM_ROWS];
+    __shared__ uint64_t s_seed[OR_LM_ROWS];
+    __shared__ uint32_t s_pos[OR_LM_ROWS];
+    __shared__ __align__(16) uint4 s_h[OR_LM_ROWS * (OR_LM_HIDDEN / 8u)];
+    const uint32_t row0 = blockIdx.x * OR_LM_ROWS;
+    const uint32_t chunk = blockIdx.y;
+    const uint32_t chunks = gridDim.y;
+    const uint32_t live = rows - row0 < OR_LM_ROWS ? rows - row0 : OR_LM_ROWS;
+    const uint32_t per = OR_LM_HIDDEN / 8u;
+    const uint32_t t = threadIdx.x;
+    const uint32_t lane = t & 31u;
+    const uint32_t warp = t >> 5;
+    if (t < live) {
+        const OhsNoise noise = ohs_noise(row0 + t, inv_t, seed, pos0, row_params);
+        s_inv_t[t] = noise.inv_t;
+        s_pos[t] = noise.pos;
+        s_seed[t] = noise.seed;
+    }
+    const uint4 *hidden4 = reinterpret_cast<const uint4 *>(hidden_all) + (uint64_t)row0 * per;
+    for (uint32_t i = t; i < live * per; i += OR_LM_THREADS) s_h[i] = __ldg(hidden4 + i);
+    // Warp y folds row y's tile bounds; a NaN never wins, so T is the best bound that is a number.
+    if (warp < live) {
+        const float *lo = tile_lo + (uint64_t)(row0 + warp) * tiles;
+        float m = -OHS_INF;
+        for (uint32_t i = lane; i < tiles; i += 32u) {
+            const float v = lo[i];
+            if (v > m) m = v;
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, m, o);
+            if (other > m) m = other;
+        }
+        if (lane == 0u) s_thr[warp] = m;
+    }
+    __syncthreads();
+    const uint32_t base = chunk * OR_LM_CHUNK;
+    float best = -3.402823466e38f;
+    uint32_t best_i = 0xffffffffu;
+    uint32_t scored = 0u;
+    for (uint32_t r = warp; r < OR_LM_CHUNK; r += OR_LM_WARPS) {
+        const uint32_t entry = base + r;
+        if (entry >= vocab) break;
+        bool want = false;
+        if (lane < live) want = !(upper[(uint64_t)(row0 + lane) * vocab + entry] < s_thr[lane]);
+        const uint32_t mask = __ballot_sync(0xffffffffu, want);
+        if (mask == 0u) continue;
+        scored += want ? 1u : 0u;
+        const uint4 *row = reinterpret_cast<const uint4 *>(w + (uint64_t)entry * OR_LM_HIDDEN);
+        uint4 wv[20];
+#pragma unroll
+        for (uint32_t i = 0; i < 20u; ++i) wv[i] = or_ldw(row + lane + 32u * i);
+#pragma unroll
+        for (uint32_t y = 0; y < OR_LM_ROWS; ++y) {
+            if ((mask >> y) & 1u) {
+                const uint4 *h = s_h + y * per;
+                float acc = 0.0f;
+#pragma unroll
+                for (uint32_t i = 0; i < 20u; ++i) acc = or_dot8(wv[i], h[lane + 32u * i], acc);
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                if (lane == y) {
+                    const float row_inv_t = s_inv_t[y];
+                    const float score = row_inv_t == 0.0f
+                        ? acc
+                        : fmaf(acc, row_inv_t, opt_sample_gumbel(s_seed[y], s_pos[y], id_base + entry));
+                    if (best_i == 0xffffffffu || score > best) { best = score; best_i = entry; }
+                }
+            }
+        }
+    }
+    if (lane < OR_LM_ROWS) { s_best[lane][warp] = best; s_best_i[lane][warp] = best_i; }
+    if (counts != nullptr && lane < live && scored != 0u) atomicAdd(counts + row0 + lane, scored);
+    __syncthreads();
+    if (t < live) {
+        const uint32_t y = t;
+        float v = s_best[y][0];
+        uint32_t idx = s_best_i[y][0];
+        for (uint32_t k = 1; k < OR_LM_WARPS; ++k) {
+            const uint32_t oi = s_best_i[y][k];
+            if (oi == 0xffffffffu) continue;
+            if (idx == 0xffffffffu || s_best[y][k] > v || (s_best[y][k] == v && oi < idx)) { v = s_best[y][k]; idx = oi; }
+        }
+        block_max_all[(uint64_t)(row0 + y) * chunks + chunk] = idx == 0xffffffffu ? -OHS_INF : v;
+        block_argmax_all[(uint64_t)(row0 + y) * chunks + chunk] = idx == 0xffffffffu ? 0u : idx;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
