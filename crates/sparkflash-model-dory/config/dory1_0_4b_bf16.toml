@@ -1,0 +1,43 @@
+# Dory1.0-4B (BF16) runtime profile.
+#
+# The checkpoint is served by the CUDA device arm when this build carries the Dory/Qwen cubins,
+# and by the CPU host reference otherwise. The typed source of truth for the model shape is the
+# checkpoint's config.json; this profile carries serving policy.
+
+model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+family = "dory"
+weights = "dory1.0-4b-bf16"
+
+[runtime]
+context_tokens = 262144
+concurrency = 1
+
+[prefill]
+enabled = true
+# The one-process prompt chunk is fixed at 4096 rows; the device arm refuses any other value
+# rather than silently ignoring the profile. A recurrence group uses its own 384/512-row chunks.
+chunk = 4096
+# The wide prompt projections and prefill attention run on the tensor cores.
+tensor_cores = true
+# Batched prefill and token-at-a-time decode use different attention kernels and are close,
+# not bit-identical; the device test checks the difference against a 1e-3 relative bound.
+exact = false
+
+[decode]
+# Decode attention is dory_attn_split, a warp-dot/FMA kernel; the token projections keep their
+# GEMV chain. No decode stage runs on the tensor cores.
+tensor_cores = false
+
+[speculation]
+# One-process speculation: Dory has no single-process drafter. A recurrence group's loop-1
+# drafting is a topology policy selected by --recurrence-draft-lanes (default 16), not this field.
+enabled = false
+
+[sequence]
+parallel = false
+overlap = false
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

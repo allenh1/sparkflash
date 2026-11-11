@@ -59,6 +59,10 @@ pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
 pub(super) const DEEPSEEK_PROFILE_TOML: &str =
     include_str!("../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml");
 
+/// The carried profile of the Dory host-reference arm.
+pub(super) const DORY_PROFILE_TOML: &str =
+    include_str!("../../../sparkflash-model-dory/config/dory1_0_4b_bf16.toml");
+
 /// The carried profile a checkpoint family serves, when this build carries one.
 ///
 /// A dynamic checkpoint whose `model_type` names a released family still reads that family's
@@ -70,6 +74,7 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
         "qwen4_exp" | "qwen4_exp_text" => Some(QwenArm::PROFILE_TOML),
         "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Qwen36Arm::PROFILE_TOML),
         "glm5_next" => Some(GlmArm::PROFILE_TOML),
+        "dory" => Some(DORY_PROFILE_TOML),
         _ => None,
     }
 }
@@ -614,6 +619,8 @@ pub(super) enum Pack {
     /// Qwen3.6-35B-A3B FP8, the Qwen arm over the Qwen3.5-MoE family.
     Qwen36,
     Glm,
+    /// Dory1.0-4B, served by the dynamic path's device arm or host reference.
+    Dory,
 }
 
 impl Pack {
@@ -628,6 +635,7 @@ impl Pack {
             Self::QwenFp8 => sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
             Self::Qwen36 => sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
             Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
+            Self::Dory => sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID,
         };
         sparkflash_model::find_model_by_weights(weights)
             .expect("the model registry carries every pack's weight selector")
@@ -641,6 +649,7 @@ impl Pack {
             sparkflash_model::descriptor::QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID => Some(Self::QwenFp8),
             sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID => Some(Self::Qwen36),
             sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
+            sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID => Some(Self::Dory),
             _ => None,
         }
     }
@@ -684,7 +693,12 @@ impl Pack {
             return Vec::new();
         };
         let served = match Self::detect(directory) {
-            Some(Self::Deepseek) | None => {
+            // Without a Dory/Qwen cubin the dynamic route opens Dory's CPU host reference,
+            // which needs no kernel image. With a device arm, the catalogue is the gate.
+            Some(Self::Dory) if !sparkflash_model_dory::DoryDeviceBackend::available() => {
+                return Vec::new();
+            }
+            Some(Self::Dory) | Some(Self::Deepseek) | None => {
                 sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
             }
             Some(Self::Qwen | Self::QwenFp8 | Self::Qwen36 | Self::Glm) => {
@@ -699,7 +713,7 @@ impl Pack {
 
     /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
     pub(super) const fn is_arm(self) -> bool {
-        !matches!(self, Self::Deepseek)
+        !matches!(self, Self::Deepseek | Self::Dory)
     }
 
     /// The served id of this pack.
@@ -726,7 +740,7 @@ impl Pack {
         let (fuses, budgets) = match self {
             Self::Qwen | Self::QwenFp8 | Self::Qwen36 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
-            Self::Deepseek => (false, false),
+            Self::Deepseek | Self::Dory => (false, false),
         };
         let mut unapplied = Vec::new();
         if group && concurrency != 1 {
@@ -751,6 +765,12 @@ impl Pack {
             Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
             Self::Qwen36 => serve_arm::<Qwen36Arm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
+            Self::Dory => {
+                return super::dynamic::serve(options).unwrap_or_else(|message| {
+                    eprintln!("sparkflash serve: {message}");
+                    ExitCode::from(EXIT_REFUSED)
+                });
+            }
         };
         served.unwrap_or_else(|message| {
             eprintln!("sparkflash serve: {message}");
@@ -1322,6 +1342,7 @@ mod tests {
             ("DeepSeek-V4.1-Flash", DEEPSEEK_PROFILE_TOML),
             ("Qwen3.8-Flash-Next", QwenArm::PROFILE_TOML),
             ("GLM-5.3-Flash", GlmArm::PROFILE_TOML),
+            ("Dory1.0-4B", DORY_PROFILE_TOML),
         ] {
             let profile = ModelProfile::from_toml(toml)
                 .unwrap_or_else(|error| panic!("{name} profile: {error}"));
@@ -1403,6 +1424,19 @@ mod tests {
         .expect("the text-only config is written");
         assert_eq!(Pack::detect(directory.path()), Some(Pack::Qwen));
         assert_eq!(Pack::named("qwen4_exp_text"), Some(Pack::Qwen));
+    }
+
+    #[test]
+    fn a_dory_checkpoint_detects_as_the_dynamic_host_pack() {
+        const CONFIG: &str = include_str!(
+            "../../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
+        );
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(directory.path().join(CHECKPOINT_CONFIG_NAME), CONFIG)
+            .expect("the Dory config is written");
+        assert_eq!(Pack::detect(directory.path()), Some(Pack::Dory));
+        assert!(!Pack::Dory.is_arm());
+        assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 
     #[test]

@@ -106,11 +106,11 @@ fn pdl_enabled() -> bool {
     *PDL.get_or_init(|| std::env::var("SPARKFLASH_PDL").as_deref() != Ok("0"))
 }
 
-/// Whether a kernel launches with programmatic stream serialization: the opt kernels and the
-/// Qwen4-Exp pack's q4e (token) and q4p (tensor-core) kernels. Every one opens with
-/// griddepcontrol.launch_dependents + griddepcontrol.wait (OPT_PDL_ENTRY), or issues only constant
-/// weight loads between the two, so it reads and writes nothing before the previous grid has
-/// completed and stream order holds.
+/// Whether a kernel launches with programmatic stream serialization: the opt kernels, the
+/// Qwen4-Exp pack's q4e (token) and q4p (tensor-core) kernels and Dory's dory kernels. Every one
+/// opens with griddepcontrol.launch_dependents + griddepcontrol.wait (OPT_PDL_ENTRY), or issues
+/// only constant weight loads between the two, so it reads and writes nothing before the previous
+/// grid has completed and stream order holds.
 fn programmatic(kernel: &Kernel) -> bool {
     PROGRAMMATIC_PREFIXES
         .iter()
@@ -120,7 +120,7 @@ fn programmatic(kernel: &Kernel) -> bool {
 
 /// The kernel name prefixes [programmatic] launches with programmatic stream serialization;
 /// tests/pdl_entry.rs holds every such kernel in kernels/ to the dependency wait.
-pub const PROGRAMMATIC_PREFIXES: [&str; 3] = ["opt_", "q4e_", "q4p_"];
+pub const PROGRAMMATIC_PREFIXES: [&str; 4] = ["opt_", "q4e_", "q4p_", "dory_"];
 
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
 fn name(code: CuResult) -> String {

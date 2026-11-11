@@ -191,6 +191,17 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::DenseMlp, Image::Qwen4Exp) => ShapeConstraint::ANY
             .hidden_equals(2560)
             .intermediate_multiple(16),
+        // Dory is a 2,560-wide normalized-GPT: its custom kernels are compiled for that hidden
+        // width, a 256-wide head with four query heads a KV head, and a 7,168-wide MLP.
+        (Part::RmsNorm, Image::Dory) => ShapeConstraint::ANY.hidden_equals(2560),
+        (Part::LmHead, Image::Dory) => ShapeConstraint::ANY.hidden_equals(2560).vocab_multiple(128),
+        (Part::GqaAttention, Image::Dory) => ShapeConstraint::ANY
+            .hidden_equals(2560)
+            .head_dim_equals(256)
+            .gqa_groups(&[4]),
+        (Part::DenseMlp, Image::Dory) => ShapeConstraint::ANY
+            .hidden_equals(2560)
+            .intermediate_equals(7168),
         (Part::DenseMlp, Image::Qwen4Prefill) => ShapeConstraint::ANY
             .hidden_equals(2560)
             .intermediate_multiple(16),
@@ -1312,6 +1323,47 @@ pub const CATALOGUE: &[PartKernel] = &[
         ],
         true,
     ),
+    sm121(
+        Part::RmsNorm,
+        Image::Dory,
+        &[
+            sym("dory_justnorm", &[Precision::Bf16]),
+            sym("dory_slerp", &[Precision::Bf16]),
+            sym("dory_loop_combine", &[Precision::Bf16]),
+        ],
+        false,
+    ),
+    sm121(
+        Part::LmHead,
+        Image::Dory,
+        &[sym("dory_logit_scale", &[Precision::Bf16])],
+        false,
+    ),
+    sm121(
+        Part::GqaAttention,
+        Image::Dory,
+        &[
+            sym("dory_rope_norm", &[Precision::Bf16]),
+            sym("dory_rope_norm_lanes", &[Precision::Bf16]),
+            sym("dory_attn_split", &[Precision::Bf16]),
+            sym("dory_attn_combine", &[Precision::Bf16]),
+            sym("dory_attn_mma16", &[Precision::Bf16]),
+            sym("dory_attn_mma64", &[Precision::Bf16]),
+            sym("dory_attn_mma128", &[Precision::Bf16]),
+            sym("dory_attn_mma256", &[Precision::Bf16]),
+        ],
+        false,
+    ),
+    sm121(
+        Part::DenseMlp,
+        Image::Dory,
+        &[
+            sym("dory_mlp_epilogue", &[Precision::Bf16]),
+            sym("dory_mma_wide", &[Precision::Bf16]),
+            sym("dory_mma_wide4", &[Precision::Bf16]),
+        ],
+        false,
+    ),
 ];
 
 /// The catalogue entries that implement part on target, in catalogue order.
@@ -1426,6 +1478,29 @@ pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
         .collect()
 }
 
+/// The Dory symbols the arm loads. The catalogue and the boot gate check that the image names
+/// every one before a Dory checkpoint is advertised as a device arm.
+const DORY_SYMBOLS: &[&str] = &[
+    "dory_attn_combine",
+    "dory_attn_mma128",
+    "dory_attn_mma16",
+    "dory_attn_mma256",
+    "dory_attn_mma64",
+    "dory_attn_split",
+    "dory_justnorm",
+    "dory_logit_scale",
+    "dory_loop_combine",
+    "dory_mlp_epilogue",
+    "dory_mma_wide",
+    "dory_mma_wide4",
+    "dory_rope_norm",
+    "dory_rope_norm_lanes",
+    "dory_slerp",
+];
+
+/// The shared Qwen token kernels Dory's projections and embedding load.
+const DORY_QWEN_SYMBOLS: &[&str] = &["q4e_embed", "q4e_gemv4_bf16", "q4e_gemv_bf16"];
+
 /// The device arm that serves a checkpoint of a family registered on the dynamic engine.
 ///
 /// Some families' device arms read only some of their releases, and the rest stay on the host
@@ -1438,6 +1513,39 @@ pub fn host_reference_missing(architecture: &Architecture) -> Vec<Part> {
 /// Why no device arm serves the checkpoint, so the host reference is its executor.
 pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, String> {
     let family = sparkflash_model::canonical_model_type(&architecture.family);
+    if family == "dory" {
+        // The released BF16 checkpoint has a Dory device arm: its custom kernels live in the
+        // Dory image and its token projections reuse the Qwen token image. Without both images
+        // this build's executor is the CPU host reference, so the arm is not advertised.
+        if !Image::Dory.available() || !Image::Qwen4Exp.available() {
+            return Err(
+                "this build has no Dory/Qwen cubin, so the Dory checkpoint stays on the CPU \
+                 host reference"
+                    .to_owned(),
+            );
+        }
+        let missing: Vec<&str> = DORY_SYMBOLS
+            .iter()
+            .copied()
+            .filter(|symbol| !Image::Dory.exported_symbols().contains(symbol))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "the Dory image does not list the kernels the arm launches: {missing:?}"
+            ));
+        }
+        let missing: Vec<&str> = DORY_QWEN_SYMBOLS
+            .iter()
+            .copied()
+            .filter(|symbol| !Image::Qwen4Exp.exported_symbols().contains(symbol))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "the Qwen token image does not list the kernels the Dory arm launches: {missing:?}"
+            ));
+        }
+        return Ok("the Dory device arm");
+    }
     if family != "qwen3_5_moe" {
         return Err(format!(
             "this build has no device arm for the {family} family"
@@ -1874,6 +1982,7 @@ mod tests {
             Image::GlmDecode,
             Image::MoePlan,
             Image::Deepseek,
+            Image::Dory,
             Image::Rocenante,
         ]
         .map(Image::name);
@@ -2017,6 +2126,21 @@ mod tests {
 
     /// The Qwen3.6 FP8 release is the Qwen3.5-MoE device arm's; the same document with no
     /// quantization block (BF16 fused experts) and every other family are not.
+    #[test]
+    fn dory_has_a_dynamic_device_arm_only_with_both_cubins() {
+        const DORY: &str = include_str!(
+            "../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
+        );
+        let architecture = Architecture::from_json(DORY).expect("Dory config");
+        let arm = dynamic_device_arm(&architecture);
+        if Image::Dory.available() && Image::Qwen4Exp.available() {
+            assert_eq!(arm, Ok("the Dory device arm"));
+        } else {
+            let error = arm.expect_err("a build without both images stays on the host");
+            assert!(error.contains("no Dory/Qwen cubin"), "{error}");
+        }
+    }
+
     #[test]
     fn only_the_tile_quantized_qwen35_release_has_a_dynamic_device_arm() {
         const QWEN36: &str =

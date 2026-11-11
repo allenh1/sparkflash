@@ -1120,8 +1120,9 @@ throughput work, not a correctness question.
     cargo test --release -p sparkflash-model-qwen4-exp --test few_rows       # needs a GPU
     cargo test --release -p sparkflash-model-qwen4-exp --test dflash_kernel  # needs a GPU
 
-`verify_rows` holds every kernel a token-kernel verify forward runs - the batched BF16 GEMV, the
-tiled wide GEMVs, the hyper passes, the snapshot writers, the recurrence replay - to the bits the
+`verify_rows` holds every kernel a token-kernel verify forward runs - the batched BF16 GEMV and its
+four-matrix twin (at every batch from two to eight, which take two weight rows a warp, with an odd
+last row and a pair split across matrices), the tiled wide GEMVs, the hyper passes, the snapshot writers, the recurrence replay - to the bits the
 same row gets alone, which is what keeps a drafter's greedy text equal to the plain decode's, and
 checks the drafter's E4M3 GEMV against the codes and scales its quantiser writes. `few_rows` holds
 the tensor-core image's few-row forms (`q4p_dense_rows`, `q4p_moe_rows_*`, `q4p_gemm_rows`) to the

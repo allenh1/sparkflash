@@ -451,11 +451,16 @@ __device__ __forceinline__ float glm_bf16_hi(uint32_t v) { return __uint_as_floa
 // splits it when staging the tile, and every output's chain is the same MMA sequence, each 16-K
 // step's head and then (kLow) its remainder, ascending K, so the outputs are its bits. The grid
 // is (cols / GLM_WIDE_BN, rows / 128); cols and inner are multiples of 32.
+//
+// shared_prefill_wide_tile is one block's tile at output column n0 and token row m0, so a caller
+// whose grid covers several matrices (dory_mma_wide4) places each block itself; an output's
+// chain does not depend on which grid computed it.
 template <bool kLow>
-__device__ __forceinline__ void shared_prefill_wide_body(const __nv_bfloat16 *__restrict__ w,
+__device__ __forceinline__ void shared_prefill_wide_tile(const __nv_bfloat16 *__restrict__ w,
                                                          const float *__restrict__ a,
                                                          float *__restrict__ out, uint32_t cols,
-                                                         uint32_t inner, uint32_t tokens) {
+                                                         uint32_t inner, uint32_t tokens,
+                                                         uint32_t n0, uint32_t m0) {
     extern __shared__ __align__(128) uint8_t glm_wide_shared[];
     auto s_a = [&](uint32_t buf) { return glm_wide_shared + buf * GLM_WIDE_STAGE_BYTES; };
     auto s_w = [&](uint32_t buf) { return s_a(buf) + GLM_BM * 128u; };
@@ -463,9 +468,6 @@ __device__ __forceinline__ void shared_prefill_wide_body(const __nv_bfloat16 *__
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5;
-    const uint2 place = glm_raster();
-    const uint32_t n0 = place.x * GLM_WIDE_BN;
-    const uint32_t m0 = place.y * GLM_BM;
     const uint32_t stages = inner >> 5;
     const uint32_t col_tiles = min(GLM_WIDE_BN / 32u, (cols - n0) >> 5);
 
@@ -585,6 +587,16 @@ __device__ __forceinline__ void shared_prefill_wide_body(const __nv_bfloat16 *__
                         make_float2(acc[mt][nt][2u * half], acc[mt][nt][2u * half + 1u]);
         }
     }
+}
+
+template <bool kLow>
+__device__ __forceinline__ void shared_prefill_wide_body(const __nv_bfloat16 *__restrict__ w,
+                                                         const float *__restrict__ a,
+                                                         float *__restrict__ out, uint32_t cols,
+                                                         uint32_t inner, uint32_t tokens) {
+    const uint2 place = glm_raster();
+    shared_prefill_wide_tile<kLow>(w, a, out, cols, inner, tokens, place.x * GLM_WIDE_BN,
+                                   place.y * GLM_BM);
 }
 
 

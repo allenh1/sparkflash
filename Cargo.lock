@@ -2360,6 +2360,7 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-model",
  "sparkflash-model-deepseek-v41",
+ "sparkflash-model-dory",
  "sparkflash-model-glm5-next",
  "sparkflash-model-qwen4-exp",
  "sparkflash-ops",
@@ -2528,6 +2529,19 @@ dependencies = [
  "sparkflash-weights",
  "thiserror 2.0.21",
  "tokenizers",
+]
+
+[[package]]
+name = "sparkflash-model-dory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-ops",
+ "sparkflash-weights",
+ "tempfile",
 ]
 
 [[package]]

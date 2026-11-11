@@ -137,6 +137,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
         norm_epsilon: 1e-6,
         embedding_tied_to_head: false,
         attention_bias: false,
+        looped: None,
         layers: vec![
             Layer {
                 index: 0,

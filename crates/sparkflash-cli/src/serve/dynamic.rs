@@ -36,8 +36,9 @@ use std::sync::Arc;
 use sparkflash_api::engine::InferenceEngine as ApiInferenceEngine;
 use sparkflash_kernels::images::CUDA_ARCH;
 use sparkflash_model::numerics::ConfigKey;
+use sparkflash_model::prompt::PromptError;
 use sparkflash_model::{
-    Architecture, Capabilities, ModelDescriptor, ModelProfile, PromptCodec, Target,
+    Architecture, Capabilities, ModelBackend, ModelDescriptor, ModelProfile, PromptCodec, Target,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::plan::KernelPhase;
@@ -61,7 +62,7 @@ pub(crate) struct DynamicCheckpoint {
 
 /// The prompt dialect a checkpoint's tokenizer declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Dialect {
+pub(crate) enum Dialect {
     /// GLM's `[gMASK]<sop>` and `<|user|>` turns.
     Glm,
     /// ChatML's `<|im_start|>`/`<|im_end|>` turns.
@@ -221,6 +222,39 @@ fn geometry_summary(geometry: &sparkflash_ops::plan::PartGeometry) -> String {
     fields.join(", ")
 }
 
+/// The Qwen ChatML codec with Dory's own released template on top.
+///
+/// Dory shares ChatML's turn tokens and Qwen's tokenizer machinery, but not its prompt: the
+/// released Dory template opens an empty system turn, never injects a reasoning-effort
+/// instruction, and uses its own thinking markers on history. Delegating tokenization while
+/// rendering Dory's template keeps both halves testable.
+struct DoryCodec {
+    inner: sparkflash_model_qwen4_exp::QwenCodec,
+}
+
+impl PromptCodec for DoryCodec {
+    fn encode_chat(&self, request: &serde_json::Value) -> Result<Vec<u32>, PromptError> {
+        let text = sparkflash_model_dory::prompt::render_chat(request)?;
+        self.inner.encode_text(&text, false)
+    }
+
+    fn encode_text(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>, PromptError> {
+        self.inner.encode_text(text, add_special_tokens)
+    }
+
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        self.inner.decode(ids)
+    }
+
+    fn token_str(&self, id: u32) -> Option<String> {
+        self.inner.token_str(id)
+    }
+
+    fn vision_codec(&self) -> Option<Arc<dyn sparkflash_model::vision::VisionCodec>> {
+        self.inner.vision_codec()
+    }
+}
+
 /// The prompt codec and dialect the checkpoint's tokenizer declares.
 fn codec(
     directory: &Path,
@@ -261,6 +295,16 @@ fn codec(
     if text.contains(sparkflash_model_qwen4_exp::codec::IM_START)
         && text.contains(sparkflash_model_qwen4_exp::codec::IM_END)
     {
+        // Dory's ChatML tokenizer has no Qwen <|endoftext|> or image delimiters, and its
+        // released template is not Qwen's: it opens an empty system turn and never injects a
+        // reasoning-effort instruction.
+        if architecture.family == "dory" {
+            let inner = sparkflash_model_qwen4_exp::QwenCodec::chatml_from_path_with_architecture(
+                &tokenizer,
+                architecture,
+            )?;
+            return Ok((Arc::new(DoryCodec { inner }), Dialect::Qwen));
+        }
         let codec = sparkflash_model_qwen4_exp::QwenCodec::from_path_with_architecture(
             &tokenizer,
             architecture,
@@ -286,6 +330,9 @@ fn device_family(family: &str, directory: &Path) -> bool {
     match family {
         "qwen4_exp" | "qwen4_exp_text" | "glm5_next" => true,
         "qwen3_5_moe" | "qwen3_5_moe_text" => pack::qwen35_on_device(directory),
+        // A Dory checkpoint is judged by the kernel catalogue only when this build carries the
+        // Dory/Qwen cubins; otherwise the CPU host reference is its executor.
+        "dory" => sparkflash_model_dory::DoryDeviceBackend::available(),
         _ => false,
     }
 }
@@ -324,6 +371,11 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
     let unresolved = if on_device {
+        // The catalogue resolver sorts canonical entries first, so a Dory plan can resolve
+        // through a Qwen image. Check the Dory image's own symbol list before advertising it.
+        if checkpoint.architecture.family == "dory" {
+            sparkflash_ops::parts::dynamic_device_arm(&checkpoint.architecture)?;
+        }
         failures(&checkpoint.plan, Availability::Catalogue)
     } else {
         // The host reference is the executor for a novel family. The CUDA catalogue answers a
@@ -350,6 +402,14 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             unresolved.join("; ")
         ));
     }
+    if options.recurrence.is_some() && checkpoint.plan.family() != "dory" {
+        return Err(format!(
+            "--recurrence-rank runs Dory's shared recurrent block a rank; --model {} is a {} \
+             checkpoint, which has no latent recurrence to split",
+            checkpoint.model_id,
+            checkpoint.plan.family()
+        ));
+    }
     let window = checkpoint.architecture.max_position_embeddings;
     let context = options
         .context
@@ -365,11 +425,15 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         &checkpoint.architecture,
         options.tokenizer.as_deref(),
     )?;
+    // A canonical family's served descriptor takes its capabilities from the registry, so the
+    // dynamic route does not re-advertise a control the arm's template does not consume.
+    let capabilities = sparkflash_model::find_model_by_type(&checkpoint.architecture.family)
+        .map_or(Capabilities::ALL, |model| model.capabilities);
     let descriptor = ModelDescriptor::from_architecture(
         checkpoint.model_id.clone(),
         &checkpoint.architecture,
         context,
-        Capabilities::ALL,
+        capabilities,
     );
     let profile = profile(&checkpoint.architecture)?;
     sparkflash_model::install_active(profile.clone());
@@ -411,6 +475,18 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             super::pack::GlmArm::respond,
         ),
+        "dory" => match options.recurrence.as_ref() {
+            #[cfg(feature = "cuda")]
+            Some(group) => super::recurrence::serve(
+                checkpoint, descriptor, seam, dialect, context, options, group,
+            ),
+            #[cfg(not(feature = "cuda"))]
+            Some(_) => Err(
+                "--recurrence-rank runs the Dory device arm over NCCL, and this build has no cuda feature"
+                    .to_owned(),
+            ),
+            None => serve_dory_host(checkpoint, descriptor, seam, dialect, context, options),
+        },
         _ => serve_host(checkpoint, descriptor, seam, dialect, context, options),
     }
 }
@@ -432,8 +508,34 @@ fn serve_host(
         context,
     )
     .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
-    let driver = sparkflash_serve::HostDriver::start(
+    let banner = format!(
+        "{} ({}) at TP=1 on {}, context {context}, dynamic host reference",
+        descriptor.id,
+        descriptor.weights_id,
+        checkpoint.directory.display()
+    );
+    serve_backend(
         Box::new(backend),
+        descriptor,
+        seam,
+        dialect,
+        options,
+        &banner,
+    )
+}
+
+/// Serves `backend` behind HTTP through the generic host driver, in `dialect`, under the TP=1
+/// numerics key; `banner` is the boot line's description of what answers.
+pub(crate) fn serve_backend(
+    backend: Box<dyn ModelBackend>,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    options: &ServeOptions,
+    banner: &str,
+) -> Result<ExitCode, String> {
+    let driver = sparkflash_serve::HostDriver::start(
+        backend,
         Arc::clone(&seam),
         sparkflash_serve::HostOptions {
             max_tokens: options.max_tokens,
@@ -447,16 +549,62 @@ fn serve_host(
         Dialect::Qwen => sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver)),
         Dialect::Deepseek => Arc::new(driver),
     };
-    println!(
-        "sparkflash serve: {} ({}) at TP=1 on {}, context {context}, dynamic host reference",
-        descriptor.id,
-        descriptor.weights_id,
-        checkpoint.directory.display()
-    );
+    println!("sparkflash serve: {banner}");
     let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))
+}
+
+/// Serves a Dory checkpoint through its device arm, or the host reference when this build has
+/// no cubin.
+fn serve_dory_host(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    let config = sparkflash_model_dory::DoryConfig::from_checkpoint_dir(&checkpoint.directory)
+        .map_err(|error| {
+            format!(
+                "--model {}: {}: {error}",
+                checkpoint.model_id,
+                checkpoint.directory.join("config.json").display()
+            )
+        })?;
+    let device = sparkflash_model_dory::DoryDeviceBackend::available();
+    let backend: Box<dyn ModelBackend> = if device {
+        Box::new(
+            sparkflash_model_dory::DoryDeviceBackend::open_with_descriptor(
+                &checkpoint.directory,
+                descriptor.clone(),
+                context,
+            )
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?,
+        )
+    } else {
+        let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+            .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+        Box::new(
+            sparkflash_model_dory::DoryHostBackend::open(
+                descriptor.clone(),
+                config,
+                &source,
+                context,
+            )
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?,
+        )
+    };
+    let banner = format!(
+        "{} ({}) at TP=1 on {}, context {context}, Dory {} reference",
+        descriptor.id,
+        descriptor.weights_id,
+        checkpoint.directory.display(),
+        if device { "device" } else { "host" }
+    );
+    serve_backend(backend, descriptor, seam, dialect, options, &banner)
 }
 
 /// Whether a non-registry `--model` names a DeepSeek checkpoint, which the existing reference
@@ -472,6 +620,8 @@ pub(crate) fn names_deepseek(options: &ServeOptions) -> bool {
 #[cfg(test)]
 mod tests {
     use super::device_family;
+    use sparkflash_model::Target;
+    use sparkflash_ops::engine_plan::EnginePlan;
 
     #[test]
     fn the_qwen_text_alias_dispatches_to_the_qwen_arm() {
@@ -482,6 +632,22 @@ mod tests {
         assert!(!device_family("acme_custom_flash", nowhere));
         // A Qwen3.5-MoE checkpoint is the device arm's only when its formats are.
         assert!(!device_family("qwen3_5_moe", nowhere));
+    }
+
+    #[test]
+    fn dory_plans_at_tp1_and_names_the_host_path() {
+        const CONFIG: &str = include_str!(
+            "../../../sparkflash-model-dory/config/nvidia_nemotron_labs_dory1_0_4b_bf16.hf.json"
+        );
+        let plan =
+            EnginePlan::from_json(CONFIG, Target::Sm121, 1, 0).expect("the Dory checkpoint plans");
+        assert_eq!(plan.family(), "dory");
+        assert_eq!(plan.architecture().layers.len(), 36);
+        assert!(plan.architecture().looped.is_some());
+        assert_eq!(
+            super::super::pack::profile_toml_for_family("dory").map(str::len),
+            Some(include_str!("../../../sparkflash-model-dory/config/dory1_0_4b_bf16.toml").len())
+        );
     }
 
     #[test]

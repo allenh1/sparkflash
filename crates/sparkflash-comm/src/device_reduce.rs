@@ -1035,6 +1035,85 @@ impl RunReduce {
         Ok(())
     }
 
+    /// One point-to-point send: `count` bf16 words at `send` go to `peer` on the caller's stream.
+    ///
+    /// The words are moved, never summed, so any payload whose byte length is even travels as is
+    /// (an f32 row is two words an element). Sends and receives between one pair of ranks match in
+    /// the order they were enqueued.
+    ///
+    /// # Safety
+    /// Same contract as reduce_bf16; `send` holds `count` bf16 values, and `peer` enqueues the
+    /// matching [Self::recv_bf16].
+    ///
+    /// # Errors
+    /// NcclError::Config for a zero or overflowing count or a peer outside the world (or this
+    /// rank), NcclError::Call when the library lacks ncclSend or refuses the enqueue.
+    pub unsafe fn send_bf16(
+        &mut self,
+        send: u64,
+        count: usize,
+        peer: usize,
+        stream: u64,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(count)?;
+        self.point_to_point_peer(peer)?;
+        // SAFETY: the caller upholds the pointer, device and stream contract documented above.
+        unsafe {
+            self.api.enqueue_send_bf16(
+                self.comm,
+                send as *const c_void,
+                count,
+                peer as i32,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// One point-to-point receive: `count` bf16 words from `peer` land at `recv` on the caller's
+    /// stream. The counterpart of [Self::send_bf16].
+    ///
+    /// # Safety
+    /// Same contract as reduce_bf16; `recv` holds `count` writable bf16 values, and `peer`
+    /// enqueues the matching send.
+    ///
+    /// # Errors
+    /// As [Self::send_bf16], for ncclRecv.
+    pub unsafe fn recv_bf16(
+        &mut self,
+        recv: u64,
+        count: usize,
+        peer: usize,
+        stream: u64,
+    ) -> Result<(), NcclError> {
+        let bytes = payload_bytes(count)?;
+        self.point_to_point_peer(peer)?;
+        // SAFETY: the caller upholds the pointer, device and stream contract documented above.
+        unsafe {
+            self.api.enqueue_recv_bf16(
+                self.comm,
+                recv as *mut c_void,
+                count,
+                peer as i32,
+                stream as CudaStream,
+            )?;
+        }
+        self.stats.record(bytes);
+        Ok(())
+    }
+
+    /// Refuses a point-to-point peer that is this rank or outside the world.
+    fn point_to_point_peer(&self, peer: usize) -> Result<(), NcclError> {
+        if peer >= self.world || peer == self.rank {
+            return Err(NcclError::Config(format!(
+                "rank {} of {} cannot send to or receive from rank {peer}",
+                self.rank, self.world
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether the one-shot exchange is available (the library exports ncclSend and ncclRecv).
     #[must_use]
     pub fn has_exchange(&self) -> bool {

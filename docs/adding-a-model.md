@@ -76,6 +76,7 @@ exposed through `sparkflash_kernels::images`:
 | GLM bulk routed expert (MoE) | `glm_moe_cubin()` |
 | GLM decode/token (mHC, router, indexer, absorbed MLA, tiled GEMV wrappers) | `glm_decode_cubin()` |
 | GLM sparse MLA attention | `glm_attention_cubin()` |
+| Dory nGPT tensor-core projections, attention and cache kernels | `dory_cubin()` |
 
 A model crate may not contain a `.cu` or `.cuh` file and may not carry a build script that
 compiles one. The workspace test `sparkflash-ops/tests/one_stack.rs` enforces both, together with
@@ -146,6 +147,19 @@ See [engine/02-execution-plan.md](engine/02-execution-plan.md). The released-con
 `crates/sparkflash-ops/tests/engine_plan.rs` is the executable contract: all three configs must
 plan and resolve at TP=1 and TP=4.
 
+### The one documented direct-launch arm
+
+Dory's nGPT kernels are fused bodies the shared plans do not describe: the looped normalized
+residual, the per-head norm folded into the rope-and-cache launch, and the draft exit that runs
+the output suffix on an earlier loop's latent. Its device arm therefore launches `dory_*` by
+name from load-time geometry rather than composing a `LayerPlan`, and its boot gate is the
+catalogue (`sparkflash_ops::parts`) rather than the plan resolver. This is a deliberate,
+single-arm exception, not the bring-up path: the arm still fixes its shapes, precision, layout
+and stream at load, allocates no device buffers at launch (the serving loop does build small
+per-frame and per-batch worklists), and refuses a checkpoint whose shapes the wide tile cannot
+run. A new arm composes the typed plans and implements `GemvDevice` as this guide
+describes.
+
 ## 3. Configuration
 
 Every arm has one typed TOML profile:
@@ -155,6 +169,7 @@ Every arm has one typed TOML profile:
 | Qwen3.8-Flash-Next (NVFP4 and FP8) | `crates/sparkflash-model-qwen4-exp/config/qwen38_flash_next_nvfp4.toml` |
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/config/glm53_flash.toml` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml` |
+| NVIDIA Nemotron Labs Dory1.0-4B (BF16) | `crates/sparkflash-model-dory/config/dory1_0_4b_bf16.toml` |
 
 The FP8 release shares that profile: the switches select arithmetic, and the one difference
 between the two Qwen checkpoints is the routed experts' storage (`ExpertQuant`), which the

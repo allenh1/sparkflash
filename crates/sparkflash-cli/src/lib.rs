@@ -21,8 +21,8 @@ pub mod allocator;
 #[cfg(feature = "cuda")]
 pub use sparkflash_deepseek_forward::attention_device;
 pub mod attn_seam_weights;
-pub mod bootlog;
 pub use sparkflash_deepseek_forward::chain_timing;
+pub use sparkflash_serve::bootlog;
 pub mod convert;
 pub mod device_chain;
 pub mod dynamic;

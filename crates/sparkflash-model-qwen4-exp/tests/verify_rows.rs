@@ -80,14 +80,14 @@ fn download(cuda: &Cuda, pointer: &Deviceptr, floats: usize) -> Vec<u32> {
         .collect()
 }
 
-/// Asserts that row `token` of `together` (`BATCH` rows of `width` outputs) is `alone(token)`.
+/// Asserts that row `token` of `together` (rows of `width` outputs) is `alone(token)`.
 fn assert_rows(
     what: &str,
     together: &[u32],
     width: usize,
     mut alone: impl FnMut(usize) -> Vec<u32>,
 ) {
-    for token in 0..BATCH {
+    for token in 0..together.len() / width {
         let single = alone(token);
         let row = &together[token * width..(token + 1) * width];
         let differing = row.iter().zip(&single).filter(|(a, b)| a != b).count();
@@ -158,54 +158,102 @@ fn a_batched_gemv_row_is_bit_identical_to_the_row_alone() {
         .expect("the cubin carries q4e_gemv_bf16");
     let mut rng = Lcg(0x5eed);
     // 2,560 is the hidden size, 10,240 the hyper-connection width and 4,416 leaves a pair and a
-    // single chunk after the groups of four on some lanes.
+    // single chunk after the groups of four on some lanes. A batch takes two rows a warp, so 97
+    // rows leave the last warp one.
     for columns in [2560_usize, 10_240, 4_416] {
-        let rows = 96;
-        let mut total = 0;
-        let w = upload(&cuda, &rng.bf16s(rows * columns), &mut total);
-        let x = upload(&cuda, &rng.floats(BATCH * columns), &mut total);
-        let batched = cuda
-            .alloc(BATCH * rows * 4, &mut total)
-            .expect("batched out");
-        let single = cuda.alloc(rows * 4, &mut total).expect("single out");
-        let grid = (rows.div_ceil(WARPS) as u32, 1, 1);
-        let block = ((WARPS * 32) as u32, 1, 1);
-        cuda.launch(
-            gemv,
-            grid,
-            block,
-            &[
-                w.0,
-                x.0,
-                batched.0,
-                rows as u64,
-                columns as u64,
-                BATCH as u64,
-            ],
-        )
-        .expect("batched launch");
-        let together = download(&cuda, &batched, BATCH * rows);
-        assert_rows(
-            &format!("GEMV at {columns} columns"),
-            &together,
-            rows,
-            |token| {
+        for rows in [96_usize, 97] {
+            let mut total = 0;
+            let w = upload(&cuda, &rng.bf16s(rows * columns), &mut total);
+            let x = upload(&cuda, &rng.floats(BATCH * columns), &mut total);
+            let batched = cuda
+                .alloc(BATCH * rows * 4, &mut total)
+                .expect("batched out");
+            let single = cuda.alloc(rows * 4, &mut total).expect("single out");
+            let grid = (rows.div_ceil(WARPS) as u32, 1, 1);
+            let block = ((WARPS * 32) as u32, 1, 1);
+            let run = |x: Deviceptr, out: &Deviceptr, batch: usize| {
                 cuda.launch(
                     gemv,
                     grid,
                     block,
-                    &[
-                        w.0,
-                        x.offset(token * columns * 4).0,
-                        single.0,
-                        rows as u64,
-                        columns as u64,
-                        1,
-                    ],
+                    &[w.0, x.0, out.0, rows as u64, columns as u64, batch as u64],
                 )
-                .expect("single launch");
-                download(&cuda, &single, rows)
-            },
+                .expect("GEMV launch");
+                download(&cuda, out, batch * rows)
+            };
+            for batch in 2..=BATCH {
+                assert_rows(
+                    &format!("GEMV at {rows} x {columns}, {batch} rows"),
+                    &run(x, &batched, batch),
+                    rows,
+                    |token| run(x.offset(token * columns * 4), &single, 1),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_batched_gemv4_row_is_bit_identical_to_the_row_alone() {
+    let Some(cuda) = cuda_or_skip() else {
+        return;
+    };
+    let (_, gemv4) = cuda
+        .load_named(embedded_cubin(), "q4e_gemv4_bf16")
+        .expect("the cubin carries q4e_gemv4_bf16");
+    let mut rng = Lcg(0x6e4);
+    let columns = 2560_usize;
+    // Odd row counts put a warp's two rows in different matrices, and the third matrix starts
+    // eight bytes off a 16-byte boundary, so its rows take the column walk - one of them beside a
+    // row of the second matrix that does not.
+    let rows = [37_usize, 8, 3, 51];
+    let mut total = 0;
+    let matrices: Vec<Deviceptr> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, &count)| {
+            let skew = if index == 2 { 8 } else { 0 };
+            let mut bytes = vec![0_u8; skew];
+            bytes.extend(rng.bf16s(count * columns));
+            upload(&cuda, &bytes, &mut total).offset(skew)
+        })
+        .collect();
+    let x = upload(&cuda, &rng.floats(BATCH * columns), &mut total);
+    let outputs: Vec<Deviceptr> = rows
+        .iter()
+        .map(|count| cuda.alloc(BATCH * count * 4, &mut total).expect("out"))
+        .collect();
+    let all: usize = rows.iter().sum();
+    let grid = (all.div_ceil(WARPS) as u32, 1, 1);
+    let block = ((WARPS * 32) as u32, 1, 1);
+    // Token t's outputs of the four matrices, end to end.
+    let run = |x: Deviceptr, batch: usize| {
+        let mut args: Vec<u64> = matrices.iter().map(|m| m.0).collect();
+        args.push(x.0);
+        args.extend(outputs.iter().map(|out| out.0));
+        args.extend(rows.iter().map(|&count| count as u64));
+        args.extend([columns as u64, batch as u64]);
+        cuda.launch(gemv4, grid, block, &args)
+            .expect("gemv4 launch");
+        let parts: Vec<Vec<u32>> = outputs
+            .iter()
+            .zip(rows)
+            .map(|(out, count)| download(&cuda, out, batch * count))
+            .collect();
+        (0..batch)
+            .flat_map(|token| {
+                parts.iter().zip(rows).flat_map(move |(part, count)| {
+                    part[token * count..(token + 1) * count].to_vec()
+                })
+            })
+            .collect::<Vec<u32>>()
+    };
+    for batch in 2..=BATCH {
+        assert_rows(
+            &format!("four-matrix GEMV, {batch} rows"),
+            &run(x, batch),
+            all,
+            |token| run(x.offset(token * columns * 4), 1),
         );
     }
 }

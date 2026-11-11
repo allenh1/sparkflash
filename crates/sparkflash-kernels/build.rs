@@ -325,6 +325,7 @@ const MODEL_IMAGES: &[(&str, &str, &str)] = &[
         "moe_plan_sm121.cubin",
         "SPARKFLASH_MOE_PLAN_CUBIN",
     ),
+    ("dory_sm121.cu", "dory_sm121.cubin", "SPARKFLASH_DORY_CUBIN"),
 ];
 
 /// The combined probe: all forty-three kernel sources in one translation unit with the trace macros
@@ -680,8 +681,20 @@ fn report_clang(clang: &Path, arch: &str) {
 fn report_clang_probe(clang: &Path, arch: &str) {
     match check_roce_probe_syntax(clang, arch) {
         Ok(()) => match check_probed_kernels_syntax(clang, arch) {
-            Ok((checked, missing)) => println!(
-                "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
+            Ok((checked, missing)) => {
+                // The model images are compiled by their own probes, so they are not in
+                // PROBED_KERNELS; Dory still gets the same clang type check on a host without nvcc.
+                let dory = Path::new("../../kernels/dory_sm121.cu");
+                if dory.is_file() {
+                    clang_syntax_check(clang, arch, dory).unwrap_or_else(|failure| {
+                        panic!(
+                            "sparkflash-kernels: the clang CUDA syntax probe failed; kernels/dory_sm121.cu does not parse:\n{}",
+                            failure.stderr
+                        )
+                    });
+                }
+                println!(
+                    "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
                  enabled, signature redeclared, slot static_asserts), {checked} of the forty-three \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
@@ -689,11 +702,13 @@ fn report_clang_probe(clang: &Path, arch: &str) {
                  task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified head's \
                  device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 \
                  entry, the D37 BF16-activation projection pair and the task-6 stored-layout \
-                 down projection; {missing} missing) and the combined probe with the trace macros \
-                 enabled, against stub headers (-fsyntax-only, {arch}). That \
-                 checks syntax, types and every static_assert, NOT PTX and NOT numerics. A CUDA \
-                 host must run the nvcc probe before any of these kernels is trusted."
-            ),
+                 down projection; {missing} missing), kernels/dory_sm121.cu and the combined \
+                 probe with the trace macros enabled, against stub headers (-fsyntax-only, \
+                 {arch}). That checks syntax, types and every static_assert, NOT PTX and NOT \
+                 numerics. A CUDA host must run the nvcc probe before any of these kernels is \
+                 trusted."
+                );
+            }
             Err(failure) => panic!(
                 "sparkflash-kernels: the clang CUDA syntax probe failed; a Milestone 4 kernel \
                  does not parse or the combined probe does not compile:\n{}",

@@ -50,7 +50,7 @@ pub mod tp_plan;
 pub mod vision;
 pub mod vision_geometry;
 
-pub use architecture::{Architecture, names_the_producer};
+pub use architecture::{Architecture, LoopSchedule, names_the_producer};
 pub use arm::{
     Admission, AdmissionRefusal, KvPlan, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES,
     PackIdentity, gib, kv_budget_bytes,
@@ -60,11 +60,13 @@ pub use capabilities::Capabilities;
 pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
 pub use descriptor::{
-    DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, MODELS, ModelDescriptor, QWEN36_CONTEXT_TOKENS,
-    QWEN36_FLASH_35B_A3B_FP8_ID, QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID, QWEN36_MAX_OUTPUT_TOKENS,
-    QWEN36_VOCAB_SIZE, V41_CONTEXT_TOKENS, V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS,
-    canonical_model_type, default_model, find_model, find_model_by_type, find_model_by_weights,
-    model_context_tokens, model_max_output_tokens,
+    DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_ID, DORY1_0_4B_BF16_WEIGHTS_ID,
+    DORY1_0_4B_CONTEXT_TOKENS, DORY1_0_4B_MAX_OUTPUT_TOKENS, DORY1_0_4B_VOCAB_SIZE, MODELS,
+    ModelDescriptor, QWEN36_CONTEXT_TOKENS, QWEN36_FLASH_35B_A3B_FP8_ID,
+    QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID, QWEN36_MAX_OUTPUT_TOKENS, QWEN36_VOCAB_SIZE,
+    V41_CONTEXT_TOKENS, V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, canonical_model_type,
+    default_model, find_model, find_model_by_type, find_model_by_weights, model_context_tokens,
+    model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
 pub use fused::{FusedArm, FusedEngine, FusedSession};

@@ -185,6 +185,57 @@ impl QwenCodec {
         })
     }
 
+    /// Load a ChatML tokenizer that carries no vision delimiters.
+    ///
+    /// Dory's released tokenizer spells `<|im_start|>` and `<|im_end|>` but not Qwen's
+    /// `<|endoftext|>` or image tokens. The prompt surface is the same ChatML turns, so this
+    /// constructor validates only the two turn markers and the checkpoint's end set.
+    ///
+    /// # Errors
+    /// A missing turn marker, or an `<|im_end|>` outside the checkpoint's end set.
+    pub fn new_chatml_without_vision(
+        tokenizer: tokenizers::Tokenizer,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let im_start = special_id(&tokenizer, IM_START)?;
+        let im_end = special_id(&tokenizer, IM_END)?;
+        let vocab = architecture.vocab_size;
+        for (spelling, id) in [(IM_START, im_start), (IM_END, im_end)] {
+            if id as usize >= vocab {
+                return Err(format!(
+                    "the tokenizer's {spelling} is {id}, outside the checkpoint vocabulary {vocab}"
+                ));
+            }
+        }
+        let eos = &architecture.tokens.eos_token_ids;
+        if !eos.is_empty() && !eos.contains(&im_end) {
+            return Err(format!(
+                "the tokenizer's <|im_end|> is {im_end}, but the checkpoint configuration ends at {eos:?}"
+            ));
+        }
+        Ok(Self {
+            tokenizer,
+            im_start,
+            im_end,
+            endoftext: im_end,
+            image_token: im_end,
+            vision: None,
+        })
+    }
+
+    /// Load a vision-less ChatML tokenizer from disk.
+    ///
+    /// # Errors
+    /// As [Self::new_chatml_without_vision], plus a read/parse failure.
+    pub fn chatml_from_path_with_architecture(
+        path: &Path,
+        architecture: &sparkflash_model::Architecture,
+    ) -> Result<Self, String> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| format!("cannot load tokenizer {}: {error}", path.display()))?;
+        Self::new_chatml_without_vision(tokenizer, architecture)
+    }
+
     /// The vocabulary size, added tokens included.
     #[must_use]
     pub fn vocabulary(&self) -> usize {

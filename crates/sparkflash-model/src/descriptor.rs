@@ -82,6 +82,25 @@ pub const GLM53_MAX_OUTPUT_TOKENS: usize = 32_768;
 /// The vocabulary of the released GLM-5.3-Flash checkpoint.
 pub const GLM53_VOCAB_SIZE: usize = 154_880;
 
+/// The served id of the NVIDIA Nemotron Labs Dory1.0-4B checkpoint.
+pub const DORY1_0_4B_BF16_ID: &str = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16";
+
+/// The control-plane weight selector for Dory1.0-4B (BF16).
+pub const DORY1_0_4B_BF16_WEIGHTS_ID: &str = "dory1.0-4b-bf16";
+
+/// The context window of the released Dory1.0-4B checkpoint.
+pub const DORY1_0_4B_CONTEXT_TOKENS: usize = 262_144;
+
+/// The output ceiling this build serves for Dory1.0-4B.
+///
+/// Dory's model card gives one 256K window for prompt and output together; there is no smaller
+/// separate generation cap. A request's prompt consumes from the same window, so the API lowers
+/// `max_tokens` to what remains after the prompt.
+pub const DORY1_0_4B_MAX_OUTPUT_TOKENS: usize = DORY1_0_4B_CONTEXT_TOKENS;
+
+/// The vocabulary of the released Dory1.0-4B checkpoint.
+pub const DORY1_0_4B_VOCAB_SIZE: usize = 131_072;
+
 /// The model ids this build knows how to serve, in selector order.
 ///
 /// Kept as a separate slice so the web control plane can expose it without constructing the
@@ -92,6 +111,7 @@ pub const WEIGHT_IDS: &[&str] = &[
     QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID,
     QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
     GLM53_FLASH_WEIGHTS_ID,
+    DORY1_0_4B_BF16_WEIGHTS_ID,
 ];
 
 /// The maximum context window of the released model.
@@ -199,6 +219,31 @@ impl ModelDescriptor {
             max_output_tokens: QWEN36_MAX_OUTPUT_TOKENS,
             vocab_size: QWEN36_VOCAB_SIZE,
             capabilities: Capabilities::ALL,
+        }
+    }
+
+    /// The released nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16 descriptor.
+    ///
+    /// Dory is a looped normalized-GPT with a single text stack: an input prefix, a shared
+    /// recurrent block applied twice by default, and an output suffix. Its device arm executes it
+    /// at TP=1 when the Dory/Qwen cubins are built, and its host reference otherwise.
+    #[must_use]
+    pub fn dory1_0_4b_bf16() -> Self {
+        Self {
+            id: DORY1_0_4B_BF16_ID.to_owned(),
+            family: "dory".to_owned(),
+            model_type: "dory".to_owned(),
+            label: "Dory".to_owned(),
+            weights_id: DORY1_0_4B_BF16_WEIGHTS_ID.to_owned(),
+            context_tokens: DORY1_0_4B_CONTEXT_TOKENS,
+            max_output_tokens: DORY1_0_4B_MAX_OUTPUT_TOKENS,
+            vocab_size: DORY1_0_4B_VOCAB_SIZE,
+            // Dory's released template has no reasoning-effort instruction; its only effort
+            // control is the optional medium_effort template flag.
+            capabilities: Capabilities {
+                reasoning_effort: false,
+                ..Capabilities::ALL
+            },
         }
     }
 
@@ -312,6 +357,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
         ModelDescriptor::qwen38_flash_next_fp8(),
         ModelDescriptor::qwen36_flash_35b_a3b_fp8(),
         ModelDescriptor::glm53_flash(),
+        ModelDescriptor::dory1_0_4b_bf16(),
     ]
 });
 
@@ -468,6 +514,21 @@ mod tests {
             Some(QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID)
         );
         assert_eq!(WEIGHT_IDS.len(), MODELS.len());
+    }
+
+    #[test]
+    fn dory_is_registered_by_its_own_model_type_and_weights() {
+        let model = find_model_by_type("dory").expect("the Dory family");
+        assert_eq!(model.id, DORY1_0_4B_BF16_ID);
+        assert_eq!(model.weights_id, DORY1_0_4B_BF16_WEIGHTS_ID);
+        assert_eq!(model.family, "dory");
+        assert_eq!(model.label, "Dory");
+        assert_eq!(model.vocab_size, DORY1_0_4B_VOCAB_SIZE);
+        assert_eq!(model.context_tokens, DORY1_0_4B_CONTEXT_TOKENS);
+        assert_eq!(
+            find_model("dory1.0-4b-bf16").map(|model| model.id.as_str()),
+            Some(DORY1_0_4B_BF16_ID)
+        );
     }
 
     #[test]

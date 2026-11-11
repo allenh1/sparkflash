@@ -78,6 +78,9 @@ pub const QWEN_FP8_WEIGHTS_ID: &str =
 pub const QWEN36_WEIGHTS_ID: &str =
     sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID;
 
+/// The control-plane weight selector for Dory1.0-4B (BF16).
+pub const DORY_WEIGHTS_ID: &str = sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID;
+
 /// The canonical Hugging Face id of the Qwen3.6-35B-A3B checkpoint.
 pub const QWEN36_MODEL_ID: &str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
 
@@ -213,6 +216,18 @@ fn deployment_for(weights: &str) -> Deployment {
             worlds: &[1, 2, 4],
             org: "zai-org",
             requires_conversion: true,
+            requires_cubins: false,
+        },
+        DORY_WEIGHTS_ID => Deployment {
+            // The dynamic route opens Dory's device arm when its cubins are present, and its
+            // CPU host reference otherwise. Dory's multi-rank group splits recurrent loops,
+            // not layers, so it is not one of this console's tensor-parallel worlds.
+            engine: DYNAMIC_ENGINE_ID,
+            search: "Dory1.0",
+            world_size: SOLO_WORLD_SIZE,
+            worlds: &[SOLO_WORLD_SIZE],
+            org: "nvidia",
+            requires_conversion: false,
             requires_cubins: false,
         },
         other => panic!("no web deployment profile for the registry weights {other}"),
@@ -1804,6 +1819,17 @@ mod tests {
             profile_for_model_type("qwen3_5_moe_text").map(|profile| profile.weights),
             Some(QWEN36_WEIGHTS_ID)
         );
+    }
+
+    #[test]
+    fn dory_launches_on_the_dynamic_engine_at_one_rank() {
+        let profile = profile_for_weights(DORY_WEIGHTS_ID).expect("the Dory profile");
+        assert_eq!(profile.model_type, "dory");
+        assert_eq!(profile.engine, DYNAMIC_ENGINE_ID);
+        assert_eq!(profile.world_size, 1);
+        assert_eq!(profile.worlds, &[1]);
+        assert!(!profile.requires_conversion);
+        assert!(!profile.requires_cubins);
     }
 
     #[test]

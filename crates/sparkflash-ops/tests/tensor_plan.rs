@@ -117,6 +117,7 @@ fn hybrid() -> Architecture {
         output_gate: true,
     };
     Architecture {
+        looped: None,
         family: "glm5_next".to_owned(),
         architectures: vec!["SyntheticHybrid".to_owned()],
         hidden_size: 4096,

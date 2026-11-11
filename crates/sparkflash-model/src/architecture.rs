@@ -51,6 +51,8 @@ pub struct Architecture {
     pub attention_bias: bool,
     /// The decoder layers, in forward order.
     pub layers: Vec<Layer>,
+    /// The looped schedule, when the release applies a shared block more than once.
+    pub looped: Option<LoopSchedule>,
     /// The stored weight format, if the release declares one.
     pub quantization: Quantization,
     /// The vision tower, if the release carries one.
@@ -82,6 +84,22 @@ pub struct Tokens {
     pub vision_start_token_id: Option<u32>,
     /// The delimiter after an image's merged rows.
     pub vision_end_token_id: Option<u32>,
+}
+
+/// A looped schedule: the stored blocks are split into an input prefix, a shared recurrent
+/// block applied many times, and an output suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopSchedule {
+    /// Sublayers before the recurrent block.
+    pub input_sublayers: usize,
+    /// Sublayers in the shared recurrent block.
+    pub recurrent_sublayers: usize,
+    /// Sublayers after the recurrent block.
+    pub output_sublayers: usize,
+    /// How many times the recurrent block runs.
+    pub loops: usize,
+    /// Whether each loop keeps its own KV cache.
+    pub per_loop_kv: bool,
 }
 
 /// One decoder layer.
@@ -645,7 +663,8 @@ impl Architecture {
         let embedding_tied_to_head = optional_bool(text, "tie_word_embeddings")?.unwrap_or(false);
         let attention_bias = optional_bool(text, "attention_bias")?.unwrap_or(false);
 
-        let layers = layers(text)?;
+        let layers = layers(text, &family)?;
+        let looped = loop_schedule(text, &family)?;
         let quantization = quantization(root)?;
         let vision = vision(root, hidden_size)?;
         let mtp = mtp(text, hidden_size)?;
@@ -661,6 +680,7 @@ impl Architecture {
             embedding_tied_to_head,
             attention_bias,
             layers,
+            looped,
             quantization,
             vision,
             mtp,
@@ -932,6 +952,34 @@ impl Architecture {
                     .saturating_mul(mtp.stages as u64),
             );
         }
+        if let Some(looped) = &self.looped
+            && looped.per_loop_kv
+            && looped.loops > 1
+        {
+            // Only the recurrent slice is replayed; the input and output blocks run once.
+            let start = looped.input_sublayers / 2;
+            let end = start + looped.recurrent_sublayers / 2;
+            let extra = (looped.loops - 1) as u64;
+            for layer in self.layers.get(start..end).unwrap_or_default() {
+                match &layer.attention.kind {
+                    AttentionKind::Gqa { kv_heads, .. } => {
+                        let heads = ((*kv_heads as u64).div_ceil(world)).max(1);
+                        let kv = 2u64
+                            .saturating_mul(heads)
+                            .saturating_mul(layer.attention.head_dim as u64)
+                            .saturating_mul(2);
+                        per_token = per_token.saturating_add(kv.saturating_mul(extra));
+                    }
+                    AttentionKind::Mla { kv_lora_rank, .. } => {
+                        let width = (*kv_lora_rank as u64)
+                            .saturating_add(layer.attention.rope.rotated_dims as u64);
+                        per_token = per_token
+                            .saturating_add(latent_bytes(width, latent_fp8).saturating_mul(extra));
+                    }
+                    AttentionKind::Gdn(_) | AttentionKind::Kda(_) => {}
+                }
+            }
+        }
         Ok(crate::KvPlan::new(per_token, fixed))
     }
 
@@ -1094,7 +1142,10 @@ impl Architecture {
     }
 }
 
-fn layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
+fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
+    if family == "dory" {
+        return dory_layers(text);
+    }
     let count = required_usize(text, "num_hidden_layers", "text_config")?;
     let mut layer_types = string_list(text.get("layer_types"))?;
     let ratios = usize_list(text.get("compress_ratios"))?;
@@ -1194,6 +1245,111 @@ fn layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
     Ok(layers)
 }
 
+/// The collapsed block schedule of a looped Dory checkpoint.
+///
+/// Dory stores each transformer block as two entries in layer_types: an attention sublayer and
+/// an MLP sublayer. The shared layer walk wants one Layer per block, so the pair becomes one
+/// layer whose attention and dense MLP are the pair's two stored sublayers.
+fn dory_layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
+    let count = required_usize(text, "num_hidden_layers", "text_config")?;
+    if !count.is_multiple_of(2) {
+        return Err(invalid(
+            "a looped model stores attention and MLP sublayers in pairs, so num_hidden_layers must be even",
+        ));
+    }
+    let layer_types = string_list(text.get("layer_types"))?;
+    if layer_types.len() != count {
+        return Err(invalid(format!(
+            "layer_types has {} entries, expected num_hidden_layers = {count}",
+            layer_types.len()
+        )));
+    }
+    let schedule = Schedule {
+        kv_sources: &[],
+        index_sources: &[],
+        indexer_types: &[],
+        candidate_pool: None,
+    };
+    let mut layers = Vec::with_capacity(count / 2);
+    for block in 0..count / 2 {
+        let attention_type = layer_types[block * 2].as_str();
+        if attention_type == "mlp" {
+            return Err(invalid(format!(
+                "block {block} starts with an MLP sublayer, expected an attention sublayer"
+            )));
+        }
+        if layer_types[block * 2 + 1] != "mlp" {
+            return Err(invalid(format!(
+                "block {block} does not follow its attention sublayer with an MLP sublayer"
+            )));
+        }
+        let attention = attention(text, block * 2, attention_type, 0, &schedule)?;
+        let ffn = ffn(text, block * 2 + 1, 0, &[])?;
+        if !matches!(ffn, Ffn::Dense(_)) {
+            return Err(invalid(format!("block {block} is not a dense MLP block")));
+        }
+        layers.push(Layer {
+            index: block,
+            attention,
+            ffn,
+            residual: Residual::Plain,
+            sides: Vec::new(),
+        });
+    }
+    Ok(layers)
+}
+
+/// The loop metadata of a looped Dory checkpoint.
+fn loop_schedule(text: &Value, family: &str) -> Result<Option<LoopSchedule>, ConfigError> {
+    if family != "dory" {
+        return Ok(None);
+    }
+    let input_sublayers = required_usize(text, "n_input_layers", "text_config")?;
+    let output_sublayers = required_usize(text, "n_output_layers", "text_config")?;
+    let count = required_usize(text, "num_hidden_layers", "text_config")?;
+    let recurrent_sublayers = optional_usize(text, "n_recurrent_layers")?
+        .unwrap_or(count.saturating_sub(input_sublayers + output_sublayers));
+    if input_sublayers + recurrent_sublayers + output_sublayers != count {
+        return Err(invalid(
+            "the input, recurrent and output sublayers do not sum to num_hidden_layers",
+        ));
+    }
+    for (name, sublayers) in [
+        ("n_input_layers", input_sublayers),
+        ("n_recurrent_layers", recurrent_sublayers),
+        ("n_output_layers", output_sublayers),
+    ] {
+        if !sublayers.is_multiple_of(2) {
+            return Err(invalid(format!(
+                "{name} must be even: Dory stores attention and MLP sublayers in pairs"
+            )));
+        }
+    }
+    let loops = optional_usize(text, "n_recurrent_loops")?.unwrap_or(1);
+    if loops == 0 {
+        return Err(invalid("n_recurrent_loops must be positive"));
+    }
+    let per_loop_kv = match optional_string(text, "recurrent_kv_cache_mode")
+        .as_deref()
+        .unwrap_or("per_loop")
+    {
+        "per_loop" => true,
+        "last_loop" => false,
+        other => {
+            return Err(invalid(format!(
+                "recurrent_kv_cache_mode must be per_loop or last_loop, not {other:?}"
+            )));
+        }
+    };
+    Ok(Some(LoopSchedule {
+        input_sublayers,
+        recurrent_sublayers,
+        output_sublayers,
+        loops,
+        per_loop_kv,
+    }))
+}
+
 /// Whether a document carries the linear-attention geometry of a hybrid release.
 fn has_linear_attention(text: &Value) -> bool {
     object(text, "linear_attn_config").is_some()
@@ -1251,11 +1407,20 @@ fn attention(
             "layer {index} has no head_dim, no qk_nope_head_dim and no divisible hidden_size"
         )));
     }
-    let window = optional_usize(text, "sliding_window")?;
     let rope_parameters = object(text, "rope_parameters");
+    // A looped model keys its rotary config by attention kind; the selected block is the one
+    // this layer runs. Every other release keeps the flat fields.
+    let selected_rope = rope_parameters
+        .and_then(|parameters| parameters.get(layer_type))
+        .filter(|value| value.is_object());
+    let window = if selected_rope.is_some() && layer_type == "full_attention" {
+        None
+    } else {
+        optional_usize(text, "sliding_window")?
+    };
     // Newer releases (Qwen4-Exp among them) nest both rotary fields under
     // `rope_parameters`; the top-level spelling is the older form and wins when both appear.
-    let nested_partial = match rope_parameters {
+    let nested_partial = match selected_rope.or(rope_parameters) {
         Some(value) => optional_f64(value, "partial_rotary_factor")?,
         None => None,
     };
@@ -1272,7 +1437,7 @@ fn attention(
         // the whole head unless a release says otherwise.
         head_dim
     };
-    let rope = rope(text, ratio, rotated_dims)?;
+    let rope = rope(text, ratio, rotated_dims, selected_rope)?;
 
     let is_linear = layer_type.contains("linear");
     let is_sparse = layer_type.contains("sparse")
@@ -1337,7 +1502,9 @@ fn attention(
         let output_gate = optional_bool(text, "attn_output_gate")?
             .or(optional_bool(text, "use_output_gate")?)
             .unwrap_or_else(|| {
-                optional_string(text, "output_gate_type").is_some() || declares_indexer
+                optional_string(text, "output_gate_type").is_some()
+                    || declares_indexer
+                    || text.get("attention_output_gate_logit_scale_init").is_some()
             });
         AttentionKind::Gqa {
             kv_heads: optional_usize(text, "num_key_value_heads")?.unwrap_or(heads),
@@ -1525,26 +1692,38 @@ fn residual(text: &Value) -> Result<Residual, ConfigError> {
     }))
 }
 
-fn rope(text: &Value, ratio: usize, rotated_dims: usize) -> Result<Rope, ConfigError> {
+fn rope(
+    text: &Value,
+    ratio: usize,
+    rotated_dims: usize,
+    selected: Option<&Value>,
+) -> Result<Rope, ConfigError> {
     let compress_theta = optional_f64(text, "compress_rope_theta")?;
-    let parameters = object(text, "rope_parameters");
+    let parameters = selected.or_else(|| object(text, "rope_parameters"));
     // Qwen4-Exp stores the base under `rope_parameters`; older releases keep it top-level.
     let nested_theta = match parameters {
         Some(value) => optional_f64(value, "rope_theta")?,
         None => None,
     };
     let top_theta = optional_f64(text, "rope_theta")?;
+    let selected_theta = match selected {
+        Some(value) => optional_f64(value, "rope_theta")?,
+        None => None,
+    };
     let theta = if ratio > 0 {
         compress_theta
             .or(top_theta)
             .or(nested_theta)
             .unwrap_or_else(|| default_rope_theta(text))
     } else {
-        top_theta
+        selected_theta
+            .or(top_theta)
             .or(nested_theta)
             .unwrap_or_else(|| default_rope_theta(text))
     };
-    let scaling_json = object(text, "rope_scaling").or(parameters);
+    let scaling_json = selected
+        .or_else(|| object(text, "rope_scaling"))
+        .or(parameters);
     // DeepSeek's ratio-0 layers run plain RoPE; every other release's scaling is global.
     let scaling = if ratio == 0 && text.get("compress_ratios").is_some() {
         None

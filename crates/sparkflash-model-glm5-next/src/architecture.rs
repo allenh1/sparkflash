@@ -165,6 +165,7 @@ pub fn tiny_architecture() -> Architecture {
         norm_epsilon: 1e-5,
         embedding_tied_to_head: false,
         attention_bias: false,
+        looped: None,
         layers: vec![kda(0), mla(1, Some(full_indexer)), mla(2, None), kda(3)],
         quantization: Quantization {
             method: Some("fp8".to_owned()),

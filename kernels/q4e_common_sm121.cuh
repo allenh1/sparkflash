@@ -51,6 +51,23 @@ __device__ __forceinline__ float q4e_sigmoid_ref(float x) {
     return e / (1.0f + e);
 }
 
+// One rotary pair of a head at absolute position `position`: elements index and index + half of
+// `src`, rotated by the frequency theta^(-2 index / rotary) (the accurate power) through the fast
+// cosine and sine, into the same elements of `dst` (which may be `src`). q4e_rope and Dory's
+// dory_rope_norm both rotate through it, so they cannot answer a position differently; q4e_rope's
+// SASS is byte for byte what its inline rotation compiled to.
+__device__ __forceinline__ void q4e_rope_pair(const float* src, float* dst, int index, int half,
+                                              int rotary, float position, float theta) {
+    const float frequency = powf(theta, -2.0f * (float)index / (float)rotary);
+    const float angle = position * frequency;
+    const float cosine = __cosf(angle);
+    const float sine = __sinf(angle);
+    const float a = src[index];
+    const float b = src[index + half];
+    dst[index] = a * cosine - b * sine;
+    dst[index + half] = a * sine + b * cosine;
+}
+
 // One row per warp, one lane per 32 columns: the packed weights are read coalesced.
 __device__ __forceinline__ float q4e_warp_sum(float value) {
 #pragma unroll

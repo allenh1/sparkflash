@@ -3676,9 +3676,12 @@ impl DeviceSequence {
         let mut base = 0usize;
         while base < batch {
             let count = GEMV_MAX_BATCH.min(batch - base);
+            // Two rows a warp for a batch, one for a single row: the grid must match the kernel's
+            // row-to-warp mapping or half the blocks exit unused.
+            let rows_per_block = if count > 1 { WARPS * 2 } else { WARPS };
             self.launch(
                 self.backend.kernels.gemv_bf16,
-                (matrix.rows.div_ceil(WARPS) as u32, 1, 1),
+                (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
                 ((WARPS * 32) as u32, 1, 1),
                 &[
                     matrix.pointer.0,
@@ -3733,11 +3736,13 @@ impl DeviceSequence {
                 ],
             );
         }
-        // One warp per output row, so the grid is the row count over the warps in a block.
+        // Two rows a warp for a batch, one for a single row: the grid must match the kernel's
+        // row-to-warp mapping or half the blocks exit unused.
         const WARPS: usize = 8;
+        let rows_per_block = if batch > 1 { WARPS * 2 } else { WARPS };
         self.launch(
             self.backend.kernels.gemv_bf16,
-            (matrix.rows.div_ceil(WARPS) as u32, 1, 1),
+            (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
             ((WARPS * 32) as u32, 1, 1),
             &[
                 matrix.pointer.0,
@@ -3852,9 +3857,10 @@ impl DeviceSequence {
         }
         const WARPS: usize = 8;
         let total_rows = m0.rows + m1.rows + m2.rows + m3.rows;
+        let rows_per_block = if batch > 1 { WARPS * 2 } else { WARPS };
         self.launch(
             self.backend.kernels.gemv4_bf16,
-            (total_rows.div_ceil(WARPS) as u32, 1, 1),
+            (total_rows.div_ceil(rows_per_block) as u32, 1, 1),
             ((WARPS * 32) as u32, 1, 1),
             &[
                 m0.pointer.0,

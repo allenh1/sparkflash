@@ -192,6 +192,8 @@ use tp4_control::*;
 pub(crate) mod dynamic;
 mod dynamic_host;
 mod pack;
+mod recurrence;
+pub use recurrence::{RECURRENCE_DEFAULT_PORT, RecurrenceNet, RecurrenceServeOptions};
 
 /// The index file a sharded safetensors checkpoint is described by.
 const CHECKPOINT_INDEX_NAME: &str = "model.safetensors.index.json";
@@ -497,7 +499,7 @@ impl Tp4ServeOptions {
                 "--tp4-peers is required for --tp4-rank: give all {world_size} rank addresses in rank order, comma separated"
             )
         })?;
-        let peers = parse_tp4_peers(raw_peers)?;
+        let peers = parse_peers("--tp4-peers", raw_peers)?;
         if peers.len() != world_size {
             return Err(format!(
                 "--tp4-peers lists {} address(es) but --tp4-world-size is {world_size}",
@@ -558,18 +560,17 @@ pub(crate) fn announce_numerics(key: ConfigKey) -> Result<NumericsIdentity, Stri
     Ok(identity)
 }
 
-/// Parses a comma-separated peer list.
-#[cfg(feature = "tp4-serve")]
-fn parse_tp4_peers(raw: &str) -> Result<Vec<IpAddr>, String> {
+/// Parses the comma-separated peer list a group flag (`flag`) names, in rank order.
+fn parse_peers(flag: &str, raw: &str) -> Result<Vec<IpAddr>, String> {
     let mut peers = Vec::new();
     for item in raw.split(',') {
         let item = item.trim();
         if item.is_empty() {
-            return Err("--tp4-peers contains an empty address".to_owned());
+            return Err(format!("{flag} contains an empty address"));
         }
         let address = item
             .parse::<IpAddr>()
-            .map_err(|_| format!("--tp4-peers: {item} is not an IP address"))?;
+            .map_err(|_| format!("{flag}: {item} is not an IP address"))?;
         peers.push(address);
     }
     Ok(peers)
@@ -681,6 +682,12 @@ pub struct ServeOptions {
     /// control channel. See [ServeEngine].
     #[cfg(feature = "tp4-serve")]
     pub tp4: Option<Tp4ServeOptions>,
+    /// Dory's latent-recurrence group, when `--recurrence-rank` was given.
+    ///
+    /// `None` is one process serving the whole model. `Some` means this process runs its share
+    /// of the recurrent loops: rank 0 owns HTTP, embeds and runs the input prefix; the last rank
+    /// runs the output suffix and the head. The latent rows travel between the GPUs over NCCL.
+    pub recurrence: Option<RecurrenceServeOptions>,
     /// The bearer key every route except `/health` and `/metrics` requires, when set.
     ///
     /// `None` is the default and keeps the server open, exactly as before. The key is never
@@ -917,7 +924,9 @@ impl ServeOptions {
         if cli.kv_budget_gib == Some(0) {
             return Err("--kv-budget-gib must be at least 1".to_owned());
         }
-        if !packed && cli.concurrency != 1 {
+        // Dory's latent-recurrence group holds one sequence lane a concurrent request on every
+        // rank; one Dory process stays serial.
+        if !packed && cli.concurrency != 1 && cli.recurrence_rank.is_none() {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -954,6 +963,44 @@ impl ServeOptions {
             }
             tp4
         };
+        let recurrence = RecurrenceServeOptions::from_cli(
+            cli.recurrence_rank,
+            cli.recurrence_peers.as_deref(),
+            cli.recurrence_port,
+            cli.recurrence_net,
+            cli.recurrence_draft_lanes,
+        )?;
+        if recurrence.is_some() {
+            #[cfg(feature = "tp4-serve")]
+            if tp4.is_some() {
+                return Err(
+                    "--recurrence-rank and --tp4-rank are different groups: the recurrence group \
+                     passes Dory's latent rows rank to rank, the TP=4 group shards every layer; \
+                     choose one"
+                        .to_owned(),
+                );
+            }
+            if cli.synthetic {
+                return Err(
+                    "--recurrence-rank serves a Dory checkpoint; --synthetic is the V4.1 tiny plan"
+                        .to_owned(),
+                );
+            }
+            if pack != Some(pack::Pack::Dory) && cli.model.is_none() {
+                return Err(
+                    "--recurrence-rank splits Dory's recurrent loops across ranks; name a Dory \
+                     checkpoint with --model or --checkpoint"
+                        .to_owned(),
+                );
+            }
+            if pack.is_some_and(|pack| pack != pack::Pack::Dory) {
+                return Err(format!(
+                    "--recurrence-rank splits Dory's recurrent loops across ranks; --model {} has \
+                     no latent recurrence (its group is --tp4-rank)",
+                    cli.model.as_deref().unwrap_or_default()
+                ));
+            }
+        }
         if cli.device_token_derived_claim && cli.device_token_dir.is_none() {
             return Err(
                 "--device-token-derived-claim needs --device-token-dir: the flag only changes how a recorded window's claim is established"
@@ -1058,6 +1105,7 @@ impl ServeOptions {
                 engram_dir: cli.engram_dir,
                 #[cfg(feature = "tp4-serve")]
                 tp4,
+                recurrence,
                 api_key: cli.api_key,
                 cors,
                 device_token_dir: cli.device_token_dir,
@@ -1359,6 +1407,29 @@ struct ServeArgs {
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "DIR", requires = "tp4_device")]
     tp4_evidence_dir: Option<PathBuf>,
+    /// This process's rank in Dory's latent-recurrence group (Dory checkpoints only).
+    ///
+    /// Each rank runs an even share of the recurrent loops on the whole hidden width and keeps
+    /// only its own loops' KV caches. Rank 0 owns HTTP, embeds and runs the input prefix; the
+    /// last rank runs the output suffix and the head. This is not --tp4-rank: nothing is sharded
+    /// or reduced, the latent rows are passed rank to rank over NCCL.
+    #[arg(long, value_name = "N")]
+    recurrence_rank: Option<usize>,
+    /// Every recurrence rank's address in rank order, comma separated; the count is the world.
+    #[arg(long, value_name = "IP,IP,...")]
+    recurrence_peers: Option<String>,
+    /// Rank R listens on this port plus R for the communicator's rendezvous; default 29801.
+    #[arg(long, value_name = "PORT")]
+    recurrence_port: Option<u16>,
+    /// Which network NCCL may carry the ring on: rdma (the default; NCCL_NET=IB, so a rail NCCL
+    /// cannot use fails the open) or any (NCCL may fall back to sockets).
+    #[arg(long, value_enum, value_name = "NET")]
+    recurrence_net: Option<RecurrenceNet>,
+    /// Rank 1 drafts the next token from rank 0's latent while at most N lanes are held, and the
+    /// last rank's choice keeps or drops the row started on it (the plain group's tokens); 0 never
+    /// drafts. Default 16 from three ranks, else 0.
+    #[arg(long, value_name = "N")]
+    recurrence_draft_lanes: Option<usize>,
 }
 
 /// What the engine thread builds: a configuration, where its weights come from, and the tokenizer.
@@ -5999,6 +6070,14 @@ pub fn run(args: impl IntoIterator<Item = String>) -> ExitCode {
             return ExitCode::from(EXIT_REFUSED);
         }
     };
+    // Before any thread starts: the recurrence ring's network is pinned in the environment NCCL
+    // reads at its open.
+    if let Some(group) = options.recurrence.as_ref()
+        && let Err(message) = recurrence::pin_network(group.net)
+    {
+        eprintln!("sparkflash serve: {message}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
     // A packed model is served by its own arm: none of the V4.1 recipe, engine selection or
     // device-chain wiring below describes it, and running through them would serve the wrong model.
     if let Some(model) = options.model.clone() {
@@ -6243,6 +6322,16 @@ fn serve_with_engine(
     )
 }
 
+/// The output ceiling a serving process actually enforces and advertises.
+///
+/// Three caps meet: the checkpoint's compiled bound, the operator's `--max-tokens`, and the
+/// allocated context (a generated token must still fit beside the prompt). The card used to
+/// publish the checkpoint bound even when `--max-tokens` was lower, so a client could request
+/// a budget the driver then silently clamped.
+fn output_ceiling(descriptor: usize, cli: usize, context: usize) -> usize {
+    descriptor.min(cli).min(context)
+}
+
 /// Builds the app state from an already chosen prompt seam and serves the router.
 ///
 /// A model pack brings its own seam (its own chat template and special ids) and its own
@@ -6255,7 +6344,7 @@ fn serve_with_seam(
     seam: Arc<dyn sparkflash_model::PromptCodec>,
     device_token_source: Option<Arc<dyn DeviceTokenSource>>,
     options: &ServeOptions,
-    descriptor: sparkflash_model::ModelDescriptor,
+    mut descriptor: sparkflash_model::ModelDescriptor,
     numerics: ConfigKey,
 ) -> ExitCode {
     let numerics = match announce_numerics(numerics) {
@@ -6271,6 +6360,11 @@ fn serve_with_seam(
         .checkpoint
         .as_ref()
         .map(|path| path.display().to_string());
+    descriptor.max_output_tokens = output_ceiling(
+        descriptor.max_output_tokens,
+        options.max_tokens,
+        descriptor.context_tokens,
+    );
     let state = AppState::new(engine)
         .with_metrics(metrics)
         .with_model_descriptor(Arc::new(descriptor))
@@ -11028,6 +11122,16 @@ mod device_token_serve_tests {
                 panic!("{label}: the serve plan check refused a resolvable config: {error}")
             });
         }
+    }
+
+    #[test]
+    fn the_advertised_output_ceiling_is_the_one_enforced() {
+        // The card must not publish the checkpoint's 32K bound when --max-tokens is 8K, and a
+        // context smaller than either bound still wins.
+        assert_eq!(output_ceiling(32_768, 8_192, 32_768), 8_192);
+        assert_eq!(output_ceiling(32_768, 65_536, 32_768), 32_768);
+        assert_eq!(output_ceiling(131_072, 65_536, 32_768), 32_768);
+        assert_eq!(output_ceiling(131_072, 65_536, 131_072), 65_536);
     }
 
     #[test]

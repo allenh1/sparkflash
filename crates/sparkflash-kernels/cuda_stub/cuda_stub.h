@@ -336,6 +336,15 @@ __device__ __forceinline__ float fminf(float a, float b) {
     return a < b ? a : b;
 }
 
+// CUDA's math.h rounds these to nearest even; the stub only needs the type check.
+__device__ __forceinline__ float rintf(float value) {
+    return __builtin_rintf(value);
+}
+
+__device__ __forceinline__ float __ll2float_rn(long long value) {
+    return (float)value;
+}
+
 __device__ __forceinline__ float copysignf(float magnitude, float sign) {
     return sign < 0.0f ? -magnitude : magnitude;
 }

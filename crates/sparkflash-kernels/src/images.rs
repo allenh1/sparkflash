@@ -51,6 +51,8 @@ pub enum Image {
     GlmDecode,
     /// The routed-expert plan every arm shares.
     MoePlan,
+    /// The Dory1.0-4B nGPT token kernels.
+    Dory,
     /// The DeepSeek kernels loaded from the shared PTX set.
     Deepseek,
     /// The RoCEnante one-shot collective.
@@ -111,6 +113,11 @@ const GLM_DECODE: &[u8] = &[];
 const MOE_PLAN: &[u8] = include_bytes!(env!("SPARKFLASH_MOE_PLAN_CUBIN"));
 #[cfg(not(sparkflash_model_cubin))]
 const MOE_PLAN: &[u8] = &[];
+
+#[cfg(sparkflash_model_cubin)]
+const DORY: &[u8] = include_bytes!(env!("SPARKFLASH_DORY_CUBIN"));
+#[cfg(not(sparkflash_model_cubin))]
+const DORY: &[u8] = &[];
 
 /// The Qwen3.8 token image, empty on a CPU-only build.
 #[must_use]
@@ -176,6 +183,12 @@ pub fn glm_decode_cubin() -> &'static [u8] {
 #[must_use]
 pub fn moe_plan_cubin() -> &'static [u8] {
     MOE_PLAN
+}
+
+/// The Dory1.0-4B token image, empty on a CPU-only build.
+#[must_use]
+pub fn dory_cubin() -> &'static [u8] {
+    DORY
 }
 
 impl Image {
@@ -330,6 +343,23 @@ impl Image {
                 "q4e_swiglu_limited",
             ],
             Self::MoePlan => &["moe_plan"],
+            Self::Dory => &[
+                "dory_attn_combine",
+                "dory_attn_mma128",
+                "dory_attn_mma16",
+                "dory_attn_mma256",
+                "dory_attn_mma64",
+                "dory_attn_split",
+                "dory_justnorm",
+                "dory_logit_scale",
+                "dory_loop_combine",
+                "dory_mlp_epilogue",
+                "dory_mma_wide",
+                "dory_mma_wide4",
+                "dory_rope_norm",
+                "dory_rope_norm_lanes",
+                "dory_slerp",
+            ],
             Self::Rocenante => &["rocenante_oneshot_allreduce_bf16_tp4"],
             Self::Deepseek => &[
                 "b12x_bf16a_mxfp8w_dense_sm121",
@@ -589,6 +619,7 @@ impl Image {
             Self::GlmMoe => glm_moe_cubin(),
             Self::GlmDecode => glm_decode_cubin(),
             Self::MoePlan => moe_plan_cubin(),
+            Self::Dory => dory_cubin(),
             // DeepSeek loads its kernels through the shared driver from the PTX set, and the
             // RoCEnante path compiles its own image at run time.
             Self::Deepseek | Self::Rocenante => &[],
@@ -616,6 +647,7 @@ impl Image {
             Self::GlmMoe => "glm_moe_sm121",
             Self::GlmDecode => "glm_decode_sm121",
             Self::MoePlan => "moe_plan_sm121",
+            Self::Dory => "dory_sm121",
             Self::Deepseek => "deepseek_ptx",
             Self::Rocenante => "rocenante_oneshot_sm121",
         }
@@ -640,6 +672,7 @@ mod tests {
             Image::GlmMoe,
             Image::GlmDecode,
             Image::Deepseek,
+            Image::Dory,
             Image::Rocenante,
         ] {
             assert!(!image.name().is_empty());

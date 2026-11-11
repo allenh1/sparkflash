@@ -153,76 +153,125 @@ __device__ __forceinline__ float q4e_row_dot_bf16(const __nv_bfloat16* __restric
     return total;
 }
 
-// Batched BF16 row dot: reads each weight chunk once and accumulates across batch token rows in
-// registers (batch <= Q4E_MAX_BATCH).
+// Batched BF16 row dot over R weight rows of one warp: reads each weight chunk once and each
+// activation chunk once for all R rows, accumulating across batch token rows in registers
+// (batch <= Q4E_MAX_BATCH).
 //
-// Each token's sum is grouped exactly as q4e_row_dot_bf16 groups it - four chunks added together
-// before they meet the total, then a pair, then one at a time - so a row of a batch is
-// bit-identical to the same row alone. A speculative verify has to compute as the one-token steps
-// it stands in for, and a different association moved its logits by ~1e-6, enough to flip a
-// near-tie and make greedy output depend on whether a drafter ran.
-__device__ __forceinline__ void q4e_row_dot_bf16_batch(
-    const __nv_bfloat16* __restrict__ row, const float* __restrict__ x, int columns, int lane,
-    int batch, float totals[Q4E_MAX_BATCH]) {
+// Each (row, token) sum is grouped exactly as q4e_row_dot_bf16 groups it - four chunks added
+// together before they meet the total, then a pair, then one at a time - so a row of a batch is
+// bit-identical to the same row alone, and to the same row in a warp of any other R. A
+// speculative verify has to compute as the one-token steps it stands in for, and a different
+// association moved its logits by ~1e-6, enough to flip a near-tie and make greedy output depend
+// on whether a drafter ran. A row the 16-byte walk cannot read takes the one-row column walk, as
+// it would alone.
+template <int R>
+__device__ __forceinline__ void q4e_rows_dot_bf16_batch(const __nv_bfloat16* const* rows,
+                                                        const float* __restrict__ x,
+                                                        int columns, int lane, int batch,
+                                                        float (*totals)[Q4E_MAX_BATCH]) {
 #pragma unroll
-    for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
-        totals[t] = 0.0f;
+    for (int r = 0; r < R; ++r) {
+#pragma unroll
+        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+            totals[r][t] = 0.0f;
+        }
     }
-    if ((columns & 7) == 0 && ((reinterpret_cast<unsigned long long>(row) & 15u) == 0) &&
-        ((reinterpret_cast<unsigned long long>(x) & 15u) == 0)) {
+    bool vector = (columns & 7) == 0 && ((reinterpret_cast<unsigned long long>(x) & 15u) == 0);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        vector = vector && ((reinterpret_cast<unsigned long long>(rows[r]) & 15u) == 0);
+    }
+    if (vector) {
         const int chunks = columns >> 3;
         int chunk = lane;
         for (; chunk + 96 < chunks; chunk += 128) {
-            const uint4 a = q4e_ldg(reinterpret_cast<const uint4*>(row + chunk * 8));
-            const uint4 b = q4e_ldg(reinterpret_cast<const uint4*>(row + (chunk + 32) * 8));
-            const uint4 c = q4e_ldg(reinterpret_cast<const uint4*>(row + (chunk + 64) * 8));
-            const uint4 d = q4e_ldg(reinterpret_cast<const uint4*>(row + (chunk + 96) * 8));
+            uint4 a[R], b[R], c[R], d[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                a[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + chunk * 8));
+                b[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + (chunk + 32) * 8));
+                c[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + (chunk + 64) * 8));
+                d[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + (chunk + 96) * 8));
+            }
 #pragma unroll
             for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
                 if (t < batch) {
                     const float* xt = x + (unsigned long long)t * columns;
-                    totals[t] += q4e_dot_chunk(a, xt, chunk * 8) +
-                                 q4e_dot_chunk(b, xt, (chunk + 32) * 8) +
-                                 q4e_dot_chunk(c, xt, (chunk + 64) * 8) +
-                                 q4e_dot_chunk(d, xt, (chunk + 96) * 8);
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        totals[r][t] += q4e_dot_chunk(a[r], xt, chunk * 8) +
+                                        q4e_dot_chunk(b[r], xt, (chunk + 32) * 8) +
+                                        q4e_dot_chunk(c[r], xt, (chunk + 64) * 8) +
+                                        q4e_dot_chunk(d[r], xt, (chunk + 96) * 8);
+                    }
                 }
             }
         }
         if (chunk + 32 < chunks) {
-            const uint4 a = q4e_ldg(reinterpret_cast<const uint4*>(row + chunk * 8));
-            const uint4 b = q4e_ldg(reinterpret_cast<const uint4*>(row + (chunk + 32) * 8));
+            uint4 a[R], b[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                a[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + chunk * 8));
+                b[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + (chunk + 32) * 8));
+            }
 #pragma unroll
             for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
                 if (t < batch) {
                     const float* xt = x + (unsigned long long)t * columns;
-                    totals[t] += q4e_dot_chunk(a, xt, chunk * 8);
-                    totals[t] += q4e_dot_chunk(b, xt, (chunk + 32) * 8);
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        totals[r][t] += q4e_dot_chunk(a[r], xt, chunk * 8);
+                        totals[r][t] += q4e_dot_chunk(b[r], xt, (chunk + 32) * 8);
+                    }
                 }
             }
             chunk += 64;
         }
         for (; chunk < chunks; chunk += 32) {
-            const uint4 value = q4e_ldg(reinterpret_cast<const uint4*>(row + chunk * 8));
+            uint4 value[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                value[r] = q4e_ldg(reinterpret_cast<const uint4*>(rows[r] + chunk * 8));
+            }
 #pragma unroll
             for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
                 if (t < batch) {
                     const float* xt = x + (unsigned long long)t * columns;
-                    totals[t] += q4e_dot_chunk(value, xt, chunk * 8);
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        totals[r][t] += q4e_dot_chunk(value[r], xt, chunk * 8);
+                    }
                 }
             }
         }
         return;
     }
-#pragma unroll 1
-    for (int column = lane; column < columns; column += 32) {
-        const float w = __bfloat162float(row[column]);
+    if constexpr (R > 1) {
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
-            if (t < batch) {
-                totals[t] += w * x[(unsigned long long)t * columns + column];
+        for (int r = 0; r < R; ++r) {
+            q4e_rows_dot_bf16_batch<1>(rows + r, x, columns, lane, batch, totals + r);
+        }
+    } else {
+#pragma unroll 1
+        for (int column = lane; column < columns; column += 32) {
+            const float w = __bfloat162float(rows[0][column]);
+#pragma unroll
+            for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+                if (t < batch) {
+                    totals[0][t] += w * x[(unsigned long long)t * columns + column];
+                }
             }
         }
     }
+}
+
+// q4e_rows_dot_bf16_batch over one row.
+__device__ __forceinline__ void q4e_row_dot_bf16_batch(
+    const __nv_bfloat16* __restrict__ row, const float* __restrict__ x, int columns, int lane,
+    int batch, float totals[Q4E_MAX_BATCH]) {
+    const __nv_bfloat16* rows[1] = {row};
+    q4e_rows_dot_bf16_batch<1>(rows, x, columns, lane, batch,
+                               reinterpret_cast<float (*)[Q4E_MAX_BATCH]>(totals));
 }
 
 // Paired BF16 row dot (gate and up sharing the same input vector x).
@@ -346,25 +395,68 @@ extern "C" __global__ void q4e_gemv_bf16(const __nv_bfloat16* __restrict__ w,
     if (batch > Q4E_MAX_BATCH) {
         return;
     }
-    for (int row = blockIdx.x * warps + warp; row < rows; row += stride) {
-        float totals[Q4E_MAX_BATCH];
-        q4e_row_dot_bf16_batch(w + (unsigned long long)row * columns, x, columns, lane, batch,
-                               totals);
+    // Two rows a warp: each activation load feeds both rows, which halves the L1 reads a weight
+    // byte costs once several tokens share the pass (eight tokens' activations are sixteen times
+    // the weight bytes). A block covers sixteen rows, so the grid's upper half has none.
+    for (int row = (blockIdx.x * warps + warp) * 2; row < rows; row += stride * 2) {
+        const bool second = row + 1 < rows;
+        const __nv_bfloat16* pair[2] = {
+            w + (unsigned long long)row * columns,
+            w + (unsigned long long)(second ? row + 1 : row) * columns};
+        float totals[2][Q4E_MAX_BATCH];
+        q4e_rows_dot_bf16_batch<2>(pair, x, columns, lane, batch, totals);
 #pragma unroll
         for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
             if (t < batch) {
-                float sum = q4e_warp_sum(totals[t]);
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
                 if (lane == 0) {
-                    y[(unsigned long long)t * rows + row] = sum;
+                    y[(unsigned long long)t * rows + row] = first_sum;
+                    if (second) {
+                        y[(unsigned long long)t * rows + row + 1] = second_sum;
+                    }
                 }
             }
         }
     }
 }
 
+// Where q4e_gemv4_bf16's row `global_row` of the four matrices stacked lands: its weight row,
+// its output, its row there and that output's row count.
+__device__ __forceinline__ void q4e_gemv4_locate(
+    int global_row, const __nv_bfloat16* __restrict__ w0, const __nv_bfloat16* __restrict__ w1,
+    const __nv_bfloat16* __restrict__ w2, const __nv_bfloat16* __restrict__ w3, float* y0,
+    float* y1, float* y2, float* y3, int r0, int r1, int r2, int r3, int columns,
+    const __nv_bfloat16** w_row, float** out, int* local_row, int* out_rows) {
+    const int r01 = r0 + r1;
+    const int r012 = r01 + r2;
+    if (global_row < r0) {
+        *local_row = global_row;
+        *out_rows = r0;
+        *w_row = w0 + (unsigned long long)*local_row * columns;
+        *out = y0;
+    } else if (global_row < r01) {
+        *local_row = global_row - r0;
+        *out_rows = r1;
+        *w_row = w1 + (unsigned long long)*local_row * columns;
+        *out = y1;
+    } else if (global_row < r012) {
+        *local_row = global_row - r01;
+        *out_rows = r2;
+        *w_row = w2 + (unsigned long long)*local_row * columns;
+        *out = y2;
+    } else {
+        *local_row = global_row - r012;
+        *out_rows = r3;
+        *w_row = w3 + (unsigned long long)*local_row * columns;
+        *out = y3;
+    }
+}
+
 // Fused four-output BF16 projection sharing the same input x ([batch, columns]):
 //   - Linear layers: (in_qkv, in_z, in_b, in_a)
 //   - Sparse layers: (q_proj, k_proj, v_proj, index_qk)
+// A batch takes two rows a warp, as q4e_gemv_bf16 does; the two may sit in different matrices.
 extern "C" __global__ void q4e_gemv4_bf16(
     const __nv_bfloat16* __restrict__ w0, const __nv_bfloat16* __restrict__ w1,
     const __nv_bfloat16* __restrict__ w2, const __nv_bfloat16* __restrict__ w3,
@@ -376,32 +468,16 @@ extern "C" __global__ void q4e_gemv4_bf16(
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
     const int stride = gridDim.x * warps;
-    const int r01 = r0 + r1;
-    const int r012 = r01 + r2;
-    const int total_rows = r012 + r3;
+    const int total_rows = r0 + r1 + r2 + r3;
     if (batch <= 1) {
         for (int global_row = blockIdx.x * warps + warp; global_row < total_rows;
              global_row += stride) {
             const __nv_bfloat16* w_row;
             float* out;
             int local_row;
-            if (global_row < r0) {
-                local_row = global_row;
-                w_row = w0 + (unsigned long long)local_row * columns;
-                out = y0;
-            } else if (global_row < r01) {
-                local_row = global_row - r0;
-                w_row = w1 + (unsigned long long)local_row * columns;
-                out = y1;
-            } else if (global_row < r012) {
-                local_row = global_row - r01;
-                w_row = w2 + (unsigned long long)local_row * columns;
-                out = y2;
-            } else {
-                local_row = global_row - r012;
-                w_row = w3 + (unsigned long long)local_row * columns;
-                out = y3;
-            }
+            int out_rows;
+            q4e_gemv4_locate(global_row, w0, w1, w2, w3, y0, y1, y2, y3, r0, r1, r2, r3, columns,
+                             &w_row, &out, &local_row, &out_rows);
             float total = q4e_row_dot_bf16(w_row, x, columns, lane);
             total = q4e_warp_sum(total);
             if (lane == 0) {
@@ -413,41 +489,29 @@ extern "C" __global__ void q4e_gemv4_bf16(
     if (batch > Q4E_MAX_BATCH) {
         return;
     }
-    for (int global_row = blockIdx.x * warps + warp; global_row < total_rows;
-         global_row += stride) {
-        const __nv_bfloat16* w_row;
-        float* out;
-        int local_row;
-        int out_rows;
-        if (global_row < r0) {
-            local_row = global_row;
-            out_rows = r0;
-            w_row = w0 + (unsigned long long)local_row * columns;
-            out = y0;
-        } else if (global_row < r01) {
-            local_row = global_row - r0;
-            out_rows = r1;
-            w_row = w1 + (unsigned long long)local_row * columns;
-            out = y1;
-        } else if (global_row < r012) {
-            local_row = global_row - r01;
-            out_rows = r2;
-            w_row = w2 + (unsigned long long)local_row * columns;
-            out = y2;
-        } else {
-            local_row = global_row - r012;
-            out_rows = r3;
-            w_row = w3 + (unsigned long long)local_row * columns;
-            out = y3;
-        }
-        float totals[Q4E_MAX_BATCH];
-        q4e_row_dot_bf16_batch(w_row, x, columns, lane, batch, totals);
+    for (int global_row = (blockIdx.x * warps + warp) * 2; global_row < total_rows;
+         global_row += stride * 2) {
+        const bool second = global_row + 1 < total_rows;
+        const __nv_bfloat16* pair[2];
+        float* out[2];
+        int local_row[2];
+        int out_rows[2];
+        q4e_gemv4_locate(global_row, w0, w1, w2, w3, y0, y1, y2, y3, r0, r1, r2, r3, columns,
+                         &pair[0], &out[0], &local_row[0], &out_rows[0]);
+        q4e_gemv4_locate(second ? global_row + 1 : global_row, w0, w1, w2, w3, y0, y1, y2, y3, r0,
+                         r1, r2, r3, columns, &pair[1], &out[1], &local_row[1], &out_rows[1]);
+        float totals[2][Q4E_MAX_BATCH];
+        q4e_rows_dot_bf16_batch<2>(pair, x, columns, lane, batch, totals);
 #pragma unroll
         for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
             if (t < batch) {
-                float sum = q4e_warp_sum(totals[t]);
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
                 if (lane == 0) {
-                    out[(unsigned long long)t * out_rows + local_row] = sum;
+                    out[0][(unsigned long long)t * out_rows[0] + local_row[0]] = first_sum;
+                    if (second) {
+                        out[1][(unsigned long long)t * out_rows[1] + local_row[1]] = second_sum;
+                    }
                 }
             }
         }
@@ -1767,14 +1831,7 @@ extern "C" __global__ void q4e_rope(float* rows, int head_dim, int rotary, int p
     // to the head so the upper half never names the next head's first element.
     const int half = (rotary < head_dim ? rotary : head_dim) / 2;
     for (int index = threadIdx.x; index < half; index += blockDim.x) {
-        float frequency = powf(theta, -2.0f * (float)index / (float)rotary);
-        float angle = position_f * frequency;
-        float cosine = __cosf(angle);
-        float sine = __sinf(angle);
-        float a = base[index];
-        float b = base[index + half];
-        base[index] = a * cosine - b * sine;
-        base[index + half] = a * sine + b * cosine;
+        q4e_rope_pair(base, base, index, half, rotary, position_f, theta);
     }
 }
 

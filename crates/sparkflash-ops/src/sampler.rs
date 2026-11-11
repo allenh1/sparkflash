@@ -50,6 +50,15 @@ pub struct Sampler {
     seed: u64,
 }
 
+/// A point in one [Sampler]'s sequence, from [Sampler::mark].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamplerMark {
+    history: usize,
+    prompt_len: usize,
+    draws: u64,
+    seed: u64,
+}
+
 impl Sampler {
     /// A sampler for a sequence that has consumed nothing yet.
     #[must_use]
@@ -83,11 +92,33 @@ impl Sampler {
         self.prompt_len = self.prompt_len.min(len);
     }
 
+    /// Where the sequence stands: [Self::rewind] returns it here, history and draw state alike.
+    #[must_use]
+    pub fn mark(&self) -> SamplerMark {
+        SamplerMark {
+            history: self.history.len(),
+            prompt_len: self.prompt_len,
+            draws: self.draws,
+            seed: self.seed,
+        }
+    }
+
+    /// Return to `mark`, taken earlier on this sequence: the tokens recorded and the draws made
+    /// since are forgotten, so the next choice is the one that would have followed the mark.
+    /// A speculative step chosen on a guessed token is undone this way when the guess was wrong.
+    pub fn rewind(&mut self, mark: SamplerMark) {
+        self.history.truncate(mark.history);
+        self.prompt_len = mark.prompt_len;
+        self.draws = mark.draws;
+        self.seed = mark.seed;
+    }
+
     /// Reset the history for a new request on the same session.
     pub fn reset(&mut self) {
         self.history.clear();
         self.prompt_len = 0;
         self.draws = 0;
+        self.seed = 0;
     }
 
     /// Choose the next token from one logits row.
@@ -378,6 +409,57 @@ mod tests {
         // A flat row over six tokens drawing only one id sixteen times would be a broken draw.
         let distinct: std::collections::BTreeSet<u32> = left.iter().copied().collect();
         assert!(distinct.len() > 1, "the draw never moved: {distinct:?}");
+    }
+
+    #[test]
+    fn reset_clears_a_previous_seed() {
+        let logits = [0.0f32, 0.1, 0.2, 0.0, 0.1, 0.3];
+        let mut seeded = sampling(1.0);
+        seeded.seed = 99;
+        let mut recycled = Sampler::new();
+        let _ = recycled.choose(&logits, &seeded);
+        recycled.reset();
+        let mut fresh = Sampler::new();
+        let unseeded = sampling(1.0);
+        let left: Vec<u32> = (0..8)
+            .map(|_| recycled.choose(&logits, &unseeded))
+            .collect();
+        let right: Vec<u32> = (0..8).map(|_| fresh.choose(&logits, &unseeded)).collect();
+        assert_eq!(left, right, "reset must return to a fresh unseeded stream");
+    }
+
+    #[test]
+    fn a_rewind_undoes_the_tokens_and_draws_after_its_mark() {
+        let logits = [0.0f32, 0.1, 0.2, 0.0, 0.1, 0.3];
+        let mut request = sampling(1.0);
+        request.seed = 7;
+        request.repetition_penalty = 1.3;
+        let mut sampler = Sampler::new();
+        sampler.record_prompt(&[1, 2]);
+        let mark = sampler.mark();
+        let straight: Vec<u32> = (0..8)
+            .map(|_| {
+                let token = sampler.choose(&logits, &request);
+                sampler.record(token);
+                token
+            })
+            .collect();
+        sampler.rewind(mark);
+        assert_eq!(sampler.history(), &[1, 2]);
+        // A wrong path chosen and recorded, then undone, leaves no trace on the right one.
+        for token in [5, 4, 3] {
+            sampler.record(token);
+            let _ = sampler.choose(&logits, &request);
+        }
+        sampler.rewind(mark);
+        let again: Vec<u32> = (0..8)
+            .map(|_| {
+                let token = sampler.choose(&logits, &request);
+                sampler.record(token);
+                token
+            })
+            .collect();
+        assert_eq!(straight, again);
     }
 
     #[test]
