@@ -10925,7 +10925,11 @@ struct ProjectionShape {
     inner: u32,
 }
 
+/// What the last `index_pack_verify` read: owner, p0, n_max, the layer that packed, and the two
+/// hashes of the chunk it packed. Named because the field's inline type is a six-tuple.
 #[cfg(feature = "cuda")]
+type PackVerifyRead = (usize, usize, usize, usize, u64, u64);
+
 /// The device-only layer of the lean decode loop.
 ///
 /// See [`crate::layer_device`] for the contract. The spans are one device allocation carved by
@@ -10938,6 +10942,7 @@ struct ProjectionShape {
 /// are still being landed by other slices (the reference seam, the attention block, the residual,
 /// the MoE indexer and the epilogue) refuse by name with their ABI inline
 /// ([crate::layer_device::not_landed]) instead of falling back to the host arm.
+#[cfg(feature = "cuda")]
 struct DeviceLayer<'a> {
     cuda: &'a Cuda,
     buffers: crate::layer_device::LayerBuffers,
@@ -11209,6 +11214,10 @@ struct DeviceLayer<'a> {
     seam_staged: Option<SeamStagedWeights>,
     /// The per-position compressor ring the ratio>0 reference_seam body appends to and pools from.
     seam_ring: Option<SeamRing>,
+    /// The last `index_pack_verify` read: `(owner, p0, n_max, layer, head, tail)`, for the
+    /// `repeat_of=` field that answers "do the owner's five packs write the same bytes?" in one
+    /// run instead of a hand diff of five log lines.
+    index_verify_last: std::cell::Cell<Option<PackVerifyRead>>,
     /// True when this position's ratio>0 layer takes part in compression without producing a cache
     /// row (it is not a kv source). Set by `reference_seam`, read by `ref_select`: such a layer's seam
     /// is the window alone, exactly the ratio-0 seam, and its id list is empty.
@@ -12430,6 +12439,7 @@ impl<'a> DeviceLayer<'a> {
             engram: None,
             seam_staged: None,
             seam_ring: None,
+            index_verify_last: std::cell::Cell::new(None),
             seam_kernels: None,
             seam_window_only: false,
             seam_rows_prepared: false,
@@ -13582,7 +13592,8 @@ impl<'a> DeviceLayer<'a> {
     /// touches device memory only.
     fn attach_moe_routed(&mut self) -> Result<(), String> {
         use sparkflash_kernels::moe_routed_device::{
-            ExpertPointerTable, MoeRoutedDevice, MoeRoutedGeometry, MoeRoutedPlan,
+            ExpertPointerTable, MoeRoutedDevice, MoeRoutedGeometry, MoeRoutedOptions,
+            MoeRoutedPlan, moe_dedup_from, plan_in_cta_from, plan_stats_from,
         };
         if self.moe_routed_device.is_some() {
             return Err("layer device routed data path: attached twice".to_owned());
@@ -13630,7 +13641,14 @@ impl<'a> DeviceLayer<'a> {
             geometry.top_k * rows::R_MAX,
             self.swiglu_limit,
         )?;
-        let mut device = MoeRoutedDevice::open(self.cuda, plan, &table, kernels)?;
+        // The routed MoE's two build switches, from the typed profile this process booted with.
+        let profile = sparkflash_model::active_profile();
+        let options = MoeRoutedOptions {
+            plan_in_cta: plan_in_cta_from(profile.diagnostics.moe_plan_in_cta.as_deref()),
+            plan_stats: plan_stats_from(profile.diagnostics.moe_plan_stats.as_deref()),
+            dedup: moe_dedup_from(profile.diagnostics.moe_dedup.as_deref()),
+        };
+        let mut device = MoeRoutedDevice::open(self.cuda, plan, &table, kernels, options)?;
         device.set_opt(self.moe_opt_kernels);
         self.moe_routed_device = Some(device);
         Ok(())
@@ -19439,6 +19457,82 @@ pub fn expected_argv_fragment() -> &'static str {
 mod tests {
     use super::*;
     use crate::tp4_combine::{CombineKernelSet, PRE_ADDED_COMBINE_KERNEL, STORED_COMBINE_KERNEL};
+
+    /// WS4's dump switch names exactly one layer, and anything that is not a layer number dumps
+    /// nothing: the point of the instrument is one step's routing, not a log a decode tick.
+    /// The two measured step points a linear cost model has to fit, pinned where the constant it
+    /// indicts is defined (docs/performance.md, issue #20 WS4): a c1 step of six verified rows took
+    /// 38 ms and a c16 step of 64 rows 147 ms.
+    ///
+    /// It is ignored because the engine's 4 ms a row does not fit them - 27 + 4 x 6 = 51 against the
+    /// measured 38 - and the replacement (a shape-dependent floor plus a marginal-expert term) needs
+    /// its own A/B. Run `cargo test -p sparkflash-deepseek-forward -- --ignored` to see the gap.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "the 4 ms a row is 2.1x the marginal a measured step pays; WS4's A/B decides the model"]
+    fn the_step_cost_fits_the_two_measured_points() {
+        let slope = (147.0 - 38.0) / (64.0 - 6.0);
+        let intercept = 38.0 - slope * 6.0;
+        for (depth, measured) in [(6usize, 38.0f64), (64, 147.0)] {
+            let modelled = super::spec::STEP_COST.ms(depth);
+            assert!(
+                (modelled - measured).abs() <= 0.15 * measured,
+                "a step of {depth} rows is modelled at {modelled:.1} ms against {measured:.1} measured, where the measured line is {intercept:.1} + {slope:.2} a row",
+            );
+        }
+    }
+    /// WS4's override takes a non-negative number and nothing else, so a typo cannot silently make
+    /// the depth policy charge a negative row.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_row_cost_override_takes_a_non_negative_number() {
+        use super::spec::row_cost_ms_from;
+        assert_eq!(
+            row_cost_ms_from(None),
+            None,
+            "unset keeps the engine's 4 ms"
+        );
+        assert_eq!(row_cost_ms_from(Some("")), None);
+        assert_eq!(row_cost_ms_from(Some("fast")), None);
+        assert_eq!(
+            row_cost_ms_from(Some("-1")),
+            None,
+            "a negative row is refused"
+        );
+        assert_eq!(row_cost_ms_from(Some("nan")), None);
+        assert_eq!(row_cost_ms_from(Some("0.75")), Some(0.75));
+        assert_eq!(row_cost_ms_from(Some(" 2 ")), Some(2.0), "trimmed");
+    }
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_moe_ids_dump_names_one_layer() {
+        use super::rows::{moe_ids_dump_layer_from, moe_ids_dumpable};
+        // A c1 step installs no segment table, so its segments are empty; it must still dump.
+        // A one-row step must not.
+        assert!(moe_ids_dumpable(1, 2), "a single-stream step dumps");
+        assert!(
+            moe_ids_dumpable(0, 2),
+            "a lone sequence's step has no segments and still dumps"
+        );
+        assert!(!moe_ids_dumpable(0, 1), "one row is not a step");
+        assert_eq!(moe_ids_dump_layer_from(None), None, "unset dumps nothing");
+        assert_eq!(
+            moe_ids_dump_layer_from(Some("")),
+            None,
+            "empty dumps nothing"
+        );
+        assert_eq!(
+            moe_ids_dump_layer_from(Some("on")),
+            None,
+            "a word is not a layer"
+        );
+        assert_eq!(
+            moe_ids_dump_layer_from(Some("0")),
+            Some(0),
+            "layer 0 is a layer"
+        );
+        assert_eq!(moe_ids_dump_layer_from(Some(" 14 ")), Some(14), "trimmed");
+    }
 
     #[test]
     fn forward_perf_defaults_to_off() {

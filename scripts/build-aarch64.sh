@@ -95,6 +95,22 @@ done
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# ----- 0. the CUDA toolkit: this script builds the binary the nodes run ---------------------
+# Why this refuses instead of warning: sparkflash-kernels' build.rs compiles every model image
+# with nvcc and points the model crates at the cubins it produced. With no nvcc on PATH it still
+# succeeds, printing one cargo:warning, and the binary it yields has no embedded images. On the
+# cluster that binary cannot take the device path: bring-up falls into the host twin's C3
+# collective walk and deadlocks (2026-11-10: all four ranks stuck at layer 16, one core
+# spinning), with a stack that blames the TCP transport rather than the build. Nothing else in
+# the workspace needs the toolkit - a CPU-only cargo test is expected to work without it - so
+# the check belongs here, on the one command that produces a deployable binary.
+toolkit="${SPARKFLASH_NVCC:-}"
+[ -n "$toolkit" ] || toolkit="$(command -v nvcc || true)"
+[ -n "$toolkit" ] && [ -x "$toolkit" ] || die "no nvcc: set SPARKFLASH_NVCC=/path/to/nvcc or put the
+       toolkit bin on PATH. Without it this build produces a binary with no embedded cubins, which
+       cannot serve on the device - it deadlocks at bring-up in the host twin collective walk."
+say "cuda toolkit: $toolkit ($("$toolkit" --version | tail -1 | sed 's/^ *//'))"
+
 # ----- 1. rustup, pinned, user-local -------------------------------------------------------------
 if [ ! -x "$RUSTUP" ]; then
   say "installing rustup under $HOME (no PATH changes, minimal profile, $RUST_VERSION)"

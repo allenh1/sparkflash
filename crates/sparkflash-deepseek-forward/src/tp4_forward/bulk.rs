@@ -30,6 +30,306 @@ use sparkflash_kernels::hostw_gemv_launch::Mode;
 use sparkflash_kernels::moe_routed_device::{BulkRows, MoeBulk};
 use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 
+/// Whether [Self::bulk_index] appends the completed key positions to the persistent fragment-order
+/// store instead of re-packing the whole history, read from `SPARKFLASH_INDEX_PACK_APPEND`.
+///
+/// **On by default. `SPARKFLASH_INDEX_PACK_APPEND=0` restores the full re-pack**, which is also the
+/// A/B arm. The pack kernel's addressing is on the append's side - its fragment address is a function
+/// of the absolute key index from a multiple of eight, which `index_pack_start` guarantees - and the
+/// saving is 3.1x at 7,538 tokens, 4.0x at 30,246 and 3.4x at 60,488, with three identical requests
+/// an arm returning the re-pack's own sha at every length (`d12c925e`, `4fdfb215`, `f87f6de6`).
+///
+/// It took three fixes to get there, and each was found by the next prompt length: the packed scratch
+/// had to be one slot per kv-source owner (`BulkState::k_codes`), and the watermark and the repeat
+/// memory had to live on the chunk state rather than on the layer the several chunk states share
+/// (`BulkState::index_packed`). The arm that disagreed looked *better* (6.9x at 30,246) because a
+/// shared watermark was skipping packs it should not have.
+///
+/// **What the default can and cannot touch.** `bulk_index` is reached only through
+/// `bulk_seam_select`, whose call site filters on `n > R_MAX`, so a decode or verify step never packs
+/// and this switch cannot reach one. A prefill's *first* chunk starts at position zero (or at the
+/// resumed prefix), where the scheduler calls `BulkState::reset_index` and `index_pack_have`
+/// returns nothing to trust, so it packs every key it has - exactly the bytes the re-pack arm would
+/// write. Only the chunks after it in one prefill append, which is what the four measured arms
+/// are.
+#[must_use]
+fn index_pack_append_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// [index_pack_append_from] over the profile (`prefill.index_pack_append`).
+#[must_use]
+fn index_pack_append() -> bool {
+    index_pack_append_from(
+        sparkflash_model::active_profile()
+            .prefill
+            .index_pack_append
+            .as_deref(),
+    )
+}
+
+/// Whether [Self::bulk_index] prints the bytes it asks the pack kernel for, read from
+/// `SPARKFLASH_INDEX_PACK_LOG`.
+///
+/// This is issue #20 WS2's real gate: the packed bytes a chunk costs must be constant in `p0`, not
+/// merely smaller, so the number has to be printed at several prompt lengths rather than inferred
+/// from a rate.
+#[must_use]
+fn index_pack_log_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// [index_pack_log_from] over the profile (`prefill.index_pack_log`).
+#[must_use]
+fn index_pack_log() -> bool {
+    index_pack_log_from(
+        sparkflash_model::active_profile()
+            .prefill
+            .index_pack_log
+            .as_deref(),
+    )
+}
+
+/// Whether this call would pack exactly what the previous call at the same boundary packed.
+///
+/// The index-source layers do not map one-to-one onto kv-source owners: of the eight in a decoder
+/// chunk, five are owner 3 (`owner_list=[0,1,2,3,3,3,3,3]`), so five consecutive calls run the pack
+/// kernel over what looks like the same source range into the same destination.
+///
+/// **The first version of the skip moved the text, and the cause was the memory, not the pack.**
+/// With the dedupe on, two consecutive warm requests on one prompt returned `418f6a1e…` then
+/// `a6461b79…` (and at 30,246 tokens three different texts in three requests), where the same binary
+/// with it off reproduced `418f6a1e…` three times. The checksum probe then showed the five calls
+/// packing identical bytes: the boundary `(p0, n_max)` is a property of the prompt, so a repeat
+/// memory that outlived its chunk matched the next request's walk and skipped packs it had not run.
+/// `pack_scope_is_new` scopes it to one chunk pass; the append's own divergence was the same shape
+/// one level up (the store and its watermark outliving the sequence, see `index_pack_have`).
+#[must_use]
+fn index_pack_repeated(
+    last: Option<(u64, usize, usize)>,
+    seq: Option<u64>,
+    p0: usize,
+    n_max: usize,
+) -> bool {
+    match (last, seq) {
+        (Some((packed_for, p0_at, n_at)), Some(seq)) => {
+            packed_for == seq && p0_at == p0 && n_at == n_max
+        }
+        _ => false,
+    }
+}
+
+/// Whether the chunk now being indexed is a different one from the chunk the repeat memory belongs
+/// to, in which case that memory must be dropped before any pack is skipped.
+///
+/// **This is the half `index_pack_repeated` was missing.** The boundary `(p0, n_max)` is a property
+/// of the prompt, not of the call, so a second request over the same prompt walks the same
+/// boundaries as the first, and a memory that survives the chunk compares a repeat across requests.
+/// Run 20261111T161121Z caught it: on the third of three identical 7,538-token requests, layers 2, 8
+/// and 14 (owners 0, 1, 2) reported `packed=false` and the verify probe read owner 3's bytes
+/// (`head=d70dceb3511ea7a1`) out of the scratch they had not written - they scored against the
+/// previous request's keys, and the text moved where the first two requests had agreed.
+///
+/// The only genuine repeat is the five index layers that share one owner *inside one chunk pass*:
+/// with the scope cleared, the earlier call that set `(p0, n_max)` is necessarily one of them, and a
+/// run with the checksum on shows those five packing identical bytes.
+#[must_use]
+fn pack_scope_is_new(
+    scope: Option<(usize, usize, usize)>,
+    layer: usize,
+    p0: usize,
+    n: usize,
+) -> bool {
+    match scope {
+        // The same chunk, and a layer later in the same walk: the only shape a real repeat has.
+        Some((p0_at, n_at, last)) => p0_at != p0 || n_at != n || layer <= last,
+        None => true,
+    }
+}
+
+/// Whether [Self::bulk_index] skips what looks like a repeated pack at the same boundary, read from
+/// `SPARKFLASH_INDEX_PACK_DEDUPE`.
+///
+/// **Off by default until its fixed arm has a device A/B.** It was measured to change the text
+/// (d14fcf8a), and the cause has since been found and fixed: not the skip - the five owner-3 layers
+/// pack identical bytes, measured - but the repeat memory outliving the chunk, so a second request
+/// over one prompt skipped packs and scored the previous request's keys. [pack_scope_is_new] now
+/// scopes that memory to one chunk pass, and the checksum probe is how the fix is checked: the
+/// owner-sharing layers must print `packed=false` with the first one's bytes, and no layer of
+/// another owner may ever print `packed=false`.
+#[must_use]
+fn index_pack_dedupe_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// [index_pack_dedupe_from] over the profile (`prefill.index_pack_dedupe`).
+#[must_use]
+fn index_pack_dedupe() -> bool {
+    index_pack_dedupe_from(
+        sparkflash_model::active_profile()
+            .prefill
+            .index_pack_dedupe
+            .as_deref(),
+    )
+}
+
+/// Whether [Self::bulk_index] hashes the packed store after each pack, read from
+/// `SPARKFLASH_INDEX_PACK_VERIFY`. A synchronising copy, so it is not part of the byte log.
+#[must_use]
+fn index_pack_verify_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// [index_pack_verify_from] over the profile (`prefill.index_pack_verify`).
+#[must_use]
+fn index_pack_verify() -> bool {
+    index_pack_verify_from(
+        sparkflash_model::active_profile()
+            .prefill
+            .index_pack_verify
+            .as_deref(),
+    )
+}
+
+/// The watermark a chunk may trust: zero unless the store was packed by *this* sequence and the
+/// chunk continues the pack that sequence left.
+///
+/// The watermark lives on the chunk state, and one state serves every sequence of a serving epoch
+/// (and every resumed sequence, whose first chunk starts at a nonzero `p0`), so a bare position is
+/// not enough to identify what the store holds. The checkpoint records the sequence it packed for,
+/// and a chunk appends only when that sequence is its own *and* its `p0` is the token end the pack
+/// reached (the watermark counts compressed positions, so a contiguous chunk starts at
+/// `watermark * ratio`).
+///
+/// Both halves are load-bearing. Without the position check, a resumed sequence at a boundary its
+/// host happened to reach would append onto the host's keys. Without the identity check, two
+/// interleaved prefills do it: A packs to 4,096 tokens, B (a 4,096-token prompt) is placed and
+/// packs its own keys, then A's next chunk at `p0 = 4,096` passes `p0 == watermark * ratio` and
+/// appends only its tail - the head stays B's, and A's queries are scored against B's keys with no
+/// error and no refusal. `BulkState::reset_index` clears both on placement, and
+/// `BulkState::set_index_seq` clears them when another sequence takes the state.
+#[must_use]
+fn index_pack_have(
+    have: Option<(u64, usize)>,
+    seq: Option<u64>,
+    p0: usize,
+    n_max: usize,
+    ratio: usize,
+) -> usize {
+    match (have, seq) {
+        (Some((packed_for, watermark)), Some(seq))
+            if packed_for == seq && p0 != 0 && n_max >= watermark && p0 == watermark * ratio =>
+        {
+            watermark
+        }
+        _ => 0,
+    }
+}
+
+/// The key positions an append from `have` must start at: `have` rounded down to the fragment
+/// layout's super-block.
+///
+/// The pack kernel's `frag = 1` address is `(key >> 3) * 512 + (key & 7) * 64 + c * 4`, which is a
+/// function of the absolute key index only while the first key of a launch is a multiple of eight —
+/// the layout groups eight keys into 512 bytes, and `key >> 3` does not decompose linearly
+/// otherwise. So an append re-packs up to seven positions it already packed, which is idempotent and
+/// keeps the addressing exact. The chunk boundaries make this a no-op today (a 128-token chunk at
+/// ratio 4 is 32 keys and at ratio 1 is 128), and the rounding is what makes that a fact about the
+/// code rather than about the scheduler.
+#[must_use]
+fn index_pack_start(have: usize) -> usize {
+    have - have % 8
+}
+
+/// What one layer's call at `(p0, n_max)` does to the packed-key store and its bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexPack {
+    /// The dedupe arm skips this call: an earlier layer of the same chunk packed the same bytes.
+    repeated: bool,
+    /// The watermark the call may trust (zero means the call packs the whole history).
+    have: usize,
+    /// Where the pack starts, rounded to the layout's eight-key super-block.
+    start: usize,
+    /// Key positions the call asks the kernel for.
+    appended: usize,
+    /// The watermark the owner holds after the call.
+    watermark: Option<(u64, usize)>,
+    /// The boundary the owner last packed at after the call.
+    at: Option<(u64, usize, usize)>,
+}
+
+/// One layer's pack call: the chunk's boundary and the two switches that shape it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackCall {
+    /// The chunk's first token position.
+    p0: usize,
+    /// The compressed key positions the chunk reaches.
+    n_max: usize,
+    /// The model's compress ratio.
+    ratio: usize,
+    /// `prefill.index_pack_append`.
+    append: bool,
+    /// `prefill.index_pack_dedupe`.
+    dedupe: bool,
+}
+
+/// Decides one layer's pack from the stored watermark, the repeat memory and this call's boundary.
+///
+/// A skip changes nothing: the earlier owner-sharing layer in the same chunk pass already wrote
+/// those bytes and set the watermark, so clearing it here would cost the *next* chunk of a deduped
+/// run its append (the two switches must compose).
+#[must_use]
+fn index_pack_plan(
+    stored: Option<(u64, usize)>,
+    at: Option<(u64, usize, usize)>,
+    seq: Option<u64>,
+    call: PackCall,
+) -> IndexPack {
+    let PackCall {
+        p0,
+        n_max,
+        ratio,
+        append,
+        dedupe,
+    } = call;
+    let repeated = dedupe && index_pack_repeated(at, seq, p0, n_max);
+    let have = if append && !repeated {
+        index_pack_have(stored, seq, p0, n_max, ratio)
+    } else {
+        0
+    };
+    let start = index_pack_start(have);
+    let appended = if repeated {
+        0
+    } else {
+        n_max.saturating_sub(start)
+    };
+    let latest = seq.map(|seq| (seq, p0, n_max));
+    IndexPack {
+        repeated,
+        have,
+        start,
+        appended,
+        watermark: if repeated {
+            stored
+        } else {
+            seq.map(|seq| (seq, n_max))
+        },
+        at: if repeated { at } else { latest },
+    }
+}
+
+/// The byte offsets an append starting at `have` writes to, from the store's base: the codes and the
+/// scales.
+///
+/// One key is `index_dim` values at four bits, so `index_dim / 2` code bytes, and
+/// `index_dim / 32` scale bytes.
+#[must_use]
+fn index_pack_offsets(have: usize, index_dim: usize) -> (usize, usize) {
+    let first_block = have * index_dim / 32;
+    (first_block * 16, first_block)
+}
+
 /// The indexer scores buffer, in bf16 scores: a chunk whose rows times compressed positions exceed
 /// it is scored and selected in row slices.
 const SCORE_ENTRIES: usize = 64 << 20;
@@ -196,10 +496,40 @@ pub(super) struct BulkState {
     /// The rows' index queries as packed E2M1 codes (two per byte) and ue8m0 scales.
     q_codes: u64,
     q_scales: u64,
-    /// The owner's index keys as packed E2M1 codes in MMA fragment order (opt_bulk_fp4_pack) and
-    /// scales, `max_positions` keys.
-    k_codes: u64,
-    k_scales: u64,
+    /// Each kv-source owner's index keys as packed E2M1 codes in MMA fragment order
+    /// (opt_bulk_fp4_pack) and scales, `max_positions` keys a slot.
+    ///
+    /// **A slot per owner, because the append arm writes only the tail.** The four owners pack into
+    /// this scratch in turn - 0, 1, 2, then 3 five times - and a full re-pack rewrites the whole
+    /// buffer every time, so one buffer served them all. The append packs only
+    /// `[start, n_max)` and leaves `[0, start)` as it found it, which with one buffer is the
+    /// *previous owner's* keys: measured, 102,184 blocks against the re-pack's 705,512 (6.9x fewer)
+    /// and three requests returning `ce2136e8`, `8e50040f`, `8e50040f` where the re-pack returns
+    /// `d12c925e` three times. **A slot per owner fixed that at 7,538 tokens but was not the whole
+    /// story**: at 30,246 tokens the append arm reproduced itself (`b476c13c` three times) and
+    /// differed from the re-pack arm (`4fdfb215` three times), because the store outlived its
+    /// sequence. The per-sequence reset and the continuity check close that; the append is the
+    /// default and reproduces the re-pack's text.
+    k_codes: Vec<u64>,
+    k_scales: Vec<u64>,
+    /// How many compressed key positions each kv-source owner has already packed into this chunk
+    /// state's scratch, one per `kv_source_layers` entry.
+    ///
+    /// **Per chunk state, not per layer.** A prefill runs several bulk states at once (three by
+    /// default), each with its own `k_codes`/`k_scales`, and a watermark kept on the layer is shared
+    /// between them: the second state is told a position is packed when what was packed is in the
+    /// first state's buffer. That is the divergence the 30,246-token append arm measures.
+    /// `(sequence, compressed key positions packed for it)` per kv-source owner. The sequence is
+    /// part of the record because a position alone does not say *whose* keys the store holds (see
+    /// `index_pack_have`).
+    pub(super) index_packed: std::cell::RefCell<Vec<Option<(u64, usize)>>>,
+    /// The `(sequence, p0, n_max)` each owner last packed at in this state, for the repeat check.
+    pub(super) index_packed_at: std::cell::RefCell<Vec<Option<(u64, usize, usize)>>>,
+    /// The `(p0, n, layer)` of the walk `index_packed_at` belongs to (see `pack_scope_is_new`).
+    pub(super) index_pack_scope: std::cell::Cell<Option<(usize, usize, usize)>>,
+    /// The sequence `index_packed` and `index_packed_at` are about; `None` before the first
+    /// placement. Set by `set_index_seq`, which clears the three when it changes.
+    pub(super) index_seq: std::cell::Cell<Option<u64>>,
     scores: u64,
     /// opt_select_rows' scratch, `select_words` u32 per block: a row's keys and chosen flags
     /// past the shared-memory table (n + n / 4 words for n compressed positions).
@@ -338,6 +668,8 @@ impl BulkState {
             }
         };
         let ring_rows = cap + 16;
+        // One packed-key slot per kv-source owner: the append arm must leave the head its own.
+        let owners = device.kv_source_layers.len();
         // A row reaches at most max_positions compressed positions (ratio 1).
         let select_words = device.max_positions + device.max_positions.div_ceil(4);
         let engram_staging = match device.engram_staging(cap)? {
@@ -378,8 +710,16 @@ impl BulkState {
             wk_bf16: alloc(cap * index_dim * 2)?,
             q_codes: alloc(cap * index_cols)?,
             q_scales: alloc(cap * index_cols / 32)?,
-            k_codes: alloc(device.max_positions * index_dim)?,
-            k_scales: alloc(device.max_positions * index_dim / 32)?,
+            k_codes: (0..owners)
+                .map(|_| alloc(device.max_positions * index_dim / 2))
+                .collect::<Result<Vec<_>, String>>()?,
+            k_scales: (0..owners)
+                .map(|_| alloc(device.max_positions * index_dim / 32))
+                .collect::<Result<Vec<_>, String>>()?,
+            index_packed: std::cell::RefCell::new(vec![None; owners]),
+            index_packed_at: std::cell::RefCell::new(vec![None; owners]),
+            index_pack_scope: std::cell::Cell::new(None),
+            index_seq: std::cell::Cell::new(None),
             scores: alloc(SCORE_ENTRIES * 2)?,
             select_scratch: alloc(SELECT_BLOCKS * select_words * 4)?,
             select_words,
@@ -404,6 +744,40 @@ impl BulkState {
             .chain(&self.engram_live)
         {
             cuda.free_host_mapped(pinned);
+        }
+    }
+
+    /// Forgets the packed-key store when a new sequence is placed on this chunk state.
+    ///
+    /// The store holds only the most recent sequence's keys, and a sequence can start at a
+    /// nonzero position (a resumed prefix, or a lane reused by a later request). `p0` alone
+    /// cannot tell that first chunk apart from the previous sequence's continuation, so the
+    /// scheduler clears both the positions and the identity where it chooses a sequence.
+    /// [Self::set_index_seq] then covers the other half: chunks of different sequences that
+    /// interleave through the state, including one that resumes exactly at another's boundary.
+    pub(super) fn reset_index(&self) {
+        for at in self.index_packed.borrow_mut().iter_mut() {
+            *at = None;
+        }
+        for at in self.index_packed_at.borrow_mut().iter_mut() {
+            *at = None;
+        }
+        self.index_pack_scope.set(None);
+        self.index_seq.set(None);
+    }
+
+    /// Names the sequence the packed-key store now belongs to, forgetting the previous one's when
+    /// it changes.
+    ///
+    /// The scheduler calls this at the start of every bulk chunk: a chunk state is shared by every
+    /// sequence of a serving epoch, and interleaved prefills walk through it in turn. The identity
+    /// is what lets `index_pack_have` tell "my own earlier chunk" from "another request's keys at
+    /// the position I am about to resume at"; without it a shorter prompt's pack at the boundary a
+    /// longer prompt had reached is mistaken for the longer prompt's own.
+    pub(super) fn set_index_seq(&self, seq: u64) {
+        if self.index_seq.get() != Some(seq) {
+            self.reset_index();
+            self.index_seq.set(Some(seq));
         }
     }
 
@@ -860,13 +1234,118 @@ impl DeviceLayer<'_> {
             n * index_cols / 32,
             0,
         )?;
-        pack(
-            ring.index_keys.0 + (owner * self.max_positions * index_dim * 4) as u64,
-            bulk.k_codes,
-            bulk.k_scales,
-            n_max * index_dim / 32,
-            1,
-        )?;
+        // The keys, packed from the persistent f32 store into MMA fragment order.
+        //
+        // The store is keyed by kv-source owner (four slots) and written by the index-source layers
+        // (eight), so the five that map to owner 3 write one slot. They write the *same* bytes: the
+        // checksum probe (`index_pack_verify`) reads layers 20, 24, 28, 32 and 36 packing identical
+        // head and tail at one boundary, because the keys are a function of the owner's compressed
+        // latent and the owner's indexer, not of the layer that triggers them. A skip is therefore
+        // byte-safe, and the skipped call leaves the scratch holding what the pack would have
+        // written.
+        //
+        // What is *not* safe is a memory of the boundary that outlives the chunk: `(p0, n_max)` is a
+        // property of the prompt, so the next request over the same prompt reproduces it, and a
+        // surviving entry made layers 2, 8 and 14 skip and score owner 3's keys (run
+        // 20261111T161121Z). `pack_scope_is_new` clears the memory whenever the chunk changes.
+        // A repeat is only a repeat inside one chunk pass: the boundary is a property of the prompt,
+        // so the next request over the same prompt walks the same boundaries and must not inherit
+        // this chunk's memory (see `pack_scope_is_new`).
+        // The bookkeeping lives on the chunk state, not on the layer: a prefill runs several bulk
+        // states at once (three by default), each with its own packed scratch. A watermark shared
+        // between them hands the second state a position the first packed into a *different*
+        // buffer, so the head it does not rewrite is empty or stale - which is what the
+        // 30,246-token arm measures (see `BulkState::index_packed`).
+        if pack_scope_is_new(bulk.index_pack_scope.get(), layer, p0, n) {
+            bulk.index_pack_scope.set(Some((p0, n, layer)));
+            for at in bulk.index_packed_at.borrow_mut().iter_mut() {
+                *at = None;
+            }
+        }
+        let seq = bulk.index_seq.get();
+        let plan = index_pack_plan(
+            bulk.index_packed.borrow()[owner],
+            bulk.index_packed_at.borrow()[owner],
+            seq,
+            PackCall {
+                p0,
+                n_max,
+                ratio,
+                append: index_pack_append(),
+                dedupe: index_pack_dedupe(),
+            },
+        );
+        let (start, appended) = (plan.start, plan.appended);
+        if appended > 0 {
+            let (codes_offset, scales_offset) = index_pack_offsets(start, index_dim);
+            pack(
+                ring.index_keys.0 + ((owner * self.max_positions + start) * index_dim * 4) as u64,
+                bulk.k_codes[owner] + codes_offset as u64,
+                bulk.k_scales[owner] + scales_offset as u64,
+                appended * index_dim / 32,
+                1,
+            )?;
+        }
+        // A skip leaves the record the earlier owner-sharing layer set, so the next chunk of a
+        // deduped run still appends.
+        bulk.index_packed.borrow_mut()[owner] = plan.watermark;
+        bulk.index_packed_at.borrow_mut()[owner] = plan.at;
+        debug_assert_eq!(start % 8, 0, "an append starts on the layout's super-block");
+        if index_pack_verify() {
+            // Is a shared owner a repeated pack? A hash of the packed chunk's first kilobyte and of
+            // its last, compared against the previous call at the same `(owner, p0, n_max)`, answers
+            // it inside one run: `repeat_of=… same` would mean the five owner-3 index layers pack
+            // identical bytes (and the skip is sound), `diff` means each layer packs its own
+            // projection and the skip / append watermark is not. It costs a synchronising copy, so it
+            // is a separate switch from the byte log.
+            let words = (n_max * index_dim / 2).min(1024) as u64;
+            let mut head = vec![0u8; words as usize];
+            self.cuda
+                .copy_dtoh(&mut head, &Deviceptr(bulk.k_codes[owner]))
+                .map_err(|error| refusal(&format!("verify head: {error}")))?;
+            let mut tail = vec![0u8; words as usize];
+            let last = (n_max * index_dim / 2).saturating_sub(words as usize) as u64;
+            self.cuda
+                .copy_dtoh(&mut tail, &Deviceptr(bulk.k_codes[owner] + last))
+                .map_err(|error| refusal(&format!("verify tail: {error}")))?;
+            let sum = |bytes: &[u8]| -> u64 {
+                bytes.as_chunks::<8>().0.iter().fold(0u64, |acc, word| {
+                    acc.rotate_left(5) ^ u64::from_le_bytes(*word)
+                })
+            };
+            let (head, tail) = (sum(&head), sum(&tail));
+            let repeat = self
+                .index_verify_last
+                .get()
+                .filter(|&(o, p, m, _, _, _)| (o, p, m) == (owner, p0, n_max))
+                .map_or_else(
+                    || "first".to_owned(),
+                    |(_, _, _, prev, head0, tail0)| {
+                        let verdict = if (head0, tail0) == (head, tail) {
+                            "same"
+                        } else {
+                            "diff"
+                        };
+                        format!("layer={prev} {verdict}")
+                    },
+                );
+            self.index_verify_last
+                .set(Some((owner, p0, n_max, layer, head, tail)));
+            println!(
+                "sparkflash serve: index_pack_verify layer={layer} owner={owner} p0={p0} n_max={n_max} packed={} head={head:016x} tail={tail:016x} repeat_of={repeat}",
+                appended > 0,
+            );
+        }
+        if index_pack_log() {
+            // The issue's real gate for this workstream: the bytes the pack kernel is asked for, per
+            // chunk, at increasing prompt lengths. O(history) shows up as a number that grows with
+            // p0; an append shows up as a number that does not.
+            println!(
+                "sparkflash serve: index_pack layer={layer} owner={owner} p0={p0} n={n} keys={} blocks={} appended_keys={appended}",
+                n_max,
+                appended * index_dim / 32,
+            );
+        }
         let mask_mode = match layer.cmp(&self.candidate_source_layer) {
             std::cmp::Ordering::Less => 0u64,
             std::cmp::Ordering::Equal => 2,
@@ -892,8 +1371,8 @@ impl DeviceLayer<'_> {
                     &[
                         bulk.q_codes + (y0 * index_cols / 2) as u64,
                         bulk.q_scales + (y0 * index_cols / 32) as u64,
-                        bulk.k_codes,
-                        bulk.k_scales,
+                        bulk.k_codes[owner],
+                        bulk.k_scales[owner],
                         b.idx_weights_f32 + (y0 * heads * 4) as u64,
                         bulk.scores,
                         m as u64,
@@ -1089,3 +1568,238 @@ impl DeviceLayer<'_> {
 
 /// The selected list's row stride in u32 ids (as the rows step's).
 const SELECTED_STRIDE: usize = 512;
+
+#[cfg(test)]
+mod index_pack_tests {
+    use super::*;
+
+    /// The append is the default and `0` is the A/B arm: three prompt lengths return the re-pack's
+    /// own sha with it on (issue #20 WS2a), so a run that sets nothing takes the new path.
+    #[test]
+    fn the_key_append_is_the_default_and_zero_is_the_arm() {
+        assert!(index_pack_append_from(None), "no variable keeps the append");
+        assert!(
+            index_pack_append_from(Some("")),
+            "an empty value keeps the append"
+        );
+        assert!(index_pack_append_from(Some("1")), "1 keeps the append");
+        assert!(
+            index_pack_append_from(Some("true")),
+            "anything but 0 is the append"
+        );
+        assert!(!index_pack_append_from(Some("0")), "0 is the re-pack arm");
+    }
+
+    /// The gate's log is off unless asked for: it prints a line a chunk.
+    #[test]
+    fn the_pack_log_is_off_unless_asked() {
+        assert!(!index_pack_log_from(None));
+        assert!(!index_pack_log_from(Some("0")));
+        assert!(!index_pack_log_from(Some("true")));
+        assert!(index_pack_log_from(Some("1")));
+    }
+
+    /// An append's offsets are the re-pack's offsets for the same positions, which is the property
+    /// the whole change rests on: `index_dim` values at four bits is `index_dim / 2` code bytes a
+    /// key, the pack kernel writes sixteen bytes a block, and there are four blocks a key at the
+    /// released 128-wide row.
+    /// The dedupe is opt-in: it was measured to remove determinism the unskipped run has, so a run
+    /// that sets nothing keeps every pack.
+    #[test]
+    fn the_repeat_pack_dedupe_is_opt_in() {
+        assert!(
+            !index_pack_dedupe_from(None),
+            "no variable keeps every pack"
+        );
+        assert!(!index_pack_dedupe_from(Some("0")), "0 keeps every pack");
+        assert!(!index_pack_dedupe_from(Some("true")), "only 1 dedupes");
+        assert!(index_pack_dedupe_from(Some("1")), "1 dedupes");
+        // The check itself: the same boundary repeats, a moved one does not, and an owner that has
+        // not packed is not a repeat.
+        assert!(index_pack_repeated(
+            Some((7, 51514, 2357)),
+            Some(7),
+            51514,
+            2357
+        ));
+        assert!(index_pack_repeated(Some((7, 0, 1024)), Some(7), 0, 1024));
+        assert!(
+            !index_pack_repeated(Some((7, 0, 1024)), Some(7), 0, 4096),
+            "a longer chunk reruns"
+        );
+        assert!(!index_pack_repeated(
+            Some((7, 4096, 2541)),
+            Some(7),
+            4200,
+            2541
+        ));
+        assert!(
+            !index_pack_repeated(None, Some(7), 0, 1024),
+            "a first pack is not a repeat"
+        );
+        assert!(
+            !index_pack_repeated(Some((7, 0, 1024)), Some(8), 0, 1024),
+            "another request over the same prompt walks the same boundary and is not a repeat"
+        );
+        assert!(
+            !index_pack_repeated(Some((7, 0, 1024)), None, 0, 1024),
+            "a chunk with no sequence named trusts nothing"
+        );
+        // And the memory only counts inside the chunk that set it: the next request walks the same
+        // boundaries, so a boundary match across chunks is not a repeat of this chunk's pack.
+        assert!(pack_scope_is_new(None, 2, 0, 512), "the first chunk is new");
+        assert!(
+            !pack_scope_is_new(Some((0, 1024, 20)), 24, 0, 1024),
+            "the owner-sharing layer later in the same walk is the repeat"
+        );
+        assert!(
+            !pack_scope_is_new(Some((0, 1024, 20)), 36, 0, 1024),
+            "and so is the last of the five"
+        );
+        assert!(
+            pack_scope_is_new(Some((0, 1024, 36)), 2, 0, 1024),
+            "the layer index going backwards is a new walk - the tail pass over one chunk, which is why request 3 moved before this test existed"
+        );
+        assert!(
+            pack_scope_is_new(Some((0, 1024, 20)), 24, 0, 4096),
+            "a longer pass over the same prompt is a new chunk, and so is the next request's"
+        );
+        assert!(
+            pack_scope_is_new(Some((4996, 3769, 36)), 2, 4997, 3769),
+            "a moved chunk is new"
+        );
+    }
+
+    /// A watermark is only trusted for the sequence that set it: a chunk at position zero, one
+    /// whose key count is below the watermark, or one that does not continue at the previous
+    /// chunk's token end starts from nothing. This is the bug the prose arms caught - after the
+    /// boot warm-up the watermark was high, the first real request appended nothing and scored the
+    /// warm-up's keys - and the interleaved case the block dependency hid.
+    #[test]
+    fn a_watermark_is_not_trusted_across_sequences() {
+        // A sequence's second chunk trusts what its first one packed: 32 keys at ratio 4 end at
+        // token 128, which is this chunk's p0.
+        assert_eq!(index_pack_have(Some((7, 32)), Some(7), 128, 64, 4), 32);
+        // A chunk at position zero never does, whatever the previous one reached.
+        assert_eq!(index_pack_have(Some((7, 4096)), Some(7), 0, 1024, 4), 0);
+        // A call with fewer keys than the store holds cannot append: re-pack.
+        assert_eq!(index_pack_have(Some((7, 4096)), Some(7), 8192, 1024, 2), 0);
+        assert_eq!(index_pack_have(Some((7, 8192)), Some(7), 512, 4096, 1), 0);
+        // An unstarted store stays unstarted, and one packed for nobody is not trusted.
+        assert_eq!(index_pack_have(Some((7, 0)), Some(7), 512, 4096, 1), 0);
+        assert_eq!(index_pack_have(None, Some(7), 512, 4096, 1), 0);
+        assert_eq!(index_pack_have(Some((7, 128)), None, 512, 128, 4), 0);
+        // Two interleaved prefills: A packs 1,024 tokens (256 keys at ratio 4), B's first chunk
+        // packs 512 tokens (128 keys), then A's next chunk at 1,024 must not append onto B's
+        // head. A contiguous continuation of A's own first chunk does append.
+        assert_eq!(index_pack_have(Some((3, 128)), Some(3), 1024, 256, 4), 0);
+        assert_eq!(index_pack_have(Some((3, 256)), Some(3), 1024, 256, 4), 256);
+        // The case the position check alone cannot see: B's pack ends exactly where A resumes,
+        // so the boundary matches and only the sequence identity refuses the append.
+        assert_eq!(index_pack_have(Some((4, 256)), Some(3), 1024, 256, 4), 0);
+        // A resumed sequence at p0 = 512 can pass the continuity check after its own earlier
+        // pack (the scheduler's reset is what makes the host independent of it).
+        assert_eq!(index_pack_have(Some((3, 128)), Some(3), 512, 128, 4), 128);
+    }
+
+    /// The two switches compose: a dedupe skip keeps the watermark the earlier owner-sharing
+    /// layer set, so the sequence's next chunk still appends, and a skip with the dedupe off is a
+    /// real pack from the chunk's start.
+    #[test]
+    fn a_dedupe_skip_keeps_the_watermark_an_append_continues() {
+        let call = |p0, n_max, ratio, append, dedupe| PackCall {
+            p0,
+            n_max,
+            ratio,
+            append,
+            dedupe,
+        };
+        // Five owner-3 layers at one chunk boundary (p0 = 0, 256 keys): the first appends from
+        // nothing, the next four are skips that must not clear what it recorded.
+        let first = index_pack_plan(None, None, Some(7), call(0, 256, 4, true, true));
+        assert!(!first.repeated);
+        assert_eq!((first.have, first.start, first.appended), (0, 0, 256));
+        assert_eq!(first.watermark, Some((7, 256)));
+        let skip = index_pack_plan(
+            first.watermark,
+            first.at,
+            Some(7),
+            call(0, 256, 4, true, true),
+        );
+        assert!(skip.repeated, "the later owner-sharing layer is the repeat");
+        assert_eq!((skip.have, skip.appended), (0, 0));
+        assert_eq!(
+            skip.watermark,
+            Some((7, 256)),
+            "a skip must not clear the watermark"
+        );
+        // The next chunk then appends from it rather than re-packing the history.
+        let next = index_pack_plan(
+            Some((7, 256)),
+            Some((7, 0, 256)),
+            Some(7),
+            call(1024, 512, 4, true, true),
+        );
+        assert!(!next.repeated);
+        assert_eq!((next.have, next.start, next.appended), (256, 256, 256));
+        // The same call with the dedupe off packs the chunk's whole history (p0 = 0, so the
+        // continuity check does not trust the watermark) and records it.
+        let no_dedupe = index_pack_plan(
+            Some((7, 256)),
+            Some((7, 0, 256)),
+            Some(7),
+            call(0, 256, 4, true, false),
+        );
+        assert!(!no_dedupe.repeated);
+        assert_eq!((no_dedupe.have, no_dedupe.appended), (0, 256));
+        assert_eq!(no_dedupe.watermark, Some((7, 256)));
+        // Another sequence's store is never trusted, whatever boundary it reached.
+        let other = index_pack_plan(
+            Some((4, 256)),
+            Some((4, 0, 256)),
+            Some(3),
+            call(1024, 512, 4, true, false),
+        );
+        assert_eq!((other.have, other.appended), (0, 512));
+        // The append switched off re-packs everything.
+        let repack = index_pack_plan(
+            Some((7, 256)),
+            Some((7, 0, 256)),
+            Some(7),
+            call(1024, 512, 4, false, false),
+        );
+        assert_eq!((repack.have, repack.appended), (0, 512));
+    }
+
+    /// An append starts on the fragment layout's eight-key super-block, because `key >> 3` and
+    /// `key & 7` in the pack kernel's address only decompose linearly from a multiple of eight. The
+    /// rounding may re-pack up to seven positions it already packed, which is idempotent.
+    #[test]
+    fn an_append_starts_on_the_layouts_eight_key_super_block() {
+        for have in 0usize..64 {
+            let start = index_pack_start(have);
+            assert_eq!(start % 8, 0, "{have} aligned");
+            assert!(start <= have, "{have}: never past the watermark");
+            assert!(have - start < 8, "{have}: at most seven re-packed");
+        }
+        // The chunk boundaries a prefill actually produces: 128 tokens at ratio 4 (32 keys) and at
+        // ratio 1 (128), and eight of them. None of them need the rounding.
+        for have in [0usize, 32, 64, 128, 256, 1024, 4096, 32768] {
+            assert_eq!(index_pack_start(have), have, "{have} is already aligned");
+        }
+    }
+
+    #[test]
+    fn an_appends_offsets_are_where_a_repack_would_have_written() {
+        let index_dim = 128;
+        for have in [0usize, 1, 3, 8, 63, 64, 1000, 4095] {
+            let (codes, scales) = index_pack_offsets(have, index_dim);
+            assert_eq!(codes, have * index_dim / 2, "codes: {have} keys at 64 B");
+            assert_eq!(scales, have * index_dim / 32, "scales: {have} keys at 4");
+        }
+        // The packed store's per-key width is half the f32 key's, so an append starts at the
+        // position the full re-pack would have reached.
+        let (codes, _) = index_pack_offsets(4096, index_dim);
+        assert_eq!(codes, 4096 * 64);
+    }
+}

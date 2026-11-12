@@ -535,6 +535,39 @@ One idea is left that was not built. A large row could leave in two shots, so th
 half overlaps the production or the fold of the other. It needs the producer or the fold split in
 two, and it pays only where the wire is bound by throughput.
 
+**Both halves of that precondition were then checked, and the second one fails.** The wire is
+throughput-bound: the p50 of a round against the bytes a rank writes is 6.7-6.9 us at 10 and 5 KiB,
+14.6-17.1 at 60 and 30, 25.7-28.7 at 160 and 80 (§"The flags"), which is a marginal 0.19 us a KiB
+over a fixed ~5 us. But the wire is not *waiting*: taking the wait off the host entirely - the
+change that made the exchange non-blocking - is worth 1.9% of a c16 step and 1% at c1, and putting
+the wait back loses about 1% rather than the ms a serialised round would cost. So the exchange's
+share of a step that is *exposed* is already ~1%, and a two-shot split can only recover a fraction
+of that, because it does not remove any bytes: it moves where they overlap. Its ceiling is a
+fraction of 1% of a decode step, against a personalised all-to-all with its own ordering proof.
+
+That is the answer for #20's WS3(d), and it retires the idea rather than filing it: the primitive
+is the wrong shape for two-shot's scatter, the group's collective is not, and nothing that
+reshapes the wire can pay while the wire is already hidden.
+
+**Issue #20's WS3 asks for four things, and three of them are this branch's history.** Its evidence
+is from before `e209b675` ("the exchange stops blocking the host and uses both rails"): a host spin
+that blocked the launch stream, and the rail counters showing one rail carrying 119 MiB and the
+other zero. (a) and (c) are that commit; (a) was then re-measured against putting the wait back on
+the host, which loses about 1% at c16 (§"The host does not wait better"). (b) — a write-through
+doorbell in place of the fence — is the one thing that *cannot* be done: §"Where it stands" has the
+fence at 6 µs a round and the gate says weakening it changes every c1 run's tokens.
+
+(d) is not the reorder the issue describes. It reads the dispatch as calling the exchange before the
+two-shot branch and proposes swapping them, but the two-shot sits *after* the exchange's early
+return inside the same match arm: it is the fallback for a step the exchange declines, so it is
+unreachable whenever the exchange takes the step, and that is by construction rather than by
+mistake. It also cannot ride the exchange: the primitive is "write my row to every peer" — one
+address per round on every rank — while two-shot's scatter is a personalised all-to-all (rank k's
+chunk j goes to rank j alone), and a broadcast cannot express that. Making it work means either a
+new all-to-all with its own ordering proof or paying two collective-group collectives (2 x 43 µs)
+for one exchange round (~35 µs at c1), which is why the idea above is filed as "needs the producer
+or the fold split in two" rather than as a dispatch change.
+
 One thing was tried after that and changed nothing: the order a rank posts a round's sends in.
 Posting them peer by peer, with each rank starting from a different peer so that no rank is every
 sender's last, gave 37.58 / 37.63 / 37.64 and 37.57 / 37.62 / 37.66 ms a c1 step against the

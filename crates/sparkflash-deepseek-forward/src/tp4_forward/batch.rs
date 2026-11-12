@@ -195,16 +195,15 @@ impl DecodeShare {
     }
 }
 
-/// What a shared speculative step costs on GB10 for each sequence past the first, besides its
-/// anchor row (ms): its draft block, its segment's seam and select, its head row. With
-/// [`super::spec::step_ms`] the steps of two to eight sequences at up to 16 rows fit 20 ms + 2.3 ms
-/// a sequence + 3.9 ms a row, and eight code streams at 32 rows step in 162 ms (167 modelled).
-const SEQ_MS: f64 = 2.3;
-
-/// The modelled wall of a shared speculative step over `seqs` sequences that verifies `drafts`
-/// drafts (ms). Only the ratios matter to [share_rows].
-fn multi_step_ms(seqs: usize, drafts: usize) -> f64 {
-    super::spec::step_ms(seqs - 1 + drafts) + SEQ_MS * (seqs - 1) as f64
+/// The modelled wall of a shared speculative step over several sequences that verify drafted rows
+/// (ms): the step's rows over the measured two-band model, plus that model's per-sequence term
+/// ([super::spec::SEQ_MS] unless the profile names its own). Only the ratios matter to
+/// [share_rows], so a measured band moves the depth the share picks, never the step itself.
+fn multi_step_ms(seqs: usize, drafts: usize, model: super::spec::StepModel) -> f64 {
+    // The step's rows are every sequence's anchor plus the drafts verified with it: the count the
+    // trace's `decode R rows` records and the fit used. The per-sequence term is charged past the
+    // first (the model's own intercept covers it), which is what the fit's `seqs - 1` feature is.
+    super::spec::batch_step_ms(model, seqs + drafts) + model.4 * (seqs - 1) as f64
 }
 
 /// Shares up to `budget` verify rows among the sequences' drafts, the likeliest accepted first:
@@ -214,7 +213,12 @@ fn multi_step_ms(seqs: usize, drafts: usize) -> f64 {
 /// takes the one with the most expected tokens a modelled millisecond ([multi_step_ms]). A row
 /// reads its own six experts a layer (rows rarely share one), so a draft is worth its row only
 /// while its chance beats the step's token rate times a row's cost.
-fn share_rows(chains: &[Vec<f64>], budget: usize, floor: f64) -> Vec<usize> {
+fn share_rows(
+    chains: &[Vec<f64>],
+    budget: usize,
+    floor: f64,
+    model: super::spec::StepModel,
+) -> Vec<usize> {
     let seqs = chains.len();
     let mut depths = vec![0usize; seqs];
     let mut order = Vec::with_capacity(budget);
@@ -240,10 +244,10 @@ fn share_rows(chains: &[Vec<f64>], budget: usize, floor: f64) -> Vec<usize> {
         return depths;
     }
     let mut tokens = seqs as f64;
-    let (mut keep, mut best_rate) = (0, tokens / multi_step_ms(seqs, 0));
+    let (mut keep, mut best_rate) = (0, tokens / multi_step_ms(seqs, 0, model));
     for (count, &(_, p)) in (1..).zip(&order) {
         tokens += p;
-        let rate = tokens / multi_step_ms(seqs, count);
+        let rate = tokens / multi_step_ms(seqs, count, model);
         if rate > best_rate {
             (keep, best_rate) = (count, rate);
         }
@@ -1430,6 +1434,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         };
         seq.phase = Phase::Waiting;
         seq.pos = 0;
+        // Its prefix was dropped with the lane, so the next placement is a fresh start: the
+        // packed-key store must be forgotten at its first chunk, not appended to.
+        seq.reused = None;
         self.lanes[lane].seq = None;
         self.lanes[lane].used = self.ticks;
         self.forget(lane)?;
@@ -1639,6 +1646,22 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let reads = pools.prefill.as_ref().filter(|_| staging.is_some());
         let id = self.seqs[index].id;
         let p = self.seqs[index].pos;
+        // The packed-key store holds whichever sequence ran last, and a chunk state is shared by
+        // every sequence of a serving epoch. Naming this one is what makes a later chunk of it
+        // able to append at all; a chunk that starts the sequence (a cold prompt at zero, a resumed
+        // prefix at a nonzero `p0`, or a lane re-placed after a preemption) also forgets the
+        // positions, because the store may hold this same sequence's keys from before the reset.
+        // Chunks of one sequence keep both and append.
+        let starts = self.seqs[index].reused == Some(p);
+        for bulk in std::iter::once(state.bulk.as_ref())
+            .chain(inputs.bulk_more.iter().map(|more| more.bulk.as_ref()))
+            .flatten()
+        {
+            if starts {
+                bulk.reset_index();
+            }
+            bulk.set_index_seq(id);
+        }
         let (budget, most) = self.bulk_budget(decoding);
         // The tick's `slot`th chunk from row p: one that another chunk of the tick follows splits
         // the decoder's rows off ([`bulk_rows`]).
@@ -1964,6 +1987,16 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 return Err(format!("prefill: sequence {} is not prefilling", seq.id));
             };
             let (p, n) = (seq.pos, target - seq.pos);
+            // Name the state's sequence before its first index layer, exactly as `prefill_bulk`
+            // does: these states are shared by every sequence of a serving epoch too, and a chunk
+            // of one sequence on a state another named would either lose the append or trust the
+            // wrong keys.
+            if let Some(bulk) = state.bulk.as_ref() {
+                if seq.reused == Some(p) {
+                    bulk.reset_index();
+                }
+                bulk.set_index_seq(seq.id);
+            }
             let staging = bulk_staging(state, inputs);
             let reads = pools.prefill.as_ref().filter(|_| staging.is_some());
             let current = submit_chunk_reads(
@@ -2570,7 +2603,8 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             .zip(&drafted)
             .map(|(&index, (_, probs))| self.seqs[index].policy.chain(probs))
             .collect();
-        let depths = share_rows(&chains, R_MAX - group.len(), floor);
+        let model = super::spec::batch_step_cost();
+        let depths = share_rows(&chains, R_MAX - group.len(), floor, model);
         let mut segs = Vec::with_capacity(group.len());
         let mut ids = Vec::with_capacity(R_MAX * 4);
         let mut parts = Vec::new();
@@ -2983,18 +3017,90 @@ mod tests {
 
     #[test]
     fn rows_go_to_the_likeliest_drafts_while_they_pay() {
+        let flat = super::spec::batch_step_cost_from(None);
         let chains = [vec![0.9, 0.8, 0.3], vec![0.95, 0.5, 0.1], vec![0.15]];
         // 0.95 (b), 0.9 (a), 0.8 (a), 0.5 (b) raise the modelled rate (3.95 / 43.6 up to 6.15 /
         // 55.6 tokens a ms); 0.3 (a) lowers it; 0.15 and 0.1 are under the floor.
-        assert_eq!(share_rows(&chains, 8, 0.2), [2, 2, 0]);
-        assert_eq!(share_rows(&chains, 3, 0.2), [2, 1, 0]);
-        assert_eq!(share_rows(&chains, 0, 0.2), [0, 0, 0]);
+        assert_eq!(share_rows(&chains, 8, 0.2, flat), [2, 2, 0]);
+        assert_eq!(share_rows(&chains, 3, 0.2, flat), [2, 1, 0]);
+        assert_eq!(share_rows(&chains, 0, 0.2, flat), [0, 0, 0]);
         // A tie goes to the lower sequence.
-        assert_eq!(share_rows(&[vec![0.9], vec![0.9]], 1, 0.0), [1, 0]);
+        assert_eq!(share_rows(&[vec![0.9], vec![0.9]], 1, 0.0, flat), [1, 0]);
         // Drafts that are nearly sure take the whole budget.
         let sure = vec![vec![0.99; 5]; 8];
-        assert_eq!(share_rows(&sure, 24, 0.2).iter().sum::<usize>(), 24);
+        assert_eq!(share_rows(&sure, 24, 0.2, flat).iter().sum::<usize>(), 24);
         // A lone unlikely draft is not worth a row.
-        assert_eq!(share_rows(&[vec![0.1], vec![0.1]], 4, 0.0), [0, 0]);
+        assert_eq!(share_rows(&[vec![0.1], vec![0.1]], 4, 0.0, flat), [0, 0]);
+    }
+
+    /// The unset knob is the model the share ran before the bend existed: 27 ms for a c=1 step's
+    /// anchor plus 4 ms a verified row, and [super::spec::SEQ_MS] a sequence past the first. The
+    /// flat band is stated over the step's actual rows, so it must be `(27 - 4) + 4 * rows` for
+    /// the equality to hold; stating it as 27 + 4 * rows prices one row too many and moves the
+    /// depth decision of every default shared step (this is what a review caught).
+    #[test]
+    fn the_unset_model_is_the_pre_branch_flat_model() {
+        let flat = super::spec::batch_step_cost_from(None);
+        for seqs in 1..=3 {
+            for drafts in 0..=6 {
+                let old = 27.0
+                    + 4.0 * (seqs - 1 + drafts) as f64
+                    + super::spec::SEQ_MS * (seqs - 1) as f64;
+                let got = super::multi_step_ms(seqs, drafts, flat);
+                assert!(
+                    (got - old).abs() < 1e-9,
+                    "{seqs} sequences, {drafts} drafts: {got} against {old}"
+                );
+            }
+        }
+        // At one sequence the flat model is the depth policy's own step cost, by depth.
+        for depth in 0..=8 {
+            assert_eq!(
+                super::spec::batch_step_ms(flat, 1 + depth),
+                super::spec::STEP_COST.ms(depth),
+                "depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_steep_wide_band_stops_the_share_at_the_bend() {
+        // Sixteen rows are cheap and everything past them dear: the share stops at 16.
+        let steep = (5.0, 1.0, 400.0, 1.0, 0.0);
+        let seqs = 8;
+        let chains = vec![vec![0.95; 5]; seqs];
+        let kept: usize = share_rows(&chains, 40, 0.0, steep).iter().sum();
+        // The model's row count is the step's rows (every anchor plus the drafts), so the widest
+        // step the narrow band holds verifies BAND_ROWS - seqs drafts; one more crosses the
+        // 16-row bend the step would then be priced in.
+        assert_eq!(kept, super::spec::BAND_ROWS - seqs, "the bend, then stop");
+        // A step whose rows cost a millisecond at every width takes the whole budget: the bend
+        // alone must never trim a draft.
+        let cheap = (5.0, 1.0, 5.0, 1.0, 0.0);
+        assert_eq!(
+            share_rows(&chains, 40, 0.0, cheap).iter().sum::<usize>(),
+            40
+        );
+        let flat = super::spec::batch_step_cost_from(None);
+        // A malformed value falls back to the flat model here; the profile refuses one at boot, so
+        // this is the function's own contract, not what a serving process sees.
+        assert_eq!(super::spec::batch_step_cost_from(Some("1,2,3")), flat);
+        assert_eq!(super::spec::batch_step_cost_from(Some("1,2,3,4,-1")), flat);
+        assert_eq!(
+            super::spec::batch_step_cost_from(Some("1,2,3,4")),
+            (1.0, 2.0, 3.0, 4.0, super::spec::SEQ_MS)
+        );
+        // A fifth number is the model's per-sequence term; the rows bands do not move.
+        let band = super::spec::batch_step_cost_from(Some("25.6,2.67,36.3,2.06,1.5"));
+        assert_eq!(band, (25.6, 2.67, 36.3, 2.06, 1.5));
+        assert_eq!(super::spec::batch_step_ms(band, 8), 25.6 + 2.67 * 8.0);
+        assert_eq!(super::spec::batch_step_ms(band, 32), 36.3 + 2.06 * 32.0);
+        // That term reaches the shared step's wall through the same model.
+        assert!(
+            super::multi_step_ms(8, 8, band) < super::multi_step_ms(8, 8, flat),
+            "the measured term is cheaper than the one the flat model carries"
+        );
+        assert_eq!(super::spec::batch_step_ms(flat, 10), flat.0 + 10.0 * flat.1);
+        assert_eq!(super::spec::batch_step_ms(flat, 40), flat.0 + 40.0 * flat.1);
     }
 }

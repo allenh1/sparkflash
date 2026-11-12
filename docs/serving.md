@@ -182,6 +182,13 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |
 | `SPARKFLASH_WARMUP=0` | Skip the warm-up pass before HTTP binds (the first request then pays the one-time setup) |
+| `SPARKFLASH_MOE_DEDUP=0` | Run the routed experts once per routed row instead of once per distinct expert (slower at several streams; for comparison). Both paths produce the same bits, so the output does not move |
+| `SPARKFLASH_MOE_PLAN_INCTA=1` | Rebuild the routed MoE's expert grouping in every dedup block instead of once a stage call (slower at c16; the A/B arm of [issue #20](https://git.allen-software.com/allenh1/deepseek-v4.1-flash-spark/-/work_items/20) WS1a, DECISIONS.md D102). The plan is the same bytes either way, so the output does not move. `SPARKFLASH_MOE_PLAN_STATS=1` prints the plan's per-band counts and bytes, but only on the hoisted path (the plan kernel that accumulates them is not launched with `INCTA=1`) |
+| `SPARKFLASH_INDEX_PACK_APPEND=0` | Re-pack the whole packed-key history every prefill chunk instead of appending only the groups the chunk completed (the A/B arm; performance.md's WS2 section). The append is the default and reproduces the re-pack's text, but the saving is bus time, not time to first token at the measured lengths |
+| `SPARKFLASH_INDEX_PACK_DEDUPE=1` | Skip the repeated owner-3 pack inside one chunk pass (opt-in). The append removes the *earlier chunks'* re-pack; inside one chunk the five owner-3 layers all run at the chunk's `p0`, so each would re-pack the whole history without this - the four skips are 22% of the pack traffic at 7,538 tokens and under 1% at 60,488. `SPARKFLASH_INDEX_PACK_LOG=1` prints the blocks each call asks for, and `SPARKFLASH_INDEX_PACK_VERIFY=1` checksums the store after each pack |
+| `SPARKFLASH_SPEC_BATCH_COST=a0,a1,b0,b1[,seq_ms]` | Price a shared step with the fitted two-band model (D110): `a0 + a1*rows` up to 16 rows, `b0 + b1*rows` past it, plus `seq_ms` a sequence, over the step's rows (every anchor plus the verified drafts). Four numbers keep the engine's per-sequence term; unset is the old flat model, and a value that is not four or five non-negative numbers refuses at startup |
+| `SPARKFLASH_SPEC_ROW_MS=N` | Price a verified row at `N` ms in the depth policy for the WS4 A/B (`speculation.row_ms`; unset keeps the engine's 4 ms; anything but a non-negative number refuses at startup). The measured A/B at c1 was neutral (DECISIONS.md D106, D113), so this is an instrument, not a default |
+| `SPARKFLASH_MOE_IDS_DUMP=<layer>` | Copy one step's routed expert ids at `<layer>` to the host and print them (a layer number, e.g. `20`; the first 48 steps that reach it, on a prefill or a decode step). The datum a row price needs, and the one the plan-stat instrument cannot report (WS4; performance.md) |
 | `SPARKFLASH_DECODE_MMA=off` | Run the dense decode projections on the CUDA cores instead of the tensor cores (`on` by default): for DeepSeek-V4.1-Flash 5% slower at eight streams, with the greedy output from before the tensor-core decode. Read by Qwen3.8-Flash-Next too, where `off` puts decode steps and verifies back on its token kernels: faster at one stream (20.1 against 18.5 tok/s without a drafter, 29.9 against 28.0 with DFlash 2), but a continued chat turn is then no longer bit for bit a cold prefill of its transcript ([qwen38](models/qwen38-flash-next-nvfp4.md#decode-on-the-tensor-cores)). A request decodes the same alone as in a batch either way ([performance](performance.md#what-an-extra-verify-row-costs)) |
 | `SPARKFLASH_GLM_PREFILL=0` | Run GLM-5.3-Flash prompts on the token path (one GEMV a few rows) instead of the bulk prefill: 82 instead of 1,114 tok/s at a 6.5k-token prompt, with the bit-identical greedy output ([glm53-flash](models/glm53-flash.md#bulk-prefill)) |
 | `SPARKFLASH_GLM_PREFILL_CHUNK=N` | The GLM bulk prefill's chunk width in rows (default 4,096). Wider chunks read each weight fewer times per prompt; 4,096 is the widest that fits beside the weights, its 9.6 GiB of chunk scratch and the 1M window. A prompt below 16 rows runs the token path whatever this says, and a width past 4,096 is clamped to it |
@@ -190,5 +197,88 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_TWO_SHOT_ROWS=N` | The fewest rows a tensor-parallel step sums with the two-shot all-reduce (reduce-scatter, then gather) instead of the one-shot exchange (default 16; 0 never). Read by the DeepSeek, GLM-5.3-Flash and Qwen3.8 device arms; a value that is not a row count refuses |
 | `SPARKFLASH_SEQUENCE_PARALLEL=0`, `SPARKFLASH_SEQUENCE_OVERLAP=0` | Qwen3.8 at TP=2/TP=4: run a prefill chunk's hyper-connections and PLE reads replicated on every rank instead of on each rank's own rows, or run a sequence-parallel chunk on one stream instead of as two halves whose collectives overlap the other half's compute (both `1` by default, bit-identical either way). GLM-5.3-Flash at TP=4 reads `SPARKFLASH_SEQUENCE_PARALLEL` for its bulk prefill chunks' hyper-connections the same way, on one stream: overlapped halves measured slower there ([glm53-flash](models/glm53-flash.md#bulk-prefill)). Set the same on every rank; a value other than 0 or 1 refuses |
 | `SPARKFLASH_ENGRAM_DIRECT=off` | Read the Engram tables through the page cache instead of with `O_DIRECT` (`on` by default). Through the cache, the ~200 GB of random lookups keep each node's memory full and the kernel reclaiming while it decodes. A table that cannot be read with `O_DIRECT` is refused at startup unless this is `off` |
-| `SPARKFLASH_ENGRAM_SHARD=off` | Read every Engram column of a prompt chunk on every rank instead of a quarter of them each, exchanged on the device (`on` by default). Either way the arena holds the same bytes and the output is the same; sharded, each node issues a quarter of the chunk's random reads |
+| `SPARKFLASH_ENGRAM_SHARD=off` | Read every Engram column of a prompt chunk on every rank instead of a quarter of them each, exchanged on the device (`on` by default). Either way the arena holds the same bytes and the output is the same; sharded, each node issues a quarter of the chunk's random reads. A decode step does not shard: see the note below |
+| `SPARKFLASH_ENGRAM_DEDUPE=0` | Read a gather's repeated table entries once and copy them to every row that looks them up (`on` by default). A verify step over eight lanes repeats a share of its 2/3/4-grams, and a row's own columns can hash to one bucket; each distinct entry is read once. Bit-identical either way |
 | `NCCL_*`, `SPARKFLASH_SERVE_API_KEY`, `SPARKFLASH_PREFILL_*`, `SPARKFLASH_BATCH_*`, `SPARKFLASH_DECODE_*`, `SPARKFLASH_ENGRAM_*` | Passed to every rank by the launcher |
+**Measured 2026-11-11: the stage is live; the counter is not.** `sparkflash_engram_lookups_total`
+reads 0 here because nothing on the device path increments it: the counters belong to the host
+cache (`sparkflash-engram/src/cache.rs` calls `EngramLayerTelemetry::record_lookups`), while this
+path's reader (`tp4_forward/spec.rs`'s `EngramReader`) reads the tensor rows itself and holds no
+handle on that telemetry, so `/metrics` publishes the initialised snapshot. Three observations
+stand against reading those zeros as an idle stage:
+
+- rank 0 of the `20261111T181950Z-final` run held two `O_DIRECT` descriptors on
+  `model-00047`/`model-00048`, the checkpoint shards that carry
+  `layers.{1,14}.engram.embed.{weight,scale}` (`/proc/<pid>/fd` flags `O_DIRECT|O_CLOEXEC`);
+- its `read_bytes` moved 5.7 MB serving one cold 7,538-token request and 2.7 MB on the repeat,
+  against 0 in an idle window - the order the sharded plan predicts (6 of the 24 columns a rank,
+  ~12 MB of row reads for 7,538 rows), not zero;
+- `pack_engram` is not what this path reads. `EngramReader` pages the two tensors out of the
+  checkpoint's `SafeTensorsSource` in place, so `--engram-dir` and `pack-engram` belong to the
+  host reference path, and the ~200 GB of tables were never missing from this deployment.
+
+**The shard switch, measured (2026-11-11, issue #20 WS5).** Fresh epoch per arm, greedy, thinking
+off, cold prompts (a random 24-char nonce ahead of each), 8-token completions, two samples an arm:
+
+| Arm | 8k prefill | 32k prefill | 64k prefill |
+| :-- | --: | --: | --: |
+| `SPARKFLASH_ENGRAM_SHARD` on (default) | 5,124 / 5,048 tok/s | **6,708 / 6,703** | 6,889 / 6,884 |
+| `SPARKFLASH_ENGRAM_SHARD=off` | 5,109 / 5,048 | 6,445 / 6,415 | 6,821 / 6,964 |
+
+Sharding is worth 4.2 % at 32k (both samples) and nothing measurable at 8k or 64k, so it stays on
+by default. The output is the same text either way: sha256 `a6cfb97f191ee5a5` over 47 tokens on
+all three arms. A first sample on a freshly killed epoch read low (4,469 / 5,950 / 6,322) and the
+next two on the same epoch did not, so one wave of one boot is not an arm.
+
+**The decode side (issue #20 WS5 items 1-3), measured 2026-11-11.** Two of the three levers
+were tried; one is in and one is out on evidence.
+
+- **the dedupe is in** (`SPARKFLASH_ENGRAM_DEDUPE`, on by default). A read whose table bytes an
+  earlier read of the same slot already lands becomes a copy, made once that slot's reads have
+  landed (`EngramGather::settle`) and before its upload. The key is (slot, table bytes), so two
+  rows - or two columns of one row - that hash to the same bucket cost one read. **Measured at c8**
+  on cold prompts (eight streams, fresh nonce and corpus slice a request, greedy, thinking off,
+  one fresh epoch an arm, 128-token completions, port 8189/8187): on 134.7 tok/s mean over eight
+  samples (median 134.5), off 132.4 mean over seven (median 133.0). That is +1.1 to +1.7 %, inside
+  a 4-5 % sample spread, so it is a direction and not yet a number - the reader's entry cache
+  already answers a repeated entry, which is why the mechanism's saving barely reaches the step.
+  Text is identical either way (sha256 `efb0f3d38a387f1d` over 49 tokens).
+- **the shard is out.** `spec_multi_step`/`plain_step` passed the exchange above 16 rows a step,
+  each rank reading a quarter of every row's columns into a run-scope share buffer on
+  `EngramDevice`. The eight-stream burst killed the device loop within a second: rank 1 reported
+  `round 3039 did not complete: rank 0 published a row length that is not the one this round sent`
+  while rank 0 was at `all_reduce_moe` and rank 1 at `all_reduce`. The ranks were one collective
+  out of phase, so a step's share exchange was not symmetric - the direct-RDMA exchange is a
+  global round queue and needs the same size and the same *order* on every rank, which a
+  per-step, per-rank-shaped slot does not guarantee. With `SPARKFLASH_ENGRAM_SHARD=off` the same
+  workload is clean (the eight samples above). Landing it needs a fixed `R_MAX`-shaped exchange
+  (and a permute that takes the per-rank stride) plus a rank-invariant shard decision; that is a
+  separate change, not a constant.
+- **the early anchor submit is not in.** `spec_step` already reads a lone sequence's anchor under
+  its draft (`read_ahead`), but `spec_multi_step` cannot: its arena rows are step rows and an
+  anchor's row is the running sum of the drafted depths. Landing it means either a second pinned
+  buffer with a per-row upload or a row table, and the anchors are only `1/g` of a step's rows.
+
+**Still open: the acceptance number.** Read wait at c8 on cold text (`<= 1.0 ms/step`, from
+3.7-4.6) is not met by the dedupe alone; the shard was the lever that would have met it, and it
+needs the fixed-shape exchange above. The c8 aggregate gate (+5 % on cold prompts) reads +1-2 %
+today. The scripted arms are `SPARKFLASH_ENGRAM_DEDUPE=0` (this one) and, once it exists, the
+fixed-shape shard.
+
+**The 1M-context ceiling is lane memory, not the index (2026-11-11).** A 1M-token prompt is
+advertised (max_context_tokens = 1_048_576) and reaches the engine (32 MB request bodies are
+accepted), and nothing in the block selection is 16-bit: selected is uint32_t at four bytes an
+entry, and block_size/num_blocks are 32-bit. pico-dgx-ds4's 17-bit block list is a
+shared-memory packing of their blist, a constraint our path does not have. What bounds a
+session is the lane budget: ~1.9 GB for 250K tokens (lanes.rs), so ~7.6 GB for 1M against the
+24 GiB per-rank pool (SPARKFLASH_LANE_MEMORY_MB) - one 1M session fits, sixteen do not, and a
+sequence that cannot grow waits for memory rather than evicting another lane. D109. The bulk
+prefill's packed-key store is part of that budget too: one scratch slot per kv-source owner
+(four owners) holds `max_positions * index_dim / 2` code bytes plus its scales, which four
+owners multiplies by four - the price of the owner-slot fix that made the append correct.
+
+**Benchmarks need a fresh epoch.** The `final` instance, up for two hours and sixty-odd requests
+(one of 210k tokens), read 2,945 / 2,547 / 2,163 tok/s on the same three prompts - 1.7x, 2.6x and
+3.2x slower than a fresh boot of the same binary, which restored it. Whatever grows over a long
+epoch (lane state, allocator, cache residency) is worth more than every switch in this table, so
+take a configuration measurement on a fresh boot and a fresh boot only.

@@ -638,6 +638,11 @@ impl<'a> DeviceLayer<'a> {
         Ok(())
     }
 
+    /// The segments the step installed (empty for a single-lane step).
+    pub(super) fn segments(&self) -> &[Seg] {
+        &self.segs
+    }
+
     /// The step's segments: the ones [Self::set_segments] installed, or the single sequence's
     /// rows p0..p0 + n on the selected state.
     pub(super) fn step_segs(&self, p0: usize, n: usize) -> Vec<Seg> {

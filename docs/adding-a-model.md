@@ -215,6 +215,17 @@ The applier is table-driven: `BOOL_FIELDS`, `COUNT_FIELDS`, `F32_FIELDS`, `F64_F
 `every_override_moves_its_field` applies each alias and refuses one that leaves its field at the
 default. A new alias needs a table row, not a new `match` arm.
 
+Issue #20's switches are typed the same way: `prefill.index_pack_append`
+(`SPARKFLASH_INDEX_PACK_APPEND`, on unless `0`, which is the re-pack A/B arm),
+`prefill.index_pack_dedupe`/`_log`/`_verify` (`SPARKFLASH_INDEX_PACK_DEDUPE|LOG|VERIFY`),
+`diagnostics.moe_plan_in_cta` (`SPARKFLASH_MOE_PLAN_INCTA`, the in-block A/B arm of D102),
+`diagnostics.moe_dedup` (`SPARKFLASH_MOE_DEDUP`, `0` for the per-row arm),
+`diagnostics.moe_plan_stats` (`SPARKFLASH_MOE_PLAN_STATS`) and `diagnostics.moe_ids_dump`
+(`SPARKFLASH_MOE_IDS_DUMP`, a layer number). `sparkflash-kernels` does not depend on
+`sparkflash-model`, so the forward resolves the two MoE switches into
+`MoeRoutedOptions` when it opens the routed device, rather than the launcher reading the
+environment once a launch.
+
 Rules for a new switch:
 
 1. add a typed field to the profile;

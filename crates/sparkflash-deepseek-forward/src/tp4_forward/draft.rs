@@ -36,6 +36,9 @@ use super::rows::{R_MAX, RowsState};
 use super::*;
 use crate::layer_device::DeviceSpan;
 use sparkflash_kernels::cuda_driver::{HostMapped, Kernel, Module};
+use sparkflash_kernels::moe_routed_device::{
+    OPT_MOE_GATE_UP_DEDUP_ARGS, OPT_MOE_PLAN_ARGS, plan_in_cta_from,
+};
 use sparkflash_kernels::mxfp8_gemv_launch::{OptArgs, OptKind, launch_opt};
 
 /// The draft block: the anchor and four noise rows (`dspark_block_size`).
@@ -112,6 +115,8 @@ struct DraftKernels {
     /// each distinct expert once for all its rows, bit-identical to gate_up + down (None under
     /// SPARKFLASH_DRAFT_MOE_DEDUP=0).
     dedup: Option<[Kernel; 3]>,
+    /// opt_moe_plan_sm121: the hoisted grouping the dedup chain reads (None with [Self::dedup]).
+    plan: Option<Kernel>,
 }
 
 /// One stage's resident operands: arena pointers (B12x weights and their scale grids), its expert
@@ -296,14 +301,17 @@ impl DraftState {
         let router = load("opt_router_sm121.cubin", "opt_router_e128k3_sm121")?;
         let gate_up = load("opt_moe_sm121.cubin", "opt_moe_gate_up_k3_sm121")?;
         let down = load("opt_moe_sm121.cubin", "opt_moe_down_combine_k3_sm121")?;
-        let dedup = if drafter.moe_dedup() {
-            Some([
-                load("opt_moe_sm121.cubin", "opt_moe_gate_up_dedup_k3_sm121")?,
-                load("opt_moe_sm121.cubin", "opt_moe_down_dedup_sm121")?,
-                load("opt_moe_sm121.cubin", "opt_moe_combine_k3_sm121")?,
-            ])
+        let (dedup, plan) = if drafter.moe_dedup() {
+            (
+                Some([
+                    load("opt_moe_sm121.cubin", "opt_moe_gate_up_dedup_k3_sm121")?,
+                    load("opt_moe_sm121.cubin", "opt_moe_down_dedup_sm121")?,
+                    load("opt_moe_sm121.cubin", "opt_moe_combine_k3_sm121")?,
+                ]),
+                Some(load("opt_moe_sm121.cubin", "opt_moe_plan_sm121")?),
+            )
         } else {
-            None
+            (None, None)
         };
         let kernels = DraftKernels {
             _modules: modules,
@@ -327,6 +335,7 @@ impl DraftState {
             gate_up,
             down,
             dedup,
+            plan,
         };
 
         let ptr = |name: String| -> Result<u64, String> {
@@ -1480,24 +1489,53 @@ impl DeviceLayer<'_> {
         let matrix = (EXPERTS * 2 * 8) as u64;
         if let Some([gate_up, down, combine]) = draft.kernels.dedup.filter(|_| n > 1) {
             let routed = (n * TOP_K) as u32;
+            // The grouping is hoisted here too (opt_moe_plan_sm121), like the serving path: the
+            // dedup blocks read one plan instead of each rebuilding it. The in-block build stays
+            // behind `diagnostics.moe_plan_in_cta=1` as the A/B arm, and the two produce the same
+            // plan bytes. When hoisted, the gate/up launch's `plan_out` is unused (the down launch
+            // reads the buffer the plan kernel just wrote); when in-block, it writes it.
+            let in_cta = plan_in_cta_from(
+                sparkflash_model::active_profile()
+                    .diagnostics
+                    .moe_plan_in_cta
+                    .as_deref(),
+            );
+            if !in_cta {
+                let plan_kernel = draft
+                    .kernels
+                    .plan
+                    .ok_or("draft routed: no plan kernel for the hoisted grouping")?;
+                let args: [u64; OPT_MOE_PLAN_ARGS] = [
+                    b.moe_ids,
+                    u64::from(routed),
+                    EXPERTS as u64,
+                    draft.moe_plan,
+                    0,
+                ];
+                self.cuda
+                    .launch(plan_kernel, (1, 1, 1), (128, 1, 1), &args)?;
+            }
+            let plan_in = if in_cta { 0 } else { draft.moe_plan };
+            let args: [u64; OPT_MOE_GATE_UP_DEDUP_ARGS] = [
+                stage.table,
+                stage.table + matrix,
+                b.moe_ids,
+                b.moe_weights,
+                b.ffn_codes,
+                b.ffn_scales,
+                draft.h_codes,
+                draft.h_scales,
+                u64::from(routed),
+                EXPERTS as u64,
+                u64::from(self.swiglu_limit.to_bits()),
+                draft.moe_plan,
+                plan_in,
+            ];
             self.cuda.launch(
                 gate_up,
                 ((LOCAL_INTER / 32) as u32, routed, 1),
                 (128, 1, 1),
-                &[
-                    stage.table,
-                    stage.table + matrix,
-                    b.moe_ids,
-                    b.moe_weights,
-                    b.ffn_codes,
-                    b.ffn_scales,
-                    draft.h_codes,
-                    draft.h_scales,
-                    u64::from(routed),
-                    EXPERTS as u64,
-                    u64::from(self.swiglu_limit.to_bits()),
-                    draft.moe_plan,
-                ],
+                &args,
             )?;
             // Two 32-column tiles a block (OPT_MOE_DD_TILES), two of a tile's 576 chunks a thread;
             // blocks past the distinct count exit.

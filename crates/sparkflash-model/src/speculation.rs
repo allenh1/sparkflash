@@ -31,6 +31,18 @@
 /// The modelled wall clock of one speculative step: a fixed part (the draft, the target's first
 /// row, the head) and a part per verified draft. Only the differences between depths steer the
 /// choice; `prior_tokens_per_ms` stands in for the sequence's rate before its first step.
+///
+/// **`row_ms` is the quantity issue #20 WS4 has measured and found too high.** The engine's
+/// constant is 4 ms, documented as "each row reads its own six experts a layer"; two recorded step
+/// times fit 26.7 ms fixed plus **1.88 ms a row** instead (a c1 step of six rows at 38 ms, a c16 step
+/// of 64 at 147), and the expert accounting agrees - a c16 row costs 1.55 experts and an
+/// expert-matrix about 0.97 ms, so 1.5 of the 1.88 is the read. Since only differences between
+/// depths are used, the effect of the overshoot is a policy that verifies fewer drafts than the
+/// bytes justify, most of all at the tail of a step where the marginal row brings no new expert.
+/// The A/B has run since (docs/performance.md, "WS4"; DECISIONS.md D106 and D113): pricing the
+/// row at the measured 5.2 ms is exactly neutral at c1, because the depth policy is set by the
+/// draft chain's decay against a floor, not by the row price. The override remains an instrument
+/// for a shape where the decision does move, not a default waiting to flip.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepCost {
     /// A step that verifies no draft (ms).
@@ -216,6 +228,8 @@ impl DepthPolicy {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_fresh_policy_explores_before_it_can_calibrate() {
         let cost = StepCost {
@@ -246,8 +260,6 @@ mod tests {
             3
         );
     }
-
-    use super::*;
 
     const COST: StepCost = StepCost {
         step_ms: 27.0,

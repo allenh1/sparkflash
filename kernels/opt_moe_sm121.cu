@@ -355,10 +355,10 @@ OPT_MOE_DOWN_ENTRY(opt_moe_down_combine_k3_sm121, 3u)
 // once per distinct expert and serve every row routed to it. Each row's arithmetic is the per-row
 // kernel's, in the same order, so every output is bit-identical to it.
 //
-// The plan (grouping the routed rows by expert) is recomputed by every block in shared memory from
-// the router's ids, rows <= OPT_MOE_PLAN_MAX: a distinct count from presence bits (a block past it
-// leaves there), then one warp's pass over the rows with a per-expert table (opt_moe_plan_build), a
-// few hundred cycles however many rows there are.
+// The plan (grouping the routed rows by expert) is built once per stage call by opt_moe_plan_sm121
+// (one block, rows <= OPT_MOE_PLAN_MAX) and read by every dedup block; the in-block build below it
+// stays behind SPARKFLASH_MOE_PLAN_INCTA=1 as the A/B arm. It is a distinct count from presence bits,
+// then one warp's pass over the rows with a per-expert table (opt_moe_plan_build).
 //
 // opt_moe_gate_up_dedup: grid (576 / 32, rows), 128 threads; block y serves distinct expert y (blocks
 //   past the distinct count exit). Same outputs as opt_moe_gate_up. A warp owns 8 columns; the K
@@ -528,6 +528,48 @@ __device__ __forceinline__ void opt_moe_plan_build(uint32_t n, uint32_t experts,
     __syncthreads();
 }
 
+// The stage's grouping, built once per stage call instead of in every block (issue #20, WS1a).
+//
+// opt_moe_gate_up_dedup used to derive the plan from the router's ids in each of its blocks: at c16
+// that is (576 / 32) x 96 = 1,728 blocks, each clearing a 1,024-entry expert table, scanning 96
+// rows and running the group scan before a single weight byte moved, and blocks below the distinct
+// count did it only to leave. One block builds it here and every dedup block reads it; the in-block
+// build stays behind SPARKFLASH_MOE_PLAN_INCTA=1 as the A/B arm. Both call the same two functions,
+// so the plan - the grouping, the group order and the row order within a group - is the same bytes
+// either way, and the dedup kernels' outputs are unchanged.
+extern "C" __global__ void __launch_bounds__(OPT_MOE_GU_THREADS) opt_moe_plan_sm121(
+    const uint32_t *__restrict__ expert_ids, const uint32_t rows, const uint32_t experts,
+    OptMoePlan *__restrict__ plan_out, unsigned long long *__restrict__ stats) {
+    OPT_PDL_ENTRY();
+    __shared__ OptMoePlan plan;
+    __shared__ __align__(16) float s_scratch[OPT_MOE_PLAN_SCRATCH];
+    if (rows > OPT_MOE_PLAN_MAX || plan_out == nullptr) {
+        return;
+    }
+    uint32_t *scratch = reinterpret_cast<uint32_t *>(s_scratch);
+    opt_moe_plan_ids(expert_ids, rows, experts, scratch);
+    opt_moe_plan_build(rows, experts, scratch, plan);
+    const uint32_t *src = reinterpret_cast<const uint32_t *>(&plan);
+    uint32_t *dst = reinterpret_cast<uint32_t *>(plan_out);
+    for (uint32_t i = threadIdx.x; i < sizeof(OptMoePlan) / 4u; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+    // The measurement instrument issue #20 WS1(b) asks for: the bytes a dedup call reads are
+    // count x an expert's matrices, and only this kernel knows count. Two atomics a launch into a
+    // host-owned pair, read back once at drain; a null pointer (the default) costs one uniform
+    // branch and nothing else.
+    //
+    // The pair is indexed by the call's row count, because one mean over a run is not the number
+    // anybody needs: a prefill chunk groups most of the 384 experts and a verify step groups a
+    // couple of dozen, so averaging them reports a rate for a mixture no single kernel launch
+    // runs. Four bands (<= 32 rows, <= 64, <= 128, more) separate them.
+    if (stats != nullptr && threadIdx.x == 0u) {
+        const uint32_t band = rows <= 32u ? 0u : rows <= 64u ? 1u : rows <= 128u ? 2u : 3u;
+        atomicAdd(&stats[2u + 2u * band], static_cast<unsigned long long>(plan.count));
+        atomicAdd(&stats[3u + 2u * band], 1ull);
+    }
+}
+
 #define OPT_MOE_GD_MB 4u       // members a fold serves: a warp's 8 columns x 4 members are its 32 lanes' chains
 #define OPT_MOE_GD_MP 16u      // members per pass over the weights
 #define OPT_MOE_GD_STRIDE 36u  // a chain's 32 segment terms, padded so 8 lanes' 16-byte reads hit distinct banks
@@ -625,7 +667,8 @@ __device__ __forceinline__ void opt_moe_gate_up_dedup_body(
     const uint32_t *__restrict__ expert_ids, const float *__restrict__ weights,
     const uint8_t *__restrict__ act_fp8, const uint8_t *__restrict__ act_scales,
     uint8_t *__restrict__ out_codes, uint8_t *__restrict__ out_scales, const uint32_t rows,
-    const uint32_t experts, const float limit, OptMoePlan *__restrict__ plan_out) {
+    const uint32_t experts, const float limit, OptMoePlan *__restrict__ plan_out,
+    const OptMoePlan *__restrict__ plan_in) {
     __shared__ OptMoePlan plan;
     // Per warp, one matrix's 32 chains of segment terms; before that, the plan's scratch.
     __shared__ __align__(16) float s_terms[OPT_MOE_GU_THREADS / 32u][32u][OPT_MOE_GD_STRIDE];
@@ -633,16 +676,31 @@ __device__ __forceinline__ void opt_moe_gate_up_dedup_body(
     if (rows > OPT_MOE_PLAN_MAX) {
         return;
     }
-    uint32_t *scratch = reinterpret_cast<uint32_t *>(&s_terms[0][0][0]);
-    if (blockIdx.y >= opt_moe_plan_ids(expert_ids, rows, experts, scratch)) {
-        return;
-    }
-    opt_moe_plan_build(rows, experts, scratch, plan);
-    if (plan_out != nullptr && blockIdx.x == 0u && blockIdx.y == 0u) {
-        const uint32_t *src = reinterpret_cast<const uint32_t *>(&plan);
-        uint32_t *dst = reinterpret_cast<uint32_t *>(plan_out);
+    if (plan_in != nullptr) {
+        // The hoisted plan (opt_moe_plan_sm121, the launch before this one): a block past the
+        // distinct count leaves on the plan's own count before copying anything.
+        if (blockIdx.y >= plan_in->count) {
+            return;
+        }
+        const uint32_t *src = reinterpret_cast<const uint32_t *>(plan_in);
+        uint32_t *dst = reinterpret_cast<uint32_t *>(&plan);
         for (uint32_t i = threadIdx.x; i < sizeof(OptMoePlan) / 4u; i += blockDim.x) {
             dst[i] = src[i];
+        }
+        __syncthreads();
+    } else {
+        // The A/B arm (SPARKFLASH_MOE_PLAN_INCTA=1): the plan is rebuilt in every block.
+        uint32_t *scratch = reinterpret_cast<uint32_t *>(&s_terms[0][0][0]);
+        if (blockIdx.y >= opt_moe_plan_ids(expert_ids, rows, experts, scratch)) {
+            return;
+        }
+        opt_moe_plan_build(rows, experts, scratch, plan);
+        if (plan_out != nullptr && blockIdx.x == 0u && blockIdx.y == 0u) {
+            const uint32_t *src = reinterpret_cast<const uint32_t *>(&plan);
+            uint32_t *dst = reinterpret_cast<uint32_t *>(plan_out);
+            for (uint32_t i = threadIdx.x; i < sizeof(OptMoePlan) / 4u; i += blockDim.x) {
+                dst[i] = src[i];
+            }
         }
     }
     const uint32_t group = blockIdx.y;
@@ -748,11 +806,12 @@ __device__ __forceinline__ void opt_moe_gate_up_dedup_body(
         const uint32_t *__restrict__ expert_ids, const float *__restrict__ weights,               \
         const uint8_t *__restrict__ act_fp8, const uint8_t *__restrict__ act_scales,              \
         uint8_t *__restrict__ out_codes, uint8_t *__restrict__ out_scales, const uint32_t rows,   \
-        const uint32_t experts, const float limit, OptMoePlan *__restrict__ plan_out) {           \
+        const uint32_t experts, const float limit, OptMoePlan *__restrict__ plan_out,             \
+        const OptMoePlan *__restrict__ plan_in) {                                                 \
         OPT_PDL_ENTRY();                                                                          \
         opt_moe_gate_up_dedup_body<TOPK>(gate_table, up_table, expert_ids, weights, act_fp8,      \
                                          act_scales, out_codes, out_scales, rows, experts, limit, \
-                                         plan_out);                                               \
+                                         plan_out, plan_in);                                      \
     }
 
 OPT_MOE_GATE_UP_DEDUP_ENTRY(opt_moe_gate_up_dedup_sm121, OPT_MOE_TOPK)

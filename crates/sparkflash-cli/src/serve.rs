@@ -6589,6 +6589,7 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
             );
             print_stage_timing_ledger();
             print_exchange_stats();
+            print_plan_stats();
             serve_result(result)
         }
         Err(_) => {
@@ -6598,6 +6599,7 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
             );
             print_stage_timing_ledger();
             print_exchange_stats();
+            print_plan_stats();
             ExitCode::FAILURE
         }
     }
@@ -6640,6 +6642,62 @@ fn print_exchange_stats() {
 #[cfg(not(feature = "cuda"))]
 fn print_exchange_stats() {}
 
+/// Prints the routed-expert grouping the plan kernel accumulated, when
+/// `SPARKFLASH_MOE_PLAN_STATS=1` armed it.
+///
+/// The bytes a dedup call reads are the distinct-expert count times an expert's matrices, and only
+/// the plan kernel knows that count; the launch is `rows` blocks wide and every block past the
+/// count leaves without loading a weight, so a rate divided by the row count understates by however
+/// far the two are apart (issue #20 WS1(b) asks for this number explicitly).
+#[cfg(feature = "cuda")]
+fn print_plan_stats() {
+    use sparkflash_kernels::moe_routed_device::{PlanStats, read_process_plan_stats};
+    // A second handle onto the primary context (retained, not created), which is what a drain-time
+    // reader with no handle to the forward can take.
+    // A default run never registers the buffer; checking first keeps the drain from retaining the
+    // context (a second handle) only to read a zero.
+    if !sparkflash_kernels::moe_routed_device::process_plan_stats_armed() {
+        return;
+    }
+    let cuda = match sparkflash_kernels::cuda_driver::Cuda::load() {
+        Ok(cuda) => cuda,
+        Err(error) => {
+            eprintln!("sparkflash serve: moe_plan_stats unavailable: {error}");
+            return;
+        }
+    };
+    // `None` is the unarmed run and stays silent; an error is a measurement mode that produced no
+    // number, which must not look like a run that was never armed.
+    let stats = match read_process_plan_stats(&cuda) {
+        Ok(Some(stats)) => stats,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("sparkflash serve: moe_plan_stats: {error}");
+            return;
+        }
+    };
+    // One line a band: the calls a run made, the experts they grouped, and the two byte counts the
+    // expert-read rate divides. Averaged over the whole run instead, a prefill chunk's ~300 experts
+    // and a verify step's ~20 would report a rate for a mixture no kernel launch runs.
+    const NAMES: [&str; 4] = ["rows_le_32", "rows_le_64", "rows_le_128", "rows_gt_128"];
+    for (name, band) in NAMES.iter().zip(stats.bands()) {
+        if band.calls == 0 {
+            continue;
+        }
+        let mean = band.mean_experts();
+        println!(
+            "sparkflash serve: moe_plan_stats band={name} calls={} experts={} mean_experts={mean:.2} gate_up_bytes_per_call={:.0} down_bytes_per_call={:.0}",
+            band.calls,
+            band.experts,
+            mean * PlanStats::gate_up_bytes_per_expert() as f64,
+            mean * PlanStats::down_bytes_per_expert() as f64,
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn print_plan_stats() {}
+
 /// Prints the per-kernel event ledger when `SPARKFLASH_STAGE_TIMING=1` armed it.
 ///
 /// The ledger is the one `device-chain --timing-json` writes into its timing file (schema
@@ -6668,7 +6726,12 @@ fn print_stage_timing_ledger() {
     );
     // A kernel's mean call is a mean over steps of different sizes, so the row that answers "what
     // did this cost" is the time a row: total over the rows of the steps it ran in.
-    for row in rows.iter().take(30) {
+    //
+    // Every row is printed, not the first thirty. A decode step is a wide fan-out of small
+    // launches (a c1 step runs ~86 mHC and rows kernels), so the tail past the thirtieth row is
+    // precisely the tail a dispatch question is about, and a ledger that stopped at thirty
+    // answered "what is the biggest kernel" while hiding "what is the rest of the step".
+    for row in &rows {
         let ns_per_row = row.total_ns.checked_div(row.rows).unwrap_or(0);
         println!(
             "sparkflash serve: stage_timing   phase={} kernel={} calls={} steps={} rows={} total_ns={} mean_ns={} ns_per_row={ns_per_row} max_ns={}",

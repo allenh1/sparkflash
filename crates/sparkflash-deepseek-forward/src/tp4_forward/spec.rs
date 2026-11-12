@@ -146,6 +146,9 @@ pub(super) struct EngramReader {
     /// Whether a bulk prefill chunk's reads are split over the ranks by column
     /// ([`EngramShard`]; SPARKFLASH_ENGRAM_SHARD=off reads every column on every rank).
     pub(super) shard: bool,
+    /// Whether a gather reads each distinct table entry once and copies it to the rows that look
+    /// it up again (SPARKFLASH_ENGRAM_DEDUPE=0 reads every row's entries).
+    dedupe: bool,
 }
 
 /// Reader threads per gather: the lookups are small random reads, latency-bound one at a time, and
@@ -205,6 +208,16 @@ impl EngramReader {
                     "0" | "off" | "false" | "no"
                 )
             });
+        let dedupe = sparkflash_model::active_profile()
+            .diagnostics
+            .engram_dedupe
+            .as_deref()
+            .is_none_or(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "off" | "false" | "no"
+                )
+            });
         let mut align = sparkflash_engram::store::MIN_ALIGN_BYTES;
         let mut region = |name: String| -> Result<(Arc<fs::File>, u64), String> {
             let (file, start, _len) = source
@@ -242,6 +255,7 @@ impl EngramReader {
                 .engram_cache
                 .unwrap_or(true),
             shard,
+            dedupe,
         })
     }
 
@@ -502,10 +516,44 @@ pub(super) struct EngramGather<'r> {
     /// This rank's share when the ranks split the columns (staged `shard.pitch` bytes a row
     /// instead of `stride`).
     shard: Option<EngramShard>,
+    /// The entries a gather did not read a second time: (slot, the staging offset they belong at,
+    /// the offset of the read that lands the same table bytes, bytes). Copied in after their
+    /// slot's reads have landed ([`Self::settle`]).
+    dups: Vec<(usize, usize, usize, usize)>,
 }
 
 /// One Engram read: (slot, file, byte offset, staging offset, length).
 type ReadJob<'f> = (usize, &'f fs::File, u64, usize, usize);
+
+/// Drops every read whose table bytes an earlier read of the same slot already lands, recording
+/// it in `dups` as (slot, where the duplicate belongs, the offset of the read that lands it,
+/// bytes). The gather copies the entry across once the slot's reads have landed
+/// ([`EngramGather::settle`]).
+///
+/// The key is the slot and the table bytes a read lands, never the row: an n-gram hashed at the
+/// same bucket by two rows (repeated text, a redraft, or two columns of one row) is one entry.
+fn dedupe_reads<'f>(
+    per_slot: &mut [Vec<ReadJob<'f>>],
+    dups: &mut Vec<(usize, usize, usize, usize)>,
+) {
+    let mut seen = std::collections::HashMap::new();
+    for slot_jobs in per_slot {
+        let mut kept = Vec::with_capacity(slot_jobs.len());
+        for job in slot_jobs.drain(..) {
+            let key = (job.0, std::ptr::from_ref(job.1) as usize, job.2, job.4);
+            match seen.entry(key) {
+                std::collections::hash_map::Entry::Occupied(read) => {
+                    dups.push((job.0, job.3, *read.get(), job.4));
+                }
+                std::collections::hash_map::Entry::Vacant(first) => {
+                    first.insert(job.3);
+                    kept.push(job);
+                }
+            }
+        }
+        *slot_jobs = kept;
+    }
+}
 
 /// Entries already read, by (file, byte).
 type EntryCache = std::collections::HashMap<(usize, u64), Box<[u8]>>;
@@ -570,6 +618,7 @@ impl EngramGather<'_> {
                 *count += more;
             }
             merged.jobs.extend(part.jobs);
+            merged.dups.extend(part.dups);
             merged.cached &= part.cached;
         }
         // Each slot's reads together, slot 0's first (the sort is stable: rows stay in order).
@@ -601,6 +650,26 @@ impl EngramGather<'_> {
             failed: Mutex::new(None),
             landed: Condvar::new(),
         }
+    }
+
+    /// Copies the entries this gather read once into the rows that look the same table bytes up
+    /// again, once `slot`'s reads have landed. Idempotent: the source is a read of this slot, so
+    /// a second call copies the same bytes over the same bytes.
+    fn settle(&self, slot: usize, staging: &Staging) -> Result<(), String> {
+        for &(_, dst, src, len) in self.dups.iter().filter(|dup| dup.0 == slot) {
+            if src + len > staging.1 || dst + len > staging.1 {
+                return Err(
+                    "engram reader: a copied read lands outside the staging buffer".to_owned(),
+                );
+            }
+            // SAFETY: both ranges are inside the buffer (checked) and inside one slot's staging
+            // rows, whose reads have all landed; the source of a copy is a job that survived the
+            // dedupe, so no other write touches it.
+            unsafe {
+                std::ptr::copy_nonoverlapping(staging.0.add(src), staging.0.add(dst), len);
+            }
+        }
+        Ok(())
     }
 
     /// Job `i`'s staging bytes, or an error if the job lands outside the buffer.
@@ -715,7 +784,11 @@ impl EngramGather<'_> {
                 scope.spawn(|| self.work(&progress, staging));
             }
         });
-        (0..self.slots()).try_for_each(|slot| Self::wait(&progress, slot))
+        for slot in 0..self.slots() {
+            Self::wait(&progress, slot)?;
+            self.settle(slot, staging)?;
+        }
+        Ok(())
     }
 
     /// Blocks until every read of `slot` has landed.
@@ -1059,9 +1132,10 @@ impl<'r> Reads<'r> {
     /// Blocks until `slot`'s reads of `task` have landed.
     fn wait(&self, task: &GatherTask<'r>, slot: usize) -> Result<(), String> {
         match self {
-            Self::Uring(uring) => uring.wait(task, slot),
-            Self::Pool(_) => EngramGather::wait(&task.progress, slot),
+            Self::Uring(uring) => uring.wait(task, slot)?,
+            Self::Pool(_) => EngramGather::wait(&task.progress, slot)?,
         }
+        task.gather.settle(slot, &task.staging)
     }
 
     pub(super) fn wait_all(&self, task: &GatherTask<'r>) -> Result<(), String> {
@@ -1161,6 +1235,13 @@ impl DeviceLayer<'_> {
                 }
             }
         }
+        // The same n-gram looked up by two rows (repeated text, a redraft, or two columns that
+        // hash to one bucket) is one table entry: read it once, copy it to every row that wants
+        // it. A verify step over eight lanes repeats a good share of its 2/3/4-grams.
+        let mut dups = Vec::new();
+        if reader.dedupe {
+            dedupe_reads(&mut per_slot, &mut dups);
+        }
         let counts = per_slot.iter().map(Vec::len).collect();
         let jobs = per_slot.into_iter().flatten().collect();
         Ok(Some(EngramGather {
@@ -1175,6 +1256,7 @@ impl DeviceLayer<'_> {
             counts,
             cached: true,
             shard,
+            dups,
         }))
     }
 
@@ -1594,8 +1676,124 @@ pub(super) const STEP_COST: StepCost = StepCost {
     prior_tokens_per_ms: 0.06,
 };
 
-pub(super) fn step_ms(depth: usize) -> f64 {
-    STEP_COST.ms(depth)
+/// The rows the shared step's cost model bends at: a step of up to this many rows is the
+/// narrow body, past it the wide one (the bucket split the model is fit over).
+pub(super) const BAND_ROWS: usize = 16;
+
+/// What a shared step costs for each sequence past the first, besides its anchor row (ms): its
+/// draft block, its segment's seam and select, its head row. This is the term the step model
+/// carried before it was measured; a four-number profile value keeps it, so a value that does not
+/// name it cannot move the per-sequence part of a step.
+pub(super) const SEQ_MS: f64 = 2.3;
+
+/// A shared step's cost model: a0 + a1 * rows up to [BAND_ROWS] rows, b0 + b1 * rows above,
+/// and seq_ms for each sequence past the first (ms). The trace's per-tick decode line (rows and
+/// milliseconds) is this model's target: one shared step, in rows and in sequences.
+pub(super) type StepModel = (f64, f64, f64, f64, f64);
+
+/// The modelled wall of a shared step over the given number of verified rows (ms).
+#[must_use]
+pub(super) fn batch_step_ms(model: StepModel, rows: usize) -> f64 {
+    let (a0, a1, b0, b1, _) = model;
+    if rows <= BAND_ROWS {
+        a0 + a1 * rows as f64
+    } else {
+        b0 + b1 * rows as f64
+    }
+}
+
+/// [batch_step_cost] over one profile value: a0,a1,b0,b1[,seq_ms], or the flat band that
+/// reproduces [STEP_COST] over the step's actual rows when the value is absent. (A malformed
+/// value never reaches here in a serving process: `ModelProfile::validate` refuses it at boot;
+/// the fallback below is the function's own contract for an unvalidated caller.)
+///
+/// The flat model's row count is the step's rows (`seqs + drafts`, the count the trace and the
+/// fit use), while [STEP_COST] prices a c=1 step by its *drafts*: 27 ms covers the anchor and
+/// 4 ms each verified row. The same curve over the step's rows is therefore `(27 - 4) + 4 * rows`,
+/// and with it an unset knob is exactly the pre-bend model the share ran - 27 + 4 x drafts plus
+/// [SEQ_MS] a sequence past the first - so the switch cannot move a step it was not asked to move.
+#[must_use]
+pub(super) fn batch_step_cost_from(value: Option<&str>) -> StepModel {
+    let flat = (
+        STEP_COST.step_ms - STEP_COST.row_ms,
+        STEP_COST.row_ms,
+        STEP_COST.step_ms - STEP_COST.row_ms,
+        STEP_COST.row_ms,
+        SEQ_MS,
+    );
+    let parsed = value.and_then(|text| {
+        let parts = text
+            .split(',')
+            .map(|part| part.trim().parse::<f64>())
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let sane = parts.iter().all(|ms| ms.is_finite() && *ms >= 0.0);
+        (sane && (parts.len() == 4 || parts.len() == 5)).then(|| {
+            (
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+                parts.get(4).copied().unwrap_or(SEQ_MS),
+            )
+        })
+    });
+    parsed.unwrap_or(flat)
+}
+
+/// The shared step's cost model the profile names ([batch_step_cost_from]).
+#[must_use]
+pub(super) fn batch_step_cost() -> StepModel {
+    batch_step_cost_from(
+        sparkflash_model::active_profile()
+            .speculation
+            .batch_spec_cost
+            .as_deref(),
+    )
+}
+
+/// The depth policy's per-row cost, from `SPARKFLASH_SPEC_ROW_MS` when it names a non-negative
+/// number, else [STEP_COST]'s.
+///
+/// This exists for one A/B (issue #20 WS4): a c1 step of six rows took 38 ms and carries about
+/// eleven experts, so with 22.8 ms fixed, 0.97 ms an expert and 0.71 ms a row of seam, head and
+/// collectives the marginal row is **0.75 ms** - not the 4 ms `STEP_COST` charges, which was
+/// justified as "each row reads its own six experts a layer" and is five times the measured cost.
+/// Only the depth policy takes it, not `step_ms`, so the multi-sequence share's term ([SEQ_MS]) is
+/// untouched and the A/B moves one decision.
+///
+/// It stays an override rather than the default until that A/B has run at both shapes: the cheaper
+/// row makes the policy verify deeper, which is only right if the extra rows really do cost what
+/// this says.
+#[must_use]
+pub(super) fn row_cost_ms_from(value: Option<&str>) -> Option<f64> {
+    value
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+}
+
+/// [row_cost_ms_from] over the typed profile (`speculation.row_ms`,
+/// `SPARKFLASH_SPEC_ROW_MS`).
+#[must_use]
+fn row_cost_ms() -> Option<f64> {
+    row_cost_ms_from(
+        sparkflash_model::active_profile()
+            .speculation
+            .row_ms
+            .as_deref(),
+    )
+}
+
+/// The cost model the depth policy is built on.
+#[must_use]
+pub(super) fn depth_cost() -> StepCost {
+    match row_cost_ms() {
+        Some(row_ms) => StepCost {
+            row_ms,
+            ..STEP_COST
+        },
+        None => STEP_COST,
+    }
 }
 
 /// How many of the k drafts a step verifies: the shared [DepthPolicy] over [STEP_COST], from the
@@ -1607,7 +1805,7 @@ pub(super) fn step_ms(depth: usize) -> f64 {
 /// accepted to the full depth); pinned to depth 5 (`speculation.min_depth = 5`) it ran as fixed,
 /// so the host read of the probabilities costs nothing.
 pub(super) fn depth_policy(k: usize) -> DepthPolicy {
-    DepthPolicy::from_profile(k, STEP_COST)
+    DepthPolicy::from_profile(k, depth_cost())
 }
 
 /// A generation's per-step callback: the step's tokens and whether the request ends with it
@@ -1939,6 +2137,7 @@ mod tests {
             cache: Mutex::new(std::collections::HashMap::new()),
             cached: true,
             shard: true,
+            dedupe: true,
         }
     }
 
@@ -1986,6 +2185,7 @@ mod tests {
                     counts: vec![reads.len()],
                     cached: false,
                     shard: None,
+                    dups: Vec::new(),
                 }
             };
             let mut got = vec![0u8; total];
@@ -2069,6 +2269,7 @@ mod tests {
                 counts: vec![3, 3],
                 cached: false,
                 shard: None,
+                dups: Vec::new(),
             }
         };
         // Two tasks on one pool, whose workers take the earliest slot of either; the later one
@@ -2087,6 +2288,65 @@ mod tests {
         });
         assert_eq!(first[..total], want, "the first task");
         assert_eq!(second[..total], want, "the second task");
+    }
+
+    #[test]
+    fn a_repeated_entry_is_read_once_and_copied_to_every_row_that_wants_it() {
+        use std::io::Write as _;
+        let mut file = tempfile::tempfile().expect("a temporary file");
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 13 + 5) as u8).collect();
+        file.write_all(&bytes).expect("write");
+        // Each slot reads one entry into two rows: the second row is a copy, not a read.
+        let mut per_slot = vec![
+            vec![
+                (0usize, &file, 0u64, 0usize, 256usize),
+                (0, &file, 0, 1024, 256),
+            ],
+            vec![(1, &file, 1024, 2048, 256), (1, &file, 1024, 3072, 256)],
+        ];
+        let mut dups = Vec::new();
+        dedupe_reads(&mut per_slot, &mut dups);
+        assert_eq!(
+            per_slot.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 1],
+            "one read a slot"
+        );
+        assert_eq!(
+            dups,
+            vec![(0, 1024, 0, 256), (1, 3072, 2048, 256)],
+            "the second row copies the first"
+        );
+        let reader = reader(None);
+        let (stride, cap, slots) = (1024, 2, 2);
+        let gather = EngramGather {
+            reader: &reader,
+            n: 2,
+            stride,
+            cap,
+            row0: 0,
+            at: 0,
+            skips: vec![false, false],
+            jobs: per_slot.into_iter().flatten().collect(),
+            counts: vec![1, 1],
+            cached: true,
+            shard: None,
+            dups,
+        };
+        let mut staged = vec![0u8; slots * cap * stride];
+        gather
+            .read_all(&Staging(staged.as_mut_ptr(), staged.len()), 2)
+            .expect("the reads and their copies");
+        for slot in 0..slots {
+            let entry = slot * cap * stride;
+            for row in 0..2 {
+                let at = entry + row * stride;
+                assert_eq!(
+                    staged[at..at + 256],
+                    bytes[slot * 1024..slot * 1024 + 256],
+                    "slot {slot} row {row}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2170,6 +2430,7 @@ mod tests {
             counts: vec![1, 1],
             cached: true,
             shard: None,
+            dups: Vec::new(),
         };
         let merged = EngramGather::merge(vec![part(0, 100), part(1, 200), part(2, 300)])
             .expect("tiles")

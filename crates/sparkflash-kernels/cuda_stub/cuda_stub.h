@@ -318,6 +318,19 @@ __device__ __forceinline__ float __sinf(float value) {
     return 0.0f;
 }
 
+// <math.h>'s round-to-nearest-even. The real toolkit declares it in the CUDA math headers the
+// kernel sources reach; the stub carries no <math.h>, so the probe could not type-check a kernel
+// that calls it.
+__device__ __forceinline__ float rintf(float value) {
+    return value;
+}
+
+// The CUDA intrinsic that widens a 64-bit integer to f32 (opt_rows_sm121.cu's int8 screen).
+// Like every other intrinsic here it carries no semantics: -fsyntax-only never calls it.
+__device__ __forceinline__ float __ll2float_rn(long long value) {
+    return (float)value;
+}
+
 __device__ __forceinline__ float fabsf(float value) {
     return value < 0.0f ? -value : value;
 }
@@ -334,15 +347,6 @@ __device__ __forceinline__ bool isfinite(float value) {
 
 __device__ __forceinline__ float fminf(float a, float b) {
     return a < b ? a : b;
-}
-
-// CUDA's math.h rounds these to nearest even; the stub only needs the type check.
-__device__ __forceinline__ float rintf(float value) {
-    return __builtin_rintf(value);
-}
-
-__device__ __forceinline__ float __ll2float_rn(long long value) {
-    return (float)value;
 }
 
 __device__ __forceinline__ float copysignf(float magnitude, float sign) {

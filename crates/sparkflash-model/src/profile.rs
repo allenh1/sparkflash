@@ -151,6 +151,17 @@ pub struct PrefillProfile {
     pub warmup: Option<bool>,
     /// Rank 0 decides each tick one ahead.
     pub tick_ahead: Option<bool>,
+    /// Append a chunk's completed key positions to the persistent packed-key store instead of
+    /// re-packing the whole history. Unset is on; `0` restores the re-pack as the A/B arm, which
+    /// writes the same bytes by design (docs/performance.md, WS2).
+    pub index_pack_append: Option<String>,
+    /// Skip the repeated owner-3 pack inside one chunk pass. Only `1` selects the skip; it writes
+    /// the same bytes, and it ships off until its fixed arm has a device A/B.
+    pub index_pack_dedupe: Option<String>,
+    /// Print the packed blocks each chunk asks for. Only `1` selects the log.
+    pub index_pack_log: Option<String>,
+    /// Checksum the packed store after each pack. Only `1` arms the probe.
+    pub index_pack_verify: Option<String>,
 }
 
 /// The decode section.
@@ -218,6 +229,16 @@ pub struct SpeculationProfile {
     pub batch_spec: Option<bool>,
     /// Least calibrated chain probability a shared verify row needs.
     pub batch_spec_floor: Option<f64>,
+    /// The shared step's cost model, as `a0,a1,b0,b1[,seq_ms]` (ms: `a0 + a1 * rows` up to 16
+    /// rows, `b0 + b1 * rows` above), fit from measured serve step times. The shared row budget
+    /// weights expected tokens against it ([`share_rows`]). Four or five non-negative finite
+    /// numbers; anything else is refused when the profile is applied.
+    pub batch_spec_cost: Option<String>,
+    /// The depth policy's per-row cost in milliseconds, as a non-negative finite number: the WS4
+    /// A/B override for `StepCost::row_ms`. Unset or empty keeps the engine's 4 ms and anything
+    /// else that is not a number is refused; the measured A/B found the decision unchanged, so
+    /// this is an instrument, not a default.
+    pub row_ms: Option<String>,
     /// The drafter directory or repository id.
     pub drafter: Option<String>,
 }
@@ -480,6 +501,19 @@ pub struct DiagnosticsProfile {
     pub engram_keepalive: Option<bool>,
     /// Shard the Engram table prefix.
     pub engram_shard: Option<String>,
+    /// Read each distinct Engram table entry once per gather.
+    pub engram_dedupe: Option<String>,
+    /// Run the routed experts once per distinct expert instead of once per routed row. Only `0`
+    /// selects the per-row path; both produce the same bits.
+    pub moe_dedup: Option<String>,
+    /// Rebuild the routed MoE's expert grouping in every dedup block instead of once a stage
+    /// call. Only `1` selects the in-block A/B arm; the plan is the same bytes either way.
+    pub moe_plan_in_cta: Option<String>,
+    /// Have the hoisted plan kernel accumulate its per-band distinct counts and call markers.
+    /// Only `1` arms the instrument.
+    pub moe_plan_stats: Option<String>,
+    /// Dump one step's routed expert ids at this layer (a layer number). Unset dumps nothing.
+    pub moe_ids_dump: Option<String>,
     /// Share the TP collectives across layers.
     pub shared_tp: Option<bool>,
     /// Require io_uring rather than falling back.
@@ -695,6 +729,17 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
         "diagnostics.engram_keepalive",
     ),
     ("SPARKFLASH_ENGRAM_SHARD", "diagnostics.engram_shard"),
+    ("SPARKFLASH_ENGRAM_DEDUPE", "diagnostics.engram_dedupe"),
+    ("SPARKFLASH_MOE_DEDUP", "diagnostics.moe_dedup"),
+    ("SPARKFLASH_INDEX_PACK_APPEND", "prefill.index_pack_append"),
+    ("SPARKFLASH_INDEX_PACK_DEDUPE", "prefill.index_pack_dedupe"),
+    ("SPARKFLASH_INDEX_PACK_LOG", "prefill.index_pack_log"),
+    ("SPARKFLASH_INDEX_PACK_VERIFY", "prefill.index_pack_verify"),
+    ("SPARKFLASH_MOE_PLAN_INCTA", "diagnostics.moe_plan_in_cta"),
+    ("SPARKFLASH_MOE_PLAN_STATS", "diagnostics.moe_plan_stats"),
+    ("SPARKFLASH_MOE_IDS_DUMP", "diagnostics.moe_ids_dump"),
+    ("SPARKFLASH_SPEC_BATCH_COST", "speculation.batch_spec_cost"),
+    ("SPARKFLASH_SPEC_ROW_MS", "speculation.row_ms"),
     ("SPARKFLASH_SHARED_TP", "diagnostics.shared_tp"),
     (
         "SPARKFLASH_REQUIRE_IO_URING",
@@ -948,6 +993,10 @@ const F64_FIELDS: &[(&str, F64Field)] = &[
 const TEXT_FIELDS: &[(&str, TextField)] = &[
     ("runtime.converted_dir", |p| &mut p.runtime.converted_dir),
     ("speculation.drafter", |p| &mut p.speculation.drafter),
+    ("speculation.batch_spec_cost", |p| {
+        &mut p.speculation.batch_spec_cost
+    }),
+    ("speculation.row_ms", |p| &mut p.speculation.row_ms),
     ("diagnostics.layer_device", |p| {
         &mut p.diagnostics.layer_device
     }),
@@ -974,6 +1023,29 @@ const TEXT_FIELDS: &[(&str, TextField)] = &[
     }),
     ("diagnostics.engram_shard", |p| {
         &mut p.diagnostics.engram_shard
+    }),
+    ("diagnostics.engram_dedupe", |p| {
+        &mut p.diagnostics.engram_dedupe
+    }),
+    ("diagnostics.moe_dedup", |p| &mut p.diagnostics.moe_dedup),
+    ("prefill.index_pack_append", |p| {
+        &mut p.prefill.index_pack_append
+    }),
+    ("prefill.index_pack_dedupe", |p| {
+        &mut p.prefill.index_pack_dedupe
+    }),
+    ("prefill.index_pack_log", |p| &mut p.prefill.index_pack_log),
+    ("prefill.index_pack_verify", |p| {
+        &mut p.prefill.index_pack_verify
+    }),
+    ("diagnostics.moe_plan_in_cta", |p| {
+        &mut p.diagnostics.moe_plan_in_cta
+    }),
+    ("diagnostics.moe_plan_stats", |p| {
+        &mut p.diagnostics.moe_plan_stats
+    }),
+    ("diagnostics.moe_ids_dump", |p| {
+        &mut p.diagnostics.moe_ids_dump
     }),
     ("diagnostics.device_trace_events", |p| {
         &mut p.diagnostics.device_trace_events
@@ -1018,7 +1090,7 @@ impl ModelProfile {
     ///
     /// # Errors
     /// A zero width, a chunk that is not a multiple of the 64-token granularity, a draft depth
-    /// of zero, or a non-positive fold scale.
+    /// of zero, a non-positive fold scale, or a cost-model value that is not the shape it names.
     pub fn validate(&self) -> Result<(), ProfileError> {
         if self.runtime.context_tokens == Some(0) {
             return Err(ProfileError::Invalid(
@@ -1048,6 +1120,49 @@ impl ModelProfile {
             return Err(ProfileError::Invalid(format!(
                 "speculation.mtp_fold_scale {scale} is not a positive finite number"
             )));
+        }
+        // The two WS4 model knobs are text so one env value can carry the whole model; an
+        // out-of-domain value is refused here rather than silently falling back to the engine's
+        // default, which would run the control arm under a name that says otherwise.
+        if let Some(text) = self
+            .speculation
+            .row_ms
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            let value = text.trim().parse::<f64>().map_err(|_| {
+                ProfileError::Invalid(format!(
+                    "speculation.row_ms {text:?} is not a number of milliseconds"
+                ))
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(ProfileError::Invalid(format!(
+                    "speculation.row_ms {text:?} is not a non-negative finite number"
+                )));
+            }
+        }
+        if let Some(text) = self
+            .speculation
+            .batch_spec_cost
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            let parts = text
+                .split(',')
+                .map(|part| part.trim().parse::<f64>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    ProfileError::Invalid(format!(
+                        "speculation.batch_spec_cost {text:?} is not comma-separated milliseconds"
+                    ))
+                })?;
+            if (parts.len() != 4 && parts.len() != 5)
+                || parts.iter().any(|ms| !ms.is_finite() || *ms < 0.0)
+            {
+                return Err(ProfileError::Invalid(format!(
+                    "speculation.batch_spec_cost {text:?} needs four or five non-negative finite numbers"
+                )));
+            }
         }
         Ok(())
     }
@@ -1430,6 +1545,10 @@ probe = "hash"
             || F64_FIELDS.iter().any(|(candidate, _)| *candidate == field)
         {
             "1"
+        } else if field == "speculation.row_ms" {
+            "1.5"
+        } else if field == "speculation.batch_spec_cost" {
+            "1,2,3,4"
         } else if TEXT_FIELDS.iter().any(|(candidate, _)| *candidate == field) {
             "set"
         } else {
@@ -1493,6 +1612,41 @@ probe = "hash"
                 "{name} left {field} at its default"
             );
         }
+    }
+
+    /// A cost-model value that is not the shape the reader parses is refused when the profile is
+    /// applied, not silently replaced by the engine's default (which would run the control arm
+    /// under the name of the A/B arm).
+    #[test]
+    fn a_malformed_cost_model_is_refused() {
+        for (name, value) in [
+            ("SPARKFLASH_SPEC_ROW_MS", "0.75f"),
+            ("SPARKFLASH_SPEC_ROW_MS", "nan"),
+            ("SPARKFLASH_SPEC_ROW_MS", "-1"),
+            ("SPARKFLASH_SPEC_BATCH_COST", "1,2,3"),
+            ("SPARKFLASH_SPEC_BATCH_COST", "1,2,3,4,5,6"),
+            ("SPARKFLASH_SPEC_BATCH_COST", "1,2,-3,4"),
+            ("SPARKFLASH_SPEC_BATCH_COST", "a,b,c,d"),
+        ] {
+            let mut profile = ModelProfile::default();
+            let result =
+                profile.apply_env(|candidate| (candidate == name).then(|| value.to_owned()));
+            assert!(result.is_err(), "{name}={value} was accepted");
+        }
+        // The shapes the readers parse are accepted, and an empty value means unset.
+        let mut profile = ModelProfile::default();
+        profile
+            .apply_env(|name| match name {
+                "SPARKFLASH_SPEC_ROW_MS" => Some("0.75".to_owned()),
+                "SPARKFLASH_SPEC_BATCH_COST" => Some("25.5,2.68,41.8,1.71,1.59".to_owned()),
+                _ => None,
+            })
+            .expect("the fitted model is in domain");
+        assert_eq!(profile.speculation.row_ms.as_deref(), Some("0.75"));
+        let mut empty = ModelProfile::default();
+        empty
+            .apply_env(|name| (name == "SPARKFLASH_SPEC_ROW_MS").then(String::new))
+            .expect("empty is unset");
     }
 
     /// The one spelling the Qwen arm accepts for its fold switch reaches the typed field.

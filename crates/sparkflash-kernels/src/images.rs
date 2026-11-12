@@ -508,6 +508,7 @@ impl Image {
                 "opt_moe_gate_up_dedup_sm121",
                 "opt_moe_gate_up_k3_sm121",
                 "opt_moe_gate_up_sm121",
+                "opt_moe_plan_sm121",
                 "opt_pool_rows",
                 "opt_ref_select",
                 "opt_ref_select_fast",

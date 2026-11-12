@@ -45,6 +45,53 @@ pub(crate) const R_MAX: usize = 64;
 // The Engram post takes a step's live rows as one 64-bit launch word.
 const _: () = assert!(R_MAX <= 64);
 
+/// The layer whose routed experts to dump for issue #20 WS4, read from
+/// `SPARKFLASH_MOE_IDS_DUMP=<layer>` (a layer number, e.g. `20`; unset dumps nothing).
+///
+/// The step's per-row expert ids are what a *price* would go on, and the one thing the plan-stat
+/// instrument cannot report: it counts the union a call pays for (`SPARKFLASH_MOE_PLAN_STATS`),
+/// not which row brought which expert. `workspace.moe_ids` already holds them, so this is a gated
+/// host copy in `rows_moe_routed` and nothing else: one line a row, for the first
+/// [`MOE_IDS_DUMPS`] steps that reach the named layer.
+#[must_use]
+pub(super) fn moe_ids_dump_layer_from(value: Option<&str>) -> Option<usize> {
+    value.and_then(|text| text.trim().parse::<usize>().ok())
+}
+
+/// Whether a step is worth the id dump: at least two rows.
+///
+/// The segment count is not the test. A lone sequence's speculative step installs no segment
+/// table (`begin_rows_queued`, not `begin_rows_segments`), so a c1 step has zero segments, and
+/// its rows are exactly the single-stream question this dump exists to answer.
+#[must_use]
+pub(super) fn moe_ids_dumpable(_segments: usize, n: usize) -> bool {
+    n >= 2
+}
+
+/// [moe_ids_dump_layer_from] over the profile (`diagnostics.moe_ids_dump`).
+///
+/// `rows_moe_routed` runs once a routed layer (forty times a step), so this is the profile's
+/// once-installed table rather than an environment lookup a layer.
+#[must_use]
+fn moe_ids_dump_layer() -> Option<usize> {
+    moe_ids_dump_layer_from(
+        sparkflash_model::active_profile()
+            .diagnostics
+            .moe_ids_dump
+            .as_deref(),
+    )
+}
+
+/// Counts the steps the dump has printed, capped by [`MOE_IDS_DUMPS`].
+static MOE_IDS_DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How many steps the dump prints. One was not enough: the first step a run takes is the boot
+/// warm-up's, so a one-shot dump described the warm-up and never the client step a price is about.
+const MOE_IDS_DUMPS: usize = 48;
+
+/// The same guard for the step's segment table, which is where a row's lane and draft depth come
+/// from: `row_tab` is only uploaded when the KV cache is off, so the ids dump's own `lane`/`depth`
+/// fields are empty in serving and this half is what supplies them.
+static MOE_SEGS_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The rows one opt_rows_lm_head block serves (its OR_LM_ROWS, staged in shared memory).
 const HEAD_ROWS: usize = 4;
 
@@ -2179,6 +2226,19 @@ impl DeviceLayer<'_> {
         segs: &[super::lanes::Seg],
     ) -> Result<(), String> {
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Issue #20 WS4: the step's row layout, printed before any of the early returns below,
+        // because the row table itself is only uploaded with the KV cache off. Rows are emitted
+        // segment by segment, so this plus the id dump is the row-to-(lane, depth) mapping.
+        if moe_ids_dump_layer().is_some()
+            && !MOE_SEGS_DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            for (index, seg) in segs.iter().enumerate() {
+                println!(
+                    "sparkflash serve: moe_segs seg={index} lane={} p0={} n={} row0={}",
+                    seg.lane, seg.p0, seg.n, seg.row0
+                );
+            }
+        }
         rows.row_tab_for.borrow_mut().clear();
         rows.group_ratios.set([0; GROUP_SLOTS]);
         let off = *OFF.get_or_init(|| {
@@ -3597,10 +3657,80 @@ impl DeviceLayer<'_> {
             delta_bf16: operand(b.delta_bf16, n * dim * 2),
         };
         device.set_addend(b.shared_out);
-        match bulk {
+        let routed = match bulk {
             Some(bulk) => device.run_bulk(self.cuda, &bulk.moe, layer, n, &operands),
             None => device.run(self.cuda, layer, p0, n, &operands),
+        };
+        // Issue #20 WS4's datum: which expert each row routed to, so the union a step pays for and
+        // each row's marginal experts can be counted instead of assumed (docs/performance.md).
+        // This branch is off by default, and it runs once a routed layer: everything below the
+        // layer check - the segment copy above all - is built only when the layer matches.
+        if moe_ids_dump_layer() == Some(layer) {
+            // Only a multi-lane step has drafts at depths: a prefill step's rows are one
+            // sequence's consecutive positions, and a dump of those says nothing about what a
+            // price charges. The step's segments are installed before its layers, so they are
+            // the test.
+            let segs: Vec<(usize, usize, usize)> = self
+                .segments()
+                .iter()
+                .map(|seg| (seg.lane, seg.p0, seg.n))
+                .collect();
+            // A step is worth dumping whenever it is a speculative step: several lanes'
+            // segments, so the rows carry draft depths. The old guard also demanded n >= 32 on
+            // the theory that a short step pays six experts a row with nothing shared - but
+            // whether consecutive rows of one sequence share experts is exactly what a
+            // single-stream question turns on, and the guard made that shape the one shape the
+            // dump refused. A step's rows are its own sequence's anchor and drafts, so the union
+            // is the number to have.
+            if moe_ids_dumpable(segs.len(), n)
+                && MOE_IDS_DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < MOE_IDS_DUMPS
+            {
+                for (index, (lane, seg_p0, seg_n)) in segs.iter().enumerate() {
+                    println!(
+                        "sparkflash serve: moe_segs seg={index} lane={lane} p0={seg_p0} n={seg_n} row0=0"
+                    );
+                }
+                let mut bytes = vec![0u8; n * top_k * 4];
+                self.cuda
+                    .copy_dtoh(&mut bytes, &Deviceptr(b.moe_ids))
+                    .map_err(|error| format!("moe ids dump: {error}"))?;
+                let ids: Vec<u32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|word| u32::from_le_bytes(*word))
+                    .collect();
+                // Which lane and position each row is, host-side: the step's own segment table,
+                // installed before its layers and printed beside these lines as `moe_segs`. A
+                // price needs the draft's *depth* (the position past the segment's first), not
+                // the row index. `row_tab` would do when the KV cache is off, but serving keeps
+                // it on and the table is never uploaded, so the segments are the source. A lone
+                // sequence installs none: its lines print without lane or depth.
+                let mut placed: Vec<Option<(usize, usize, usize)>> = vec![None; n];
+                let mut at = 0usize;
+                for (lane, seg_p0, seg_n) in &segs {
+                    for row in 0..*seg_n {
+                        if at < n {
+                            placed[at] = Some((*lane, *seg_p0, seg_p0 + row));
+                        }
+                        at += 1;
+                    }
+                }
+                for row in 0..n {
+                    let got = &ids[row * top_k..(row + 1) * top_k];
+                    match placed[row] {
+                        Some((lane, seg_p0, pos)) => println!(
+                            "sparkflash serve: moe_ids layer={layer} p0={p0} n={n} top_k={top_k} row={row} lane={lane} seg_p0={seg_p0} depth={} ids={got:?}",
+                            pos - seg_p0
+                        ),
+                        None => println!(
+                            "sparkflash serve: moe_ids layer={layer} p0={p0} n={n} top_k={top_k} row={row} lane=- seg_p0=- depth=- ids={got:?}"
+                        ),
+                    }
+                }
+            }
         }
+        routed
     }
 
     /// (world, rank) when the run's reduce handle carries the one-shot exchange: the argmax and

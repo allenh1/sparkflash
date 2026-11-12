@@ -191,7 +191,7 @@ rank_env() {
     # exchange opens, and SPARKFLASH_DEVICE_GATHER and SPARKFLASH_TWO_SHOT_ROWS choose whether a
     # rank takes the exchange's slot path at all. A value that reaches rank 0 alone makes one rank
     # a different program from its peers, which is the same split as a rank that stood down.
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN)' || true); do
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0

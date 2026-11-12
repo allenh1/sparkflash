@@ -133,6 +133,70 @@ pub const MAX_ROUTED_ROWS: usize = 384;
 /// OPT_MOE_PLAN_MAX): 64 verify rows of top-6 fit.
 const DEDUP_MAX_ROWS: usize = 384;
 
+/// The parameters `OPT_MOE_GATE_UP_DEDUP_ENTRY` declares in `kernels/opt_moe_sm121.cu`.
+///
+/// The launch arrays are sized by it, and `tests/moe_kernel_abi.rs` counts the macro's parameters
+/// from the source so a call site cannot drift from the kernel again: the k3 entry gained the
+/// plan input and the drafter still passed twelve arguments, which the driver's spare zero turned
+/// into a valid in-block call.
+pub const OPT_MOE_GATE_UP_DEDUP_ARGS: usize = 13;
+
+/// The parameters `opt_moe_plan_sm121` declares; `tests/moe_kernel_abi.rs` holds it to the source.
+pub const OPT_MOE_PLAN_ARGS: usize = 5;
+
+/// Whether the dedup path rebuilds the stage's grouping in every block (the A/B arm of issue #20
+/// WS1a), parsed from the profile's `diagnostics.moe_plan_in_cta`.
+///
+/// The default is the hoisted plan: `opt_moe_plan_sm121` builds it once and every dedup block reads
+/// it. `=1` restores the in-block build, which is the arm the issue compares against. The two call
+/// the same two device functions, so the plan - and therefore every dedup output - is identical
+/// either way; only the cost of deriving it moves.
+#[must_use]
+pub fn plan_in_cta_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Whether the hoisted plan kernel accumulates the routed grouping it built, parsed from the
+/// profile's `diagnostics.moe_plan_stats`.
+///
+/// The bytes a dedup call reads are `count` expert matrices and nothing else knows `count`: the
+/// launch is `rows` blocks wide and every block past the distinct count leaves, so the row count is
+/// an upper bound and the published GB/s figure is a lower bound by however far apart the two are
+/// (issue #20 WS1(b), and the correction to the survey's 134 GB/s). With this on, the plan kernel
+/// adds each call's distinct count and one call marker into its band's pair - four bands keyed by
+/// row count, [PLAN_STATS_BYTES] in all - and [MoeRoutedDevice::read_plan_stats] reads them back
+/// once at drain.
+///
+/// Off by default: two atomics a launch is nothing, but a counter that a measurement mode did not
+/// ask for is still a counter in the steady-state kernel path.
+#[must_use]
+pub fn plan_stats_from(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// The routed MoE's build switches, resolved from the serving profile by the forward and handed to
+/// [MoeRoutedDevice::open].
+///
+/// This crate does not depend on `sparkflash-model`, so the profile is read once by the caller
+/// instead of the environment being read once a launch here: a per-launch `getenv` plus a `String`
+/// allocation in a 40-layer step is exactly what the typed profile exists to remove.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoeRoutedOptions {
+    /// Rebuild the plan in every dedup block instead of reading the hoisted one.
+    pub plan_in_cta: bool,
+    /// Have the hoisted plan kernel accumulate its per-band counts.
+    pub plan_stats: bool,
+    /// Run the routed experts once per distinct expert (`SPARKFLASH_MOE_DEDUP`, on unless `0`).
+    pub dedup: bool,
+}
+
+/// [MoeRoutedOptions::dedup]'s parser: the switch documents `=0` as the per-row arm, and any
+/// other value (including unset) keeps the distinct-expert path.
+#[must_use]
+pub fn moe_dedup_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
 /// One routed expert matrix, in the order the table and the bind use.
 ///
 /// The variant order is the table's matrix axis and the `[Gate, Up, Down]` order
@@ -1194,6 +1258,156 @@ pub struct MoeRoutedKernels {
 /// One instance is created at open (the layer port's prewarm, next to the shared expert's own
 /// run-scope state) and lives for the run. A stage call allocates nothing, uploads nothing and reads
 /// nothing back to the host.
+/// One row-count band of [PlanStats]: the calls whose routed-row count fell in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlanBand {
+    /// The summed distinct-expert counts of the band's calls.
+    pub experts: u64,
+    /// The calls in the band.
+    pub calls: u64,
+}
+
+impl PlanBand {
+    /// The mean distinct experts one call in this band grouped, or 0 when it holds none.
+    #[must_use]
+    pub fn mean_experts(self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.experts as f64 / self.calls as f64
+        }
+    }
+}
+
+/// What the hoisted plan kernel accumulated under `SPARKFLASH_MOE_PLAN_STATS=1`.
+///
+/// Indexed by the call's routed-row count, because a single mean over a run is a rate for a
+/// mixture no launch runs: a prefill chunk groups most of the 384 experts and a verify step groups
+/// a couple of dozen, and the two must not be averaged into one number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlanStats {
+    /// `rows <= 32`: a one- or two-stream verify step.
+    pub small: PlanBand,
+    /// `32 < rows <= 64`.
+    pub medium: PlanBand,
+    /// `64 < rows <= 128`: a sixteen-stream verify step.
+    pub large: PlanBand,
+    /// `rows > 128`: a prefill chunk, which groups experts by the hundred.
+    pub chunk: PlanBand,
+}
+
+impl PlanStats {
+    /// Every band in row-count order.
+    #[must_use]
+    pub fn bands(self) -> [PlanBand; 4] {
+        [self.small, self.medium, self.large, self.chunk]
+    }
+
+    /// The calls counted, over every band.
+    #[must_use]
+    pub fn calls(self) -> u64 {
+        self.bands().iter().map(|band| band.calls).sum()
+    }
+
+    /// The summed distinct-expert count, over every band.
+    #[must_use]
+    pub fn experts(self) -> u64 {
+        self.bands().iter().map(|band| band.experts).sum()
+    }
+
+    /// The mean distinct experts a call grouped within one band, or 0 when it holds none.
+    #[must_use]
+    pub fn mean_experts(self, band: usize) -> f64 {
+        self.bands()
+            .get(band)
+            .copied()
+            .unwrap_or_default()
+            .mean_experts()
+    }
+
+    /// An expert's gate-plus-up weight bytes: the numerator the expert-read rate divides.
+    ///
+    /// One rank's slice of an expert's w1 and w3 is each `LOCAL_INTER` rows of `HIDDEN` FP4 nibbles
+    /// (half a byte a value) plus one ue8m0 per 32 values along the row, and the dedup gate/up
+    /// kernel reads both matrices for every distinct expert its plan groups.
+    #[must_use]
+    pub fn gate_up_bytes_per_expert() -> u64 {
+        let row = (HIDDEN / 2 + HIDDEN / QUANT_BLOCK) as u64;
+        2 * LOCAL_INTER as u64 * row
+    }
+
+    /// An expert's down weight bytes, the numerator the down kernel's rate divides.
+    #[must_use]
+    pub fn down_bytes_per_expert() -> u64 {
+        let row = (LOCAL_INTER / 2 + LOCAL_INTER / QUANT_BLOCK) as u64;
+        HIDDEN as u64 * row
+    }
+}
+
+/// The address of the process's plan-stats pair, or 0 when no [MoeRoutedDevice] registered one.
+///
+/// The drain print runs after the rank's forward has been built and while it is still alive, on a
+/// thread that has no handle to it, so the one word the plan kernel accumulates into is published
+/// here. Same shape as `rdma_exchange::stats`: a static a teardown-time reader can reach.
+static PROCESS_PLAN_STATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes the plan kernel accumulates into: a reserved pair, then one pair a row-count band.
+pub const PLAN_STATS_BYTES: usize = 8 * (2 + 2 * 4);
+
+/// The words the plan kernel accumulates into, little-endian, in the order it writes them: each
+/// band's (sum of counts, number of calls) pair, four bands.
+fn stats_from_words(raw: &[u8]) -> PlanStats {
+    let word = |index: usize| {
+        let mut eight = [0u8; 8];
+        eight.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        u64::from_le_bytes(eight)
+    };
+    // The kernel accumulates from word 2, so the host-owned pair at words 0..1 stays reserved for
+    // an unbanded total a later reader may want; reading band 0 from word 0 instead shifted every
+    // label by one and made the largest band invisible.
+    let band = |index: usize| PlanBand {
+        experts: word(2 + 2 * index),
+        calls: word(3 + 2 * index),
+    };
+    PlanStats {
+        small: band(0),
+        medium: band(1),
+        large: band(2),
+        chunk: band(3),
+    }
+}
+
+/// Whether a [MoeRoutedDevice] in this process registered a plan-stats buffer.
+///
+/// A drain-time reader checks this before opening a second handle onto the context: a default run
+/// (the instrument off) would otherwise retain the primary context only to read a zero.
+#[must_use]
+pub fn process_plan_stats_armed() -> bool {
+    PROCESS_PLAN_STATS.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+/// [MoeRoutedDevice::read_plan_stats] for the process's device, reachable without a handle.
+///
+/// `Cuda::load` retains (and refcounts) the primary context rather than creating one, so a caller
+/// at drain opens a second handle onto the context the forward is already using; the device pointer
+/// stays valid until that forward drops.
+///
+/// # Errors
+/// The driver's copy failure.
+pub fn read_process_plan_stats(cuda: &Cuda) -> Result<Option<PlanStats>, String> {
+    let address = PROCESS_PLAN_STATS.load(std::sync::atomic::Ordering::Relaxed);
+    if address == 0 {
+        return Ok(None);
+    }
+    let mut raw = [0u8; PLAN_STATS_BYTES];
+    cuda.copy_dtoh(&mut raw, &Deviceptr(address))
+        .map_err(|error| format!("moe_routed device: plan stats read: {error}"))?;
+    Ok(Some(stats_from_words(&raw)))
+}
+
+/// The routed experts' device state: the grouping plan's geometry, the driver-resolved kernel
+/// images, and the scratch a stage call walks. Built once per run by the forward's
+/// `attach_moe_routed` and borrowed by every routed call.
 #[derive(Debug)]
 pub struct MoeRoutedDevice {
     plan: MoeRoutedPlan,
@@ -1211,7 +1425,28 @@ pub struct MoeRoutedDevice {
     /// An f32 [tokens][5120] row the opt combine adds after the routed slots (the rank's shared
     /// expert partial), or 0 for none.
     addend: std::cell::Cell<u64>,
+    /// The plan's accumulator: [PLAN_STATS_BYTES] (an eight-word reserved pair, then each row-count
+    /// band's `(sum of the plan's counts, number of launches)` pair), or 0 when the profile has
+    /// `diagnostics.moe_plan_stats` off. [MoeRoutedDevice::read_plan_stats] reads it at drain.
+    plan_stats: Deviceptr,
+    /// The build switches the profile selected (see [MoeRoutedOptions]).
+    options: MoeRoutedOptions,
     device_bytes: usize,
+}
+
+/// A device recreating in one process must not leave the process pointer on its predecessor's
+/// memory: the drain reader would copy from a freed allocation and print a former run's counts.
+impl Drop for MoeRoutedDevice {
+    fn drop(&mut self) {
+        if self.plan_stats.0 != 0 {
+            let _ = PROCESS_PLAN_STATS.compare_exchange(
+                self.plan_stats.0,
+                0,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
 }
 
 /// The fused two-launch routed path (kernels/opt_moe_sm121.cu): gate+up+SwiGLU+quantise reading the
@@ -1225,10 +1460,14 @@ pub struct OptMoeKernels {
     /// `opt_moe_gate_up_dedup_sm121`, `opt_moe_down_dedup_sm121`, `opt_moe_combine_sm121`: the
     /// multi-token path that reads each distinct expert once (bit-identical to the two above).
     pub dedup: [(Module, Kernel); 3],
+    /// `opt_moe_plan_sm121`: the stage's grouping, built once for the dedup launch instead of in
+    /// every dedup block (issue #20 WS1a). `diagnostics.moe_plan_in_cta` keeps the in-block build,
+    /// which is the A/B arm and produces the same plan from the same two functions.
+    pub plan: (Module, Kernel),
 }
 
 impl OptMoeKernels {
-    /// Loads both symbols from the opt cubin (unpinned).
+    /// Loads the six symbols from the opt cubin (unpinned).
     ///
     /// # Errors
     /// The driver's load error.
@@ -1241,6 +1480,7 @@ impl OptMoeKernels {
                 cuda.load_named(cubin, "opt_moe_down_dedup_sm121")?,
                 cuda.load_named(cubin, "opt_moe_combine_sm121")?,
             ],
+            plan: cuda.load_named(cubin, "opt_moe_plan_sm121")?,
         })
     }
 }
@@ -1330,6 +1570,7 @@ impl MoeRoutedDevice {
         plan: MoeRoutedPlan,
         table: &ExpertPointerTable,
         kernels: MoeRoutedKernels,
+        options: MoeRoutedOptions,
     ) -> Result<Self, String> {
         if table.layers() != plan.layers() {
             return Err(format!(
@@ -1440,6 +1681,21 @@ impl MoeRoutedDevice {
             )?;
             cuda.copy_htod(&slot_ids_ptr, &slot_ids)
                 .map_err(|error| format!("moe_routed device: slot id upload: {error}"))?;
+            let stats_ptr = if options.plan_stats {
+                let pointer = fresh(
+                    cuda,
+                    &mut pointers,
+                    &mut allocated,
+                    PLAN_STATS_BYTES,
+                    "plan stats",
+                )?;
+                cuda.copy_htod(&pointer, &[0u8; PLAN_STATS_BYTES])
+                    .map_err(|error| format!("moe_routed device: plan stats clear: {error}"))?;
+                PROCESS_PLAN_STATS.store(pointer.0, std::sync::atomic::Ordering::Relaxed);
+                pointer
+            } else {
+                Deviceptr(0)
+            };
             Ok(Self {
                 plan,
                 table: table_ptr,
@@ -1454,6 +1710,8 @@ impl MoeRoutedDevice {
                 kernels,
                 opt: None,
                 addend: std::cell::Cell::new(0),
+                plan_stats: stats_ptr,
+                options,
                 device_bytes: allocated,
             })
         })();
@@ -1507,10 +1765,7 @@ impl MoeRoutedDevice {
             u32::try_from(rows).map_err(|_| "moe_routed opt: rows overflow".to_owned())?;
         let tokens_u32 =
             u32::try_from(tokens).map_err(|_| "moe_routed opt: tokens overflow".to_owned())?;
-        if tokens > 1
-            && rows <= DEDUP_MAX_ROWS
-            && std::env::var("SPARKFLASH_MOE_DEDUP").as_deref() != Ok("0")
-        {
+        if tokens > 1 && rows <= DEDUP_MAX_ROWS && self.options.dedup {
             return self.run_dedup(cuda, opt, (gate, up, down), tokens_u32, rows_u32, operands);
         }
         let gate_up_args = [
@@ -1567,26 +1822,45 @@ impl MoeRoutedDevice {
     ) -> Result<(), String> {
         let experts = self.plan.geometry().experts as u64;
         let plan = self.gate_out.0;
+        // The stage's grouping: one block builds it for the whole grid, or every block builds its
+        // own when the A/B arm is on (diagnostics.moe_plan_in_cta=1). Both produce the same plan.
+        let in_cta = self.options.plan_in_cta;
+        let plan_in = if in_cta {
+            0
+        } else {
+            let args: [u64; OPT_MOE_PLAN_ARGS] = [
+                operands.ids.device.0,
+                u64::from(rows),
+                experts,
+                plan,
+                self.plan_stats.0,
+            ];
+            cuda.launch(opt.plan.1, (1, 1, 1), (128, 1, 1), &args)
+                .map_err(|error| format!("moe_routed dedup: plan: {error}"))?;
+            plan
+        };
         // A block row per distinct expert; there are at most as many as rows, or as experts.
         let groups = rows.min(self.plan.geometry().experts as u32);
+        let args: [u64; OPT_MOE_GATE_UP_DEDUP_ARGS] = [
+            gate.0,
+            up.0,
+            operands.ids.device.0,
+            operands.weights.device.0,
+            operands.act_codes.device.0,
+            operands.act_scales.device.0,
+            self.codes.0,
+            self.scales.0,
+            u64::from(rows),
+            experts,
+            u64::from(self.plan.limit().to_bits()),
+            plan,
+            plan_in,
+        ];
         cuda.launch(
             opt.dedup[0].1,
             ((INTER / WORLD / QUANT_BLOCK) as u32, groups, 1),
             (128, 1, 1),
-            &[
-                gate.0,
-                up.0,
-                operands.ids.device.0,
-                operands.weights.device.0,
-                operands.act_codes.device.0,
-                operands.act_scales.device.0,
-                self.codes.0,
-                self.scales.0,
-                u64::from(rows),
-                experts,
-                u64::from(self.plan.limit().to_bits()),
-                plan,
-            ],
+            &args,
         )
         .map_err(|error| format!("moe_routed dedup: gate/up: {error}"))?;
         cuda.launch(
@@ -1611,6 +1885,27 @@ impl MoeRoutedDevice {
             ],
         )
         .map_err(|error| format!("moe_routed dedup: combine: {error}"))
+    }
+
+    /// The routed grouping the hoisted plan kernel accumulated, or `None` when
+    /// `SPARKFLASH_MOE_PLAN_STATS` is off (the default).
+    ///
+    /// The bytes a dedup call reads are the distinct-expert count times an expert's matrices; the
+    /// launch is `rows` blocks wide and every block past that count leaves without reading a
+    /// weight, so dividing a call's bytes by its row count understates the rate. This is the count
+    /// the acceptance gate in issue #20 WS1(b) says to divide by instead. One
+    /// [PLAN_STATS_BYTES] copy, taken at drain, so it costs the run nothing.
+    ///
+    /// # Errors
+    /// The driver's copy failure.
+    pub fn read_plan_stats(&self, cuda: &Cuda) -> Result<Option<PlanStats>, String> {
+        if self.plan_stats.0 == 0 {
+            return Ok(None);
+        }
+        let mut raw = [0u8; PLAN_STATS_BYTES];
+        cuda.copy_dtoh(&mut raw, &self.plan_stats)
+            .map_err(|error| format!("moe_routed device: plan stats read: {error}"))?;
+        Ok(Some(stats_from_words(&raw)))
     }
 
     /// The chunked-prefill path ([MoeBulk]): groups the routed rows by expert, runs each group's
@@ -2154,6 +2449,93 @@ mod tests {
 
     fn released_plan() -> MoeRoutedPlan {
         MoeRoutedPlan::new(MoeRoutedGeometry::released(), 40, TOP_K, 10.0).expect("released plan")
+    }
+
+    /// The plan-hoist switch is the A/B arm, and only the exact value `1` selects it: an operator
+    /// who sets `0`, `true` or nothing gets the hoisted plan, which is the default the issue asks
+    /// for. The kernels are not switchable at run time any other way, so this is where the arm is
+    /// pinned.
+    /// The routed MoE's distinct-expert path is the default; only `0` selects the per-row arm,
+    /// which is what `SPARKFLASH_MOE_DEDUP=0` has always documented.
+    #[test]
+    fn the_distinct_expert_path_is_the_default_and_zero_is_the_per_row_arm() {
+        assert!(moe_dedup_from(None), "unset keeps the distinct-expert path");
+        assert!(moe_dedup_from(Some("")), "empty keeps it");
+        assert!(moe_dedup_from(Some("1")), "1 keeps it");
+        assert!(!moe_dedup_from(Some("0")), "0 runs a pass a row");
+    }
+
+    #[test]
+    fn the_plan_hoist_is_the_default_and_in_cta_is_the_ab_arm() {
+        assert!(!plan_in_cta_from(None), "the hoisted plan is the default");
+        assert!(
+            !plan_in_cta_from(Some("")),
+            "an empty value is not the A/B arm"
+        );
+        assert!(!plan_in_cta_from(Some("0")), "0 is the hoisted plan");
+        assert!(
+            !plan_in_cta_from(Some("true")),
+            "only 1 selects the in-block build"
+        );
+        assert!(plan_in_cta_from(Some("1")), "1 restores the in-block build");
+    }
+
+    /// The plan-stat instrument is the measurement mode issue #20 WS1(b) asks for, and only the
+    /// exact value `1` arms it: the default run must not pay for a counter it did not ask for.
+    #[test]
+    fn the_plan_stats_instrument_is_off_unless_asked() {
+        assert!(!plan_stats_from(None), "no variable is off");
+        assert!(!plan_stats_from(Some("")), "an empty value is off");
+        assert!(!plan_stats_from(Some("0")), "0 is off");
+        assert!(!plan_stats_from(Some("true")), "only 1 arms it");
+        assert!(plan_stats_from(Some("1")), "1 arms it");
+    }
+
+    /// The denominators the expert-read rate divides: one rank's slice of an expert's matrices, in
+    /// the layout the dedup kernels index (`OPT_MOE_GU_ROW` bytes a gate/up row,
+    /// `OPT_MOE_D_ROW` a down row, one ue8m0 scale per 32 values along each).
+    #[test]
+    fn the_expert_read_denominators_are_one_ranks_slice() {
+        assert_eq!(
+            LOCAL_INTER, 576,
+            "one rank's slice of the 2304 intermediate"
+        );
+        // gate and up: 576 rows of (5120 nibbles + 160 scales) bytes each, both matrices.
+        assert_eq!(
+            PlanStats::gate_up_bytes_per_expert(),
+            2 * 576 * (2560 + 160)
+        );
+        assert_eq!(PlanStats::gate_up_bytes_per_expert(), 3_133_440);
+        // down: 5120 rows of (576 nibbles + 18 scales) bytes.
+        assert_eq!(PlanStats::down_bytes_per_expert(), 5120 * (288 + 18));
+        assert_eq!(PlanStats::down_bytes_per_expert(), 1_566_720);
+    }
+
+    /// The stats words decode little-endian, band by band, in the order the kernel accumulates
+    /// them, and a band that counted nothing reports a zero mean rather than a division by zero.
+    #[test]
+    fn the_stats_words_decode_count_first_band_by_band() {
+        let mut raw = [0u8; PLAN_STATS_BYTES];
+        // Band 0 (small): 108 experts over 24 calls, from word 2. Band 2 (large): 1400 over 24.
+        raw[16..24].copy_from_slice(&108u64.to_le_bytes());
+        raw[24..32].copy_from_slice(&24u64.to_le_bytes());
+        raw[48..56].copy_from_slice(&1400u64.to_le_bytes());
+        raw[56..64].copy_from_slice(&24u64.to_le_bytes());
+        // The reserved pair must not be read as a band.
+        raw[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let stats = stats_from_words(&raw);
+        assert_eq!(
+            stats.small.experts, 108,
+            "band 0 starts at word 2, not word 0"
+        );
+        assert_eq!(stats.small.calls, 24);
+        assert!((stats.small.mean_experts() - 4.5).abs() < 1e-9);
+        assert_eq!(stats.medium.calls, 0, "an empty band");
+        assert_eq!(stats.medium.mean_experts(), 0.0, "no division by zero");
+        assert!((stats.large.mean_experts() - 1400.0 / 24.0).abs() < 1e-9);
+        assert_eq!(stats.calls(), 48, "the bands are the calls");
+        assert_eq!(stats.experts(), 1508, "and their experts");
+        assert_eq!(stats.mean_experts(3), 0.0);
     }
 
     /// The one-token workspace spans, with every field at exactly the required length.
