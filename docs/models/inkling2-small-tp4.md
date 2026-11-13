@@ -298,6 +298,20 @@ canonical for shared parts.
   rows decoded inline instead of through a one-byte slice per value, the same request took
   **10.6 s** and produced the same token. The eight MXFP8 layers were 15.8 s each before the
   change and are 0.22 s after. `SPARKFLASH_INKLING_TRACE=1` prints the per-stage split.
+* **Kernels, verified on hardware.** `crates/sparkflash-model-inkling2/tests/kernels.rs` runs
+  each sm_121a kernel against `inkling2::reference` — the same functions the f32 host forward
+  calls, so a kernel cannot pass by agreeing with a second hand-written oracle. All seven cases
+  pass on a GB10 at one rank's geometry (12 query heads, 2 key/value heads of 128, 2,304
+  intermediate columns, a 1,024-token window, 8 relative dimensions).
+
+  The harness found five real defects, all fixed: attention read the learned `q_l2_clip`
+  and `k_l2_clip` scales as one gain per head instead of per element, ignored
+  `rel_l2_clip.scale` entirely, and clipped the raw query and key instead of the scaled ones;
+  the relative bank was indexed as `[heads, distance, d_rel]` where the release stores
+  `[d_rel, rel_extent]`; the prefill convolution read its taps in the wrong order (the
+  decode path was right, so prefill and decode disagreed); and the softcapped SwiGLU dropped
+  the cap that multiplies back after the tanh.
+
 * **Converted weights.** `sparkflash convert --checkpoint DIR --tp-world-size 4` writes four
   rank files; `--inspect FILE --verify-weights` checks every slot digest;
   `SPARKFLASH_INKLING_CONVERTED_DIR` makes `serve` read a staged rank file instead of the

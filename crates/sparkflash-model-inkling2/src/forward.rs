@@ -351,11 +351,17 @@ impl Inkling2Weights {
             4096,
         )?;
         if let Some(cap) = config.final_logit_softcap {
-            for value in &mut logits {
-                *value = (*value / cap as f32).tanh() * cap as f32;
-            }
+            let capped = crate::reference::logit_softcap(
+                &logits,
+                1,
+                vocab,
+                config.unpadded_vocab_size,
+                cap as f32,
+            );
+            logits = capped;
+        } else {
+            logits.truncate(config.unpadded_vocab_size);
         }
-        logits.truncate(config.unpadded_vocab_size);
         trace_timing!(format!("token={token} head"), head);
         state.position += 1;
         Ok(logits)
@@ -410,7 +416,7 @@ impl Inkling2Weights {
         trace_timing!(format!("layer={layer} attention"), stage);
         let attn_norm = self.vector(&format!("{prefix}.attn_norm.weight")).ok();
         let _ = attn_norm;
-        let attn = self.conv(&format!("{prefix}.attn_sconv.weight"), &attn, None, state, layer, 2, sliding)?;
+        let attn = self.conv(&format!("{prefix}.attn_sconv.weight"), &attn, state, layer, 2)?;
         let residual = if layer % config.n_layers_per_attn_res_block == 0 {
             state.block_states.push(block_residual_state);
             attn.clone()
@@ -432,7 +438,7 @@ impl Inkling2Weights {
         let stage = std::time::Instant::now();
         let mlp = self.moe(layer, &mlp_in)?;
         trace_timing!(format!("layer={layer} moe"), stage);
-        let mlp = self.conv(&format!("{prefix}.mlp_sconv.weight"), &mlp, None, state, layer, 3, sliding)?;
+        let mlp = self.conv(&format!("{prefix}.mlp_sconv.weight"), &mlp, state, layer, 3)?;
         Ok(add(&residual, &mlp))
     }
 
@@ -462,8 +468,8 @@ impl Inkling2Weights {
         let sink = self.matvec_name(&format!("{prefix}.attn_sink_proj.weight"), q_input, heads, h)?;
 
         if sliding {
-            k = self.conv(&format!("{prefix}.k_sconv.weight"), &k, Some(k_input), state, layer, 0, sliding)?;
-            v = self.conv(&format!("{prefix}.v_sconv.weight"), &v, Some(v_input), state, layer, 1, sliding)?;
+            k = self.conv(&format!("{prefix}.k_sconv.weight"), &k, state, layer, 0)?;
+            v = self.conv(&format!("{prefix}.v_sconv.weight"), &v, state, layer, 1)?;
         } else {
             k = self.conv_dynamic(&format!("{prefix}.k_sconv"), &k, k_input, state, layer, 0)?;
             v = self.conv_dynamic(&format!("{prefix}.v_sconv"), &v, v_input, state, layer, 1)?;
@@ -471,26 +477,6 @@ impl Inkling2Weights {
 
         let q_scale = self.vector(&format!("{prefix}.q_l2_clip.scale"))?;
         let rel_scale = self.vector(&format!("{prefix}.rel_l2_clip.scale"))?;
-        let mut q = q;
-        for head in 0..heads {
-            let row = &mut q[head * head_dim..(head + 1) * head_dim];
-            for (value, scale) in row.iter_mut().zip(&q_scale[head * head_dim..(head + 1) * head_dim]) {
-                *value *= *scale;
-            }
-            clip_l2(row, config.qk_l2_clip_threshold as f32);
-        }
-        for head in 0..kv_heads {
-            clip_l2(&mut k[head * head_dim..(head + 1) * head_dim], config.qk_l2_clip_threshold as f32);
-            rms_norm_in_place(&mut v[head * head_dim..(head + 1) * head_dim], config.architecture.norm_epsilon);
-        }
-        let mut rel = rel;
-        for head in 0..heads {
-            let row = &mut rel[head * config.d_rel..(head + 1) * config.d_rel];
-            for (value, scale) in row.iter_mut().zip(&rel_scale[head * config.d_rel..(head + 1) * config.d_rel]) {
-                *value *= *scale;
-            }
-            clip_l2(row, config.rel_l2_clip_threshold as f32);
-        }
         let tau = if sliding {
             1.0
         } else if config.log_scaling_n_floor > 0 {
@@ -499,13 +485,6 @@ impl Inkling2Weights {
         } else {
             1.0
         };
-        for value in &mut q {
-            *value *= tau;
-        }
-        for value in &mut rel {
-            *value *= tau;
-        }
-
         let cache = &mut state.layers[layer];
         cache.k.push(k);
         cache.v.push(v);
@@ -515,52 +494,37 @@ impl Inkling2Weights {
             0
         };
         let rel_bank = self.vector(&format!("{prefix}.rel_logits_proj.proj"))?;
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut output = vec![0f32; heads * head_dim];
-        for head in 0..heads {
-            let kv_head = head / (heads / kv_heads);
-            let mut scores = Vec::with_capacity(cache.k.len() - start);
-            for key in start..cache.k.len() {
-                let mut dot = 0.0f32;
-                for dim in 0..head_dim {
-                    dot += q[head * head_dim + dim] * cache.k[key][kv_head * head_dim + dim];
-                }
-                let distance = position - key;
-                let rel_extent = if sliding {
-                    config.sliding_window_size
-                } else {
-                    config.rel_extent
-                };
-                let bias = if distance < rel_extent {
-                    let mut value = 0.0f32;
-                    for rel_dim in 0..config.d_rel {
-                        value += rel[head * config.d_rel + rel_dim]
-                            * rel_bank[rel_dim * config.rel_extent + distance];
-                    }
-                    value
-                } else {
-                    0.0
-                };
-                scores.push(dot * scale + bias);
-            }
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max)
-                .max(sink[head]);
-            let mut denominator = (sink[head] - max).exp();
-            for score in &mut scores {
-                *score = (*score - max).exp();
-                denominator += *score;
-            }
-            for (index, score) in scores.iter().enumerate() {
-                let weight = *score / denominator;
-                let key = start + index;
-                for dim in 0..head_dim {
-                    output[head * head_dim + dim] += weight * cache.v[key][kv_head * head_dim + dim];
-                }
-            }
-        }
-        for (value, gate) in output.iter_mut().zip(&gate) {
-            *value *= 1.0 / (1.0 + (-gate).exp());
-        }
+        let rel_extent = if sliding {
+            config.sliding_window_size
+        } else {
+            config.rel_extent
+        };
+        // The window is applied by handing the oracle the cached rows it may see, so the decode
+        // and prefill kernels' `window` argument has exactly this meaning.
+        let output = crate::reference::attention(
+            &q,
+            &gate,
+            &cache.k[start..],
+            &cache.v[start..],
+            &rel,
+            &rel_bank,
+            &sink,
+            &q_scale,
+            None,
+            &rel_scale,
+            &crate::reference::AttentionParams {
+                heads,
+                kv_heads,
+                head_dim,
+                d_rel: config.d_rel,
+                rel_extent,
+                qk_clip: config.qk_l2_clip_threshold as f32,
+                rel_clip: config.rel_l2_clip_threshold as f32,
+                tau,
+                value_norm: true,
+                eps: config.architecture.norm_epsilon,
+            },
+        )?;
         self.matvec_name(&format!("{prefix}.wo_ud.weight"), &output, h, heads * head_dim)
     }
 
@@ -569,45 +533,28 @@ impl Inkling2Weights {
         Ok(matvec_parallel(&weight, input, rows, columns))
     }
 
+    /// One decode step of a static short convolution.
+    ///
+    /// The state is `[channels, kernel - 1]` oldest first, the layout the decode kernel keeps,
+    /// and the arithmetic is [crate::reference::short_conv_decode].
     fn conv(
         &self,
         weight_name: &str,
         input: &[f32],
-        _dynamic: Option<&[f32]>,
         state: &mut Inkling2State,
         layer: usize,
         slot: usize,
-        sliding: bool,
     ) -> Result<Vec<f32>, String> {
         let width = input.len();
         let kernel = self.config.sconv_kernel_size;
         let weights = self.matrix(weight_name, width, kernel)?;
         let history = &mut state.layers[layer].conv[slot];
-        let mut out = vec![0f32; width];
-        for channel in 0..width {
-            for tap in 0..kernel {
-                let value = if tap < history.len() {
-                    history[history.len() - 1 - tap][channel]
-                } else {
-                    0.0
-                };
-                // The checkpoint's conv weight index runs oldest-first (PyTorch conv1d with
-                // padding K-1); tap here is the backward distance, current token first.
-                out[channel] += weights[channel * kernel + (kernel - 1 - tap)] * value;
-            }
-            out[channel] += input[channel];
-        }
-        for value in &mut out {
-            *value /= ((kernel + 1) as f32).sqrt();
-        }
-        history.push(input.to_vec());
-        if history.len() > kernel - 1 {
-            history.remove(0);
-        }
-        let _ = sliding;
-        Ok(out)
+        Ok(crate::reference::short_conv_decode(
+            input, &weights, history, width, kernel,
+        ))
     }
 
+    /// One decode step of the dynamic short convolution.
     fn conv_dynamic(
         &self,
         prefix: &str,
@@ -621,32 +568,22 @@ impl Inkling2Weights {
         let kv_width = config.num_key_value_heads * config.head_dim;
         let kernel = config.sconv_kernel_size;
         let static_w = self.matrix(&format!("{prefix}.static_w"), kernel, kv_width)?;
-        let projected = self.matvec_name(&format!("{prefix}.weight_proj"), dynamic, config.num_key_value_heads * kernel, config.hidden_size)?;
+        let projected = self.matvec_name(
+            &format!("{prefix}.weight_proj"),
+            dynamic,
+            config.num_key_value_heads * kernel,
+            config.hidden_size,
+        )?;
         let history = &mut state.layers[layer].conv[slot];
-        let mut out = vec![0f32; kv_width];
-        for head in 0..config.num_key_value_heads {
-            for channel in 0..config.head_dim {
-                let index = head * config.head_dim + channel;
-                for tap in 0..kernel {
-                    let value = if tap < history.len() {
-                        history[history.len() - 1 - tap][index]
-                    } else {
-                        0.0
-                    };
-                    let dynamic_tap = projected[head * kernel + tap];
-                    out[index] += (static_w[tap * kv_width + index] + dynamic_tap) * value;
-                }
-                out[index] += input[index];
-            }
-        }
-        for value in &mut out {
-            *value /= ((2 * kernel + 1) as f32).sqrt();
-        }
-        history.push(input.to_vec());
-        if history.len() > kernel - 1 {
-            history.remove(0);
-        }
-        Ok(out)
+        Ok(crate::reference::short_conv_dynamic_decode(
+            input,
+            &static_w,
+            &projected,
+            history,
+            kv_width,
+            kernel,
+            config.head_dim,
+        ))
     }
 
     fn moe(&self, layer: usize, input: &[f32]) -> Result<Vec<f32>, String> {
@@ -689,16 +626,12 @@ impl Inkling2Weights {
                         config.moe_intermediate_size,
                     )?;
                     let gate_up = matvec(&gate_up, input, intermediate, config.hidden_size);
-                    let mut act = vec![0f32; config.moe_intermediate_size];
-                    for index in 0..config.moe_intermediate_size {
-                        let g = gate_up[index];
-                        let u = gate_up[index + config.moe_intermediate_size];
-                        let sg = (g / config.mlp_gate_softcap as f32).tanh()
-                            * config.mlp_gate_softcap as f32;
-                        let su = (u / config.mlp_up_softcap as f32).tanh()
-                            * config.mlp_up_softcap as f32;
-                        act[index] = sg * (1.0 / (1.0 + (-g).exp())) * su;
-                    }
+                    let act = crate::reference::softcapped_swiglu(
+                        &gate_up,
+                        config.moe_intermediate_size,
+                        config.mlp_gate_softcap as f32,
+                        config.mlp_up_softcap as f32,
+                    );
                     Ok((slot, matvec(&down, &act, config.hidden_size, config.moe_intermediate_size)))
                 }));
             }
@@ -730,17 +663,33 @@ pub struct Inkling2State {
 struct LayerState {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
-    conv: [Vec<Vec<f32>>; 4],
+    /// The four short convolutions' histories, `[channels, kernel - 1]` oldest first, in slot
+    /// order: k, v, attention output, mlp output.
+    conv: [Vec<f32>; 4],
 }
 
 impl Inkling2State {
     /// A fresh state.
     #[must_use]
     pub fn new(config: &Inkling2Config) -> Self {
+        let history = config.conv_history();
+        let kv_width = config.num_key_value_heads * config.head_dim;
+        let hidden = config.hidden_size;
         Self {
             position: 0,
             block_states: Vec::new(),
-            layers: (0..config.num_hidden_layers).map(|_| LayerState::default()).collect(),
+            layers: (0..config.num_hidden_layers)
+                .map(|_| LayerState {
+                    k: Vec::new(),
+                    v: Vec::new(),
+                    conv: [
+                        vec![0f32; kv_width * history],
+                        vec![0f32; kv_width * history],
+                        vec![0f32; hidden * history],
+                        vec![0f32; hidden * history],
+                    ],
+                })
+                .collect(),
         }
     }
 

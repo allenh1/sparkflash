@@ -94,8 +94,10 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapp
     const float* source = gate_up + (uint64_t)row * 2 * width;
     const float gate = source[column];
     const float up = source[width + column];
-    const float gated = gate_cap > 0.0f ? inkling_tanh(gate / gate_cap) : gate;
-    const float capped_up = up_cap > 0.0f ? inkling_tanh(up / up_cap) : up;
+    // softcap(x) = tanh(x / cap) * cap: the cap multiplies back, or the activation would be
+    // the tanh itself and the branch would lose its scale.
+    const float gated = gate_cap > 0.0f ? inkling_tanh(gate / gate_cap) * gate_cap : gate;
+    const float capped_up = up_cap > 0.0f ? inkling_tanh(up / up_cap) * up_cap : up;
     out[(uint64_t)row * width + column] =
         __fmul_rn(__fmul_rn(gated, inkling_sigmoid(gate)), capped_up);
 }

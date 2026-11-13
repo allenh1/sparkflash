@@ -20,6 +20,7 @@ pub mod convert;
 pub mod forward;
 pub mod host;
 pub mod prompt;
+pub mod reference;
 pub mod tensor;
 
 pub use architecture::{architecture_from_config, architecture_from_json};
@@ -30,6 +31,7 @@ pub use config::{
 pub use prompt::InklingCodec;
 pub use forward::{Inkling2State, Inkling2Weights};
 pub use host::Inkling2HostBackend;
+pub use reference::{AttentionParams, attention, softcapped_swiglu};
 pub use convert::{
     InklingRecords, RankFileSource, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots,
     verify_rank, visit_rank,

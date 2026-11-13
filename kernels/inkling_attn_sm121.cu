@@ -89,6 +89,7 @@ __device__ __forceinline__ void inkling_attn_one(
     const float* __restrict__ sink,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
+    const float* __restrict__ rel_scale,
     __nv_bfloat16* __restrict__ out_row,
     int head,
     int kv_heads,
@@ -115,19 +116,24 @@ __device__ __forceinline__ void inkling_attn_one(
     const float inv_dim = 1.0f / sqrtf((float)head_dim);
     const float use_tau = tau > 0.0f ? tau : 1.0f;
 
-    // Query: clip, learned scale, tau.
+    // Query: learned scale, then clip, then tau. The released q_l2_clip.scale is
+    // [heads, head_dim], a gain per element, and the clip is on the *scaled* vector - clipping
+    // the raw vector first would clip a different vector, because the gains are not uniform.
     float qv[INKLING_MAX_HEAD_DIM / 32];
     float q_norm = 0.0f;
 #pragma unroll
     for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
         const int dim = (int)lane + 32 * step;
-        qv[step] = dim < head_dim ? q_row[dim] : 0.0f;
+        const float gain = dim < head_dim && q_scale != nullptr
+                               ? q_scale[(uint64_t)head * head_dim + dim]
+                               : 1.0f;
+        qv[step] = dim < head_dim ? __fmul_rn(q_row[dim], gain) : 0.0f;
         q_norm = __fadd_rn(q_norm, __fmul_rn(qv[step], qv[step]));
     }
     q_norm = sqrtf(inkling_attn_warp_sum(q_norm));
-    float q_gain = q_scale != nullptr ? q_scale[head] : 1.0f;
+    float q_gain = 1.0f;
     if (qk_clip > 0.0f && q_norm > qk_clip) {
-        q_gain *= qk_clip / q_norm;
+        q_gain = qk_clip / q_norm;
     }
     q_gain *= use_tau;
 #pragma unroll
@@ -137,6 +143,9 @@ __device__ __forceinline__ void inkling_attn_one(
 
     // Relative state: one d_rel value a lane for the first d_rel lanes. Clip then tau.
     float rv = lane < (unsigned int)d_rel ? rel_proj[(uint64_t)head * d_rel + lane] : 0.0f;
+    if (rel_scale != nullptr && lane < (unsigned int)d_rel) {
+        rv = __fmul_rn(rv, rel_scale[(uint64_t)head * d_rel + (int)lane]);
+    }
     const float r_norm = sqrtf(inkling_attn_warp_sum(__fmul_rn(rv, rv)));
     float r_gain = 1.0f;
     if (rel_clip > 0.0f && r_norm > rel_clip) {
@@ -173,15 +182,19 @@ __device__ __forceinline__ void inkling_attn_one(
 #pragma unroll
         for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
             const int dim = (int)lane + 32 * step;
-            kv[step] = dim < head_dim ? __bfloat162float(krow[dim]) : 0.0f;
+            // The key carries its own learned gain, and its clip is on the scaled vector too.
+            const float gain = dim < head_dim && k_scale != nullptr
+                                   ? k_scale[(uint64_t)kv_head * head_dim + dim]
+                                   : 1.0f;
+            kv[step] = dim < head_dim ? __fmul_rn(__bfloat162float(krow[dim]), gain) : 0.0f;
             vv[step] = dim < head_dim ? __bfloat162float(vrow[dim]) : 0.0f;
             k_norm = __fadd_rn(k_norm, __fmul_rn(kv[step], kv[step]));
             v_norm = __fadd_rn(v_norm, __fmul_rn(vv[step], vv[step]));
         }
         k_norm = sqrtf(inkling_attn_warp_sum(k_norm));
-        float k_gain = k_scale != nullptr ? k_scale[kv_head] : 1.0f;
+        float k_gain = 1.0f;
         if (qk_clip > 0.0f && k_norm > qk_clip) {
-            k_gain *= qk_clip / k_norm;
+            k_gain = qk_clip / k_norm;
         }
         float dot = 0.0f;
 #pragma unroll
@@ -196,9 +209,11 @@ __device__ __forceinline__ void inkling_attn_one(
             if (distance >= 0 && distance < rel_extent) {
                 float bias = 0.0f;
                 if (lane < (unsigned int)d_rel) {
-                    const uint64_t index =
-                        ((uint64_t)head * rel_extent + (uint64_t)distance) * (uint64_t)d_rel;
-                    bias = __fmul_rn(rv, __bfloat162float(rel_bank[index + lane]));
+                    // The released bank is [d_rel, rel_extent]: a row per relative dimension,
+                    // one column per distance. Indexing it as [head][distance][d_rel] would read
+                    // a different weight and still stay in bounds, so nothing would catch it.
+                    const uint64_t index = (uint64_t)lane * rel_extent + (uint64_t)distance;
+                    bias = __fmul_rn(rv, __bfloat162float(rel_bank[index]));
                 }
                 score = __fadd_rn(score, inkling_attn_warp_sum(bias));
             }
@@ -253,6 +268,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
     const float* __restrict__ sink,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
+    const float* __restrict__ rel_scale,
     __nv_bfloat16* __restrict__ out,
     int heads,
     int kv_heads,
@@ -273,7 +289,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
     }
     const uint64_t offset = (uint64_t)head * head_dim;
     inkling_attn_one(q + offset, gate + offset, keys, values, rel_proj, rel_bank, sink,
-                      q_scale, k_scale, out + offset, head, kv_heads, head_dim, groups,
+                      q_scale, k_scale, rel_scale, out + offset, head, kv_heads, head_dim, groups,
                       position, window, rel_extent, d_rel, qk_clip, rel_clip, tau,
                       value_norm, eps);
 }
@@ -291,6 +307,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     const float* __restrict__ sink,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
+    const float* __restrict__ rel_scale,
     __nv_bfloat16* __restrict__ out,
     int heads,
     int kv_heads,
@@ -315,7 +332,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     const uint64_t row_offset = (uint64_t)row * heads * head_dim;
     inkling_attn_one(q + row_offset + head_offset, gate + row_offset + head_offset, keys,
                       values, rel_proj + (uint64_t)row * heads * d_rel, rel_bank, sink,
-                      q_scale, k_scale, out + row_offset + head_offset, head, kv_heads,
-                      head_dim, groups, first_position + row, window, rel_extent, d_rel,
+                      q_scale, k_scale, rel_scale, out + row_offset + head_offset, head,
+                      kv_heads, head_dim, groups, first_position + row, window, rel_extent, d_rel,
                       qk_clip, rel_clip, tau, value_norm, eps);
 }

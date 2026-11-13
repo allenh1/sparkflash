@@ -113,9 +113,12 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv(
         for (int tap = 0; tap < kernel; ++tap) {
             const int source_row = row - tap;
             if (source_row >= 0) {
+                // The released taps are a conv1d kernel, so index k multiplies the input at
+                // distance kernel - 1 - k: index 0 is the oldest tap. `tap` here is the
+                // backward distance, which is why the index runs backwards.
                 convolution = __fadd_rn(
                     convolution,
-                    __fmul_rn(__bfloat162float(taps[(uint64_t)channel * kernel + tap]),
+                    __fmul_rn(__bfloat162float(taps[(uint64_t)channel * kernel + (kernel - 1 - tap)]),
                               x[(uint64_t)source_row * channels + channel]));
             }
         }
@@ -193,9 +196,13 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
             if (source_row < 0) {
                 continue;
             }
+            // Both tap tables are in conv1d index order, so index k covers distance
+            // kernel - 1 - k: static_w is [kernel, channels] and the projection's rows are
+            // [heads, kernel] in that same order.
+            const int k = kernel - 1 - tap;
             const float weight =
-                __fadd_rn(__bfloat162float(static_taps[(uint64_t)channel * kernel + tap]),
-                          dynamic_taps[((uint64_t)row * heads + head) * kernel + tap]);
+                __fadd_rn(__bfloat162float(static_taps[(uint64_t)k * channels + channel]),
+                          dynamic_taps[((uint64_t)row * heads + head) * kernel + k]);
             convolution = __fadd_rn(
                 convolution, __fmul_rn(weight, x[(uint64_t)source_row * channels + channel]));
         }
@@ -228,14 +235,17 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
         const float current = x[channel];
         float convolution = 0.0f;
         for (int tap = 0; tap < history; ++tap) {
+            // state[tap] is the sample at distance history - tap, whose conv1d index is
+            // kernel - 1 - (history - tap) = tap. So both tables are read at tap, and
+            // static_w is [kernel, channels].
             const float weight =
-                __fadd_rn(__bfloat162float(static_taps[(uint64_t)channel * kernel + tap]),
+                __fadd_rn(__bfloat162float(static_taps[(uint64_t)tap * channels + channel]),
                           dynamic_taps[(uint64_t)head * kernel + tap]);
             convolution = __fadd_rn(
                 convolution, __fmul_rn(weight, state[(uint64_t)channel * history + tap]));
         }
         const float last_weight =
-            __fadd_rn(__bfloat162float(static_taps[(uint64_t)channel * kernel + history]),
+            __fadd_rn(__bfloat162float(static_taps[(uint64_t)history * channels + channel]),
                       dynamic_taps[(uint64_t)head * kernel + history]);
         convolution = __fadd_rn(convolution, __fmul_rn(last_weight, current));
         out[channel] = __fmul_rn(convolution, scale);
