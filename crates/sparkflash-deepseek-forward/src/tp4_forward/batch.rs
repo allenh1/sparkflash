@@ -117,6 +117,11 @@ pub(super) const DECODER_WARM: usize = (sparkflash_kernels::flash_mla_csa2_seq_l
     * (sparkflash_kv::layout::SWA_LAYERS - ENCODER_LAYERS)
     + sparkflash_kernels::flash_mla_csa2_seq_launch::SWA_WINDOW;
 
+/// The fewest shared rows a match on a lane holding a long prefix must have to be reused
+/// (SPARKFLASH_PREFIX_REUSE_MIN_ROWS): below it the lane is kept for a turn that shares more of
+/// it, unless no lane holds less. `0` reuses every match.
+pub(super) const PREFIX_REUSE_MIN_ROWS: usize = 256;
+
 /// Whether prompt rows p..p+n of a prefill to `target` run the decoder layers: the chunks that
 /// reach into its last [`DECODER_WARM`] rows.
 fn runs_decoder(p: usize, n: usize, target: usize) -> bool {
@@ -453,6 +458,9 @@ pub(super) struct Batch<'b, 'a, 'r> {
     /// The longest prompt a sequence may bring: one verify block of room after it.
     room: usize,
     reuse: bool,
+    /// The shared-row floor below which a long-prefix lane is kept for another turn
+    /// ([`PREFIX_REUSE_MIN_ROWS`] unless SPARKFLASH_PREFIX_REUSE_MIN_ROWS says otherwise).
+    prefix_reuse_min_rows: usize,
     early: bool,
     exact_prefill: bool,
     /// The prompt rows before the last [`DECODER_WARM`] stop after the encoder layers.
@@ -525,6 +533,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 .diagnostics
                 .prefix_cache
                 .unwrap_or(true),
+            prefix_reuse_min_rows: sparkflash_model::active_profile()
+                .diagnostics
+                .prefix_reuse_min_rows
+                .unwrap_or(PREFIX_REUSE_MIN_ROWS),
             early: sparkflash_model::active_profile()
                 .diagnostics
                 .engram_ahead
@@ -1172,13 +1184,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     };
                     // A short match against a lane holding a long prefix keeps the prefix: that
                     // lane is passed over (the least recently used empty lane takes the sequence)
-                    // so the next turn that does share the prefix still finds it. A match of 256
-                    // rows or more is always used, and so is any match on a lane holding fewer.
-                    let effective_shared = if raw_shared < 256 && held.resident.len() >= 256 {
-                        0
-                    } else {
-                        raw_shared
-                    };
+                    // so the next turn that does share the prefix still finds it. A match of
+                    // [`PREFIX_REUSE_MIN_ROWS`] rows or more is always used, and so is any match
+                    // on a lane holding fewer. SPARKFLASH_PREFIX_REUSE_MIN_ROWS moves the floor
+                    // (`0` reuses every match).
+                    let effective_shared = reusable_shared(
+                        raw_shared,
+                        held.resident.len(),
+                        self.prefix_reuse_min_rows,
+                    );
                     (lane, effective_shared)
                 })
                 .max_by(|a, b| {
@@ -2749,6 +2763,17 @@ fn bulk_rows(left: usize, budget: usize, most: usize, split: Option<usize>) -> u
     }
 }
 
+/// The shared rows [`Batch::place`] credits a lane with: a match below `min_rows` against a
+/// lane holding at least that many rows is worth more kept for a longer turn, so it counts as no
+/// match. `0` credits every match (the pre-`!197` behaviour).
+fn reusable_shared(raw_shared: usize, resident_len: usize, min_rows: usize) -> usize {
+    if raw_shared < min_rows && resident_len >= min_rows {
+        0
+    } else {
+        raw_shared
+    }
+}
+
 /// How many leading positions of `wanted` a lane holding `held` (its image spans `spans`) holds
 /// alike: the common prefix, cut at the first of the prompt's `images` the lane does not hold alike
 /// (equal span tokens are not equal images).
@@ -2859,8 +2884,9 @@ impl Drop for Batch<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DECODER_WARM, DecodeShare, ENCODER_LAYERS, R_MAX, bulk_rows, common_prefix,
-        constraint_refusal, decoder_resume, runs_decoder, share_rows, skip_end_after,
+        DECODER_WARM, DecodeShare, ENCODER_LAYERS, PREFIX_REUSE_MIN_ROWS, R_MAX, bulk_rows,
+        common_prefix, constraint_refusal, decoder_resume, reusable_shared, runs_decoder,
+        share_rows, skip_end_after,
     };
     use sparkflash_api::constrained::TokenConstraint;
     use sparkflash_api::vocab::TokenBytes;
@@ -3013,6 +3039,21 @@ mod tests {
         assert_eq!(common_prefix(&[1, 2, 3, 4], &[], &[1, 2, 3, 9, 9], &[]), 3);
         assert_eq!(common_prefix(&[1, 2], &[], &[1, 2, 3], &[]), 2);
         assert_eq!(common_prefix(&[], &[], &[1], &[]), 0);
+    }
+
+    #[test]
+    fn a_short_match_does_not_spend_a_lane_s_long_prefix() {
+        // The default floor: a 200-row match on a lane holding 1,200 rows is kept for a later
+        // turn, and the same match on a lane holding 200 rows is used (that lane holds nothing
+        // worth keeping).
+        assert_eq!(reusable_shared(200, 1200, PREFIX_REUSE_MIN_ROWS), 0);
+        assert_eq!(reusable_shared(200, 200, PREFIX_REUSE_MIN_ROWS), 200);
+        assert_eq!(reusable_shared(256, 1200, PREFIX_REUSE_MIN_ROWS), 256);
+        assert_eq!(reusable_shared(1200, 1200, PREFIX_REUSE_MIN_ROWS), 1200);
+        // The knob's control arm: 0 credits every match, which is the pre-!197 behaviour the
+        // reporter measured at 86% cache hits.
+        assert_eq!(reusable_shared(200, 1200, 0), 200);
+        assert_eq!(reusable_shared(0, 1200, 0), 0);
     }
 
     #[test]

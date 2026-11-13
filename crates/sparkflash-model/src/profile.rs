@@ -449,6 +449,10 @@ pub struct DiagnosticsProfile {
     pub row_table: Option<bool>,
     /// Reuse a prefix cache.
     pub prefix_cache: Option<bool>,
+    /// The fewest shared rows a match on a lane holding a long prefix must have to be reused:
+    /// below this the lane is kept for a turn that shares more of it (256 by default; `0` reuses
+    /// every match).
+    pub prefix_reuse_min_rows: Option<usize>,
     /// Read the next Engram rows ahead.
     pub engram_ahead: Option<bool>,
     /// Skip the decoder on exact prefill steps.
@@ -688,6 +692,10 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_ROWS_INDEXER", "diagnostics.rows_indexer"),
     ("SPARKFLASH_ROW_TABLE", "diagnostics.row_table"),
     ("SPARKFLASH_PREFIX_CACHE", "diagnostics.prefix_cache"),
+    (
+        "SPARKFLASH_PREFIX_REUSE_MIN_ROWS",
+        "diagnostics.prefix_reuse_min_rows",
+    ),
     ("SPARKFLASH_ENGRAM_AHEAD", "diagnostics.engram_ahead"),
     (
         "SPARKFLASH_PREFILL_DECODER_SKIP",
@@ -967,6 +975,9 @@ const COUNT_FIELDS: &[(&str, CountField)] = &[
     }),
     ("speculation.min_depth", |p| &mut p.speculation.min_depth),
     ("diagnostics.seg_blocks", |p| &mut p.diagnostics.seg_blocks),
+    ("diagnostics.prefix_reuse_min_rows", |p| {
+        &mut p.diagnostics.prefix_reuse_min_rows
+    }),
     ("diagnostics.tp4_boundary_position", |p| {
         &mut p.diagnostics.tp4_boundary_position
     }),
