@@ -50,6 +50,10 @@ use sparkflash_engine::parallel_tp::TpLayout;
 use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_model::{Architecture, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
+use sparkflash_model_inkling2::config::Inkling2Config;
+use sparkflash_model_inkling2::convert::{
+    InklingRecords, convert_rank as inkling_convert_rank, verify_rank as inkling_verify_rank,
+};
 use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
 use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
@@ -183,7 +187,7 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         let world = world_size.unwrap_or_else(|| default_convert_world(&architecture.family));
         let released = matches!(
             architecture.family.as_str(),
-            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41"
+            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41" | "inkling2"
         );
         if !released && world != 1 {
             return Err(format!(
@@ -224,6 +228,29 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
             return slot_pack.convert::<WalkSpecs>(&checkpoint_dir, |source, layout, label| {
                 glm_convert_rank(source, &config, layout, &out_dir, label)
                     .map_err(|error| error.to_string())
+            });
+        }
+        if architecture.family == "inkling2" {
+            // Inkling-2's plan already names every rank's bytes, so its converter is a walk over
+            // that plan through the shared rank-file container; the pack below only selects the
+            // ranks and prints. Verifying also compares every slot against the checkpoint, which
+            // SlotPack's own read only checks against the header.
+            let config = Inkling2Config::from_checkpoint_dir(&checkpoint_dir)
+                .map_err(|error| unparsed(error.to_string()))?;
+            let slot_pack = SlotPack {
+                name: "Inkling-2-Small",
+                world_size: world,
+                ranks: &ranks,
+                pad_moe_640,
+                verify,
+                allows_no_pad: true,
+            };
+            return slot_pack.convert::<InklingRecords>(&checkpoint_dir, |source, layout, label| {
+                let converted = inkling_convert_rank(source, &config, layout, &out_dir, label)?;
+                if verify {
+                    inkling_verify_rank(&converted.path, source, &config, layout)?;
+                }
+                Ok(converted)
             });
         }
         if architecture.family != "deepseek_v41" {
@@ -374,6 +401,13 @@ struct DynamicRecords {}
 
 impl SlotRecords for DynamicRecords {
     const MODEL: &'static str = "dynamic";
+}
+
+impl ShownRecords for InklingRecords {
+    fn shown(&self) -> String {
+        // The plan names every slot, so the index carries no extra records to print.
+        String::new()
+    }
 }
 
 impl ShownRecords for DynamicRecords {
@@ -564,6 +598,9 @@ fn inspect_file(path: &Path, verify_weights: bool) -> Result<Vec<String>, String
     }
     if model == Some(DynamicRecords::MODEL) {
         return inspect_slot_file::<DynamicRecords>(path, preamble, verify_weights);
+    }
+    if model == Some(InklingRecords::MODEL) {
+        return inspect_slot_file::<InklingRecords>(path, preamble, verify_weights);
     }
     let (preamble, header) = inspect_converted_rank(path)?;
     if verify_weights {
