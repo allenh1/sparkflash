@@ -115,7 +115,7 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        43,
+        46,
         "the list must name every baseline kernel - the forty-three entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
@@ -487,6 +487,7 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             || name == "moe_routed_device_sm121"
             || name == "moe_plan_sm121"
             || name == "pool_group_sm121"
+            || name.starts_with("inkling_")
             || name.starts_with("opt_")
         {
             continue;

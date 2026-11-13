@@ -445,7 +445,8 @@ impl Qwen4ExpConfig {
                 .layers
                 .first()
                 .map_or((1, 0), |layer| match &layer.residual {
-                    sparkflash_model::architecture::Residual::Plain => (1, 0),
+                    sparkflash_model::architecture::Residual::Plain
+                    | sparkflash_model::architecture::Residual::BlockAttention => (1, 0),
                     sparkflash_model::architecture::Residual::Hyper(hyper) => {
                         (hyper.streams, hyper.lowrank.unwrap_or(0))
                     }

@@ -124,6 +124,7 @@ fn hybrid() -> Architecture {
         vocab_size: 4096,
         max_position_embeddings: 4096,
         norm_epsilon: 1e-5,
+        inkling: None,
         embedding_tied_to_head: false,
         attention_bias: false,
         layers: vec![

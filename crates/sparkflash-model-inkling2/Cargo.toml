@@ -1,0 +1,16 @@
+[package]
+name = "sparkflash-model-inkling2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sparkflash-model = { workspace = true }
+sparkflash-weights = { workspace = true }
+sparkflash-kernels = { workspace = true }
+sparkflash-ops = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
+tokenizers = { workspace = true }

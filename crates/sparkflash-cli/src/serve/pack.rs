@@ -75,6 +75,7 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
         "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Qwen36Arm::PROFILE_TOML),
         "glm5_next" => Some(GlmArm::PROFILE_TOML),
         "dory" => Some(DORY_PROFILE_TOML),
+        "inkling2" => Some(sparkflash_model_inkling2::PROFILE_TOML),
         _ => None,
     }
 }
@@ -621,6 +622,8 @@ pub(super) enum Pack {
     Glm,
     /// Dory1.0-4B, served by the dynamic path's device arm or host reference.
     Dory,
+    /// Inkling-2-Small, served by its pack's host/device arm.
+    Inkling,
 }
 
 impl Pack {
@@ -636,6 +639,7 @@ impl Pack {
             Self::Qwen36 => sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
             Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
             Self::Dory => sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID,
+            Self::Inkling => sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID,
         };
         sparkflash_model::find_model_by_weights(weights)
             .expect("the model registry carries every pack's weight selector")
@@ -650,6 +654,7 @@ impl Pack {
             sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID => Some(Self::Qwen36),
             sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
             sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID => Some(Self::Dory),
+            sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID => Some(Self::Inkling),
             _ => None,
         }
     }
@@ -698,6 +703,9 @@ impl Pack {
             Some(Self::Dory) if !sparkflash_model_dory::DoryDeviceBackend::available() => {
                 return Vec::new();
             }
+            // The Inkling pack's host reference is the initial serving path; its device arm is
+            // gated by the same catalogue once it lands.
+            Some(Self::Inkling) => return Vec::new(),
             Some(Self::Dory) | Some(Self::Deepseek) | None => {
                 sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
             }
@@ -713,7 +721,7 @@ impl Pack {
 
     /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
     pub(super) const fn is_arm(self) -> bool {
-        !matches!(self, Self::Deepseek | Self::Dory)
+        !matches!(self, Self::Deepseek | Self::Dory | Self::Inkling)
     }
 
     /// The served id of this pack.
@@ -740,7 +748,7 @@ impl Pack {
         let (fuses, budgets) = match self {
             Self::Qwen | Self::QwenFp8 | Self::Qwen36 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
-            Self::Deepseek | Self::Dory => (false, false),
+            Self::Deepseek | Self::Dory | Self::Inkling => (false, false),
         };
         let mut unapplied = Vec::new();
         if group && concurrency != 1 {
@@ -765,7 +773,7 @@ impl Pack {
             Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
             Self::Qwen36 => serve_arm::<Qwen36Arm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
-            Self::Dory => {
+            Self::Dory | Self::Inkling => {
                 return super::dynamic::serve(options).unwrap_or_else(|message| {
                     eprintln!("sparkflash serve: {message}");
                     ExitCode::from(EXIT_REFUSED)
@@ -1436,6 +1444,24 @@ mod tests {
             .expect("the Dory config is written");
         assert_eq!(Pack::detect(directory.path()), Some(Pack::Dory));
         assert!(!Pack::Dory.is_arm());
+        assert!(Pack::missing_parts(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn an_inkling_checkpoint_detects_as_the_inkling_pack() {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(
+            directory.path().join(CHECKPOINT_CONFIG_NAME),
+            sparkflash_model_inkling2::carried_config(),
+        )
+        .expect("the released config is written");
+        std::fs::write(
+            directory.path().join("hf_quant_config.json"),
+            sparkflash_model_inkling2::carried_quant(),
+        )
+        .expect("the quant groups are written");
+        assert_eq!(Pack::detect(directory.path()), Some(Pack::Inkling));
+        assert!(!Pack::Inkling.is_arm());
         assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 

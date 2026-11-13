@@ -1,0 +1,38 @@
+# Inkling-2-Small (NVFP4) runtime profile.
+#
+# The released checkpoint is 393.5 GB on disk and needs four Sparks at TP=4. The context default
+# is 256K: 1M fits the weight+KV arithmetic with ~11 GiB headroom, but prefill scratch at 1M is
+# the remaining risk, so an operator asks for it explicitly.
+
+model = "thinkingmachines/Inkling-2-Small"
+family = "inkling2"
+weights = "inkling2-small-nvfp4"
+
+[runtime]
+context_tokens = 262144
+concurrency = 1
+
+[prefill]
+enabled = true
+# Four-rank prompt chunks. The relative bias is materialized per chunk; 4096 keeps the
+# score matrix inside the scratch budget.
+chunk = 4096
+tensor_cores = true
+exact = false
+
+[decode]
+# Decode runs the shared GEMV path; the new attention body is warp-per-head.
+tensor_cores = false
+
+[speculation]
+# The five-layer DSpark stage is carried but the first serving milestone does not draft.
+enabled = false
+
+[sequence]
+parallel = false
+overlap = false
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

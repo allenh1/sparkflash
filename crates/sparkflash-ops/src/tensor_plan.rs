@@ -1273,7 +1273,7 @@ impl Builder {
                     );
                 }
             }
-            Residual::Plain => {
+            Residual::Plain | Residual::BlockAttention => {
                 // Qwen3.5/3.6: one `[hidden, 2 * hidden]` projection of the normed embedding
                 // and hidden state, concatenated, then an ordinary pre-norm layer.
                 self.whole(
@@ -2001,7 +2001,7 @@ impl Builder {
 fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::HyperConnection> {
     match &layer.residual {
         Residual::Hyper(hyper) => Some(hyper),
-        Residual::Plain => None,
+        Residual::Plain | Residual::BlockAttention => None,
     }
 }
 
@@ -2039,7 +2039,7 @@ fn qwen_expert_format(format: WeightFormat) -> ExpertFormat {
 fn hyper_of(layer: &Layer) -> Result<&sparkflash_model::architecture::HyperConnection, PlanError> {
     match &layer.residual {
         Residual::Hyper(hyper) => Ok(hyper),
-        Residual::Plain => Err(PlanError::Invalid(format!(
+        Residual::Plain | Residual::BlockAttention => Err(PlanError::Invalid(format!(
             "layer {} uses a plain residual where the plan expects hyper-connections",
             layer.index
         ))),

@@ -170,6 +170,7 @@ Every arm has one typed TOML profile:
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/config/glm53_flash.toml` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml` |
 | NVIDIA Nemotron Labs Dory1.0-4B (BF16) | `crates/sparkflash-model-dory/config/dory1_0_4b_bf16.toml` |
+| thinkingmachines/Inkling-2-Small (NVFP4) | `crates/sparkflash-model-inkling2/config/inkling2_small.toml` |
 
 The FP8 release shares that profile: the switches select arithmetic, and the one difference
 between the two Qwen checkpoints is the routed experts' storage (`ExpertQuant`), which the

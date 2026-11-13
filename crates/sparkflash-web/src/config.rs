@@ -46,6 +46,7 @@ pub const SUPPORTED_ENGINES: &[&str] = &[
     DEFAULT_ENGINE_ID,
     QWEN_ENGINE_ID,
     GLM_ENGINE_ID,
+    INKLING_ENGINE_ID,
     DYNAMIC_ENGINE_ID,
 ];
 
@@ -80,6 +81,12 @@ pub const QWEN36_WEIGHTS_ID: &str =
 
 /// The control-plane weight selector for Dory1.0-4B (BF16).
 pub const DORY_WEIGHTS_ID: &str = sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID;
+
+/// The control-plane weight selector for Inkling-2-Small (NVFP4).
+pub const INKLING_WEIGHTS_ID: &str = sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID;
+
+/// The control-plane engine selector for the TP=4 Inkling-2-Small pack.
+pub const INKLING_ENGINE_ID: &str = "inkling2";
 
 /// The canonical Hugging Face id of the Qwen3.6-35B-A3B checkpoint.
 pub const QWEN36_MODEL_ID: &str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
@@ -229,6 +236,16 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "nvidia",
             requires_conversion: false,
             requires_cubins: false,
+        },
+        INKLING_WEIGHTS_ID => Deployment {
+            engine: INKLING_ENGINE_ID,
+            search: "Inkling-2",
+            world_size: WORLD_SIZE,
+            // The 393.5 GB checkpoint fits four Sparks; it does not fit one or two.
+            worlds: &[WORLD_SIZE],
+            org: "thinkingmachines",
+            requires_conversion: true,
+            requires_cubins: true,
         },
         other => panic!("no web deployment profile for the registry weights {other}"),
     }

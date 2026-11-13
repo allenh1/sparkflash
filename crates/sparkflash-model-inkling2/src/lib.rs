@@ -1,0 +1,55 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+//! The thinkingmachines/Inkling-2-Small pack.
+//!
+//! Inkling is a 594B-parameter / 17B-active hybrid: 48 decoder layers, 40 sliding-window and
+//! 8 full-attention, a learned relative bias instead of RoPE, four short convolutions a layer,
+//! a block-attention residual stream and 384 sigmoid-routed experts. This crate owns the typed
+//! configuration, the shared-architecture bridge, the tensor plan, the prompt seam and the f32
+//! reference forward. The device tables live in the shared kernel catalogue.
+
+pub mod architecture;
+pub mod config;
+pub mod forward;
+pub mod host;
+pub mod prompt;
+pub mod tensor;
+
+pub use architecture::{architecture_from_config, architecture_from_json};
+pub use config::{
+    Inkling2Config, InklingMtpConfig, InklingQuantConfig, InklingVisionConfig, MODEL_ID,
+    MODEL_TYPE, WEIGHTS_ID,
+};
+pub use prompt::InklingCodec;
+pub use forward::{Inkling2State, Inkling2Weights};
+pub use host::Inkling2HostBackend;
+pub use tensor::{InklingTensorPlan, Role, Slice};
+
+use sparkflash_model::ModelDescriptor;
+
+/// The pack's carried typed profile.
+pub const PROFILE_TOML: &str = include_str!("../config/inkling2_small.toml");
+
+/// The descriptor this pack serves.
+#[must_use]
+pub fn descriptor() -> ModelDescriptor {
+    ModelDescriptor::inkling2_small()
+}
+
+/// The released configuration carried in this crate.
+#[must_use]
+pub fn carried_config() -> &'static str {
+    include_str!("../config/inkling2_small.hf.json")
+}
+
+/// The released external quantization groups carried in this crate.
+#[must_use]
+pub fn carried_quant() -> &'static str {
+    include_str!("../config/inkling2_small.hf_quant.json")
+}

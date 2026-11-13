@@ -292,6 +292,15 @@ fn codec(
         )?;
         return Ok((Arc::new(codec), Dialect::Glm));
     }
+    if architecture.family == "inkling2" {
+        let codec = sparkflash_model_inkling2::InklingCodec::from_path(
+            &tokenizer,
+            architecture.tokens.bos_token_id,
+            architecture.tokens.eos_token_ids.clone(),
+        )
+        .map_err(|error| format!("{}: {error}", tokenizer.display()))?;
+        return Ok((Arc::new(codec), Dialect::Deepseek));
+    }
     if text.contains(sparkflash_model_qwen4_exp::codec::IM_START)
         && text.contains(sparkflash_model_qwen4_exp::codec::IM_END)
     {
@@ -370,7 +379,11 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     }
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
-    let unresolved = if on_device {
+    let unresolved = if checkpoint.architecture.family == "inkling2" {
+        // Its host backend runs the new relative/short-conv/block arithmetic itself; the CUDA
+        // catalogue is a device-arm gate, not this path's capability list.
+        Vec::new()
+    } else if on_device {
         // The catalogue resolver sorts canonical entries first, so a Dory plan can resolve
         // through a Qwen image. Check the Dory image's own symbol list before advertising it.
         if checkpoint.architecture.family == "dory" {
@@ -475,6 +488,14 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             super::pack::GlmArm::respond,
         ),
+        "inkling2" => serve_inkling_host(
+            checkpoint,
+            descriptor,
+            seam,
+            dialect,
+            context,
+            options,
+        ),
         "dory" => match options.recurrence.as_ref() {
             #[cfg(feature = "cuda")]
             Some(group) => super::recurrence::serve(
@@ -489,6 +510,36 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         },
         _ => serve_host(checkpoint, descriptor, seam, dialect, context, options),
     }
+}
+
+
+/// Serves an Inkling checkpoint through its pack's f32 host reference.
+fn serve_inkling_host(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    let config = sparkflash_model_inkling2::Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
+        .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+    let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
+        descriptor.clone(),
+        config,
+        Arc::new(source),
+        context,
+    )
+    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let banner = format!(
+        "{} ({}) at TP=1 on {}, context {context}, Inkling f32 host reference",
+        descriptor.id,
+        descriptor.weights_id,
+        checkpoint.directory.display()
+    );
+    serve_backend(Box::new(backend), descriptor, seam, dialect, options, &banner)
 }
 
 fn serve_host(

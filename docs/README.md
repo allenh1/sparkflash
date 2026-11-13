@@ -5,6 +5,7 @@
 | [design.md](design.md) | How the engine is built and why: data layout, the decode step, DSpark speculation, prefill, serving, correctness rules |
 | [performance.md](performance.md) | Current measured numbers, how they were taken, and how they got here |
 | [optimization-strategy.md](optimization-strategy.md) | Making a model fast on GB10: the timing and exactness probes, kernel practice, the hardware's measured limits, strategy, and a record of what each optimisation bought |
+| [thermal-fan-control.md](thermal-fan-control.md) | The GB10 fan path that actually works (EC mailbox over FF-A eSPI), the max-RPM setup on all four nodes, measured temperatures and the firmware caveat |
 | [serving.md](serving.md) | Converting weights, launching the four ranks, the HTTP API, behaviour and tuning knobs |
 | [web.md](web.md) | The `sparkflash --web` lead-node control plane: TOML, mDNS/SSH discovery, launch/convert actions and live graphs |
 | [adding-a-model.md](adding-a-model.md) | The one-stack bring-up path: typed ops, per-model profiles, the environment override table, and the parity harness |
@@ -15,6 +16,8 @@
 | [models/glm53-flash.md](models/glm53-flash.md) | GLM-5.3-Flash (FP8, TP=4): the released architecture, its serving frontend (backend, prompt codec, descriptor), the tiny-fixture run, and what the arm does not serve yet |
 | [models/dory1-4b-bf16.md](models/dory1-4b-bf16.md) | NVIDIA Nemotron Labs Dory1.0-4B (BF16): looped nGPT arithmetic, the 507-name tensor plan, the TP=1 device arm and the CPU host reference |
 | [models/qwen36-35b-a3b-fp8.md](models/qwen36-35b-a3b-fp8.md) | Qwen3.6-35B-A3B (FP8): the Qwen3.5-MoE hybrid on the generalised Qwen device arm at TP=1 (plain residual, full attention, FP8 dense), and what it still refuses |
+| [models/inkling2-small-tp4.md](models/inkling2-small-tp4.md) | Inkling 2 Small (NVFP4): the 594B/17B-active hybrid, four-Spark memory feasibility, and the parts, kernels and arm it needs |
+| [../crates/sparkflash-model-inkling2/](../crates/sparkflash-model-inkling2/) | Inkling-2-Small: the typed config, exact 390 GB tensor plan and TP4 slices, the f32 host reference, the released prompt template, and the device kernel catalogue |
 | [../crates/sparkflash-model-glm5-next/](../crates/sparkflash-model-glm5-next/) | GLM-5.3-Flash: the pack's tensor plan, host reference, device arm and rank-file converter, documented in its crate root |
 | [../crates/sparkflash-deepseek-forward/](../crates/sparkflash-deepseek-forward/) | The V4.1 device forward, moved out of sparkflash-cli and composed from the model pack and the shared kernel stack |
 | [architecture/](architecture/) | The model: CSA2 attention, mHC, MoE, Engram, DSpark, vision, prompt encoding, KV footprint |

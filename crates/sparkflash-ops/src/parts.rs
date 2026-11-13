@@ -119,6 +119,18 @@ const QWEN_ROUTED_SHAPES: &[(usize, usize, usize)] = &[(2560, 512, 10), (2048, 2
 /// published list is the set the released arms resolve at.
 const GQA_GROUPS: &[usize] = &[1, 2, 3, 4, 6, 8, 12];
 
+/// The Inkling-2-Small text geometry every inkling_* entry is compiled for.
+///
+/// The released checkpoint is 4,608-wide with 48 query heads of 128 and 8 KV heads (group 6),
+/// a kernel-4 short convolution, a 2,304-wide routed expert and a 1,024-token sliding window.
+/// The window is per layer (1024 on a sliding layer, 0 on a full one), so it is documented
+/// here rather than pinned as an equality: a full layer legitimately carries no window.
+const INKLING_HIDDEN: usize = 4608;
+const INKLING_HEAD_DIM: usize = 128;
+const INKLING_GQA_GROUPS: &[usize] = &[6];
+const INKLING_SHORT_CONV: usize = 4;
+const INKLING_INTERMEDIATE: usize = 2304;
+
 /// The shape rule of one catalogue entry.
 ///
 /// This is the model-independent part of kernel selection: a kernel that only works on whole
@@ -244,6 +256,23 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         }
         (Part::Rope, Image::Deepseek) => ShapeConstraint::ANY.hidden_equals(5120),
         (Part::Rope, Image::Qwen4Exp) => ShapeConstraint::ANY.hidden_equals(2560),
+        // Inkling's four new arithmetic families. The relative-attention entry serves both the
+        // 1,024-token sliding layers and the eight full layers, so the window is a documented
+        // per-layer fact rather than an equality the full layers would fail.
+        (Part::RelativeAttention, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(INKLING_HIDDEN)
+            .head_dim_equals(INKLING_HEAD_DIM)
+            .gqa_groups(INKLING_GQA_GROUPS)
+            .positions(0, 1 << 21),
+        (Part::ShortConv, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(INKLING_HIDDEN)
+            .window_between(INKLING_SHORT_CONV, INKLING_SHORT_CONV),
+        (Part::BlockAttentionResidual, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(INKLING_HIDDEN)
+            .streams_between(1, 16),
+        (Part::SoftcappedActivation, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(INKLING_HIDDEN)
+            .intermediate_equals(INKLING_INTERMEDIATE),
         (Part::Quantize, _) => ShapeConstraint::ANY,
         // Only the GLM decode image exports a LayerNorm body; RMSNorm is a different part and
         // the resolver must never fall back to it.
@@ -847,6 +876,58 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[sym("q4e_rope", &[Precision::Bf16])],
         false,
     ),
+    // Inkling-2-Small. The relative-attention pair is one body with a one-row (decode) and a
+    // many-row (prefill) entry; the caches are BF16, which is the precision both name.
+    sm121(
+        Part::RelativeAttention,
+        Image::Inkling,
+        &[
+            dec("inkling_attn_decode", &[Precision::Bf16]),
+            pre("inkling_attn_prefill", &[Precision::Bf16]),
+        ],
+        true,
+    ),
+    sm121(
+        Part::ShortConv,
+        Image::Inkling,
+        &[
+            sym("inkling_short_conv", &[Precision::Bf16, Precision::F32]),
+            sym(
+                "inkling_short_conv_decode",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_dynamic",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym(
+                "inkling_short_conv_dynamic_decode",
+                &[Precision::Bf16, Precision::F32],
+            ),
+        ],
+        true,
+    ),
+    sm121(
+        Part::BlockAttentionResidual,
+        Image::Inkling,
+        &[sym(
+            "inkling_block_residual",
+            &[Precision::Bf16, Precision::F32],
+        )],
+        true,
+    ),
+    sm121(
+        Part::SoftcappedActivation,
+        Image::Inkling,
+        &[
+            sym(
+                "inkling_softcapped_swiglu",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            sym("inkling_logit_softcap", &[Precision::Bf16, Precision::F32]),
+        ],
+        true,
+    ),
     sm121(
         Part::Quantize,
         Image::Deepseek,
@@ -855,6 +936,18 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("mxfp8_quantize_activations_sm121", &[Precision::Bf16]),
         ],
         true,
+    ),
+    // Inkling's routed-expert activation quantiser: the same packed-E2M1/E4M3-scale storage
+    // as the shared NVFP4 path, but with the released four-over-six block-scale choice. It sits
+    // beside the canonical DeepSeek quantisers rather than replacing them.
+    sm121(
+        Part::Quantize,
+        Image::Inkling,
+        &[sym(
+            "inkling_nvfp4_quantize_4_6",
+            &[Precision::Bf16, Precision::NvFp4],
+        )],
+        false,
     ),
     sm121(
         Part::Quantize,
@@ -1983,6 +2076,7 @@ mod tests {
             Image::MoePlan,
             Image::Deepseek,
             Image::Dory,
+            Image::Inkling,
             Image::Rocenante,
         ]
         .map(Image::name);
@@ -2033,6 +2127,116 @@ mod tests {
             let missing = missing(&architecture, Target::Sm121);
             assert!(missing.is_empty(), "{name} is missing {missing:?} on sm121");
         }
+    }
+
+    /// Inkling-2-Small's four new arithmetic families are catalogued at the geometry the
+    /// released document names, and the entries refuse a shape the body was not compiled for.
+    #[test]
+    fn inkling_entries_match_the_released_geometry() {
+        use crate::plan::PartGeometry;
+
+        const INKLING: &str =
+            include_str!("../../sparkflash-model/tests/data/inkling2_config.json");
+        let architecture = Architecture::from_json(INKLING).expect("the Inkling-2 config parses");
+        let required = [
+            Part::RelativeAttention,
+            Part::ShortConv,
+            Part::BlockAttentionResidual,
+            Part::SoftcappedActivation,
+        ];
+        for part in required {
+            assert!(
+                architecture.parts().contains(part),
+                "the released document requires {part}"
+            );
+            let entry = kernels(part, Target::Sm121)
+                .find(|entry| entry.image == Image::Inkling)
+                .unwrap_or_else(|| panic!("{part} has no Inkling image entry"));
+            assert!(entry.canonical, "{part}'s Inkling entry must be canonical");
+            assert_eq!(entry.shape.hidden_equals, Some(INKLING_HIDDEN));
+        }
+
+        let attention = kernels(Part::RelativeAttention, Target::Sm121)
+            .next()
+            .expect("the relative-attention entry");
+        let released = PartGeometry {
+            hidden: INKLING_HIDDEN,
+            heads: 48,
+            kv_heads: 8,
+            head_dim: INKLING_HEAD_DIM,
+            groups: 6,
+            positions: 1024,
+            ..PartGeometry::new()
+        };
+        assert!(attention.shape.accepts(&released).is_ok());
+        for wrong in [
+            PartGeometry {
+                hidden: 4096,
+                ..released
+            },
+            PartGeometry {
+                head_dim: 64,
+                ..released
+            },
+            PartGeometry {
+                heads: 32,
+                ..released
+            },
+        ] {
+            assert!(
+                attention.shape.accepts(&wrong).is_err(),
+                "the relative-attention entry accepted {wrong:?}"
+            );
+        }
+
+        // The short convolution is the released kernel 4, and the softcapped activation is the
+        // released 2,304-wide expert. A different width is a refusal, not a launch.
+        let convolution = kernels(Part::ShortConv, Target::Sm121)
+            .next()
+            .expect("the short-convolution entry");
+        assert!(
+            convolution
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: INKLING_HIDDEN,
+                    window: 4,
+                    ..PartGeometry::new()
+                })
+                .is_ok()
+        );
+        assert!(
+            convolution
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: INKLING_HIDDEN,
+                    window: 3,
+                    ..PartGeometry::new()
+                })
+                .is_err()
+        );
+        let activation = kernels(Part::SoftcappedActivation, Target::Sm121)
+            .next()
+            .expect("the softcapped activation entry");
+        assert!(
+            activation
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: INKLING_HIDDEN,
+                    intermediate: INKLING_INTERMEDIATE,
+                    ..PartGeometry::new()
+                })
+                .is_ok()
+        );
+        assert!(
+            activation
+                .shape
+                .accepts(&PartGeometry {
+                    hidden: INKLING_HIDDEN,
+                    intermediate: 4096,
+                    ..PartGeometry::new()
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -2088,6 +2292,8 @@ mod tests {
             Image::GlmDecode,
             Image::MoePlan,
             Image::Deepseek,
+            Image::Dory,
+            Image::Inkling,
             Image::Rocenante,
         ] {
             for cubin_dir in [false, true] {

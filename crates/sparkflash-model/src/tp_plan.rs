@@ -351,7 +351,7 @@ impl TpPlan {
                     detail: format!("layer {}: {}", layer.index, error.detail),
                 })?;
             match attention.kind {
-                AttentionKind::Gqa { kv_heads, .. } => {
+                AttentionKind::Gqa { kv_heads, .. } | AttentionKind::Inkling { kv_heads } => {
                     plan.split(kv_heads, TpAxis::KvHeads, 1)
                         .map_err(|error| TpPlanError {
                             axis: error.axis,

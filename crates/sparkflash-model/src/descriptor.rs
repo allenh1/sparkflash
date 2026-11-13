@@ -101,6 +101,24 @@ pub const DORY1_0_4B_MAX_OUTPUT_TOKENS: usize = DORY1_0_4B_CONTEXT_TOKENS;
 /// The vocabulary of the released Dory1.0-4B checkpoint.
 pub const DORY1_0_4B_VOCAB_SIZE: usize = 131_072;
 
+/// The served id of the Inkling-2-Small NVFP4 checkpoint.
+pub const INKLING2_SMALL_ID: &str = "thinkingmachines/Inkling-2-Small";
+
+/// The control-plane weight selector for Inkling-2-Small (NVFP4).
+pub const INKLING2_SMALL_WEIGHTS_ID: &str = "inkling2-small-nvfp4";
+
+/// The context window of the released Inkling-2-Small checkpoint.
+pub const INKLING2_CONTEXT_TOKENS: usize = 1_048_576;
+
+/// The output ceiling this build serves for Inkling-2-Small.
+pub const INKLING2_MAX_OUTPUT_TOKENS: usize = 32_768;
+
+/// The padded vocabulary of the released Inkling-2-Small checkpoint.
+pub const INKLING2_VOCAB_SIZE: usize = 201_024;
+
+/// The real (unpadded) vocabulary the released head scores.
+pub const INKLING2_UNPADDED_VOCAB_SIZE: usize = 200_058;
+
 /// The model ids this build knows how to serve, in selector order.
 ///
 /// Kept as a separate slice so the web control plane can expose it without constructing the
@@ -112,6 +130,7 @@ pub const WEIGHT_IDS: &[&str] = &[
     QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
     GLM53_FLASH_WEIGHTS_ID,
     DORY1_0_4B_BF16_WEIGHTS_ID,
+    INKLING2_SMALL_WEIGHTS_ID,
 ];
 
 /// The maximum context window of the released model.
@@ -247,6 +266,26 @@ impl ModelDescriptor {
         }
     }
 
+    /// The released thinkingmachines/Inkling-2-Small descriptor.
+    ///
+    /// The backbone is the served model. The checkpoint also carries a 23-layer vision tower
+    /// and a five-layer DSpark drafter; the descriptor declares both because the release does,
+    /// and an engine narrows what it actually loaded.
+    #[must_use]
+    pub fn inkling2_small() -> Self {
+        Self {
+            id: INKLING2_SMALL_ID.to_owned(),
+            family: "inkling2".to_owned(),
+            model_type: "inkling2".to_owned(),
+            label: "Inkling".to_owned(),
+            weights_id: INKLING2_SMALL_WEIGHTS_ID.to_owned(),
+            context_tokens: INKLING2_CONTEXT_TOKENS,
+            max_output_tokens: INKLING2_MAX_OUTPUT_TOKENS,
+            vocab_size: INKLING2_VOCAB_SIZE,
+            capabilities: Capabilities::ALL_WITH_VISION,
+        }
+    }
+
     /// The released zai-org/GLM-5.3-Flash descriptor.
     ///
     /// The vision tower is in the checkpoint but is not loaded, so vision is not declared. The
@@ -358,6 +397,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
         ModelDescriptor::qwen36_flash_35b_a3b_fp8(),
         ModelDescriptor::glm53_flash(),
         ModelDescriptor::dory1_0_4b_bf16(),
+        ModelDescriptor::inkling2_small(),
     ]
 });
 

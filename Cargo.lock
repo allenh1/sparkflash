@@ -2375,6 +2375,7 @@ dependencies = [
  "sparkflash-model-deepseek-v41",
  "sparkflash-model-dory",
  "sparkflash-model-glm5-next",
+ "sparkflash-model-inkling2",
  "sparkflash-model-qwen4-exp",
  "sparkflash-ops",
  "sparkflash-scheduler",
@@ -2576,6 +2577,19 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "sparkflash-model-inkling2"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-ops",
+ "sparkflash-weights",
+ "tokenizers",
 ]
 
 [[package]]

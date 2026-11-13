@@ -114,9 +114,20 @@ impl VisionGeometry {
             .ok_or_else(|| {
                 ConfigError::Invalid("vision_config names no attention heads".to_owned())
             })?;
-        let intermediate_size = number("intermediate_size")?.ok_or_else(|| {
-            ConfigError::Invalid("vision_config names no intermediate_size".to_owned())
-        })?;
+        let intermediate_size = match number("intermediate_size")? {
+            Some(width) => width,
+            None => {
+                // Transformers vision configs in the CLIP family name an MLP ratio instead of
+                // an explicit width. Inkling's tower is one of them.
+                let ratio = float("mlp_ratio")?.unwrap_or(0.0);
+                if ratio <= 0.0 {
+                    return Err(ConfigError::Invalid(
+                        "vision_config names no intermediate_size".to_owned(),
+                    ));
+                }
+                ((hidden_size as f64 * ratio).round() as usize).max(1)
+            }
+        };
         Ok(Self {
             depth,
             hidden_size,
@@ -125,19 +136,30 @@ impl VisionGeometry {
             // The merger hands the language model its own width; a tower that does not name one
             // hands it the language width, not its own block width.
             out_hidden_size: number("out_hidden_size")?.unwrap_or(language_hidden),
-            projection_intermediate_size: number("projection_intermediate_size")?.unwrap_or(0),
+            projection_intermediate_size: number("projection_intermediate_size")?
+                .or(number("projection_hidden_dim")?)
+                .unwrap_or(0),
             in_channels: number("in_channels")?.unwrap_or(3),
             // A patch side is geometry, not a default: a missing value would make the merge cell
             // zero and every planned image empty. An arm that carries a default states it.
-            patch_size: number("patch_size")?.ok_or_else(|| {
-                ConfigError::Invalid("vision_config names no patch_size".to_owned())
-            })?,
+            patch_size: number("patch_size")?
+                .or(number("native_patch_size")?)
+                .ok_or_else(|| {
+                    ConfigError::Invalid("vision_config names no patch_size".to_owned())
+                })?,
             temporal_patch_size: number("temporal_patch_size")?.unwrap_or(1),
-            // DeepSeek names the same factor `downsample_ratio`.
+            // DeepSeek names the same factor `downsample_ratio`; Inkling names it
+            // `adapter_merge_size`.
             spatial_merge_size: number("spatial_merge_size")?
                 .or(number("downsample_ratio")?)
+                .or(number("adapter_merge_size")?)
                 .unwrap_or(1),
-            num_position_embeddings: number("num_position_embeddings")?.unwrap_or(0),
+            num_position_embeddings: match number("num_position_embeddings")? {
+                Some(entries) => entries,
+                None => number("posemb_grid_size")?
+                    .map(|side| side.saturating_mul(side))
+                    .unwrap_or(0),
+            },
             rope_theta: float("rope_theta")?.unwrap_or(10_000.0),
             min_pixels: number("min_pixels")?.unwrap_or(0),
             max_pixels: number("max_pixels")?.unwrap_or(0),

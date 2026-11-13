@@ -69,6 +69,14 @@ pub enum Part {
     Activation,
     /// A rotary embedding epilogue.
     Rope,
+    /// A learned relative-position bias bank and its per-token profile projection.
+    RelativeAttention,
+    /// A depthwise causal short convolution with decode history.
+    ShortConv,
+    /// A block-attention residual over a stack of block summaries.
+    BlockAttentionResidual,
+    /// A softcapped gated activation (Inkling's SwiGLU).
+    SoftcappedActivation,
     /// An on-the-fly quantization epilogue.
     Quantize,
     /// Layer normalization, distinct from RMSNorm.
@@ -108,6 +116,10 @@ impl Part {
         Self::DenseGemm,
         Self::Activation,
         Self::Rope,
+        Self::RelativeAttention,
+        Self::ShortConv,
+        Self::BlockAttentionResidual,
+        Self::SoftcappedActivation,
         Self::Quantize,
         Self::LayerNorm,
         Self::MoeRouter,
@@ -141,6 +153,10 @@ impl Part {
             Self::DenseGemm => "dense_gemm",
             Self::Activation => "activation",
             Self::Rope => "rope",
+            Self::RelativeAttention => "relative_attention",
+            Self::ShortConv => "short_conv",
+            Self::BlockAttentionResidual => "block_attention_residual",
+            Self::SoftcappedActivation => "softcapped_activation",
             Self::Quantize => "quantize",
             Self::LayerNorm => "layer_norm",
             Self::MoeRouter => "moe_router",
