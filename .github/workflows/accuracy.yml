@@ -1,0 +1,100 @@
+# The nightly half of .gitlab-ci.yml: checks that compare committed artifacts
+# against what this machine's toolchain produces, plus the feature sweep and the
+# recorded host-gate artifact.  They are not per-commit work; they run on the
+# schedule and on demand, exactly like the .accuracy jobs in GitLab.
+
+name: Accuracy
+
+on:
+  schedule:
+    - cron: "15 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: accuracy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  cuda-baseline:
+    name: cuda-baseline
+    runs-on: [self-hosted, gb10]
+    timeout-minutes: 180
+    env:
+      SPARKFLASH_NVCC: /opt/cuda/bin/nvcc
+      # Unlike the per-commit job, no opt-out: the script is the only say.
+      SPARKFLASH_KERNEL_BASELINE: ""
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../ci-cache/target-cuda
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          export PATH="/opt/cuda/bin:$HOME/.cargo/bin:$PATH"
+          echo "/opt/cuda/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          test -x "$SPARKFLASH_NVCC"
+          "$SPARKFLASH_NVCC" --version
+          rustc --version
+          rustup show active-toolchain
+      - name: Committed artifact baselines
+        run: |
+          export PATH="/opt/cuda/bin:$HOME/.cargo/bin:$PATH"
+          cargo clean -p sparkflash-kernels
+          /bin/sh crates/sparkflash-kernels/scripts/check-kernel-baseline.sh
+          sh crates/sparkflash-kernels/scripts/regen-codec-fixture.sh
+
+  feature-sweep:
+    name: feature-sweep
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 120
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Feature sweep
+        run: |
+          rustup component add clippy
+          python3 ci/test_check_features.py
+          python3 ci/check_features.py
+
+  gate-artifact:
+    name: gate-artifact
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 240
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Host gate record
+        run: |
+          rustup component add rustfmt clippy
+          python3 ci/host-gates.py --out gate-artifacts
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-artifacts-${{ github.run_id }}
+          path: gate-artifacts/
+          retention-days: 90

@@ -1,0 +1,278 @@
+# GitHub Actions mirror of .gitlab-ci.yml.
+#
+# The jobs, images, shards and cache boundaries are deliberately the same as the
+# GitLab pipeline: this is the same gate, run by the same host, reported on the PR
+# instead of the MR.  The differences are GitHub's vocabulary:
+#
+#   GitLab                     GitHub
+#   -------------------------  ---------------------------------------------
+#   merge request pipeline     pull_request workflow
+#   workflow:auto_cancel       concurrency.cancel-in-progress
+#   stage check/test           needs: check
+#   pipeline schedule          schedule (and workflow_dispatch)
+#   runner cache volume        sparkflash-ci-cache (Docker named volume)
+#
+# Build state is kept on the runner host, not in the GitHub cache service: the
+# workspace's target/ is 100+ GB, well past GitHub's 10 GB per-repo cache limit.
+# The x64 container jobs share the named Docker volume sparkflash-ci-cache; the
+# native GB10 jobs use a directory under the runner workspace.  Either way the
+# path is private to the runner, not written into this file.
+#
+# Security note: this is a public repository running persistent self-hosted
+# runners.  The x64 jobs execute in a container with only the workspace and the
+# cache volume mounted; the GB10 jobs execute natively on a dedicated worker.
+# A fork PR can still change this file, so keep "Require approval for all outside
+# collaborators" enabled for the repository.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep target/ small and the linker out of the picture; see the GitLab file.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # check: style and static analysis
+  # ---------------------------------------------------------------------------
+  style:
+    name: style
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 30
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup component add rustfmt
+      - name: Style gates
+        run: |
+          sh ci/check-m4-abi-size.sh
+          cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 60
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup component add clippy
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  deny:
+    name: deny
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 30
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency policy
+        run: |
+          # Installed into the cached CARGO_HOME: the first run pays for
+          # cargo install, and later runs find the binary.
+          if [ ! -x "$CARGO_HOME/bin/cargo-deny" ]; then
+            cargo install cargo-deny --locked
+          fi
+          "$CARGO_HOME/bin/cargo-deny" --version
+          "$CARGO_HOME/bin/cargo-deny" check
+
+  rustdoc:
+    name: rustdoc
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 30
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build docs
+        env:
+          RUSTDOCFLAGS: -D missing_docs
+        run: cargo doc --workspace --no-deps
+
+  # ---------------------------------------------------------------------------
+  # test: the per-commit correctness gate, in the same three shards
+  # ---------------------------------------------------------------------------
+  test-kernels:
+    name: test-kernels
+    needs: [style, clippy, deny, rustdoc]
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 90
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel tests
+        run: |
+          cargo test -p sparkflash-kernels
+          # cargo test --workspace builds examples but never runs their
+          # #[cfg(test)] blocks; the m8_sequence harness needs those.
+          cargo test -p sparkflash-kernels --examples
+
+  test-cli:
+    name: test-cli
+    needs: [style, clippy, deny, rustdoc]
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 90
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: CLI and siblings
+        run: cargo test -p sparkflash-cli -p sparkflash-serve -p sparkflash-model -p sparkflash-vision
+
+  test-workspace:
+    name: test-workspace
+    needs: [style, clippy, deny, rustdoc]
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 90
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Workspace tests
+        run: |
+          cargo test -p sparkflash-api -p sparkflash-comm -p sparkflash-engine -p sparkflash-model-deepseek-v41
+          cargo test -p sparkflash-model-qwen4-exp
+          cargo test -p sparkflash-model-glm5-next
+          cargo test -p sparkflash-kv -p sparkflash-engram -p sparkflash-scheduler -p sparkflash-device -p sparkflash-web
+          cargo test -p sparkflash-weights -p sparkflash-trace
+          cargo test -p sparkflash-trace --no-default-features
+
+  scripts-tests:
+    name: scripts-tests
+    needs: [style, clippy, deny, rustdoc]
+    runs-on: [self-hosted, linux, x64, sparkflash]
+    timeout-minutes: 30
+    container:
+      image: rust:1.98
+      volumes:
+        - sparkflash-ci-cache:/cache
+    env:
+      RUSTUP_HOME: /cache/rustup
+      CARGO_HOME: /cache/cargo-home
+      CARGO_TARGET_DIR: /cache/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Python and shell gates
+        env:
+          # scripts/numerics.py ci measures the change against the MR base.  GitHub
+          # has no CI_MERGE_REQUEST_* variables; map the PR base and the push
+          # before-sha onto the names the script already reads.
+          CI_MERGE_REQUEST_DIFF_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_COMMIT_BEFORE_SHA: ${{ github.event.before }}
+          CI_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          bash scripts/identity-gate.sh --anchor
+          bash scripts/identity-gate.sh --self-test
+          python3 -m unittest scripts/tests/test_identity_gate.py -v
+          bash scripts/numerical-gate.sh --self-test
+          # The numerics declaration check diffs a checkout the runner cloned as
+          # another user, so git needs to trust it.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 scripts/numerics.py self-test
+          python3 scripts/numerics.py ci
+          python3 ci/test_check_features.py
+
+  # Actually compiles CUDA, on the GB10 worker that has the toolkit.  The x64
+  # runner has no nvcc, so this job asks only for the gb10 label and runs
+  # natively; the host's rustup toolchain follows rust-toolchain.toml.
+  cuda:
+    name: cuda
+    needs: [style, clippy, deny, rustdoc]
+    runs-on: [self-hosted, gb10]
+    timeout-minutes: 120
+    env:
+      SPARKFLASH_NVCC: /opt/cuda/bin/nvcc
+      # The kernel baseline is cuda-baseline's nightly job; here it costs 238 s
+      # per test invocation twice.
+      SPARKFLASH_KERNEL_BASELINE: skip
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../ci-cache/target-cuda
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          export PATH="/opt/cuda/bin:$HOME/.cargo/bin:$PATH"
+          echo "/opt/cuda/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          test -x "$SPARKFLASH_NVCC"
+          "$SPARKFLASH_NVCC" --version
+          rustc --version
+          rustup show active-toolchain
+      - name: CUDA gates
+        run: |
+          export PATH="/opt/cuda/bin:$HOME/.cargo/bin:$PATH"
+          # build.rs writes its PTX into OUT_DIR, which is not part of cargo's
+          # fingerprint; clear this crate so the build script must run again.
+          cargo clean -p sparkflash-kernels
+          cargo check -p sparkflash-kernels --all-targets
+          test -n "$(find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -print -quit)"
+          find "$CARGO_TARGET_DIR" -name trace_abi_probe.ptx -exec ls -l {} +
+          cargo test -p sparkflash-kernels --features cuda
+          cargo clippy -p sparkflash-kernels --all-targets --features cuda -- -D warnings
