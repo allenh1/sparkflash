@@ -29,11 +29,11 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sparkflash_model::TpPlan;
-use sparkflash_weights::WeightSource;
+use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 use sparkflash_weights::rank_file::{
     SlotCursor, SlotFileWriter, SlotIndex, SlotPlan, SlotRecords, WrittenRank, fnv1a,
 };
@@ -383,6 +383,179 @@ pub fn verify_rank(
         slots: index.slots.len(),
         bytes,
     })
+}
+
+/// A [WeightSource] over one converted rank file.
+///
+/// The plan decides what the file holds, so this opens with the same [rank_slots] walk the
+/// converter wrote and presents each planned tensor under its released name with the rank-local
+/// shape. A rank file's payload is contiguous and in plan order, so a read is one `pread` per
+/// slot it touches rather than one per source range: the loader is a walk, not a re-tiling.
+pub struct RankFileSource {
+    path: PathBuf,
+    file: std::sync::Mutex<File>,
+    data_offset: u64,
+    index: SlotIndex<InklingRecords>,
+    specs: std::collections::BTreeMap<String, TensorSpec>,
+    slots: Vec<RankSlot>,
+}
+
+impl std::fmt::Debug for RankFileSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RankFileSource")
+            .field("path", &self.path)
+            .field("slots", &self.slots.len())
+            .field("tensors", &self.specs.len())
+            .finish()
+    }
+}
+
+impl RankFileSource {
+    /// Opens one converted rank file and checks its slots against the plan it was written from.
+    ///
+    /// # Errors
+    /// A file that is another model's or rank's, a slot that is not where the plan puts it, or a
+    /// file that cannot be opened.
+    pub fn open(path: &Path, config: &Inkling2Config, layout: TpLayout) -> Result<Self, String> {
+        let (preamble, index) = SlotIndex::<InklingRecords>::read(path, layout)?;
+        let slots = rank_slots(config, layout)?;
+        let mut cursor = SlotCursor::new(&index.slots);
+        for slot in &slots {
+            cursor.take(&slot.key, slot.bytes)?;
+        }
+        cursor.finish()?;
+        let tp = TpPlan::new(layout.world_size, layout.rank)
+            .map_err(|error| format!("TP{}/rank{}: {error}", layout.world_size, layout.rank))?;
+        let plan = InklingTensorPlan::served(config, tp)?;
+        let specs = (0..plan.plan().len())
+            .map(|index| plan.rank_spec_at(index).clone())
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: std::sync::Mutex::new(file),
+            data_offset: preamble.data_offset,
+            index,
+            specs,
+            slots,
+        })
+    }
+
+    /// The slots the file holds, in plan order.
+    #[must_use]
+    pub fn slots(&self) -> &[RankSlot] {
+        &self.slots
+    }
+
+    /// The converted payload bytes of one tensor, or `None` when the rank does not hold it.
+    #[must_use]
+    pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
+        self.specs
+            .get(name)
+            .map(|spec| spec.storage_bytes() as u64)
+    }
+
+    /// Reads `len` payload bytes at `offset` of one tensor's rank-local bytes.
+    fn read_tensor(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>, WeightError> {
+        if self.specs.get(name).is_none() {
+            return Err(WeightError::Missing {
+                name: name.to_string(),
+            });
+        }
+        let mut out = Vec::with_capacity(len);
+        let mut tensor_start = 0u64;
+        let mut remaining = len as u64;
+        let mut wanted = offset;
+        for (position, slot) in self.slots.iter().enumerate() {
+            if slot.name != name {
+                continue;
+            }
+            let slot_start = tensor_start;
+            tensor_start += slot.bytes as u64;
+            if remaining == 0 {
+                break;
+            }
+            let slot_end = slot_start + slot.bytes as u64;
+            if wanted >= slot_end {
+                continue;
+            }
+            let local = wanted.max(slot_start) - slot_start;
+            let take = (slot_end - (slot_start + local)).min(remaining);
+            let header = &self.index.slots[position];
+            let at = self.data_offset + header.offset as u64 + local;
+            let mut buffer = vec![0u8; take as usize];
+            let mut file = self.file.lock().map_err(|_| WeightError::Io {
+                name: name.to_string(),
+                detail: "the rank file lock is poisoned".to_owned(),
+            })?;
+            file.seek(SeekFrom::Start(at))
+                .and_then(|_| file.read_exact(&mut buffer))
+                .map_err(|error| WeightError::Io {
+                    name: name.to_string(),
+                    detail: error.to_string(),
+                })?;
+            out.extend_from_slice(&buffer);
+            wanted += take;
+            remaining -= take;
+        }
+        if remaining != 0 {
+            return Err(WeightError::Malformed {
+                name: name.to_string(),
+                detail: format!(
+                    "{len} bytes at {offset} run past the {} the rank file holds",
+                    self.tensor_bytes(name).unwrap_or(0)
+                ),
+            });
+        }
+        Ok(out)
+    }
+}
+
+impl WeightSource for RankFileSource {
+    fn directory(&self) -> Option<&Path> {
+        self.path.parent()
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.specs.keys().cloned().collect()
+    }
+
+    fn spec(&self, name: &str) -> Result<TensorSpec, WeightError> {
+        self.specs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WeightError::Missing {
+                name: name.to_string(),
+            })
+    }
+
+    fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
+        let bytes = self.tensor_bytes(name).ok_or_else(|| WeightError::Missing {
+            name: name.to_string(),
+        })?;
+        let bytes = usize::try_from(bytes).map_err(|_| WeightError::TooLarge {
+            name: name.to_string(),
+            bytes: bytes as u128,
+            limit: usize::MAX as u128,
+        })?;
+        self.read_tensor(name, 0, bytes)
+    }
+
+    fn read_ranges(
+        &self,
+        name: &str,
+        ranges: &[(u64, usize)],
+    ) -> Option<Result<Vec<u8>, WeightError>> {
+        Some((|| {
+            let mut out = Vec::new();
+            for (offset, len) in ranges {
+                out.extend_from_slice(&self.read_tensor(name, *offset, *len)?);
+            }
+            Ok(out)
+        })())
+    }
 }
 
 #[cfg(test)]

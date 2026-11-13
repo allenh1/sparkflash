@@ -53,6 +53,8 @@ use super::{
 
 /// The variable naming a directory of Qwen3.8-Flash-Next rank files (`sparkflash convert`).
 pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
+/// Where an Inkling run reads its converted rank file, when one is staged.
+pub(super) const INKLING_CONVERTED_DIR_ENV: &str = "SPARKFLASH_INKLING_CONVERTED_DIR";
 
 /// The default DeepSeek arm's carried profile. The arm has no [PackArm] (the reference path
 /// serves it), but its boot still reads the same typed profile as the packed arms.

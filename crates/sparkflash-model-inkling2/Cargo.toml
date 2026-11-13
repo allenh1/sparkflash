@@ -14,3 +14,6 @@ sparkflash-ops = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
 tokenizers = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

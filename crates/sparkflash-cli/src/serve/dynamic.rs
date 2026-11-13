@@ -524,20 +524,44 @@ fn serve_inkling_host(
 ) -> Result<ExitCode, String> {
     let config = sparkflash_model_inkling2::Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
         .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
-    let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
-        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+    // A staged converted rank file is served as it is: the same plan, the same arithmetic, and a
+    // load that is a walk over one file instead of a sharded safetensors seek per tensor.
+    let layout = sparkflash_engine::parallel_tp::TpLayout {
+        rank: 0,
+        world_size: 1,
+    };
+    let converted = crate::serve::pack::converted_rank_file(
+        crate::serve::pack::INKLING_CONVERTED_DIR_ENV,
+        layout.rank,
+        layout.world_size,
+    )?;
+    let (source, where_from): (Arc<dyn sparkflash_weights::WeightSource>, String) = match &converted
+    {
+        Some(path) => (
+            Arc::new(
+                sparkflash_model_inkling2::RankFileSource::open(path, &config, layout)
+                    .map_err(|error| format!("{}: {error}", path.display()))?,
+            ),
+            format!("converted {}", path.display()),
+        ),
+        None => (
+            Arc::new(
+                sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+                    .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?,
+            ),
+            checkpoint.directory.display().to_string(),
+        ),
+    };
     let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
         descriptor.clone(),
         config,
-        Arc::new(source),
+        source,
         context,
     )
     .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
     let banner = format!(
-        "{} ({}) at TP=1 on {}, context {context}, Inkling f32 host reference",
-        descriptor.id,
-        descriptor.weights_id,
-        checkpoint.directory.display()
+        "{} ({}) at TP=1 on {where_from}, context {context}, Inkling f32 host reference",
+        descriptor.id, descriptor.weights_id
     );
     serve_backend(Box::new(backend), descriptor, seam, dialect, options, &banner)
 }

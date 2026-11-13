@@ -193,6 +193,23 @@ impl InklingTensorPlan {
                     plan.push(&format!("{prefix}.mlp.experts.w13_weight_scale"), DType::U8, vec![config.n_routed_experts, w13_out, w13_cols], Role::Experts);
                     plan.push(&format!("{prefix}.mlp.experts.w2_weight_scale"), DType::U8, vec![config.n_routed_experts, hidden, w2_cols], Role::Experts);
                 }
+                WeightFormat::Bf16 => {
+                    // An unquantised checkpoint (and the tiny fixture) stores each expert dense:
+                    // w13 is [experts, 2 * intermediate, hidden] and w2 the reverse, with no
+                    // scale or amax beside them.
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight"),
+                        DType::BF16,
+                        vec![config.n_routed_experts, 2 * config.moe_intermediate_size, hidden],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight"),
+                        DType::BF16,
+                        vec![config.n_routed_experts, hidden, config.moe_intermediate_size],
+                        Role::Experts,
+                    );
+                }
                 _ => return Err(format!("layer {layer} has no expert format")),
             }
         }

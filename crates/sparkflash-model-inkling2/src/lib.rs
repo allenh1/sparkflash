@@ -30,7 +30,10 @@ pub use config::{
 pub use prompt::InklingCodec;
 pub use forward::{Inkling2State, Inkling2Weights};
 pub use host::Inkling2HostBackend;
-pub use convert::{InklingRecords, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots, verify_rank, visit_rank};
+pub use convert::{
+    InklingRecords, RankFileSource, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots,
+    verify_rank, visit_rank,
+};
 pub use tensor::{InklingTensorPlan, Role, Slice};
 
 use sparkflash_model::ModelDescriptor;
