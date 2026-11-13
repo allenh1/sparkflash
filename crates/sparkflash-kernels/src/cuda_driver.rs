@@ -5719,15 +5719,18 @@ mod stage_timing_tests {
     }
 }
 
+/// Serialises every test that arms or clears the process-wide probe meter: the async-switch
+/// test toggles it too, and arming clears the cells another test is reading.
+#[cfg(test)]
+static PROBE_METER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod probe_meter_tests {
     use super::*;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn the_meter_is_off_by_default_arms_explicitly_and_reads_back_what_was_added() {
-        let _serial = TEST_LOCK.lock().expect("test lock");
+        let _serial = super::PROBE_METER_TEST_LOCK.lock().expect("test lock");
         probe_meter_arm(false);
         assert!(
             !probe_meter_armed(),
@@ -5783,7 +5786,7 @@ mod probe_meter_tests {
 
     #[test]
     fn a_reading_is_never_negative_and_an_unchanged_meter_is_clear() {
-        let _serial = TEST_LOCK.lock().expect("test lock");
+        let _serial = super::PROBE_METER_TEST_LOCK.lock().expect("test lock");
         probe_meter_arm(true);
         let before = probe_meter_read();
         note_launch(5);
@@ -5841,6 +5844,9 @@ mod async_launch_cache_tests {
             queued_dispatch_wanted(),
             "queued run queues launches and copies"
         );
+        let _meter = super::PROBE_METER_TEST_LOCK
+            .lock()
+            .expect("probe meter test lock");
         probe_meter_arm(true);
         assert!(
             !queued_dispatch_wanted(),
