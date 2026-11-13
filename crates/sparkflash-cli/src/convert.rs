@@ -242,7 +242,10 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 world_size: world,
                 ranks: &ranks,
                 pad_moe_640,
-                verify,
+                // The closure below verifies the file against the checkpoint, slot digest
+                // included, so the pack's own payload re-read would be a third pass over 97.5 GB
+                // per rank for a weaker check (the header against itself).
+                verify: false,
                 allows_no_pad: true,
             };
             return slot_pack.convert::<InklingRecords>(&checkpoint_dir, |source, layout, label| {

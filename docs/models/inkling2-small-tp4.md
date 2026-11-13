@@ -1,6 +1,9 @@
 # Inkling 2 Small on four Sparks (TP4)
 
-Status: **implemented as a host/reference arm; TP4 device kernels are compiled, the device arm is the next milestone.**
+Status: **text backbone runs end to end at TP1 through the f32 host reference, and TP4 rank
+files convert, verify and load; the TP4 device arm, the drafter and vision are the remaining
+milestones.**
+
 
 This note answers two questions about `thinkingmachines/Inkling-2-Small`:
 
@@ -286,6 +289,34 @@ canonical for shared parts.
   only 0.655 GB, but the patch-20 tower and the image-token path are a separate kernel and
   preprocessing project. The dynamic host ignores vision; a device arm must not claim it
   until it runs.
+
+### 7. What runs today
+
+* **Serving (TP1, f32 host reference).** One request against the released 367 GB checkpoint
+  answers end to end. The first measured request — one prompt token plus one generated token —
+  took 165.3 s; after the routed experts were spread over the machine's cores and the MXFP8
+  rows decoded inline instead of through a one-byte slice per value, the same request took
+  **10.6 s** and produced the same token. The eight MXFP8 layers were 15.8 s each before the
+  change and are 0.22 s after. `SPARKFLASH_INKLING_TRACE=1` prints the per-stage split.
+* **Converted weights.** `sparkflash convert --checkpoint DIR --tp-world-size 4` writes four
+  rank files; `--inspect FILE --verify-weights` checks every slot digest;
+  `SPARKFLASH_INKLING_CONVERTED_DIR` makes `serve` read a staged rank file instead of the
+  sharded checkpoint, and the banner names whichever source is in use. The host reference
+  serves identical logits from either (tests/convert.rs).
+
+  Measured on the four-node cluster (DGX Spark, sm_121a), one 367 GB checkpoint:
+
+  | rank | file bytes | weights | header hash | file digest | `--inspect --verify-weights` |
+  | ---: | ---: | ---: | :-- | :-- | :-- |
+  | 0 | 97,488,232,448 | 1,420 | `0x1f53298aa68134af` | `0x30fd86d74b3a4f84` | ok on sg1-jackson |
+  | 1 | 97,488,232,448 | 1,420 | `0x04cc72543b1ad22a` | `0xa0f3013070d457d5` | ok on sg1-teilc |
+  | 2 | 97,488,232,448 | 1,420 | `0x4d85e9f6f93b16ea` | `0xbe02d64ab0dec264` | ok on sg1-carter |
+  | 3 | 97,488,232,448 | 1,420 | `0x8b743f3f1ddcc102` | `0x2de0634eee1e41ca` | ok on sg1-oneill |
+
+  Each rank took 872-952 s to write and verify against the checkpoint on the converting node
+  (399 GB of files, 381 GB of payload). Every file was then copied to a different node and
+  re-verified there from its own header, digest and payload alone — the node that will read
+  that rank is the node that checked it.
 
 ## Bring-up order
 
