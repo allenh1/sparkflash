@@ -312,10 +312,17 @@ impl InklingTensorPlan {
         self.plan.index_of(name)
     }
 
-    /// The exact stored byte total.
+    /// The exact stored byte total of the whole model, at any TP world.
     #[must_use]
     pub fn storage_bytes(&self) -> u128 {
         self.plan.storage_bytes()
+    }
+
+    /// The exact byte total this rank holds: the same number [Self::storage_bytes] gives at TP1,
+    /// and a quarter of it at TP4.
+    #[must_use]
+    pub fn rank_storage_bytes(&self) -> u128 {
+        self.rank.iter().map(TensorSpec::storage_bytes).sum()
     }
 }
 
@@ -337,16 +344,15 @@ fn split_of(
         return Ok(Vec::new());
     }
     if name.contains(".mlp.experts.") {
-        // Each rank holds whole experts. The released w13 keeps its output width on axis 1
-        // and w2 keeps the intermediate width on axis 2; both split by the TP4 intermediate,
-        // so a rank's expert is [96, 2*576, H] and [96, H, 576].
-        let mut slices = vec![slice(0, shape[0], TpAxis::Experts)?];
-        if name.ends_with("w13_weight") || name.ends_with("w13_weight_scale") {
-            slices.push(slice(1, shape[1], TpAxis::Intermediate)?);
-        } else if name.ends_with("w2_weight") || name.ends_with("w2_weight_scale") {
-            slices.push(slice(2, shape[2], TpAxis::Intermediate)?);
-        }
-        return Ok(slices);
+        // Expert parallelism: each rank holds whole experts, [96, 2*2304, H] and [96, H, 2304].
+        //
+        // The expert axis alone, not the expert axis *and* the intermediate axis. Splitting both
+        // gives a rank 96 experts of 576 intermediate columns, a sixteenth of the expert weights,
+        // and four such files hold a quarter of the model. The router picks 8 of 384 experts, so
+        // an expert is the natural unit: a rank computes its own experts whole and the collective
+        // exchanges tokens, while the intermediate width stays the shape the kernels are built
+        // for. The tiling test in `convert` is the check that four files hold the served plan.
+        return Ok(vec![slice(0, shape[0], TpAxis::Experts)?]);
     }
     if name.ends_with(".wo_ud.weight") {
         return Ok(vec![slice(1, shape[1], TpAxis::Heads)?]);
@@ -423,6 +429,13 @@ mod tests {
         let plan = InklingTensorPlan::served(&config, tp).expect("the plan");
         let experts = plan.index_of("model.llm.layers.0.mlp.experts.w13_weight").unwrap();
         assert_eq!(plan.rank_spec_at(experts).shape[0], 96);
+        // Whole experts: the intermediate width is not sharded as well, or a rank would hold a
+        // sixteenth of the expert weights instead of a quarter.
+        assert_eq!(plan.rank_spec_at(experts).shape[1], 2 * 2304);
+        let down = plan.index_of("model.llm.layers.0.mlp.experts.w2_weight").unwrap();
+        // The packed w2 keeps half its intermediate width in bytes, so the whole 2,304-element
+        // width is stored as 1,152 bytes per row and is not split any further.
+        assert_eq!(plan.rank_spec_at(down).shape[2], 1152);
         let embed = plan.index_of("model.llm.embed.weight").unwrap();
         assert_eq!(plan.rank_spec_at(embed).shape[0], 50_256);
     }

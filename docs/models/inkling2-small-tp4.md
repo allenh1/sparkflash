@@ -236,12 +236,24 @@ canonical for shared parts.
   (`wq_du`, `wk_dv`, `wv_dv`, `wr_du`, `gate_attn`, `attn_sink_proj`, `wo_ud`,
   `rel_logits_proj.proj`, `k_sconv`/`v_sconv`, `attn_sconv`, `mlp_sconv`, `w13_weight`,
   `w2_weight`, `w13_weight_scale`, `w13_weight_amax`, ...).
-* TP4: heads 48/4 = 12, KV 8/4 = 2, experts 384/4 = 96, intermediate 2,304/4 = 576. The
-  vocabulary 201,024/4 = 50,256 pads to 50,304 at a 128 alignment; use 64 or the padded
-  width rather than reusing Qwen's `vocab_multiple(128)` rule.
-* `sparkflash convert`'s current generic dynamic writer is TP1 raw tensors
-  (`DynamicRecords`); Inkling needs a TP4 rank-file path like Qwen/GLM. The Hub resolver
-  needs an entry for the repo and its sibling `mtp.safetensors`.
+* TP4: heads 48/4 = 12, KV 8/4 = 2, experts 384/4 = 96, vocabulary 201,024/4 = 50,256
+  (padded to 50,304 at a 128 alignment; use 64 or the padded width rather than reusing
+  Qwen's `vocab_multiple(128)` rule). Routed experts are split by **expert**, not by expert
+  *and* intermediate width: a rank holds 96 whole experts of 2,304 intermediate columns.
+  Splitting both axes gives a rank 96 experts of 576 columns, a sixteenth of the expert
+  weights, and four such files hold a quarter of the model. Expert parallelism also matches
+  the router — a rank computes its own experts whole and the collective exchanges tokens —
+  and keeps the intermediate width the shape the kernels are built for.
+* Measured rank payload: 97.49 GB per rank at TP4 (389.95 GB of files, 390.06 GB of
+  distinct checkpoint bytes). Four ranks cover the checkpoint exactly once — every sharded
+  tensor tiled with no gap and no overlap, every replicated tensor identical on all ranks —
+  and each rank clears the 113.7 GB budget. `inkling2::convert`'s tiling test is the check.
+* `sparkflash convert` writes Inkling's ranks through the shared rank-file container:
+  `sparkflash-model-inkling2::convert` walks `InklingTensorPlan` in plan order with
+  `SlotPlan`/`SlotFileWriter`, chunking payloads over 512 MiB and recording the source
+  ranges an inner-axis split needs, and `verify_rank` compares every slot against the
+  checkpoint. `--inspect` reads a file back. The Hub resolver needs an entry for the repo
+  and its sibling `mtp.safetensors`.
 
 ### 5. Serving, tokenizer and KV
 

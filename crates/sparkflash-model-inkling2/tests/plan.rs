@@ -91,21 +91,23 @@ fn the_tp4_rank_slices_divide_heads_experts_and_vocabulary() {
         spec("model.llm.layers.0.attn.wo_ud.weight"),
         vec![4608, 12 * 128]
     );
+    // Experts are split by expert, not by intermediate width as well: a rank holds 96 whole
+    // experts, so the intermediate stays 2,304 and four ranks hold all 384 experts once.
     assert_eq!(
         spec("model.llm.layers.0.mlp.experts.w13_weight"),
-        vec![96, 2 * 576, 4608 / 2]
+        vec![96, 2 * 2304, 4608 / 2]
     );
     assert_eq!(
         spec("model.llm.layers.0.mlp.experts.w2_weight"),
-        vec![96, 4608, 576 / 2]
+        vec![96, 4608, 2304 / 2]
     );
     assert_eq!(
         spec("model.llm.layers.40.mlp.experts.w13_weight"),
-        vec![96, 2 * 576, 4608]
+        vec![96, 2 * 2304, 4608]
     );
     assert_eq!(
         spec("model.llm.layers.40.mlp.experts.w2_weight"),
-        vec![96, 4608, 576]
+        vec![96, 4608, 2304]
     );
     assert_eq!(
         spec("model.llm.embed.weight"),

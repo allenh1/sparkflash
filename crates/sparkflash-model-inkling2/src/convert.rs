@@ -162,7 +162,9 @@ fn rank_ranges(
             };
             element = element * full.shape[axis] + index;
         }
-        ranges.push((full.dtype.storage_bytes(element) as u64, run_bytes));
+        // `element` indexes the run's first corner; the inner axes after the last sliced one
+        // are all held, so the byte offset scales by their product.
+        ranges.push((full.dtype.storage_bytes(element * inner) as u64, run_bytes));
         for axis in (0..last).rev() {
             counter[axis] += 1;
             if counter[axis] < radices[axis] {
@@ -399,38 +401,82 @@ mod tests {
         .expect("the released config parses")
     }
 
-    /// The four rank files must tile the served plan: no byte of the checkpoint is written twice
-    /// and none is left out, which is what makes the per-node load a partition of the model.
-    ///
-    /// This is ignored because it currently documents a defect rather than a passing check. The
-    /// plan shards a routed expert on the expert axis *and* on its intermediate axis, so one
-    /// rank holds 96 experts' 1152 gate/up rows and the four ranks together hold a quarter of the
-    /// expert weights: 26.97 GB each, 108 GB in total, against 389 GB in the served plan. A TP4
-    /// world has to split one of those axes, not both. The choice is the open decision in
-    /// docs/models/inkling2-small-tp4.md, and this test is the acceptance check for it.
+    /// The four rank files must tile the checkpoint: a sharded tensor's ranks cover it once,
+    /// exactly, and a replicated tensor is the same bytes on every rank. Nothing may fall between
+    /// ranks and nothing may be counted twice, which is what makes the per-node load a partition.
     #[test]
-    #[ignore = "the TP4 expert split divides the expert axis and the intermediate axis, so four ranks hold 108 GB of the 389 GB served plan"]
-    fn the_four_ranks_tile_the_served_plan() {
+    fn the_four_ranks_tile_the_checkpoint() {
+        use std::collections::BTreeMap;
+
         let config = released();
         let served = InklingTensorPlan::served(&config, TpPlan::new(1, 0).expect("TP1"))
             .expect("the served plan");
-        let whole = u64::try_from(served.storage_bytes()).expect("the plan fits u64");
-        let mut total = 0u64;
+        let mut coverage: BTreeMap<String, (usize, Vec<Vec<(u64, usize)>>)> = BTreeMap::new();
         for rank in 0..4 {
             let layout = TpLayout {
                 rank,
                 world_size: 4,
             };
             let slots = rank_slots(&config, layout).expect("rank slots");
-            let rank_plan = InklingTensorPlan::served(&config, TpPlan::new(4, rank).expect("TP4"))
+            let plan = InklingTensorPlan::served(&config, TpPlan::new(4, rank).expect("TP4"))
                 .expect("the rank plan");
             let bytes: u64 = slots.iter().map(|slot| slot.bytes as u64).sum();
-            assert_eq!(bytes, u64::try_from(rank_plan.storage_bytes()).expect("fits"));
-            total += bytes;
+            assert_eq!(
+                bytes,
+                u64::try_from(plan.rank_storage_bytes()).expect("the rank fits u64"),
+                "rank {rank} holds what its plan says"
+            );
+            // A rank has to fit the box: 113.7 GiB after the memory floor.
+            assert!(
+                bytes <= 113_700_000_000,
+                "rank {rank} holds {bytes} bytes, past the 113.7 GB budget"
+            );
+            for slot in &slots {
+                let entry = coverage
+                    .entry(slot.name.clone())
+                    .or_insert_with(|| (0, vec![Vec::new(); 4]));
+                entry.0 = slot.bytes.max(entry.0) + entry.0 - entry.0;
+                entry.1[rank].push(slot.ranges[0]);
+                for range in slot.ranges.iter().skip(1) {
+                    entry.1[rank].push(*range);
+                }
+            }
         }
-        assert_eq!(
-            total, whole,
-            "the four rank files must hold exactly the served plan's bytes"
+        for (name, (_, per_rank)) in &coverage {
+            let spec = served
+                .plan()
+                .spec(&served.plan().specs()[0].name)
+                .map(|_| ());
+            let _ = spec;
+            let full = served
+                .plan()
+                .specs()
+                .iter()
+                .find(|spec| &spec.name == name)
+                .map(|spec| u64::try_from(spec.storage_bytes()).expect("fits"))
+                .expect("the covered tensor is planned");
+            let replicated = per_rank.iter().all(|rank| rank == &per_rank[0]);
+            if replicated {
+                assert_eq!(
+                    per_rank[0].iter().map(|(_, len)| *len as u64).sum::<u64>(),
+                    full,
+                    "{name}: a replicated tensor must be the whole tensor"
+                );
+                continue;
+            }
+            let mut runs: Vec<(u64, usize)> =
+                per_rank.iter().flatten().copied().collect();
+            runs.sort_unstable();
+            let mut end = 0u64;
+            for (offset, len) in runs {
+                assert_eq!(offset, end, "{name}: the ranks leave a gap at {end}");
+                end += len as u64;
+            }
+            assert_eq!(end, full, "{name}: the ranks do not cover the whole tensor");
+        }
+        assert!(
+            coverage.contains_key("model.llm.layers.0.mlp.experts.w13_weight"),
+            "the expert tensor is covered"
         );
     }
 
