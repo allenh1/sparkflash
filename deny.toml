@@ -1,0 +1,82 @@
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# `cargo deny check` policy, run by the `audit` job in .gitlab-ci.yml.
+#
+# The advisory database is not vendored, so the check needs network access; the CI job runs it in
+# the uncached stage next to `style` and `clippy`.
+
+[graph]
+targets = [
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[advisories]
+# A vulnerability fails the job. The two entries below are `unmaintained` notices, which cargo-deny
+# raises at the same severity as a vulnerability: they are not exploited bugs, they are warnings
+# that the crate will not receive fixes. Each is recorded with the path that pulls it in and what
+# replaces it, so the exemption is a decision rather than a blind ignore.
+ignore = [
+    # RUSTSEC-2025-0119: number_prefix, through tokenizers -> indicatif. It is a progress-bar
+    # formatting helper with no arithmetic in the serving path; indicatif's successor crate has not
+    # been adopted by tokenizers yet.
+    "RUSTSEC-2025-0119",
+    # RUSTSEC-2024-0436: paste, a proc-macro used by tokenizers. It is compile-time only and the
+    # unmaintained status has no runtime consequence.
+    "RUSTSEC-2024-0436",
+]
+yanked = "deny"
+
+[bans]
+multiple-versions = "allow"
+# `{ workspace = true }` dependencies count as wildcards here, and the workspace pins them, so the
+# wildcard check would only report the same pin twice.
+wildcards = "allow"
+highlight = "all"
+
+# One runtime, one allocator, one HTTP stack. A second copy of any of these would put two
+# incompatible global states in one process.
+deny = [
+    # Two TLS stacks would mean two root stores and two sets of advisory obligations.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    # The workspace uses rustls through `ureq`; native-tls would pull the other one in.
+    { name = "native-tls" },
+]
+
+[licenses]
+# Every entry is on the Apache-2.0-compatible inbound list, and the only copyleft term is MPL-2.0,
+# which is file-scoped and satisfied because nothing here modifies the crate it covers. An
+# allowance no dependency uses is removed rather than left to rot: cargo-deny warns on it.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

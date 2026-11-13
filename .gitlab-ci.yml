@@ -148,6 +148,27 @@ clippy:
     - rustup component add clippy
     - cargo clippy --workspace --all-targets -- -D warnings
 
+# The dependency policy in deny.toml: advisories, yanked releases, duplicate-risk
+# bans, licences and source provenance. It is its own job rather than a line in
+# `clippy` because it answers a different question - "is what we depend on still
+# good?" rather than "is our own code clean?" - and because the advisory half
+# changes with the calendar, not with the commit: a green pipeline on Monday says
+# nothing about Tuesday's database.
+#
+# The binary is installed into $CARGO_HOME/bin, which is one of the cached paths,
+# using the same guard the CUDA job uses for rustup: the first run pays the
+# `cargo install`, every later run finds it. It needs network for the advisory
+# database, so it cannot run inside the CUDA image's offline stage.
+deny:
+  extends: .cached-build
+  stage: check
+  script:
+    - if [ ! -x "$CARGO_HOME/bin/cargo-deny" ]; then
+        cargo install cargo-deny --locked;
+      fi
+    - cargo deny --version
+    - cargo deny check
+
 # Every public item in the workspace must carry a doc comment. Review round 5 found that
 # nothing had ever run this, which is how sparkflash-trace, sparkflash-kv, sparkflash-comm
 # and sparkflash-cli all drifted out of compliance.
