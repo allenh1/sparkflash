@@ -5442,11 +5442,24 @@ impl Drop for Cuda {
     }
 }
 
+/// Serialises every test that touches a process-wide switch in this file.
+///
+/// `ASYNC_LAUNCHES`, `PROBE_METER` and `STAGE_RECORDER` are statics, so the tests that write them
+/// race each other unless they share one lock. Three module-local `TEST_LOCK`s is the shape that
+/// raced: `probe_meter_tests` arming the meter made
+/// `async_launch_cache_tests::a_stage_copy_is_queued_exactly_when_a_launch_is` fail on an unchanged
+/// tree, roughly one full-workspace run in ten and never in isolation.
+#[cfg(test)]
+mod test_lock {
+    use super::Mutex;
+
+    pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+}
+
 #[cfg(test)]
 mod stage_timing_tests {
+    use super::test_lock::TEST_LOCK;
     use super::*;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn reset() {
         *STAGE_RECORDER.lock().expect("lock") = Some(StageRecorder::default());
@@ -5726,6 +5739,7 @@ static PROBE_METER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod probe_meter_tests {
+    use super::test_lock::TEST_LOCK;
     use super::*;
 
     #[test]
@@ -5805,10 +5819,8 @@ mod probe_meter_tests {
 /// buffer-pool reuse fence. That is the contract the device window exercises.
 #[cfg(test)]
 mod async_launch_cache_tests {
+    use super::test_lock::TEST_LOCK;
     use super::*;
-
-    /// Serialises the tests that touch the process-wide async switch.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn the_forward_opt_out_is_one_environment_variable() {
