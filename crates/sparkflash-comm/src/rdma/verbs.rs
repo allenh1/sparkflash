@@ -543,7 +543,18 @@ impl Pd {
                 ),
             ));
         }
-        Ok(Mr { raw, fns: self.fns })
+        // The keys and the base address are fixed for the region's lifetime, so they are read
+        // once here, while `raw` is known live, and the getters below become plain field reads.
+        // SAFETY: `raw` is the MR `ibv_reg_mr` just returned and its public prefix is asserted in
+        // abi.rs; a registered region's addr/lkey/rkey do not change until it is deregistered.
+        let (base, lkey, rkey) = unsafe { ((*raw).addr as u64, (*raw).lkey, (*raw).rkey) };
+        Ok(Mr {
+            raw,
+            fns: self.fns,
+            base,
+            lkey,
+            rkey,
+        })
     }
 
     /// Creates a reliable-connected QP that posts to `send_cq` and consumes `recv_cq`.
@@ -575,7 +586,15 @@ impl Pd {
                 "returned a null QP; the requested queue capacities may exceed the device's",
             ));
         }
-        Ok(Qp { raw, fns: self.fns })
+        // The QP number is assigned at creation and never changes, so read it once here.
+        // SAFETY: `raw` is the QP `ibv_create_qp` just returned and `qp_num` is inside the public
+        // prefix asserted in abi.rs.
+        let qp_num = unsafe { (*raw).qp_num };
+        Ok(Qp {
+            raw,
+            fns: self.fns,
+            qp_num,
+        })
     }
 }
 
@@ -627,29 +646,32 @@ impl Drop for Cq {
 }
 
 /// One registered memory region.
+///
+/// The base address and both keys are copied out of the library's struct when the region is
+/// registered: they are fixed for its lifetime, and holding them here means the getters do not
+/// have to dereference a raw pointer to answer.
 pub(crate) struct Mr {
     raw: *mut IbvMr,
     fns: Fns,
+    base: u64,
+    lkey: u32,
+    rkey: u32,
 }
 
 impl Mr {
     /// Base address the registration covers.
     pub(crate) fn addr(&self) -> u64 {
-        // SAFETY: `raw` is a live MR and the public prefix is stable; the backend reads it
-        // immediately after registration and never mutates it.
-        unsafe { (*self.raw).addr as u64 }
+        self.base
     }
 
     /// Local key for SGEs.
     pub(crate) fn lkey(&self) -> u32 {
-        // SAFETY: as `addr`.
-        unsafe { (*self.raw).lkey }
+        self.lkey
     }
 
     /// Remote key authorising peer RDMA operations.
     pub(crate) fn rkey(&self) -> u32 {
-        // SAFETY: as `addr`.
-        unsafe { (*self.raw).rkey }
+        self.rkey
     }
 }
 
@@ -661,16 +683,19 @@ impl Drop for Mr {
 }
 
 /// One reliable-connected queue pair.
+///
+/// The QP number is read once at creation for the same reason [Mr] keeps its keys: it is fixed,
+/// and the peer's RTR transition asks for it long after the library struct need not be touched.
 pub(crate) struct Qp {
     raw: *mut IbvQp,
     fns: Fns,
+    qp_num: u32,
 }
 
 impl Qp {
     /// The QP number the peer's RTR transition needs.
     pub(crate) fn qp_num(&self) -> u32 {
-        // SAFETY: `raw` is a live QP and `qp_num` is inside the public prefix asserted in abi.rs.
-        unsafe { (*self.raw).qp_num }
+        self.qp_num
     }
 
     /// Applies a QP attribute transition.
