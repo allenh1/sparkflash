@@ -3285,8 +3285,6 @@ struct StagingFence(StreamEvent);
 // SAFETY: an event handle of the backend's context, owned by one session and recorded/waited on
 // that session's stream by one thread at a time.
 unsafe impl Send for StagingFence {}
-// SAFETY: as above.
-unsafe impl Sync for StagingFence {}
 
 // SAFETY: a Kernel is a function handle loaded from the cubin; the handle is immutable and each
 // session launches it on its own stream.
