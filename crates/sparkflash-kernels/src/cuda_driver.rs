@@ -413,7 +413,6 @@ pub struct HostMapped {
 // Safety: `HostMapped` points to a page-locked, portable CUDA host slab (`CU_MEMHOSTALLOC_PORTABLE`)
 // whose address range `host..host+len` is valid across threads until `Cuda::free_host_mapped`.
 unsafe impl Send for HostMapped {}
-unsafe impl Sync for HostMapped {}
 
 impl HostMapped {
     /// The device-visible pointer for kernel arguments.
