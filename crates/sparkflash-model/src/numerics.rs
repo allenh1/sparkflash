@@ -123,6 +123,7 @@ pub const ARITHMETIC_FIELDS: &[&str] = &[
     "diagnostics.forward_evidence",
     "diagnostics.layer_device",
     "diagnostics.prefix_cache",
+    "diagnostics.prefix_reuse_min_rows",
 ];
 
 /// The profile fields that cannot change the bits a request gets, each because an invariance gate

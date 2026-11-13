@@ -178,6 +178,7 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 
 | Variable | Effect |
 | :-- | :-- |
+| `SPARKFLASH_PREFIX_REUSE_MIN_ROWS=N` | The fewest shared rows a match on a lane holding a long prefix must have to be reused (default 256). Below it the lane is kept for a later turn that shares more of the prefix, so repeated short prompts on a full server re-prefill whole. `0` reuses every match, which is the pre-`!197` behaviour; a value that is not a row count refuses at startup |
 | `SPARKFLASH_PREFILL_EXACT=1` | Prefill every prompt on the exact one-row path: slower long prompts, output bit-identical to a single-stream reference |
 | `SPARKFLASH_PREFILL_DECODER_SKIP=0` | Run every layer over every prompt row (slower long prompts; for comparison). By default a prompt's rows before its last 2,541 run only layers 0-20, which hold every cache the later layers read |
 | `SPARKFLASH_PREFILL_MOE_MERGE=0` | Run each in-flight prefill chunk's experts separately (slower; for comparison) |

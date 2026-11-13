@@ -487,6 +487,15 @@ eight suite prompts produce different greedy text than after boot, and with
 `SPARKFLASH_PREFIX_CACHE=0` every pass agrees. A setting whose on-state is the documented exception
 to an invariance is the opposite of a neutral one. It is in `ARITHMETIC_FIELDS` now.
 
+### `diagnostics.prefix_reuse_min_rows` - arithmetic, moved
+
+Read at `crates/sparkflash-deepseek-forward/src/tp4_forward/batch.rs` in `place()`
+(`SPARKFLASH_PREFIX_REUSE_MIN_ROWS`, 256 by default). It decides which requests resume from a
+lane's prefix, so it reaches the same resume invariance as `diagnostics.prefix_cache`: on the
+device path a resumed request does not always produce the greedy text of a cold prefill
+([docs/NUMERICS.md](../NUMERICS.md) section 7). A value of `0` reuses every match (the
+pre-`!197` behaviour) and therefore widens that exception rather than removing it.
+
 ### `runtime.converted_dir` - not arithmetic, but not a serving setting either
 
 Read at `crates/sparkflash-deepseek-forward/src/tp4_resident.rs:887`. It is a filesystem path, and it
