@@ -800,8 +800,11 @@ Four defects stood between the first chunk and that trace, and each is a test no
 4. **A tensor-core projection cannot keep the walk's bits.** The tiled `q4e_gemm_bf16` sums a
    row's inner dimension in its own order, and any true tensor-core product would round the
    activation to TF32's ten bits or BF16's eight before multiplying. The residual stream carries
-   that rounding: the `gemm` walk agrees with the row walk on the prefill's own token and then
-   diverges to token 220 by the second decode step. The chunk therefore takes
+   that rounding: with every projection on the tiled kernel the chunk still picks the walk's own
+   token `149879` and then answers `[149879, 151194, 149884, ...]` where the walk answers
+   `[149879, 149876, 151451, ...]`; leaving only the dynamic convolution's tap projection on it
+   moved the prefill's own token as well, which is how that projection was found. The chunk
+   therefore takes
    `q4e_gemv_bf16`'s **batched** walk (up to eight rows a launch), which the kernel documents and
    `crates/sparkflash-model-inkling2/tests/prefill.rs` asserts to be bit-identical to its
    one-row launches. `gemm` is kept for the comparison below and is not a served path.
@@ -838,14 +841,17 @@ Served at that window (`CONTEXT=1048576 scripts/inkling-serve-group.sh launch`):
 | 258 tokens | 8.50 s | 30.3 tok/s | 5.4 tok/s |
 
 The five-token prompt's time to first token is not prefill: the batch arm forwards the same five
-ids in 264 ms, and the rest is the session's first request - the 8.04 GiB cache being cleared and
-the chunk buffer being allocated. The 258-token prompt is the honest number: 30 tok/s against the
-row walk's 6.7, which is the batch arm's ratio arriving at the socket.
+ids in 264 ms, and the rest belongs to the session's first request, which is where `open_session`
+allocates and clears the 8.04 GiB of cache and the chunk buffer. The 258-token prompt is the
+honest number: 30 tok/s against the row walk's 6.7, which is the batch arm's ratio arriving at the
+socket.
 
-The session's other new cost is the chunk buffer: 128 rows of every scratch buffer, 115 MiB,
-allocated on the first prefill and released with the session (`Drop for InklingDeviceSession`). A
-served request ends by dropping its session, so that release is what keeps a long window servable
-across requests rather than once.
+The session's other new cost is the chunk buffer: 128 rows of every scratch buffer, 99,572,416
+bytes measured, of which 21,233,664 are the rows' summary stacks. It is allocated on the first
+prefill and released with the session (`Drop for InklingDeviceSession`, which also gives back the
+cache, the four convolution histories and the summary stack). A served request ends by dropping
+its session, so that release is what keeps a long window servable across requests rather than
+once.
 
 ### Two defects the server found
 
