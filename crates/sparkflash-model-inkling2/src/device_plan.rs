@@ -127,6 +127,10 @@ pub enum Op {
     ShortConvDynamic,
     /// The relative-attention body.
     Attention,
+    /// Widen the attention's BF16 output to the f32 its projection reads.
+    Widen,
+    /// Append the current stream to the block-summary stack: a device-to-device copy, no kernel.
+    SummaryPush,
     /// Write the f32 key/value projections into the BF16 cache at one position.
     KvStore,
     /// The sigmoid router: scores, the learned bias, top-k, route scale.
@@ -161,6 +165,8 @@ impl Op {
             Self::ShortConv => "short_conv",
             Self::ShortConvDynamic => "short_conv_dynamic",
             Self::Attention => "attention",
+            Self::Widen => "widen",
+            Self::SummaryPush => "summary_push",
             Self::KvStore => "kv_store",
             Self::Router => "router",
             Self::ExpertGateUp => "expert_gate_up",
@@ -223,6 +229,129 @@ impl TauRule {
     }
 }
 
+/// Which norm a launch writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormRole {
+    /// The embedding's norm, after the gather.
+    Embedding,
+    /// The raw stream: layer 0 has no block-residual bank, so its attention input is the stream
+    /// itself rather than a row of the block-residual output.
+    Stream,
+    /// A sliding layer's single attention input norm.
+    Attention,
+    /// A full layer's query input norm.
+    Query,
+    /// A full layer's key input norm.
+    Key,
+    /// A full layer's value input norm.
+    Value,
+    /// The MLP input norm.
+    Mlp,
+    /// The final norm before the head.
+    Final,
+}
+
+/// Where a dense projection writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Projection {
+    /// The query projection.
+    Query,
+    /// The attention output gate.
+    Gate,
+    /// The key projection.
+    Key,
+    /// The value projection.
+    Value,
+    /// The relative-profile projection.
+    Relative,
+    /// The attention sink.
+    Sink,
+    /// The attention output projection.
+    AttentionOut,
+    /// The router logits.
+    Router,
+    /// The vocabulary projection.
+    Head,
+}
+
+/// Which short convolution a launch runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvSlot {
+    /// The key projection's convolution.
+    Key,
+    /// The value projection's convolution.
+    Value,
+    /// The attention output's convolution.
+    Attention,
+    /// The MLP output's convolution.
+    Mlp,
+}
+
+/// Which block-residual read a launch performs: which learned query it uses, and in turn which
+/// sublayer input it produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidualInput {
+    /// The attention input, from the bank addressed by the previous layer.
+    Attention,
+    /// The MLP input, from this layer's own query.
+    Mlp,
+    /// The head input, from the released output query.
+    Output,
+}
+
+/// One launch of the routed band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandOp {
+    /// One expert's gate/up projection.
+    GateUp,
+    /// The softcapped SwiGLU over the band.
+    Activation,
+    /// One expert's down projection.
+    Down,
+    /// The weighted sum over the selected experts.
+    Mix,
+}
+
+/// The stored format a layer's routed experts read.
+///
+/// The three differ in what a scale multiplies and where the bytes are: NVFP4 packs two E2M1 codes
+/// a byte with one E4M3 block scale a 16 columns and a per-expert `amax / (6 * denominator)`;
+/// MXFP8 is one E4M3 byte a value with a ue8m0 block scale a 32 columns and no per-expert factor;
+/// and a BF16 band is one dense `[experts][rows][columns]` matrix, which an unquantised
+/// checkpoint and the tiny fixture store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertBody {
+    /// The released NVFP4 band.
+    NvFp4,
+    /// The released MXFP8 band.
+    MxFp8,
+    /// A dense BF16 band.
+    Bf16,
+}
+
+/// The destination or role a launch has, beyond its [Op].
+///
+/// An [Op] says *what kind of arithmetic* a launch is; the target says *which of the layer's
+/// several instances of it* this is. A layer runs six dense projections, four convolutions, three
+/// block-residual reads and four band launches, and they share ops - so without this a walk would
+/// have to infer the instance from its position in the vector, which is exactly the second,
+/// silent copy of the schedule this module exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The step has one instance a pass; its op names it.
+    None,
+    /// An RMSNorm.
+    Norm(NormRole),
+    /// A dense projection.
+    Project(Projection),
+    /// A short convolution.
+    Conv(ConvSlot),
+    /// A block-residual read.
+    Input(ResidualInput),
+    /// A routed-band launch.
+    Band(BandOp),
+}
+
 /// One scheduled launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -244,9 +373,18 @@ pub struct Step {
     pub columns: usize,
     /// The static-tap layout, on a convolution step.
     pub taps: Option<TapLayout>,
+    /// Which instance of the op this launch is.
+    pub target: Target,
 }
 
 impl Step {
+    /// The same step, carrying its target.
+    #[must_use]
+    pub fn at(mut self, target: Target) -> Self {
+        self.target = target;
+        self
+    }
+
     /// Whether the step reads any weight.
     #[must_use]
     pub fn reads_weights(&self) -> bool {
@@ -267,6 +405,17 @@ pub struct LayerSchedule {
     pub taps: TapLayout,
     /// The attention's log-scaling rule.
     pub tau: TauRule,
+    /// The rows this layer's key/value cache holds. A sliding layer holds its window and the
+    /// attention reads it as a ring (absolute slot modulo this); a full layer holds the context
+    /// and is addressed absolutely.
+    pub kv_rows: usize,
+    /// The window the attention is given (0 on a full layer).
+    pub window: usize,
+    /// The relative bank's addressed extent: the window on a sliding layer, the released
+    /// `rel_extent` on a full one. The bank itself is `[d_rel][rel_extent]` either way.
+    pub rel_extent: usize,
+    /// The stored format the routed band reads.
+    pub experts: ExpertBody,
     /// The steps, in order.
     pub steps: Vec<Step>,
 }
@@ -315,7 +464,8 @@ pub struct InklingDevicePlan {
     rows: usize,
     context: usize,
     served: InklingTensorPlan,
-    globals: Vec<Step>,
+    prologue: Vec<Step>,
+    epilogue: Vec<Step>,
     layers: Vec<LayerSchedule>,
     buffers: BufferPlan,
 }
@@ -353,7 +503,8 @@ impl InklingDevicePlan {
             rows,
             context,
             served,
-            globals: Vec::new(),
+            prologue: Vec::new(),
+            epilogue: Vec::new(),
             layers: Vec::new(),
             buffers: BufferPlan {
                 hidden: 0,
@@ -373,7 +524,9 @@ impl InklingDevicePlan {
                 total: 0,
             },
         };
-        plan.globals = plan.global_steps()?;
+        let (prologue, epilogue) = plan.global_steps()?;
+        plan.prologue = prologue;
+        plan.epilogue = epilogue;
         for layer in 0..config.num_hidden_layers {
             plan.layers.push(plan.layer_schedule(layer)?);
         }
@@ -417,10 +570,30 @@ impl InklingDevicePlan {
         &self.served
     }
 
-    /// The steps outside the decoder layers.
+    /// The steps before the decoder layers: the embedding, its gather and its norm.
     #[must_use]
-    pub fn globals(&self) -> &[Step] {
-        &self.globals
+    pub fn prologue(&self) -> &[Step] {
+        &self.prologue
+    }
+
+    /// The steps after the decoder layers: the head's block residual, its norm, the vocabulary
+    /// projection, the softcap and the slice gather.
+    ///
+    /// The two are separate lists because the head reads the *last* layer's output: a walk that
+    /// ran one combined list before the layers would project the embedding through the head.
+    #[must_use]
+    pub fn epilogue(&self) -> &[Step] {
+        &self.epilogue
+    }
+
+    /// The steps outside the decoder layers, in pass order.
+    #[must_use]
+    pub fn globals(&self) -> Vec<Step> {
+        self.prologue
+            .iter()
+            .chain(&self.epilogue)
+            .cloned()
+            .collect()
     }
 
     /// The decoder layers in forward order.
@@ -431,8 +604,9 @@ impl InklingDevicePlan {
 
     /// Every step, globals first, then layers in forward order.
     pub fn steps(&self) -> impl Iterator<Item = &Step> {
-        self.globals
+        self.prologue
             .iter()
+            .chain(self.epilogue.iter())
             .chain(self.layers.iter().flat_map(|layer| layer.steps.iter()))
     }
 
@@ -528,6 +702,7 @@ impl InklingDevicePlan {
             rows,
             columns,
             taps: None,
+            target: Target::None,
         })
     }
 
@@ -542,6 +717,7 @@ impl InklingDevicePlan {
             rows,
             columns,
             taps: None,
+            target: Target::None,
         }
     }
 
@@ -556,13 +732,15 @@ impl InklingDevicePlan {
             rows,
             columns,
             taps: None,
+            target: Target::None,
         }
     }
 
-    /// A shared launch that reads no weight of this plan's: the combine over the expert band.
+    /// A launch that reads no weight of this plan's: the combine over the expert band, or the
+    /// arm's own widening of the attention output.
     fn shared(
         op: Op,
-        part: Part,
+        part: Option<Part>,
         image: Image,
         entry: &'static str,
         rows: usize,
@@ -570,13 +748,14 @@ impl InklingDevicePlan {
     ) -> Step {
         Step {
             op,
-            part: Some(part),
+            part,
             image: Some(image),
             entry: Some(entry),
             weights: Vec::new(),
             rows,
             columns,
             taps: None,
+            target: Target::None,
         }
     }
 
@@ -588,20 +767,25 @@ impl InklingDevicePlan {
         }
     }
 
-    /// The dense BF16 projection of a pass: an M=1 GEMV in decode, a tiled GEMM in prefill.
+    /// The dense BF16 projection of a pass: a row-war GEMV in decode, a tiled GEMM in prefill.
     ///
-    /// The decode body is the shared host-weight GEMV with f32 accumulators, which is the one
-    /// the checkpoint's BF16 matrices want: a BF16 store would narrow the query and the relative
-    /// profile before the L2 clip, and the clip is on the f32 vector. The prefill body is the
-    /// token image's BF16 GEMM, which the Qwen arm already uses for the same matrices.
+    /// Both are the token image's, and both are shape-generic over `rows` and `columns`, which the
+    /// released checkpoint needs: the projections range from 12 rows (the attention sink) to
+    /// 201,024 (the head), and the vocabulary is a multiple of 64 rather than of the 32-column
+    /// micro-tile every tiled body would demand.
+    ///
+    /// The pinned host-weight GEMV is *not* usable here even though it names this situation: its
+    /// weight is the checkpoint's B12x permutation of 32x32 micro-tiles, and these matrices are
+    /// plain row-major. A tiled body would read permuted weights and produce a plausible wrong
+    /// answer, so the arm takes the generic row-dot body and leaves the B12x one to DeepSeek.
     fn gemv_launch(&self) -> (Image, &'static str) {
         match self.pass {
-            Pass::Decode => (Image::Deepseek, "b12x_hostw_gemv_m1_bf16w_f32o_sm121"),
+            Pass::Decode => (Image::TOKEN, "q4e_gemv_bf16"),
             Pass::Prefill => (Image::TOKEN, "q4e_gemm_bf16"),
         }
     }
 
-    fn global_steps(&self) -> Result<Vec<Step>, String> {
+    fn global_steps(&self) -> Result<(Vec<Step>, Vec<Step>), String> {
         let config = &self.config;
         let hidden = config.hidden_size;
         let rows = self.rows;
@@ -629,7 +813,8 @@ impl InklingDevicePlan {
             &["model.llm.embed_norm.weight"],
             rows,
             hidden,
-        )?);
+        )?.at(Target::Norm(NormRole::Embedding)));
+        let prologue = std::mem::take(&mut steps);
         // The output query is the one learned query of the final block residual.
         steps.push(self.step(
             Op::BlockResidual,
@@ -639,7 +824,7 @@ impl InklingDevicePlan {
             &["model.llm.attn_res.output_query"],
             1,
             hidden,
-        )?);
+        )?.at(Target::Input(ResidualInput::Output)));
         steps.push(self.step(
             Op::RmsNorm,
             Some(Part::RmsNorm),
@@ -648,7 +833,7 @@ impl InklingDevicePlan {
             &["model.llm.norm.weight"],
             rows,
             hidden,
-        )?);
+        )?.at(Target::Norm(NormRole::Final)));
         // The vocabulary projection is the shared dense GEMV: the released head is an untied
         // BF16 matrix and the shared body already serves an M=1 row, so the arm does not carry a
         // head kernel of its own. The LmHead part's own entries are fused reduces that Inkling
@@ -661,7 +846,7 @@ impl InklingDevicePlan {
             &["model.llm.unembed.weight"],
             self.rank_vocab(),
             hidden,
-        )?);
+        )?.at(Target::Project(Projection::Head)));
         steps.push(self.step(
             Op::LogitSoftcap,
             Some(Part::SoftcappedActivation),
@@ -677,7 +862,7 @@ impl InklingDevicePlan {
             1,
             config.unpadded_vocab_size,
         ));
-        Ok(steps)
+        Ok((prologue, steps))
     }
 
     fn layer_schedule(&self, layer: usize) -> Result<LayerSchedule, String> {
@@ -709,7 +894,7 @@ impl InklingDevicePlan {
                 &[&bank],
                 if full { 3 } else { 1 },
                 hidden,
-            )?)
+            )?.at(Target::Input(ResidualInput::Attention)))
         } else {
             None
         };
@@ -728,9 +913,20 @@ impl InklingDevicePlan {
                 &[&format!("{prefix}.attn_norm.weight")],
                 rows,
                 hidden,
-            )?);
+            )?.at(Target::Norm(if layer == 0 {
+                NormRole::Stream
+            } else {
+                NormRole::Attention
+            })));
         } else {
-            for name in ["q_input_norm", "k_input_norm", "v_input_norm"] {
+            for (name, role) in [
+                ("q_input_norm", NormRole::Query),
+                ("k_input_norm", NormRole::Key),
+                ("v_input_norm", NormRole::Value),
+            ] {
+                // Layer 0 has no bank, so all three inputs are the stream (the host's one-row
+                // attention input, read three times).
+                let role = if layer == 0 { NormRole::Stream } else { role };
                 steps.push(self.step(
                     Op::RmsNorm,
                     Some(Part::RmsNorm),
@@ -739,18 +935,18 @@ impl InklingDevicePlan {
                     &[&format!("{prefix}.{name}.weight")],
                     rows,
                     hidden,
-                )?);
+                )?.at(Target::Norm(role)));
             }
         }
 
         // The six attention projections, in the host's order.
-        for (name, width) in [
-            ("wq_du", heads * head_dim),
-            ("wk_dv", kv_width),
-            ("wv_dv", kv_width),
-            ("wr_du", heads * config.d_rel),
-            ("gate_attn", heads * head_dim),
-            ("attn_sink_proj", heads),
+        for (name, width, target) in [
+            ("wq_du", heads * head_dim, Projection::Query),
+            ("wk_dv", kv_width, Projection::Key),
+            ("wv_dv", kv_width, Projection::Value),
+            ("wr_du", heads * config.d_rel, Projection::Relative),
+            ("gate_attn", heads * head_dim, Projection::Gate),
+            ("attn_sink_proj", heads, Projection::Sink),
         ] {
             steps.push(self.step(
                 Op::Gemv,
@@ -760,12 +956,12 @@ impl InklingDevicePlan {
                 &[&format!("{attn}.{name}.weight")],
                 width,
                 hidden,
-            )?);
+            )?.at(Target::Project(target)));
         }
 
         // The key and value convolutions. A full layer's form reads the static taps tap-major and
         // adds a per-token projection; a sliding layer's reads them channel-major.
-        for name in ["k_sconv", "v_sconv"] {
+        for (name, slot) in [("k_sconv", ConvSlot::Key), ("v_sconv", ConvSlot::Value)] {
             if full {
                 steps.push(self.step(
                     Op::ShortConvDynamic,
@@ -781,7 +977,7 @@ impl InklingDevicePlan {
                     ],
                     kv_width,
                     config.sconv_kernel_size,
-                )?);
+                )?.at(Target::Conv(slot)));
             } else {
                 steps.push(self.step(
                     Op::ShortConv,
@@ -791,7 +987,7 @@ impl InklingDevicePlan {
                     &[&format!("{attn}.{name}.weight")],
                     kv_width,
                     config.sconv_kernel_size,
-                )?);
+                )?.at(Target::Conv(slot)));
             }
         }
 
@@ -820,6 +1016,15 @@ impl InklingDevicePlan {
             heads * head_dim,
         )?);
 
+        // The attention wrote BF16; its projection reads f32.
+        steps.push(Self::shared(
+            Op::Widen,
+            None,
+            Image::Inkling,
+            "inkling_widen_f32",
+            rows,
+            heads * head_dim,
+        ));
         // The attention output projection and its short convolution.
         steps.push(self.step(
             Op::Gemv,
@@ -829,7 +1034,7 @@ impl InklingDevicePlan {
             &[&format!("{attn}.wo_ud.weight")],
             hidden,
             heads * head_dim,
-        )?);
+        )?.at(Target::Project(Projection::AttentionOut)));
         steps.push(self.step(
             Op::ShortConv,
             Some(Part::ShortConv),
@@ -838,7 +1043,7 @@ impl InklingDevicePlan {
             &[&format!("{prefix}.attn_sconv.weight")],
             hidden,
             config.sconv_kernel_size,
-        )?);
+        )?.at(Target::Conv(ConvSlot::Attention)));
 
         // The residual. At a block boundary the input *is* the sublayer's output and the summary
         // stack grows instead: layer % n_layers_per_attn_res_block == 0 returns the attention
@@ -846,6 +1051,10 @@ impl InklingDevicePlan {
         let boundary = layer.is_multiple_of(config.n_layers_per_attn_res_block.max(1));
         if !boundary {
             steps.push(Self::add(rows, hidden));
+        } else {
+            // The boundary layer grows the summary stack instead of adding a residual: its
+            // pre-attention stream becomes the next summary.
+            steps.push(Self::plain(Op::SummaryPush, None, rows, hidden));
         }
 
         // The MLP input is a second block-residual read, one learned query a layer.
@@ -857,7 +1066,7 @@ impl InklingDevicePlan {
             &[&format!("model.llm.attn_res.mlp_queries.{layer}")],
             1,
             hidden,
-        )?);
+        )?.at(Target::Input(ResidualInput::Mlp)));
         steps.push(self.step(
             Op::RmsNorm,
             Some(Part::RmsNorm),
@@ -866,7 +1075,7 @@ impl InklingDevicePlan {
             &[&format!("{prefix}.mlp_norm.weight")],
             rows,
             hidden,
-        )?);
+        )?.at(Target::Norm(NormRole::Mlp)));
 
         // The router, then the routed band.
         steps.push(self.step(
@@ -877,7 +1086,7 @@ impl InklingDevicePlan {
             &[&format!("{prefix}.mlp.gate.weight")],
             config.n_routed_experts,
             hidden,
-        )?);
+        )?.at(Target::Project(Projection::Router)));
         steps.push(self.step(
             Op::Router,
             Some(Part::Moe),
@@ -902,9 +1111,23 @@ impl InklingDevicePlan {
         // is another factor of the same product, so the executor passes scale_2 * weight and the
         // sum over selected experts is already the mix. The MXFP8 body has no per-expert factor,
         // so the arm applies that weight when it accumulates the band.
-        let (entry, gate_up_weights, down_weights) = match config.layer_format(layer) {
-            Some(WeightFormat::NvFp4 { .. }) => (
+        // The stored expert format, as a typed fact: the executor slices the band differently for
+        // each, and a BF16 band is a slice of one dense `[experts][rows][columns]` matrix.
+        let body = match config.layer_format(layer) {
+            Some(WeightFormat::NvFp4 { .. }) => ExpertBody::NvFp4,
+            Some(WeightFormat::MxFp8 { .. }) => ExpertBody::MxFp8,
+            Some(WeightFormat::Bf16) | None => ExpertBody::Bf16,
+            Some(other) => {
+                return Err(format!(
+                    "layer {layer} stores its experts as {other:?}, which has no Inkling expert entry"
+                ));
+            }
+        };
+        let (entry, part, image, gate_up_weights, down_weights) = match body {
+            ExpertBody::NvFp4 => (
                 "inkling_nvfp4_expert_matvec",
+                Part::Moe,
+                Image::Inkling,
                 vec![
                     format!("{prefix}.mlp.experts.w13_weight"),
                     format!("{prefix}.mlp.experts.w13_weight_scale"),
@@ -918,8 +1141,10 @@ impl InklingDevicePlan {
                     format!("{prefix}.mlp.experts.w2_weight_outer_scale_denominator"),
                 ],
             ),
-            Some(WeightFormat::MxFp8 { .. }) => (
+            ExpertBody::MxFp8 => (
                 "inkling_mxfp8_expert_matvec",
+                Part::Moe,
+                Image::Inkling,
                 vec![
                     format!("{prefix}.mlp.experts.w13_weight"),
                     format!("{prefix}.mlp.experts.w13_weight_scale"),
@@ -929,23 +1154,28 @@ impl InklingDevicePlan {
                     format!("{prefix}.mlp.experts.w2_weight_scale"),
                 ],
             ),
-            other => {
-                return Err(format!(
-                    "layer {layer} stores its experts as {other:?}, which has no Inkling expert                      entry (the arm serves the released NVFP4 and MXFP8 bands)"
-                ));
-            }
+            // An unquantised band is one dense matrix a projection, so the band's launches are the
+            // shared dense GEMV pointed at one expert's rows: the same body the layer's other
+            // projections use, at an offset.
+            ExpertBody::Bf16 => (
+                "q4e_gemv_bf16",
+                Part::DenseGemm,
+                Image::TOKEN,
+                vec![format!("{prefix}.mlp.experts.w13_weight")],
+                vec![format!("{prefix}.mlp.experts.w2_weight")],
+            ),
         };
         let gate_up: Vec<&str> = gate_up_weights.iter().map(String::as_str).collect();
         let down: Vec<&str> = down_weights.iter().map(String::as_str).collect();
         steps.push(self.step(
             Op::ExpertGateUp,
-            Some(Part::Moe),
-            Some(Image::Inkling),
+            Some(part),
+            Some(image),
             Some(entry),
             &gate_up,
             2 * intermediate,
             hidden,
-        )?);
+        )?.at(Target::Band(BandOp::GateUp)));
         steps.push(self.step(
             Op::ExpertActivation,
             Some(Part::SoftcappedActivation),
@@ -954,16 +1184,16 @@ impl InklingDevicePlan {
             &[],
             intermediate,
             2 * intermediate,
-        )?);
+        )?.at(Target::Band(BandOp::Activation)));
         steps.push(self.step(
             Op::ExpertDown,
-            Some(Part::Moe),
-            Some(Image::Inkling),
+            Some(part),
+            Some(image),
             Some(entry),
             &down,
             hidden,
             intermediate,
-        )?);
+        )?.at(Target::Band(BandOp::Down)));
         steps.push(Self::plain(
             Op::Collective(Collective::ExpertDelta),
             Some(Part::Collective),
@@ -972,14 +1202,17 @@ impl InklingDevicePlan {
         ));
         // The combine sums the band's slots. The router weight is already inside each partial,
         // so this is the shared plain sum and not a second weighting.
-        steps.push(Self::shared(
-            Op::ExpertMix,
-            Part::MoeCombine,
-            Image::ROUTED_EXPERTS,
-            "q4e_moe_combine",
-            rows,
-            hidden,
-        ));
+        steps.push(
+            Self::shared(
+                Op::ExpertMix,
+                Some(Part::MoeCombine),
+                Image::Inkling,
+                "inkling_expert_mix",
+                rows,
+                hidden,
+            )
+            .at(Target::Band(BandOp::Mix)),
+        );
 
         // The MLP output's short convolution, then the residual add that closes the layer.
         steps.push(self.step(
@@ -990,14 +1223,27 @@ impl InklingDevicePlan {
             &[&format!("{prefix}.mlp_sconv.weight")],
             hidden,
             config.sconv_kernel_size,
-        )?);
+        )?.at(Target::Conv(ConvSlot::Mlp)));
         steps.push(Self::add(rows, hidden));
 
+        let kv_rows = if sliding {
+            config.sliding_window_size.min(self.context)
+        } else {
+            self.context
+        };
         Ok(LayerSchedule {
             index: layer,
             sliding,
             block_queries: if full { 3 } else { 1 },
             taps,
+            experts: body,
+            kv_rows,
+            window: if sliding { config.sliding_window_size } else { 0 },
+            rel_extent: if sliding {
+                config.sliding_window_size
+            } else {
+                config.rel_extent
+            },
             tau: if sliding {
                 TauRule::One
             } else {
@@ -1140,7 +1386,7 @@ mod tests {
             for step in plan.steps() {
                 let Some(image) = step.image else {
                     assert!(
-                        matches!(step.op, Op::Collective(_)),
+                        matches!(step.op, Op::Collective(_) | Op::SummaryPush),
                         "{} has no image and no kernel",
                         step.op.name()
                     );
@@ -1337,22 +1583,20 @@ mod tests {
         // the final norm, the head, its softcap and the three collectives' two device steps.
         let mut expected = plan.globals().len();
         for layer in plan.layers() {
-            // A sliding layer is 26 launches and a full layer 28: the full layer's three input
+            // A sliding layer is 27 launches and a full layer 29: the full layer's three input
             // norms and its two dynamic K/V convolutions replace the sliding layer's single norm
             // and two static convolutions. Layer 0 has no attention block-residual bank, and a
-            // block-boundary layer has no attention residual add.
-            let mut steps = if layer.sliding { 26 } else { 28 };
+            // block-boundary layer swaps its attention residual add for a summary push, which is
+            // the same one launch, so only the bank changes the number.
+            let mut steps = if layer.sliding { 27 } else { 29 };
             if layer.index == 0 {
-                steps -= 1;
-            }
-            if layer.index.is_multiple_of(6) {
                 steps -= 1;
             }
             assert_eq!(layer.steps.len(), steps, "layer {}", layer.index);
             expected += steps;
         }
         assert_eq!(plan.launch_count(), expected);
-        assert_eq!(plan.launch_count(), 1_263);
+        assert_eq!(plan.launch_count(), 1_319);
     }
 
     #[test]

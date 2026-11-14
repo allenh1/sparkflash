@@ -47,6 +47,12 @@
 //
 //   position / first_position   absolute position of the token (decode) or of row 0
 //   window                       0 for a full layer, otherwise the sliding window
+//   cache_rows                   0 for a linear (absolute-position) cache, otherwise the rows the
+//     layer's cache holds and the ring length: an absolute slot addresses cache row
+//     slot % cache_rows. A sliding layer's cache is exactly its window, so 40 of the 48 layers
+//     hold 1,024 rows instead of one row a context position - the difference between 41 GiB and
+//     8 GiB at a million tokens. Over the slots a window can address, the modulo is injective, so
+//     a ring and a linear cache read the same rows.
 //   qk_clip / rel_clip           per-head L2 clip thresholds, <=0 or not finite disables
 //   tau                          log-scaling factor applied to q and rel_proj, <=0 means 1
 //   value_norm                   non-zero to RMS-normalise each value row before mixing
@@ -97,6 +103,7 @@ __device__ __forceinline__ void inkling_attn_one(
     int groups,
     int position,
     int window,
+    int cache_rows,
     int rel_extent,
     int d_rel,
     float qk_clip,
@@ -173,8 +180,9 @@ __device__ __forceinline__ void inkling_attn_one(
     }
 
     for (int64_t slot = first; slot <= (int64_t)position; ++slot) {
-        const __nv_bfloat16* krow = keys + (uint64_t)slot * kv_stride + kv_offset;
-        const __nv_bfloat16* vrow = values + (uint64_t)slot * kv_stride + kv_offset;
+        const int64_t row = cache_rows > 0 ? slot % (int64_t)cache_rows : slot;
+        const __nv_bfloat16* krow = keys + (uint64_t)row * kv_stride + kv_offset;
+        const __nv_bfloat16* vrow = values + (uint64_t)row * kv_stride + kv_offset;
         float kv[INKLING_MAX_HEAD_DIM / 32];
         float vv[INKLING_MAX_HEAD_DIM / 32];
         float k_norm = 0.0f;
@@ -276,6 +284,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
     int groups,
     int position,
     int window,
+    int cache_rows,
     int rel_extent,
     int d_rel,
     float qk_clip,
@@ -290,7 +299,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
     const uint64_t offset = (uint64_t)head * head_dim;
     inkling_attn_one(q + offset, gate + offset, keys, values, rel_proj, rel_bank, sink,
                       q_scale, k_scale, rel_scale, out + offset, head, kv_heads, head_dim, groups,
-                      position, window, rel_extent, d_rel, qk_clip, rel_clip, tau,
+                      position, window, cache_rows, rel_extent, d_rel, qk_clip, rel_clip, tau,
                       value_norm, eps);
 }
 
@@ -316,6 +325,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     int rows,
     int first_position,
     int window,
+    int cache_rows,
     int rel_extent,
     int d_rel,
     float qk_clip,
@@ -333,6 +343,6 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     inkling_attn_one(q + row_offset + head_offset, gate + row_offset + head_offset, keys,
                       values, rel_proj + (uint64_t)row * heads * d_rel, rel_bank, sink,
                       q_scale, k_scale, rel_scale, out + row_offset + head_offset, head,
-                      kv_heads, head_dim, groups, first_position + row, window, rel_extent, d_rel,
-                      qk_clip, rel_clip, tau, value_norm, eps);
+                      kv_heads, head_dim, groups, first_position + row, window, cache_rows,
+                      rel_extent, d_rel, qk_clip, rel_clip, tau, value_norm, eps);
 }

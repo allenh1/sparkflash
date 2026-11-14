@@ -335,9 +335,23 @@ impl Inkling2Weights {
         trace_timing!(format!("token={token} embed"), step);
 
         let position = state.position;
+        // The block-summary stack is this token's residual chain: one entry a block boundary,
+        // read by the layers after it and discarded when the token is done. Keeping it across
+        // tokens would grow it a block group a token and feed the next token's sublayers an
+        // older token's stream, which is not a residual the released model has.
+        state.block_states.clear();
         for layer in 0..config.num_hidden_layers {
             let start = std::time::Instant::now();
             x = self.layer(layer, position, x, state)?;
+            if trace_on() {
+                let rms = (x.iter().map(|value| value * value).sum::<f32>()
+                    / x.len() as f32)
+                    .sqrt();
+                eprintln!(
+                    "[inkling] host   layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
+                    x[0], x[1]
+                );
+            }
             trace_timing!(format!("token={token} layer={layer}"), start);
         }
         let head = std::time::Instant::now();
@@ -349,6 +363,15 @@ impl Inkling2Weights {
             config.attn_res_normalize_values,
             config.architecture.norm_epsilon,
         )?;
+        if trace_on() {
+            let rms = (final_input[0].iter().map(|value| value * value).sum::<f32>()
+                / final_input[0].len() as f32)
+                .sqrt();
+            eprintln!(
+                "[inkling] host final_input rms={rms:.5} first={:.5}",
+                final_input[0][0]
+            );
+        }
         let final_norm = self.vector("model.llm.norm.weight")?;
         let x = rms_norm(&final_input[0], Some(&final_norm), config.architecture.norm_epsilon);
         let mut logits = self.matvec_rows(
@@ -358,6 +381,18 @@ impl Inkling2Weights {
             config.hidden_size,
             4096,
         )?;
+        if trace_on() {
+            let rms = (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
+            eprintln!(
+                "[inkling] host final_norm rms={rms:.5} first={:.5}",
+                x[0]
+            );
+            eprintln!(
+                "[inkling] host raw_logits rms={:.5} first={:.5}",
+                (logits.iter().take(4).map(|value| value * value).sum::<f32>() / 4.0).sqrt(),
+                logits[0]
+            );
+        }
         if let Some(cap) = config.final_logit_softcap {
             let capped = crate::reference::logit_softcap(
                 &logits,

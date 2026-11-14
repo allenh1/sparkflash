@@ -210,7 +210,10 @@ impl Inkling2HostSession {
     }
 }
 
-fn greedy(logits: &[f32], sampling: &Sampling) -> Option<u32> {
+/// The next token under one sampling request: greedy, or a deterministic temperature draw.
+///
+/// The device arm calls the same function so the two backends answer a request identically.
+pub(crate) fn greedy(logits: &[f32], sampling: &Sampling) -> Option<u32> {
     if logits.is_empty() {
         return None;
     }

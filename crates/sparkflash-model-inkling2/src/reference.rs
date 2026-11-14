@@ -535,6 +535,26 @@ pub fn residual_add(residual: &[f32], delta: &[f32], rows: usize, columns: usize
     out
 }
 
+/// The routed experts' mix: `out = sum over slots of scales[slot] * partials[slot]`.
+///
+/// One body serves the three expert formats because they differ only in where the per-expert
+/// factor comes from: an NVFP4 expert stores `amax / (6 * outer_scale_denominator)`, an MXFP8
+/// expert stores nothing, and a BF16 expert is the fixture's dense tensor. The arm multiplies that
+/// factor by the router's share and hands the product here, so the mix is a plain scaled sum in
+/// slot order - the same sequential f32 order the host forward's combine used, which is why the
+/// kernel and this function can be compared exactly.
+#[must_use]
+pub fn expert_mix(partials: &[f32], scales: &[f32], slots: usize, width: usize) -> Vec<f32> {
+    let mut out = vec![0f32; width];
+    for slot in 0..slots {
+        let scale = scales[slot];
+        for column in 0..width {
+            out[column] += scale * partials[slot * width + column];
+        }
+    }
+    out
+}
+
 /// The BF16 value the key/value cache stores for one f32 projection.
 ///
 /// The attention body reads its cache as BF16, which is the released model's stored precision,

@@ -464,6 +464,65 @@ DSpark drafter; and the image path. The dynamic-convolution tap order of section
 one thing a reference implementation could overturn, and the schedule follows the host either way.
 
 
+### 10. The device arm, on hardware
+
+\`inkling2::device\` walks the schedule and launches it. It owns no ordering: it matches each
+[Op] with its [Target] and dispatches to the entry the plan named, so the plan is the single
+description of a pass and the walk is a dispatcher. It opens one rank of a world of one and
+refuses a larger world rather than run without the three collectives.
+
+**The arm is the host reference, to the cache's rounding.** \`tests/device.rs\` runs both backends
+on the tiny fixture, from the same weights and the same sampler, and compares the logits:
+
+| pass | host best | device best | largest difference | row scale |
+| :-- | :-- | :-- | :-- | :-- |
+| prefill of 3 tokens | 35 (0.4437) | 35 (0.4434) | 0.00108 | 0.4514 |
+| one decode step | 19 (0.6114) | 19 (0.6133) | 0.00193 | 0.6114 |
+
+That is 0.2-0.3% of the row, which is what narrowing the key/value cache, the attention output
+and the logits to BF16 costs; the bound in the test is 1%. The per-layer trace agrees to four
+decimal places (layer 0: 0.00224/0.03323 device against 0.00228/0.03321 host).
+
+**Two defects in the f32 reference, both found by the device's first two comparisons.** The host
+was the oracle, so a difference was as likely to be its fault as the kernel's, and twice it was:
+
+* **The block-summary stack accumulated across tokens.** \`forward_token\` pushed a summary a
+  block boundary a token and never cleared the stack, so the second token read the first token's
+  streams as its own summaries and the stack grew 8 rows a token. The device's push wrote past
+  its arena and the process died; the host had been silently answering with an ever-longer
+  summary stack. It is now cleared at the start of a token, in both walks.
+* **A sliding layer ignored its own block-residual bank.** \`layer()\` computed the attention
+  input from the bank, then normalized the *stream* instead and dropped the result. The released
+  checkpoint stores a bank for every layer and the shapes encode one query on a sliding layer and
+  three on a full one, so the bank is read; the sliding branch now normalizes the row it just
+  computed. This changes the host's answers for every sliding layer, which is why the first
+  token moved again.
+
+**The schedule itself had one bug the arm found immediately: the head ran first.** The plan kept
+one \`globals\` list, and a walk that ran it before the layers projected the *embedding* through
+the head. The plan now carries a prologue (embed, gather, norm) and an epilogue (the head's block
+residual, its norm, the vocabulary projection, the softcap, the slice gather), and the walk runs
+prologue, layers, epilogue.
+
+**Three more seam kernels, for the same reason as the first two:**
+
+* \`inkling_widen_f32\` — the attention body writes BF16 (the released cache and output
+  precision) and the projection that follows reads f32. Exact, so it is compared bit for bit.
+* \`inkling_expert_mix\` — the mix is \`sum over slots of scale * partial\`. One body serves all
+  three expert formats because they differ only in where the per-expert factor comes from: an
+  NVFP4 amax over six times its denominator, nothing for MXFP8, and the fixture's dense BF16. The
+  arm hands the mix the router's share times that factor.
+* the attention body gained a \`cache_rows\` argument: an absolute slot addresses
+  \`slot % cache_rows\`, so a sliding layer's cache is its window and is read as a ring. Without
+  it every layer would need a context-length cache: 41 GiB at a million tokens instead of 8.
+
+Both new parity cases pass on the GB10 (14/14: the twelve previous, the mix and the ring), the
+ring case proving a ring cache reads the same rows as a linear one, and the cubin baseline is
+regenerated (the attention image grows by 4,336 bytes, the epilogue by 9,640).
+
+**What the arm still does not do:** collectives (TP4), a chunked prefill (it loops the decode
+walk, which is correct and slow), the DSpark drafter, the image path, and the 367 GB run itself.
+
 ## Bring-up order
 
 1. **Text, TP4, 256K, no drafter or vision.** Parse the config, add the parts and the host

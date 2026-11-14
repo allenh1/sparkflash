@@ -17,7 +17,9 @@
 pub mod architecture;
 pub mod config;
 pub mod convert;
+pub mod device;
 pub mod device_plan;
+pub mod fixture;
 pub mod forward;
 pub mod host;
 pub mod prompt;
@@ -32,6 +34,7 @@ pub use config::{
 };
 pub use prompt::InklingCodec;
 pub use forward::{Inkling2State, Inkling2Weights};
+pub use device::InklingDeviceBackend;
 pub use host::Inkling2HostBackend;
 pub use reference::{AttentionParams, attention, softcapped_swiglu};
 pub use convert::{

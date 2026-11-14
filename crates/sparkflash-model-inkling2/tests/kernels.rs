@@ -542,6 +542,9 @@ fn the_relative_attention_decode_matches_the_host() {
             u(HEADS / KV_HEADS),
             u(positions - 1),
             u(WINDOW),
+            // A linear cache: the host hands the attention the rows the window may see, so the
+            // kernel addresses absolute positions.
+            u(0),
             u(REL_EXTENT),
             u(D_REL),
             f(QK_CLIP),
@@ -800,5 +803,142 @@ fn the_kv_store_matches_the_host_rounding() {
     let expected_value = cache_bf16(&host_value);
     assert_close_bf16("kv_store key", &expected_key, &key_rows);
     assert_close_bf16("kv_store value", &expected_value, &value_rows);
+}
+
+
+/// The ring a sliding layer's cache is: with `cache_rows` equal to the window, an absolute slot
+/// addresses `slot % cache_rows`, and over the slots a window can reach that mapping is injective.
+/// This is what lets 40 of the 48 layers hold 1,024 rows instead of one a context position.
+#[test]
+fn a_ring_cache_reads_the_same_rows_as_a_linear_one() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let positions = 9usize;
+    let window = 5usize;
+    let kv_width = KV_HEADS * HEAD_DIM;
+    let q_width = HEADS * HEAD_DIM;
+    let mut rng = Lcg::new(0x71a9);
+    let q = rng.values(q_width);
+    let gate = rng.values(q_width);
+    let rel = rng.values(HEADS * D_REL);
+    let rel_bank = rng.values(D_REL * REL_EXTENT);
+    let rel_bank_raw: Vec<f32> = rel_bank
+        .iter()
+        .map(|value| {
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
+        })
+        .collect();
+    let sink = rng.values(HEADS);
+    let q_scale = rng.values(HEADS * HEAD_DIM);
+    let rel_scale = rng.values(HEADS * D_REL);
+    let keys: Vec<Vec<f32>> = (0..positions).map(|_| rng.values(kv_width)).collect();
+    let values: Vec<Vec<f32>> = (0..positions).map(|_| rng.values(kv_width)).collect();
+    let (_, kernel) = kernel(&cuda, "inkling_attn_decode");
+    let q_device = upload_f32(&cuda, &q);
+    let gate_device = upload_f32(&cuda, &gate);
+    let rel_device = upload_f32(&cuda, &rel);
+    let bank_device = upload_bf16(&cuda, &rel_bank);
+    let sink_device = upload_f32(&cuda, &sink);
+    let q_scale_device = upload_f32(&cuda, &q_scale);
+    let rel_scale_device = upload_f32(&cuda, &rel_scale);
+    let out = upload_bf16(&cuda, &vec![0f32; q_width]);
+
+    // The kernel rounds the cache to BF16 on read, so both runs start from the same rows.
+    let narrowed_keys: Vec<f32> = keys.iter().flatten().copied().collect();
+    let narrowed_values: Vec<f32> = values.iter().flatten().copied().collect();
+    let linear_keys = upload_bf16(&cuda, &narrowed_keys);
+    let linear_values = upload_bf16(&cuda, &narrowed_values);
+    // The ring holds only the window; slot s lives at s % window.
+    let mut ring_keys = vec![0f32; window * kv_width];
+    let mut ring_values = vec![0f32; window * kv_width];
+    for slot in positions - window..positions {
+        let row = slot % window;
+        ring_keys[row * kv_width..(row + 1) * kv_width]
+            .copy_from_slice(&keys[slot]);
+        ring_values[row * kv_width..(row + 1) * kv_width]
+            .copy_from_slice(&values[slot]);
+    }
+    let ring_keys_device = upload_bf16(&cuda, &ring_keys);
+    let ring_values_device = upload_bf16(&cuda, &ring_values);
+
+    let run = |keys: Deviceptr, values: Deviceptr, cache_rows: usize| {
+        cuda.launch(
+            kernel,
+            (HEADS as u32, 1, 1),
+            (32, 1, 1),
+            &[
+                q_device.0,
+                gate_device.0,
+                keys.0,
+                values.0,
+                rel_device.0,
+                bank_device.0,
+                sink_device.0,
+                q_scale_device.0,
+                0,
+                rel_scale_device.0,
+                out.0,
+                u(HEADS),
+                u(KV_HEADS),
+                u(HEAD_DIM),
+                u(HEADS / KV_HEADS),
+                u(positions - 1),
+                u(window),
+                u(cache_rows),
+                u(REL_EXTENT),
+                u(D_REL),
+                f(QK_CLIP),
+                f(REL_CLIP),
+                f(1.0),
+                u(VALUE_NORM as usize),
+                f(EPS),
+            ],
+        )
+        .expect("attn_decode launch");
+        download_bf16(&cuda, &out, q_width)
+    };
+    let linear = run(linear_keys, linear_values, 0);
+    let ring = run(ring_keys_device, ring_values_device, window);
+    assert_eq!(linear, ring, "the ring cache read different rows");
+    let _ = rel_bank_raw;
+}
+
+#[test]
+fn the_expert_mix_matches_the_host_exactly() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let width = 4608usize;
+    let slots = 8usize;
+    let mut rng = Lcg::new(0x3117);
+    let partials = rng.values(slots * width);
+    let scales = rng.values(slots);
+    let host = reference::expert_mix(&partials, &scales, slots, width);
+
+    let (_, kernel) = kernel(&cuda, "inkling_expert_mix");
+    let partials_device = upload_f32(&cuda, &partials);
+    let scales_device = upload_f32(&cuda, &scales);
+    let out = upload_zeros(&cuda, width);
+    let blocks = width.div_ceil(256) as u32;
+    cuda.launch(
+        kernel,
+        (blocks, 1, 1),
+        (256, 1, 1),
+        &[
+            out.0,
+            partials_device.0,
+            scales_device.0,
+            u(1),
+            u(slots),
+            u(width),
+        ],
+    )
+    .expect("expert_mix launch");
+    let device = download_f32(&cuda, &out, width);
+    // A scaled sum of f32 rows in one order is the same operation on both sides.
+    assert_eq!(host, device, "expert_mix is not the host's mix");
 }
 

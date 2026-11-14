@@ -69,6 +69,21 @@
 //     residual, delta, out  [rows][width] f32; out may alias either input
 //     The two residual topologies the block-attention stream needs: the additive residual and,
 //     at a block boundary, the same expression with the summary stack as the first term.
+//
+//   inkling_widen_f32(src, dst, count)
+//     src  BF16, dst f32; the widening is a bit insertion, so it rounds nothing
+//     The attention body writes BF16 (the released cache and output precision) and the output
+//     projection that follows reads f32, so this is the one conversion between them. It is the
+//     inverse of what inkling_kv_store does on the key/value path.
+//
+//   inkling_expert_mix(out, partials, scales, slots, width)
+//     partials  [rows][slots][width] f32, one selected expert's projection a slot
+//     scales    [rows][slots] f32, the expert's share of the mix
+//     out       [rows][width] f32
+//     The three expert formats differ only in where their per-expert factor comes from, so the
+//     mix is one body: the arm hands it the router weight times whatever scale the format stores
+//     on the expert, and the sum is the layer's MLP output. It is a plain sum of scaled rows, in
+//     slot order, so the host's sequential f32 sum and this kernel agree to the last bit.
 
 #include <cstdint>
 
@@ -186,6 +201,42 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_residual
          column += gridDim.x * INKLING_EPI_BLOCK) {
         out[offset + column] =
             __fadd_rn(residual[offset + column], delta[offset + column]);
+    }
+}
+
+// BF16 -> f32: exact, a bit insertion.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_widen_f32(
+    const __nv_bfloat16* __restrict__ src,
+    float* __restrict__ dst,
+    int count) {
+    for (int index = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; index < count;
+         index += gridDim.x * INKLING_EPI_BLOCK) {
+        dst[index] = __bfloat162float(src[index]);
+    }
+}
+
+// The routed experts' mix: out = sum over the selected slots of scales[slot] * partials[slot].
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_mix(
+    float* __restrict__ out,
+    const float* __restrict__ partials,
+    const float* __restrict__ scales,
+    int rows,
+    int slots,
+    int width) {
+    const int row = blockIdx.y;
+    if (row >= rows || slots <= 0 || width <= 0) {
+        return;
+    }
+    const float* band = partials + (uint64_t)row * slots * width;
+    const float* shares = scales + (uint64_t)row * slots;
+    float* target = out + (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        float value = 0.0f;
+        for (int slot = 0; slot < slots; ++slot) {
+            value = __fadd_rn(value, __fmul_rn(shares[slot], band[(uint64_t)slot * width + column]));
+        }
+        target[column] = value;
     }
 }
 

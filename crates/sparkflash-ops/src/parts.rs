@@ -283,6 +283,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::SoftcappedActivation, Image::Inkling) => ShapeConstraint::ANY
             .hidden_equals(INKLING_HIDDEN)
             .intermediate_equals(INKLING_INTERMEDIATE),
+        (Part::MoeCombine, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(INKLING_HIDDEN)
+            .max_top_k(64),
         (Part::Quantize, _) => ShapeConstraint::ANY,
         // Only the GLM decode image exports a LayerNorm body; RMSNorm is a different part and
         // the resolver must never fall back to it.
@@ -760,13 +763,6 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("b12x_mxfp8_wo_a_sm121", &[Precision::MxFp8]),
             dec("b12x_mxfp8_gemv_m1_sm121", &[Precision::MxFp8]),
             dec("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::Bf16]),
-            // The same body with f32 accumulators out. A projection whose result is clipped or
-            // mixed in f32 - Inkling's query, gate, relative, sink, router and head projections -
-            // cannot take the BF16 store: narrowing before the clip is a different vector.
-            dec(
-                "b12x_hostw_gemv_m1_bf16w_f32o_sm121",
-                &[Precision::Bf16, Precision::F32],
-            ),
             dec("b12x_hostw_gemv_m1_f32w_f32o_sm121", &[Precision::F32]),
             sym("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
             sym("opt_mma_f32a_f32o", &[Precision::F32]),
@@ -1115,6 +1111,17 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::MoeCombine,
         Image::ROUTED_EXPERTS,
         &[sym("q4e_moe_combine", &[Precision::Bf16, Precision::F32])],
+        false,
+    ),
+    // The routed experts' mix. The shared combine sums its slots unweighted and adds a shared
+    // expert; Inkling's experts carry their share in three different places (an NVFP4 per-expert
+    // scale, an MXFP8 body with no per-expert factor, and a BF16 dense body), so the arm hands the
+    // mix one scale a slot and the body is a plain scaled sum. That also keeps the host's
+    // sequential f32 sum and the kernel identical, which is what the parity case checks.
+    sm121(
+        Part::MoeCombine,
+        Image::Inkling,
+        &[sym("inkling_expert_mix", &[Precision::F32])],
         false,
     ),
     sm121(

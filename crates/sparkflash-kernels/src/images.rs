@@ -361,6 +361,7 @@ impl Image {
                 "inkling_attn_decode",
                 "inkling_attn_prefill",
                 "inkling_block_residual",
+                "inkling_expert_mix",
                 "inkling_kv_store",
                 "inkling_logit_softcap",
                 "inkling_nvfp4_quantize_4_6",
@@ -373,6 +374,7 @@ impl Image {
                 "inkling_nvfp4_expert_matvec",
                 "inkling_router_topk",
                 "inkling_softcapped_swiglu",
+                "inkling_widen_f32",
             ],
             Self::Dory => &[
                 "dory_attn_combine",
