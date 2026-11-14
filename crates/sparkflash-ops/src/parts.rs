@@ -760,6 +760,13 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("b12x_mxfp8_wo_a_sm121", &[Precision::MxFp8]),
             dec("b12x_mxfp8_gemv_m1_sm121", &[Precision::MxFp8]),
             dec("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::Bf16]),
+            // The same body with f32 accumulators out. A projection whose result is clipped or
+            // mixed in f32 - Inkling's query, gate, relative, sink, router and head projections -
+            // cannot take the BF16 store: narrowing before the clip is a different vector.
+            dec(
+                "b12x_hostw_gemv_m1_bf16w_f32o_sm121",
+                &[Precision::Bf16, Precision::F32],
+            ),
             dec("b12x_hostw_gemv_m1_f32w_f32o_sm121", &[Precision::F32]),
             sym("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
             sym("opt_mma_f32a_f32o", &[Precision::F32]),

@@ -517,4 +517,39 @@ pub fn router_topk(
     (order, shares)
 }
 
+/// `out = residual + delta`, elementwise: the layer's additive residual.
+///
+/// The block-attention topology has two residual forms. At a block boundary the sublayer output
+/// *is* the stream, so this is not called; at every other layer the stream is updated here. The
+/// addition is one f32 add a element, which is why the kernel and this function can be compared
+/// exactly rather than within a tolerance.
+#[must_use]
+pub fn residual_add(residual: &[f32], delta: &[f32], rows: usize, columns: usize) -> Vec<f32> {
+    let mut out = vec![0f32; rows * columns];
+    for row in 0..rows {
+        for column in 0..columns {
+            let index = row * columns + column;
+            out[index] = residual[index] + delta[index];
+        }
+    }
+    out
+}
+
+/// The BF16 value the key/value cache stores for one f32 projection.
+///
+/// The attention body reads its cache as BF16, which is the released model's stored precision,
+/// so the narrowing is part of the model's arithmetic and not a transport detail: the oracle
+/// returns the same rounded value the kernel writes.
+#[must_use]
+pub fn cache_bf16(values: &[f32]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|value| {
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
+        })
+        .collect()
+}
+
 

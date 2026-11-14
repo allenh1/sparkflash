@@ -17,6 +17,7 @@
 pub mod architecture;
 pub mod config;
 pub mod convert;
+pub mod device_plan;
 pub mod forward;
 pub mod host;
 pub mod prompt;
@@ -36,6 +37,10 @@ pub use reference::{AttentionParams, attention, softcapped_swiglu};
 pub use convert::{
     InklingRecords, RankFileSource, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots,
     verify_rank, visit_rank,
+};
+pub use device_plan::{
+    BufferPlan, Collective, InklingDevicePlan, LayerSchedule, Op, Pass, Step, TapLayout, TauRule,
+    VOCAB_ALIGNMENT,
 };
 pub use tensor::{InklingTensorPlan, Role, Slice};
 pub use vision::{InklingVision, MAX_MERGED_TOKENS, patch_values, plan_grid};

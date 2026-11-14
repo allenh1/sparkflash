@@ -375,6 +375,95 @@ consistent. Nothing in the release settles which reading the exporter used, so t
 first thing to check against a reference implementation, and the kernels follow the host either
 way — `inkling_short_conv_dynamic` and its decode form are held to the same oracle.
 
+### 9. The device schedule
+
+`inkling2::device_plan` is the layer between the host reference and an executor: a typed,
+CPU-inspectable list of every launch one pass issues, at one rank, with the image and entry each
+launch loads. It is derived from the released configuration, a `TpPlan` and the served tensor
+plan — never from a family name — so the rank-local widths and the weight slots cannot drift from
+what the converter wrote.
+
+Three properties are tests rather than claims:
+
+* **Every served weight is read exactly once.** The union of the schedule's weight references is
+  exactly the served tensor plan, with no tensor read twice, at TP1 and at TP4 on ranks 0 and 3.
+  A weight the converter wrote and the schedule never names is paid for and unused; a weight
+  named twice double-counts a residual.
+* **Every named kernel is carried.** A step that names a `Part` must resolve to a catalogue entry
+  on the same image and symbol (`every_named_kernel_is_carried_by_its_image`, both passes); a step
+  with no `Part` is arm-private glue and must name a symbol the Inkling image exports.
+* **The state is accounted.** `BufferPlan` sizes the residual stream, the block-residual inputs,
+  the query/gate/relative/sink projections, the expert band, the logit slice, the four
+  convolution histories a layer, the block-summary stack and the KV cache at the admitted
+  context.
+
+What the schedule says, in numbers:
+
+| fact | value |
+| :-- | :-- |
+| launches for one decode step | 1,263 |
+| a sliding layer | 26 launches |
+| a full layer | 28 (three input norms, two dynamic K/V convolutions) |
+| layer 0 | 24 (no attention block-residual bank: it consumes the embedding) |
+| a block-boundary layer | one fewer (no attention residual add) |
+| TP4 per rank | 12 query heads, 2 KV heads, 96 whole experts, 50,256 vocabulary rows |
+| state at 4,096 tokens | 77.9 MiB |
+| state at 1,048,576 tokens | 8 GiB KV, 5.6 MiB convolution histories, 147 KiB summaries |
+
+The KV figure is the per-layer window allocation: the 8 full layers keep the whole context and
+the 40 sliding layers keep 1,024 rows each, which is 8 GiB instead of the 25 GiB a full-context
+cache for all 48 layers would need.
+
+Two design points the schedule makes explicit because the executor would otherwise get them
+wrong silently. **Routed experts are expert-parallel**: the router is replicated, so every rank
+selects the same global top-8 and computes only its own experts, and one all-reduce over the
+residual width completes the mix — the schedule records that as `Collective::ExpertDelta`, which
+is why the band is followed by the reduce and then a plain combine and not a local weighting.
+**The static taps keep their stored layout**: the sliding layers store `[channels][kernel]` and
+the full layers `[kernel, channels]`, the two decode entries read those two layouts, and the plan
+records which is which per layer — a transposed tap table is the same size, in bounds, and wrong.
+
+#### The two seam kernels
+
+The schedule needed two launches no shared image has, so they are additions to
+`kernels/inkling_epilogue_sm121.cu` rather than fits into an unrelated part:
+
+* `inkling_kv_store` narrows the f32 key/value projections into the BF16 cache rows the attention
+  body reads. The released model's cache is BF16, and the projection that feeds it is f32, so the
+  narrowing is its own launch instead of a silent argument to the attention kernel.
+* `inkling_residual_add` is `out = residual + delta`, in place. The block-attention topology has
+  two residual forms and the boundary layers take the other one, so this is called on every layer
+  but a boundary.
+
+Both are exact operations — a round-to-nearest-wide conversion and an f32 addition — so
+`tests/kernels.rs` compares them bit for bit instead of within the pack's relative bound. All
+twelve parity cases pass on a GB10 (12/12: the ten previous ones plus the two new).
+
+#### Two catalogue gaps the schedule found
+
+* `b12x_hostw_gemv_m1_bf16w_f32o_sm121` — the host-weight M=1 GEMV with BF16 weights and f32
+  accumulators — was exported by the DeepSeek image and **not catalogued**. It is the launch every
+  one of this arm's dense projections needs: the query, gate and relative projections are clipped
+  in f32 before use, so the BF16-store variant is a different vector. It is now a `DenseGemm`
+  symbol; the catalogue's omission would have surfaced as a resolver refusal, not a wrong number.
+* The released vocabulary is 201,024 rows, which is `64 * 3,141`: a multiple of 64 and not of
+  128. The shared `(Embedding, Qwen4Exp)` and `(LmHead, Qwen4Exp)` shape rules require 128, so an
+  `Architecture`-driven resolve refuses this checkpoint's embedding and head even though
+  `q4e_embed` is a plain row gather with no alignment requirement. The device arm loads by symbol
+  and is unaffected; the resolver path needs either a 64 rule with that argument recorded, or an
+  Inkling entry. This is the next catalogue item, and it is why the schedule names the pair
+  explicitly rather than pretending the entry resolves.
+
+#### What is still missing
+
+The schedule is not an executor. What remains, in order: the executor that walks it (kernel
+loads by image and symbol, the three collectives, the position/state ring for the four
+convolutions, the expert loop over the local selected experts); folding the router weight into the
+MXFP8 expert body, which today has no scale argument (NVFP4 already takes it as `scale_2`); the
+DSpark drafter; and the image path. The dynamic-convolution tap order of section 8 is still the
+one thing a reference implementation could overturn, and the schedule follows the host either way.
+
+
 ## Bring-up order
 
 1. **Text, TP4, 256K, no drafter or vision.** Parse the config, add the parts and the host

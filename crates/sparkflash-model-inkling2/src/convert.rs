@@ -685,9 +685,16 @@ mod tests {
             projection.ranges.len() > 1,
             "an inner-axis split is more than one range"
         );
-        assert_eq!(
-            projection.ranges.len(),
-            config.hidden_size / config.num_attention_heads / config.head_dim * 0 + projection.ranges.len()
+        // [hidden, heads * head_dim] sharded on the contraction axis: every one of the hidden
+        // rows contributes its own run of head_dim * heads / world columns.
+        assert_eq!(projection.ranges.len(), config.hidden_size);
+        // A range is in bytes, and a row's run is a quarter of the 6,144-wide contraction at two
+        // bytes a value.
+        let per_row = config.num_attention_heads * config.head_dim / 4 * 2;
+        assert!(
+            projection.ranges.iter().all(|(_, len)| *len == per_row),
+            "every row's run is one rank's width"
         );
+        assert_eq!(projection.bytes, config.hidden_size * per_row);
     }
 }

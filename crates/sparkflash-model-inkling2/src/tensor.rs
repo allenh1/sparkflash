@@ -415,7 +415,7 @@ fn rank_spec(spec: &TensorSpec, runs: &[Slice]) -> Result<TensorSpec, String> {
 mod tests {
     use super::*;
     use crate::config::Inkling2Config;
-    use sparkflash_model::{TpPlan, Target};
+    use sparkflash_model::TpPlan;
 
     const CONFIG: &str = include_str!("../config/inkling2_small.hf.json");
     const QUANT: &str = include_str!("../config/inkling2_small.hf_quant.json");

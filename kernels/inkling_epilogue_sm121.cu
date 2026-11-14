@@ -53,6 +53,22 @@
 //     x        [rows][columns] f32, columns a multiple of 16
 //     packed   [rows][columns / 2] uint8, two E2M1 codes a byte, low nibble first
 //     scales   [rows][columns / 16] uint8, E4M3 block scales
+//
+// The two seam kernels the arm's schedule needs and no shared image has. Both are exact: a
+// round-to-nearest-wide conversion and an addition, so their parity is a bit comparison rather
+// than a tolerance.
+//
+//   inkling_kv_store(key, value, key_cache, value_cache, rows, position, width)
+//     key, value        [rows][width] f32, the projected rows
+//     key_cache, value_cache  [positions][width] BF16, written at position + row
+//     The attention body reads BF16 cache rows because that is what the released model stores;
+//     the projection that feeds it is f32, so the narrowing is its own launch and not a silent
+//     argument to the attention kernel.
+//
+//   inkling_residual_add(residual, delta, out, rows, width)
+//     residual, delta, out  [rows][width] f32; out may alias either input
+//     The two residual topologies the block-attention stream needs: the additive residual and,
+//     at a block boundary, the same expression with the summary stack as the first term.
 
 #include <cstdint>
 
@@ -130,6 +146,47 @@ __device__ __forceinline__ float inkling_four_over_six_error(float value, float 
     }
     const float decoded = spark_fp4_e2m1_decode(spark_fp4_e2m1_encode(value / scale)) * scale;
     return fabsf(__fadd_rn(value, -decoded));
+}
+
+// The f32 projections become the BF16 cache rows the attention body reads.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_kv_store(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    int rows,
+    int position,
+    int width) {
+    const int row = blockIdx.y;
+    if (row >= rows || width <= 0) {
+        return;
+    }
+    const uint64_t destination = (uint64_t)(position + row) * width;
+    const uint64_t source = (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        key_cache[destination + column] = __float2bfloat16_rn(key[source + column]);
+        value_cache[destination + column] = __float2bfloat16_rn(value[source + column]);
+    }
+}
+
+// out = residual + delta, elementwise. out may alias residual (the stream is updated in place).
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_residual_add(
+    const float* __restrict__ residual,
+    const float* __restrict__ delta,
+    float* __restrict__ out,
+    int rows,
+    int width) {
+    const int row = blockIdx.y;
+    if (row >= rows || width <= 0) {
+        return;
+    }
+    const uint64_t offset = (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        out[offset + column] =
+            __fadd_rn(residual[offset + column], delta[offset + column]);
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(128) inkling_nvfp4_quantize_4_6(

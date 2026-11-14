@@ -26,8 +26,8 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_kernels::images::inkling_cubin;
 use sparkflash_model_inkling2::reference::{
-    self, AttentionParams, logit_softcap, short_conv, short_conv_decode, short_conv_dynamic,
-    short_conv_dynamic_decode, softcapped_swiglu,
+    self, AttentionParams, cache_bf16, logit_softcap, residual_add, short_conv, short_conv_decode,
+    short_conv_dynamic, short_conv_dynamic_decode, softcapped_swiglu,
 };
 
 /// One TP4 rank's attention geometry.
@@ -191,8 +191,6 @@ fn the_static_short_convolution_matches_the_host() {
     let mut rng = Lcg::new(0x1c0d);
     let x = rng.values(rows * channels);
     let taps = rng.values(channels * kernel_width);
-    let host = short_conv(&x, &taps, rows, channels, kernel_width);
-
     let (_, kernel) = kernel(&cuda, "inkling_short_conv");
     let x_device = upload_f32(&cuda, &x);
     let taps_device = upload_bf16(&cuda, &taps);
@@ -707,5 +705,100 @@ fn the_sigmoid_router_matches_the_host() {
     let device_weights = download_f32(&cuda, &weights_device, top_k);
     assert_eq!(device_indices, host_indices, "the router chose other experts");
     assert_close("router_topk", &host_weights, &device_weights);
+}
+
+
+#[test]
+fn the_residual_add_matches_the_host_exactly() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let columns = 4608usize;
+    let rows = 3usize;
+    let mut rng = Lcg::new(0xadd1);
+    let residual = rng.values(rows * columns);
+    let delta = rng.values(rows * columns);
+    let host = residual_add(&residual, &delta, rows, columns);
+
+    let (_, kernel) = kernel(&cuda, "inkling_residual_add");
+    let residual_device = upload_f32(&cuda, &residual);
+    let delta_device = upload_f32(&cuda, &delta);
+    // In place: the stream is updated by writing over the residual.
+    let out = upload_f32(&cuda, &residual);
+    let blocks = columns.div_ceil(256) as u32;
+    cuda.launch(
+        kernel,
+        (blocks, rows as u32, 1),
+        (256, 1, 1),
+        &[
+            residual_device.0,
+            delta_device.0,
+            out.0,
+            u(rows),
+            u(columns),
+        ],
+    )
+    .expect("residual_add launch");
+    let device = download_f32(&cuda, &out, rows * columns);
+    // An addition of two f32 values in one rounding is the same operation on both sides, so the
+    // comparison is exact: no tolerance would hide a kernel that added the wrong term.
+    assert_eq!(host, device, "residual_add is not the host's add");
+}
+
+#[test]
+fn the_kv_store_matches_the_host_rounding() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let width = KV_HEADS * HEAD_DIM;
+    let rows = 4usize;
+    let position = 5usize;
+    let capacity = position + rows + 3;
+    let mut rng = Lcg::new(0x4b4b);
+    let key = rng.values(rows * width);
+    let value = rng.values(rows * width);
+    // The cache starts non-zero, so a kernel that forgot the position offset would still be
+    // caught: the rows before and after the written window must come back unchanged.
+    let key_cache_seed = rng.values(capacity * width);
+    let value_cache_seed = rng.values(capacity * width);
+
+    let (_, kernel) = kernel(&cuda, "inkling_kv_store");
+    let key_device = upload_f32(&cuda, &key);
+    let value_device = upload_f32(&cuda, &value);
+    let key_cache = upload_bf16(&cuda, &key_cache_seed);
+    let value_cache = upload_bf16(&cuda, &value_cache_seed);
+    let blocks = width.div_ceil(256) as u32;
+    cuda.launch(
+        kernel,
+        (blocks, rows as u32, 1),
+        (256, 1, 1),
+        &[
+            key_device.0,
+            value_device.0,
+            key_cache.0,
+            value_cache.0,
+            u(rows),
+            u(position),
+            u(width),
+        ],
+    )
+    .expect("kv_store launch");
+    let key_rows = download_bf16(&cuda, &key_cache, capacity * width);
+    let value_rows = download_bf16(&cuda, &value_cache, capacity * width);
+
+    // The host's cache: the seed, narrowed, with the written window replaced by the projection.
+    let mut host_key: Vec<f32> = key_cache_seed.clone();
+    let mut host_value: Vec<f32> = value_cache_seed.clone();
+    for row in 0..rows {
+        let destination = (position + row) * width;
+        host_key[destination..destination + width]
+            .copy_from_slice(&cache_bf16(&key[row * width..(row + 1) * width]));
+        host_value[destination..destination + width]
+            .copy_from_slice(&cache_bf16(&value[row * width..(row + 1) * width]));
+    }
+    let expected_key = cache_bf16(&host_key);
+    let expected_value = cache_bf16(&host_value);
+    assert_close_bf16("kv_store key", &expected_key, &key_rows);
+    assert_close_bf16("kv_store value", &expected_value, &value_rows);
 }
 
