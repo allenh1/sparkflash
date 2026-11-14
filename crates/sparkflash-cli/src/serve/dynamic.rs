@@ -60,6 +60,12 @@ pub(crate) struct DynamicCheckpoint {
     pub plan: EnginePlan,
 }
 
+/// The context a device-arm group admits when the operator does not name one.
+///
+/// The Inkling release's window is 1M tokens; 256K is the arm's documented serving default, and
+/// the difference is 6 GiB of KV a rank.
+const INKLING_GROUP_DEFAULT_CONTEXT: usize = 262_144;
+
 /// The prompt dialect a checkpoint's tokenizer declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dialect {
@@ -97,6 +103,9 @@ pub(crate) fn resolve(options: &ServeOptions) -> Result<DynamicCheckpoint, Strin
 /// The world a dynamic run plans at: one node for the host path, and the group's world only when
 /// the checkpoint belongs to a preset arm that has a group.
 fn serving_world(options: &ServeOptions) -> Result<usize, String> {
+    if let Some(group) = options.group.as_ref() {
+        return Ok(group.world);
+    }
     #[cfg(feature = "tp4-serve")]
     if let Some(tp4) = options.tp4.as_ref() {
         return Ok(tp4.world_size);
@@ -427,6 +436,13 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let context = options
         .context
         .unwrap_or(if window == 0 { 4096 } else { window });
+    // Every rank of the device group allocates its KV at the admitted context, and the released
+    // 1M window is not what a first server wants: the arm's documented default is 256K. An
+    // explicit --context still reaches the whole window, and validation below still bounds it.
+    let context = match (options.group.is_some(), options.context) {
+        (true, None) => context.min(INKLING_GROUP_DEFAULT_CONTEXT),
+        _ => context,
+    };
     if context == 0 || (window != 0 && context > window) {
         return Err(format!(
             "context limit {context} is outside 1..={window} for {}",
@@ -488,6 +504,9 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             super::pack::GlmArm::respond,
         ),
+        "inkling2" if options.group.is_some() => {
+            serve_inkling_group(options, checkpoint, descriptor, seam, dialect, context)
+        }
         "inkling2" => serve_inkling_host(
             checkpoint,
             descriptor,
@@ -512,7 +531,6 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     }
 }
 
-
 /// Serves an Inkling checkpoint through its pack's f32 host reference.
 fn serve_inkling_host(
     checkpoint: DynamicCheckpoint,
@@ -522,8 +540,9 @@ fn serve_inkling_host(
     context: usize,
     options: &ServeOptions,
 ) -> Result<ExitCode, String> {
-    let config = sparkflash_model_inkling2::Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
-        .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let config =
+        sparkflash_model_inkling2::Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
     // A staged converted rank file is served as it is: the same plan, the same arithmetic, and a
     // load that is a walk over one file instead of a sharded safetensors seek per tensor.
     let layout = sparkflash_engine::parallel_tp::TpLayout {
@@ -563,7 +582,42 @@ fn serve_inkling_host(
         "{} ({}) at TP=1 on {where_from}, context {context}, Inkling f32 host reference",
         descriptor.id, descriptor.weights_id
     );
-    serve_backend(Box::new(backend), descriptor, seam, dialect, options, &banner)
+    serve_backend(
+        Box::new(backend),
+        descriptor,
+        seam,
+        dialect,
+        options,
+        &banner,
+    )
+}
+
+/// Serves an Inkling checkpoint through its four-rank device arm.
+///
+/// Rank 0 owns HTTP, the tokenizer and the control channel; every rank holds its own device state
+/// and mirrors the token ids rank 0 admits. The dispatch is here rather than in the pack because
+/// the device arm's group needs the resolved checkpoint, its tokenizer seam and the served
+/// descriptor, all of which this module built.
+fn serve_inkling_group(
+    options: &ServeOptions,
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+) -> Result<ExitCode, String> {
+    #[cfg(feature = "tp4-serve")]
+    {
+        super::inkling_group::serve(options, checkpoint, descriptor, seam, dialect, context)
+    }
+    #[cfg(not(feature = "tp4-serve"))]
+    {
+        let _ = (options, checkpoint, descriptor, seam, dialect, context);
+        Err(
+            "--rank is the Inkling device arm's four-rank group: this build carries no tp4-serve feature, so rebuild with --features tp4-serve"
+                .to_owned(),
+        )
+    }
 }
 
 fn serve_host(
@@ -609,6 +663,23 @@ pub(crate) fn serve_backend(
     options: &ServeOptions,
     banner: &str,
 ) -> Result<ExitCode, String> {
+    serve_backend_world(backend, descriptor, seam, dialect, options, banner, 1)
+}
+
+/// Serves `backend` behind HTTP in a group of `world` ranks, under that group's numerics key.
+///
+/// The single-process path is [serve_backend] with `world = 1`; a four-rank device arm names its
+/// own world so the boot line's numerics identity is the configuration that actually answered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_backend_world(
+    backend: Box<dyn ModelBackend>,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    options: &ServeOptions,
+    banner: &str,
+    world: usize,
+) -> Result<ExitCode, String> {
     let driver = sparkflash_serve::HostDriver::start(
         backend,
         Arc::clone(&seam),
@@ -625,7 +696,7 @@ pub(crate) fn serve_backend(
         Dialect::Deepseek => Arc::new(driver),
     };
     println!("sparkflash serve: {banner}");
-    let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
+    let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))

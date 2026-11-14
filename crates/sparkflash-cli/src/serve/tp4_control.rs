@@ -407,7 +407,21 @@ impl Tp4ControlHub {
         if world == 0 {
             return Err(Tp4ControlError::BadRank { rank: 0, world });
         }
-        let listener = TcpListener::bind(address)?;
+        Self::start_with_listener(TcpListener::bind(address)?, world, timeout)
+    }
+
+    /// Accepts on an already-bound listener; [Self::start] is this with the bind in front.
+    ///
+    /// A caller that needs the address before rank 0 starts - a test on an ephemeral port, or a
+    /// launcher that reports the port it will use - binds the socket itself and hands it here.
+    pub(super) fn start_with_listener(
+        listener: TcpListener,
+        world: usize,
+        timeout: Duration,
+    ) -> Result<Self, Tp4ControlError> {
+        if world == 0 {
+            return Err(Tp4ControlError::BadRank { rank: 0, world });
+        }
         listener.set_nonblocking(true)?;
         let deadline = Instant::now() + timeout;
         let mut streams: Vec<Option<TcpStream>> = (0..world).map(|_| None).collect();

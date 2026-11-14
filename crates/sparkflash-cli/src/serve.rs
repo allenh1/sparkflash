@@ -184,6 +184,8 @@ use crate::run_header::{COMM_REDUCE_ENV, ReducePath};
 #[cfg(feature = "tp4-serve")]
 mod device;
 #[cfg(feature = "tp4-serve")]
+mod inkling_group;
+#[cfg(feature = "tp4-serve")]
 mod tp4_control;
 #[cfg(feature = "tp4-serve")]
 pub use device::DeviceServeOptions;
@@ -560,6 +562,132 @@ pub(crate) fn announce_numerics(key: ConfigKey) -> Result<NumericsIdentity, Stri
     Ok(identity)
 }
 
+/// Parses the comma-separated peer list a group flag (`flag`) names, in /// The default control port of the device-arm group: rank 0 binds it at its own peer address,
+/// and every worker dials it. It sits above the 29600 + rank collective ports the converted run
+/// uses, so one process can hold both.
+pub const GROUP_DEFAULT_CONTROL_PORT: u16 = 29700;
+
+/// The family-neutral four-rank group: one process per rank of a device arm.
+///
+/// The Inkling-2-Small device arm reads it today. Its flags are the batch command's
+/// (sparkflash inkling-tp4), so moving a run from the batch walk to the server does not rename
+/// its arguments: --rank names this process, --peer lists every rank's collective address in
+/// rank order, --control-port is rank 0's control endpoint, and --converted is the directory
+/// the four rank files were written into.
+///
+/// This is deliberately not --tp4-*: that group is the DeepSeek host-reference twin, whose
+/// peers are bare addresses and whose ports are derived from --tp4-base-port. A device arm names
+/// its own collective addresses, and its rank file is per rank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupOptions {
+    /// This process's rank, 0..world.
+    pub rank: usize,
+    /// The number of ranks.
+    pub world: usize,
+    /// Every rank's collective address, in rank order; each carries the port that rank binds.
+    pub peers: Vec<SocketAddr>,
+    /// Rank 0's control endpoint, which the workers dial.
+    pub control: SocketAddr,
+    /// The directory holding rank-R-of-W.bin.
+    pub converted: PathBuf,
+}
+
+impl GroupOptions {
+    /// Parses the group flags, or returns None when none was given.
+    ///
+    /// # Errors
+    /// A flag without --rank, a world that is not the peer list's length, a rank outside the
+    /// world, a peer that is not an address, or a group without a converted directory.
+    fn from_cli(
+        rank: Option<usize>,
+        world: Option<usize>,
+        peers: Option<&str>,
+        control_port: Option<u16>,
+        converted: Option<PathBuf>,
+    ) -> Result<Option<Self>, String> {
+        if rank.is_none()
+            && world.is_none()
+            && peers.is_none()
+            && control_port.is_none()
+            && converted.is_none()
+        {
+            return Ok(None);
+        }
+        let rank = rank.ok_or_else(|| {
+            "--rank is required when any group flag is given: one process serves one rank of the device arm"
+                .to_owned()
+        })?;
+        let raw = peers.ok_or_else(|| {
+            "--peer is required with --rank: every rank's collective address in rank order, comma separated"
+                .to_owned()
+        })?;
+        let peers = parse_group_peers(raw)?;
+        let world = world.unwrap_or(peers.len());
+        if world == 0 {
+            return Err("--world needs at least one rank".to_owned());
+        }
+        if peers.len() != world {
+            return Err(format!(
+                "--peer lists {} address(es) but --world is {world}",
+                peers.len()
+            ));
+        }
+        if rank >= world {
+            return Err(format!("--rank {rank} is outside a world of {world}"));
+        }
+        let control = SocketAddr::new(
+            peers[0].ip(),
+            control_port.unwrap_or(GROUP_DEFAULT_CONTROL_PORT),
+        );
+        let converted = match converted {
+            Some(directory) => directory,
+            None => match std::env::var_os(pack::INKLING_CONVERTED_DIR_ENV) {
+                Some(value) if !value.is_empty() => PathBuf::from(value),
+                _ => {
+                    return Err(format!(
+                        "--converted DIR is required with --rank: it holds the four rank files the group loads (or set {})",
+                        pack::INKLING_CONVERTED_DIR_ENV
+                    ));
+                }
+            },
+        };
+        Ok(Some(Self {
+            rank,
+            world,
+            peers,
+            control,
+            converted,
+        }))
+    }
+
+    /// The converted rank file this process reads.
+    ///
+    /// # Errors
+    /// The directory holds no file for this rank and world.
+    fn rank_file(&self) -> Result<PathBuf, String> {
+        sparkflash_model_inkling2::rank_file(&self.converted, self.rank, self.world)
+    }
+}
+
+/// Parses the comma-separated address list a group flag names, in rank order.
+///
+/// Unlike [parse_peers], each entry carries its port: a device arm's ranks bind the addresses the
+/// group was given, so the port is part of the identity rather than derived from a base.
+fn parse_group_peers(raw: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut peers = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err("--peer contains an empty address".to_owned());
+        }
+        let address = item
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("--peer: {item}: {error}"))?;
+        peers.push(address);
+    }
+    Ok(peers)
+}
+
 /// Parses the comma-separated peer list a group flag (`flag`) names, in rank order.
 fn parse_peers(flag: &str, raw: &str) -> Result<Vec<IpAddr>, String> {
     let mut peers = Vec::new();
@@ -682,6 +810,13 @@ pub struct ServeOptions {
     /// control channel. See [ServeEngine].
     #[cfg(feature = "tp4-serve")]
     pub tp4: Option<Tp4ServeOptions>,
+    /// The device-arm group this process is one rank of, when `--rank` was given.
+    ///
+    /// `None` is a single-process run. `Some` means this process is one rank of the Inkling-2-Small
+    /// device arm: rank 0 owns HTTP, the tokenizer and the control channel, and every rank holds
+    /// its own device state and mirrors the token ids rank 0 admits. The device arm's rank file
+    /// comes from [GroupOptions::converted].
+    pub group: Option<GroupOptions>,
     /// Dory's latent-recurrence group, when `--recurrence-rank` was given.
     ///
     /// `None` is one process serving the whole model. `Some` means this process runs its share
@@ -781,6 +916,13 @@ impl ServeOptions {
         // not a PackArm, so the packed-model flag checks below are keyed on `is_arm`.
         let pack = cli.model.as_deref().and_then(pack::Pack::named);
         let packed = pack.is_some_and(pack::Pack::is_arm);
+        let group = GroupOptions::from_cli(
+            cli.rank,
+            cli.world,
+            cli.peer.as_deref(),
+            cli.control_port,
+            cli.converted.clone(),
+        )?;
         let tokenizer = cli.tokenizer;
         let mut checkpoint = cli.checkpoint;
         // A model id names its snapshot through the hub cache. Resolve it before the
@@ -809,6 +951,53 @@ impl ServeOptions {
                         });
                     }
                 }
+            }
+        }
+        if let Some(group) = group.as_ref() {
+            if cli.synthetic {
+                return Err(
+                    "--rank cannot be combined with --synthetic: the device arm serves the converted ranks of a released checkpoint, and the synthetic tiny plan is a single-process path"
+                        .to_owned(),
+                );
+            }
+            if checkpoint.is_none() {
+                return Err(
+                    "--rank requires --checkpoint DIR: every rank reads the released checkpoint's configuration"
+                        .to_owned(),
+                );
+            }
+            if pack != Some(pack::Pack::Inkling) {
+                return Err(format!(
+                    "--rank serves the Inkling-2-Small device arm; {} names another model. Its four-rank group reads converted rank files with --converted and its collective with --peer",
+                    cli.model.as_deref().unwrap_or("this checkpoint")
+                ));
+            }
+            if cli.recurrence_rank.is_some() {
+                return Err(
+                    "--rank and --recurrence-rank are different groups: choose one".to_owned(),
+                );
+            }
+            #[cfg(feature = "tp4-serve")]
+            if cli.tp4_rank.is_some() {
+                return Err(
+                    "--rank (the device arm's group) and --tp4-rank (the DeepSeek host group) are different groups: choose one"
+                        .to_owned(),
+                );
+            }
+            if cli.continuous_batching {
+                return Err(
+                    "--continuous-batching cannot be combined with --rank: the group runs one request at a time so every rank sees the same token sequence, and batching a different request into the group would desync it"
+                        .to_owned(),
+                );
+            }
+            if cli.concurrency != 1 {
+                return Err(
+                    "--concurrency cannot be combined with --rank: the group runs one sequence across every rank, so a second worker would interleave two different token sequences"
+                        .to_owned(),
+                );
+            }
+            if group.control.port() == 0 {
+                return Err("--control-port needs a non-zero port".to_owned());
             }
         }
         // An empty key would authenticate only an empty bearer token; refuse it at parse time
@@ -1045,10 +1234,11 @@ impl ServeOptions {
             // refused by name when it is served, and the group flags stay off its surface.
             let pack = pack::Pack::named(model);
             #[cfg(feature = "tp4-serve")]
-            let group = cli.tp4_rank.is_some();
+            let in_group = cli.tp4_rank.is_some() || group.is_some();
             #[cfg(not(feature = "tp4-serve"))]
-            let group = false;
-            if group && pack.is_none() {
+            let in_group = group.is_some();
+            #[cfg(feature = "tp4-serve")]
+            if cli.tp4_rank.is_some() && pack.is_none() {
                 unsupported.push("--tp4-rank");
             }
             if !unsupported.is_empty() {
@@ -1060,7 +1250,7 @@ impl ServeOptions {
             // The pack-model knobs its arm would not apply on this path are refused too.
             if let Some(pack) = pack {
                 let unapplied = pack.unapplied(
-                    group,
+                    in_group,
                     cli.concurrency,
                     cli.fuse_batch,
                     cli.kv_budget_gib.is_some(),
@@ -1068,7 +1258,7 @@ impl ServeOptions {
                 if !unapplied.is_empty() {
                     return Err(format!(
                         "--model {model} {} does not apply {}; it is refused rather than ignored",
-                        if group {
+                        if in_group {
                             "in a tensor-parallel group, which serves one request at a time,"
                         } else {
                             "at TP=1"
@@ -1105,6 +1295,7 @@ impl ServeOptions {
                 engram_dir: cli.engram_dir,
                 #[cfg(feature = "tp4-serve")]
                 tp4,
+                group,
                 recurrence,
                 api_key: cli.api_key,
                 cors,
@@ -1407,6 +1598,25 @@ struct ServeArgs {
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "DIR", requires = "tp4_device")]
     tp4_evidence_dir: Option<PathBuf>,
+    /// This process's rank in a device-arm group (the Inkling-2-Small four-rank server).
+    ///
+    /// One process serves one rank: rank 0 binds HTTP and the control channel, ranks 1-3 mirror
+    /// its prefill and decode on their own resident device state. --peer lists every rank's
+    /// collective address in rank order; --converted names the directory of converted rank files.
+    #[arg(long, value_name = "N")]
+    rank: Option<usize>,
+    /// The number of ranks in the group; default the --peer list's length.
+    #[arg(long, value_name = "N")]
+    world: Option<usize>,
+    /// Every rank's collective address, in rank order, comma separated (host:port each).
+    #[arg(long, value_name = "ADDR,ADDR")]
+    peer: Option<String>,
+    /// The control port rank 0 binds at its own peer address; default 29700.
+    #[arg(long, value_name = "PORT")]
+    control_port: Option<u16>,
+    /// The directory holding the converted rank files (rank-R-of-W.bin).
+    #[arg(long, value_name = "DIR")]
+    converted: Option<PathBuf>,
     /// This process's rank in Dory's latent-recurrence group (Dory checkpoints only).
     ///
     /// Each rank runs an even share of the recurrent loops on the whole hidden width and keeps
