@@ -15,6 +15,7 @@
 //! reference forward. The device tables live in the shared kernel catalogue.
 
 pub mod architecture;
+pub mod collective;
 pub mod config;
 pub mod convert;
 pub mod device;
@@ -25,9 +26,11 @@ pub mod host;
 pub mod prompt;
 pub mod reference;
 pub mod tensor;
+pub mod tp4_run;
 pub mod vision;
 
 pub use architecture::{architecture_from_config, architecture_from_json};
+pub use collective::{Exchange, Solo, TcpExchange};
 pub use config::{
     Inkling2Config, InklingMtpConfig, InklingQuantConfig, InklingVisionConfig, MODEL_ID,
     MODEL_TYPE, WEIGHTS_ID,
@@ -46,6 +49,7 @@ pub use device_plan::{
     VOCAB_ALIGNMENT,
 };
 pub use tensor::{InklingTensorPlan, Role, Slice};
+pub use tp4_run::{Tp4Outcome, Tp4Run, rank_file};
 pub use vision::{InklingVision, MAX_MERGED_TOKENS, patch_values, plan_grid};
 
 use sparkflash_model::ModelDescriptor;

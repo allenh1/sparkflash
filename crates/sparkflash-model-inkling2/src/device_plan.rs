@@ -49,6 +49,13 @@
 //! and one all-reduce over the residual width completes it. The schedule records that as
 //! [Collective::ExpertDelta], which is why the expert band is followed by a reduce and then the
 //! residual add rather than by a local combine.
+//!
+//! The attention output projection shards its *contraction* axis - the heads - so it is the second
+//! partial sum a layer and needs its own all-reduce: a rank multiplies its 12 heads by its own
+//! slice of `wo_ud`'s columns, and the released layer is the sum over all 48. The schedule records
+//! that as [Collective::AttentionDelta], placed between the projection and the short convolution
+//! that follows it, so the convolution mixes an already-complete row and its four-tap history is
+//! the single-rank history rather than a quarter of it.
 
 use sparkflash_model::architecture::WeightFormat;
 use sparkflash_model::{Part, TpPlan};
@@ -89,6 +96,10 @@ pub enum Collective {
     /// The last prompt token's embedding row, gathered from the rank that owns its vocabulary
     /// row. The embedding is vocabulary-parallel, so exactly one rank holds the row.
     EmbeddingRow,
+    /// The attention output projection's partial hidden delta, summed across ranks. The
+    /// projection shards the heads, which is its contraction axis, so a rank's dense result is one
+    /// quarter of every element of the layer's attention output and the all-reduce is the sum.
+    AttentionDelta,
     /// The routed experts' partial hidden deltas, summed across ranks. Expert parallelism leaves
     /// each rank holding a subset of the selected experts, and the mix is a sum, so an all-reduce
     /// is the whole exchange.
@@ -104,6 +115,7 @@ impl Collective {
     pub const fn name(self) -> &'static str {
         match self {
             Self::EmbeddingRow => "embedding_row",
+            Self::AttentionDelta => "attention_delta",
             Self::ExpertDelta => "expert_delta",
             Self::LogitSlice => "logit_slice",
         }
@@ -638,16 +650,59 @@ impl InklingDevicePlan {
             .map_or(0, |index| self.served.rank_spec_at(index).shape[0])
     }
 
-    /// The rank-local query-head count.
+    /// The routed experts this rank owns: the first global index and the count.
+    ///
+    /// Experts are expert-parallel and split whole on the outer axis, so a rank's slice is a
+    /// contiguous run. The released indices stay global - the router is replicated and selects the
+    /// same eight experts everywhere - so the band skips the slots outside this range and addresses
+    /// its own weights and per-expert scales with the index less the first.
     #[must_use]
-    pub fn rank_heads(&self) -> usize {
-        self.config.num_attention_heads / self.tp.world().max(1)
+    pub fn expert_range(&self) -> (usize, usize) {
+        let count = self.rank_experts();
+        if count == 0 {
+            return (0, 0);
+        }
+        let first = self.tp.rank() * count;
+        let total = self.config.n_routed_experts;
+        // A world that does not divide the experts still tiles the whole axis: the last rank takes
+        // whatever the division left rather than running off the end of its own slice.
+        (first.min(total), count.min(total.saturating_sub(first)))
     }
 
-    /// The rank-local key/value head count.
+    /// The rank-local query-head count, from the sharded projection's own row count.
+    ///
+    /// Reading it off the plan's served tensor rather than dividing the configuration keeps the
+    /// two in step: the shared plan's key/value rule shares a head count below the world instead
+    /// of dividing it (two key/value heads over four ranks are one head each, not zero), and a
+    /// second division here would disagree with the weights the rank holds.
+    #[must_use]
+    pub fn rank_heads(&self) -> usize {
+        self.config
+            .num_attention_heads
+            .checked_div(self.tp.world().max(1))
+            .filter(|heads| *heads > 0)
+            .unwrap_or_else(|| self.heads_from_projection("wq_du"))
+    }
+
+    /// The rank-local key/value head count, from the sharded projection.
     #[must_use]
     pub fn rank_kv_heads(&self) -> usize {
-        self.config.num_key_value_heads / self.tp.world().max(1)
+        let divided = self.config.num_key_value_heads / self.tp.world().max(1);
+        if divided > 0 {
+            return divided;
+        }
+        // A key/value head count below the world is shared: the split gives every rank one head.
+        self.heads_from_projection("wk_dv").max(1)
+    }
+
+    /// One attention projection's head count, from the served shape.
+    fn heads_from_projection(&self, projection: &str) -> usize {
+        let head_dim = self.config.head_dim.max(1);
+        self.served
+            .index_of(&format!("model.llm.layers.0.attn.{projection}.weight"))
+            .map_or(1, |index| {
+                (self.served.rank_spec_at(index).shape[0] / head_dim).max(1)
+            })
     }
 
     /// A one-line boot summary: pass, rows, layers, launches and the state byte total.
@@ -847,6 +902,15 @@ impl InklingDevicePlan {
             self.rank_vocab(),
             hidden,
         )?.at(Target::Project(Projection::Head)));
+        // The vocabulary is spread over the ranks, so one rank's projection is a slice of the
+        // head's row. Gather the slices, then cap and trim: the softcap is elementwise, so
+        // applying it after the gather is the same arithmetic on the same values.
+        steps.push(Self::plain(
+            Op::Collective(Collective::LogitSlice),
+            Some(Part::Collective),
+            1,
+            self.rank_vocab().saturating_mul(self.tp.world()),
+        ));
         steps.push(self.step(
             Op::LogitSoftcap,
             Some(Part::SoftcappedActivation),
@@ -856,12 +920,6 @@ impl InklingDevicePlan {
             1,
             config.unpadded_vocab_size,
         )?);
-        steps.push(Self::plain(
-            Op::Collective(Collective::LogitSlice),
-            Some(Part::Collective),
-            1,
-            config.unpadded_vocab_size,
-        ));
         Ok((prologue, steps))
     }
 
@@ -1035,6 +1093,14 @@ impl InklingDevicePlan {
             hidden,
             heads * head_dim,
         )?.at(Target::Project(Projection::AttentionOut)));
+        // The projection sharded its contraction axis, so what each rank holds is a partial sum:
+        // complete it before the convolution mixes it across taps.
+        steps.push(Self::plain(
+            Op::Collective(Collective::AttentionDelta),
+            Some(Part::Collective),
+            rows,
+            hidden,
+        ));
         steps.push(self.step(
             Op::ShortConv,
             Some(Part::ShortConv),
@@ -1194,14 +1260,10 @@ impl InklingDevicePlan {
             hidden,
             intermediate,
         )?.at(Target::Band(BandOp::Down)));
-        steps.push(Self::plain(
-            Op::Collective(Collective::ExpertDelta),
-            Some(Part::Collective),
-            rows,
-            hidden,
-        ));
-        // The combine sums the band's slots. The router weight is already inside each partial,
-        // so this is the shared plain sum and not a second weighting.
+        // The mix is local: the rank's own experts, each scaled by its share of the router's
+        // selection, and a slot it does not own contributes a zero scale. The all-reduce that
+        // follows is then the whole exchange - one residual-width vector a layer - and it gives
+        // every rank the same sum.
         steps.push(
             Self::shared(
                 Op::ExpertMix,
@@ -1213,6 +1275,12 @@ impl InklingDevicePlan {
             )
             .at(Target::Band(BandOp::Mix)),
         );
+        steps.push(Self::plain(
+            Op::Collective(Collective::ExpertDelta),
+            Some(Part::Collective),
+            rows,
+            hidden,
+        ));
 
         // The MLP output's short convolution, then the residual add that closes the layer.
         steps.push(self.step(
@@ -1576,19 +1644,20 @@ mod tests {
     #[test]
     fn the_launch_count_is_the_layers_plus_the_globals() {
         let plan = plan(4, 0, Pass::Decode, 1, 4096);
-        // A sliding layer is 27 launches and a full layer 29: the full layer's third input norm
+        // A sliding layer is 28 launches and a full layer 30: the full layer's third input norm
         // and its two dynamic K/V convolutions replace the sliding layer's single norm and two
         // static convolutions. Layer 0 is one fewer because it has no attention block-residual
         // bank, and the eight global launches are the embed, its norm, the output block residual,
         // the final norm, the head, its softcap and the three collectives' two device steps.
         let mut expected = plan.globals().len();
         for layer in plan.layers() {
-            // A sliding layer is 27 launches and a full layer 29: the full layer's three input
+            // A sliding layer is 28 launches and a full layer 30: the full layer's three input
             // norms and its two dynamic K/V convolutions replace the sliding layer's single norm
             // and two static convolutions. Layer 0 has no attention block-residual bank, and a
             // block-boundary layer swaps its attention residual add for a summary push, which is
-            // the same one launch, so only the bank changes the number.
-            let mut steps = if layer.sliding { 27 } else { 29 };
+            // the same one launch, so only the bank changes the number. The attention-delta
+            // collective is one of the 28.
+            let mut steps = if layer.sliding { 28 } else { 30 };
             if layer.index == 0 {
                 steps -= 1;
             }
@@ -1596,7 +1665,7 @@ mod tests {
             expected += steps;
         }
         assert_eq!(plan.launch_count(), expected);
-        assert_eq!(plan.launch_count(), 1_319);
+        assert_eq!(plan.launch_count(), 1_367);
     }
 
     #[test]

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 sparkflash-model = { workspace = true }
 sparkflash-weights = { workspace = true }
+sparkflash-comm = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-ops = { workspace = true }
 serde = { workspace = true }

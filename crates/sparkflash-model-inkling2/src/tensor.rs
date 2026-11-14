@@ -344,7 +344,7 @@ impl InklingTensorPlan {
 }
 
 fn split_of(
-    _config: &Inkling2Config,
+    config: &Inkling2Config,
     tp: TpPlan,
     name: &str,
     shape: &[usize],
@@ -354,6 +354,31 @@ fn split_of(
             .map(|split| Slice { axis, split })
             .map_err(|error| format!("{name}: {}", error.detail))
     };
+    // A short convolution's stored axis is *channel rows*, and one head is a run of them: a
+    // key/value tap table is [head][channel][tap], not [channel][tap] in a flat list. Dividing the
+    // rows directly would cut a head in quarters at TP4 instead of giving each rank its own - and
+    // would disagree with the shared key/value head rule, where two heads over four ranks are one
+    // head each, read twice. This splits the head axis and scales to rows, so the rank's table
+    // starts at the same head its key/value projection produced.
+    let head_block =
+        |axis: usize, heads: usize, block: usize| -> Result<Slice, String> {
+            let split = tp
+                .split(heads, TpAxis::KvHeads, 1)
+                .map_err(|error| format!("{name}: {}", error.detail))?;
+            let per_rank = split.per_rank * block;
+            Ok(Slice {
+                axis,
+                split: Split {
+                    total: heads * block,
+                    per_rank,
+                    offset: split.offset * block,
+                    padded: per_rank,
+                    padding: 0,
+                    rank: split.rank,
+                    world: split.world,
+                },
+            })
+        };
     if name == "model.llm.embed.weight" || name == "model.llm.unembed.weight" {
         return Ok(vec![slice(0, shape[0], TpAxis::Vocab)?]);
     }
@@ -383,8 +408,26 @@ fn split_of(
     {
         return Ok(vec![slice(0, shape[0], TpAxis::Heads)?]);
     }
+    // A key/value projection is one head a rank, not a quarter of a head. Splitting its rows
+    // directly divides the *dimensions* as soon as the head count is not a multiple of the world
+    // (two heads over four ranks are four dimensions each, not one head each), and the kernel
+    // then mixes half a head with another head's other half.
+    let kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+    let kernel = config.sconv_kernel_size;
     if name.ends_with(".wk_dv.weight") || name.ends_with(".wv_dv.weight") {
-        return Ok(vec![slice(0, shape[0], TpAxis::KvHeads)?]);
+        return Ok(vec![head_block(0, kv_heads, head_dim)?]);
+    }
+    // The key/value short convolutions are per head, in the same head order the projections
+    // produce, so they follow the same split at their own granularity.
+    if name.ends_with(".k_sconv.weight") || name.ends_with(".v_sconv.weight") {
+        return Ok(vec![head_block(0, kv_heads, head_dim)?]);
+    }
+    if name.ends_with(".k_sconv.static_w") || name.ends_with(".v_sconv.static_w") {
+        return Ok(vec![head_block(1, kv_heads, head_dim)?]);
+    }
+    if name.ends_with(".k_sconv.weight_proj") || name.ends_with(".v_sconv.weight_proj") {
+        return Ok(vec![head_block(0, kv_heads, kernel)?]);
     }
     Ok(Vec::new())
 }

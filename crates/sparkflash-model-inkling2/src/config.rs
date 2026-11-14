@@ -384,6 +384,35 @@ impl Inkling2Config {
         Self::from_json(TINY, None).expect("the tiny Inkling config is valid")
     }
 
+    /// A four-expert variant of [Self::tiny], for the tensor-parallel tests.
+    ///
+    /// Every axis a four-rank plan shards divides four here and does not in [Self::tiny]: four
+    /// routed experts rather than two, and two active experts so a token's mix spans more than
+    /// one rank.
+    ///
+    /// # Panics
+    /// Only if the carried JSON stops parsing, which is a crate bug.
+    #[must_use]
+    pub fn tiny_world() -> Self {
+        const TINY: &str = r#"{
+          "model_type":"inkling2",
+          "text_config":{
+            "hidden_size":32,"num_hidden_layers":2,"vocab_size":256,"max_position_embeddings":64,
+            "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+            "d_rel":4,"rel_extent":8,"qk_l2_clip_threshold":22.627416997969522,
+            "rel_l2_clip_threshold":8.0,"log_scaling_n_floor":16,"log_scaling_alpha":0.1,
+            "rms_norm_eps":1e-06,"use_value_norm_no_gamma":true,
+            "local_layer_ids":[0],"sconv_kernel_size":4,"unpadded_vocab_size":250,
+            "final_logit_softcapping":30.0,"sliding_window_size":8,
+            "n_layers_per_attn_res_block":1,"attn_res_normalize_values":true,
+            "n_routed_experts":4,"num_experts_per_tok":2,"n_shared_experts":0,
+            "intermediate_size":16,"mlp_gate_softcap":4.0,"mlp_up_softcap":25.0,
+            "route_scale":8.0,"use_gate_bias":true
+          }
+        }"#;
+        Self::from_json(TINY, None).expect("the four-expert fixture is valid")
+    }
+
     /// The shared architecture.
     #[must_use]
     pub fn architecture(&self) -> &Architecture {

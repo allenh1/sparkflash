@@ -330,6 +330,13 @@ impl Inkling2Weights {
         }
         let step = std::time::Instant::now();
         let mut x = self.row("model.llm.embed.weight", token as usize, config.hidden_size)?;
+        if trace_on() {
+            let rms = (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
+            eprintln!(
+                "[inkling] host embed_row rms={rms:.5} first={:.5} second={:.5}",
+                x[0], x[1]
+            );
+        }
         let embed_norm = self.vector("model.llm.embed_norm.weight")?;
         x = rms_norm(&x, Some(&embed_norm), config.architecture.norm_epsilon);
         trace_timing!(format!("token={token} embed"), step);
@@ -456,6 +463,14 @@ impl Inkling2Weights {
 
         let stage = std::time::Instant::now();
         let attn = self.attention(layer, position, sliding, &q_input, &k_input, &v_input, state)?;
+        if trace_on() {
+            let rms = (attn.iter().map(|value| value * value).sum::<f32>() / attn.len() as f32)
+                .sqrt();
+            eprintln!(
+                "[inkling] host attn_proj layer {layer} rms={rms:.6} first={:.6} second={:.6}",
+                attn[0], attn[1]
+            );
+        }
         trace_timing!(format!("layer={layer} attention"), stage);
         let attn_norm = self.vector(&format!("{prefix}.attn_norm.weight")).ok();
         let _ = attn_norm;
@@ -528,6 +543,27 @@ impl Inkling2Weights {
         } else {
             1.0
         };
+        if trace_on() {
+            for head in 0..heads {
+                eprintln!(
+                    "[inkling] host head {head} q={:.6} {:.6} g={:.6} s={:.6} r={:.6}",
+                    q[head * head_dim],
+                    q[head * head_dim + 1],
+                    gate[head * head_dim],
+                    sink[head],
+                    rel[head * config.d_rel]
+                );
+            }
+            for head in 0..kv_heads {
+                eprintln!(
+                    "[inkling] host kv {head} k={:.6} {:.6} v={:.6} {:.6}",
+                    k[head * head_dim],
+                    k[head * head_dim + 1],
+                    v[head * head_dim],
+                    v[head * head_dim + 1]
+                );
+            }
+        }
         let cache = &mut state.layers[layer];
         cache.k.push(k);
         cache.v.push(v);

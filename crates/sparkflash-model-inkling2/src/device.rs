@@ -44,9 +44,10 @@ use sparkflash_model::{Capabilities, ModelDescriptor, TpPlan};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
+use crate::collective::{Exchange, Solo};
 use crate::config::Inkling2Config;
 use crate::device_plan::{
-    BandOp, ConvSlot, ExpertBody, InklingDevicePlan, NormRole, Op, Pass, Projection,
+    BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, NormRole, Op, Pass, Projection,
     ResidualInput, Step, Target,
 };
 use crate::forward::trace_on;
@@ -86,6 +87,25 @@ fn gemv_grid(rows: usize) -> u32 {
 /// One f32 argument as the driver's one-word cell.
 fn bits(value: f32) -> u64 {
     u64::from(value.to_bits())
+}
+
+/// A host vector of f32 as the little-endian bytes the driver copies.
+fn row_bytes(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// The f32 values of a little-endian byte buffer.
+fn from_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect()
 }
 
 /// One loaded symbol.
@@ -220,6 +240,7 @@ struct Shared {
     clip_arena: Deviceptr,
     experts: Vec<Option<ExpertScale>>,
     context: usize,
+    exchange: Box<dyn Exchange>,
 }
 
 impl Shared {
@@ -368,6 +389,26 @@ impl InklingDeviceBackend {
         source: Arc<dyn WeightSource>,
         context: usize,
     ) -> Result<Self, String> {
+        let tp = TpPlan::new(1, 0).map_err(|error| error.detail)?;
+        Self::open_rank(descriptor, config, source, context, tp, Box::new(Solo))
+    }
+
+    /// Open one rank of a larger world, exchanging through the given collective.
+    ///
+    /// The three collectives the schedule names are the only steps whose behaviour depends on the
+    /// world: the embedding row is gathered from its owner, the routed experts' mix is reduced
+    /// across the ranks that computed it, and the logit slices are gathered before the softcap.
+    ///
+    /// # Errors
+    /// As [Self::open], and a plan the world does not divide.
+    pub fn open_rank(
+        descriptor: ModelDescriptor,
+        config: Inkling2Config,
+        source: Arc<dyn WeightSource>,
+        context: usize,
+        tp: TpPlan,
+        exchange: Box<dyn Exchange>,
+    ) -> Result<Self, String> {
         if !Self::available() {
             return Err("this build carries no Inkling or token cubin: rebuild on a host with nvcc \
                         (or set SPARKFLASH_NVCC)"
@@ -385,7 +426,15 @@ impl InklingDeviceBackend {
                         that clears attn_res_normalize_values has no kernel in this arm"
                 .to_owned());
         }
-        let tp = TpPlan::new(1, 0).map_err(|error| error.detail)?;
+        if exchange.world() != tp.world() || exchange.rank() != tp.rank() {
+            return Err(format!(
+                "the collective is rank {}/{} and the plan rank {}/{}",
+                exchange.rank(),
+                exchange.world(),
+                tp.rank(),
+                tp.world()
+            ));
+        }
         let plan = InklingDevicePlan::build(&config, tp, Pass::Decode, 1, context)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda)?;
@@ -407,6 +456,7 @@ impl InklingDeviceBackend {
                 clip_arena,
                 experts,
                 context,
+                exchange,
             }),
         })
     }
@@ -759,6 +809,7 @@ struct Scratch {
     scales: Deviceptr,
     mixed: Deviceptr,
     logits: Deviceptr,
+    logits_full: Deviceptr,
     logits_bf16: Deviceptr,
     final_row: Deviceptr,
 }
@@ -775,7 +826,7 @@ impl Scratch {
         let activation = config.moe_intermediate_size;
         let top_k = config.num_experts_per_tok;
         let vocab = plan.rank_vocab();
-        let taps = config.num_key_value_heads * config.sconv_kernel_size;
+        let taps = plan.rank_kv_heads() * config.sconv_kernel_size;
         let mut cursor = 0usize;
         let mut take = |elements: usize, width: usize| {
             let at = cursor;
@@ -806,7 +857,10 @@ impl Scratch {
         let scales = take(top_k, 4);
         let mixed = take(hidden, 4);
         let logits = take(vocab.max(1), 4);
-        let logits_bf16 = take(vocab.max(1), 2);
+        let logits_full = take(vocab.max(1) * shared.exchange.world(), 4);
+        // The softcap trims the whole gathered row, so the released bf16 row is as wide as the
+        // gathered vocabulary and not as wide as this rank's slice of it.
+        let logits_bf16 = take(vocab.max(1) * shared.exchange.world(), 2);
         let final_row = take(hidden, 4);
         let arena = cuda.alloc(cursor, total)?;
         cuda.memset_d8_async(arena, 0, cursor)?;
@@ -836,6 +890,7 @@ impl Scratch {
             scales: at(scales),
             mixed: at(mixed),
             logits: at(logits),
+            logits_full: at(logits_full),
             logits_bf16: at(logits_bf16),
             final_row: at(final_row),
         })
@@ -934,6 +989,37 @@ impl InklingDeviceSession {
         self.shared.weights.get(index).pointer
     }
 
+    /// One all-reduce of a residual-width f32 vector, in place.
+    ///
+    /// Every collective this arm performs over the hidden stream is a sum of partial sums, so the
+    /// exchange is the same staged round-trip whatever produced the partial: a download, the
+    /// transport's sum, an upload.
+    fn all_reduce(
+        &self,
+        shared: &Shared,
+        pointer: Deviceptr,
+        elements: usize,
+    ) -> Result<(), BackendError> {
+        if shared.exchange.world() == 1 {
+            return Ok(());
+        }
+        let mut bytes = row_bytes(&vec![0f32; elements]);
+        shared
+            .cuda
+            .copy_dtoh(&mut bytes, &pointer)
+            .map_err(Self::fail)?;
+        let mut values = from_bytes(&bytes);
+        shared
+            .exchange
+            .all_reduce_f32(&mut values)
+            .map_err(Self::fail)?;
+        shared
+            .cuda
+            .copy_htod(&pointer, &row_bytes(&values))
+            .map_err(Self::fail)?;
+        Ok(())
+    }
+
     /// The root-mean-square of one f32 buffer, for the trace. A debug read: it synchronises.
     fn rms(&self, shared: &Shared, label: &str, pointer: Deviceptr, elements: usize) -> Result<(), BackendError> {
         if !trace_on() {
@@ -980,25 +1066,55 @@ impl InklingDeviceSession {
         for step in plan.prologue() {
             match (step.op, step.target) {
                 (Op::Embed, _) => {
+                    // The embedding is vocabulary-parallel: exactly one rank holds this token's
+                    // row, and the gather below sums the row it widens with the zeros the others
+                    // contribute.
+                    let rank_vocab = plan.rank_vocab();
+                    let first = plan.tp().rank() * rank_vocab;
+                    let local = (token as usize).checked_sub(first);
                     let weight = self.weight(step.weights[0]);
-                    run(shared.launch(
-                        shared.kernels.embed,
-                        (flat(hidden), 1, 1),
-                        (TOKEN_BLOCK, 1, 1),
-                        &[
-                            weight.0,
-                            self.state.scratch.x.0,
-                            u64::from(token),
-                            hidden as u64,
-                            hidden as u64,
-                            0,
-                        ],
-                    ))?;
+                    match local {
+                        Some(row) if row < rank_vocab => run(shared.launch(
+                            shared.kernels.embed,
+                            (flat(hidden), 1, 1),
+                            (TOKEN_BLOCK, 1, 1),
+                            &[
+                                weight.0,
+                                self.state.scratch.x.0,
+                                row as u64,
+                                hidden as u64,
+                                hidden as u64,
+                                0,
+                            ],
+                        ))?,
+                        _ => run(shared
+                            .cuda
+                            .memset_d8_async(
+                                self.state.scratch.x,
+                                0,
+                                hidden * std::mem::size_of::<f32>(),
+                            )
+                            .map_err(|error| error.to_string()))?,
+                    }
                 }
                 (Op::RmsNorm, Target::Norm(NormRole::Embedding)) => {
                     let weight = self.weight(step.weights[0]);
                     run(shared.rmsnorm(self.state.scratch.x, weight, self.state.scratch.x, 1, hidden))?;
                     self.rms(&shared, "embed_norm", self.state.scratch.x, hidden)?;
+                }
+                (Op::Collective(Collective::EmbeddingRow), _) => {
+                    let mut bytes = row_bytes(&vec![0f32; hidden]);
+                    shared
+                        .cuda
+                        .copy_dtoh(&mut bytes, &self.state.scratch.x)
+                        .map_err(Self::fail)?;
+                    let mut row = from_bytes(&bytes);
+                    shared.exchange.all_reduce_f32(&mut row).map_err(Self::fail)?;
+                    shared
+                        .cuda
+                        .copy_htod(&self.state.scratch.x, &row_bytes(&row))
+                        .map_err(Self::fail)?;
+                    self.rms(&shared, "embed_row", self.state.scratch.x, hidden)?;
                 }
                 (Op::Collective(_), _) | (Op::SummaryPush, _) => {}
                 (op, target) => {
@@ -1228,7 +1344,7 @@ impl InklingDeviceSession {
                         };
                         // The dynamic taps are a projection of this slot's input, one kernel width
                         // a key/value head.
-                        let taps = config.num_key_value_heads * shared.kernel_width();
+                        let taps = plan.rank_kv_heads() * shared.kernel_width();
                         run(shared.gemv(projection, source, self.state.scratch.taps, taps, hidden))?;
                         run(shared.launch(
                             shared.kernels.short_conv_dynamic,
@@ -1260,6 +1376,24 @@ impl InklingDeviceSession {
                         ))?;
                     }
                     (Op::KvStore, _) => {
+                        if trace_on() {
+                            let rank = plan.tp().rank();
+                            let read = |pointer: Deviceptr, count: usize| -> Vec<f32> {
+                                let mut bytes = vec![0u8; count * 4];
+                                let _ = shared.cuda.copy_dtoh(&mut bytes, &pointer);
+                                from_bytes(&bytes)
+                            };
+                            let q = read(self.state.scratch.q, 2);
+                            let k = read(self.state.scratch.k_next, 2);
+                            let v = read(self.state.scratch.v_next, 2);
+                            let gate = read(self.state.scratch.gate, 1);
+                            let sink = read(self.state.scratch.sink, 1);
+                            let rel = read(self.state.scratch.rel, 1);
+                            eprintln!(
+                                "[inkling] device rank {rank} layer {layer} q={:.6} {:.6} g={:.6}                                  s={:.6} r={:.6} k={:.6} {:.6} v={:.6} {:.6}",
+                                q[0], q[1], gate[0], sink[0], rel[0], k[0], k[1], v[0], v[1]
+                            );
+                        }
                         // A ring cache indexes by the position modulo its length; the attention
                         // body is given the absolute position and maps it itself.
                         let slot_position = position % cache_rows.max(1);
@@ -1369,10 +1503,25 @@ impl InklingDeviceSession {
                         let activation = &schedule.steps[cursor + 1];
                         let down = &schedule.steps[cursor + 2];
                         self.run_band(&shared, index, step, activation, down)?;
-                        // The band's three launches, the reduce (a no-op at world one) and the
-                        // mix, which the band itself issues last.
-                        cursor += 5;
+                        // The band's three launches and its local mix; the all-reduce that
+                        // follows them is the next step and stays the walk's.
+                        cursor += 4;
                         continue;
+                    }
+                    (Op::Collective(Collective::AttentionDelta), _) => {
+                        // The output projection sharded the heads, its contraction axis, so the
+                        // dense result is a partial sum of every element of the layer's attention
+                        // output. The convolution that follows reads a complete row.
+                        self.all_reduce(&shared, self.state.scratch.delta, hidden)?;
+                        if trace_on() {
+                            let label = format!("attn_proj layer {layer}");
+                            self.rms(&shared, &label, self.state.scratch.delta, hidden)?;
+                        }
+                    }
+                    (Op::Collective(Collective::ExpertDelta), _) => {
+                        // Each rank mixed its own experts and zeroed the slots it does not own,
+                        // so the sum over ranks is the layer's whole expert contribution.
+                        self.all_reduce(&shared, self.state.scratch.mixed, hidden)?;
                     }
                     (Op::Collective(_), _) => {}
                     (op, target) => {
@@ -1441,24 +1590,46 @@ impl InklingDeviceSession {
                         hidden,
                     ))?;
                 }
+                (Op::Collective(Collective::LogitSlice), _) => {
+                    let width = plan.rank_vocab();
+                    let mut bytes = row_bytes(&vec![0f32; width]);
+                    shared
+                        .cuda
+                        .copy_dtoh(&mut bytes, &self.state.scratch.logits)
+                        .map_err(Self::fail)?;
+                    let mut gathered = vec![0f32; width * shared.exchange.world()];
+                    shared
+                        .exchange
+                        .all_gather_f32(&from_bytes(&bytes), &mut gathered)
+                        .map_err(Self::fail)?;
+                    shared
+                        .cuda
+                        .copy_htod(&self.state.scratch.logits_full, &row_bytes(&gathered))
+                        .map_err(Self::fail)?;
+                }
+                (Op::Collective(_), _) => {}
                 (Op::LogitSoftcap, _) => {
                     self.rms(&shared, "raw_logits", self.state.scratch.logits, 4)?;
-                    let unpadded = config.unpadded_vocab_size.min(plan.rank_vocab()).max(1);
+                    // The gathered row is the whole padded vocabulary, so the released trim is
+                    // against that width and not against one rank's slice of it.
+                    let padded = plan.rank_vocab() * shared.exchange.world();
+                    let unpadded = config.unpadded_vocab_size.min(padded).max(1);
                     run(shared.launch(
                         shared.kernels.logit_softcap,
                         (1, 1, 1),
                         (ELEMENT_BLOCK, 1, 1),
                         &[
-                            self.state.scratch.logits.0,
+                            self.state.scratch.logits_full.0,
                             self.state.scratch.logits_bf16.0,
                             1,
-                            plan.rank_vocab() as u64,
+                            // The gathered row is the whole padded vocabulary, which is what
+                            // the softcap trims to the released 200,058.
+                            (plan.rank_vocab() * shared.exchange.world()) as u64,
                             unpadded as u64,
                             bits(config.final_logit_softcap.unwrap_or(0.0) as f32),
                         ],
                     ))?;
                 }
-                (Op::Collective(_), _) => {}
                 (op, target) => {
                     return Err(Self::fail(format!(
                         "the schedule's epilogue {op:?} at {target:?} has no device dispatch"
@@ -1468,8 +1639,12 @@ impl InklingDeviceSession {
         }
 
         self.state.position += 1;
-        shared.cuda.synchronize().map_err(|error| Self::fail(error))?;
-        let unpadded = config.unpadded_vocab_size.min(plan.rank_vocab()).max(1);
+        shared
+            .cuda
+            .synchronize()
+            .map_err(|error| Self::fail(error))?;
+        let padded = plan.rank_vocab() * shared.exchange.world();
+        let unpadded = config.unpadded_vocab_size.min(padded).max(1);
         let mut bytes = vec![0u8; unpadded * 2];
         shared
             .cuda
@@ -1533,11 +1708,18 @@ impl InklingDeviceSession {
         let gate_up_scales = gate_up.weights.get(1).map(|index| self.weight(*index));
         let down_codes = self.weight(down.weights[0]);
         let down_scales = down.weights.get(1).map(|index| self.weight(*index));
+        // The router is replicated and selects global experts; each rank holds one contiguous run
+        // of them. A slot outside the run is not this rank's to compute - its share stays zero, so
+        // the mix contributes nothing and the all-reduce that follows is the whole exchange.
+        let (first, owned) = shared.plan.expert_range();
         for (slot, expert) in selected.iter().copied().enumerate() {
-            if expert >= config.n_routed_experts {
+            if expert >= config.n_routed_experts || expert < first || expert >= first + owned {
                 continue;
             }
-            let gate_up_offset = expert * codes_bytes(2 * intermediate, hidden, schedule.experts);
+            // The rank's own weights and per-expert scales are indexed from zero, not from the
+            // released expert number.
+            let local = expert - first;
+            let gate_up_offset = local * codes_bytes(2 * intermediate, hidden, schedule.experts);
             let destination = band.offset(slot * 2 * intermediate * std::mem::size_of::<f32>());
             match schedule.experts {
                 ExpertBody::Bf16 => {
@@ -1553,13 +1735,13 @@ impl InklingDeviceSession {
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
-                        expert * scales_bytes(2 * intermediate, hidden, schedule.experts);
+                        local * scales_bytes(2 * intermediate, hidden, schedule.experts);
                     let scale_pointer = gate_up_scales
                         .map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
                     let (entry, last) = match schedule.experts {
                         ExpertBody::NvFp4 => (
                             shared.kernels.expert_nvfp4,
-                            bits(scales.map_or(1.0, |scale| scale.gate_up[expert])),
+                            bits(scales.map_or(1.0, |scale| scale.gate_up[local])),
                         ),
                         _ => (shared.kernels.expert_mxfp8, MXFP8_BLOCK as u64),
                     };
@@ -1596,7 +1778,7 @@ impl InklingDeviceSession {
                     ],
                 )
                 .map_err(|error| Self::fail(error))?;
-            let down_offset = expert * codes_bytes(hidden, intermediate, schedule.experts);
+            let down_offset = local * codes_bytes(hidden, intermediate, schedule.experts);
             let partial = partials.offset(slot * hidden * 4);
             match schedule.experts {
                 ExpertBody::Bf16 => {
@@ -1612,13 +1794,13 @@ impl InklingDeviceSession {
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
-                        expert * scales_bytes(hidden, intermediate, schedule.experts);
+                        local * scales_bytes(hidden, intermediate, schedule.experts);
                     let scale_pointer = down_scales
                         .map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
                     let (entry, last) = match schedule.experts {
                         ExpertBody::NvFp4 => (
                             shared.kernels.expert_nvfp4,
-                            bits(scales.map_or(1.0, |scale| scale.down[expert])),
+                            bits(scales.map_or(1.0, |scale| scale.down[local])),
                         ),
                         _ => (shared.kernels.expert_mxfp8, MXFP8_BLOCK as u64),
                     };

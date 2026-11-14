@@ -401,11 +401,11 @@ What the schedule says, in numbers:
 
 | fact | value |
 | :-- | :-- |
-| launches for one decode step | 1,263 |
-| a sliding layer | 26 launches |
-| a full layer | 28 (three input norms, two dynamic K/V convolutions) |
-| layer 0 | 24 (no attention block-residual bank: it consumes the embedding) |
-| a block-boundary layer | one fewer (no attention residual add) |
+| launches for one decode step | 1,367 |
+| a sliding layer | 28 launches |
+| a full layer | 30 (three input norms, two dynamic K/V convolutions) |
+| layer 0 | 27 (no attention block-residual bank: it consumes the embedding) |
+| a block-boundary layer | unchanged (a summary push replaces the residual add) |
 | TP4 per rank | 12 query heads, 2 KV heads, 96 whole experts, 50,256 vocabulary rows |
 | state at 4,096 tokens | 77.9 MiB |
 | state at 1,048,576 tokens | 8 GiB KV, 5.6 MiB convolution histories, 147 KiB summaries |
@@ -419,6 +419,12 @@ wrong silently. **Routed experts are expert-parallel**: the router is replicated
 selects the same global top-8 and computes only its own experts, and one all-reduce over the
 residual width completes the mix — the schedule records that as `Collective::ExpertDelta`, which
 is why the band is followed by the reduce and then a plain combine and not a local weighting.
+**The attention output projection needs its own reduce**: `wo_ud` shards its *contraction* axis,
+the heads, so a rank's dense result is a partial sum of every element of the layer's attention
+output. The schedule records that as `Collective::AttentionDelta`, placed between the projection
+and the short convolution that follows it, so the convolution mixes a complete row and its
+four-tap history is the single-rank history instead of a quarter of it. A layer is therefore two
+residual-width exchanges, attention and experts, which is the same pair the V4.1 TP4 chain posts.
 **The static taps keep their stored layout**: the sliding layers store `[channels][kernel]` and
 the full layers `[kernel, channels]`, the two decode entries read those two layouts, and the plan
 records which is which per layer — a transposed tap table is the same size, in bounds, and wrong.
@@ -520,8 +526,32 @@ Both new parity cases pass on the GB10 (14/14: the twelve previous, the mix and 
 ring case proving a ring cache reads the same rows as a linear one, and the cubin baseline is
 regenerated (the attention image grows by 4,336 bytes, the epilogue by 9,640).
 
-**What the arm still does not do:** collectives (TP4), a chunked prefill (it loops the decode
-walk, which is correct and slow), the DSpark drafter, the image path, and the 367 GB run itself.
+**TP4, and the three defects the four-rank test found.** `inkling2::collective` carries the
+exchange (`all_reduce_f32`, `all_gather_f32`, the embedding row as a zero-padded sum) over the
+shared `sparkflash_comm::tcp` framing, and `tests/device.rs` runs four converted rank files on
+four threads of one GB10 over TCP loopback against the single-rank host reference. Getting that
+test from "the logits are NaN" to 0.26% of the row took three fixes, all of them invisible at TP1:
+
+* **The band ran every selected expert on every rank.** The router's indices are global and the
+  band looped over all top-k slots, so a rank read `w13`/`w2` at a global expert offset inside
+  its own 96-expert slice — past the end for three of the four slots — and mixed the result. The
+  band now skips the slots outside `InklingDevicePlan::expert_range()` and addresses its weights
+  and its per-expert amax table with the local index. The zeroed share is what makes the following
+  all-reduce the whole exchange.
+* **The key/value projections were sharded on the dimension axis, not the head axis.** `TpAxis::KvHeads`
+  splits a *head count* (the shared rule: two heads over four ranks are one head each, read twice),
+  but the plan was handing it `kv_heads * head_dim` rows. With eight key/value heads over four
+  ranks both readings agree, which is why only the fixture (two heads, four ranks) refused to
+  match: ranks 0 and 1 held `wk_dv` rows 0-3 and 4-7 — half a head each — while the kernel
+  computed one head. The plan now splits the head axis and scales to rows, for the projections
+  and for the four key/value short-convolution tables (`weight`, `static_w`, `weight_proj`),
+  whose per-head blocks are 128 channels or one kernel width.
+* **The dynamic convolution's tap projection asked for the world's heads.** `inkling_short_conv_dynamic`
+  was launched with `num_key_value_heads * kernel` rows of `weight_proj` output while the rank's
+  `weight_proj` holds one head a rank.
+
+**What the arm still does not do:** a chunked prefill (it loops the decode walk, which is correct
+and slow), the DSpark drafter, the image path, and the 367 GB run itself.
 
 ## Bring-up order
 

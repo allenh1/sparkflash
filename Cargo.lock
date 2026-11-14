@@ -2585,6 +2585,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sparkflash-comm",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",

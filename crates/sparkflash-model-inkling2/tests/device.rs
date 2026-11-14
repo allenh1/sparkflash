@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use sparkflash_model::backend::{ModelBackend, ModelSession, Sampling};
+use sparkflash_model::backend::{ModelBackend, Sampling};
 use sparkflash_model_inkling2::config::Inkling2Config;
-use sparkflash_model_inkling2::device::{InklingDeviceBackend, DEVICE};
+use sparkflash_model_inkling2::device::InklingDeviceBackend;
 use sparkflash_model_inkling2::fixture::tiny_source;
 use sparkflash_model_inkling2::host::Inkling2HostBackend;
 
@@ -127,6 +127,16 @@ fn compare(what: &str, host: &[f32], device: &[f32]) {
          difference {difference:.5} of {scale:.4}",
         host[host_best], device[device_best]
     );
+    // The head of the row, on the way to a failure: a scale, a permutation and a rounding are
+    // told apart in three numbers.
+    if device_best != host_best || difference > RELATIVE_TOLERANCE * scale {
+        for index in 0..host.len().min(6) {
+            eprintln!(
+                "{what}: [{index}] host {:.5} device {:.5}",
+                host[index], device[index]
+            );
+        }
+    }
     assert_eq!(
         device_best, host_best,
         "{what}: the device chose {device_best} and the host {host_best}"
@@ -166,3 +176,100 @@ fn the_device_arm_refuses_a_context_past_the_window() {
     assert_eq!(opened.plan().pass(), sparkflash_model_inkling2::device_plan::Pass::Decode);
     assert_eq!(opened.plan().layers().len(), 2);
 }
+
+/// Four ranks of one checkpoint: the converted rank files, four backends and the loopback
+/// exchange, against the same host reference a single rank is checked on.
+///
+/// This is the arm's tensor-parallel path end to end without a cluster: the conversion splits
+/// the checkpoint exactly once, each rank loads only its file, and the three collectives carry
+/// the embedding row, the expert mix and the logits between them.
+#[test]
+fn four_converted_ranks_answer_like_one_rank() {
+    if !backend_available() {
+        return;
+    }
+    // The four-expert fixture: every axis a four-rank plan shards divides four.
+    let config = Inkling2Config::tiny_world();
+    let source = tiny_source(&config);
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let mut paths = Vec::new();
+    for rank in 0..4usize {
+        let layout = sparkflash_weights::tp::TpLayout {
+            rank,
+            world_size: 4,
+        };
+        let written = sparkflash_model_inkling2::convert::convert_rank(
+            &source,
+            &config,
+            layout,
+            directory.path(),
+            "tiny",
+        )
+        .expect("the rank file is written");
+        paths.push(written.path);
+    }
+
+    let reference = {
+        let host = Inkling2HostBackend::open(
+            sparkflash_model_inkling2::descriptor(),
+            config.clone(),
+            Arc::new(tiny_source(&config)) as Arc<dyn sparkflash_weights::WeightSource>,
+            16,
+        )
+        .expect("the host reference opens");
+        let mut session = host.open_session().expect("a host session");
+        session.set_sampling(greedy());
+        session.prefill(&[3, 7, 11]).expect("the host prompt")
+    };
+
+    let base_port = 29_623u16;
+    let prompt = [3u32, 7, 11];
+    let mut handles = Vec::new();
+    for (rank, path) in paths.into_iter().enumerate() {
+        let config = config.clone();
+        handles.push(std::thread::spawn(move || -> Result<Vec<f32>, String> {
+            let layout = sparkflash_weights::tp::TpLayout {
+                rank,
+                world_size: 4,
+            };
+            let source = sparkflash_model_inkling2::convert::RankFileSource::open(
+                &path, &config, layout,
+            )?;
+            let exchange = sparkflash_model_inkling2::collective::TcpExchange::connect(
+                &sparkflash_comm::tcp::TcpConfig::loopback4(rank, base_port),
+            )?;
+            let tp = sparkflash_model::TpPlan::new(4, rank).map_err(|error| error.detail)?;
+            let backend = InklingDeviceBackend::open_rank(
+                sparkflash_model_inkling2::descriptor(),
+                config,
+                Arc::new(source) as Arc<dyn sparkflash_weights::WeightSource>,
+                16,
+                tp,
+                Box::new(exchange),
+            )?;
+            let mut session = backend
+                .open_session()
+                .map_err(|error| error.message().to_owned())?;
+            session.set_sampling(greedy());
+            let output = session
+                .prefill(&prompt)
+                .map_err(|error| error.message().to_owned())?;
+            Ok(output.logits)
+        }));
+    }
+    let mut achieved = Vec::new();
+    let mut failures = Vec::new();
+    for (rank, handle) in handles.into_iter().enumerate() {
+        match handle.join().expect("the rank thread") {
+            Ok(logits) => achieved.push((rank, logits)),
+            Err(error) => failures.push(format!("rank {rank}: {error}")),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    // Every rank gathered the same row, so all four hold the reference's vocabulary.
+    for (rank, logits) in &achieved {
+        assert_eq!(logits.len(), reference.logits.len(), "rank {rank} width");
+        compare(&format!("tp4/rank{rank}"), &reference.logits, logits);
+    }
+}
+
