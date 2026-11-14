@@ -622,3 +622,47 @@ released-config `engine_plan` test at TP=1 and TP=4. Capture the new profile's a
   reference and vLLM before writing the kernel.
 * **1M memory.** 11 GiB of headroom is enough for the weights and KV, not necessarily for a
   naive 1M prefill. Chunk attention and measure.
+
+## 12. Independent arithmetic check: the forward is right, the completions are the model
+
+The defects in §10 were found by reading the release's `modeling_inkling2.py` against ours,
+which cannot rule out a defect both share in *spirit* — a misread sign, a transposed weight, an
+off-by-one in the tap order. So an independent numpy implementation was written from the HF
+source alone (bf16/f32/NVFP4/MXFP8 read straight from the 24 shards, no torch, no SparkFlash
+code) and the two residual streams were compared at every layer.
+
+**Result: all 48 layers agree.** With one five-token prompt, 1 decode step, no cache:
+
+| layer | numpy `x0, x1` | host forward `x0, x1` | `Δrms` |
+|---|---|---|---|
+| 0 | 0.176000, −0.022951 | 0.17600, −0.02295 | 0.0000 % |
+| 5 | −0.33718, 1.1805 | −0.33720, 1.1805 | 0.0000 % |
+| 24 | 0.11153, 0.40054 | 0.11153, 0.40055 | 0.0000 % |
+| 40 | 0.95748, 0.28299 | 0.95724, 0.28299 | 0.0000 % |
+| 47 | −0.64874, −0.62371 | −0.64883, −0.62371 | 0.0000 % |
+
+Across all 48 layers the largest stream discrepancy is `0.270 %` (layer 29), the largest
+`Δrms` `0.0023 %` (layer 42), and the median `Δrms` `0.0003 %`. The ends match as well:
+`final_input` `0.696008, −0.16553` against `0.69601, −0.16560`, `final_norm`
+`4.92836, −1.68709` against `4.92838, −1.68777`, and `raw_logits[0]` `20.3493` against
+`20.34900`. The numpy reference's top-8 at the last position is
+`220 (28.485)`, `151451 (27.925)`, `149876 (27.375)`, `149884 (26.902)`, `149878 (26.781)`,
+`149935 (26.663)`, `11 (26.509)`, `150386 (26.476)` — token 220 first, which is exactly what
+the host forward and the four-rank device arm both pick.
+
+So the host forward, the kernels and the TP4 device arm are computing the released model. What
+is left is **the model's own behaviour on raw text**: it is a chat-trained preview and greedy
+continuation of `"The capital of France is"` really is `" of"` (`" Paris"` is not first). That is
+not a defect in this arm, but it does mean "the completion looks right" is not a usable end-to-end
+oracle — the oracle is the two-way trace, and it now has an independent leg.
+
+Two habits this check produced:
+
+* A trace line that is printed *before* the operation it appears to measure (here `embed_row`
+  prints the raw row, then normalises) reads as a bug and is not one. Print the value you mean.
+* A reference that reports a 10–40 % divergence at layer 1 and an exact match at layer 0 is
+  usually wrong in the *reference*: layer 0 matched because its attention output was compared
+  before the block-residual path ran. Compare the last stage first, then bisect backwards.
+
+The numpy implementation lives at `/home/allenh1/inkling-bin/hf_reference.py` on the cluster, with
+the clean trace at `pyref_trace.log`; it runs in about 500 s for one 48-layer forward.
