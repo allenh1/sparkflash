@@ -791,13 +791,6 @@ fn rms_norm_in_place(input: &mut [f32], epsilon: f64) {
     }
 }
 
-fn clip_l2(input: &mut [f32], threshold: f32) {
-    let norm = input.iter().map(|value| value * value).sum::<f32>().sqrt();
-    let scale = (threshold / (norm + 1e-6)).min(1.0);
-    for value in input {
-        *value *= scale;
-    }
-}
 
 fn block_residual(
     partial: &[f32],

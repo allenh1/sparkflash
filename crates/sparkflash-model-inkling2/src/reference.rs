@@ -178,7 +178,7 @@ pub fn attention(
             let weight = *score / denominator;
             let mut normalised = Vec::new();
             let value = if value_norm {
-                normalised = values[slot][kv_head * head_dim..(kv_head + 1) * head_dim].to_vec();
+                normalised.extend_from_slice(&values[slot][kv_head * head_dim..(kv_head + 1) * head_dim]);
                 rms_norm_in_place(&mut normalised, eps);
                 &normalised
             } else {
@@ -275,6 +275,7 @@ pub fn short_conv_dynamic(
                 if row < tap {
                     continue;
                 }
+                // Distance `tap` back is conv1d index kernel - 1 - tap in both tables.
                 let index = kernel - 1 - tap;
                 let weight = static_taps[index * channels + channel]
                     + dynamic_taps[(row * heads + head) * kernel + index];
@@ -298,7 +299,6 @@ pub fn short_conv_dynamic_decode(
 ) -> Vec<f32> {
     let scale = 1.0 / ((2 * kernel + 1) as f32).sqrt();
     let history = kernel - 1;
-    let heads = channels / head_dim;
     let mut out = vec![0f32; channels];
     for channel in 0..channels {
         let head = channel / head_dim;

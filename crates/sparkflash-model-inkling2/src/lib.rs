@@ -22,6 +22,7 @@ pub mod host;
 pub mod prompt;
 pub mod reference;
 pub mod tensor;
+pub mod vision;
 
 pub use architecture::{architecture_from_config, architecture_from_json};
 pub use config::{
@@ -37,6 +38,7 @@ pub use convert::{
     verify_rank, visit_rank,
 };
 pub use tensor::{InklingTensorPlan, Role, Slice};
+pub use vision::{InklingVision, MAX_MERGED_TOKENS, patch_values, plan_grid};
 
 use sparkflash_model::ModelDescriptor;
 

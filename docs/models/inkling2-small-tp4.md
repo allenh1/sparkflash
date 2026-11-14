@@ -312,6 +312,20 @@ canonical for shared parts.
   decode path was right, so prefill and decode disagreed); and the softcapped SwiGLU dropped
   the cap that multiplies back after the tanh.
 
+* **Vision (host reference).** `inkling2::vision` loads the released `model.visual` tensors and
+  encodes a canvas to image tokens: patch-20 embedding, the class token, the learned 32x32
+  position grid bilinearly resampled to the patch grid, 23 pre-norm blocks with layer scale,
+  axial 2-D RoPE (a head's first half turns with the patch row and its second half with its
+  column), the 2x2 merger and the two-layer adapter. `plan_grid` enforces the released
+  40..4,096-pixel range and the patch-times-merge cell. Tests pin the merged token count, that
+  the class token reaches the output, that a patch one row down produces different tokens (the
+  row angle is live), determinism and the 4,096-token cap.
+
+  The release ships no modelling code, so the choices a config cannot express — GELU's tanh
+  approximation, pre-norm order, the merger's patch order, rope base 10,000 — are stated in the
+  module. Nothing serves images yet: `ModelSession` has no image input, so the tower is an
+  oracle and a loader until the request path carries images.
+
 * **Converted weights.** `sparkflash convert --checkpoint DIR --tp-world-size 4` writes four
   rank files; `--inspect FILE --verify-weights` checks every slot digest;
   `SPARKFLASH_INKLING_CONVERTED_DIR` makes `serve` read a staged rank file instead of the
