@@ -666,3 +666,20 @@ Two habits this check produced:
 
 The numpy implementation lives at `/home/allenh1/inkling-bin/hf_reference.py` on the cluster, with
 the clean trace at `pyref_trace.log`; it runs in about 500 s for one 48-layer forward.
+
+## 13. The converted artefacts, pinned
+
+The four rank files the arm ships and loads, as they stand after the head-axis split
+(97,484,103,680 bytes each, 1,420 weights per rank):
+
+| rank | bytes | sha256 |
+|---|---|---|
+| 0 | 97,484,103,680 | `d62c2d1b716ea89831b106caaf5ed254798df0f96b53c813b2f111467e6578c4` |
+| 1 | 97,484,103,680 | `6ed4c11f022cf3396ffae78fb0180176e679e3e8313e10ee10a4bb909cd1f828` |
+| 2 | 97,484,103,680 | `7c7a7c971f4dfcd4bd727b527c62c071b2ba398619906b1e12b94d9021b09b28` |
+| 3 | 97,484,103,680 | `21b950f03853ebf2bf4efe8432980a4702595d73b4778561b880c838c055211d` |
+
+Hash a file before a run and compare, not after: a rank file that predates a sharding fix still
+loads, because the loader checks each slot's byte width against the plan and only the tensors
+whose axis rule changed were resized — the rest of the file is simply the wrong arithmetic, which
+no load-time check can see. Two of this arm's four worst hours came from that shape of mistake.
