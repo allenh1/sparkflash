@@ -683,3 +683,27 @@ Hash a file before a run and compare, not after: a rank file that predates a sha
 loads, because the loader checks each slot's byte width against the plan and only the tensors
 whose axis rule changed were resized — the rest of the file is simply the wrong arithmetic, which
 no load-time check can see. Two of this arm's four worst hours came from that shape of mistake.
+
+## 14. What the serve wiring still needs
+
+The arm runs two ways today and they do not meet. `inkling-tp4` (one rank of a four-host run,
+`Tp4Run::execute`) is a batch command: prompt in, tokens out, exit. `serve` does reach Inkling
+models, but only through `serve_inkling_host` (`serve/dynamic.rs:491,516`), which is the TP1 f32
+host reference in `RankFileSource::open` + `Inkling2HostBackend::open` — correct arithmetic at a
+speed that is fine for a trace and useless for a server.
+
+Closing the gap means taking the three things `inkling-tp4` already does and moving them behind
+`ServeOptions`:
+
+1. **Rank identity.** `--wp-rank`/`--peer`/`--wp-world` are declared only under
+   `#[cfg(feature = "tp4-serve")]` and are named for the DeepSeek arm. Inkling needs the same
+   three values, so either reuse them (and stop gating on the feature) or add a family-neutral
+   `--rank`/`--world`/`--peer` group that both TP4 arms read.
+2. **The execute loop.** `Tp4Run::execute` takes a whole prompt and a decode count. A server
+   needs prefill, then one `execute` per accepted token with the KV untouched, plus the frame
+   timeouts left at 900 s so a slow rank is a stall and not a disconnect.
+3. **The codec.** `InklingCodec` is already registered (`serve/dynamic.rs:295`), so tokenisation,
+   chat rendering and the stop tokens are not the problem; only the backend selection is.
+
+The honest ordering is (1) then (2): a server that can hold the four ranks open and stream one
+token at a time is the whole feature, and prefill chunking is an optimisation on top of it.
