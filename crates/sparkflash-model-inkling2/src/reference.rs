@@ -253,7 +253,10 @@ pub fn short_conv_decode(
 /// The dynamic short convolution over several rows.
 ///
 /// `static_taps` is `[kernel, channels]` and `dynamic_taps` is `[rows, heads, kernel]`, both in
-/// conv1d order; the scale is `1 / sqrt(2 * kernel + 1)`.
+/// the released *backward-distance* order - index 0 weights the current token - and the result is
+/// `(conv + x) / sqrt(2 * kernel + 1)`, the input added back before the scale (the release's
+/// dynamic convolution is a residual convolution, unlike the static one, which is the same shape
+/// `(conv + x) / sqrt(kernel + 1)`).
 #[must_use]
 pub fn short_conv_dynamic(
     x: &[f32],
@@ -275,13 +278,13 @@ pub fn short_conv_dynamic(
                 if row < tap {
                     continue;
                 }
-                // Distance `tap` back is conv1d index kernel - 1 - tap in both tables.
-                let index = kernel - 1 - tap;
-                let weight = static_taps[index * channels + channel]
-                    + dynamic_taps[(row * heads + head) * kernel + index];
+                // Both tables are indexed by distance back, so index 0 weights the current token.
+                let weight = static_taps[tap * channels + channel]
+                    + dynamic_taps[(row * heads + head) * kernel + tap];
                 convolution += weight * x[(row - tap) * channels + channel];
             }
-            out[row * channels + channel] = convolution * scale;
+            out[row * channels + channel] =
+                (convolution + x[row * channels + channel]) * scale;
         }
     }
     out
@@ -304,14 +307,14 @@ pub fn short_conv_dynamic_decode(
         let head = channel / head_dim;
         let current = x[channel];
         let mut convolution = 0.0f32;
-        for tap in 0..history {
-            let weight = static_taps[tap * channels + channel]
-                + dynamic_taps[head * kernel + tap];
-            convolution += weight * state[channel * history + tap];
+        // The history is oldest first and the taps count backwards, so lag 1 - the token before
+        // this one - is the newest stored row.
+        for lag in 1..kernel {
+            let weight = static_taps[lag * channels + channel] + dynamic_taps[head * kernel + lag];
+            convolution += weight * state[channel * history + (history - lag)];
         }
-        let last = static_taps[history * channels + channel] + dynamic_taps[head * kernel + history];
-        convolution += last * current;
-        out[channel] = convolution * scale;
+        convolution += (static_taps[channel] + dynamic_taps[head * kernel]) * current;
+        out[channel] = (convolution + current) * scale;
         for tap in 0..history.saturating_sub(1) {
             state[channel * history + tap] = state[channel * history + tap + 1];
         }

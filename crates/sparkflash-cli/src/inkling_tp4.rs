@@ -43,6 +43,7 @@ struct Args {
     decode: usize,
     tokenizer: Option<PathBuf>,
     text: Option<String>,
+    chat: bool,
 }
 
 impl Args {
@@ -56,6 +57,7 @@ impl Args {
         let mut prompt = None;
         let mut tokenizer = None;
         let mut text = None;
+        let mut chat = false;
         let mut decode = 8usize;
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
@@ -78,6 +80,7 @@ impl Args {
                         .parse::<usize>()
                         .map_err(|error| format!("--decode: {error}"))?;
                 }
+                "--chat" => chat = true,
                 "--tokenizer" => tokenizer = Some(PathBuf::from(value()?)),
                 "--text" => text = Some(value()?),
                 "--prompt" => {
@@ -124,6 +127,7 @@ impl Args {
             decode,
             tokenizer,
             text,
+            chat,
         })
     }
 }
@@ -165,10 +169,22 @@ fn execute(args: &Args) -> Result<(), String> {
     // prompt is resolved before the rank opens anything.
     let prompt = match (&args.text, &codec) {
         (Some(text), Some(codec)) => {
+            // A chat model answers an instruction only through its own template; a bare sentence
+            // continues as a document and a greedy decode degenerates, which reads like a kernel
+            // bug and is not one.
+            let rendered = if args.chat {
+                let request = serde_json::json!({
+                    "messages": [{"role": "user", "content": text}],
+                });
+                sparkflash_model_inkling2::InklingCodec::render_chat(&request)
+                    .map_err(|error| format!("--chat: {error}"))?
+            } else {
+                text.clone()
+            };
             let ids = codec
-                .encode_text(text, true)
+                .encode_text(&rendered, true)
                 .map_err(|error| format!("--text: {error}"))?;
-            println!("inkling-tp4: prompt {:?} from {:?}", ids, text);
+            println!("inkling-tp4: prompt {:?} from {:?}", ids, rendered);
             ids
         }
         _ => args.prompt.clone(),

@@ -164,8 +164,9 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     }
 }
 
-// The dynamic multi-row convolution: the effective tap is static[c][t] + dynamic[r][head][t],
-// head = c / head_dim, and out = conv / sqrt(2 * kernel + 1).
+// The dynamic multi-row convolution: the effective tap is static[t][c] + dynamic[r][head][t],
+// head = c / head_dim, t is the distance back (index 0 weights the current token), and
+// out = (conv + x) / sqrt(2 * kernel + 1) - a residual convolution, like the static one.
 extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_dynamic(
     const float* __restrict__ x,
     const __nv_bfloat16* __restrict__ static_taps,
@@ -196,17 +197,19 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
             if (source_row < 0) {
                 continue;
             }
-            // Both tap tables are in conv1d index order, so index k covers distance
-            // kernel - 1 - k: static_w is [kernel, channels] and the projection's rows are
-            // [heads, kernel] in that same order.
-            const int k = kernel - 1 - tap;
+            // Both tap tables count the distance back, so index tap is the sample tap steps ago:
+            // static_w is [kernel, channels] and the projection's rows are [heads, kernel].
             const float weight =
-                __fadd_rn(__bfloat162float(static_taps[(uint64_t)k * channels + channel]),
-                          dynamic_taps[((uint64_t)row * heads + head) * kernel + k]);
+                __fadd_rn(__bfloat162float(static_taps[(uint64_t)tap * channels + channel]),
+                          dynamic_taps[((uint64_t)row * heads + head) * kernel + tap]);
             convolution = __fadd_rn(
                 convolution, __fmul_rn(weight, x[(uint64_t)source_row * channels + channel]));
         }
-        out[(uint64_t)row * channels + channel] = __fmul_rn(convolution, scale);
+        // The input comes back before the scale: the release's dynamic convolution is a residual
+        // convolution.
+        const float residual = x[(uint64_t)row * channels + channel];
+        out[(uint64_t)row * channels + channel] =
+            __fmul_rn(__fadd_rn(convolution, residual), scale);
     }
 }
 
@@ -234,21 +237,20 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
         }
         const float current = x[channel];
         float convolution = 0.0f;
-        for (int tap = 0; tap < history; ++tap) {
-            // state[tap] is the sample at distance history - tap, whose conv1d index is
-            // kernel - 1 - (history - tap) = tap. So both tables are read at tap, and
-            // static_w is [kernel, channels].
+        // The history is oldest first and the taps count backwards, so lag 1 - the sample before
+        // this one - is the newest stored row.
+        for (int lag = 1; lag < kernel; ++lag) {
             const float weight =
-                __fadd_rn(__bfloat162float(static_taps[(uint64_t)tap * channels + channel]),
-                          dynamic_taps[(uint64_t)head * kernel + tap]);
+                __fadd_rn(__bfloat162float(static_taps[(uint64_t)lag * channels + channel]),
+                          dynamic_taps[(uint64_t)head * kernel + lag]);
             convolution = __fadd_rn(
-                convolution, __fmul_rn(weight, state[(uint64_t)channel * history + tap]));
+                convolution,
+                __fmul_rn(weight, state[(uint64_t)channel * history + (history - lag)]));
         }
-        const float last_weight =
-            __fadd_rn(__bfloat162float(static_taps[(uint64_t)history * channels + channel]),
-                      dynamic_taps[(uint64_t)head * kernel + history]);
-        convolution = __fadd_rn(convolution, __fmul_rn(last_weight, current));
-        out[channel] = __fmul_rn(convolution, scale);
+        const float current_weight =
+            __fadd_rn(__bfloat162float(static_taps[channel]), dynamic_taps[(uint64_t)head * kernel]);
+        convolution = __fadd_rn(convolution, __fmul_rn(current_weight, current));
+        out[channel] = __fmul_rn(__fadd_rn(convolution, current), scale);
         for (int tap = 0; tap + 1 < history; ++tap) {
             state[(uint64_t)channel * history + tap] =
                 state[(uint64_t)channel * history + tap + 1];

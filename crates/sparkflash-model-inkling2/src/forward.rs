@@ -448,7 +448,10 @@ impl Inkling2Weights {
 
         let (q_input, k_input, v_input) = if sliding {
             let norm = self.vector(&format!("{prefix}.attn_norm.weight"))?;
-            let x = rms_norm(&hidden, Some(&norm), config.architecture.norm_epsilon);
+            // The block-attention residual is read on a sliding layer too: `attention_input` is the
+            // softmax mix over the summary stack, and it is the layer's attention input, not the
+            // raw stream. At layer 0 the two coincide because there is no stack yet.
+            let x = rms_norm(&attention_input[0], Some(&norm), config.architecture.norm_epsilon);
             (x.clone(), x.clone(), x)
         } else {
             let qn = self.vector(&format!("{prefix}.q_input_norm.weight"))?;
