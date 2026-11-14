@@ -717,7 +717,7 @@ broadcasts before each step, and the worker mirror. The control frames and the h
 `sparkflash-comm::control`, where the DeepSeek host group reads them too. Both moves were
 forced by the CLI's source-line ratchet (`sparkflash-ops/tests/one_stack.rs`, 34,000 lines):
 the CLI was already at 34,245 before this work, and the server would have taken it to 35,274. It is
-33,961 now, which is under the gate and not a licence to grow.
+33,964 now, which is under the gate and not a licence to grow.
 
 A group that names no `--context` admits 256K, not the released 1M window: every rank allocates
 its KV at the admitted context, and 1M is 8 GiB a rank. `--context` still reaches 1,048,576.
