@@ -24,7 +24,7 @@ description = "DeepSeek-V4.1-Flash's device forward, out of sparkflash-cli"
 [features]
 default = []
 cuda = ["sparkflash-device/cuda"]
-rdma = ["sparkflash-comm/rdma"]
+rdma = ["sparkflash-comm/rdma", "sparkflash-kernels/rdma"]
 
 [dependencies]
 sparkflash-api = { workspace = true }

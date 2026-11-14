@@ -950,13 +950,7 @@ impl VisionCodec for QwenVisionCodec {
             sparkflash_vision::decode::decode_with_alpha(bytes, &limits, AlphaPolicy::Drop)
                 .map_err(|error| VisionError::new(error.to_string()))?;
         if let Some(long_side) = options.max_long_side {
-            let longest = image.width.max(image.height);
-            if longest > long_side as usize {
-                let scale = long_side as f64 / longest as f64;
-                let width = ((image.width as f64 * scale).round() as usize).max(1);
-                let height = ((image.height as f64 * scale).round() as usize).max(1);
-                image = sparkflash_vision::resize_bicubic(&image, width, height);
-            }
+            image = sparkflash_vision::shrink_long_side(&image, long_side as usize);
         }
         let (height, width) = smart_resize(
             image.height,

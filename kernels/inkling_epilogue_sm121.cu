@@ -42,7 +42,8 @@
 // ABI:
 //
 //   inkling_softcapped_swiglu(gate_up, out, width, gate_cap, up_cap)
-//     gate_up  [rows][2 * width] f32, gate row first then up
+//     gate_up  [rows][2 * width] f32 in the checkpoint's w13 order: gate and up interleaved,
+//              element 2c the gate of column c and 2c + 1 its up
 //     out      [rows][width] f32
 //
 //   inkling_logit_softcap(logits, out, rows, padded_vocab, unpadded_vocab, cap)
@@ -83,7 +84,8 @@
 //     The three expert formats differ only in where their per-expert factor comes from, so the
 //     mix is one body: the arm hands it the router weight times whatever scale the format stores
 //     on the expert, and the sum is the layer's MLP output. It is a plain sum of scaled rows, in
-//     slot order, so the host's sequential f32 sum and this kernel agree to the last bit.
+//     slot order, so the host's sequential f32 sum and this kernel agree to the last bit. A slot
+//     with a zero share (another rank's expert) is skipped rather than multiplied by zero.
 
 #include <cstdint>
 
@@ -91,25 +93,11 @@
 #include <cuda_runtime.h>
 
 #include "m4_common_sm121.cuh"
+// inkling_tanh, inkling_sigmoid and the softcapped SwiGLU expression, shared with the grouped
+// MMA's gate_up epilogue (q4p_moe_gate_up_capped).
+#include "inkling_softcap_sm121.cuh"
 
 #define INKLING_EPI_BLOCK 256
-
-// tanh through exp, so the epilogue depends only on expf and the same expression is available
-// to the clang syntax probe's stub. Saturating the input keeps the exponent finite.
-__device__ __forceinline__ float inkling_tanh(float value) {
-    if (value > 20.0f) {
-        return 1.0f;
-    }
-    if (value < -20.0f) {
-        return -1.0f;
-    }
-    const float exponential = expf(2.0f * value);
-    return __fdiv_rn(__fadd_rn(exponential, -1.0f), __fadd_rn(exponential, 1.0f));
-}
-
-__device__ __forceinline__ float inkling_sigmoid(float value) {
-    return __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-value)));
-}
 
 extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapped_swiglu(
     const float* __restrict__ gate_up,
@@ -123,14 +111,8 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapp
         return;
     }
     const float* source = gate_up + (uint64_t)row * 2 * width;
-    const float gate = source[column];
-    const float up = source[width + column];
-    // softcap(x) = tanh(x / cap) * cap: the cap multiplies back, or the activation would be
-    // the tanh itself and the branch would lose its scale.
-    const float gated = gate_cap > 0.0f ? inkling_tanh(gate / gate_cap) * gate_cap : gate;
-    const float capped_up = up_cap > 0.0f ? inkling_tanh(up / up_cap) * up_cap : up;
     out[(uint64_t)row * width + column] =
-        __fmul_rn(__fmul_rn(gated, inkling_sigmoid(gate)), capped_up);
+        inkling_softcapped_swiglu_value(source[2 * column], source[2 * column + 1], gate_cap, up_cap);
 }
 
 // The final softcap and the unpadded slice in one pass.
@@ -258,7 +240,13 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
          column += gridDim.x * INKLING_EPI_BLOCK) {
         float value = 0.0f;
         for (int slot = 0; slot < slots; ++slot) {
-            value = __fadd_rn(value, __fmul_rn(shares[slot], band[(uint64_t)slot * width + column]));
+            // A zero share is a slot another rank computed, whose partial here is whatever the
+            // buffer last held: skipping it is the sum with that term's +-0 for any finite stale
+            // value, and keeps a stale non-finite one out of the row.
+            const float share = shares[slot];
+            if (share != 0.0f) {
+                value = __fadd_rn(value, __fmul_rn(share, band[(uint64_t)slot * width + column]));
+            }
         }
         target[column] = value;
     }

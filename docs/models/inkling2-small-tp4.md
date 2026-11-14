@@ -1,9 +1,9 @@
 # Inkling 2 Small on four Sparks (TP4)
 
-Status: **the text backbone runs end to end - TP1 through the f32 host reference, and TP4
-through the device arm on four Sparks - and the device arm now serves HTTP as a four-rank
-group. The DSpark drafter and vision remain the outstanding milestones; chunked prefill and a
-numerics entry for the TP4 configuration are not done.**
+Status: **the device arm serves HTTP as a four-rank group on four Sparks: text and images,
+chunked tensor-core prefill to a million positions, and concurrent requests through fused lanes
+(§15). The DSpark drafter is the outstanding milestone; the numerics entry for the TP4
+configuration is not registered.**
 
 
 This note answers two questions about `thinkingmachines/Inkling-2-Small`:
@@ -285,11 +285,13 @@ canonical for shared parts.
   Markov-head shape, but for DeepSeek's 3-layer/block-5 stage. Inkling's 5-layer draft
   model, `mtp_config.block_size = 8`, `markov_head_type = rnn_hidden`, `dflare_norm`,
   `k_proj_ctx`/`v_proj_ctx` and `markov_head.rnn_proj`/`markov_w1` need a device
-  drafter and a `DraftDevice`. It can be deferred; the backbone serves without it.
-* **Vision:** the 23-layer ViT and merger can be deferred for a text-only bring-up. It is
-  only 0.655 GB, but the patch-20 tower and the image-token path are a separate kernel and
-  preprocessing project. The dynamic host ignores vision; a device arm must not claim it
-  until it runs.
+  drafter and a `DraftDevice`. It can be deferred; the backbone serves without it. The forward
+  it has to reproduce (the taps are each block's in-progress residual partial and the final
+  norm's output, not post-layer hidden states; the `rnn_hidden` head corrects the hidden before
+  the shared lm_head) is [inkling2-small-drafter.md](inkling2-small-drafter.md); no Thinking
+  Machines paper describes it, and SGLang's implementation is the source.
+* **Vision:** done (§15, "Images"): the patch-20 tower runs on rank 0's device and the image
+  rows reach every rank through the group's sum.
 
 ### 7. What runs today
 
@@ -350,10 +352,10 @@ canonical for shared parts.
 
   | rank | file bytes | weights | header hash | file digest | `--inspect --verify-weights` |
   | ---: | ---: | ---: | :-- | :-- | :-- |
-  | 0 | 97,488,232,448 | 1,420 | `0x1f53298aa68134af` | `0x30fd86d74b3a4f84` | ok on sg1-jackson |
-  | 1 | 97,488,232,448 | 1,420 | `0x04cc72543b1ad22a` | `0xa0f3013070d457d5` | ok on sg1-teilc |
-  | 2 | 97,488,232,448 | 1,420 | `0x4d85e9f6f93b16ea` | `0xbe02d64ab0dec264` | ok on sg1-carter |
-  | 3 | 97,488,232,448 | 1,420 | `0x8b743f3f1ddcc102` | `0x2de0634eee1e41ca` | ok on sg1-oneill |
+  | 0 | 97,488,232,448 | 1,420 | `0x1f53298aa68134af` | `0x30fd86d74b3a4f84` | ok on node1 |
+  | 1 | 97,488,232,448 | 1,420 | `0x04cc72543b1ad22a` | `0xa0f3013070d457d5` | ok on node2 |
+  | 2 | 97,488,232,448 | 1,420 | `0x4d85e9f6f93b16ea` | `0xbe02d64ab0dec264` | ok on node3 |
+  | 3 | 97,488,232,448 | 1,420 | `0x8b743f3f1ddcc102` | `0x2de0634eee1e41ca` | ok on node0 |
 
   Each rank took 872-952 s to write and verify against the checkpoint on the converting node
   (399 GB of files, 381 GB of payload). Every file was then copied to a different node and
@@ -626,6 +628,11 @@ released-config `engine_plan` test at TP=1 and TP=4. Capture the new profile's a
 
 ## 12. Independent arithmetic check: the forward is right, the completions are the model
 
+> **Superseded by §15.** Both legs of this check read `w13` as a gate half followed by an up
+> half; the checkpoint interleaves them row by row. The agreement below is real - two
+> implementations of the same misreading - and so is the conclusion's error: the looping
+> completions were the defect, not the model.
+
 The defects in §10 were found by reading the release's `modeling_inkling2.py` against ours,
 which cannot rule out a defect both share in *spirit* — a misread sign, a transposed weight, an
 off-by-one in the tap order. So an independent numpy implementation was written from the HF
@@ -665,7 +672,7 @@ Two habits this check produced:
   usually wrong in the *reference*: layer 0 matched because its attention output was compared
   before the block-residual path ran. Compare the last stage first, then bisect backwards.
 
-The numpy implementation lives at `/home/allenh1/inkling-bin/hf_reference.py` on the cluster, with
+The numpy implementation lives at `~/inkling-bin/hf_reference.py` on node0, with
 the clean trace at `pyref_trace.log`; it runs in about 500 s for one 48-layer forward.
 
 ## 13. The converted artefacts, pinned
@@ -774,8 +781,9 @@ decode schedule with five entries swapped for row forms: `inkling_attn_decode` �
 `inkling_short_conv` (a `lead` of stored history rows), `inkling_short_conv_dynamic_decode` →
 `inkling_short_conv_dynamic`, `q4e_rmsnorm` → `q4e_rmsnorm_rows`, and `inkling_kv_store`
 writes the chunk's positions and lets the sliding layers' ring wrap each of them.
-`SPARKFLASH_INKLING_PREFILL` selects the walk: `chunk` (the default), `rows` (the
-token-at-a-time one) or `gemm` (the reordered tiled projection, below).
+`SPARKFLASH_INKLING_PREFILL` selects the walk: `tensor` (the default since D117, §15), `chunk`
+(the walk this section describes, with the decode step's bits), `rows` (the token-at-a-time one)
+or `gemm` (the reordered tiled projection, below).
 
 **The gate is the two-way trace, not the completion.** With `SPARKFLASH_INKLING_TRACE=1` the
 chunk prints each row's post-layer stream (`[inkling] chunk rank R layer L row N x0=… x1=… rms=…`)
@@ -847,7 +855,9 @@ honest number: 30 tok/s against the row walk's 6.7, which is the batch arm's rat
 socket.
 
 The session's other new cost is the chunk buffer: 128 rows of every scratch buffer, 99,572,416
-bytes measured, of which 21,233,664 are the rows' summary stacks. It is allocated on the first
+bytes measured, of which 21,233,664 are the rows' summary stacks. (Since §15 the buffer is sized
+to the prompt's first chunk - the next power of two, at least 128 rows - and grows on demand up
+to the widest chunk, so a short prompt still pays the 128-row figure.) It is allocated on the first
 prefill and released with the session (`Drop for InklingDeviceSession`, which also gives back the
 cache, the four convolution histories and the summary stack). A served request ends by dropping
 its session, so that release is what keeps a long window servable across requests rather than
@@ -877,7 +887,187 @@ worker-to-hub failure frame yet. The launcher used for these runs is
 `scripts/inkling-serve-probe.py` is the client that produced the tables above (`/v1/models` for
 the card, then one streamed request, timing the first chunk against the rest).
 
-And the gate is unchanged: the two-way trace is the oracle, not the completion. The greedy
-continuation of `"The capital of France is"` really is `" of"` — the batch arm, the served arm
-and the independent numpy reference (section 12) all pick token 149879 first — so a server that
-answered "Paris" would be the wrong server.
+(§15 closes the speed, the looping, one request at a time and the image path.)
+
+The two-way trace is still the bit gate, but this section's last claim was wrong: the greedy
+`" of the capital of the capital"` was the `w13` misreading that §12's reference shared, not the
+model. A completion that loops on a plain prompt is a symptom worth chasing even when two
+implementations agree.
+
+## 15. The looping was `w13`; the prompt runs on tensor cores
+
+### The defect
+
+Every completion degenerated into a loop (`" of the capital of the capital of the capital"`), and
+the independent numpy reference of §12 looped the same way, which read as a model trait. It was
+the weights' row order. The checkpoint's `w13` is `[2 x moe_intermediate][hidden]` with the two
+projections **interleaved row by row** - row `2c` is gate column `c`, row `2c + 1` is up column
+`c` - and the released loader de-interleaves it (`Interleave(dim=1)`) before it chunks the gate
+and up halves. Both of our legs read it as a gate half followed by an up half, so every routed
+expert paired each gate with the wrong up. Nothing failed: the dense path, the router, the shared
+expert and the residual chain were all right, and the experts' contribution was plausible noise,
+which is why the text stayed fluent and only the long-range behaviour broke.
+
+The fix is in the reading, not the conversion: the host forward's softcapped SwiGLU, the decode
+band, the chunk band and the grouped MMA's epilogue all take the interleaved order, and the
+converted rank files are unchanged. The numpy reference with the interleave (`pyref_interleave`)
+and the device arm now agree again, this time on the model's own answer: both put token `152717`
+first for the recorded five ids (28.92 in the reference, 28.875 on four ranks), and the device
+walks generate the same 25 ids under `chunk` and `tensor`.
+
+### The tensor walk (D117)
+
+`SPARKFLASH_INKLING_PREFILL` unset is now `tensor`. It is the chunk walk of §14 with the two
+heavy operations moved onto the tensor cores, reusing the workspace's kernels rather than adding
+an Inkling form:
+
+* **Dense projections** take the shared wide tile, `glm_prefill_bf16_wide` - the body GLM's and
+  Dory's prompt projections take - whenever the projection's width and inner width are whole
+  32-column tiles (`wide_fits`); the rest stay on the batched GEMV.
+* **NVFP4 experts (layers 0-39)** take Qwen's grouped W4A16 MMA as Qwen runs it: `q4p_split_bf16`,
+  the shared `moe_plan`, `q4p_moe_gate_up_capped` (the same kernel with Inkling's softcapped
+  SwiGLU as its epilogue, `inkling_softcap_sm121.cuh`, shared with the decode band) and
+  `q4p_moe_down`, writing the `[slot][hidden]` partials the pair walk writes. The router's choice
+  never leaves the device: `inkling_band_shares` writes the shares and the plan's local ids.
+* **MXFP8 experts (layers 40-47)** stay on the pair walk: no grouped MXFP8 MMA exists in the
+  workspace to reuse, and the eight layers are a small share of the chunk.
+
+Both MMA forms carry each f32 activation as a BF16 head and remainder (16 significant bits) and
+accumulate in f32 in the tile's order, so this is a declared precision change, not a
+reassociation. D117 records the decision and its measurement: on twelve teacher-forced cuts of a
+6,000-token text, tensor against exact agrees on the top-1 token at 11 of 12 cuts, with KL at most
+6.1e-3 nats and a mean absolute logit difference of 0.07-0.50 a cut. `chunk` stays as the
+opt-out with the decode step's bits.
+
+What the tensor walk keeps is chunk-width invariance, bit for bit: an output's sum depends on K
+alone and never on which rows share its tile, so the same cuts at 4,096- and 8,192-row chunks are
+identical in every logit. What it gives up is that a prompt row is the bits a decode step would
+give it, which is why a one-position tail stays a chunk under `tensor` (a prompt's last row would
+otherwise depend on where the chunks fell), and why a continued conversation does not resume on
+the bits of a cold prefill until decode runs on the same forms.
+
+### Chunk widths
+
+`ChunkWidths` cuts a prompt into 4,096-row chunks and widens to 8,192 while at least 16,384
+positions remain; `SPARKFLASH_INKLING_PREFILL_CHUNK=n` fixes the width and turns the boost off.
+The session's chunk buffer is sized to the first chunk (the next power of two, at least 128 rows)
+and grows on demand, so a short prompt does not pay for the widest chunk; at 8,192 rows it is about
+6.4 GB a rank (778 KB a row), which still fits beside 1M of cache (§14's 99.4 GiB).
+
+Four ranks, greedy, batch arm, second pass where two were run:
+
+| prompt | walk | chunk | prefill | prompt tok/s |
+| --- | --- | --- | --- | --- |
+| 4,096 ids | chunk (exact) | 128 / 4,096 | 24.2 / 25.2 s | 163-169 |
+| 4,096 ids | dense on tiles only | 4,096 | 18.4 s | 222 |
+| 4,096 ids | tensor | 4,096 | 9.25 s | 443 |
+| 6,000-token text | chunk (exact) | 4,096 | 33.5 s | 179 |
+| 6,000-token text | tensor | 4,096 / 8,192 | 13.7 / 13.3 s | 438 / 451 |
+| 16,384 ids | tensor | 4,096 | 46.2 s | 355 |
+| 16,384 ids | tensor | 8,192 | 45.7 s | 358 |
+| 16,384 ids | tensor | default (8,192 then 4,096) | 45.8 s | 358 |
+
+The tensor walk is 2.5-2.7x the exact one. The 8,192 boost is worth about 1 % at 16K: past a few
+thousand rows the MMA forms already read each expert's weights once a chunk, so a wider chunk
+saves little, and the 16K prompt's extra time over 4K is attention over the growing context, not
+weights. The boost is kept because it is free in bits and buys a little at long prompts.
+
+Decode, unchanged in arithmetic, is 39-40 ms a step after a five-token prompt, 45 ms after 4K and
+55-58 ms after 16K, against 112-147 ms when §14 was written. Three changes landed in between: the
+collectives moved from the TCP frames onto the device through NCCL (`RunReduce`, the communicator
+GLM's arm opens), the decode attention became the split walk in `inkling_attn_sm121.cu` (key
+scales, parallel scores, then the softmax recurrence alone, with the serial body's bits), and the
+sliding layers' caches became rings of their window plus the widest chunk.
+
+### The doorbell, the grouped GEMV and the two-shot sum
+
+All three reuse DeepSeek's code and none changes a bit: each run below generates the same ids and
+the teacher-forced logits of the 6,000-token text are identical.
+
+* **The doorbell.** With the `rdma` feature, the device leg's rounds of at most 256 KiB go over
+  DeepSeek's direct RDMA write exchange (`sparkflash_kernels::write_exchange`, the GB10
+  doorbell) on the null stream, and wider rounds stay on NCCL. Decode is 37-38 ms a step against
+  NCCL's 39-40. The first run's five-token prefill took 2,097 ms: the ranks finished loading
+  minutes apart and the first exchange round absorbed the skew. A host-leg meeting at the end of
+  `open_rank` now takes it, and the same prefill is 109 ms.
+* **The grouped GEMV.** The narrow projections the tiles do not take ran as 8-row launches on one
+  or two blocks: 8.8 s of GPU time in a 4,096-row prompt. The groups now go on the grid's y axis
+  and take 0.3 s. The chunk walk's 6,000-token text went from 33.5 s to 28.8 s, the tensor walk's
+  to 12.16 s, and a 4,096-id prompt under `tensor` from 9.25 s to 8.2 s.
+* **The two-shot sum.** A wide sum is DeepSeek's pattern: scatter, sum this rank's slice in rank
+  order, then gather the summed slices. It moves half the bytes. The 4,096-id prompt is 7.85 s,
+  522 prompt tok/s.
+
+### Concurrency: fused lanes
+
+`LANES=N` (`--concurrency N --fuse-batch`) serves N requests at once through the workspace's
+`FusedEngine`, the engine Dory and Qwen use. Requests are admitted within a 300 µs window. A prefill
+runs alone, and the decodes due together run as one multi-row step that reads each weight once for
+every lane. Rank 0 broadcasts each lane's prompt (`LaneRequest`) and each fused step's members in
+its own order (`LaneStep`), so every rank steps the same rows in the same order. A lane decodes the
+bits it would decode alone: every request at widths 2 and 4 returns its width-1 text.
+
+| width | aggregate | per request | time to first token |
+| --- | --- | --- | --- |
+| 1 | 23.2 tok/s | 23.9-24.5 tok/s | 0.16-0.20 s |
+| 2 | 29.7 tok/s | 15.2-15.8 tok/s | 0.17-0.35 s |
+| 4 | 39.0 tok/s | 9.9-10.6 tok/s | 0.18-0.64 s |
+
+(Four requests, 64 greedy tokens each; width 1 runs them one after another;
+`scripts/inkling-lanes-probe.py --widths 1,2,4`.) Each lane holds its
+own cache, 8.04 GiB a rank at 1M positions, so `LANES` is paired with a smaller `CONTEXT`: eight
+lanes at 131,072 hold 8 GiB a rank in all.
+
+### Images (D118)
+
+Rank 0 holds the vision tower on its device (653,318,144 bytes, BF16) and encodes every image of a
+request before the prompt runs. The ViT is DeepSeek's geometry (1024 wide, 16 heads of 64), so its
+GEMMs (with their bias, GELU and residual epilogues) and attention are DeepSeek's `opt_vision_sm121`
+kernels, which `kernels/inkling_vision_sm121.cu` includes. That file adds Inkling's four: the
+patch-20 patchify (each patch padded from 1,200 to 1,216 values), the LayerNorm, the interleaved
+axial RoPE and the layer-scaled residual. The class row, the half-pixel resampling of the 32x32
+position grid and the RoPE tables are made on the host by the reference's own functions and copied
+in. The release folds the temporal axis into the stored patch projection (`[1024, 1200]`), so a
+config's `temporal_patch_size` of 2 is a still image's shape and not a refusal.
+
+The image rows reach every rank through the group's own sum: rank 0 writes its rows into a zeroed
+f32 buffer, every other rank contributes zeros, and each rank copies the result over the
+placeholder rows after the embedding norm, inside the chunk walk. A request's images travel in the
+broadcast frame (`Request`, `LaneRequest`) as spans and keys, never pixels. `SpanCheck` refuses,
+on rank 0 before the broadcast and identically on every worker, any span a rank could not prefill:
+a request with images when no tower is loaded, a span whose stride, grid or delimiters are not the
+codec's, one past the prompt's end, overlapping spans, and a stray placeholder outside every span.
+`SPARKFLASH_INKLING_VISION=off` serves text only; any other value than `on` or `off` is refused.
+
+**Bits.** The device tower is held to the f32 host reference
+(`tests/vision.rs::the_device_tower_matches_the_host_reference`: the released width, heads, patch,
+merge and folded temporal patch, two blocks deep): the lowest token cosine is 0.999917 and the
+largest difference 8.5e-3 of a largest magnitude 1.28 (6.6e-3 relative), against the test's floor
+of 0.999 and 2e-2.
+
+**Served** (four ranks, `LANES=4`, `CONTEXT=131072`, synthetic PNGs, greedy, the default reasoning
+effort, so each answer follows a short reasoning turn):
+
+| image | prompt | first token | answer |
+| --- | --- | --- | --- |
+| 400x300, left red, right blue | 122 | 0.92-0.97 s | "The left half is red and the right half is blue." |
+| 256x256 green | 78 | 0.52-0.78 s | "Green" |
+| 320x320 black disc on white | 94 | 0.54-0.55 s | "A solid black circle on a white background." |
+| 320x320 quadrants | 117 | 0.61 s | "Top-left: red; top-right: green; bottom-left: blue; bottom-right: yellow." |
+| 320x240, red bottom 40 rows | 88 | 0.57 s | "a horizontal band along the bottom, covering roughly the bottom fifth" |
+| 240x320, blue right 40 columns | 88 | 0.56 s | "a vertical band along the right edge, covering roughly one-fifth" |
+| 360x240, four 60-row bands | 93 | 0.58 s | "4 horizontal bands. The top band is yellow, and the bottom band is black." |
+| 360x240, six 40-row bands | 86 | 0.55 s | "Five horizontal bands ... starting and ending with yellow" (wrong: six, ending black) |
+| green, then halves (two images) | 169 | 1.02-1.18 s | "First image: green. Second image: red and blue." |
+
+The six-band miss is the model's count, not a lost row: the bottom-strip, right-strip and
+four-band images show that the last cell row and column reach it. Decode runs at 24.6-25.9 tok/s
+behind an image, the text rate. A second turn over the same image ("Which of those two colors is
+warmer?") answers "Red", and the first request sent again returns its first text. Run together,
+two and four image requests each return the text they return alone (width 4: 13.8 s wall,
+28.6 tok/s aggregate). `scripts/inkling-image-probe.py` produced the table (`--geometry` for the
+layout rows); it draws its PNGs in pure Python, so it needs no image library.
+
+`reasoning_effort` cannot turn the reasoning off yet: the shared API parser accepts DeepSeek's
+integer 1-100 and the named levels, so Inkling's `"none"` (and its fractional 0-0.99 scale) is
+refused before the prompt builder sees it.

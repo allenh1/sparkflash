@@ -613,6 +613,7 @@ fn group_from_cli(
         peers,
         control,
         converted,
+        lanes: 1,
     }))
 }
 
@@ -937,9 +938,11 @@ impl ServeOptions {
                         .to_owned(),
                 );
             }
-            if cli.concurrency != 1 {
+            // Fused lanes are the one way a group serves several requests: rank 0 sends each lane's
+            // prompt and every step's members, so the ranks step the same rows in the same order.
+            if cli.concurrency != 1 && !cli.fuse_batch {
                 return Err(
-                    "--concurrency cannot be combined with --rank: the group runs one sequence across every rank, so a second worker would interleave two different token sequences"
+                    "--concurrency cannot be combined with --rank unless --fuse-batch steps the requests as lanes: the group runs one sequence across every rank, so a second worker would interleave two different token sequences"
                         .to_owned(),
                 );
             }
@@ -1045,7 +1048,10 @@ impl ServeOptions {
                 sparkflash_serve::host::DEFAULT_QUEUE
             ));
         }
-        if cli.fuse_batch && !packed {
+        // The Inkling device group fuses its own lanes: rank 0's engine steps every waiting
+        // request's row in one walk and broadcasts each step, so the group takes both knobs.
+        let fused_group = cli.fuse_batch && group.is_some();
+        if cli.fuse_batch && !packed && !fused_group {
             return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
         }
         if cli.fuse_batch && cli.concurrency < 2 {
@@ -1062,7 +1068,7 @@ impl ServeOptions {
         }
         // Dory's latent-recurrence group holds one sequence lane a concurrent request on every
         // rank; one Dory process stays serial.
-        if !packed && cli.concurrency != 1 && cli.recurrence_rank.is_none() {
+        if !packed && cli.concurrency != 1 && cli.recurrence_rank.is_none() && !fused_group {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -1198,6 +1204,7 @@ impl ServeOptions {
             if let Some(pack) = pack {
                 let unapplied = pack.unapplied(
                     in_group,
+                    group.is_some(),
                     cli.concurrency,
                     cli.fuse_batch,
                     cli.kv_budget_gib.is_some(),
@@ -1206,7 +1213,8 @@ impl ServeOptions {
                     return Err(format!(
                         "--model {model} {} does not apply {}; it is refused rather than ignored",
                         if in_group {
-                            "in a tensor-parallel group, which serves one request at a time,"
+                            "in a tensor-parallel group, which serves one request at a time \
+                             unless it is the Inkling device group stepping --fuse-batch lanes,"
                         } else {
                             "at TP=1"
                         },
@@ -1215,6 +1223,13 @@ impl ServeOptions {
                 }
             }
         }
+        // A fused group opens one lane a concurrent request on every rank.
+        let group = group.map(|mut group| {
+            if cli.fuse_batch {
+                group.lanes = cli.concurrency;
+            }
+            group
+        });
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -5438,6 +5453,7 @@ fn run_tp4_request(
         prompt_logprobs: prompt_logprobs_frame,
         speculative: sampling.speculative,
         cached_tokens: cached,
+        images: Vec::new(),
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
@@ -5796,7 +5812,18 @@ fn tp4_worker_loop(
                 prompt_logprobs,
                 speculative,
                 cached_tokens,
+                images,
             }) => {
+                // This group's images travel in DeviceTick admissions; a serial Request that names
+                // spans has no path here, and reading its placeholders as text would answer from a
+                // prompt whose images were dropped.
+                if !images.is_empty() {
+                    return Err(format!(
+                        "a serial Request carried {} image spans; this group admits images only \
+                         through the device scheduler",
+                        images.len()
+                    ));
+                }
                 // Workers do not sample; reset their state with the greedy default. The engine's
                 // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
                 // Whether the request speculates is rank 0's decision, so every rank runs the

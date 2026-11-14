@@ -140,7 +140,6 @@ use std::mem::size_of;
 use crate::nccl::{
     self, CudaStream, NCCL_UNIQUE_ID_BYTES, NcclApi, NcclComm, NcclError, NcclRedOp, NcclUniqueId,
 };
-use crate::transport::Transport;
 
 /// Which transport the layer's cross-rank all-reduce uses.
 ///
@@ -1422,6 +1421,28 @@ pub fn bootstrap_segment(
     words
 }
 
+/// The one collective the bootstrap needs: a synchronous all-gather of equal u16 segments.
+///
+/// Every [crate::transport::Transport] is one (its bf16 all-gather moves words, never sums
+/// them), and a model arm whose host exchange is its own type implements this one method to open
+/// the run's communicator over that exchange instead of a second socket set.
+pub trait WordGather {
+    /// Gather `local` from every rank into `out`, in ascending rank order. `sequence` names the
+    /// collective for a transport whose frames carry one; an exchange that numbers its own frames
+    /// may ignore it.
+    ///
+    /// # Errors
+    /// A length mismatch, a peer that is gone, or a transport timeout.
+    fn gather_words(&self, sequence: u64, local: &[u16], out: &mut [u16]) -> Result<(), String>;
+}
+
+impl<T: crate::transport::Transport + ?Sized> WordGather for T {
+    fn gather_words(&self, sequence: u64, local: &[u16], out: &mut [u16]) -> Result<(), String> {
+        self.all_gather_bf16(local, out, sequence)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// One synchronous all-gather of fixed-width rank segments on the run's own transport.
 ///
 /// Every rank passes the same local segment length and the same sequence; the output is world
@@ -1432,7 +1453,7 @@ pub fn bootstrap_segment(
 /// NcclError::Config for a bad world/rank or an empty segment; NcclError::Bootstrap when the
 /// transport gather fails.
 pub fn bootstrap_exchange(
-    transport: &crate::tcp::TcpTransport,
+    transport: &dyn WordGather,
     world: usize,
     rank: usize,
     sequence: u64,
@@ -1452,7 +1473,7 @@ pub fn bootstrap_exchange(
     })?;
     let mut gathered = vec![0u16; expected];
     transport
-        .all_gather_bf16(local, &mut gathered, sequence)
+        .gather_words(sequence, local, &mut gathered)
         .map_err(|error| {
             NcclError::Bootstrap(format!(
                 "the bootstrap all-gather over the run TCP transport failed: {error}; every rank aborts the run here, before any communicator is opened"
@@ -1594,7 +1615,7 @@ pub fn bootstrap_agreement(gathered: &[u16], world: usize) -> Result<(), NcclErr
 /// NcclError::Bootstrap when the transport gather fails or the agreement words disagree;
 /// NcclError::Config for a bad world/rank or an id supplied by the wrong rank.
 pub fn exchange_unique_id(
-    transport: &crate::tcp::TcpTransport,
+    transport: &dyn WordGather,
     world: usize,
     rank: usize,
     local: Option<NcclUniqueId>,
@@ -1620,7 +1641,7 @@ pub fn exchange_unique_id(
 /// # Errors
 /// NcclError::Bootstrap when the gather fails or a participant reports it did not finish setup.
 pub fn setup_barrier(
-    transport: &crate::tcp::TcpTransport,
+    transport: &dyn WordGather,
     world: usize,
     rank: usize,
 ) -> Result<(), NcclError> {
@@ -1631,6 +1652,58 @@ pub fn setup_barrier(
         )));
     }
     Ok(())
+}
+
+/// Opens the run's NCCL communicator over `transport`: library check, rendezvous, open, warm up,
+/// one sync, one barrier.
+///
+/// This is the whole bootstrap sequence the forward loops share; `sync` is the caller's context
+/// synchronise (this crate has no CUDA dependency), which completes the warm-up collectives before
+/// the barrier. Every rank loads the library first and carries the result into the agreement
+/// gather, so a rank without libnccl refuses all of them before any is inside NCCL; a failure
+/// after the gather (open, warm-up, sync) is rank-local, and the barrier turns it into an all-rank
+/// abort at the transport's deadline. Any error returned here aborts the run on every rank.
+///
+/// # Safety
+/// `scratch` is a writable device address of at least `payload` bf16 values on the current
+/// device, `stream` is valid there, and every rank passes the same `payload`.
+///
+/// # Errors
+/// The gather, the agreement words, the open, the warm-up, `sync` or the barrier.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn open_run_reduce_over(
+    transport: &dyn WordGather,
+    world: usize,
+    rank: usize,
+    stream: u64,
+    scratch: u64,
+    payload: usize,
+    config: BootstrapConfig,
+    sync: &dyn Fn() -> Result<(), NcclError>,
+) -> Result<RunReduce, NcclError> {
+    let library = NcclApi::load();
+    let local = if rank == 0 {
+        match &library {
+            Ok(api) => Some(api.unique_id()?),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let unique = exchange_unique_id(transport, world, rank, local, library.is_ok(), config)?;
+    let handle = RunReduce::open(world, rank, unique)?;
+    // open hands back Box::into_raw(Box::new(RunReduce)); rebuilding the Box and moving the value
+    // out is its exact inverse, so the returned value is the only owner and Drop destroys the
+    // communicator (close(handle) must not be called on it).
+    // SAFETY: the pointer came from RunReduce::open just above and is not null.
+    let mut reduce: RunReduce = unsafe { *Box::from_raw(handle.cast::<RunReduce>()) };
+    // SAFETY: the caller's contract is warm_up's.
+    unsafe {
+        reduce.warm_up(stream, scratch, payload)?;
+    }
+    sync()?;
+    setup_barrier(transport, world, rank)?;
+    Ok(reduce)
 }
 
 /// Borrows the run's communicator from the opaque handle, refusing a null pointer.

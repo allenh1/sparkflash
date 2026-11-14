@@ -248,7 +248,7 @@ impl Inkling2Config {
                 _ => 1.0,
             });
         let block = inkling.block_residual;
-        let quant_config = parse_quant(text, quant, &inkling.layer_expert_formats, num_hidden_layers)?;
+        let quant_config = parse_quant(quant, &inkling.layer_expert_formats, num_hidden_layers)?;
         let vision = parse_vision(root, hidden_size)?;
         let mtp = parse_mtp(root)?;
         Ok(Self {
@@ -425,6 +425,16 @@ impl Inkling2Config {
         self.architecture.max_position_embeddings
     }
 
+    /// The token a step hands back to serve: `chosen`, or `None` when it ends the turn.
+    ///
+    /// The released checkpoint names `<|content_model_end_sampling|>` (200006) as its only
+    /// end-of-generation id, which is what the template appends after a model turn. Without this
+    /// the host driver decodes past the end of the answer and the model opens a new turn.
+    #[must_use]
+    pub fn next_token(&self, chosen: u32) -> Option<u32> {
+        Some(chosen).filter(|token| !self.architecture.tokens.eos_token_ids.contains(token))
+    }
+
     /// The sliding layers' attention kind, or an error for a mis-shaped layer.
     #[must_use]
     pub fn is_sliding(&self, layer: usize) -> bool {
@@ -457,7 +467,6 @@ impl Inkling2Config {
 }
 
 fn parse_quant(
-    text: &Value,
     quant: Option<&Value>,
     formats: &[WeightFormat],
     layers: usize,
@@ -496,12 +505,9 @@ fn parse_quant(
             }
         }))
         .unwrap_or(WeightFormat::Bf16);
-    let dense_format = text
-        .get("torch_dtype")
-        .and_then(Value::as_str)
-        .map_or(WeightFormat::Bf16, |dtype| {
-            if dtype.eq_ignore_ascii_case("bfloat16") { WeightFormat::Bf16 } else { WeightFormat::Bf16 }
-        });
+    // The dense tensors are BF16 in every release; each one's dtype is checked against the plan
+    // on load, so the config's torch_dtype decides nothing here.
+    let dense_format = WeightFormat::Bf16;
     Ok(InklingQuantConfig {
         layer_expert_formats,
         dense_format,

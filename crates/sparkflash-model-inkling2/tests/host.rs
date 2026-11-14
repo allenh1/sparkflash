@@ -29,6 +29,16 @@ use sparkflash_model_inkling2::host::Inkling2HostBackend;
 use sparkflash_model_inkling2::fixture::tiny_source;
 
 #[test]
+fn the_swiglu_reads_gate_and_up_interleaved_as_the_checkpoint_stores_them() {
+    // The released w13 rows alternate gate, up, gate, up: [g0, u0, g1, u1]. With no caps the
+    // activation is gate * sigmoid(gate) * up, so a zero gate or a zero up must zero exactly its
+    // own column, which a halves read ([g0, g1, u0, u1]) would get wrong.
+    let out = sparkflash_model_inkling2::softcapped_swiglu(&[2.0, 3.0, 0.0, 5.0], 2, 0.0, 0.0);
+    let expected = 2.0 * (1.0 / (1.0 + (-2.0f32).exp())) * 3.0;
+    assert_eq!(out, vec![expected, 0.0]);
+}
+
+#[test]
 fn the_tiny_fixture_prefills_and_decodes_through_the_host_backend() {
     let config = Inkling2Config::tiny();
     let source = Arc::new(tiny_source(&config));

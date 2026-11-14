@@ -91,6 +91,11 @@ pub enum Tp4ControlFrame {
         /// different prefix would run different collectives in the same step.
         #[serde(default)]
         cached_tokens: u32,
+        /// The prompt's image spans, in prompt order: every rank writes the images' rows over
+        /// these positions, so every rank must know them. The canvases do not travel; the rank
+        /// that encodes holds them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Tp4DeviceImage>,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {
@@ -119,6 +124,23 @@ pub enum Tp4ControlFrame {
         /// The canvas bytes after the frame.
         bytes: u64,
     },
+    /// Rank 0 -> every worker of a fused group: lane `lane` takes a new request's prompt. A lane
+    /// that still holds an earlier request forgets it first, on every rank alike.
+    LaneRequest {
+        /// The lane, `0..lanes`, in the order rank 0's pool opened them.
+        lane: u32,
+        /// The tokens rank 0 rendered (the chat template is already applied).
+        prompt_ids: Vec<u32>,
+        /// The prompt's image spans, as [Tp4ControlFrame::Request] carries them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Tp4DeviceImage>,
+    },
+    /// Rank 0 -> every worker of a fused group: one step of these lanes, each consuming the token
+    /// rank 0 sampled for it, in this order - the order is the step's row order on every rank.
+    LaneStep {
+        /// `(lane, token)` a member.
+        members: Vec<(u32, u32)>,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -140,6 +162,8 @@ impl Tp4ControlFrame {
             Self::Token { .. } => "Token",
             Self::DeviceTick { .. } => "DeviceTick",
             Self::DevicePixels { .. } => "DevicePixels",
+            Self::LaneRequest { .. } => "LaneRequest",
+            Self::LaneStep { .. } => "LaneStep",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
@@ -190,6 +214,31 @@ pub struct Tp4DeviceImage {
     pub best_width: u32,
     /// The canvas's content key, hex.
     pub key: String,
+}
+
+impl Tp4DeviceImage {
+    /// A content key as the frame's 64 lowercase hex digits.
+    #[must_use]
+    pub fn hex_key(key: &[u8; 32]) -> String {
+        key.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The content key the frame's hex digits spell.
+    ///
+    /// # Errors
+    /// A key that is not 64 hex digits.
+    pub fn key_bytes(&self) -> Result<[u8; 32], String> {
+        let hex = self.key.as_bytes();
+        if hex.len() != 64 {
+            return Err(format!("a key of {} digits, not 64", hex.len()));
+        }
+        let mut key = [0u8; 32];
+        for (byte, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
+            let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| "the key is not hex".to_owned())?;
+        }
+        Ok(key)
+    }
 }
 
 /// A typed control-channel refusal or transport failure.

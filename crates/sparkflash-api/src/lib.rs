@@ -25,6 +25,7 @@ pub mod device_token;
 pub mod engine;
 pub mod error;
 pub mod glm;
+pub mod inkling;
 pub mod loop_abort;
 pub mod metrics;
 pub mod multimodal;

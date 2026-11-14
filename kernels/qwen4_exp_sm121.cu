@@ -373,10 +373,20 @@ extern "C" __global__ void q4e_argmax_slices(const float* __restrict__ logits,
 }
 
 // y = W x, with W in BF16 [rows, columns] and x/y in f32 ([batch, columns] -> [batch, rows]).
+//
+// The grid's y dimension carries independent groups of `batch` tokens: group blockIdx.y reads
+// the activations at token blockIdx.y * batch and writes the outputs there, and nothing else
+// about the walk changes, so every (row, token) sum is the one a launch of that group alone
+// computes. A one-group launch (gridDim.y = 1, every caller before this) is unchanged. It is how
+// a chunk of thousands of tokens runs a projection too narrow for the tensor-core tile (a dozen
+// output rows) as one launch instead of a launch per eight tokens on one or two blocks.
 extern "C" __global__ void q4e_gemv_bf16(const __nv_bfloat16* __restrict__ w,
                                          const float* __restrict__ x, float* __restrict__ y,
                                          int rows, int columns, int batch) {
     OPT_PDL_ENTRY();
+    const unsigned long long group = (unsigned long long)blockIdx.y * (batch > 1 ? batch : 1);
+    x += group * columns;
+    y += group * rows;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;

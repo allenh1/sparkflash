@@ -87,6 +87,43 @@ __device__ __forceinline__ float inkling_moe_row_sum(float value, float* scratch
     return total;
 }
 
+// One NVFP4 row's dot product with x, before the expert's scale_2: every thread walks the columns
+// congruent to its index in order, and the block sums the threads' partials. Both NVFP4 entries
+// below call this one body, so a row's bits do not depend on which entry computed it.
+__device__ __forceinline__ float inkling_nvfp4_row(
+    const unsigned char* __restrict__ row_codes,
+    const unsigned char* __restrict__ row_scales,
+    const float* __restrict__ x,
+    int columns,
+    float* scratch) {
+    float sum = 0.0f;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const unsigned char byte = row_codes[column >> 1];
+        const unsigned char nibble = (column & 1) ? (byte >> 4) : (byte & 0x0F);
+        const float weight = inkling_e2m1(nibble);
+        const float block = inkling_e4m3(row_scales[column >> 4]);
+        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(weight, block), x[column]));
+    }
+    return inkling_moe_row_sum(sum, scratch);
+}
+
+// One MXFP8 row's dot product with x, the MXFP8 entries' shared body.
+__device__ __forceinline__ float inkling_mxfp8_row(
+    const unsigned char* __restrict__ row_codes,
+    const unsigned char* __restrict__ row_scales,
+    const float* __restrict__ x,
+    int columns,
+    int block,
+    float* scratch) {
+    float sum = 0.0f;
+    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
+        const float weight = inkling_e4m3(row_codes[column]);
+        const float scale = inkling_ue8m0(row_scales[column / block]);
+        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(weight, scale), x[column]));
+    }
+    return inkling_moe_row_sum(sum, scratch);
+}
+
 // One expert's NVFP4 matrix-vector product: one block a row, out[row] = scale_2 * (W x).
 extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_expert_matvec(
     const unsigned char* __restrict__ codes,
@@ -116,20 +153,203 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     out += (uint64_t)output_slot * rows;
     const int packed = (columns + 1) / 2;
     const int scale_columns = (columns + 15) / 16;
-    const unsigned char* row_codes = codes + (uint64_t)row * packed;
-    const unsigned char* row_scales = scales + (uint64_t)row * scale_columns;
-    float sum = 0.0f;
-    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
-        const unsigned char byte = row_codes[column >> 1];
-        const unsigned char nibble = (column & 1) ? (byte >> 4) : (byte & 0x0F);
-        const float weight = inkling_e2m1(nibble);
-        const float block = inkling_e4m3(row_scales[column >> 4]);
-        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(weight, block), x[column]));
-    }
     __shared__ float scratch[INKLING_MOE_BLOCK / 32 + 1];
-    const float total = inkling_moe_row_sum(sum, scratch);
+    const float total = inkling_nvfp4_row(
+        codes + (uint64_t)row * packed, scales + (uint64_t)row * scale_columns, x, columns, scratch);
     if (threadIdx.x == 0) {
         out[row] = __fmul_rn(total, scale_2);
+    }
+}
+
+// The decode band's grouped walk. The row-a-block body above spends ~30 instructions a weight on
+// byte loads and bit-twiddled decodes, so it is issue-bound at a third of the DRAM rate. Here one
+// physical thread carries sixteen of that body's threads: logical thread t = 16 q + i (i < 16)
+// of a row's 256 lives in physical lane q of a half-warp, so its columns t + 256 k form one run
+// of sixteen adjacent columns a step - one 8-byte (NVFP4) or 16-byte (MXFP8) load of codes, one
+// scale code, and the hardware's pair converts for the codes.
+//
+// The arithmetic is still inkling_nvfp4_row's / inkling_mxfp8_row's, term for term: logical
+// thread t sums its columns in ascending k, each term __fmul_rn(__fmul_rn(weight, scale), x),
+// and the row's 256 partials meet in inkling_moe_row_sum's tree. That tree is replayed exactly:
+// a logical warp's 32 lanes are two physical lanes (q even: lanes 0-15, q odd: 16-31), so its
+// shuffle-down offsets 16, 8, 4, 2, 1 become one exchange between the pair and then additions in
+// registers in the same pairing; the eight warp sums then go through the block tree's 32-lane
+// pass, whose first two levels add the +0.0 of the lanes past the eighth warp, replayed here as
+// the same two additions. The codes decode to the same floats: E2M1 and E4M3 values are exact
+// in f16, so cvt to f16 and then to f32 is the table's value, and the E4M3 *scale* still comes
+// through inkling_e4m3 (a table the block fills with it), so a NaN scale keeps its bits too.
+// A row a half-warp, so a block of INKLING_MOE_BLOCK physical threads computes 16 rows of a slot.
+#define INKLING_GROUP 16
+#define INKLING_GROUP_ROWS (INKLING_MOE_BLOCK / INKLING_GROUP)
+
+// Eight E2M1 codes (one 32-bit word, low nibble first) as eight floats, exact.
+__device__ __forceinline__ void inkling_e2m1x8(unsigned int word, float (&out)[8]) {
+    unsigned int pairs[4];
+    asm("{\n\t.reg .b8 c0, c1, c2, c3;\n\t"
+        "mov.b32 {c0, c1, c2, c3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, c0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %1, c1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %2, c2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %3, c3;\n\t}"
+        : "=r"(pairs[0]), "=r"(pairs[1]), "=r"(pairs[2]), "=r"(pairs[3])
+        : "r"(word));
+#pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        const unsigned short lo = (unsigned short)(pairs[p] & 0xFFFFu);
+        const unsigned short hi = (unsigned short)(pairs[p] >> 16);
+        float a, b;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(lo));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(b) : "h"(hi));
+        out[2 * p] = a;
+        out[2 * p + 1] = b;
+    }
+}
+
+// Four E4M3 codes (one 32-bit word, low byte first) as four floats: the pair convert, exact for
+// every finite code, with a code of 0x7F/0xFF given inkling_e4m3's NaN bits.
+__device__ __forceinline__ void inkling_e4m3x4(unsigned int word, float (&out)[4]) {
+    unsigned int pairs[2];
+    asm("{\n\t.reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, %2;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %0, lo;\n\t"
+        "cvt.rn.f16x2.e4m3x2 %1, hi;\n\t}"
+        : "=r"(pairs[0]), "=r"(pairs[1])
+        : "r"(word));
+#pragma unroll
+    for (int p = 0; p < 2; ++p) {
+        const unsigned short lo = (unsigned short)(pairs[p] & 0xFFFFu);
+        const unsigned short hi = (unsigned short)(pairs[p] >> 16);
+        float a, b;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(lo));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(b) : "h"(hi));
+        out[2 * p] = a;
+        out[2 * p + 1] = b;
+    }
+    // A byte whose low seven bits are all set is the format's NaN.
+    const unsigned int marked = (word & 0x7F7F7F7Fu) ^ 0x7F7F7F7Fu;
+    if (((marked - 0x01010101u) & ~marked & 0x80808080u) != 0u) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            out[j] = inkling_e4m3((unsigned char)(word >> (8 * j)));
+        }
+    }
+}
+
+// One row's sixteen partials of a physical lane through inkling_moe_row_sum's tree; the row's
+// total lands in physical lane 0 of the half-warp (the other lanes return garbage).
+__device__ __forceinline__ float inkling_group_row_sum(float (&v)[INKLING_GROUP]) {
+    const int q = threadIdx.x & (INKLING_GROUP - 1);
+    // Offset 16 of the logical warp: lane l (< 16) adds lane l + 16, which is the odd partner's
+    // partial i = l. The even lane keeps the sums; the odd lane's become don't-cares.
+    float a[INKLING_GROUP];
+#pragma unroll
+    for (int i = 0; i < INKLING_GROUP; ++i) {
+        a[i] = __fadd_rn(v[i], __shfl_down_sync(0xFFFFFFFFu, v[i], 1));
+    }
+    // Offsets 8, 4, 2, 1, lane l adding lane l + offset, all inside the even lane.
+#pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int i = 0; i < offset; ++i) {
+            a[i] = __fadd_rn(a[i], a[i + offset]);
+        }
+    }
+    // a[0] of even lane q is warp q/2's sum. The block tree: lanes 0..7 hold the warp sums and
+    // lanes 8..31 zero; offsets 16 and 8 add those zeros, then 4, 2, 1 pair lane l with l + offset.
+    float w[8];
+#pragma unroll
+    for (int warp = 0; warp < 8; ++warp) {
+        w[warp] = __shfl_sync(0xFFFFFFFFu, a[0], (threadIdx.x & ~(INKLING_GROUP - 1)) + 2 * warp);
+    }
+#pragma unroll
+    for (int warp = 0; warp < 8; ++warp) {
+        w[warp] = __fadd_rn(__fadd_rn(w[warp], 0.0f), 0.0f);
+    }
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int i = 0; i < offset; ++i) {
+            w[i] = __fadd_rn(w[i], w[i + offset]);
+        }
+    }
+    (void)q;
+    return w[0];
+}
+
+// A decode band's NVFP4 projection with the router's choice read on the device, so no host ever
+// waits for it: blockIdx.x is a group of INKLING_GROUP_ROWS rows and blockIdx.y the band slot.
+// indices[slot] is the global expert; this rank holds the contiguous run [first, first + owned)
+// of them, indexed from zero, and a block whose slot names an expert outside the run exits (the
+// mix gives that slot no share). The input is one row for every slot (the gate/up projection
+// reads the token's stream) or a row a slot (the down projection reads the slot's activation):
+// `per_slot` picks which. columns is a multiple of 16 (the arm refuses any other width).
+// grid (ceil(rows / INKLING_GROUP_ROWS), slots), block INKLING_MOE_BLOCK.
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_expert_band(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    const float* __restrict__ scale_2,
+    const int* __restrict__ indices,
+    int first,
+    int owned,
+    int per_slot) {
+    const int slot = blockIdx.y;
+    const int local = indices[slot] - first;
+    if (local < 0 || local >= owned || columns <= 0) {
+        return;
+    }
+    __shared__ float e4m3[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        e4m3[code] = inkling_e4m3((unsigned char)code);
+    }
+    __syncthreads();
+    const int row = blockIdx.x * INKLING_GROUP_ROWS + (threadIdx.x / INKLING_GROUP);
+    const int q = threadIdx.x & (INKLING_GROUP - 1);
+    const int packed = (columns + 1) / 2;
+    const int scale_columns = (columns + 15) / 16;
+    const int live = row < rows ? row : rows - 1;
+    const unsigned char* __restrict__ row_codes =
+        codes + ((uint64_t)local * rows + live) * packed;
+    const unsigned char* __restrict__ row_scales =
+        scales + ((uint64_t)local * rows + live) * scale_columns;
+    x += per_slot ? (uint64_t)slot * columns : 0;
+    float v[INKLING_GROUP];
+#pragma unroll
+    for (int i = 0; i < INKLING_GROUP; ++i) {
+        v[i] = 0.0f;
+    }
+#pragma unroll 2
+    for (int base = INKLING_GROUP * q; base < columns; base += INKLING_MOE_BLOCK) {
+        const uint2 word = *reinterpret_cast<const uint2*>(row_codes + (base >> 1));
+        const float block = e4m3[row_scales[base >> 4]];
+        const float4* __restrict__ in = reinterpret_cast<const float4*>(x + base);
+        float weight[INKLING_GROUP];
+        float half_weights[8];
+        inkling_e2m1x8(word.x, half_weights);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            weight[j] = half_weights[j];
+        }
+        inkling_e2m1x8(word.y, half_weights);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            weight[8 + j] = half_weights[j];
+        }
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const float4 x4 = in[f];
+            v[4 * f + 0] = __fadd_rn(v[4 * f + 0], __fmul_rn(__fmul_rn(weight[4 * f + 0], block), x4.x));
+            v[4 * f + 1] = __fadd_rn(v[4 * f + 1], __fmul_rn(__fmul_rn(weight[4 * f + 1], block), x4.y));
+            v[4 * f + 2] = __fadd_rn(v[4 * f + 2], __fmul_rn(__fmul_rn(weight[4 * f + 2], block), x4.z));
+            v[4 * f + 3] = __fadd_rn(v[4 * f + 3], __fmul_rn(__fmul_rn(weight[4 * f + 3], block), x4.w));
+        }
+    }
+    const float total = inkling_group_row_sum(v);
+    if (q == 0 && row < rows) {
+        out[(uint64_t)slot * rows + row] = __fmul_rn(total, scale_2[local]);
     }
 }
 
@@ -156,25 +376,317 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     x += (uint64_t)input_row * columns;
     out += (uint64_t)output_slot * rows;
     const int scale_columns = (columns + block - 1) / block;
-    const unsigned char* row_codes = codes + (uint64_t)row * columns;
-    const unsigned char* row_scales = scales + (uint64_t)row * scale_columns;
-    float sum = 0.0f;
-    for (int column = threadIdx.x; column < columns; column += blockDim.x) {
-        const float weight = inkling_e4m3(row_codes[column]);
-        const float scale = inkling_ue8m0(row_scales[column / block]);
-        sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(weight, scale), x[column]));
-    }
     __shared__ float scratch[INKLING_MOE_BLOCK / 32 + 1];
-    const float total = inkling_moe_row_sum(sum, scratch);
+    const float total = inkling_mxfp8_row(
+        codes + (uint64_t)row * columns, scales + (uint64_t)row * scale_columns, x, columns, block,
+        scratch);
     if (threadIdx.x == 0) {
         out[row] = total;
     }
 }
 
+// inkling_nvfp4_expert_band for the MXFP8 layers: no per-expert factor, one ue8m0 code a block
+// of `block` columns (a multiple of 16, so a run of sixteen never straddles two), and
+// inkling_mxfp8_row's arithmetic for every row.
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_expert_band(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    int block,
+    const int* __restrict__ indices,
+    int first,
+    int owned,
+    int per_slot) {
+    const int slot = blockIdx.y;
+    const int local = indices[slot] - first;
+    if (local < 0 || local >= owned || columns <= 0 || block <= 0) {
+        return;
+    }
+    const int row = blockIdx.x * INKLING_GROUP_ROWS + (threadIdx.x / INKLING_GROUP);
+    const int q = threadIdx.x & (INKLING_GROUP - 1);
+    const int scale_columns = (columns + block - 1) / block;
+    const int live = row < rows ? row : rows - 1;
+    const unsigned char* __restrict__ row_codes =
+        codes + ((uint64_t)local * rows + live) * columns;
+    const unsigned char* __restrict__ row_scales =
+        scales + ((uint64_t)local * rows + live) * scale_columns;
+    x += per_slot ? (uint64_t)slot * columns : 0;
+    float v[INKLING_GROUP];
+#pragma unroll
+    for (int i = 0; i < INKLING_GROUP; ++i) {
+        v[i] = 0.0f;
+    }
+#pragma unroll 2
+    for (int base = INKLING_GROUP * q; base < columns; base += INKLING_MOE_BLOCK) {
+        const uint4 word = *reinterpret_cast<const uint4*>(row_codes + base);
+        const float scale = inkling_ue8m0(row_scales[base / block]);
+        const float4* __restrict__ in = reinterpret_cast<const float4*>(x + base);
+        const unsigned int words[4] = {word.x, word.y, word.z, word.w};
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            float weight[4];
+            inkling_e4m3x4(words[f], weight);
+            const float4 x4 = in[f];
+            v[4 * f + 0] = __fadd_rn(v[4 * f + 0], __fmul_rn(__fmul_rn(weight[0], scale), x4.x));
+            v[4 * f + 1] = __fadd_rn(v[4 * f + 1], __fmul_rn(__fmul_rn(weight[1], scale), x4.y));
+            v[4 * f + 2] = __fadd_rn(v[4 * f + 2], __fmul_rn(__fmul_rn(weight[2], scale), x4.z));
+            v[4 * f + 3] = __fadd_rn(v[4 * f + 3], __fmul_rn(__fmul_rn(weight[3], scale), x4.w));
+        }
+    }
+    const float total = inkling_group_row_sum(v);
+    if (q == 0 && row < rows) {
+        out[(uint64_t)slot * rows + row] = total;
+    }
+}
+
+// A chunk's expert projection over the (input row, output slot) pairs that chose one expert:
+// the prefill twin of the band kernels above. inkling_*_expert_matvec computes a pair a block
+// row, so every pair re-reads the expert's weights; here a block owns INKLING_GROUP_ROWS rows and
+// walks every pair of the expert INKLING_PAIRS at a time, so a weight run is loaded and decoded
+// once a group and its product with the scale feeds each pair's term. A (row, pair) sum is still
+// the band kernels' - and so inkling_*_row's - term for term and tree for tree, which keeps the
+// chunked prefill's bits the row-at-a-time walk's. grid (ceil(rows / INKLING_GROUP_ROWS)), block
+// INKLING_MOE_BLOCK; plan holds `count` pairs, [input row, output slot] each.
+#ifndef INKLING_PAIRS
+#define INKLING_PAIRS 4
+#endif
+#ifndef INKLING_PAIRS_UNROLL
+#define INKLING_PAIRS_UNROLL 2
+#endif
+// The column steps a pair walk keeps in flight together (an unroll pragma takes a constant).
+constexpr int kInklingPairsUnroll = INKLING_PAIRS_UNROLL;
+
+// The sixteen weight-times-scale products of one run of an NVFP4 row, inkling_nvfp4_row's
+// __fmul_rn(weight, block) for each.
+__device__ __forceinline__ void inkling_nvfp4_run(const unsigned char* __restrict__ row_codes,
+                                                  const unsigned char* __restrict__ row_scales,
+                                                  const float* __restrict__ e4m3, int base,
+                                                  float (&scaled)[INKLING_GROUP]) {
+    const uint2 word = *reinterpret_cast<const uint2*>(row_codes + (base >> 1));
+    const float block = e4m3[row_scales[base >> 4]];
+    float weight[8];
+    inkling_e2m1x8(word.x, weight);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        scaled[j] = __fmul_rn(weight[j], block);
+    }
+    inkling_e2m1x8(word.y, weight);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        scaled[8 + j] = __fmul_rn(weight[j], block);
+    }
+}
+
+// The same sixteen products for an MXFP8 row, inkling_mxfp8_row's __fmul_rn(weight, scale).
+__device__ __forceinline__ void inkling_mxfp8_run(const unsigned char* __restrict__ row_codes,
+                                                  const unsigned char* __restrict__ row_scales,
+                                                  int block, int base,
+                                                  float (&scaled)[INKLING_GROUP]) {
+    const uint4 word = *reinterpret_cast<const uint4*>(row_codes + base);
+    const float scale = inkling_ue8m0(row_scales[base / block]);
+    const unsigned int words[4] = {word.x, word.y, word.z, word.w};
+#pragma unroll
+    for (int f = 0; f < 4; ++f) {
+        float weight[4];
+        inkling_e4m3x4(words[f], weight);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            scaled[4 * f + j] = __fmul_rn(weight[j], scale);
+        }
+    }
+}
+
+// A step's inputs for a pair group, staged in shared memory: the 256 columns of a step for each
+// pair, as sixteen runs of sixteen floats padded to twenty, so the sixteen lanes reading their
+// runs with 128-bit loads land on distinct banks (a quarter-warp's runs start at banks 20 q mod
+// 32: 0, 20, 8, 28, 16, 4, 24, 12). Read straight from global memory the same loads sit 64 bytes
+// apart and cost eight L1 wavefronts each, which is what held the walk to a third of its rate.
+#define INKLING_STAGE_RUN 20
+#define INKLING_STAGE (INKLING_MOE_BLOCK / INKLING_GROUP * INKLING_STAGE_RUN)
+// The 128-bit pieces one stage holds, and how many a thread loads.
+#define INKLING_STAGE_PIECES (INKLING_PAIRS * INKLING_MOE_BLOCK / 4)
+#define INKLING_STAGE_LOADS ((INKLING_STAGE_PIECES + INKLING_MOE_BLOCK - 1) / INKLING_MOE_BLOCK)
+
+template <bool kNvfp4>
+__device__ __forceinline__ void inkling_expert_pairs(const unsigned char* __restrict__ codes,
+                                                     const unsigned char* __restrict__ scales,
+                                                     const float* __restrict__ x,
+                                                     float* __restrict__ out, int rows,
+                                                     int columns, int block, float scale_2,
+                                                     const int* __restrict__ plan, int count,
+                                                     const float* __restrict__ e4m3) {
+    __shared__ __align__(16) float staged[2][INKLING_PAIRS * INKLING_STAGE];
+    const int row = blockIdx.x * INKLING_GROUP_ROWS + (threadIdx.x / INKLING_GROUP);
+    const int q = threadIdx.x & (INKLING_GROUP - 1);
+    const int live = row < rows ? row : rows - 1;
+    const int code_row = kNvfp4 ? (columns + 1) / 2 : columns;
+    const int scale_row = kNvfp4 ? (columns + 15) / 16 : (columns + block - 1) / block;
+    const unsigned char* __restrict__ row_codes = codes + (uint64_t)live * code_row;
+    const unsigned char* __restrict__ row_scales = scales + (uint64_t)live * scale_row;
+    const int steps = (columns + INKLING_MOE_BLOCK - 1) / INKLING_MOE_BLOCK;
+    for (int group = 0; group < count; group += INKLING_PAIRS) {
+        const int here = count - group < INKLING_PAIRS ? count - group : INKLING_PAIRS;
+        // This thread's pieces of every stage: piece = pair * 64 + run * 4 + quarter.
+        const float* source[INKLING_STAGE_LOADS];
+        int offset[INKLING_STAGE_LOADS];
+        int target[INKLING_STAGE_LOADS];
+        bool loads[INKLING_STAGE_LOADS];
+#pragma unroll
+        for (int l = 0; l < INKLING_STAGE_LOADS; ++l) {
+            const int piece = threadIdx.x + l * INKLING_MOE_BLOCK;
+            const int pair = piece / (INKLING_MOE_BLOCK / 4);
+            offset[l] = 4 * (piece % (INKLING_MOE_BLOCK / 4));
+            loads[l] = piece < INKLING_STAGE_PIECES && pair < here;
+            source[l] = x + (uint64_t)(loads[l] ? plan[2 * (group + pair)] : 0) * columns;
+            target[l] = pair * INKLING_STAGE + (offset[l] / INKLING_GROUP) * INKLING_STAGE_RUN +
+                        offset[l] % INKLING_GROUP;
+        }
+        auto fetch = [&](int step, float4 (&value)[INKLING_STAGE_LOADS]) {
+#pragma unroll
+            for (int l = 0; l < INKLING_STAGE_LOADS; ++l) {
+                const int column = step * INKLING_MOE_BLOCK + offset[l];
+                value[l] = loads[l] && column < columns
+                               ? *reinterpret_cast<const float4*>(source[l] + column)
+                               : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        };
+        auto stage = [&](int buffer, const float4 (&value)[INKLING_STAGE_LOADS]) {
+#pragma unroll
+            for (int l = 0; l < INKLING_STAGE_LOADS; ++l) {
+                if (threadIdx.x + l * INKLING_MOE_BLOCK < INKLING_STAGE_PIECES) {
+                    *reinterpret_cast<float4*>(&staged[buffer][target[l]]) = value[l];
+                }
+            }
+        };
+        float4 pending[INKLING_STAGE_LOADS];
+        fetch(0, pending);
+        stage(0, pending);
+        __syncthreads();
+        float v[INKLING_PAIRS][INKLING_GROUP];
+#pragma unroll
+        for (int p = 0; p < INKLING_PAIRS; ++p) {
+#pragma unroll
+            for (int i = 0; i < INKLING_GROUP; ++i) {
+                v[p][i] = 0.0f;
+            }
+        }
+        for (int step = 0; step < steps; ++step) {
+            const int current = step & 1;
+            if (step + 1 < steps) {
+                fetch(step + 1, pending);
+            }
+            const int base = step * INKLING_MOE_BLOCK + INKLING_GROUP * q;
+            if (base < columns) {
+                float scaled[INKLING_GROUP];
+                if (kNvfp4) {
+                    inkling_nvfp4_run(row_codes, row_scales, e4m3, base, scaled);
+                } else {
+                    inkling_mxfp8_run(row_codes, row_scales, block, base, scaled);
+                }
+#pragma unroll
+                for (int p = 0; p < INKLING_PAIRS; ++p) {
+                    if (p < here) {
+                        const float* in = &staged[current][p * INKLING_STAGE + q * INKLING_STAGE_RUN];
+#pragma unroll
+                        for (int f = 0; f < 4; ++f) {
+                            const float4 x4 = *reinterpret_cast<const float4*>(in + 4 * f);
+                            v[p][4 * f + 0] = __fadd_rn(v[p][4 * f + 0], __fmul_rn(scaled[4 * f + 0], x4.x));
+                            v[p][4 * f + 1] = __fadd_rn(v[p][4 * f + 1], __fmul_rn(scaled[4 * f + 1], x4.y));
+                            v[p][4 * f + 2] = __fadd_rn(v[p][4 * f + 2], __fmul_rn(scaled[4 * f + 2], x4.z));
+                            v[p][4 * f + 3] = __fadd_rn(v[p][4 * f + 3], __fmul_rn(scaled[4 * f + 3], x4.w));
+                        }
+                    }
+                }
+            }
+            if (step + 1 < steps) {
+                stage(current ^ 1, pending);
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int p = 0; p < INKLING_PAIRS; ++p) {
+            const float total = inkling_group_row_sum(v[p]);
+            if (q == 0 && row < rows && p < here) {
+                const int slot = plan[2 * (group + p) + 1];
+                out[(uint64_t)slot * rows + row] = kNvfp4 ? __fmul_rn(total, scale_2) : total;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_expert_pairs(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    float scale_2,
+    const int* __restrict__ plan,
+    int count) {
+    if (columns <= 0 || count <= 0) {
+        return;
+    }
+    __shared__ float e4m3[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        e4m3[code] = inkling_e4m3((unsigned char)code);
+    }
+    __syncthreads();
+    inkling_expert_pairs<true>(codes, scales, x, out, rows, columns, 16, scale_2, plan, count, e4m3);
+}
+
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_expert_pairs(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    int block,
+    const int* __restrict__ plan,
+    int count) {
+    if (columns <= 0 || count <= 0 || block <= 0) {
+        return;
+    }
+    inkling_expert_pairs<false>(codes, scales, x, out, rows, columns, block, 1.0f, plan, count,
+                                nullptr);
+}
+
+// The mix's share a band slot: the router's weight for a slot this rank computed, zero for one it
+// did not (its partial is another rank's, and the all-reduce after the mix brings it in). One
+// thread a slot, the grid striding over the slots; the band's replacement for the host's copy of
+// the shares. `local`, when not null, gets the slot's expert as this rank numbers its experts,
+// -1 for another rank's: the ids the shared plan (moe_plan, MOE_PLAN_DROP) sorts.
+extern "C" __global__ void __launch_bounds__(64) inkling_band_shares(
+    const int* __restrict__ indices,
+    const float* __restrict__ shares,
+    float* __restrict__ out,
+    int slots,
+    int first,
+    int owned,
+    int* __restrict__ local) {
+    for (int slot = blockIdx.x * blockDim.x + threadIdx.x; slot < slots;
+         slot += gridDim.x * blockDim.x) {
+        const int expert = indices[slot] - first;
+        const bool mine = expert >= 0 && expert < owned;
+        out[slot] = mine ? shares[slot] : 0.0f;
+        if (local != nullptr) {
+            local[slot] = mine ? expert : -1;
+        }
+    }
+}
+
 // The sigmoid router: a score an expert, the learned bias on the selection, and the selected
-// experts' shares. One thread walks the 384 experts, so the order is the host's order exactly
-// (ties keep the lower index) and the schedule is a function of the scores alone.
-extern "C" __global__ void __launch_bounds__(32) inkling_router_topk(
+// experts' shares. The block shares the walk: each thread scans the experts congruent to its index
+// in ascending order and keeps the first best it meets, and the block then keeps the best of those,
+// the lower index on a tie. That is the sequential scan's answer exactly (the first index holding
+// the greatest biased score, NaN and -inf never chosen), so the schedule is still a function of the
+// scores alone, and the shares are summed by one thread in slot order as before.
+#define INKLING_ROUTER_THREADS 128
+extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_router_topk(
     const float* __restrict__ logits,
     const float* __restrict__ bias,
     int* __restrict__ indices,
@@ -182,7 +694,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_router_topk(
     int experts,
     int top_k,
     float route_scale) {
-    if (threadIdx.x != 0 || experts <= 0 || top_k <= 0 || top_k > experts) {
+    if (experts <= 0 || top_k <= 0 || top_k > experts || top_k > 64) {
         return;
     }
     // One block a row: a prefill chunk routes every row of the chunk, a decode step its one row
@@ -192,41 +704,82 @@ extern "C" __global__ void __launch_bounds__(32) inkling_router_topk(
     indices += (uint64_t)row * top_k;
     weights += (uint64_t)row * top_k;
     const int capacity = 4096;
-    __shared__ float scores[capacity];
-    __shared__ unsigned char taken[capacity];
-    for (int expert = 0; expert < experts; ++expert) {
-        scores[expert] = 1.0f / (1.0f + expf(-logits[expert]));
-        taken[expert] = 0;
+    if (experts > capacity) {
+        return;
     }
-    float selected[64];
-    int chosen[64];
+    __shared__ float scores[capacity];
+    __shared__ float ranked[capacity];
+    __shared__ float best_scores[INKLING_ROUTER_THREADS / 32];
+    __shared__ int best_experts[INKLING_ROUTER_THREADS / 32];
+    __shared__ int chosen[64];
+    for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+        const float score = 1.0f / (1.0f + expf(-logits[expert]));
+        scores[expert] = score;
+        ranked[expert] = __fadd_rn(score, bias != nullptr ? bias[expert] : 0.0f);
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
     for (int slot = 0; slot < top_k; ++slot) {
         int best = -1;
         float best_score = -INFINITY;
-        for (int expert = 0; expert < experts; ++expert) {
-            if (taken[expert]) {
-                continue;
+        for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+            bool taken = false;
+            for (int earlier = 0; earlier < slot; ++earlier) {
+                taken = taken || chosen[earlier] == expert;
             }
-            const float ranked = __fadd_rn(scores[expert], bias != nullptr ? bias[expert] : 0.0f);
-            if (ranked > best_score) {
-                best_score = ranked;
+            const float value = ranked[expert];
+            if (!taken && value > best_score) {
+                best_score = value;
                 best = expert;
             }
         }
-        if (best < 0) {
+        // A candidate beats another on a greater score, or on an equal score at a lower index;
+        // "none" is index -1 at -inf, which no real candidate loses to.
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const float other_score = __shfl_down_sync(0xFFFFFFFFu, best_score, offset);
+            const int other = __shfl_down_sync(0xFFFFFFFFu, best, offset);
+            if (other >= 0 && (best < 0 || other_score > best_score ||
+                               (other_score == best_score && other < best))) {
+                best_score = other_score;
+                best = other;
+            }
+        }
+        if (lane == 0) {
+            best_scores[warp] = best_score;
+            best_experts[warp] = best;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int winner = -1;
+            float winner_score = -INFINITY;
+            for (int index = 0; index < warps; ++index) {
+                const int other = best_experts[index];
+                const float other_score = best_scores[index];
+                if (other >= 0 && (winner < 0 || other_score > winner_score ||
+                                   (other_score == winner_score && other < winner))) {
+                    winner_score = other_score;
+                    winner = other;
+                }
+            }
+            chosen[slot] = winner;
+        }
+        __syncthreads();
+        if (chosen[slot] < 0) {
             return;
         }
-        taken[best] = 1;
-        chosen[slot] = best;
-        selected[slot] = scores[best];
+    }
+    if (threadIdx.x != 0) {
+        return;
     }
     float sum = 0.0f;
     for (int slot = 0; slot < top_k; ++slot) {
-        sum = __fadd_rn(sum, selected[slot]);
+        sum = __fadd_rn(sum, scores[chosen[slot]]);
     }
     const float denominator = __fadd_rn(sum, 1e-20f);
     for (int slot = 0; slot < top_k; ++slot) {
         indices[slot] = chosen[slot];
-        weights[slot] = __fmul_rn(__fdiv_rn(selected[slot], denominator), route_scale);
+        weights[slot] = __fmul_rn(__fdiv_rn(scores[chosen[slot]], denominator), route_scale);
     }
 }

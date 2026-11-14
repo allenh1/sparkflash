@@ -304,7 +304,7 @@ mod tests {
         // while the manifest listed forty-three, and a test that agrees with the prose would have
         // kept saying so.
         let pins = crate::baseline::parse_pins(BASELINE).expect("the manifest parses");
-        assert_eq!(pins.len(), 47, "the manifest must pin forty-seven kernels");
+        assert_eq!(pins.len(), 48, "the manifest must pin forty-eight kernels");
         assert!(BASELINE.contains(&format!("nvcc_release={TOOLKIT_RELEASE}")));
         assert!(BASELINE.contains("arch=sm_121a"));
     }

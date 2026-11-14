@@ -582,3 +582,64 @@ fn the_batched_projection_is_the_one_row_projection_a_row_at_a_time() {
     }
     assert_eq!(got, expected, "a row of a batch is the row alone");
 }
+
+/// A grouped launch - several groups of eight tokens along the grid's y - is each group's own
+/// launch, to the bit, and so (by the test above) each token's one-row projection.
+///
+/// The chunk walk runs a projection too narrow for the tensor-core tile this way: one launch for
+/// all of a chunk's whole groups, then one for the remainder. A dozen output rows a launch is one
+/// block, and a launch per group left a 4,096-row chunk 512 launches a layer on that block.
+#[test]
+fn a_grouped_projection_is_each_group_launched_alone() {
+    let Some(cuda) = open() else { return };
+    let mut rng = Lcg::new(0x2545_f491);
+    let rows = 12usize;
+    let columns = 96usize;
+    let batch = 8usize;
+    let groups = 5usize;
+    let tokens = batch * groups;
+    let weight: Vec<f32> = rng.values(rows * columns);
+    let x: Vec<f32> = rng.values(tokens * columns);
+    let weight_device = upload_bf16(&cuda, &weight);
+    let x_device = upload_f32(&cuda, &x);
+    let gemv = token_kernel(&cuda, "q4e_gemv_bf16");
+    let grid = rows.div_ceil(8) as u32;
+
+    let grouped = upload_f32(&cuda, &vec![0f32; tokens * rows]);
+    cuda.launch(
+        gemv,
+        (grid, groups as u32, 1),
+        (256, 1, 1),
+        &[
+            weight_device.0,
+            x_device.0,
+            grouped.0,
+            u(rows),
+            u(columns),
+            u(batch),
+        ],
+    )
+    .expect("the grouped projection");
+    let got = download_f32(&cuda, &grouped, tokens * rows);
+
+    let mut expected = Vec::with_capacity(tokens * rows);
+    for group in 0..groups {
+        let alone = upload_f32(&cuda, &vec![0f32; batch * rows]);
+        cuda.launch(
+            gemv,
+            (grid, 1, 1),
+            (256, 1, 1),
+            &[
+                weight_device.0,
+                x_device.offset(group * batch * columns * 4).0,
+                alone.0,
+                u(rows),
+                u(columns),
+                u(batch),
+            ],
+        )
+        .expect("one group alone");
+        expected.extend(download_f32(&cuda, &alone, batch * rows));
+    }
+    assert_eq!(got, expected, "a group of a grouped launch is the group alone");
+}

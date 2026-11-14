@@ -177,6 +177,96 @@ fn the_device_arm_refuses_a_context_past_the_window() {
     assert_eq!(opened.plan().layers().len(), 2);
 }
 
+/// Lanes stepped together answer what each would decode alone, to the bit.
+///
+/// Three prompts of different lengths, so the lanes sit at different positions and their caches
+/// and convolution histories differ: a lane that read another's state, or a row the walk summed
+/// in another order, moves a logit. A step of one member is the decode step itself, so the last
+/// steps drop the lanes to one and check that path too.
+#[test]
+fn fused_lanes_step_as_each_lane_decodes_alone() {
+    use sparkflash_model::FusedArm;
+
+    if !backend_available() {
+        return;
+    }
+    let config = Inkling2Config::tiny();
+    let source = Arc::new(tiny_source(&config));
+    let device = InklingDeviceBackend::open(
+        sparkflash_model_inkling2::descriptor(),
+        config,
+        Arc::clone(&source) as Arc<dyn sparkflash_weights::WeightSource>,
+        16,
+    )
+    .expect("the device arm opens");
+    let prompts: [&[u32]; 3] = [&[3, 7, 11], &[5], &[2, 9, 4, 8, 1]];
+
+    // Each prompt alone: its first answer and the tokens it decodes after it.
+    let steps = 4usize;
+    let mut solo: Vec<Vec<Vec<f32>>> = Vec::new();
+    let mut fed: Vec<Vec<u32>> = Vec::new();
+    for prompt in prompts {
+        let mut session = device.open_session().expect("a device session");
+        session.set_sampling(greedy());
+        let first = session.prefill(prompt).expect("the solo prompt");
+        let mut rows = vec![first.logits.clone()];
+        let mut tokens = Vec::new();
+        let mut next = first.next_token.expect("a next token");
+        for _ in 0..steps {
+            tokens.push(next);
+            let output = session.decode(next).expect("the solo decode");
+            next = output.next_token.expect("a next token");
+            rows.push(output.logits);
+        }
+        solo.push(rows);
+        fed.push(tokens);
+    }
+
+    let lanes = device.lanes(4).expect("the lanes open");
+    let mut slots = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let mut slot = lanes.open_slot().expect("a lane");
+        lanes.set_sampling(&mut slot, greedy());
+        let first = lanes.prefill(&mut slot, prompt).expect("the lane's prompt");
+        assert_eq!(first.logits, solo[index][0], "lane {index}: the prompt's answer");
+        slots.push(slot);
+    }
+    for step in 0..steps {
+        // The last step runs the first lane alone: the one-member path.
+        let width = if step + 1 == steps { 1 } else { slots.len() };
+        let mut members: Vec<_> = slots
+            .drain(..width)
+            .enumerate()
+            .map(|(index, slot)| (slot, fed[index][step]))
+            .collect();
+        let outputs = lanes.step(&mut members).expect("the fused step");
+        assert_eq!(outputs.len(), width);
+        for (index, output) in outputs.iter().enumerate() {
+            let expected = &solo[index][step + 1];
+            let differ = output
+                .logits
+                .iter()
+                .zip(expected)
+                .filter(|(left, right)| left.to_bits() != right.to_bits())
+                .count();
+            assert_eq!(
+                differ, 0,
+                "step {step}, lane {index}: {differ} logits differ from the lane decoding alone"
+            );
+        }
+        let mut kept: Vec<_> = members.into_iter().map(|(slot, _)| slot).collect();
+        kept.append(&mut slots);
+        slots = kept;
+    }
+    // A lane that served a request is renewed for the next one and answers it from position zero.
+    let mut slot = slots.remove(0);
+    assert!(lanes.holds_request(&slot));
+    lanes.renew(&mut slot).expect("the lane renews");
+    lanes.set_sampling(&mut slot, greedy());
+    let again = lanes.prefill(&mut slot, prompts[1]).expect("the renewed prompt");
+    assert_eq!(again.logits, solo[1][0], "a renewed lane answers its prompt afresh");
+}
+
 /// Four ranks of one checkpoint: the converted rank files, four backends and the loopback
 /// exchange, against the same host reference a single rank is checked on.
 ///

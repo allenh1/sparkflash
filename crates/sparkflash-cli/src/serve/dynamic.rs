@@ -75,6 +75,8 @@ pub(crate) enum Dialect {
     Qwen,
     /// DeepSeek's own renderer, which its reference path normally serves.
     Deepseek,
+    /// Inkling-2's typed messages: `<|message_model|><|content_thinking|>...<|end_message|>`.
+    Inkling,
 }
 
 /// Resolves `options` into a checkpoint and its plan.
@@ -308,7 +310,16 @@ fn codec(
             architecture.tokens.eos_token_ids.clone(),
         )
         .map_err(|error| format!("{}: {error}", tokenizer.display()))?;
-        return Ok((Arc::new(codec), Dialect::Deepseek));
+        // The tower's geometry plans the image spans; a checkpoint without one serves text.
+        let config = sparkflash_model_inkling2::config::Inkling2Config::from_checkpoint_dir(directory)
+            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let codec = match config.vision {
+            Some(vision) => codec
+                .with_vision(vision)
+                .map_err(|error| format!("{}: {error}", tokenizer.display()))?,
+            None => codec,
+        };
+        return Ok((Arc::new(codec), Dialect::Inkling));
     }
     if text.contains(sparkflash_model_qwen4_exp::codec::IM_START)
         && text.contains(sparkflash_model_qwen4_exp::codec::IM_END)
@@ -694,6 +705,7 @@ pub(crate) fn serve_backend_world(
         Dialect::Glm => sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver)),
         Dialect::Qwen => sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver)),
         Dialect::Deepseek => Arc::new(driver),
+        Dialect::Inkling => sparkflash_api::inkling::InklingResponseEngine::layer(Arc::new(driver)),
     };
     println!("sparkflash serve: {banner}");
     let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);

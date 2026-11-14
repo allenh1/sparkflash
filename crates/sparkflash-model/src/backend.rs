@@ -26,6 +26,7 @@
 
 use crate::capabilities::Capabilities;
 use crate::descriptor::ModelDescriptor;
+use crate::vision::VisionImage;
 
 /// A backend failure.
 ///
@@ -150,6 +151,31 @@ pub trait ModelSession: Send {
     /// # Errors
     /// A backend failure, such as a shape mismatch or an exhausted context.
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError>;
+
+    /// Consumes a prompt whose image spans take `images`' features, and returns the first step.
+    ///
+    /// The images are in prompt order and their spans lie inside `tokens`. Without images this is
+    /// [`Self::prefill`]. The default refuses any image: a session that cannot encode one must
+    /// say so rather than read the placeholders as text.
+    ///
+    /// # Errors
+    /// As [`Self::prefill`], and a session without a vision path refuses images.
+    fn prefill_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
+        if images.is_empty() {
+            return self.prefill(tokens);
+        }
+        Err(BackendError::new(
+            "vision",
+            format!(
+            "this session has no vision path for the request's {} images",
+            images.len()
+            ),
+        ))
+    }
 
     /// Consumes one generated token and returns the next step.
     ///

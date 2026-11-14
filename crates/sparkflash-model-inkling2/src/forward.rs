@@ -894,7 +894,6 @@ fn block_residual(
         }
     }
     let query = query.ok_or_else(|| "block residual has no query".to_owned())?;
-    let query = if queries == 1 { query.to_vec() } else { query.to_vec() };
     let mut out = Vec::with_capacity(queries);
     for q in 0..queries {
         let offset = if queries == 1 { 0 } else { q * hidden };

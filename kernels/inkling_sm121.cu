@@ -21,9 +21,15 @@
 //
 // The shared token, GEMV, RMSNorm and routed-MoE plan kernels stay in their own images and are
 // reused unchanged; the expert's own weight format and the sigmoid router are this pack's and
-// live in inkling_moe_sm121.cu.
+// live in inkling_moe_sm121.cu. The direct-RDMA exchange's stage and collect kernels are the
+// DeepSeek arm's own (kernels/opt_exchange_sm121.cuh, which opt_misc_sm121.cu also includes), so
+// the Inkling collectives ring the same doorbell with the same code. The vision tower's own
+// stages (inkling_vision_sm121.cu) bring DeepSeek's vision GEMM and attention with them
+// (opt_vision_sm121.cu), which rank 0 runs on an image before its prompt.
 
 #include "inkling_attn_sm121.cu"
 #include "inkling_conv_sm121.cu"
 #include "inkling_epilogue_sm121.cu"
 #include "inkling_moe_sm121.cu"
+#include "inkling_vision_sm121.cu"
+#include "opt_exchange_sm121.cuh"

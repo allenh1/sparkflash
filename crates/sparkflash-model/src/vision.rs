@@ -160,6 +160,24 @@ impl fmt::Debug for PreparedImage {
     }
 }
 
+/// One image as a session receives it: where its span sits in the prompt and its canvas.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VisionImage {
+    /// The span's position, grid and content key.
+    pub span: ImageSpan,
+    /// The canvas: best_height * best_width * 3 bytes of RGB.
+    pub pixels: Arc<[u8]>,
+}
+
+impl fmt::Debug for VisionImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VisionImage")
+            .field("span", &self.span)
+            .field("pixels", &self.pixels.len())
+            .finish()
+    }
+}
+
 /// How a model's image preparation treats one image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VisionOptions {

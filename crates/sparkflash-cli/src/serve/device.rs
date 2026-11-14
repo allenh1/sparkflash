@@ -794,7 +794,7 @@ fn admit_frame(seq: u64, job: &DeviceJob) -> Tp4DeviceAdmit {
                     n_llm_w: narrow(span.grid.n_llm_w),
                     best_height: narrow(span.grid.best_height),
                     best_width: narrow(span.grid.best_width),
-                    key: span.key.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    key: Tp4DeviceImage::hex_key(&span.key),
                 }
             })
             .collect(),
@@ -814,19 +814,9 @@ fn admitted_job(
     let seq = admit.seq;
     let mut images = Vec::with_capacity(admit.images.len());
     for (index, image) in admit.images.into_iter().enumerate() {
-        let mut key = [0u8; 32];
-        let hex = image.key.as_bytes();
-        if hex.len() != 64 {
-            return Err(format!(
-                "sequence {seq} image {index}: a key of {} digits",
-                hex.len()
-            ));
-        }
-        for (byte, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
-            let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
-            *byte = u8::from_str_radix(pair, 16)
-                .map_err(|_| format!("sequence {seq} image {index}: the key is not hex"))?;
-        }
+        let key = image
+            .key_bytes()
+            .map_err(|error| format!("sequence {seq} image {index}: {error}"))?;
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         images.push(VisionImage {
             span: ImageSpan {

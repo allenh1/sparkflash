@@ -53,6 +53,7 @@ pub struct AttentionParams {
 ///
 /// # Errors
 /// A tensor whose length does not match the parameters.
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     q: &[f32],
     gate: &[f32],
@@ -327,13 +328,17 @@ pub fn short_conv_dynamic_decode(
 
 /// The softcapped SwiGLU: `softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap)`.
 ///
-/// The two halves of `gate_up` are `[width]` each; a cap of 0 means no cap.
+/// `gate_up` is `[2 * width]` in the checkpoint's `w13` row order, which interleaves the two
+/// projections: row `2c` is gate column `c` and row `2c + 1` is up column `c` (the released
+/// loader de-interleaves with `Interleave(dim=1)` before it chunks). Reading the halves instead
+/// pairs every gate with the wrong up and silently scrambles every routed expert. A cap of 0
+/// means no cap.
 #[must_use]
 pub fn softcapped_swiglu(gate_up: &[f32], width: usize, gate_cap: f32, up_cap: f32) -> Vec<f32> {
     let mut out = vec![0f32; width];
     for column in 0..width {
-        let gate = gate_up[column];
-        let up = gate_up[width + column];
+        let gate = gate_up[2 * column];
+        let up = gate_up[2 * column + 1];
         let gated = if gate_cap > 0.0 {
             (gate / gate_cap).tanh() * gate_cap
         } else {

@@ -31,14 +31,16 @@ pub mod tp4_run;
 pub mod vision;
 
 pub use architecture::{architecture_from_config, architecture_from_json};
-pub use collective::{Exchange, Solo, TcpExchange};
+pub use collective::{
+    COMM_REDUCE_ENV, Exchange, NcclExchange, Solo, TcpExchange, connect_rank, nccl_requested,
+};
 pub use config::{
     Inkling2Config, InklingMtpConfig, InklingQuantConfig, InklingVisionConfig, MODEL_ID,
     MODEL_TYPE, WEIGHTS_ID,
 };
 pub use prompt::InklingCodec;
 pub use forward::{Inkling2State, Inkling2Weights};
-pub use device::InklingDeviceBackend;
+pub use device::{InklingDeviceBackend, InklingVisionTower};
 pub use group::{GroupOptions, MasterRank, open_master, run_worker};
 pub use host::Inkling2HostBackend;
 pub use reference::{AttentionParams, attention, softcapped_swiglu};
@@ -52,7 +54,10 @@ pub use device_plan::{
 };
 pub use tensor::{InklingTensorPlan, Role, Slice};
 pub use tp4_run::{Tp4Outcome, Tp4Run, rank_file};
-pub use vision::{InklingVision, MAX_MERGED_TOKENS, patch_values, plan_grid};
+pub use vision::{
+    IMAGE_TOKEN_ID, InklingVision, InklingVisionCodec, MAX_MERGED_TOKENS, SpanCheck, patch_values,
+    patchify, plan_cells, plan_grid,
+};
 
 use sparkflash_model::ModelDescriptor;
 

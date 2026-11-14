@@ -62,9 +62,23 @@ fn the_group_flags_parse_and_refuse_the_knobs_they_cannot_honour() {
     assert_eq!(group.world, 2);
     assert_eq!(group.control.port(), GROUP_DEFAULT_CONTROL_PORT);
 
+    assert_eq!(group.lanes, 1, "a group without --fuse-batch is the serial mirror");
+
     let error = ServeOptions::parse(group_argv(&checkpoint, &["--concurrency", "2"]))
         .expect_err("a group cannot run two interleaved sequences");
     assert!(error.contains("--concurrency"), "{error}");
+
+    // Fused lanes: one a concurrent request, stepped together on every rank.
+    let fused = ServeOptions::parse(group_argv(
+        &checkpoint,
+        &["--concurrency", "4", "--fuse-batch"],
+    ))
+    .expect("a group fuses its lanes");
+    assert_eq!(fused.group.expect("a group").lanes, 4);
+
+    let error = ServeOptions::parse(group_argv(&checkpoint, &["--fuse-batch"]))
+        .expect_err("one lane is not a fused batch");
+    assert!(error.contains("--concurrency of at least 2"), "{error}");
 
     let error = ServeOptions::parse(group_argv(&checkpoint, &["--continuous-batching"]))
         .expect_err("a group cannot batch a second request into its lockstep");

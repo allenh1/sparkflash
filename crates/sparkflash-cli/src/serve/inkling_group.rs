@@ -51,7 +51,13 @@ pub(super) fn serve(
         sparkflash_model_inkling2::run_worker(&descriptor, &config, group, context)?;
         return Ok(ExitCode::SUCCESS);
     }
-    let master = sparkflash_model_inkling2::open_master(descriptor.clone(), &config, group, context)?;
+    let master = sparkflash_model_inkling2::open_master(
+        descriptor.clone(),
+        &config,
+        group,
+        context,
+        &checkpoint.directory,
+    )?;
     serve_backend_world(
         master.backend,
         descriptor,

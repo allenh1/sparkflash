@@ -28,6 +28,8 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use sparkflash_comm::device_reduce::{BootstrapConfig, RunReduce, WordGather, open_run_reduce_over};
+use sparkflash_comm::nccl::NcclError;
 use sparkflash_comm::tcp::{FrameHeader, FrameKind, TcpConfig, read_frame, write_frame};
 
 /// The exchanges a rank performs with its peers.
@@ -54,6 +56,88 @@ pub trait Exchange: Send + Sync {
     /// # Errors
     /// A length mismatch, a peer that is gone, or a transport timeout.
     fn all_gather_f32(&self, values: &[f32], out: &mut [f32]) -> Result<(), String>;
+
+    /// Whether [Self::exchange_on_device] is wired, so a collective can stay on the device.
+    fn has_device_leg(&self) -> bool {
+        false
+    }
+
+    /// Enqueues on `stream` the copy of this rank's `bytes` at the device address `send` into
+    /// every peer's `slots + rank * bytes`, and every peer's into this rank's
+    /// `slots + peer * bytes`; this rank's own slot is not written and nothing is synchronised.
+    /// The words are moved, never summed: the caller sums its own payload and the slots in
+    /// ascending rank order from zero on the same stream, which is [Self::all_reduce_f32]'s rule,
+    /// so the device leg and the host one give the same bits. (The contract is
+    /// sparkflash_weights::tp::TpCollective::exchange_on_device's.)
+    ///
+    /// # Errors
+    /// An exchange with no device leg, or one the library refuses to enqueue.
+    fn exchange_on_device(
+        &self,
+        _stream: u64,
+        _send: u64,
+        _slots: u64,
+        _bytes: usize,
+    ) -> Result<(), String> {
+        Err("this exchange has no device leg".to_owned())
+    }
+
+    /// Enqueues on `stream` the two-shot sum's first half: chunk `peer` of the `world` equal
+    /// chunks of the `bytes` at `send` goes to `peer`, and every peer's chunk `rank` lands at
+    /// `slots + peer * bytes / world`; this rank's own slot is not written. The caller sums its
+    /// own chunk and the slots in ascending rank order and shares the sum with
+    /// [Self::exchange_on_device], so every element is folded as the one-shot exchange folds it
+    /// and each rank sends half the bytes. (The contract is
+    /// sparkflash_comm::device_reduce's scatter_bf16, which DeepSeek's two-shot reduce uses.)
+    ///
+    /// # Errors
+    /// An exchange with no device leg, or one the library refuses to enqueue.
+    fn scatter_on_device(
+        &self,
+        _stream: u64,
+        _send: u64,
+        _slots: u64,
+        _bytes: usize,
+    ) -> Result<(), String> {
+        Err("this exchange has no device leg".to_owned())
+    }
+
+    /// Reports a device-leg round that could not complete, once the device has drained.
+    ///
+    /// The direct-RDMA exchange's stage kernel gives a round up rather than hang when a peer's row
+    /// never arrives or disagrees, and what the step wrote behind it is not usable; the walk calls
+    /// this after each drain and before it reads a result back. Every other leg reports its
+    /// failures where it enqueues, so the default has nothing to say.
+    ///
+    /// # Errors
+    /// The exchange's first failed round.
+    fn check_device(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The switch the TP arms share for their collective path: `nccl` (the default for a world of
+/// two or more) keeps the step's collectives on the device through the run's NCCL communicator,
+/// `tcp` stages every one through the host exchange. The DeepSeek, GLM and Qwen serve paths read
+/// the same variable.
+pub const COMM_REDUCE_ENV: &str = "SPARK_COMM_REDUCE";
+
+/// Whether this world's collectives take the NCCL device leg, from [COMM_REDUCE_ENV].
+///
+/// # Errors
+/// A value this arm has no path for: anything but `nccl` or `tcp`, or `nccl` in a world of one.
+pub fn nccl_requested(world: usize) -> Result<bool, String> {
+    match std::env::var(COMM_REDUCE_ENV).ok().as_deref() {
+        None | Some("") => Ok(world > 1),
+        Some("nccl") if world > 1 => Ok(true),
+        Some("nccl") => Err(format!(
+            "{COMM_REDUCE_ENV}=nccl needs a world of 2 or more; a world of 1 has nothing to exchange"
+        )),
+        Some("tcp") => Ok(false),
+        Some(other) => Err(format!(
+            "{COMM_REDUCE_ENV}={other:?} has no Inkling path: nccl or tcp"
+        )),
+    }
 }
 
 /// A world of one: both exchanges are the identity, and no socket is opened.
@@ -310,7 +394,7 @@ impl TcpExchange {
         &self,
         kind: FrameKind,
         payload: &[u8],
-        elements: usize,
+        expected_bytes: usize,
     ) -> Result<Vec<Vec<u8>>, String> {
         let sequence = self.next_sequence()?;
         let header = FrameHeader {
@@ -364,11 +448,10 @@ impl TcpExchange {
                         kind, header.kind, header.seq, header.rank
                     ));
                 }
-                if payload.len() != elements * 4 {
+                if payload.len() != expected_bytes {
                     return Err(format!(
-                        "rank {peer} sent {} bytes where the collective expects {}",
-                        payload.len(),
-                        elements * 4
+                        "rank {peer} sent {} bytes where the collective expects {expected_bytes}",
+                        payload.len()
                     ));
                 }
                 frames.push(payload);
@@ -415,7 +498,8 @@ impl Exchange for TcpExchange {
         if values.is_empty() {
             return Err("an all-reduce needs at least one element".to_owned());
         }
-        let frames = self.exchange(FrameKind::ReducePayload, &encode_f32(values), values.len())?;
+        let frames =
+            self.exchange(FrameKind::ReducePayload, &encode_f32(values), values.len() * 4)?;
         // Ascending rank from zero, the shared reduce module's rule, so every rank holds the
         // same bits whatever order the frames arrived in.
         let mut panes: Vec<Vec<f32>> = Vec::with_capacity(self.world);
@@ -453,7 +537,8 @@ impl Exchange for TcpExchange {
             out.copy_from_slice(values);
             return Ok(());
         }
-        let frames = self.exchange(FrameKind::GatherPayload, &encode_f32(values), values.len())?;
+        let frames =
+            self.exchange(FrameKind::GatherPayload, &encode_f32(values), values.len() * 4)?;
         let width = values.len();
         out[self.rank * width..(self.rank + 1) * width].copy_from_slice(values);
         let mut peer_frames = frames.into_iter();
@@ -467,6 +552,334 @@ impl Exchange for TcpExchange {
             out[peer * width..(peer + 1) * width].copy_from_slice(&decode_f32(&payload));
         }
         Ok(())
+    }
+}
+
+/// The NCCL bootstrap's gather over this exchange: the rendezvous rides the collective's own
+/// connections, so opening the communicator needs no second socket set. The frames carry this
+/// exchange's own sequence, so the bootstrap's sequence number is not needed to tell them apart.
+impl WordGather for TcpExchange {
+    fn gather_words(&self, _sequence: u64, local: &[u16], out: &mut [u16]) -> Result<(), String> {
+        if out.len() != local.len().saturating_mul(self.world) {
+            return Err(format!(
+                "a gather of {} words a rank into a {} word buffer of {} ranks",
+                local.len(),
+                out.len(),
+                self.world
+            ));
+        }
+        let payload: Vec<u8> = local.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let width = local.len();
+        out[self.rank * width..(self.rank + 1) * width].copy_from_slice(local);
+        if self.world == 1 {
+            return Ok(());
+        }
+        let frames = self.exchange(FrameKind::GatherPayload, &payload, payload.len())?;
+        let mut peer_frames = frames.into_iter();
+        for peer in 0..self.world {
+            if peer == self.rank {
+                continue;
+            }
+            let frame = peer_frames
+                .next()
+                .ok_or_else(|| "a peer's gather frame is missing".to_owned())?;
+            for (slot, word) in out[peer * width..(peer + 1) * width]
+                .iter_mut()
+                .zip(frame.as_chunks::<2>().0)
+            {
+                *slot = u16::from_le_bytes(*word);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The run's NCCL communicator, owned behind a lock, and the reference to the primary context it
+/// was opened in. The fields drop in order, so the communicator is destroyed while its context
+/// still stands: a context whose last reference is released is reset, with the communicator's
+/// device buffers in it.
+struct Communicator {
+    reduce: Mutex<RunReduce>,
+    // Held for its drop order in every build; read only by the doorbell's launches.
+    #[cfg_attr(not(feature = "rdma"), allow(dead_code))]
+    context: sparkflash_kernels::cuda_driver::Cuda,
+}
+
+// SAFETY: RunReduce holds the communicator's raw handles, which NCCL lets any one thread use at a
+// time; the lock keeps every call on one thread at a time, and every rank enqueues its collectives
+// on the default stream of the primary context the arm's kernels use. After the open the context
+// reference launches only the direct-RDMA exchange's kernels, under that exchange's own lock.
+unsafe impl Send for Communicator {}
+// SAFETY: as above: shared access goes through the lock.
+unsafe impl Sync for Communicator {}
+
+/// [TcpExchange] with the run's NCCL communicator as its device leg, and the direct-RDMA
+/// exchange (the GB10 doorbell) in front of it for the rounds that fit one.
+///
+/// The host collectives stay the TCP exchange's. [Exchange::exchange_on_device] is one round of
+/// the doorbell when the run opened it and the payload is at most [DOORBELL_ROW_CAP] bytes - a
+/// decode step's sums and its logit gather - through the DeepSeek arm's own stage and collect
+/// kernels ([sparkflash_kernels::write_exchange]); a wider payload, a prefill chunk's, is one
+/// RunReduce::exchange_bf16 of its bytes, the same one-hop exchange the DeepSeek and GLM device
+/// arms use. Both move bits and sum nothing, so the fold behind either gives the same bits. The
+/// choice is the payload's width, which every rank shares, so every rank takes the same leg.
+pub struct NcclExchange {
+    host: TcpExchange,
+    reduce: Communicator,
+    /// The doorbell, when this run opened it.
+    #[cfg(feature = "rdma")]
+    doorbell: Option<&'static Mutex<sparkflash_kernels::write_exchange::ExchangeState>>,
+}
+
+/// The widest round the doorbell carries for this arm: a decode step's logit slice is the
+/// widest of its collectives (50,015 f32 a rank at TP4, 200,060 bytes), and the residual sums
+/// are 18 KiB. A prefill chunk of a few rows fits too; a wider one stays on NCCL, which the open
+/// banner says.
+pub const DOORBELL_ROW_CAP: usize = 256 * 1024;
+
+/// What the open banner says the doorbell replaces in this arm.
+#[cfg(feature = "rdma")]
+const DOORBELL_REPLACES: &str = "every Inkling collective of at most 262144 bytes (a decode \
+     step's embedding, attention and expert sums and its logit gather, and a prefill chunk's when \
+     it is that narrow); wider prefill chunks stay on NCCL";
+
+/// Opens the doorbell for this rank, or `None` when the run selected the NCCL group or was never
+/// told where its peers are (the shared switch, [sparkflash_kernels::write_exchange::EXCHANGE_ENV]).
+///
+/// Collective: every rank calls it at the same point, right after the NCCL open, and the
+/// exchange's own rendezvous is inside.
+#[cfg(feature = "rdma")]
+fn open_doorbell(
+    cuda: &sparkflash_kernels::cuda_driver::Cuda,
+    world: usize,
+    rank: usize,
+) -> Result<Option<&'static Mutex<sparkflash_kernels::write_exchange::ExchangeState>>, String> {
+    use sparkflash_kernels::write_exchange::{Opening, shared, validate};
+    validate()?;
+    let opening = Opening {
+        row_cap: DOORBELL_ROW_CAP,
+        replaces: DOORBELL_REPLACES,
+    };
+    shared(cuda, world, rank, opening, || {
+        let image = sparkflash_kernels::images::inkling_cubin();
+        if image.is_empty() {
+            return Err("this build carries no Inkling cubin, whose image holds the exchange's \
+                        stage and collect kernels"
+                .to_owned());
+        }
+        Ok(image)
+    })
+}
+
+/// A build without the verbs backend has no doorbell; a run that asked for it by name is refused
+/// rather than measured on the group it was trying to replace.
+#[cfg(not(feature = "rdma"))]
+fn refuse_doorbell() -> Result<(), String> {
+    match std::env::var("SPARKFLASH_EXCHANGE").ok().as_deref().map(str::trim) {
+        None | Some("" | "0" | "nccl" | "off" | "NCCL" | "OFF") => Ok(()),
+        Some(other) => Err(format!(
+            "SPARKFLASH_EXCHANGE={other:?}: this build has no direct-RDMA exchange (it was built \
+             without the rdma feature); unset it or say nccl"
+        )),
+    }
+}
+
+impl std::fmt::Debug for NcclExchange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NcclExchange")
+            .field("rank", &self.host.rank)
+            .field("world", &self.host.world)
+            .finish()
+    }
+}
+
+impl NcclExchange {
+    /// Opens the run's communicator over `host`'s connections and pairs the two.
+    ///
+    /// Collective: every rank of the world calls it at the same point with the same `run`, whose
+    /// digest is the agreement word, so ranks about to run different things refuse before any
+    /// enters NCCL. The warm-up moves one `payload_words` bf16 slab; the calling thread's CUDA
+    /// context is the one the communicator binds, which must be the primary context the arm
+    /// launches on.
+    ///
+    /// # Errors
+    /// A library without point-to-point calls, or any refusal of the shared open sequence.
+    pub fn open(host: TcpExchange, payload_words: usize, run: &str) -> Result<Self, String> {
+        use sparkflash_kernels::cuda_driver::Cuda;
+        let cuda = Cuda::load()?;
+        let mut allocated = 0usize;
+        let scratch = cuda.alloc(payload_words.max(1) * 2, &mut allocated)?;
+        let config = BootstrapConfig {
+            native_rounding: 0,
+            env_toggles: 0,
+            plan_digest: fnv1a(run.as_bytes()),
+        };
+        let sync = || {
+            cuda.synchronize()
+                .map_err(|error| NcclError::Bootstrap(format!("the setup sync: {error}")))
+        };
+        // SAFETY: `scratch` is a fresh device allocation of `payload_words` bf16 values on the
+        // context this thread holds current, stream 0 is that context's default stream, and every
+        // rank passes the same payload.
+        let opened = unsafe {
+            open_run_reduce_over(
+                &host,
+                host.world,
+                host.rank,
+                0,
+                scratch.0,
+                payload_words.max(1),
+                config,
+                &sync,
+            )
+        };
+        cuda.free_buffers(&[&scratch]);
+        let reduce = opened.map_err(|error| format!("nccl open: {error}"))?;
+        if !reduce.has_exchange() {
+            return Err("the NCCL library has no point-to-point calls to exchange with".to_owned());
+        }
+        #[cfg(feature = "rdma")]
+        let doorbell = open_doorbell(&cuda, host.world, host.rank)?;
+        #[cfg(not(feature = "rdma"))]
+        refuse_doorbell()?;
+        Ok(Self {
+            host,
+            reduce: Communicator {
+                reduce: Mutex::new(reduce),
+                context: cuda,
+            },
+            #[cfg(feature = "rdma")]
+            doorbell,
+        })
+    }
+}
+
+impl Exchange for NcclExchange {
+    fn rank(&self) -> usize {
+        self.host.rank
+    }
+
+    fn world(&self) -> usize {
+        self.host.world
+    }
+
+    fn all_reduce_f32(&self, values: &mut [f32]) -> Result<(), String> {
+        self.host.all_reduce_f32(values)
+    }
+
+    fn all_gather_f32(&self, values: &[f32], out: &mut [f32]) -> Result<(), String> {
+        self.host.all_gather_f32(values, out)
+    }
+
+    fn has_device_leg(&self) -> bool {
+        true
+    }
+
+    fn exchange_on_device(
+        &self,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), String> {
+        if !bytes.is_multiple_of(2) || bytes == 0 {
+            return Err(format!(
+                "{bytes} bytes are not whole bf16 words, the unit the exchange moves"
+            ));
+        }
+        #[cfg(feature = "rdma")]
+        if let Some(doorbell) = self.doorbell
+            && stream == 0
+            && bytes <= DOORBELL_ROW_CAP
+        {
+            let mut state = doorbell
+                .lock()
+                .map_err(|_| "the direct-RDMA exchange is poisoned by an earlier panic".to_owned())?;
+            if bytes <= state.row_cap() {
+                let (rank, world) = (self.host.rank, self.host.world);
+                let cuda = &self.reduce.context;
+                // The stage kernel copies `send` into this rank's row of the round and rings the
+                // doorbell; the collect kernel behind it copies the peers' rows into their slots.
+                // Both are on the default stream, which is the one the walk folds on.
+                let round = state.stage(cuda, send, bytes, rank, world, &"inkling exchange")?;
+                return state.collect_slots(cuda, &round, slots, bytes, rank, world);
+            }
+        }
+        let mut reduce = self
+            .reduce
+            .reduce
+            .lock()
+            .map_err(|_| "the communicator lock is poisoned".to_owned())?;
+        // SAFETY: Exchange::exchange_on_device's contract is exchange_bf16's: `send` holds
+        // `bytes` and `slots` a world of them on the communicator's device, `stream` is a stream
+        // there, and every rank enqueues the same exchanges in the same order.
+        unsafe { reduce.exchange_bf16(send, slots, bytes / 2, stream) }
+            .map_err(|error| format!("nccl exchange: {error}"))
+    }
+
+    fn scatter_on_device(
+        &self,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let world = self.host.world;
+        if bytes == 0 || !bytes.is_multiple_of(2 * world) {
+            return Err(format!(
+                "{bytes} bytes are not {world} chunks of whole bf16 words, the unit the exchange \
+                 moves"
+            ));
+        }
+        let mut reduce = self
+            .reduce
+            .reduce
+            .lock()
+            .map_err(|_| "the communicator lock is poisoned".to_owned())?;
+        // SAFETY: Exchange::scatter_on_device's contract is scatter_bf16's: `send` holds `bytes`
+        // and `slots` as many on the communicator's device, `stream` is a stream there, and every
+        // rank enqueues the same exchanges in the same order.
+        unsafe { reduce.scatter_bf16(send, slots, bytes / 2 / world, stream) }
+            .map_err(|error| format!("nccl scatter: {error}"))
+    }
+
+    fn check_device(&self) -> Result<(), String> {
+        #[cfg(feature = "rdma")]
+        if self.doorbell.is_some() {
+            return sparkflash_kernels::write_exchange::check()
+                .map_err(|error| format!("direct-RDMA exchange: {error}"));
+        }
+        Ok(())
+    }
+}
+
+/// FNV-1a over the run description, the agreement digest the shared opener checks.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The exchange one rank of a TP group runs: the TCP exchange over `config`, with the run's NCCL
+/// communicator as its device leg unless [COMM_REDUCE_ENV] says `tcp`.
+///
+/// # Errors
+/// A transport that does not form, a switch value this arm has no path for, or an NCCL open that
+/// refuses (which aborts every rank: there is no silent fall back to the host path).
+pub fn connect_rank(
+    config: &TcpConfig,
+    payload_words: usize,
+    run: &str,
+) -> Result<Box<dyn Exchange>, String> {
+    let host = TcpExchange::connect(config)?;
+    if nccl_requested(host.world)? {
+        Ok(Box::new(NcclExchange::open(host, payload_words, run)?))
+    } else {
+        Ok(Box::new(host))
     }
 }
 

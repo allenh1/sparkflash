@@ -1040,6 +1040,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             pre("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
+            // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
+            // softcapped SwiGLU; its down pass is q4p_moe_down.
+            pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
         ],
         false,
     ),
@@ -1163,6 +1166,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             pre("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
+            // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
+            // softcapped SwiGLU; its down pass is q4p_moe_down.
+            pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
         ],
         false,
     ),

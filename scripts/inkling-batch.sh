@@ -21,19 +21,17 @@
 # so the run has no tokenizer in the way: the chunked prefill and the row-at-a-time walk are
 # compared on the ids they generate, and the arm's own tokenizer is not one of the variables.
 #
-# SPARKFLASH_INKLING_PREFILL=chunk (the default here) or rows selects the prefill walk.
+# PREFILL=tensor (the default), chunk (the decode step's bits), rows or gemm selects the prefill
+# walk (SPARKFLASH_INKLING_PREFILL; an unknown one is refused at open). The hosts, ports and NCCL
+# environment come from the site file scripts/inkling-env.sh reads. NSYS=/path/report profiles
+# rank 0 under Nsight Systems (CUDA and OS runtime traces) into that report; NSYS_ALL=1 also
+# profiles ranks 1-3, each into ${NSYS}-rank<r> on its own host.
 set -uo pipefail
-LOG=${LOG:-/home/allenh1/inkling-bin}
-BIN=${BIN:-/home/allenh1/inkling-bin/sparkflash}
-MODEL=${MODEL:-/home/allenh1/models/inkling2-small/ckpt}
-CONVERTED=${CONVERTED:-/home/allenh1/models/inkling2-small/converted}
-PEERS=${PEERS:-192.168.1.80:29600,192.168.1.68:29600,192.168.1.63:29600,192.168.1.88:29600}
+source "$(dirname "$0")/inkling-env.sh"
+MODEL=${MODEL:-$MODEL_DIR/ckpt}
+CONVERTED=${CONVERTED:-$MODEL_DIR/converted}
 CONTEXT=${CONTEXT:-4096}
-TRACE=${TRACE:-0}
-PREFILL=${PREFILL:-chunk}
 DECODE=${DECODE:-9}
-declare -A HOSTS=( [1]=192.168.1.68 [2]=192.168.1.63 [3]=192.168.1.88 )
-SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
 
 common=(
   inkling-tp4
@@ -47,13 +45,16 @@ common=(
 )
 
 for rank in 1 2 3; do
-  ip=${HOSTS[$rank]}
-  $SSH allenh1@$ip "cd $LOG && ( SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL setsid nohup $BIN ${common[*]} --rank $rank > $LOG/batch-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
+  remote_profile=""
+  # NSYS_ALL=1 profiles every rank: rank r writes ${NSYS}-rank$r on its own host.
+  [ -n "${NSYS:-}" ] && [ "${NSYS_ALL:-0}" = 1 ] \
+    && remote_profile="nsys profile -t cuda -f true -o ${NSYS}-rank$rank"
+  $SSH "$(rank_host $rank)" "cd $LOG && ( setsid nohup env ${RANK_ENV[*]} $remote_profile $BIN ${common[*]} --rank $rank > $LOG/batch-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
   sleep 1
 done
 echo "batch: rank 0 here, prefill $PREFILL"
-SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL $BIN ${common[*]} --rank 0 2>&1 | tee $LOG/batch-rank0.log | grep -E 'prompt|generated|prefill|decode step|best' || true
-for rank in 1 2 3; do
-  $SSH allenh1@$ip true >/dev/null 2>&1 || true
-done
+profile=()
+[ -n "${NSYS:-}" ] && profile=(nsys profile -t cuda,osrt -f true -o "$NSYS")
+env "${RANK_ENV[@]}" "${profile[@]}" "$BIN" "${common[@]}" --rank 0 2>&1 | tee "$LOG/batch-rank0.log" \
+  | grep -E 'prompt|generated|prefill|decode step|best|error|refus' || true
 echo "batch: done"

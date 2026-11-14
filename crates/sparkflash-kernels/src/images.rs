@@ -282,6 +282,7 @@ impl Image {
                 "q4p_moe_down",
                 "q4p_moe_down_fp8",
                 "q4p_moe_gate_up",
+                "q4p_moe_gate_up_capped",
                 "q4p_moe_gate_up_fp8",
                 "q4p_moe_rows_down",
                 "q4p_moe_rows_gate_up",
@@ -375,6 +376,18 @@ impl Image {
                 "inkling_router_topk",
                 "inkling_softcapped_swiglu",
                 "inkling_widen_f32",
+                // kernels/inkling_vision_sm121.cu: the vision tower's own stages.
+                "inkling_vision_layernorm",
+                "inkling_vision_patchify",
+                "inkling_vision_rope",
+                "inkling_vision_scale_add",
+                // kernels/opt_exchange_sm121.cuh: the direct-RDMA exchange's device side.
+                "opt_exchange_collect",
+                "opt_exchange_stage_bf16",
+                // kernels/opt_vision_sm121.cu, which the vision stages bring: DeepSeek's vision
+                // GEMM and attention, reused unchanged by the Inkling tower.
+                "opt_vision_attn",
+                "opt_vision_gemm",
             ],
             Self::Dory => &[
                 "dory_attn_combine",

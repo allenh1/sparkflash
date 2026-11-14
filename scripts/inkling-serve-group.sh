@@ -19,26 +19,26 @@
 #   TRACE=1 ./inkling-serve-group.sh launch    # rank 0 blocks; the others are detached over ssh
 #   ./inkling-serve-group.sh stop
 #
-# The defaults name the four-node window (sg1-oneill/jackson/carter/teilc) and the converted ranks
-# under /home/allenh1/models/inkling2-small; BIN, CONTEXT, BIND and TRACE override what a run needs.
+# The hosts, ports, paths and NCCL environment come from the site file scripts/inkling-env.sh
+# reads; BIN, CONTEXT, BIND, TRACE and PREFILL override what a run needs.
 #
 # CONTEXT defaults to the released window, 1,048,576 positions: eight full layers of KV is 8 KiB
 # a token a rank, so a rank's cache is 8.04 GiB and the four rank files plus it are 99.4 GiB of
 # the engine's 113.7 GiB budget. A smaller CONTEXT is the way to run when something else is using
-# the memory. The chunked prefill is the default; SPARKFLASH_INKLING_PREFILL=rows forces the
-# row-at-a-time walk, which is what the batch arm compares against.
+# the memory. The tensor-core chunked prefill is the default; PREFILL=chunk keeps a prompt's rows
+# on the decode step's bits and PREFILL=rows forces the row-at-a-time walk.
+#
+# LANES=N (N >= 2) steps N concurrent requests together as fused lanes on every rank. Each lane is
+# a whole sequence, so each holds its own cache: at the full window that is 8 GiB a lane a rank,
+# and only one or two lanes fit beside the weights. Pair LANES with a smaller CONTEXT - eight
+# lanes at CONTEXT=131072 hold 8 GiB a rank in all.
 set -uo pipefail
-LOG=/home/allenh1/inkling-bin
-BIN=${BIN:-/home/allenh1/inkling-bin/sparkflash}
-CKPT=/home/allenh1/models/inkling2-small/ckpt
-CONVERTED=/home/allenh1/models/inkling2-small/converted
-PEERS=192.168.1.80:29600,192.168.1.68:29600,192.168.1.63:29600,192.168.1.88:29600
+source "$(dirname "$0")/inkling-env.sh"
+CKPT=${CKPT:-$MODEL_DIR/ckpt}
+CONVERTED=${CONVERTED:-$MODEL_DIR/converted}
 CONTEXT=${CONTEXT:-1048576}
 BIND=${BIND:-0.0.0.0:8010}
-TRACE=${TRACE:-0}
-PREFILL=${PREFILL:-chunk}
-declare -A HOSTS=( [1]=192.168.1.68 [2]=192.168.1.63 [3]=192.168.1.88 )
-SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
+LANES=${LANES:-1}
 
 common=(
   --model inkling2
@@ -49,26 +49,28 @@ common=(
   --context "$CONTEXT"
   --tokenizer "$CKPT/tokenizer.json"
 )
+if [ "$LANES" -gt 1 ]; then
+  common+=(--concurrency "$LANES" --fuse-batch)
+fi
 
 case "${1:-launch}" in
 stop)
   for rank in 1 2 3; do
-    $SSH allenh1@${HOSTS[$rank]} "pkill -f 'sparkflash serve --model inkling2'" >/dev/null 2>&1 || true
+    $SSH "$(rank_host $rank)" "pkill -f 'sparkflash serve --model inkling2'" >/dev/null 2>&1 || true
   done
   pkill -f 'sparkflash serve --model inkling2' >/dev/null 2>&1 || true
   echo "serve-group: stopped"
   ;;
 launch)
   for rank in 1 2 3; do
-    ip=${HOSTS[$rank]}
     # setsid + </dev/null detaches the rank from the ssh channel: without it sshd waits for the
     # inherited stdin/stdout and the launcher never reaches rank 0.
-    $SSH allenh1@$ip "cd /home/allenh1/inkling-bin && ( SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL setsid nohup $BIN serve ${common[*]} --rank $rank > $LOG/group-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
+    $SSH "$(rank_host $rank)" "cd $LOG && ( setsid nohup env ${RANK_ENV[*]} $BIN serve ${common[*]} --rank $rank > $LOG/group-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
     sleep 1
   done
   echo "serve-group: rank 0 here"
-  cd /home/allenh1/inkling-bin
-  SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL $BIN serve ${common[*]} --rank 0 --bind "$BIND" > $LOG/group-rank0.log 2>&1
+  cd "$LOG"
+  env "${RANK_ENV[@]}" "$BIN" serve "${common[@]}" --rank 0 --bind "$BIND" > "$LOG/group-rank0.log" 2>&1
   echo "serve-group: rank 0 exited $?"
   ;;
 *)

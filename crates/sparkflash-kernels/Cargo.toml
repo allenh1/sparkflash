@@ -38,6 +38,7 @@ cudarc = { workspace = true, optional = true }
 # nothing links libcuda and a CPU-only build is unaffected. Same crate and version family cudarc
 # itself uses for fallback-dynamic-loading, so this adds an edge and not a new package version.
 libloading = "0.8"
+sparkflash-comm = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -52,6 +53,12 @@ default = []
 # features: ...". Making it build means choosing a version feature (cuda-12090 matches the 12.9
 # toolkit this repo probes with) in the root Cargo.toml, which is outside this crate.
 cuda = ["dep:cudarc"]
+# The direct-RDMA exchange's device side (src/write_exchange.rs): the pinned slab, the doorbell
+# kernels' launches and the run-wide switch, over sparkflash-comm's verbs backend. It is a
+# feature because the verbs backend is: a build without it still has every kernel, and the
+# arms that ring the doorbell (the DeepSeek forward, the Inkling device arm) turn it on with
+# their own rdma feature. The edge is acyclic: sparkflash-comm depends on no kernel crate.
+rdma = ["dep:sparkflash-comm", "sparkflash-comm/rdma"]
 
 [dev-dependencies]
 # The engine crate is a normal dependency now (src/cuda_harness.rs calls its released

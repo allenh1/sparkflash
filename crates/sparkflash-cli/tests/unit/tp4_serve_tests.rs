@@ -316,6 +316,7 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             prompt_logprobs: None,
             speculative: true,
             cached_tokens: 0,
+            images: Vec::new(),
         },
         Tp4ControlFrame::Request {
             prompt_ids: vec![9, 8],
@@ -323,6 +324,20 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             prompt_logprobs: Some(3),
             speculative: false,
             cached_tokens: 0,
+            images: Vec::new(),
+        },
+        // A fused group's prompt with an image span: the spans travel, the canvas does not.
+        Tp4ControlFrame::LaneRequest {
+            lane: 2,
+            prompt_ids: vec![5, 200_054, 200_054, 6],
+            images: vec![sparkflash_comm::control::Tp4DeviceImage {
+                start: 0,
+                n_llm_h: 1,
+                n_llm_w: 2,
+                best_height: 40,
+                best_width: 80,
+                key: sparkflash_comm::control::Tp4DeviceImage::hex_key(&[0xab; 32]),
+            }],
         },
         Tp4ControlFrame::Token { token_id: 7 },
         Tp4ControlFrame::End,

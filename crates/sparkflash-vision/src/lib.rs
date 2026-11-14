@@ -47,7 +47,7 @@ use thiserror::Error;
 
 pub use decode::{AlphaPolicy, DecodeLimits, ImageFormat, decode, decode_with_alpha};
 pub use plan::{Geometry, Grid, plan_grid};
-pub use prep::{PrepOptions, PreparedImage, prepare};
+pub use prep::{PrepOptions, PreparedImage, prepare, shrink_long_side};
 pub use resample::{RgbImage, resize_bicubic};
 pub use span::{IMAGE_TOKEN_ID, ImageSpan, SpanRow, TokenType};
 

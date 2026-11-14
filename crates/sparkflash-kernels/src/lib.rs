@@ -107,3 +107,5 @@ pub mod router_ref;
 pub mod sequence_chain;
 pub mod swiglu_ref;
 pub mod vision_tower;
+#[cfg(feature = "rdma")]
+pub mod write_exchange;

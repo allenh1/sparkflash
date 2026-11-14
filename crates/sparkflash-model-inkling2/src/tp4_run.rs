@@ -30,7 +30,7 @@ use sparkflash_model::backend::{ModelBackend, Sampling};
 use sparkflash_model::{ModelDescriptor, TpPlan};
 use sparkflash_weights::tp::TpLayout;
 
-use crate::collective::TcpExchange;
+use crate::collective::connect_rank;
 use crate::config::Inkling2Config;
 use crate::convert::RankFileSource;
 use crate::device::InklingDeviceBackend;
@@ -48,6 +48,37 @@ pub struct Tp4Run {
     pub converted: PathBuf,
     /// The admitted context, in tokens.
     pub context: usize,
+    /// How many times the prompt is walked, each in a fresh session on the one open rank: the
+    /// first walk pays the warm-up a served request after the first does not.
+    pub passes: usize,
+    /// Prefix lengths scored after the passes: the prompt's first `len * i / cuts` tokens for i in
+    /// 1..=cuts, each prefilled in a fresh session, so two prefill walks can be compared on the
+    /// logits they give at the same positions of the same text. Zero scores nothing.
+    pub cuts: usize,
+    /// Where rank 0 writes the scored logit rows: f32 little-endian, one row a cut, in cut order.
+    pub dump: Option<PathBuf>,
+}
+
+/// One scored prefix.
+#[derive(Debug, Clone, Copy)]
+pub struct Score {
+    /// The prefix's length in tokens.
+    pub length: usize,
+    /// The logits' best entry and its value.
+    pub best: (usize, f32),
+    /// The token the text continues with and its logit, when the prefix is not the whole prompt.
+    pub next: Option<(u32, f32)>,
+}
+
+/// The first greatest entry of a logit row.
+fn best_of(logits: &[f32]) -> (usize, f32) {
+    let mut best = (0usize, f32::NEG_INFINITY);
+    for (index, value) in logits.iter().enumerate() {
+        if *value > best.1 {
+            best = (index, *value);
+        }
+    }
+    best
 }
 
 /// What one rank of the run saw.
@@ -61,14 +92,16 @@ pub struct Tp4Outcome {
     pub prompt: Vec<u32>,
     /// The tokens every rank chose, in order: the prompt's last step and then one a decode.
     pub generated: Vec<u32>,
-    /// The prefill's wall time, in milliseconds.
-    pub prefill_ms: u128,
-    /// Each decode step's wall time, in milliseconds.
+    /// Each pass's prefill wall time, in milliseconds.
+    pub prefill_ms: Vec<u128>,
+    /// The last pass's decode step wall times, in milliseconds.
     pub decode_ms: Vec<u128>,
     /// The first logits' width, which is the released unpadded vocabulary.
     pub logits: usize,
     /// The first logits' best entry and its value, the comparison a second rank can make.
     pub best: (usize, f32),
+    /// The scored prefixes ([Tp4Run::cuts]), in cut order.
+    pub scores: Vec<Score>,
 }
 
 impl Tp4Run {
@@ -103,6 +136,9 @@ impl Tp4Run {
         if self.rank >= self.world {
             return Err(format!("rank {} is outside a world of {}", self.rank, self.world));
         }
+        if self.passes == 0 {
+            return Err("a run walks the prompt at least once".to_owned());
+        }
         Ok(())
     }
 
@@ -136,8 +172,12 @@ impl Tp4Run {
             .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?
             .with_timeout(Duration::from_secs(900))
             .with_connect_timeout(Duration::from_secs(180));
-        let exchange = TcpExchange::connect(&transport)
-            .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
+        let exchange = connect_rank(
+            &transport,
+            2 * config.hidden_size,
+            &format!("{} TP{} context {}", descriptor.id, self.world, self.context),
+        )
+        .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let tp = TpPlan::new(self.world, self.rank)
             .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let opened = Instant::now();
@@ -147,7 +187,7 @@ impl Tp4Run {
             Arc::new(source),
             self.context,
             tp,
-            Box::new(exchange),
+            exchange,
         )
         .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let banner = format!(
@@ -159,38 +199,78 @@ impl Tp4Run {
             backend.weight_bytes(),
             opened.elapsed().as_millis()
         );
-        let mut session = backend
-            .open_session()
-            .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
-        session.set_sampling(Self::greedy());
+        let mut prefill_ms = Vec::with_capacity(self.passes);
+        let mut walked = None;
+        for pass in 0..self.passes {
+            let mut session = backend
+                .open_session()
+                .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
+            session.set_sampling(Self::greedy());
 
-        let started = Instant::now();
-        let first = session
-            .prefill(prompt)
-            .map_err(|error| format!("TP{}/rank{} prefill: {}", self.world, self.rank, error.message()))?;
-        let prefill_ms = started.elapsed().as_millis();
-        let mut best = (0usize, f32::NEG_INFINITY);
-        for (index, value) in first.logits.iter().enumerate() {
-            if *value > best.1 {
-                best = (index, *value);
+            let started = Instant::now();
+            let first = session
+                .prefill(prompt)
+                .map_err(|error| format!("TP{}/rank{} prefill: {}", self.world, self.rank, error.message()))?;
+            prefill_ms.push(started.elapsed().as_millis());
+            let best = best_of(&first.logits);
+            let mut generated = Vec::with_capacity(decode + 1);
+            let mut next = first
+                .next_token
+                .ok_or_else(|| format!("TP{}/rank{}: the prefill chose no token", self.world, self.rank))?;
+            generated.push(next);
+            let mut decode_ms = Vec::with_capacity(decode);
+            for _ in 0..decode {
+                let started = Instant::now();
+                let step = session
+                    .decode(next)
+                    .map_err(|error| format!("TP{}/rank{} decode: {}", self.world, self.rank, error.message()))?;
+                decode_ms.push(started.elapsed().as_millis());
+                next = step
+                    .next_token
+                    .ok_or_else(|| format!("TP{}/rank{}: a decode chose no token", self.world, self.rank))?;
+                generated.push(next);
+            }
+            // Every pass walks the same ids greedily, so a pass that chose differently is a state
+            // leak between sessions, which is a bug and not a report.
+            if let Some((earlier, _, _, _)) = &walked
+                && *earlier != generated
+            {
+                return Err(format!(
+                    "TP{}/rank{}: pass {pass} generated {generated:?}, the first pass {earlier:?}",
+                    self.world, self.rank
+                ));
+            }
+            walked = Some((generated, decode_ms, first.logits.len(), best));
+        }
+        let (generated, decode_ms, logits, best) = walked.expect("a run walks at least once");
+        let mut scores = Vec::with_capacity(self.cuts);
+        let mut rows: Vec<u8> = Vec::new();
+        for cut in 1..=self.cuts {
+            let length = (prompt.len() * cut / self.cuts).max(1);
+            let mut session = backend
+                .open_session()
+                .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
+            session.set_sampling(Self::greedy());
+            let scored = session.prefill(&prompt[..length]).map_err(|error| {
+                format!("TP{}/rank{} score {length}: {}", self.world, self.rank, error.message())
+            })?;
+            let next = prompt.get(length).map(|&id| {
+                (id, scored.logits.get(id as usize).copied().unwrap_or(f32::NAN))
+            });
+            scores.push(Score {
+                length,
+                best: best_of(&scored.logits),
+                next,
+            });
+            if self.rank == 0 && self.dump.is_some() {
+                rows.extend(scored.logits.iter().flat_map(|value| value.to_le_bytes()));
             }
         }
-        let mut generated = Vec::with_capacity(decode + 1);
-        let mut next = first
-            .next_token
-            .ok_or_else(|| format!("TP{}/rank{}: the prefill chose no token", self.world, self.rank))?;
-        generated.push(next);
-        let mut decode_ms = Vec::with_capacity(decode);
-        for _ in 0..decode {
-            let started = Instant::now();
-            let step = session
-                .decode(next)
-                .map_err(|error| format!("TP{}/rank{} decode: {}", self.world, self.rank, error.message()))?;
-            decode_ms.push(started.elapsed().as_millis());
-            next = step
-                .next_token
-                .ok_or_else(|| format!("TP{}/rank{}: a decode chose no token", self.world, self.rank))?;
-            generated.push(next);
+        if self.rank == 0
+            && let Some(path) = &self.dump
+        {
+            std::fs::write(path, &rows)
+                .map_err(|error| format!("--dump-logits {}: {error}", path.display()))?;
         }
         Ok(Tp4Outcome {
             rank: self.rank,
@@ -199,8 +279,9 @@ impl Tp4Run {
             generated,
             prefill_ms,
             decode_ms,
-            logits: first.logits.len(),
+            logits,
             best,
+            scores,
         })
     }
 }
@@ -237,6 +318,9 @@ mod tests {
             addresses: vec![address(); addresses],
             converted: std::path::PathBuf::from("/nonexistent"),
             context: 16,
+            passes: 1,
+            cuts: 0,
+            dump: None,
         }
     }
 
@@ -249,6 +333,8 @@ mod tests {
         assert!(outside.contains("outside a world of 4"), "{outside}");
         let empty = run(0, 0, 0).check().expect_err("a world of nothing");
         assert!(empty.contains("zero"), "{empty}");
+        let idle = Tp4Run { passes: 0, ..run(4, 0, 4) }.check().expect_err("no pass");
+        assert!(idle.contains("at least once"), "{idle}");
     }
 
     #[test]

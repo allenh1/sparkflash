@@ -17,6 +17,7 @@ use std::sync::Arc;
 use sparkflash_model::{
     BackendError, Capabilities, ModelBackend, ModelDescriptor, ModelSession, Sampling, StepOutput,
 };
+use sparkflash_ops::sampler::Sampler;
 use sparkflash_weights::WeightSource;
 
 use crate::config::Inkling2Config;
@@ -103,6 +104,7 @@ impl ModelBackend for Inkling2HostBackend {
             last_logits: Vec::new(),
             cached: 0,
             sampling: Sampling::default(),
+            sampler: Sampler::new(),
         }))
     }
 }
@@ -115,11 +117,13 @@ struct Inkling2HostSession {
     last_logits: Vec<f32>,
     cached: usize,
     sampling: Sampling,
+    sampler: Sampler,
 }
 
 impl ModelSession for Inkling2HostSession {
     fn set_sampling(&mut self, sampling: Sampling) {
         self.sampling = sampling;
+        self.sampler.reset();
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
@@ -147,6 +151,9 @@ impl ModelSession for Inkling2HostSession {
                 ),
             ));
         }
+        // The penalties count the whole prompt, the reused prefix included: it is one request.
+        self.sampler.reset();
+        self.sampler.record_prompt(tokens);
         if remaining == 0 && !self.last_logits.is_empty() {
             return Ok(self.output(self.last_logits.clone()));
         }
@@ -179,6 +186,7 @@ impl ModelSession for Inkling2HostSession {
         }
         let logits = self.step(token)?;
         self.history.push(token);
+        self.sampler.record(token);
         self.last_logits = logits.clone();
         self.cached = 0;
         Ok(self.output(logits))
@@ -200,8 +208,8 @@ impl Inkling2HostSession {
             .map_err(|message| BackendError::new("forward", message))
     }
 
-    fn output(&self, logits: Vec<f32>) -> StepOutput {
-        let next_token = greedy(&logits, &self.sampling);
+    fn output(&mut self, logits: Vec<f32>) -> StepOutput {
+        let next_token = choose(self.weights.config(), &mut self.sampler, &logits, &self.sampling);
         StepOutput {
             logits,
             next_token,
@@ -210,40 +218,20 @@ impl Inkling2HostSession {
     }
 }
 
-/// The next token under one sampling request: greedy, or a deterministic temperature draw.
+/// The next token under one request's sampling, or `None` at an end-of-generation id.
 ///
-/// The device arm calls the same function so the two backends answer a request identically.
-pub(crate) fn greedy(logits: &[f32], sampling: &Sampling) -> Option<u32> {
+/// The penalties, temperature, top-k, top-p and the draw are the shared served sampler's (the
+/// one Dory and the DeepSeek host group use), so a request's options are applied rather than
+/// accepted and ignored, and each step draws a fresh number from the sequence's own stream. The
+/// device arm calls the same function, so the two backends answer a request identically.
+pub(crate) fn choose(
+    config: &Inkling2Config,
+    sampler: &mut Sampler,
+    logits: &[f32],
+    sampling: &Sampling,
+) -> Option<u32> {
     if logits.is_empty() {
         return None;
     }
-    if sampling.temperature <= 0.0 || sampling.top_k == 1 {
-        let mut best = 0usize;
-        for (index, value) in logits.iter().enumerate() {
-            if *value > logits[best] {
-                best = index;
-            }
-        }
-        return u32::try_from(best).ok();
-    }
-    // A deterministic temperature sample: enough for the host path, and reproducible per seed.
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let weights: Vec<f32> = logits
-        .iter()
-        .map(|value| ((value - max) / sampling.temperature).exp())
-        .collect();
-    let total: f32 = weights.iter().sum();
-    let mut state = sampling.seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    state ^= state >> 30;
-    state = state.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    state ^= state >> 27;
-    let draw = (state >> 11) as f32 / (1u64 << 53) as f32 * total;
-    let mut running = 0.0f32;
-    for (index, weight) in weights.iter().enumerate() {
-        running += weight;
-        if running >= draw {
-            return u32::try_from(index).ok();
-        }
-    }
-    u32::try_from(logits.len() - 1).ok()
+    config.next_token(sampler.choose(logits, sampling))
 }

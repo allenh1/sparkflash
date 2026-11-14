@@ -740,9 +740,14 @@ impl Pack {
     /// The flags among those given that this pack's arm would not apply: on one node, the
     /// knobs its host arm lacks; in a group, which serves one request at a time over a window
     /// every rank allocates, `--concurrency` above 1, `--fuse-batch` and `--kv-budget-gib`.
+    ///
+    /// `device_group` is the `--rank` group of the Inkling device arm, which steps concurrent
+    /// requests as fused lanes on every rank: it takes `--concurrency` with `--fuse-batch`, and
+    /// still refuses `--concurrency` alone, which would interleave sequences in its lockstep.
     pub(super) fn unapplied(
         self,
         group: bool,
+        device_group: bool,
         concurrency: usize,
         fuse_batch: bool,
         kv_budget: bool,
@@ -752,11 +757,12 @@ impl Pack {
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
             Self::Deepseek | Self::Dory | Self::Inkling => (false, false),
         };
+        let lanes = device_group && matches!(self, Self::Inkling);
         let mut unapplied = Vec::new();
-        if group && concurrency != 1 {
+        if group && concurrency != 1 && !(lanes && fuse_batch) {
             unapplied.push("--concurrency");
         }
-        if fuse_batch && (group || !fuses) {
+        if fuse_batch && if group { !lanes } else { !fuses } {
             unapplied.push("--fuse-batch");
         }
         if kv_budget && (group || !budgets) {

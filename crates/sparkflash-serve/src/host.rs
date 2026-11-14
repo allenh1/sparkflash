@@ -56,6 +56,7 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_model::telemetry::PrefixMatchPlan;
+use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
     ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation,
 };
@@ -252,15 +253,13 @@ impl InferenceEngine for HostDriver {
             let missing = MissingCapability::vision();
             return refused(&missing.to_string(), missing.code());
         }
-        // The API prepares images into `vision` only for an engine that advertises vision. The
-        // generic host driver has no way to write those rows over the placeholder embeddings yet,
-        // and prefill would otherwise read the placeholders as ordinary text. Refuse rather than
-        // answer from a prompt whose images were silently dropped.
-        if !request.vision.is_empty() {
-            return refused(
-                "the generic host driver cannot prefill prepared images yet; use the V4.1 device arm or a text-only request",
-                REFUSED_CODE,
-            );
+        // The API prepares images into `vision` only for an engine that advertises vision, and the
+        // session writes their rows over the placeholders ([ModelSession::prefill_images]). A
+        // backend that does not advertise it would read the placeholders as ordinary text, so
+        // refuse rather than answer from a prompt whose images were silently dropped.
+        if !request.vision.is_empty() && !self.capabilities.vision {
+            let missing = MissingCapability::vision();
+            return refused(&missing.to_string(), missing.code());
         }
         if request.prompt_tokens.is_empty() {
             return refused(
@@ -285,6 +284,7 @@ impl InferenceEngine for HostDriver {
         let (replies, answers) = mpsc::channel(self.reply_buffer);
         let job = Job {
             prompt_tokens: request.prompt_tokens,
+            images: request.vision,
             forced_tokens: request.forced_tokens,
             max_tokens,
             sampling: Sampling {
@@ -404,6 +404,8 @@ struct AnswerState {
 /// One queued generation request.
 struct Job {
     prompt_tokens: Vec<u32>,
+    /// The prepared images whose spans lie in `prompt_tokens`, in prompt order.
+    images: Vec<VisionImage>,
     /// Teacher forcing: the tokens fed in place of the backend's choice; empty for a generation.
     forced_tokens: Vec<u32>,
     max_tokens: usize,
@@ -537,8 +539,14 @@ fn run_request(
     held: &mut Option<Box<dyn ModelSession>>,
 ) -> Result<(), String> {
     let started = Instant::now();
+    // A held history is ids only, so a prefix that would cover an image's span cannot be matched
+    // by its ids; such a request starts a fresh sequence.
+    let reusable = |session: &dyn ModelSession| {
+        reusable_prefix_len(session, &job.prompt_tokens)
+            .filter(|cached| job.images.iter().all(|image| image.span.start >= *cached))
+    };
     let (mut session, cached) = match held.take() {
-        Some(session) => match reusable_prefix_len(session.as_ref(), &job.prompt_tokens) {
+        Some(session) => match reusable(session.as_ref()) {
             Some(cached) => (session, cached),
             None => (
                 backend
@@ -568,7 +576,7 @@ fn run_request(
         })
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     let prefill_started = Instant::now();
-    let mut step = session.prefill(&job.prompt_tokens).map_err(|error| {
+    let mut step = session.prefill_images(&job.prompt_tokens, &job.images).map_err(|error| {
         format!(
             "prefill failed after {} prompt token(s): {error}",
             job.prompt_tokens.len()

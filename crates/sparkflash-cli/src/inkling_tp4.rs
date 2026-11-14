@@ -15,7 +15,7 @@
 //! The `inkling-tp4` subcommand: one rank of an Inkling-2-Small four-host run.
 //!
 //!   sparkflash inkling-tp4 --model DIR --converted DIR --rank 0 --world 4 \
-//!       --peer 192.168.1.80:29600,192.168.1.64:29600,192.168.1.59:29600,192.168.1.88:29600 \
+//!       --peer 192.0.2.10:29600,192.0.2.11:29600,192.0.2.12:29600,192.0.2.13:29600 \
 //!       --context 4096 --prompt 1,2,3 --decode 8
 //!
 //! Every host runs the same command with its own `--rank`. The addresses are given in rank order,
@@ -41,6 +41,9 @@ struct Args {
     context: usize,
     prompt: Vec<u32>,
     decode: usize,
+    passes: usize,
+    cuts: usize,
+    dump: Option<PathBuf>,
     tokenizer: Option<PathBuf>,
     text: Option<String>,
     chat: bool,
@@ -59,6 +62,9 @@ impl Args {
         let mut text = None;
         let mut chat = false;
         let mut decode = 8usize;
+        let mut passes = 1usize;
+        let mut cuts = 0usize;
+        let mut dump = None;
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
             let mut value = || -> Result<String, String> {
@@ -80,6 +86,22 @@ impl Args {
                         .parse::<usize>()
                         .map_err(|error| format!("--decode: {error}"))?;
                 }
+                // The prompt is walked this many times on the one open rank, each in a fresh
+                // session, so the warm-up the first walk pays shows apart from the steady cost.
+                "--passes" => {
+                    passes = value()?
+                        .parse::<usize>()
+                        .map_err(|error| format!("--passes: {error}"))?;
+                }
+                // After the passes, the prompt's first len * i / cuts tokens are prefilled for i in
+                // 1..=cuts, each in a fresh session, and rank 0 writes their logit rows to
+                // --dump-logits: two prefill walks compared at the same positions of one text.
+                "--cuts" => {
+                    cuts = value()?
+                        .parse::<usize>()
+                        .map_err(|error| format!("--cuts: {error}"))?;
+                }
+                "--dump-logits" => dump = Some(PathBuf::from(value()?)),
                 "--chat" => chat = true,
                 "--tokenizer" => tokenizer = Some(PathBuf::from(value()?)),
                 "--text" => text = Some(value()?),
@@ -116,6 +138,9 @@ impl Args {
         if text.is_some() && tokenizer.is_none() {
             return Err("--text needs --tokenizer".to_owned());
         }
+        if dump.is_some() && cuts == 0 {
+            return Err("--dump-logits writes the --cuts rows; give --cuts N".to_owned());
+        }
         Ok(Self {
             model: model.ok_or_else(|| "--model is required".to_owned())?,
             converted: converted.ok_or_else(|| "--converted is required".to_owned())?,
@@ -125,6 +150,9 @@ impl Args {
             context,
             prompt: prompt.unwrap_or_default(),
             decode,
+            passes,
+            cuts,
+            dump,
             tokenizer,
             text,
             chat,
@@ -196,6 +224,9 @@ fn execute(args: &Args) -> Result<(), String> {
         addresses: args.peers.clone(),
         converted,
         context: args.context,
+        passes: args.passes,
+        cuts: args.cuts,
+        dump: args.dump.clone(),
     };
     let outcome = run.execute(
         &sparkflash_model_inkling2::descriptor(),
@@ -209,7 +240,7 @@ fn execute(args: &Args) -> Result<(), String> {
         outcome.rank, outcome.prompt, outcome.generated
     );
     println!(
-        "inkling-tp4: rank {} prefill {} ms, {} decode step(s) {:?} ms, logits {} best {:?}",
+        "inkling-tp4: rank {} prefill {:?} ms, {} decode step(s) {:?} ms, logits {} best {:?}",
         outcome.rank,
         outcome.prefill_ms,
         outcome.decode_ms.len(),
@@ -217,6 +248,12 @@ fn execute(args: &Args) -> Result<(), String> {
         outcome.logits,
         outcome.best
     );
+    for score in &outcome.scores {
+        println!(
+            "inkling-tp4: rank {} score length {} best {:?} next {:?}",
+            outcome.rank, score.length, score.best, score.next
+        );
+    }
     if let Some(codec) = &codec {
         let text = codec.decode(&outcome.generated).unwrap_or_default();
         println!("inkling-tp4: rank {} text {:?}", outcome.rank, text);

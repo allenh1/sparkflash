@@ -42,6 +42,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
+use crate::vision::VisionImage;
 
 /// What a model exposes for its sessions to be fused.
 ///
@@ -75,6 +76,26 @@ pub trait FusedArm: Send + Sync + 'static {
     /// A backend failure, such as a shape mismatch or an exhausted context.
     fn prefill(&self, slot: &mut Self::Slot, tokens: &[u32]) -> Result<StepOutput, BackendError>;
 
+    /// Consumes a prompt whose image spans take `images`' features, as
+    /// [ModelSession::prefill_images]. The default refuses any image.
+    ///
+    /// # Errors
+    /// As [FusedArm::prefill], and an arm without a vision path refuses images.
+    fn prefill_images(
+        &self,
+        slot: &mut Self::Slot,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
+        if images.is_empty() {
+            return self.prefill(slot, tokens);
+        }
+        Err(BackendError::new(
+            "vision",
+            format!("this arm has no vision path for the request's {} images", images.len()),
+        ))
+    }
+
     /// Consumes one token a member and returns each member's step, in the order given.
     ///
     /// A row must compute as it would alone: the arm's wide stages read the weights once for
@@ -106,9 +127,11 @@ const FILL_WINDOW: Duration = Duration::from_micros(300);
 
 /// What one job asks the engine for.
 enum Work {
-    /// Consume a prompt. `sampling` is the request's, applied before its prompt runs.
+    /// Consume a prompt. `sampling` is the request's, applied before its prompt runs; `images`
+    /// fill the prompt's image spans.
     Prefill {
         tokens: Vec<u32>,
+        images: Vec<VisionImage>,
         sampling: Sampling,
     },
     /// Consume one token of a request already prefilled.
@@ -287,12 +310,21 @@ impl<A: FusedArm> ModelSession for FusedSession<A> {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        self.prefill_images(tokens, &[])
+    }
+
+    fn prefill_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
         if tokens.is_empty() {
             return Err(BackendError::new("fused", "an empty prompt has no logits"));
         }
         self.fresh = false;
         self.ask(Work::Prefill {
             tokens: tokens.to_vec(),
+            images: images.to_vec(),
             sampling: self.sampling,
         })
     }
@@ -338,10 +370,17 @@ fn run<A: FusedArm>(
         for job in jobs {
             match job.work {
                 Work::Shutdown => return,
-                Work::Prefill { tokens, sampling } => {
-                    prefill(
-                        &*arm, &mut pool, &stats, job.slot, &tokens, sampling, job.reply,
-                    );
+                Work::Prefill {
+                    tokens,
+                    images,
+                    sampling,
+                } => {
+                    let prompt = Prompt {
+                        tokens: &tokens,
+                        images: &images,
+                        sampling,
+                    };
+                    prefill(&*arm, &mut pool, &stats, job.slot, prompt, job.reply);
                 }
                 Work::Decode { token } => decodes.push((job.slot, token, job.reply)),
             }
@@ -352,14 +391,20 @@ fn run<A: FusedArm>(
     }
 }
 
+/// One prompt job's request: its tokens, its images and its sampler.
+struct Prompt<'a> {
+    tokens: &'a [u32],
+    images: &'a [VisionImage],
+    sampling: Sampling,
+}
+
 /// Runs one prompt on its slot, between the slot's decodes.
 fn prefill<A: FusedArm>(
     arm: &A,
     pool: &mut [Option<A::Slot>],
     stats: &[Arc<Mutex<Speculation>>],
     slot: usize,
-    tokens: &[u32],
-    sampling: Sampling,
+    prompt: Prompt<'_>,
     reply: Sender<Result<StepOutput, BackendError>>,
 ) {
     let Some(mut state) = pool[slot].take() else {
@@ -373,8 +418,8 @@ fn prefill<A: FusedArm>(
         if arm.holds_request(&state) {
             arm.renew(&mut state)?;
         }
-        arm.set_sampling(&mut state, sampling);
-        arm.prefill(&mut state, tokens)
+        arm.set_sampling(&mut state, prompt.sampling);
+        arm.prefill_images(&mut state, prompt.tokens, prompt.images)
     })();
     if let Ok(mut cell) = stats[slot].lock() {
         *cell = arm.speculation(&state);

@@ -459,7 +459,7 @@ impl RankFileSource {
 
     /// Reads `len` payload bytes at `offset` of one tensor's rank-local bytes.
     fn read_tensor(&self, name: &str, offset: u64, len: usize) -> Result<Vec<u8>, WeightError> {
-        if self.specs.get(name).is_none() {
+        if !self.specs.contains_key(name) {
             return Err(WeightError::Missing {
                 name: name.to_string(),
             });
@@ -584,7 +584,9 @@ mod tests {
         let config = released();
         let served = InklingTensorPlan::served(&config, TpPlan::new(1, 0).expect("TP1"))
             .expect("the served plan");
-        let mut coverage: BTreeMap<String, (usize, Vec<Vec<(u64, usize)>>)> = BTreeMap::new();
+        // A tensor's largest rank slot, and each rank's (offset, length) ranges of it.
+        type Coverage = (usize, Vec<Vec<(u64, usize)>>);
+        let mut coverage: BTreeMap<String, Coverage> = BTreeMap::new();
         for rank in 0..4 {
             let layout = TpLayout {
                 rank,

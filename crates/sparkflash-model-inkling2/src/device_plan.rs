@@ -417,9 +417,10 @@ pub struct LayerSchedule {
     pub taps: TapLayout,
     /// The attention's log-scaling rule.
     pub tau: TauRule,
-    /// The rows this layer's key/value cache holds. A sliding layer holds its window and the
-    /// attention reads it as a ring (absolute slot modulo this); a full layer holds the context
-    /// and is addressed absolutely.
+    /// The rows this layer's key/value cache holds. A sliding layer holds its window plus the
+    /// widest chunk less one, and the attention reads it as a ring (absolute slot modulo this); a
+    /// full layer holds the context and is addressed absolutely. See
+    /// [InklingDevicePlan::cache_rows] for why the ring is wider than the window.
     pub kv_rows: usize,
     /// The window the attention is given (0 on a full layer).
     pub window: usize,
@@ -474,6 +475,9 @@ pub struct InklingDevicePlan {
     tp: TpPlan,
     pass: Pass,
     rows: usize,
+    /// The widest chunk any pass over this session's cache writes at once, which sizes the
+    /// sliding rings ([Self::cache_rows]).
+    chunk: usize,
     context: usize,
     served: InklingTensorPlan,
     prologue: Vec<Step>,
@@ -483,7 +487,8 @@ pub struct InklingDevicePlan {
 }
 
 impl InklingDevicePlan {
-    /// Build the schedule of one rank and one pass.
+    /// Build the schedule of one rank and one pass, for a session whose widest write is this
+    /// pass's own rows.
     ///
     /// # Errors
     /// A world the model's heads, experts or vocabulary do not divide, a zero row count, or a
@@ -495,11 +500,31 @@ impl InklingDevicePlan {
         rows: usize,
         context: usize,
     ) -> Result<Self, String> {
+        Self::build_for_chunk(config, tp, pass, rows, context, rows)
+    }
+
+    /// Build the schedule of one rank and one pass, for a session that also walks chunks of up
+    /// to `chunk` rows: the decode and the chunk schedules of one session must agree on the
+    /// sliding rings' length, because both address the same cache.
+    ///
+    /// # Errors
+    /// As [Self::build], and a chunk narrower than the pass's rows.
+    pub fn build_for_chunk(
+        config: &Inkling2Config,
+        tp: TpPlan,
+        pass: Pass,
+        rows: usize,
+        context: usize,
+        chunk: usize,
+    ) -> Result<Self, String> {
         if rows == 0 {
             return Err("a pass needs at least one row".to_owned());
         }
         if pass == Pass::Decode && rows != 1 {
             return Err(format!("a decode pass is one row, not {rows}"));
+        }
+        if chunk < rows {
+            return Err(format!("a chunk of {chunk} rows is narrower than the pass's {rows}"));
         }
         let window = config.context_tokens();
         if context == 0 || (window != 0 && context > window) {
@@ -513,6 +538,7 @@ impl InklingDevicePlan {
             tp,
             pass,
             rows,
+            chunk,
             context,
             served,
             prologue: Vec::new(),
@@ -574,6 +600,31 @@ impl InklingDevicePlan {
     #[must_use]
     pub const fn context(&self) -> usize {
         self.context
+    }
+
+    /// The widest chunk the session's cache is sized for.
+    #[must_use]
+    pub const fn chunk(&self) -> usize {
+        self.chunk
+    }
+
+    /// The rows a layer's key/value cache holds.
+    ///
+    /// A full layer holds the context and is addressed absolutely. A sliding layer is a ring,
+    /// and a chunk writes all of its rows' keys before any of them attends, so the ring must hold
+    /// the window *and* the chunk: row `r` of a chunk reads back to `window - 1` positions before
+    /// itself, and the rows after it have already been stored. A ring of exactly the window lets
+    /// row `j > r` land on a slot row `r` still reads - a key from row `r`'s future in place of
+    /// one from its past. `window + chunk - 1` is the smallest ring in which no row of a chunk
+    /// overwrites a key an earlier row of it reads. The attention walks keys by position and only
+    /// their slots move, so a wider ring reads the same keys in the same order.
+    #[must_use]
+    pub fn cache_rows(&self, layer: usize) -> usize {
+        if self.config.is_sliding(layer) {
+            (self.config.sliding_window_size + self.chunk - 1).min(self.context)
+        } else {
+            self.context
+        }
     }
 
     /// The served tensor plan the step indices address.
@@ -1294,11 +1345,7 @@ impl InklingDevicePlan {
         )?.at(Target::Conv(ConvSlot::Mlp)));
         steps.push(Self::add(rows, hidden));
 
-        let kv_rows = if sliding {
-            config.sliding_window_size.min(self.context)
-        } else {
-            self.context
-        };
+        let kv_rows = self.cache_rows(layer);
         Ok(LayerSchedule {
             index: layer,
             sliding,
@@ -1339,12 +1386,7 @@ impl InklingDevicePlan {
             if layer.is_multiple_of(config.n_layers_per_attn_res_block.max(1)) {
                 blocks += 1;
             }
-            // A sliding layer addresses at most its window; a full layer addresses the context.
-            let cache_rows = if config.is_sliding(layer) {
-                config.sliding_window_size.min(self.context)
-            } else {
-                self.context
-            };
+            let cache_rows = self.cache_rows(layer);
             // Two caches (key and value) of BF16 rows.
             kv_cache = kv_cache.saturating_add(cache_rows * kv_heads * head_dim * 2 * 2);
         }
@@ -1408,6 +1450,46 @@ mod tests {
     ) -> InklingDevicePlan {
         let tp = TpPlan::new(world, rank).expect("a TP plan");
         InklingDevicePlan::build(&released(), tp, pass, rows, context).expect("the schedule")
+    }
+
+    #[test]
+    fn a_sliding_ring_holds_the_window_and_the_widest_chunk() {
+        let config = released();
+        let tp = TpPlan::new(4, 0).expect("a TP plan");
+        let window = config.sliding_window_size;
+        for (chunk, context) in [(1, 262_144), (128, 262_144), (4096, 16_384), (8192, 4096)] {
+            let decode =
+                InklingDevicePlan::build_for_chunk(&config, tp, Pass::Decode, 1, context, chunk)
+                    .expect("the decode schedule");
+            let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, chunk, context)
+                .expect("the chunk schedule");
+            for (layer, (step, wide)) in decode.layers().iter().zip(prefill.layers()).enumerate() {
+                // One cache, two schedules: they must agree on its length.
+                assert_eq!(step.kv_rows, wide.kv_rows, "layer {layer} at chunk {chunk}");
+                let expected = if config.is_sliding(layer) {
+                    (window + chunk - 1).min(context)
+                } else {
+                    context
+                };
+                assert_eq!(step.kv_rows, expected, "layer {layer} at chunk {chunk}");
+            }
+        }
+        // A chunk's later rows must not land on a slot an earlier row reads: for every pair of
+        // rows r < j of one chunk, j's slot is not one of r's window slots.
+        let (chunk, ring) = (64usize, window + 64 - 1);
+        let first = 5 * window + 17;
+        for r in 0..chunk {
+            let position = first + r;
+            let oldest = position + 1 - window;
+            let read: std::collections::HashSet<usize> =
+                (oldest..=position).map(|slot| slot % ring).collect();
+            for j in r + 1..chunk {
+                assert!(!read.contains(&((first + j) % ring)), "row {j} overwrites row {r}");
+            }
+        }
+        let narrower = InklingDevicePlan::build_for_chunk(&config, tp, Pass::Prefill, 128, 4096, 64)
+            .expect_err("a chunk narrower than its pass");
+        assert!(narrower.contains("narrower"), "{narrower}");
     }
 
     #[test]

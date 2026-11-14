@@ -70,6 +70,8 @@
 // The 128 x 128 bulk-prefill tile body GLM's dense and routed-expert images launch: Qwen's
 // block-scaled FP8 experts run their grouped prefill MMA on the same body (D95).
 #include "shared_prefill_mma_sm121.cuh"
+// Inkling-2-Small's softcapped SwiGLU, the activation q4p_moe_gate_up_capped applies.
+#include "inkling_softcap_sm121.cuh"
 
 // The shared header's gate, under the name this image used.
 #define q4p_silu q4e_silu
@@ -706,6 +708,26 @@ __device__ __forceinline__ float q4p_routed(float sum, float route, float d2) {
     return route * (sum * d2);
 }
 
+// The gate_up pass's weight layout and activation. Qwen's checkpoint stores gate and up as two
+// matrices (table entries 0/1 and 2/3, an intermediate column a row) under a SiLU SwiGLU.
+struct Q4pSiluSwiglu {
+    static constexpr int kGateUpRows = 1;
+    __device__ __forceinline__ float activate(float gate, float up, float g2, float u2) const {
+        return q4p_swiglu(gate, up, g2, u2);
+    }
+};
+// Inkling-2-Small's w13 interleaves them, row 2c the gate of column c and 2c + 1 its up: the
+// host points entries 2/3 one row past 0/1 and a column is two rows on. The activation is the
+// softcapped SwiGLU (kernels/inkling_softcap_sm121.cuh) of the scaled sums.
+struct Q4pSoftcapSwiglu {
+    static constexpr int kGateUpRows = 2;
+    float gate_cap;
+    float up_cap;
+    __device__ __forceinline__ float activate(float gate, float up, float g2, float u2) const {
+        return inkling_softcapped_swiglu_value(gate * g2, up * u2, gate_cap, up_cap);
+    }
+};
+
 // One CTA: an item's rows (up to 32) times one 128-row panel of NVFP4 weights, K in stages of 64.
 //
 // Warp w owns panel rows 8w..8w+7 and 64+8w..64+8w+7 - for gate_up the same 8 intermediate
@@ -719,14 +741,16 @@ __device__ __forceinline__ float q4p_routed(float sum, float route, float d2) {
 // accumulator.
 //
 // `a_plane` is the element offset of a_src's remainder plane; `out_plane` that of the SwiGLU
-// rows' remainder plane gate_up writes.
-template <bool GATE_UP>
+// rows' remainder plane gate_up writes. `Epi` is gate_up's row layout and activation
+// (Q4pSiluSwiglu or Q4pSoftcapSwiglu); down ignores it.
+template <bool GATE_UP, class Epi = Q4pSiluSwiglu>
 __device__ __forceinline__ void q4p_moe_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ sorted, const int4* __restrict__ items,
     const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ a_src,
     unsigned long long a_plane, const float* __restrict__ route_weights, void* __restrict__ out,
-    unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride) {
+    unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride,
+    const Epi epi = Epi()) {
     __shared__ __align__(16) Q4pStage stages[Q4P_STAGES];
     __shared__ uint32_t lut[256];
     __shared__ int s_slot[Q4P_MOE_ROWS];
@@ -769,7 +793,8 @@ __device__ __forceinline__ void q4p_moe_body(
     if (GATE_UP) {
         const int which = b_row < Q4P_BN / 2 ? 0 : 2;
         const unsigned long long row = (unsigned long long)(n0 + (b_row & (Q4P_BN / 2 - 1)));
-        b_base = (const unsigned char*)table[expert * 6 + which] + row * packed_row;
+        b_base = (const unsigned char*)table[expert * 6 + which] +
+                 row * (Epi::kGateUpRows * packed_row);
     } else {
         b_base = (const unsigned char*)table[expert * 6 + 4] +
                  (unsigned long long)(n0 + b_row) * packed_row;
@@ -781,7 +806,8 @@ __device__ __forceinline__ void q4p_moe_body(
         if (GATE_UP) {
             const int which = tid < Q4P_BN / 2 ? 1 : 3;
             const unsigned long long row = (unsigned long long)(n0 + (tid & (Q4P_BN / 2 - 1)));
-            sc_base = (const unsigned char*)table[expert * 6 + which] + row * scale_row;
+            sc_base = (const unsigned char*)table[expert * 6 + which] +
+                      row * (Epi::kGateUpRows * scale_row);
         } else {
             sc_base = (const unsigned char*)table[expert * 6 + 5] +
                       (unsigned long long)(n0 + tid) * scale_row;
@@ -889,8 +915,8 @@ __device__ __forceinline__ void q4p_moe_body(
                     continue;
                 }
                 const int slot = s_slot[r];
-                const float a0 = q4p_swiglu(acc[mt][0][2 * h], acc[mt][1][2 * h], g2, u2);
-                const float a1 = q4p_swiglu(acc[mt][0][2 * h + 1], acc[mt][1][2 * h + 1], g2, u2);
+                const float a0 = epi.activate(acc[mt][0][2 * h], acc[mt][1][2 * h], g2, u2);
+                const float a1 = epi.activate(acc[mt][0][2 * h + 1], acc[mt][1][2 * h + 1], g2, u2);
                 __nv_bfloat162 head;
                 __nv_bfloat162 rest;
                 q4p_split2(a0, a1, head, rest);
@@ -938,6 +964,24 @@ extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_gate_up(
     OPT_PDL_ENTRY();
     q4p_moe_body<true>(table, scales, sorted, items, item_count, x, x_plane, nullptr, activated,
                        activated_plane, topk, hidden, intermediate, 0);
+}
+
+// Pass one for a w13 that interleaves gate and up rows under the softcapped SwiGLU
+// (Inkling-2-Small): q4p_moe_gate_up's tile, stages and MMA chain, with table entries 2 and 3 one
+// row past 0 and 1 and an intermediate column two rows on (Q4pSoftcapSwiglu). A cap that is not
+// positive leaves its branch uncapped. q4p_moe_down is the second pass unchanged. Grid
+// (intermediate / 64, max items), 256 threads.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_gate_up_capped(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ x,
+    unsigned long long x_plane, __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, int topk, int hidden, int intermediate, float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<true>(table, scales, sorted, items, item_count, x, x_plane, nullptr, activated,
+                       activated_plane, topk, hidden, intermediate, 0,
+                       Q4pSoftcapSwiglu{gate_cap, up_cap});
 }
 
 // Pass two: down for 128 output columns of one item, scaled by the routing weight into f32
