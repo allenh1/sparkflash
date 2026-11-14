@@ -389,8 +389,14 @@ fn rms_norm_in_place(input: &mut [f32], epsilon: f64) {
 ///
 /// `codes` is `[rows, columns / 2]` with the **low** nibble the even column, `scales` is
 /// `[rows, columns / 16]` of E4M3 multipliers, and `scale_2` is the expert's own
-/// `amax / (6 * outer_scale_denominator)`. The release stores one of those per expert, so the
-/// factor rides on the expert's output rather than on a shared tensor constant.
+/// `amax / outer_scale_denominator`.
+///
+/// The release's `outer_scale_denominator` already carries the block rescale factor: it is
+/// `6 * 448 = 2688` (six times the E4M3 multiplier maximum), and the stored `amax` is the
+/// matching `6 *` block amax. So `scale_2 = amax / 2688`, and multiplying by the six a second
+/// time shrinks every NVFP4 expert by 6x - dense `wq_du` is 0.014731, a 6x-small expert is
+/// 0.002455. The release stores one of those per expert, so the factor rides on the expert's
+/// output rather than on a shared tensor constant.
 ///
 /// # Errors
 /// A tensor whose length does not match the shape.
@@ -541,7 +547,8 @@ pub fn residual_add(residual: &[f32], delta: &[f32], rows: usize, columns: usize
 /// The routed experts' mix: `out = sum over slots of scales[slot] * partials[slot]`.
 ///
 /// One body serves the three expert formats because they differ only in where the per-expert
-/// factor comes from: an NVFP4 expert stores `amax / (6 * outer_scale_denominator)`, an MXFP8
+/// factor comes from: an NVFP4 expert stores `amax / outer_scale_denominator` (already `6 * 448`,
+/// see `nvfp4_matvec`), an MXFP8
 /// expert stores nothing, and a BF16 expert is the fixture's dense tensor. The arm multiplies that
 /// factor by the router's share and hands the product here, so the mix is a plain scaled sum in
 /// slot order - the same sequential f32 order the host forward's combine used, which is why the
