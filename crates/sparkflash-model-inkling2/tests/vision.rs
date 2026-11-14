@@ -133,7 +133,8 @@ fn tower_source(config: &InklingVisionConfig) -> Filled {
         vec![width],
         0.4,
     );
-    for name in ["ln_pre"] {
+    {
+        let name = "ln_pre";
         source.put(&format!("{prefix}.backbone.{name}.weight"), vec![width], 1.0);
         source.put(&format!("{prefix}.backbone.{name}.bias"), vec![width], 0.1);
     }

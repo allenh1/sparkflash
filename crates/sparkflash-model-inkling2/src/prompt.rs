@@ -95,8 +95,8 @@ impl InklingCodec {
             })?;
         let mut text = String::new();
         let mut effort_emitted = false;
-        if let Some(tools) = request.get("tools").and_then(Value::as_array) {
-            if !tools.is_empty() {
+        if let Some(tools) = request.get("tools").and_then(Value::as_array)
+            && !tools.is_empty() {
                 text.push_str(MESSAGE_SYSTEM);
                 text.push_str("tool_declare");
                 text.push_str("<|content_xml|>");
@@ -106,7 +106,6 @@ impl InklingCodec {
                 );
                 text.push_str(END_MESSAGE);
             }
-        }
         for message in messages {
             let role = message
                 .get("role")
@@ -214,7 +213,7 @@ impl InklingCodec {
                         text.push_str(&serde_json::to_string(&args).map_err(|error| {
                             PromptError::invalid(error.to_string(), None, None)
                         })?);
-                        text.push_str("}");
+                        text.push('}');
                         text.push_str(END_MESSAGE);
                     }
                 }

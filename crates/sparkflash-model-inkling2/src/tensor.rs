@@ -214,8 +214,8 @@ impl InklingTensorPlan {
             }
         }
 
-        if vision {
-            if let Some(vision) = &config.vision {
+        if vision
+            && let Some(vision) = &config.vision {
                 let width = vision.hidden_size;
                 // The release folds the temporal axis before the patch projection; the stored
                 // input width is three channels times the square patch.
@@ -249,7 +249,6 @@ impl InklingTensorPlan {
                 plan.push(&format!("{prefix}.proj_in.weight"), DType::BF16, vec![vision.projection_hidden_dim, width * vision.adapter_merge_size * vision.adapter_merge_size], Role::Vision);
                 plan.push(&format!("{prefix}.proj_out.weight"), DType::BF16, vec![vision.out_hidden_size, vision.projection_hidden_dim], Role::Vision);
             }
-        }
 
         if mtp {
             // The MTP checkpoint is a separate file; the plan names its stage tensors for the

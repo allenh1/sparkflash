@@ -1538,7 +1538,7 @@ impl InklingDeviceSession {
                 shared
                     .cuda
                     .copy_dtoh(&mut probe, &self.state.scratch.x)
-                    .map_err(|error| Self::fail(error))?;
+                    .map_err(Self::fail)?;
                 let values: Vec<f32> = probe
                     .as_chunks::<4>()
                     .0
@@ -1642,14 +1642,14 @@ impl InklingDeviceSession {
         shared
             .cuda
             .synchronize()
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         let padded = plan.rank_vocab() * shared.exchange.world();
         let unpadded = config.unpadded_vocab_size.min(padded).max(1);
         let mut bytes = vec![0u8; unpadded * 2];
         shared
             .cuda
             .copy_dtoh(&mut bytes, &self.state.scratch.logits_bf16)
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         Ok(bytes
             .as_chunks::<2>()
             .0
@@ -1681,11 +1681,11 @@ impl InklingDeviceSession {
         shared
             .cuda
             .copy_dtoh(&mut index_bytes, &self.state.scratch.indices)
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         shared
             .cuda
             .copy_dtoh(&mut share_bytes, &self.state.scratch.shares)
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         let selected: Vec<usize> = index_bytes
             .as_chunks::<4>()
             .0
@@ -1731,7 +1731,7 @@ impl InklingDeviceSession {
                             2 * intermediate,
                             hidden,
                         )
-                        .map_err(|error| Self::fail(error))?;
+                        .map_err(Self::fail)?;
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
@@ -1760,7 +1760,7 @@ impl InklingDeviceSession {
                                 last,
                             ],
                         )
-                        .map_err(|error| Self::fail(error))?;
+                        .map_err(Self::fail)?;
                 }
             }
             let activation_out = activated.offset(slot * intermediate * 4);
@@ -1777,7 +1777,7 @@ impl InklingDeviceSession {
                         bits(config.mlp_up_softcap as f32),
                     ],
                 )
-                .map_err(|error| Self::fail(error))?;
+                .map_err(Self::fail)?;
             let down_offset = local * codes_bytes(hidden, intermediate, schedule.experts);
             let partial = partials.offset(slot * hidden * 4);
             match schedule.experts {
@@ -1790,7 +1790,7 @@ impl InklingDeviceSession {
                             hidden,
                             intermediate,
                         )
-                        .map_err(|error| Self::fail(error))?;
+                        .map_err(Self::fail)?;
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
@@ -1819,7 +1819,7 @@ impl InklingDeviceSession {
                                 last,
                             ],
                         )
-                        .map_err(|error| Self::fail(error))?;
+                        .map_err(Self::fail)?;
                 }
             }
             // The share this expert's output carries into the mix, which is the router's weight
@@ -1831,7 +1831,7 @@ impl InklingDeviceSession {
         shared
             .cuda
             .copy_htod(&self.state.scratch.scales, &scale_bytes)
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         shared
             .launch(
                 shared.kernels.expert_mix,
@@ -1846,7 +1846,7 @@ impl InklingDeviceSession {
                     hidden as u64,
                 ],
             )
-            .map_err(|error| Self::fail(error))?;
+            .map_err(Self::fail)?;
         Ok(())
     }
 }

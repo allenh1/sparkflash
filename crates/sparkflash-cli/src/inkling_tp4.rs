@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sparkflash_model::PromptCodec;
 use sparkflash_model_inkling2::config::Inkling2Config;
 use sparkflash_model_inkling2::{Tp4Run, rank_file};
 
@@ -40,6 +41,8 @@ struct Args {
     context: usize,
     prompt: Vec<u32>,
     decode: usize,
+    tokenizer: Option<PathBuf>,
+    text: Option<String>,
 }
 
 impl Args {
@@ -51,6 +54,8 @@ impl Args {
         let mut peers = None;
         let mut context = 4096usize;
         let mut prompt = None;
+        let mut tokenizer = None;
+        let mut text = None;
         let mut decode = 8usize;
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
@@ -73,6 +78,8 @@ impl Args {
                         .parse::<usize>()
                         .map_err(|error| format!("--decode: {error}"))?;
                 }
+                "--tokenizer" => tokenizer = Some(PathBuf::from(value()?)),
+                "--text" => text = Some(value()?),
                 "--prompt" => {
                     let raw = value()?;
                     let mut ids = Vec::new();
@@ -100,6 +107,12 @@ impl Args {
         }
         let peers = peers.ok_or_else(|| "--peer is required".to_owned())?;
         let world = world.unwrap_or(peers.len());
+        if prompt.is_none() && text.is_none() {
+            return Err("--prompt or --text is required".to_owned());
+        }
+        if text.is_some() && tokenizer.is_none() {
+            return Err("--text needs --tokenizer".to_owned());
+        }
         Ok(Self {
             model: model.ok_or_else(|| "--model is required".to_owned())?,
             converted: converted.ok_or_else(|| "--converted is required".to_owned())?,
@@ -107,8 +120,10 @@ impl Args {
             world,
             peers,
             context,
-            prompt: prompt.ok_or_else(|| "--prompt is required".to_owned())?,
+            prompt: prompt.unwrap_or_default(),
             decode,
+            tokenizer,
+            text,
         })
     }
 }
@@ -139,6 +154,25 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 fn execute(args: &Args) -> Result<(), String> {
     let config = Inkling2Config::from_checkpoint_dir(&args.model)
         .map_err(|error| format!("--model {}: {error}", args.model.display()))?;
+    let codec = args
+        .tokenizer
+        .as_ref()
+        .map(|path| {
+            sparkflash_model_inkling2::InklingCodec::from_path(path, None, Vec::new())
+        })
+        .transpose()?;
+    // A sentence is tokenized here and only here: the four ranks must forward the same ids, so the
+    // prompt is resolved before the rank opens anything.
+    let prompt = match (&args.text, &codec) {
+        (Some(text), Some(codec)) => {
+            let ids = codec
+                .encode_text(text, true)
+                .map_err(|error| format!("--text: {error}"))?;
+            println!("inkling-tp4: prompt {:?} from {:?}", ids, text);
+            ids
+        }
+        _ => args.prompt.clone(),
+    };
     let converted = rank_file(&args.converted, args.rank, args.world)?;
     let run = Tp4Run {
         rank: args.rank,
@@ -150,7 +184,7 @@ fn execute(args: &Args) -> Result<(), String> {
     let outcome = run.execute(
         &sparkflash_model_inkling2::descriptor(),
         &config,
-        &args.prompt,
+        &prompt,
         args.decode,
     )?;
     println!("inkling-tp4: {}", outcome.banner);
@@ -167,6 +201,10 @@ fn execute(args: &Args) -> Result<(), String> {
         outcome.logits,
         outcome.best
     );
+    if let Some(codec) = &codec {
+        let text = codec.decode(&outcome.generated).unwrap_or_default();
+        println!("inkling-tp4: rank {} text {:?}", outcome.rank, text);
+    }
     Ok(())
 }
 
@@ -193,8 +231,15 @@ mod tests {
     #[test]
     fn every_required_flag_is_named() {
         let error = parse(&[]).expect_err("no prompt");
-        assert!(error.contains("--prompt is required"), "{error}");
-        let argv: Vec<String> = vec!["--peer".into(), "10.0.0.1:9".into()];
+        assert!(error.contains("--prompt or --text is required"), "{error}");
+        let error = parse(&["--text", "hi"]).expect_err("text without a tokenizer");
+        assert!(error.contains("--text needs --tokenizer"), "{error}");
+        let argv: Vec<String> = vec![
+            "--peer".into(),
+            "10.0.0.1:9".into(),
+            "--prompt".into(),
+            "1".into(),
+        ];
         let error = Args::parse(argv.into_iter()).expect_err("no model");
         assert!(error.contains("--model is required"), "{error}");
     }

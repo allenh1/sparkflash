@@ -269,7 +269,7 @@ impl TcpExchange {
             }
             peers[peer] = Some(connection);
         }
-        for peer in rank + 1..world {
+        for (peer, slot) in peers.iter_mut().enumerate().skip(rank + 1) {
             let address = dial(peer);
             if std::env::var_os("SPARKFLASH_INKLING_TRACE").is_some() {
                 eprintln!("[inkling] rank {rank} dials {peer} at {address}");
@@ -285,7 +285,7 @@ impl TcpExchange {
                     "dialed rank {peer} and reached rank {answered}"
                 ));
             }
-            peers[peer] = Some(connection);
+            *slot = Some(connection);
         }
         Ok(Self {
             rank,

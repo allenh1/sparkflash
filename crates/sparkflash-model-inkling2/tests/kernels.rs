@@ -172,8 +172,8 @@ fn assert_close(what: &str, host: &[f32], device: &[f32]) {
     );
 }
 
-fn kernel<'a>(
-    cuda: &'a Cuda,
+fn kernel(
+    cuda: &Cuda,
     name: &'static str,
 ) -> (sparkflash_kernels::cuda_driver::Module, sparkflash_kernels::cuda_driver::Kernel) {
     cuda.load_named(inkling_cubin(), name)

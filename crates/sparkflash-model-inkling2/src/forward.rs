@@ -456,8 +456,8 @@ impl Inkling2Weights {
             let vn = self.vector(&format!("{prefix}.v_input_norm.weight"))?;
             (
                 rms_norm(&attention_input[0], Some(&qn), config.architecture.norm_epsilon),
-                rms_norm(&attention_input.get(1).unwrap_or(&attention_input[0]), Some(&kn), config.architecture.norm_epsilon),
-                rms_norm(&attention_input.get(2).unwrap_or(&attention_input[0]), Some(&vn), config.architecture.norm_epsilon),
+                rms_norm(attention_input.get(1).unwrap_or(&attention_input[0]), Some(&kn), config.architecture.norm_epsilon),
+                rms_norm(attention_input.get(2).unwrap_or(&attention_input[0]), Some(&vn), config.architecture.norm_epsilon),
             )
         };
 
@@ -475,7 +475,7 @@ impl Inkling2Weights {
         let attn_norm = self.vector(&format!("{prefix}.attn_norm.weight")).ok();
         let _ = attn_norm;
         let attn = self.conv(&format!("{prefix}.attn_sconv.weight"), &attn, state, layer, 2)?;
-        let residual = if layer % config.n_layers_per_attn_res_block == 0 {
+        let residual = if layer.is_multiple_of(config.n_layers_per_attn_res_block) {
             state.block_states.push(block_residual_state);
             attn.clone()
         } else {
