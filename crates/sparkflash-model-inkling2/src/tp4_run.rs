@@ -134,7 +134,10 @@ impl Tp4Run {
             ));
         }
         if self.rank >= self.world {
-            return Err(format!("rank {} is outside a world of {}", self.rank, self.world));
+            return Err(format!(
+                "rank {} is outside a world of {}",
+                self.rank, self.world
+            ));
         }
         if self.passes == 0 {
             return Err("a run walks the prompt at least once".to_owned());
@@ -175,7 +178,10 @@ impl Tp4Run {
         let exchange = connect_rank(
             &transport,
             2 * config.hidden_size,
-            &format!("{} TP{} context {}", descriptor.id, self.world, self.context),
+            &format!(
+                "{} TP{} context {}",
+                descriptor.id, self.world, self.context
+            ),
         )
         .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let tp = TpPlan::new(self.world, self.rank)
@@ -202,32 +208,48 @@ impl Tp4Run {
         let mut prefill_ms = Vec::with_capacity(self.passes);
         let mut walked = None;
         for pass in 0..self.passes {
-            let mut session = backend
-                .open_session()
-                .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
+            let mut session = backend.open_session().map_err(|error| {
+                format!("TP{}/rank{}: {}", self.world, self.rank, error.message())
+            })?;
             session.set_sampling(Self::greedy());
 
             let started = Instant::now();
-            let first = session
-                .prefill(prompt)
-                .map_err(|error| format!("TP{}/rank{} prefill: {}", self.world, self.rank, error.message()))?;
+            let first = session.prefill(prompt).map_err(|error| {
+                format!(
+                    "TP{}/rank{} prefill: {}",
+                    self.world,
+                    self.rank,
+                    error.message()
+                )
+            })?;
             prefill_ms.push(started.elapsed().as_millis());
             let best = best_of(&first.logits);
             let mut generated = Vec::with_capacity(decode + 1);
-            let mut next = first
-                .next_token
-                .ok_or_else(|| format!("TP{}/rank{}: the prefill chose no token", self.world, self.rank))?;
+            let mut next = first.next_token.ok_or_else(|| {
+                format!(
+                    "TP{}/rank{}: the prefill chose no token",
+                    self.world, self.rank
+                )
+            })?;
             generated.push(next);
             let mut decode_ms = Vec::with_capacity(decode);
             for _ in 0..decode {
                 let started = Instant::now();
-                let step = session
-                    .decode(next)
-                    .map_err(|error| format!("TP{}/rank{} decode: {}", self.world, self.rank, error.message()))?;
+                let step = session.decode(next).map_err(|error| {
+                    format!(
+                        "TP{}/rank{} decode: {}",
+                        self.world,
+                        self.rank,
+                        error.message()
+                    )
+                })?;
                 decode_ms.push(started.elapsed().as_millis());
-                next = step
-                    .next_token
-                    .ok_or_else(|| format!("TP{}/rank{}: a decode chose no token", self.world, self.rank))?;
+                next = step.next_token.ok_or_else(|| {
+                    format!(
+                        "TP{}/rank{}: a decode chose no token",
+                        self.world, self.rank
+                    )
+                })?;
                 generated.push(next);
             }
             // Every pass walks the same ids greedily, so a pass that chose differently is a state
@@ -247,15 +269,23 @@ impl Tp4Run {
         let mut rows: Vec<u8> = Vec::new();
         for cut in 1..=self.cuts {
             let length = (prompt.len() * cut / self.cuts).max(1);
-            let mut session = backend
-                .open_session()
-                .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
+            let mut session = backend.open_session().map_err(|error| {
+                format!("TP{}/rank{}: {}", self.world, self.rank, error.message())
+            })?;
             session.set_sampling(Self::greedy());
             let scored = session.prefill(&prompt[..length]).map_err(|error| {
-                format!("TP{}/rank{} score {length}: {}", self.world, self.rank, error.message())
+                format!(
+                    "TP{}/rank{} score {length}: {}",
+                    self.world,
+                    self.rank,
+                    error.message()
+                )
             })?;
             let next = prompt.get(length).map(|&id| {
-                (id, scored.logits.get(id as usize).copied().unwrap_or(f32::NAN))
+                (
+                    id,
+                    scored.logits.get(id as usize).copied().unwrap_or(f32::NAN),
+                )
             });
             scores.push(Score {
                 length,
@@ -327,13 +357,20 @@ mod tests {
     #[test]
     fn a_world_must_match_its_address_list() {
         assert!(run(4, 0, 4).check().is_ok());
-        let short = run(4, 0, 3).check().expect_err("three addresses for a world of four");
+        let short = run(4, 0, 3)
+            .check()
+            .expect_err("three addresses for a world of four");
         assert!(short.contains("3 address(es)"), "{short}");
         let outside = run(4, 4, 4).check().expect_err("rank beyond the world");
         assert!(outside.contains("outside a world of 4"), "{outside}");
         let empty = run(0, 0, 0).check().expect_err("a world of nothing");
         assert!(empty.contains("zero"), "{empty}");
-        let idle = Tp4Run { passes: 0, ..run(4, 0, 4) }.check().expect_err("no pass");
+        let idle = Tp4Run {
+            passes: 0,
+            ..run(4, 0, 4)
+        }
+        .check()
+        .expect_err("no pass");
         assert!(idle.contains("at least once"), "{idle}");
     }
 

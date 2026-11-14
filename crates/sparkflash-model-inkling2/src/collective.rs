@@ -28,7 +28,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sparkflash_comm::device_reduce::{BootstrapConfig, RunReduce, WordGather, open_run_reduce_over};
+use sparkflash_comm::device_reduce::{
+    BootstrapConfig, RunReduce, WordGather, open_run_reduce_over,
+};
 use sparkflash_comm::nccl::NcclError;
 use sparkflash_comm::tcp::{FrameHeader, FrameKind, TcpConfig, read_frame, write_frame};
 
@@ -222,7 +224,10 @@ fn dial_within(address: &SocketAddr, deadline: std::time::Instant) -> Result<Tcp
 }
 
 /// Accepts one connection before the deadline, polling the non-blocking listener.
-fn accept_within(listener: &TcpListener, deadline: std::time::Instant) -> Result<TcpStream, String> {
+fn accept_within(
+    listener: &TcpListener,
+    deadline: std::time::Instant,
+) -> Result<TcpStream, String> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -283,7 +288,10 @@ fn handshake(
     }
     let peer = header.rank as usize;
     if std::env::var_os("SPARKFLASH_INKLING_TRACE").is_some() {
-        eprintln!("[inkling] rank {rank} handshake read peer {peer} of kind {:?}", header.kind);
+        eprintln!(
+            "[inkling] rank {rank} handshake read peer {peer} of kind {:?}",
+            header.kind
+        );
     }
     let _ = rank;
     Ok((
@@ -365,9 +373,7 @@ impl TcpExchange {
             let (answered, connection) =
                 handshake(stream, rank, config.timeout, config.max_frame_bytes)?;
             if answered != peer {
-                return Err(format!(
-                    "dialed rank {peer} and reached rank {answered}"
-                ));
+                return Err(format!("dialed rank {peer} and reached rank {answered}"));
             }
             *slot = Some(connection);
         }
@@ -498,8 +504,11 @@ impl Exchange for TcpExchange {
         if values.is_empty() {
             return Err("an all-reduce needs at least one element".to_owned());
         }
-        let frames =
-            self.exchange(FrameKind::ReducePayload, &encode_f32(values), values.len() * 4)?;
+        let frames = self.exchange(
+            FrameKind::ReducePayload,
+            &encode_f32(values),
+            values.len() * 4,
+        )?;
         // Ascending rank from zero, the shared reduce module's rule, so every rank holds the
         // same bits whatever order the frames arrived in.
         let mut panes: Vec<Vec<f32>> = Vec::with_capacity(self.world);
@@ -537,8 +546,11 @@ impl Exchange for TcpExchange {
             out.copy_from_slice(values);
             return Ok(());
         }
-        let frames =
-            self.exchange(FrameKind::GatherPayload, &encode_f32(values), values.len() * 4)?;
+        let frames = self.exchange(
+            FrameKind::GatherPayload,
+            &encode_f32(values),
+            values.len() * 4,
+        )?;
         let width = values.len();
         out[self.rank * width..(self.rank + 1) * width].copy_from_slice(values);
         let mut peer_frames = frames.into_iter();
@@ -663,9 +675,11 @@ fn open_doorbell(
     shared(cuda, world, rank, opening, || {
         let image = sparkflash_kernels::images::inkling_cubin();
         if image.is_empty() {
-            return Err("this build carries no Inkling cubin, whose image holds the exchange's \
+            return Err(
+                "this build carries no Inkling cubin, whose image holds the exchange's \
                         stage and collect kernels"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         Ok(image)
     })
@@ -675,7 +689,11 @@ fn open_doorbell(
 /// rather than measured on the group it was trying to replace.
 #[cfg(not(feature = "rdma"))]
 fn refuse_doorbell() -> Result<(), String> {
-    match std::env::var("SPARKFLASH_EXCHANGE").ok().as_deref().map(str::trim) {
+    match std::env::var("SPARKFLASH_EXCHANGE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         None | Some("" | "0" | "nccl" | "off" | "NCCL" | "OFF") => Ok(()),
         Some(other) => Err(format!(
             "SPARKFLASH_EXCHANGE={other:?}: this build has no direct-RDMA exchange (it was built \
@@ -793,9 +811,9 @@ impl Exchange for NcclExchange {
             && stream == 0
             && bytes <= DOORBELL_ROW_CAP
         {
-            let mut state = doorbell
-                .lock()
-                .map_err(|_| "the direct-RDMA exchange is poisoned by an earlier panic".to_owned())?;
+            let mut state = doorbell.lock().map_err(|_| {
+                "the direct-RDMA exchange is poisoned by an earlier panic".to_owned()
+            })?;
             if bytes <= state.row_cap() {
                 let (rank, world) = (self.host.rank, self.host.world);
                 let cuda = &self.reduce.context;
@@ -906,15 +924,17 @@ mod tests {
         let base_port = 29_611u16;
         let mut handles = Vec::new();
         for rank in 0..4usize {
-            handles.push(std::thread::spawn(move || -> Result<(Vec<f32>, Vec<f32>), String> {
-                let config = TcpConfig::loopback4(rank, base_port);
-                let exchange = TcpExchange::connect(&config)?;
-                let mut values = vec![(rank as f32) + 1.0, 2.0 * rank as f32, -1.0];
-                exchange.all_reduce_f32(&mut values)?;
-                let mut gathered = vec![0f32; 12];
-                exchange.all_gather_f32(&values, &mut gathered)?;
-                Ok((values, gathered))
-            }));
+            handles.push(std::thread::spawn(
+                move || -> Result<(Vec<f32>, Vec<f32>), String> {
+                    let config = TcpConfig::loopback4(rank, base_port);
+                    let exchange = TcpExchange::connect(&config)?;
+                    let mut values = vec![(rank as f32) + 1.0, 2.0 * rank as f32, -1.0];
+                    exchange.all_reduce_f32(&mut values)?;
+                    let mut gathered = vec![0f32; 12];
+                    exchange.all_gather_f32(&values, &mut gathered)?;
+                    Ok((values, gathered))
+                },
+            ));
         }
         let mut reduced = Vec::new();
         let mut gathered = Vec::new();

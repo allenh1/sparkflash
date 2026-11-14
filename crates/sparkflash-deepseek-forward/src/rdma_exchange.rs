@@ -26,8 +26,8 @@ use std::sync::Mutex;
 use sparkflash_kernels::cuda_driver::Cuda;
 use sparkflash_kernels::write_exchange::Opening;
 pub use sparkflash_kernels::write_exchange::{
-    EXCHANGE_ENV, ExchangeState, Round, Selection, check, is_open, note_fall_through,
-    refusal_here, selection, stats, validate,
+    EXCHANGE_ENV, ExchangeState, Round, Selection, check, is_open, note_fall_through, refusal_here,
+    selection, stats, validate,
 };
 
 /// The largest row a step can send: `dim` (5120) times the most rows a step carries

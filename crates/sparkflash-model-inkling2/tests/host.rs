@@ -24,9 +24,9 @@ use sparkflash_model::ModelDescriptor;
 use sparkflash_model::architecture::WeightFormat;
 use sparkflash_model::backend::ModelBackend;
 use sparkflash_model_inkling2::config::Inkling2Config;
+use sparkflash_model_inkling2::fixture::tiny_source;
 use sparkflash_model_inkling2::forward::{Inkling2State, Inkling2Weights};
 use sparkflash_model_inkling2::host::Inkling2HostBackend;
-use sparkflash_model_inkling2::fixture::tiny_source;
 
 #[test]
 fn the_swiglu_reads_gate_and_up_interleaved_as_the_checkpoint_stores_them() {
@@ -66,13 +66,19 @@ fn the_blank_state_and_one_step_agree_with_a_prefix() {
     let source = Arc::new(tiny_source(&config));
     let weights = Inkling2Weights::load(config.clone(), source).expect("the weights load");
     let mut state = Inkling2State::new(&config);
-    let first = weights.forward_token(7, &mut state).expect("the first token");
+    let first = weights
+        .forward_token(7, &mut state)
+        .expect("the first token");
     let mut prompt = Inkling2State::new(&config);
     let same = weights.forward_prompt(&[7]).expect("the prompt");
-    let _ = weights.forward_token(7, &mut prompt).expect("the prompt state");
+    let _ = weights
+        .forward_token(7, &mut prompt)
+        .expect("the prompt state");
     assert_eq!(first.len(), same.len());
     assert!(first.iter().zip(&same).all(|(a, b)| (a - b).abs() < 1e-5));
-    let second = weights.forward_token(8, &mut state).expect("the second token");
+    let second = weights
+        .forward_token(8, &mut state)
+        .expect("the second token");
     assert_eq!(second.len(), config.unpadded_vocab_size);
     assert_eq!(prompt.position(), 1);
 }
@@ -111,7 +117,9 @@ fn an_mxfp8_layer_uses_the_power_of_two_scale() {
     let source = Arc::new(tiny_source(&config));
     let weights = Inkling2Weights::load(config.clone(), source).expect("the weights load");
     let mut state = Inkling2State::new(&config);
-    let logits = weights.forward_token(3, &mut state).expect("the token runs");
+    let logits = weights
+        .forward_token(3, &mut state)
+        .expect("the token runs");
     // A ue8m0 scale of 127 is exactly 1.0. The broken (code + 127) decode produces 2^127,
     // which saturates a score to infinity; a finite row pins the exponent convention.
     assert!(

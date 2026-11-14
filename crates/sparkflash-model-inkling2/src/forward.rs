@@ -73,8 +73,14 @@ impl Inkling2Weights {
     /// A missing or mis-shaped embedding/head, or a tensor the source cannot describe.
     pub fn load(config: Inkling2Config, source: Arc<dyn WeightSource>) -> Result<Self, String> {
         let weights = Self { config, source };
-        weights.check_shape("model.llm.embed.weight", &[weights.config.vocab_size, weights.config.hidden_size])?;
-        weights.check_shape("model.llm.unembed.weight", &[weights.config.vocab_size, weights.config.hidden_size])?;
+        weights.check_shape(
+            "model.llm.embed.weight",
+            &[weights.config.vocab_size, weights.config.hidden_size],
+        )?;
+        weights.check_shape(
+            "model.llm.unembed.weight",
+            &[weights.config.vocab_size, weights.config.hidden_size],
+        )?;
         weights.check_shape("model.llm.norm.weight", &[weights.config.hidden_size])?;
         Ok(weights)
     }
@@ -161,14 +167,18 @@ impl Inkling2Weights {
         if values.len() != rows * columns {
             return Err(format!(
                 "{name} decoded {} values, expected {}x{}",
-                values.len(), rows, columns
+                values.len(),
+                rows,
+                columns
             ));
         }
         Ok(values)
     }
 
     fn raw(&self, name: &str) -> Result<Vec<u8>, String> {
-        self.source.read(name).map_err(|error| format!("{name}: {error}"))
+        self.source
+            .read(name)
+            .map_err(|error| format!("{name}: {error}"))
     }
 
     /// One byte range of a tensor, for an expert tensor whose whole allocation is over a
@@ -182,7 +192,12 @@ impl Inkling2Weights {
                 let all = self.raw(name)?;
                 all.get(offset..offset + len)
                     .map(<[u8]>::to_vec)
-                    .ok_or_else(|| format!("{name}: range {offset}..{} is outside the tensor", offset + len))
+                    .ok_or_else(|| {
+                        format!(
+                            "{name}: range {offset}..{} is outside the tensor",
+                            offset + len
+                        )
+                    })
             }
         }
     }
@@ -229,7 +244,11 @@ impl Inkling2Weights {
         columns: usize,
     ) -> Result<Vec<f32>, String> {
         let prefix = format!("model.llm.layers.{layer}.mlp.experts.{which}");
-        match self.config.layer_format(layer).unwrap_or(WeightFormat::Bf16) {
+        match self
+            .config
+            .layer_format(layer)
+            .unwrap_or(WeightFormat::Bf16)
+        {
             WeightFormat::NvFp4 { group_size } => {
                 let amax = self.vector(&format!("{prefix}_weight_amax"))?;
                 let outer = self.vector(&format!("{prefix}_weight_outer_scale_denominator"))?;
@@ -311,11 +330,7 @@ impl Inkling2Weights {
     ///
     /// # Errors
     /// A missing/mis-shaped tensor, or a position outside the model's window.
-    pub fn forward_token(
-        &self,
-        token: u32,
-        state: &mut Inkling2State,
-    ) -> Result<Vec<f32>, String> {
+    pub fn forward_token(&self, token: u32, state: &mut Inkling2State) -> Result<Vec<f32>, String> {
         let config = &self.config;
         if state.position >= config.context_tokens() {
             return Err(format!(
@@ -351,9 +366,8 @@ impl Inkling2Weights {
             let start = std::time::Instant::now();
             x = self.layer(layer, position, x, state)?;
             if trace_on() {
-                let rms = (x.iter().map(|value| value * value).sum::<f32>()
-                    / x.len() as f32)
-                    .sqrt();
+                let rms =
+                    (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
                 eprintln!(
                     "[inkling] host   layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
                     x[0], x[1]
@@ -371,7 +385,10 @@ impl Inkling2Weights {
             config.architecture.norm_epsilon,
         )?;
         if trace_on() {
-            let rms = (final_input[0].iter().map(|value| value * value).sum::<f32>()
+            let rms = (final_input[0]
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
                 / final_input[0].len() as f32)
                 .sqrt();
             eprintln!(
@@ -380,7 +397,11 @@ impl Inkling2Weights {
             );
         }
         let final_norm = self.vector("model.llm.norm.weight")?;
-        let x = rms_norm(&final_input[0], Some(&final_norm), config.architecture.norm_epsilon);
+        let x = rms_norm(
+            &final_input[0],
+            Some(&final_norm),
+            config.architecture.norm_epsilon,
+        );
         let mut logits = self.matvec_rows(
             "model.llm.unembed.weight",
             &x,
@@ -390,13 +411,16 @@ impl Inkling2Weights {
         )?;
         if trace_on() {
             let rms = (x.iter().map(|value| value * value).sum::<f32>() / x.len() as f32).sqrt();
-            eprintln!(
-                "[inkling] host final_norm rms={rms:.5} first={:.5}",
-                x[0]
-            );
+            eprintln!("[inkling] host final_norm rms={rms:.5} first={:.5}", x[0]);
             eprintln!(
                 "[inkling] host raw_logits rms={:.5} first={:.5}",
-                (logits.iter().take(4).map(|value| value * value).sum::<f32>() / 4.0).sqrt(),
+                (logits
+                    .iter()
+                    .take(4)
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    / 4.0)
+                    .sqrt(),
                 logits[0]
             );
         }
@@ -435,7 +459,11 @@ impl Inkling2Weights {
             // bank 4 is the three-query input of full layer 5.
             let queries_name = format!("model.llm.attn_res.attn_queries.{}", layer - 1);
             let queries = self.vector(&queries_name)?;
-            let count = if config.full_layer_ids.contains(&layer) { 3 } else { 1 };
+            let count = if config.full_layer_ids.contains(&layer) {
+                3
+            } else {
+                1
+            };
             block_residual(
                 &hidden,
                 &state.block_states,
@@ -451,24 +479,42 @@ impl Inkling2Weights {
             // The block-attention residual is read on a sliding layer too: `attention_input` is the
             // softmax mix over the summary stack, and it is the layer's attention input, not the
             // raw stream. At layer 0 the two coincide because there is no stack yet.
-            let x = rms_norm(&attention_input[0], Some(&norm), config.architecture.norm_epsilon);
+            let x = rms_norm(
+                &attention_input[0],
+                Some(&norm),
+                config.architecture.norm_epsilon,
+            );
             (x.clone(), x.clone(), x)
         } else {
             let qn = self.vector(&format!("{prefix}.q_input_norm.weight"))?;
             let kn = self.vector(&format!("{prefix}.k_input_norm.weight"))?;
             let vn = self.vector(&format!("{prefix}.v_input_norm.weight"))?;
             (
-                rms_norm(&attention_input[0], Some(&qn), config.architecture.norm_epsilon),
-                rms_norm(attention_input.get(1).unwrap_or(&attention_input[0]), Some(&kn), config.architecture.norm_epsilon),
-                rms_norm(attention_input.get(2).unwrap_or(&attention_input[0]), Some(&vn), config.architecture.norm_epsilon),
+                rms_norm(
+                    &attention_input[0],
+                    Some(&qn),
+                    config.architecture.norm_epsilon,
+                ),
+                rms_norm(
+                    attention_input.get(1).unwrap_or(&attention_input[0]),
+                    Some(&kn),
+                    config.architecture.norm_epsilon,
+                ),
+                rms_norm(
+                    attention_input.get(2).unwrap_or(&attention_input[0]),
+                    Some(&vn),
+                    config.architecture.norm_epsilon,
+                ),
             )
         };
 
         let stage = std::time::Instant::now();
-        let attn = self.attention(layer, position, sliding, &q_input, &k_input, &v_input, state)?;
+        let attn = self.attention(
+            layer, position, sliding, &q_input, &k_input, &v_input, state,
+        )?;
         if trace_on() {
-            let rms = (attn.iter().map(|value| value * value).sum::<f32>() / attn.len() as f32)
-                .sqrt();
+            let rms =
+                (attn.iter().map(|value| value * value).sum::<f32>() / attn.len() as f32).sqrt();
             eprintln!(
                 "[inkling] host attn_proj layer {layer} rms={rms:.6} first={:.6} second={:.6}",
                 attn[0], attn[1]
@@ -477,7 +523,13 @@ impl Inkling2Weights {
         trace_timing!(format!("layer={layer} attention"), stage);
         let attn_norm = self.vector(&format!("{prefix}.attn_norm.weight")).ok();
         let _ = attn_norm;
-        let attn = self.conv(&format!("{prefix}.attn_sconv.weight"), &attn, state, layer, 2)?;
+        let attn = self.conv(
+            &format!("{prefix}.attn_sconv.weight"),
+            &attn,
+            state,
+            layer,
+            2,
+        )?;
         let residual = if layer.is_multiple_of(config.n_layers_per_attn_res_block) {
             state.block_states.push(block_residual_state);
             attn.clone()
@@ -521,12 +573,32 @@ impl Inkling2Weights {
         let kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let kv_width = kv_heads * head_dim;
-        let q = self.matvec_name(&format!("{prefix}.wq_du.weight"), q_input, heads * head_dim, h)?;
+        let q = self.matvec_name(
+            &format!("{prefix}.wq_du.weight"),
+            q_input,
+            heads * head_dim,
+            h,
+        )?;
         let mut k = self.matvec_name(&format!("{prefix}.wk_dv.weight"), k_input, kv_width, h)?;
         let mut v = self.matvec_name(&format!("{prefix}.wv_dv.weight"), v_input, kv_width, h)?;
-        let rel = self.matvec_name(&format!("{prefix}.wr_du.weight"), q_input, heads * config.d_rel, h)?;
-        let gate = self.matvec_name(&format!("{prefix}.gate_attn.weight"), q_input, heads * head_dim, h)?;
-        let sink = self.matvec_name(&format!("{prefix}.attn_sink_proj.weight"), q_input, heads, h)?;
+        let rel = self.matvec_name(
+            &format!("{prefix}.wr_du.weight"),
+            q_input,
+            heads * config.d_rel,
+            h,
+        )?;
+        let gate = self.matvec_name(
+            &format!("{prefix}.gate_attn.weight"),
+            q_input,
+            heads * head_dim,
+            h,
+        )?;
+        let sink = self.matvec_name(
+            &format!("{prefix}.attn_sink_proj.weight"),
+            q_input,
+            heads,
+            h,
+        )?;
 
         if sliding {
             k = self.conv(&format!("{prefix}.k_sconv.weight"), &k, state, layer, 0)?;
@@ -607,10 +679,21 @@ impl Inkling2Weights {
                 eps: config.architecture.norm_epsilon,
             },
         )?;
-        self.matvec_name(&format!("{prefix}.wo_ud.weight"), &output, h, heads * head_dim)
+        self.matvec_name(
+            &format!("{prefix}.wo_ud.weight"),
+            &output,
+            h,
+            heads * head_dim,
+        )
     }
 
-    fn matvec_name(&self, name: &str, input: &[f32], rows: usize, columns: usize) -> Result<Vec<f32>, String> {
+    fn matvec_name(
+        &self,
+        name: &str,
+        input: &[f32],
+        rows: usize,
+        columns: usize,
+    ) -> Result<Vec<f32>, String> {
         let weight = self.matrix(name, rows, columns)?;
         Ok(matvec_parallel(&weight, input, rows, columns))
     }
@@ -671,7 +754,11 @@ impl Inkling2Weights {
     fn moe(&self, layer: usize, input: &[f32]) -> Result<Vec<f32>, String> {
         let config = &self.config;
         let prefix = format!("model.llm.layers.{layer}.mlp");
-        let gate = self.matrix(&format!("{prefix}.gate.weight"), config.n_routed_experts, config.hidden_size)?;
+        let gate = self.matrix(
+            &format!("{prefix}.gate.weight"),
+            config.n_routed_experts,
+            config.hidden_size,
+        )?;
         let bias = self.vector(&format!("{prefix}.gate.bias"))?;
         let logits = matvec_parallel(&gate, input, config.n_routed_experts, config.hidden_size);
         // The router is the oracle's: a sigmoid a expert, the learned bias on the selection, and
@@ -875,7 +962,6 @@ fn rms_norm_in_place(input: &mut [f32], epsilon: f64) {
         *value *= scale;
     }
 }
-
 
 fn block_residual(
     partial: &[f32],

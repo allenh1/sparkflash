@@ -111,7 +111,10 @@ pub fn attention(
             *value *= tau;
         }
         let row = &mut rel[head * d_rel..(head + 1) * d_rel];
-        for (value, scale) in row.iter_mut().zip(&rel_scale[head * d_rel..(head + 1) * d_rel]) {
+        for (value, scale) in row
+            .iter_mut()
+            .zip(&rel_scale[head * d_rel..(head + 1) * d_rel])
+        {
             *value *= *scale;
         }
         clip_l2(row, rel_clip);
@@ -179,7 +182,8 @@ pub fn attention(
             let weight = *score / denominator;
             let mut normalised = Vec::new();
             let value = if value_norm {
-                normalised.extend_from_slice(&values[slot][kv_head * head_dim..(kv_head + 1) * head_dim]);
+                normalised
+                    .extend_from_slice(&values[slot][kv_head * head_dim..(kv_head + 1) * head_dim]);
                 rms_norm_in_place(&mut normalised, eps);
                 &normalised
             } else {
@@ -201,7 +205,13 @@ pub fn attention(
 /// `x` is `[rows, channels]`, `taps` is `[channels, kernel]` in conv1d order (index 0 the
 /// oldest tap), and a row before the first uses zeros.
 #[must_use]
-pub fn short_conv(x: &[f32], taps: &[f32], rows: usize, channels: usize, kernel: usize) -> Vec<f32> {
+pub fn short_conv(
+    x: &[f32],
+    taps: &[f32],
+    rows: usize,
+    channels: usize,
+    kernel: usize,
+) -> Vec<f32> {
     let scale = 1.0 / ((kernel + 1) as f32).sqrt();
     let mut out = vec![0f32; rows * channels];
     for row in 0..rows {
@@ -214,8 +224,7 @@ pub fn short_conv(x: &[f32], taps: &[f32], rows: usize, channels: usize, kernel:
                 convolution += taps[channel * kernel + (kernel - 1 - tap)]
                     * x[(row - tap) * channels + channel];
             }
-            out[row * channels + channel] =
-                (convolution + x[row * channels + channel]) * scale;
+            out[row * channels + channel] = (convolution + x[row * channels + channel]) * scale;
         }
     }
     out
@@ -284,8 +293,7 @@ pub fn short_conv_dynamic(
                     + dynamic_taps[(row * heads + head) * kernel + tap];
                 convolution += weight * x[(row - tap) * channels + channel];
             }
-            out[row * channels + channel] =
-                (convolution + x[row * channels + channel]) * scale;
+            out[row * channels + channel] = (convolution + x[row * channels + channel]) * scale;
         }
     }
     out
@@ -356,7 +364,13 @@ pub fn softcapped_swiglu(gate_up: &[f32], width: usize, gate_cap: f32, up_cap: f
 
 /// The softcap and unpadded slice of the final logits.
 #[must_use]
-pub fn logit_softcap(logits: &[f32], rows: usize, padded: usize, unpadded: usize, cap: f32) -> Vec<f32> {
+pub fn logit_softcap(
+    logits: &[f32],
+    rows: usize,
+    padded: usize,
+    unpadded: usize,
+    cap: f32,
+) -> Vec<f32> {
     let mut out = vec![0f32; rows * unpadded];
     for row in 0..rows {
         for column in 0..unpadded.min(padded) {
@@ -440,7 +454,11 @@ pub fn nvfp4_matvec(
         let mut value = 0.0f32;
         for (column, weight) in input.iter().enumerate() {
             let byte = codes[column / 2];
-            let code = if column % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let code = if column % 2 == 0 {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
             let scale = sparkflash_weights::quant::f8e4m3_to_f32(scales[column / 16]);
             value += sparkflash_weights::quant::f4e2m1_to_f32(code) * scale * weight;
         }
@@ -586,5 +604,3 @@ pub fn cache_bf16(values: &[f32]) -> Vec<f32> {
         })
         .collect()
 }
-
-

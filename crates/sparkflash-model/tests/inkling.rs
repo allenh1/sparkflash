@@ -41,7 +41,10 @@ fn the_released_document_parses_its_hybrid_schedule_and_geometry() {
     assert!(!sliding.contains(&5));
     assert!(!sliding.contains(&47));
     for layer in &architecture.layers {
-        assert!(matches!(layer.attention.kind, AttentionKind::Inkling { kv_heads: 8 }));
+        assert!(matches!(
+            layer.attention.kind,
+            AttentionKind::Inkling { kv_heads: 8 }
+        ));
         assert_eq!(layer.attention.rope.rotated_dims, 0);
         assert!(matches!(layer.residual, Residual::BlockAttention));
         let Ffn::Moe(moe) = &layer.ffn else {
@@ -63,8 +66,14 @@ fn the_released_document_parses_its_hybrid_schedule_and_geometry() {
     assert_eq!(inkling.final_logit_softcap, Some(30.0));
     assert_eq!(inkling.softcaps.gate, 4.0);
     assert_eq!(inkling.softcaps.up, 25.0);
-    assert_eq!(inkling.layer_expert_formats[0], WeightFormat::NvFp4 { group_size: 16 });
-    assert_eq!(inkling.layer_expert_formats[40], WeightFormat::MxFp8 { block: 32 });
+    assert_eq!(
+        inkling.layer_expert_formats[0],
+        WeightFormat::NvFp4 { group_size: 16 }
+    );
+    assert_eq!(
+        inkling.layer_expert_formats[40],
+        WeightFormat::MxFp8 { block: 32 }
+    );
 }
 
 #[test]

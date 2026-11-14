@@ -311,8 +311,9 @@ fn codec(
         )
         .map_err(|error| format!("{}: {error}", tokenizer.display()))?;
         // The tower's geometry plans the image spans; a checkpoint without one serves text.
-        let config = sparkflash_model_inkling2::config::Inkling2Config::from_checkpoint_dir(directory)
-            .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let config =
+            sparkflash_model_inkling2::config::Inkling2Config::from_checkpoint_dir(directory)
+                .map_err(|error| format!("{}: {error}", directory.display()))?;
         let codec = match config.vision {
             Some(vision) => codec
                 .with_vision(vision)

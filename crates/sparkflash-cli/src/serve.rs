@@ -173,9 +173,9 @@ use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_glm5_next::device::CudaHandle;
-use sparkflash_model_inkling2::GroupOptions;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence};
+use sparkflash_model_inkling2::GroupOptions;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_qwen4_exp::sampling::Sampler;
 

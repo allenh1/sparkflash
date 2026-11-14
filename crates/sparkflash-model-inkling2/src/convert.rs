@@ -33,11 +33,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sparkflash_model::TpPlan;
-use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 use sparkflash_weights::rank_file::{
     SlotCursor, SlotFileWriter, SlotIndex, SlotPlan, SlotRecords, WrittenRank, fnv1a,
 };
 use sparkflash_weights::tp::TpLayout;
+use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 
 use crate::config::Inkling2Config;
 use crate::tensor::InklingTensorPlan;
@@ -112,8 +112,7 @@ fn rank_ranges(
         return Err(format!("{}: a scalar cannot be sharded", full.name));
     }
     // Every axis the plan slices, as the run this rank holds on it.
-    let mut bounds: Vec<(usize, usize)> =
-        full.shape.iter().map(|width| (0, *width)).collect();
+    let mut bounds: Vec<(usize, usize)> = full.shape.iter().map(|width| (0, *width)).collect();
     let mut slices = slices.to_vec();
     slices.retain(|slice| {
         // A split that hands this rank the whole axis is not a shard, and treating it as one
@@ -262,15 +261,19 @@ fn read_range(
         Some(Ok(bytes)) => Ok(bytes),
         Some(Err(error)) => Err(format!("{name}: {error}")),
         None => {
-            let all = source.read(name).map_err(|error| format!("{name}: {error}"))?;
+            let all = source
+                .read(name)
+                .map_err(|error| format!("{name}: {error}"))?;
             let start = usize::try_from(offset)
                 .map_err(|_| format!("{name}: offset {offset} does not fit this machine"))?;
-            all.get(start..start + len).map(<[u8]>::to_vec).ok_or_else(|| {
-                format!(
-                    "{name}: range {offset}..{} is outside the tensor",
-                    offset as usize + len
-                )
-            })
+            all.get(start..start + len)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    format!(
+                        "{name}: range {offset}..{} is outside the tensor",
+                        offset as usize + len
+                    )
+                })
         }
     }
 }
@@ -452,9 +455,7 @@ impl RankFileSource {
     /// The converted payload bytes of one tensor, or `None` when the rank does not hold it.
     #[must_use]
     pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
-        self.specs
-            .get(name)
-            .map(|spec| spec.storage_bytes() as u64)
+        self.specs.get(name).map(|spec| spec.storage_bytes() as u64)
     }
 
     /// Reads `len` payload bytes at `offset` of one tensor's rank-local bytes.
@@ -532,9 +533,11 @@ impl WeightSource for RankFileSource {
     }
 
     fn read(&self, name: &str) -> Result<Vec<u8>, WeightError> {
-        let bytes = self.tensor_bytes(name).ok_or_else(|| WeightError::Missing {
-            name: name.to_string(),
-        })?;
+        let bytes = self
+            .tensor_bytes(name)
+            .ok_or_else(|| WeightError::Missing {
+                name: name.to_string(),
+            })?;
         let bytes = usize::try_from(bytes).map_err(|_| WeightError::TooLarge {
             name: name.to_string(),
             bytes: bytes as u128,
@@ -639,8 +642,7 @@ mod tests {
                 );
                 continue;
             }
-            let mut runs: Vec<(u64, usize)> =
-                per_rank.iter().flatten().copied().collect();
+            let mut runs: Vec<(u64, usize)> = per_rank.iter().flatten().copied().collect();
             runs.sort_unstable();
             let mut end = 0u64;
             for (offset, len) in runs {
@@ -659,13 +661,20 @@ mod tests {
     #[test]
     fn every_planned_tensor_reaches_the_rank_file() {
         let config = released();
-        let layout = TpLayout { rank: 1, world_size: 4 };
+        let layout = TpLayout {
+            rank: 1,
+            world_size: 4,
+        };
         let slots = rank_slots(&config, layout).expect("rank slots");
         let names: std::collections::BTreeSet<&str> =
             slots.iter().map(|slot| slot.name.as_str()).collect();
         for slot in &slots {
             let sum: usize = slot.ranges.iter().map(|(_, len)| *len).sum();
-            assert_eq!(sum, slot.bytes, "{}: the ranges and payload disagree", slot.key);
+            assert_eq!(
+                sum, slot.bytes,
+                "{}: the ranges and payload disagree",
+                slot.key
+            );
         }
         assert!(names.contains("model.llm.embed.weight"));
         assert!(names.contains("model.llm.layers.0.mlp.experts.w13_weight"));
@@ -677,7 +686,10 @@ mod tests {
     #[test]
     fn a_contraction_axis_shard_is_one_range_per_row() {
         let config = released();
-        let layout = TpLayout { rank: 2, world_size: 4 };
+        let layout = TpLayout {
+            rank: 2,
+            world_size: 4,
+        };
         let slots = rank_slots(&config, layout).expect("rank slots");
         let projection = slots
             .iter()

@@ -380,7 +380,10 @@ pub fn note_fall_through(path: &str, why: &str) {
         return;
     }
     seen.insert(path.to_owned());
-    let replaces = REPLACES.get().copied().unwrap_or("the collectives its arm named");
+    let replaces = REPLACES
+        .get()
+        .copied()
+        .unwrap_or("the collectives its arm named");
     eprintln!(
         "direct-RDMA exchange: {path} stays on the NCCL group ({why}); the exchange is replacing {replaces}, and this collective is not one of them on this run"
     );

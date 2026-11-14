@@ -62,7 +62,10 @@ fn the_group_flags_parse_and_refuse_the_knobs_they_cannot_honour() {
     assert_eq!(group.world, 2);
     assert_eq!(group.control.port(), GROUP_DEFAULT_CONTROL_PORT);
 
-    assert_eq!(group.lanes, 1, "a group without --fuse-batch is the serial mirror");
+    assert_eq!(
+        group.lanes, 1,
+        "a group without --fuse-batch is the serial mirror"
+    );
 
     let error = ServeOptions::parse(group_argv(&checkpoint, &["--concurrency", "2"]))
         .expect_err("a group cannot run two interleaved sequences");
@@ -122,7 +125,10 @@ fn a_group_reads_one_rank_file_per_rank() {
     assert_eq!(group.world, 2);
     assert_eq!(
         group.control,
-        SocketAddr::new("127.0.0.1".parse().expect("an address"), GROUP_DEFAULT_CONTROL_PORT)
+        SocketAddr::new(
+            "127.0.0.1".parse().expect("an address"),
+            GROUP_DEFAULT_CONTROL_PORT
+        )
     );
     assert_eq!(
         group
@@ -151,5 +157,8 @@ fn a_group_reads_one_rank_file_per_rank() {
         Some(directory.path().to_path_buf()),
     )
     .expect_err("two addresses for a world of four");
-    assert!(error.contains("2 address(es)") && error.contains("world is 4"), "{error}");
+    assert!(
+        error.contains("2 address(es)") && error.contains("world is 4"),
+        "{error}"
+    );
 }

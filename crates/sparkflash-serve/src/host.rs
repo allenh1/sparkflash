@@ -350,7 +350,10 @@ impl InferenceEngine for HostDriver {
                     Some(Reply::Done(summary)) => {
                         state.done = true;
                         let fabric = state.fabric.clone();
-                        Some((finished_event(state.prompt_tokens, *summary, &fabric), state))
+                        Some((
+                            finished_event(state.prompt_tokens, *summary, &fabric),
+                            state,
+                        ))
                     }
                     Some(Reply::Failed(message)) => {
                         state.done = true;
@@ -576,12 +579,14 @@ fn run_request(
         })
         .map_err(|_| "the client stopped reading this response".to_owned())?;
     let prefill_started = Instant::now();
-    let mut step = session.prefill_images(&job.prompt_tokens, &job.images).map_err(|error| {
-        format!(
-            "prefill failed after {} prompt token(s): {error}",
-            job.prompt_tokens.len()
-        )
-    })?;
+    let mut step = session
+        .prefill_images(&job.prompt_tokens, &job.images)
+        .map_err(|error| {
+            format!(
+                "prefill failed after {} prompt token(s): {error}",
+                job.prompt_tokens.len()
+            )
+        })?;
     let prefill_elapsed = prefill_started.elapsed();
     let cached = session.cached_tokens();
     let mut generated = Vec::new();

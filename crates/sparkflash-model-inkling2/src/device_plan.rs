@@ -524,7 +524,9 @@ impl InklingDevicePlan {
             return Err(format!("a decode pass is one row, not {rows}"));
         }
         if chunk < rows {
-            return Err(format!("a chunk of {chunk} rows is narrower than the pass's {rows}"));
+            return Err(format!(
+                "a chunk of {chunk} rows is narrower than the pass's {rows}"
+            ));
         }
         let window = config.context_tokens();
         if context == 0 || (window != 0 && context > window) {
@@ -911,48 +913,60 @@ impl InklingDevicePlan {
             rows,
             hidden,
         ));
-        steps.push(self.step(
-            Op::RmsNorm,
-            Some(Part::RmsNorm),
-            Some(Image::TOKEN),
-            Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-            &["model.llm.embed_norm.weight"],
-            rows,
-            hidden,
-        )?.at(Target::Norm(NormRole::Embedding)));
+        steps.push(
+            self.step(
+                Op::RmsNorm,
+                Some(Part::RmsNorm),
+                Some(Image::TOKEN),
+                Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                &["model.llm.embed_norm.weight"],
+                rows,
+                hidden,
+            )?
+            .at(Target::Norm(NormRole::Embedding)),
+        );
         let prologue = std::mem::take(&mut steps);
         // The output query is the one learned query of the final block residual.
-        steps.push(self.step(
-            Op::BlockResidual,
-            Some(Part::BlockAttentionResidual),
-            Some(Image::Inkling),
-            Some("inkling_block_residual"),
-            &["model.llm.attn_res.output_query"],
-            1,
-            hidden,
-        )?.at(Target::Input(ResidualInput::Output)));
-        steps.push(self.step(
-            Op::RmsNorm,
-            Some(Part::RmsNorm),
-            Some(Image::TOKEN),
-            Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-            &["model.llm.norm.weight"],
-            rows,
-            hidden,
-        )?.at(Target::Norm(NormRole::Final)));
+        steps.push(
+            self.step(
+                Op::BlockResidual,
+                Some(Part::BlockAttentionResidual),
+                Some(Image::Inkling),
+                Some("inkling_block_residual"),
+                &["model.llm.attn_res.output_query"],
+                1,
+                hidden,
+            )?
+            .at(Target::Input(ResidualInput::Output)),
+        );
+        steps.push(
+            self.step(
+                Op::RmsNorm,
+                Some(Part::RmsNorm),
+                Some(Image::TOKEN),
+                Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                &["model.llm.norm.weight"],
+                rows,
+                hidden,
+            )?
+            .at(Target::Norm(NormRole::Final)),
+        );
         // The vocabulary projection is the shared dense GEMV: the released head is an untied
         // BF16 matrix and the shared body already serves an M=1 row, so the arm does not carry a
         // head kernel of its own. The LmHead part's own entries are fused reduces that Inkling
         // does not use, because the slice gather is the collective below.
-        steps.push(self.step(
-            Op::Gemv,
-            Some(Part::DenseGemm),
-            Some(self.gemv_launch().0),
-            Some(self.gemv_launch().1),
-            &["model.llm.unembed.weight"],
-            self.rank_vocab(),
-            hidden,
-        )?.at(Target::Project(Projection::Head)));
+        steps.push(
+            self.step(
+                Op::Gemv,
+                Some(Part::DenseGemm),
+                Some(self.gemv_launch().0),
+                Some(self.gemv_launch().1),
+                &["model.llm.unembed.weight"],
+                self.rank_vocab(),
+                hidden,
+            )?
+            .at(Target::Project(Projection::Head)),
+        );
         // The vocabulary is spread over the ranks, so one rank's projection is a slice of the
         // head's row. Gather the slices, then cap and trim: the softcap is elementwise, so
         // applying it after the gather is the same arithmetic on the same values.
@@ -995,15 +1009,18 @@ impl InklingDevicePlan {
         // layer 0 has no bank and consumes the raw embedding, which is the host's rule too.
         let bank_step = if layer > 0 {
             let bank = format!("model.llm.attn_res.attn_queries.{}", layer - 1);
-            Some(self.step(
-                Op::BlockResidual,
-                Some(Part::BlockAttentionResidual),
-                Some(Image::Inkling),
-                Some("inkling_block_residual"),
-                &[&bank],
-                if full { 3 } else { 1 },
-                hidden,
-            )?.at(Target::Input(ResidualInput::Attention)))
+            Some(
+                self.step(
+                    Op::BlockResidual,
+                    Some(Part::BlockAttentionResidual),
+                    Some(Image::Inkling),
+                    Some("inkling_block_residual"),
+                    &[&bank],
+                    if full { 3 } else { 1 },
+                    hidden,
+                )?
+                .at(Target::Input(ResidualInput::Attention)),
+            )
         } else {
             None
         };
@@ -1014,19 +1031,22 @@ impl InklingDevicePlan {
 
         // The attention input norm: one shared norm on a sliding layer, three on a full one.
         if sliding {
-            steps.push(self.step(
-                Op::RmsNorm,
-                Some(Part::RmsNorm),
-                Some(Image::TOKEN),
-                Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-                &[&format!("{prefix}.attn_norm.weight")],
-                rows,
-                hidden,
-            )?.at(Target::Norm(if layer == 0 {
-                NormRole::Stream
-            } else {
-                NormRole::Attention
-            })));
+            steps.push(
+                self.step(
+                    Op::RmsNorm,
+                    Some(Part::RmsNorm),
+                    Some(Image::TOKEN),
+                    Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                    &[&format!("{prefix}.attn_norm.weight")],
+                    rows,
+                    hidden,
+                )?
+                .at(Target::Norm(if layer == 0 {
+                    NormRole::Stream
+                } else {
+                    NormRole::Attention
+                })),
+            );
         } else {
             for (name, role) in [
                 ("q_input_norm", NormRole::Query),
@@ -1036,15 +1056,18 @@ impl InklingDevicePlan {
                 // Layer 0 has no bank, so all three inputs are the stream (the host's one-row
                 // attention input, read three times).
                 let role = if layer == 0 { NormRole::Stream } else { role };
-                steps.push(self.step(
-                    Op::RmsNorm,
-                    Some(Part::RmsNorm),
-                    Some(Image::TOKEN),
-                    Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-                    &[&format!("{prefix}.{name}.weight")],
-                    rows,
-                    hidden,
-                )?.at(Target::Norm(role)));
+                steps.push(
+                    self.step(
+                        Op::RmsNorm,
+                        Some(Part::RmsNorm),
+                        Some(Image::TOKEN),
+                        Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                        &[&format!("{prefix}.{name}.weight")],
+                        rows,
+                        hidden,
+                    )?
+                    .at(Target::Norm(role)),
+                );
             }
         }
 
@@ -1057,46 +1080,55 @@ impl InklingDevicePlan {
             ("gate_attn", heads * head_dim, Projection::Gate),
             ("attn_sink_proj", heads, Projection::Sink),
         ] {
-            steps.push(self.step(
-                Op::Gemv,
-                Some(Part::DenseGemm),
-                Some(self.gemv_launch().0),
-                Some(self.gemv_launch().1),
-                &[&format!("{attn}.{name}.weight")],
-                width,
-                hidden,
-            )?.at(Target::Project(target)));
+            steps.push(
+                self.step(
+                    Op::Gemv,
+                    Some(Part::DenseGemm),
+                    Some(self.gemv_launch().0),
+                    Some(self.gemv_launch().1),
+                    &[&format!("{attn}.{name}.weight")],
+                    width,
+                    hidden,
+                )?
+                .at(Target::Project(target)),
+            );
         }
 
         // The key and value convolutions. A full layer's form reads the static taps tap-major and
         // adds a per-token projection; a sliding layer's reads them channel-major.
         for (name, slot) in [("k_sconv", ConvSlot::Key), ("v_sconv", ConvSlot::Value)] {
             if full {
-                steps.push(self.step(
-                    Op::ShortConvDynamic,
-                    Some(Part::ShortConv),
-                    Some(Image::Inkling),
-                    Some(self.entry_for(
-                        "inkling_short_conv_dynamic_decode",
-                        "inkling_short_conv_dynamic",
-                    )),
-                    &[
-                        &format!("{attn}.{name}.static_w"),
-                        &format!("{attn}.{name}.weight_proj"),
-                    ],
-                    kv_width,
-                    config.sconv_kernel_size,
-                )?.at(Target::Conv(slot)));
+                steps.push(
+                    self.step(
+                        Op::ShortConvDynamic,
+                        Some(Part::ShortConv),
+                        Some(Image::Inkling),
+                        Some(self.entry_for(
+                            "inkling_short_conv_dynamic_decode",
+                            "inkling_short_conv_dynamic",
+                        )),
+                        &[
+                            &format!("{attn}.{name}.static_w"),
+                            &format!("{attn}.{name}.weight_proj"),
+                        ],
+                        kv_width,
+                        config.sconv_kernel_size,
+                    )?
+                    .at(Target::Conv(slot)),
+                );
             } else {
-                steps.push(self.step(
-                    Op::ShortConv,
-                    Some(Part::ShortConv),
-                    Some(Image::Inkling),
-                    Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
-                    &[&format!("{attn}.{name}.weight")],
-                    kv_width,
-                    config.sconv_kernel_size,
-                )?.at(Target::Conv(slot)));
+                steps.push(
+                    self.step(
+                        Op::ShortConv,
+                        Some(Part::ShortConv),
+                        Some(Image::Inkling),
+                        Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
+                        &[&format!("{attn}.{name}.weight")],
+                        kv_width,
+                        config.sconv_kernel_size,
+                    )?
+                    .at(Target::Conv(slot)),
+                );
             }
         }
 
@@ -1135,15 +1167,18 @@ impl InklingDevicePlan {
             heads * head_dim,
         ));
         // The attention output projection and its short convolution.
-        steps.push(self.step(
-            Op::Gemv,
-            Some(Part::DenseGemm),
-            Some(self.gemv_launch().0),
-            Some(self.gemv_launch().1),
-            &[&format!("{attn}.wo_ud.weight")],
-            hidden,
-            heads * head_dim,
-        )?.at(Target::Project(Projection::AttentionOut)));
+        steps.push(
+            self.step(
+                Op::Gemv,
+                Some(Part::DenseGemm),
+                Some(self.gemv_launch().0),
+                Some(self.gemv_launch().1),
+                &[&format!("{attn}.wo_ud.weight")],
+                hidden,
+                heads * head_dim,
+            )?
+            .at(Target::Project(Projection::AttentionOut)),
+        );
         // The projection sharded its contraction axis, so what each rank holds is a partial sum:
         // complete it before the convolution mixes it across taps.
         steps.push(Self::plain(
@@ -1152,15 +1187,18 @@ impl InklingDevicePlan {
             rows,
             hidden,
         ));
-        steps.push(self.step(
-            Op::ShortConv,
-            Some(Part::ShortConv),
-            Some(Image::Inkling),
-            Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
-            &[&format!("{prefix}.attn_sconv.weight")],
-            hidden,
-            config.sconv_kernel_size,
-        )?.at(Target::Conv(ConvSlot::Attention)));
+        steps.push(
+            self.step(
+                Op::ShortConv,
+                Some(Part::ShortConv),
+                Some(Image::Inkling),
+                Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
+                &[&format!("{prefix}.attn_sconv.weight")],
+                hidden,
+                config.sconv_kernel_size,
+            )?
+            .at(Target::Conv(ConvSlot::Attention)),
+        );
 
         // The residual. At a block boundary the input *is* the sublayer's output and the summary
         // stack grows instead: layer % n_layers_per_attn_res_block == 0 returns the attention
@@ -1175,35 +1213,44 @@ impl InklingDevicePlan {
         }
 
         // The MLP input is a second block-residual read, one learned query a layer.
-        steps.push(self.step(
-            Op::BlockResidual,
-            Some(Part::BlockAttentionResidual),
-            Some(Image::Inkling),
-            Some("inkling_block_residual"),
-            &[&format!("model.llm.attn_res.mlp_queries.{layer}")],
-            1,
-            hidden,
-        )?.at(Target::Input(ResidualInput::Mlp)));
-        steps.push(self.step(
-            Op::RmsNorm,
-            Some(Part::RmsNorm),
-            Some(Image::TOKEN),
-            Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
-            &[&format!("{prefix}.mlp_norm.weight")],
-            rows,
-            hidden,
-        )?.at(Target::Norm(NormRole::Mlp)));
+        steps.push(
+            self.step(
+                Op::BlockResidual,
+                Some(Part::BlockAttentionResidual),
+                Some(Image::Inkling),
+                Some("inkling_block_residual"),
+                &[&format!("model.llm.attn_res.mlp_queries.{layer}")],
+                1,
+                hidden,
+            )?
+            .at(Target::Input(ResidualInput::Mlp)),
+        );
+        steps.push(
+            self.step(
+                Op::RmsNorm,
+                Some(Part::RmsNorm),
+                Some(Image::TOKEN),
+                Some(self.entry_for("q4e_rmsnorm", "q4e_rmsnorm_rows")),
+                &[&format!("{prefix}.mlp_norm.weight")],
+                rows,
+                hidden,
+            )?
+            .at(Target::Norm(NormRole::Mlp)),
+        );
 
         // The router, then the routed band.
-        steps.push(self.step(
-            Op::Gemv,
-            Some(Part::DenseGemm),
-            Some(self.gemv_launch().0),
-            Some(self.gemv_launch().1),
-            &[&format!("{prefix}.mlp.gate.weight")],
-            config.n_routed_experts,
-            hidden,
-        )?.at(Target::Project(Projection::Router)));
+        steps.push(
+            self.step(
+                Op::Gemv,
+                Some(Part::DenseGemm),
+                Some(self.gemv_launch().0),
+                Some(self.gemv_launch().1),
+                &[&format!("{prefix}.mlp.gate.weight")],
+                config.n_routed_experts,
+                hidden,
+            )?
+            .at(Target::Project(Projection::Router)),
+        );
         steps.push(self.step(
             Op::Router,
             Some(Part::Moe),
@@ -1284,33 +1331,42 @@ impl InklingDevicePlan {
         };
         let gate_up: Vec<&str> = gate_up_weights.iter().map(String::as_str).collect();
         let down: Vec<&str> = down_weights.iter().map(String::as_str).collect();
-        steps.push(self.step(
-            Op::ExpertGateUp,
-            Some(part),
-            Some(image),
-            Some(entry),
-            &gate_up,
-            2 * intermediate,
-            hidden,
-        )?.at(Target::Band(BandOp::GateUp)));
-        steps.push(self.step(
-            Op::ExpertActivation,
-            Some(Part::SoftcappedActivation),
-            Some(Image::Inkling),
-            Some("inkling_softcapped_swiglu"),
-            &[],
-            intermediate,
-            2 * intermediate,
-        )?.at(Target::Band(BandOp::Activation)));
-        steps.push(self.step(
-            Op::ExpertDown,
-            Some(part),
-            Some(image),
-            Some(entry),
-            &down,
-            hidden,
-            intermediate,
-        )?.at(Target::Band(BandOp::Down)));
+        steps.push(
+            self.step(
+                Op::ExpertGateUp,
+                Some(part),
+                Some(image),
+                Some(entry),
+                &gate_up,
+                2 * intermediate,
+                hidden,
+            )?
+            .at(Target::Band(BandOp::GateUp)),
+        );
+        steps.push(
+            self.step(
+                Op::ExpertActivation,
+                Some(Part::SoftcappedActivation),
+                Some(Image::Inkling),
+                Some("inkling_softcapped_swiglu"),
+                &[],
+                intermediate,
+                2 * intermediate,
+            )?
+            .at(Target::Band(BandOp::Activation)),
+        );
+        steps.push(
+            self.step(
+                Op::ExpertDown,
+                Some(part),
+                Some(image),
+                Some(entry),
+                &down,
+                hidden,
+                intermediate,
+            )?
+            .at(Target::Band(BandOp::Down)),
+        );
         // The mix is local: the rank's own experts, each scaled by its share of the router's
         // selection, and a slot it does not own contributes a zero scale. The all-reduce that
         // follows is then the whole exchange - one residual-width vector a layer - and it gives
@@ -1334,15 +1390,18 @@ impl InklingDevicePlan {
         ));
 
         // The MLP output's short convolution, then the residual add that closes the layer.
-        steps.push(self.step(
-            Op::ShortConv,
-            Some(Part::ShortConv),
-            Some(Image::Inkling),
-            Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
-            &[&format!("{prefix}.mlp_sconv.weight")],
-            hidden,
-            config.sconv_kernel_size,
-        )?.at(Target::Conv(ConvSlot::Mlp)));
+        steps.push(
+            self.step(
+                Op::ShortConv,
+                Some(Part::ShortConv),
+                Some(Image::Inkling),
+                Some(self.entry_for("inkling_short_conv_decode", "inkling_short_conv")),
+                &[&format!("{prefix}.mlp_sconv.weight")],
+                hidden,
+                config.sconv_kernel_size,
+            )?
+            .at(Target::Conv(ConvSlot::Mlp)),
+        );
         steps.push(Self::add(rows, hidden));
 
         let kv_rows = self.cache_rows(layer);
@@ -1353,7 +1412,11 @@ impl InklingDevicePlan {
             taps,
             experts: body,
             kv_rows,
-            window: if sliding { config.sliding_window_size } else { 0 },
+            window: if sliding {
+                config.sliding_window_size
+            } else {
+                0
+            },
             rel_extent: if sliding {
                 config.sliding_window_size
             } else {
@@ -1484,11 +1547,15 @@ mod tests {
             let read: std::collections::HashSet<usize> =
                 (oldest..=position).map(|slot| slot % ring).collect();
             for j in r + 1..chunk {
-                assert!(!read.contains(&((first + j) % ring)), "row {j} overwrites row {r}");
+                assert!(
+                    !read.contains(&((first + j) % ring)),
+                    "row {j} overwrites row {r}"
+                );
             }
         }
-        let narrower = InklingDevicePlan::build_for_chunk(&config, tp, Pass::Prefill, 128, 4096, 64)
-            .expect_err("a chunk narrower than its pass");
+        let narrower =
+            InklingDevicePlan::build_for_chunk(&config, tp, Pass::Prefill, 128, 4096, 64)
+                .expect_err("a chunk narrower than its pass");
         assert!(narrower.contains("narrower"), "{narrower}");
     }
 

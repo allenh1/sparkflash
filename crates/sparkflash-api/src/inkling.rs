@@ -255,12 +255,18 @@ impl InklingStreamParser {
             let before = self.buffer[..start].to_owned();
             self.text(&before, &mut events);
             self.buffer.drain(..start);
-            if let Some(marker) = MARKERS.iter().find(|marker| self.buffer.starts_with(**marker)) {
+            if let Some(marker) = MARKERS
+                .iter()
+                .find(|marker| self.buffer.starts_with(**marker))
+            {
                 self.buffer.drain(..marker.len());
                 self.marker(marker, &mut events);
                 continue;
             }
-            if MARKERS.iter().any(|marker| marker.starts_with(self.buffer.as_str())) {
+            if MARKERS
+                .iter()
+                .any(|marker| marker.starts_with(self.buffer.as_str()))
+            {
                 // A marker may still be arriving: hold the tail for the next delta.
                 break;
             }
@@ -480,7 +486,11 @@ mod tests {
         assert_eq!(content, "Looking.");
         assert_eq!(
             calls,
-            [(0, "lookup".to_owned(), r#"{"city":"Paris","n":2}"#.to_owned())]
+            [(
+                0,
+                "lookup".to_owned(),
+                r#"{"city":"Paris","n":2}"#.to_owned()
+            )]
         );
     }
 
@@ -544,7 +554,10 @@ mod tests {
         assert_eq!(reasoning, "I should look.");
         assert_eq!(
             calls,
-            [(Some("read".to_owned()), r#"{"path":"src/lib.rs"}"#.to_owned())]
+            [(
+                Some("read".to_owned()),
+                r#"{"path":"src/lib.rs"}"#.to_owned()
+            )]
         );
         assert_eq!(finish, Some(FinishReason::ToolCalls));
 

@@ -50,12 +50,12 @@ use sparkflash_engine::parallel_tp::TpLayout;
 use sparkflash_engine::safetensors::SafeTensorsSource;
 use sparkflash_model::{Architecture, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
+use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
+use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
 use sparkflash_model_inkling2::config::Inkling2Config;
 use sparkflash_model_inkling2::convert::{
     InklingRecords, convert_rank as inkling_convert_rank, verify_rank as inkling_verify_rank,
 };
-use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
-use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_model_qwen4_exp::convert::{Nvfp4Scalars, convert_rank as qwen_convert_rank};
 use sparkflash_ops::engine_plan::EnginePlan;
@@ -248,13 +248,16 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 verify: false,
                 allows_no_pad: true,
             };
-            return slot_pack.convert::<InklingRecords>(&checkpoint_dir, |source, layout, label| {
-                let converted = inkling_convert_rank(source, &config, layout, &out_dir, label)?;
-                if verify {
-                    inkling_verify_rank(&converted.path, source, &config, layout)?;
-                }
-                Ok(converted)
-            });
+            return slot_pack.convert::<InklingRecords>(
+                &checkpoint_dir,
+                |source, layout, label| {
+                    let converted = inkling_convert_rank(source, &config, layout, &out_dir, label)?;
+                    if verify {
+                        inkling_verify_rank(&converted.path, source, &config, layout)?;
+                    }
+                    Ok(converted)
+                },
+            );
         }
         if architecture.family != "deepseek_v41" {
             // A novel architecture composed of supported parts: convert it through the shared

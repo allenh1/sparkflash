@@ -15,7 +15,7 @@
 //! The released Inkling-2-Small geometry and its TP4 rank-local tensor slices.
 
 use sparkflash_model::architecture::{AttentionKind, Ffn, Residual, WeightFormat};
-use sparkflash_model::{TpPlan, built, Target};
+use sparkflash_model::{Target, TpPlan, built};
 use sparkflash_model_inkling2::architecture::architecture_from_config;
 use sparkflash_model_inkling2::config::Inkling2Config;
 use sparkflash_model_inkling2::tensor::InklingTensorPlan;
@@ -53,17 +53,27 @@ fn the_released_architecture_names_its_schedule() {
     }
     assert_eq!(config.quant.nvfp4_layers, (0..40).collect::<Vec<_>>());
     assert_eq!(config.quant.mxfp8_layers, (40..48).collect::<Vec<_>>());
-    assert!(config.quant.layer_expert_formats[..40]
-        .iter()
-        .all(|format| matches!(format, WeightFormat::NvFp4 { group_size: 16 })));
-    assert!(config.quant.layer_expert_formats[40..]
-        .iter()
-        .all(|format| matches!(format, WeightFormat::MxFp8 { block: 32 })));
+    assert!(
+        config.quant.layer_expert_formats[..40]
+            .iter()
+            .all(|format| matches!(format, WeightFormat::NvFp4 { group_size: 16 }))
+    );
+    assert!(
+        config.quant.layer_expert_formats[40..]
+            .iter()
+            .all(|format| matches!(format, WeightFormat::MxFp8 { block: 32 }))
+    );
     assert_eq!(config.vision.as_ref().map(|vision| vision.depth), Some(23));
-    assert_eq!(config.mtp.as_ref().map(|mtp| mtp.num_hidden_layers), Some(5));
+    assert_eq!(
+        config.mtp.as_ref().map(|mtp| mtp.num_hidden_layers),
+        Some(5)
+    );
     assert_eq!(config.mtp.as_ref().map(|mtp| mtp.block_size), Some(8));
     assert!(architecture.missing_on(Target::Sm121).is_empty());
-    assert_eq!(built(Target::Sm121).len(), sparkflash_model::Part::ALL.len());
+    assert_eq!(
+        built(Target::Sm121).len(),
+        sparkflash_model::Part::ALL.len()
+    );
 }
 
 #[test]
@@ -109,14 +119,8 @@ fn the_tp4_rank_slices_divide_heads_experts_and_vocabulary() {
         spec("model.llm.layers.40.mlp.experts.w2_weight"),
         vec![96, 4608, 2304]
     );
-    assert_eq!(
-        spec("model.llm.embed.weight"),
-        vec![50_256, 4608]
-    );
-    assert_eq!(
-        spec("model.llm.unembed.weight"),
-        vec![50_256, 4608]
-    );
+    assert_eq!(spec("model.llm.embed.weight"), vec![50_256, 4608]);
+    assert_eq!(spec("model.llm.unembed.weight"), vec![50_256, 4608]);
     // Norms, the hidden-width post convolutions, relative banks and block-residual queries
     // are replicated, not sliced.
     assert_eq!(spec("model.llm.norm.weight"), vec![4608]);
@@ -129,12 +133,6 @@ fn the_tp4_rank_slices_divide_heads_experts_and_vocabulary() {
         spec("model.llm.layers.0.attn.rel_logits_proj.proj"),
         vec![16, 1024]
     );
-    assert_eq!(
-        spec("model.llm.attn_res.attn_queries.4"),
-        vec![3, 4608]
-    );
-    assert_eq!(
-        spec("model.llm.attn_res.mlp_queries.7"),
-        vec![4608]
-    );
+    assert_eq!(spec("model.llm.attn_res.attn_queries.4"), vec![3, 4608]);
+    assert_eq!(spec("model.llm.attn_res.mlp_queries.7"), vec![4608]);
 }

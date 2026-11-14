@@ -226,13 +226,16 @@ impl Inkling2Config {
         let full_layer_ids = (0..num_hidden_layers)
             .filter(|index| !local_layer_ids.contains(index))
             .collect();
-        let inkling = architecture
-            .inkling
-            .clone()
-            .ok_or_else(|| ConfigError::Invalid("the document is not an Inkling architecture".to_owned()))?;
+        let inkling = architecture.inkling.clone().ok_or_else(|| {
+            ConfigError::Invalid("the document is not an Inkling architecture".to_owned())
+        })?;
         let n_routed_experts = match architecture.layers.first().map(|layer| &layer.ffn) {
             Some(Ffn::Moe(moe)) => moe.routed_experts,
-            _ => return Err(ConfigError::Invalid("the first layer is not MoE".to_owned())),
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "the first layer is not MoE".to_owned(),
+                ));
+            }
         };
         let num_experts_per_tok = match architecture.layers.first().map(|layer| &layer.ffn) {
             Some(Ffn::Moe(moe)) => moe.active_experts,
@@ -242,10 +245,12 @@ impl Inkling2Config {
             Some(Ffn::Moe(moe)) => moe.intermediate,
             _ => 0,
         };
-        let route_scale = optional_f64(text, "route_scale")?
-            .unwrap_or_else(|| match architecture.layers.first().map(|layer| &layer.ffn) {
-                Some(Ffn::Moe(moe)) => moe.routed_scaling,
-                _ => 1.0,
+        let route_scale =
+            optional_f64(text, "route_scale")?.unwrap_or_else(|| {
+                match architecture.layers.first().map(|layer| &layer.ffn) {
+                    Some(Ffn::Moe(moe)) => moe.routed_scaling,
+                    _ => 1.0,
+                }
             });
         let block = inkling.block_residual;
         let quant_config = parse_quant(quant, &inkling.layer_expert_formats, num_hidden_layers)?;
@@ -309,7 +314,10 @@ impl Inkling2Config {
                 return Err(ConfigError::Invalid(format!("{name} is zero")));
             }
         }
-        if !self.num_attention_heads.is_multiple_of(self.num_key_value_heads) {
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
             return Err(ConfigError::Invalid(format!(
                 "{} query heads do not divide {} key/value heads",
                 self.num_attention_heads, self.num_key_value_heads
@@ -328,7 +336,9 @@ impl Inkling2Config {
             ));
         }
         if self.n_layers_per_attn_res_block == 0
-            || !self.num_hidden_layers.is_multiple_of(self.n_layers_per_attn_res_block)
+            || !self
+                .num_hidden_layers
+                .is_multiple_of(self.n_layers_per_attn_res_block)
         {
             return Err(ConfigError::Invalid(format!(
                 "{} layers do not divide into blocks of {}",
@@ -439,7 +449,10 @@ impl Inkling2Config {
     #[must_use]
     pub fn is_sliding(&self, layer: usize) -> bool {
         matches!(
-            self.architecture.layers.get(layer).map(|layer| &layer.attention.kind),
+            self.architecture
+                .layers
+                .get(layer)
+                .map(|layer| &layer.attention.kind),
             Some(AttentionKind::Inkling { .. })
         ) && self.local_layer_ids.contains(&layer)
     }
@@ -484,26 +497,36 @@ fn parse_quant(
             _ => {}
         }
     }
-    let nvfp4_group = layer_expert_formats.iter().find_map(|format| match format {
-        WeightFormat::NvFp4 { group_size } => Some(*group_size),
-        _ => None,
-    }).unwrap_or(16);
-    let mxfp8_block = layer_expert_formats.iter().find_map(|format| match format {
-        WeightFormat::MxFp8 { block } => Some(*block),
-        _ => None,
-    }).unwrap_or(32);
+    let nvfp4_group = layer_expert_formats
+        .iter()
+        .find_map(|format| match format {
+            WeightFormat::NvFp4 { group_size } => Some(*group_size),
+            _ => None,
+        })
+        .unwrap_or(16);
+    let mxfp8_block = layer_expert_formats
+        .iter()
+        .find_map(|format| match format {
+            WeightFormat::MxFp8 { block } => Some(*block),
+            _ => None,
+        })
+        .unwrap_or(32);
     let mtp_format = quant
         .and_then(|value| object(value, "mtp"))
         .and_then(|mtp| mtp.get("parameter_groups"))
         .and_then(Value::as_array)
-        .and_then(|groups| groups.iter().find_map(|group| {
-            let compute = string(group, "compute_dtype").unwrap_or_default();
-            match compute.as_str() {
-                "nvfp4" => Some(WeightFormat::NvFp4 { group_size: nvfp4_group }),
-                "mxfp8" => Some(WeightFormat::MxFp8 { block: mxfp8_block }),
-                _ => None,
-            }
-        }))
+        .and_then(|groups| {
+            groups.iter().find_map(|group| {
+                let compute = string(group, "compute_dtype").unwrap_or_default();
+                match compute.as_str() {
+                    "nvfp4" => Some(WeightFormat::NvFp4 {
+                        group_size: nvfp4_group,
+                    }),
+                    "mxfp8" => Some(WeightFormat::MxFp8 { block: mxfp8_block }),
+                    _ => None,
+                }
+            })
+        })
         .unwrap_or(WeightFormat::Bf16);
     // The dense tensors are BF16 in every release; each one's dtype is checked against the plan
     // on load, so the config's torch_dtype decides nothing here.
@@ -519,7 +542,10 @@ fn parse_quant(
     })
 }
 
-fn parse_vision(root: &Value, language_hidden: usize) -> Result<Option<InklingVisionConfig>, ConfigError> {
+fn parse_vision(
+    root: &Value,
+    language_hidden: usize,
+) -> Result<Option<InklingVisionConfig>, ConfigError> {
     let Some(config) = object(root, "vision_config") else {
         return Ok(None);
     };
@@ -596,8 +622,7 @@ fn optional_usize(value: &Value, name: &str) -> Result<Option<usize>, ConfigErro
 }
 
 fn required_usize(value: &Value, name: &str) -> Result<usize, ConfigError> {
-    optional_usize(value, name)?
-        .ok_or_else(|| ConfigError::Invalid(format!("{name} is missing")))
+    optional_usize(value, name)?.ok_or_else(|| ConfigError::Invalid(format!("{name} is missing")))
 }
 
 fn optional_f64(value: &Value, name: &str) -> Result<Option<f64>, ConfigError> {
@@ -618,10 +643,14 @@ fn usize_list(value: Option<&Value>) -> Result<Vec<usize>, ConfigError> {
             .map(|item| {
                 item.as_u64()
                     .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(|| ConfigError::Invalid("a layer list holds a non-integer".to_owned()))
+                    .ok_or_else(|| {
+                        ConfigError::Invalid("a layer list holds a non-integer".to_owned())
+                    })
             })
             .collect(),
-        Some(_) => Err(ConfigError::Invalid("a layer list is not an array".to_owned())),
+        Some(_) => Err(ConfigError::Invalid(
+            "a layer list is not an array".to_owned(),
+        )),
     }
 }
 
@@ -639,7 +668,10 @@ mod tests {
         assert_eq!(config.local_layer_ids.len(), 40);
         assert_eq!(config.full_layer_ids, vec![5, 11, 17, 23, 29, 35, 41, 47]);
         assert_eq!(config.quant.nvfp4_layers.len(), 40);
-        assert_eq!(config.quant.mxfp8_layers, vec![40, 41, 42, 43, 44, 45, 46, 47]);
+        assert_eq!(
+            config.quant.mxfp8_layers,
+            vec![40, 41, 42, 43, 44, 45, 46, 47]
+        );
         assert_eq!(config.quant.nvfp4_group, 16);
         assert_eq!(config.quant.mxfp8_block, 32);
         assert_eq!(config.vision.as_ref().map(|v| v.patch_size), Some(20));

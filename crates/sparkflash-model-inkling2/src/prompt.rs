@@ -62,13 +62,9 @@ impl InklingCodec {
     ///
     /// # Errors
     /// A missing or malformed tokenizer, or one that carries none of Inkling's message tokens.
-    pub fn from_path(
-        path: &Path,
-        bos: Option<u32>,
-        eos: Vec<u32>,
-    ) -> Result<Self, String> {
-        let tokenizer = Tokenizer::from_file(path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+    pub fn from_path(path: &Path, bos: Option<u32>, eos: Vec<u32>) -> Result<Self, String> {
+        let tokenizer =
+            Tokenizer::from_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
         let codec = Self {
             tokenizer,
             bos,
@@ -97,7 +93,8 @@ impl InklingCodec {
                 .token_to_id(token)
                 .ok_or_else(|| format!("the tokenizer has no {token}, which images need"))
         };
-        let (open, placeholder, close) = (id(CONTENT_IMAGE)?, id(IMAGE_PLACEHOLDER)?, id(END_MESSAGE)?);
+        let (open, placeholder, close) =
+            (id(CONTENT_IMAGE)?, id(IMAGE_PLACEHOLDER)?, id(END_MESSAGE)?);
         if placeholder != crate::vision::IMAGE_TOKEN_ID {
             return Err(format!(
                 "the tokenizer's {IMAGE_PLACEHOLDER} is id {placeholder}, not the image token {}",
@@ -127,24 +124,22 @@ impl InklingCodec {
         let mut text = String::new();
         let mut effort_emitted = false;
         if let Some(tools) = request.get("tools").and_then(Value::as_array)
-            && !tools.is_empty() {
-                text.push_str(MESSAGE_SYSTEM);
-                text.push_str("tool_declare");
-                text.push_str("<|content_xml|>");
-                text.push_str(&tool_specs(tools)?);
-                text.push_str(END_MESSAGE);
-            }
+            && !tools.is_empty()
+        {
+            text.push_str(MESSAGE_SYSTEM);
+            text.push_str("tool_declare");
+            text.push_str("<|content_xml|>");
+            text.push_str(&tool_specs(tools)?);
+            text.push_str(END_MESSAGE);
+        }
         for message in messages {
-            let role = message
-                .get("role")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    PromptError::invalid(
-                        "every message needs a role",
-                        Some("messages"),
-                        Some("invalid_request_error"),
-                    )
-                })?;
+            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+                PromptError::invalid(
+                    "every message needs a role",
+                    Some("messages"),
+                    Some("invalid_request_error"),
+                )
+            })?;
             if !effort_emitted && role != "system" {
                 text.push_str(MESSAGE_SYSTEM);
                 text.push_str(CONTENT_TEXT);
@@ -330,11 +325,16 @@ fn answered_call<'a>(messages: &'a [Value], id: &str) -> Option<&'a str> {
 }
 
 fn invalid(message: impl Into<String>) -> PromptError {
-    PromptError::invalid(message.into(), Some("messages"), Some("invalid_request_error"))
+    PromptError::invalid(
+        message.into(),
+        Some("messages"),
+        Some("invalid_request_error"),
+    )
 }
 
 fn json(value: &Value) -> Result<String, PromptError> {
-    serde_json::to_string(value).map_err(|error| PromptError::invalid(error.to_string(), None, None))
+    serde_json::to_string(value)
+        .map_err(|error| PromptError::invalid(error.to_string(), None, None))
 }
 
 /// `value` with every object's keys in sorted order, which is what the template's
@@ -345,7 +345,11 @@ fn sorted(value: &Value) -> Value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            Value::Object(keys.into_iter().map(|key| (key.clone(), sorted(&map[key]))).collect())
+            Value::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), sorted(&map[key])))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
         other => other.clone(),
@@ -522,10 +526,12 @@ mod tests {
              <|message_tool|>lookup<|content_text|>12C<|end_message|>"
         ));
         assert!(!text.contains("<|message_model|><|content_text|><|end_message|>"));
-        assert!(InklingCodec::render_chat(&json!({"messages":[
-            {"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":"[1]"}}]}
-        ]}))
-        .is_err());
+        assert!(
+            InklingCodec::render_chat(&json!({"messages":[
+                {"role":"assistant","tool_calls":[{"function":{"name":"f","arguments":"[1]"}}]}
+            ]}))
+            .is_err()
+        );
     }
 
     #[test]

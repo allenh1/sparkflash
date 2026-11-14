@@ -200,7 +200,11 @@ fn blend_onto(c: u8, a: u8, background: u8) -> u8 {
 
 /// The [`AlphaPolicy::Checkerboard`] sample under pixel (`x`, `y`).
 fn checkerboard(x: usize, y: usize) -> u8 {
-    if (y / 8 + x / 8).is_multiple_of(2) { 204 } else { 153 }
+    if (y / 8 + x / 8).is_multiple_of(2) {
+        204
+    } else {
+        153
+    }
 }
 
 /// Grey, grey + alpha, RGB or RGBA 8-bit samples to RGB.
@@ -212,7 +216,11 @@ fn to_rgb(
     alpha: AlphaPolicy,
 ) -> RgbImage {
     let mut data = Vec::with_capacity(width * height * 3);
-    for (index, px) in samples.chunks_exact(channels).take(width * height).enumerate() {
+    for (index, px) in samples
+        .chunks_exact(channels)
+        .take(width * height)
+        .enumerate()
+    {
         let under = || checkerboard(index % width.max(1), index / width.max(1));
         match channels {
             1 => data.extend_from_slice(&[px[0]; 3]),

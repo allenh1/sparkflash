@@ -76,9 +76,7 @@ fn the_device_prefill_and_decode_agree_with_the_host() {
 
     let prompt = [3u32, 7, 11];
     let host_first = host_session.prefill(&prompt).expect("the host prompt");
-    let device_first = device_session
-        .prefill(&prompt)
-        .expect("the device prompt");
+    let device_first = device_session.prefill(&prompt).expect("the device prompt");
     assert_eq!(device_first.logits.len(), config.unpadded_vocab_size);
     assert!(
         device_first.logits.iter().all(|value| value.is_finite()),
@@ -117,11 +115,15 @@ fn compare(what: &str, host: &[f32], device: &[f32]) {
     };
     let host_best = best(host);
     let device_best = best(device);
-    let scale = host.iter().fold(0f32, |largest, value| largest.max(value.abs()));
+    let scale = host
+        .iter()
+        .fold(0f32, |largest, value| largest.max(value.abs()));
     let difference = host
         .iter()
         .zip(device)
-        .fold(0f32, |largest, (left, right)| largest.max((left - right).abs()));
+        .fold(0f32, |largest, (left, right)| {
+            largest.max((left - right).abs())
+        });
     eprintln!(
         "{what}: host best {host_best} ({:.4}), device best {device_best} ({:.4}), largest \
          difference {difference:.5} of {scale:.4}",
@@ -173,7 +175,10 @@ fn the_device_arm_refuses_a_context_past_the_window() {
     )
     .expect("the fixture opens");
     // The schedule the arm executes is the plan's, not a second walk's.
-    assert_eq!(opened.plan().pass(), sparkflash_model_inkling2::device_plan::Pass::Decode);
+    assert_eq!(
+        opened.plan().pass(),
+        sparkflash_model_inkling2::device_plan::Pass::Decode
+    );
     assert_eq!(opened.plan().layers().len(), 2);
 }
 
@@ -228,7 +233,10 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
         let mut slot = lanes.open_slot().expect("a lane");
         lanes.set_sampling(&mut slot, greedy());
         let first = lanes.prefill(&mut slot, prompt).expect("the lane's prompt");
-        assert_eq!(first.logits, solo[index][0], "lane {index}: the prompt's answer");
+        assert_eq!(
+            first.logits, solo[index][0],
+            "lane {index}: the prompt's answer"
+        );
         slots.push(slot);
     }
     for step in 0..steps {
@@ -263,8 +271,13 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
     assert!(lanes.holds_request(&slot));
     lanes.renew(&mut slot).expect("the lane renews");
     lanes.set_sampling(&mut slot, greedy());
-    let again = lanes.prefill(&mut slot, prompts[1]).expect("the renewed prompt");
-    assert_eq!(again.logits, solo[1][0], "a renewed lane answers its prompt afresh");
+    let again = lanes
+        .prefill(&mut slot, prompts[1])
+        .expect("the renewed prompt");
+    assert_eq!(
+        again.logits, solo[1][0],
+        "a renewed lane answers its prompt afresh"
+    );
 }
 
 /// Four ranks of one checkpoint: the converted rank files, four backends and the loopback
@@ -322,9 +335,8 @@ fn four_converted_ranks_answer_like_one_rank() {
                 rank,
                 world_size: 4,
             };
-            let source = sparkflash_model_inkling2::convert::RankFileSource::open(
-                &path, &config, layout,
-            )?;
+            let source =
+                sparkflash_model_inkling2::convert::RankFileSource::open(&path, &config, layout)?;
             let exchange = sparkflash_model_inkling2::collective::TcpExchange::connect(
                 &sparkflash_comm::tcp::TcpConfig::loopback4(rank, base_port),
             )?;
@@ -362,4 +374,3 @@ fn four_converted_ranks_answer_like_one_rank() {
         compare(&format!("tp4/rank{rank}"), &reference.logits, logits);
     }
 }
-

@@ -99,7 +99,10 @@ fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
 fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
     upload(
         cuda,
-        &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+        &values
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -175,7 +178,10 @@ fn assert_close(what: &str, host: &[f32], device: &[f32]) {
 fn kernel(
     cuda: &Cuda,
     name: &'static str,
-) -> (sparkflash_kernels::cuda_driver::Module, sparkflash_kernels::cuda_driver::Kernel) {
+) -> (
+    sparkflash_kernels::cuda_driver::Module,
+    sparkflash_kernels::cuda_driver::Kernel,
+) {
     cuda.load_named(inkling_cubin(), name)
         .unwrap_or_else(|error| panic!("load {name}: {error}"))
 }
@@ -200,7 +206,14 @@ fn the_static_short_convolution_matches_the_host() {
         kernel,
         (blocks, rows as u32, 1),
         (256, 1, 1),
-        &[x_device.0, taps_device.0, out.0, u(rows), u(channels), u(kernel_width)],
+        &[
+            x_device.0,
+            taps_device.0,
+            out.0,
+            u(rows),
+            u(channels),
+            u(kernel_width),
+        ],
     )
     .expect("short_conv launch");
     let device = download_f32(&cuda, &out, rows * channels);
@@ -208,9 +221,9 @@ fn the_static_short_convolution_matches_the_host() {
     let rounded: Vec<f32> = taps
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
     let host = short_conv(&x, &rounded, rows, channels, kernel_width);
@@ -230,9 +243,9 @@ fn the_static_short_convolution_decode_matches_the_prefill() {
     let rounded: Vec<f32> = taps
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
     let tokens: Vec<Vec<f32>> = (0..6).map(|_| rng.values(channels)).collect();
@@ -241,7 +254,13 @@ fn the_static_short_convolution_decode_matches_the_prefill() {
     let mut state = vec![0f32; channels * history];
     let mut host = Vec::new();
     for token in &tokens {
-        host.extend(short_conv_decode(token, &rounded, &mut state, channels, kernel_width));
+        host.extend(short_conv_decode(
+            token,
+            &rounded,
+            &mut state,
+            channels,
+            kernel_width,
+        ));
     }
 
     let (_, kernel) = kernel(&cuda, "inkling_short_conv_decode");
@@ -286,12 +305,20 @@ fn the_dynamic_short_convolution_matches_the_host() {
     let rounded: Vec<f32> = static_taps
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
-    let host = short_conv_dynamic(&x, &rounded, &dynamic, rows, channels, kernel_width, HEAD_DIM);
+    let host = short_conv_dynamic(
+        &x,
+        &rounded,
+        &dynamic,
+        rows,
+        channels,
+        kernel_width,
+        HEAD_DIM,
+    );
 
     let (_, kernel) = kernel(&cuda, "inkling_short_conv_dynamic");
     let x_device = upload_f32(&cuda, &x);
@@ -332,13 +359,15 @@ fn the_dynamic_short_convolution_decode_matches_the_host() {
     let rounded: Vec<f32> = static_taps
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
     let tokens: Vec<Vec<f32>> = (0..5).map(|_| rng.values(channels)).collect();
-    let dynamic: Vec<Vec<f32>> = (0..5).map(|_| rng.values(KV_HEADS * kernel_width)).collect();
+    let dynamic: Vec<Vec<f32>> = (0..5)
+        .map(|_| rng.values(KV_HEADS * kernel_width))
+        .collect();
 
     let mut state = vec![0f32; channels * history];
     let mut host = Vec::new();
@@ -445,9 +474,9 @@ fn the_logit_softcap_matches_the_host() {
     let rounded: Vec<f32> = host
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
     assert_close_bf16("logit_softcap", &rounded, &device);
@@ -475,9 +504,9 @@ fn the_relative_attention_decode_matches_the_host() {
         items
             .iter()
             .map(|value| {
-                sparkflash_weights::quant::bf16_to_f32(
-                    sparkflash_weights::quant::f32_to_bf16_bits(*value),
-                )
+                sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                    *value,
+                ))
             })
             .collect()
     };
@@ -485,8 +514,14 @@ fn the_relative_attention_decode_matches_the_host() {
     let host = reference::attention(
         &q,
         &gate,
-        &round(&keys.concat()).chunks_exact(kv_width).map(<[f32]>::to_vec).collect::<Vec<_>>(),
-        &round(&values.concat()).chunks_exact(kv_width).map(<[f32]>::to_vec).collect::<Vec<_>>(),
+        &round(&keys.concat())
+            .chunks_exact(kv_width)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>(),
+        &round(&values.concat())
+            .chunks_exact(kv_width)
+            .map(<[f32]>::to_vec)
+            .collect::<Vec<_>>(),
         &rel,
         &rel_bank,
         &sink,
@@ -560,9 +595,9 @@ fn the_relative_attention_decode_matches_the_host() {
     let rounded: Vec<f32> = host
         .iter()
         .map(|value| {
-            sparkflash_weights::quant::bf16_to_f32(
-                sparkflash_weights::quant::f32_to_bf16_bits(*value),
-            )
+            sparkflash_weights::quant::bf16_to_f32(sparkflash_weights::quant::f32_to_bf16_bits(
+                *value,
+            ))
         })
         .collect();
     assert_close_bf16("attn_decode", &rounded, &device);
@@ -706,10 +741,12 @@ fn the_sigmoid_router_matches_the_host() {
         .map(|word| i32::from_le_bytes(*word) as usize)
         .collect();
     let device_weights = download_f32(&cuda, &weights_device, top_k);
-    assert_eq!(device_indices, host_indices, "the router chose other experts");
+    assert_eq!(
+        device_indices, host_indices,
+        "the router chose other experts"
+    );
     assert_close("router_topk", &host_weights, &device_weights);
 }
-
 
 #[test]
 fn the_residual_add_matches_the_host_exactly() {
@@ -805,7 +842,6 @@ fn the_kv_store_matches_the_host_rounding() {
     assert_close_bf16("kv_store value", &expected_value, &value_rows);
 }
 
-
 /// The ring a sliding layer's cache is: with `cache_rows` equal to the window, an absolute slot
 /// addresses `slot % cache_rows`, and over the slots a window can reach that mapping is injective.
 /// This is what lets 40 of the 48 layers hold 1,024 rows instead of one a context position.
@@ -856,10 +892,8 @@ fn a_ring_cache_reads_the_same_rows_as_a_linear_one() {
     let mut ring_values = vec![0f32; window * kv_width];
     for slot in positions - window..positions {
         let row = slot % window;
-        ring_keys[row * kv_width..(row + 1) * kv_width]
-            .copy_from_slice(&keys[slot]);
-        ring_values[row * kv_width..(row + 1) * kv_width]
-            .copy_from_slice(&values[slot]);
+        ring_keys[row * kv_width..(row + 1) * kv_width].copy_from_slice(&keys[slot]);
+        ring_values[row * kv_width..(row + 1) * kv_width].copy_from_slice(&values[slot]);
     }
     let ring_keys_device = upload_bf16(&cuda, &ring_keys);
     let ring_values_device = upload_bf16(&cuda, &ring_values);
@@ -941,4 +975,3 @@ fn the_expert_mix_matches_the_host_exactly() {
     // A scaled sum of f32 rows in one order is the same operation on both sides.
     assert_eq!(host, device, "expert_mix is not the host's mix");
 }
-

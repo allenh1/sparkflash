@@ -641,5 +641,8 @@ fn a_grouped_projection_is_each_group_launched_alone() {
         .expect("one group alone");
         expected.extend(download_f32(&cuda, &alone, batch * rows));
     }
-    assert_eq!(got, expected, "a group of a grouped launch is the group alone");
+    assert_eq!(
+        got, expected,
+        "a group of a grouped launch is the group alone"
+    );
 }

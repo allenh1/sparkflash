@@ -171,8 +171,8 @@ pub trait ModelSession: Send {
         Err(BackendError::new(
             "vision",
             format!(
-            "this session has no vision path for the request's {} images",
-            images.len()
+                "this session has no vision path for the request's {} images",
+                images.len()
             ),
         ))
     }

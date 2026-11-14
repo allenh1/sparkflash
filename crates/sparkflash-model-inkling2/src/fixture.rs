@@ -139,7 +139,11 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
         }
     }
     source.bf16("model.llm.embed.weight", vec![vocab, hidden], &embed);
-    source.bf16("model.llm.embed_norm.weight", vec![hidden], &vec![1.0; hidden]);
+    source.bf16(
+        "model.llm.embed_norm.weight",
+        vec![hidden],
+        &vec![1.0; hidden],
+    );
     source.bf16("model.llm.norm.weight", vec![hidden], &vec![1.0; hidden]);
     let mut unembed = Vec::with_capacity(vocab * hidden);
     for row in 0..vocab {
@@ -153,7 +157,11 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
     // carries indexes 0..layers-2, so the fixture does too.
     for bank in 0..config.num_hidden_layers.saturating_sub(1) {
         let layer = bank + 1;
-        let queries = if config.full_layer_ids.contains(&layer) { 3 } else { 1 };
+        let queries = if config.full_layer_ids.contains(&layer) {
+            3
+        } else {
+            1
+        };
         let name = format!("model.llm.attn_res.attn_queries.{bank}");
         let shape = if queries == 1 {
             vec![hidden]
@@ -181,9 +189,17 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
         let prefix = format!("model.llm.layers.{layer}");
         let attn = format!("{prefix}.attn");
         let sliding = config.is_sliding(layer);
-        source.bf16(&format!("{prefix}.mlp_norm.weight"), vec![hidden], &vec![1.0; hidden]);
+        source.bf16(
+            &format!("{prefix}.mlp_norm.weight"),
+            vec![hidden],
+            &vec![1.0; hidden],
+        );
         if sliding {
-            source.bf16(&format!("{prefix}.attn_norm.weight"), vec![hidden], &vec![1.0; hidden]);
+            source.bf16(
+                &format!("{prefix}.attn_norm.weight"),
+                vec![hidden],
+                &vec![1.0; hidden],
+            );
             source.bf16(
                 &format!("{attn}.k_sconv.weight"),
                 vec![kv_width, 1, kernel],
@@ -196,7 +212,11 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
             );
         } else {
             for name in ["q_input_norm", "k_input_norm", "v_input_norm"] {
-                source.bf16(&format!("{prefix}.{name}.weight"), vec![hidden], &vec![1.0; hidden]);
+                source.bf16(
+                    &format!("{prefix}.{name}.weight"),
+                    vec![hidden],
+                    &vec![1.0; hidden],
+                );
             }
             for name in ["k_sconv", "v_sconv"] {
                 source.bf16(
@@ -223,17 +243,63 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
             vec![hidden, 1, kernel],
             &random_vec(&format!("{prefix}.mlp_sconv"), hidden * kernel, 0.12),
         );
-        matrix(&mut source, &format!("{attn}.wq_du.weight"), q_width, hidden, 0.08);
-        matrix(&mut source, &format!("{attn}.wk_dv.weight"), kv_width, hidden, 0.08);
-        matrix(&mut source, &format!("{attn}.wv_dv.weight"), kv_width, hidden, 0.08);
-        matrix(&mut source, &format!("{attn}.wo_ud.weight"), hidden, q_width, 0.08);
-        matrix(&mut source, &format!("{attn}.wr_du.weight"), r_width, hidden, 0.08);
-        matrix(&mut source, &format!("{attn}.gate_attn.weight"), q_width, hidden, 0.08);
-        matrix(&mut source, &format!("{attn}.attn_sink_proj.weight"), heads, hidden, 0.05);
+        matrix(
+            &mut source,
+            &format!("{attn}.wq_du.weight"),
+            q_width,
+            hidden,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.wk_dv.weight"),
+            kv_width,
+            hidden,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.wv_dv.weight"),
+            kv_width,
+            hidden,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.wo_ud.weight"),
+            hidden,
+            q_width,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.wr_du.weight"),
+            r_width,
+            hidden,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.gate_attn.weight"),
+            q_width,
+            hidden,
+            0.08,
+        );
+        matrix(
+            &mut source,
+            &format!("{attn}.attn_sink_proj.weight"),
+            heads,
+            hidden,
+            0.05,
+        );
         source.bf16(
             &format!("{attn}.rel_logits_proj.proj"),
             vec![d_rel, config.rel_extent],
-            &random_vec(&format!("{attn}.rel_logits_proj"), d_rel * config.rel_extent, 0.05),
+            &random_vec(
+                &format!("{attn}.rel_logits_proj"),
+                d_rel * config.rel_extent,
+                0.05,
+            ),
         );
         source.bf16(
             &format!("{attn}.q_l2_clip.scale"),
@@ -245,8 +311,18 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
             vec![heads, d_rel],
             &vec![1.0; heads * d_rel],
         );
-        matrix(&mut source, &format!("{prefix}.mlp.gate.weight"), experts, hidden, 0.1);
-        source.f32(&format!("{prefix}.mlp.gate.bias"), vec![experts], &vec![0.0; experts]);
+        matrix(
+            &mut source,
+            &format!("{prefix}.mlp.gate.weight"),
+            experts,
+            hidden,
+            0.1,
+        );
+        source.f32(
+            &format!("{prefix}.mlp.gate.bias"),
+            vec![experts],
+            &vec![0.0; experts],
+        );
         write_experts(&mut source, config, layer);
     }
     source
@@ -269,11 +345,19 @@ pub fn write_experts(source: &mut TinySource, config: &Inkling2Config, layer: us
             let codes: Vec<u8> = (0..experts * w13_rows * w13_columns)
                 .map(|index| (seeded("w13codes", index, 7.0) as i32).rem_euclid(16) as u8)
                 .collect();
-            source.u8(&format!("{prefix}.w13_weight"), vec![experts, w13_rows, w13_columns], &codes);
+            source.u8(
+                &format!("{prefix}.w13_weight"),
+                vec![experts, w13_rows, w13_columns],
+                &codes,
+            );
             let codes: Vec<u8> = (0..experts * hidden * w2_columns)
                 .map(|index| (seeded("w2codes", index, 7.0) as i32).rem_euclid(16) as u8)
                 .collect();
-            source.u8(&format!("{prefix}.w2_weight"), vec![experts, hidden, w2_columns], &codes);
+            source.u8(
+                &format!("{prefix}.w2_weight"),
+                vec![experts, hidden, w2_columns],
+                &codes,
+            );
             let w13_scales = hidden.div_ceil(group_size);
             let w2_scales = intermediate.div_ceil(group_size);
             source.bf16(
@@ -286,25 +370,57 @@ pub fn write_experts(source: &mut TinySource, config: &Inkling2Config, layer: us
                 vec![experts, hidden, w2_scales],
                 &vec![1.0; experts * hidden * w2_scales],
             );
-            source.f32(&format!("{prefix}.w13_weight_amax"), vec![experts], &vec![1.0; experts]);
-            source.f32(&format!("{prefix}.w2_weight_amax"), vec![experts], &vec![1.0; experts]);
-            source.f32(&format!("{prefix}.w13_weight_outer_scale_denominator"), vec![1], &[6.0]);
-            source.f32(&format!("{prefix}.w2_weight_outer_scale_denominator"), vec![1], &[6.0]);
+            source.f32(
+                &format!("{prefix}.w13_weight_amax"),
+                vec![experts],
+                &vec![1.0; experts],
+            );
+            source.f32(
+                &format!("{prefix}.w2_weight_amax"),
+                vec![experts],
+                &vec![1.0; experts],
+            );
+            source.f32(
+                &format!("{prefix}.w13_weight_outer_scale_denominator"),
+                vec![1],
+                &[6.0],
+            );
+            source.f32(
+                &format!("{prefix}.w2_weight_outer_scale_denominator"),
+                vec![1],
+                &[6.0],
+            );
         }
         WeightFormat::MxFp8 { block } => {
             let w13_rows = 2 * intermediate;
             let w13_columns = hidden;
             let w2_columns = intermediate;
             let codes: Vec<u8> = vec![0x38; experts * w13_rows * w13_columns];
-            source.u8(&format!("{prefix}.w13_weight"), vec![experts, w13_rows, w13_columns], &codes);
+            source.u8(
+                &format!("{prefix}.w13_weight"),
+                vec![experts, w13_rows, w13_columns],
+                &codes,
+            );
             let codes: Vec<u8> = vec![0x38; experts * hidden * w2_columns];
-            source.u8(&format!("{prefix}.w2_weight"), vec![experts, hidden, w2_columns], &codes);
+            source.u8(
+                &format!("{prefix}.w2_weight"),
+                vec![experts, hidden, w2_columns],
+                &codes,
+            );
             let w13_scales = hidden.div_ceil(block);
             let w2_scales = intermediate.div_ceil(block);
             let scales = vec![127u8; experts * w13_rows * w13_scales];
-            source.u8(&format!("{prefix}.w13_weight_scale"), vec![experts, w13_rows, w13_scales], &scales);
+            source.u8(
+                &format!("{prefix}.w13_weight_scale"),
+                vec![experts, w13_rows, w13_scales],
+                &scales,
+            );
             let scales = vec![127u8; experts * hidden * w2_scales];
-            source.u8(&format!("{prefix}.w2_weight_scale"), vec![experts, hidden, w2_scales], &scales);
+            source.u8(
+                &format!("{prefix}.w2_weight_scale"),
+                vec![experts, hidden, w2_scales],
+                &scales,
+            );
         }
         WeightFormat::Bf16 => {
             let w13: Vec<f32> = (0..experts * 2 * intermediate * hidden)

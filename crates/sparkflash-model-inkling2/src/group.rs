@@ -487,7 +487,8 @@ fn mirror_lanes<A: FusedArm>(
                 prompt_ids,
                 images,
             } => {
-                let images = frame_images(images).map_err(|error| format!("lane {lane}: {error}"))?;
+                let images =
+                    frame_images(images).map_err(|error| format!("lane {lane}: {error}"))?;
                 let slot = pool
                     .get_mut(lane as usize)
                     .and_then(Option::as_mut)
@@ -622,7 +623,10 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
         // Refuse before the broadcast, as the serial session does.
         admit(self.context, &self.check, tokens, images)?;
         if trace_on() {
-            eprintln!("[inkling] serve rank 0 lane {} prefill {tokens:?}", slot.lane);
+            eprintln!(
+                "[inkling] serve rank 0 lane {} prefill {tokens:?}",
+                slot.lane
+            );
         }
         self.send(&Tp4ControlFrame::LaneRequest {
             lane: slot.lane,
@@ -690,7 +694,10 @@ fn admit(
     if tokens.len() > context {
         return Err(BackendError::new(
             "context",
-            format!("the prompt needs {} positions, {context} remain", tokens.len()),
+            format!(
+                "the prompt needs {} positions, {context} remain",
+                tokens.len()
+            ),
         ));
     }
     check
@@ -852,7 +859,6 @@ fn trace_on() -> bool {
     std::env::var_os("SPARKFLASH_INKLING_TRACE").is_some()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -979,9 +985,8 @@ mod tests {
         let worker = {
             let backend = Arc::clone(&backend);
             thread::spawn(move || {
-                let mut control =
-                    Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                        .expect("a control connection");
+                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                    .expect("a control connection");
                 control.handshake().expect("the handshake");
                 let _ = mirror(&mut control, backend.as_ref());
             })
@@ -1029,7 +1034,11 @@ mod tests {
         drop(hub);
         worker.join().expect("the worker finishes");
         let record = record.lock().expect("the record");
-        assert_eq!(record.decodes, vec![4, 5], "End must not be mirrored as a decode");
+        assert_eq!(
+            record.decodes,
+            vec![4, 5],
+            "End must not be mirrored as a decode"
+        );
     }
 
     #[test]
@@ -1041,9 +1050,8 @@ mod tests {
         let worker = {
             let backend = Arc::clone(&backend);
             thread::spawn(move || {
-                let mut control =
-                    Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                        .expect("a control connection");
+                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                    .expect("a control connection");
                 control.handshake().expect("the handshake");
                 mirror(&mut control, backend.as_ref())
             })
@@ -1082,7 +1090,11 @@ mod tests {
 
         fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
 
-        fn prefill(&self, slot: &mut Self::Slot, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
             slot.extend_from_slice(tokens);
             self.record
                 .lock()
@@ -1121,9 +1133,8 @@ mod tests {
         let worker = {
             let mirrored = Arc::clone(&mirrored);
             thread::spawn(move || {
-                let mut control =
-                    Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
-                        .expect("a control connection");
+                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                    .expect("a control connection");
                 control.handshake().expect("the handshake");
                 mirror_lanes(&mut control, mirrored.as_ref(), 2)
             })
@@ -1149,7 +1160,9 @@ mod tests {
         // A lane that held a request forgets it on its next prompt, on rank 1 as on rank 0.
         assert!(lanes.holds_request(&first));
         lanes.renew(&mut first).expect("the lane renews");
-        lanes.prefill(&mut first, &[5]).expect("lane 0's next prompt");
+        lanes
+            .prefill(&mut first, &[5])
+            .expect("lane 0's next prompt");
         let expected = vec![
             "prefill [1, 2]".to_owned(),
             "prefill [7]".to_owned(),

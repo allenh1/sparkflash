@@ -81,12 +81,7 @@ impl InklingTensorPlan {
         Self::build(config, tp, true, true)
     }
 
-    fn build(
-        config: &Inkling2Config,
-        tp: TpPlan,
-        mtp: bool,
-        vision: bool,
-    ) -> Result<Self, String> {
+    fn build(config: &Inkling2Config, tp: TpPlan, mtp: bool, vision: bool) -> Result<Self, String> {
         let mut plan = TensorPlan::default();
         let hidden = config.hidden_size;
         let vocab = config.vocab_size;
@@ -105,22 +100,55 @@ impl InklingTensorPlan {
         tp.split(config.n_routed_experts, TpAxis::Experts, 1)
             .map_err(|error| format!("routed experts: {}", error.detail))?;
 
-        plan.push("model.llm.embed.weight", DType::BF16, vec![vocab, hidden], Role::Embedding);
-        plan.push("model.llm.embed_norm.weight", DType::BF16, vec![hidden], Role::Norm);
-        plan.push("model.llm.norm.weight", DType::BF16, vec![hidden], Role::Norm);
-        plan.push("model.llm.unembed.weight", DType::BF16, vec![vocab, hidden], Role::LmHead);
-        plan.push("model.llm.attn_res.output_query", DType::F32, vec![hidden], Role::BlockResidual);
+        plan.push(
+            "model.llm.embed.weight",
+            DType::BF16,
+            vec![vocab, hidden],
+            Role::Embedding,
+        );
+        plan.push(
+            "model.llm.embed_norm.weight",
+            DType::BF16,
+            vec![hidden],
+            Role::Norm,
+        );
+        plan.push(
+            "model.llm.norm.weight",
+            DType::BF16,
+            vec![hidden],
+            Role::Norm,
+        );
+        plan.push(
+            "model.llm.unembed.weight",
+            DType::BF16,
+            vec![vocab, hidden],
+            Role::LmHead,
+        );
+        plan.push(
+            "model.llm.attn_res.output_query",
+            DType::F32,
+            vec![hidden],
+            Role::BlockResidual,
+        );
         // The bank is addressed by the layer before the one that consumes it: bank 4 is the
         // three-query attention input of full layer 5, and bank 5 is the one-query input of
         // sliding layer 6. Layer 0 has no input bank, so the names are 0..=46 for layers
         // 1..=47.
         for bank in 0..config.num_hidden_layers.saturating_sub(1) {
             let layer = bank + 1;
-            let query_width = if config.full_layer_ids.contains(&layer) { 3 } else { 1 };
+            let query_width = if config.full_layer_ids.contains(&layer) {
+                3
+            } else {
+                1
+            };
             plan.push(
                 &format!("model.llm.attn_res.attn_queries.{bank}"),
                 DType::F32,
-                if query_width == 1 { vec![hidden] } else { vec![query_width, hidden] },
+                if query_width == 1 {
+                    vec![hidden]
+                } else {
+                    vec![query_width, hidden]
+                },
                 Role::BlockResidual,
             );
         }
@@ -136,62 +164,230 @@ impl InklingTensorPlan {
         for layer in 0..config.num_hidden_layers {
             let prefix = format!("model.llm.layers.{layer}");
             let attn = format!("{prefix}.attn");
-            plan.push(&format!("{prefix}.mlp_norm.weight"), DType::BF16, vec![hidden], Role::Norm);
+            plan.push(
+                &format!("{prefix}.mlp_norm.weight"),
+                DType::BF16,
+                vec![hidden],
+                Role::Norm,
+            );
             if config.full_layer_ids.contains(&layer) {
                 for name in ["q_input_norm", "k_input_norm", "v_input_norm"] {
-                    plan.push(&format!("{prefix}.{name}.weight"), DType::BF16, vec![hidden], Role::Norm);
+                    plan.push(
+                        &format!("{prefix}.{name}.weight"),
+                        DType::BF16,
+                        vec![hidden],
+                        Role::Norm,
+                    );
                 }
             } else {
-                plan.push(&format!("{prefix}.attn_norm.weight"), DType::BF16, vec![hidden], Role::Norm);
+                plan.push(
+                    &format!("{prefix}.attn_norm.weight"),
+                    DType::BF16,
+                    vec![hidden],
+                    Role::Norm,
+                );
             }
-            plan.push(&format!("{prefix}.attn_sconv.weight"), DType::BF16, vec![hidden, 1, config.sconv_kernel_size], Role::ShortConv);
-            plan.push(&format!("{prefix}.mlp_sconv.weight"), DType::BF16, vec![hidden, 1, config.sconv_kernel_size], Role::ShortConv);
-            plan.push(&format!("{attn}.wq_du.weight"), DType::BF16, vec![heads * head_dim, hidden], Role::Attention);
-            plan.push(&format!("{attn}.wk_dv.weight"), DType::BF16, vec![kv_heads * head_dim, hidden], Role::Attention);
-            plan.push(&format!("{attn}.wv_dv.weight"), DType::BF16, vec![kv_heads * head_dim, hidden], Role::Attention);
-            plan.push(&format!("{attn}.wo_ud.weight"), DType::BF16, vec![hidden, heads * head_dim], Role::Attention);
-            plan.push(&format!("{attn}.wr_du.weight"), DType::BF16, vec![heads * config.d_rel, hidden], Role::Attention);
-            plan.push(&format!("{attn}.gate_attn.weight"), DType::BF16, vec![heads * head_dim, hidden], Role::Attention);
-            plan.push(&format!("{attn}.attn_sink_proj.weight"), DType::BF16, vec![heads, hidden], Role::Attention);
-            plan.push(&format!("{attn}.rel_logits_proj.proj"), DType::BF16, vec![config.d_rel, config.rel_extent], Role::Attention);
-            plan.push(&format!("{attn}.q_l2_clip.scale"), DType::BF16, vec![heads, head_dim], Role::Clip);
-            plan.push(&format!("{attn}.rel_l2_clip.scale"), DType::BF16, vec![heads, config.d_rel], Role::Clip);
+            plan.push(
+                &format!("{prefix}.attn_sconv.weight"),
+                DType::BF16,
+                vec![hidden, 1, config.sconv_kernel_size],
+                Role::ShortConv,
+            );
+            plan.push(
+                &format!("{prefix}.mlp_sconv.weight"),
+                DType::BF16,
+                vec![hidden, 1, config.sconv_kernel_size],
+                Role::ShortConv,
+            );
+            plan.push(
+                &format!("{attn}.wq_du.weight"),
+                DType::BF16,
+                vec![heads * head_dim, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.wk_dv.weight"),
+                DType::BF16,
+                vec![kv_heads * head_dim, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.wv_dv.weight"),
+                DType::BF16,
+                vec![kv_heads * head_dim, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.wo_ud.weight"),
+                DType::BF16,
+                vec![hidden, heads * head_dim],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.wr_du.weight"),
+                DType::BF16,
+                vec![heads * config.d_rel, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.gate_attn.weight"),
+                DType::BF16,
+                vec![heads * head_dim, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.attn_sink_proj.weight"),
+                DType::BF16,
+                vec![heads, hidden],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.rel_logits_proj.proj"),
+                DType::BF16,
+                vec![config.d_rel, config.rel_extent],
+                Role::Attention,
+            );
+            plan.push(
+                &format!("{attn}.q_l2_clip.scale"),
+                DType::BF16,
+                vec![heads, head_dim],
+                Role::Clip,
+            );
+            plan.push(
+                &format!("{attn}.rel_l2_clip.scale"),
+                DType::BF16,
+                vec![heads, config.d_rel],
+                Role::Clip,
+            );
             if config.full_layer_ids.contains(&layer) {
                 // A full layer's dynamic short convolution stores the static taps as
                 // `static_w` and a per-token projection from the hidden state.
                 for name in ["k_sconv", "v_sconv"] {
-                    plan.push(&format!("{attn}.{name}.static_w"), DType::BF16, vec![config.sconv_kernel_size, kv_heads * head_dim], Role::ShortConv);
-                    plan.push(&format!("{attn}.{name}.weight_proj"), DType::BF16, vec![kv_heads * config.sconv_kernel_size, hidden], Role::ShortConv);
+                    plan.push(
+                        &format!("{attn}.{name}.static_w"),
+                        DType::BF16,
+                        vec![config.sconv_kernel_size, kv_heads * head_dim],
+                        Role::ShortConv,
+                    );
+                    plan.push(
+                        &format!("{attn}.{name}.weight_proj"),
+                        DType::BF16,
+                        vec![kv_heads * config.sconv_kernel_size, hidden],
+                        Role::ShortConv,
+                    );
                 }
             } else {
                 for name in ["k_sconv", "v_sconv"] {
-                    plan.push(&format!("{attn}.{name}.weight"), DType::BF16, vec![kv_heads * head_dim, 1, config.sconv_kernel_size], Role::ShortConv);
+                    plan.push(
+                        &format!("{attn}.{name}.weight"),
+                        DType::BF16,
+                        vec![kv_heads * head_dim, 1, config.sconv_kernel_size],
+                        Role::ShortConv,
+                    );
                 }
             }
-            plan.push(&format!("{prefix}.mlp.gate.weight"), DType::BF16, vec![config.n_routed_experts, hidden], Role::Router);
-            plan.push(&format!("{prefix}.mlp.gate.bias"), DType::F32, vec![config.n_routed_experts], Role::Router);
+            plan.push(
+                &format!("{prefix}.mlp.gate.weight"),
+                DType::BF16,
+                vec![config.n_routed_experts, hidden],
+                Role::Router,
+            );
+            plan.push(
+                &format!("{prefix}.mlp.gate.bias"),
+                DType::F32,
+                vec![config.n_routed_experts],
+                Role::Router,
+            );
             match config.layer_format(layer).unwrap_or(WeightFormat::Bf16) {
                 WeightFormat::NvFp4 { group_size } => {
                     let w13_out = 2 * config.moe_intermediate_size;
                     let w13_cols = hidden.div_ceil(group_size);
                     let w2_cols = config.moe_intermediate_size.div_ceil(group_size);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight"), DType::U8, vec![config.n_routed_experts, w13_out, hidden / 2], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight"), DType::U8, vec![config.n_routed_experts, hidden, config.moe_intermediate_size / 2], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight_scale"), DType::F8E4M3, vec![config.n_routed_experts, w13_out, w13_cols], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight_scale"), DType::F8E4M3, vec![config.n_routed_experts, hidden, w2_cols], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight_amax"), DType::F32, vec![config.n_routed_experts], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight_amax"), DType::F32, vec![config.n_routed_experts], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight_outer_scale_denominator"), DType::F32, vec![1], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight_outer_scale_denominator"), DType::F32, vec![1], Role::Experts);
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight"),
+                        DType::U8,
+                        vec![config.n_routed_experts, w13_out, hidden / 2],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight"),
+                        DType::U8,
+                        vec![
+                            config.n_routed_experts,
+                            hidden,
+                            config.moe_intermediate_size / 2,
+                        ],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight_scale"),
+                        DType::F8E4M3,
+                        vec![config.n_routed_experts, w13_out, w13_cols],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight_scale"),
+                        DType::F8E4M3,
+                        vec![config.n_routed_experts, hidden, w2_cols],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight_amax"),
+                        DType::F32,
+                        vec![config.n_routed_experts],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight_amax"),
+                        DType::F32,
+                        vec![config.n_routed_experts],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight_outer_scale_denominator"),
+                        DType::F32,
+                        vec![1],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight_outer_scale_denominator"),
+                        DType::F32,
+                        vec![1],
+                        Role::Experts,
+                    );
                 }
                 WeightFormat::MxFp8 { block } => {
                     let w13_out = 2 * config.moe_intermediate_size;
                     let w13_cols = hidden.div_ceil(block);
                     let w2_cols = config.moe_intermediate_size.div_ceil(block);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight"), DType::F8E4M3, vec![config.n_routed_experts, w13_out, hidden], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight"), DType::F8E4M3, vec![config.n_routed_experts, hidden, config.moe_intermediate_size], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w13_weight_scale"), DType::U8, vec![config.n_routed_experts, w13_out, w13_cols], Role::Experts);
-                    plan.push(&format!("{prefix}.mlp.experts.w2_weight_scale"), DType::U8, vec![config.n_routed_experts, hidden, w2_cols], Role::Experts);
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight"),
+                        DType::F8E4M3,
+                        vec![config.n_routed_experts, w13_out, hidden],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight"),
+                        DType::F8E4M3,
+                        vec![
+                            config.n_routed_experts,
+                            hidden,
+                            config.moe_intermediate_size,
+                        ],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w13_weight_scale"),
+                        DType::U8,
+                        vec![config.n_routed_experts, w13_out, w13_cols],
+                        Role::Experts,
+                    );
+                    plan.push(
+                        &format!("{prefix}.mlp.experts.w2_weight_scale"),
+                        DType::U8,
+                        vec![config.n_routed_experts, hidden, w2_cols],
+                        Role::Experts,
+                    );
                 }
                 WeightFormat::Bf16 => {
                     // An unquantised checkpoint (and the tiny fixture) stores each expert dense:
@@ -200,13 +396,21 @@ impl InklingTensorPlan {
                     plan.push(
                         &format!("{prefix}.mlp.experts.w13_weight"),
                         DType::BF16,
-                        vec![config.n_routed_experts, 2 * config.moe_intermediate_size, hidden],
+                        vec![
+                            config.n_routed_experts,
+                            2 * config.moe_intermediate_size,
+                            hidden,
+                        ],
                         Role::Experts,
                     );
                     plan.push(
                         &format!("{prefix}.mlp.experts.w2_weight"),
                         DType::BF16,
-                        vec![config.n_routed_experts, hidden, config.moe_intermediate_size],
+                        vec![
+                            config.n_routed_experts,
+                            hidden,
+                            config.moe_intermediate_size,
+                        ],
                         Role::Experts,
                     );
                 }
@@ -214,41 +418,128 @@ impl InklingTensorPlan {
             }
         }
 
-        if vision
-            && let Some(vision) = &config.vision {
-                let width = vision.hidden_size;
-                // The release folds the temporal axis before the patch projection; the stored
-                // input width is three channels times the square patch.
-                let patch = 3 * vision.patch_size * vision.patch_size;
-                let intermediate = ((width as f64) * 4.0).round() as usize;
-                let prefix = "model.visual";
-                plan.push(&format!("{prefix}.backbone.embeddings.patch_embedding.weight"), DType::BF16, vec![width, patch], Role::Vision);
-                plan.push(&format!("{prefix}.backbone.embeddings.position_embedding"), DType::BF16, vec![vision.posemb_grid_size * vision.posemb_grid_size, width], Role::Vision);
-                plan.push(&format!("{prefix}.backbone.embeddings.class_embedding"), DType::BF16, vec![width], Role::Vision);
-                plan.push(&format!("{prefix}.backbone.embeddings.cls_position_embedding"), DType::BF16, vec![width], Role::Vision);
-                plan.push(&format!("{prefix}.backbone.ln_pre.weight"), DType::BF16, vec![width], Role::Vision);
-                plan.push(&format!("{prefix}.backbone.ln_pre.bias"), DType::BF16, vec![width], Role::Vision);
-                for layer in 0..vision.depth {
-                    let p = format!("{prefix}.backbone.layers.{layer}");
-                    for name in ["ln_1", "ln_2"] {
-                        plan.push(&format!("{p}.{name}.weight"), DType::BF16, vec![width], Role::Vision);
-                        plan.push(&format!("{p}.{name}.bias"), DType::BF16, vec![width], Role::Vision);
-                    }
-                    for name in ["ls_1", "ls_2"] {
-                        plan.push(&format!("{p}.{name}.gamma"), DType::BF16, vec![width], Role::Vision);
-                    }
-                    for name in ["q_proj", "k_proj", "v_proj", "out_proj"] {
-                        plan.push(&format!("{p}.self_attn.{name}.weight"), DType::BF16, vec![width, width], Role::Vision);
-                        plan.push(&format!("{p}.self_attn.{name}.bias"), DType::BF16, vec![width], Role::Vision);
-                    }
-                    plan.push(&format!("{p}.mlp.c_fc.weight"), DType::BF16, vec![intermediate, width], Role::Vision);
-                    plan.push(&format!("{p}.mlp.c_fc.bias"), DType::BF16, vec![intermediate], Role::Vision);
-                    plan.push(&format!("{p}.mlp.c_proj.weight"), DType::BF16, vec![width, intermediate], Role::Vision);
-                    plan.push(&format!("{p}.mlp.c_proj.bias"), DType::BF16, vec![width], Role::Vision);
+        if vision && let Some(vision) = &config.vision {
+            let width = vision.hidden_size;
+            // The release folds the temporal axis before the patch projection; the stored
+            // input width is three channels times the square patch.
+            let patch = 3 * vision.patch_size * vision.patch_size;
+            let intermediate = ((width as f64) * 4.0).round() as usize;
+            let prefix = "model.visual";
+            plan.push(
+                &format!("{prefix}.backbone.embeddings.patch_embedding.weight"),
+                DType::BF16,
+                vec![width, patch],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.backbone.embeddings.position_embedding"),
+                DType::BF16,
+                vec![vision.posemb_grid_size * vision.posemb_grid_size, width],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.backbone.embeddings.class_embedding"),
+                DType::BF16,
+                vec![width],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.backbone.embeddings.cls_position_embedding"),
+                DType::BF16,
+                vec![width],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.backbone.ln_pre.weight"),
+                DType::BF16,
+                vec![width],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.backbone.ln_pre.bias"),
+                DType::BF16,
+                vec![width],
+                Role::Vision,
+            );
+            for layer in 0..vision.depth {
+                let p = format!("{prefix}.backbone.layers.{layer}");
+                for name in ["ln_1", "ln_2"] {
+                    plan.push(
+                        &format!("{p}.{name}.weight"),
+                        DType::BF16,
+                        vec![width],
+                        Role::Vision,
+                    );
+                    plan.push(
+                        &format!("{p}.{name}.bias"),
+                        DType::BF16,
+                        vec![width],
+                        Role::Vision,
+                    );
                 }
-                plan.push(&format!("{prefix}.proj_in.weight"), DType::BF16, vec![vision.projection_hidden_dim, width * vision.adapter_merge_size * vision.adapter_merge_size], Role::Vision);
-                plan.push(&format!("{prefix}.proj_out.weight"), DType::BF16, vec![vision.out_hidden_size, vision.projection_hidden_dim], Role::Vision);
+                for name in ["ls_1", "ls_2"] {
+                    plan.push(
+                        &format!("{p}.{name}.gamma"),
+                        DType::BF16,
+                        vec![width],
+                        Role::Vision,
+                    );
+                }
+                for name in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                    plan.push(
+                        &format!("{p}.self_attn.{name}.weight"),
+                        DType::BF16,
+                        vec![width, width],
+                        Role::Vision,
+                    );
+                    plan.push(
+                        &format!("{p}.self_attn.{name}.bias"),
+                        DType::BF16,
+                        vec![width],
+                        Role::Vision,
+                    );
+                }
+                plan.push(
+                    &format!("{p}.mlp.c_fc.weight"),
+                    DType::BF16,
+                    vec![intermediate, width],
+                    Role::Vision,
+                );
+                plan.push(
+                    &format!("{p}.mlp.c_fc.bias"),
+                    DType::BF16,
+                    vec![intermediate],
+                    Role::Vision,
+                );
+                plan.push(
+                    &format!("{p}.mlp.c_proj.weight"),
+                    DType::BF16,
+                    vec![width, intermediate],
+                    Role::Vision,
+                );
+                plan.push(
+                    &format!("{p}.mlp.c_proj.bias"),
+                    DType::BF16,
+                    vec![width],
+                    Role::Vision,
+                );
             }
+            plan.push(
+                &format!("{prefix}.proj_in.weight"),
+                DType::BF16,
+                vec![
+                    vision.projection_hidden_dim,
+                    width * vision.adapter_merge_size * vision.adapter_merge_size,
+                ],
+                Role::Vision,
+            );
+            plan.push(
+                &format!("{prefix}.proj_out.weight"),
+                DType::BF16,
+                vec![vision.out_hidden_size, vision.projection_hidden_dim],
+                Role::Vision,
+            );
+        }
 
         if mtp {
             // The MTP checkpoint is a separate file; the plan names its stage tensors for the
@@ -256,13 +547,31 @@ impl InklingTensorPlan {
             if let Some(mtp) = &config.mtp {
                 let hidden = mtp.hidden_size;
                 let prefix = "mtp";
-                plan.push(&format!("{prefix}.fuse_weight"), DType::BF16, vec![hidden, 2 * hidden], Role::Mtp);
+                plan.push(
+                    &format!("{prefix}.fuse_weight"),
+                    DType::BF16,
+                    vec![hidden, 2 * hidden],
+                    Role::Mtp,
+                );
                 for layer in 0..mtp.num_hidden_layers {
                     let p = format!("{prefix}.layers.{layer}");
                     for name in ["input_layernorm", "post_attention_layernorm", "dflare_norm"] {
-                        plan.push(&format!("{p}.{name}.weight"), DType::BF16, vec![hidden], Role::Mtp);
+                        plan.push(
+                            &format!("{p}.{name}.weight"),
+                            DType::BF16,
+                            vec![hidden],
+                            Role::Mtp,
+                        );
                     }
-                    for name in ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] {
+                    for name in [
+                        "q_proj",
+                        "k_proj",
+                        "v_proj",
+                        "o_proj",
+                        "gate_proj",
+                        "up_proj",
+                        "down_proj",
+                    ] {
                         let (rows, cols) = match name {
                             "q_proj" => (mtp.num_attention_heads * mtp.head_dim, hidden),
                             "k_proj" | "v_proj" => (mtp.num_key_value_heads * mtp.head_dim, hidden),
@@ -271,7 +580,12 @@ impl InklingTensorPlan {
                             "down_proj" => (hidden, mtp.intermediate_size),
                             _ => unreachable!(),
                         };
-                        plan.push(&format!("{p}.self_attn.{name}.weight"), DType::BF16, vec![rows, cols], Role::Mtp);
+                        plan.push(
+                            &format!("{p}.self_attn.{name}.weight"),
+                            DType::BF16,
+                            vec![rows, cols],
+                            Role::Mtp,
+                        );
                     }
                 }
             }
@@ -288,7 +602,12 @@ impl InklingTensorPlan {
             .zip(&runs)
             .map(|(spec, run)| rank_spec(spec, run))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { plan, rank, runs, tp })
+        Ok(Self {
+            plan,
+            rank,
+            runs,
+            tp,
+        })
     }
 
     /// The logical plan.
@@ -359,25 +678,24 @@ fn split_of(
     // would disagree with the shared key/value head rule, where two heads over four ranks are one
     // head each, read twice. This splits the head axis and scales to rows, so the rank's table
     // starts at the same head its key/value projection produced.
-    let head_block =
-        |axis: usize, heads: usize, block: usize| -> Result<Slice, String> {
-            let split = tp
-                .split(heads, TpAxis::KvHeads, 1)
-                .map_err(|error| format!("{name}: {}", error.detail))?;
-            let per_rank = split.per_rank * block;
-            Ok(Slice {
-                axis,
-                split: Split {
-                    total: heads * block,
-                    per_rank,
-                    offset: split.offset * block,
-                    padded: per_rank,
-                    padding: 0,
-                    rank: split.rank,
-                    world: split.world,
-                },
-            })
-        };
+    let head_block = |axis: usize, heads: usize, block: usize| -> Result<Slice, String> {
+        let split = tp
+            .split(heads, TpAxis::KvHeads, 1)
+            .map_err(|error| format!("{name}: {}", error.detail))?;
+        let per_rank = split.per_rank * block;
+        Ok(Slice {
+            axis,
+            split: Split {
+                total: heads * block,
+                per_rank,
+                offset: split.offset * block,
+                padded: per_rank,
+                padding: 0,
+                rank: split.rank,
+                world: split.world,
+            },
+        })
+    };
     if name == "model.llm.embed.weight" || name == "model.llm.unembed.weight" {
         return Ok(vec![slice(0, shape[0], TpAxis::Vocab)?]);
     }
@@ -436,7 +754,10 @@ fn rank_spec(spec: &TensorSpec, runs: &[Slice]) -> Result<TensorSpec, String> {
     for run in runs {
         let axis = run.axis;
         if axis >= shape.len() {
-            return Err(format!("{}: slice axis {axis} is outside the shape", spec.name));
+            return Err(format!(
+                "{}: slice axis {axis} is outside the shape",
+                spec.name
+            ));
         }
         if shape[axis] != run.split.total {
             return Err(format!(
@@ -486,12 +807,16 @@ mod tests {
         let config = Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the release parses");
         let tp = TpPlan::new(4, 3).expect("a TP plan");
         let plan = InklingTensorPlan::served(&config, tp).expect("the plan");
-        let experts = plan.index_of("model.llm.layers.0.mlp.experts.w13_weight").unwrap();
+        let experts = plan
+            .index_of("model.llm.layers.0.mlp.experts.w13_weight")
+            .unwrap();
         assert_eq!(plan.rank_spec_at(experts).shape[0], 96);
         // Whole experts: the intermediate width is not sharded as well, or a rank would hold a
         // sixteenth of the expert weights instead of a quarter.
         assert_eq!(plan.rank_spec_at(experts).shape[1], 2 * 2304);
-        let down = plan.index_of("model.llm.layers.0.mlp.experts.w2_weight").unwrap();
+        let down = plan
+            .index_of("model.llm.layers.0.mlp.experts.w2_weight")
+            .unwrap();
         // The packed w2 keeps half its intermediate width in bytes, so the whole 2,304-element
         // width is stored as 1,152 bytes per row and is not split any further.
         assert_eq!(plan.rank_spec_at(down).shape[2], 1152);

@@ -92,7 +92,10 @@ pub trait FusedArm: Send + Sync + 'static {
         }
         Err(BackendError::new(
             "vision",
-            format!("this arm has no vision path for the request's {} images", images.len()),
+            format!(
+                "this arm has no vision path for the request's {} images",
+                images.len()
+            ),
         ))
     }
 

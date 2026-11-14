@@ -176,7 +176,9 @@ pub fn patchify(
                 let (y, x) = (row * patch + py, column * patch + px);
                 for channel in 0..3 {
                     values[(py * patch + px) * 3 + channel] = if y < height && x < width {
-                        bf16_round(normalize_sample(f32::from(rgb[(y * width + x) * 3 + channel])))
+                        bf16_round(normalize_sample(f32::from(
+                            rgb[(y * width + x) * 3 + channel],
+                        )))
                     } else {
                         pad
                     };
@@ -311,9 +313,13 @@ impl Norm {
 
 /// One vector of `width` values.
 fn vector(source: &dyn WeightSource, name: &str, width: usize) -> Result<Vec<f32>, String> {
-    let values = decode_by_name(source, name, 1 << 24).map_err(|error| format!("{name}: {error}"))?;
+    let values =
+        decode_by_name(source, name, 1 << 24).map_err(|error| format!("{name}: {error}"))?;
     if values.len() != width {
-        return Err(format!("{name} holds {} values, expected {width}", values.len()));
+        return Err(format!(
+            "{name} holds {} values, expected {width}",
+            values.len()
+        ));
     }
     Ok(values)
 }
@@ -372,7 +378,10 @@ impl InklingVision {
     ///
     /// # Errors
     /// A missing or mis-shaped tensor.
-    pub fn load(config: &InklingVisionConfig, source: Arc<dyn WeightSource>) -> Result<Self, String> {
+    pub fn load(
+        config: &InklingVisionConfig,
+        source: Arc<dyn WeightSource>,
+    ) -> Result<Self, String> {
         let source = source.as_ref();
         let prefix = "model.visual";
         let width = config.hidden_size;
@@ -394,7 +403,11 @@ impl InklingVision {
             ));
         }
         let class_embedding = vector(source, &format!("{embeddings}.class_embedding"), width)?;
-        let cls_position = vector(source, &format!("{embeddings}.cls_position_embedding"), width)?;
+        let cls_position = vector(
+            source,
+            &format!("{embeddings}.cls_position_embedding"),
+            width,
+        )?;
         let ln_pre = Norm::load(source, &format!("{prefix}.backbone.ln_pre"), width)?;
         let mut blocks = Vec::with_capacity(config.depth);
         for layer in 0..config.depth {
@@ -419,7 +432,12 @@ impl InklingVision {
                 out_bias: bias("out_proj")?,
                 fc: Matrix::load(source, &format!("{p}.mlp.c_fc.weight"), intermediate, width)?,
                 fc_bias: vector(source, &format!("{p}.mlp.c_fc.bias"), intermediate)?,
-                proj: Matrix::load(source, &format!("{p}.mlp.c_proj.weight"), width, intermediate)?,
+                proj: Matrix::load(
+                    source,
+                    &format!("{p}.mlp.c_proj.weight"),
+                    width,
+                    intermediate,
+                )?,
                 proj_bias: vector(source, &format!("{p}.mlp.c_proj.bias"), width)?,
             });
         }
@@ -460,7 +478,12 @@ impl InklingVision {
     ///
     /// # Errors
     /// As [patchify] and [Self::encode].
-    pub fn encode_canvas(&self, rgb: &[u8], height: usize, width: usize) -> Result<Vec<f32>, String> {
+    pub fn encode_canvas(
+        &self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+    ) -> Result<Vec<f32>, String> {
         let (pixels, grid_h, grid_w) = patchify(rgb, height, width, &self.config)?;
         self.encode(&pixels, grid_h, grid_w)
     }
@@ -479,7 +502,11 @@ impl InklingVision {
         let width = config.hidden_size;
         let merge = config.adapter_merge_size;
         let epsilon = config.layer_norm_eps;
-        if grid_h == 0 || grid_w == 0 || !grid_h.is_multiple_of(merge) || !grid_w.is_multiple_of(merge) {
+        if grid_h == 0
+            || grid_w == 0
+            || !grid_h.is_multiple_of(merge)
+            || !grid_w.is_multiple_of(merge)
+        {
             return Err(format!(
                 "a {grid_h}x{grid_w} patch grid does not divide into {merge}x{merge} merge blocks"
             ));
@@ -618,7 +645,10 @@ fn rotate(
                 } else {
                     (grid_row, pair - count)
                 };
-                let (c, s) = (cos[position * count + frequency], sin[position * count + frequency]);
+                let (c, s) = (
+                    cos[position * count + frequency],
+                    sin[position * count + frequency],
+                );
                 let (x0, x1) = (values[0], values[1]);
                 values[0] = x0 * c - x1 * s;
                 values[1] = x1 * c + x0 * s;
@@ -628,7 +658,14 @@ fn rotate(
 }
 
 /// Bidirectional softmax attention over all `tokens`, each head on its own, scale `head_dim^-1/2`.
-fn attend(q: &[f32], k: &[f32], v: &[f32], tokens: usize, heads: usize, head_dim: usize) -> Vec<f32> {
+fn attend(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
     let width = heads * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut out = vec![0f32; tokens * width];
@@ -740,8 +777,9 @@ impl VisionCodec for InklingVisionCodec {
             max_bytes: options.max_bytes,
             max_dimension: options.max_dimension,
         };
-        let mut image = sparkflash_vision::decode_with_alpha(bytes, &limits, AlphaPolicy::Checkerboard)
-            .map_err(|error| VisionError::new(error.to_string()))?;
+        let mut image =
+            sparkflash_vision::decode_with_alpha(bytes, &limits, AlphaPolicy::Checkerboard)
+                .map_err(|error| VisionError::new(error.to_string()))?;
         // Low detail is this server's option, not the processor's: the processor never resizes,
         // so a full-detail image is its own pixels and a low-detail one is shrunk first.
         if let Some(long_side) = options.max_long_side {
@@ -791,7 +829,10 @@ impl VisionCodec for InklingVisionCodec {
                 )));
             }
             let start = ids.len() - 1;
-            ids.extend(std::iter::repeat_n(self.image_token, image.grid.image_rows()));
+            ids.extend(std::iter::repeat_n(
+                self.image_token,
+                image.grid.image_rows(),
+            ));
             spans.push(ImageSpan {
                 start,
                 grid: image.grid,
@@ -872,7 +913,11 @@ impl SpanCheck {
             if planned != (grid.n_llm_h, grid.n_llm_w) {
                 return Err(format!(
                     "image {number} is {}x{} cells, and its {}x{} canvas makes {}x{}",
-                    grid.n_llm_w, grid.n_llm_h, grid.best_width, grid.best_height, planned.1,
+                    grid.n_llm_w,
+                    grid.n_llm_h,
+                    grid.best_width,
+                    grid.best_height,
+                    planned.1,
                     planned.0
                 ));
             }
@@ -949,7 +994,16 @@ mod tests {
         let order: Vec<(usize, usize)> = (0..8).map(|index| patch_position(index, 6, 2)).collect();
         assert_eq!(
             order,
-            vec![(0, 0), (0, 1), (1, 0), (1, 1), (0, 2), (0, 3), (1, 2), (1, 3)]
+            vec![
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (0, 2),
+                (0, 3),
+                (1, 2),
+                (1, 3)
+            ]
         );
         assert_eq!(patch_position(12, 6, 2), (2, 0));
     }
@@ -978,7 +1032,11 @@ mod tests {
         assert_eq!(patch2[0], sample(2, 0, 0));
         assert_eq!(patch2[6], pad);
         // Patch 5 is rows 0-1, columns 6-7 - wholly right of the image.
-        assert!(pixels[5 * features..6 * features].iter().all(|value| *value == pad));
+        assert!(
+            pixels[5 * features..6 * features]
+                .iter()
+                .all(|value| *value == pad)
+        );
         assert_eq!(pad, bf16_round(-128.5 / 127.5));
     }
 
@@ -1030,8 +1088,16 @@ mod tests {
         assert_eq!(spans[0].start, 1);
         assert_eq!(spans[0].end(), 9);
         assert_eq!(spans[0].row(2), sparkflash_model::vision::SpanRow::Image(0));
-        assert!(codec.expand(&[1, 9, 8], std::slice::from_ref(&image)).is_err());
-        assert!(codec.expand(&[1, 7, 9, 2], std::slice::from_ref(&image)).is_err());
+        assert!(
+            codec
+                .expand(&[1, 9, 8], std::slice::from_ref(&image))
+                .is_err()
+        );
+        assert!(
+            codec
+                .expand(&[1, 7, 9, 2], std::slice::from_ref(&image))
+                .is_err()
+        );
         assert!(codec.expand(&[1, 7, 9, 8], &[]).is_err());
     }
 }

@@ -120,7 +120,13 @@ struct Layout {
 }
 
 impl Layout {
-    fn of(rows: usize, canvas_bytes: usize, rope_positions: usize, tokens: usize, config: &InklingVisionConfig) -> Self {
+    fn of(
+        rows: usize,
+        canvas_bytes: usize,
+        rope_positions: usize,
+        tokens: usize,
+        config: &InklingVisionConfig,
+    ) -> Self {
         let mut at = 0;
         let mut take = |bytes: usize| {
             let offset = at;
@@ -257,7 +263,9 @@ impl InklingVisionTower {
                 ));
             }
         }
-        if !config.projection_hidden_dim.is_multiple_of(32) || !config.out_hidden_size.is_multiple_of(8) {
+        if !config.projection_hidden_dim.is_multiple_of(32)
+            || !config.out_hidden_size.is_multiple_of(8)
+        {
             return Err(format!(
                 "the merger's widths {} and {} are not the GEMM's multiples of 32 and 8",
                 config.projection_hidden_dim, config.out_hidden_size
@@ -265,9 +273,11 @@ impl InklingVisionTower {
         }
         let cubin = inkling_cubin();
         if cubin.is_empty() {
-            return Err("this build has no Inkling cubin: the device tower's kernels are \
+            return Err(
+                "this build has no Inkling cubin: the device tower's kernels are \
                         kernels/inkling_vision_sm121.cu"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let mut modules = Vec::new();
         let mut kernel = |name: &'static str| -> Result<Kernel, String> {
@@ -305,16 +315,28 @@ impl InklingVisionTower {
             // A [1024][1024] matrix and a [1024] row are whole multiples of the alignment, so
             // q, k and v placed in turn are one [3072][1024] matrix and one [3072] bias.
             let attention = format!("{p}.self_attn");
-            let [qkv, ..] = ["q_proj", "k_proj", "v_proj"]
-                .map(|name| arena.place(format!("{attention}.{name}.weight"), &[WIDTH, WIDTH], WIDTH));
+            let [qkv, ..] = ["q_proj", "k_proj", "v_proj"].map(|name| {
+                arena.place(format!("{attention}.{name}.weight"), &[WIDTH, WIDTH], WIDTH)
+            });
             let [qkv_bias, ..] = ["q_proj", "k_proj", "v_proj"]
                 .map(|name| arena.place(format!("{attention}.{name}.bias"), &[WIDTH], WIDTH));
-            let out = arena.place(format!("{attention}.out_proj.weight"), &[WIDTH, WIDTH], WIDTH);
+            let out = arena.place(
+                format!("{attention}.out_proj.weight"),
+                &[WIDTH, WIDTH],
+                WIDTH,
+            );
             let out_bias = arena.place(format!("{attention}.out_proj.bias"), &[WIDTH], WIDTH);
-            let fc1 = arena.place(format!("{p}.mlp.c_fc.weight"), &[intermediate, WIDTH], WIDTH);
+            let fc1 = arena.place(
+                format!("{p}.mlp.c_fc.weight"),
+                &[intermediate, WIDTH],
+                WIDTH,
+            );
             let fc1_bias = arena.place(format!("{p}.mlp.c_fc.bias"), &[intermediate], intermediate);
-            let fc2 =
-                arena.place(format!("{p}.mlp.c_proj.weight"), &[WIDTH, intermediate], intermediate);
+            let fc2 = arena.place(
+                format!("{p}.mlp.c_proj.weight"),
+                &[WIDTH, intermediate],
+                intermediate,
+            );
             let fc2_bias = arena.place(format!("{p}.mlp.c_proj.bias"), &[WIDTH], WIDTH);
             blocks.push([
                 ln_1[0], ln_1[1], ln_2[0], ln_2[1], ls_1, ls_2, qkv, qkv_bias, out, out_bias, fc1,
@@ -335,14 +357,18 @@ impl InklingVisionTower {
         let Arena { placed, at } = arena;
 
         let read = |name: &str, shape: &[usize]| -> Result<Vec<u8>, String> {
-            let spec = source.spec(name).map_err(|error| format!("{name}: {error}"))?;
+            let spec = source
+                .spec(name)
+                .map_err(|error| format!("{name}: {error}"))?;
             if spec.dtype != DType::BF16 || spec.shape != shape {
                 return Err(format!(
                     "{name}: {:?} {:?}, expected BF16 {shape:?}",
                     spec.dtype, spec.shape
                 ));
             }
-            source.read(name).map_err(|error| format!("{name}: {error}"))
+            source
+                .read(name)
+                .map_err(|error| format!("{name}: {error}"))
         };
         let widen = |bytes: &[u8]| -> Vec<f32> {
             bytes
@@ -358,8 +384,15 @@ impl InklingVisionTower {
             &[side * side, WIDTH],
         )?);
         let class = widen(&read(&format!("{embeddings}.class_embedding"), &[WIDTH])?);
-        let class_position = widen(&read(&format!("{embeddings}.cls_position_embedding"), &[WIDTH])?);
-        let class_row: Vec<f32> = class.iter().zip(&class_position).map(|(a, b)| a + b).collect();
+        let class_position = widen(&read(
+            &format!("{embeddings}.cls_position_embedding"),
+            &[WIDTH],
+        )?);
+        let class_row: Vec<f32> = class
+            .iter()
+            .zip(&class_position)
+            .map(|(a, b)| a + b)
+            .collect();
 
         let mut total = 0usize;
         let arena = cuda.alloc(at, &mut total)?;
@@ -397,7 +430,22 @@ impl InklingVisionTower {
             blocks: blocks
                 .into_iter()
                 .map(
-                    |[ln_1w, ln_1b, ln_2w, ln_2b, ls_1, ls_2, qkv, qkv_bias, out, out_bias, fc1, fc1_bias, fc2, fc2_bias]| Block {
+                    |[
+                        ln_1w,
+                        ln_1b,
+                        ln_2w,
+                        ln_2b,
+                        ls_1,
+                        ls_2,
+                        qkv,
+                        qkv_bias,
+                        out,
+                        out_bias,
+                        fc1,
+                        fc1_bias,
+                        fc2,
+                        fc2_bias,
+                    ]| Block {
                         ln_1: [pointer(ln_1w), pointer(ln_1b)],
                         ln_2: [pointer(ln_2w), pointer(ln_2b)],
                         ls_1: pointer(ls_1),
@@ -515,14 +563,38 @@ impl InklingVisionTower {
                 patches as u64,
             ],
         )?;
-        self.gemm(cuda, mlp, self.patch, None, x.offset(row_bytes), patches, WIDTH, PATCH_STRIDE, PATCH_STRIDE, WIDTH, GEMM_RESIDUAL)?;
+        self.gemm(
+            cuda,
+            mlp,
+            self.patch,
+            None,
+            x.offset(row_bytes),
+            patches,
+            WIDTH,
+            PATCH_STRIDE,
+            PATCH_STRIDE,
+            WIDTH,
+            GEMM_RESIDUAL,
+        )?;
         let epsilon = self.config.layer_norm_eps as f32;
         self.layernorm(cuda, x, self.ln_pre, x, rows, epsilon)?;
 
         for block in &self.blocks {
             // x = x + ls_1 * out(attention(rope(qkv(ln_1(x)))))
             self.layernorm(cuda, x, block.ln_1, h, rows, epsilon)?;
-            self.gemm(cuda, h, block.qkv, Some(block.qkv_bias), qkv, rows, QKV, WIDTH, WIDTH, QKV, 0)?;
+            self.gemm(
+                cuda,
+                h,
+                block.qkv,
+                Some(block.qkv_bias),
+                qkv,
+                rows,
+                QKV,
+                WIDTH,
+                WIDTH,
+                QKV,
+                0,
+            )?;
             cuda.launch(
                 k.rope,
                 (blocks(rows * 2 * HEADS * (HEAD_DIM / 2)), 1, 1),
@@ -536,13 +608,49 @@ impl InklingVisionTower {
                 &[qkv.0, h.0, rows as u64],
             )?;
             // The q|k|v rows are dead once the attention has read them: the projection lands there.
-            self.gemm(cuda, h, block.out, Some(block.out_bias), qkv, rows, WIDTH, WIDTH, WIDTH, WIDTH, 0)?;
+            self.gemm(
+                cuda,
+                h,
+                block.out,
+                Some(block.out_bias),
+                qkv,
+                rows,
+                WIDTH,
+                WIDTH,
+                WIDTH,
+                WIDTH,
+                0,
+            )?;
             self.scale_add(cuda, x, block.ls_1, qkv, rows)?;
             // x = x + ls_2 * fc2(gelu(fc1(ln_2(x))))
             self.layernorm(cuda, x, block.ln_2, h, rows, epsilon)?;
             let intermediate = mlp_width(WIDTH);
-            self.gemm(cuda, h, block.fc1, Some(block.fc1_bias), mlp, rows, intermediate, WIDTH, WIDTH, intermediate, GEMM_GELU)?;
-            self.gemm(cuda, mlp, block.fc2, Some(block.fc2_bias), qkv, rows, WIDTH, intermediate, intermediate, WIDTH, 0)?;
+            self.gemm(
+                cuda,
+                h,
+                block.fc1,
+                Some(block.fc1_bias),
+                mlp,
+                rows,
+                intermediate,
+                WIDTH,
+                WIDTH,
+                intermediate,
+                GEMM_GELU,
+            )?;
+            self.gemm(
+                cuda,
+                mlp,
+                block.fc2,
+                Some(block.fc2_bias),
+                qkv,
+                rows,
+                WIDTH,
+                intermediate,
+                intermediate,
+                WIDTH,
+                0,
+            )?;
             self.scale_add(cuda, x, block.ls_2, qkv, rows)?;
         }
 
@@ -551,8 +659,32 @@ impl InklingVisionTower {
         let cell = WIDTH * MERGE * MERGE;
         let hidden = self.config.projection_hidden_dim;
         let out_hidden = self.config.out_hidden_size;
-        self.gemm(cuda, x.offset(row_bytes), self.proj_in, None, qkv, tokens, hidden, cell, cell, hidden, GEMM_GELU)?;
-        self.gemm(cuda, qkv, self.proj_out, None, mlp, tokens, out_hidden, hidden, hidden, out_hidden, 0)?;
+        self.gemm(
+            cuda,
+            x.offset(row_bytes),
+            self.proj_in,
+            None,
+            qkv,
+            tokens,
+            hidden,
+            cell,
+            cell,
+            hidden,
+            GEMM_GELU,
+        )?;
+        self.gemm(
+            cuda,
+            qkv,
+            self.proj_out,
+            None,
+            mlp,
+            tokens,
+            out_hidden,
+            hidden,
+            hidden,
+            out_hidden,
+            0,
+        )?;
         let count = tokens * out_hidden;
         cuda.launch(
             k.widen,
@@ -603,7 +735,14 @@ impl InklingVisionTower {
             self.kernels.layernorm,
             (m.div_ceil(8) as u32, 1, 1),
             (BLOCK, 1, 1),
-            &[x.0, norm[0].0, norm[1].0, out.0, m as u64, u64::from(epsilon.to_bits())],
+            &[
+                x.0,
+                norm[0].0,
+                norm[1].0,
+                out.0,
+                m as u64,
+                u64::from(epsilon.to_bits()),
+            ],
         )
     }
 
@@ -665,5 +804,8 @@ fn blocks(threads: usize) -> u32 {
 
 /// f32 values as the little-endian bytes the driver copies.
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }

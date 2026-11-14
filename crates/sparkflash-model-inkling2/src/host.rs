@@ -209,7 +209,12 @@ impl Inkling2HostSession {
     }
 
     fn output(&mut self, logits: Vec<f32>) -> StepOutput {
-        let next_token = choose(self.weights.config(), &mut self.sampler, &logits, &self.sampling);
+        let next_token = choose(
+            self.weights.config(),
+            &mut self.sampler,
+            &logits,
+            &self.sampling,
+        );
         StepOutput {
             logits,
             next_token,

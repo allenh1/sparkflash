@@ -40,12 +40,12 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
-use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{Capabilities, FusedArm, ModelDescriptor, TpPlan};
+use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
@@ -57,9 +57,9 @@ use crate::device_plan::{
 };
 use crate::forward::trace_on;
 use crate::host::choose;
-use sparkflash_ops::sampler::Sampler;
 use crate::tensor::InklingTensorPlan;
 use crate::vision::SpanCheck;
+use sparkflash_ops::sampler::Sampler;
 
 mod chunk;
 mod tower;
@@ -177,7 +177,11 @@ fn split_attention() -> Result<bool, String> {
 /// The keys a split-walk pass covers for `rows` rows of `heads` heads: a whole number of the
 /// recurrence's 32-key tiles.
 fn attention_pass_slots(rows: usize, heads: usize) -> usize {
-    let budget = if rows > 1 { CHUNK_SCORE_BUDGET } else { SCORE_BUDGET };
+    let budget = if rows > 1 {
+        CHUNK_SCORE_BUDGET
+    } else {
+        SCORE_BUDGET
+    };
     ((budget / (rows.max(1) * heads.max(1))) / 32 * 32).max(32)
 }
 
@@ -250,7 +254,11 @@ impl ChunkWidths {
                              1..={MAX_PREFILL_CHUNK}"
                         )
                     })?;
-                Self { base: chunk, long: chunk, long_from: usize::MAX }
+                Self {
+                    base: chunk,
+                    long: chunk,
+                    long_from: usize::MAX,
+                }
             }
         };
         // A chunk is never wider than the prompt the context admits, so its buffers need not be.
@@ -264,12 +272,20 @@ impl ChunkWidths {
 
     /// The widest chunk any prompt walks: what the rings and the exchange slots are sized for.
     const fn widest(self) -> usize {
-        if self.long > self.base { self.long } else { self.base }
+        if self.long > self.base {
+            self.long
+        } else {
+            self.base
+        }
     }
 
     /// The rows the next chunk forwards when `left` positions remain.
     fn next(self, left: usize) -> usize {
-        let width = if left >= self.long_from { self.long } else { self.base };
+        let width = if left >= self.long_from {
+            self.long
+        } else {
+            self.base
+        };
         left.min(width)
     }
 }
@@ -393,35 +409,46 @@ impl Kernels {
         let inkling = inkling_cubin();
         let token = qwen4_exp_cubin();
         if inkling.is_empty() {
-            return Err("this build has no Inkling cubin: rebuild on a host with nvcc (or set \
+            return Err(
+                "this build has no Inkling cubin: rebuild on a host with nvcc (or set \
                         SPARKFLASH_NVCC) so build.rs compiles kernels/inkling_sm121.cu"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         if token.is_empty() {
-            return Err("this build has no token-image cubin: the arm's embedding, RMSNorm and \
+            return Err(
+                "this build has no token-image cubin: the arm's embedding, RMSNorm and \
                         dense projections are kernels/qwen4_exp_sm121.cu"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let prefill = glm_prefill_cubin();
         if prefill.is_empty() {
-            return Err("this build has no GLM prefill cubin: the tensor-core prefill's wide \
+            return Err(
+                "this build has no GLM prefill cubin: the tensor-core prefill's wide \
                         tile is kernels/glm_prefill_sm121.cu's glm_prefill_bf16_wide"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let experts = qwen4_prefill_cubin();
         if experts.is_empty() {
-            return Err("this build has no Qwen prefill cubin: the tensor-core prefill's routed \
+            return Err(
+                "this build has no Qwen prefill cubin: the tensor-core prefill's routed \
                         experts are kernels/qwen4_prefill_sm121.cu's grouped MMA"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let moe_plan = moe_plan_cubin();
         if moe_plan.is_empty() {
-            return Err("this build has no routed-expert plan cubin: the tensor-core prefill \
+            return Err(
+                "this build has no routed-expert plan cubin: the tensor-core prefill \
                         sorts its slots with kernels/moe_plan_sm121.cu"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let mut modules = Vec::new();
-        let (wide_module, wide) = cuda.load_named_shared(prefill, "glm_prefill_bf16_wide", WIDE_SHARED)?;
+        let (wide_module, wide) =
+            cuda.load_named_shared(prefill, "glm_prefill_bf16_wide", WIDE_SHARED)?;
         modules.push(wide_module);
         let mut load = |cubin: &'static [u8], name: &'static str| -> Result<Entry, String> {
             let (module, kernel) = cuda.load_named(cubin, name)?;
@@ -694,9 +721,20 @@ impl Shared {
         }
         self.launch(
             self.kernels.wide,
-            (grid_blocks(width, WIDE_COLUMNS), grid_blocks(rows, WIDE_ROWS), 1),
+            (
+                grid_blocks(width, WIDE_COLUMNS),
+                grid_blocks(rows, WIDE_ROWS),
+                1,
+            ),
             (WIDE_THREADS, 1, 1),
-            &[weight.0, input.0, out.0, width as u64, inner as u64, rows as u64],
+            &[
+                weight.0,
+                input.0,
+                out.0,
+                width as u64,
+                inner as u64,
+                rows as u64,
+            ],
         )
     }
 
@@ -1254,9 +1292,11 @@ impl InklingDeviceBackend {
         exchange: Box<dyn Exchange>,
     ) -> Result<Self, String> {
         if !Self::available() {
-            return Err("this build carries no Inkling or token cubin: rebuild on a host with nvcc \
+            return Err(
+                "this build carries no Inkling or token cubin: rebuild on a host with nvcc \
                         (or set SPARKFLASH_NVCC)"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         let window = config.context_tokens();
         if context == 0 || (window != 0 && context > window) {
@@ -1266,9 +1306,11 @@ impl InklingDeviceBackend {
             ));
         }
         if !config.attn_res_normalize_values {
-            return Err("the released block residual normalises its summary stack; a checkpoint \
+            return Err(
+                "the released block residual normalises its summary stack; a checkpoint \
                         that clears attn_res_normalize_values has no kernel in this arm"
-                .to_owned());
+                    .to_owned(),
+            );
         }
         if exchange.world() != tp.world() || exchange.rank() != tp.rank() {
             return Err(format!(
@@ -1285,15 +1327,20 @@ impl InklingDeviceBackend {
         let prefill_chunk = chunk_widths.widest();
         // The decode schedule is built for the chunk too: the two address the same sliding
         // rings, and a ring is sized by the widest write into it.
-        let plan =
-            InklingDevicePlan::build_for_chunk(&config, tp, Pass::Decode, 1, context, prefill_chunk)?;
+        let plan = InklingDevicePlan::build_for_chunk(
+            &config,
+            tp,
+            Pass::Decode,
+            1,
+            context,
+            prefill_chunk,
+        )?;
         // The chunk schedule is the decode one at a chunk's rows: every projection is the same
         // shared GEMM at a wider M, and the two kernels that cannot take a chunk (the decode
         // attention and the four-tap convolution) have their own row forms. The plan is built
         // here rather than at the first long prompt so a shape it refuses is an open-time error
         // and not a request the server has already admitted.
-        let prefill =
-            InklingDevicePlan::build(&config, tp, Pass::Prefill, prefill_chunk, context)?;
+        let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, prefill_chunk, context)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda)?;
         let weights = upload(&cuda, source.as_ref(), plan.served())?;
@@ -1302,7 +1349,10 @@ impl InklingDeviceBackend {
         let exchange_slots = if exchange.has_device_leg() {
             let widest = (prefill_chunk * config.hidden_size).max(plan.rank_vocab());
             let mut total = 0usize;
-            Some(cuda.alloc(widest * exchange.world() * std::mem::size_of::<f32>(), &mut total)?)
+            Some(cuda.alloc(
+                widest * exchange.world() * std::mem::size_of::<f32>(),
+                &mut total,
+            )?)
         } else {
             None
         };
@@ -1439,7 +1489,10 @@ impl InklingDeviceBackend {
     /// A batch of no rows.
     pub fn lanes(&self, max_batch: usize) -> Result<InklingLanes, BackendError> {
         if max_batch == 0 {
-            return Err(BackendError::new(DEVICE, "fused lanes need at least one row a step"));
+            return Err(BackendError::new(
+                DEVICE,
+                "fused lanes need at least one row a step",
+            ));
         }
         Ok(InklingLanes {
             shared: Arc::clone(&self.shared),
@@ -1557,7 +1610,10 @@ impl FusedArm for InklingLanes {
         let shared = &self.shared;
         for (lane, token) in members.iter() {
             if lane.session.state.position >= shared.context {
-                return Err(BackendError::new("context", "a lane's context is exhausted"));
+                return Err(BackendError::new(
+                    "context",
+                    "a lane's context is exhausted",
+                ));
             }
             if *token as usize >= shared.config.vocab_size {
                 return Err(BackendError::new(
@@ -1572,13 +1628,25 @@ impl FusedArm for InklingLanes {
         let tokens: Vec<u32> = members.iter().map(|(_, token)| *token).collect();
         let rows = {
             let mut buffer = self.buffer()?;
-            open_buffer(shared, &mut buffer, tokens.len(), tokens.len().next_power_of_two())?;
+            open_buffer(
+                shared,
+                &mut buffer,
+                tokens.len(),
+                tokens.len().next_power_of_two(),
+            )?;
             let chunk = buffer.as_mut().expect("the lanes' buffer was just opened");
             let mut states: Vec<&mut State> = members
                 .iter_mut()
                 .map(|(lane, _)| &mut lane.session.state)
                 .collect();
-            walk_rows(shared, Rows::Lanes(&mut states), chunk, &tokens, PrefillWalk::Chunk, &[])?
+            walk_rows(
+                shared,
+                Rows::Lanes(&mut states),
+                chunk,
+                &tokens,
+                PrefillWalk::Chunk,
+                &[],
+            )?
         };
         Ok(members
             .iter_mut()
@@ -1735,9 +1803,7 @@ fn expert_scales(
                 .copied()
                 .filter(|value| *value != 0.0)
                 .unwrap_or(1.0);
-            amax.into_iter()
-                .map(|value| value / denominator)
-                .collect()
+            amax.into_iter().map(|value| value / denominator).collect()
         };
         let gate_up = scale(
             read("w13_weight_amax")?,
@@ -1795,7 +1861,10 @@ fn expert_scales(
                         .and_then(|step| step.weights.get(which))
                         .map(|index| weights.get(*index).pointer)
                         .ok_or_else(|| {
-                            format!("layer {}: no {op:?} weight {which} for the MMA table", layer.index)
+                            format!(
+                                "layer {}: no {op:?} weight {which} for the MMA table",
+                                layer.index
+                            )
                         })
                 };
                 let (w13, w13_scales) = (codes(Op::ExpertGateUp, 0)?, codes(Op::ExpertGateUp, 1)?);
@@ -1832,8 +1901,10 @@ fn expert_scales(
                         layer.index
                     ));
                 }
-                let pointer_bytes: Vec<u8> =
-                    pointers.iter().flat_map(|pointer| pointer.to_le_bytes()).collect();
+                let pointer_bytes: Vec<u8> = pointers
+                    .iter()
+                    .flat_map(|pointer| pointer.to_le_bytes())
+                    .collect();
                 let mma_table = place(&pointer_bytes)?;
                 let mma_scales = place(&row_bytes(&outer))?;
                 Some(ExpertScale {
@@ -1903,12 +1974,7 @@ impl State {
         let mut conv = Vec::with_capacity(plan.layers().len());
         for _ in 0..plan.layers().len() {
             let mut slots = [Deviceptr(0); 4];
-            let widths = [
-                shared.kv_width(),
-                shared.kv_width(),
-                hidden,
-                hidden,
-            ];
+            let widths = [shared.kv_width(), shared.kv_width(), hidden, hidden];
             for (slot, width) in widths.into_iter().enumerate() {
                 let bytes = width.max(1) * history * std::mem::size_of::<f32>();
                 let pointer = cuda.alloc(bytes, &mut total)?;
@@ -1921,7 +1987,11 @@ impl State {
         let summaries_rows = plan
             .layers()
             .iter()
-            .filter(|layer| layer.index.is_multiple_of(shared.config.n_layers_per_attn_res_block.max(1)))
+            .filter(|layer| {
+                layer
+                    .index
+                    .is_multiple_of(shared.config.n_layers_per_attn_res_block.max(1))
+            })
             .count()
             .max(1);
         let summaries_bytes = summaries_rows * hidden * std::mem::size_of::<f32>();
@@ -2135,7 +2205,10 @@ impl Scratch {
         let final_row = take(answers * hidden, 4);
         let plan = take(rows * top_k * 2, 4);
         let local = take(rows * top_k, 4);
-        let items = take(chunk::moe_items(rows * top_k, shared.plan.expert_range().1) * 4, 4);
+        let items = take(
+            chunk::moe_items(rows * top_k, shared.plan.expert_range().1) * 4,
+            4,
+        );
         let item_count = take(1, 4);
         let taus = take(rows, 4);
         let attention_pass = attention_pass_slots(rows, heads);
@@ -2421,7 +2494,11 @@ impl InklingDeviceSession {
     /// prefix are encoded on rank 0 into a zeroed row buffer every rank holds, the group's sum
     /// makes every rank's buffer rank 0's, and each chunk writes its image rows over the
     /// placeholders' after the embedding norm ([Injection]).
-    fn prompt(&mut self, tokens: &[u32], images: &[VisionImage]) -> Result<StepOutput, BackendError> {
+    fn prompt(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
         if tokens.is_empty() {
             return Err(BackendError::new("request", "the prompt is empty"));
         }
@@ -2560,12 +2637,23 @@ impl InklingDeviceSession {
                 self.step(slice[0])?
             } else {
                 // The rows walk forwards an image row as a one-row chunk of the exact walk.
-                let walk = if walk.chunked() { walk } else { PrefillWalk::Chunk };
+                let walk = if walk.chunked() {
+                    walk
+                } else {
+                    PrefillWalk::Chunk
+                };
                 self.open_chunk(take)?;
                 let chunk = self.chunk.as_mut().expect("a chunk buffer was just opened");
-                walk_rows(&self.shared, Rows::Chunk(&mut self.state), chunk, slice, walk, &images)?
-                    .pop()
-                    .ok_or_else(|| Self::fail("a chunk answered no row"))?
+                walk_rows(
+                    &self.shared,
+                    Rows::Chunk(&mut self.state),
+                    chunk,
+                    slice,
+                    walk,
+                    &images,
+                )?
+                .pop()
+                .ok_or_else(|| Self::fail("a chunk answered no row"))?
             };
             self.history.extend_from_slice(slice);
             forwarded += take;
@@ -2577,13 +2665,19 @@ impl InklingDeviceSession {
     /// rank 0's tower fills, summed across the group so every rank holds rank 0's rows. The sum
     /// goes a chunk's worth of rows at a time, the widest the exchange carries; zeros plus rows is
     /// the rows exactly.
-    fn encode_images(&self, images: &[&VisionImage], rows: usize) -> Result<Deviceptr, BackendError> {
+    fn encode_images(
+        &self,
+        images: &[&VisionImage],
+        rows: usize,
+    ) -> Result<Deviceptr, BackendError> {
         let shared = &self.shared;
         let cuda = &shared.cuda;
         let hidden = shared.hidden();
         let row_bytes = hidden * std::mem::size_of::<f32>();
         let mut total = 0usize;
-        let buffer = cuda.alloc(rows * row_bytes, &mut total).map_err(Self::fail)?;
+        let buffer = cuda
+            .alloc(rows * row_bytes, &mut total)
+            .map_err(Self::fail)?;
         let fill = || -> Result<(), BackendError> {
             cuda.memset_d8_async(buffer, 0, rows * row_bytes)
                 .map_err(Self::fail)?;
@@ -2679,7 +2773,12 @@ impl InklingDeviceSession {
     }
 
     fn output(&mut self, logits: Vec<f32>) -> StepOutput {
-        let next_token = choose(&self.shared.config, &mut self.sampler, &logits, &self.sampling);
+        let next_token = choose(
+            &self.shared.config,
+            &mut self.sampler,
+            &logits,
+            &self.sampling,
+        );
         StepOutput {
             logits,
             next_token,
@@ -2719,7 +2818,13 @@ impl InklingDeviceSession {
     }
 
     /// The root-mean-square of one f32 buffer, for the trace. A debug read: it synchronises.
-    fn rms(&self, shared: &Shared, label: &str, pointer: Deviceptr, elements: usize) -> Result<(), BackendError> {
+    fn rms(
+        &self,
+        shared: &Shared,
+        label: &str,
+        pointer: Deviceptr,
+        elements: usize,
+    ) -> Result<(), BackendError> {
         if !trace_on() {
             return Ok(());
         }
@@ -2797,7 +2902,13 @@ impl InklingDeviceSession {
                 }
                 (Op::RmsNorm, Target::Norm(NormRole::Embedding)) => {
                     let weight = self.weight(step.weights[0]);
-                    run(shared.rmsnorm(self.state.scratch.x, weight, self.state.scratch.x, 1, hidden))?;
+                    run(shared.rmsnorm(
+                        self.state.scratch.x,
+                        weight,
+                        self.state.scratch.x,
+                        1,
+                        hidden,
+                    ))?;
                     self.rms(&shared, "embed_norm", self.state.scratch.x, hidden)?;
                 }
                 (Op::Collective(Collective::EmbeddingRow), _) => {
@@ -2815,11 +2926,13 @@ impl InklingDeviceSession {
             }
         }
 
-
         for (index, schedule) in plan.layers().iter().enumerate() {
             let layer = schedule.index;
             if trace_on() {
-                eprintln!("[inkling] layer {layer} sliding={} blocks={}", schedule.sliding, self.state.blocks);
+                eprintln!(
+                    "[inkling] layer {layer} sliding={} blocks={}",
+                    schedule.sliding, self.state.blocks
+                );
             }
             let sliding = schedule.sliding;
             let cache_rows = schedule.kv_rows;
@@ -2886,10 +2999,9 @@ impl InklingDeviceSession {
                             (NormRole::Attention, _) => {
                                 (self.state.scratch.rows, self.state.scratch.normed)
                             }
-                            (NormRole::Query, false) => (
-                                self.state.scratch.rows,
-                                self.state.scratch.normed,
-                            ),
+                            (NormRole::Query, false) => {
+                                (self.state.scratch.rows, self.state.scratch.normed)
+                            }
                             (NormRole::Key, false) => (
                                 self.state.scratch.rows.offset(hidden * 4),
                                 self.state.scratch.normed.offset(hidden * 4),
@@ -2911,26 +3023,23 @@ impl InklingDeviceSession {
                         if trace_on() && layer == 0 && matches!(role, NormRole::Mlp) {
                             self.rms(&shared, "row mlp_norm", destination, hidden)?;
                         }
-
                     }
                     (Op::Gemv, Target::Project(projection)) => {
                         let weight = self.weight(step.weights[0]);
                         let normed = self.state.scratch.normed;
                         let (input, out, rows, columns) = match projection {
-                            Projection::Query => (
-                                normed,
-                                self.state.scratch.q,
-                                heads * head_dim,
-                                hidden,
-                            ),
-                            Projection::Gate => (
-                                normed,
-                                self.state.scratch.gate,
-                                heads * head_dim,
-                                hidden,
-                            ),
+                            Projection::Query => {
+                                (normed, self.state.scratch.q, heads * head_dim, hidden)
+                            }
+                            Projection::Gate => {
+                                (normed, self.state.scratch.gate, heads * head_dim, hidden)
+                            }
                             Projection::Key => (
-                                if sliding { normed } else { normed.offset(hidden * 4) },
+                                if sliding {
+                                    normed
+                                } else {
+                                    normed.offset(hidden * 4)
+                                },
                                 self.state.scratch.k,
                                 kv_width,
                                 hidden,
@@ -2945,12 +3054,9 @@ impl InklingDeviceSession {
                                 kv_width,
                                 hidden,
                             ),
-                            Projection::Relative => (
-                                normed,
-                                self.state.scratch.rel,
-                                heads * config.d_rel,
-                                hidden,
-                            ),
+                            Projection::Relative => {
+                                (normed, self.state.scratch.rel, heads * config.d_rel, hidden)
+                            }
                             Projection::Sink => (normed, self.state.scratch.sink, heads, hidden),
                             Projection::AttentionOut => (
                                 self.state.scratch.attn,
@@ -3041,7 +3147,13 @@ impl InklingDeviceSession {
                         // The dynamic taps are a projection of this slot's input, one kernel width
                         // a key/value head.
                         let taps = plan.rank_kv_heads() * shared.kernel_width();
-                        run(shared.gemv(projection, source, self.state.scratch.taps, taps, hidden))?;
+                        run(shared.gemv(
+                            projection,
+                            source,
+                            self.state.scratch.taps,
+                            taps,
+                            hidden,
+                        ))?;
                         run(shared.launch(
                             shared.kernels.short_conv_dynamic,
                             (flat(kv_width), 1, 1),
@@ -3244,9 +3356,8 @@ impl InklingDeviceSession {
                     .iter()
                     .map(|word| f32::from_le_bytes(*word))
                     .collect();
-                let rms = (values.iter().map(|value| value * value).sum::<f32>()
-                    / hidden as f32)
-                    .sqrt();
+                let rms =
+                    (values.iter().map(|value| value * value).sum::<f32>() / hidden as f32).sqrt();
                 eprintln!(
                     "[inkling] row rank {} layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
                     plan.tp().rank(),
@@ -3333,10 +3444,7 @@ impl InklingDeviceSession {
         }
 
         self.state.position += 1;
-        shared
-            .cuda
-            .synchronize()
-            .map_err(Self::fail)?;
+        shared.cuda.synchronize().map_err(Self::fail)?;
         // A doorbell round that was given up leaves its fold on whatever was in the slots; the
         // logits are not read back over one.
         shared.exchange.check_device().map_err(Self::fail)?;
@@ -3436,8 +3544,8 @@ impl InklingDeviceSession {
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
                     let scale_offset =
                         local * scales_bytes(2 * intermediate, hidden, schedule.experts);
-                    let scale_pointer = gate_up_scales
-                        .map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
+                    let scale_pointer =
+                        gate_up_scales.map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
                     let (entry, last) = match schedule.experts {
                         ExpertBody::NvFp4 => (
                             shared.kernels.expert_nvfp4,
@@ -3499,10 +3607,9 @@ impl InklingDeviceSession {
                         .map_err(Self::fail)?;
                 }
                 ExpertBody::NvFp4 | ExpertBody::MxFp8 => {
-                    let scale_offset =
-                        local * scales_bytes(hidden, intermediate, schedule.experts);
-                    let scale_pointer = down_scales
-                        .map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
+                    let scale_offset = local * scales_bytes(hidden, intermediate, schedule.experts);
+                    let scale_pointer =
+                        down_scales.map_or(Deviceptr(0), |pointer| pointer.offset(scale_offset));
                     let (entry, last) = match schedule.experts {
                         ExpertBody::NvFp4 => (
                             shared.kernels.expert_nvfp4,
@@ -3607,10 +3714,13 @@ impl InklingDeviceSession {
             let (entry, tail) = match schedule.experts {
                 ExpertBody::NvFp4 => (
                     shared.kernels.expert_nvfp4_band,
-                    factor.ok_or_else(|| {
-                        Self::fail(format!("layer {layer}: an NVFP4 band has no scale_2 vector"))
-                    })?
-                    .0,
+                    factor
+                        .ok_or_else(|| {
+                            Self::fail(format!(
+                                "layer {layer}: an NVFP4 band has no scale_2 vector"
+                            ))
+                        })?
+                        .0,
                 ),
                 _ => (shared.kernels.expert_mxfp8_band, MXFP8_BLOCK as u64),
             };
@@ -3714,7 +3824,6 @@ impl InklingDeviceSession {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{ChunkWidths, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM};
@@ -3745,7 +3854,11 @@ mod tests {
 
     #[test]
     fn a_fixed_width_never_widens() {
-        let fixed = ChunkWidths { base: 512, long: 512, long_from: usize::MAX };
+        let fixed = ChunkWidths {
+            base: 512,
+            long: 512,
+            long_from: usize::MAX,
+        };
         assert_eq!(fixed.widest(), 512);
         assert_eq!(fixed.next(1_000_000), 512);
         assert_eq!(fixed.next(7), 7);

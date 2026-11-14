@@ -23,12 +23,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sparkflash_model::ModelDescriptor;
+use sparkflash_model::TpPlan;
 use sparkflash_model_inkling2::Inkling2HostBackend;
 use sparkflash_model_inkling2::config::Inkling2Config;
 use sparkflash_model_inkling2::convert::{RankFileSource, convert_rank, verify_rank};
-use sparkflash_model_inkling2::tensor::InklingTensorPlan;
 use sparkflash_model_inkling2::forward::Inkling2Weights;
-use sparkflash_model::TpPlan;
+use sparkflash_model_inkling2::tensor::InklingTensorPlan;
 use sparkflash_weights::tp::TpLayout;
 use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 
@@ -139,12 +139,13 @@ fn a_rank_file_verifies_against_the_checkpoint() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let written = convert_rank(&source, &config, layout(), directory.path(), "tiny")
         .expect("the rank file is written");
-    let checked = verify_rank(&written.path, &source, &config, layout()).expect("the file verifies");
+    let checked =
+        verify_rank(&written.path, &source, &config, layout()).expect("the file verifies");
     assert_eq!(checked.slots, written.slots);
     // The payload is every tensor's bytes; the file is those bytes plus the 256-byte alignment
     // between slots, so it must be the smaller of the two and never smaller than the plan.
-    let plan = InklingTensorPlan::served(&config, TpPlan::new(1, 0).expect("TP1"))
-        .expect("the tiny plan");
+    let plan =
+        InklingTensorPlan::served(&config, TpPlan::new(1, 0).expect("TP1")).expect("the tiny plan");
     assert_eq!(checked.bytes, plan.rank_storage_bytes() as u64);
     assert!(written.data_bytes >= checked.bytes);
 }
@@ -161,8 +162,8 @@ fn the_host_serves_the_same_logits_from_converted_weights() {
     let loaded = RankFileSource::open(&written.path, &config, layout()).expect("the file opens");
 
     let descriptor: ModelDescriptor = sparkflash_model::ModelDescriptor::inkling2_small();
-    let from_checkpoint = Inkling2Weights::load(config.clone(), Arc::new(source))
-        .expect("the checkpoint loads");
+    let from_checkpoint =
+        Inkling2Weights::load(config.clone(), Arc::new(source)).expect("the checkpoint loads");
     let from_file = Inkling2Weights::load(config.clone(), Arc::new(loaded))
         .expect("the converted weights load");
     let mut left = sparkflash_model_inkling2::Inkling2State::new(&config);

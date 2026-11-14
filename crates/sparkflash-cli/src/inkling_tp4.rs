@@ -68,14 +68,25 @@ impl Args {
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
             let mut value = || -> Result<String, String> {
-                rest.next()
-                    .ok_or_else(|| format!("{flag} needs a value"))
+                rest.next().ok_or_else(|| format!("{flag} needs a value"))
             };
             match flag.as_str() {
                 "--model" => model = Some(PathBuf::from(value()?)),
                 "--converted" => converted = Some(PathBuf::from(value()?)),
-                "--rank" => rank = Some(value()?.parse::<usize>().map_err(|error| format!("--rank: {error}"))?),
-                "--world" => world = Some(value()?.parse::<usize>().map_err(|error| format!("--world: {error}"))?),
+                "--rank" => {
+                    rank = Some(
+                        value()?
+                            .parse::<usize>()
+                            .map_err(|error| format!("--rank: {error}"))?,
+                    )
+                }
+                "--world" => {
+                    world = Some(
+                        value()?
+                            .parse::<usize>()
+                            .map_err(|error| format!("--world: {error}"))?,
+                    )
+                }
                 "--context" => {
                     context = value()?
                         .parse::<usize>()
@@ -121,9 +132,11 @@ impl Args {
                     let raw = value()?;
                     let mut list = Vec::new();
                     for address in raw.split(',').filter(|address| !address.is_empty()) {
-                        list.push(address.parse::<SocketAddr>().map_err(|error| {
-                            format!("--peer: {address}: {error}")
-                        })?);
+                        list.push(
+                            address
+                                .parse::<SocketAddr>()
+                                .map_err(|error| format!("--peer: {address}: {error}"))?,
+                        );
                     }
                     peers = Some(list);
                 }
@@ -189,9 +202,7 @@ fn execute(args: &Args) -> Result<(), String> {
     let codec = args
         .tokenizer
         .as_ref()
-        .map(|path| {
-            sparkflash_model_inkling2::InklingCodec::from_path(path, None, Vec::new())
-        })
+        .map(|path| sparkflash_model_inkling2::InklingCodec::from_path(path, None, Vec::new()))
         .transpose()?;
     // A sentence is tokenized here and only here: the four ranks must forward the same ids, so the
     // prompt is resolved before the rank opens anything.
@@ -266,7 +277,16 @@ mod tests {
     use super::Args;
 
     fn parse(extra: &[&'static str]) -> Result<Args, String> {
-        let mut argv = vec!["--model", "/m", "--converted", "/c", "--rank", "1", "--peer", "10.0.0.1:9,10.0.0.2:9"];
+        let mut argv = vec![
+            "--model",
+            "/m",
+            "--converted",
+            "/c",
+            "--rank",
+            "1",
+            "--peer",
+            "10.0.0.1:9,10.0.0.2:9",
+        ];
         argv.extend_from_slice(extra);
         Args::parse(argv.into_iter().map(str::to_owned))
     }

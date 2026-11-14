@@ -942,7 +942,9 @@ impl Architecture {
     pub fn apply_quant_config(&mut self, root: &Value) -> Result<(), ConfigError> {
         let model = object(root, "model").unwrap_or(root);
         let Some(groups) = model.get("parameter_groups").and_then(Value::as_array) else {
-            return Err(invalid("hf_quant_config.json has no model.parameter_groups"));
+            return Err(invalid(
+                "hf_quant_config.json has no model.parameter_groups",
+            ));
         };
         let mut formats = vec![self.quantization.expert_format; self.layers.len()];
         let mut dense = self.quantization.dense_format;
@@ -954,10 +956,13 @@ impl Architecture {
             let output = optional_string(group, "output_dtype")
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let block = usize_list(group.get("weight_block_shape"))?.last().copied()
+            let block = usize_list(group.get("weight_block_shape"))?
+                .last()
+                .copied()
                 .or_else(|| {
-                    object(group, "required_activation_quantization")
-                        .and_then(|activation| optional_usize(activation, "block_size").ok().flatten())
+                    object(group, "required_activation_quantization").and_then(|activation| {
+                        optional_usize(activation, "block_size").ok().flatten()
+                    })
                 });
             let format = match (compute.as_str(), output.as_str()) {
                 ("nvfp4", _) => WeightFormat::NvFp4 {
@@ -966,16 +971,18 @@ impl Architecture {
                 ("mxfp8", _) => WeightFormat::MxFp8 {
                     block: block.unwrap_or(32),
                 },
-                (_, "uint8") if group.get("weight_scale_format").is_some() => {
-                    WeightFormat::NvFp4 {
-                        group_size: block.unwrap_or(16),
+                (_, "uint8") if group.get("weight_scale_format").is_some() => WeightFormat::NvFp4 {
+                    group_size: block.unwrap_or(16),
+                },
+                (_, "float8_e4m3fn")
+                    if group.get("weight_transform").is_some_and(|value| {
+                        value.as_str().is_some_and(|name| name.contains("mxfp8"))
+                    }) =>
+                {
+                    WeightFormat::MxFp8 {
+                        block: block.unwrap_or(32),
                     }
                 }
-                (_, "float8_e4m3fn") if group.get("weight_transform").is_some_and(|value| {
-                    value.as_str().is_some_and(|name| name.contains("mxfp8"))
-                }) => WeightFormat::MxFp8 {
-                    block: block.unwrap_or(32),
-                },
                 _ => WeightFormat::Bf16,
             };
             let tensors = string_list(group.get("tensors"))?;
@@ -1006,7 +1013,9 @@ impl Architecture {
                 .unwrap_or(self.quantization.expert_format);
         }
         self.quantization.dense_format = dense;
-        self.quantization.method.get_or_insert_with(|| "mixed".to_owned());
+        self.quantization
+            .method
+            .get_or_insert_with(|| "mixed".to_owned());
         if let Some(inkling) = &mut self.inkling {
             inkling.layer_expert_formats = formats;
         }
@@ -1078,7 +1087,8 @@ impl Architecture {
                     // per session rather than a per-token charge. This is the difference that
                     // makes a 1M-token session fit: 40 sliding layers x 1023 positions.
                     if let Some(window) = layer.attention.window {
-                        fixed = fixed.saturating_add(kv.saturating_mul(window.saturating_sub(1) as u64));
+                        fixed = fixed
+                            .saturating_add(kv.saturating_mul(window.saturating_sub(1) as u64));
                     } else {
                         per_token = per_token.saturating_add(kv);
                     }
@@ -1472,8 +1482,8 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
                 moe.score = Score::Sigmoid;
                 moe.norm_topk = true;
                 moe.selection_bias = true;
-                moe.routed_scaling = optional_f64(text, "route_scale")?
-                    .unwrap_or(moe.routed_scaling);
+                moe.routed_scaling =
+                    optional_f64(text, "route_scale")?.unwrap_or(moe.routed_scaling);
             }
         }
     }
@@ -1896,8 +1906,8 @@ fn ffn(
     let expert_intermediate = optional_usize(text, "moe_intermediate_size")?
         .or(optional_usize(text, "intermediate_size")?)
         .ok_or_else(|| invalid(format!("layer {index} has no MoE intermediate width")))?;
-    let shared_intermediate = optional_usize(text, "shared_expert_intermediate_size")?
-        .unwrap_or(expert_intermediate);
+    let shared_intermediate =
+        optional_usize(text, "shared_expert_intermediate_size")?.unwrap_or(expert_intermediate);
     Ok(Ffn::Moe(Moe {
         routed_experts,
         active_experts: required_usize(text, "num_experts_per_tok", "text_config")?,
@@ -2151,8 +2161,7 @@ fn mtp(root: &Value, text: &Value, _hidden: usize) -> Result<Option<Mtp>, Config
     };
     Ok(Some(Mtp {
         stages,
-        block_size: optional_usize(text, "dspark_block_size")?
-            .or(nested_value("block_size")?),
+        block_size: optional_usize(text, "dspark_block_size")?.or(nested_value("block_size")?),
         target_layers,
         routed_experts: optional_usize(text, "dspark_n_routed_experts")?,
         active_experts: optional_usize(text, "dspark_num_experts_per_tok")?,

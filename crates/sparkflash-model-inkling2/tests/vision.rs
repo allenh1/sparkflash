@@ -148,7 +148,11 @@ fn tower_source_scaled(config: &InklingVisionConfig, matrix: impl Fn(usize, f32)
     );
     {
         let name = "ln_pre";
-        source.put(&format!("{prefix}.backbone.{name}.weight"), vec![width], 1.0);
+        source.put(
+            &format!("{prefix}.backbone.{name}.weight"),
+            vec![width],
+            1.0,
+        );
         source.put(&format!("{prefix}.backbone.{name}.bias"), vec![width], 0.1);
     }
     for layer in 0..config.depth {
@@ -247,7 +251,9 @@ fn the_class_token_reaches_the_image_tokens() {
     let mut source = tower_source(&config2);
     let name = "model.visual.backbone.embeddings.class_embedding";
     let width = config2.hidden_size;
-    let values: Vec<f32> = (0..width).map(|index| 0.25 * (index as f32 + 1.0)).collect();
+    let values: Vec<f32> = (0..width)
+        .map(|index| 0.25 * (index as f32 + 1.0))
+        .collect();
     source.put_values(name, vec![width], &values);
     let other = InklingVision::load(&config2, Arc::new(source)).expect("the second tower");
     let second = other.encode(&pixels, 6, 6).expect("the second encode");
@@ -275,7 +281,10 @@ fn the_axial_rope_depends_on_both_axes() {
     let below = bright(1, 0);
     let right = bright(0, 1);
     assert_ne!(corner, below, "a patch one row down made the same tokens");
-    assert_ne!(corner, right, "a patch one column right made the same tokens");
+    assert_ne!(
+        corner, right,
+        "a patch one column right made the same tokens"
+    );
     assert_ne!(below, right, "the row and the column are interchangeable");
 }
 
@@ -284,11 +293,16 @@ fn the_axial_rope_depends_on_both_axes() {
 #[test]
 fn a_canvas_encodes_to_its_padded_cells() {
     let (tower, config) = tower();
-    let rgb: Vec<u8> = (0..5 * 7 * 3).map(|index| (index * 11 % 256) as u8).collect();
+    let rgb: Vec<u8> = (0..5 * 7 * 3)
+        .map(|index| (index * 11 % 256) as u8)
+        .collect();
     let encoded = tower.encode_canvas(&rgb, 5, 7).expect("the canvas encodes");
     assert_eq!(plan_cells(5, 7, &config), Ok((2, 2)));
     assert_eq!(encoded.len(), 4 * config.out_hidden_size);
-    assert!(tower.encode_canvas(&rgb[1..], 5, 7).is_err(), "a short canvas");
+    assert!(
+        tower.encode_canvas(&rgb[1..], 5, 7).is_err(),
+        "a short canvas"
+    );
 }
 
 /// The planner pads partial cells and refuses what the tower cannot encode.
@@ -296,7 +310,11 @@ fn a_canvas_encodes_to_its_padded_cells() {
 fn the_planner_pads_and_refuses_bad_canvases() {
     let config = config();
     assert_eq!(plan_grid(160, 160, &config), Ok((80, 80)));
-    assert_eq!(plan_grid(160, 98, &config), Ok((80, 50)), "a partial cell pads");
+    assert_eq!(
+        plan_grid(160, 98, &config),
+        Ok((80, 50)),
+        "a partial cell pads"
+    );
     assert_eq!(plan_grid(1, 1, &config), Ok((2, 2)));
     assert!(plan_grid(0, 160, &config).is_err(), "an empty image");
     // 364 x 364 pixels is 91 x 91 cells of 4, over the 8,192-token cap.
@@ -310,7 +328,9 @@ fn a_grid_over_the_token_cap_is_refused() {
     let (grid_h, grid_w) = (182, 182);
     assert!(grid_h * grid_w / 4 > MAX_MERGED_TOKENS);
     let pixels = vec![0f32; grid_h * grid_w * patch_values(&config)];
-    let error = tower.encode(&pixels, grid_h, grid_w).expect_err("the cap refuses it");
+    let error = tower
+        .encode(&pixels, grid_h, grid_w)
+        .expect_err("the cap refuses it");
     assert!(error.contains("token cap"), "{error}");
 }
 
@@ -400,7 +420,11 @@ fn the_device_tower_matches_the_host_reference() {
         .chunks_exact(config.out_hidden_size)
         .zip(reference.chunks_exact(config.out_hidden_size))
     {
-        let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+        let dot: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| f64::from(*x) * f64::from(*y))
+            .sum();
         let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
         lowest = lowest.min(dot / (norm(a) * norm(b)));
     }
@@ -503,9 +527,17 @@ fn the_span_check_refuses_what_a_rank_could_not_prefill() {
 
     let mut twice = tokens.clone();
     twice.extend(span_prompt());
-    refused(&twice, &[span_image(1, true), span_image(4, true)], "inside the span before");
+    refused(
+        &twice,
+        &[span_image(1, true), span_image(4, true)],
+        "inside the span before",
+    );
     // A second image that starts on the first one's end delimiter overlaps it too.
-    refused(&twice, &[span_image(1, true), span_image(6, true)], "inside the span before");
+    refused(
+        &twice,
+        &[span_image(1, true), span_image(6, true)],
+        "inside the span before",
+    );
     check
         .check(&twice, &[span_image(1, true), span_image(9, true)])
         .expect("two images, each its own span");

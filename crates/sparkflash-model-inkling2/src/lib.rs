@@ -38,20 +38,20 @@ pub use config::{
     Inkling2Config, InklingMtpConfig, InklingQuantConfig, InklingVisionConfig, MODEL_ID,
     MODEL_TYPE, WEIGHTS_ID,
 };
-pub use prompt::InklingCodec;
-pub use forward::{Inkling2State, Inkling2Weights};
-pub use device::{InklingDeviceBackend, InklingVisionTower};
-pub use group::{GroupOptions, MasterRank, open_master, run_worker};
-pub use host::Inkling2HostBackend;
-pub use reference::{AttentionParams, attention, softcapped_swiglu};
 pub use convert::{
     InklingRecords, RankFileSource, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots,
     verify_rank, visit_rank,
 };
+pub use device::{InklingDeviceBackend, InklingVisionTower};
 pub use device_plan::{
     BufferPlan, Collective, InklingDevicePlan, LayerSchedule, Op, Pass, Step, TapLayout, TauRule,
     VOCAB_ALIGNMENT,
 };
+pub use forward::{Inkling2State, Inkling2Weights};
+pub use group::{GroupOptions, MasterRank, open_master, run_worker};
+pub use host::Inkling2HostBackend;
+pub use prompt::InklingCodec;
+pub use reference::{AttentionParams, attention, softcapped_swiglu};
 pub use tensor::{InklingTensorPlan, Role, Slice};
 pub use tp4_run::{Tp4Outcome, Tp4Run, rank_file};
 pub use vision::{

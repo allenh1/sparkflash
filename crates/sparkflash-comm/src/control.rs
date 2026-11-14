@@ -393,10 +393,7 @@ pub fn control_pixels_bytes(
 }
 
 /// Reads the `bytes` canvas bytes that follow a [`Tp4ControlFrame::DevicePixels`] frame.
-pub fn read_control_pixels(
-    stream: &mut TcpStream,
-    bytes: u64,
-) -> Result<Vec<u8>, Tp4ControlError> {
+pub fn read_control_pixels(stream: &mut TcpStream, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
     let length = usize::try_from(bytes).unwrap_or(usize::MAX);
     if length > TP4_CONTROL_MAX_PIXELS {
         return Err(Tp4ControlError::FrameTooLarge { bytes: length });
@@ -424,9 +421,7 @@ pub fn control_read_is_idle(error: &Tp4ControlError) -> bool {
 }
 
 /// Reads one length-prefixed JSON control frame.
-pub fn read_control_frame(
-    stream: &mut TcpStream,
-) -> Result<Tp4ControlFrame, Tp4ControlError> {
+pub fn read_control_frame(stream: &mut TcpStream) -> Result<Tp4ControlFrame, Tp4ControlError> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
     let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);

@@ -642,7 +642,16 @@ pub(super) fn walk_rows(
                     // The taps are a projection of this slot's own input, one kernel width a
                     // head, and they scale the row they were projected from - never the history.
                     let taps = kv_heads * shared.kernel_width();
-                    project(shared, walk, projection, source, scratch.taps, taps, hidden, rows)?;
+                    project(
+                        shared,
+                        walk,
+                        projection,
+                        source,
+                        scratch.taps,
+                        taps,
+                        hidden,
+                        rows,
+                    )?;
                     let slot_index = conv_slot(slot);
                     match &sequences {
                         Rows::Chunk(state) => {
@@ -909,8 +918,7 @@ pub(super) fn walk_rows(
                 (Op::ExpertGateUp, Target::Band(BandOp::GateUp)) => {
                     let activation = &layer.steps[cursor + 1];
                     let down = &layer.steps[cursor + 2];
-                    if walk == PrefillWalk::Tensor && layer.experts == ExpertBody::NvFp4
-                    {
+                    if walk == PrefillWalk::Tensor && layer.experts == ExpertBody::NvFp4 {
                         run_band_mma(shared, chunk, layer, rows)?;
                     } else {
                         run_band_chunk(shared, chunk, layer, step, activation, down, rows)?;
@@ -1144,7 +1152,10 @@ fn run_band_mma(
     let hidden = config.hidden_size;
     let (first, owned) = shared.plan.expert_range();
     let meta = shared.experts[layer.index].as_ref().ok_or_else(|| {
-        device_error(format!("layer {}: an NVFP4 band with no expert scales", layer.index))
+        device_error(format!(
+            "layer {}: an NVFP4 band with no expert scales",
+            layer.index
+        ))
     })?;
     if !hidden.is_multiple_of(MOE_DOWN_COLUMNS)
         || !hidden.is_multiple_of(MOE_K_STAGE)
@@ -1164,7 +1175,11 @@ fn run_band_mma(
     shared
         .launch(
             shared.kernels.band_shares,
-            (u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX), 1, 1),
+            (
+                u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
+                1,
+                1,
+            ),
             (SHARES_BLOCK, 1, 1),
             &[
                 scratch.indices.0,
@@ -1182,7 +1197,11 @@ fn run_band_mma(
     shared
         .launch(
             shared.kernels.split_bf16,
-            ((elements / 2).div_ceil(MOE_THREADS as usize).clamp(1, 4096) as u32, 1, 1),
+            (
+                (elements / 2).div_ceil(MOE_THREADS as usize).clamp(1, 4096) as u32,
+                1,
+                1,
+            ),
             (MOE_THREADS, 1, 1),
             &[scratch.q_in.0, scratch.band.0, elements as u64],
         )
@@ -1191,7 +1210,11 @@ fn run_band_mma(
         .launch(
             shared.kernels.moe_plan,
             (1, 1, 1),
-            (sparkflash_model::active_profile().plan.block_threads(), 1, 1),
+            (
+                sparkflash_model::active_profile().plan.block_threads(),
+                1,
+                1,
+            ),
             &[
                 scratch.local.0,
                 scratch.plan.0,
@@ -1484,7 +1507,10 @@ fn run_band_chunk(
                 (ELEMENT_BLOCK, 1, 1),
                 &[
                     scratch.band.offset(first_slot * 2 * intermediate * byte).0,
-                    scratch.activation.offset(first_slot * intermediate * byte).0,
+                    scratch
+                        .activation
+                        .offset(first_slot * intermediate * byte)
+                        .0,
                     intermediate as u64,
                     bits(config.mlp_gate_softcap as f32),
                     bits(config.mlp_up_softcap as f32),
