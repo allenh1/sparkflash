@@ -298,6 +298,19 @@ canonical for shared parts.
   rows decoded inline instead of through a one-byte slice per value, the same request took
   **10.6 s** and produced the same token. The eight MXFP8 layers were 15.8 s each before the
   change and are 0.22 s after. `SPARKFLASH_INKLING_TRACE=1` prints the per-stage split.
+* **Routed experts and the router, verified on hardware.** `kernels/inkling_moe_sm121.cu` adds
+  the two expert weight formats and the sigmoid router, and all three pass parity against
+  `reference` on a GB10. The formats differ from DeepSeek's in what a scale multiplies:
+  ModelOpt NVFP4 with a per-expert `scale_2 = amax / (6 * outer_scale_denominator)`, and MXFP8
+  with a `ue8m0` power of two a 32 columns and no per-expert factor. Because both factors are
+  linear, **an expert's scale rides on its own output**, `scale_2 * (W x)`, so one body serves
+  every expert and no kernel needs a per-expert amax.
+
+  The host forward now streams those products too (`expert_matvec`): codes and scales for one
+  expert are read and multiplied straight into the result, so a routed expert costs a few MB of
+  I/O instead of a four-gigabyte dequantised buffer, and the host and the parity harness call
+  the same function.
+
 * **Kernels, verified on hardware.** `crates/sparkflash-model-inkling2/tests/kernels.rs` runs
   each sm_121a kernel against `inkling2::reference` — the same functions the f32 host forward
   calls, so a kernel cannot pass by agreeing with a second hand-written oracle. All seven cases
@@ -345,6 +358,22 @@ canonical for shared parts.
   (399 GB of files, 381 GB of payload). Every file was then copied to a different node and
   re-verified there from its own header, digest and payload alone — the node that will read
   that rank is the node that checked it.
+
+### 8. Open risk: the dynamic short convolution's tap order
+
+The released checkpoint stores the full layers' convolution as `static_w` of shape
+`[kernel, channels]` plus a per-token projection, and ships no modelling code. Two readings are
+possible: row `k` is conv1d index `k` (PyTorch correlation, so `k` covers distance
+`kernel - 1 - k`), or row `k` is already distance `k`. The host originally used the second for
+the dynamic form while the static depthwise form (`[channels, 1, kernel]`) used the first; both
+now use the PyTorch reading, which is the only one that makes the two convolutions of the same
+layer agree.
+
+That choice is observable: the first token for the raw completion "Hi" changed from `719` to
+`Ġ` (a space, top-1 at -2.12 nats, next `Ġwherein` at -2.67) when the dynamic order was made
+consistent. Nothing in the release settles which reading the exporter used, so this stays the
+first thing to check against a reference implementation, and the kernels follow the host either
+way — `inkling_short_conv_dynamic` and its decode form are held to the same oracle.
 
 ## Bring-up order
 

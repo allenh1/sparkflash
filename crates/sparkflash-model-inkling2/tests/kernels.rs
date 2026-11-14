@@ -566,3 +566,146 @@ fn the_relative_attention_decode_matches_the_host() {
         .collect();
     assert_close_bf16("attn_decode", &rounded, &device);
 }
+#[test]
+fn the_nvfp4_expert_matvec_matches_the_host() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    // One rank's gate/up row count: 2 * 2,304 rows of a 128-wide hidden state would be too
+    // large a dump to compare, so this runs a 96-row slice of the same geometry.
+    let rows = 96usize;
+    let columns = 128usize;
+    let scale_2 = 0.017_5f32;
+    let mut rng = Lcg::new(0xf4);
+    let mut codes = vec![0u8; rows * columns.div_ceil(2)];
+    for byte in &mut codes {
+        *byte = (rng.next().abs() * 255.0) as u8;
+    }
+    let scale_columns = columns.div_ceil(16);
+    let mut scales = vec![0u8; rows * scale_columns];
+    for code in &mut scales {
+        *code = 0x30 + (rng.next().abs() * 0x20 as f32) as u8;
+    }
+    let x = rng.values(columns);
+    let host = reference::nvfp4_matvec(&codes, &scales, scale_2, &x, rows, columns)
+        .expect("the host product");
+
+    let (_, kernel) = kernel(&cuda, "inkling_nvfp4_expert_matvec");
+    let codes_device = upload(&cuda, &codes);
+    let scales_device = upload(&cuda, &scales);
+    let x_device = upload_f32(&cuda, &x);
+    let out = upload_zeros(&cuda, rows);
+    cuda.launch(
+        kernel,
+        (rows as u32, 1, 1),
+        (256, 1, 1),
+        &[
+            codes_device.0,
+            scales_device.0,
+            x_device.0,
+            out.0,
+            u(rows),
+            u(columns),
+            f(scale_2),
+        ],
+    )
+    .expect("nvfp4_expert_matvec launch");
+    let device = download_f32(&cuda, &out, rows);
+    assert_close("nvfp4_expert_matvec", &host, &device);
+}
+
+#[test]
+fn the_mxfp8_expert_matvec_matches_the_host() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let rows = 96usize;
+    let columns = 128usize;
+    let block = 32usize;
+    let mut rng = Lcg::new(0xf8);
+    let mut codes = vec![0u8; rows * columns];
+    for byte in &mut codes {
+        *byte = (rng.next().abs() * 255.0) as u8;
+    }
+    let scale_columns = columns.div_ceil(block);
+    let mut scales = vec![0u8; rows * scale_columns];
+    for code in &mut scales {
+        *code = 0x78 + (rng.next().abs() * 8.0) as u8;
+    }
+    let x = rng.values(columns);
+    let host = reference::mxfp8_matvec(&codes, &scales, &x, rows, columns, block)
+        .expect("the host product");
+
+    let (_, kernel) = kernel(&cuda, "inkling_mxfp8_expert_matvec");
+    let codes_device = upload(&cuda, &codes);
+    let scales_device = upload(&cuda, &scales);
+    let x_device = upload_f32(&cuda, &x);
+    let out = upload_zeros(&cuda, rows);
+    cuda.launch(
+        kernel,
+        (rows as u32, 1, 1),
+        (256, 1, 1),
+        &[
+            codes_device.0,
+            scales_device.0,
+            x_device.0,
+            out.0,
+            u(rows),
+            u(columns),
+            u(block),
+        ],
+    )
+    .expect("mxfp8_expert_matvec launch");
+    let device = download_f32(&cuda, &out, rows);
+    assert_close("mxfp8_expert_matvec", &host, &device);
+}
+
+#[test]
+fn the_sigmoid_router_matches_the_host() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let experts = 384usize;
+    let top_k = 8usize;
+    let route_scale = 8.0f32;
+    let mut rng = Lcg::new(0x4074);
+    let logits = rng.values(experts);
+    let bias = rng.values(experts);
+    let (host_indices, host_weights) =
+        reference::router_topk(&logits, &bias, experts, top_k, route_scale);
+
+    let (_, kernel) = kernel(&cuda, "inkling_router_topk");
+    let logits_device = upload_f32(&cuda, &logits);
+    let bias_device = upload_f32(&cuda, &bias);
+    let indices_device = upload(&cuda, &vec![0u8; top_k * 4]);
+    let weights_device = upload_zeros(&cuda, top_k);
+    cuda.launch(
+        kernel,
+        (1, 1, 1),
+        (32, 1, 1),
+        &[
+            logits_device.0,
+            bias_device.0,
+            indices_device.0,
+            weights_device.0,
+            u(experts),
+            u(top_k),
+            f(route_scale),
+        ],
+    )
+    .expect("router_topk launch");
+    cuda.synchronize().expect("synchronize");
+    let mut index_bytes = vec![0u8; top_k * 4];
+    cuda.copy_dtoh(&mut index_bytes, &indices_device)
+        .expect("download indices");
+    let device_indices: Vec<usize> = index_bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| i32::from_le_bytes(*word) as usize)
+        .collect();
+    let device_weights = download_f32(&cuda, &weights_device, top_k);
+    assert_eq!(device_indices, host_indices, "the router chose other experts");
+    assert_close("router_topk", &host_weights, &device_weights);
+}
+

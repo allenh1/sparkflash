@@ -19,9 +19,11 @@
 // bodies stay in their own sources (they are also probed on their own), so this file is only
 // the image's composition. Every symbol is loaded by name; a missing one is a load error.
 //
-// The shared token, GEMV, RMSNorm, router, routed-MoE plan and combine kernels stay in their
-// own images and are reused unchanged.
+// The shared token, GEMV, RMSNorm and routed-MoE plan kernels stay in their own images and are
+// reused unchanged; the expert's own weight format and the sigmoid router are this pack's and
+// live in inkling_moe_sm121.cu.
 
 #include "inkling_attn_sm121.cu"
 #include "inkling_conv_sm121.cu"
 #include "inkling_epilogue_sm121.cu"
+#include "inkling_moe_sm121.cu"

@@ -367,6 +367,9 @@ impl Image {
                 "inkling_short_conv_decode",
                 "inkling_short_conv_dynamic",
                 "inkling_short_conv_dynamic_decode",
+                "inkling_mxfp8_expert_matvec",
+                "inkling_nvfp4_expert_matvec",
+                "inkling_router_topk",
                 "inkling_softcapped_swiglu",
             ],
             Self::Dory => &[

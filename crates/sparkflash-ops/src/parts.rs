@@ -241,6 +241,16 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
             .top_k_equals(8)
             .max_experts(512)
             .max_top_k(64),
+        // Inkling's routed experts are 384 experts of 2,304 intermediate columns at a 4,608
+        // hidden width, top-8, with a sigmoid router. The body is a scalar dequantise, so the
+        // only fixed shape is the width it was written for.
+        (Part::Moe, Image::Inkling) => ShapeConstraint::ANY
+            .hidden_equals(4608)
+            .intermediate_multiple(16)
+            .experts_equals(384)
+            .top_k_equals(8)
+            .max_experts(512)
+            .max_top_k(64),
         // The shared dense projection. The b12x and q4p bodies are generic over the hidden and
         // intermediate widths, so this entry is not pinned to one model's 5120.
         (Part::DenseGemm, Image::Deepseek) => ShapeConstraint::ANY,
@@ -976,6 +986,26 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("moe_expert_stage_sm121", &[Precision::Bf16]),
         ],
         true,
+    ),
+    // Inkling's routed experts read two weight formats the shared plans do not: ModelOpt NVFP4
+    // with a per-expert scale, and MXFP8 with a ue8m0 block scale. Because both factors are
+    // linear, an expert's scale is applied to its own output, so one body serves every expert.
+    // Its router is a sigmoid schedule (score + bias, then route_scale), not the shared softmax.
+    sm121(
+        Part::Moe,
+        Image::Inkling,
+        &[
+            sym(
+                "inkling_nvfp4_expert_matvec",
+                &[Precision::NvFp4, Precision::F32],
+            ),
+            sym(
+                "inkling_mxfp8_expert_matvec",
+                &[Precision::MxFp8, Precision::F32],
+            ),
+            sym("inkling_router_topk", &[Precision::F32]),
+        ],
+        false,
     ),
     sm121(
         Part::Moe,

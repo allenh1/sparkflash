@@ -17,8 +17,7 @@ use std::sync::Arc;
 use sparkflash_model::architecture::WeightFormat;
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::linalg::decode_by_name;
-use sparkflash_weights::nvfp4::dequantize_nvfp4;
-use sparkflash_weights::quant::{decode_f8e4m3, f4e2m1_to_f32, f8e4m3_to_f32};
+use sparkflash_weights::quant::{decode_f8e4m3, f4e2m1_to_f32};
 
 use crate::config::Inkling2Config;
 
@@ -215,11 +214,17 @@ impl Inkling2Weights {
         Ok(out)
     }
 
-    fn expert_matrix(
+    /// One expert's matrix-vector product, streamed from the checkpoint.
+    ///
+    /// The weights are never materialised: the codes and scales for the one expert are read and
+    /// multiplied straight into the product, which is what keeps a routed expert a few megabytes
+    /// of I/O instead of a four-gigabyte buffer.
+    fn expert_matvec(
         &self,
         layer: usize,
         expert: usize,
         which: &str,
+        input: &[f32],
         rows: usize,
         columns: usize,
     ) -> Result<Vec<f32>, String> {
@@ -228,42 +233,38 @@ impl Inkling2Weights {
             WeightFormat::NvFp4 { group_size } => {
                 let amax = self.vector(&format!("{prefix}_weight_amax"))?;
                 let outer = self.vector(&format!("{prefix}_weight_outer_scale_denominator"))?;
-                let packed = columns.div_ceil(2);
-                let scale_columns = columns.div_ceil(group_size);
-                let code_stride = rows * packed;
-                let scale_stride = rows * scale_columns;
-                let start = expert * code_stride;
-                let scale_start = expert * scale_stride;
-                let codes = self.range(&format!("{prefix}_weight"), start, code_stride)?;
-                let scales = self.range(&format!("{prefix}_weight_scale"), scale_start, scale_stride)?;
-                let scale_2 = nvfp4_outer_scale(
-                    amax[expert],
-                    outer.first().copied().unwrap_or(1.0),
-                );
-                dequantize_nvfp4(&codes, &scales, scale_2, rows, columns)
+                let code_stride = rows * columns.div_ceil(2);
+                let scale_stride = rows * columns.div_ceil(group_size);
+                let codes = self.range(
+                    &format!("{prefix}_weight"),
+                    expert * code_stride,
+                    code_stride,
+                )?;
+                let scales = self.range(
+                    &format!("{prefix}_weight_scale"),
+                    expert * scale_stride,
+                    scale_stride,
+                )?;
+                let scale_2 =
+                    nvfp4_outer_scale(amax[expert], outer.first().copied().unwrap_or(1.0));
+                crate::reference::nvfp4_matvec(&codes, &scales, scale_2, input, rows, columns)
                     .map_err(|error| format!("{prefix}: {error}"))
             }
             WeightFormat::MxFp8 { block } => {
-                let scale_columns = columns.div_ceil(block);
                 let code_stride = rows * columns;
-                let scale_stride = rows * scale_columns;
-                let code_start = expert * code_stride;
-                let scale_start = expert * scale_stride;
-                let codes = self.range(&format!("{prefix}_weight"), code_start, code_stride)?;
-                let scales = self.range(&format!("{prefix}_weight_scale"), scale_start, scale_stride)?;
-                let mut out = vec![0f32; rows * columns];
-                for row in 0..rows {
-                    let codes = &codes[row * columns..(row + 1) * columns];
-                    let scales = &scales[row * scale_columns..(row + 1) * scale_columns];
-                    let out_row = &mut out[row * columns..(row + 1) * columns];
-                    for (column, value) in out_row.iter_mut().enumerate() {
-                        // One E4M3 byte times its block's ue8m0 power of two. Decoding inline
-                        // matters here: an E4M3 decode per element through a one-byte slice was
-                        // sixteen times slower than the NVFP4 rows on the same checkpoint.
-                        *value = f8e4m3_to_f32(codes[column]) * e8m0_scale(scales[column / block]);
-                    }
-                }
-                Ok(out)
+                let scale_stride = rows * columns.div_ceil(block);
+                let codes = self.range(
+                    &format!("{prefix}_weight"),
+                    expert * code_stride,
+                    code_stride,
+                )?;
+                let scales = self.range(
+                    &format!("{prefix}_weight_scale"),
+                    expert * scale_stride,
+                    scale_stride,
+                )?;
+                crate::reference::mxfp8_matvec(&codes, &scales, input, rows, columns, block)
+                    .map_err(|error| format!("{prefix}: {error}"))
             }
             WeightFormat::Bf16 => {
                 // A synthetic fixture stores the experts as one dense BF16 tensor
@@ -277,9 +278,16 @@ impl Inkling2Weights {
                         values.len()
                     ));
                 }
-                Ok(values[expert * stride..(expert + 1) * stride].to_vec())
+                Ok(matvec(
+                    &values[expert * stride..(expert + 1) * stride],
+                    input,
+                    rows,
+                    columns,
+                ))
             }
-            other => Err(format!("layer {layer} expert format {other:?} is not supported by the host")),
+            other => Err(format!(
+                "layer {layer} expert format {other:?} is not supported by the host"
+            )),
         }
     }
 
@@ -592,15 +600,15 @@ impl Inkling2Weights {
         let gate = self.matrix(&format!("{prefix}.gate.weight"), config.n_routed_experts, config.hidden_size)?;
         let bias = self.vector(&format!("{prefix}.gate.bias"))?;
         let logits = matvec_parallel(&gate, input, config.n_routed_experts, config.hidden_size);
-        let scores: Vec<f32> = logits.iter().map(|value| 1.0 / (1.0 + (-value).exp())).collect();
-        let mut selected: Vec<usize> = (0..config.n_routed_experts).collect();
-        selected.sort_by(|a, b| (scores[*b] + bias[*b]).total_cmp(&(scores[*a] + bias[*a])));
-        selected.truncate(config.num_experts_per_tok);
-        let sum: f32 = selected.iter().map(|index| scores[*index]).sum();
-        let mixes: Vec<f32> = selected
-            .iter()
-            .map(|expert| scores[*expert] / (sum + 1e-20) * config.route_scale as f32)
-            .collect();
+        // The router is the oracle's: a sigmoid a expert, the learned bias on the selection, and
+        // the selected scores' shares under route_scale.
+        let (selected, mixes) = crate::reference::router_topk(
+            &logits,
+            &bias,
+            config.n_routed_experts,
+            config.num_experts_per_tok,
+            config.route_scale as f32,
+        );
         let intermediate = 2 * config.moe_intermediate_size;
         // The routed band is a handful of independent experts, each one a dequantise plus two
         // products. They run on every core; the mix below stays in router order so the f32 sum is
@@ -611,28 +619,31 @@ impl Inkling2Weights {
             for (slot, expert) in selected.iter().copied().enumerate() {
                 let this = &*self;
                 handles.push(scope.spawn(move || -> Result<(usize, Vec<f32>), String> {
-                    let gate_up = this.expert_matrix(
+                    let gate_up = this.expert_matvec(
                         layer,
                         expert,
                         "w13",
+                        input,
                         intermediate,
                         config.hidden_size,
                     )?;
-                    let down = this.expert_matrix(
-                        layer,
-                        expert,
-                        "w2",
-                        config.hidden_size,
-                        config.moe_intermediate_size,
-                    )?;
-                    let gate_up = matvec(&gate_up, input, intermediate, config.hidden_size);
                     let act = crate::reference::softcapped_swiglu(
                         &gate_up,
                         config.moe_intermediate_size,
                         config.mlp_gate_softcap as f32,
                         config.mlp_up_softcap as f32,
                     );
-                    Ok((slot, matvec(&down, &act, config.hidden_size, config.moe_intermediate_size)))
+                    Ok((
+                        slot,
+                        this.expert_matvec(
+                            layer,
+                            expert,
+                            "w2",
+                            &act,
+                            config.hidden_size,
+                            config.moe_intermediate_size,
+                        )?,
+                    ))
                 }));
             }
             for handle in handles {

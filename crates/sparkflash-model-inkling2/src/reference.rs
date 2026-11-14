@@ -381,3 +381,140 @@ fn rms_norm_in_place(input: &mut [f32], epsilon: f64) {
         *value *= scale;
     }
 }
+
+/// One NVFP4 expert's matrix-vector product: `y = W x`, with `W` dequantised on the fly.
+///
+/// `codes` is `[rows, columns / 2]` with the **low** nibble the even column, `scales` is
+/// `[rows, columns / 16]` of E4M3 multipliers, and `scale_2` is the expert's own
+/// `amax / (6 * outer_scale_denominator)`. The release stores one of those per expert, so the
+/// factor rides on the expert's output rather than on a shared tensor constant.
+///
+/// # Errors
+/// A tensor whose length does not match the shape.
+pub fn nvfp4_matvec(
+    codes: &[u8],
+    scales: &[u8],
+    scale_2: f32,
+    input: &[f32],
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, String> {
+    let packed = columns.div_ceil(2);
+    let scale_columns = columns.div_ceil(16);
+    if codes.len() != rows * packed {
+        return Err(format!(
+            "the NVFP4 codes hold {} bytes, expected {rows}x{packed}",
+            codes.len()
+        ));
+    }
+    if scales.len() != rows * scale_columns {
+        return Err(format!(
+            "the NVFP4 scales hold {} bytes, expected {rows}x{scale_columns}",
+            scales.len()
+        ));
+    }
+    if input.len() != columns {
+        return Err(format!(
+            "the input is {} wide, expected {columns}",
+            input.len()
+        ));
+    }
+    let mut out = vec![0f32; rows];
+    for row in 0..rows {
+        let codes = &codes[row * packed..(row + 1) * packed];
+        let scales = &scales[row * scale_columns..(row + 1) * scale_columns];
+        let mut value = 0.0f32;
+        for (column, weight) in input.iter().enumerate() {
+            let byte = codes[column / 2];
+            let code = if column % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            let scale = sparkflash_weights::quant::f8e4m3_to_f32(scales[column / 16]);
+            value += sparkflash_weights::quant::f4e2m1_to_f32(code) * scale * weight;
+        }
+        out[row] = value * scale_2;
+    }
+    Ok(out)
+}
+
+/// One MXFP8 expert's matrix-vector product.
+///
+/// `codes` is `[rows, columns]` of E4M3, `scales` is `[rows, columns / block]` of ue8m0
+/// codes (a power of two each), and the layer has no per-expert factor.
+///
+/// # Errors
+/// A tensor whose length does not match the shape.
+pub fn mxfp8_matvec(
+    codes: &[u8],
+    scales: &[u8],
+    input: &[f32],
+    rows: usize,
+    columns: usize,
+    block: usize,
+) -> Result<Vec<f32>, String> {
+    let scale_columns = columns.div_ceil(block);
+    if codes.len() != rows * columns || scales.len() != rows * scale_columns {
+        return Err(format!(
+            "the MXFP8 tensors do not match a {rows}x{columns} weight at block {block}"
+        ));
+    }
+    if input.len() != columns {
+        return Err(format!(
+            "the input is {} wide, expected {columns}",
+            input.len()
+        ));
+    }
+    let mut out = vec![0f32; rows];
+    for row in 0..rows {
+        let codes = &codes[row * columns..(row + 1) * columns];
+        let scales = &scales[row * scale_columns..(row + 1) * scale_columns];
+        let mut value = 0.0f32;
+        for (column, weight) in input.iter().enumerate() {
+            let code = sparkflash_weights::quant::f8e4m3_to_f32(codes[column]);
+            value += code * ue8m0(scales[column / block]) * weight;
+        }
+        out[row] = value;
+    }
+    Ok(out)
+}
+
+/// A ue8m0 scale code: the power of two `2^(code - 127)`.
+#[must_use]
+pub fn ue8m0(code: u8) -> f32 {
+    f32::from_bits(u32::from(code) << 23)
+}
+
+/// The sigmoid router: a score a expert, a learned bias on the selection, and the selected
+/// experts' shares.
+///
+/// The released router scores with a sigmoid (not a softmax), ranks `score + bias`, and scales
+/// the selected scores by `route_scale` over their sum. Ties keep the lower expert index, so the
+/// schedule is a function of the scores alone.
+#[must_use]
+pub fn router_topk(
+    logits: &[f32],
+    bias: &[f32],
+    experts: usize,
+    top_k: usize,
+    route_scale: f32,
+) -> (Vec<usize>, Vec<f32>) {
+    let scores: Vec<f32> = logits[..experts]
+        .iter()
+        .map(|value| 1.0 / (1.0 + (-value).exp()))
+        .collect();
+    let mut order: Vec<usize> = (0..experts).collect();
+    order.sort_by(|left, right| {
+        let left_score = scores[*left] + bias.get(*left).copied().unwrap_or(0.0);
+        let right_score = scores[*right] + bias.get(*right).copied().unwrap_or(0.0);
+        right_score
+            .total_cmp(&left_score)
+            .then_with(|| left.cmp(right))
+    });
+    order.truncate(top_k);
+    let sum: f32 = order.iter().map(|expert| scores[*expert]).sum();
+    let shares = order
+        .iter()
+        .map(|expert| scores[*expert] / (sum + 1e-20) * route_scale)
+        .collect();
+    (order, shares)
+}
+
+

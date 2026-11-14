@@ -115,7 +115,7 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        46,
+        47,
         "the list must name every baseline kernel - the forty-three entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
