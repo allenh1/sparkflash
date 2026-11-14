@@ -276,6 +276,10 @@ impl ModelBackend for GroupBackend {
         self.device.capabilities()
     }
 
+    fn fabric_mode(&self) -> Option<&'static str> {
+        Some("tcp tp4 device")
+    }
+
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
         Ok(Box::new(GroupSession {
             inner: self.device.open_session()?,

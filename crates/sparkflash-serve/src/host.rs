@@ -142,6 +142,10 @@ impl HostDriver {
             return Err("the host engine needs at least one worker".to_owned());
         }
         let descriptor = Arc::new(backend.descriptor().clone());
+        let fabric = backend
+            .fabric_mode()
+            .unwrap_or("none (host backend)")
+            .to_owned();
         // The model says what it can render; the driver adds what its own loop implements.
         // run_request feeds a forced token in place of the backend's choice, through the same
         // session.decode every request takes, so teacher forcing is this driver's to declare.
@@ -205,7 +209,7 @@ impl HostDriver {
             })
             .map_err(|error| format!("cannot start the host engine monitor: {error}"))?;
         drop(queued);
-        let cluster = cluster_snapshot(&descriptor);
+        let cluster = cluster_snapshot(&descriptor, &fabric);
         Ok(Self {
             model: descriptor.id.clone(),
             descriptor,
@@ -317,11 +321,15 @@ impl InferenceEngine for HostDriver {
         }
         // The worker sends `Started` once it has decided which session serves the request, so the
         // event can carry the prefix the engine already holds. It is still the first event.
+        // The finish event's transport block names the fabric this driver's backend declared, so
+        // a four-rank device server does not report "no cluster" on the response it served.
+        let fabric = self.cluster.fabric_mode.clone();
         let answers = stream::unfold(
             AnswerState {
                 answers,
                 prompt_tokens,
                 done: false,
+                fabric,
             },
             move |mut state| async move {
                 if state.done {
@@ -341,7 +349,8 @@ impl InferenceEngine for HostDriver {
                     }
                     Some(Reply::Done(summary)) => {
                         state.done = true;
-                        Some((finished_event(state.prompt_tokens, *summary), state))
+                        let fabric = state.fabric.clone();
+                        Some((finished_event(state.prompt_tokens, *summary, &fabric), state))
                     }
                     Some(Reply::Failed(message)) => {
                         state.done = true;
@@ -388,6 +397,8 @@ struct AnswerState {
     answers: mpsc::Receiver<Reply>,
     prompt_tokens: usize,
     done: bool,
+    /// The fabric this driver's backend declared, carried to the finish event's transport block.
+    fabric: String,
 }
 
 /// One queued generation request.
@@ -852,7 +863,7 @@ fn top_k(logprobs: &[f32], count: usize) -> Vec<usize> {
     order
 }
 
-fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
+fn finished_event(prompt_tokens: usize, summary: HostSummary, fabric: &str) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     let speculation = summary.speculation;
     let cached = summary.cached_tokens.min(prompt_tokens);
@@ -881,7 +892,7 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
             speculation.drafts_accepted,
         ),
         transport: RoceTransportStats {
-            fabric_mode: "none (host backend)".to_owned(),
+            fabric_mode: fabric.to_owned(),
             ..RoceTransportStats::default()
         },
         timing: RequestTimingStats {
@@ -915,15 +926,15 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
     }
 }
 
-fn cluster_snapshot(descriptor: &ModelDescriptor) -> ClusterStatsSnapshot {
+fn cluster_snapshot(descriptor: &ModelDescriptor, fabric: &str) -> ClusterStatsSnapshot {
     ClusterStatsSnapshot {
         model: descriptor.id.clone(),
-        fabric_mode: "none (host backend)".to_owned(),
+        fabric_mode: fabric.to_owned(),
         nodes: Vec::new(),
         kv: empty_kv_snapshot(),
         engram: Vec::new(),
         transport: RoceTransportStats {
-            fabric_mode: "none (host backend)".to_owned(),
+            fabric_mode: fabric.to_owned(),
             ..RoceTransportStats::default()
         },
         dspark: DSparkStepStats::default(),

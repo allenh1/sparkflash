@@ -206,6 +206,15 @@ pub trait ModelBackend: Send + Sync {
         self.descriptor().capabilities
     }
 
+    /// The interconnect this backend's ranks exchange over, when it serves a group.
+    ///
+    /// A single-process backend leaves this `None`, and the serving layer reports that there is no
+    /// cluster behind it. A backend that is one rank of a group names the transport honestly, so
+    /// the model card and the cluster stats do not claim "no cluster" for a four-host server.
+    fn fabric_mode(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Opens a fresh sequence.
     ///
     /// # Errors

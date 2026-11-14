@@ -489,6 +489,14 @@ impl ModelBackend for InklingDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        // A CUDA context is per-thread: [Cuda::load] makes the primary context current on the
+        // thread that opened the backend, and the generic host driver opens a sequence on its own
+        // worker thread. Without this bind the first allocation answers CUDA_ERROR_INVALID_CONTEXT
+        // (201) - which is exactly how the four-rank server failed its first request.
+        self.shared
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new(DEVICE, error))?;
         let state =
             State::allocate(&self.shared).map_err(|error| BackendError::new(DEVICE, error))?;
         Ok(Box::new(InklingDeviceSession {
