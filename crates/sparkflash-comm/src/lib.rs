@@ -70,6 +70,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sparkflash_trace::{TraceScope, spark_trace_span};
 
 pub mod bf16;
+pub mod control;
 pub mod device_reduce;
 pub mod dispatch;
 pub mod error;

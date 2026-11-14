@@ -690,7 +690,8 @@ no load-time check can see. Two of this arm's four worst hours came from that sh
 The three pieces the previous revision of this section named are in, and the arm answers HTTP.
 
 1. **Rank identity.** `sparkflash serve --rank/--world/--peer/--control-port/--converted` — the
-   batch command's own flags, moved behind `ServeOptions` (`GroupOptions` in `serve.rs`). They
+   batch command's own flags, moved behind `ServeOptions` (`GroupOptions` in the arm's `group`
+   module, parsed by `group_from_cli` in `serve.rs`). They
    parse unconditionally and refuse with a feature message when the binary has no `tp4-serve`.
    `--peer` carries each rank's collective address (`host:port`, rank order), `--control-port`
    defaults to 29700 at `peers[0]`, and `--converted` falls back to
@@ -710,6 +711,13 @@ The three pieces the previous revision of this section named are in, and the arm
    control channel is the shared `tp4_control` Hello/Ready/Request/Token/End protocol.
 3. **The codec.** Unchanged: `InklingCodec` was already registered, and the served path renders
    the chat template, encodes and detokenises exactly as the TP1 host reference does.
+
+The rank machinery lives in `sparkflash-model-inkling2::group` - the backend, the session that
+broadcasts before each step, and the worker mirror. The control frames and the hub/worker moved to
+`sparkflash-comm::control`, where the DeepSeek host group reads them too. Both moves were
+forced by the CLI's source-line ratchet (`sparkflash-ops/tests/one_stack.rs`, 34,000 lines):
+the CLI was already at 34,245 before this work, and the server would have taken it to 35,274. It is
+33,961 now, which is under the gate and not a licence to grow.
 
 A group that names no `--context` admits 256K, not the released 1M window: every rank allocates
 its KV at the admitted context, and 1M is 8 GiB a rank. `--context` still reaches 1,048,576.
