@@ -327,7 +327,7 @@ pub enum BandOp {
 /// The stored format a layer's routed experts read.
 ///
 /// The three differ in what a scale multiplies and where the bytes are: NVFP4 packs two E2M1 codes
-/// a byte with one E4M3 block scale a 16 columns and a per-expert `amax / (6 * denominator)`;
+/// a byte with one E4M3 block scale a 16 columns and a per-expert `amax / denominator`;
 /// MXFP8 is one E4M3 byte a value with a ue8m0 block scale a 32 columns and no per-expert factor;
 /// and a BF16 band is one dense `[experts][rows][columns]` matrix, which an unquantised
 /// checkpoint and the tiny fixture store.

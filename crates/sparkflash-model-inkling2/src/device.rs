@@ -217,7 +217,7 @@ struct ClipScales {
 
 /// The per-expert scale a stored format puts on an expert's own output.
 ///
-/// An NVFP4 expert stores amax over six times its outer-scale denominator, and that factor is
+/// An NVFP4 expert stores amax over its outer-scale denominator, and that factor is
 /// linear, so it rides on the expert's output: the arm multiplies it into the mix's share and no
 /// kernel needs a per-expert amax. A band without one records nothing.
 struct ExpertScale {
@@ -630,8 +630,9 @@ fn expert_scales(
                 .map(|word| f32::from_le_bytes(*word))
                 .collect())
         };
-        // ModelOpt's NVFP4 outer scale is amax over six times the outer-scale denominator, the
-        // same convention the host forward's nvfp4_outer_scale records.
+        // ModelOpt's NVFP4 outer scale is amax over the outer-scale denominator, which already
+        // carries the six times the E4M3 maximum: the same convention the host forward's
+        // nvfp4_outer_scale records.
         let scale = |amax: Vec<f32>, denominator: Vec<f32>| -> Vec<f32> {
             let denominator = denominator
                 .first()
@@ -639,7 +640,7 @@ fn expert_scales(
                 .filter(|value| *value != 0.0)
                 .unwrap_or(1.0);
             amax.into_iter()
-                .map(|value| value / (6.0 * denominator))
+                .map(|value| value / denominator)
                 .collect()
         };
         let gate_up = scale(

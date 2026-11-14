@@ -785,16 +785,16 @@ impl Inkling2State {
     }
 }
 
-/// ModelOpt's NVFP4 outer scale.
+/// ModelOpt's NVFP4 outer scale: `amax / outer_scale_denominator`.
 ///
-/// The released Inkling groups record weight_scale_format amax_denominator and store a
-/// per-expert amax plus a per-tensor denominator. NVIDIA's NVFP4 reference divides the amax by
-/// six times that denominator; this is the one place the host asserts that convention, so a
-/// converted checkpoint with a different producer can be corrected here rather than in three
-/// call sites.
+/// The released groups store a per-expert amax and one per-tensor denominator, and that
+/// denominator is already six times the E4M3 maximum (the checkpoint carries 2,688 = 6 * 448), so
+/// the `/ 6` the NVIDIA reference folds into it is inside the stored number. Dividing by it twice
+/// scales every routed expert's weight by a sixth: the decoded matrix then has an rms of 0.0025
+/// where the layer's BF16 projections have 0.0147, which is how this was found.
 fn nvfp4_outer_scale(amax: f32, denominator: f32) -> f32 {
     let denominator = if denominator == 0.0 { 1.0 } else { denominator };
-    amax / (6.0 * denominator)
+    amax / denominator
 }
 
 /// A ue8m0 scale code: the power of two 2^(code - 127).

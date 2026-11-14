@@ -550,8 +550,41 @@ test from "the logits are NaN" to 0.26% of the row took three fixes, all of them
   was launched with `num_key_value_heads * kernel` rows of `weight_proj` output while the rank's
   `weight_proj` holds one head a rank.
 
+### 11. The four-node run, and what is still wrong
+
+`sparkflash inkling-tp4` runs one rank of a four-host cluster. On the four DGX Sparks the four
+converted ranks load, connect over TCP, and answer in lockstep: 97.48 GB of weights a rank in
+96-123 s, a 5-token prefill in 0.6-3.4 s at TP4, and 111-147 ms a decode token, with all four
+ranks reporting the same tokens and the same top logit. That is the arm running at the released
+geometry, and it is the first thing the cluster has ever done with this checkpoint on the device.
+
+**Its answers were not yet the model's.** The first run produced a repeating token. Diffing the
+released transformers implementation (`modeling_inkling2.py`) against `forward.rs` and
+`reference.rs` found three arithmetic defects, all now fixed: the dynamic short convolution
+dropped its input term (`(conv + x) / sqrt(2k + 1)`, not `conv / sqrt(...)`), its tap tables
+count the distance back rather than conv1d order, and a sliding layer normalized the raw stream
+instead of its block-attention residual input - the last one silently dropped the released
+softmax mix on 39 of 48 layers.
+
+A fourth defect came from the checkpoint rather than the code. The NVFP4 per-expert factor is
+`amax / outer_scale_denominator`, and the stored denominator is already six times the E4M3
+maximum (the file carries 2,688 = 6 * 448). Dividing by the six again scaled every routed
+expert's weight to a sixth. The evidence is arithmetic: the largest stored block scale is 448, the
+largest code is 6, so `6 * 448 * amax / 2688` reproduces the stored `amax` exactly, and the
+decoded matrix's rms (0.014726) matches the layer's BF16 projections (0.014731) instead of being
+six times smaller.
+
+**Still open.** With those fixed the model is coherent but not right: asked
+"What is the capital of France? Answer with one word." it echoes the instruction, and the
+top-8 after "The quick brown fox jumps over the lazy" is `" "`, `" The"`, `" the"`,
+`" brown"` rather than " dog". The symptom is a model whose sublayer deltas are too small beside
+the embedding stream, so it behaves like a copy-the-last-token model; the next step is a
+layer-by-layer comparison against `modeling_inkling2.py` on the same checkpoint, not more
+inspection of our own two implementations, which agree with each other by construction.
+
 **What the arm still does not do:** a chunked prefill (it loops the decode walk, which is correct
-and slow), the DSpark drafter, the image path, and the 367 GB run itself.
+and slow), the DSpark drafter, the image path, and a serving path for the device arm (`serve`
+still selects the TP1 f32 host reference for this pack).
 
 ## Bring-up order
 
