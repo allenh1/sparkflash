@@ -95,11 +95,25 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     float* __restrict__ out,
     int rows,
     int columns,
-    float scale_2) {
+    float scale_2,
+    const int* __restrict__ plan) {
     const int row = blockIdx.x;
     if (row >= rows || columns <= 0) {
         return;
     }
+    // A chunk selects its own experts a (row, band slot) pair, so one launch carries every pair
+    // that picked this expert: `plan` holds those pairs and blockIdx.y indexes it.
+    //
+    // The two offsets are not the same index and this is where they part: the *input* row of the
+    // gate/up projection is the token's own row of the stream, while the *output* goes to the
+    // pair's band slot. The down projection's input is that band slot instead, which is why the
+    // plan carries both numbers rather than one. A decode step passes no plan, which leaves one
+    // pair and the launch's own buffer - the shape this entry had before a chunk existed.
+    const int entry = blockIdx.y;
+    const int input_row = plan != nullptr ? plan[2 * entry] : entry;
+    const int output_slot = plan != nullptr ? plan[2 * entry + 1] : entry;
+    x += (uint64_t)input_row * columns;
+    out += (uint64_t)output_slot * rows;
     const int packed = (columns + 1) / 2;
     const int scale_columns = (columns + 15) / 16;
     const unsigned char* row_codes = codes + (uint64_t)row * packed;
@@ -127,11 +141,20 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     float* __restrict__ out,
     int rows,
     int columns,
-    int block) {
+    int block,
+    const int* __restrict__ plan) {
     const int row = blockIdx.x;
     if (row >= rows || columns <= 0 || block <= 0) {
         return;
     }
+    // The input row of a pair is not always its band slot: the gate/up projection reads the
+    // token's row of the stream and writes the pair's slot, while the down projection reads the
+    // slot it was activated in. Both numbers travel in the plan, in this order.
+    const int entry = blockIdx.y;
+    const int input_row = plan != nullptr ? plan[2 * entry] : entry;
+    const int output_slot = plan != nullptr ? plan[2 * entry + 1] : entry;
+    x += (uint64_t)input_row * columns;
+    out += (uint64_t)output_slot * rows;
     const int scale_columns = (columns + block - 1) / block;
     const unsigned char* row_codes = codes + (uint64_t)row * columns;
     const unsigned char* row_scales = scales + (uint64_t)row * scale_columns;
@@ -159,9 +182,15 @@ extern "C" __global__ void __launch_bounds__(32) inkling_router_topk(
     int experts,
     int top_k,
     float route_scale) {
-    if (blockIdx.x != 0 || threadIdx.x != 0 || experts <= 0 || top_k <= 0 || top_k > experts) {
+    if (threadIdx.x != 0 || experts <= 0 || top_k <= 0 || top_k > experts) {
         return;
     }
+    // One block a row: a prefill chunk routes every row of the chunk, a decode step its one row
+    // (grid 1, which leaves the three offsets below at zero).
+    const int row = blockIdx.x;
+    logits += (uint64_t)row * experts;
+    indices += (uint64_t)row * top_k;
+    weights += (uint64_t)row * top_k;
     const int capacity = 4096;
     __shared__ float scores[capacity];
     __shared__ unsigned char taken[capacity];

@@ -306,6 +306,11 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
 // Prefill: grid (heads, rows). Row r is at absolute position first_position + r and sees the
 // cache rows 0..=position; a chunked prefill therefore passes the chunk's cache prefix in
 // keys/values, and the same body gives the same bits as decoding those rows one at a time.
+//
+// Three operands are per row and are offset here, not by the body: the query and its gate by
+// `row * heads * head_dim`, the relative profile by `row * heads * d_rel`, and the sink by
+// `row * heads` - the sink is a projection of the row's own input, one value a head, so a chunk
+// that passed row 0's sinks for every row would give a plausible wrong answer in bounds.
 extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     const float* __restrict__ q,
     const float* __restrict__ gate,
@@ -332,17 +337,23 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     float rel_clip,
     float tau,
     int value_norm,
-    float eps) {
+    float eps,
+    const float* __restrict__ tau_rows) {
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     if (head >= heads || row >= rows) {
         return;
     }
+    // A full layer's log scaling is a function of the absolute position, so a chunk's rows
+    // differ. The table is computed on the host by the same rule the row-at-a-time walk uses,
+    // which is what keeps the two paths' scores identical rather than merely close.
+    const float row_tau = tau_rows != nullptr ? tau_rows[row] : tau;
     const uint64_t head_offset = (uint64_t)head * head_dim;
     const uint64_t row_offset = (uint64_t)row * heads * head_dim;
     inkling_attn_one(q + row_offset + head_offset, gate + row_offset + head_offset, keys,
-                      values, rel_proj + (uint64_t)row * heads * d_rel, rel_bank, sink,
-                      q_scale, k_scale, rel_scale, out + row_offset + head_offset, head,
-                      kv_heads, head_dim, groups, first_position + row, window, cache_rows,
-                      rel_extent, d_rel, qk_clip, rel_clip, tau, value_norm, eps);
+                      values, rel_proj + (uint64_t)row * heads * d_rel, rel_bank,
+                      sink + (uint64_t)row * heads, q_scale, k_scale, rel_scale,
+                      out + row_offset + head_offset, head, kv_heads, head_dim, groups,
+                      first_position + row, window, cache_rows, rel_extent, d_rel, qk_clip,
+                      rel_clip, row_tau, value_norm, eps);
 }

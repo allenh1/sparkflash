@@ -34,19 +34,26 @@
 //
 // ABI:
 //
-//   inkling_short_conv(x, taps, out, rows, channels, kernel)
+//   inkling_short_conv(x, taps, out, rows, channels, kernel, lead)
 //     x, out   [rows][channels] f32 (a row-major matrix)
 //     taps     [channels][kernel] BF16, channel-major
+//     lead     rows of history physically in front of x, so `x - lead * channels` is the
+//              sample one row back. A chunk that continues a sequence passes its kernel - 1
+//              rows of history this way and needs no branch on the chunk's first rows; a cold
+//              start passes that many zero rows, which is the release's "no such sample".
 //
 //   inkling_short_conv_decode(x, taps, state, out, channels, kernel)
 //     x, out   [channels] f32
 //     state    [channels][kernel - 1] f32, oldest first; updated in place
 //
 //   inkling_short_conv_dynamic(x, static_taps, dynamic_taps, out, rows, channels, kernel,
-//                               head_dim)
+//                               head_dim, lead)
 //     x, out          [rows][channels] f32
 //     static_taps     [channels][kernel] BF16
-//     dynamic_taps    [rows][channels / head_dim][kernel] f32
+//     dynamic_taps    [rows][channels / head_dim][kernel] f32, one row of taps a row of x:
+//                      the dynamic half is a projection of the row's own input, never of the
+//                      history, so a lead needs no taps of its own.
+//     lead             as in inkling_short_conv
 //
 //   inkling_short_conv_dynamic_decode(x, static_taps, dynamic_taps, state, out, channels,
 //                                      kernel, head_dim)
@@ -54,11 +61,20 @@
 //     dynamic_taps    [channels / head_dim][kernel] f32
 //     state            [channels][kernel - 1] f32, updated in place
 //
-//   inkling_block_residual(summaries, partial, queries, out, blocks, hidden, nq, eps)
-//     summaries  [blocks][hidden] f32
-//     partial    [hidden] f32, nullable
-//     queries    [nq][hidden] f32 learned
-//     out        [nq][hidden] f32
+//   inkling_conv_history_copy(source, destination, channels, kernel, to_pad)
+//     The two layouts of a convolution's history: the decode form keeps a channel's taps
+//     together ([channels][kernel - 1], oldest first) and the row form keeps a row's channels
+//     together ([kernel - 1][channels], farthest first). `to_pad` reads the first and writes
+//     the second; zero does the reverse. A chunk reads its history in the row form and writes
+//     the next decode step's back in the channel form.
+//
+//   inkling_block_residual(summaries, partial, queries, out, blocks, hidden, nq, eps,
+//                          summary_stride)
+//     summaries  [rows][summary_stride] f32, of which row r's stack is the first
+//                `blocks * hidden` floats; a single-row walk passes stride 0
+//     partial    [rows][hidden] f32, nullable: each row's current sublayer input
+//     queries    [nq][hidden] f32 learned, shared by every row
+//     out        [rows][nq][hidden] f32
 //
 // The kernel width is 4 in the released checkpoint; the entries accept 1..INKLING_MAX_KERNEL
 // so the same body can be brought up against a different release.
@@ -98,7 +114,8 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv(
     float* __restrict__ out,
     int rows,
     int channels,
-    int kernel) {
+    int kernel,
+    int lead) {
     const int row = blockIdx.y;
     if (row >= rows) {
         return;
@@ -107,15 +124,20 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv(
         return;
     }
     const float scale = 1.0f / sqrtf((float)(kernel + 1));
+    // `lead` history rows sit in front of the first row of x, so a chunk's first rows read the
+    // rows the previous launch ended on instead of a zero that would drop a tap.
+    const int current_row = row + lead;
     for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
          channel += gridDim.x * INKLING_BLOCK) {
         float convolution = 0.0f;
-        for (int tap = 0; tap < kernel; ++tap) {
-            const int source_row = row - tap;
+        // The taps are accumulated in the decode entry's order - oldest sample first, the current
+        // sample last - and not merely over the same terms: f32 addition is not associative, and
+        // a chunk's row has to be the bits its own step would give it, or the two walks' residual
+        // streams part company a layer later. `tap` is the distance back, so the oldest sample is
+        // the largest tap and the weight index runs from 0 up.
+        for (int tap = kernel - 1; tap >= 0; --tap) {
+            const int source_row = current_row - tap;
             if (source_row >= 0) {
-                // The released taps are a conv1d kernel, so index k multiplies the input at
-                // distance kernel - 1 - k: index 0 is the oldest tap. `tap` here is the
-                // backward distance, which is why the index runs backwards.
                 convolution = __fadd_rn(
                     convolution,
                     __fmul_rn(__bfloat162float(taps[(uint64_t)channel * kernel + (kernel - 1 - tap)]),
@@ -123,7 +145,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv(
             }
         }
         out[(uint64_t)row * channels + channel] = __fmul_rn(
-            __fadd_rn(convolution, x[(uint64_t)row * channels + channel]), scale);
+            __fadd_rn(convolution, x[(uint64_t)current_row * channels + channel]), scale);
     }
 }
 
@@ -175,7 +197,8 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     int rows,
     int channels,
     int kernel,
-    int head_dim) {
+    int head_dim,
+    int lead) {
     const int row = blockIdx.y;
     if (row >= rows || head_dim <= 0) {
         return;
@@ -185,6 +208,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     }
     const float scale = 1.0f / sqrtf((float)(2 * kernel + 1));
     const int heads = channels / head_dim;
+    const int current_row = row + lead;
     for (int channel = blockIdx.x * INKLING_BLOCK + threadIdx.x; channel < channels;
          channel += gridDim.x * INKLING_BLOCK) {
         const int head = channel / head_dim;
@@ -192,22 +216,33 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
             continue;
         }
         float convolution = 0.0f;
-        for (int tap = 0; tap < kernel; ++tap) {
-            const int source_row = row - tap;
+        // The decode entry accumulates the stored history newest first and the current sample
+        // last; the terms here are the same ones in that order, for the same reason the static
+        // convolution does: a chunk's row must be the row's own bits.
+        for (int lag = 1; lag < kernel; ++lag) {
+            const int source_row = current_row - lag;
             if (source_row < 0) {
                 continue;
             }
-            // Both tap tables count the distance back, so index tap is the sample tap steps ago:
+            // Both tap tables count the distance back, so index lag is the sample lag steps ago:
             // static_w is [kernel, channels] and the projection's rows are [heads, kernel].
             const float weight =
-                __fadd_rn(__bfloat162float(static_taps[(uint64_t)tap * channels + channel]),
-                          dynamic_taps[((uint64_t)row * heads + head) * kernel + tap]);
+                __fadd_rn(__bfloat162float(static_taps[(uint64_t)lag * channels + channel]),
+                          dynamic_taps[((uint64_t)row * heads + head) * kernel + lag]);
+            convolution = __fadd_rn(
+                convolution, __fmul_rn(weight, x[(uint64_t)source_row * channels + channel]));
+        }
+        {
+            const int source_row = current_row;
+            const float weight =
+                __fadd_rn(__bfloat162float(static_taps[channel]),
+                          dynamic_taps[((uint64_t)row * heads + head) * kernel]);
             convolution = __fadd_rn(
                 convolution, __fmul_rn(weight, x[(uint64_t)source_row * channels + channel]));
         }
         // The input comes back before the scale: the release's dynamic convolution is a residual
         // convolution.
-        const float residual = x[(uint64_t)row * channels + channel];
+        const float residual = x[(uint64_t)current_row * channels + channel];
         out[(uint64_t)row * channels + channel] =
             __fmul_rn(__fadd_rn(convolution, residual), scale);
     }
@@ -274,11 +309,20 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     int blocks,
     int hidden,
     int nq,
-    float eps) {
+    float eps,
+    int summary_stride) {
     const int query_index = blockIdx.x;
+    const int sequence_row = blockIdx.z;
     if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0) {
         return;
     }
+    // A chunk's rows each carry their own stack; a single-row walk passes stride 0 and row 0, so
+    // the three offsets below are no-ops.
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    out += (uint64_t)sequence_row * nq * hidden;
     const int rows = blocks + (partial != nullptr ? 1 : 0);
     if (rows <= 0) {
         return;
@@ -344,5 +388,35 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
                                  __fmul_rn(partial[index], inv_norm[blocks])));
         }
         out[(uint64_t)query_index * hidden + index] = mixed;
+    }
+}
+
+// The convolution history in the other layout, either way.
+//
+// The decode entry keeps one channel's taps together, because a decode step advances every
+// channel independently; a chunk reads its history as rows, because its first rows need the
+// samples the previous launch ended on. Both numbers are the same history, and this is the
+// conversion between them: no arithmetic, so nothing can round.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_conv_history_copy(
+    const float* __restrict__ source,
+    float* __restrict__ destination,
+    int channels,
+    int kernel,
+    int to_pad) {
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL || channels <= 0) {
+        return;
+    }
+    const int history = kernel - 1;
+    for (int index = blockIdx.x * INKLING_BLOCK + threadIdx.x; index < channels * history;
+         index += gridDim.x * INKLING_BLOCK) {
+        const int channel = index / history;
+        // Both layouts are oldest first, so this is a transpose and not a reversal: tap j of a
+        // channel and column j of a row are the same sample.
+        const int tap = index - channel * history;
+        if (to_pad != 0) {
+            destination[(uint64_t)tap * channels + channel] = source[index];
+        } else {
+            destination[index] = source[(uint64_t)tap * channels + channel];
+        }
     }
 }

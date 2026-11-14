@@ -54,6 +54,10 @@ use crate::forward::trace_on;
 use crate::host::greedy;
 use crate::tensor::InklingTensorPlan;
 
+mod chunk;
+
+use chunk::{exchange_sum, walk_chunk};
+
 /// The backend name the diagnostics use.
 pub const DEVICE: &str = "inkling_device";
 
@@ -67,6 +71,40 @@ const ATTENTION_BLOCK: u32 = 32;
 const ROUTER_BLOCK: u32 = 32;
 /// The column block a released MXFP8 expert stores one ue8m0 code for.
 const MXFP8_BLOCK: usize = 32;
+
+/// The switch that forces a prompt back to the row-at-a-time walk.
+///
+/// The chunked pass is the default because it is the same arithmetic through wider launches;
+/// this exists so the two can be compared on the cluster, and so a chunk that ever disagrees
+/// with the batch arm has a fallback that is one environment variable away.
+pub const PREFILL_ENV: &str = "SPARKFLASH_INKLING_PREFILL";
+
+/// Whether a prompt is forwarded in chunks rather than a row at a time.
+#[must_use]
+pub fn chunked_prefill() -> bool {
+    !matches!(std::env::var(PREFILL_ENV).as_deref(), Ok("rows"))
+}
+
+/// Whether a chunk's dense projections take the reordered tiled GEMM.
+///
+/// The tiled kernel sums a row's inner dimension in its own order, which is not the row
+/// kernel's, and a residual stream carries that difference: measured against the row-at-a-time
+/// walk the two traces part company at layer four and the greedy token flips by the first
+/// decode step. It is kept for the comparison the note's table quotes, and the batched walk
+/// below is what a served chunk takes.
+#[must_use]
+pub fn projection_gemm() -> bool {
+    matches!(std::env::var(PREFILL_ENV).as_deref(), Ok("gemm"))
+}
+
+/// The tokens one batched projection launch carries (the row kernel's `Q4E_MAX_BATCH`).
+const BATCH_ROWS: usize = 8;
+/// The most rows one chunked-prefill launch forwards.
+///
+/// The token image's tensor-core body stages a 128-token tile, so a chunk above 128 would be a
+/// second walk of the same kernel rather than a wider one; a prompt longer than this is walked in
+/// chunks of it.
+const PREFILL_CHUNK: usize = 128;
 
 /// The blocks a flat elementwise launch takes: one a 256 elements, at least one and at most the
 /// grid limit, so a launch never asks for a zero-sized grid.
@@ -135,6 +173,20 @@ struct Kernels {
     residual_add: Entry,
     logit_softcap: Entry,
     widen: Entry,
+    /// The tensor-core row GEMM a prefill chunk's projections take.
+    gemm: Entry,
+    /// The stride-carrying row RMSNorm both passes use at a chunk's width.
+    rmsnorm_rows: Entry,
+    /// The per-row attention: a chunk's rows against the prefix the step has stored.
+    attention_prefill: Entry,
+    /// The static short convolution over a chunk, reading its taps across the chunk's rows.
+    short_conv_rows: Entry,
+    /// The dynamic (static taps plus a per-row projection) short convolution over a chunk.
+    short_conv_dynamic_rows: Entry,
+    /// Append a chunk's rows to their summary stacks.
+    summary_push: Entry,
+    /// Convert a convolution history between the decode layout and a chunk's row layout.
+    conv_history: Entry,
 }
 
 impl Kernels {
@@ -174,6 +226,13 @@ impl Kernels {
             residual_add: load(inkling, "inkling_residual_add")?,
             logit_softcap: load(inkling, "inkling_logit_softcap")?,
             widen: load(inkling, "inkling_widen_f32")?,
+            gemm: load(token, "q4e_gemm_bf16")?,
+            rmsnorm_rows: load(token, "q4e_rmsnorm_rows")?,
+            attention_prefill: load(inkling, "inkling_attn_prefill")?,
+            short_conv_rows: load(inkling, "inkling_short_conv")?,
+            short_conv_dynamic_rows: load(inkling, "inkling_short_conv_dynamic")?,
+            summary_push: load(inkling, "inkling_summary_push")?,
+            conv_history: load(inkling, "inkling_conv_history_copy")?,
             _modules: modules,
         })
     }
@@ -233,6 +292,9 @@ struct ExpertScale {
 struct Shared {
     cuda: CudaHandle,
     plan: InklingDevicePlan,
+    /// The same schedule at a prefill chunk's width, or `None` when this build has no prefill
+    /// kernel: the chunked path decodes instead of walking a schedule it cannot launch.
+    prefill: Option<InklingDevicePlan>,
     config: Inkling2Config,
     kernels: Kernels,
     weights: Weights,
@@ -289,6 +351,36 @@ impl Shared {
         )
     }
 
+    /// One dense BF16 projection of `batch` rows, through the row kernel's own batched walk.
+    ///
+    /// The entry groups each (weight row, token) sum exactly as its one-token walk groups it -
+    /// four chunks added together, then a pair, then one at a time - so a row of a batch is the
+    /// bits its own launch would give it. That is the property a chunked prefill needs: the
+    /// schedule may widen a launch, but the token it picks has to stay the token.
+    fn gemv_batch(
+        &self,
+        weight: Deviceptr,
+        input: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        columns: usize,
+        batch: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.gemv,
+            (gemv_grid(rows), 1, 1),
+            (TOKEN_BLOCK, 1, 1),
+            &[
+                weight.0,
+                input.0,
+                out.0,
+                rows as u64,
+                columns as u64,
+                batch as u64,
+            ],
+        )
+    }
+
     /// One RMSNorm of one row.
     fn rmsnorm(
         &self,
@@ -316,6 +408,10 @@ impl Shared {
     }
 
     /// The block-attention residual over the summary stack plus the current stream.
+    ///
+    /// `rows` rows each read their own stack of `blocks` summaries, laid out one stride apart; a
+    /// single-row walk passes `rows` 1 and a stride of 0.
+    #[allow(clippy::too_many_arguments)]
     fn block_residual(
         &self,
         summaries: Deviceptr,
@@ -324,10 +420,12 @@ impl Shared {
         out: Deviceptr,
         blocks: usize,
         queries_count: usize,
+        rows: usize,
+        summary_stride: usize,
     ) -> Result<(), String> {
         self.launch(
             self.kernels.block_residual,
-            (queries_count as u32, 1, 1),
+            (queries_count as u32, 1, rows as u32),
             (ELEMENT_BLOCK, 1, 1),
             &[
                 summaries.0,
@@ -338,6 +436,262 @@ impl Shared {
                 self.hidden() as u64,
                 queries_count as u64,
                 bits(self.config.architecture.norm_epsilon as f32),
+                summary_stride as u64,
+            ],
+        )
+    }
+
+    /// A dense BF16 projection over a chunk: the token image's tensor-core tile.
+    ///
+    /// The tile is 64 output rows by QG_TOKENS (128) tokens, so a chunk of at most that many
+    /// rows is one launch and its rows' sums are the sums a launch of their own would give.
+    fn gemm(
+        &self,
+        weight: Deviceptr,
+        input: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        columns: usize,
+        batch: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.gemm,
+            (u32::try_from(rows.div_ceil(64)).unwrap_or(1).max(1), 1, 1),
+            (128, 1, 1),
+            &[
+                weight.0,
+                input.0,
+                out.0,
+                rows as u64,
+                columns as u64,
+                batch as u64,
+                0,
+                bits(1.0),
+                1,
+                0,
+            ],
+        )
+    }
+
+    /// One RMSNorm a row over a chunk, with the source and destination strides the chunk needs.
+    #[allow(clippy::too_many_arguments)]
+    fn rmsnorm_rows(
+        &self,
+        input: Deviceptr,
+        weight: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        width: usize,
+        src_stride: usize,
+        dst_stride: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.rmsnorm_rows,
+            (1, rows as u32, 1),
+            (TOKEN_BLOCK, 1, 1),
+            &[
+                input.0,
+                weight.0,
+                out.0,
+                width as u64,
+                width as u64,
+                bits(self.config.architecture.norm_epsilon as f32),
+                0,
+                0,
+                src_stride as u64,
+                dst_stride as u64,
+            ],
+        )
+    }
+
+    /// The static short convolution over a chunk, reading `lead` rows of history in front of the
+    /// first row.
+    fn short_conv_rows(
+        &self,
+        input: Deviceptr,
+        taps: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        channels: usize,
+        lead: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.short_conv_rows,
+            (flat(channels), rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                input.0,
+                taps.0,
+                out.0,
+                rows as u64,
+                channels as u64,
+                self.kernel_width() as u64,
+                lead as u64,
+            ],
+        )
+    }
+
+    /// The dynamic short convolution over a chunk: the static taps plus a per-row projection.
+    #[allow(clippy::too_many_arguments)]
+    fn short_conv_dynamic_rows(
+        &self,
+        input: Deviceptr,
+        static_taps: Deviceptr,
+        dynamic_taps: Deviceptr,
+        out: Deviceptr,
+        rows: usize,
+        channels: usize,
+        lead: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.short_conv_dynamic_rows,
+            (flat(channels), rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                input.0,
+                static_taps.0,
+                dynamic_taps.0,
+                out.0,
+                rows as u64,
+                channels as u64,
+                self.kernel_width() as u64,
+                self.config.head_dim as u64,
+                lead as u64,
+            ],
+        )
+    }
+
+    /// The relative attention over a chunk's rows against the cache prefix the step stored.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_rows(
+        &self,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        let config = &self.config;
+        self.launch(
+            self.kernels.attention_prefill,
+            (self.heads() as u32, rows as u32, 1),
+            (ATTENTION_BLOCK, 1, 1),
+            &[
+                queries.0,
+                gate.0,
+                keys.0,
+                values.0,
+                relative.0,
+                bank.0,
+                sink.0,
+                clip.query.0,
+                0,
+                clip.relative.0,
+                out.0,
+                self.heads() as u64,
+                kv_heads as u64,
+                config.head_dim as u64,
+                groups as u64,
+                rows as u64,
+                first_position as u64,
+                window as u64,
+                cache_rows as u64,
+                rel_extent as u64,
+                config.d_rel as u64,
+                bits(config.qk_l2_clip_threshold as f32),
+                bits(config.rel_l2_clip_threshold as f32),
+                bits(tau),
+                1,
+                bits(config.architecture.norm_epsilon as f32),
+                taus.0,
+            ],
+        )
+    }
+
+    /// The sigmoid router, one block a row.
+    fn router_rows(
+        &self,
+        logits: Deviceptr,
+        bias: Deviceptr,
+        indices: Deviceptr,
+        shares: Deviceptr,
+        rows: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.router,
+            (rows as u32, 1, 1),
+            (ROUTER_BLOCK, 1, 1),
+            &[
+                logits.0,
+                bias.0,
+                indices.0,
+                shares.0,
+                self.config.n_routed_experts as u64,
+                self.config.num_experts_per_tok as u64,
+                bits(self.config.route_scale as f32),
+            ],
+        )
+    }
+
+    /// Append a chunk's rows to their own summary stacks.
+    fn summary_push(
+        &self,
+        x: Deviceptr,
+        summaries: Deviceptr,
+        rows: usize,
+        blocks: usize,
+        block_stride: usize,
+    ) -> Result<(), String> {
+        self.launch(
+            self.kernels.summary_push,
+            (flat(self.hidden()), rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                x.0,
+                summaries.0,
+                self.hidden() as u64,
+                blocks as u64,
+                block_stride as u64,
+            ],
+        )
+    }
+
+    /// Move one convolution history between the two layouts a chunk and a decode step read.
+    ///
+    /// `to_pad` reads the channel form and writes the row form; zero does the reverse. The two
+    /// are the same numbers, so the conversion cannot round.
+    fn conv_history(
+        &self,
+        source: Deviceptr,
+        destination: Deviceptr,
+        channels: usize,
+        to_pad: bool,
+    ) -> Result<(), String> {
+        let kernel = self.kernel_width();
+        let elements = channels * kernel.saturating_sub(1);
+        self.launch(
+            self.kernels.conv_history,
+            (flat(elements), 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                source.0,
+                destination.0,
+                channels as u64,
+                kernel as u64,
+                u64::from(to_pad),
             ],
         )
     }
@@ -436,6 +790,12 @@ impl InklingDeviceBackend {
             ));
         }
         let plan = InklingDevicePlan::build(&config, tp, Pass::Decode, 1, context)?;
+        // The chunk schedule is the decode one at a chunk's rows: every projection is the same
+        // shared GEMM at a wider M, and the two kernels that cannot take a chunk (the decode
+        // attention and the four-tap convolution) have their own row forms. The plan is built
+        // here rather than at the first long prompt so a shape it refuses is an open-time error
+        // and not a request the server has already admitted.
+        let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, PREFILL_CHUNK, context)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda)?;
         let weights = upload(&cuda, source.as_ref(), plan.served())?;
@@ -449,6 +809,7 @@ impl InklingDeviceBackend {
             shared: Arc::new(Shared {
                 cuda,
                 plan,
+                prefill: Some(prefill),
                 config,
                 kernels,
                 weights,
@@ -502,6 +863,7 @@ impl ModelBackend for InklingDeviceBackend {
         Ok(Box::new(InklingDeviceSession {
             shared: Arc::clone(&self.shared),
             state,
+            chunk: None,
             history: Vec::new(),
             last_logits: Vec::new(),
             cached: 0,
@@ -792,11 +1154,31 @@ impl State {
     }
 }
 
-/// The scratch arena one session allocates.
+/// The scratch arena one session allocates: one row for a decode step, [PREFILL_CHUNK] for a
+/// prefill chunk.
+///
+/// Every buffer below is `[rows][width]`, and the four that a short convolution reads carry
+/// `history` rows in front of their first row. Those rows are the previous launch's tail, so the
+/// multi-row convolution entry needs no branch on a chunk's first rows and no separate state; the
+/// pointers stored here already address row zero, and the headroom is arithmetic on the offset.
 struct Scratch {
     x: Deviceptr,
+    /// The block-attention residual's output: `[rows][nq][hidden]`, three rows a row on a full
+    /// layer.
     rows: Deviceptr,
+    /// The single-row walk's norms: three consecutive `[hidden]` slabs a row.
     normed: Deviceptr,
+    /// The chunk walk's three separated norm outputs: the shared GEMM reads one contiguous
+    /// `[rows][hidden]` per input, which three slabs of one row cannot be.
+    q_in: Deviceptr,
+    k_in: Deviceptr,
+    v_in: Deviceptr,
+    /// The heads of the four convolution inputs, whose first `history` rows are the tail of the
+    /// row before this arena's first row. The four pointers above address row zero of each.
+    k_head: Deviceptr,
+    v_head: Deviceptr,
+    delta_head: Deviceptr,
+    mixed_head: Deviceptr,
     q: Deviceptr,
     gate: Deviceptr,
     attn_bf16: Deviceptr,
@@ -809,6 +1191,7 @@ struct Scratch {
     rel: Deviceptr,
     sink: Deviceptr,
     delta: Deviceptr,
+    delta_conv: Deviceptr,
     router_logits: Deviceptr,
     indices: Deviceptr,
     shares: Deviceptr,
@@ -817,14 +1200,30 @@ struct Scratch {
     partials: Deviceptr,
     scales: Deviceptr,
     mixed: Deviceptr,
+    mixed_conv: Deviceptr,
     logits: Deviceptr,
     logits_full: Deviceptr,
     logits_bf16: Deviceptr,
     final_row: Deviceptr,
+    /// The band's (row, slot) pairs, one pair an entry, uploaded once a layer.
+    plan: Deviceptr,
+    /// The per-row attention scale a chunk's rows take (`TauRule::at`, computed on the host so
+    /// the chunk and the row-at-a-time walk agree to the bit).
+    taus: Deviceptr,
+    /// The one allocation every pointer above is an offset into, kept so the session can give it
+    /// back: a 1M-token context holds 8 GiB of cache beside it, and a leak per request would
+    /// spend the budget three requests in.
+    arena: Deviceptr,
 }
 
 impl Scratch {
+    /// The arena a single-row (decode) session walks in.
     fn allocate(shared: &Shared, total: &mut usize) -> Result<Self, String> {
+        Self::allocate_rows(shared, 1, total)
+    }
+
+    /// The arena for `rows` rows of the schedule.
+    fn allocate_rows(shared: &Shared, rows: usize, total: &mut usize) -> Result<Self, String> {
         let plan = &shared.plan;
         let config = &shared.config;
         let cuda = &shared.cuda;
@@ -836,48 +1235,70 @@ impl Scratch {
         let top_k = config.num_experts_per_tok;
         let vocab = plan.rank_vocab();
         let taps = plan.rank_kv_heads() * config.sconv_kernel_size;
+        let rows = rows.max(1);
+        let history = config.conv_history().max(1);
         let mut cursor = 0usize;
         let mut take = |elements: usize, width: usize| {
             let at = cursor;
             cursor += (elements.max(1) * width).max(1);
             at
         };
-        let x = take(hidden, 4);
-        let rows = take(3 * hidden, 4);
+        let x = take(rows * hidden, 4);
+        let block_inputs = take(rows * 3 * hidden, 4);
         let normed = take(3 * hidden, 4);
-        let q = take(heads * head_dim, 4);
-        let gate = take(heads * head_dim, 4);
-        let attn_bf16 = take(heads * head_dim, 2);
-        let attn = take(heads * head_dim, 4);
-        let k = take(kv_width, 4);
-        let v = take(kv_width, 4);
-        let k_next = take(kv_width, 4);
-        let v_next = take(kv_width, 4);
-        let taps_buffer = take(taps, 4);
-        let rel = take(heads * config.d_rel, 4);
-        let sink = take(heads, 4);
-        let delta = take(hidden, 4);
-        let router_logits = take(config.n_routed_experts, 4);
-        let indices = take(top_k, 4);
-        let shares = take(top_k, 4);
-        let band = take(top_k * 2 * activation, 4);
-        let activation_buffer = take(top_k * activation, 4);
-        let partials = take(top_k * hidden, 4);
-        let scales = take(top_k, 4);
-        let mixed = take(hidden, 4);
+        let q_in = take(rows * hidden, 4);
+        let k_in = take(rows * hidden, 4);
+        let v_in = take(rows * hidden, 4);
+        let q = take(rows * heads * head_dim, 4);
+        let gate = take(rows * heads * head_dim, 4);
+        let attn_bf16 = take(rows * heads * head_dim, 2);
+        let attn = take(rows * heads * head_dim, 4);
+        // The four convolution inputs: their first `history` rows are the tail of the row before
+        // this arena's first row, which is why the stored pointer is `history` rows in.
+        let k_head = take((rows + history) * kv_width, 4);
+        let v_head = take((rows + history) * kv_width, 4);
+        let k = k_head + history * kv_width * 4;
+        let v = v_head + history * kv_width * 4;
+        let k_next = take(rows * kv_width, 4);
+        let v_next = take(rows * kv_width, 4);
+        let taps_buffer = take(rows * taps, 4);
+        let rel = take(rows * heads * config.d_rel, 4);
+        let sink = take(rows * heads, 4);
+        let delta_head = take((rows + history) * hidden, 4);
+        let delta = delta_head + history * hidden * 4;
+        let delta_conv = take(rows * hidden, 4);
+        let router_logits = take(rows * config.n_routed_experts, 4);
+        let indices = take(rows * top_k, 4);
+        let shares = take(rows * top_k, 4);
+        let band = take(rows * top_k * 2 * activation, 4);
+        let activation_buffer = take(rows * top_k * activation, 4);
+        let partials = take(rows * top_k * hidden, 4);
+        let scales = take(rows * top_k, 4);
+        let mixed_head = take((rows + history) * hidden, 4);
+        let mixed = mixed_head + history * hidden * 4;
+        let mixed_conv = take(rows * hidden, 4);
         let logits = take(vocab.max(1), 4);
         let logits_full = take(vocab.max(1) * shared.exchange.world(), 4);
         // The softcap trims the whole gathered row, so the released bf16 row is as wide as the
         // gathered vocabulary and not as wide as this rank's slice of it.
         let logits_bf16 = take(vocab.max(1) * shared.exchange.world(), 2);
         let final_row = take(hidden, 4);
+        let plan = take(rows * top_k * 2, 4);
+        let taus = take(rows, 4);
         let arena = cuda.alloc(cursor, total)?;
         cuda.memset_d8_async(arena, 0, cursor)?;
         let at = |offset: usize| arena.offset(offset);
         Ok(Self {
             x: at(x),
-            rows: at(rows),
+            rows: at(block_inputs),
             normed: at(normed),
+            q_in: at(q_in),
+            k_in: at(k_in),
+            v_in: at(v_in),
+            k_head: at(k_head),
+            v_head: at(v_head),
+            delta_head: at(delta_head),
+            mixed_head: at(mixed_head),
             q: at(q),
             gate: at(gate),
             attn_bf16: at(attn_bf16),
@@ -890,6 +1311,7 @@ impl Scratch {
             rel: at(rel),
             sink: at(sink),
             delta: at(delta),
+            delta_conv: at(delta_conv),
             router_logits: at(router_logits),
             indices: at(indices),
             shares: at(shares),
@@ -898,10 +1320,14 @@ impl Scratch {
             partials: at(partials),
             scales: at(scales),
             mixed: at(mixed),
+            mixed_conv: at(mixed_conv),
             logits: at(logits),
             logits_full: at(logits_full),
             logits_bf16: at(logits_bf16),
             final_row: at(final_row),
+            plan: at(plan),
+            taus: at(taus),
+            arena,
         })
     }
 }
@@ -910,10 +1336,105 @@ impl Scratch {
 struct InklingDeviceSession {
     shared: Arc<Shared>,
     state: State,
+    /// The chunk buffer and its device state.
+    ///
+    /// A chunk's rows are walked together rather than one at a time, and two of the braids they
+    /// need are per-pass rather than per-layer: the block summary stack the rows push as they
+    /// cross a boundary, and the four-tap histories the last row of each convolution leaves.
+    /// [Chunk::open] copies the sequence's own stack and histories in, [Chunk::close] copies them
+    /// back, and the chunk's working copies are sized for one pass of [PREFILL_CHUNK] rows.
+    chunk: Option<Chunk>,
     history: Vec<u32>,
     last_logits: Vec<f32>,
     cached: usize,
     sampling: Sampling,
+}
+
+/// The device state one prefill chunk walks in: [PREFILL_CHUNK] rows of every scratch buffer, and
+/// a working copy of the two pieces of state a chunk advances per pass rather than per layer.
+struct Chunk {
+    scratch: Scratch,
+    /// The block-summary stacks the chunk's rows push into: one stack a row, because the stack is
+    /// a token's residual chain and not a history.
+    summaries: Deviceptr,
+    /// The elements one row's stack holds, between rows.
+    summary_stride: usize,
+    /// The rows of one stack, which the block residual's bound checks.
+    summary_rows: usize,
+}
+
+impl Chunk {
+    /// A chunk buffer for this rank, allocated once per sequence.
+    ///
+    /// The arena is the session's own rather than a shared one: a chunk's intermediates are
+    /// live from the first layer to the last, and two sessions that shared them would have to
+    /// serialise a pass apiece.
+    fn allocate(shared: &Shared) -> Result<Self, String> {
+        let cuda = &shared.cuda;
+        let hidden = shared.hidden();
+        let mut total = 0usize;
+        let scratch = Scratch::allocate_rows(shared, PREFILL_CHUNK, &mut total)?;
+        // A stack grows one row a block boundary, so its depth is the schedule's, not a guess.
+        let block = shared.config.n_layers_per_attn_res_block.max(1);
+        let summary_rows = shared.plan.layers().len().div_ceil(block) + 1;
+        // The stride is in elements, which is the unit the kernel indexes with; the allocation
+        // is in bytes.
+        let summary_stride = summary_rows * hidden;
+        let summaries_bytes = summary_stride * std::mem::size_of::<f32>() * PREFILL_CHUNK;
+        let summaries = cuda.alloc(summaries_bytes, &mut total)?;
+        cuda.memset_d8_async(summaries, 0, summaries_bytes)?;
+        cuda.synchronize()?;
+        let bytes = total;
+        if trace_on() {
+            eprintln!(
+                "[inkling] chunk buffer: {bytes} bytes, {} of them the summary stacks",
+                summaries_bytes
+            );
+        }
+        Ok(Self {
+            scratch,
+            summaries,
+            summary_stride,
+            summary_rows,
+        })
+    }
+
+    /// The head of one convolution input for this chunk: the rows before its first row.
+    fn conv_head(&self, slot: usize) -> Deviceptr {
+        match slot {
+            0 => self.scratch.k_head,
+            1 => self.scratch.v_head,
+            2 => self.scratch.delta_head,
+            _ => self.scratch.mixed_head,
+        }
+    }
+}
+
+impl Drop for InklingDeviceSession {
+    /// Give the sequence's device memory back: the cache, the convolution histories, the summary
+    /// stack, and both scratch arenas.
+    ///
+    /// A served request ends by dropping its session, and the next request allocates its own, so
+    /// this is what keeps the arm servable at a long context: at 1M tokens a session's cache is
+    /// 8.04 GiB a rank, and a session that leaked it would spend the whole budget in a request or
+    /// two.
+    fn drop(&mut self) {
+        let state = &self.state;
+        let mut pointers: Vec<Deviceptr> = Vec::new();
+        pointers.extend(state.keys.iter().copied());
+        pointers.extend(state.values.iter().copied());
+        for taps in &state.conv {
+            pointers.extend(taps.iter().copied());
+        }
+        pointers.push(state.summaries);
+        pointers.push(state.scratch.arena);
+        if let Some(chunk) = &self.chunk {
+            pointers.push(chunk.scratch.arena);
+            pointers.push(chunk.summaries);
+        }
+        let refs: Vec<&Deviceptr> = pointers.iter().collect();
+        self.shared.cuda.free_buffers(&refs);
+    }
 }
 
 impl ModelSession for InklingDeviceSession {
@@ -949,10 +1470,38 @@ impl ModelSession for InklingDeviceSession {
         if remaining == 0 && !self.last_logits.is_empty() {
             return Ok(self.output(self.last_logits.clone()));
         }
+        if remaining == 0 {
+            return Err(BackendError::new(
+                "request",
+                "the prompt adds no position and this sequence holds no logits",
+            ));
+        }
+        // A prompt's positions are forwarded a chunk at a time through the tensor-core pass. A
+        // tail of one position takes the row-at-a-time walk, which computes the same numbers at a
+        // narrower launch: one token has nothing for a tile to widen.
         let mut logits = Vec::new();
-        for token in &tokens[start..] {
-            logits = self.step(*token)?;
-            self.history.push(*token);
+        let mut forwarded = 0usize;
+        while forwarded < remaining {
+            let take = if chunked_prefill() {
+                (remaining - forwarded).min(PREFILL_CHUNK)
+            } else {
+                1
+            };
+            let slice = &tokens[start + forwarded..start + forwarded + take];
+            logits = if take == 1 {
+                self.step(slice[0])?
+            } else {
+                if self.chunk.is_none() {
+                    self.chunk = Some(
+                        Chunk::allocate(&self.shared)
+                            .map_err(|error| BackendError::new(DEVICE, error))?,
+                    );
+                }
+                let chunk = self.chunk.as_mut().expect("a chunk buffer was just opened");
+                walk_chunk(&self.shared, &mut self.state, chunk, slice)?
+            };
+            self.history.extend_from_slice(slice);
+            forwarded += take;
         }
         self.last_logits = logits.clone();
         Ok(self.output(logits))
@@ -1009,24 +1558,7 @@ impl InklingDeviceSession {
         pointer: Deviceptr,
         elements: usize,
     ) -> Result<(), BackendError> {
-        if shared.exchange.world() == 1 {
-            return Ok(());
-        }
-        let mut bytes = row_bytes(&vec![0f32; elements]);
-        shared
-            .cuda
-            .copy_dtoh(&mut bytes, &pointer)
-            .map_err(Self::fail)?;
-        let mut values = from_bytes(&bytes);
-        shared
-            .exchange
-            .all_reduce_f32(&mut values)
-            .map_err(Self::fail)?;
-        shared
-            .cuda
-            .copy_htod(&pointer, &row_bytes(&values))
-            .map_err(Self::fail)?;
-        Ok(())
+        exchange_sum(shared, pointer, elements)
     }
 
     /// The root-mean-square of one f32 buffer, for the trace. A debug read: it synchronises.
@@ -1160,6 +1692,8 @@ impl InklingDeviceSession {
                             self.state.scratch.rows,
                             self.state.blocks,
                             if sliding { 1 } else { 3 },
+                            1,
+                            0,
                         ))?;
                     }
                     (Op::SummaryPush, _) => {
@@ -1225,6 +1759,10 @@ impl InklingDeviceSession {
                             }
                         };
                         run(shared.rmsnorm(source, weight, destination, 1, hidden))?;
+                        if trace_on() && layer == 0 && matches!(role, NormRole::Mlp) {
+                            self.rms(&shared, "row mlp_norm", destination, hidden)?;
+                        }
+
                     }
                     (Op::Gemv, Target::Project(projection)) => {
                         let weight = self.weight(step.weights[0]);
@@ -1418,6 +1956,9 @@ impl InklingDeviceSession {
                                 1,
                                 slot_position as u64,
                                 kv_width as u64,
+                                // The single-row walk wraps the slot here; a chunk passes the
+                                // ring length and lets the entry wrap each of its rows.
+                                0,
                             ],
                         ))?;
                     }
@@ -1489,10 +2030,20 @@ impl InklingDeviceSession {
                             self.state.scratch.rows,
                             self.state.blocks,
                             1,
+                            1,
+                            0,
                         ))?;
                     }
                     (Op::Router, _) => {
                         let bias = self.weight(step.weights[0]);
+                        if trace_on() && layer == 0 {
+                            self.rms(
+                                &shared,
+                                "row router_logits",
+                                self.state.scratch.router_logits,
+                                config.n_routed_experts,
+                            )?;
+                        }
                         run(shared.launch(
                             shared.kernels.router,
                             (1, 1, 1),
@@ -1558,8 +2109,10 @@ impl InklingDeviceSession {
                     / hidden as f32)
                     .sqrt();
                 eprintln!(
-                    "[inkling] device layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
-                    values[0], values[1]
+                    "[inkling] row rank {} layer {layer} x0={:.5} x1={:.5} rms={rms:.5}",
+                    plan.tp().rank(),
+                    values[0],
+                    values[1]
                 );
             }
         }
@@ -1575,6 +2128,8 @@ impl InklingDeviceSession {
                         self.state.scratch.final_row,
                         self.state.blocks,
                         1,
+                        1,
+                        0,
                     ))?;
                 }
                 (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
@@ -1767,10 +2322,16 @@ impl InklingDeviceSession {
                                 2 * intermediate as u64,
                                 hidden as u64,
                                 last,
+                                // One row, one expert: the launch's own row and band slot.
+                                0,
                             ],
                         )
                         .map_err(Self::fail)?;
                 }
+            }
+            if trace_on() && layer == 0 && self.state.position == 0 {
+                eprintln!("[inkling] row gate_up slot {slot}");
+                self.rms(shared, "row gate_up", destination, 2 * intermediate)?;
             }
             let activation_out = activated.offset(slot * intermediate * 4);
             shared
@@ -1826,10 +2387,16 @@ impl InklingDeviceSession {
                                 hidden as u64,
                                 intermediate as u64,
                                 last,
+                                // One row, one expert: the launch's own row and band slot.
+                                0,
                             ],
                         )
                         .map_err(Self::fail)?;
                 }
+            }
+            if trace_on() && layer == 0 && self.state.position == 0 {
+                self.rms(shared, "row swiglu", activation_out, intermediate)?;
+                self.rms(shared, "row down", partial, hidden)?;
             }
             // The share this expert's output carries into the mix, which is the router's weight
             // times whatever per-expert scale the stored format puts on its own output.
@@ -1856,6 +2423,10 @@ impl InklingDeviceSession {
                 ],
             )
             .map_err(Self::fail)?;
+        if trace_on() && layer == 0 {
+            eprintln!("[inkling] row router layer 0 slots {selected:?} shares {shares:?}");
+            self.rms(shared, "row band", self.state.scratch.mixed, hidden)?;
+        }
         Ok(())
     }
 }

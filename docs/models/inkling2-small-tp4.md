@@ -720,7 +720,9 @@ the CLI was already at 34,245 before this work, and the server would have taken 
 33,964 now, which is under the gate and not a licence to grow.
 
 A group that names no `--context` admits 256K, not the released 1M window: every rank allocates
-its KV at the admitted context, and 1M is 8 GiB a rank. `--context` still reaches 1,048,576.
+its KV at the admitted context, and 1M is 8 GiB a rank. `--context` still reaches 1,048,576, and
+the launcher (`scripts/inkling-serve-group.sh`) now names it, which is what the window below was
+served at.
 
 ### The first served tokens
 
@@ -746,8 +748,104 @@ Four DGX Sparks, the converted ranks pinned in section 13, greedy, context 4,096
 
 The served TTFT for the 16-token chat prompt was 2.26 s (7.1 tok/s prefill) and decode 5.0 tok/s;
 the batch walk's decode is 112-147 ms a token. The difference is the per-step control round trip
-and a prefill that forwards one position a step: **prefill chunking is still the missing
-optimisation**.
+and a prefill that forwards one position a step - which is what the next two sections close.
+
+### The chunked prefill
+
+A prompt's positions are independent in every dense projection, in the routed band and in the
+convolutions' taps, so they can be forwarded together. Three things are per *position* rather than
+per launch, and each is why the chunked pass is a schedule of its own instead of a wider loop:
+
+* **The convolution's seam.** A row's filter reads the three rows before it; a chunk's first rows
+  read the ones the previous launch ended on. Each of the four convolution inputs therefore
+  carries three history rows in front of its first row, filled from the decode layout by
+  `inkling_conv_history_copy` and written back the same way. The two layouts hold the same
+  numbers, so the copy rounds nothing.
+* **The block-summary stack.** The stack is a token's residual chain, not a history, so every row
+  of a chunk builds its own: the stack is indexed by row, and the boundary layer of every row
+  pushes into it in one strided launch (`inkling_summary_push`).
+* **The per-position scalars.** A full layer's log scaling is a function of the absolute
+  position, so a chunk's rows differ. The table is computed on the host by the plan's own rule
+  (`TauRule::at`) and passed beside the launch.
+
+`InklingDevicePlan::build(..., Pass::Prefill, rows, context)` is the same step order as the
+decode schedule with five entries swapped for row forms: `inkling_attn_decode` →
+`inkling_attn_prefill` (one block a (row, head)), `inkling_short_conv_decode` →
+`inkling_short_conv` (a `lead` of stored history rows), `inkling_short_conv_dynamic_decode` →
+`inkling_short_conv_dynamic`, `q4e_rmsnorm` → `q4e_rmsnorm_rows`, and `inkling_kv_store`
+writes the chunk's positions and lets the sliding layers' ring wrap each of them.
+`SPARKFLASH_INKLING_PREFILL` selects the walk: `chunk` (the default), `rows` (the
+token-at-a-time one) or `gemm` (the reordered tiled projection, below).
+
+**The gate is the two-way trace, not the completion.** With `SPARKFLASH_INKLING_TRACE=1` the
+chunk prints each row's post-layer stream (`[inkling] chunk rank R layer L row N x0=… x1=… rms=…`)
+and the row walk prints one line a token. On the recorded five-token prompt the 240 lines - five
+rows by forty-eight layers - are identical to the last printed bit, and the chunk generates the
+walk's exact ten ids `[149879, 149876, 151451, 149879, 149876, 151451, 149879, 149876, 151451,
+149879]` with the same best logit `(149879, 27.875)`.
+
+Four defects stood between the first chunk and that trace, and each is a test now:
+
+1. **The band's plan carries two different indices.** The gate/up projection reads the *token's
+   row* of the stream and writes the pair's *band slot*; the down projection reads the slot it was
+   activated in. One number for both read the wrong activation for every row but the first, which
+   silenced the rank's own experts and still produced fluent text.
+2. **A boundary takes the convolution's output.** At a block layer the sublayer output *is* the
+   stream, and the decode walk's convolution writes in place, so the chunk's copy has to come from
+   the convolved buffer and not from the projection.
+3. **f32 addition is not associative, and the taps were accumulated newest-first** where the
+   decode walk accumulates oldest-first. The terms were the same and the bits were not: the traces
+   parted at layer four and the greedy token flipped. Both convolution entries now mirror the
+   decode entry's order.
+4. **A tensor-core projection cannot keep the walk's bits.** The tiled `q4e_gemm_bf16` sums a
+   row's inner dimension in its own order, and any true tensor-core product would round the
+   activation to TF32's ten bits or BF16's eight before multiplying. The residual stream carries
+   that rounding: the `gemm` walk agrees with the row walk on the prefill's own token and then
+   diverges to token 220 by the second decode step. The chunk therefore takes
+   `q4e_gemv_bf16`'s **batched** walk (up to eight rows a launch), which the kernel documents and
+   `crates/sparkflash-model-inkling2/tests/prefill.rs` asserts to be bit-identical to its
+   one-row launches. `gemm` is kept for the comparison below and is not a served path.
+
+Measured on the four Sparks, greedy, batch arm (`scripts/inkling-batch.sh`):
+
+| prompt | rows | chunk | ratio |
+| --- | --- | --- | --- |
+| the recorded five ids | 627-715 ms (128 ms a position) | 264-292 ms | 2.4x |
+| 256 ids | 37,995 ms = 6.7 tok/s | 7,455 ms = 34.3 tok/s | 5.1x |
+
+The chunk's throughput is bounded below by the routed band's weight traffic rather than by its
+launches: eight of ninety-six local experts is 7.6 GiB a rank a position, and a chunk of five rows
+selects nearly the same union of experts as five positions do one at a time. What the chunk buys
+is the launches - 1,367 a position becomes 1,367 a chunk - and the weight reads the band shares
+across the rows that picked the same expert.
+
+### A million tokens
+
+`--context 1048576` is the released window, and the launcher now names it. The arithmetic: eight
+full layers, two KV heads of 128 values, f16 each, k and v - 8 KiB a token a rank, so 1M positions
+is 8.04 GiB a rank. The four rank files are 97,483,910,480 bytes each (91.4 GiB of weights), so a
+rank's whole state is 99.4 GiB of the engine's 113.7 GiB budget. The sliding layers' caches are
+their 1,024-token windows and do not grow with the context.
+
+Served at that window (`CONTEXT=1048576 scripts/inkling-serve-group.sh launch`): rank 0 opens
+97,483,911,488 weight bytes in 97 s, the card reports `context_length 1048576` and
+`max_output_tokens 32768`, and `scripts/inkling-serve-probe.py` measures
+
+| prompt | TTFT | prefill | decode |
+| --- | --- | --- | --- |
+| the recorded five ids | 0.99 s | 5.1 tok/s (overhead-bound) | 7.1 tok/s |
+| a 20-token chat template | 1.50 s | 13.0 tok/s | 6.9 tok/s |
+| 258 tokens | 8.50 s | 30.3 tok/s | 5.4 tok/s |
+
+The five-token prompt's time to first token is not prefill: the batch arm forwards the same five
+ids in 264 ms, and the rest is the session's first request - the 8.04 GiB cache being cleared and
+the chunk buffer being allocated. The 258-token prompt is the honest number: 30 tok/s against the
+row walk's 6.7, which is the batch arm's ratio arriving at the socket.
+
+The session's other new cost is the chunk buffer: 128 rows of every scratch buffer, 115 MiB,
+allocated on the first prefill and released with the session (`Drop for InklingDeviceSession`). A
+served request ends by dropping its session, so that release is what keeps a long window servable
+across requests rather than once.
 
 ### Two defects the server found
 
@@ -765,11 +863,13 @@ optimisation**.
 
 ### What the server still does not do
 
-One request at a time; no chunked prefill; no DSpark, so no speculation; no image path; the
-numerics entry is unregistered. A worker that fails ends its process, and rank 0 then stalls on
-the next collective until the transport's 900 s deadline rather than receiving a typed error -
-the protocol has no worker-to-hub failure frame yet. The launcher used for these runs is
-`scripts/inkling-serve-group.sh`; the four-node window's addresses are its defaults.
+One request at a time; no DSpark, so no speculation; no image path; the numerics entry is
+unregistered. A worker that fails ends its process, and rank 0 then stalls on the next collective
+until the transport's 900 s deadline rather than receiving a typed error - the protocol has no
+worker-to-hub failure frame yet. The launcher used for these runs is
+`scripts/inkling-serve-group.sh`; the four-node window's addresses are its defaults, and
+`scripts/inkling-serve-probe.py` is the client that produced the tables above (`/v1/models` for
+the card, then one streamed request, timing the first chunk against the rest).
 
 And the gate is unchanged: the two-way trace is the oracle, not the completion. The greedy
 continuation of `"The capital of France is"` really is `" of"` — the batch arm, the served arm

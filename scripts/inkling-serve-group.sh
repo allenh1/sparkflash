@@ -21,15 +21,22 @@
 #
 # The defaults name the four-node window (sg1-oneill/jackson/carter/teilc) and the converted ranks
 # under /home/allenh1/models/inkling2-small; BIN, CONTEXT, BIND and TRACE override what a run needs.
+#
+# CONTEXT defaults to the released window, 1,048,576 positions: eight full layers of KV is 8 KiB
+# a token a rank, so a rank's cache is 8.04 GiB and the four rank files plus it are 99.4 GiB of
+# the engine's 113.7 GiB budget. A smaller CONTEXT is the way to run when something else is using
+# the memory. The chunked prefill is the default; SPARKFLASH_INKLING_PREFILL=rows forces the
+# row-at-a-time walk, which is what the batch arm compares against.
 set -uo pipefail
 LOG=/home/allenh1/inkling-bin
 BIN=${BIN:-/home/allenh1/inkling-bin/sparkflash}
 CKPT=/home/allenh1/models/inkling2-small/ckpt
 CONVERTED=/home/allenh1/models/inkling2-small/converted
 PEERS=192.168.1.80:29600,192.168.1.68:29600,192.168.1.63:29600,192.168.1.88:29600
-CONTEXT=${CONTEXT:-4096}
+CONTEXT=${CONTEXT:-1048576}
 BIND=${BIND:-0.0.0.0:8010}
 TRACE=${TRACE:-0}
+PREFILL=${PREFILL:-chunk}
 declare -A HOSTS=( [1]=192.168.1.68 [2]=192.168.1.63 [3]=192.168.1.88 )
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes"
 
@@ -56,12 +63,12 @@ launch)
     ip=${HOSTS[$rank]}
     # setsid + </dev/null detaches the rank from the ssh channel: without it sshd waits for the
     # inherited stdin/stdout and the launcher never reaches rank 0.
-    $SSH allenh1@$ip "cd /home/allenh1/inkling-bin && ( SPARKFLASH_INKLING_TRACE=$TRACE setsid nohup $BIN serve ${common[*]} --rank $rank > $LOG/group-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
+    $SSH allenh1@$ip "cd /home/allenh1/inkling-bin && ( SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL setsid nohup $BIN serve ${common[*]} --rank $rank > $LOG/group-rank$rank.log 2>&1 < /dev/null & ) ; echo started-rank$rank"
     sleep 1
   done
   echo "serve-group: rank 0 here"
   cd /home/allenh1/inkling-bin
-  SPARKFLASH_INKLING_TRACE=$TRACE $BIN serve ${common[*]} --rank 0 --bind "$BIND" > $LOG/group-rank0.log 2>&1
+  SPARKFLASH_INKLING_TRACE=$TRACE SPARKFLASH_INKLING_PREFILL=$PREFILL $BIN serve ${common[*]} --rank 0 --bind "$BIND" > $LOG/group-rank0.log 2>&1
   echo "serve-group: rank 0 exited $?"
   ;;
 *)

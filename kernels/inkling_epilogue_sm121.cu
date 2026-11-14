@@ -171,12 +171,16 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_kv_store
     __nv_bfloat16* __restrict__ value_cache,
     int rows,
     int position,
-    int width) {
+    int width,
+    int cache_rows) {
     const int row = blockIdx.y;
     if (row >= rows || width <= 0) {
         return;
     }
-    const uint64_t destination = (uint64_t)(position + row) * width;
+    // A sliding layer's cache is a ring, so a chunk that crosses the wrap writes its rows at the
+    // wrapped slot rather than past the end. A full layer passes 0 and addresses absolutely.
+    const int slot = cache_rows > 0 ? (position + row) % cache_rows : position + row;
+    const uint64_t destination = (uint64_t)slot * width;
     const uint64_t source = (uint64_t)row * width;
     for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
          column += gridDim.x * INKLING_EPI_BLOCK) {
@@ -201,6 +205,26 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_residual
          column += gridDim.x * INKLING_EPI_BLOCK) {
         out[offset + column] =
             __fadd_rn(residual[offset + column], delta[offset + column]);
+    }
+}
+
+// Append every row's stream to that row's block-summary stack: a chunk's rows each own a stack,
+// and the boundary layer's pre-attention stream is the new entry of it.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_summary_push(
+    const float* __restrict__ x,
+    float* __restrict__ summaries,
+    int hidden,
+    int blocks,
+    int block_stride) {
+    const int row = blockIdx.y;
+    if (hidden <= 0) {
+        return;
+    }
+    float* target = summaries + (uint64_t)row * block_stride + (uint64_t)blocks * hidden;
+    const float* source = x + (uint64_t)row * hidden;
+    for (int index = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; index < hidden;
+         index += gridDim.x * INKLING_EPI_BLOCK) {
+        target[index] = source[index];
     }
 }
 
