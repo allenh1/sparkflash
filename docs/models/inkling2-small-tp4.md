@@ -1,8 +1,9 @@
 # Inkling 2 Small on four Sparks (TP4)
 
-Status: **text backbone runs end to end at TP1 through the f32 host reference, and TP4 rank
-files convert, verify and load; the TP4 device arm, the drafter and vision are the remaining
-milestones.**
+Status: **the text backbone runs end to end - TP1 through the f32 host reference, and TP4
+through the device arm on four Sparks - and the device arm now serves HTTP as a four-rank
+group. The DSpark drafter and vision remain the outstanding milestones; chunked prefill and a
+numerics entry for the TP4 configuration are not done.**
 
 
 This note answers two questions about `thinkingmachines/Inkling-2-Small`:
@@ -582,9 +583,9 @@ the embedding stream, so it behaves like a copy-the-last-token model; the next s
 layer-by-layer comparison against `modeling_inkling2.py` on the same checkpoint, not more
 inspection of our own two implementations, which agree with each other by construction.
 
-**What the arm still does not do:** a chunked prefill (it loops the decode walk, which is correct
-and slow), the DSpark drafter, the image path, and a serving path for the device arm (`serve`
-still selects the TP1 f32 host reference for this pack).
+**What the arm still did not do at this point:** a chunked prefill (it loops the decode walk,
+which is correct and slow), the DSpark drafter and the image path. The serving path for the device
+arm landed afterwards; section 14 is that work and the tokens it served.
 
 ## Bring-up order
 
@@ -684,26 +685,85 @@ loads, because the loader checks each slot's byte width against the plan and onl
 whose axis rule changed were resized — the rest of the file is simply the wrong arithmetic, which
 no load-time check can see. Two of this arm's four worst hours came from that shape of mistake.
 
-## 14. What the serve wiring still needs
+## 14. The four-rank server
 
-The arm runs two ways today and they do not meet. `inkling-tp4` (one rank of a four-host run,
-`Tp4Run::execute`) is a batch command: prompt in, tokens out, exit. `serve` does reach Inkling
-models, but only through `serve_inkling_host` (`serve/dynamic.rs:491,516`), which is the TP1 f32
-host reference in `RankFileSource::open` + `Inkling2HostBackend::open` — correct arithmetic at a
-speed that is fine for a trace and useless for a server.
+The three pieces the previous revision of this section named are in, and the arm answers HTTP.
 
-Closing the gap means taking the three things `inkling-tp4` already does and moving them behind
-`ServeOptions`:
+1. **Rank identity.** `sparkflash serve --rank/--world/--peer/--control-port/--converted` — the
+   batch command's own flags, moved behind `ServeOptions` (`GroupOptions` in `serve.rs`). They
+   parse unconditionally and refuse with a feature message when the binary has no `tp4-serve`.
+   `--peer` carries each rank's collective address (`host:port`, rank order), `--control-port`
+   defaults to 29700 at `peers[0]`, and `--converted` falls back to
+   `SPARKFLASH_INKLING_CONVERTED_DIR`. The DeepSeek host group keeps `--tp4-*`: the two groups
+   name their transports differently (bare addresses plus a base port, against per-rank
+   addresses), and unifying them is not this change. A group is refused for any other pack, for
+   `--synthetic`, `--concurrency` above one, `--continuous-batching`, and alongside
+   `--tp4-rank` or `--recurrence-rank`.
+2. **The execute loop.** Rank 0 owns HTTP, the tokenizer and the control channel; every rank
+   opens its own converted file and device state. Before each step rank 0 broadcasts the frame
+   the workers mirror — `Request{prompt_ids}` before its own prefill, `Token{id}` before its own
+   decode — so no rank waits on a collective the others were not told to join. A session dropped
+   before its next prefill broadcasts `End`; a completed request keeps its state on both sides,
+   which is what the host driver's prefix reuse expects, and the next `Request` resumes or
+   resets that state identically on every rank. A prompt longer than the admitted context is
+   refused before it is broadcast. The model collective keeps its 900 s frame deadline; the
+   control channel is the shared `tp4_control` Hello/Ready/Request/Token/End protocol.
+3. **The codec.** Unchanged: `InklingCodec` was already registered, and the served path renders
+   the chat template, encodes and detokenises exactly as the TP1 host reference does.
 
-1. **Rank identity.** `--wp-rank`/`--peer`/`--wp-world` are declared only under
-   `#[cfg(feature = "tp4-serve")]` and are named for the DeepSeek arm. Inkling needs the same
-   three values, so either reuse them (and stop gating on the feature) or add a family-neutral
-   `--rank`/`--world`/`--peer` group that both TP4 arms read.
-2. **The execute loop.** `Tp4Run::execute` takes a whole prompt and a decode count. A server
-   needs prefill, then one `execute` per accepted token with the KV untouched, plus the frame
-   timeouts left at 900 s so a slow rank is a stall and not a disconnect.
-3. **The codec.** `InklingCodec` is already registered (`serve/dynamic.rs:295`), so tokenisation,
-   chat rendering and the stop tokens are not the problem; only the backend selection is.
+A group that names no `--context` admits 256K, not the released 1M window: every rank allocates
+its KV at the admitted context, and 1M is 8 GiB a rank. `--context` still reaches 1,048,576.
 
-The honest ordering is (1) then (2): a server that can hold the four ranks open and stream one
-token at a time is the whole feature, and prefill chunking is an optimisation on top of it.
+### The first served tokens
+
+Four DGX Sparks, the converted ranks pinned in section 13, greedy, context 4,096:
+
+* **Batch reference** (`inkling-tp4 --text "The capital of France is"`): prompt
+  `[371, 151451, 149879, 151194, 149884]`, generated
+  `[149879, 149876, 151451, 149879, 149876, 151451, 149879, 149876, 151451]`, text
+  `" of the capital of the capital of the capital"`; all four ranks agree, best
+  `(149879, 27.875)`.
+* **Served** (`POST /v1/completions`, the same prompt, `max_tokens` 9, temperature 0): the same
+  prompt ids, the same fed token ids on rank 0 and on the workers (their
+  `SPARKFLASH_INKLING_TRACE=1` lines are identical), `finish_reason: length`,
+  `completion_tokens: 9`, and the same text.
+* **Prefix reuse across requests.** `"The capital of France is"` for one token returns `" of"`;
+  then `"The capital of France is of Paris"` reports `prompt_tokens 7`, `cached_tokens 6` and
+  forwards one position on every rank; a fresh `"Hello"` reports `cached_tokens 0`.
+* **Chat and streaming.** `/v1/chat/completions` answers the 27-token template (16 tokens,
+  `finish length`), and `stream: true` emits role and content deltas and a terminal
+  `finish_reason: length` chunk. The served surface reports `context_length 4096`,
+  `world 4`, `fabric_mode "tcp tp4 device"` and numerics `unregistered`, which is the honest
+  state until the configuration's arithmetic is captured in `numerics/registry.toml`.
+
+The served TTFT for the 16-token chat prompt was 2.26 s (7.1 tok/s prefill) and decode 5.0 tok/s;
+the batch walk's decode is 112-147 ms a token. The difference is the per-step control round trip
+and a prefill that forwards one position a step: **prefill chunking is still the missing
+optimisation**.
+
+### Two defects the server found
+
+* **A CUDA context is per-thread.** The first request failed with
+  `cuMemAlloc(524288) failed: 201` (`CUDA_ERROR_INVALID_CONTEXT`) from `open_session`. The
+  backend retained the primary context on the thread that opened it, and `sparkflash-serve`'s
+  host driver opens a sequence on its own worker thread; the batch walk never saw it because it
+  allocates on the opening thread. `InklingDeviceBackend::open_session` now calls
+  `Cuda::make_current` before `State::allocate`.
+* **The served surface claimed no cluster.** The same first response reported
+  `"fabric_mode": "none (host backend)"`, false for a four-host device group. `ModelBackend`
+  gained `fabric_mode` (default `None`, so no other arm changes), the host driver uses it for the
+  cluster snapshot and each response's transport block, and the Inkling group declares
+  `"tcp tp4 device"`.
+
+### What the server still does not do
+
+One request at a time; no chunked prefill; no DSpark, so no speculation; no image path; the
+numerics entry is unregistered. A worker that fails ends its process, and rank 0 then stalls on
+the next collective until the transport's 900 s deadline rather than receiving a typed error -
+the protocol has no worker-to-hub failure frame yet. The launcher used for these runs is
+`scripts/inkling-serve-group.sh`; the four-node window's addresses are its defaults.
+
+And the gate is unchanged: the two-way trace is the oracle, not the completion. The greedy
+continuation of `"The capital of France is"` really is `" of"` — the batch arm, the served arm
+and the independent numpy reference (section 12) all pick token 149879 first — so a server that
+answered "Paris" would be the wrong server.
