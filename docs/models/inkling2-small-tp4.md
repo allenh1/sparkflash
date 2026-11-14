@@ -819,8 +819,8 @@ Measured on the four Sparks, greedy, batch arm (`scripts/inkling-batch.sh`):
 The chunk's throughput is bounded below by the routed band's weight traffic rather than by its
 launches: eight of ninety-six local experts is 7.6 GiB a rank a position, and a chunk of five rows
 selects nearly the same union of experts as five positions do one at a time. What the chunk buys
-is the launches - 1,367 a position becomes 1,367 a chunk - and the weight reads the band shares
-across the rows that picked the same expert.
+is the launches - the schedule's 1,367 go from one position to one chunk - and the weight reads
+the band shares across the rows that picked the same expert.
 
 ### A million tokens
 
