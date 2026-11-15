@@ -1582,3 +1582,51 @@ repeating prompt and DSpark depth 3 all equal the two-launch build's:
 | decode step, repeating 5K prompt | | 31.71 | 31.24 |
 | DSpark depth 3 after the 93K prompt | | 31.57 | 31.39 |
 | 93K prompt | 120.3 s | | 121.8 s |
+
+### Experts split by residual rows: expert parallelism's bits, a quarter of every pick a rank
+
+The intermediate split above fixes expert parallelism's imbalance, but it moves where the down
+projection's sums round. `sparkflash convert --expert-split rows` splits the same work without
+moving a bit:
+
+* **gate/up** is the intermediate split's: every rank holds a quarter of every expert's
+  interleaved w13 rows (576 of the 2,304 intermediate columns, gate and up together), so it
+  computes 576 activation columns of each of the eight picks.
+* **The activation is gathered.** The ranks gather those runs in place on the device leg, and
+  `inkling_join_pieces` lays them side by side as whole 2,304-wide rows. It is a copy.
+* **down** is split on its output rows: a rank holds 1,152 of w2's 4,608 hidden rows with all
+  2,304 contraction columns, and its block scales on the same rows. Every output element is the
+  expert-parallel walk's dot product, in the same order.
+* **The mix rebuilds expert parallelism's fold.** `inkling_expert_mix` takes the picks' expert
+  indices. An expert-parallel rank owns experts `96 r` to `96 r + 95`, so for each of those four
+  owners in turn the kernel sums the owner's picks in slot order. It then folds the four mixes
+  from 0.0 in rank order, which is the order `exchange_sum` adds the ranks' rows. The ranks then
+  gather their 1,152-row pieces, where expert parallelism ran an all-reduce.
+
+The loader takes the split from the rank file. It refuses a split without the device leg, a BF16
+expert layer, or pieces that are not whole 16-byte words. The files are the same size as expert
+parallelism's (97,484,185,600 bytes a rank). The checkpoint's shards are only on the lead, so
+the lead converts every rank (about 10 minutes each) and ships ranks 1-3 to their hosts.
+
+On the four ranks the decode logits digests were equal to the deployed build's: the 93K prompt
+(`724cc71b52c00a7e`, twice), the repeating prompt (`0fe1437d677108a4`) and DSpark depth 3 after
+the 93K prompt. The greedy ids were equal too. In one session, A/B/A:
+
+| on the four ranks (batch arm, ms a token after the first) | expert parallel | row split |
+|---|---|---|
+| decode step after the 93K prompt | 34.91 | 30.00, 31.26 |
+| decode step, repeating 5K prompt | 31.32 | 26.13 |
+| DSpark depth 3 after the 93K prompt | 31.39 (window build) | 31.83 (7 rounds of 104.6 ms) |
+| 93K prompt | 120.7 s | 132.0 s, 132.7 s |
+| repeating 5K prompt | 8.7 s | 9.6 s |
+
+The prompt pays for the gathers. At an 8,192-row chunk each rank sends 566 MB a layer: the two
+BF16 planes of its activation runs (151 MB to each of three peers) and its mix rows (38 MB to
+each). Expert parallelism's two-shot all-reduce sends 226 MB.
+
+A plain decode step gains 10-14% after the 93K prompt and 17% on the repeating prompt, because
+every rank now reads the same quarter of each pick's expert bytes. A depth-3 verify routes 32
+picks, which already spread fairly evenly over expert parallelism's ranks. DSpark therefore
+gains nothing here, and after the 93K prompt plain decoding is as fast or slightly faster. The
+split stays opt-in at conversion: the maintainer weighs the prompt's 10% against the decode
+step's 10-17%.
