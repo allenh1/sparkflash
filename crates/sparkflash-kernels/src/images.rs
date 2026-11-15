@@ -363,6 +363,8 @@ impl Image {
                 "inkling_attn_decode",
                 "inkling_attn_prefill",
                 "inkling_block_residual",
+                "inkling_block_residual_mix",
+                "inkling_block_residual_stats",
                 "inkling_expert_mix",
                 "inkling_kv_store",
                 "inkling_logit_softcap",

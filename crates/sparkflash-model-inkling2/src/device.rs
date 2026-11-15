@@ -81,6 +81,14 @@ pub const DEVICE: &str = "inkling_device";
 const TOKEN_BLOCK: u32 = 256;
 /// The threads the Inkling elementwise bodies run.
 const ELEMENT_BLOCK: u32 = 256;
+/// The rows a block-attention residual reads at most: the summary stack (INKLING_MAX_BLOCKS)
+/// and the current stream.
+const RESIDUAL_ROWS: usize = 17;
+/// The (row, query) pairs at or under which the residual takes its two-launch form, every
+/// stack row in a block of its own: a decode row's one or three queries fill a block or three
+/// of the one-block form, which then walks its rows one after another. A chunk's pairs fill
+/// the device already.
+const RESIDUAL_SPLIT_PAIRS: usize = 8;
 /// The threads the serial attention body runs: one warp a head.
 const ATTENTION_BLOCK: u32 = 32;
 /// The threads a block of the split walk's key-scale and score launches runs
@@ -511,6 +519,10 @@ struct Kernels {
     /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
     gemv4: Entry,
     block_residual: Entry,
+    /// The residual's two-launch form: every stack row's statistics in a block of its own,
+    /// then the softmax and the mix.
+    block_residual_stats: Entry,
+    block_residual_mix: Entry,
     short_conv: Entry,
     short_conv_dynamic: Entry,
     kv_store: Entry,
@@ -647,6 +659,8 @@ impl Kernels {
             gemv: load(token, "q4e_gemv_bf16")?,
             gemv4: load(token, "q4e_gemv4_bf16")?,
             block_residual: load(inkling, "inkling_block_residual")?,
+            block_residual_stats: load(inkling, "inkling_block_residual_stats")?,
+            block_residual_mix: load(inkling, "inkling_block_residual_mix")?,
             short_conv: load(inkling, "inkling_short_conv_decode")?,
             short_conv_dynamic: load(inkling, "inkling_short_conv_dynamic_decode")?,
             kv_store: load(inkling, "inkling_kv_store")?,
@@ -999,7 +1013,9 @@ impl Shared {
     /// The block-attention residual over the summary stack plus the current stream.
     ///
     /// `rows` rows each read their own stack of `blocks` summaries, laid out one stride apart; a
-    /// single-row walk passes `rows` 1 and a stride of 0.
+    /// single-row walk passes `rows` 1 and a stride of 0. `stats` is the arena's
+    /// [Scratch::residual_stats], which the two-launch form passes its rows' statistics through;
+    /// both forms give the same bits.
     #[allow(clippy::too_many_arguments)]
     fn block_residual(
         &self,
@@ -1007,24 +1023,71 @@ impl Shared {
         partial: Deviceptr,
         queries: Deviceptr,
         out: Deviceptr,
+        stats: Deviceptr,
         blocks: usize,
         queries_count: usize,
         rows: usize,
         summary_stride: usize,
     ) -> Result<(), String> {
+        let stack = blocks + 1;
+        if stack > RESIDUAL_ROWS {
+            return Err(format!(
+                "the block residual reads {stack} rows, more than the {RESIDUAL_ROWS} its \
+                 kernels hold"
+            ));
+        }
+        let hidden = self.hidden();
+        let eps = bits(self.config.architecture.norm_epsilon as f32);
+        if rows * queries_count > RESIDUAL_SPLIT_PAIRS {
+            return self.launch(
+                self.kernels.block_residual,
+                (queries_count as u32, 1, rows as u32),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    summaries.0,
+                    partial.0,
+                    queries.0,
+                    out.0,
+                    blocks as u64,
+                    hidden as u64,
+                    queries_count as u64,
+                    eps,
+                    summary_stride as u64,
+                ],
+            );
+        }
         self.launch(
-            self.kernels.block_residual,
-            (queries_count as u32, 1, rows as u32),
+            self.kernels.block_residual_stats,
+            (stack as u32, queries_count as u32, rows as u32),
             (ELEMENT_BLOCK, 1, 1),
             &[
                 summaries.0,
                 partial.0,
                 queries.0,
+                stats.0,
+                blocks as u64,
+                hidden as u64,
+                queries_count as u64,
+                eps,
+                summary_stride as u64,
+            ],
+        )?;
+        self.launch(
+            self.kernels.block_residual_mix,
+            (
+                hidden.div_ceil(ELEMENT_BLOCK as usize) as u32,
+                queries_count as u32,
+                rows as u32,
+            ),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                stats.0,
                 out.0,
                 blocks as u64,
-                self.hidden() as u64,
+                hidden as u64,
                 queries_count as u64,
-                bits(self.config.architecture.norm_epsilon as f32),
                 summary_stride as u64,
             ],
         )
@@ -2990,6 +3053,9 @@ struct Scratch {
     /// The block-attention residual's output: `[rows][nq][hidden]`, three rows a row on a full
     /// layer.
     rows: Deviceptr,
+    /// The two-launch residual's statistics: `[rows][3][RESIDUAL_ROWS][2]`, each stack row's
+    /// RMS inverse and score.
+    residual_stats: Deviceptr,
     /// The single-row walk's norms: three consecutive `[hidden]` slabs a row.
     normed: Deviceptr,
     /// The chunk walk's three separated norm outputs: the shared GEMM reads one contiguous
@@ -3128,6 +3194,7 @@ impl Scratch {
         };
         let x = take(rows * hidden, 4);
         let block_inputs = take(rows * 3 * hidden, 4);
+        let residual_stats = take(rows * 3 * RESIDUAL_ROWS * 2, 4);
         let normed = take(3 * hidden, 4);
         let q_in = take(rows * hidden, 4);
         let k_in = take(rows * hidden, 4);
@@ -3212,6 +3279,7 @@ impl Scratch {
         Ok(Self {
             x: at(x),
             rows: at(block_inputs),
+            residual_stats: at(residual_stats),
             normed: at(normed),
             q_in: at(q_in),
             k_in: at(k_in),
@@ -4310,6 +4378,7 @@ impl InklingDeviceSession {
                             self.state.scratch.x,
                             queries,
                             self.state.scratch.rows,
+                            self.state.scratch.residual_stats,
                             self.state.blocks,
                             if sliding { 1 } else { 3 },
                             1,
@@ -4666,6 +4735,7 @@ impl InklingDeviceSession {
                             self.state.scratch.x,
                             queries,
                             self.state.scratch.rows,
+                            self.state.scratch.residual_stats,
                             self.state.blocks,
                             1,
                             1,
@@ -4763,6 +4833,7 @@ impl InklingDeviceSession {
                         self.state.scratch.x,
                         queries,
                         self.state.scratch.final_row,
+                        self.state.scratch.residual_stats,
                         self.state.blocks,
                         1,
                         1,

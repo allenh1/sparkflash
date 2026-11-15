@@ -301,6 +301,73 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
 // the scores are softmaxed and the row mix is the query's output. The learned query is the
 // only thing that differs between the one-query and three-query schedules; nq is a launch
 // parameter.
+// One row of the stack: its RMS inverse and its normalised dot against `query`, scaled by
+// 1 / sqrt(hidden). Every thread of the block takes part; the results are thread 0's to keep.
+__device__ __forceinline__ void inkling_residual_row(const float* __restrict__ source,
+                                                     const float* __restrict__ query,
+                                                     int hidden,
+                                                     float eps,
+                                                     float* scratch,
+                                                     float* inverse_out,
+                                                     float* score_out) {
+    float squares = 0.0f;
+    for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+        const float value = source[index];
+        squares = __fadd_rn(squares, __fmul_rn(value, value));
+    }
+    const float total = inkling_conv_block_sum(squares, scratch);
+    const float mean = __fdiv_rn(total, (float)hidden);
+    const float inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
+    float dot = 0.0f;
+    for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+        dot = __fadd_rn(dot, __fmul_rn(query[index], __fmul_rn(source[index], inverse)));
+    }
+    const float reduced = inkling_conv_block_sum(dot, scratch);
+    *inverse_out = inverse;
+    *score_out = __fmul_rn(reduced, 1.0f / sqrtf((float)hidden));
+}
+
+// The rows' scores softmaxed into `probabilities`, on one thread.
+__device__ __forceinline__ void inkling_residual_softmax(const float* scores,
+                                                         float* probabilities,
+                                                         int rows) {
+    float maximum = -INFINITY;
+    for (int row = 0; row < rows; ++row) {
+        maximum = fmaxf(maximum, scores[row]);
+    }
+    float denominator = 0.0f;
+    for (int row = 0; row < rows; ++row) {
+        probabilities[row] = expf(scores[row] - maximum);
+        denominator += probabilities[row];
+    }
+    const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    for (int row = 0; row < rows; ++row) {
+        probabilities[row] *= inverse;
+    }
+}
+
+// Element `index` of the query's mix: the normalised rows weighted in stack order, the partial
+// row last.
+__device__ __forceinline__ float inkling_residual_mix(const float* __restrict__ summaries,
+                                                      const float* __restrict__ partial,
+                                                      const float* probabilities,
+                                                      const float* inv_norm,
+                                                      int blocks,
+                                                      int hidden,
+                                                      int index) {
+    float mixed = 0.0f;
+    for (int row = 0; row < blocks; ++row) {
+        mixed = __fadd_rn(
+            mixed, __fmul_rn(probabilities[row],
+                             __fmul_rn(summaries[(uint64_t)row * hidden + index], inv_norm[row])));
+    }
+    if (partial != nullptr) {
+        mixed = __fadd_rn(mixed, __fmul_rn(probabilities[blocks],
+                                           __fmul_rn(partial[index], inv_norm[blocks])));
+    }
+    return mixed;
+}
+
 extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual(
     const float* __restrict__ summaries,
     const float* __restrict__ partial,
@@ -335,59 +402,117 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     // The RMS of every row, and the normalised dot of every row against the query.
     for (int row = 0; row < rows; ++row) {
         const float* source = row < blocks ? summaries + (uint64_t)row * hidden : partial;
-        float squares = 0.0f;
-        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-            const float value = source[index];
-            squares = __fadd_rn(squares, __fmul_rn(value, value));
-        }
-        const float total = inkling_conv_block_sum(squares, scratch);
-        const float mean = __fdiv_rn(total, (float)hidden);
-        const float inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
-        float dot = 0.0f;
-        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-            dot = __fadd_rn(
-                dot, __fmul_rn(queries[(uint64_t)query_index * hidden + index],
-                               __fmul_rn(source[index], inverse)));
-        }
-        const float reduced = inkling_conv_block_sum(dot, scratch);
+        float inverse;
+        float score;
+        inkling_residual_row(source, queries + (uint64_t)query_index * hidden, hidden, eps,
+                             scratch, &inverse, &score);
         if (threadIdx.x == 0) {
             inv_norm[row] = inverse;
-            scores[row] = __fmul_rn(reduced, 1.0f / sqrtf((float)hidden));
+            scores[row] = score;
         }
         __syncthreads();
     }
 
     if (threadIdx.x == 0) {
-        float maximum = -INFINITY;
-        for (int row = 0; row < rows; ++row) {
-            maximum = fmaxf(maximum, scores[row]);
-        }
-        float denominator = 0.0f;
-        for (int row = 0; row < rows; ++row) {
-            probabilities[row] = expf(scores[row] - maximum);
-            denominator += probabilities[row];
-        }
-        const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
-        for (int row = 0; row < rows; ++row) {
-            probabilities[row] *= inverse;
-        }
+        inkling_residual_softmax(scores, probabilities, rows);
     }
     __syncthreads();
 
     for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
-        float mixed = 0.0f;
-        for (int row = 0; row < blocks; ++row) {
-            mixed = __fadd_rn(
-                mixed, __fmul_rn(probabilities[row],
-                                 __fmul_rn(summaries[(uint64_t)row * hidden + index],
-                                           inv_norm[row])));
-        }
-        if (partial != nullptr) {
-            mixed = __fadd_rn(
-                mixed, __fmul_rn(probabilities[blocks],
-                                 __fmul_rn(partial[index], inv_norm[blocks])));
-        }
-        out[(uint64_t)query_index * hidden + index] = mixed;
+        out[(uint64_t)query_index * hidden + index] = inkling_residual_mix(
+            summaries, partial, probabilities, inv_norm, blocks, hidden, index);
+    }
+}
+
+// inkling_block_residual in two launches, its rows side by side. The one-block form walks the
+// stack's rows one after another, two block reductions each, which is most of a decode step's
+// residual time; here a block takes one row's statistics, and the mix reads them back. Every
+// number is the one-block form's: the same row body, softmax and mix, in the same orders.
+//
+// Statistics: grid (rows, nq, sequence rows), where rows is the stack plus the partial row.
+// stats is [sequence rows][nq][INKLING_MAX_BLOCKS + 1][2]: each row's RMS inverse and score.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_stats(
+    const float* __restrict__ summaries,
+    const float* __restrict__ partial,
+    const float* __restrict__ queries,
+    float* __restrict__ stats,
+    int blocks,
+    int hidden,
+    int nq,
+    float eps,
+    int summary_stride) {
+    const int row = blockIdx.x;
+    const int query_index = blockIdx.y;
+    const int sequence_row = blockIdx.z;
+    if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0) {
+        return;
+    }
+    const int rows = blocks + (partial != nullptr ? 1 : 0);
+    if (row >= rows) {
+        return;
+    }
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    __shared__ float scratch[INKLING_BLOCK];
+    const float* source = row < blocks ? summaries + (uint64_t)row * hidden : partial;
+    float inverse;
+    float score;
+    inkling_residual_row(source, queries + (uint64_t)query_index * hidden, hidden, eps, scratch,
+                         &inverse, &score);
+    if (threadIdx.x == 0) {
+        float* cell =
+            stats + (((uint64_t)sequence_row * nq + query_index) * (INKLING_MAX_BLOCKS + 1) + row) * 2;
+        cell[0] = inverse;
+        cell[1] = score;
+    }
+}
+
+// Mix: grid (ceil(hidden / INKLING_BLOCK), nq, sequence rows). Each block softmaxes the scores
+// itself, so every block holds the same probabilities.
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_mix(
+    const float* __restrict__ summaries,
+    const float* __restrict__ partial,
+    const float* __restrict__ stats,
+    float* __restrict__ out,
+    int blocks,
+    int hidden,
+    int nq,
+    int summary_stride) {
+    const int query_index = blockIdx.y;
+    const int sequence_row = blockIdx.z;
+    if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0) {
+        return;
+    }
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    out += (uint64_t)sequence_row * nq * hidden;
+    const int rows = blocks + (partial != nullptr ? 1 : 0);
+    if (rows <= 0) {
+        return;
+    }
+    __shared__ float inv_norm[INKLING_MAX_BLOCKS + 1];
+    __shared__ float scores[INKLING_MAX_BLOCKS + 1];
+    __shared__ float probabilities[INKLING_MAX_BLOCKS + 1];
+    if ((int)threadIdx.x < rows) {
+        const float* cell =
+            stats + (((uint64_t)sequence_row * nq + query_index) * (INKLING_MAX_BLOCKS + 1) +
+                     threadIdx.x) * 2;
+        inv_norm[threadIdx.x] = cell[0];
+        scores[threadIdx.x] = cell[1];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        inkling_residual_softmax(scores, probabilities, rows);
+    }
+    __syncthreads();
+    for (int index = blockIdx.x * INKLING_BLOCK + threadIdx.x; index < hidden;
+         index += gridDim.x * INKLING_BLOCK) {
+        out[(uint64_t)query_index * hidden + index] = inkling_residual_mix(
+            summaries, partial, probabilities, inv_norm, blocks, hidden, index);
     }
 }
 
