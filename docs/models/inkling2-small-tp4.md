@@ -1218,3 +1218,25 @@ nats**. `check` on the same text gives the per-layer bound, every layer from exa
   largest difference (3.1e-2 at 5.66 the worst), with a mean at most 5.5e-6.
 * Every decode row's layer, over eight steps on rank 0, is likewise within one BF16 step (7.8e-3
   at 1.03 the worst), with a mean at most 7.0e-6.
+
+### Full layers keep each key's scales
+
+The split walk read each full layer's keys twice and its values twice. The first read of both
+was `inkling_attn_key_scales` (each key's clip gain and its value's RMS scale), which depends
+only on the key's own row. A full layer now writes those two numbers once, when the key is
+stored, into per-layer tables at the key's absolute slot (`KeyTables`, `[kv_heads][context]`
+f32 a table, 2 x 8 MiB a full layer at 1M). The split walk and the tensor-core walk read the
+tables instead of recomputing them, so a decode step reads a full layer's keys and values once
+each, and a prompt chunk no longer rescales the whole prefix before its walk. A sliding layer
+keeps computing its window's scales per pass, since its ring overwrites slots.
+
+This is the same arithmetic: the same kernel runs over the same row. After the 93,159-token
+prompt, the 25 greedy ids match the deployed fast walk's.
+
+| on the four ranks | before | key tables |
+|---|---|---|
+| decode step after the 93K prompt (batch arm) | 47-49 ms | 43-46 ms |
+| 93K prompt (batch arm) | 120.6 s | 121.2 s |
+| served decode, 2,223-token prompt | 26.1 tokens/s | 26.0 tokens/s |
+| served decode, 78,540-token prompt | — | 22.5 tokens/s |
+| served decode, 99,848-token prompt | 19.0 tokens/s | 21.4 tokens/s |
