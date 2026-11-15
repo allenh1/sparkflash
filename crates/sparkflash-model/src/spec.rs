@@ -71,6 +71,45 @@ pub fn verdict(chunk: &[u32], picks: &[u32]) -> usize {
     kept
 }
 
+/// Drafts up to `depth` tokens by prompt lookup: the tokens that followed the most recent earlier
+/// occurrence of `history`'s last `n` tokens, for the longest `n` in `min_ngram..=max_ngram` that
+/// has one.
+///
+/// This is the n-gram ("prompt lookup") drafter. It needs no model, so it drafts where a reply
+/// repeats its context (code edits, quotes, structured output) and proposes nothing elsewhere.
+/// [verdict] keeps only what the model chose, so a poor draft costs a verify row and never a
+/// token.
+///
+/// # Example
+///
+/// ```
+/// use sparkflash_model::spec::lookup_draft;
+/// // "3 4" occurred before, followed by 5 6 7.
+/// assert_eq!(lookup_draft(&[1, 3, 4, 5, 6, 7, 2, 3, 4], 2, 3, 2), vec![5, 6]);
+/// // No earlier "9 4", and a single token is below the shortest n-gram.
+/// assert!(lookup_draft(&[1, 4, 2, 9, 4], 2, 3, 4).is_empty());
+/// ```
+#[must_use]
+pub fn lookup_draft(history: &[u32], min_ngram: usize, max_ngram: usize, depth: usize) -> Vec<u32> {
+    let len = history.len();
+    if depth == 0 || len < 2 {
+        return Vec::new();
+    }
+    for n in (min_ngram.max(1)..=max_ngram.min(len - 1)).rev() {
+        let suffix = &history[len - n..];
+        // The most recent earlier occurrence, which always has a token after it: it starts
+        // before the suffix does.
+        if let Some(start) = (0..len - n)
+            .rev()
+            .find(|&start| &history[start..start + n] == suffix)
+        {
+            let from = start + n;
+            return history[from..(from + depth).min(len)].to_vec();
+        }
+    }
+    Vec::new()
+}
+
 /// A token a verify produced that the serving adapter has not been handed yet.
 ///
 /// The adapter's `decode` is called once per token the request emits. A round emitted several,
@@ -314,6 +353,21 @@ mod tests {
         assert_eq!(stats.drafts_accepted, 2);
         speculator.reset();
         assert_eq!(speculator.stats(), Speculation::default());
+    }
+
+    #[test]
+    fn a_lookup_draft_takes_the_longest_and_latest_match() {
+        // "7 8" last occurred at 4..6 (followed by 2), earlier at 0..2 (followed by 9); the
+        // latest wins.
+        let history = [7, 8, 9, 1, 7, 8, 2, 5, 7, 8];
+        assert_eq!(lookup_draft(&history, 1, 3, 3), vec![2, 5, 7]);
+        // "1 2 3" beats the shorter "2 3" whose later occurrence follows something else.
+        let history = [1, 2, 3, 4, 0, 2, 3, 6, 1, 2, 3];
+        assert_eq!(lookup_draft(&history, 1, 3, 2), vec![4, 0]);
+        // The draft stops at the history's end.
+        assert_eq!(lookup_draft(&[5, 6, 5], 1, 2, 4), vec![6, 5]);
+        assert!(lookup_draft(&[5, 6, 5], 1, 2, 0).is_empty());
+        assert!(lookup_draft(&[5], 1, 2, 4).is_empty());
     }
 
     fn row(value: f32) -> Vec<f32> {
