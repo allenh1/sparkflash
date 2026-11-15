@@ -4411,11 +4411,7 @@ fn responses_message_item(object: &Map<String, Value>) -> Result<Value, ApiError
     // The released V4.1 encoder drops a developer message in thinking mode (the default) and
     // refuses it in chat mode. Fold it onto the system role, which the renderer supports at any
     // position, so the instruction reaches the model instead of disappearing.
-    let role = if role == "developer" {
-        "system".to_owned()
-    } else {
-        role
-    };
+    let role = sparkflash_model::prompt::template_role(&role).to_owned();
     let content = match object.get("content") {
         None => Value::Null,
         Some(content) => responses_content_to_chat(content)?,

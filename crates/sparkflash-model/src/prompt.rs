@@ -96,6 +96,31 @@ impl fmt::Display for PromptError {
 
 impl std::error::Error for PromptError {}
 
+/// The role a chat message is rendered under: `developer` folded onto `system`, every other role
+/// unchanged.
+///
+/// OpenAI's newer clients send their instructions as `developer`. A released template with no
+/// such role either drops the message (DeepSeek V4.1's encoder in thinking mode) or refuses it
+/// (its chat mode, and Inkling's template), so a client loses its instructions or gets a 400.
+/// Folding it here keeps that rule in one place for every renderer that has only `system`; a
+/// renderer whose template names `developer` itself has no reason to call this.
+#[must_use]
+pub fn template_role(role: &str) -> &str {
+    if role == "developer" { "system" } else { role }
+}
+
+/// A chat message's role after [template_role], or None when the message has no string role.
+///
+/// Renderers read every role through this, including the neighbour and system-prompt checks, so
+/// a `developer` message is a `system` message everywhere a template looks at it.
+#[must_use]
+pub fn message_role(message: &Value) -> Option<&str> {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .map(template_role)
+}
+
 /// What the HTTP surface needs from a model's prompt handling.
 pub trait PromptCodec: Send + Sync {
     /// Render a chat-completion request body and tokenize it.

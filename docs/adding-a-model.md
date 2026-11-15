@@ -277,6 +277,7 @@ the mechanism there; never copy it into the arm.
 | a routed-expert plan (count by expert, order the slots, cut items) | `kernels/moe_plan_sm121.cu`, `Image::MoePlan`; every arm launches it rather than carrying its own counting pass |
 | model id to checkpoint (the Hugging Face cache) | `sparkflash_weights::hub` |
 | `--synthetic` prompts without a tokenizer | `sparkflash_ops::codec::ByteCodec` |
+| a chat message's role, with OpenAI's `developer` folded onto `system` | `sparkflash_model::prompt::{message_role, template_role}`; a renderer reads every role through it |
 | `config.json` errors and a field that is one value or a list | `sparkflash_model::config::{ConfigError, OneOrMany}` |
 | an arm that renders every text channel (tools, thinking, reasoning effort) | `Capabilities::ALL`; forced decoding is the driver's, which the host and TP drivers add |
 | a tensor's byte length against its slot | `sparkflash_weights::weights::check_length` |
