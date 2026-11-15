@@ -548,16 +548,15 @@ fn run_request(
         reusable_prefix_len(session, &job.prompt_tokens)
             .filter(|cached| job.images.iter().all(|image| image.span.start >= *cached))
     };
-    let (mut session, cached) = match held.take() {
-        Some(session) => match reusable(session.as_ref()) {
-            Some(cached) => (session, cached),
-            None => (
-                backend
-                    .open_session()
-                    .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
-                0,
-            ),
-        },
+    // A held sequence this request cannot continue is dropped before the next one opens, never
+    // after: a session owns its whole cache, and at a long context two of them do not fit (an
+    // Inkling rank at the 1M window holds 8 GiB a session beside a chunk scratch, and opening the
+    // second ran the lead out of memory).
+    let (mut session, cached) = match held
+        .take()
+        .and_then(|session| reusable(session.as_ref()).map(|cached| (session, cached)))
+    {
+        Some(continued) => continued,
         None => (
             backend
                 .open_session()

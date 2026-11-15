@@ -70,15 +70,21 @@ fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// What the backend saw: one entry per forwarded prefill, the tokens it actually received.
+/// What the backend saw: one entry per forwarded prefill, the tokens it actually received, and
+/// how many sessions were alive at once (live now, and the most ever).
 #[derive(Default)]
 struct Recorder {
     prefills: Mutex<Vec<Vec<u32>>>,
+    sessions: Mutex<(usize, usize)>,
 }
 
 impl Recorder {
     fn prefills(&self) -> Vec<Vec<u32>> {
         self.prefills.lock().expect("the recorder lock").clone()
+    }
+
+    fn most_alive(&self) -> usize {
+        self.sessions.lock().expect("the recorder lock").1
     }
 }
 
@@ -93,6 +99,10 @@ impl ModelBackend for PrefixBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        let mut sessions = self.recorder.sessions.lock().expect("the recorder lock");
+        sessions.0 += 1;
+        sessions.1 = sessions.1.max(sessions.0);
+        drop(sessions);
         Ok(Box::new(PrefixSession {
             recorder: Arc::clone(&self.recorder),
             consumed: Vec::new(),
@@ -126,6 +136,12 @@ impl PrefixSession {
             next_token: next,
             draft: Vec::new(),
         }
+    }
+}
+
+impl Drop for PrefixSession {
+    fn drop(&mut self) {
+        self.recorder.sessions.lock().expect("the recorder lock").0 -= 1;
     }
 }
 
@@ -306,4 +322,7 @@ async fn a_prompt_that_does_not_extend_the_held_tokens_starts_a_fresh_sequence()
         vec![vec![5, 6, 7], vec![5, 6, 8, 9]],
         "a divergent prompt is prefilled whole"
     );
+    // The held sequence is gone before the fresh one opens: a real arm's session owns its whole
+    // cache, and at a long context two of them do not fit.
+    assert_eq!(recorder.most_alive(), 1, "two sequences were alive at once");
 }
