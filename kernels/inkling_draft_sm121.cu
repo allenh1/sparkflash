@@ -56,8 +56,8 @@
 #define IKD_MAX_PER_THREAD 32
 // The logits each thread of a step-logits block scores.
 #define IKD_LOGIT_PER_THREAD 8
-// The floats a rank's slot of the cross-rank pick takes: (value, id) and two zeros, so the
-// group's sum moves whole groups of four.
+// The floats a rank's slot of the cross-rank pick takes: (value, id, mass) and a zero, so the
+// group's sum moves whole groups of four. The mass is the rank's sum of exp(logit - value).
 #define IKD_PICK_SLOT 4
 
 __device__ __forceinline__ float ikd_bf16(float value) {
@@ -133,6 +133,26 @@ __device__ __forceinline__ int ikd_pick(const float* __restrict__ slots, int wor
         }
     }
     return id;
+}
+
+// The probability the step's softmax over every rank's logits gives its pick, from the slots
+// after the group's sum: each rank's mass is relative to its own best, so it is rescaled to the
+// group's best, whose own term is the pick's 1. Every rank reads the same slots and so the same
+// probability, which is what lets each choose the same verify depth from it.
+__device__ __forceinline__ float ikd_confidence(const float* __restrict__ slots, int world) {
+    float best = slots[0];
+    for (int rank = 1; rank < world; ++rank) {
+        best = fmaxf(best, slots[rank * IKD_PICK_SLOT]);
+    }
+    float total = 0.0f;
+    for (int rank = 0; rank < world; ++rank) {
+        const float value = slots[rank * IKD_PICK_SLOT];
+        // A rank whose ids are all masked holds no mass.
+        if (value > -CUDART_INF_F) {
+            total += slots[rank * IKD_PICK_SLOT + 2] * expf(value - best);
+        }
+    }
+    return total > 0.0f ? 1.0f / total : 0.0f;
 }
 
 // One NeoX rotate-half pair of a head of `dim` at `position`, rounded to BF16: the reference's
@@ -328,8 +348,8 @@ extern "C" __global__ void inkling_draft_context(const float* __restrict__ keys,
 
 // The Markov head's step input z = [s; W1[x]; h; f] (rank, rank, hidden, hidden values), BF16
 // values: x is `anchor` at step 0 and otherwise the pick of the last step's slots, which block 0
-// records at tokens[step]. h is the step's normed block row, rounded here; s and f already hold
-// BF16 values. Grid (width / 256).
+// records at tokens[step] with its probability at confidence[step]. h is the step's normed block
+// row, rounded here; s and f already hold BF16 values. Grid (width / 256).
 extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
                                                       const float* __restrict__ state,
                                                       const __nv_bfloat16* __restrict__ embed,
@@ -337,7 +357,7 @@ extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
                                                       const float* __restrict__ slots, int world,
                                                       int step, const float* __restrict__ row,
                                                       const float* __restrict__ fused, int rank,
-                                                      int hidden) {
+                                                      int hidden, float* __restrict__ confidence) {
     OPT_PDL_ENTRY();
     int token;
     if (step == 0) {
@@ -346,6 +366,7 @@ extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
         token = ikd_pick(slots, world);
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             tokens[step] = (unsigned)token;
+            confidence[step] = ikd_confidence(slots, world);
         }
     }
     const int width = 2 * rank + 2 * hidden;
@@ -388,7 +409,9 @@ extern "C" __global__ void inkling_draft_markov_gates(const float* __restrict__ 
     }
 }
 
-// One step's logits over this rank's `count` ids from first_id, and each block's best:
+// One step's logits over this rank's `count` ids from first_id, each block's best, and each
+// block's mass, the sum of exp(v - best) over its ids (the softmax's normaliser relative to the
+// best, a masked id adding nothing):
 // v = bf16(bf16(U) + bf16(b_f + W_f l)), softcapped as the target's (bf16(cap * tanh(v / cap)),
 // none when cap is 0), ids at or past `valid` masked. `base` is the block row's head sums U and
 // `product` the fold's sums W_f l. Grid (count / (blockDim.x * IKD_LOGIT_PER_THREAD)).
@@ -397,16 +420,19 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
                                                        const __nv_bfloat16* __restrict__ bias,
                                                        int count, int first_id, int valid,
                                                        float cap, float* __restrict__ part_values,
-                                                       int* __restrict__ part_ids) {
+                                                       int* __restrict__ part_ids,
+                                                       float* __restrict__ part_sums) {
     OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
+    float values[IKD_LOGIT_PER_THREAD];
     float best = -CUDART_INF_F;
     int best_id = 0x7fffffff;
     const int start = blockIdx.x * blockDim.x * IKD_LOGIT_PER_THREAD;
 #pragma unroll
     for (int i = 0; i < IKD_LOGIT_PER_THREAD; ++i) {
         const int index = start + i * blockDim.x + threadIdx.x;
+        values[i] = -CUDART_INF_F;
         if (index < count) {
             const float head = ikd_bf16(base[index]);
             const float shift = ikd_bf16(__bfloat162float(bias[index]) + product[index]);
@@ -418,6 +444,7 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
             if (id >= valid) {
                 value = -CUDART_INF_F;
             }
+            values[i] = value;
             if (ikd_above(value, id, best, best_id)) {
                 best = value;
                 best_id = id;
@@ -425,19 +452,30 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
         }
     }
     ikd_block_best(best, best_id, s_value, s_id);
+    float mass = 0.0f;
+#pragma unroll
+    for (int i = 0; i < IKD_LOGIT_PER_THREAD; ++i) {
+        if (values[i] > -CUDART_INF_F) {
+            mass += expf(values[i] - best);
+        }
+    }
+    mass = ikd_block_sum(mass, s_value);
     if (threadIdx.x == 0) {
         part_values[blockIdx.x] = best;
         part_ids[blockIdx.x] = best_id;
+        part_sums[blockIdx.x] = mass;
     }
 }
 
-// This rank's best of `parts` block bests into its slot of `world` pick slots ((value, id, 0, 0)
-// each), every other slot zero, so the group's sum leaves each rank's best in its own slot on
-// every rank. One block.
+// This rank's best of `parts` block bests into its slot of `world` pick slots ((value, id, mass,
+// 0) each), every other slot zero, so the group's sum leaves each rank's best in its own slot on
+// every rank. The mass is the blocks' masses (`part_sums`) rescaled to the rank's best. One
+// block.
 extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ part_values,
                                                       const int* __restrict__ part_ids, int parts,
                                                       float* __restrict__ slots, int rank,
-                                                      int world) {
+                                                      int world,
+                                                      const float* __restrict__ part_sums) {
     OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
@@ -450,6 +488,13 @@ extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ 
         }
     }
     ikd_block_best(best, best_id, s_value, s_id);
+    float mass = 0.0f;
+    for (int part = threadIdx.x; part < parts; part += blockDim.x) {
+        if (part_values[part] > -CUDART_INF_F) {
+            mass += part_sums[part] * expf(part_values[part] - best);
+        }
+    }
+    mass = ikd_block_sum(mass, s_value);
     for (int index = threadIdx.x; index < world * IKD_PICK_SLOT; index += blockDim.x) {
         const int owner = index / IKD_PICK_SLOT;
         const int field = index % IKD_PICK_SLOT;
@@ -458,16 +503,21 @@ extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ 
             value = best;
         } else if (owner == rank && field == 1) {
             value = (float)best_id;
+        } else if (owner == rank && field == 2) {
+            value = mass;
         }
         slots[index] = value;
     }
 }
 
-// The last step's pick, into tokens[step]. One thread.
+// The last step's pick, into tokens[step], and its probability, into confidence[step]. One
+// thread.
 extern "C" __global__ void inkling_draft_markov_last(const float* __restrict__ slots, int world,
-                                                     unsigned* __restrict__ tokens, int step) {
+                                                     unsigned* __restrict__ tokens, int step,
+                                                     float* __restrict__ confidence) {
     OPT_PDL_ENTRY();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         tokens[step] = (unsigned)ikd_pick(slots, world);
+        confidence[step] = ikd_confidence(slots, world);
     }
 }

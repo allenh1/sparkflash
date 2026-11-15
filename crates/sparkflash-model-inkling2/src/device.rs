@@ -47,7 +47,10 @@ use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
 use sparkflash_model::vision::{ImageSpan, VisionImage};
-use sparkflash_model::{Capabilities, FusedArm, ModelDescriptor, Speculator, TpPlan, lookup_draft};
+use sparkflash_model::{
+    Capabilities, DepthPolicy, FusedArm, ModelDescriptor, Speculator, StepCost, TpPlan,
+    lookup_draft,
+};
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
@@ -109,7 +112,9 @@ const SCORE_GRID: u32 = 96;
 /// rows are resident together and walk the same keys at once (block b of every row starts at the
 /// same key and strides the same), and all but the first find each key in L2 instead of DRAM.
 fn score_grid(rows: usize) -> u32 {
-    SCORE_GRID.div_ceil(u32::try_from(rows.max(1)).unwrap_or(u32::MAX)).max(1)
+    SCORE_GRID
+        .div_ceil(u32::try_from(rows.max(1)).unwrap_or(u32::MAX))
+        .max(1)
 }
 /// The threads one (head, row) of the split walk's recurrence runs (INKLING_MAX_HEAD_DIM: a dim a
 /// thread).
@@ -866,6 +871,9 @@ struct Shared {
     /// The drafter a sequence speculates with and the most drafts a round verifies
     /// ([DRAFT_ENV]); `None` steps a token at a time.
     draft: Option<(Drafter, usize)>,
+    /// How many of a DSpark round's drafts to verify ([DRAFT_POLICY_ENV]): each session starts
+    /// from this fresh policy and calibrates its own.
+    depth_policy: Option<DepthPolicy>,
     /// The DSpark drafter's weights, once [InklingDeviceBackend::load_drafter] loaded them.
     dspark: Option<DraftModel>,
     /// The vision tower, on rank 0 when it was loaded ([InklingDeviceBackend::load_vision]): the
@@ -2368,6 +2376,7 @@ impl InklingDeviceBackend {
                 ));
             }
         }
+        let depth_policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
         // The decode schedule is built for the chunk too: the two address the same sliding
         // rings, and a ring is sized by the widest write into it.
         let plan = InklingDevicePlan::build_for_chunk(
@@ -2474,6 +2483,7 @@ impl InklingDeviceBackend {
                 prefill_chunk,
                 prefill_walk,
                 draft,
+                depth_policy,
                 dspark: None,
                 vision: None,
             }),
@@ -2551,10 +2561,12 @@ impl InklingDeviceBackend {
             .map(|(_, rows, columns)| rows * columns * 2)
             .max()
             .unwrap_or(0);
-        match shared
-            .dense
-            .pack(&shared.cuda, &shared.kernels, model.dense_matrices(), widest)
-        {
+        match shared.dense.pack(
+            &shared.cuda,
+            &shared.kernels,
+            model.dense_matrices(),
+            widest,
+        ) {
             Ok((bf16_bytes, packed_bytes)) if bf16_bytes > 0 => eprintln!(
                 "[inkling] rank {}: drafter projections packed: {:.1} -> {:.1} MB",
                 shared.exchange.rank(),
@@ -3861,6 +3873,9 @@ struct Round {
     start: usize,
     /// The anchor and the drafts the verify ran.
     chunk: Vec<u32>,
+    /// The probability the drafter gave each draft it made, the verified ones first: what the
+    /// depth policy learns from when the round settles.
+    confidence: Vec<f32>,
     /// Each row's logits.
     rows: Vec<Vec<f32>>,
     /// The rows the caller has fed: the anchor, then each draft it fed in turn.
@@ -3884,6 +3899,67 @@ pub const DRAFT_ENV: &str = "SPARKFLASH_INKLING_DRAFT";
 pub const DRAFT_DEPTH_ENV: &str = "SPARKFLASH_INKLING_DRAFT_DEPTH";
 const DEFAULT_DRAFT_DEPTH: usize = 7;
 const MAX_DRAFT_DEPTH: usize = 15;
+/// How many of a DSpark round's drafts the verify walks: `adaptive` (unset, as every drafting
+/// arm's default) picks the depth from the probabilities the drafter gave its drafts, `fixed`
+/// walks all [DRAFT_DEPTH_ENV] of them. Read through the profile's `speculation.depth_policy`.
+pub const DRAFT_POLICY_ENV: &str = "SPARKFLASH_INKLING_DRAFT_POLICY";
+/// The fewest drafts an adaptive DSpark round verifies, 0 unset: the profile's
+/// `speculation.min_depth`.
+pub const DRAFT_MIN_DEPTH_ENV: &str = "SPARKFLASH_INKLING_DRAFT_MIN_DEPTH";
+
+/// The modelled wall of a DSpark round at TP4 on four GB10-class nodes that verifies `depth`
+/// drafts (ms), for [DepthPolicy]: the draft and the anchor's row at 41.6 ms, and 9.6 ms a verified
+/// draft (mostly the experts its row adds). Fit to the 93k-token gate's 70.4 ms rounds at depth 3
+/// against its 29.6 ms plain step and 8.9 ms draft; the 5k-token repeat prompt's rounds at 3 and 7
+/// drafts fit 39.6 and 7.9. The first round assumes the 21.4 ms a token depth 3 made at 93k.
+const DSPARK_STEP_COST: StepCost = StepCost {
+    step_ms: 41.6,
+    row_ms: 9.6,
+    prior_tokens_per_ms: 1.0 / 21.4,
+};
+
+/// The verify-depth policy a DSpark sequence starts from ([DRAFT_POLICY_ENV],
+/// [DRAFT_MIN_DEPTH_ENV]), over chains of the drafter's `depth`. Only DSpark gives its drafts a
+/// probability, so either switch set for another drafter, or none, is refused rather than ignored,
+/// as is a value outside the switch's domain or a minimum past the depth.
+fn depth_policy_from_env(
+    draft: Option<(Drafter, usize)>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<DepthPolicy>, String> {
+    const SWITCHES: [&str; 2] = [DRAFT_POLICY_ENV, DRAFT_MIN_DEPTH_ENV];
+    let ours = |name: &str| {
+        SWITCHES
+            .contains(&name)
+            .then(|| lookup(name))
+            .flatten()
+            .filter(|value| !value.is_empty())
+    };
+    let Some((Drafter::Dspark, depth)) = draft else {
+        return match SWITCHES.iter().find(|name| ours(name).is_some()) {
+            Some(name) => Err(format!(
+                "{name} sets how many DSpark drafts a round verifies, and {DRAFT_ENV} is not \
+                 dspark: no other drafter gives its drafts a probability"
+            )),
+            None => Ok(None),
+        };
+    };
+    let mut profile = sparkflash_model::profile::ModelProfile::default();
+    profile.apply_env(ours).map_err(|error| error.to_string())?;
+    let speculation = &profile.speculation;
+    if let Some(least) = speculation.min_depth
+        && least > depth
+    {
+        return Err(format!(
+            "{DRAFT_MIN_DEPTH_ENV}={least} is past the {depth} drafts a round makes \
+             ({DRAFT_DEPTH_ENV})"
+        ));
+    }
+    Ok(Some(DepthPolicy::from_speculation(
+        speculation,
+        depth,
+        DSPARK_STEP_COST,
+    )))
+}
 /// The n-grams prompt lookup matches, longest first.
 const LOOKUP_NGRAMS: (usize, usize) = (2, 4);
 
@@ -4013,11 +4089,14 @@ impl ModelSession for InklingDeviceSession {
         if self.state.position >= self.shared.context {
             return Err(BackendError::new("context", "the context is exhausted"));
         }
-        let drafts = self.draft(token)?;
+        let (drafts, confidence) = self.draft(token)?;
         if drafts.is_empty() {
             let position = self.state.position;
             let logits = self.step(token)?;
             self.inject(1, position)?;
+            // A round that verifies nothing is still a round: the policy weighs the next depth at
+            // the rate its rounds have made.
+            self.speculator.observe(&confidence, 0, 1);
             return Ok(self.decoded(token, logits));
         }
         let start = self.state.position;
@@ -4032,6 +4111,7 @@ impl ModelSession for InklingDeviceSession {
         self.round = Some(Round {
             start,
             chunk,
+            confidence,
             rows,
             fed: 1,
         });
@@ -4349,7 +4429,10 @@ impl InklingDeviceSession {
             sampler: Sampler::new(),
             verify: None,
             round: None,
-            speculator: Speculator::new(shared.draft.map_or(0, |(_, depth)| depth), None),
+            speculator: Speculator::new(
+                shared.draft.map_or(0, |(_, depth)| depth),
+                shared.depth_policy.clone(),
+            ),
         })
     }
 
@@ -4380,25 +4463,30 @@ impl InklingDeviceSession {
         self.output(logits)
     }
 
-    /// The drafts to verify after `anchor`: none without a drafter, and never more than the
-    /// context has room for past the anchor.
-    fn draft(&mut self, anchor: u32) -> Result<Vec<u32>, BackendError> {
+    /// The drafts to verify after `anchor`, and the probability the drafter gave each draft it
+    /// made: none without a drafter, never more than the context has room for past the anchor,
+    /// and of DSpark's chain the leading drafts the depth policy picks from those probabilities.
+    fn draft(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         let Some((drafter, _)) = self.shared.draft else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let room = self.shared.context.saturating_sub(self.state.position + 1);
-        let depth = self.speculator.depth(&[], room);
         match drafter {
             Drafter::Lookup => {
+                let depth = self.speculator.depth(&[], room);
                 let mut context = Vec::with_capacity(self.history.len() + 1);
                 context.extend_from_slice(&self.history);
                 context.push(anchor);
                 let (shortest, longest) = LOOKUP_NGRAMS;
-                Ok(lookup_draft(&context, shortest, longest, depth))
+                Ok((lookup_draft(&context, shortest, longest, depth), Vec::new()))
             }
             Drafter::Dspark => {
-                if depth == 0 {
-                    return Ok(Vec::new());
+                // The whole chain is drafted before the depth is known, since the depth comes from
+                // the drafts' probabilities: a Markov step past the depth costs about 0.2 ms, a
+                // verified row about 9.6 ms.
+                let chain = self.speculator.max_depth().min(room);
+                if chain == 0 {
+                    return Ok((Vec::new(), Vec::new()));
                 }
                 let shared = Arc::clone(&self.shared);
                 let (Some(model), Some(drafter)) = (shared.dspark.as_ref(), self.drafter.as_mut())
@@ -4414,7 +4502,10 @@ impl InklingDeviceSession {
                         self.state.position
                     )));
                 }
-                drafter.draft(&shared, model, anchor, depth.min(model.max_depth()))
+                let (mut drafts, confidence) =
+                    drafter.draft(&shared, model, anchor, chain.min(model.max_depth()))?;
+                drafts.truncate(self.speculator.depth(&confidence, room));
+                Ok((drafts, confidence))
             }
         }
     }
@@ -4439,8 +4530,7 @@ impl InklingDeviceSession {
         if self.verify.is_none() {
             let rows = self.speculator.max_depth() + 1;
             self.verify = Some(
-                VerifyBuffer::allocate(&self.shared, rows, &self.state.conv)
-                    .map_err(Self::fail)?,
+                VerifyBuffer::allocate(&self.shared, rows, &self.state.conv).map_err(Self::fail)?,
             );
         }
         let verify = self
@@ -4469,7 +4559,7 @@ impl InklingDeviceSession {
             return Ok(());
         };
         self.speculator
-            .observe(&[], round.chunk.len() - 1, round.fed);
+            .observe(&round.confidence, round.chunk.len() - 1, round.fed);
         // The verify left every row's taps; the drafter keeps the rows the caller fed.
         self.inject(round.fed, round.start)?;
         let verify = self
@@ -5447,8 +5537,9 @@ impl InklingDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM,
-        PrefillWalk, mma_attention_shared,
+        AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV,
+        DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, PrefillWalk,
+        depth_policy_from_env, mma_attention_shared,
     };
     use crate::config::Inkling2Config;
 
@@ -5547,5 +5638,63 @@ mod tests {
         assert_eq!(fixed.widest(), 512);
         assert_eq!(fixed.next(1_000_000), 512);
         assert_eq!(fixed.next(7), 7);
+    }
+
+    /// The verify-depth policy's switches as `pairs` set them, and nothing else.
+    fn policy_with(
+        draft: Option<(Drafter, usize)>,
+        pairs: &[(&str, &str)],
+    ) -> Result<Option<DepthPolicy>, String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        depth_policy_from_env(draft, |name| {
+            pairs
+                .iter()
+                .find(|(set, _)| set == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    #[test]
+    fn a_dspark_round_picks_its_depth_unless_told_to_verify_every_draft() {
+        let dspark = Some((Drafter::Dspark, 7));
+        let adaptive = policy_with(dspark, &[]).unwrap().unwrap();
+        assert!(adaptive.is_adaptive());
+        assert_eq!(adaptive.cost(), DSPARK_STEP_COST);
+        let fixed = policy_with(dspark, &[(DRAFT_POLICY_ENV, "fixed")])
+            .unwrap()
+            .unwrap();
+        assert!(!fixed.is_adaptive());
+        assert_eq!(fixed.depth(&[0.0; 7]), 7);
+        // A floor holds however unlikely the drafts.
+        let floored = policy_with(dspark, &[(DRAFT_MIN_DEPTH_ENV, "2")])
+            .unwrap()
+            .unwrap();
+        assert!(floored.depth(&[0.0; 7]) >= 2);
+        // An empty value is unset.
+        assert!(
+            policy_with(dspark, &[(DRAFT_POLICY_ENV, "")])
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_depth_switch_the_round_cannot_honour_is_refused() {
+        // A value outside the switch's domain.
+        assert!(policy_with(Some((Drafter::Dspark, 7)), &[(DRAFT_POLICY_ENV, "always")]).is_err());
+        assert!(policy_with(Some((Drafter::Dspark, 7)), &[(DRAFT_MIN_DEPTH_ENV, "two")]).is_err());
+        // A floor past the drafts a round makes.
+        assert!(policy_with(Some((Drafter::Dspark, 3)), &[(DRAFT_MIN_DEPTH_ENV, "4")]).is_err());
+        // No other drafter gives its drafts a probability, and no drafter drafts nothing.
+        for draft in [None, Some((Drafter::Lookup, 7))] {
+            assert_eq!(policy_with(draft, &[]), Ok(None));
+            for name in [DRAFT_POLICY_ENV, DRAFT_MIN_DEPTH_ENV] {
+                let refused = policy_with(draft, &[(name, "1")]).unwrap_err();
+                assert!(refused.contains(name), "{refused}");
+            }
+        }
     }
 }

@@ -701,8 +701,12 @@ pub(super) struct DraftState {
     product: Deviceptr,
     part_values: Deviceptr,
     part_ids: Deviceptr,
+    /// Each step-logits block's mass: its sum of exp(logit - the block's best).
+    part_sums: Deviceptr,
     slots: Deviceptr,
     tokens: Deviceptr,
+    /// The probability the step's softmax gave each pick, beside [Self::tokens].
+    confidence: Deviceptr,
     parts: usize,
     /// The positions whose context the rings hold: 0..committed.
     committed: usize,
@@ -762,8 +766,10 @@ impl DraftState {
         let product = layout.take(rank_vocab * f);
         let part_values = layout.take(parts * f);
         let part_ids = layout.take(parts * 4);
+        let part_sums = layout.take(parts * f);
         let slots = layout.take(world * PICK_SLOT * f);
         let tokens = layout.take(rows * 4);
+        let confidence = layout.take(rows * f);
         let mut total = 0usize;
         let arena = shared.cuda.alloc(layout.bytes, &mut total)?;
         let at = |region: Region| arena.offset(region.0);
@@ -804,8 +810,10 @@ impl DraftState {
             product: at(product),
             part_values: at(part_values),
             part_ids: at(part_ids),
+            part_sums: at(part_sums),
             slots: at(slots),
             tokens: at(tokens),
+            confidence: at(confidence),
             parts,
             committed: 0,
         })
@@ -948,9 +956,13 @@ impl DraftState {
         Ok(())
     }
 
-    /// Up to `depth` drafts after `anchor`, the token at position [Self::committed]: the block
-    /// through the five layers, its rows' base logits through the head, and the Markov head's
-    /// greedy steps.
+    /// Up to `depth` drafts after `anchor`, the token at position [Self::committed], and the
+    /// probability the drafter gave each: the block through the five layers, its rows' base
+    /// logits through the head, and the Markov head's greedy steps.
+    ///
+    /// A draft's probability is its step's softmax at the pick, over the logits the pick was the
+    /// largest of. It is computed on the device from the values every rank exchanged, so every
+    /// rank reads the same floats and a depth chosen from them is the same on each.
     ///
     /// # Errors
     /// A sequence with no committed row (the Markov head's feature is the last one's), a depth
@@ -961,9 +973,9 @@ impl DraftState {
         model: &DraftModel,
         anchor: u32,
         depth: usize,
-    ) -> Result<Vec<u32>, BackendError> {
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         if depth == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         if depth > model.max_depth() {
             return Err(device_error(format!(
@@ -1218,6 +1230,7 @@ impl DraftState {
                     self.feature.0,
                     markov as u64,
                     hidden as u64,
+                    self.confidence.0,
                 ],
             ))?;
             run(shared.gemv(
@@ -1260,6 +1273,7 @@ impl DraftState {
                     bits(cap),
                     self.part_values.0,
                     self.part_ids.0,
+                    self.part_sums.0,
                 ],
             ))?;
             run(shared.launch(
@@ -1273,6 +1287,7 @@ impl DraftState {
                     self.slots.0,
                     shared.exchange.rank() as u64,
                     world as u64,
+                    self.part_sums.0,
                 ],
             ))?;
             exchange_sum(shared, self.slots, world * PICK_SLOT)?;
@@ -1281,10 +1296,17 @@ impl DraftState {
             kernels.markov_last,
             (1, 1, 1),
             (32, 1, 1),
-            &[self.slots.0, world as u64, self.tokens.0, depth as u64],
+            &[
+                self.slots.0,
+                world as u64,
+                self.tokens.0,
+                depth as u64,
+                self.confidence.0,
+            ],
         ))?;
         run(shared.cuda.synchronize())?;
         run(shared.exchange.check_device())?;
+        // Word 0 of each is the anchor's, which no step picks.
         let mut bytes = vec![0u8; (depth + 1) * 4];
         run(shared.cuda.copy_dtoh(&mut bytes, &self.tokens))?;
         let drafts: Vec<u32> = bytes
@@ -1299,6 +1321,19 @@ impl DraftState {
                 "the drafter picked {bad}, past the {valid} ids it may draft"
             )));
         }
-        Ok(drafts)
+        run(shared.cuda.copy_dtoh(&mut bytes, &self.confidence))?;
+        let confidence: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .skip(1)
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        if let Some(bad) = confidence.iter().find(|p| !(0.0..=1.0).contains(*p)) {
+            return Err(device_error(format!(
+                "the drafter gave a pick the probability {bad}"
+            )));
+        }
+        Ok((drafts, confidence))
     }
 }
