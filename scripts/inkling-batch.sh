@@ -22,10 +22,11 @@
 # compared on the ids they generate, and the arm's own tokenizer is not one of the variables.
 #
 # PREFILL=tensor (the default), chunk (the decode step's bits), rows or gemm selects the prefill
-# walk (SPARKFLASH_INKLING_PREFILL; an unknown one is refused at open). The hosts, ports and NCCL
-# environment come from the site file scripts/inkling-env.sh reads. NSYS=/path/report profiles
-# rank 0 under Nsight Systems (CUDA and OS runtime traces) into that report; NSYS_ALL=1 also
-# profiles ranks 1-3, each into ${NSYS}-rank<r> on its own host.
+# walk (SPARKFLASH_INKLING_PREFILL; an unknown one is refused at open). --text-file reads a
+# prompt too long for one argument from a file at the same path on every rank. The hosts, ports
+# and NCCL environment come from the site file scripts/inkling-env.sh reads. NSYS=/path/report
+# profiles rank 0 under Nsight Systems (CUDA and OS runtime traces) into that report; NSYS_ALL=1
+# also profiles ranks 1-3, each into ${NSYS}-rank<r> on its own host.
 set -uo pipefail
 source "$(dirname "$0")/inkling-env.sh"
 MODEL=${MODEL:-$MODEL_DIR/ckpt}

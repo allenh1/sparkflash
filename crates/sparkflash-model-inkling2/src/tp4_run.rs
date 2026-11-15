@@ -441,6 +441,15 @@ impl Tp4Args {
                 "--chat" => chat = true,
                 "--tokenizer" => tokenizer = Some(PathBuf::from(value()?)),
                 "--text" => text = Some(value()?),
+                // The same text from a file at the same path on every rank: a long prompt is past
+                // what one argument of a command line may hold (128 KiB on Linux).
+                "--text-file" => {
+                    let path = value()?;
+                    text = Some(
+                        std::fs::read_to_string(&path)
+                            .map_err(|error| format!("--text-file {path}: {error}"))?,
+                    );
+                }
                 "--prompt" => {
                     let raw = value()?;
                     let mut ids = Vec::new();
@@ -471,10 +480,10 @@ impl Tp4Args {
         let peers = peers.ok_or_else(|| "--peer is required".to_owned())?;
         let world = world.unwrap_or(peers.len());
         if prompt.is_none() && text.is_none() {
-            return Err("--prompt or --text is required".to_owned());
+            return Err("--prompt, --text or --text-file is required".to_owned());
         }
         if text.is_some() && tokenizer.is_none() {
-            return Err("--text needs --tokenizer".to_owned());
+            return Err("--text and --text-file need --tokenizer".to_owned());
         }
         if dump.is_some() && cuts == 0 {
             return Err("--dump-logits writes the --cuts rows; give --cuts N".to_owned());
@@ -572,11 +581,42 @@ mod tests {
     }
 
     #[test]
+    fn a_text_file_is_the_text_flag_read_from_a_file() {
+        let path = std::env::temp_dir().join(format!("inkling-text-{}.txt", std::process::id()));
+        std::fs::write(&path, "a long\nprompt\n").expect("write the text file");
+        let argv = [
+            "--model",
+            "/m",
+            "--converted",
+            "/c",
+            "--rank",
+            "1",
+            "--peer",
+            "10.0.0.1:9",
+            "--tokenizer",
+            "/t",
+            "--text-file",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([path.display().to_string()]);
+        let args = Tp4Args::parse(argv).expect("the run parses");
+        std::fs::remove_file(&path).expect("remove the text file");
+        assert_eq!(args.text.as_deref(), Some("a long\nprompt\n"));
+        let error =
+            parse(&["--tokenizer", "/t", "--text-file", "/nonexistent-text"]).expect_err("no file");
+        assert!(error.contains("--text-file /nonexistent-text"), "{error}");
+    }
+
+    #[test]
     fn every_required_flag_is_named() {
         let error = parse(&[]).expect_err("no prompt");
-        assert!(error.contains("--prompt or --text is required"), "{error}");
+        assert!(
+            error.contains("--prompt, --text or --text-file is required"),
+            "{error}"
+        );
         let error = parse(&["--text", "hi"]).expect_err("text without a tokenizer");
-        assert!(error.contains("--text needs --tokenizer"), "{error}");
+        assert!(error.contains("--text-file need --tokenizer"), "{error}");
         let argv: Vec<String> = vec![
             "--peer".into(),
             "10.0.0.1:9".into(),
