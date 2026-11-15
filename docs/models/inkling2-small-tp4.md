@@ -258,6 +258,9 @@ canonical for shared parts.
   ranges an inner-axis split needs, and `verify_rank` compares every slot against the
   checkpoint. `--inspect` reads a file back. The Hub resolver needs an entry for the repo
   and its sibling `mtp.safetensors`.
+* `--expert-split intermediate` writes the other expert layout: every rank holds all 384
+  experts at a quarter of their intermediate width, not 96 whole experts. It is opt-in and
+  changes bits; §15, "Experts split by intermediate columns", has the measurements.
 
 ### 5. Serving, tokenizer and KV
 
@@ -1276,3 +1279,67 @@ At 93K, verifying an 8-row round costs four plain steps. Each row routes its own
 so eight rows read about 59 distinct experts against one row's 8, and every row walks the full
 layers' keys. The drafter therefore stays off by default, and depth 3 is the choice when it is
 on.
+
+### Decode launches: fused projections, the residual's rows side by side
+
+After the 93K prompt a decode step ran about 1,765 kernels on a rank. A single-row kernel that
+finishes in a few microseconds leaves the device idle for about as long between launches. Two
+changes take launches and serial work out of the step without moving a bit:
+
+* **Same-input projections in one launch.** A decode row's consecutive projections that read the
+  same input at the same width run as one `q4e_gemv4_bf16` launch of up to four matrices: a
+  sliding layer's q, k, v and relative-state projections, then its gate and sink. That kernel
+  computes each output row with the same `q4e_row_dot_bf16` and `q4e_warp_sum` as the
+  one-matrix GEMV, so every output is the same number. A sliding layer goes from six projection
+  launches to two, a full layer to four.
+* **The block residual's rows side by side.** `inkling_block_residual` runs one block a query
+  and walks the summary stack's rows one after another, two block reductions a row: about 21 µs
+  a call, 96 calls a step. A call of at most eight (row, query) pairs, which is every decode row,
+  now runs `inkling_block_residual_stats` (one block a stack row: its RMS inverse and score) and
+  then `inkling_block_residual_mix` (the softmax, then the mix across the hidden width). Both use
+  the one-block form's row body, softmax and mix in the same orders, so the output is
+  bit-identical. A chunk's pairs already fill the device and keep the one-block form. A stack
+  deeper than the kernels' 17 rows is refused; the one-block kernel skipped it.
+
+Each was checked against the deployed build on the four ranks: teacher-forced logits identical
+on all twelve D117 cuts, and the greedy ids of both prompts below equal.
+
+| on the four ranks | key tables (before) | fused projections | and the residual |
+|---|---|---|---|
+| decode step, repeating 5K prompt (batch arm) | 39.0 ms | 38.5 ms | 37.4 ms |
+| decode step after the 93K prompt (batch arm) | 44.3 ms | 43.8 ms | 42.7 ms |
+| served decode, 2,223-token prompt | 26.0 tokens/s | — | 26.2 tokens/s |
+| served decode, 99,848-token prompt | 21.4 tokens/s | — | 22.2 tokens/s |
+
+### Experts split by intermediate columns (opt-in, not the default)
+
+Expert parallelism gives each rank 96 whole experts, so a decode row's eight experts land on the
+ranks unevenly: one rank often holds three or four of them while another holds none. A profile
+after the 93K prompt put the slowest rank's expert phase at 20.4 ms a step against a mean of
+13.5 ms. The other ranks wait out the difference in the exchange, which is where rank 0's
+largest share of a step went (8.4 ms).
+
+`sparkflash convert --expert-split intermediate` instead gives every rank all 384 experts at a
+quarter of their intermediate width, 576 of 2,304 columns: the gate and up rows and the down
+projection's contraction columns. The all-reduce after the experts already finishes the down
+projection's contraction, so no collective is added. 576 is a whole number of NVFP4 (16) and
+MXFP8 (32) scale blocks, of the decode band's 16-column runs and of the prompt MMA's 64-wide
+stages; a world that would cut a scale block is refused. The rank file records the split and the
+loader takes it from there, so a server needs no flag. DeepSeek's routed experts take the same
+slicing at TP4 (D2, D30). The files are the same size as expert parallelism's (97,484,185,600
+bytes a rank).
+
+The split changes where the down projection's sums are rounded: each rank's BF16 exchange row is
+a partial sum over all eight experts rather than the whole of a few. Its bits therefore differ
+from expert parallelism's, and it stays opt-in at conversion until the maintainer decides.
+
+| on the four ranks | expert parallel | intermediate split |
+|---|---|---|
+| decode step, repeating 5K prompt (batch arm) | 39.0 ms | 33.2 ms (same 96 greedy ids) |
+| decode step after the 93K prompt, with the fused projections | 43.8 ms | 38.6 ms |
+| 93K prompt (batch arm) | 121.2 s | 121.1 s |
+
+After the 93K prompt the greedy ids agree for 15 tokens and part at the 16th.
+Teacher-forced on the D117 text against expert parallelism: top-1 agrees on 12 of 12 cuts, top-5
+overlap 4-5, mean abs logit difference 0.08-0.37 a row (max 2.37), KL at most 1.19e-2 nats (mean
+4.1e-3). That is the size of D119's distance, and 2,253,663 of the 2,400,696 logits differ.
