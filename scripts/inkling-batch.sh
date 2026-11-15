@@ -22,7 +22,9 @@
 # compared on the ids they generate, and the arm's own tokenizer is not one of the variables.
 #
 # PREFILL=tensor (the default), chunk (the decode step's bits), rows or gemm selects the prefill
-# walk (SPARKFLASH_INKLING_PREFILL; an unknown one is refused at open). --text-file reads a
+# walk (SPARKFLASH_INKLING_PREFILL; an unknown one is refused at open), and an exported
+# SPARKFLASH_INKLING_ATTENTION (fast, split, serial or check) the attention walk, as every exported
+# SPARKFLASH_INKLING_* variable reaches every rank. --text-file reads a
 # prompt too long for one argument from a file at the same path on every rank. The hosts, ports
 # and NCCL environment come from the site file scripts/inkling-env.sh reads. NSYS=/path/report
 # profiles rank 0 under Nsight Systems (CUDA and OS runtime traces) into that report; NSYS_ALL=1

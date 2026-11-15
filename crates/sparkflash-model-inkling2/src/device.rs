@@ -91,6 +91,10 @@ const MIX_BLOCK: u32 = 128;
 const SCORE_GROUPS: usize = 8;
 /// The f32 slots of the split walk's running state a (row, head) (INKLING_STATE_WIDTH).
 const MIX_STATE: usize = 2 + 128;
+/// The split-key decode walk's keys a run and threads a block (INKLING_PART_KEYS and
+/// INKLING_PART_THREADS in kernels/inkling_attn_sm121.cu).
+const PART_KEYS: usize = 256;
+const PART_THREADS: u32 = 128;
 /// The scores one decode split-walk pass may hold across its heads: ~175k keys, so a sliding
 /// layer is one pass and a full layer at a million positions a handful.
 const SCORE_BUDGET: usize = 1 << 21;
@@ -127,7 +131,8 @@ pub enum PrefillWalk {
     /// chain depends on K alone and not on which rows share its tile.
     Tensor,
     /// Chunks through the row kernels' own arithmetic: every row is the bits a decode step gives
-    /// it, which is what the bit gate reproduces.
+    /// it, which is what the bit gate reproduces. Its attention is the exact walk unless
+    /// [ATTENTION_ENV] names another.
     Chunk,
     /// One position at a time through the decode step.
     Rows,
@@ -159,33 +164,176 @@ impl PrefillWalk {
     }
 }
 
-/// The switch between the split attention walk (the default) and the serial body.
-///
-/// Both give the same bits - the split walk is the serial body's arithmetic with the
-/// recurrence alone left serial, compared bit for bit against it over ring, full, multi-pass,
-/// tied and NaN cases - and the serial body is kept as the reference it is checked against.
+/// The switch between attention walks: `fast`, `split`, `serial` or `check`. Unset or empty
+/// follows the prompt's walk: `fast` under [PrefillWalk::Tensor], standing down to `split` with
+/// one printed line on a shape the fast walks are not built for, and `split` under the others, so
+/// [PrefillWalk::Chunk] keeps the decode step's bits. `fast` or `check` named on a shape they are
+/// not built for is refused, as is an unknown value.
 pub const ATTENTION_ENV: &str = "SPARKFLASH_INKLING_ATTENTION";
 
-/// Whether attention takes the split walk; an unknown value is refused rather than ignored.
-fn split_attention() -> Result<bool, String> {
-    match std::env::var(ATTENTION_ENV).as_deref() {
-        Err(_) | Ok("" | "split") => Ok(true),
-        Ok("serial") => Ok(false),
-        Ok(other) => Err(format!(
-            "{ATTENTION_ENV}={other} is not an attention walk: use split (the default) or serial"
-        )),
+/// How attention is walked.
+///
+/// `split` and `serial` give the same bits - the split walk is the serial body's arithmetic with
+/// the recurrence alone left serial, compared bit for bit against it over ring, full, multi-pass,
+/// tied and NaN cases - and the serial body is kept as the reference it is checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionWalk {
+    /// A prompt chunk's rows on the tensor cores (inkling_attn_mma: the shared prefill attention
+    /// body Dory's dory_attn_mma runs, with Inkling's clips, bias, sink and gate as its policy),
+    /// and a single row's keys split into runs merged in run order (inkling_attn_part and
+    /// inkling_attn_merge after the split walk's scores). Neither is the exact walks' bits: the
+    /// tensor-core walk's scores and value sum are MMA products, q and the softmax weights
+    /// carried as a BF16 head and the BF16 of its remainder, and the split-key walk adds a row's
+    /// terms in another order.
+    Fast,
+    /// The split walk everywhere.
+    Split,
+    /// The serial body everywhere.
+    Serial,
+    /// The split walk's output everywhere, with the fast walks run beside it on every prompt
+    /// chunk and decode row and each layer's largest difference printed: the per-layer bound of
+    /// the fast walks on a real prompt, each layer from exact inputs.
+    Check,
+}
+
+impl AttentionWalk {
+    /// The walk [ATTENTION_ENV] names for a rank that holds `groups` query heads a kv head and
+    /// forwards prompts by `prefill`, and the tensor-core walk's dynamic shared memory when it
+    /// runs.
+    fn select(
+        config: &Inkling2Config,
+        groups: usize,
+        prefill: PrefillWalk,
+    ) -> Result<(Self, Option<u32>), String> {
+        let value = std::env::var(ATTENTION_ENV).ok();
+        Self::choose(value.as_deref(), config, groups, prefill)
     }
+
+    /// [Self::select] given the variable's value, `None` when it is unset.
+    fn choose(
+        value: Option<&str>,
+        config: &Inkling2Config,
+        groups: usize,
+        prefill: PrefillWalk,
+    ) -> Result<(Self, Option<u32>), String> {
+        let named = match value {
+            None | Some("") => None,
+            Some("fast") => Some(Self::Fast),
+            Some("split") => Some(Self::Split),
+            Some("serial") => Some(Self::Serial),
+            Some("check") => Some(Self::Check),
+            Some(other) => {
+                return Err(format!(
+                    "{ATTENTION_ENV}={other} is not an attention walk: use fast (the default: \
+                     prompt rows on the tensor cores, a decode row's keys split into runs), split \
+                     or serial (the exact walks), or check (split, with each layer's difference \
+                     from fast printed)"
+                ));
+            }
+        };
+        match named {
+            Some(walk @ (Self::Split | Self::Serial)) => Ok((walk, None)),
+            Some(walk) => match fast_attention_fits(config, groups) {
+                Ok(shared) => Ok((walk, Some(shared))),
+                Err(why) => Err(format!(
+                    "{ATTENTION_ENV}={}: {why}; set {ATTENTION_ENV}=split for the exact walk",
+                    walk.name()
+                )),
+            },
+            // The exact prompt walks keep the exact attention: chunk is the decode step's bits.
+            None if prefill != PrefillWalk::Tensor => Ok((Self::Split, None)),
+            None => match fast_attention_fits(config, groups) {
+                Ok(shared) => Ok((Self::Fast, Some(shared))),
+                Err(why) => {
+                    eprintln!(
+                        "[inkling] attention takes the split walk: {why} \
+                         ({ATTENTION_ENV}=split selects it without this line)"
+                    );
+                    Ok((Self::Split, None))
+                }
+            },
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Split => "split",
+            Self::Serial => "serial",
+            Self::Check => "check",
+        }
+    }
+
+    /// Whether the fast walks run, alone or beside the split walk.
+    const fn fast(self) -> bool {
+        matches!(self, Self::Fast | Self::Check)
+    }
+
+    /// Whether the exact walk is the split one rather than the serial body.
+    const fn split(self) -> bool {
+        !matches!(self, Self::Serial)
+    }
+}
+
+/// The tensor-core walk's geometry: query positions a block (SHARED_ATTN_Q in
+/// kernels/shared_attn_mma_sm121.cuh), keys a tile (SHARED_ATTN_KEYS), the head width it is built
+/// for (INKLING_MAX_HEAD_DIM), the relative state it takes (INKLING_MMA_D_REL), the f32 a row of
+/// a warp's bias tile (INKLING_MMA_REL_STRIDE) and the opt-in ceiling on one block's dynamic
+/// shared memory on sm_121.
+const MMA_Q: usize = 16;
+const MMA_KEYS: usize = 32;
+const MMA_HEAD_DIM: usize = 128;
+const MMA_D_REL: usize = 16;
+const MMA_REL_STRIDE: usize = 52;
+const MMA_SHARED_LIMIT: usize = 101_376;
+
+/// inkling_attn_mma's dynamic shared memory for `groups` query heads a kv head: q's BF16 head
+/// and remainder for the group's rows, a key and a value tile, the tile's key gains and value
+/// scales, and a bias tile a warp.
+const fn mma_attention_shared(groups: usize) -> usize {
+    (2 * groups * MMA_Q + 2 * MMA_KEYS) * MMA_HEAD_DIM * 2
+        + 2 * MMA_KEYS * 4
+        + groups * MMA_Q * MMA_REL_STRIDE * 4
+}
+
+/// The tensor-core walk's dynamic shared memory for this shape, or why the fast walks are not
+/// built for it (the split-key walk's own bounds - a head width of whole 8-dim loads at most
+/// INKLING_MAX_HEAD_DIM, at most INKLING_MAX_GROUPS heads a kv head - are inside these).
+fn fast_attention_fits(config: &Inkling2Config, groups: usize) -> Result<u32, String> {
+    if config.head_dim != MMA_HEAD_DIM {
+        return Err(format!(
+            "the tensor-core walk is built for head_dim {MMA_HEAD_DIM}, and this checkpoint has {}",
+            config.head_dim
+        ));
+    }
+    if config.d_rel > MMA_D_REL {
+        return Err(format!(
+            "the tensor-core walk takes a relative state of at most {MMA_D_REL}, and this \
+             checkpoint has {}",
+            config.d_rel
+        ));
+    }
+    let shared = mma_attention_shared(groups);
+    if groups == 0 || groups > SCORE_GROUPS || shared > MMA_SHARED_LIMIT {
+        return Err(format!(
+            "the tensor-core walk serves 1..={SCORE_GROUPS} query heads a kv head within \
+             {MMA_SHARED_LIMIT} bytes of shared memory, and this rank holds {groups} ({shared} \
+             bytes)"
+        ));
+    }
+    Ok(shared as u32)
 }
 
 /// The keys a split-walk pass covers for `rows` rows of `heads` heads: a whole number of the
 /// recurrence's 32-key tiles.
 fn attention_pass_slots(rows: usize, heads: usize) -> usize {
-    let budget = if rows > 1 {
-        CHUNK_SCORE_BUDGET
+    // A single row's passes are whole split-key runs, so a pass's runs are the row's own.
+    let (budget, unit) = if rows > 1 {
+        (CHUNK_SCORE_BUDGET, 32)
     } else {
-        SCORE_BUDGET
+        (SCORE_BUDGET, PART_KEYS)
     };
-    ((budget / (rows.max(1) * heads.max(1))) / 32 * 32).max(32)
+    ((budget / (rows.max(1) * heads.max(1))) / unit * unit).max(unit)
 }
 
 /// The shared wide tile's geometry (kernels/shared_prefill_mma_sm121.cuh): GLM_WIDE_BN output
@@ -397,6 +545,15 @@ struct Kernels {
     attention_scales: Entry,
     attention_scores: Entry,
     attention_mix: Entry,
+    /// The split-key decode walk: a run of a row's keys a block after the split walk's scores,
+    /// then the runs merged in order.
+    attention_part: Entry,
+    attention_merge: Entry,
+    /// The tensor-core prompt walk: each row's query side as the exact walks compute it, then the
+    /// shared MMA body over it. `attention_mma` is loaded only when the walk runs
+    /// ([AttentionWalk::fast]), sized to the rank's group.
+    attention_prepare: Entry,
+    attention_mma: Option<Entry>,
     /// The static short convolution over a chunk, reading its taps across the chunk's rows.
     short_conv_rows: Entry,
     /// The dynamic (static taps plus a per-row projection) short convolution over a chunk.
@@ -408,7 +565,9 @@ struct Kernels {
 }
 
 impl Kernels {
-    fn load(cuda: &Cuda) -> Result<Self, String> {
+    /// `mma_shared` is the tensor-core attention's dynamic shared memory, or `None` when the walk
+    /// does not run.
+    fn load(cuda: &Cuda, mma_shared: Option<u32>) -> Result<Self, String> {
         let inkling = inkling_cubin();
         let token = qwen4_exp_cubin();
         if inkling.is_empty() {
@@ -453,6 +612,15 @@ impl Kernels {
         let (wide_module, wide) =
             cuda.load_named_shared(prefill, "glm_prefill_bf16_wide", WIDE_SHARED)?;
         modules.push(wide_module);
+        let attention_mma = match mma_shared {
+            Some(bytes) => {
+                let (module, kernel) =
+                    cuda.load_named_shared(inkling, "inkling_attn_mma", bytes)?;
+                modules.push(module);
+                Some(Entry { kernel })
+            }
+            None => None,
+        };
         let mut load = |cubin: &'static [u8], name: &'static str| -> Result<Entry, String> {
             let (module, kernel) = cuda.load_named(cubin, name)?;
             modules.push(module);
@@ -491,6 +659,10 @@ impl Kernels {
             attention_scales: load(inkling, "inkling_attn_key_scales")?,
             attention_scores: load(inkling, "inkling_attn_scores")?,
             attention_mix: load(inkling, "inkling_attn_mix")?,
+            attention_part: load(inkling, "inkling_attn_part")?,
+            attention_merge: load(inkling, "inkling_attn_merge")?,
+            attention_prepare: load(inkling, "inkling_attn_prepare")?,
+            attention_mma,
             short_conv_rows: load(inkling, "inkling_short_conv")?,
             short_conv_dynamic_rows: load(inkling, "inkling_short_conv_dynamic")?,
             summary_push: load(inkling, "inkling_summary_push")?,
@@ -590,8 +762,8 @@ struct Shared {
     /// chunk's residual rows. `None` when the exchange has no device leg.
     exchange_slots: Option<Deviceptr>,
     exchange: Box<dyn Exchange>,
-    /// Whether attention takes the split walk ([ATTENTION_ENV]).
-    split_attention: bool,
+    /// How attention is walked ([ATTENTION_ENV]).
+    attention: AttentionWalk,
     /// The rows prefill chunks forward ([PREFILL_CHUNK_ENV]).
     chunk_widths: ChunkWidths,
     /// The widest of them: what the rings and the exchange slots are sized for.
@@ -927,11 +1099,12 @@ impl Shared {
 
     /// The relative attention of `rows` rows (row r at absolute position first_position + r)
     /// against the cache prefix the step stored; `taus` is the per-row scale table or null for
-    /// `tau` on every row.
+    /// `tau` on every row. `layer` is the schedule's layer, for [AttentionWalk::Check]'s line.
     #[allow(clippy::too_many_arguments)]
     fn attention_rows(
         &self,
         scratch: &Scratch,
+        layer: usize,
         queries: Deviceptr,
         gate: Deviceptr,
         keys: Deviceptr,
@@ -953,9 +1126,10 @@ impl Shared {
     ) -> Result<(), String> {
         let config = &self.config;
         let heads = self.heads();
-        if self.split_attention && groups <= SCORE_GROUPS && rows <= scratch.attention_rows {
+        if self.attention.split() && groups <= SCORE_GROUPS && rows <= scratch.attention_rows {
             return self.attention_split(
                 scratch,
+                layer,
                 queries,
                 gate,
                 keys,
@@ -1012,12 +1186,279 @@ impl Shared {
         )
     }
 
+    /// A prompt chunk's attention ([Self::attention_rows]'s arguments, `layer` the schedule's
+    /// layer for [AttentionWalk::Check]'s line): the tensor-core walk under [AttentionWalk::Fast],
+    /// the exact walk otherwise, and under [AttentionWalk::Check] the exact walk's output with the
+    /// tensor-core walk run beside it and the layer's largest difference printed.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_chunk(
+        &self,
+        scratch: &Scratch,
+        layer: usize,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        let tensor = |into: Deviceptr| -> Result<(), String> {
+            let mma = scratch.mma.as_ref().ok_or_else(|| {
+                format!("a {rows}-row chunk arena holds no tensor-core attention buffers")
+            })?;
+            self.attention_mma(
+                mma,
+                queries,
+                gate,
+                keys,
+                values,
+                relative,
+                bank,
+                sink,
+                clip,
+                into,
+                taus,
+                rows,
+                first_position,
+                kv_heads,
+                groups,
+                window,
+                cache_rows,
+                rel_extent,
+                tau,
+            )
+        };
+        if self.attention == AttentionWalk::Fast {
+            return tensor(out);
+        }
+        self.attention_rows(
+            scratch,
+            layer,
+            queries,
+            gate,
+            keys,
+            values,
+            relative,
+            bank,
+            sink,
+            clip,
+            out,
+            taus,
+            rows,
+            first_position,
+            kv_heads,
+            groups,
+            window,
+            cache_rows,
+            rel_extent,
+            tau,
+        )?;
+        if self.attention != AttentionWalk::Check {
+            return Ok(());
+        }
+        let check = scratch.mma.and_then(|mma| mma.check).ok_or_else(|| {
+            "the check walk's arena holds no output beside the exact one".to_owned()
+        })?;
+        tensor(check)?;
+        self.attention_compare(layer, out, check, rows, first_position)
+    }
+
+    /// The tensor-core walk of a chunk's rows: the query side as the exact walks compute it
+    /// (inkling_attn_prepare), every visible key's clip gain and value scale (the split walk's
+    /// inkling_attn_key_scales over the chunk's whole range), then the MMA body (inkling_attn_mma).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_mma(
+        &self,
+        mma: &MmaScratch,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        let config = &self.config;
+        let heads = self.heads();
+        let entry = self
+            .kernels
+            .attention_mma
+            .ok_or_else(|| "the tensor-core attention kernel was not loaded".to_owned())?;
+        let qk_clip = bits(config.qk_l2_clip_threshold as f32);
+        self.launch(
+            self.kernels.attention_prepare,
+            (heads as u32, rows as u32, 1),
+            (32, 1, 1),
+            &[
+                queries.0,
+                relative.0,
+                clip.query.0,
+                clip.relative.0,
+                mma.q.0,
+                mma.rel.0,
+                heads as u64,
+                config.head_dim as u64,
+                rows as u64,
+                config.d_rel as u64,
+                qk_clip,
+                bits(config.rel_l2_clip_threshold as f32),
+                bits(tau),
+                taus.0,
+            ],
+        )?;
+        let last = first_position + rows - 1;
+        let scale_first = if window > 0 {
+            (first_position + 1).saturating_sub(window)
+        } else {
+            0
+        };
+        let span = last + 1 - scale_first;
+        if span > mma.stride {
+            return Err(format!(
+                "a chunk at {first_position}..={last} sees {span} keys, past the {} the \
+                 tensor-core walk's key tables hold",
+                mma.stride
+            ));
+        }
+        self.launch(
+            self.kernels.attention_scales,
+            (grid_blocks(span, SCORE_KEYS), kv_heads as u32, 1),
+            (SCORE_BLOCK, 1, 1),
+            &[
+                keys.0,
+                values.0,
+                0,
+                mma.gains.0,
+                mma.scales.0,
+                kv_heads as u64,
+                config.head_dim as u64,
+                cache_rows as u64,
+                qk_clip,
+                1,
+                bits(config.architecture.norm_epsilon as f32),
+                scale_first as u64,
+                span as u64,
+                mma.stride as u64,
+            ],
+        )?;
+        self.launch(
+            entry,
+            (rows.div_ceil(MMA_Q) as u32, kv_heads as u32, 1),
+            ((groups * 32) as u32, 1, 1),
+            &[
+                mma.q.0,
+                keys.0,
+                values.0,
+                mma.rel.0,
+                bank.0,
+                sink.0,
+                mma.gains.0,
+                mma.scales.0,
+                gate.0,
+                out.0,
+                heads as u64,
+                kv_heads as u64,
+                rows as u64,
+                first_position as u64,
+                window as u64,
+                cache_rows as u64,
+                rel_extent as u64,
+                config.d_rel as u64,
+                scale_first as u64,
+                mma.stride as u64,
+            ],
+        )
+    }
+
+    /// [AttentionWalk::Check]'s line: the largest difference between the exact walk's output and
+    /// the tensor-core walk's over a chunk's rows of one layer, where it is, and the mean.
+    fn attention_compare(
+        &self,
+        layer: usize,
+        exact: Deviceptr,
+        fast: Deviceptr,
+        rows: usize,
+        first_position: usize,
+    ) -> Result<(), String> {
+        let heads = self.heads();
+        let head_dim = self.config.head_dim;
+        let count = rows * heads * head_dim;
+        self.cuda.synchronize()?;
+        let read = |pointer: Deviceptr| -> Result<Vec<f32>, String> {
+            let mut bytes = vec![0u8; count * 2];
+            self.cuda
+                .copy_dtoh(&mut bytes, &pointer)
+                .map_err(|error| error.to_string())?;
+            Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
+                .collect())
+        };
+        let exact = read(exact)?;
+        let fast = read(fast)?;
+        let (mut worst, mut at, mut sum, mut largest, mut unequal_finite) =
+            (0f32, 0usize, 0f64, 0f32, 0);
+        for (index, (e, t)) in exact.iter().zip(&fast).enumerate() {
+            if e.is_finite() != t.is_finite() {
+                unequal_finite += 1;
+                continue;
+            }
+            let difference = (e - t).abs();
+            if difference > worst {
+                worst = difference;
+                at = index;
+            }
+            sum += f64::from(difference);
+            largest = largest.max(e.abs());
+        }
+        let row = at / (heads * head_dim);
+        eprintln!(
+            "[inkling] attention check rank {} layer {layer} positions {first_position}..{}: max \
+             |fast - exact| {worst:.3e} at row {row} head {} dim {} (exact {:.5}, fast {:.5}), \
+             mean {:.3e}, max |exact| {largest:.4}, {unequal_finite} finite on one side only",
+            self.plan.tp().rank(),
+            first_position + rows - 1,
+            at / head_dim % heads,
+            at % head_dim,
+            exact[at],
+            fast[at],
+            sum / count.max(1) as f64,
+        );
+        Ok(())
+    }
+
     /// The split walk of [Self::attention_rows]: per pass, the keys' clip gains and value scales,
     /// the scores, and the recurrence (inkling_attn_sm121.cu).
     #[allow(clippy::too_many_arguments)]
     fn attention_split(
         &self,
         scratch: &Scratch,
+        layer: usize,
         queries: Deviceptr,
         gate: Deviceptr,
         keys: Deviceptr,
@@ -1054,6 +1495,15 @@ impl Shared {
         let passes = widest.div_ceil(pass_slots);
         let qk_clip = bits(config.qk_l2_clip_threshold as f32);
         let eps = bits(config.architecture.norm_epsilon as f32);
+        // A single row takes the split-key walk when the fast walks run: under Fast it is the
+        // row's output, under Check it runs beside the exact mix into its own buffer.
+        let parts = scratch.parts.filter(|_| rows == 1);
+        let exact = parts.is_none() || self.attention == AttentionWalk::Check;
+        if parts.is_some() && !pass_slots.is_multiple_of(PART_KEYS) {
+            return Err(format!(
+                "a split-key pass of {pass_slots} keys is not whole runs of {PART_KEYS}"
+            ));
+        }
         for pass in 0..passes {
             let pass_first = pass * pass_slots;
             let span = (widest - pass_first).min(pass_slots);
@@ -1115,35 +1565,98 @@ impl Shared {
                     scale_stride as u64,
                 ],
             )?;
-            self.launch(
-                self.kernels.attention_mix,
-                (heads as u32, rows as u32, 1),
-                (MIX_BLOCK, 1, 1),
-                &[
-                    gate.0,
-                    values.0,
-                    sink.0,
-                    scratch.scores.0,
-                    scratch.value_scales.0,
-                    scratch.attention_state.0,
-                    out.0,
-                    heads as u64,
-                    kv_heads as u64,
-                    config.head_dim as u64,
-                    groups as u64,
-                    rows as u64,
-                    first_position as u64,
-                    window as u64,
-                    cache_rows as u64,
-                    1,
-                    pass_first as u64,
-                    pass_slots as u64,
-                    scale_first as u64,
-                    scale_stride as u64,
-                    u64::from(pass == 0),
-                    u64::from(pass + 1 == passes),
-                ],
-            )?;
+            if exact {
+                self.launch(
+                    self.kernels.attention_mix,
+                    (heads as u32, rows as u32, 1),
+                    (MIX_BLOCK, 1, 1),
+                    &[
+                        gate.0,
+                        values.0,
+                        sink.0,
+                        scratch.scores.0,
+                        scratch.value_scales.0,
+                        scratch.attention_state.0,
+                        out.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        1,
+                        pass_first as u64,
+                        pass_slots as u64,
+                        scale_first as u64,
+                        scale_stride as u64,
+                        u64::from(pass == 0),
+                        u64::from(pass + 1 == passes),
+                    ],
+                )?;
+            }
+            if let Some(parts) = parts {
+                self.launch(
+                    self.kernels.attention_part,
+                    (
+                        kv_heads as u32,
+                        span.div_ceil(PART_KEYS) as u32,
+                        rows as u32,
+                    ),
+                    (PART_THREADS, 1, 1),
+                    &[
+                        values.0,
+                        scratch.scores.0,
+                        scratch.value_scales.0,
+                        parts.parts.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        1,
+                        pass_first as u64,
+                        pass_slots as u64,
+                        scale_first as u64,
+                        scale_stride as u64,
+                        parts.stride as u64,
+                    ],
+                )?;
+            }
+        }
+        let Some(parts) = parts else {
+            return Ok(());
+        };
+        let merged = if self.attention == AttentionWalk::Check {
+            parts
+                .check
+                .ok_or_else(|| "a check arena holds no split-key output buffer".to_owned())?
+        } else {
+            out
+        };
+        self.launch(
+            self.kernels.attention_merge,
+            (heads as u32, rows as u32, 1),
+            (config.head_dim as u32, 1, 1),
+            &[
+                gate.0,
+                sink.0,
+                parts.parts.0,
+                merged.0,
+                heads as u64,
+                config.head_dim as u64,
+                rows as u64,
+                first_position as u64,
+                window as u64,
+                parts.stride as u64,
+            ],
+        )?;
+        if self.attention == AttentionWalk::Check {
+            self.attention_compare(layer, out, merged, rows, first_position)?;
         }
         Ok(())
     }
@@ -1363,7 +1876,6 @@ impl InklingDeviceBackend {
                 tp.world()
             ));
         }
-        let split_attention = split_attention()?;
         let prefill_walk = PrefillWalk::from_env()?;
         let chunk_widths = ChunkWidths::from_env(context)?;
         let prefill_chunk = chunk_widths.widest();
@@ -1383,8 +1895,13 @@ impl InklingDeviceBackend {
         // here rather than at the first long prompt so a shape it refuses is an open-time error
         // and not a request the server has already admitted.
         let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, prefill_chunk, context)?;
+        let (attention, mma_shared) = AttentionWalk::select(
+            &config,
+            plan.rank_heads() / plan.rank_kv_heads().max(1),
+            prefill_walk,
+        )?;
         let cuda = CudaHandle::new(Cuda::load()?);
-        let kernels = Kernels::load(&cuda)?;
+        let kernels = Kernels::load(&cuda, mma_shared)?;
         let weights = weights(&cuda, plan.served())?;
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
         let (experts, expert_arena, route_ones) = expert_scales(&cuda, &plan, &weights)?;
@@ -1434,7 +1951,7 @@ impl InklingDeviceBackend {
                 context,
                 exchange_slots,
                 exchange,
-                split_attention,
+                attention,
                 chunk_widths,
                 prefill_chunk,
                 prefill_walk,
@@ -2229,10 +2746,38 @@ struct Scratch {
     /// The keys one split-walk pass covers, and the rows the buffers are sized for.
     attention_pass: usize,
     attention_rows: usize,
+    /// The tensor-core walk's buffers, in a multi-row arena when the walk runs.
+    mma: Option<MmaScratch>,
+    /// The split-key decode walk's buffers, in a single-row arena when the walk runs.
+    parts: Option<PartScratch>,
     /// The one allocation every pointer above is an offset into, kept so the session can give it
     /// back: a 1M-token context holds 8 GiB of cache beside it, and a leak per request would
     /// spend the budget three requests in.
     arena: Deviceptr,
+}
+
+/// The tensor-core attention walk's buffers (kernels/inkling_attn_sm121.cu): each row's query
+/// (`[rows][heads][head_dim]`) and relative state (`[rows][heads][16]`) as the exact walks compute
+/// them, each visible key's clip gain and value scale (`[kv_heads][stride]`, a full layer's every
+/// slot), and under [AttentionWalk::Check] the walk's own output beside the exact one.
+#[derive(Debug, Clone, Copy)]
+struct MmaScratch {
+    q: Deviceptr,
+    rel: Deviceptr,
+    gains: Deviceptr,
+    scales: Deviceptr,
+    stride: usize,
+    check: Option<Deviceptr>,
+}
+
+/// The split-key decode walk's buffers (kernels/inkling_attn_sm121.cu): every run's partial
+/// (`[heads][stride][2 + head_dim]`, `stride` the runs a row at the context can have) and under
+/// [AttentionWalk::Check] the walk's own output beside the exact one.
+#[derive(Debug, Clone, Copy)]
+struct PartScratch {
+    parts: Deviceptr,
+    stride: usize,
+    check: Option<Deviceptr>,
 }
 
 impl Scratch {
@@ -2325,6 +2870,28 @@ impl Scratch {
         let value_scales = take(kv_heads * (attention_pass + rows), 4);
         let scores = take(rows * heads * attention_pass, 4);
         let attention_state = take(rows * heads * MIX_STATE, 4);
+        // A full layer's last row sees every slot up to the context, a sliding one at most
+        // window + rows of them.
+        let mma = (rows > 1 && shared.attention.fast()).then(|| {
+            let stride = shared.context.max(1);
+            (
+                take(rows * heads * head_dim, 4),
+                take(rows * heads * MMA_D_REL, 4),
+                take(kv_heads * stride, 4),
+                take(kv_heads * stride, 4),
+                stride,
+                (shared.attention == AttentionWalk::Check)
+                    .then(|| take(rows * heads * head_dim, 2)),
+            )
+        });
+        let parts = (rows == 1 && shared.attention.fast()).then(|| {
+            let stride = shared.context.max(1).div_ceil(PART_KEYS);
+            (
+                take(heads * stride * (2 + head_dim), 4),
+                stride,
+                (shared.attention == AttentionWalk::Check).then(|| take(heads * head_dim, 2)),
+            )
+        });
         let arena = cuda.alloc(cursor, total)?;
         cuda.memset_d8_async(arena, 0, cursor)?;
         let at = |offset: usize| arena.offset(offset);
@@ -2376,6 +2943,19 @@ impl Scratch {
             attention_state: at(attention_state),
             attention_pass,
             attention_rows: rows,
+            mma: mma.map(|(q, rel, gains, scales, stride, check)| MmaScratch {
+                q: at(q),
+                rel: at(rel),
+                gains: at(gains),
+                scales: at(scales),
+                stride,
+                check: check.map(at),
+            }),
+            parts: parts.map(|(parts, stride, check)| PartScratch {
+                parts: at(parts),
+                stride,
+                check: check.map(at),
+            }),
             arena,
         })
     }
@@ -3336,6 +3916,7 @@ impl InklingDeviceSession {
                         let scratch = &self.state.scratch;
                         run(shared.attention_rows(
                             scratch,
+                            index,
                             scratch.q,
                             scratch.gate,
                             self.state.keys[index],
@@ -3934,7 +4515,72 @@ impl InklingDeviceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkWidths, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM};
+    use super::{
+        AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM,
+        PrefillWalk, mma_attention_shared,
+    };
+    use crate::config::Inkling2Config;
+
+    #[test]
+    fn the_attention_walk_follows_the_prompt_walk_unless_one_is_named() {
+        // The released attention shape: head_dim 128, a 16-wide relative state, six query heads
+        // a kv head on a rank of four.
+        let mut released = Inkling2Config::tiny();
+        released.head_dim = 128;
+        released.d_rel = 16;
+        assert_eq!(mma_attention_shared(6), 85_760);
+        let shared = Some(85_760);
+        let choose = |value, config, prefill| AttentionWalk::choose(value, config, 6, prefill);
+        assert_eq!(
+            choose(None, &released, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Fast, shared))
+        );
+        assert_eq!(
+            choose(Some(""), &released, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Fast, shared))
+        );
+        // The exact prompt walks keep the exact attention, so chunk stays the decode step's bits.
+        for prefill in [PrefillWalk::Chunk, PrefillWalk::Rows, PrefillWalk::Gemm] {
+            assert_eq!(
+                choose(None, &released, prefill),
+                Ok((AttentionWalk::Split, None))
+            );
+        }
+        // A named walk is the walk, whatever the prompt's.
+        assert_eq!(
+            choose(Some("fast"), &released, PrefillWalk::Chunk),
+            Ok((AttentionWalk::Fast, shared))
+        );
+        assert_eq!(
+            choose(Some("check"), &released, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Check, shared))
+        );
+        assert_eq!(
+            choose(Some("split"), &released, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Split, None))
+        );
+        assert_eq!(
+            choose(Some("serial"), &released, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Serial, None))
+        );
+        let error = choose(Some("mma"), &released, PrefillWalk::Tensor).expect_err("unknown");
+        assert!(error.contains("is not an attention walk"), "{error}");
+
+        // A shape the tensor-core walk is not built for: unset stands down, named is refused.
+        let tiny = Inkling2Config::tiny();
+        assert_eq!(
+            choose(None, &tiny, PrefillWalk::Tensor),
+            Ok((AttentionWalk::Split, None))
+        );
+        for named in ["fast", "check"] {
+            let error = choose(Some(named), &tiny, PrefillWalk::Tensor).expect_err("no fit");
+            assert!(error.contains("head_dim 128"), "{error}");
+            assert!(error.contains("=split for the exact walk"), "{error}");
+        }
+        let error = AttentionWalk::choose(Some("fast"), &released, 9, PrefillWalk::Tensor)
+            .expect_err("nine heads a kv head");
+        assert!(error.contains("this rank holds 9"), "{error}");
+    }
 
     #[test]
     fn a_long_prompt_widens_its_chunks_until_its_tail() {

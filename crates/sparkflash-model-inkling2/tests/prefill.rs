@@ -27,6 +27,18 @@
 //! 3. `inkling_conv_history_copy` moves a history between the two layouts without changing it,
 //!    either way, which is what lets claim 2 hold across a chunk boundary.
 //!
+//! 4. The tensor-core prompt walk (`inkling_attn_prepare`, `inkling_attn_key_scales`, then
+//!    `inkling_attn_mma`) is `inkling_attn_prefill` to within one BF16 step of its output, over a
+//!    full layer and a sliding ring, with and without sinks, per-row tau, a chunk that is not a
+//!    whole number of the walk's 16-row blocks, a bias band that ends inside the keys, and both
+//!    relative widths the walk takes. Not the same bits: the walk's products are the tensor
+//!    cores', so a value near a BF16 rounding boundary may land one step either side.
+//!
+//! 5. The split-key decode walk (`inkling_attn_part` over runs of 256 keys, then
+//!    `inkling_attn_merge`) is `inkling_attn_mix` to within one BF16 step of its output, for one
+//!    row over a full layer and a sliding ring, with and without a sink, over one pass and
+//!    several. Not the same bits: the denominator and the value sums are added in another order.
+//!
 //! They are the same claims the whole-chunk test makes from the other end; these fail in a
 //! second with a number to look at.
 
@@ -645,4 +657,592 @@ fn a_grouped_projection_is_each_group_launched_alone() {
         got, expected,
         "a group of a grouped launch is the group alone"
     );
+}
+
+/// One case of the tensor-core walk against the exact one.
+struct MmaCase {
+    label: &'static str,
+    rows: usize,
+    first_position: usize,
+    /// Zero for a full layer.
+    window: usize,
+    /// The ring's rows, zero for a full layer's flat cache.
+    cache_rows: usize,
+    d_rel: usize,
+    rel_extent: usize,
+    sinks: bool,
+    tau_rows: bool,
+}
+
+/// The tensor-core walk's dynamic shared memory at this test's group (inkling_attn_mma: q's two
+/// BF16 planes for six heads of 16 rows, a key and a value tile of 32, their gains and scales, a
+/// 16 x 52 f32 bias tile a warp).
+const MMA_SHARED: u32 = ((2 * 6 * 16 + 2 * 32) * 128 * 2 + 2 * 32 * 4 + 6 * 16 * 52 * 4) as u32;
+
+fn run_mma_case(cuda: &Cuda, case: &MmaCase, seed: u64) {
+    let rows = case.rows;
+    let d_rel = case.d_rel;
+    let q_width = HEADS * HEAD_DIM;
+    let kv_width = KV_HEADS * HEAD_DIM;
+    let last = case.first_position + rows - 1;
+    let cache = if case.cache_rows > 0 {
+        case.cache_rows
+    } else {
+        last + 1
+    };
+    let mut rng = Lcg::new(seed);
+    // Wider than the unit interval so the softmax is not flat: the scores reach a few units.
+    let q: Vec<f32> = rng.values(rows * q_width).iter().map(|v| 4.0 * v).collect();
+    let gate: Vec<f32> = rng.values(rows * q_width);
+    let rel: Vec<f32> = rng
+        .values(rows * HEADS * d_rel)
+        .iter()
+        .map(|v| 3.0 * v)
+        .collect();
+    let sink: Vec<f32> = rng.values(rows * HEADS).iter().map(|v| 2.0 * v).collect();
+    let keys: Vec<f32> = rng
+        .values(cache * kv_width)
+        .iter()
+        .map(|v| 2.0 * v)
+        .collect();
+    let values: Vec<f32> = rng.values(cache * kv_width);
+    let bank: Vec<f32> = rng.values(d_rel * case.rel_extent);
+    let q_scale: Vec<f32> = rng
+        .values(HEADS * HEAD_DIM)
+        .iter()
+        .map(|v| 1.0 + 0.5 * v)
+        .collect();
+    let rel_scale: Vec<f32> = rng.values(HEADS * d_rel);
+    let taus: Vec<f32> = rng.values(rows).iter().map(|v| 1.2 + 0.4 * v).collect();
+    let tau = 1.1f32;
+
+    let q_device = upload_f32(cuda, &q);
+    let gate_device = upload_f32(cuda, &gate);
+    let rel_device = upload_f32(cuda, &rel);
+    let sink_device = if case.sinks {
+        upload_f32(cuda, &sink)
+    } else {
+        Deviceptr(0)
+    };
+    let keys_device = upload_bf16(cuda, &keys);
+    let values_device = upload_bf16(cuda, &values);
+    let bank_device = upload_bf16(cuda, &bank);
+    let q_scale_device = upload_f32(cuda, &q_scale);
+    let rel_scale_device = upload_f32(cuda, &rel_scale);
+    let taus_device = if case.tau_rows {
+        upload_f32(cuda, &taus)
+    } else {
+        Deviceptr(0)
+    };
+    let exact_out = upload_bf16(cuda, &vec![0f32; rows * q_width]);
+    let mma_out = upload_bf16(cuda, &vec![0f32; rows * q_width]);
+
+    // The exact walk, with the arguments the arm passes (no per-dimension key scale).
+    cuda.launch(
+        kernel(cuda, "inkling_attn_prefill"),
+        (HEADS as u32, rows as u32, 1),
+        (32, 1, 1),
+        &[
+            q_device.0,
+            gate_device.0,
+            keys_device.0,
+            values_device.0,
+            rel_device.0,
+            bank_device.0,
+            sink_device.0,
+            q_scale_device.0,
+            0,
+            rel_scale_device.0,
+            exact_out.0,
+            u(HEADS),
+            u(KV_HEADS),
+            u(HEAD_DIM),
+            u(HEADS / KV_HEADS),
+            u(rows),
+            u(case.first_position),
+            u(case.window),
+            u(case.cache_rows),
+            u(case.rel_extent),
+            u(d_rel),
+            f(QK_CLIP),
+            f(REL_CLIP),
+            f(tau),
+            u(VALUE_NORM as usize),
+            f(EPS),
+            taus_device.0,
+        ],
+    )
+    .expect("attn_prefill launch");
+
+    // The tensor-core walk: the query side, every visible key's gain and scale, the MMA body.
+    let q_ready = upload_f32(cuda, &vec![0f32; rows * q_width]);
+    let rel_ready = upload_f32(cuda, &vec![0f32; rows * HEADS * 16]);
+    cuda.launch(
+        kernel(cuda, "inkling_attn_prepare"),
+        (HEADS as u32, rows as u32, 1),
+        (32, 1, 1),
+        &[
+            q_device.0,
+            rel_device.0,
+            q_scale_device.0,
+            rel_scale_device.0,
+            q_ready.0,
+            rel_ready.0,
+            u(HEADS),
+            u(HEAD_DIM),
+            u(rows),
+            u(d_rel),
+            f(QK_CLIP),
+            f(REL_CLIP),
+            f(tau),
+            taus_device.0,
+        ],
+    )
+    .expect("attn_prepare launch");
+    let scale_first = if case.window > 0 {
+        (case.first_position + 1).saturating_sub(case.window)
+    } else {
+        0
+    };
+    let span = last + 1 - scale_first;
+    // A stride wider than the span, as the arm's context-wide tables are.
+    let stride = span + 40;
+    let gains = upload_f32(cuda, &vec![0f32; KV_HEADS * stride]);
+    let scales = upload_f32(cuda, &vec![0f32; KV_HEADS * stride]);
+    cuda.launch(
+        kernel(cuda, "inkling_attn_key_scales"),
+        (span.div_ceil(16) as u32, KV_HEADS as u32, 1),
+        (128, 1, 1),
+        &[
+            keys_device.0,
+            values_device.0,
+            0,
+            gains.0,
+            scales.0,
+            u(KV_HEADS),
+            u(HEAD_DIM),
+            u(case.cache_rows),
+            f(QK_CLIP),
+            u(VALUE_NORM as usize),
+            f(EPS),
+            u(scale_first),
+            u(span),
+            u(stride),
+        ],
+    )
+    .expect("attn_key_scales launch");
+    let (_module, mma) = cuda
+        .load_named_shared(inkling_cubin(), "inkling_attn_mma", MMA_SHARED)
+        .expect("load inkling_attn_mma");
+    cuda.launch(
+        mma,
+        (rows.div_ceil(16) as u32, KV_HEADS as u32, 1),
+        ((HEADS / KV_HEADS * 32) as u32, 1, 1),
+        &[
+            q_ready.0,
+            keys_device.0,
+            values_device.0,
+            rel_ready.0,
+            bank_device.0,
+            sink_device.0,
+            gains.0,
+            scales.0,
+            gate_device.0,
+            mma_out.0,
+            u(HEADS),
+            u(KV_HEADS),
+            u(rows),
+            u(case.first_position),
+            u(case.window),
+            u(case.cache_rows),
+            u(case.rel_extent),
+            u(d_rel),
+            u(scale_first),
+            u(stride),
+        ],
+    )
+    .expect("attn_mma launch");
+
+    let exact = download_bf16(cuda, &exact_out, rows * q_width);
+    let tensor = download_bf16(cuda, &mma_out, rows * q_width);
+    // Most outputs are the exact walk's bits: the products differ in the f32's low bits only.
+    assert_within_a_bf16_step(case.label, &exact, &tensor, q_width);
+}
+
+/// The tensor-core prompt walk is the exact prefill walk to within one BF16 step of its output.
+#[test]
+fn the_tensor_core_prompt_attention_is_the_exact_walk_within_a_bf16_step() {
+    let Some(cuda) = open() else { return };
+    let cases = [
+        MmaCase {
+            label: "full, sinks, per-row tau, band inside the keys",
+            rows: 37,
+            first_position: 70,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 8,
+            rel_extent: 40,
+            sinks: true,
+            tau_rows: true,
+        },
+        MmaCase {
+            label: "full from position zero, no sink, launch tau, d_rel 16",
+            rows: 50,
+            first_position: 0,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 16,
+            rel_extent: 1024,
+            sinks: false,
+            tau_rows: false,
+        },
+        MmaCase {
+            label: "sliding ring past its wrap, sinks, d_rel 16",
+            rows: 37,
+            first_position: 100,
+            window: 24,
+            cache_rows: 64,
+            d_rel: 16,
+            rel_extent: 20,
+            sinks: true,
+            tau_rows: true,
+        },
+        MmaCase {
+            label: "long full prefix, one block, d_rel 8",
+            rows: 16,
+            first_position: 700,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 8,
+            rel_extent: 1024,
+            sinks: true,
+            tau_rows: true,
+        },
+        MmaCase {
+            label: "no relative state",
+            rows: 21,
+            first_position: 5,
+            window: 0,
+            cache_rows: 0,
+            d_rel: 0,
+            rel_extent: 16,
+            sinks: true,
+            tau_rows: false,
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        run_mma_case(&cuda, case, 0x7e45_0000 + index as u64);
+    }
+}
+
+/// The BF16-step comparison the fast walks are held to: every output within one BF16 step of the
+/// exact walk's (or a floor far under any value that matters, for outputs that round near zero),
+/// and most of them its very bits.
+fn assert_within_a_bf16_step(label: &str, exact: &[f32], fast: &[f32], q_width: usize) {
+    let largest = exact.iter().fold(0f32, |top, value| top.max(value.abs()));
+    assert!(largest > 0.0, "{label}: the exact walk wrote nothing");
+    let mut same = 0usize;
+    for (index, (want, got)) in exact.iter().zip(fast).enumerate() {
+        assert!(got.is_finite(), "{label}: [{index}] fast {got}");
+        let step = want.abs().max(got.abs()).max(f32::MIN_POSITIVE);
+        let ulp = 2f32.powi(step.log2().floor() as i32 - 7);
+        let difference = (want - got).abs();
+        assert!(
+            difference <= ulp * 1.001 || difference <= largest * 1e-5,
+            "{label}: [{index}] (row {}, head {}, dim {}) exact {want} fast {got}, {} BF16 steps",
+            index / q_width,
+            index / HEAD_DIM % HEADS,
+            index % HEAD_DIM,
+            difference / ulp
+        );
+        same += usize::from(want.to_bits() == got.to_bits());
+    }
+    let share = same as f64 / exact.len() as f64;
+    eprintln!(
+        "{label}: {same} of {} outputs the exact bits ({share:.3})",
+        exact.len()
+    );
+    assert!(
+        share > 0.8,
+        "{label}: only {share:.3} of outputs match the exact bits"
+    );
+}
+
+/// One decode row of the split-key walk against the exact mix.
+struct SplitCase {
+    label: &'static str,
+    position: usize,
+    /// Zero for a full layer.
+    window: usize,
+    /// The ring's rows, zero for a full layer's flat cache.
+    cache_rows: usize,
+    /// A pass's keys, whole runs of 256 as the arm's are.
+    pass_slots: usize,
+    sinks: bool,
+}
+
+const PART_KEYS: usize = 256;
+
+fn run_split_case(cuda: &Cuda, case: &SplitCase, seed: u64) {
+    let q_width = HEADS * HEAD_DIM;
+    let kv_width = KV_HEADS * HEAD_DIM;
+    let position = case.position;
+    let cache = if case.cache_rows > 0 {
+        case.cache_rows
+    } else {
+        position + 1
+    };
+    let first = if case.window > 0 {
+        (position + 1).saturating_sub(case.window)
+    } else {
+        0
+    };
+    let count = position + 1 - first;
+    let runs = count.div_ceil(PART_KEYS);
+    // Wider than the runs the row needs, as the arm's context-wide stride is.
+    let part_stride = runs + 3;
+    let passes = count.div_ceil(case.pass_slots);
+    let (d_rel, rel_extent) = (16, 1024);
+    let mut rng = Lcg::new(seed);
+    let q: Vec<f32> = rng.values(q_width).iter().map(|v| 4.0 * v).collect();
+    let gate: Vec<f32> = rng.values(q_width);
+    let rel: Vec<f32> = rng.values(HEADS * d_rel).iter().map(|v| 3.0 * v).collect();
+    let sink: Vec<f32> = rng.values(HEADS).iter().map(|v| 2.0 * v).collect();
+    let keys: Vec<f32> = rng
+        .values(cache * kv_width)
+        .iter()
+        .map(|v| 2.0 * v)
+        .collect();
+    let values: Vec<f32> = rng.values(cache * kv_width);
+    let bank: Vec<f32> = rng.values(d_rel * rel_extent);
+    let q_scale: Vec<f32> = rng
+        .values(HEADS * HEAD_DIM)
+        .iter()
+        .map(|v| 1.0 + 0.5 * v)
+        .collect();
+    let rel_scale: Vec<f32> = rng.values(HEADS * d_rel);
+    let tau = 1.1f32;
+
+    let q_device = upload_f32(cuda, &q);
+    let gate_device = upload_f32(cuda, &gate);
+    let rel_device = upload_f32(cuda, &rel);
+    let sink_device = if case.sinks {
+        upload_f32(cuda, &sink)
+    } else {
+        Deviceptr(0)
+    };
+    let keys_device = upload_bf16(cuda, &keys);
+    let values_device = upload_bf16(cuda, &values);
+    let bank_device = upload_bf16(cuda, &bank);
+    let q_scale_device = upload_f32(cuda, &q_scale);
+    let rel_scale_device = upload_f32(cuda, &rel_scale);
+    let scale_stride = case.pass_slots + 1;
+    let gains = upload_f32(cuda, &vec![0f32; KV_HEADS * scale_stride]);
+    let scales = upload_f32(cuda, &vec![0f32; KV_HEADS * scale_stride]);
+    let scores = upload_f32(cuda, &vec![0f32; HEADS * case.pass_slots]);
+    let state = upload_f32(cuda, &vec![0f32; HEADS * (2 + HEAD_DIM)]);
+    let parts = upload_f32(cuda, &vec![f32::NAN; HEADS * part_stride * (2 + HEAD_DIM)]);
+    let exact_out = upload_bf16(cuda, &vec![0f32; q_width]);
+    let fast_out = upload_bf16(cuda, &vec![0f32; q_width]);
+    let (key_scales, scorer, mix, part, merge) = (
+        kernel(cuda, "inkling_attn_key_scales"),
+        kernel(cuda, "inkling_attn_scores"),
+        kernel(cuda, "inkling_attn_mix"),
+        kernel(cuda, "inkling_attn_part"),
+        kernel(cuda, "inkling_attn_merge"),
+    );
+    let groups = HEADS / KV_HEADS;
+
+    // The arm's pass loop for one row: each pass's scales and scores, then both walks over them.
+    for pass in 0..passes {
+        let pass_first = pass * case.pass_slots;
+        let span = (count - pass_first).min(case.pass_slots);
+        let scale_first = first + pass_first;
+        cuda.launch(
+            key_scales,
+            (span.div_ceil(16) as u32, KV_HEADS as u32, 1),
+            (128, 1, 1),
+            &[
+                keys_device.0,
+                values_device.0,
+                0,
+                gains.0,
+                scales.0,
+                u(KV_HEADS),
+                u(HEAD_DIM),
+                u(case.cache_rows),
+                f(QK_CLIP),
+                u(VALUE_NORM as usize),
+                f(EPS),
+                u(scale_first),
+                u(span),
+                u(scale_stride),
+            ],
+        )
+        .expect("attn_key_scales launch");
+        cuda.launch(
+            scorer,
+            (span.div_ceil(16) as u32, KV_HEADS as u32, 1),
+            (128, 1, 1),
+            &[
+                q_device.0,
+                keys_device.0,
+                rel_device.0,
+                bank_device.0,
+                q_scale_device.0,
+                0,
+                rel_scale_device.0,
+                gains.0,
+                scores.0,
+                u(HEADS),
+                u(KV_HEADS),
+                u(HEAD_DIM),
+                u(groups),
+                1,
+                u(position),
+                u(case.window),
+                u(case.cache_rows),
+                u(rel_extent),
+                u(d_rel),
+                f(QK_CLIP),
+                f(REL_CLIP),
+                f(tau),
+                0,
+                u(pass_first),
+                u(case.pass_slots),
+                u(scale_first),
+                u(scale_stride),
+            ],
+        )
+        .expect("attn_scores launch");
+        cuda.launch(
+            mix,
+            (HEADS as u32, 1, 1),
+            (HEAD_DIM as u32, 1, 1),
+            &[
+                gate_device.0,
+                values_device.0,
+                sink_device.0,
+                scores.0,
+                scales.0,
+                state.0,
+                exact_out.0,
+                u(HEADS),
+                u(KV_HEADS),
+                u(HEAD_DIM),
+                u(groups),
+                1,
+                u(position),
+                u(case.window),
+                u(case.cache_rows),
+                u(VALUE_NORM as usize),
+                u(pass_first),
+                u(case.pass_slots),
+                u(scale_first),
+                u(scale_stride),
+                u(usize::from(pass == 0)),
+                u(usize::from(pass + 1 == passes)),
+            ],
+        )
+        .expect("attn_mix launch");
+        cuda.launch(
+            part,
+            (KV_HEADS as u32, span.div_ceil(PART_KEYS) as u32, 1),
+            (128, 1, 1),
+            &[
+                values_device.0,
+                scores.0,
+                scales.0,
+                parts.0,
+                u(HEADS),
+                u(KV_HEADS),
+                u(HEAD_DIM),
+                u(groups),
+                1,
+                u(position),
+                u(case.window),
+                u(case.cache_rows),
+                u(VALUE_NORM as usize),
+                u(pass_first),
+                u(case.pass_slots),
+                u(scale_first),
+                u(scale_stride),
+                u(part_stride),
+            ],
+        )
+        .expect("attn_part launch");
+    }
+    cuda.launch(
+        merge,
+        (HEADS as u32, 1, 1),
+        (HEAD_DIM as u32, 1, 1),
+        &[
+            gate_device.0,
+            sink_device.0,
+            parts.0,
+            fast_out.0,
+            u(HEADS),
+            u(HEAD_DIM),
+            1,
+            u(position),
+            u(case.window),
+            u(part_stride),
+        ],
+    )
+    .expect("attn_merge launch");
+
+    let exact = download_bf16(cuda, &exact_out, q_width);
+    let fast = download_bf16(cuda, &fast_out, q_width);
+    assert_within_a_bf16_step(case.label, &exact, &fast, q_width);
+}
+
+/// The split-key decode walk is the exact mix to within one BF16 step of its output.
+#[test]
+fn the_split_key_decode_attention_is_the_exact_mix_within_a_bf16_step() {
+    let Some(cuda) = open() else { return };
+    let cases = [
+        SplitCase {
+            label: "full, three passes, the last part-filled",
+            position: 3000,
+            window: 0,
+            cache_rows: 0,
+            pass_slots: 1024,
+            sinks: true,
+        },
+        SplitCase {
+            label: "full, one whole run, no sink",
+            position: 255,
+            window: 0,
+            cache_rows: 0,
+            pass_slots: 1024,
+            sinks: false,
+        },
+        SplitCase {
+            label: "the first position",
+            position: 0,
+            window: 0,
+            cache_rows: 0,
+            pass_slots: 1024,
+            sinks: true,
+        },
+        SplitCase {
+            label: "sliding ring past its wrap, two passes",
+            position: 5000,
+            window: 1024,
+            cache_rows: 1024,
+            pass_slots: 512,
+            sinks: true,
+        },
+        SplitCase {
+            label: "long full layer, one pass of many runs",
+            position: 40_000,
+            window: 0,
+            cache_rows: 0,
+            pass_slots: 174_592,
+            sinks: true,
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        run_split_case(&cuda, case, 0x5b17_0000 + index as u64);
+    }
 }

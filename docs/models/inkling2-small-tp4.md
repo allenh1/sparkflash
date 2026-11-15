@@ -1132,3 +1132,89 @@ On the four-rank group: a completion forced to write `ĠRibb` + `on`, then a pro
 abandoned 4 s into its prefill, then retried, reported 6,331 cached and the same message as a
 cold run of that prompt (10.7 s including the abandoned prefill's remainder, against 14.5 s
 cold).
+
+### Fast attention: prompts on the tensor cores, decode split by keys (D119)
+
+The 84K turn above ran at 115 prompt tokens a second, and its decode at about 5 tokens a
+second. Past a few thousand positions both are attention: a prompt row's attention grows with
+every position before it, and a decode row's exact walk is one serial recurrence a head, so a
+full layer at 93K positions is 2,900 dependent 32-key tiles on 12 blocks. With
+`SPARKFLASH_INKLING_ATTENTION` unset, both now take a fast walk.
+
+**Prompt chunks** run on the tensor cores, reusing the body Dory's prompt attention runs rather
+than adding an Inkling loop:
+
+* **The body** is `shared_attn_mma_body` in `kernels/shared_attn_mma_sm121.cuh`, which was
+  `dory_attn_mma`'s (Dory's cubin is byte-identical after the move), on the `mma.sync`,
+  `ldmatrix` and `cp.async` helpers of `opt_mma_common_sm121.cuh` that DeepSeek's, GLM's and
+  Qwen's tensor-core kernels share. A block is one kv head and 16 query positions, a warp a query
+  head of its group, so one shared key and value tile feeds all six heads; the scores and the
+  value sum are `m16n8k16` BF16 products accumulated in f32 over 32-key tiles, with q and the
+  softmax weights carried as a BF16 head and remainder (16 significant bits), and the softmax is
+  f32 in key order.
+* **Inkling's arithmetic is the policy** (`InklingAttnPolicy` in `inkling_attn_sm121.cu`), and its
+  inputs are the exact walk's own: the query side is `inkling_attn_query`'s result
+  (`inkling_attn_prepare` writes it once a chunk), each key's clip gain and value scale are
+  `inkling_attn_key_scales`' over the slots the chunk sees, the sink opens the softmax, and the
+  output is the sum over the denominator times the gate's sigmoid. The relative bias of a key
+  within `rel_extent` of the block's rows is one more 16 x 16 x 48 MMA a warp a tile, the row's
+  relative state split as q is.
+
+A one-position tail stays a chunk under `tensor`, so it takes the tensor-core walk too.
+
+**A decode row** splits its keys ("flash-decoding", the partials-then-merge order of Dory's
+`dory_attn_split` and `dory_attn_combine`). The key scales and the scores are the exact walk's
+launches; then `inkling_attn_part` takes a block for each kv head and run of 256 keys, writing a
+partial per query head of the group (the run's largest score, its sum of `exp(score -
+largest)` and the value sums weighted by those terms and the keys' value scales, a value row
+read once a group), and `inkling_attn_merge` merges a head's runs in run order with the sink,
+divides and applies the gate. What changes is the order of the denominator's and the value
+sums' additions, and that each run's terms are taken against its own maximum. The order is fixed
+by the row's key count alone. A lane row (several sessions in one step) keeps the exact mix.
+
+The cache is the same bytes under every walk, the sliding layers' rings included.
+
+`SPARKFLASH_INKLING_ATTENTION` is `fast`, `split` (the exact walk), `serial` (its reference) or
+`check`. Unset follows the prompt walk: `fast` under `tensor`, and `split` under `chunk`, `rows`
+and `gemm`, so `chunk` keeps the decode step's bits. Unset on a shape the tensor-core walk is not
+built for (a head width other than 128, a relative state past 16, more than eight query heads a
+kv head, or past the shared memory) stands down to `split` with one printed line. `fast` or
+`check` named there is refused, as is any other value. `check` serves the exact walk's output,
+runs the fast walks beside it on every prompt chunk and decode row, and prints each layer's
+largest and mean difference (`[inkling] attention check rank R layer L positions a..b: ...`):
+the per-layer bound on a real prompt, every layer from exact inputs. The batch arm reads a long
+prompt from a file (`--text-file`, the same path on every rank), since an 80K-token text is past
+what one argument may hold.
+
+**Checks.** `tests/prefill.rs` holds both walks to the exact ones:
+
+* The tensor-core walk runs against `inkling_attn_prefill` on full and sliding layers, a ring, a
+  long prefix, sinks, the tau rows, `d_rel` 0 and 16, and a short `rel_extent`. Every output is
+  within one BF16 step of the exact one (or within 1e-5 of the largest), and 99.6-99.7 % carry
+  its exact bits.
+* The split-key walk runs against `inkling_attn_mix` for one row: a full layer over three passes
+  and over one pass of 157 runs, one whole run, the first position, and a ring past its wrap over
+  two passes. It is held to the same bound, and 99.5-100 % carry the exact bits.
+
+On the four ranks:
+
+| 93,159-token prompt, then 24 greedy steps | exact (`split`) | fast (unset) |
+|---|---|---|
+| prompt | 115 tokens/s (13.5 min) | 772 tokens/s (120.6 s) |
+| decode step after it | 187-189 ms (5.3 tokens/s) | 47-49 ms (20.4-21.3 tokens/s) |
+| the 25 greedy ids | — | the same 25 as exact decode on the same prompt |
+
+The decode row's attention was 148 of its 188 ms. The split walk reads each full layer's keys
+twice and its values twice (key scales, then scores, then the value sums), about 0.7 ms a full
+layer at 93K positions, so the step is now within about 8 ms of its 40 ms floor at a short
+context.
+
+**Distance.** Teacher-forced on twelve cuts of the 6,000-token text (the D117 method), the
+tensor-core prompt walk against the exact one, both under `tensor`: top-1 agrees on 11 of 12,
+top-5 overlap 4-5, mean abs logit difference 0.07-0.31 a row (max 2.11), **KL at most 1.2e-2
+nats**. `check` on the same text gives the per-layer bound, every layer from exact inputs:
+
+* Every prompt chunk's layer, on all four ranks, is within one BF16 step of its value at its
+  largest difference (3.1e-2 at 5.66 the worst), with a mean at most 5.5e-6.
+* Every decode row's layer, over eight steps on rank 0, is likewise within one BF16 step (7.8e-3
+  at 1.03 the worst), with a mean at most 7.0e-6.

@@ -760,8 +760,9 @@ pub(super) fn walk_rows(
                                 .cuda
                                 .copy_htod(&scratch.taus, &row_bytes(&taus))
                                 .map_err(|error| error.to_string()))?;
-                            run(shared.attention_rows(
+                            run(shared.attention_chunk(
                                 scratch,
+                                index,
                                 scratch.q,
                                 scratch.gate,
                                 state.keys[index],
@@ -792,6 +793,7 @@ pub(super) fn walk_rows(
                                 let at = state.position;
                                 run(shared.attention_rows(
                                     &state.scratch,
+                                    index,
                                     scratch.q.offset(row * query_width * byte),
                                     scratch.gate.offset(row * query_width * byte),
                                     state.keys[index],
