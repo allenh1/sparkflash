@@ -575,6 +575,10 @@ struct Kernels {
     /// The decode band's projections, reading the router's choice on the device.
     expert_nvfp4_band: Entry,
     expert_mxfp8_band: Entry,
+    /// A band of a few rows over moe_plan's items: the pair walk, an expert read once for every
+    /// slot that picked it, with the plan made on the device.
+    expert_nvfp4_items: Entry,
+    expert_mxfp8_items: Entry,
     /// The decode band's mix shares: the router's weight for an owned slot, zero otherwise.
     band_shares: Entry,
     /// The device leg's sum: this rank's partial and every peer's slot, ascending rank from zero.
@@ -724,6 +728,8 @@ impl Kernels {
             expert_mxfp8_pairs: load(inkling, "inkling_mxfp8_expert_pairs")?,
             expert_nvfp4_band: load(inkling, "inkling_nvfp4_expert_band")?,
             expert_mxfp8_band: load(inkling, "inkling_mxfp8_expert_band")?,
+            expert_nvfp4_items: load(inkling, "inkling_nvfp4_expert_items")?,
+            expert_mxfp8_items: load(inkling, "inkling_mxfp8_expert_items")?,
             band_shares: load(inkling, "inkling_band_shares")?,
             sum_slots: load(token, "q4e_sum_slots")?,
             swiglu: load(inkling, "inkling_softcapped_swiglu")?,

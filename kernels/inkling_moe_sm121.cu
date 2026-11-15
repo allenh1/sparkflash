@@ -517,14 +517,20 @@ __device__ __forceinline__ void inkling_mxfp8_run(const unsigned char* __restric
 #define INKLING_STAGE_PIECES (INKLING_PAIRS * INKLING_MOE_BLOCK / 4)
 #define INKLING_STAGE_LOADS ((INKLING_STAGE_PIECES + INKLING_MOE_BLOCK - 1) / INKLING_MOE_BLOCK)
 
-template <bool kNvfp4>
+// kSlots picks how `plan` names a pair: false, interleaved (input row, output slot) entries (the
+// host's grouping); true, a list of band slots, slot s reading input row s / row_slots (moe_plan's
+// sorted slots, see inkling_nvfp4_expert_items).
+template <bool kNvfp4, bool kSlots>
 __device__ __forceinline__ void inkling_expert_pairs(const unsigned char* __restrict__ codes,
                                                      const unsigned char* __restrict__ scales,
                                                      const float* __restrict__ x,
                                                      float* __restrict__ out, int rows,
                                                      int columns, int block, float scale_2,
                                                      const int* __restrict__ plan, int count,
-                                                     const float* __restrict__ e4m3) {
+                                                     const float* __restrict__ e4m3,
+                                                     int row_slots) {
+    auto input_row = [&](int pair) { return kSlots ? plan[pair] / row_slots : plan[2 * pair]; };
+    auto output_slot = [&](int pair) { return kSlots ? plan[pair] : plan[2 * pair + 1]; };
     __shared__ __align__(16) float staged[2][INKLING_PAIRS * INKLING_STAGE];
     const int row = blockIdx.x * INKLING_GROUP_ROWS + (threadIdx.x / INKLING_GROUP);
     const int q = threadIdx.x & (INKLING_GROUP - 1);
@@ -547,7 +553,7 @@ __device__ __forceinline__ void inkling_expert_pairs(const unsigned char* __rest
             const int pair = piece / (INKLING_MOE_BLOCK / 4);
             offset[l] = 4 * (piece % (INKLING_MOE_BLOCK / 4));
             loads[l] = piece < INKLING_STAGE_PIECES && pair < here;
-            source[l] = x + (uint64_t)(loads[l] ? plan[2 * (group + pair)] : 0) * columns;
+            source[l] = x + (uint64_t)(loads[l] ? input_row(group + pair) : 0) * columns;
             target[l] = pair * INKLING_STAGE + (offset[l] / INKLING_GROUP) * INKLING_STAGE_RUN +
                         offset[l] % INKLING_GROUP;
         }
@@ -617,7 +623,7 @@ __device__ __forceinline__ void inkling_expert_pairs(const unsigned char* __rest
         for (int p = 0; p < INKLING_PAIRS; ++p) {
             const float total = inkling_group_row_sum(v[p]);
             if (q == 0 && row < rows && p < here) {
-                const int slot = plan[2 * (group + p) + 1];
+                const int slot = output_slot(group + p);
                 out[(uint64_t)slot * rows + row] = kNvfp4 ? __fmul_rn(total, scale_2) : total;
             }
         }
@@ -643,7 +649,8 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
         e4m3[code] = inkling_e4m3((unsigned char)code);
     }
     __syncthreads();
-    inkling_expert_pairs<true>(codes, scales, x, out, rows, columns, 16, scale_2, plan, count, e4m3);
+    inkling_expert_pairs<true, false>(codes, scales, x, out, rows, columns, 16, scale_2, plan, count,
+                                      e4m3, 1);
 }
 
 extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_expert_pairs(
@@ -660,8 +667,85 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     if (columns <= 0 || count <= 0 || block <= 0) {
         return;
     }
-    inkling_expert_pairs<false>(codes, scales, x, out, rows, columns, block, 1.0f, plan, count,
-                                nullptr);
+    inkling_expert_pairs<false, false>(codes, scales, x, out, rows, columns, block, 1.0f, plan,
+                                       count, nullptr, 1);
+}
+
+// The pair walk over moe_plan's items, for a band of a few rows (a verify, a few fused lanes) with
+// the router's choice left on the device: blockIdx.y is an item, one an expert this rank holds
+// with every slot that picked it, so an expert two rows picked is read once for both rather than
+// once a slot as the band reads it. Item n is (local expert, first, count, n) and its slots are
+// sorted[first .. first + count); slot s reads input row s / row_slots (the token's row of the
+// stream for gate/up, row_slots = top-k; the slot's own activation for down, row_slots = 1) and
+// lands in out[s][rows]. A block past *item_count exits. Every output is inkling_expert_pairs'
+// arithmetic, so a slot's bits are the band's and the host-grouped walk's. scale_2 is the layer's
+// per-expert vector on the device.
+// grid (ceil(rows / INKLING_GROUP_ROWS), the plan's most items), block INKLING_MOE_BLOCK.
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_expert_items(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    const float* __restrict__ scale_2,
+    const int* __restrict__ sorted,
+    const int* __restrict__ items,
+    const int* __restrict__ item_count,
+    int row_slots) {
+    OPT_PDL_ENTRY();
+    const int n = blockIdx.y;
+    if (columns <= 0 || row_slots <= 0 || n >= *item_count) {
+        return;
+    }
+    const int local = items[4 * n];
+    const int first = items[4 * n + 1];
+    const int count = items[4 * n + 2];
+    if (local < 0 || count <= 0) {
+        return;
+    }
+    __shared__ float e4m3[256];
+    for (int code = threadIdx.x; code < 256; code += blockDim.x) {
+        e4m3[code] = inkling_e4m3((unsigned char)code);
+    }
+    __syncthreads();
+    const uint64_t packed = (uint64_t)(columns + 1) / 2;
+    const uint64_t scale_columns = (uint64_t)(columns + 15) / 16;
+    inkling_expert_pairs<true, true>(codes + (uint64_t)local * rows * packed,
+                                     scales + (uint64_t)local * rows * scale_columns, x, out, rows,
+                                     columns, 16, scale_2[local], sorted + first, count, e4m3,
+                                     row_slots);
+}
+
+// inkling_nvfp4_expert_items for the MXFP8 layers: one ue8m0 code a block of `block` columns.
+extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_expert_items(
+    const unsigned char* __restrict__ codes,
+    const unsigned char* __restrict__ scales,
+    const float* __restrict__ x,
+    float* __restrict__ out,
+    int rows,
+    int columns,
+    int block,
+    const int* __restrict__ sorted,
+    const int* __restrict__ items,
+    const int* __restrict__ item_count,
+    int row_slots) {
+    OPT_PDL_ENTRY();
+    const int n = blockIdx.y;
+    if (columns <= 0 || block <= 0 || row_slots <= 0 || n >= *item_count) {
+        return;
+    }
+    const int local = items[4 * n];
+    const int first = items[4 * n + 1];
+    const int count = items[4 * n + 2];
+    if (local < 0 || count <= 0) {
+        return;
+    }
+    const uint64_t scale_columns = (uint64_t)(columns + block - 1) / block;
+    inkling_expert_pairs<false, true>(codes + (uint64_t)local * rows * columns,
+                                      scales + (uint64_t)local * rows * scale_columns, x, out,
+                                      rows, columns, block, 1.0f, sorted + first, count, nullptr,
+                                      row_slots);
 }
 
 // The mix's share a band slot: the router's weight for a slot this rank computed, zero for one it

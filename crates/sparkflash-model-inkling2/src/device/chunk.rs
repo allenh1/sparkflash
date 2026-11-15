@@ -319,19 +319,29 @@ pub(super) fn band_exchange(
 
 /// The most rows the chunk walk steers on the device ([run_steered_band]): a verify's anchor and
 /// up to seven drafts, or up to eight fused lanes. A wider chunk groups its pairs by expert on the
-/// host ([run_band_chunk]), which reads an expert once for all the rows that chose it.
+/// host ([run_band_chunk]).
 pub(super) const STEERED_BAND_ROWS: usize = 8;
+
+/// The fewest rows whose steered band is planned by expert ([run_steered_band]). Four rows' 32
+/// top-8 picks name about 30 experts, so reading each once saves next to nothing and the plan's
+/// launches cost more: at 93k a four-row verify measured the same either way and two or four
+/// fused lanes 5-9% slower planned, while an eight-row verify (DSpark at depth 7) measured 7%
+/// faster planned.
+pub(super) const PLANNED_BAND_ROWS: usize = 5;
 
 /// The routed band of a quantised layer over `rows` rows of `input` [row][hidden], with the
 /// router's choice left on the device.
 ///
-/// Every launch covers the rows' top-k slots at once (grid y, slot `row * top_k + k`), and a block
-/// whose slot names an expert another rank holds exits: [ExpertBody::NvFp4] and
-/// [ExpertBody::MxFp8] read the selection through `indices`, the NVFP4 scale_2 through the layer's
-/// device vector, and the mix's shares come from inkling_band_shares. A slot's every output is the
-/// pair walk's and the host-steered loop's sum, term for term, so the band's bits are theirs;
-/// what is gone is the readback of the selection that made every layer wait for the host, and a
-/// launch an expert. A decode step is its one-row case.
+/// A decode step's one row picks top-k distinct experts, and its launches cover the slots at once
+/// (grid y, slot `row * top_k + k`): a block whose slot names an expert another rank holds exits,
+/// [ExpertBody::NvFp4] and [ExpertBody::MxFp8] read the selection through `indices` and the NVFP4
+/// scale_2 through the layer's device vector, and the mix's shares come from inkling_band_shares.
+/// From [PLANNED_BAND_ROWS] rows on (a deep verify, several fused lanes) rows share enough experts
+/// that moe_plan sorts this rank's slots by expert on the device and the item walk reads an expert
+/// once for every slot that picked it; fewer rows stay on the band, an expert a slot. A slot's
+/// every output is the pair walk's sum, term for term, either way, so the bits are the
+/// host-grouped walk's; what is gone is the readback of the selection that made every layer wait
+/// for the host, and a launch an expert.
 pub(super) fn run_steered_band(
     shared: &Shared,
     scratch: &Scratch,
@@ -355,6 +365,65 @@ pub(super) fn run_steered_band(
             .map_or(Deviceptr(0), |index| shared.weights.get(*index).pointer)
     };
     let scale_2 = shared.experts[layer].as_ref();
+    let planned = rows >= PLANNED_BAND_ROWS;
+    let max_items = owned.min(slots);
+    if planned {
+        // The shares, and this rank's local id a slot (-1 for another rank's), then the plan: one
+        // item an expert this rank holds, its slots in ascending order; another rank's slots are
+        // left out, and their zero shares keep the mix off their rows.
+        shared
+            .launch(
+                shared.kernels.band_shares,
+                (
+                    u32::try_from(slots.div_ceil(SHARES_BLOCK as usize)).unwrap_or(u32::MAX),
+                    1,
+                    1,
+                ),
+                (SHARES_BLOCK, 1, 1),
+                &[
+                    scratch.indices.0,
+                    scratch.shares.0,
+                    scratch.scales.0,
+                    slots as u64,
+                    first as u64,
+                    owned as u64,
+                    scratch.local.0,
+                ],
+            )
+            .map_err(device_error)?;
+        shared
+            .launch(
+                shared.kernels.moe_plan,
+                (1, 1, 1),
+                (
+                    sparkflash_model::active_profile().plan.block_threads(),
+                    1,
+                    1,
+                ),
+                &[
+                    scratch.local.0,
+                    scratch.plan.0,
+                    scratch.items.0,
+                    scratch.item_count.0,
+                    0,
+                    slots as u64,
+                    owned as u64,
+                    top_k as u64,
+                    // One item an expert, whatever its slot count.
+                    0,
+                    max_items as u64,
+                    0,
+                    MOE_PLAN_DROP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+            .map_err(device_error)?;
+    }
     // `row_slots` is the slots that read one input row: a token's top-k for the gate/up
     // projection, which reads its row of the stream, and 1 for the down projection, which reads
     // the slot's own activation.
@@ -366,9 +435,10 @@ pub(super) fn run_steered_band(
                       row_slots: usize,
                       factor: Option<Deviceptr>|
      -> Result<(), BackendError> {
-        let (entry, tail) = match schedule.experts {
+        let (band, items, tail) = match schedule.experts {
             ExpertBody::NvFp4 => (
                 shared.kernels.expert_nvfp4_band,
+                shared.kernels.expert_nvfp4_items,
                 factor
                     .ok_or_else(|| {
                         device_error(format!(
@@ -377,7 +447,11 @@ pub(super) fn run_steered_band(
                     })?
                     .0,
             ),
-            ExpertBody::MxFp8 => (shared.kernels.expert_mxfp8_band, MXFP8_BLOCK as u64),
+            ExpertBody::MxFp8 => (
+                shared.kernels.expert_mxfp8_band,
+                shared.kernels.expert_mxfp8_items,
+                MXFP8_BLOCK as u64,
+            ),
             ExpertBody::Bf16 => {
                 return Err(device_error(format!(
                     "layer {layer}: a BF16 expert band is steered on the host"
@@ -390,9 +464,35 @@ pub(super) fn run_steered_band(
                  not whole runs of the {BAND_RUN} columns a thread reads"
             )));
         }
+        if planned {
+            return shared
+                .launch(
+                    items,
+                    (
+                        pair_grid(outputs),
+                        u32::try_from(max_items).map_err(device_error)?,
+                        1,
+                    ),
+                    (ELEMENT_BLOCK, 1, 1),
+                    &[
+                        weight(step, 0).0,
+                        weight(step, 1).0,
+                        input.0,
+                        out.0,
+                        outputs as u64,
+                        columns as u64,
+                        tail,
+                        scratch.plan.0,
+                        scratch.items.0,
+                        scratch.item_count.0,
+                        row_slots as u64,
+                    ],
+                )
+                .map_err(device_error);
+        }
         shared
             .launch(
-                entry,
+                band,
                 (
                     outputs.div_ceil(BAND_ROWS) as u32,
                     u32::try_from(slots).map_err(device_error)?,
@@ -472,6 +572,9 @@ pub(super) fn run_steered_band(
         1,
         scale_2.map(|scale| scale.device_down),
     )?;
+    if planned {
+        return band_mix(shared, scratch, rows);
+    }
     shared
         .launch(
             shared.kernels.band_shares,
