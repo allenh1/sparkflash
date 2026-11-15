@@ -460,6 +460,9 @@ fn grid_blocks(items: usize, per_block: usize) -> u32 {
 }
 
 /// The blocks a dense GEMV takes: the kernel strides rows over its warps times the grid's blocks.
+/// The matrices `q4e_gemv4_bf16` stacks in one launch.
+const GEMV_FUSED: usize = 4;
+
 fn gemv_grid(rows: usize) -> u32 {
     let warps = (TOKEN_BLOCK / 32) as usize;
     u32::try_from(rows.div_ceil(warps).max(1))
@@ -505,6 +508,8 @@ struct Kernels {
     embed: Entry,
     rmsnorm: Entry,
     gemv: Entry,
+    /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
+    gemv4: Entry,
     block_residual: Entry,
     short_conv: Entry,
     short_conv_dynamic: Entry,
@@ -640,6 +645,7 @@ impl Kernels {
             embed: load(token, "q4e_embed")?,
             rmsnorm: load(token, "q4e_rmsnorm")?,
             gemv: load(token, "q4e_gemv_bf16")?,
+            gemv4: load(token, "q4e_gemv4_bf16")?,
             block_residual: load(inkling, "inkling_block_residual")?,
             short_conv: load(inkling, "inkling_short_conv_decode")?,
             short_conv_dynamic: load(inkling, "inkling_short_conv_dynamic_decode")?,
@@ -839,6 +845,43 @@ impl Shared {
             (gemv_grid(rows), 1, 1),
             (TOKEN_BLOCK, 1, 1),
             &[weight.0, input.0, out.0, rows as u64, columns as u64, 1],
+        )
+    }
+
+    /// Up to four dense BF16 projections of one row that read the same input, as one launch.
+    ///
+    /// `q4e_gemv4_bf16` walks the matrices' rows stacked, and each row's sum is the one
+    /// [Self::gemv] computes - the same row dot and warp sum over the same input - so a fused
+    /// group is the bits of its projections launched one at a time. A slot past `parts` has no
+    /// rows. `parts` holds (weight, output, rows).
+    fn gemv_fused(
+        &self,
+        parts: &[(Deviceptr, Deviceptr, usize)],
+        input: Deviceptr,
+        columns: usize,
+    ) -> Result<(), String> {
+        if parts.is_empty() || parts.len() > GEMV_FUSED {
+            return Err(format!(
+                "a fused projection takes 1 to {GEMV_FUSED} matrices, not {}",
+                parts.len()
+            ));
+        }
+        // (w0..w3, x, y0..y3, r0..r3, columns, batch): an absent slot is a null matrix of no rows.
+        let mut args = [0u64; 3 * GEMV_FUSED + 3];
+        for (slot, (weight, out, rows)) in parts.iter().enumerate() {
+            args[slot] = weight.0;
+            args[GEMV_FUSED + 1 + slot] = out.0;
+            args[2 * GEMV_FUSED + 1 + slot] = *rows as u64;
+        }
+        args[GEMV_FUSED] = input.0;
+        args[3 * GEMV_FUSED + 1] = columns as u64;
+        args[3 * GEMV_FUSED + 2] = 1;
+        let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
+        self.launch(
+            self.kernels.gemv4,
+            (gemv_grid(total), 1, 1),
+            (TOKEN_BLOCK, 1, 1),
+            &args,
         )
     }
 
@@ -4340,16 +4383,15 @@ impl InklingDeviceSession {
                         }
                     }
                     (Op::Gemv, Target::Project(projection)) => {
-                        let weight = self.weight(step.weights[0]);
                         let normed = self.state.scratch.normed;
-                        let (input, out, rows, columns) = match projection {
+                        let io = |projection: Projection| match projection {
                             Projection::Query => {
-                                (normed, self.state.scratch.q, heads * head_dim, hidden)
+                                Ok((normed, self.state.scratch.q, heads * head_dim, hidden))
                             }
                             Projection::Gate => {
-                                (normed, self.state.scratch.gate, heads * head_dim, hidden)
+                                Ok((normed, self.state.scratch.gate, heads * head_dim, hidden))
                             }
-                            Projection::Key => (
+                            Projection::Key => Ok((
                                 if sliding {
                                     normed
                                 } else {
@@ -4358,8 +4400,8 @@ impl InklingDeviceSession {
                                 self.state.scratch.k,
                                 kv_width,
                                 hidden,
-                            ),
-                            Projection::Value => (
+                            )),
+                            Projection::Value => Ok((
                                 if sliding {
                                     normed
                                 } else {
@@ -4368,28 +4410,56 @@ impl InklingDeviceSession {
                                 self.state.scratch.v,
                                 kv_width,
                                 hidden,
-                            ),
+                            )),
                             Projection::Relative => {
-                                (normed, self.state.scratch.rel, heads * config.d_rel, hidden)
+                                Ok((normed, self.state.scratch.rel, heads * config.d_rel, hidden))
                             }
-                            Projection::Sink => (normed, self.state.scratch.sink, heads, hidden),
-                            Projection::AttentionOut => (
+                            Projection::Sink => {
+                                Ok((normed, self.state.scratch.sink, heads, hidden))
+                            }
+                            Projection::AttentionOut => Ok((
                                 self.state.scratch.attn,
                                 self.state.scratch.delta,
                                 hidden,
                                 heads * head_dim,
-                            ),
-                            Projection::Router => (
+                            )),
+                            Projection::Router => Ok((
                                 normed,
                                 self.state.scratch.router_logits,
                                 config.n_routed_experts,
                                 hidden,
-                            ),
-                            Projection::Head => {
-                                return Err(Self::fail("the head is a global step"));
-                            }
+                            )),
+                            Projection::Head => Err(Self::fail("the head is a global step")),
                         };
-                        run(shared.gemv(weight, input, out, rows, columns))?;
+                        let (input, out, rows, columns) = io(projection)?;
+                        // The projections that follow over the same input go out with this one,
+                        // up to four a launch: a sliding layer's six attention projections all
+                        // read the one normed row, so they are two launches rather than six. A
+                        // fused row's sum is its own launch's bits (Shared::gemv_fused).
+                        let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
+                        parts[0] = (self.weight(step.weights[0]), out, rows);
+                        let mut fused = 1;
+                        while fused < GEMV_FUSED {
+                            let Some(next) = schedule.steps.get(cursor + fused) else {
+                                break;
+                            };
+                            let (Op::Gemv, Target::Project(following)) = (next.op, next.target)
+                            else {
+                                break;
+                            };
+                            let (next_input, next_out, next_rows, next_columns) = io(following)?;
+                            if next_input.0 != input.0 || next_columns != columns {
+                                break;
+                            }
+                            parts[fused] = (self.weight(next.weights[0]), next_out, next_rows);
+                            fused += 1;
+                        }
+                        if fused > 1 {
+                            run(shared.gemv_fused(&parts[..fused], input, columns))?;
+                            cursor += fused;
+                            continue;
+                        }
+                        run(shared.gemv(parts[0].0, input, out, rows, columns))?;
                         if layer == 0 && matches!(projection, Projection::AttentionOut) {
                             self.rms(&shared, "attention_out", out, rows)?;
                         }
