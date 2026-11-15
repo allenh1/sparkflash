@@ -67,11 +67,13 @@ use sparkflash_ops::sampler::Sampler;
 
 mod chunk;
 mod draft;
+mod packed;
 mod tower;
 
 use chunk::{Injection, Rows, exchange_gather, exchange_sum, walk_rows};
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
+use packed::{DenseForm, DenseWeights, pack_dense};
 pub use tower::InklingVisionTower;
 
 /// The backend name the diagnostics use.
@@ -530,6 +532,11 @@ struct Kernels {
     gemv: Entry,
     /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
     gemv4: Entry,
+    /// The same two walks over packed matrices ([packed]), and the form's packer and unpacker.
+    gemv_packed: Entry,
+    gemv4_packed: Entry,
+    pack: Entry,
+    unpack: Entry,
     block_residual: Entry,
     /// The residual's two-launch form: every stack row's statistics in a block of its own,
     /// then the softmax and the mix.
@@ -670,6 +677,10 @@ impl Kernels {
             rmsnorm: load(token, "q4e_rmsnorm")?,
             gemv: load(token, "q4e_gemv_bf16")?,
             gemv4: load(token, "q4e_gemv4_bf16")?,
+            gemv_packed: load(token, "q4e_gemv_packed")?,
+            gemv4_packed: load(token, "q4e_gemv4_packed")?,
+            pack: load(token, "q4e_pack_bf16")?,
+            unpack: load(token, "q4e_unpack_bf16")?,
             block_residual: load(inkling, "inkling_block_residual")?,
             block_residual_stats: load(inkling, "inkling_block_residual_stats")?,
             block_residual_mix: load(inkling, "inkling_block_residual_mix")?,
@@ -787,6 +798,8 @@ struct Shared {
     config: Inkling2Config,
     kernels: Kernels,
     weights: Weights,
+    /// The dense projections packed in place ([packed]), by their slots' pointers.
+    dense: DenseWeights,
     clip: Vec<ClipScales>,
     clip_arena: Deviceptr,
     experts: Vec<Option<ExpertScale>>,
@@ -857,7 +870,8 @@ impl Shared {
             .map_err(|error| format!("{}: {error}", entry.kernel.name()))
     }
 
-    /// One dense BF16 projection of one row.
+    /// One dense BF16 projection of one row (a packed matrix's through the packed walk, the same
+    /// bits).
     fn gemv(
         &self,
         weight: Deviceptr,
@@ -866,6 +880,9 @@ impl Shared {
         rows: usize,
         columns: usize,
     ) -> Result<(), String> {
+        if let Some(packed) = self.dense.get(weight) {
+            return self.gemv_packed(packed, input, out, rows, columns, 1, 1);
+        }
         self.launch(
             self.kernels.gemv,
             (gemv_grid(rows), 1, 1),
@@ -893,6 +910,21 @@ impl Shared {
             ));
         }
         // (w0..w3, x, y0..y3, r0..r3, columns, batch): an absent slot is a null matrix of no rows.
+        // Packed matrices take the packed launch; a group that mixes the two forms goes out a
+        // matrix at a time, which is the same bits.
+        let packed: Vec<_> = parts
+            .iter()
+            .filter_map(|(weight, out, rows)| Some((self.dense.get(*weight)?, *out, *rows)))
+            .collect();
+        if packed.len() == parts.len() {
+            return self.gemv4_packed(&packed, input, columns);
+        }
+        if !packed.is_empty() {
+            for (weight, out, rows) in parts {
+                self.gemv(*weight, input, *out, *rows, columns)?;
+            }
+            return Ok(());
+        }
         let mut args = [0u64; 3 * GEMV_FUSED + 3];
         for (slot, (weight, out, rows)) in parts.iter().enumerate() {
             args[slot] = weight.0;
@@ -935,6 +967,9 @@ impl Shared {
             .ok()
             .filter(|groups| (1..=MAX_GRID_Y).contains(groups))
             .ok_or_else(|| format!("{groups} token groups do not fit one launch's grid"))?;
+        if let Some(packed) = self.dense.get(weight) {
+            return self.gemv_packed(packed, input, out, rows, columns, batch, groups);
+        }
         self.launch(
             self.kernels.gemv,
             (gemv_grid(rows), groups, 1),
@@ -977,6 +1012,7 @@ impl Shared {
                  projection"
             ));
         }
+        let weight = self.bf16_rows(weight, width, inner)?;
         self.launch(
             self.kernels.wide,
             (
@@ -1118,6 +1154,7 @@ impl Shared {
         columns: usize,
         batch: usize,
     ) -> Result<(), String> {
+        let weight = self.bf16_rows(weight, rows, columns)?;
         self.launch(
             self.kernels.gemm,
             (u32::try_from(rows.div_ceil(64)).unwrap_or(1).max(1), 1, 1),
@@ -2007,6 +2044,7 @@ impl Shared {
 impl Drop for Shared {
     fn drop(&mut self) {
         let mut pointers: Vec<Deviceptr> = self.weights.allocations.clone();
+        pointers.extend(self.dense.allocations());
         pointers.push(self.weights.zeros);
         pointers.push(self.clip_arena);
         pointers.push(self.expert_arena);
@@ -2150,6 +2188,7 @@ impl InklingDeviceBackend {
             ));
         }
         let prefill_walk = PrefillWalk::from_env()?;
+        let dense_form = DenseForm::from_env()?;
         let chunk_widths = ChunkWidths::from_env(context)?;
         let prefill_chunk = chunk_widths.widest();
         let draft = draft_from_env()?;
@@ -2203,6 +2242,8 @@ impl InklingDeviceBackend {
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda, mma_shared)?;
         let weights = weights(&cuda, plan.served())?;
+        let dense = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
+        eprintln!("[inkling] rank {}: {}", tp.rank(), dense.summary());
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
         let (experts, expert_arena, route_ones) = expert_scales(&cuda, &plan, &weights)?;
         let exchange_slots = if exchange.has_device_leg() {
@@ -2243,6 +2284,7 @@ impl InklingDeviceBackend {
                 config,
                 kernels,
                 weights,
+                dense,
                 clip,
                 clip_arena,
                 experts,
