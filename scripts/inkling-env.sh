@@ -32,6 +32,8 @@
 #                       (default: INKLING_NODES); its rails and GIDs come from each rank's fabric
 #   SPARK_COMM_CONTROL_PORT the doorbell's control port (default: INKLING_PORT + 105)
 #   SPARK_COMM_RAIL_COUNT   the doorbell's rails (default: the backend's, two)
+#   SPARKFLASH_RAIL_DEVICES the doorbell's two RDMA devices as rail0,rail1 (default: discovered);
+#                       with SPARK_COMM_RAIL_COUNT=1 only rail0 carries the rows
 SITE=${INKLING_SITE:-$HOME/inkling-bin/site.env}
 # shellcheck disable=SC1090
 [ -f "$SITE" ] && source "$SITE"
@@ -60,6 +62,7 @@ RANK_ENV=(SPARKFLASH_INKLING_TRACE="$TRACE" SPARKFLASH_INKLING_PREFILL="$PREFILL
 RANK_ENV+=(SPARK_COMM_PEERS="$SPARK_COMM_PEERS" SPARK_COMM_CONTROL_PORT="$SPARK_COMM_CONTROL_PORT")
 [ -n "${SPARKFLASH_EXCHANGE:-}" ] && RANK_ENV+=(SPARKFLASH_EXCHANGE="$SPARKFLASH_EXCHANGE")
 [ -n "${SPARK_COMM_RAIL_COUNT:-}" ] && RANK_ENV+=(SPARK_COMM_RAIL_COUNT="$SPARK_COMM_RAIL_COUNT")
+[ -n "${SPARKFLASH_RAIL_DEVICES:-}" ] && RANK_ENV+=(SPARKFLASH_RAIL_DEVICES="$SPARKFLASH_RAIL_DEVICES")
 [ -n "${SPARKFLASH_NCCL_LIB:-}" ] && RANK_ENV+=(LD_LIBRARY_PATH="$SPARKFLASH_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
 for name in $(compgen -v | grep '^NCCL_'); do
   RANK_ENV+=("$name=${!name}")
