@@ -438,6 +438,12 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
 //
 // Statistics: grid (rows, nq, sequence rows), where rows is the stack plus the partial row.
 // stats is [sequence rows][nq][INKLING_MAX_BLOCKS + 1][2]: each row's RMS inverse and score.
+//
+// The query is a weight, so a thread loads its share of it before the previous grid ends; the
+// thread then holds its share of the row too, so the dot pass reads nothing again. The sums are
+// inkling_residual_row's, the same additions in the same order. A row wider than
+// INKLING_RESIDUAL_HELD a thread takes inkling_residual_row itself.
+#define INKLING_RESIDUAL_HELD 32
 extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residual_stats(
     const float* __restrict__ summaries,
     const float* __restrict__ partial,
@@ -448,7 +454,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     int nq,
     float eps,
     int summary_stride) {
-    OPT_PDL_ENTRY();
+    OPT_PDL_LAUNCH();
     const int row = blockIdx.x;
     const int query_index = blockIdx.y;
     const int sequence_row = blockIdx.z;
@@ -465,10 +471,50 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     }
     __shared__ float scratch[INKLING_BLOCK];
     const float* source = row < blocks ? summaries + (uint64_t)row * hidden : partial;
+    const float* query = queries + (uint64_t)query_index * hidden;
     float inverse;
     float score;
-    inkling_residual_row(source, queries + (uint64_t)query_index * hidden, hidden, eps, scratch,
-                         &inverse, &score);
+    if (hidden > INKLING_RESIDUAL_HELD * INKLING_BLOCK) {
+        OPT_PDL_WAIT();
+        inkling_residual_row(source, query, hidden, eps, scratch, &inverse, &score);
+    } else {
+        // Predicated, not a break: every load of a pass is in flight at once.
+        float held_query[INKLING_RESIDUAL_HELD];
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
+            const int index = threadIdx.x + k * INKLING_BLOCK;
+            held_query[k] = index < hidden ? query[index] : 0.0f;
+        }
+        OPT_PDL_WAIT();
+        float held[INKLING_RESIDUAL_HELD];
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
+            const int index = threadIdx.x + k * INKLING_BLOCK;
+            held[k] = index < hidden ? source[index] : 0.0f;
+        }
+        float squares = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
+            if (threadIdx.x + k * INKLING_BLOCK < hidden) {
+                squares = __fadd_rn(squares, __fmul_rn(held[k], held[k]));
+            }
+        }
+        const float total = inkling_conv_block_sum(squares, scratch);
+        // Every warp has read the first sum before any writes the second into the same scratch:
+        // the dot pass no longer waits on loads that kept the two apart.
+        __syncthreads();
+        const float mean = __fdiv_rn(total, (float)hidden);
+        inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
+        float dot = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_RESIDUAL_HELD; ++k) {
+            if (threadIdx.x + k * INKLING_BLOCK < hidden) {
+                dot = __fadd_rn(dot, __fmul_rn(held_query[k], __fmul_rn(held[k], inverse)));
+            }
+        }
+        const float reduced = inkling_conv_block_sum(dot, scratch);
+        score = __fmul_rn(reduced, 1.0f / sqrtf((float)hidden));
+    }
     if (threadIdx.x == 0) {
         float* cell =
             stats + (((uint64_t)sequence_row * nq + query_index) * (INKLING_MAX_BLOCKS + 1) + row) * 2;
