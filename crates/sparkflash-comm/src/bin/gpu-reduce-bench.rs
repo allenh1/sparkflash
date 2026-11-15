@@ -328,6 +328,8 @@ struct Args {
     /// Print exactly one JSON object on stdout.
     #[arg(long)]
     json: bool,
+    #[arg(long, default_value = "switched")]
+    fabric_schedule: String,
     /// Measure only the device (GPU->GPU) arm: skip the host transport and the host reduce arm.
     /// This is the gate's shape; it also means --addrs is not needed.
     #[arg(long = "device-only")]
@@ -655,7 +657,11 @@ fn run(args: &Args) -> Result<bool, String> {
         if let Some(transport) = host_transport.as_ref() {
             let mut payload = contribution(args.rank, elements);
             let layout =
-                CollectiveLayout::new(args.world, elements, FabricSchedule::OneShotAllToAll)
+                CollectiveLayout::new(args.world, elements, match args.fabric_schedule.as_str() {
+                    "switched" => FabricSchedule::OneShotAllToAll,
+                    "switchless" => FabricSchedule::HairpinRingReduceScatterAllGather,
+                    other => panic!("unknown schedule {other}"),
+                })
                     .map_err(|error| format!("layout: {error}"))?;
             let mut seq = 0u64;
             let mut host_us: Vec<Duration> = Vec::with_capacity(args.samples);
