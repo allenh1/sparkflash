@@ -1332,6 +1332,42 @@ identical on all twelve cuts, and the greedy ids of both prompts were equal.
 | served decode, 127,603-token prompt | 20.7 tokens/s | 22.5 tokens/s |
 | served time to first token, 99,848-token prompt | 156 s | 134 s |
 
+### Strided score warps and held part scores
+
+`inkling_attn_scores` gave every warp one run of four keys. A 93K-key full layer launched 5,824
+blocks a KV head, and every warp prepared its eight queries for just those four keys. A warp now
+prepares its queries once and walks the pass in runs of four, `gridDim.x * WARPS * RUN` keys
+apart, with the next run's key loads in flight while it scores the current one. The host caps the
+grid at 96 blocks a row (`SCORE_GRID`): one wave of four blocks an SM at two KV heads. Every
+score is the same expression on the same operands whatever the grid; only which warp computes a
+key changes.
+
+`inkling_attn_part` read each of a thread's scores twice, once for the run's maximum and again
+for the terms against it. A thread now holds its keys' scores (two a head) in registers across
+both phases, which are the same operations on the same values in the same order.
+
+| one full layer at the rank's shape (min of five) | scores before | after | part before | after |
+|---|---|---|---|---|
+| 1K keys | 8.9 us | 8.2 us | 18.4 us | 16.4 us |
+| 5K keys | 22.5 us | 14.3 us | 18.4 us | 16.4 us |
+| 93K keys | 337.6 us | 236.5 us | 296.8 us | 267.4 us |
+| 262K keys | 951.9 us | 686.0 us | 805.7 us | 732.3 us |
+
+Every output word of both micro-benches equalled the previous kernel's. On the four ranks the
+teacher-forced logits were identical on all twelve cuts, and the greedy ids of both prompts were
+equal.
+
+| on the four ranks | PDL | strided scores and held part scores |
+|---|---|---|
+| decode step, repeating 5K prompt (batch arm, same session) | 35.61 ms | 35.14 ms |
+| decode step after the 93K prompt (batch arm, same session) | 40.68 ms | 39.68 ms |
+| served decode, 2,223-token prompt | 28.6 tokens/s | 28.75 tokens/s |
+| served decode, 99,848-token prompt | 23.1 tokens/s | 23.8 tokens/s |
+| served decode, 127,603-token prompt | 22.5 tokens/s | 22.4 tokens/s |
+| served time to first token, 99,848-token prompt | 134 s | 135 s |
+
+The served rows are single runs; the 127,603-token one moved by less than its noise.
+
 ### Experts split by intermediate columns (opt-in, not the default)
 
 Expert parallelism gives each rank 96 whole experts, so a decode row's eight experts land on the
