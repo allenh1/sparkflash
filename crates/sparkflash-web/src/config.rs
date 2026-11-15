@@ -126,6 +126,15 @@ pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 /// (issue #19). The aliases exist because the docs, the CLI and the UI grew different words for
 /// the same two recipes; they all canonicalise here, so the saved TOML, the exported
 /// `SPARKFLASH_FABRIC_SCHEDULE` and the launcher's `--fabric-schedule` always agree.
+#[must_use]
+pub fn canonical_fabric_schedule(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "switched" | "one-shot" | "oneshot" | "one_shot" => Some("switched"),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => Some("switchless"),
+        _ => None,
+    }
+}
+
 /// The schedule a saved value names, for the places that must produce a spelling: an alias
 /// becomes its canonical name and an unknown value becomes `switched`.
 ///
@@ -135,15 +144,6 @@ pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 #[must_use]
 pub fn fabric_schedule_name(value: &str) -> &'static str {
     canonical_fabric_schedule(value).unwrap_or("switched")
-}
-
-#[must_use]
-pub fn canonical_fabric_schedule(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "" | "switched" | "one-shot" | "oneshot" | "one_shot" => Some("switched"),
-        "switchless" | "hairpin" | "ring" | "hairpin-ring" => Some("switchless"),
-        _ => None,
-    }
 }
 
 /// One checkpoint family this build knows how to run, and the selector pair that runs it.
