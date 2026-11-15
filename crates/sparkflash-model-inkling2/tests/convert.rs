@@ -131,6 +131,40 @@ fn a_rank_file_round_trips_every_planned_tensor() {
     assert_eq!(&middle[16..], &whole[32..40]);
 }
 
+/// The device arm reads the data section whole and points each tensor at
+/// [RankFileSource::tensor_span]: that span of the file must be the bytes a read of the tensor
+/// returns, for every tensor the plan names.
+#[test]
+fn every_tensor_is_its_span_of_the_data_section() {
+    use std::os::unix::fs::FileExt;
+
+    let config = Inkling2Config::tiny();
+    let source = Filled::new(&config);
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let written = convert_rank(&source, &config, layout(), directory.path(), "tiny")
+        .expect("the rank file is written");
+    let loaded = RankFileSource::open(&written.path, &config, layout()).expect("the file opens");
+    let (path, data_offset, data_bytes) = loaded.data_section();
+    assert_eq!(data_offset % 4096, 0, "a direct read starts on a page");
+    assert_eq!(data_bytes % 4096, 0, "a direct read is whole pages");
+    let file = std::fs::File::open(path).expect("the rank file opens");
+    let mut section = vec![0u8; data_bytes];
+    file.read_exact_at(&mut section, data_offset)
+        .expect("the data section reads");
+    for name in source.names() {
+        let (start, bytes) = loaded.tensor_span(&name).expect("one span");
+        assert_eq!(
+            &section[start..start + bytes],
+            loaded
+                .read(&name)
+                .expect("the rank file holds it")
+                .as_slice(),
+            "{name}: the span holds other bytes"
+        );
+    }
+    assert!(loaded.tensor_span("model.llm.no_such.weight").is_err());
+}
+
 /// [verify_rank] compares the file against the checkpoint, not only against its own header.
 #[test]
 fn a_rank_file_verifies_against_the_checkpoint() {

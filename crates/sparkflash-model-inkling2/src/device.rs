@@ -36,7 +36,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, Module};
+use sparkflash_kernels::cuda_driver::{
+    Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
+};
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
@@ -51,6 +53,7 @@ use sparkflash_weights::quant::bf16_to_f32;
 
 use crate::collective::{Exchange, Solo};
 use crate::config::Inkling2Config;
+use crate::convert::RankFileSource;
 use crate::device_plan::{
     BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, NormRole, Op, Pass, Projection,
     ResidualInput, Step, Target,
@@ -515,6 +518,10 @@ struct Slot {
 /// The rank's weights, in the served plan's order.
 struct Weights {
     slots: Vec<Slot>,
+    /// The device allocations the slots point into, which are what is freed: one a slot from a
+    /// checkpoint source ([upload]), one for the whole data section of a rank file
+    /// ([upload_rank_file]).
+    allocations: Vec<Deviceptr>,
     /// [hidden] zeros, for a launch that names a term this arm does not use.
     zeros: Deviceptr,
     total_bytes: usize,
@@ -1219,8 +1226,7 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        let mut pointers: Vec<Deviceptr> =
-            self.weights.slots.iter().map(|slot| slot.pointer).collect();
+        let mut pointers: Vec<Deviceptr> = self.weights.allocations.clone();
         pointers.push(self.weights.zeros);
         pointers.push(self.clip_arena);
         pointers.push(self.expert_arena);
@@ -1291,6 +1297,42 @@ impl InklingDeviceBackend {
         tp: TpPlan,
         exchange: Box<dyn Exchange>,
     ) -> Result<Self, String> {
+        Self::open_with(descriptor, config, context, tp, exchange, |cuda, plan| {
+            upload(cuda, source.as_ref(), plan)
+        })
+    }
+
+    /// [Self::open_rank] over a converted rank file, read the way the GLM and DeepSeek ranks
+    /// read theirs: the whole data section into one allocation in parallel direct-I/O chunks,
+    /// each tensor a span of it. A buffered read a tensor at a time runs near 1 GB/s and leaves
+    /// the file in the page cache beside the weights it was copied into.
+    ///
+    /// # Errors
+    /// As [Self::open_rank], and a rank file whose read fails or whose tensors are not each one
+    /// span of its data section.
+    pub fn open_rank_file(
+        descriptor: ModelDescriptor,
+        config: Inkling2Config,
+        file: &RankFileSource,
+        context: usize,
+        tp: TpPlan,
+        exchange: Box<dyn Exchange>,
+    ) -> Result<Self, String> {
+        Self::open_with(descriptor, config, context, tp, exchange, |cuda, plan| {
+            upload_rank_file(cuda, file, plan)
+        })
+    }
+
+    /// The rank around the weights `weights` places, once the configuration is one the kernels
+    /// take: every refusal here runs before a weight is read.
+    fn open_with(
+        descriptor: ModelDescriptor,
+        config: Inkling2Config,
+        context: usize,
+        tp: TpPlan,
+        exchange: Box<dyn Exchange>,
+        weights: impl FnOnce(&Cuda, &InklingTensorPlan) -> Result<Weights, String>,
+    ) -> Result<Self, String> {
         if !Self::available() {
             return Err(
                 "this build carries no Inkling or token cubin: rebuild on a host with nvcc \
@@ -1343,7 +1385,7 @@ impl InklingDeviceBackend {
         let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, prefill_chunk, context)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         let kernels = Kernels::load(&cuda)?;
-        let weights = upload(&cuda, source.as_ref(), plan.served())?;
+        let weights = weights(&cuda, plan.served())?;
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
         let (experts, expert_arena, route_ones) = expert_scales(&cuda, &plan, &weights)?;
         let exchange_slots = if exchange.has_device_leg() {
@@ -1691,20 +1733,86 @@ fn upload(
         cuda.copy_htod(&pointer, &data)?;
         slots.push(Slot { pointer, bytes });
     }
+    let allocations = slots.iter().map(|slot| slot.pointer).collect();
+    let zeros = zeros(cuda, plan, &mut total)?;
+    Ok(Weights {
+        slots,
+        allocations,
+        zeros,
+        total_bytes: total,
+    })
+}
+
+/// Upload a converted rank file's whole data section into one allocation with the shared
+/// parallel direct-I/O read ([Cuda::upload_file_parallel], the GLM rank's `Allocations::file`),
+/// and point each served tensor at its span of it.
+///
+/// Every span is checked against the plan before the allocation, so a file that disagrees with
+/// the plan costs no device memory. Each tensor starts on a 256-byte slot boundary
+/// ([sparkflash_weights::rank_file::SLOT_ALIGN_BYTES]), the alignment the GLM slab serves its
+/// kernels at; the data section itself is page-aligned and page-padded, which is what the direct
+/// read needs.
+fn upload_rank_file(
+    cuda: &Cuda,
+    file: &RankFileSource,
+    plan: &InklingTensorPlan,
+) -> Result<Weights, String> {
+    let (path, data_offset, data_bytes) = file.data_section();
+    let specs = plan.plan().specs();
+    let mut spans = Vec::with_capacity(specs.len());
+    for index in 0..specs.len() {
+        let spec = plan.rank_spec_at(index);
+        let bytes = usize::try_from(spec.storage_bytes())
+            .map_err(|_| format!("{}: {} bytes past usize", spec.name, spec.storage_bytes()))?;
+        let (start, held) = file.tensor_span(&spec.name)?;
+        if held != bytes {
+            return Err(format!(
+                "{}: the rank file holds {held} bytes and the rank plan {bytes}",
+                spec.name
+            ));
+        }
+        spans.push((start, bytes));
+    }
+    let mut total = 0usize;
+    let arena = cuda.alloc(data_bytes.max(1), &mut total)?;
+    if let Err(error) = cuda.upload_file_parallel(
+        &arena,
+        path,
+        data_offset,
+        data_bytes,
+        DEFAULT_DIRECT_CHUNK_BYTES,
+        DEFAULT_DIRECT_CONCURRENCY,
+        true,
+    ) {
+        cuda.free_buffers(&[&arena]);
+        return Err(format!("{}: {error}", path.display()));
+    }
+    let slots = spans
+        .into_iter()
+        .map(|(start, bytes)| Slot {
+            pointer: arena.offset(start),
+            bytes,
+        })
+        .collect();
+    let zeros = zeros(cuda, plan, &mut total)?;
+    Ok(Weights {
+        slots,
+        allocations: vec![arena],
+        zeros,
+        total_bytes: total,
+    })
+}
+
+/// [hidden] f32 zeros, for a launch that names a term this arm does not use.
+fn zeros(cuda: &Cuda, plan: &InklingTensorPlan, total: &mut usize) -> Result<Deviceptr, String> {
     let hidden = plan
         .index_of("model.llm.norm.weight")
         .map_or(4096, |index| plan.rank_spec_at(index).shape[0]);
-    let zeros_bytes = hidden.max(1) * std::mem::size_of::<f32>();
-    let mut zeros_total = 0usize;
-    let zeros = cuda.alloc(zeros_bytes, &mut zeros_total)?;
-    cuda.memset_d8_async(zeros, 0, zeros_bytes)?;
+    let bytes = hidden.max(1) * std::mem::size_of::<f32>();
+    let zeros = cuda.alloc(bytes, total)?;
+    cuda.memset_d8_async(zeros, 0, bytes)?;
     cuda.synchronize()?;
-    let _ = zeros_bytes;
-    Ok(Weights {
-        slots,
-        zeros,
-        total_bytes: total + zeros_total,
-    })
+    Ok(zeros)
 }
 
 /// Widen every layer's two L2-clip gain vectors from the checkpoint's BF16 to the f32 the

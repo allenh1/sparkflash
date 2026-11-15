@@ -341,10 +341,11 @@ fn four_converted_ranks_answer_like_one_rank() {
                 &sparkflash_comm::tcp::TcpConfig::loopback4(rank, base_port),
             )?;
             let tp = sparkflash_model::TpPlan::new(4, rank).map_err(|error| error.detail)?;
-            let backend = InklingDeviceBackend::open_rank(
+            // The served ranks' load: the data section whole, in parallel direct reads.
+            let backend = InklingDeviceBackend::open_rank_file(
                 sparkflash_model_inkling2::descriptor(),
                 config,
-                Arc::new(source) as Arc<dyn sparkflash_weights::WeightSource>,
+                &source,
                 16,
                 tp,
                 Box::new(exchange),

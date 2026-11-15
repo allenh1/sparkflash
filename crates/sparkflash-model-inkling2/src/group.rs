@@ -237,10 +237,10 @@ pub fn open_master(
     let source = RankFileSource::open(&converted, config, layout)
         .map_err(|error| format!("{}: {error}", converted.display()))?;
     let opened = std::time::Instant::now();
-    let mut device = InklingDeviceBackend::open_rank(
+    let mut device = InklingDeviceBackend::open_rank_file(
         descriptor.clone(),
         config.clone(),
-        Arc::new(source),
+        &source,
         context,
         tp,
         exchange,
@@ -351,10 +351,10 @@ pub fn run_worker(
     let opened = std::time::Instant::now();
     let source = RankFileSource::open(&converted, config, layout)
         .map_err(|error| format!("{}: {error}", converted.display()))?;
-    let backend = InklingDeviceBackend::open_rank(
+    let backend = InklingDeviceBackend::open_rank_file(
         descriptor.clone(),
         config.clone(),
-        Arc::new(source),
+        &source,
         context,
         tp,
         exchange,

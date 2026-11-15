@@ -394,10 +394,15 @@ pub fn verify_rank(
 /// converter wrote and presents each planned tensor under its released name with the rank-local
 /// shape. A rank file's payload is contiguous and in plan order, so a read is one `pread` per
 /// slot it touches rather than one per source range: the loader is a walk, not a re-tiling.
+/// The device arm reads none of it this way: it takes the whole data section at once
+/// ([RankFileSource::data_section]) and points each tensor at its span
+/// ([RankFileSource::tensor_span]).
 pub struct RankFileSource {
     path: PathBuf,
     file: std::sync::Mutex<File>,
     data_offset: u64,
+    /// The data section's page-padded length, which is what a direct-I/O read of it takes.
+    data_bytes: usize,
     index: SlotIndex<InklingRecords>,
     specs: std::collections::BTreeMap<String, TensorSpec>,
     slots: Vec<RankSlot>,
@@ -436,10 +441,18 @@ impl RankFileSource {
             .map(|spec| (spec.name.clone(), spec))
             .collect();
         let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+        let data_bytes = usize::try_from(preamble.padded_data_bytes).map_err(|_| {
+            format!(
+                "{}: {} data bytes do not fit this machine",
+                path.display(),
+                preamble.padded_data_bytes
+            )
+        })?;
         Ok(Self {
             path: path.to_path_buf(),
             file: std::sync::Mutex::new(file),
             data_offset: preamble.data_offset,
+            data_bytes,
             index,
             specs,
             slots,
@@ -456,6 +469,57 @@ impl RankFileSource {
     #[must_use]
     pub fn tensor_bytes(&self, name: &str) -> Option<u64> {
         self.specs.get(name).map(|spec| spec.storage_bytes() as u64)
+    }
+
+    /// The file, where its data section starts, and that section's page-padded length: one
+    /// direct-I/O read of these bytes is every weight the rank holds.
+    #[must_use]
+    pub fn data_section(&self) -> (&Path, u64, usize) {
+        (&self.path, self.data_offset, self.data_bytes)
+    }
+
+    /// Where one tensor's rank-local bytes start in the data section, and how many there are.
+    ///
+    /// A tensor past [SLOT_CHUNK_BYTES] is several slots, and the writer places each at the next
+    /// [sparkflash_weights::rank_file::SLOT_ALIGN_BYTES] boundary; the chunk is a multiple of that,
+    /// so they abut and the tensor is one span. This checks that rather than assume it, since a
+    /// reader that points a kernel at the
+    /// first slot of a gapped tensor would read the gap as weights.
+    ///
+    /// # Errors
+    /// A tensor the rank does not hold, or whose slots do not abut.
+    pub fn tensor_span(&self, name: &str) -> Result<(usize, usize), String> {
+        let mut span: Option<(usize, usize)> = None;
+        for (position, slot) in self.slots.iter().enumerate() {
+            if slot.name != name {
+                continue;
+            }
+            let header = &self.index.slots[position];
+            span = match span {
+                None => Some((header.offset, slot.bytes)),
+                Some((start, bytes)) if start + bytes == header.offset => {
+                    Some((start, bytes + slot.bytes))
+                }
+                Some((start, bytes)) => {
+                    return Err(format!(
+                        "{name}: slot {} starts at {} and the tensor's last one ends at {}, so \
+                         its bytes are not one span",
+                        slot.key,
+                        header.offset,
+                        start + bytes
+                    ));
+                }
+            };
+        }
+        let (start, bytes) =
+            span.ok_or_else(|| format!("{name}: this rank holds no slot of it"))?;
+        if start + bytes > self.data_bytes {
+            return Err(format!(
+                "{name}: {bytes} bytes at {start} run past the {} the data section holds",
+                self.data_bytes
+            ));
+        }
+        Ok((start, bytes))
     }
 
     /// Reads `len` payload bytes at `offset` of one tensor's rank-local bytes.
@@ -710,5 +774,44 @@ mod tests {
             "every row's run is one rank's width"
         );
         assert_eq!(projection.bytes, config.hidden_size * per_row);
+    }
+
+    /// A tensor past one chunk is several slots, and the device arm points a kernel at the first
+    /// and reads on through the rest ([super::RankFileSource::tensor_span]): placed the way the
+    /// converter places them, every released tensor's slots abut on every rank.
+    #[test]
+    fn every_released_tensor_is_one_span() {
+        use sparkflash_weights::rank_file::SlotPlan;
+
+        let config = released();
+        let mut chunked = 0usize;
+        for rank in 0..4 {
+            let layout = TpLayout {
+                rank,
+                world_size: 4,
+            };
+            let slots = rank_slots(&config, layout).expect("rank slots");
+            let mut placing = SlotPlan::default();
+            for slot in &slots {
+                placing.place(&slot.key, slot.bytes);
+            }
+            let placed = placing.slots();
+            for index in 1..slots.len() {
+                if slots[index - 1].name != slots[index].name {
+                    continue;
+                }
+                chunked += 1;
+                assert_eq!(
+                    placed[index].offset,
+                    placed[index - 1].offset + placed[index - 1].bytes,
+                    "rank {rank}: {} does not start where the tensor's last slot ends",
+                    slots[index].key
+                );
+            }
+        }
+        assert!(
+            chunked > 0,
+            "the released ranks hold tensors past one chunk"
+        );
     }
 }

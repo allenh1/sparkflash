@@ -838,8 +838,9 @@ is 8.04 GiB a rank. The four rank files are 97,483,910,480 bytes each (91.4 GiB 
 rank's whole state is 99.4 GiB of the engine's 113.7 GiB budget. The sliding layers' caches are
 their 1,024-token windows and do not grow with the context.
 
-Served at that window (`CONTEXT=1048576 scripts/inkling-serve-group.sh launch`): rank 0 opens
-97,483,911,488 weight bytes in 97 s, the card reports `context_length 1048576` and
+Served at that window (`CONTEXT=1048576 scripts/inkling-serve-group.sh launch`): rank 0 opened
+97,483,911,488 weight bytes in 97 s at the time (the load is now 15 s; see "Loading a rank" below),
+the card reports `context_length 1048576` and
 `max_output_tokens 32768`, and `scripts/inkling-serve-probe.py` measures
 
 | prompt | TTFT | prefill | decode |
@@ -1071,3 +1072,33 @@ layout rows); it draws its PNGs in pure Python, so it needs no image library.
 `reasoning_effort` cannot turn the reasoning off yet: the shared API parser accepts DeepSeek's
 integer 1-100 and the named levels, so Inkling's `"none"` (and its fractional 0-0.99 scale) is
 refused before the prompt builder sees it.
+
+### Loading a rank
+
+The rank file was read through its `WeightSource`: one buffered `read_exact` a tensor, on one
+thread, into a fresh host buffer, then one `cuMemAlloc` and copy each. That ran near 1 GB/s (97 s
+for rank 0) and left about 19 GiB of the file in the page cache beside the weights it had been
+copied into, with 3 GiB free on rank 0 at the 1M window. That launch's image probe saw one 18.6 s
+first token among 1.5-2.8 s ones; the direct-read launch did not repeat it (1.4-3.8 s), though one
+probe is not proof the cache was the cause.
+
+The served ranks now load the way the GLM and DeepSeek ranks do
+(`InklingDeviceBackend::open_rank_file`): the whole data section into one allocation with the
+shared `upload_file_parallel` (16 MiB `O_DIRECT` reads, eight in flight), and each tensor a
+pointer into it. A tensor past one 512 MiB chunk is several slots; the writer places each on the
+next 256-byte slot boundary and the chunk is a multiple of that, so a tensor's slots abut and it is
+one span. `RankFileSource::tensor_span` checks that rather than assume it, and every span is
+checked against the plan before the allocation. A checkpoint source (the tests' fixtures, the host
+reference) still uploads a tensor at a time through `open_rank`.
+
+| at the 1M window | before | parallel direct read |
+| --- | --- | --- |
+| rank 0 open (91.4 GiB of weights) | 97.9 s | 15.3 s |
+| ranks 1-3 open | not recorded | 14.6 s |
+| launch to `/v1/models` | 110 s | 22 s |
+| rank 0 page cache after load | 19 GiB | 3 GiB |
+
+The disk reads 11.8 GB/s on one direct stream, so the read alone is about 8 s of the 15; the
+rest (not split out here) is the host-to-device copy after each 1 GiB window, which the shared
+reader does not overlap with the next read, and the open's own setup. The four-rank device test
+opens through the new path and still answers like the host reference.

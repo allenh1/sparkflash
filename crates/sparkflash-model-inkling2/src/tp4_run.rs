@@ -22,7 +22,6 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sparkflash_comm::tcp::TcpConfig;
@@ -187,10 +186,10 @@ impl Tp4Run {
         let tp = TpPlan::new(self.world, self.rank)
             .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let opened = Instant::now();
-        let backend = InklingDeviceBackend::open_rank(
+        let backend = InklingDeviceBackend::open_rank_file(
             descriptor.clone(),
             config.clone(),
-            Arc::new(source),
+            &source,
             self.context,
             tp,
             exchange,
