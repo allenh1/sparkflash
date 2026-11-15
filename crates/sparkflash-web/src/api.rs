@@ -108,8 +108,12 @@ const MODEL_EXCLUSIVE: &[&str] = &[
 /// How long one node check may take, on top of the SSH connect timeout.
 const INSPECT_SECS: u64 = 60;
 
-/// How long the per-rank link probe may take, on top of the SSH connect timeout.
-const FABRIC_SECS: u64 = 20;
+/// How long the per-rank link probe may take, on top of the SSH connect timeout. The probe
+/// ARPs and pings every fast address of every peer from every fast port, and each unanswered
+/// attempt can burn its one-second wait: two ports, two addresses per peer and three peers is
+/// twelve ARP attempts plus twelve pings in the worst case. The deadline must outlast that, or a
+/// disconnected fabric would be reported as an unfinished probe instead of a measured one.
+const FABRIC_SECS: u64 = 60;
 
 /// What a fast-port setup must not overlap: a launch or stop, and the jobs that move model bytes,
 /// since reconfiguring the ports can drop in-flight transfers.
