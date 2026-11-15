@@ -1496,3 +1496,60 @@ DSpark against plain decoding on this build:
 Depth 3 now beats plain decoding after the 93K prompt as well, by 15%. The drafter stays opt-in.
 It costs a rank about 3.6 GB at 1M positions, lanes refuse it, and its gain rests on how many
 drafts the text accepts.
+
+### The dense projections in a lossless packed form
+
+A decode step reads every dense BF16 projection once, and at one row those GEMVs run at the
+DRAM floor, so their bytes are their time. A rank reads 401 of them in a pass: the attention
+projections, the router, the dynamic short convolution's tap projection and the head. That is
+2,989 MB, the head alone 462 MB. A BF16 word spends 8 bits on its exponent, but the weights one
+lane reads together sit within a few binades of each other.
+
+The packed form (`kernels/bf16_packed_sm121.cuh`) follows `q4e_row_dot_bf16`'s walk: lane `l`
+reads 16-byte chunks `l`, `l + 32`, ... in steps of four chunks, then perhaps two, then one. For
+each step and lane it keeps three planes:
+
+* each weight's sign and mantissa as a byte;
+* its exponent as a 4-bit offset under the largest of the lane's 32 weights at that step;
+* that largest exponent, once.
+
+That is 12.25 bits a weight. A weight 15 or more binades under its step's largest (zeros, mostly)
+is an escape: its offset reads 15, and its whole word sits in the matrix's escape list, by row
+and column. A row's columns must be a multiple of 256, so every lane walks the same steps; every
+dense projection here qualifies.
+
+`q4e_gemv_packed` and `q4e_gemv4_packed` rebuild each lane's words in registers, patch in its
+escapes, and hand them to `q4e_dot_chunk` in the grouping `q4e_gemv_bf16` and `q4e_gemv4_bf16`
+use. A packed projection is therefore the BF16 projection's bits, from 77% of the bytes.
+
+The arm packs at load, in place, a group of rows at a time through one scratch buffer the size
+of the widest matrix but the head. Before a group overwrites its BF16 rows, `q4e_unpack_bf16`
+rebuilds the group and counts the words that differ from those rows. A single differing word
+refuses the rank. A prompt's tensor-core tiles read BF16, so `wide` and `gemm` unpack a
+projection into the scratch first; at an 8,192-row chunk that costs nothing measurable.
+`SPARKFLASH_INKLING_DENSE=bf16` keeps the checkpoint's rows, and any other value is refused.
+
+| standalone, one rank's slice (BF16 -> packed, every output word equal) | batch 1 | batch 4 |
+|---|---|---|
+| query, 1,536 x 4,608 | 63.4 -> 51.5 us (1.23x) | 1.23x |
+| attention out, 4,608 x 1,536 | 61.9 -> 48.9 us (1.26x) | 1.25x |
+| head, 50,176 x 4,608 | 323.4 -> 258.9 us (1.25x) | 1.23x |
+
+On the four ranks, against the build before, the teacher-forced logits were identical on all
+twelve cuts. The greedy ids were equal on both prompts, plain and with DSpark depth 3, and with
+the bf16 opt-out:
+
+| on the four ranks | BF16 rows | packed |
+|---|---|---|
+| decode step, repeating 5K prompt (batch arm, same session) | 33.82 ms | 31.64 ms |
+| decode step after the 93K prompt (batch arm, same session) | 37.74 ms | 35.39 ms |
+| depth-3 verify after the 93K prompt | 105.0 ms | 102.7 ms |
+| 93K prompt (batch arm) | 121.5 s | 120.3 s |
+| served decode, 2,223-token prompt | 29.92 tokens/s | 31.74 tokens/s |
+| served decode, 99,848-token prompt | 25.8 tokens/s | 26.89 tokens/s |
+| served decode, 127,603-token prompt | 24.9 tokens/s | 26.12 tokens/s |
+| served time to first token, 99,848-token prompt | 130 s | 133 s |
+
+The served rows are single runs; the BF16 column's are the small decode kernels' build. The
+verify gains less than a plain step because each of its rows routes its own experts, so the
+dense projections are a smaller share of its bytes.
