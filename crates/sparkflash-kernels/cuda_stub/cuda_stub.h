@@ -452,6 +452,20 @@ __device__ __forceinline__ int __ffs(int value) {
     return __builtin_ffs(value);
 }
 
+// Byte i of the result is byte (selector >> 4i) & 7 of the pair (x the low four bytes, y the
+// high), as the device's prmt; the sign-replicating mode (selector bit 3 a nibble) is not
+// modelled.
+__device__ __forceinline__ unsigned int __byte_perm(unsigned int x, unsigned int y,
+                                                    unsigned int selector) {
+    const unsigned long long pair = ((unsigned long long)y << 32) | x;
+    unsigned int result = 0;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned int pick = (selector >> (4 * i)) & 7u;
+        result |= (unsigned int)((pair >> (8 * pick)) & 0xFFu) << (8 * i);
+    }
+    return result;
+}
+
 __device__ __forceinline__ unsigned int atomicOr(unsigned int *address, unsigned int value) {
     const unsigned int old = *address;
     *address |= value;

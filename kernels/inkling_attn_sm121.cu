@@ -1468,12 +1468,228 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
 // scores kept in shared memory. A long row's runs are many more blocks than the SMs hold, and
 // there the scores' round trip through DRAM and the second launch are what the split pays for:
 // at 93k keys a full layer's two launches move its keys and values at 184 GB/s, this one at
-// 205. Every number is the two kernels' own: warp w scores the run's sub-runs of
-// INKLING_SCORE_RUN keys w, w + WARPS, ... with inkling_group_score, and inkling_part_run takes
-// the run from those scores as inkling_attn_part reads them. A short row is a few blocks, so the
-// host keeps the two launches there (the scores spread over many more blocks).
+// 205. Every number is the two kernels' own: the scores are inkling_group_score's (below, a key
+// a quad), and inkling_part_run takes the run from them as inkling_attn_part reads them. A short
+// row is a few blocks, so the host keeps the two launches there (the scores spread over many
+// more blocks).
 #define INKLING_SCORED_WARPS 8
 #define INKLING_SCORED_GROUPS 6
+
+// The scored partial scores a key a quad (four threads) where inkling_group_score takes a warp:
+// thread u of the quad holds the key's dims u + 4m + 32 step (m < 8), which are lane u + 4m's
+// dims of the lane layout, so its partial dot for lane u + 4m is that lane's chain of products in
+// step order. The warp's tree pairs lanes differing in bit 4, then 3, 2, 1, 0 (offset 16 first);
+// lanes u + 4m differ in m's bits 2, 1, 0, so the first three levels pair a thread's own partials
+// (m with m + 4, then + 2, then + 1) and the last two pair the quad's threads (u ^ 2, then u ^ 1):
+// every sum adds the same two operands at every node, the bias's too (its partials past d_rel the
+// same zeros). A warp at a time takes the dot's 32 lanes' work for 8 keys instead of one, and the
+// tree's 31 adds a sum instead of 5 shuffle levels of 16 sums.
+//
+// A warp stages its 8 keys' rows through shared memory (16-byte loads along each row) so the
+// quad's threads read their own dims as words: word k of thread u holds dims 8k + u and
+// 8k + 4 + u, so word (m >> 1) + 4 step, half m & 1, is dim u + 4m + 32 step. A thread's 16 words
+// sit at a stride of INKLING_QUAD_PAD words, so a quarter warp's 16-byte reads (two keys' quads)
+// and a store's 32 words fall in distinct banks.
+#define INKLING_QUAD_PAD 20
+
+// What the scored partial needs in shared memory: inkling_part_run's, with the keys' stage in the
+// value sums' place (the scores are done with it, past a barrier, before a sum is written), and
+// the quads' operands: thread u's lane u + 4m prepared query at queries[u][m][g][step], relative
+// query at rel[u][m * 8 + g], key gain at dim_gains[u][m][step] (each u's row 4 words longer, for
+// the banks).
+template <int MG>
+struct InklingScoredShared {
+    static constexpr bool ALIASED = false;
+    float weights[MG][INKLING_PART_KEYS];
+    float scales[INKLING_PART_KEYS];
+    float block[4][MG];
+    union {
+        float sums[INKLING_PART_STRIDE][MG][INKLING_MAX_HEAD_DIM];
+        alignas(16) uint32_t stage[INKLING_SCORED_WARPS][8][4][INKLING_QUAD_PAD];
+    };
+    alignas(16) float queries[4][8 * MG * 4 + 4];
+    alignas(16) float rel[4][8 * 8 + 4];
+    alignas(16) float dim_gains[4][8 * 4 + 4];
+};
+
+// A warp's 8 keys from `base` of a run whose key i is at cache slot slot0 + i: lane t loads the
+// 16-byte pieces t, t + 32, ... (key base + (t >> 4) + 2h, dims 8 (t & 15) ..), zeros for a key at
+// n or past and for dims past head_dim.
+__device__ __forceinline__ void inkling_quad_fetch(const __nv_bfloat16* __restrict__ keys,
+                                                   int64_t slot0, int base, int n, int cache_rows,
+                                                   uint64_t kv_stride, uint64_t kv_offset,
+                                                   int head_dim, uint4 (&pieces)[4]) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const int k = (int)(lane & 15u);
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+        const int i = base + (int)(lane >> 4) + 2 * h;
+        pieces[h] = make_uint4(0u, 0u, 0u, 0u);
+        if (i < n && 8 * k < head_dim) {
+            pieces[h] = *reinterpret_cast<const uint4*>(
+                keys + inkling_attn_cache_row(slot0 + i, cache_rows) * kv_stride + kv_offset +
+                8 * k);
+        }
+    }
+}
+
+// The fetched pieces into the warp's stage: piece (r, k) holds dims 8k .. 8k + 7 of key r as BF16
+// pairs x = (8k, 8k + 1), y, z, w, and thread u's word k pairs dims 8k + u and 8k + 4 + u.
+__device__ __forceinline__ void inkling_quad_stage(uint32_t (&stage)[8][4][INKLING_QUAD_PAD],
+                                                   const uint4 (&pieces)[4]) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const int k = (int)(lane & 15u);
+#pragma unroll
+    for (int h = 0; h < 4; ++h) {
+        const int r = (int)(lane >> 4) + 2 * h;
+        stage[r][0][k] = __byte_perm(pieces[h].x, pieces[h].z, 0x5410);
+        stage[r][1][k] = __byte_perm(pieces[h].x, pieces[h].z, 0x7632);
+        stage[r][2][k] = __byte_perm(pieces[h].y, pieces[h].w, 0x5410);
+        stage[r][3][k] = __byte_perm(pieces[h].y, pieces[h].w, 0x7632);
+    }
+}
+
+// Word `i` (compile-time after unrolling) of four.
+__device__ __forceinline__ uint32_t inkling_quad_word(const uint4& four, int i) {
+    return i == 0 ? four.x : i == 1 ? four.y : i == 2 ? four.z : four.w;
+}
+
+// The warp tree's last three levels of one sum on a thread's eight partials (lanes u + 4m).
+__device__ __forceinline__ float inkling_quad_tree(const float (&leaf)[8]) {
+    const float a0 = __fadd_rn(leaf[0], leaf[4]);
+    const float a2 = __fadd_rn(leaf[2], leaf[6]);
+    const float a1 = __fadd_rn(leaf[1], leaf[5]);
+    const float a3 = __fadd_rn(leaf[3], leaf[7]);
+    return __fadd_rn(__fadd_rn(a0, a2), __fadd_rn(a1, a3));
+}
+
+// The tree's first two levels across the quad: every thread of it returns the sum.
+__device__ __forceinline__ float inkling_quad_sum(float value) {
+    value = __fadd_rn(value, __shfl_xor_sync(0xffffffffu, value, 2));
+    return __fadd_rn(value, __shfl_xor_sync(0xffffffffu, value, 1));
+}
+
+// The scored partial's scores for keys [0, n) of the run whose key i is at cache slot slot0 + i,
+// into shared.weights, once the queries, relative queries and key gains are in shared memory.
+// `pieces` holds the warp's first keys (inkling_quad_fetch from base 8 * warp) on entry. Every
+// lane of a warp runs the same iterations (a quad past n computes and stores nothing).
+template <int MG>
+__device__ __forceinline__ void inkling_quad_scores(
+    InklingScoredShared<MG>& shared,
+    uint4 (&pieces)[4],
+    const __nv_bfloat16* __restrict__ keys,
+    const __nv_bfloat16* __restrict__ rel_bank,
+    const float* __restrict__ gains,
+    int64_t slot0,
+    int n,
+    int position,
+    int cache_rows,
+    uint64_t kv_stride,
+    uint64_t kv_offset,
+    int head_dim,
+    int groups,
+    int rel_extent,
+    int d_rel,
+    float inv_dim) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const int warp = (int)(threadIdx.x >> 5);
+    const int u = (int)(lane & 3u);
+    const int quad = (int)(lane >> 2);
+    uint32_t(&stage)[8][4][INKLING_QUAD_PAD] = shared.stage[warp];
+    for (int base = 8 * warp; base < n; base += 8 * INKLING_SCORED_WARPS) {
+        __syncwarp();
+        inkling_quad_stage(stage, pieces);
+        __syncwarp();
+        uint4 words[4];
+#pragma unroll
+        for (int step = 0; step < 4; ++step) {
+            words[step] = *reinterpret_cast<const uint4*>(&stage[quad][u][4 * step]);
+        }
+        if (base + 8 * INKLING_SCORED_WARPS < n) {
+            inkling_quad_fetch(keys, slot0, base + 8 * INKLING_SCORED_WARPS, n, cache_rows,
+                               kv_stride, kv_offset, head_dim, pieces);
+        }
+        const int i = base + quad;
+        const bool valid = i < n;
+        const int64_t slot = slot0 + i;
+        const float k_gain = valid ? gains[slot] : 1.0f;
+        // inkling_group_score's kv for thread u's dims; the stage's zeros past head_dim (gain 1)
+        // give its zeros.
+        float kv[8][4];
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const float4 gain = *reinterpret_cast<const float4*>(&shared.dim_gains[u][4 * m]);
+            const float gains4[4] = {gain.x, gain.y, gain.z, gain.w};
+#pragma unroll
+            for (int step = 0; step < 4; ++step) {
+                const uint32_t word = inkling_quad_word(words[step], m >> 1);
+                const float key = (m & 1) != 0 ? __uint_as_float(word & 0xffff0000u)
+                                               : __uint_as_float(word << 16);
+                kv[m][step] = __fmul_rn(__fmul_rn(key, gains4[step]), k_gain);
+            }
+        }
+        float dots[MG];
+#pragma unroll
+        for (int g = 0; g < MG; ++g) {
+            dots[g] = 0.0f;
+            if (g < groups) {
+                float leaf[8];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    const float4 q4 =
+                        *reinterpret_cast<const float4*>(&shared.queries[u][(m * MG + g) * 4]);
+                    float dot = 0.0f;
+                    dot = __fadd_rn(dot, __fmul_rn(q4.x, kv[m][0]));
+                    dot = __fadd_rn(dot, __fmul_rn(q4.y, kv[m][1]));
+                    dot = __fadd_rn(dot, __fmul_rn(q4.z, kv[m][2]));
+                    dot = __fadd_rn(dot, __fmul_rn(q4.w, kv[m][3]));
+                    leaf[m] = dot;
+                }
+                dots[g] = inkling_quad_sum(inkling_quad_tree(leaf));
+            }
+        }
+        const int64_t distance = (int64_t)position - slot;
+        const bool biased = valid && inkling_attn_biased(distance, rel_extent, d_rel);
+        float biases[MG];
+#pragma unroll
+        for (int g = 0; g < MG; ++g) {
+            biases[g] = 0.0f;
+        }
+        if (__any_sync(0xffffffffu, biased)) {
+            float bank[8];
+#pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                const int dim = u + 4 * m;
+                bank[m] = biased && dim < d_rel
+                              ? __bfloat162float(
+                                    rel_bank[(uint64_t)dim * rel_extent + (uint64_t)distance])
+                              : 0.0f;
+            }
+#pragma unroll
+            for (int g = 0; g < MG; ++g) {
+                if (g < groups) {
+                    float leaf[8];
+#pragma unroll
+                    for (int m = 0; m < 8; ++m) {
+                        leaf[m] = u + 4 * m < d_rel ? __fmul_rn(shared.rel[u][m * 8 + g], bank[m])
+                                                    : 0.0f;
+                    }
+                    biases[g] = inkling_quad_sum(inkling_quad_tree(leaf));
+                }
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < MG; ++g) {
+            if (valid && g < groups && (g & 3) == u) {
+                float score = __fmul_rn(dots[g], inv_dim);
+                if (biased) {
+                    score = __fadd_rn(score, biases[g]);
+                }
+                shared.weights[g][i] = score;
+            }
+        }
+    }
+}
 
 // grid (kv_heads, rows, ceil(pass span / INKLING_PART_KEYS)), 32 * INKLING_SCORED_WARPS threads;
 // the arguments are inkling_attn_scores' and inkling_attn_part's. groups <=
@@ -1511,8 +1727,9 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORED_WARPS) inkling_
     int scale_stride,
     int part_stride) {
     constexpr int MG = INKLING_SCORED_GROUPS;
+    static_assert(MG <= INKLING_SCORED_WARPS && MG <= 8, "a warp prepares each head's queries");
     OPT_PDL_ENTRY();
-    __shared__ InklingPartShared<MG> shared;
+    __shared__ InklingScoredShared<MG> shared;
     const int kv_head = blockIdx.x;
     const int row = blockIdx.y;
     if (kv_head >= kv_heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
@@ -1537,55 +1754,40 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORED_WARPS) inkling_
     const uint64_t kv_stride = (uint64_t)kv_heads * head_dim;
     const uint64_t kv_offset = (uint64_t)kv_head * head_dim;
 
-    // The scores, a warp's first keys in flight while it prepares the queries.
-    constexpr int STRIDE = INKLING_SCORED_WARPS * INKLING_SCORE_RUN;
-    int64_t at = begin + (int64_t)warp * INKLING_SCORE_RUN;
-    __nv_bfloat16 loaded[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
-    float banked[INKLING_SCORE_RUN];
-    if (at < end) {
-        inkling_score_load(keys, rel_bank, first, at, end, position, cache_rows, kv_stride,
-                           kv_offset, head_dim, rel_extent, d_rel, loaded, banked);
+    // The scores, a warp's first keys in flight while the queries are prepared: warp g prepares
+    // head g's (inkling_group_queries' arithmetic, a head at a time) and its lane u + 4m writes
+    // them where quad thread u reads them.
+    uint4 pieces[4];
+    if (8 * warp < n) {
+        inkling_quad_fetch(keys, first + begin, 8 * warp, n, cache_rows, kv_stride, kv_offset,
+                           head_dim, pieces);
     }
-    float qv[MG][INKLING_MAX_HEAD_DIM / 32];
-    float rv[MG];
-    inkling_group_queries<MG>(q, rel_proj, q_scale, rel_scale, row, heads, head0, head_dim, groups,
-                              d_rel, qk_clip, rel_clip, tau_rows != nullptr ? tau_rows[row] : tau,
-                              qv, rv);
+    if (warp < groups) {
+        const int head = head0 + warp;
+        float qv[INKLING_MAX_HEAD_DIM / 32];
+        float rv;
+        inkling_attn_query(q + ((uint64_t)row * heads + head) * head_dim,
+                           rel_proj + (uint64_t)row * heads * d_rel, q_scale, rel_scale, head,
+                           head_dim, d_rel, qk_clip, rel_clip,
+                           tau_rows != nullptr ? tau_rows[row] : tau, qv, rv);
+        const int u = (int)(lane & 3u);
+        const int m = (int)(lane >> 2);
+        *reinterpret_cast<float4*>(&shared.queries[u][(m * MG + warp) * 4]) =
+            make_float4(qv[0], qv[1], qv[2], qv[3]);
+        shared.rel[u][m * 8 + warp] = rv;
+    }
+    for (int dim = (int)threadIdx.x; dim < INKLING_MAX_HEAD_DIM; dim += (int)blockDim.x) {
+        // inkling_key_gain's.
+        shared.dim_gains[dim & 3][4 * ((dim >> 2) & 7) + (dim >> 5)] =
+            dim < head_dim && k_scale != nullptr ? k_scale[(uint64_t)kv_head * head_dim + dim]
+                                                 : 1.0f;
+    }
+    __syncthreads();
     const float inv_dim = 1.0f / sqrtf((float)head_dim);
-    const float* gains = key_gains + (uint64_t)kv_head * scale_stride - scale_first;
-    float gain[INKLING_MAX_HEAD_DIM / 32];
-    inkling_key_gain(k_scale, kv_head, head_dim, gain);
-    for (; at < end; at += STRIDE) {
-        __nv_bfloat16 run[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
-        float bank[INKLING_SCORE_RUN];
-#pragma unroll
-        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
-#pragma unroll
-            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                run[i][step] = loaded[i][step];
-            }
-            bank[i] = banked[i];
-        }
-        if (at + STRIDE < end) {
-            inkling_score_load(keys, rel_bank, first, at + STRIDE, end, position, cache_rows,
-                               kv_stride, kv_offset, head_dim, rel_extent, d_rel, loaded, banked);
-        }
-#pragma unroll
-        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
-            const int64_t index = at + i;
-            if (index < end) {
-                const int64_t slot = first + index;
-                const float score =
-                    inkling_group_score<MG>(run[i], gain, gains[slot], qv, rv, bank[i],
-                                            (int64_t)position - slot, rel_extent, d_rel, head_dim,
-                                            inv_dim);
-                const int g = (int)(lane >> 1);
-                if ((lane & 1u) == 0 && g < groups) {
-                    shared.weights[g][index - begin] = score;
-                }
-            }
-        }
-    }
+    inkling_quad_scores<MG>(shared, pieces, keys, rel_bank,
+                            key_gains + (uint64_t)kv_head * scale_stride - scale_first,
+                            first + begin, n, position, cache_rows, kv_stride, kv_offset, head_dim,
+                            groups, rel_extent, d_rel, inv_dim);
     inkling_part_scales(
         shared, value_scales + (uint64_t)kv_head * scale_stride - scale_first + first + begin,
         value_norm, n);
