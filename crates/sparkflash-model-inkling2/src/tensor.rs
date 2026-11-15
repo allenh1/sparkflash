@@ -46,6 +46,53 @@ pub enum Role {
     Vision,
 }
 
+/// How a rank file divides the routed experts among the ranks.
+///
+/// Not a released field: the converter picks it, the rank file records it, and a load takes the
+/// file's word for it. A file written before the choice existed records nothing and reads as
+/// [ExpertSplit::Experts], which is what it holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExpertSplit {
+    /// Expert parallelism: a rank holds a contiguous run of whole experts, 96 of 384 at TP4.
+    /// The router's eight picks land on the ranks unevenly, so a decode step waits on the rank
+    /// that drew the most of them: three and a half experts on average against the mean of two.
+    #[default]
+    Experts,
+    /// Every rank holds every expert's quarter of the intermediate axis, 576 of 2,304 columns at
+    /// TP4: a contiguous run of w13's interleaved gate/up rows and the same columns of w2, with
+    /// the per-expert amax vectors whole. Each rank computes all eight picks at a quarter width,
+    /// so the ranks finish together; the down projection's sum over the intermediate axis is
+    /// then split across ranks and finished by the all-reduce that already follows the band,
+    /// which is a different rounding from a rank summing all 2,304 columns itself.
+    Intermediate,
+}
+
+impl ExpertSplit {
+    /// The name the converter takes and the rank file records.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Experts => "experts",
+            Self::Intermediate => "intermediate",
+        }
+    }
+
+    /// Parses [Self::name].
+    ///
+    /// # Errors
+    /// Any other spelling.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "experts" => Ok(Self::Experts),
+            "intermediate" => Ok(Self::Intermediate),
+            other => Err(format!(
+                "{other:?} is not an expert split (experts or intermediate)"
+            )),
+        }
+    }
+}
+
 /// One rank's slice of a tensor: the logical axis and the run on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Slice {
@@ -97,8 +144,33 @@ impl InklingTensorPlan {
             tp.split(count, axis, 1)
                 .map_err(|error| format!("{name}: {}", error.detail))?;
         }
-        tp.split(config.n_routed_experts, TpAxis::Experts, 1)
-            .map_err(|error| format!("routed experts: {}", error.detail))?;
+        match config.expert_split {
+            ExpertSplit::Experts => {
+                tp.split(config.n_routed_experts, TpAxis::Experts, 1)
+                    .map_err(|error| format!("routed experts: {}", error.detail))?;
+            }
+            ExpertSplit::Intermediate => {
+                // A rank's columns must be whole scale blocks, or one block's scale would cover
+                // columns on two ranks.
+                let block = (0..config.num_hidden_layers)
+                    .map(|layer| match config.layer_format(layer) {
+                        Some(WeightFormat::NvFp4 { group_size }) => group_size,
+                        Some(WeightFormat::MxFp8 { block }) => block,
+                        _ => 1,
+                    })
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let width = config.moe_intermediate_size;
+                if !width.is_multiple_of(tp.world() * block) {
+                    return Err(format!(
+                        "an intermediate expert split needs the {width}-column expert width to \
+                         be whole {block}-column scale blocks on each of {} ranks",
+                        tp.world()
+                    ));
+                }
+            }
+        }
 
         plan.push(
             "model.llm.embed.weight",
@@ -711,7 +783,32 @@ fn split_of(
         // an expert is the natural unit: a rank computes its own experts whole and the collective
         // exchanges tokens, while the intermediate width stays the shape the kernels are built
         // for. The tiling test in `convert` is the check that four files hold the served plan.
-        return Ok(vec![slice(0, shape[0], TpAxis::Experts)?]);
+        //
+        // [ExpertSplit::Intermediate] is the other quarter: every expert at a quarter of the
+        // intermediate width (not both splits at once). w13's rows interleave gate and up, row
+        // 2c the gate of column c and 2c + 1 its up, so a contiguous quarter of the rows is a
+        // quarter of the columns with both halves; w2 and its block scales split their last
+        // axis, which is the same columns. The amax vectors are per expert and stay whole.
+        return match config.expert_split {
+            ExpertSplit::Experts => Ok(vec![slice(0, shape[0], TpAxis::Experts)?]),
+            ExpertSplit::Intermediate if name.ends_with("_amax") => Ok(Vec::new()),
+            ExpertSplit::Intermediate if name.contains(".w13_weight") => {
+                let run = slice(1, shape[1], TpAxis::Intermediate)?;
+                if !run.split.per_rank.is_multiple_of(2) {
+                    return Err(format!(
+                        "{name}: {} gate/up rows a rank would split a column's pair",
+                        run.split.per_rank
+                    ));
+                }
+                Ok(vec![run])
+            }
+            ExpertSplit::Intermediate if name.contains(".w2_weight") => {
+                Ok(vec![slice(2, shape[2], TpAxis::Intermediate)?])
+            }
+            ExpertSplit::Intermediate => Err(format!(
+                "{name}: an expert tensor the intermediate split has no rule for"
+            )),
+        };
     }
     if name.ends_with(".wo_ud.weight") {
         return Ok(vec![slice(1, shape[1], TpAxis::Heads)?]);
@@ -822,5 +919,70 @@ mod tests {
         assert_eq!(plan.rank_spec_at(down).shape[2], 1152);
         let embed = plan.index_of("model.llm.embed.weight").unwrap();
         assert_eq!(plan.rank_spec_at(embed).shape[0], 50_256);
+    }
+
+    #[test]
+    fn an_intermediate_split_gives_every_rank_a_quarter_of_every_expert() {
+        let mut config =
+            Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the release parses");
+        let whole = InklingTensorPlan::served(&config, TpPlan::new(4, 2).expect("TP4"))
+            .expect("the expert split")
+            .rank_storage_bytes();
+        config.expert_split = ExpertSplit::Intermediate;
+        let plan = InklingTensorPlan::served(&config, TpPlan::new(4, 2).expect("TP4"))
+            .expect("the intermediate split");
+        let shape = |name: &str| {
+            let index = plan.index_of(name).unwrap_or_else(|| panic!("{name}"));
+            plan.rank_spec_at(index).shape.clone()
+        };
+        // NVFP4 (layer 0): 576 columns are 1,152 interleaved gate/up rows, 288 packed w2 bytes
+        // and 36 of w2's 16-column block scales; the amax vectors stay whole.
+        let nvfp4 = "model.llm.layers.0.mlp.experts";
+        assert_eq!(shape(&format!("{nvfp4}.w13_weight")), vec![384, 1152, 2304]);
+        assert_eq!(
+            shape(&format!("{nvfp4}.w13_weight_scale")),
+            vec![384, 1152, 288]
+        );
+        assert_eq!(shape(&format!("{nvfp4}.w2_weight")), vec![384, 4608, 288]);
+        assert_eq!(
+            shape(&format!("{nvfp4}.w2_weight_scale")),
+            vec![384, 4608, 36]
+        );
+        assert_eq!(shape(&format!("{nvfp4}.w13_weight_amax")), vec![384]);
+        assert_eq!(shape(&format!("{nvfp4}.w2_weight_amax")), vec![384]);
+        // MXFP8 (layer 47): a byte a column and a ue8m0 scale a 32.
+        let mxfp8 = "model.llm.layers.47.mlp.experts";
+        assert_eq!(shape(&format!("{mxfp8}.w13_weight")), vec![384, 1152, 4608]);
+        assert_eq!(
+            shape(&format!("{mxfp8}.w13_weight_scale")),
+            vec![384, 1152, 144]
+        );
+        assert_eq!(shape(&format!("{mxfp8}.w2_weight")), vec![384, 4608, 576]);
+        assert_eq!(
+            shape(&format!("{mxfp8}.w2_weight_scale")),
+            vec![384, 4608, 18]
+        );
+        // The same quarter of the expert bytes, plus three ranks' worth of the 1.5 KB amax
+        // vectors a layer that every rank now holds whole.
+        let amax = 40 * 2 * 384 * 4 * 3 / 4;
+        assert_eq!(plan.rank_storage_bytes(), whole + amax as u128);
+    }
+
+    #[test]
+    fn an_intermediate_split_refuses_a_world_that_cuts_a_scale_block() {
+        let mut config =
+            Inkling2Config::from_json(CONFIG, Some(QUANT)).expect("the release parses");
+        config.expert_split = ExpertSplit::Intermediate;
+        // 2,304 columns over 8 ranks are 288 a rank, nine MXFP8 blocks of 32; over 16 they are
+        // 144, four and a half.
+        assert!(InklingTensorPlan::served(&config, TpPlan::new(8, 0).expect("TP8")).is_ok());
+        let refused = InklingTensorPlan::served(&config, TpPlan::new(16, 0).expect("TP16"))
+            .expect_err("a ragged block");
+        assert!(refused.contains("scale blocks"), "{refused}");
+        assert_eq!(
+            ExpertSplit::parse("intermediate"),
+            Ok(ExpertSplit::Intermediate)
+        );
+        assert!(ExpertSplit::parse("rows").is_err());
     }
 }

@@ -1979,6 +1979,9 @@ impl InklingDeviceBackend {
         tp: TpPlan,
         exchange: Box<dyn Exchange>,
     ) -> Result<Self, String> {
+        // The file decides how the experts are divided; the released configuration never says.
+        let mut config = config;
+        config.expert_split = file.expert_split();
         Self::open_with(descriptor, config, context, tp, exchange, |cuda, plan| {
             upload_rank_file(cuda, file, plan)
         })
@@ -2694,7 +2697,7 @@ fn expert_scales(
     // shares, so the MMA reads one for every slot.
     let route_ones = place(&row_bytes(&vec![1.0f32; plan.config().num_experts_per_tok]))?;
     let config = plan.config();
-    let (hidden, intermediate) = (config.hidden_size, config.moe_intermediate_size);
+    let (hidden, intermediate) = (config.hidden_size, plan.expert_intermediate());
     let mut scales = Vec::with_capacity(table.len());
     for (layer, entry) in plan.layers().iter().zip(table) {
         scales.push(match entry {
@@ -3066,7 +3069,7 @@ impl Scratch {
         let heads = shared.heads();
         let head_dim = config.head_dim;
         let kv_width = shared.kv_width();
-        let activation = config.moe_intermediate_size;
+        let activation = plan.expert_intermediate();
         let top_k = config.num_experts_per_tok;
         let vocab = plan.rank_vocab();
         let taps = plan.rank_kv_heads() * config.sconv_kernel_size;
@@ -4799,7 +4802,7 @@ impl InklingDeviceSession {
         let config = &shared.config;
         let schedule = &shared.plan.layers()[layer];
         let top_k = config.num_experts_per_tok;
-        let intermediate = config.moe_intermediate_size;
+        let intermediate = shared.plan.expert_intermediate();
         let hidden = config.hidden_size;
         let mut index_bytes = vec![0u8; top_k * std::mem::size_of::<i32>()];
         let mut share_bytes = vec![0u8; top_k * std::mem::size_of::<f32>()];
@@ -5007,7 +5010,7 @@ impl InklingDeviceSession {
         let config = &shared.config;
         let schedule = &shared.plan.layers()[layer];
         let top_k = config.num_experts_per_tok;
-        let intermediate = config.moe_intermediate_size;
+        let intermediate = shared.plan.expert_intermediate();
         let hidden = config.hidden_size;
         let (first, owned) = shared.plan.expert_range();
         let indices = self.state.scratch.indices;

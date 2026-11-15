@@ -40,20 +40,35 @@ use sparkflash_weights::tp::TpLayout;
 use sparkflash_weights::{TensorSpec, WeightError, WeightSource};
 
 use crate::config::Inkling2Config;
-use crate::tensor::InklingTensorPlan;
+use crate::tensor::{ExpertSplit, InklingTensorPlan};
 
 /// The largest payload one slot holds. A released expert tensor is a few gigabytes; chunking it
 /// keeps every read under a weight source's single-read limit and lets a load stream the tensor.
 pub const SLOT_CHUNK_BYTES: usize = 512 << 20;
 
-/// What an Inkling rank file records beside its slots. The plan names every weight, so there is
-/// nothing else to carry; the empty record is still written so the container's model name is
-/// checked on a load.
+/// What an Inkling rank file records beside its slots: how it divides the routed experts. The
+/// plan names every weight from that and the configuration, and the record is written even when
+/// it is the default so the container's model name is checked on a load. A file written before
+/// the split existed has no `experts` field and holds whole experts, which is what it reads as.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InklingRecords {}
+pub struct InklingRecords {
+    /// The expert split the file was written with.
+    #[serde(default)]
+    pub experts: ExpertSplit,
+}
 
 impl SlotRecords for InklingRecords {
     const MODEL: &'static str = "inkling2";
+}
+
+/// The configuration a rank file's slots were planned from: `config` with the file's own expert
+/// split, which a load takes from the file rather than from the released configuration (that
+/// never names one).
+#[must_use]
+pub fn file_config(config: &Inkling2Config, records: &InklingRecords) -> Inkling2Config {
+    let mut config = config.clone();
+    config.expert_split = records.experts;
+    config
 }
 
 /// One slot of one rank: the released tensor it streams and the source ranges its payload
@@ -82,11 +97,15 @@ impl RankSlot {
     /// # Errors
     /// A source read error, or a range outside the tensor.
     pub fn read(&self, source: &dyn WeightSource) -> Result<Vec<u8>, String> {
-        let mut payload = Vec::with_capacity(self.bytes);
-        for (offset, len) in &self.ranges {
-            payload.extend_from_slice(&read_range(source, &self.name, *offset, *len)?);
+        let payload = read_ranges(source, &self.name, &self.ranges)?;
+        if payload.len() != self.bytes {
+            return Err(format!(
+                "{}: the ranges read {} bytes and the slot holds {}",
+                self.key,
+                payload.len(),
+                self.bytes
+            ));
         }
-        debug_assert_eq!(payload.len(), self.bytes);
         Ok(payload)
     }
 }
@@ -201,13 +220,34 @@ fn rank_ranges(
 /// A world the model does not divide, an unaligned split, or a plan whose rank payload disagrees
 /// with the split the plan records.
 pub fn rank_slots(config: &Inkling2Config, layout: TpLayout) -> Result<Vec<RankSlot>, String> {
+    slots_of(config, layout, true)
+}
+
+/// [rank_slots] without the checkpoint ranges: the keys and sizes a load checks a file's index
+/// against. An intermediate expert split's w2 is a range a row of every expert, 1.8 M a tensor
+/// and 170 M a rank, which a load would otherwise build and throw away.
+fn rank_slot_sizes(config: &Inkling2Config, layout: TpLayout) -> Result<Vec<RankSlot>, String> {
+    slots_of(config, layout, false)
+}
+
+fn slots_of(
+    config: &Inkling2Config,
+    layout: TpLayout,
+    with_ranges: bool,
+) -> Result<Vec<RankSlot>, String> {
     let tp = TpPlan::new(layout.world_size, layout.rank)
         .map_err(|error| format!("TP{}/rank{}: {error}", layout.world_size, layout.rank))?;
     let plan = InklingTensorPlan::served(config, tp)?;
     let mut slots = Vec::new();
     for index in 0..plan.plan().len() {
         let name = plan.plan().specs()[index].name.clone();
-        let (ranges, bytes) = rank_ranges(config, layout, &plan, index)?;
+        let (ranges, bytes) = if with_ranges {
+            rank_ranges(config, layout, &plan, index)?
+        } else {
+            let bytes = usize::try_from(plan.rank_spec_at(index).storage_bytes())
+                .map_err(|_| format!("{name}: the rank payload does not fit this machine"))?;
+            (Vec::new(), bytes)
+        };
         if bytes == 0 {
             continue;
         }
@@ -220,7 +260,7 @@ pub fn rank_slots(config: &Inkling2Config, layout: TpLayout) -> Result<Vec<RankS
         while taken < bytes {
             let want = SLOT_CHUNK_BYTES.min(bytes - taken);
             let mut pieces = Vec::new();
-            let mut room = want;
+            let mut room = if with_ranges { want } else { 0 };
             while room > 0 {
                 let Some((offset, len)) = pending.pop_front() else {
                     return Err(format!("{name}: the ranges end after {taken} bytes"));
@@ -250,30 +290,35 @@ pub fn rank_slots(config: &Inkling2Config, layout: TpLayout) -> Result<Vec<RankS
     Ok(slots)
 }
 
-/// One byte range of one released tensor, through the source's range path when it has one.
-fn read_range(
+/// A slot's byte ranges of one released tensor, concatenated in order: one call to the source's
+/// range path when it has one, so a source can serve a many-range slot (an intermediate split's
+/// w2 is a 288-byte range a row) from one read of the stored region rather than a call a range.
+/// A source without one reads the tensor once and the ranges are cut from it.
+fn read_ranges(
     source: &dyn WeightSource,
     name: &str,
-    offset: u64,
-    len: usize,
+    ranges: &[(u64, usize)],
 ) -> Result<Vec<u8>, String> {
-    match source.read_ranges(name, &[(offset, len)]) {
+    match source.read_ranges(name, ranges) {
         Some(Ok(bytes)) => Ok(bytes),
         Some(Err(error)) => Err(format!("{name}: {error}")),
         None => {
             let all = source
                 .read(name)
                 .map_err(|error| format!("{name}: {error}"))?;
-            let start = usize::try_from(offset)
-                .map_err(|_| format!("{name}: offset {offset} does not fit this machine"))?;
-            all.get(start..start + len)
-                .map(<[u8]>::to_vec)
-                .ok_or_else(|| {
+            let mut out = Vec::with_capacity(ranges.iter().map(|(_, len)| *len).sum());
+            for &(offset, len) in ranges {
+                let start = usize::try_from(offset)
+                    .map_err(|_| format!("{name}: offset {offset} does not fit this machine"))?;
+                let piece = all.get(start..start + len).ok_or_else(|| {
                     format!(
                         "{name}: range {offset}..{} is outside the tensor",
                         offset as usize + len
                     )
-                })
+                })?;
+                out.extend_from_slice(piece);
+            }
+            Ok(out)
         }
     }
 }
@@ -294,7 +339,13 @@ pub fn convert_rank(
     for slot in &slots {
         placing.place(&slot.key, slot.bytes);
     }
-    let index = placing.into_index(layout, label, InklingRecords {});
+    let index = placing.into_index(
+        layout,
+        label,
+        InklingRecords {
+            experts: config.expert_split,
+        },
+    );
     let mut writer = SlotFileWriter::create(output_dir, index)?;
     for slot in &slots {
         let payload = slot.read(source)?;
@@ -322,7 +373,7 @@ where
     F: FnMut(&RankSlot, &[u8]) -> Result<(), String>,
 {
     let (preamble, index) = SlotIndex::<InklingRecords>::read(path, layout)?;
-    let slots = rank_slots(config, layout)?;
+    let slots = rank_slots(&file_config(config, &index.extra), layout)?;
     let mut cursor = SlotCursor::new(&index.slots);
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
     let mut payload = Vec::new();
@@ -427,7 +478,10 @@ impl RankFileSource {
     /// file that cannot be opened.
     pub fn open(path: &Path, config: &Inkling2Config, layout: TpLayout) -> Result<Self, String> {
         let (preamble, index) = SlotIndex::<InklingRecords>::read(path, layout)?;
-        let slots = rank_slots(config, layout)?;
+        let config = &file_config(config, &index.extra);
+        // A load reads through the file's own index, not the checkpoint ranges a slot was
+        // written from, so it plans the sizes alone.
+        let slots = rank_slot_sizes(config, layout)?;
         let mut cursor = SlotCursor::new(&index.slots);
         for slot in &slots {
             cursor.take(&slot.key, slot.bytes)?;
@@ -459,10 +513,17 @@ impl RankFileSource {
         })
     }
 
-    /// The slots the file holds, in plan order.
+    /// The slots the file holds, in plan order, without the checkpoint ranges they were written
+    /// from (a load reads the file's own index).
     #[must_use]
     pub fn slots(&self) -> &[RankSlot] {
         &self.slots
+    }
+
+    /// How the file divides the routed experts, from its own record.
+    #[must_use]
+    pub fn expert_split(&self) -> ExpertSplit {
+        self.index.extra.experts
     }
 
     /// The converted payload bytes of one tensor, or `None` when the rank does not hold it.
@@ -627,9 +688,9 @@ impl WeightSource for RankFileSource {
 
 #[cfg(test)]
 mod tests {
-    use super::rank_slots;
+    use super::{RankSlot, rank_ranges, rank_slot_sizes, rank_slots};
     use crate::config::Inkling2Config;
-    use crate::tensor::InklingTensorPlan;
+    use crate::tensor::{ExpertSplit, InklingTensorPlan};
     use sparkflash_model::TpPlan;
     use sparkflash_weights::tp::TpLayout;
 
@@ -743,6 +804,85 @@ mod tests {
         assert!(names.contains("model.llm.embed.weight"));
         assert!(names.contains("model.llm.layers.0.mlp.experts.w13_weight"));
         assert!(names.contains("model.llm.layers.0.attn.wo_ud.weight"));
+    }
+
+    /// Under the intermediate expert split the four ranks still tile every expert tensor once:
+    /// w13's quarter of the rows of each expert, w2's quarter of each row, the amax vectors whole
+    /// on every rank. A load's sizes-only plan agrees with the converter's slot for slot.
+    #[test]
+    fn an_intermediate_split_tiles_every_expert_tensor() {
+        let mut config = released();
+        config.expert_split = ExpertSplit::Intermediate;
+        let tensors = [
+            "model.llm.layers.0.mlp.experts.w13_weight",
+            "model.llm.layers.0.mlp.experts.w13_weight_scale",
+            "model.llm.layers.0.mlp.experts.w2_weight",
+            "model.llm.layers.0.mlp.experts.w2_weight_scale",
+            "model.llm.layers.47.mlp.experts.w13_weight",
+            "model.llm.layers.47.mlp.experts.w2_weight",
+            "model.llm.layers.47.mlp.experts.w2_weight_scale",
+        ];
+        let served = InklingTensorPlan::served(&config, TpPlan::new(1, 0).expect("TP1"))
+            .expect("the served plan");
+        for name in tensors {
+            let index = served.index_of(name).expect("planned");
+            let full = usize::try_from(served.plan().specs()[index].storage_bytes()).expect("fits");
+            let mut ranges = Vec::new();
+            for rank in 0..4 {
+                let layout = TpLayout {
+                    rank,
+                    world_size: 4,
+                };
+                let plan = InklingTensorPlan::served(&config, TpPlan::new(4, rank).expect("TP4"))
+                    .expect("the rank plan");
+                let (rank_ranges, bytes) =
+                    rank_ranges(&config, layout, &plan, index).expect("the ranges");
+                assert_eq!(bytes * 4, full, "{name}: a rank holds a quarter");
+                ranges.extend(rank_ranges);
+            }
+            ranges.sort_unstable();
+            let mut end = 0u64;
+            for (offset, len) in ranges {
+                assert_eq!(offset, end, "{name}: a gap or an overlap at {offset}");
+                end = offset + len as u64;
+            }
+            assert_eq!(end as usize, full, "{name}: the ranks cover the tensor");
+        }
+        // w13's rank 1 starts at expert 0's row 1,152: a quarter of the interleaved pairs.
+        let plan = InklingTensorPlan::served(&config, TpPlan::new(4, 1).expect("TP4"))
+            .expect("the rank plan");
+        let index = plan.index_of(tensors[0]).expect("planned");
+        let layout = TpLayout {
+            rank: 1,
+            world_size: 4,
+        };
+        let (ranges, _) = rank_ranges(&config, layout, &plan, index).expect("the ranges");
+        assert_eq!(ranges[0], (1152 * 2304, 1152 * 2304));
+        assert_eq!(ranges.len(), 384);
+        // The amax vectors are whole on every rank.
+        let amax = plan
+            .index_of("model.llm.layers.0.mlp.experts.w2_weight_amax")
+            .expect("planned");
+        assert_eq!(plan.rank_spec_at(amax).shape, vec![384]);
+        // A load plans sizes alone: the rank's bytes, and no ranges. (The whole rank's ranges are
+        // 170 M here, so the slot-for-slot comparison runs on the expert split below.)
+        let sizes = rank_slot_sizes(&config, layout).expect("the sizes");
+        assert!(sizes.iter().all(|slot| slot.ranges.is_empty()));
+        assert_eq!(
+            sizes.iter().map(|slot| slot.bytes as u128).sum::<u128>(),
+            plan.rank_storage_bytes()
+        );
+        let whole = released();
+        let key = |slots: Vec<RankSlot>| -> Vec<(String, usize)> {
+            slots
+                .into_iter()
+                .map(|slot| (slot.key, slot.bytes))
+                .collect()
+        };
+        assert_eq!(
+            key(rank_slot_sizes(&whole, layout).expect("the sizes")),
+            key(rank_slots(&whole, layout).expect("the slots"))
+        );
     }
 
     /// The output projections shard their contraction axis, so their payload is one row range per

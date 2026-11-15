@@ -52,7 +52,7 @@ pub use group::{GroupOptions, MasterRank, open_master, run_worker};
 pub use host::Inkling2HostBackend;
 pub use prompt::InklingCodec;
 pub use reference::{AttentionParams, attention, softcapped_swiglu};
-pub use tensor::{InklingTensorPlan, Role, Slice};
+pub use tensor::{ExpertSplit, InklingTensorPlan, Role, Slice};
 pub use tp4_run::{Tp4Args, Tp4Outcome, Tp4Run, rank_file};
 pub use vision::{
     IMAGE_TOKEN_ID, InklingVision, InklingVisionCodec, MAX_MERGED_TOKENS, SpanCheck, patch_values,

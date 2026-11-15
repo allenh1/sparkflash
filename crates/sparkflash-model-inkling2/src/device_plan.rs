@@ -58,6 +58,8 @@
 //! the single-rank history rather than a quarter of it.
 
 use sparkflash_model::architecture::WeightFormat;
+
+use crate::tensor::ExpertSplit;
 use sparkflash_model::{Part, TpPlan};
 use sparkflash_ops::images::Image;
 
@@ -703,17 +705,34 @@ impl InklingDevicePlan {
             .map_or(0, |index| self.served.rank_spec_at(index).shape[0])
     }
 
+    /// The intermediate columns of one expert this rank computes: the released width, or its
+    /// quarter at TP4 under [ExpertSplit::Intermediate]. Every band, MMA table and scratch
+    /// buffer sizes its expert rows from this, never from the configuration's width.
+    #[must_use]
+    pub fn expert_intermediate(&self) -> usize {
+        match self.config.expert_split {
+            ExpertSplit::Experts => self.config.moe_intermediate_size,
+            ExpertSplit::Intermediate => self.config.moe_intermediate_size / self.tp.world().max(1),
+        }
+    }
+
     /// The routed experts this rank owns: the first global index and the count.
     ///
     /// Experts are expert-parallel and split whole on the outer axis, so a rank's slice is a
     /// contiguous run. The released indices stay global - the router is replicated and selects the
     /// same eight experts everywhere - so the band skips the slots outside this range and addresses
     /// its own weights and per-expert scales with the index less the first.
+    ///
+    /// Under [ExpertSplit::Intermediate] every rank holds every expert, so the run is all of
+    /// them from zero and each rank computes all eight picks at [Self::expert_intermediate].
     #[must_use]
     pub fn expert_range(&self) -> (usize, usize) {
         let count = self.rank_experts();
         if count == 0 {
             return (0, 0);
+        }
+        if self.config.expert_split == ExpertSplit::Intermediate {
+            return (0, count);
         }
         let first = self.tp.rank() * count;
         let total = self.config.n_routed_experts;
@@ -762,8 +781,8 @@ impl InklingDevicePlan {
     #[must_use]
     pub fn boot_summary(&self) -> String {
         format!(
-            "inkling2 {} rows={} TP{}/{}: {} layers, {} launches, heads {}/{}, experts {}/{}, \
-             vocab {}, state {:.1} MiB",
+            "inkling2 {} rows={} TP{}/{}: {} layers, {} launches, heads {}/{}, experts {}/{} \
+             at {} columns ({} split), vocab {}, state {:.1} MiB",
             self.pass.name(),
             self.rows,
             self.tp.rank(),
@@ -774,6 +793,8 @@ impl InklingDevicePlan {
             self.rank_kv_heads(),
             self.rank_experts(),
             self.config.n_routed_experts,
+            self.expert_intermediate(),
+            self.config.expert_split.name(),
             self.rank_vocab(),
             self.buffers.total as f64 / (1024.0 * 1024.0),
         )
@@ -1264,7 +1285,7 @@ impl InklingDevicePlan {
         // One expert's three launches, repeated over the local experts the router selected. The
         // band is one set of steps, not one per expert: the executor loops the selected experts
         // through it, so the schedule does not grow with the top-k count.
-        let intermediate = config.moe_intermediate_size;
+        let intermediate = self.expert_intermediate();
         // The band's entry and the tensors it reads are one fact: the stored format. An NVFP4
         // expert carries a per-expert amax and a per-tensor outer-scale denominator beside its
         // packed codes and block scales; an MXFP8 expert carries a ue8m0 scale a 32 columns and
@@ -1441,7 +1462,7 @@ impl InklingDevicePlan {
         let kv_heads = self.rank_kv_heads();
         let head_dim = config.head_dim;
         let rows = self.rows;
-        let activation = config.moe_intermediate_size;
+        let activation = self.expert_intermediate();
         let history = config.conv_history();
         let mut blocks = 0usize;
         let mut kv_cache = 0usize;
@@ -1572,6 +1593,32 @@ mod tests {
             .index_of("model.llm.layers.0.mlp.experts.w13_weight")
             .expect("the expert tensor");
         assert_eq!(plan.served().rank_spec_at(experts).shape[1], 2 * 2304);
+    }
+
+    #[test]
+    fn an_intermediate_split_runs_every_expert_at_a_quarter_width() {
+        let mut config = released();
+        config.expert_split = ExpertSplit::Intermediate;
+        let tp = TpPlan::new(4, 3).expect("a TP plan");
+        let rows = 16;
+        let plan = InklingDevicePlan::build(&config, tp, Pass::Prefill, rows, 65_536)
+            .expect("the schedule");
+        assert_eq!(plan.rank_experts(), 384);
+        // Every rank runs every pick from expert zero: the router's indices address its weights.
+        assert_eq!(plan.expert_range(), (0, 384));
+        assert_eq!(plan.expert_intermediate(), 576);
+        let experts = plan
+            .served()
+            .index_of("model.llm.layers.0.mlp.experts.w13_weight")
+            .expect("the expert tensor");
+        assert_eq!(plan.served().rank_spec_at(experts).shape[1], 2 * 576);
+        assert_eq!(plan.buffers().expert_activation, rows * 576 * 4);
+        // The expert split leaves the expert-parallel plan as it was.
+        let whole = InklingDevicePlan::build(&released(), tp, Pass::Prefill, rows, 65_536)
+            .expect("the schedule");
+        assert_eq!(whole.expert_range(), (288, 96));
+        assert_eq!(whole.expert_intermediate(), 2304);
+        assert_eq!(whole.buffers().expert_activation, rows * 2304 * 4);
     }
 
     #[test]

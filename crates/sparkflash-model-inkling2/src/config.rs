@@ -20,6 +20,8 @@ use serde_json::Value;
 use sparkflash_model::architecture::{AttentionKind, Ffn, Residual, WeightFormat};
 use sparkflash_model::{Architecture, ConfigError};
 
+use crate::tensor::ExpertSplit;
+
 /// The released model type.
 pub const MODEL_TYPE: &str = "inkling2";
 /// The canonical Hugging Face id.
@@ -90,6 +92,9 @@ pub struct Inkling2Config {
     pub mtp: Option<InklingMtpConfig>,
     /// The mixed-precision split.
     pub quant: InklingQuantConfig,
+    /// How the rank files divide the routed experts. Not a released field: the converter sets
+    /// it and a rank file's load takes it from the file.
+    pub expert_split: ExpertSplit,
 }
 
 /// The vision tower's released geometry.
@@ -289,6 +294,7 @@ impl Inkling2Config {
             vision,
             mtp,
             quant: quant_config,
+            expert_split: ExpertSplit::default(),
         })
     }
 

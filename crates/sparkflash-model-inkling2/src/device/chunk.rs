@@ -1274,7 +1274,7 @@ fn run_band_mma(
     let config = &shared.config;
     let scratch = &chunk.scratch;
     let top_k = config.num_experts_per_tok;
-    let intermediate = config.moe_intermediate_size;
+    let intermediate = shared.plan.expert_intermediate();
     let hidden = config.hidden_size;
     let (first, owned) = shared.plan.expert_range();
     let meta = shared.experts[layer.index].as_ref().ok_or_else(|| {
@@ -1445,7 +1445,7 @@ fn run_band_chunk(
     let config = &shared.config;
     let scratch = &chunk.scratch;
     let top_k = config.num_experts_per_tok;
-    let intermediate = config.moe_intermediate_size;
+    let intermediate = shared.plan.expert_intermediate();
     let hidden = config.hidden_size;
     let weights = &shared.weights;
     let weight = |index: usize| weights.get(index).pointer;
