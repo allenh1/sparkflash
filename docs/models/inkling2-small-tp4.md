@@ -1553,3 +1553,32 @@ the bf16 opt-out:
 The served rows are single runs; the BF16 column's are the small decode kernels' build. The
 verify gains less than a plain step because each of its rows routes its own experts, so the
 dense projections are a smaller share of its bytes.
+
+### Fewer launches in the split-key walk: scored runs and the sliding window's cluster
+
+The split-key walk scores a pass's keys into DRAM, reads them back for each run's partial, and
+merges the runs. Two kernels now fold those launches together:
+
+* **A long pass's scores and partials in one block.** `inkling_attn_scored_part` scores one run
+  and takes its partial in the same block, with the scores held in shared memory. The scores and
+  part kernels share their helpers with it (`inkling_group_queries`, `inkling_key_gain`,
+  `inkling_score_load`, `inkling_group_score`, `inkling_part_run`), so every number is still
+  theirs. The host takes it for a pass of at least 128 runs and a group of at most six heads:
+  on the 93K-key full layer the kernel goes from 525.6 to 470.1 us (262K keys: 1,459 to
+  1,310 us), but at 16K keys it is 7% slower.
+* **A sliding layer's whole walk in one cluster.** A sliding layer's row sees at most 1,024
+  keys: four runs of 256. `inkling_attn_window` runs a (KV head, row) as a cluster of four
+  blocks, one run a block. Each block scores and takes its run's partial, and the merge reads
+  the four partials through distributed shared memory. That one launch replaces the passes and
+  the merge. One row's layer goes from 38.3 to 32.4 us with the cache flushed, and a four-row
+  verify's from 50.7 to 31.7 us. Under Check the passes still run, for the exact mix.
+
+Both are bit-identical. On the four ranks, the decode logits digests of the 93K prompt, the
+repeating prompt and DSpark depth 3 all equal the two-launch build's:
+
+| on the four ranks (batch arm, ms a token after the first) | before | scored | window |
+|---|---|---|---|
+| decode step after the 93K prompt | 35.52 | 35.35-35.57 | 34.78-34.91 (35.43 between) |
+| decode step, repeating 5K prompt | | 31.71 | 31.24 |
+| DSpark depth 3 after the 93K prompt | | 31.57 | 31.39 |
+| 93K prompt | 120.3 s | | 121.8 s |
