@@ -431,6 +431,13 @@ paper.
   step logits to cut verify lengths. It does so only when there is no confidence head and the
   ragged verify is not STATIC (dspark_worker_v2.py:331, 558-574; dspark_draft.py:535-541). This
   is serving-side policy, not part of the model.
+- **This engine's signal** is the step's own softmax at its pick, `1 / Σ_v exp(v - v_pick)` over
+  the §9.3 logits the pick was the largest of. Each rank sums `exp(v - m_r)` over its slice of
+  the vocabulary beside its best `m_r`, and the pick's exchange carries that sum, so every rank
+  computes the same probability with no further collective. The shared adaptive depth policy
+  calibrates it against the acceptances a sequence sees and picks how many drafts a round
+  verifies ([the TP4 note](inkling2-small-tp4.md)).
+  The picks themselves are unchanged.
 - **Per step:** 7 tokens drafted, 8 verified, 1 to 8 committed. The vLLM blog reports acceptance
   length 3.3 to 3.5 (32K to 256K context, TP8) and about 630 tok/s single-user at TP4, with
   probabilistic drafting.

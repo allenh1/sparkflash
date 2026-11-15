@@ -1249,7 +1249,9 @@ prompt, the 25 greedy ids match the deployed fast walk's.
 `SPARKFLASH_INKLING_DRAFT=dspark` drafts with the release's own drafter (`mtp.safetensors` beside
 the checkpoint's `config.json`, on every rank), whose forward
 [the drafter note](inkling2-small-drafter.md) restates. `SPARKFLASH_INKLING_DRAFT_DEPTH` is the
-drafts a round (default 7, at most the block's 7). The arm has three parts:
+most drafts a round verifies (default 7, at most the block's 7). How many it does verify is the
+shared depth policy's choice from the drafter's probabilities, unless
+`SPARKFLASH_INKLING_DRAFT_POLICY=fixed`. The arm has three parts:
 
 * **Taps.** Every prompt chunk, decode step and verify row writes the target's eight features
   into a tap buffer: the residual entering layers 5, 11, 17, 23, 29, 35 and 41, and the
@@ -1685,6 +1687,4 @@ The drafter's full layer is what grows. Its span attention costs about 2.9 ms a 
 and 14.5 ms at 500K. Each walk is bound by its chain of folds, not by bandwidth. Giving a warp
 several queries measured slower, and an L2 prefetch of the next keys was 8% faster on the full
 layer and slower on the sliding ones. The drafter's LM head (1.63 ms) is at its DRAM floor.
-The round always verifies its full depth: an adaptive depth needs a probability for each draft,
-and this drafter does not produce one. DSpark stays off by default. At a million positions it
-costs a rank about 3.6 GB.
+DSpark stays off by default. At a million positions it costs a rank about 3.6 GB.
