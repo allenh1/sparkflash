@@ -1267,8 +1267,10 @@ __device__ __forceinline__ void inkling_part_scales(Shared& shared,
 // is its n keys' value rows at rows.row(0) .. rows.row(n - 1). The value sums take QUARTERS
 // blocks of INKLING_PART_THREADS threads, quarter u heads u, u + QUARTERS, ...; every head's
 // sum is the same fmaf chain whichever thread runs it, and threads past the ones a phase uses
-// keep the block's barriers only, so a block of any width computes the same bits.
-template <int MG, int UNROLL, int QUARTERS, class Shared, class Rows>
+// keep the block's barriers only, so a block of any width computes the same bits. FULL says
+// groups is MG, so the value sums take every head without a test a key (a head past groups would
+// sum unwritten weights, though never store them).
+template <int MG, int UNROLL, int QUARTERS, bool FULL = false, class Shared, class Rows>
 __device__ __forceinline__ void inkling_part_run(
     Shared& shared,
     const float (&held)[MG][INKLING_PART_HELD],
@@ -1346,7 +1348,7 @@ __device__ __forceinline__ void inkling_part_run(
 #pragma unroll
             for (int u = 0; u < SHARE; ++u) {
                 const int g = quarter + QUARTERS * u;
-                if (g < groups) {
+                if ((QUARTERS * (u + 1) <= MG || g < MG) && (FULL || g < groups)) {
                     const float weight = shared.weights[g][i];
 #pragma unroll
                     for (int j = 0; j < INKLING_PART_DIMS; ++j) {
@@ -1809,10 +1811,15 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORED_WARPS) inkling_
     // The value sums take both halves of the block, a half every other head (the same bits as
     // one half taking them all); with one, half the block waits out the slowest phase.
     constexpr int QUARTERS = 32 * INKLING_SCORED_WARPS / INKLING_PART_THREADS;
-    inkling_part_run<MG, 8, QUARTERS>(
-        shared, held, n, groups, cache, head_dim,
-        parts + ((uint64_t)row * heads + head0) * head_stride + run * (2 + (uint64_t)head_dim),
-        head_stride);
+    float* const out =
+        parts + ((uint64_t)row * heads + head0) * head_stride + run * (2 + (uint64_t)head_dim);
+    if (groups == MG) {
+        inkling_part_run<MG, 8, QUARTERS, true>(shared, held, n, groups, cache, head_dim, out,
+                                                head_stride);
+    } else {
+        inkling_part_run<MG, 8, QUARTERS>(shared, held, n, groups, cache, head_dim, out,
+                                          head_stride);
+    }
 }
 
 // The runs one merge block holds factors for in shared memory: a 1M-key row's 4,096 runs of
@@ -2156,9 +2163,13 @@ extern "C" __global__ void __cluster_dims__(1, 1, INKLING_WINDOW_RUNS)
             held[g][k] = g < groups && i < n ? shared.weights[g][i] : -INFINITY;
         }
     }
-    inkling_part_run<MG, 4, THREADS / INKLING_PART_THREADS>(shared, held, n, groups, staged,
-                                                            head_dim, &shared.part[0][0],
-                                                            2 + INKLING_MAX_HEAD_DIM);
+    if (groups == MG) {
+        inkling_part_run<MG, 4, THREADS / INKLING_PART_THREADS, true>(
+            shared, held, n, groups, staged, head_dim, &shared.part[0][0], 2 + INKLING_MAX_HEAD_DIM);
+    } else {
+        inkling_part_run<MG, 4, THREADS / INKLING_PART_THREADS>(
+            shared, held, n, groups, staged, head_dim, &shared.part[0][0], 2 + INKLING_MAX_HEAD_DIM);
+    }
     cluster.sync();
 
     // The merge of the cluster's partials in run order, block r taking outputs r, r + RUNS, ...
