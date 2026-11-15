@@ -181,6 +181,8 @@ __device__ __forceinline__ __half2 __hmul2(__half2 a, __half2 b) {
 
 // CUDA's launch-bounds annotation is an attribute on the kernel; the syntax probe does not need it.
 #define __launch_bounds__(...)
+// Nor the thread-block-cluster shape (inkling_attn_window).
+#define __cluster_dims__(...)
 
 // vector_functions.h: make_uint4 is a device function, not a type, so the probe needs it declared
 // too (kernels/rmsnorm_sm121.cu packs four bf16 pairs into one 128-bit store through it).

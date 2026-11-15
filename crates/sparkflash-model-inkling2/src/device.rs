@@ -129,6 +129,16 @@ const PART_THREADS: u32 = 128;
 const SCORED_THREADS: u32 = 256;
 const SCORED_GROUPS: usize = 6;
 const SCORED_RUNS: usize = 128;
+/// A sliding layer's walk in one launch (inkling_attn_window): its cluster's blocks
+/// (INKLING_WINDOW_RUNS, a run of [PART_KEYS] each, so the widest window it holds), threads
+/// (32 * INKLING_WINDOW_WARPS), widest group (INKLING_WINDOW_GROUPS), head width
+/// (INKLING_MAX_HEAD_DIM) and dynamic shared bytes (sizeof(InklingWindowShared<6>): the run's
+/// staged values, its scores, scales and reductions, and its partial).
+const WINDOW_RUNS: usize = 4;
+const WINDOW_THREADS: u32 = 512;
+const WINDOW_GROUPS: usize = 6;
+const WINDOW_HEAD_DIM: usize = 128;
+const WINDOW_SHARED: u32 = 75_920;
 /// The scores one decode split-walk pass may hold across its heads: ~175k keys, so a sliding
 /// layer is one pass and a full layer at a million positions a handful.
 const SCORE_BUDGET: usize = 1 << 21;
@@ -600,6 +610,8 @@ struct Kernels {
     attention_part: Entry,
     attention_scored: Entry,
     attention_merge: Entry,
+    /// A sliding layer's split-key walk in one launch: a cluster a (KV head, row), a block a run.
+    attention_window: Entry,
     /// The tensor-core prompt walk: each row's query side as the exact walks compute it, then the
     /// shared MMA body over it. `attention_mma` is loaded only when the walk runs
     /// ([AttentionWalk::fast]), sized to the rank's group.
@@ -663,6 +675,9 @@ impl Kernels {
         let (wide_module, wide) =
             cuda.load_named_shared(prefill, "glm_prefill_bf16_wide", WIDE_SHARED)?;
         modules.push(wide_module);
+        let (window_module, window) =
+            cuda.load_named_shared(inkling, "inkling_attn_window", WINDOW_SHARED)?;
+        modules.push(window_module);
         let attention_mma = match mma_shared {
             Some(bytes) => {
                 let (module, kernel) =
@@ -720,6 +735,7 @@ impl Kernels {
             attention_part: load(inkling, "inkling_attn_part")?,
             attention_scored: load(inkling, "inkling_attn_scored_part")?,
             attention_merge: load(inkling, "inkling_attn_merge")?,
+            attention_window: Entry { kernel: window },
             attention_prepare: load(inkling, "inkling_attn_prepare")?,
             attention_mma,
             short_conv_rows: load(inkling, "inkling_short_conv")?,
@@ -1802,7 +1818,17 @@ impl Shared {
                 "a split-key pass of {pass_slots} keys is not whole runs of {PART_KEYS}"
             ));
         }
-        for pass in 0..passes {
+        // A sliding layer's rows each see one cluster's runs: its split-key walk is one launch
+        // after the passes (which then run only the exact mix's launches under Check).
+        let windowed = parts.is_some()
+            && tables.is_none()
+            && window > 0
+            && window <= WINDOW_RUNS * PART_KEYS
+            && groups <= WINDOW_GROUPS
+            && config.head_dim == WINDOW_HEAD_DIM;
+        // Under Fast a windowed layer runs no pass: the window launch is its whole walk.
+        let walked = if windowed && !exact { 0 } else { passes };
+        for pass in 0..walked {
             let pass_first = pass * pass_slots;
             let span = (widest - pass_first).min(pass_slots);
             // A full layer's tables hold every key's entries at its absolute slot; otherwise the
@@ -1847,7 +1873,7 @@ impl Shared {
             let scored = parts.is_some()
                 && groups <= SCORED_GROUPS
                 && span.div_ceil(PART_KEYS) >= SCORED_RUNS;
-            if exact || !scored {
+            if exact || !(scored || windowed) {
                 self.launch(
                     self.kernels.attention_scores,
                     (
@@ -1917,6 +1943,9 @@ impl Shared {
                         u64::from(pass + 1 == passes),
                     ],
                 )?;
+            }
+            if windowed {
+                continue;
             }
             if let Some(parts) = parts.filter(|_| scored) {
                 self.launch(
@@ -2003,23 +2032,60 @@ impl Shared {
         } else {
             out
         };
-        self.launch(
-            self.kernels.attention_merge,
-            (heads as u32, rows as u32, 1),
-            (config.head_dim as u32, 1, 1),
-            &[
-                gate.0,
-                sink.0,
-                parts.parts.0,
-                merged.0,
-                heads as u64,
-                config.head_dim as u64,
-                rows as u64,
-                first_position as u64,
-                window as u64,
-                parts.stride as u64,
-            ],
-        )?;
+        if windowed {
+            self.launch(
+                self.kernels.attention_window,
+                (kv_heads as u32, rows as u32, WINDOW_RUNS as u32),
+                (WINDOW_THREADS, 1, 1),
+                &[
+                    queries.0,
+                    keys.0,
+                    values.0,
+                    relative.0,
+                    bank.0,
+                    clip.query.0,
+                    0,
+                    clip.relative.0,
+                    gate.0,
+                    sink.0,
+                    merged.0,
+                    heads as u64,
+                    kv_heads as u64,
+                    config.head_dim as u64,
+                    groups as u64,
+                    rows as u64,
+                    first_position as u64,
+                    window as u64,
+                    cache_rows as u64,
+                    rel_extent as u64,
+                    config.d_rel as u64,
+                    qk_clip,
+                    bits(config.rel_l2_clip_threshold as f32),
+                    bits(tau),
+                    taus.0,
+                    1,
+                    eps,
+                ],
+            )?;
+        } else {
+            self.launch(
+                self.kernels.attention_merge,
+                (heads as u32, rows as u32, 1),
+                (config.head_dim as u32, 1, 1),
+                &[
+                    gate.0,
+                    sink.0,
+                    parts.parts.0,
+                    merged.0,
+                    heads as u64,
+                    config.head_dim as u64,
+                    rows as u64,
+                    first_position as u64,
+                    window as u64,
+                    parts.stride as u64,
+                ],
+            )?;
+        }
         if self.attention == AttentionWalk::Check {
             self.attention_compare(layer, out, merged, rows, first_position)?;
         }
