@@ -694,7 +694,15 @@ extern "C" __global__ void __launch_bounds__(64) inkling_band_shares(
 // the lower index on a tie. That is the sequential scan's answer exactly (the first index holding
 // the greatest biased score, NaN and -inf never chosen), so the schedule is still a function of the
 // scores alone, and the shares are summed by one thread in slot order as before.
+//
+// A thread holds its experts' biased scores in registers and marks the ones already chosen in a
+// mask, so a pick rescans nothing in shared memory; every thread then takes the block's best from
+// the warps' bests itself, one barrier a pick (the warps' bests alternate between two buffers, so
+// a pick's writes never meet the previous pick's reads). The bias is a weight and is loaded before
+// the previous kernel ends.
 #define INKLING_ROUTER_THREADS 128
+// The experts a thread holds: the capacity over the block, one bit of the chosen mask each.
+#define INKLING_ROUTER_HELD 32
 extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_router_topk(
     const float* __restrict__ logits,
     const float* __restrict__ bias,
@@ -703,8 +711,10 @@ extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_rou
     int experts,
     int top_k,
     float route_scale) {
-    OPT_PDL_ENTRY();
-    if (experts <= 0 || top_k <= 0 || top_k > experts || top_k > 64) {
+    OPT_PDL_LAUNCH();
+    const int stride = blockDim.x;
+    if (experts <= 0 || top_k <= 0 || top_k > experts || top_k > 64 ||
+        experts > INKLING_ROUTER_HELD * stride) {
         return;
     }
     // One block a row: a prefill chunk routes every row of the chunk, a decode step its one row
@@ -718,30 +728,44 @@ extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_rou
         return;
     }
     __shared__ float scores[capacity];
-    __shared__ float ranked[capacity];
-    __shared__ float best_scores[INKLING_ROUTER_THREADS / 32];
-    __shared__ int best_experts[INKLING_ROUTER_THREADS / 32];
+    __shared__ float best_scores[2][INKLING_ROUTER_THREADS / 32];
+    __shared__ int best_experts[2][INKLING_ROUTER_THREADS / 32];
     __shared__ int chosen[64];
-    for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
+    float ranked[INKLING_ROUTER_HELD];
+#pragma unroll
+    for (int k = 0; k < INKLING_ROUTER_HELD; ++k) {
+        const int expert = threadIdx.x + k * stride;
+        if (expert >= experts) {
+            break;
+        }
+        ranked[k] = bias != nullptr ? bias[expert] : 0.0f;
+    }
+    OPT_PDL_WAIT();
+#pragma unroll
+    for (int k = 0; k < INKLING_ROUTER_HELD; ++k) {
+        const int expert = threadIdx.x + k * stride;
+        if (expert >= experts) {
+            break;
+        }
         const float score = 1.0f / (1.0f + expf(-logits[expert]));
         scores[expert] = score;
-        ranked[expert] = __fadd_rn(score, bias != nullptr ? bias[expert] : 0.0f);
+        ranked[k] = __fadd_rn(score, ranked[k]);
     }
-    __syncthreads();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int warps = (blockDim.x + 31) >> 5;
+    const int warps = (stride + 31) >> 5;
+    unsigned int taken = 0;
     for (int slot = 0; slot < top_k; ++slot) {
         int best = -1;
         float best_score = -INFINITY;
-        for (int expert = threadIdx.x; expert < experts; expert += blockDim.x) {
-            bool taken = false;
-            for (int earlier = 0; earlier < slot; ++earlier) {
-                taken = taken || chosen[earlier] == expert;
+#pragma unroll
+        for (int k = 0; k < INKLING_ROUTER_HELD; ++k) {
+            const int expert = threadIdx.x + k * stride;
+            if (expert >= experts) {
+                break;
             }
-            const float value = ranked[expert];
-            if (!taken && value > best_score) {
-                best_score = value;
+            if (!((taken >> k) & 1u) && ranked[k] > best_score) {
+                best_score = ranked[k];
                 best = expert;
             }
         }
@@ -756,33 +780,37 @@ extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_rou
                 best = other;
             }
         }
+        const int buffer = slot & 1;
         if (lane == 0) {
-            best_scores[warp] = best_score;
-            best_experts[warp] = best;
+            best_scores[buffer][warp] = best_score;
+            best_experts[buffer][warp] = best;
         }
         __syncthreads();
-        if (threadIdx.x == 0) {
-            int winner = -1;
-            float winner_score = -INFINITY;
-            for (int index = 0; index < warps; ++index) {
-                const int other = best_experts[index];
-                const float other_score = best_scores[index];
-                if (other >= 0 && (winner < 0 || other_score > winner_score ||
-                                   (other_score == winner_score && other < winner))) {
-                    winner_score = other_score;
-                    winner = other;
-                }
+        int winner = -1;
+        float winner_score = -INFINITY;
+        for (int index = 0; index < warps; ++index) {
+            const int other = best_experts[buffer][index];
+            const float other_score = best_scores[buffer][index];
+            if (other >= 0 && (winner < 0 || other_score > winner_score ||
+                               (other_score == winner_score && other < winner))) {
+                winner_score = other_score;
+                winner = other;
             }
+        }
+        if (winner < 0) {
+            return;
+        }
+        if (threadIdx.x == 0) {
             chosen[slot] = winner;
         }
-        __syncthreads();
-        if (chosen[slot] < 0) {
-            return;
+        if (winner % stride == (int)threadIdx.x) {
+            taken |= 1u << (winner / stride);
         }
     }
     if (threadIdx.x != 0) {
         return;
     }
+    // Thread 0 wrote every chosen slot and every score it reads below is behind the last barrier.
     float sum = 0.0f;
     for (int slot = 0; slot < top_k; ++slot) {
         sum = __fadd_rn(sum, scores[chosen[slot]]);
