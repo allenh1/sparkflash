@@ -1120,9 +1120,13 @@ impl ServeOptions {
                 tp4,
                 recurrence,
                 api_key: cli.api_key,
-                fabric_schedule: cli
-                    .fabric_schedule
-                    .unwrap_or(FabricSchedule::OneShotAllToAll),
+                // The environment is read here rather than by clap so an empty
+                // SPARKFLASH_FABRIC_SCHEDULE= means the default, as it does for the stages and
+                // the configuration file, instead of an invalid empty value.
+                fabric_schedule: match cli.fabric_schedule {
+                    Some(schedule) => schedule,
+                    None => crate::tp4_host::fabric_schedule_from_env()?,
+                },
                 cors,
                 device_token_dir: cli.device_token_dir,
                 device_token_derived_claim: cli.device_token_derived_claim,
@@ -1273,12 +1277,7 @@ struct ServeArgs {
     /// reduce-scatter + all-gather). Every rank of one group must run the same value, or their
     /// collectives disagree; the launcher writes it for all four. An unknown name is refused
     /// rather than served as `switched`.
-    #[arg(
-        long,
-        value_name = "SCHEDULE",
-        env = "SPARKFLASH_FABRIC_SCHEDULE",
-        value_parser = parse_fabric_schedule_flag
-    )]
+    #[arg(long, value_name = "SCHEDULE", value_parser = parse_fabric_schedule_flag)]
     fabric_schedule: Option<FabricSchedule>,
     /// Allow browser requests only from this origin; repeat for several. Default: any origin.
     ///
@@ -9776,17 +9775,23 @@ mod tests {
 
     #[test]
     fn the_fabric_schedule_flag_parses_and_a_typo_is_refused() {
-        // No flag: clap resolves the environment (and validates it), so the expectation is what
-        // that variable names - switched when it is unset. Assert it that way rather than
+        // No flag: the environment is read when the options are built, so the expectation is what
+        // that variable names - switched when it is unset or empty. Assert it that way rather than
         // assuming a clean shell, which would make the test fail for an operator who exported it.
-        let expected = crate::tp4_host::fabric_schedule_from_value(
-            std::env::var(crate::tp4_host::FABRIC_SCHEDULE_ENV)
-                .ok()
-                .as_deref(),
-        )
-        .expect("the environment names a schedule");
+        let expected =
+            crate::tp4_host::fabric_schedule_from_env().expect("the environment names a schedule");
         let plain = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
         assert_eq!(plain.fabric_schedule, expected);
+        // An exported-but-empty variable is the default, not an invalid schedule: the stages and
+        // the configuration file already read it that way, and serve must start for the launcher
+        // that writes an empty value.
+        for empty in ["", "   "] {
+            assert_eq!(
+                crate::tp4_host::fabric_schedule_from_value(Some(empty)),
+                Ok(FabricSchedule::OneShotAllToAll),
+                "{empty:?}"
+            );
+        }
         for (written, expected) in [
             (
                 "switchless",

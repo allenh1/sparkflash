@@ -1536,7 +1536,7 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the ConnectX-7 hairpin on the Spark between them. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the Spark between them, and the port setup routes them there. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
   },
 ];
 
@@ -1554,6 +1554,11 @@ function fabricPicker(state, model) {
   const measured = setup && setup.fabric ? setup.fabric : null;
   const shape = measured ? measured.shape : null;
   const recommended = shape === "switched" ? "switched" : shape === "ring" ? "switchless" : null;
+  // A rank that cannot reach a peer is a finding the step blocks on. The cards must not also say
+  // the saved schedule matches the wiring: that would be a success note next to the errors.
+  const reached = measured && Array.isArray(measured.reachable) ? measured.reachable : [];
+  const unreachable = reached.some((peers, rank) =>
+    Array.isArray(peers) && reached.some((_, peer) => peer !== rank && !peers.includes(peer)));
   const parts = ['<div class="fabric">'];
   parts.push('<div class="fabric-head"><div><h3 class="fabric-title">Fabric</h3>' +
     '<p class="fabric-sub">How the four Sparks are cabled. The cross-rank collectives follow this choice.</p></div>');
@@ -1582,19 +1587,19 @@ function fabricPicker(state, model) {
   }
   parts.push("</div>");
   if (measured && !measured.links_measured) {
-    parts.push('<p class="guide-note">The ports answered no ARP probe. Install <code>iputils-arping</code> on every Spark, then check again and the wiring will be identified automatically.</p>');
+    parts.push('<p class="guide-note">The ports answered no ARP probe. Install <code>iputils-arping</code> on every Spark and let it open a raw socket, then check again and the wiring will be identified automatically.</p>');
   } else if (recommended && recommended !== chosen) {
     parts.push('<div class="guide-actions"><span class="guide-hint">The measured wiring is ' + esc(FABRIC_SHAPE_NAMES[shape]) + '; the saved schedule is ' + esc(chosen) + '.</span><button class="btn btn-primary" type="button" data-act="choose-fabric" data-fabric="' + recommended + '">Use the measured fabric</button></div>');
-  } else if (measured && recommended === chosen) {
-    // A ring's non-neighbours are not cabled to each other: the ConnectX-7 hairpin on the Spark
-    // between the two cables forwards them, and the launch dials every rank, so the note says
-    // what the check has to see rather than implying the cables alone carry the traffic.
-    const hairpin = shape === "ring"
-      ? " Non-neighbours are reached through the ConnectX-7 hairpin on the Spark between the two cables; every Spark has to answer before the launch can connect to it."
+  } else if (measured && recommended === chosen && !unreachable) {
+    // A ring's non-neighbours are not cabled to each other: the Spark between the two cables
+    // forwards them (the port setup routes them there), and the launch dials every rank, so the
+    // note says what the check has to see rather than implying the cables alone carry the traffic.
+    const relay = shape === "ring"
+      ? " Non-neighbours are reached through the Spark between the two cables (the port setup routes them there); every Spark has to answer before the launch can connect to it."
       : "";
-    parts.push('<p class="guide-note fabric-ok">The saved schedule matches the measured wiring.' + hairpin + "</p>");
+    parts.push('<p class="guide-note fabric-ok">The saved schedule matches the measured wiring.' + relay + "</p>");
   } else if (measured && shape === "pairs") {
-    parts.push('<p class="guide-note">Each Spark has both fast ports wired to the same Spark: two-node pairs, not a ring. The collectives still run, but ranks across the pairs fall back to the slow path. Rewire to 0-1-2-3-0 with the 0-2 and 1-3 hairpins for the full ring.</p>');
+    parts.push('<p class="guide-note">Each Spark has both fast ports wired to the same Spark: two-node pairs, not a ring. A pair can talk, but a rank in the other pair has no fast path, and the launch opens a connection to every rank. Rewire to 0-1-2-3-0 so every Spark is reachable.</p>');
   } else if (measured && shape === "unknown") {
     parts.push('<p class="guide-note">The measured links match neither a switch nor the ring. Check that every fast port has a cable and an address, then check again.</p>');
   }
@@ -1670,7 +1675,7 @@ function networkBody(state, model) {
     if (fixable.length) {
       const names = fixable.map((node) => node.hostname || node.ssh).join(", ");
       parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="setup-ports"><svg><use href="#i-bolt"/></svg>Set up the ports</button>',
-        "Writes the port addresses, MTU and ARP settings on " + esc(names) + " and applies them with netplan. The fast ports drop for a moment."));
+        "Writes the port addresses, MTU, ARP settings and any routes the wiring needs on " + esc(names) + " and applies them with netplan. The fast ports drop for a moment."));
     }
   }
   if (fixable.length) {
@@ -1702,7 +1707,12 @@ async function chooseFabric(schedule) {
   config.cluster.fabric_schedule = schedule;
   try {
     await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
-    toast(schedule === "switchless" ? "Switchless ring selected." : "Switched fabric selected.");
+  } catch (error) {
+    toast("Not saved: " + error.message, true);
+    return;
+  }
+  toast(schedule === "switchless" ? "Switchless ring selected." : "Switched fabric selected.");
+  try {
     // refreshState() repaints the form only when there are no unsaved edits; the fabric
     // cards read the saved schedule, so they update either way.
     await refreshState();
@@ -1711,7 +1721,8 @@ async function chooseFabric(schedule) {
     // the new choice.
     await inspect(true);
   } catch (error) {
-    toast("Not saved: " + error.message, true);
+    // The choice is saved; only the refresh failed. Do not report that as a failed save.
+    toast("Saved, but the page could not refresh: " + error.message, true);
   }
 }
 
@@ -2190,9 +2201,10 @@ function maybeInspect() {
     S.shelfRefreshTimer = setTimeout(() => loadModels(true), 1500);
   }
   // Four port jobs finish one after another; checking between them would record a cluster that
-  // is half-reconfigured. Wait for the last one, like the prepare jobs above.
-  const portBusy = S.jobs.some((job) => job.status === "running" && job.kind.startsWith("network-setup-"));
-  if ((finished && !portBusy) || stale || old) inspect(true);
+  // is half-reconfigured. Wait for the last one whatever asked for the check: a finished job, a
+  // stale report or a reloaded page.
+  if (S.jobs.some((job) => job.status === "running" && job.kind.startsWith("network-setup-"))) return;
+  if (finished || stale || old) inspect(true);
 }
 
 function checkAgain() {

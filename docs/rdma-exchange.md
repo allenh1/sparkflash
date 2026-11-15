@@ -36,26 +36,31 @@ selected by `FabricSchedule` and exposed by the `--fabric-schedule switched|swit
 variable (issue #19). The device arm's hot per-layer all-reduce is not one of them: it enqueues on
 NCCL (`SPARK_COMM_REDUCE=nccl`, the device default), so the schedule shapes the layout-based
 all-reduces on the reference transport - the host arm's per-layer reductions and the barriers -
-and the gathers keep their own one-segment-to-every-peer exchange either way:
+and the gathers keep their own one-segment-to-every-peer exchange either way. That transport is
+ordinary IP, so the routes a switchless setup writes carry it; NCCL's queue pairs do not use them,
+which is why a bare-ring device run also needs an NCCL that stays on the cabled peers or
+`SPARK_COMM_REDUCE=tcp` (see `docs/web.md`):
 
 - **OneShotAllToAll** (switched, the default): every rank posts its whole bf16 payload to all
   `world - 1` peers over the 200 Gb/s switch and reduces locally in canonical rank order. It moves
   `world * (world - 1) * elements` element writes cluster-wide.
 - **HairpinRingReduceScatterAllGather** (switchless): the buffer is split into one chunk per rank,
   each rank sends its contribution of chunk c to the owner of c (a ring neighbour, or the opposite
-  rank across the ConnectX-7 hairpin diagonal), the owner accumulates ranks 0 + 1 + 2 + 3 in order
+  rank across the diagonal through the Spark between the two cables), the owner accumulates ranks
+  0 + 1 + 2 + 3 in order
   and rounds once, and the owners all-gather the reduced chunks back. It moves
   `2 * (world - 1) * elements` element writes - half the traffic at world 4 - and never changes the
   summation order, so the two schedules return identical bits.
 
 The schedule also classifies each peer link: switched runs every transfer over `SwitchFabric`, while
 the ring labels its peers `RingEdge` or `HairpinDiagonal`. On a switchless fabric a diagonal
-transfer crosses the two cables through the ConnectX-7 of the Spark between them, which forwards it
-inside the ASIC (the hairpin, or relay); the sender still posts one transfer to the opposite rank,
-and that forwarding has to be programmed for the fabric. Until it is, a bare DAC ring has no path
-for the traffic to a non-neighbour, and the rank-to-rank reference transport — which opens a
-connection to every rank before the group starts — needs every peer to answer; the web check
-reports a silent one as an error naming what to enable (`docs/web.md`). The schedule driver in
+transfer crosses the two cables through the Spark between them, which forwards it — in the ASIC or
+in its host stack, depending on what the fabric runs (the web port setup routes the address through
+that Spark and turns on forwarding); the sender still posts one transfer to the opposite rank. Until
+that forwarding is in place a bare DAC ring has no path for the traffic to a non-neighbour, and the
+rank-to-rank reference transport — which opens a connection to every rank before the group starts —
+needs every peer to answer; the web check reports a silent one as an error naming what to enable
+(`docs/web.md`). The schedule driver in
 `crates/sparkflash-comm/src/exchange.rs` executes the transfer list and the reduction, so the
 loopback, TCP and RDMA `Exchange` backends all run the same protocol; the layout knows the chunk
 ranges, the transfer list and the expected write count without a backend.

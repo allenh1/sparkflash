@@ -107,18 +107,25 @@ cards describe the two wirings this build supports, and the check tells you whic
   every peer and reduces locally, the one-shot all-to-all schedule;
 - **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs, and
   each collective reduce-scatters to the chunk owners and all-gathers the reduced chunks back. It
-  is the same arithmetic, bit for bit, with `2 * (world - 1)` payload element writes cluster-wide
-  against `world * (world - 1)` for the one-shot: half the fabric bytes at world 4. A Spark has no
-  cable to the rank opposite it, so those transfers cross the two cables in between and are
-  forwarded inside the ConnectX-7 of the Spark between them (its hairpin, also called a relay);
-  that forwarding is programmed, not implied by the cable: until it is, traffic to a non-neighbour
-  has no path.
+  is the same arithmetic, bit for bit, with `2 * (world - 1) * elements` payload element writes
+  cluster-wide against `world * (world - 1) * elements` for the one-shot: half the traffic at world
+  4. A Spark has no cable to the rank opposite it, so those transfers cross the two cables in
+  between and are forwarded by the Spark between them: the port setup routes each non-neighbour's
+  address through that Spark and turns on forwarding, so a bare DAC ring carries the transport's
+  traffic for every rank. A fabric that forwards in the ConnectX-7 itself (the vendor's switchless
+  tooling) needs no host relay; the check sees either one as reachable.
 
 The schedule governs the layout-based all-reduces on the rank-to-rank reference transport: the
 host reference arm's per-layer reductions and the barriers. The gathers keep their own
 one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduce enqueues on NCCL
 (`SPARK_COMM_REDUCE=nccl`, the device default) without being re-decomposed by this value;
 `docs/rdma-exchange.md` describes which path each arm takes.
+
+The routes the port setup writes carry the reference transport, whose connections are ordinary IP.
+The device arm's NCCL is not: it opens its own RDMA queue pairs and cannot use those routes, so a
+bare-ring device run also needs an NCCL that stays on the cabled peers (`NCCL_ALGO=Ring` with a
+switchless NCCL build, where the two non-neighbours are never opened) or `SPARK_COMM_REDUCE=tcp`,
+which keeps the partials on the host seam. The check cannot see which NCCL is installed.
 
 When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
 every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective
@@ -127,27 +134,32 @@ classifies the fabric as a switch (every port answers for every peer), the ring 
 Spark's two ports answers for exactly one neighbour, forming 0-1-2-3-0), two-node pairs (both
 ports reach the same Spark), or unrecognised wiring, and records what it measured next to the
 cards. The ARP answers are the cable map; the pings are the reachability the transport needs, and
-the two can disagree: a ring's non-neighbour has no cable and answers only where the hairpin
-forwards it, and a fabric that forwards ARP as well measures as a switch even when it is cabled
-as a ring. When the measured wiring and the saved schedule disagree, a **Use the measured fabric**
-button writes the matching choice and checks the Sparks again, so the findings agree with the new
-choice. Matching the schedule to the wiring is not required for correctness — the one-shot
+the two can disagree: a ring's non-neighbour has no cable and answers only where the Spark between
+the cables forwards it, and a fabric that forwards ARP as well measures as a switch even when it is
+cabled as a ring. When the measured wiring and the saved schedule disagree, a **Use the measured
+fabric** button writes the matching choice and checks the Sparks again, so the findings agree with
+the new choice. Matching the schedule to the wiring is not required for correctness — the one-shot
 schedule runs its full all-to-all over a ring and the ring schedule does chunked transfers on a
-switch — but it is the fast path for both wirings. Without `arping` on the Sparks the cable map
-cannot be identified; only reachability is checked.
+switch — but it is the fast path for both wirings. Without `arping` (or where it cannot open a raw
+socket) the cable map cannot be identified; only reachability is checked.
 
 Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
 launch opens a connection to every rank before it starts, so a peer that does not answer stops it
 whatever the cables are. The message says what to look at. On a switch, and for a neighbour on a
-ring, it is the cable or the address. For a ring's non-neighbour it is the ConnectX-7 hairpin on
-the Spark between the two cables: the cable alone gives no path, so that forwarding has to be
-enabled before the check passes. Wiring that is none of the named shapes says so, and its
-silent pairs are errors too. When `arping` could not run, the finding says the wiring was not
-measured and reports the ping result alone.
+ring, it is the cable or the address. For a ring's non-neighbour it is the relay through the
+Spark between the two cables: the cable alone gives no path, so **Set up the ports** writes the
+route through that Spark and turns on forwarding before the check passes. A ring whose diagonals
+still do not answer after the ports are set up has a missing cable or a wrong address, and the
+finding stays. Wiring that is none of the named shapes says so, and its silent pairs are errors
+too. When `arping` could not run (missing, or unable to open a raw socket), the finding says the
+wiring was not measured and reports the ping result alone.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
-settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`) on every
-Spark over SSH under `sudo -n` and applies them. The manual commands remain available behind
+settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
+ring a `/32` route for every peer through the port that reaches it plus `ip_forward=1` so the
+Spark in between relays the diagonals) on every Spark over SSH under `sudo -n` and applies them.
+The routes are worked out from the measured wiring, so after a pass that changes addresses, check
+again: a second pass may be offered to add them. The manual commands remain available behind
 **Prefer to run the commands yourself**.
 
 The choice is saved as `[cluster].fabric_schedule` and exported to every rank as

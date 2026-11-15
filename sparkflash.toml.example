@@ -71,10 +71,11 @@ base_port = 29601
 # all-to-all schedule. "switchless" is the direct-attach ring: rank 0-1-2-3-0 over the DACs, with
 # the 0<->2 and 1<->3 transfers forwarded by the ConnectX-7 hairpin of the Spark between the two
 # cables, reduced with reduce-scatter + all-gather so the cross-rank all-reduces move
-# 2*(world-1) element writes instead of world*(world-1): half the bytes at four ranks. A bare DAC
-# ring has no path to a non-neighbour until that forwarding is programmed, and the launch opens a
-# connection to every rank (the web check reports a silent one); the hairpin is programmed on the
-# Sparks, not implied by the cable. It is forwarded to every rank as
+# 2*(world-1)*elements element writes instead of world*(world-1)*elements: half the bytes at four
+# ranks. A bare DAC
+# ring has no path to a non-neighbour until the Spark between the two cables forwards it, and the
+# launch opens a connection to every rank (the web check reports a silent one); the web port setup
+# routes the diagonals through that Spark and turns on forwarding. It is forwarded to every rank as
 # SPARKFLASH_FABRIC_SCHEDULE; "one-shot", "hairpin" and "ring" are accepted aliases.
 fabric_schedule = "switched"
 # Empty means the user running the control plane.

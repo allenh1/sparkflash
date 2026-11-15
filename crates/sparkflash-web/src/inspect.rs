@@ -57,6 +57,7 @@ for dev in /sys/class/infiniband/*; do
   done
 done
 echo "arp all $(cat /proc/sys/net/ipv4/conf/all/arp_ignore 2>/dev/null || echo 0) $(cat /proc/sys/net/ipv4/conf/all/arp_announce 2>/dev/null || echo 0)"
+echo "forward $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
 for net in /sys/class/net/*; do
   name=${net##*/}
   [ -e "$net/device" ] || continue
@@ -171,6 +172,8 @@ pub struct Route {
     pub destination: String,
     /// The netdev it leaves by.
     pub netdev: String,
+    /// The next hop, when the route has one.
+    pub via: Option<String>,
     /// The metric; the kernel prefers the lowest.
     pub metric: u32,
     /// Whether DHCP installed it.
@@ -218,6 +221,8 @@ pub struct NodeFacts {
     pub routes: Vec<Route>,
     /// `net.ipv4.conf.all.arp_ignore` and `arp_announce`.
     pub arp_all: (u8, u8),
+    /// Whether `net.ipv4.ip_forward` is on, which a ring's relayed diagonals need.
+    pub forward: bool,
     /// Files by label (`binary`, `nccl`, `converted`, `manifest`); `None` when absent.
     pub files: BTreeMap<String, Option<FileFact>>,
     /// Trees by label (`cubins`, `checkpoint`); `None` when absent.
@@ -260,6 +265,7 @@ pub fn parse_facts(text: &str) -> NodeFacts {
             ("arp", ["all", ignore, announce]) => {
                 facts.arp_all = (ignore.parse().unwrap_or(0), announce.parse().unwrap_or(0));
             }
+            ("forward", [on]) => facts.forward = *on == "1",
             ("link", [name, mtu, state, ignore, announce]) => facts.links.push(NetLink {
                 name: (*name).to_owned(),
                 mtu: mtu.parse().unwrap_or(0),
@@ -291,6 +297,7 @@ pub fn parse_facts(text: &str) -> NodeFacts {
                 facts.routes.push(Route {
                     destination: (*destination).to_owned(),
                     netdev: (*netdev).to_owned(),
+                    via: after("via").map(|via| (*via).to_owned()),
                     metric: after("metric")
                         .and_then(|metric| metric.parse().ok())
                         .unwrap_or(0),
@@ -479,6 +486,10 @@ pub struct FabricLink {
     pub netdev: String,
     /// The Spark on the other end.
     pub peer: usize,
+    /// The peer address that answered on this port. The port is two PCIe halves with an address
+    /// each, so one cable can answer for two of the peer's addresses; the setup needs the address
+    /// because it is also the next hop of a route through the Spark the cable reaches.
+    pub address: String,
 }
 
 /// The cabling the fast ports describe.
@@ -909,9 +920,9 @@ pub fn analyze_fabric(
                 // The reference transport opens a connection to every rank's address before the
                 // launch can start, so a peer that does not answer is an error whatever the cables
                 // measure; only the message depends on the shape. A ring's non-neighbour is
-                // reached through the ConnectX-7 hairpin on the Spark between the two cables,
-                // which has to forward that address: a bare DAC does not carry it, so the check
-                // must not pass the guide on a ring whose diagonals are silent.
+                // reached through the Spark between the two cables, which has to forward that
+                // address: the port setup writes that route and turns on forwarding, and without it
+                // a bare DAC ring carries nothing across the gap.
                 let message = match fabric.shape {
                     _ if !fabric.links_measured => format!(
                         "{} cannot reach {} over the fast network. The wiring could not be \
@@ -924,10 +935,10 @@ pub fn analyze_fabric(
                     ),
                     FabricShape::Ring if !neighbour => format!(
                         "{} cannot reach {} over the fast network. {} is not cabled directly to \
-                         {}; the ring reaches it through the ConnectX-7 hairpin on the Spark \
-                         between the two cables, which has to forward that address. The cable on \
-                         its own gives no path, and the launch opens a connection to every rank, \
-                         so enable that forwarding and check again.",
+                         {}; the ring reaches it through the Spark between the two cables, and \
+                         the launch opens a connection to every rank. Set the ports up: the \
+                         command writes a route through that Spark and turns on forwarding, so a \
+                         bare DAC ring can carry the traffic, then check again.",
                         name(rank),
                         name(peer),
                         name(peer),
@@ -1134,8 +1145,9 @@ pub fn analyze_fabric(
         });
     }
 
-    // A network command for every node whose ports need addresses, MTU or ARP settings.
-    let fixes = network_fixes(probes, &name);
+    // A network command for every node whose ports need addresses, MTU, ARP settings or the
+    // routes a ring needs.
+    let fixes = network_fixes(probes, fabric.as_ref(), &name);
     for (node, fix) in nodes.iter_mut().zip(fixes) {
         if let Some((text, remote)) = fix {
             node.network_fix = Some(text);
@@ -1277,13 +1289,115 @@ fn arp_ok(facts: &NodeFacts, netdevs: &[&str]) -> bool {
     netdevs.iter().all(|netdev| facts.arp(netdev) == (1, 2))
 }
 
+/// One route the port setup pins on a Spark: a peer's collective address on the port that reaches
+/// it. A cabled neighbour answers on that port; a ring's diagonal has no cable, so it goes via the
+/// Spark between the two cables and the kernel relays it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricRoute {
+    /// The peer's collective address.
+    to: Ipv4Addr,
+    /// The next hop, `None` when the peer is cabled directly.
+    via: Option<Ipv4Addr>,
+    /// The port the route leaves by.
+    netdev: String,
+}
+
+/// Whether the node already carries every route.
+fn routes_installed(facts: &NodeFacts, routes: &[FabricRoute]) -> bool {
+    routes.iter().all(|route| {
+        let destination = format!("{}/32", route.to);
+        let via = route.via.map(|via| via.to_string());
+        facts.routes.iter().any(|have| {
+            have.destination == destination && have.netdev == route.netdev && have.via == via
+        })
+    })
+}
+
+/// The routes a ring needs, per rank. A neighbour's collective address is reached over the cable
+/// that carries it; a diagonal goes through a Spark cabled to both ends, the lowest-numbered one,
+/// so both directions of a pair cross the same relay.
+fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<FabricRoute>> {
+    let world = probes.len();
+    let mut routes: Vec<Vec<FabricRoute>> = vec![Vec::new(); world];
+    let Some(fabric) = fabric.filter(|fabric| fabric.shape == FabricShape::Ring) else {
+        return routes;
+    };
+    let primaries: Vec<Option<Ipv4Addr>> = probes
+        .iter()
+        .map(|probe| {
+            probe.as_ref().ok().and_then(|facts| {
+                let rails = facts.rails();
+                facts.primary_rail(&rails).map(|rail| rail.ip)
+            })
+        })
+        .collect();
+    if primaries.iter().any(Option::is_none) {
+        return routes;
+    }
+    // The port that carries each peer's collective address, per rank: a cable answers for the
+    // address of the half it reaches.
+    let mut direct: Vec<BTreeMap<usize, (String, Ipv4Addr)>> = vec![BTreeMap::new(); world];
+    for link in &fabric.links {
+        let Ok(address) = link.address.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        if primaries.get(link.peer).copied().flatten() != Some(address) {
+            continue;
+        }
+        direct[link.rank]
+            .entry(link.peer)
+            .or_insert_with(|| (link.netdev.clone(), address));
+    }
+    for rank in 0..world {
+        if primaries[rank].is_none() {
+            continue;
+        }
+        for peer in 0..world {
+            let Some(target) = primaries[peer] else {
+                continue;
+            };
+            if peer == rank {
+                continue;
+            }
+            if let Some((netdev, _)) = direct[rank].get(&peer) {
+                routes[rank].push(FabricRoute {
+                    to: target,
+                    via: None,
+                    netdev: netdev.clone(),
+                });
+                continue;
+            }
+            let relay = (0..world).find(|candidate| {
+                *candidate != rank
+                    && *candidate != peer
+                    && direct[rank].contains_key(candidate)
+                    && direct[*candidate].contains_key(&peer)
+            });
+            if let Some(relay) = relay
+                && let (Some((netdev, _)), Some(hop)) = (direct[rank].get(&relay), primaries[relay])
+            {
+                routes[rank].push(FabricRoute {
+                    to: target,
+                    via: Some(hop),
+                    netdev: netdev.clone(),
+                });
+            }
+        }
+    }
+    routes
+}
+
 /// The netplan and sysctl commands each node needs, or `None` when its ports are already right.
 ///
 /// A port that DHCP addresses keeps DHCP. A port without an address gets one on the subnet the
 /// other Sparks use (a free host number), or on 10.200.0.0/24 when none has an address yet. Both
-/// lanes of a node land on one subnet, so the ARP settings come with any address change.
+/// lanes of a node land on one subnet, so the ARP settings come with any address change. On a ring
+/// the same command pins every peer's collective address to the port that reaches it (a diagonal
+/// through the Spark in between) and turns on forwarding, so a bare DAC ring carries the
+/// rank-to-rank transport's connections to every rank.
 fn network_fixes(
     probes: &[ProbeResult],
+    fabric: Option<&Fabric>,
     name: &dyn Fn(usize) -> String,
 ) -> Vec<Option<(String, String)>> {
     let mut used: BTreeSet<Ipv4Addr> = probes
@@ -1303,6 +1417,7 @@ fn network_fixes(
             ))
         })
         .unwrap_or(DEFAULT_SUBNET);
+    let routes_by_rank = fabric_routes(probes, fabric);
 
     let mut fixes = Vec::new();
     for (rank, probe) in probes.iter().enumerate() {
@@ -1312,8 +1427,11 @@ fn network_fixes(
         };
         let rails = facts.rails();
         let unaddressed = facts.unaddressed();
+        let required = &routes_by_rank[rank];
+        let routes_missing = !required.is_empty() && !routes_installed(facts, required);
+        let needs_forwarding = required.iter().any(|route| route.via.is_some()) && !facts.forward;
         let mut ports: Vec<(String, String)> = Vec::new();
-        let mut needs_netplan = !unaddressed.is_empty();
+        let mut needs_netplan = !unaddressed.is_empty() || routes_missing;
         for rail in &rails {
             if rail.mtu.is_some_and(|mtu| mtu < FABRIC_MTU) {
                 needs_netplan = true;
@@ -1358,30 +1476,49 @@ fn network_fixes(
         let needs_arp = lanes.len() > 1
             && (shares_subnet(&rails) || !unaddressed.is_empty())
             && !arp_ok(facts, &lanes);
-        if ports.is_empty() && !needs_arp {
+        let needs_sysctl = needs_arp || needs_forwarding;
+        if !needs_netplan && !needs_sysctl {
             fixes.push(None);
             continue;
         }
-        let mut body = String::new();
-        if !ports.is_empty() {
-            body.push_str(&format!("sudo tee {NETPLAN_FILE} > /dev/null <<'EOF'\n"));
-            body.push_str("network:\n  version: 2\n  ethernets:\n");
+        let mut body = String::from("set -e\n");
+        if needs_netplan {
+            let mut yaml = String::from("network:\n  version: 2\n  ethernets:\n");
             for (netdev, line) in &ports {
-                body.push_str(&format!(
+                yaml.push_str(&format!(
                     "    {netdev}:\n      mtu: {FABRIC_MTU}\n      {line}\n"
                 ));
+                let on_port: Vec<&FabricRoute> = required
+                    .iter()
+                    .filter(|route| route.netdev == *netdev)
+                    .collect();
+                if !on_port.is_empty() {
+                    yaml.push_str("      routes:\n");
+                    for route in on_port {
+                        yaml.push_str(&format!("        - to: {}/32\n", route.to));
+                        if let Some(via) = route.via {
+                            yaml.push_str(&format!("          via: {via}\n"));
+                        } else {
+                            yaml.push_str("          scope: link\n");
+                        }
+                    }
+                }
             }
-            body.push_str("EOF\n");
+            body.push_str(&format!(
+                "sudo tee {NETPLAN_FILE} > /dev/null <<'EOF'\n{yaml}EOF\n"
+            ));
             body.push_str(&format!("sudo chmod 600 {NETPLAN_FILE}\n"));
         }
-        if needs_arp {
+        if needs_sysctl {
             body.push_str(&format!("sudo tee {SYSCTL_FILE} > /dev/null <<'EOF'\n"));
-            body.push_str(
-                "net.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2\nEOF\n",
-            );
+            body.push_str("net.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2\n");
+            if needs_forwarding {
+                body.push_str("net.ipv4.ip_forward = 1\n");
+            }
+            body.push_str("EOF\n");
             body.push_str(&format!("sudo sysctl -p {SYSCTL_FILE}\n"));
         }
-        if !ports.is_empty() {
+        if needs_netplan {
             body.push_str("sudo netplan apply\n");
         }
         // The paste-into-a-terminal variant prompts for a password via sudo; the copy that
@@ -1496,17 +1633,18 @@ if ! command -v arping >/dev/null 2>&1; then
   have_arping=0
 fi
 out=$(mktemp) || exit 0
-trap 'rm -f "$out"' EXIT
+errs=$(mktemp) || exit 0
+trap 'rm -f "$out" "$errs"' EXIT
 if [ "$have_arping" = 1 ]; then
   for spec in "${peers[@]}"; do
     peer=${spec%%:*}
     addr=${spec#*:}
     for dev in "${devs[@]}"; do
       (
-        if arping -q -c1 -w1 -I "$dev" "$addr" >/dev/null 2>&1; then
-          echo "link $peer $dev ok"
+        if arping -q -c1 -w1 -I "$dev" "$addr" >/dev/null 2>>"$errs"; then
+          echo "link $peer $dev $addr ok"
         else
-          echo "link $peer $dev no"
+          echo "link $peer $dev $addr no"
         fi
       ) >> "$out" &
     done
@@ -1527,6 +1665,12 @@ for spec in "${pings[@]}"; do
 done
 wait
 sort "$out"
+# A present-but-unusable arping (no CAP_NET_RAW, or a refused raw socket) is not a missing
+# cable: every attempt fails, which would otherwise read as "nothing is plugged in". Say so
+# instead, and the check reports the wiring as unmeasured.
+if [ "$have_arping" = 1 ] && grep -qiE 'operation not permitted|permission denied' "$errs"; then
+  echo "arping unusable"
+fi
 exit 0
 "#;
 
@@ -1578,9 +1722,9 @@ pub struct FabricProbe {
 }
 
 /// Reads one node's link probe output: the links that answered, the peers it reached, and whether
-/// arping was available. The probe prints one `link` line per port per *address*, so a peer with
-/// four addresses repeats the same (port, peer) pair; it is recorded once. Unknown or malformed
-/// lines are skipped.
+/// arping was available. The probe prints one `link` line per port per address, so a peer answers
+/// once for each of the peer's addresses and each is recorded (the setup routes the addresses);
+/// a repeated line is dropped. Unknown or malformed lines are skipped.
 #[must_use]
 pub fn parse_fabric(rank: usize, text: &str) -> FabricProbe {
     let mut links: Vec<FabricLink> = Vec::new();
@@ -1591,20 +1735,24 @@ pub fn parse_fabric(rank: usize, text: &str) -> FabricProbe {
         match (fields.next(), fields.next()) {
             (Some("arping"), Some("missing" | "unusable")) => links_measured = false,
             (Some("link"), Some(peer)) => {
-                let (Some(netdev), Some(state), Ok(peer)) =
-                    (fields.next(), fields.next(), peer.parse::<usize>())
-                else {
+                let (Some(netdev), Some(address), Some(state), Ok(peer)) = (
+                    fields.next(),
+                    fields.next(),
+                    fields.next(),
+                    peer.parse::<usize>(),
+                ) else {
                     continue;
                 };
                 if state == "ok"
-                    && !links
-                        .iter()
-                        .any(|link| link.netdev == netdev && link.peer == peer)
+                    && !links.iter().any(|link| {
+                        link.netdev == netdev && link.peer == peer && link.address == address
+                    })
                 {
                     links.push(FabricLink {
                         rank,
                         netdev: netdev.to_owned(),
                         peer,
+                        address: address.to_owned(),
                     });
                 }
             }
@@ -2027,6 +2175,7 @@ link enp1s0f1np1 1500 up 0 0
             rank,
             netdev: netdev.to_owned(),
             peer,
+            address: format!("198.51.100.{}", 100 + peer),
         }
     }
 
@@ -2190,10 +2339,13 @@ link enp1s0f1np1 1500 up 0 0
                 "ping=2:10.0.0.5",
             ],
         );
-        assert!(text.contains("link 1 enp1s0f0np0 ok"), "{text}");
-        assert!(text.contains("link 1 enP2p1s0f0np0 ok"), "{text}");
         assert!(
-            text.contains("link 2 enp1s0f0np0 no"),
+            text.contains("link 1 enp1s0f0np0 10.0.0.3 ok"),
+            "the answering address is part of the link: {text}"
+        );
+        assert!(text.contains("link 1 enP2p1s0f0np0 10.0.0.3 ok"), "{text}");
+        assert!(
+            text.contains("link 2 enp1s0f0np0 10.0.0.5 no"),
             "an address that did not answer is a no, not a missing line: {text}"
         );
         assert!(text.contains("ping 2 enp1s0f0np0 ok"), "{text}");
@@ -2234,6 +2386,33 @@ link enp1s0f1np1 1500 up 0 0
         assert!(probe.measured, "arping ran, it just got no answer: {text}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_arping_that_cannot_open_a_raw_socket_is_reported_as_unmeasured() {
+        // Without CAP_NET_RAW arping is present but every attempt fails with a permission error.
+        // That is not "nothing is plugged in": the script has to say the tool is unusable so the
+        // check reports the wiring as unmeasured instead of blaming the cables.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_stub(
+            &dir.path().join("bin"),
+            "arping",
+            "echo 'arping: socket: Operation not permitted' >&2\nexit 2\n",
+        );
+        write_stub(&dir.path().join("bin"), "ping", "exit 1\n");
+        let text = run_probe(
+            dir.path(),
+            &["ndev=dev0", "peer=1:10.0.0.3", "ping=1:10.0.0.3"],
+        );
+        assert!(text.contains("arping unusable"), "{text}");
+        let probe = parse_fabric(0, &text);
+        assert!(
+            !probe.measured,
+            "the wiring is unmeasured, not absent: {text}"
+        );
+        assert!(probe.links.is_empty(), "{text}");
+        assert!(probe.reached.is_empty(), "{text}");
+    }
+
     #[test]
     fn the_probe_arguments_name_ports_peers_and_collective_addresses() {
         let args = fabric_probe_args(
@@ -2257,18 +2436,34 @@ link enp1s0f1np1 1500 up 0 0
     fn parse_fabric_reads_links_pings_and_a_missing_arping() {
         let probe = parse_fabric(
             2,
-            "arping missing\nlink 1 enp1s0f1np1 ok\nlink 3 enP2p1s0f1np1 no\n             ping 1 enp1s0f1np1 ok\nping 3 enP2p1s0f1np1 no\nnoise\n",
+            "arping missing\nlink 1 enp1s0f1np1 10.0.0.3 ok\nlink 3 enP2p1s0f1np1 10.0.0.5 no\n             ping 1 enp1s0f1np1 ok\nping 3 enP2p1s0f1np1 no\nnoise\n",
         );
-        assert_eq!(probe.links, vec![fabric_link(2, "enp1s0f1np1", 1)]);
+        assert_eq!(
+            probe.links,
+            vec![FabricLink {
+                rank: 2,
+                netdev: "enp1s0f1np1".to_owned(),
+                peer: 1,
+                address: "10.0.0.3".to_owned(),
+            }]
+        );
         assert_eq!(probe.reached, vec![1]);
         assert!(!probe.measured);
 
         // One line per port: a peer counts as reached when any port reached it, once.
         let probe = parse_fabric(
             0,
-            "link 1 a ok\nlink 1 b no\nping 1 a ok\nping 1 b ok\nping 2 a no\nping 2 b no\n",
+            "link 1 a 10.0.0.3 ok\nlink 1 b 10.1.0.3 no\nping 1 a ok\nping 1 b ok\nping 2 a no\nping 2 b no\n",
         );
-        assert_eq!(probe.links, vec![fabric_link(0, "a", 1)]);
+        assert_eq!(
+            probe.links,
+            vec![FabricLink {
+                rank: 0,
+                netdev: "a".to_owned(),
+                peer: 1,
+                address: "10.0.0.3".to_owned(),
+            }]
+        );
         assert!(probe.measured);
         assert_eq!(probe.reached, vec![1]);
 
@@ -2357,9 +2552,9 @@ link enp1s0f1np1 1500 up 0 0
         );
         let stopped = errors(&report);
         assert!(
-            stopped
-                .iter()
-                .any(|m| m.contains("spark0 cannot reach spark2") && m.contains("hairpin")),
+            stopped.iter().any(
+                |m| m.contains("spark0 cannot reach spark2") && m.contains("through the Spark")
+            ),
             "{stopped:?}"
         );
         assert!(!report.network_ok(), "{:?}", report.findings);
@@ -2392,7 +2587,7 @@ link enp1s0f1np1 1500 up 0 0
     fn a_linked_neighbour_that_does_not_answer_is_an_error() {
         // Rank 0 is cabled to rank 3 (port1 -> 3) but only pings 1: the cable works, the address
         // does not, so the guide must stop for it. The 0-2 diagonal is not cabled at all, so it
-        // stops the guide too, with the hairpin message.
+        // stops the guide too, with the message naming the Spark in between.
         let probes = cluster();
         let ring = Fabric {
             links: ring_links(),
@@ -2414,9 +2609,9 @@ link enp1s0f1np1 1500 up 0 0
             "{errors:?}"
         );
         assert!(
-            errors
-                .iter()
-                .any(|m| m.contains("spark0 cannot reach spark2") && m.contains("hairpin")),
+            errors.iter().any(
+                |m| m.contains("spark0 cannot reach spark2") && m.contains("through the Spark")
+            ),
             "{errors:?}"
         );
     }
@@ -2444,14 +2639,15 @@ link enp1s0f1np1 1500 up 0 0
     }
 
     #[test]
-    fn a_peer_that_answers_on_every_address_is_one_link() {
+    fn a_peer_address_that_answers_twice_is_one_link() {
         let probe = parse_fabric(
             2,
             "arping missing
-link 1 enp1s0f1np1 ok
-link 1 enp1s0f1np1 ok
-link 1 enP2p1s0f1np1 ok
-link 3 enp1s0f1np1 ok
+link 1 enp1s0f1np1 198.51.100.11 ok
+link 1 enp1s0f1np1 198.51.100.11 ok
+link 1 enp1s0f1np1 198.51.100.21 ok
+link 1 enP2p1s0f1np1 198.51.100.11 ok
+link 3 enp1s0f1np1 198.51.100.13 ok
 ",
         );
         assert!(!probe.measured, "the arping line is honoured");
@@ -2462,19 +2658,132 @@ link 3 enp1s0f1np1 ok
                     rank: 2,
                     netdev: "enp1s0f1np1".to_owned(),
                     peer: 1,
+                    address: "198.51.100.11".to_owned(),
+                },
+                FabricLink {
+                    rank: 2,
+                    netdev: "enp1s0f1np1".to_owned(),
+                    peer: 1,
+                    address: "198.51.100.21".to_owned(),
                 },
                 FabricLink {
                     rank: 2,
                     netdev: "enP2p1s0f1np1".to_owned(),
                     peer: 1,
+                    address: "198.51.100.11".to_owned(),
                 },
                 FabricLink {
                     rank: 2,
                     netdev: "enp1s0f1np1".to_owned(),
                     peer: 3,
+                    address: "198.51.100.13".to_owned(),
                 },
             ]
         );
+    }
+
+    /// The collective addresses of the `cluster()` fixture, in rank order.
+    fn primaries() -> [String; 4] {
+        (21..=24)
+            .map(|last| format!("198.51.100.{last}"))
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("four")
+    }
+
+    /// A four-Spark ring measured from `cluster()`: each rank answers its two neighbours on its two
+    /// cabled ports, for the neighbours' collective addresses.
+    fn ring_fabric() -> Fabric {
+        let primaries = primaries();
+        let mut links = Vec::new();
+        for rank in 0..4usize {
+            for (netdev, peer) in [
+                ("enp1s0f1np1", (rank + 1) % 4),
+                ("enP2p1s0f1np1", (rank + 3) % 4),
+            ] {
+                links.push(FabricLink {
+                    rank,
+                    netdev: netdev.to_owned(),
+                    peer,
+                    address: primaries[peer].clone(),
+                });
+            }
+        }
+        Fabric {
+            links,
+            reachable: vec![
+                Some(vec![1, 3]),
+                Some(vec![0, 2]),
+                Some(vec![1, 3]),
+                Some(vec![0, 2]),
+            ],
+            shape: FabricShape::Ring,
+            links_measured: true,
+        }
+    }
+
+    #[test]
+    fn a_ring_setup_pins_every_peer_route_and_enables_forwarding() {
+        // A bare ring has no cable between opposite Sparks. The port setup has to pin each peer's
+        // collective address to the port that reaches it (a neighbour directly, a diagonal via the
+        // Spark in between) and turn on forwarding, or the transport cannot connect to every rank.
+        let probes = cluster();
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(ring_fabric()),
+            true,
+            1,
+        );
+        for node in &report.nodes {
+            let fix = node.network_fix.as_deref().expect("a port fix");
+            assert!(fix.contains("routes:"), "{fix}");
+            assert!(fix.contains("scope: link"), "{fix}");
+            assert!(fix.contains("via: 198.51.100."), "{fix}");
+            assert!(fix.contains("net.ipv4.ip_forward = 1"), "{fix}");
+            let remote = node.network_fix_remote.as_deref().expect("remote");
+            assert_eq!(remote.lines().next(), Some("set -e"), "{remote}");
+            assert!(
+                !remote.lines().any(|line| line.starts_with("sudo ")),
+                "{remote}"
+            );
+        }
+        // Rank 0's neighbours are 1 and 3; rank 2 is reached through one of them.
+        let node = report.nodes[0].network_fix.as_deref().expect("fix");
+        assert!(node.contains("to: 198.51.100.22/32"), "{node}");
+        assert!(node.contains("to: 198.51.100.23/32"), "{node}");
+        assert!(node.contains("via: 198.51.100.22"), "{node}");
+    }
+
+    #[test]
+    fn a_ring_whose_routes_and_forwarding_are_installed_needs_no_further_fix() {
+        // The setup has to converge: once the routes and forwarding are in place the check must
+        // stop offering the port command, or the guide would ask for it forever.
+        let mut probes = cluster();
+        let fabric = ring_fabric();
+        let routes = fabric_routes(&probes, Some(&fabric));
+        for (rank, probe) in probes.iter_mut().enumerate() {
+            let facts = probe.as_mut().expect("facts");
+            facts.forward = true;
+            for route in &routes[rank] {
+                facts.routes.push(Route {
+                    destination: format!("{}/32", route.to),
+                    netdev: route.netdev.clone(),
+                    via: route.via.map(|via| via.to_string()),
+                    metric: 0,
+                    dhcp: false,
+                });
+            }
+        }
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(fabric), true, 1);
+        for node in &report.nodes {
+            assert!(
+                node.network_fix.is_none(),
+                "rank {} still gets a fix: {:?}",
+                node.rank,
+                node.network_fix
+            );
+        }
     }
 
     #[test]
@@ -2538,6 +2847,9 @@ link enP2p1s0f1np1 1500 up 0 0
             !remote.lines().any(|line| line.starts_with("sudo ")),
             "{remote}"
         );
+        // A step that fails must stop the body: `netplan apply` at the end must not turn a failed
+        // `tee` into a successful job.
+        assert_eq!(remote.lines().next(), Some("set -e"), "{remote}");
         assert!(
             remote.contains("tee /etc/netplan/60-sparkflash-fabric.yaml"),
             "{remote}"

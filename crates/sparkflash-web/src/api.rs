@@ -144,6 +144,11 @@ const NETWORK_SETUP_EXCLUSIVE: &[&str] = &[
     "prepare-r3",
 ];
 
+/// How old the last node check may be when its port fixes are applied. The fixes carry the
+/// addresses and routes the check measured and run as root, so a stale report must not be
+/// replayed onto a cluster that has since changed under it.
+const NETWORK_SETUP_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+
 /// How long a stop or its confirmation through the launcher may take.
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
@@ -1110,6 +1115,15 @@ async fn network_setup(State(web): State<WebState>) -> Response {
             "the last node check was taken of a different configuration; check the nodes again",
         );
     };
+    // The config was not the only thing that could change since the check: an address, a lease or
+    // a cable could have. Ten minutes is long enough to read the report and click the button.
+    if now_ms().saturating_sub(report.checked_ms) > NETWORK_SETUP_MAX_AGE_MS {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check is more than ten minutes old; check the nodes again before \
+             writing its fixes",
+        );
+    }
     // netplan apply drops the fast ports for a moment, so a serving cluster would lose the links
     // its collectives are mid-transfer on.
     if web.stats.latest().is_some_and(|sample| sample.online) {
@@ -3529,6 +3543,43 @@ mod tests {
             .to_owned();
         assert!(error.contains("still reports a problem on"), "{error}");
         assert!(!error.contains("already match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_a_report_older_than_ten_minutes() {
+        // The fixes replay the addresses and routes measured at check time under root. The
+        // configuration check cannot see a host that changed since, so the age is bounded too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            report.checked_ms = 1;
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("more than ten minutes old"), "{error}");
     }
 
     #[test]

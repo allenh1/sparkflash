@@ -41,10 +41,11 @@
 //! ~~~
 //!
 //! On the switched fabric every transfer is a switch hop. On a switchless fabric a diagonal
-//! transfer crosses the two cables through the ConnectX-7 of the Spark between them, which
-//! forwards it inside the ASIC (its hairpin, or relay), so the sender still posts one transfer;
-//! that forwarding has to be programmed; without it a bare DAC ring has no path to a
-//! non-neighbour, and the reference transport opens a connection to every rank.
+//! transfer crosses the two cables through the Spark between them, so the sender still posts one
+//! transfer; that Spark has to forward it, which the web port setup does by routing the address
+//! through it and turning on forwarding (the ConnectX-7 can also do it in the ASIC). Without it a
+//! bare DAC ring has no path to a non-neighbour, and the reference transport opens a connection to
+//! every rank.
 
 use std::ops::Range;
 
