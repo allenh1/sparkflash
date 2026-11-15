@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Measure one served request: the card, the prefill, and the tokens after it.
 
-    python3 scripts/inkling-serve-probe.py [--base http://127.0.0.1:8010] [--prompt TEXT]
+    python3 scripts/inkling-serve-probe.py [--base http://127.0.0.1:8000] [--prompt TEXT]
                                           [--max-tokens N] [--chat]
 
 The first streamed chunk is the time to first token - the prompt's prefill plus the control
@@ -24,7 +24,7 @@ def request(base, path, body=None, timeout=900):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="http://127.0.0.1:8010")
+    parser.add_argument("--base", default="http://127.0.0.1:8000")
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-tokens", type=int, default=9)
     parser.add_argument("--chat", action="store_true")

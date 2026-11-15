@@ -37,7 +37,7 @@ source "$(dirname "$0")/inkling-env.sh"
 CKPT=${CKPT:-$MODEL_DIR/ckpt}
 CONVERTED=${CONVERTED:-$MODEL_DIR/converted}
 CONTEXT=${CONTEXT:-1048576}
-BIND=${BIND:-0.0.0.0:8010}
+BIND=${BIND:-0.0.0.0:8000}
 LANES=${LANES:-1}
 
 common=(

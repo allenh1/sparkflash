@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Concurrency probe: the same greedy requests one at a time, then N at once.
 
-    python3 scripts/inkling-lanes-probe.py [--base http://127.0.0.1:8010] [--max-tokens N]
+    python3 scripts/inkling-lanes-probe.py [--base http://127.0.0.1:8000] [--max-tokens N]
                                            [--widths 1,2,4] [--requests N]
 
 Prints, for each width, the requests' time to first token, each request's decode rate and the
@@ -94,7 +94,7 @@ def run(base, model, prompts, max_tokens, width):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="http://127.0.0.1:8010")
+    parser.add_argument("--base", default="http://127.0.0.1:8000")
     parser.add_argument("--max-tokens", type=int, default=64)
     parser.add_argument("--widths", default="1,2,4")
     parser.add_argument("--requests", type=int, default=0)

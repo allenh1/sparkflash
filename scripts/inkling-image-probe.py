@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ask the served model about images it can be checked against.
 
-    python3 scripts/inkling-image-probe.py [--base http://127.0.0.1:8010] [--widths 1,2,4]
+    python3 scripts/inkling-image-probe.py [--base http://127.0.0.1:8000] [--widths 1,2,4]
                                            [--max-tokens N] [--effort LEVEL] [--geometry]
 
 Draws synthetic PNGs in pure Python (no image library) and asks short greedy questions whose
@@ -134,7 +134,7 @@ def show(name, result):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", default="http://127.0.0.1:8010")
+    parser.add_argument("--base", default="http://127.0.0.1:8000")
     parser.add_argument("--max-tokens", type=int, default=384)
     parser.add_argument("--effort", default=None)
     parser.add_argument("--geometry", action="store_true", help="only the layout cases")
