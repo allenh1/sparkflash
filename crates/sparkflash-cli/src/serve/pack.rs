@@ -1118,7 +1118,8 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
             max_tokens: options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
             concurrency: options.concurrency,
             ..sparkflash_serve::HostOptions::default()
-        },
+        }
+        .with_env()?,
     )?;
     let metrics = driver.metrics();
     println!(
@@ -1214,7 +1215,8 @@ pub(super) fn serve_arm_identity<A: PackArm>(
             max_tokens: options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
             concurrency: options.concurrency,
             ..sparkflash_serve::HostOptions::default()
-        },
+        }
+        .with_env()?,
     )?;
     let metrics = driver.metrics();
     println!(

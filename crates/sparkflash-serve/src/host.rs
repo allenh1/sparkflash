@@ -18,7 +18,15 @@
 //! requests when the backend says the sequence can continue from the prefix the next prompt shares
 //! with it ([ModelSession::reusable_prefix]), so a chat turn prefills only the text it added
 //! instead of the whole conversation. A prompt that does not extend the held tokens gets a fresh
-//! session; the two are equivalent, and only the work differs. Requests arrive through a bounded
+//! session; the two are equivalent, and only the work differs.
+//!
+//! Two cases continue a held sequence although the ids differ. A client that sends the model's
+//! reply back as text has it re-encoded, and the tokenizer may spell a word with other ids than the
+//! model chose (`ĠRibb`+`on` against `Ġ`+`Ribbon`): when the prompt spells the held tokens' exact
+//! bytes, the sequence continues from its own ids and forwards the rest
+//! ([HostOptions::reuse_by_text]). And a request whose client left after its prefill finished keeps
+//! the sequence and the step it computed, so a retry of the same prompt answers from that step
+//! instead of prefilling it again. Requests arrive through a bounded
 //! channel and their events leave through a bounded reply channel, so a client that stops reading
 //! applies backpressure to the engine rather than growing an unbounded buffer.
 //!
@@ -58,7 +66,7 @@ use sparkflash_api::telemetry_types::{
 use sparkflash_model::telemetry::PrefixMatchPlan;
 use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
-    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation,
+    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation, StepOutput,
 };
 use tokio::sync::mpsc;
 
@@ -80,6 +88,27 @@ pub const ENGINE_GONE_CODE: &str = "engine_gone";
 /// The error code for a request refused before any backend work.
 pub const REFUSED_CODE: &str = "refused";
 
+/// The environment switch for [HostOptions::reuse_by_text]: `0` (or `off`) turns it off.
+pub const REUSE_BY_TEXT_ENV: &str = "SPARKFLASH_REUSE_BY_TEXT";
+
+/// Reads [REUSE_BY_TEXT_ENV]: unset is on, `1`/`on`/`true`/`yes` is on, `0`/`off`/`false`/`no` is
+/// off. Any other value is refused rather than read as either.
+fn reuse_by_text_from_env() -> Result<bool, String> {
+    match std::env::var(REUSE_BY_TEXT_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{REUSE_BY_TEXT_ENV} is not valid UTF-8"))
+        }
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => Ok(true),
+            "0" | "off" | "false" | "no" => Ok(false),
+            _ => Err(format!(
+                "{REUSE_BY_TEXT_ENV}={value:?} is neither on (1) nor off (0)"
+            )),
+        },
+    }
+}
+
 /// How the generic host driver is sized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostOptions {
@@ -95,6 +124,10 @@ pub struct HostOptions {
     /// batch: it opens that many independent sessions and lets the operating system interleave
     /// their steps. A backend whose sessions share mutable state must keep this at 1.
     pub concurrency: usize,
+    /// Whether a held sequence continues a prompt that spells its tokens' exact bytes with other
+    /// ids, from its own ids. The model then reads the ids it chose for that span, not the ones a
+    /// cold prefill of the prompt would read. On by default; [REUSE_BY_TEXT_ENV] turns it off.
+    pub reuse_by_text: bool,
 }
 
 impl Default for HostOptions {
@@ -104,7 +137,21 @@ impl Default for HostOptions {
             queue_capacity: DEFAULT_QUEUE,
             reply_buffer: DEFAULT_REPLY_BUFFER,
             concurrency: 1,
+            reuse_by_text: true,
         }
+    }
+}
+
+impl HostOptions {
+    /// These options with the switches the environment sets ([REUSE_BY_TEXT_ENV]).
+    ///
+    /// # Errors
+    /// A switch whose value is neither on nor off.
+    pub fn with_env(self) -> Result<Self, String> {
+        Ok(Self {
+            reuse_by_text: reuse_by_text_from_env()?,
+            ..self
+        })
     }
 }
 
@@ -165,10 +212,11 @@ impl HostDriver {
             let queued = queued.clone();
             let ready = ready.clone();
             let thread_metrics = Arc::clone(&metrics);
+            let by_text = options.reuse_by_text;
             let handle = std::thread::Builder::new()
                 .name(format!("sparkflash-host-engine-{worker}"))
                 .spawn(move || {
-                    host_thread(backend, codec, queued, ready, thread_metrics);
+                    host_thread(backend, codec, queued, ready, thread_metrics, by_text);
                 })
                 .map_err(|error| format!("cannot start host engine worker {worker}: {error}"))?;
             handles.push(handle);
@@ -481,6 +529,7 @@ fn host_thread(
     jobs: Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     metrics: Arc<Metrics>,
+    by_text: bool,
 ) {
     if ready.send(Ok(())).is_err() {
         return;
@@ -491,12 +540,19 @@ fn host_thread(
     drop(ready);
     // The sequence this worker last served, kept for the next request when the backend says it
     // can continue from the prefix that request shares with it.
-    let mut held: Option<Box<dyn ModelSession>> = None;
+    let mut held: Option<Held> = None;
     while let Ok(job) = jobs.recv() {
         metrics.request_admitted();
         let replies = job.replies.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            run_request(backend.as_ref(), codec.as_ref(), job, &metrics, &mut held)
+            run_request(
+                backend.as_ref(),
+                codec.as_ref(),
+                job,
+                &metrics,
+                &mut held,
+                by_text,
+            )
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
@@ -523,15 +579,156 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// How many of `prompt` the held session already holds, when it may serve this request.
+/// A sequence a worker keeps between requests.
+struct Held {
+    session: Box<dyn ModelSession>,
+    /// The step after the last token the session holds, and the sampler that drew it.
+    ///
+    /// A request whose prompt is exactly the held history has nothing left to forward, so only
+    /// this step can answer it: the retry of a request whose client left once its prefill was done.
+    pending: Option<(Sampling, StepOutput)>,
+}
+
+/// How a request continues the held sequence.
+struct Continuation {
+    /// The ids the session is handed when they are not the request's own: its prompt with the
+    /// held ids where it spells their bytes with others.
+    respelled: Option<Vec<u32>>,
+    /// How many of the ids the session is handed it already holds.
+    held: usize,
+    /// How many of the request's own prompt ids those stand for.
+    covered: usize,
+    /// The session has nothing left to forward and answers from its pending step.
+    resume: bool,
+}
+
+impl Continuation {
+    /// A fresh sequence: nothing held.
+    const COLD: Self = Self {
+        respelled: None,
+        held: 0,
+        covered: 0,
+        resume: false,
+    };
+}
+
+/// How `job` may continue `kept`, when it may.
 ///
-/// The session must have a reusable history, the prompt must extend it (strictly: a session with
-/// nothing left to forward has no logits for the last token), and the histories must agree token
-/// for token.
-fn reusable_prefix_len(session: &dyn ModelSession, prompt: &[u32]) -> Option<usize> {
-    let history = session.reusable_prefix()?;
-    (!history.is_empty() && prompt.len() > history.len() && prompt.starts_with(history))
-        .then_some(history.len())
+/// The prompt must extend the held tokens, or, with `by_text`, spell their exact bytes and then
+/// extend them. Extend means strictly unless the held step answers the request: a session with
+/// nothing left to forward has no other logits for the last token. Images must lie past what is
+/// held, since a held history is ids only and cannot match an image's pixels, and a re-spelled
+/// prompt carries none because the re-spelling would move their spans.
+fn continuation(
+    kept: &Held,
+    job: &Job,
+    codec: &dyn PromptCodec,
+    by_text: bool,
+) -> Option<Continuation> {
+    let history = kept
+        .session
+        .reusable_prefix()
+        .filter(|history| !history.is_empty())?;
+    let prompt = job.prompt_tokens.as_slice();
+    let (respelled, covered) = if prompt.starts_with(history) {
+        (None, history.len())
+    } else if by_text && job.images.is_empty() {
+        let (ids, covered) = respelled_prompt(codec, history, prompt)?;
+        (Some(ids), covered)
+    } else {
+        return None;
+    };
+    if job.images.iter().any(|image| image.span.start < covered) {
+        return None;
+    }
+    let handed = respelled.as_ref().map_or(prompt.len(), Vec::len);
+    let resume = handed == history.len();
+    if resume {
+        let (sampling, _) = kept.pending.as_ref()?;
+        if *sampling != sampling_for(job.sampling, handed) {
+            return None;
+        }
+    }
+    Some(Continuation {
+        respelled,
+        held: history.len(),
+        covered,
+        resume,
+    })
+}
+
+/// `sampling` for a session handed `handed` prompt ids.
+fn sampling_for(mut sampling: Sampling, handed: usize) -> Sampling {
+    sampling.prompt_len = handed;
+    sampling
+}
+
+/// `prompt` with the held ids in place of the ids that spell the same bytes, and how many of
+/// `prompt`'s ids the held ones stand for.
+///
+/// The two agree id for id up to where they part. From there `prompt` must spell the rest of
+/// `history` byte for byte in vocabulary spellings, special tokens included, ending on one of its
+/// own id boundaries. The codec's decode of the result must then equal its decode of `prompt`, so
+/// the conversation reads the same to it as well.
+fn respelled_prompt(
+    codec: &dyn PromptCodec,
+    history: &[u32],
+    prompt: &[u32],
+) -> Option<(Vec<u32>, usize)> {
+    let shared = history
+        .iter()
+        .zip(prompt)
+        .take_while(|(held, given)| held == given)
+        .count();
+    if shared == history.len() || shared == prompt.len() {
+        return None;
+    }
+    let mut held = Vec::new();
+    for &id in &history[shared..] {
+        held.extend_from_slice(codec.token_str(id)?.as_bytes());
+    }
+    let (mut spelled, mut covered) = (0usize, shared);
+    while spelled < held.len() {
+        let piece = codec.token_str(*prompt.get(covered)?)?;
+        let piece = piece.as_bytes();
+        if held.get(spelled..spelled + piece.len()) != Some(piece) {
+            return None;
+        }
+        spelled += piece.len();
+        covered += 1;
+    }
+    let mut ids = Vec::with_capacity(history.len() + prompt.len() - covered);
+    ids.extend_from_slice(history);
+    ids.extend_from_slice(&prompt[covered..]);
+    (codec.decode(&ids)? == codec.decode(prompt)?).then_some((ids, covered))
+}
+
+/// The prompt ids a request's hit stands for, from the ids the session reports it reused.
+fn client_cached(session_cached: usize, plan: &Continuation) -> usize {
+    if session_cached >= plan.held {
+        session_cached - plan.held + plan.covered
+    } else {
+        session_cached.min(plan.covered)
+    }
+}
+
+/// Why a request stopped before it finished.
+enum Ending {
+    /// The client stopped reading. The sequence is intact and may serve a retry.
+    ClientGone,
+    /// The request could not be answered, and the sequence is intact.
+    Refused(String),
+    /// The backend failed, and the sequence's state is unknown.
+    Failed(String),
+}
+
+impl Ending {
+    fn message(self) -> String {
+        match self {
+            Self::ClientGone => "the client stopped reading this response".to_owned(),
+            Self::Refused(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 fn run_request(
@@ -539,55 +736,140 @@ fn run_request(
     codec: &dyn PromptCodec,
     job: Job,
     metrics: &Metrics,
-    held: &mut Option<Box<dyn ModelSession>>,
+    held: &mut Option<Held>,
+    by_text: bool,
 ) -> Result<(), String> {
-    let started = Instant::now();
-    // A held history is ids only, so a prefix that would cover an image's span cannot be matched
-    // by its ids; such a request starts a fresh sequence.
-    let reusable = |session: &dyn ModelSession| {
-        reusable_prefix_len(session, &job.prompt_tokens)
-            .filter(|cached| job.images.iter().all(|image| image.span.start >= *cached))
-    };
-    // A held sequence this request cannot continue is dropped before the next one opens, never
-    // after: a session owns its whole cache, and at a long context two of them do not fit (an
-    // Inkling rank at the 1M window holds 8 GiB a session beside a chunk scratch, and opening the
-    // second ran the lead out of memory).
-    let (mut session, cached) = match held
-        .take()
-        .and_then(|session| reusable(session.as_ref()).map(|cached| (session, cached)))
-    {
-        Some(continued) => continued,
-        None => (
-            backend
-                .open_session()
-                .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
-            0,
-        ),
-    };
-    session.set_sampling(job.sampling);
+    // A request whose client is already gone, such as a retry queued behind the request it
+    // replaced, must not cost the held sequence the next request may continue.
+    if job.replies.is_closed() {
+        return Err(Ending::ClientGone.message());
+    }
     if job.logprobs.wants_prompt() {
         return Err(
             "the generic host backend does not expose per-position prompt logits yet".to_owned(),
         );
     }
+    let started = Instant::now();
+    let kept = held.take();
+    let plan = kept
+        .as_ref()
+        .and_then(|kept| continuation(kept, &job, codec, by_text));
+    // A held sequence this request cannot continue is dropped before the next one opens, never
+    // after: a session owns its whole cache, and at a long context two of them do not fit (an
+    // Inkling rank at the 1M window holds 8 GiB a session beside a chunk scratch, and opening the
+    // second ran the lead out of memory).
+    let (mut session, pending, plan) = match (kept, plan) {
+        (Some(kept), Some(plan)) => (kept.session, kept.pending, plan),
+        (kept, _) => {
+            drop(kept);
+            let session = backend
+                .open_session()
+                .map_err(|error| format!("the backend could not open a sequence: {error}"))?;
+            (session, None, Continuation::COLD)
+        }
+    };
+    if let Some(ids) = &plan.respelled {
+        eprintln!(
+            "sparkflash serve: prefix reuse by text: the prompt spells the held reply with other ids; {} held ids stand for {} of its {}, {} to forward",
+            plan.held,
+            plan.covered,
+            job.prompt_tokens.len(),
+            ids.len() - plan.held,
+        );
+    }
+    if plan.resume {
+        eprintln!(
+            "sparkflash serve: prefix reuse: the prompt is the held sequence of {} ids; answering from its held step",
+            plan.held,
+        );
+    }
+    let (ending, last) = serve_request(
+        session.as_mut(),
+        codec,
+        &job,
+        metrics,
+        &plan,
+        pending.as_ref().map(|(_, step)| step),
+        started,
+    );
+    // Keep the sequence unless the backend failed in it. One the request moved keeps the step
+    // after its last token; one it never touched keeps the step it had.
+    if !matches!(ending, Err(Ending::Failed(_)))
+        && session
+            .reusable_prefix()
+            .is_some_and(|prefix| !prefix.is_empty())
+    {
+        let handed = plan
+            .respelled
+            .as_ref()
+            .map_or(job.prompt_tokens.len(), Vec::len);
+        let pending = match last {
+            Some(step) => Some((sampling_for(job.sampling, handed), step)),
+            None => pending,
+        };
+        *held = Some(Held { session, pending });
+    }
+    ending.map_err(Ending::message)
+}
+
+/// Runs `job` on `session` as `plan` says, and returns how it ended with the step after the last
+/// token the session holds, when the request moved the session.
+fn serve_request(
+    session: &mut dyn ModelSession,
+    codec: &dyn PromptCodec,
+    job: &Job,
+    metrics: &Metrics,
+    plan: &Continuation,
+    pending: Option<&StepOutput>,
+    started: Instant,
+) -> (Result<(), Ending>, Option<StepOutput>) {
+    let send = |reply: Reply| {
+        job.replies
+            .blocking_send(reply)
+            .map_err(|_| Ending::ClientGone)
+    };
     // The worker owns the decision, so the client learns the hit before the prefill runs and the
     // event stays first in the stream.
-    job.replies
-        .blocking_send(Reply::Started {
-            cached_tokens: cached,
-        })
-        .map_err(|_| "the client stopped reading this response".to_owned())?;
+    if let Err(ending) = send(Reply::Started {
+        cached_tokens: plan.covered,
+    }) {
+        return (Err(ending), None);
+    }
+    let prompt = plan.respelled.as_deref().unwrap_or(&job.prompt_tokens);
     let prefill_started = Instant::now();
-    let mut step = session
-        .prefill_images(&job.prompt_tokens, &job.images)
-        .map_err(|error| {
-            format!(
-                "prefill failed after {} prompt token(s): {error}",
-                job.prompt_tokens.len()
-            )
-        })?;
+    let (mut step, cached) = if plan.resume {
+        // The held step was drawn under this request's sampler (see `continuation`); setting it
+        // again could restart the random source that step already drew from.
+        let Some(step) = pending else {
+            return (
+                Err(Ending::Failed(
+                    "the held sequence was to resume from a step it does not have".to_owned(),
+                )),
+                None,
+            );
+        };
+        (step.clone(), job.prompt_tokens.len())
+    } else {
+        session.set_sampling(sampling_for(job.sampling, prompt.len()));
+        match session.prefill_images(prompt, &job.images) {
+            Ok(step) => (step, client_cached(session.cached_tokens(), plan)),
+            Err(error) => {
+                return (
+                    Err(Ending::Failed(format!(
+                        "prefill failed after {} prompt token(s): {error}",
+                        job.prompt_tokens.len()
+                    ))),
+                    None,
+                );
+            }
+        }
+    };
     let prefill_elapsed = prefill_started.elapsed();
-    let cached = session.cached_tokens();
+    // A client that left during the prefill is caught before the first decode, so the sequence
+    // holds exactly the prompt and the retry answers from this step.
+    if job.replies.is_closed() {
+        return (Err(Ending::ClientGone), Some(step));
+    }
     let mut generated = Vec::new();
     let mut decoded = String::new();
     let mut stop_buffer = StopBuffer::new(&job.stop);
@@ -609,35 +891,46 @@ fn run_request(
         let piece = decode_new(codec, &mut decoded, &generated);
         let emit = stop_buffer.push(piece.as_deref());
         if want_sample {
-            let entry = token_logprob(&step.logits, token, &job.logprobs, codec)?;
-            if !emit.is_empty() {
-                job.replies
-                    .blocking_send(Reply::Delta(emit))
-                    .map_err(|_| "the client stopped reading this response".to_owned())?;
+            let entry = match token_logprob(&step.logits, token, &job.logprobs, codec) {
+                Ok(entry) => entry,
+                Err(message) => return (Err(Ending::Refused(message)), Some(step)),
+            };
+            if !emit.is_empty()
+                && let Err(ending) = send(Reply::Delta(emit))
+            {
+                return (Err(ending), Some(step));
             }
-            job.replies
-                .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
-        } else if !emit.is_empty() {
-            job.replies
-                .blocking_send(Reply::Delta(emit))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
+            if let Err(ending) = send(Reply::TokenLogprobs(Box::new(entry))) {
+                return (Err(ending), Some(step));
+            }
+        } else if !emit.is_empty()
+            && let Err(ending) = send(Reply::Delta(emit))
+        {
+            return (Err(ending), Some(step));
         }
         completion_tokens += 1;
         metrics.record_generation_tokens(1);
         if stop_buffer.matched() {
             break;
         }
-        step = session.decode(token).map_err(|error| {
-            format!("decode failed after {completion_tokens} token(s): {error}")
-        })?;
+        step = match session.decode(token) {
+            Ok(step) => step,
+            Err(error) => {
+                return (
+                    Err(Ending::Failed(format!(
+                        "decode failed after {completion_tokens} token(s): {error}"
+                    ))),
+                    None,
+                );
+            }
+        };
         next = step.next_token;
     }
     let tail = stop_buffer.finish();
-    if !tail.is_empty() {
-        job.replies
-            .blocking_send(Reply::Delta(tail))
-            .map_err(|_| "the client stopped reading this response".to_owned())?;
+    if !tail.is_empty()
+        && let Err(ending) = send(Reply::Delta(tail))
+    {
+        return (Err(ending), Some(step));
     }
     let elapsed = started.elapsed();
     // The prefill rate is the work the engine did, not the prompt it was given: the tokens the
@@ -657,24 +950,14 @@ fn run_request(
         FinishReason::Stop
     };
     let speculation = session.speculation();
-    job.replies
-        .blocking_send(Reply::Done(Box::new(HostSummary {
-            completion_tokens,
-            finish_reason,
-            timing,
-            speculation,
-            cached_tokens: cached,
-        })))
-        .map_err(|_| "the client stopped reading this response".to_owned())?;
-    // Hold the sequence for the next request when it can continue from a prefix. The client has
-    // its whole answer by now, so a failure to store costs nothing.
-    if session
-        .reusable_prefix()
-        .is_some_and(|prefix| !prefix.is_empty())
-    {
-        *held = Some(session);
-    }
-    Ok(())
+    let ending = send(Reply::Done(Box::new(HostSummary {
+        completion_tokens,
+        finish_reason,
+        timing,
+        speculation,
+        cached_tokens: cached,
+    })));
+    (ending, Some(step))
 }
 
 /// Decodes the whole generated prefix and returns the part that is new.

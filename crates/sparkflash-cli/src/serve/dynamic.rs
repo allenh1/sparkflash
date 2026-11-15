@@ -699,7 +699,8 @@ pub(crate) fn serve_backend_world(
             max_tokens: options.max_tokens,
             concurrency: options.concurrency,
             ..sparkflash_serve::HostOptions::default()
-        },
+        }
+        .with_env()?,
     )?;
     let metrics = driver.metrics();
     let engine: Arc<dyn ApiInferenceEngine> = match dialect {

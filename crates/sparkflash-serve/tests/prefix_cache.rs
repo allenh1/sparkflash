@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! The host driver's prefix cache: a kept sequence continues from the tokens it holds, so the
-//! next request prefills only what it added, and the hit is reported as such.
+//! next request prefills only what it added, and the hit is reported as such. A prompt that spells
+//! the held tokens' bytes with other ids continues them too, and a request whose client left after
+//! its prefill keeps its work for the retry.
 
 use std::sync::{Arc, Mutex};
 
@@ -24,6 +26,7 @@ use sparkflash_model::{
     StepOutput,
 };
 use sparkflash_serve::{HostDriver, HostOptions};
+use tokio::time::{Duration, timeout};
 
 const MODEL: &str = "toy/prefix";
 const VOCAB: usize = 64;
@@ -56,6 +59,41 @@ impl PromptCodec for Codec {
     }
 }
 
+/// A codec whose spellings tile like a byte-level vocabulary's: `10`+`11` and `20`+`21` both spell
+/// `abc`, the way a tokenizer may spell a word the model wrote with ids other than the model's.
+struct Spelling;
+
+impl PromptCodec for Spelling {
+    fn encode_chat(
+        &self,
+        _request: &serde_json::Value,
+    ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+        Ok(vec![1])
+    }
+
+    fn encode_text(
+        &self,
+        _text: &str,
+        _add_special_tokens: bool,
+    ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+        Ok(vec![1])
+    }
+
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        ids.iter().map(|id| self.token_str(*id)).collect()
+    }
+
+    fn token_str(&self, id: u32) -> Option<String> {
+        Some(match id {
+            10 => "ab".to_owned(),
+            11 => "c".to_owned(),
+            20 => "a".to_owned(),
+            21 => "bc".to_owned(),
+            other => format!("<{other}>"),
+        })
+    }
+}
+
 fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL.to_owned(),
@@ -76,6 +114,8 @@ fn descriptor() -> ModelDescriptor {
 struct Recorder {
     prefills: Mutex<Vec<Vec<u32>>>,
     sessions: Mutex<(usize, usize)>,
+    /// When set, every prefill waits on it; the test opens it by dropping the sender.
+    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl Recorder {
@@ -149,6 +189,15 @@ impl ModelSession for PrefixSession {
     fn set_sampling(&mut self, _sampling: Sampling) {}
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        if let Some(gate) = self
+            .recorder
+            .gate
+            .lock()
+            .expect("the recorder lock")
+            .as_ref()
+        {
+            let _ = gate.recv();
+        }
         // The driver only hands a kept sequence a prompt that extends it; anything else is a
         // backend contract violation, as it is on the real arm.
         let reused = self
@@ -245,18 +294,35 @@ async fn answer(driver: &HostDriver, request: EngineRequest) -> Answer {
 }
 
 fn host_driver(recorder: Arc<Recorder>) -> HostDriver {
+    host_driver_with(recorder, Arc::new(Codec), true)
+}
+
+fn host_driver_with(
+    recorder: Arc<Recorder>,
+    codec: Arc<dyn PromptCodec>,
+    reuse_by_text: bool,
+) -> HostDriver {
     HostDriver::start(
         Box::new(PrefixBackend {
             descriptor: descriptor(),
             recorder,
         }),
-        Arc::new(Codec),
+        codec,
         HostOptions {
             max_tokens: 8,
+            reuse_by_text,
             ..HostOptions::default()
         },
     )
     .expect("the host driver starts")
+}
+
+/// A first turn that writes `10`,`11` (`abc`) after the prompt `5 6 7`, so the sequence holds
+/// `5 6 7 10 11`.
+fn first_turn() -> EngineRequest {
+    let mut first = request("a", vec![5, 6, 7], 2);
+    first.forced_tokens = vec![10, 11];
+    first
 }
 
 /// The ids a request emitted, from the dot separated text the toy codec produces.
@@ -325,4 +391,115 @@ async fn a_prompt_that_does_not_extend_the_held_tokens_starts_a_fresh_sequence()
     // The held sequence is gone before the fresh one opens: a real arm's session owns its whole
     // cache, and at a long context two of them do not fit.
     assert_eq!(recorder.most_alive(), 1, "two sequences were alive at once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_that_spells_the_held_reply_with_other_ids_continues_it() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver_with(Arc::clone(&recorder), Arc::new(Spelling), true);
+    answer(&driver, first_turn()).await;
+
+    // The client sent the reply back as text, and it came back as `20`+`21`: the same bytes.
+    let respelled = vec![5u32, 6, 7, 20, 21, 9];
+    let second = answer(&driver, request("b", respelled.clone(), 2)).await;
+    assert_eq!(
+        second.cached, 5,
+        "the prompt and the two ids that respell the reply"
+    );
+    assert_eq!(second.usage_cached, 5);
+    assert_eq!(second.usage_miss, 1);
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7], vec![9]],
+        "only the new turn was forwarded"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    // The model reads its own ids for the reply: the answer is a cold run of the held spelling.
+    let cold = host_driver_with(Arc::new(Recorder::default()), Arc::new(Spelling), true);
+    let own = answer(&cold, request("cold", vec![5, 6, 7, 10, 11, 9], 2)).await;
+    assert_eq!(second.text, own.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reuse_by_text_off_prefills_a_respelled_prompt_whole() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver_with(Arc::clone(&recorder), Arc::new(Spelling), false);
+    answer(&driver, first_turn()).await;
+
+    let respelled = vec![5u32, 6, 7, 20, 21, 9];
+    let second = answer(&driver, request("b", respelled.clone(), 2)).await;
+    assert_eq!(second.cached, 0);
+    assert_eq!(second.usage_miss, respelled.len());
+    assert_eq!(recorder.prefills(), vec![vec![5, 6, 7], respelled]);
+    assert_eq!(recorder.most_alive(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_whose_bytes_differ_from_the_held_reply_starts_a_fresh_sequence() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver_with(Arc::clone(&recorder), Arc::new(Spelling), true);
+    answer(&driver, first_turn()).await;
+
+    // `20` alone spells `a`, not `abc`, and `9` does not go on with it.
+    let other = vec![5u32, 6, 7, 20, 9];
+    let second = answer(&driver, request("b", other.clone(), 2)).await;
+    assert_eq!(second.cached, 0);
+    assert_eq!(recorder.prefills(), vec![vec![5, 6, 7], other]);
+}
+
+/// Starts `prompt` on a driver whose prefill waits, reads the request's start, leaves, and lets
+/// the prefill finish.
+async fn abandon_after_prefill(driver: &HostDriver, recorder: &Recorder, prompt: Vec<u32>) {
+    let (open, gate) = std::sync::mpsc::channel();
+    *recorder.gate.lock().expect("the recorder lock") = Some(gate);
+    let mut events = driver.generate(request("left", prompt, 4));
+    let started = timeout(Duration::from_secs(10), events.next())
+        .await
+        .expect("the request starts");
+    assert!(
+        matches!(started, Some(EngineEvent::Started { .. })),
+        "the first event is the start"
+    );
+    drop(events);
+    drop(open);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_retry_of_a_request_whose_client_left_answers_from_its_prefill() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver(Arc::clone(&recorder));
+    let prompt = vec![5u32, 6, 7];
+    abandon_after_prefill(&driver, &recorder, prompt.clone()).await;
+
+    let retry = answer(&driver, request("retry", prompt.clone(), 4)).await;
+    assert_eq!(retry.cached, prompt.len(), "the whole prompt is held");
+    assert_eq!(retry.usage_cached, prompt.len());
+    assert_eq!(retry.usage_miss, 0);
+    assert_eq!(
+        recorder.prefills(),
+        vec![prompt.clone()],
+        "the retry forwarded nothing"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    let cold = host_driver(Arc::new(Recorder::default()));
+    let own = answer(&cold, request("cold", prompt, 4)).await;
+    assert_eq!(retry.text, own.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_with_another_sampler_prefills_again() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver(Arc::clone(&recorder));
+    let prompt = vec![5u32, 6, 7];
+    abandon_after_prefill(&driver, &recorder, prompt.clone()).await;
+
+    // The held step was drawn under the first request's sampler, so it cannot answer this one.
+    let mut retry = request("retry", prompt.clone(), 4);
+    retry.seed = Some(7);
+    let retry = answer(&driver, retry).await;
+    assert_eq!(retry.cached, 0);
+    assert_eq!(recorder.prefills(), vec![prompt.clone(), prompt]);
+    assert_eq!(recorder.most_alive(), 1);
 }

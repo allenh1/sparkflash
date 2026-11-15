@@ -1102,3 +1102,33 @@ The disk reads 11.8 GB/s on one direct stream, so the read alone is about 8 s of
 rest (not split out here) is the host-to-device copy after each 1 GiB window, which the shared
 reader does not overlap with the next read, and the open's own setup. The four-rank device test
 opens through the new path and still answers like the host reference.
+
+### Holding the conversation across a re-spelled reply and a retry
+
+An agentic client on the 1M window stopped at an 84K-token turn: every request ran a cold
+prefill of the whole conversation (7-10 minutes on the exact attention walk), the client gave up
+first, and its retry started cold again. Two things broke the held sequence:
+
+* **The reply came back in other ids.** The model had written `ĠRibb` + `on`; the client sent
+  the reply back as text and the tokenizer spelled it `Ġ` + `Ribbon`. The bytes agree, the ids do
+  not, and the host driver's reuse needed the prompt to extend the held ids exactly, so the
+  79,325 held tokens were dropped. The host driver now matches the held tokens by their bytes
+  (`HostOptions::reuse_by_text`): from the first id the two disagree on, the prompt must spell
+  the held ids' vocabulary spellings byte for byte, ending on one of its own id boundaries, and
+  the codec's decode of the result must equal its decode of the prompt. The sequence then
+  continues from its own ids and forwards the rest. The model reads the ids it chose for that
+  span, not the ones a cold prefill would read. A request with images never takes this path.
+  `SPARKFLASH_REUSE_BY_TEXT=0` turns it off (any value other than on/off is refused at start-up);
+  `scripts/inkling-env.sh` forwards it to every rank.
+* **A request whose client left threw its work away.** A finished prefill whose first send
+  failed dropped the session (the group's `End`), so the retry of the same prompt began cold. A
+  request that ends because its client stopped reading now keeps the sequence and the step after
+  its last token; a retry whose prompt is exactly that sequence, under an equal sampler, answers
+  from the step without a prefill or a new seed. A backend failure still drops the session, and
+  a queued request whose client is already gone is skipped before it touches the held one.
+
+On the four-rank group: a completion forced to write `ĠRibb` + `on`, then a prompt that sends
+` Ribbon` back, reported 10 of 13 prompt tokens cached and forwarded 3. A 6,331-token chat
+abandoned 4 s into its prefill, then retried, reported 6,331 cached and the same message as a
+cold run of that prompt (10.7 s including the abandoned prefill's remainder, against 14.5 s
+cold).
