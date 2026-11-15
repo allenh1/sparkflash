@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
+use sparkflash_model::prompt::message_role;
 use sparkflash_model::{PromptCodec, PromptError};
 use tokenizers::Tokenizer;
 
@@ -133,7 +134,9 @@ impl InklingCodec {
             text.push_str(END_MESSAGE);
         }
         for message in messages {
-            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+            // The released template has no `developer` role; message_role reads it as the
+            // system instruction it is.
+            let role = message_role(message).ok_or_else(|| {
                 PromptError::invalid(
                     "every message needs a role",
                     Some("messages"),
@@ -316,7 +319,7 @@ impl PromptCodec for InklingCodec {
 fn answered_call<'a>(messages: &'a [Value], id: &str) -> Option<&'a str> {
     messages
         .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter(|message| message_role(message) == Some("assistant"))
         .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
         .flatten()
         .filter(|call| call.get("id").and_then(Value::as_str) == Some(id))
@@ -496,6 +499,29 @@ mod tests {
             text,
             "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>hello<|end_message|>"
         );
+    }
+
+    /// A `developer` message is the system instruction under OpenAI's newer name: it renders
+    /// exactly as `system` does, ahead of the effort line, and an unknown role is still refused.
+    #[test]
+    fn a_developer_message_is_the_system_instruction() {
+        let render = |role: &str| {
+            InklingCodec::render_chat(&json!({
+                "messages": [
+                    {"role": role, "content": "be brief"},
+                    {"role": "user", "content": "hello"}
+                ]
+            }))
+            .expect("the template renders")
+        };
+        assert_eq!(render("developer"), render("system"));
+        assert!(render("developer").starts_with(
+            "<|message_system|><|content_text|>be brief<|end_message|><|message_system|>"
+        ));
+        let refused = InklingCodec::render_chat(&json!({
+            "messages": [{"role": "narrator", "content": "x"}]
+        }));
+        assert!(refused.is_err(), "an unknown role is refused");
     }
 
     #[test]

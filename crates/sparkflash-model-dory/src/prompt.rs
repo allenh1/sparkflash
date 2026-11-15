@@ -22,7 +22,7 @@
 //! markers on historical assistant turns.
 
 use serde_json::Value;
-use sparkflash_model::prompt::PromptError;
+use sparkflash_model::prompt::{PromptError, message_role};
 
 const IM_START: &str = "<|im_start|>";
 const IM_END: &str = "<|im_end|>";
@@ -53,7 +53,7 @@ pub fn render_chat(request: &Value) -> Result<String, PromptError> {
         .get("tools")
         .and_then(Value::as_array)
         .filter(|tools| !tools.is_empty());
-    let first_is_system = messages[0].get("role").and_then(Value::as_str) == Some("system");
+    let first_is_system = message_role(&messages[0]) == Some("system");
     let system_defined = first_is_system && messages[0].get("content").is_some();
     let (system, loop_messages) = if first_is_system {
         (content_text(&messages[0])?, &messages[1..])
@@ -62,7 +62,7 @@ pub fn render_chat(request: &Value) -> Result<String, PromptError> {
     };
     let last_user = loop_messages
         .iter()
-        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        .rposition(|message| message_role(message) == Some("user"));
 
     let mut text = String::new();
     if !first_is_system || system_defined || tools.is_some() {
@@ -80,10 +80,7 @@ pub fn render_chat(request: &Value) -> Result<String, PromptError> {
     }
 
     for (index, message) in loop_messages.iter().enumerate() {
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid("every message needs a role"))?;
+        let role = message_role(message).ok_or_else(|| invalid("every message needs a role"))?;
         match role {
             "assistant" => {
                 let content_value = message.get("content");
@@ -165,7 +162,7 @@ pub fn render_chat(request: &Value) -> Result<String, PromptError> {
                 text.push_str(IM_END);
                 text.push('\n');
             }
-            "user" | "system" | "developer" => {
+            "user" | "system" => {
                 let content = if matches!(message.get("content"), Some(Value::Null)) {
                     "None".to_owned()
                 } else {
@@ -184,13 +181,10 @@ pub fn render_chat(request: &Value) -> Result<String, PromptError> {
                 text.push('\n');
             }
             "tool" => {
-                let merged_before = index > 0
-                    && loop_messages[index - 1].get("role").and_then(Value::as_str) == Some("tool");
-                let merged_after = loop_messages
-                    .get(index + 1)
-                    .and_then(|next| next.get("role"))
-                    .and_then(Value::as_str)
-                    == Some("tool");
+                let merged_before =
+                    index > 0 && message_role(&loop_messages[index - 1]) == Some("tool");
+                let merged_after =
+                    loop_messages.get(index + 1).and_then(message_role) == Some("tool");
                 if !merged_before && index > 0 {
                     text.push_str(IM_START);
                     text.push_str("user");
@@ -846,7 +840,9 @@ mod tests {
     }
 
     #[test]
-    fn developer_and_null_user_content_render_like_the_template() {
+    fn null_user_content_renders_like_the_template_and_developer_is_system() {
+        // The released template would print a `developer` turn literally, a role the model never
+        // saw; the shared rule renders it as the system turn it means.
         let text = render_chat(&json!({
             "messages": [
                 {"role": "user", "content": null},
@@ -857,9 +853,20 @@ mod tests {
         .expect("the request renders");
         assert_eq!(
             text,
-            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nNone<|im_end|>\n<|im_start|>developer\nd<|im_end|>\n",
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nNone<|im_end|>\n<|im_start|>system\nd<|im_end|>\n",
             "{text}"
         );
+        let leading = |role: &str| {
+            render_chat(&json!({
+                "messages": [
+                    {"role": role, "content": "be terse"},
+                    {"role": "user", "content": "hello"}
+                ],
+                "chat_template_kwargs": {"enable_thinking": false, "add_generation_prompt": false}
+            }))
+            .expect("the request renders")
+        };
+        assert_eq!(leading("developer"), leading("system"));
     }
 
     #[test]

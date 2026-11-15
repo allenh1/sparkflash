@@ -36,6 +36,7 @@
 use std::path::Path;
 
 use serde_json::Value;
+use sparkflash_model::prompt::message_role;
 use sparkflash_model::{PromptCodec, PromptError};
 
 /// The serialized special tokens the released template writes.
@@ -237,11 +238,11 @@ impl GlmCodec {
         }
         let last_user = messages
             .iter()
-            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+            .rposition(|message| message_role(message) == Some("user"));
         let mut index = 0;
         while index < messages.len() {
             let message = &messages[index];
-            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+            let role = message_role(message).ok_or_else(|| {
                 PromptError::invalid("a message has no role", Some("messages"), None)
             })?;
             match role {
@@ -291,9 +292,7 @@ impl GlmCodec {
                 "tool" => {
                     // The template opens one observation turn for the whole run of tool
                     // messages, so the first of a run writes it and the rest only their response.
-                    if index == 0
-                        || messages[index - 1].get("role").and_then(Value::as_str) != Some("tool")
-                    {
+                    if index == 0 || message_role(&messages[index - 1]) != Some("tool") {
                         text.push_str(OBSERVATION);
                     }
                     let content = self.visible_text(message.get("content"))?;
@@ -615,6 +614,27 @@ mod tests {
         );
         assert_eq!(ids.last(), Some(&154_816), "the prompt ends in <think>");
         assert_eq!(codec.endoftext(), 154_820);
+    }
+
+    #[test]
+    fn a_developer_message_is_a_system_turn() {
+        let codec = codec();
+        let render = |role: &str| {
+            codec
+                .render(&json!({"messages": [
+                    {"role": role, "content": "hello"},
+                    {"role": "user", "content": "hi"}
+                ]}))
+                .expect("the template renders")
+        };
+        assert_eq!(render("developer"), render("system"));
+        assert_eq!(
+            render("developer"),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>hello<|user|>hi<|assistant|><think>"
+        );
+        codec
+            .render(&json!({"messages": [{"role": "narrator", "content": "x"}]}))
+            .expect_err("a role the template has no turn for is still refused");
     }
 
     #[test]
