@@ -27,7 +27,8 @@
 //     attention and of the MLP with taps projected from the sublayer's input.
 //   - q4d_kv_ring: the context keys and values of committed positions, appended to a layer's
 //     ring.
-//   - q4d_attn: the block's non-causal sliding-window GQA over the ring and its own keys.
+//   - q4d_attn: the block's non-causal sliding-window GQA over the ring and its own keys, and
+//     q4d_attn_span, the same over one span of the ring for every row (Inkling's drafter).
 //   - q4d_topk_partial / q4d_topk_final: the target head's top candidates for each draft row, and
 //     at TP the merge of the ranks' candidates for their slices of the vocabulary.
 //   - q4d_select: the candidate selector's greedy walk through the candidates' transition
@@ -147,19 +148,19 @@ extern "C" __global__ void q4d_kv_ring(float* __restrict__ key_ring, float* __re
     }
 }
 
-// The draft block's attention: query row r sits at position base + r and attends, without a
-// causal mask, to every committed position p with base + r - p <= window_left (read from the
-// ring) and to all `block_rows` of the block's own keys. GQA: query head h reads key head
-// h / (heads / kv_heads). Grid (heads, block_rows); blockDim a multiple of 32, at most
-// Q4D_ATTN_WARPS warps, each walking every warps-th key with an online softmax, merged at the end.
-extern "C" __global__ void q4d_attn(const float* __restrict__ queries,
-                                    const float* __restrict__ key_ring,
-                                    const float* __restrict__ value_ring,
-                                    const float* __restrict__ block_keys,
-                                    const float* __restrict__ block_values,
-                                    float* __restrict__ out, int heads, int kv_heads, int head_dim,
-                                    int base, int window_left, int ring, int block_rows,
-                                    float scale) {
+// One query row of the draft block's attention: row `row` attends, without a causal mask, to the
+// committed positions [lowest, base) (read from the ring) and to all `block_rows` of the block's
+// own keys. GQA: query head h reads key head h / (heads / kv_heads). blockDim a multiple of 32, at
+// most Q4D_ATTN_WARPS warps, each walking every warps-th key with an online softmax, merged at the
+// end.
+__device__ __forceinline__ void q4d_attn_row(const float* __restrict__ queries,
+                                             const float* __restrict__ key_ring,
+                                             const float* __restrict__ value_ring,
+                                             const float* __restrict__ block_keys,
+                                             const float* __restrict__ block_values,
+                                             float* __restrict__ out, int heads, int kv_heads,
+                                             int head_dim, int base, int lowest, int ring,
+                                             int block_rows, float scale, int head, int row) {
     __shared__ float s_max[Q4D_ATTN_WARPS];
     __shared__ float s_sum[Q4D_ATTN_WARPS];
     __shared__ float s_acc[Q4D_ATTN_WARPS][Q4D_HEAD_DIM];
@@ -169,14 +170,11 @@ extern "C" __global__ void q4d_attn(const float* __restrict__ queries,
     if (head_dim != Q4D_HEAD_DIM || warps > Q4D_ATTN_WARPS || heads % kv_heads != 0) {
         return;
     }
-    const int head = blockIdx.x;
-    const int row = blockIdx.y;
     const int key_head = head / (heads / kv_heads);
     const int q_width = heads * head_dim;
     const int kv_width = kv_heads * head_dim;
     const float4 query = *reinterpret_cast<const float4*>(
         queries + (unsigned long long)row * q_width + head * head_dim + lane * 4);
-    const int lowest = max(0, base + row - window_left);
     const int context = max(0, base - lowest);
     const int total = context + block_rows;
 
@@ -242,6 +240,38 @@ extern "C" __global__ void q4d_attn(const float* __restrict__ queries,
     for (int i = 0; i < 4; ++i) {
         into[i] = merged[i] / merged_sum;
     }
+}
+
+// The draft block's attention: query row r sits at position base + r and attends to every
+// committed position p with base + r - p <= window_left and to all `block_rows` of the block's own
+// keys. Grid (heads, block_rows); see q4d_attn_row.
+extern "C" __global__ void q4d_attn(const float* __restrict__ queries,
+                                    const float* __restrict__ key_ring,
+                                    const float* __restrict__ value_ring,
+                                    const float* __restrict__ block_keys,
+                                    const float* __restrict__ block_values,
+                                    float* __restrict__ out, int heads, int kv_heads, int head_dim,
+                                    int base, int window_left, int ring, int block_rows,
+                                    float scale) {
+    const int row = blockIdx.y;
+    q4d_attn_row(queries, key_ring, value_ring, block_keys, block_values, out, heads, kv_heads,
+                 head_dim, base, max(0, base + row - window_left), ring, block_rows, scale,
+                 blockIdx.x, row);
+}
+
+// The draft block's attention over one span of committed positions for every row: each row
+// attends to [lowest, base) and to all `block_rows` of the block's own keys (Inkling's drafter
+// anchors its windows at the block, not at each row). Grid (heads, block_rows); see q4d_attn_row.
+extern "C" __global__ void q4d_attn_span(const float* __restrict__ queries,
+                                         const float* __restrict__ key_ring,
+                                         const float* __restrict__ value_ring,
+                                         const float* __restrict__ block_keys,
+                                         const float* __restrict__ block_values,
+                                         float* __restrict__ out, int heads, int kv_heads,
+                                         int head_dim, int base, int lowest, int ring,
+                                         int block_rows, float scale) {
+    q4d_attn_row(queries, key_ring, value_ring, block_keys, block_values, out, heads, kv_heads,
+                 head_dim, base, lowest, ring, block_rows, scale, blockIdx.x, blockIdx.y);
 }
 
 // The block's top k of `count` (value, id) pairs, best first, into out_values / out_ids. The pairs
