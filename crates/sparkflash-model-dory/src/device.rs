@@ -811,7 +811,8 @@ const WIDE_SHARED: u32 = 98_304;
 
 /// The head widths dory_attn_mma is instantiated for.
 const PREFILL_HEAD_DIMS: [usize; 4] = [16, 64, 128, 256];
-/// dory_attn_mma's query positions a block and keys a shared tile (DORY_MMA_Q, DORY_MMA_KEYS).
+/// dory_attn_mma's query positions a block and keys a shared tile (SHARED_ATTN_Q,
+/// SHARED_ATTN_KEYS in kernels/shared_attn_mma_sm121.cuh).
 const PREFILL_Q: usize = 16;
 const PREFILL_KEYS: usize = 32;
 
