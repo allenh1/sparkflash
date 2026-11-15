@@ -61,6 +61,10 @@ __device__ __forceinline__ uint32_t om_smem(const void *p) {
 __device__ __forceinline__ void om_cp16(uint32_t dst, const void *src, bool valid) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(valid ? 16 : 0));
 }
+// 4 bytes global -> shared through L1, zero-filled when !valid (the source is then not read).
+__device__ __forceinline__ void om_cp4(uint32_t dst, const void *src, bool valid) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(valid ? 4 : 0));
+}
 __device__ __forceinline__ void om_commit() { asm volatile("cp.async.commit_group;"); }
 template <int N>
 __device__ __forceinline__ void om_wait() {

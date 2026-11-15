@@ -99,13 +99,6 @@ __device__ __forceinline__ uint2 glm_raster() {
 }
 
 
-// 4 bytes global -> shared, zero-filled when !valid (the source is then not read).
-__device__ __forceinline__ void glm_cp4(uint32_t dst, const void *src, bool valid) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src),
-                 "r"(valid ? 4 : 0));
-}
-
-
 // One 128-column block of a row, four columns a lane of a warp, as the release's dynamic
 // activation: its four codes (low byte first) and, in `scale`, amax / 448 (zero for an all-zero
 // block, whose codes are zero).
@@ -691,8 +684,8 @@ __device__ __forceinline__ void shared_prefill_q8_body(
         }
         if (tid < GLM_BM) {
             const int r = s_row[tid];
-            glm_cp4(om_smem(s_as(buf) + tid), r >= 0 ? as + (uint64_t)r * blocks + (stage >> 1) : as,
-                    r >= 0);
+            om_cp4(om_smem(s_as(buf) + tid), r >= 0 ? as + (uint64_t)r * blocks + (stage >> 1) : as,
+                   r >= 0);
         }
     };
 
