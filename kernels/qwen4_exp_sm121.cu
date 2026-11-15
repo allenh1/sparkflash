@@ -1061,26 +1061,75 @@ extern "C" __global__ void q4e_shared_gate_up(
     }
 }
 
+// The values one thread of q4e_rmsnorm holds between its two passes: offsets t, t + blockDim.x,
+// ... of its group. A group wider than this many a thread takes the unheld walk.
+#define Q4E_NORM_HELD 32
+
 // out = x * rsqrt(mean(x^2) per group + eps) * (zero_centred ? 1 + w : w).
 // weight_per_group == 0 reads a width-element weight per token; otherwise the weight repeats every
 // group.
+//
+// A thread loads its gains (constant weights) before the previous grid has finished, then holds
+// its values from the sum to the scaling, so a decode norm pays one cold weight load overlapped
+// with the kernel before it instead of a dependent one an element. The arithmetic is the unheld
+// walk's: the same sum in the same order, the same block tree, the same products.
 extern "C" __global__ void q4e_rmsnorm(const float* x, const __nv_bfloat16* __restrict__ weight,
                                        float* out, int width, int group, float eps,
                                        int zero_centred, int weight_per_group) {
-    OPT_PDL_ENTRY();
-    int start = blockIdx.x * group;
-    float sum = 0.0f;
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        float value = x[start + offset];
-        sum += value * value;
-    }
+    OPT_PDL_LAUNCH();
+    const int start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
+    if (group > Q4E_NORM_HELD * (int)blockDim.x) {
+        OPT_PDL_WAIT();
+        float sum = 0.0f;
+        for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
+            float value = x[start + offset];
+            sum += value * value;
+        }
+        float mean = q4e_block_sum(sum, scratch) / group;
+        float scale = rsqrtf(mean + eps);
+        for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
+            int index = start + offset;
+            float gain = __bfloat162float(weight[weight_per_group ? offset : (index % width)]);
+            out[index] = x[index] * scale * (zero_centred ? (1.0f + gain) : gain);
+        }
+        return;
+    }
+    float gains[Q4E_NORM_HELD];
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            const float gain =
+                __bfloat162float(weight[weight_per_group ? offset : ((start + offset) % width)]);
+            gains[k] = zero_centred ? (1.0f + gain) : gain;
+        }
+    }
+    OPT_PDL_WAIT();
+    float held[Q4E_NORM_HELD];
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            held[k] = x[start + offset];
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            sum += held[k] * held[k];
+        }
+    }
     float mean = q4e_block_sum(sum, scratch) / group;
     float scale = rsqrtf(mean + eps);
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        int index = start + offset;
-        float gain = __bfloat162float(weight[weight_per_group ? offset : (index % width)]);
-        out[index] = x[index] * scale * (zero_centred ? (1.0f + gain) : gain);
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            out[start + offset] = held[k] * scale * gains[k];
+        }
     }
 }
 
