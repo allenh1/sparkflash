@@ -1097,9 +1097,55 @@ impl Shared {
         )
     }
 
+    /// Write the [KeyTables] entries of the `rows` keys just stored at first_position on: the
+    /// walks' own inkling_attn_key_scales launch over those slots alone.
+    fn store_key_tables(
+        &self,
+        tables: KeyTables,
+        keys: Deviceptr,
+        values: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+    ) -> Result<(), String> {
+        let config = &self.config;
+        if first_position + rows > tables.stride {
+            return Err(format!(
+                "keys {first_position}..{} fall past the {} slots a full layer's tables hold",
+                first_position + rows,
+                tables.stride
+            ));
+        }
+        let at = first_position * std::mem::size_of::<f32>();
+        self.launch(
+            self.kernels.attention_scales,
+            (grid_blocks(rows, SCORE_KEYS), kv_heads as u32, 1),
+            (SCORE_BLOCK, 1, 1),
+            &[
+                keys.0,
+                values.0,
+                0,
+                tables.gains.offset(at).0,
+                tables.scales.offset(at).0,
+                kv_heads as u64,
+                config.head_dim as u64,
+                // A full layer's cache is addressed absolutely.
+                0,
+                bits(config.qk_l2_clip_threshold as f32),
+                1,
+                bits(config.architecture.norm_epsilon as f32),
+                first_position as u64,
+                rows as u64,
+                tables.stride as u64,
+            ],
+        )
+    }
+
     /// The relative attention of `rows` rows (row r at absolute position first_position + r)
     /// against the cache prefix the step stored; `taus` is the per-row scale table or null for
-    /// `tau` on every row. `layer` is the schedule's layer, for [AttentionWalk::Check]'s line.
+    /// `tau` on every row. `layer` is the schedule's layer, for [AttentionWalk::Check]'s line;
+    /// `tables` are a full layer's [KeyTables], which take the rows' entries here whichever walk
+    /// runs.
     #[allow(clippy::too_many_arguments)]
     fn attention_rows(
         &self,
@@ -1109,6 +1155,62 @@ impl Shared {
         gate: Deviceptr,
         keys: Deviceptr,
         values: Deviceptr,
+        tables: Option<KeyTables>,
+        relative: Deviceptr,
+        bank: Deviceptr,
+        sink: Deviceptr,
+        clip: ClipScales,
+        out: Deviceptr,
+        taus: Deviceptr,
+        rows: usize,
+        first_position: usize,
+        kv_heads: usize,
+        groups: usize,
+        window: usize,
+        cache_rows: usize,
+        rel_extent: usize,
+        tau: f32,
+    ) -> Result<(), String> {
+        if let Some(tables) = tables {
+            self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
+        }
+        self.attention_walk(
+            scratch,
+            layer,
+            queries,
+            gate,
+            keys,
+            values,
+            tables,
+            relative,
+            bank,
+            sink,
+            clip,
+            out,
+            taus,
+            rows,
+            first_position,
+            kv_heads,
+            groups,
+            window,
+            cache_rows,
+            rel_extent,
+            tau,
+        )
+    }
+
+    /// [Self::attention_rows] once the rows' table entries are written: the split walk, or the
+    /// serial body under [AttentionWalk::Serial].
+    #[allow(clippy::too_many_arguments)]
+    fn attention_walk(
+        &self,
+        scratch: &Scratch,
+        layer: usize,
+        queries: Deviceptr,
+        gate: Deviceptr,
+        keys: Deviceptr,
+        values: Deviceptr,
+        tables: Option<KeyTables>,
         relative: Deviceptr,
         bank: Deviceptr,
         sink: Deviceptr,
@@ -1134,6 +1236,7 @@ impl Shared {
                 gate,
                 keys,
                 values,
+                tables,
                 relative,
                 bank,
                 sink,
@@ -1199,6 +1302,7 @@ impl Shared {
         gate: Deviceptr,
         keys: Deviceptr,
         values: Deviceptr,
+        tables: Option<KeyTables>,
         relative: Deviceptr,
         bank: Deviceptr,
         sink: Deviceptr,
@@ -1214,6 +1318,9 @@ impl Shared {
         rel_extent: usize,
         tau: f32,
     ) -> Result<(), String> {
+        if let Some(tables) = tables {
+            self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
+        }
         let tensor = |into: Deviceptr| -> Result<(), String> {
             let mma = scratch.mma.as_ref().ok_or_else(|| {
                 format!("a {rows}-row chunk arena holds no tensor-core attention buffers")
@@ -1224,6 +1331,7 @@ impl Shared {
                 gate,
                 keys,
                 values,
+                tables,
                 relative,
                 bank,
                 sink,
@@ -1243,13 +1351,14 @@ impl Shared {
         if self.attention == AttentionWalk::Fast {
             return tensor(out);
         }
-        self.attention_rows(
+        self.attention_walk(
             scratch,
             layer,
             queries,
             gate,
             keys,
             values,
+            tables,
             relative,
             bank,
             sink,
@@ -1276,8 +1385,9 @@ impl Shared {
     }
 
     /// The tensor-core walk of a chunk's rows: the query side as the exact walks compute it
-    /// (inkling_attn_prepare), every visible key's clip gain and value scale (the split walk's
-    /// inkling_attn_key_scales over the chunk's whole range), then the MMA body (inkling_attn_mma).
+    /// (inkling_attn_prepare), every visible key's clip gain and value scale (a full layer's
+    /// [KeyTables], or the split walk's inkling_attn_key_scales over a sliding layer's whole
+    /// range), then the MMA body (inkling_attn_mma).
     #[allow(clippy::too_many_arguments)]
     fn attention_mma(
         &self,
@@ -1286,6 +1396,7 @@ impl Shared {
         gate: Deviceptr,
         keys: Deviceptr,
         values: Deviceptr,
+        tables: Option<KeyTables>,
         relative: Deviceptr,
         bank: Deviceptr,
         sink: Deviceptr,
@@ -1330,40 +1441,46 @@ impl Shared {
             ],
         )?;
         let last = first_position + rows - 1;
-        let scale_first = if window > 0 {
-            (first_position + 1).saturating_sub(window)
+        // A full layer's tables already hold every key's entries at its absolute slot.
+        let (gains, scales, scale_first, scale_stride) = if let Some(tables) = tables {
+            (tables.gains, tables.scales, 0, tables.stride)
         } else {
-            0
+            let scale_first = if window > 0 {
+                (first_position + 1).saturating_sub(window)
+            } else {
+                0
+            };
+            let span = last + 1 - scale_first;
+            if span > mma.stride {
+                return Err(format!(
+                    "a chunk at {first_position}..={last} sees {span} keys, past the {} the \
+                     tensor-core walk's key tables hold",
+                    mma.stride
+                ));
+            }
+            self.launch(
+                self.kernels.attention_scales,
+                (grid_blocks(span, SCORE_KEYS), kv_heads as u32, 1),
+                (SCORE_BLOCK, 1, 1),
+                &[
+                    keys.0,
+                    values.0,
+                    0,
+                    mma.gains.0,
+                    mma.scales.0,
+                    kv_heads as u64,
+                    config.head_dim as u64,
+                    cache_rows as u64,
+                    qk_clip,
+                    1,
+                    bits(config.architecture.norm_epsilon as f32),
+                    scale_first as u64,
+                    span as u64,
+                    mma.stride as u64,
+                ],
+            )?;
+            (mma.gains, mma.scales, scale_first, mma.stride)
         };
-        let span = last + 1 - scale_first;
-        if span > mma.stride {
-            return Err(format!(
-                "a chunk at {first_position}..={last} sees {span} keys, past the {} the \
-                 tensor-core walk's key tables hold",
-                mma.stride
-            ));
-        }
-        self.launch(
-            self.kernels.attention_scales,
-            (grid_blocks(span, SCORE_KEYS), kv_heads as u32, 1),
-            (SCORE_BLOCK, 1, 1),
-            &[
-                keys.0,
-                values.0,
-                0,
-                mma.gains.0,
-                mma.scales.0,
-                kv_heads as u64,
-                config.head_dim as u64,
-                cache_rows as u64,
-                qk_clip,
-                1,
-                bits(config.architecture.norm_epsilon as f32),
-                scale_first as u64,
-                span as u64,
-                mma.stride as u64,
-            ],
-        )?;
         self.launch(
             entry,
             (rows.div_ceil(MMA_Q) as u32, kv_heads as u32, 1),
@@ -1375,8 +1492,8 @@ impl Shared {
                 mma.rel.0,
                 bank.0,
                 sink.0,
-                mma.gains.0,
-                mma.scales.0,
+                gains.0,
+                scales.0,
                 gate.0,
                 out.0,
                 heads as u64,
@@ -1388,7 +1505,7 @@ impl Shared {
                 rel_extent as u64,
                 config.d_rel as u64,
                 scale_first as u64,
-                mma.stride as u64,
+                scale_stride as u64,
             ],
         )
     }
@@ -1452,8 +1569,9 @@ impl Shared {
         Ok(())
     }
 
-    /// The split walk of [Self::attention_rows]: per pass, the keys' clip gains and value scales,
-    /// the scores, and the recurrence (inkling_attn_sm121.cu).
+    /// The split walk of [Self::attention_rows]: per pass, the keys' clip gains and value scales
+    /// (read from a full layer's [KeyTables] instead), the scores, and the recurrence
+    /// (inkling_attn_sm121.cu).
     #[allow(clippy::too_many_arguments)]
     fn attention_split(
         &self,
@@ -1463,6 +1581,7 @@ impl Shared {
         gate: Deviceptr,
         keys: Deviceptr,
         values: Deviceptr,
+        tables: Option<KeyTables>,
         relative: Deviceptr,
         bank: Deviceptr,
         sink: Deviceptr,
@@ -1507,30 +1626,43 @@ impl Shared {
         for pass in 0..passes {
             let pass_first = pass * pass_slots;
             let span = (widest - pass_first).min(pass_slots);
-            let scale_first = first_slot(first_position) + pass_first;
-            let scale_end = (first_slot(last) + pass_first + pass_slots).min(last + 1);
-            let scale_span = scale_end - scale_first;
-            self.launch(
-                self.kernels.attention_scales,
-                (grid_blocks(scale_span, SCORE_KEYS), kv_heads as u32, 1),
-                (SCORE_BLOCK, 1, 1),
-                &[
-                    keys.0,
-                    values.0,
-                    0,
-                    scratch.key_gains.0,
-                    scratch.value_scales.0,
-                    kv_heads as u64,
-                    config.head_dim as u64,
-                    cache_rows as u64,
-                    qk_clip,
-                    1,
-                    eps,
-                    scale_first as u64,
-                    scale_span as u64,
-                    scale_stride as u64,
-                ],
-            )?;
+            // A full layer's tables hold every key's entries at its absolute slot; otherwise the
+            // pass computes its own slots' into the arena.
+            let (key_gains, value_scales, scale_first, scale_stride) = if let Some(tables) = tables
+            {
+                (tables.gains, tables.scales, 0, tables.stride)
+            } else {
+                let scale_first = first_slot(first_position) + pass_first;
+                let scale_end = (first_slot(last) + pass_first + pass_slots).min(last + 1);
+                let scale_span = scale_end - scale_first;
+                self.launch(
+                    self.kernels.attention_scales,
+                    (grid_blocks(scale_span, SCORE_KEYS), kv_heads as u32, 1),
+                    (SCORE_BLOCK, 1, 1),
+                    &[
+                        keys.0,
+                        values.0,
+                        0,
+                        scratch.key_gains.0,
+                        scratch.value_scales.0,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        cache_rows as u64,
+                        qk_clip,
+                        1,
+                        eps,
+                        scale_first as u64,
+                        scale_span as u64,
+                        scale_stride as u64,
+                    ],
+                )?;
+                (
+                    scratch.key_gains,
+                    scratch.value_scales,
+                    scale_first,
+                    scale_stride,
+                )
+            };
             self.launch(
                 self.kernels.attention_scores,
                 (grid_blocks(span, SCORE_KEYS), kv_heads as u32, rows as u32),
@@ -1543,7 +1675,7 @@ impl Shared {
                     clip.query.0,
                     0,
                     clip.relative.0,
-                    scratch.key_gains.0,
+                    key_gains.0,
                     scratch.scores.0,
                     heads as u64,
                     kv_heads as u64,
@@ -1575,7 +1707,7 @@ impl Shared {
                         values.0,
                         sink.0,
                         scratch.scores.0,
-                        scratch.value_scales.0,
+                        value_scales.0,
                         scratch.attention_state.0,
                         out.0,
                         heads as u64,
@@ -1608,7 +1740,7 @@ impl Shared {
                     &[
                         values.0,
                         scratch.scores.0,
-                        scratch.value_scales.0,
+                        value_scales.0,
                         parts.parts.0,
                         heads as u64,
                         kv_heads as u64,
@@ -2564,10 +2696,28 @@ fn scales_bytes(rows: usize, columns: usize, body: ExpertBody) -> usize {
     }
 }
 
+/// A full layer's per-key attention tables (kernels/inkling_attn_sm121.cu): every stored key's
+/// clip gain and its value row's RMS scale, `[kv_heads][stride]` f32 at the key's absolute slot.
+///
+/// Both depend on the key and value rows alone, so they are computed once, when the rows are
+/// stored ([Shared::store_key_tables]), by the same inkling_attn_key_scales launch the walks
+/// otherwise run over every visible key on every step: the same bits, without reading a long
+/// context's whole cache a second time each step. A sliding layer's ring sees at most its window
+/// plus a chunk and keeps the per-step tables.
+#[derive(Debug, Clone, Copy)]
+struct KeyTables {
+    gains: Deviceptr,
+    scales: Deviceptr,
+    stride: usize,
+}
+
 /// One session's device state.
 struct State {
     keys: Vec<Deviceptr>,
     values: Vec<Deviceptr>,
+    /// Each full layer's [KeyTables] when a split or fast walk reads them; `None` on a sliding
+    /// layer and under [AttentionWalk::Serial].
+    tables: Vec<Option<KeyTables>>,
     conv: Vec<[Deviceptr; 4]>,
     summaries: Deviceptr,
     summaries_bytes: usize,
@@ -2586,6 +2736,7 @@ impl State {
         let kv_bytes = |rows: usize, width: usize| rows.max(1) * width * 2;
         let mut keys = Vec::with_capacity(plan.layers().len());
         let mut values = Vec::with_capacity(plan.layers().len());
+        let mut tables = Vec::with_capacity(plan.layers().len());
         for layer in plan.layers() {
             let bytes = kv_bytes(layer.kv_rows, shared.kv_width());
             let key = cuda.alloc(bytes, &mut total)?;
@@ -2594,6 +2745,21 @@ impl State {
             cuda.memset_d8_async(value, 0, bytes)?;
             keys.push(key);
             values.push(value);
+            // A slot's entries are written when its key is stored and read only after, so the
+            // tables need no clearing.
+            tables.push(
+                (!layer.sliding && shared.attention.split())
+                    .then(|| -> Result<KeyTables, String> {
+                        let stride = layer.kv_rows.max(1);
+                        let bytes = plan.rank_kv_heads().max(1) * stride * 4;
+                        Ok(KeyTables {
+                            gains: cuda.alloc(bytes, &mut total)?,
+                            scales: cuda.alloc(bytes, &mut total)?,
+                            stride,
+                        })
+                    })
+                    .transpose()?,
+            );
         }
         let history = shared.config.conv_history().max(1);
         let mut conv = Vec::with_capacity(plan.layers().len());
@@ -2627,6 +2793,7 @@ impl State {
         Ok(Self {
             keys,
             values,
+            tables,
             conv,
             summaries,
             summaries_bytes,
@@ -2758,8 +2925,9 @@ struct Scratch {
 
 /// The tensor-core attention walk's buffers (kernels/inkling_attn_sm121.cu): each row's query
 /// (`[rows][heads][head_dim]`) and relative state (`[rows][heads][16]`) as the exact walks compute
-/// them, each visible key's clip gain and value scale (`[kv_heads][stride]`, a full layer's every
-/// slot), and under [AttentionWalk::Check] the walk's own output beside the exact one.
+/// them, a sliding layer's visible keys' clip gains and value scales (`[kv_heads][stride]`, its
+/// window and a chunk; a full layer reads its session's [KeyTables]), and under
+/// [AttentionWalk::Check] the walk's own output beside the exact one.
 #[derive(Debug, Clone, Copy)]
 struct MmaScratch {
     q: Deviceptr,
@@ -2870,10 +3038,12 @@ impl Scratch {
         let value_scales = take(kv_heads * (attention_pass + rows), 4);
         let scores = take(rows * heads * attention_pass, 4);
         let attention_state = take(rows * heads * MIX_STATE, 4);
-        // A full layer's last row sees every slot up to the context, a sliding one at most
-        // window + rows of them.
+        // A full layer reads its session's [KeyTables]; a sliding layer's chunk sees at most
+        // window + rows - 1 slots, which these tables hold.
         let mma = (rows > 1 && shared.attention.fast()).then(|| {
-            let stride = shared.context.max(1);
+            let stride = (config.sliding_window_size + rows - 1)
+                .min(shared.context)
+                .max(1);
             (
                 take(rows * heads * head_dim, 4),
                 take(rows * heads * MMA_D_REL, 4),
@@ -3118,6 +3288,9 @@ impl Drop for InklingDeviceSession {
         let mut pointers: Vec<Deviceptr> = Vec::new();
         pointers.extend(state.keys.iter().copied());
         pointers.extend(state.values.iter().copied());
+        for tables in state.tables.iter().flatten() {
+            pointers.extend([tables.gains, tables.scales]);
+        }
         for taps in &state.conv {
             pointers.extend(taps.iter().copied());
         }
@@ -3921,6 +4094,7 @@ impl InklingDeviceSession {
                             scratch.gate,
                             self.state.keys[index],
                             self.state.values[index],
+                            self.state.tables[index],
                             scratch.rel,
                             bank,
                             scratch.sink,
