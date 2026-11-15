@@ -2494,6 +2494,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sparkflash-comm",
  "sparkflash-engine",
  "sparkflash-kv",
  "sparkflash-trace",
@@ -2583,12 +2584,15 @@ dependencies = [
 name = "sparkflash-model-inkling2"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "serde",
  "serde_json",
+ "sha2",
  "sparkflash-comm",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-vision",
  "sparkflash-weights",
  "tempfile",
  "tokenizers",
