@@ -70,8 +70,9 @@ base_port = 29601
 # The fabric the collective runs on. "switched" is the 200G RoCEv2 switch with the one-shot
 # all-to-all schedule. "switchless" is the direct-attach ring: rank 0-1-2-3-0 over the DACs plus
 # the 0<->2 and 1<->3 ConnectX-7 hairpin diagonals, reduced with reduce-scatter + all-gather so
-# each element crosses the fabric once instead of being posted to every peer. It is forwarded to
-# every rank as SPARKFLASH_FABRIC_SCHEDULE; "one-shot", "hairpin" and "ring" are accepted aliases.
+# the cross-rank all-reduces move 2*(world-1) element writes instead of world*(world-1): half the
+# bytes at four ranks. It is forwarded to every rank as SPARKFLASH_FABRIC_SCHEDULE; "one-shot",
+# "hairpin" and "ring" are accepted aliases.
 fabric_schedule = "switched"
 # Empty means the user running the control plane.
 ssh_user = ""

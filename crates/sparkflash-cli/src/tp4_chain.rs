@@ -104,8 +104,9 @@ struct ChainArgs {
     /// --fabric-schedule: which schedule every layout this run builds executes. `switched` (the
     /// default) is the one-shot all-to-all; `switchless` is the hairpin ring that reduce-scatters
     /// to chunk owners and all-gathers back (issue #19). It selects the transport-level schedule
-    /// (host reduce, gathers, barriers, smokes); the NCCL device reduce is its own backend,
-    /// selected by SPARK_COMM_REDUCE, and picks its own NCCL topology.
+    /// (host reduce, barriers, smokes); the NCCL device reduce is its own backend, selected by
+    /// SPARK_COMM_REDUCE, and picks its own NCCL topology. Resolved at parse time: the flag wins,
+    /// and without it the environment decides ([`crate::tp4_host::FABRIC_SCHEDULE_ENV`]).
     fabric_schedule: FabricSchedule,
 }
 
@@ -152,9 +153,9 @@ impl ChainArgs {
         let mut forward_lean = false;
         let mut forward_perf_probe = false;
         let mut forward_perf_probe_nosync = false;
-        // The env selects it for a hand-run stage; --fabric-schedule overrides it below, and an
-        // unknown env value is refused rather than served as switched.
-        let mut fabric_schedule = crate::tp4_host::fabric_schedule_from_env()?;
+        // The flag wins; without it the environment decides when the stage runs, so a bad env
+        // value cannot block a run that names the schedule on the command line.
+        let mut fabric_schedule = None;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -261,10 +262,11 @@ impl ChainArgs {
                 "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
                 "--fabric-schedule" => {
                     let value = take("--fabric-schedule")?;
-                    fabric_schedule =
+                    fabric_schedule = Some(
                         crate::tp4_host::parse_fabric_schedule(&value).ok_or_else(|| {
                             format!("--fabric-schedule {value}: expected switched or switchless")
-                        })?;
+                        })?,
+                    );
                 }
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
@@ -405,7 +407,10 @@ impl ChainArgs {
             forward_lean,
             forward_perf_probe,
             forward_perf_probe_nosync,
-            fabric_schedule,
+            fabric_schedule: match fabric_schedule {
+                Some(schedule) => schedule,
+                None => crate::tp4_host::fabric_schedule_from_env()?,
+            },
         })
     }
 }

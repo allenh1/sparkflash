@@ -75,7 +75,7 @@ while the model downloads, for example).
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
 | 2. Connect the fast network | Card: **Switched 200G** / **Switchless ring** | `PUT /api/config`: saves the fabric schedule the collectives run (the card marked **Detected** matches the measured wiring) |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
-| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that runs the check's netplan/sysctl fix under `sudo -n` |
+| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that needs a fix, running the check's netplan/sysctl fix under `sudo -n` (refused while rank 0 is serving) |
 | 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
@@ -111,10 +111,11 @@ cards describe the two wirings this build supports, and the check tells you whic
   `2 * (world - 1)` payload element writes cluster-wide against `world * (world - 1)` for the
   one-shot: half the fabric bytes at world 4.
 
-The schedule governs the collectives that run on the rank-to-rank reference transport: the
-barriers, the embedding and token gathers, and the host reference arm's reductions. The device
-arm's hot per-layer all-reduce enqueues on NCCL (`SPARK_COMM_REDUCE=nccl`, the device default) and
-is not re-decomposed by this value; `docs/rdma-exchange.md` describes which path each arm takes.
+The schedule governs the layout-based all-reduces on the rank-to-rank reference transport: the
+host reference arm's per-layer reductions and the barriers. The gathers keep their own
+one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduce enqueues on NCCL
+(`SPARK_COMM_REDUCE=nccl`, the device default) without being re-decomposed by this value;
+`docs/rdma-exchange.md` describes which path each arm takes.
 
 When the node check runs it also probes the wiring: each Spark ARPs and pings every fast-network
 address of every other Spark from each of its fast ports (`arping`, then `ping -I`). A port that

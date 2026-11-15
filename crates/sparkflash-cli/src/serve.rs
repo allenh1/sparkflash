@@ -9776,8 +9776,17 @@ mod tests {
 
     #[test]
     fn the_fabric_schedule_flag_parses_and_a_typo_is_refused() {
+        // No flag: clap resolves the environment (and validates it), so the expectation is what
+        // that variable names - switched when it is unset. Assert it that way rather than
+        // assuming a clean shell, which would make the test fail for an operator who exported it.
+        let expected = crate::tp4_host::fabric_schedule_from_value(
+            std::env::var(crate::tp4_host::FABRIC_SCHEDULE_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .expect("the environment names a schedule");
         let plain = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
-        assert_eq!(plain.fabric_schedule, FabricSchedule::OneShotAllToAll);
+        assert_eq!(plain.fabric_schedule, expected);
         for (written, expected) in [
             (
                 "switchless",

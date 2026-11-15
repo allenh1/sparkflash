@@ -373,10 +373,10 @@ pub fn fabric_probe_command(
     rank: usize,
     netdevs: &[String],
     peers: &[(usize, String)],
-    own: &[(String, String)],
+    pings: &[(usize, String)],
 ) -> CommandSpec {
     let node = &config.cluster.nodes[rank];
-    let args = inspect::fabric_probe_args(netdevs, peers, own);
+    let args = inspect::fabric_probe_args(netdevs, peers, pings);
     let label = format!("Probe the fast ports on {}", node.ssh);
     if node.local {
         let mut argv = vec![
@@ -917,22 +917,18 @@ mod tests {
         let config = SparkConfig::default();
         let netdevs = vec!["enp1s0f0np0".to_owned()];
         let peers = vec![(1usize, "10.0.0.3".to_owned())];
-        let own = vec![("enp1s0f0np0".to_owned(), "10.0.0.1".to_owned())];
-        let local = fabric_probe_command(&config, 0, &netdevs, &peers, &own);
+        let pings = vec![(1usize, "10.0.0.3".to_owned())];
+        let local = fabric_probe_command(&config, 0, &netdevs, &peers, &pings);
         assert_eq!(local.program, "bash");
         assert_eq!(local.kind, "fabric-probe");
         assert_eq!(local.args[0], "-c");
         assert_eq!(local.args[2], "sparkflash-fabric");
         assert_eq!(
             local.args[3..],
-            [
-                "ndev=enp1s0f0np0",
-                "peer=1:10.0.0.3",
-                "own=enp1s0f0np0:10.0.0.1"
-            ]
+            ["ndev=enp1s0f0np0", "peer=1:10.0.0.3", "ping=1:10.0.0.3"]
         );
 
-        let remote = fabric_probe_command(&config, 2, &netdevs, &peers, &own);
+        let remote = fabric_probe_command(&config, 2, &netdevs, &peers, &pings);
         assert_eq!(remote.program, "ssh");
         assert!(remote.args.iter().any(|arg| arg == "BatchMode=yes"));
         let destination = config.ssh_destination(2);

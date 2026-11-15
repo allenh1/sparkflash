@@ -100,8 +100,9 @@ struct GlmArgs {
     /// The NCCL communicator as the collective's device leg; the default where it applies.
     nccl: bool,
     /// The collective fabric this rank runs (issue #19): every rank of a group must carry the
-    /// same value. The flag overrides `SPARKFLASH_FABRIC_SCHEDULE`, which overrides switched.
-    fabric_schedule: FabricSchedule,
+    /// same value. The flag overrides `SPARKFLASH_FABRIC_SCHEDULE`, which overrides switched;
+    /// `None` means the environment decides when the rank runs.
+    fabric_schedule: Option<FabricSchedule>,
 }
 
 impl GlmArgs {
@@ -129,7 +130,7 @@ impl GlmArgs {
             adaptive: false,
             wire: Wire::F32,
             nccl: false,
-            fabric_schedule: crate::tp4_host::fabric_schedule_from_env()?,
+            fabric_schedule: None,
         };
         let mut index = 0;
         while index < args.len() {
@@ -183,10 +184,11 @@ impl GlmArgs {
                 }
                 "--fabric-schedule" => {
                     let value = take()?;
-                    parsed.fabric_schedule = crate::tp4_host::parse_fabric_schedule(value)
-                        .ok_or_else(|| {
+                    parsed.fabric_schedule = Some(
+                        crate::tp4_host::parse_fabric_schedule(value).ok_or_else(|| {
                             format!("--fabric-schedule {value}: expected switched or switchless")
-                        })?;
+                        })?,
+                    );
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -406,7 +408,10 @@ fn run_rank(args: &GlmArgs) -> Result<(), String> {
         layout.world_size,
         transport,
         args.wire,
-        args.fabric_schedule,
+        match args.fabric_schedule {
+            Some(schedule) => schedule,
+            None => crate::tp4_host::fabric_schedule_from_env()?,
+        },
     );
     if let Some(reduce) = reduce {
         collective = Box::new(DeviceExchange::new(collective, reduce)?) as Box<dyn TpCollective>;

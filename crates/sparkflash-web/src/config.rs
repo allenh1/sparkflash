@@ -126,6 +126,17 @@ pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 /// (issue #19). The aliases exist because the docs, the CLI and the UI grew different words for
 /// the same two recipes; they all canonicalise here, so the saved TOML, the exported
 /// `SPARKFLASH_FABRIC_SCHEDULE` and the launcher's `--fabric-schedule` always agree.
+/// The schedule a saved value names, for the places that must produce a spelling: an alias
+/// becomes its canonical name and an unknown value becomes `switched`.
+///
+/// [`SparkConfig::validate`] refuses an unknown value, so the fallback only matters for a value
+/// that reached a caller without validation. Naming that single decision here keeps it out of
+/// scattered `unwrap_or` calls.
+#[must_use]
+pub fn fabric_schedule_name(value: &str) -> &'static str {
+    canonical_fabric_schedule(value).unwrap_or("switched")
+}
+
 #[must_use]
 pub fn canonical_fabric_schedule(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -1618,12 +1629,6 @@ impl SparkConfig {
                 nccl_lib.display().to_string(),
             );
         }
-        env.insert(
-            "SPARKFLASH_FABRIC_SCHEDULE".to_owned(),
-            canonical_fabric_schedule(&self.cluster.fabric_schedule)
-                .unwrap_or("switched")
-                .to_owned(),
-        );
         if !self.network.nccl_ib_hca.trim().is_empty() {
             env.insert("NCCL_IB_HCA".to_owned(), self.network.nccl_ib_hca.clone());
         }
@@ -1639,6 +1644,12 @@ impl SparkConfig {
         for (key, value) in &self.network.env {
             env.insert(key.clone(), value.clone());
         }
+        // The typed field is the authority: a stale SPARKFLASH_FABRIC_SCHEDULE left in
+        // [network].env must not silently override the schedule the console saved.
+        env.insert(
+            "SPARKFLASH_FABRIC_SCHEDULE".to_owned(),
+            fabric_schedule_name(&self.cluster.fabric_schedule).to_owned(),
+        );
         env
     }
 
@@ -2419,6 +2430,25 @@ mod tests {
             );
         }
         assert_eq!(canonical_fabric_schedule("mesh"), None);
+        assert_eq!(fabric_schedule_name("ring"), "switchless");
+        assert_eq!(fabric_schedule_name("switched"), "switched");
+
+        // A stale SPARKFLASH_FABRIC_SCHEDULE left in [network].env must not override the saved
+        // field: the typed value is the authority the launcher exports.
+        let mut typed = SparkConfig::default();
+        typed.cluster.fabric_schedule = "switchless".to_owned();
+        typed.network.env.insert(
+            "SPARKFLASH_FABRIC_SCHEDULE".to_owned(),
+            "switched".to_owned(),
+        );
+        assert_eq!(
+            typed
+                .launch_env()
+                .get("SPARKFLASH_FABRIC_SCHEDULE")
+                .map(String::as_str),
+            Some("switchless"),
+            "the saved field wins over a leftover environment entry"
+        );
 
         let mut config = SparkConfig::default();
         config.cluster.fabric_schedule = "switchless".to_owned();

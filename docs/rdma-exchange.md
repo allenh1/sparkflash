@@ -34,8 +34,9 @@ Every collective that runs on the rank-to-rank exchange takes one of two transfe
 selected by `FabricSchedule` and exposed by the `--fabric-schedule switched|switchless` flag, the
 `[cluster].fabric_schedule` configuration field and the `SPARKFLASH_FABRIC_SCHEDULE` environment
 variable (issue #19). The device arm's hot per-layer all-reduce is not one of them: it enqueues on
-NCCL (`SPARK_COMM_REDUCE=nccl`, the device default), so the schedule shapes the barriers, the
-embedding/token gathers and the host reference arm's reductions:
+NCCL (`SPARK_COMM_REDUCE=nccl`, the device default), so the schedule shapes the layout-based
+all-reduces on the reference transport - the host arm's per-layer reductions and the barriers -
+and the gathers keep their own one-segment-to-every-peer exchange either way:
 
 - **OneShotAllToAll** (switched, the default): every rank posts its whole bf16 payload to all
   `world - 1` peers over the 200 Gb/s switch and reduces locally in canonical rank order. It moves

@@ -998,6 +998,7 @@ fn run_fabric_probe(
     probes: &[ProbeResult],
 ) -> Option<inspect::Fabric> {
     let addresses = inspect::probe_addresses(config, probes)?;
+    let primaries = inspect::planned_peers(config, probes)?;
     let world = probes.len();
     let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs + FABRIC_SECS);
     let results: Vec<Option<inspect::FabricProbe>> = std::thread::scope(|scope| {
@@ -1011,16 +1012,23 @@ fn run_fabric_probe(
                         list.iter().map(move |address| (index, address.clone()))
                     })
                     .collect();
+                let pings: Vec<(usize, String)> = primaries
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != rank)
+                    .map(|(index, address)| (index, address.clone()))
+                    .collect();
                 let rails = probes[rank]
                     .as_ref()
                     .map(|facts| facts.rails())
                     .unwrap_or_default();
-                let netdevs: Vec<String> = rails.iter().map(|rail| rail.netdev.clone()).collect();
-                let own: Vec<(String, String)> = rails
-                    .iter()
-                    .map(|rail| (rail.netdev.clone(), rail.ip.to_string()))
-                    .collect();
-                let command = fabric_probe_command(config, rank, &netdevs, &peers, &own);
+                // One attempt per netdev: the two halves of a cabled port are distinct netdevs
+                // with their own addresses, and both answer the same neighbour.
+                let mut netdevs: Vec<String> =
+                    rails.iter().map(|rail| rail.netdev.clone()).collect();
+                netdevs.sort();
+                netdevs.dedup();
+                let command = fabric_probe_command(config, rank, &netdevs, &peers, &pings);
                 scope.spawn(move || {
                     probe
                         .capture(&command, timeout)
@@ -1093,6 +1101,14 @@ async fn network_setup(State(web): State<WebState>) -> Response {
             "the last node check was taken of a different configuration; check the nodes again",
         );
     };
+    // netplan apply drops the fast ports for a moment, so a serving cluster would lose the links
+    // its collectives are mid-transfer on.
+    if web.stats.latest().is_some_and(|sample| sample.online) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "rank 0 is online; stop the cluster before reconfiguring the fast ports",
+        );
+    }
     let fixes: Vec<(usize, String)> = report
         .nodes
         .iter()
@@ -1275,7 +1291,15 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
     let exclusive: &[&str] = match request.what {
-        SyncWhat::Software => &["launch", "swap"],
+        // A port job can cut the link the copy is running over.
+        SyncWhat::Software => &[
+            "launch",
+            "swap",
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
+        ],
         SyncWhat::Model => MODEL_EXCLUSIVE,
     };
     match web.jobs.start_exclusive(command, exclusive).await {
@@ -1812,7 +1836,18 @@ async fn prepare_model(State(web): State<WebState>, Json(request): Json<ModelReq
         let command = prepare_command(&target, rank);
         match web
             .jobs
-            .start_exclusive(command, &["download", "sync-model", "swap"])
+            .start_exclusive(
+                command,
+                &[
+                    "download",
+                    "sync-model",
+                    "swap",
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ],
+            )
             .await
         {
             Ok(id) => started.push(id),
@@ -1876,6 +1911,10 @@ async fn swap(State(web): State<WebState>, Json(request): Json<ModelRequest>) ->
         "convert-r1",
         "convert-r2",
         "convert-r3",
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
     ]) {
         return api_error(
             StatusCode::CONFLICT,
@@ -1938,6 +1977,10 @@ async fn swap(State(web): State<WebState>, Json(request): Json<ModelRequest>) ->
             "convert-r1",
             "convert-r2",
             "convert-r3",
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
         ],
         &scope,
     ) {

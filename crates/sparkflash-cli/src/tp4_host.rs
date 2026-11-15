@@ -295,9 +295,10 @@ struct HostArgs {
     resident_cache: bool,
     profile: bool,
     bench_steps: usize,
-    /// Which fabric schedule the collectives run: the switched one-shot all-to-all or the
-    /// switchless hairpin ring (issue #19). Selected by `--fabric-schedule`.
-    fabric_schedule: FabricSchedule,
+    /// The fabric schedule `--fabric-schedule` named. `None` means the environment selects it
+    /// ([`FABRIC_SCHEDULE_ENV`]), resolved when the stage runs; the flag always wins, so a bad
+    /// environment value cannot override it (issue #19).
+    fabric_schedule: Option<FabricSchedule>,
 }
 
 impl Default for HostArgs {
@@ -320,19 +321,14 @@ impl Default for HostArgs {
             resident_cache: false,
             profile: false,
             bench_steps: 0,
-            fabric_schedule: FabricSchedule::OneShotAllToAll,
+            fabric_schedule: None,
         }
     }
 }
 
 impl HostArgs {
     fn parse(args: &[&str]) -> Result<Self, String> {
-        let mut parsed = Self {
-            // The environment selects the recipe for a hand-run rank; --fabric-schedule overrides
-            // it below, and a bad env value is refused here rather than served as switched.
-            fabric_schedule: fabric_schedule_from_env()?,
-            ..Self::default()
-        };
+        let mut parsed = Self::default();
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -391,9 +387,10 @@ impl HostArgs {
                 "--reference-check" => parsed.reference_check = true,
                 "--fabric-schedule" => {
                     let value = take("--fabric-schedule")?;
-                    parsed.fabric_schedule = parse_fabric_schedule(&value).ok_or_else(|| {
-                        format!("--fabric-schedule {value}: expected switched or switchless")
-                    })?;
+                    parsed.fabric_schedule =
+                        Some(parse_fabric_schedule(&value).ok_or_else(|| {
+                            format!("--fabric-schedule {value}: expected switched or switchless")
+                        })?);
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -508,7 +505,12 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
                 .unwrap_or(false),
         bench_steps: parsed.bench_steps,
         tokenizer: parsed.tokenizer.clone(),
-        fabric_schedule: parsed.fabric_schedule,
+        // The flag wins; otherwise the environment selects the recipe for a hand-run rank, and a
+        // value it cannot parse is refused rather than served as switched.
+        fabric_schedule: match parsed.fabric_schedule {
+            Some(schedule) => schedule,
+            None => fabric_schedule_from_env()?,
+        },
     };
     let tcp_config = if parsed.world == 1 {
         None
@@ -5342,7 +5344,10 @@ mod tests {
     fn the_fabric_schedule_flag_selects_the_ring_and_rejects_a_typo() {
         let defaults =
             HostArgs::parse(&["--fixture", "/tmp/twin", "--prompt-tokens", "3"]).expect("parse");
-        assert_eq!(defaults.fabric_schedule, FabricSchedule::OneShotAllToAll);
+        assert_eq!(
+            defaults.fabric_schedule, None,
+            "no flag means the environment decides at run time, not at parse time"
+        );
         for alias in ["switchless", "hairpin", "ring"] {
             let parsed = HostArgs::parse(&[
                 "--fixture",
@@ -5355,7 +5360,7 @@ mod tests {
             .expect("parse");
             assert_eq!(
                 parsed.fabric_schedule,
-                FabricSchedule::HairpinRingReduceScatterAllGather,
+                Some(FabricSchedule::HairpinRingReduceScatterAllGather),
                 "alias {alias}"
             );
         }

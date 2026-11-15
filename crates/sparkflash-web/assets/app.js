@@ -1536,7 +1536,7 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Cross-rank collectives reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
   },
 ];
 
@@ -1608,10 +1608,16 @@ function measuredLinks(setup, measured) {
     byRank.get(link.rank).push(link);
   }
   const rows = [...byRank.entries()].sort((a, b) => a[0] - b[0]).map(([rank, links]) => {
-    const ports = links
-      .slice()
-      .sort((a, b) => a.netdev.localeCompare(b.netdev))
-      .map((link) => esc(link.netdev) + " &rarr; " + nameOf(link.peer))
+    // A cabled port is two PCIe halves, so one cable answers on two netdevs. Group by the
+    // Spark reached and name the ports under it: twelve lines per rank would bury the answer.
+    const byPeer = new Map();
+    for (const link of links) {
+      if (!byPeer.has(link.peer)) byPeer.set(link.peer, []);
+      byPeer.get(link.peer).push(link.netdev);
+    }
+    const ports = [...byPeer.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([peer, netdevs]) => nameOf(peer) + " via " + netdevs.sort().map(esc).join(", "))
       .join(" · ");
     return '<li><span class="host-name">' + nameOf(rank) + '</span><span class="host-meta">' + ports + "</span></li>";
   });
@@ -2173,7 +2179,10 @@ function maybeInspect() {
     clearTimeout(S.shelfRefreshTimer);
     S.shelfRefreshTimer = setTimeout(() => loadModels(true), 1500);
   }
-  if (finished || stale || old) inspect(true);
+  // Four port jobs finish one after another; checking between them would record a cluster that
+  // is half-reconfigured. Wait for the last one, like the prepare jobs above.
+  const portBusy = S.jobs.some((job) => job.status === "running" && job.kind.startsWith("network-setup-"));
+  if ((finished && !portBusy) || stale || old) inspect(true);
 }
 
 function checkAgain() {
