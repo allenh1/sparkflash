@@ -1630,3 +1630,61 @@ picks, which already spread fairly evenly over expert parallelism's ranks. DSpar
 gains nothing here, and after the 93K prompt plain decoding is as fast or slightly faster. The
 split stays opt-in at conversion: the maintainer weighs the prompt's 10% against the decode
 step's 10-17%.
+
+### What a verify costs: thirty experts, and the launches around them
+
+A depth-3 round verifies four rows (the anchor and three drafts) in one walk. After the 93K
+prompt, traced on rank 0, that walk took 61.0 ms of device time against a plain step's 32.3 ms.
+About 22.6 ms of the difference is expert weights. The four rows' 32 top-8 picks name about 30
+distinct experts, and a plain step's one row names 8. Every distinct expert's bytes are read
+once, whichever rows picked it, so this part is the routing's and stays. The rest was launches
+and walks that did not need to cost what they did:
+
+* **The band is steered on the device** (`run_steered_band`). It used to read the router's
+  choice back to the host on every layer. From five rows up, `moe_plan` sorts the slots by
+  expert, and the item walk reads an expert once for all of its slots. At four rows the 32 picks
+  are nearly all distinct experts, so the plan saves nothing and its launches cost more.
+* **The drafter's span attention runs as walks and a merge.** Each block walks one eighth of the
+  keys for four queries of a key head, and loads and scores eight keys ahead of its fold. The fold
+  is the only chain from key to key. The merge combines a query's eight walks.
+* **Fewer launches for a few rows.** The projections that read the same input share a launch, as
+  in the decode step: a sliding layer's six attention projections take two launches. The full
+  layers' tau table is uploaded once per walk, not once per layer, because each upload waited on
+  the stream. Hidden-width norms hold their rows.
+* **The scored partial scores a key with a quad of four threads.** It used to take a warp a key.
+  Thread `u` holds dims `u + 4m + 32 step`, so the warp tree's first three levels add a thread's
+  own partials and its last two add across the quad. Every sum adds the same operands as the warp
+  walk did. The value sums now use the whole block and skip the head test when every head is
+  live.
+* **The drafter's projections are packed** in the target's lossless form, except the block's key
+  and value, which measured slower packed at eight rows. A verify leaves the convolution
+  histories as they were, and the round's settle restores all of them from the kept tails in one
+  launch.
+
+None of these changes moves a bit. On the four ranks, after each change, the decode logits
+digests and the greedy ids were unchanged, and so was every round's accepted count. The 93K
+digest stayed `724cc71b52c00a7e` and the repeating prompt's `0fe1437d677108a4`. Rounds in ms:
+
+| on the four ranks (batch arm) | 93K, depth 3 | repeating 5K, depth 3 | repeating 5K, depth 7 |
+|---|---|---|---|
+| host-steered band | 103.0 | 84.0 | 128.0 |
+| steered band on the device | 90.1 | 68.1 | 108.3 |
+| expert items from five rows | 92.0 | 68.2 | 101.5 |
+| span walks and merge, tau table once | 80.6 | 67.0 | 99.1 |
+| few-row fused projections, held norms | 78.6 | 64.7 | 97.1 |
+| quad scores, whole-block value sums | 72.1 | 65.6 | 97.8 |
+| packed drafter, one-launch restore | 70.4 | 63.3 | 95.0 |
+| a token, now (plain) | 21.43 ms (29.57) | 15.32 ms (26.09) | 12.00 ms (26.09) |
+
+The "expert items" row takes its four-row rounds from the build without the plan and its
+eight-row round from the build with it, which is what five rows as the threshold runs. Every
+number includes about 0.8 ms a token that the batch arm spends digesting each token's logits.
+Serving does not pay it.
+
+The drafter's full layer is what grows. Its span attention costs about 2.9 ms a round at 93K
+and 14.5 ms at 500K. Each walk is bound by its chain of folds, not by bandwidth. Giving a warp
+several queries measured slower, and an L2 prefetch of the next keys was 8% faster on the full
+layer and slower on the sliding ones. The drafter's LM head (1.63 ms) is at its DRAM floor.
+The round always verifies its full depth: an adaptive depth needs a probability for each draft,
+and this drafter does not produce one. DSpark stays off by default. At a million positions it
+costs a rank about 3.6 GB.
