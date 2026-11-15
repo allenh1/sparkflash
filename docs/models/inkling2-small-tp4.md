@@ -1368,6 +1368,64 @@ equal.
 
 The served rows are single runs; the 127,603-token one moved by less than its noise.
 
+### The small decode kernels: weights before the wait, rows held, run factors shared
+
+Under PDL a kernel is launched while the grid before it is still running, and everything up to
+`griddepcontrol.wait` overlaps that grid. A decode step's one-block kernels were latency bound
+on loads they issued only after the wait: a cold weight read costs several microseconds, and a
+row read twice costs its latency twice. Four kernels now load their weights before the wait
+(`OPT_PDL_LAUNCH`, the weight loads, then `OPT_PDL_WAIT`), hold what they read in registers, or
+share work across the block. Each one runs the same operations on the same operands in the same
+order, so no output word moves:
+
+* **`q4e_rmsnorm`** (shared with GLM, Qwen and the DFlash drafter) loads its gains before the
+  wait and holds its row between the sum of squares and the scaled write, up to 32 values a
+  thread; a wider group keeps the two-loop walk.
+* **`inkling_logit_softcap`** ran one block over the gathered row's 200,058 entries. It now takes
+  a grid of column blocks a row, each striding `gridDim.x` blocks apart.
+* **`inkling_attn_merge`** computed every run's `exp(largest_r - largest)` once in every dim's
+  thread. The block now takes the runs' maxima strided over its threads (`fmaxf` returns one of
+  its operands, so the largest is the same in any order) and each run's factor once, into shared
+  memory. Each dim's thread then folds the denominator and its value sum in run order with those
+  factors, the `fmaf` chain it ran before. A row past 4,096 runs (over 1M keys) keeps the
+  one-thread walk.
+* **`inkling_router_topk`** rescanned shared memory for every one of its eight picks, checking
+  each expert against the picks so far, and thread 0 took the block's best behind a second
+  barrier. A thread now holds its experts' biased scores in registers and marks its chosen ones
+  in a mask. Every thread takes the block's best from the warps' bests itself, one barrier a
+  pick, with the warps' bests alternating between two buffers. The bias loads before the wait.
+  The comparisons are the same, so are the picks: the first index holding the greatest biased
+  score, with NaN and -inf never chosen.
+
+| micro-bench, behind a 20 µs kernel under PDL unless noted | before | after |
+|---|---|---|
+| `q4e_rmsnorm`, one 4,608-wide row | 12.45 µs | 2.2 µs |
+| `inkling_router_topk`, 384 experts, top 8 | 11.9 µs | 5.7 µs |
+| `inkling_attn_merge`, 93K keys, 12 heads (alone, min of seven) | 47.4 µs | 13.6 µs |
+| `inkling_attn_merge`, 1M keys | 763.1 µs | 190.4 µs |
+| `inkling_attn_merge`, a sliding row | 3.2 µs | 4.2 µs |
+
+Every output word of each micro-bench equalled the shipped kernel's. The router's inputs
+included heavy ties, NaN and infinite logits, and rows with fewer live experts than picks. On the
+four ranks the teacher-forced logits were identical on all twelve cuts, and the greedy ids of
+both prompts were equal.
+
+| on the four ranks | strided scores and held part scores | small kernels |
+|---|---|---|
+| decode step, repeating 5K prompt (batch arm, same session) | 35.23 ms | 33.81 ms |
+| decode step after the 93K prompt (batch arm, same session) | 39.50 ms | 37.91 ms |
+| served decode, 2,223-token prompt | 28.75 tokens/s | 29.92 tokens/s |
+| served decode, 99,848-token prompt | 23.8 tokens/s | 25.8 tokens/s |
+| served decode, 127,603-token prompt | 22.4 tokens/s | 24.9 tokens/s |
+| served time to first token, 99,848-token prompt | 135 s | 130 s |
+
+Two things measured nothing to gain. The lm_head GEMV, at 1.93 ms a step, reads 462 MB a rank
+at the DRAM floor. The 93K trace's MXFP8 pair walks, 6.6 ms a step at first sight, were the
+prompt's last chunk falling after the last tensor-core attention launch the split marks decode
+from.
+
+The served rows are single runs.
+
 ### Experts split by intermediate columns (opt-in, not the default)
 
 Expert parallelism gives each rank 96 whole experts, so a decode row's eight experts land on the
