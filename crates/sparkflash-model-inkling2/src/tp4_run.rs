@@ -83,6 +83,19 @@ fn best_of(logits: &[f32]) -> (usize, f32) {
     best
 }
 
+/// FNV-1a over a logit row's little-endian bytes, folded into `digest`.
+fn digest_logits(digest: u64, logits: &[f32]) -> u64 {
+    logits
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .fold(digest, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+        })
+}
+
+/// The FNV-1a offset basis: the digest of no logits.
+const DIGEST_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
 /// What one rank of the run saw.
 #[derive(Debug, Clone)]
 pub struct Tp4Outcome {
@@ -102,6 +115,10 @@ pub struct Tp4Outcome {
     pub logits: usize,
     /// The first logits' best entry and its value, the comparison a second rank can make.
     pub best: (usize, f32),
+    /// The last pass's decode logits, every step's row in order, as one FNV-1a digest: two builds
+    /// that decode the same bits print the same digest, where the generated ids only show that
+    /// each step's best entry agreed.
+    pub decode_digest: u64,
     /// The scored prefixes ([Tp4Run::cuts]), in cut order.
     pub scores: Vec<Score>,
 }
@@ -246,6 +263,7 @@ impl Tp4Run {
             })?;
             generated.push(next);
             let mut decode_ms = Vec::with_capacity(decode);
+            let mut decode_digest = DIGEST_BASIS;
             for _ in 0..decode {
                 let started = Instant::now();
                 let step = session.decode(next).map_err(|error| {
@@ -257,6 +275,7 @@ impl Tp4Run {
                     )
                 })?;
                 decode_ms.push(started.elapsed().as_millis());
+                decode_digest = digest_logits(decode_digest, &step.logits);
                 next = step.next_token.ok_or_else(|| {
                     format!(
                         "TP{}/rank{}: a decode chose no token",
@@ -267,7 +286,7 @@ impl Tp4Run {
             }
             // Every pass walks the same ids greedily, so a pass that chose differently is a state
             // leak between sessions, which is a bug and not a report.
-            if let Some((earlier, _, _, _)) = &walked
+            if let Some((earlier, _, _, _, _)) = &walked
                 && *earlier != generated
             {
                 return Err(format!(
@@ -275,9 +294,16 @@ impl Tp4Run {
                     self.world, self.rank
                 ));
             }
-            walked = Some((generated, decode_ms, first.logits.len(), best));
+            walked = Some((
+                generated,
+                decode_ms,
+                first.logits.len(),
+                best,
+                decode_digest,
+            ));
         }
-        let (generated, decode_ms, logits, best) = walked.expect("a run walks at least once");
+        let (generated, decode_ms, logits, best, decode_digest) =
+            walked.expect("a run walks at least once");
         let mut scores = Vec::with_capacity(self.cuts);
         let mut rows: Vec<u8> = Vec::new();
         for cut in 1..=self.cuts {
@@ -324,6 +350,7 @@ impl Tp4Run {
             decode_ms,
             logits,
             best,
+            decode_digest,
             scores,
         })
     }

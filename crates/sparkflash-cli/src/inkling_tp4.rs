@@ -114,6 +114,10 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         outcome.logits,
         outcome.best
     );
+    println!(
+        "inkling-tp4: rank {} decode logits digest {:016x}",
+        outcome.rank, outcome.decode_digest
+    );
     for score in &outcome.scores {
         println!(
             "inkling-tp4: rank {} score length {} best {:?} next {:?}",
