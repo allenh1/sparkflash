@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sparkflash_comm::tcp::TcpConfig;
-use sparkflash_model::backend::{ModelBackend, Sampling};
+use sparkflash_model::backend::{ModelBackend, Sampling, Speculation};
 use sparkflash_model::{ModelDescriptor, TpPlan};
 use sparkflash_weights::tp::TpLayout;
 
@@ -119,6 +119,9 @@ pub struct Tp4Outcome {
     /// that decode the same bits print the same digest, where the generated ids only show that
     /// each step's best entry agreed.
     pub decode_digest: u64,
+    /// The last pass's drafted rounds as its session counted them: the rounds settled by the end
+    /// of the decode steps, so a round still being fed at the last step is not in it.
+    pub speculation: Speculation,
     /// The scored prefixes ([Tp4Run::cuts]), in cut order.
     pub scores: Vec<Score>,
 }
@@ -286,7 +289,7 @@ impl Tp4Run {
             }
             // Every pass walks the same ids greedily, so a pass that chose differently is a state
             // leak between sessions, which is a bug and not a report.
-            if let Some((earlier, _, _, _, _)) = &walked
+            if let Some((earlier, _, _, _, _, _)) = &walked
                 && *earlier != generated
             {
                 return Err(format!(
@@ -300,9 +303,10 @@ impl Tp4Run {
                 first.logits.len(),
                 best,
                 decode_digest,
+                session.speculation(),
             ));
         }
-        let (generated, decode_ms, logits, best, decode_digest) =
+        let (generated, decode_ms, logits, best, decode_digest, speculation) =
             walked.expect("a run walks at least once");
         let mut scores = Vec::with_capacity(self.cuts);
         let mut rows: Vec<u8> = Vec::new();
@@ -351,6 +355,7 @@ impl Tp4Run {
             logits,
             best,
             decode_digest,
+            speculation,
             scores,
         })
     }

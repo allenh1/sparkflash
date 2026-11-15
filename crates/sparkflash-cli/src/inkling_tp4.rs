@@ -118,6 +118,16 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         "inkling-tp4: rank {} decode logits digest {:016x}",
         outcome.rank, outcome.decode_digest
     );
+    let speculation = outcome.speculation;
+    if speculation.drafts_proposed > 0 {
+        println!(
+            "inkling-tp4: rank {} speculation: {} verify round(s) offered {} draft(s), {} accepted",
+            outcome.rank,
+            speculation.verify_steps,
+            speculation.drafts_proposed,
+            speculation.drafts_accepted
+        );
+    }
     for score in &outcome.scores {
         println!(
             "inkling-tp4: rank {} score length {} best {:?} next {:?}",
