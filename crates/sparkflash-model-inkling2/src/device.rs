@@ -2538,7 +2538,31 @@ impl InklingDeviceBackend {
         let shared = Arc::get_mut(&mut self.shared)
             .ok_or("the drafter loads before any session or lanes open on this rank")?;
         shared.cuda.make_current()?;
-        let model = DraftModel::load(shared, directory)?;
+        let mut model = DraftModel::load(shared, directory)?;
+        // The drafter's projections take the target's dense form: the same lossless rows its
+        // GEMVs read in about three quarters of the bytes, and the same bits.
+        let widest = model
+            .dense_matrices()
+            .iter()
+            .map(|(_, rows, columns)| rows * columns * 2)
+            .max()
+            .unwrap_or(0);
+        match shared
+            .dense
+            .pack(&shared.cuda, &shared.kernels, model.dense_matrices(), widest)
+        {
+            Ok((bf16_bytes, packed_bytes)) if bf16_bytes > 0 => eprintln!(
+                "[inkling] rank {}: drafter projections packed: {:.1} -> {:.1} MB",
+                shared.exchange.rank(),
+                bf16_bytes as f64 / 1e6,
+                packed_bytes as f64 / 1e6
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                model.free(&shared.cuda);
+                return Err(format!("the drafter's projections: {error}"));
+            }
+        }
         let bytes = model.device_bytes();
         shared.dspark = Some(model);
         Ok(bytes)

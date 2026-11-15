@@ -194,6 +194,11 @@ pub(super) struct DraftModel {
     rank: usize,
     eps: f32,
     theta: f32,
+    /// The matrices only the GEMV walks and the prompt tiles read, as (slot, rows, columns), that
+    /// the rank packs in place once they are loaded, as it packs the target's: the layers'
+    /// projections but the block's key and value, the Markov head's input projection and its
+    /// fold ([Self::dense_matrices]).
+    dense: Vec<(Deviceptr, usize, usize)>,
     allocations: Vec<Deviceptr>,
     bytes: usize,
 }
@@ -380,6 +385,7 @@ impl DraftModel {
         let source = single_file_source(directory, DRAFT_FILE)
             .map_err(|error| format!("{}: {error}", directory.display()))?;
         let up = DraftUploader::new(cuda, &source);
+        let mut dense = Vec::new();
         let mut allocations = Vec::new();
         let mut bytes = 0usize;
         let mut keep = |pointer: Deviceptr, size: usize| -> Deviceptr {
@@ -462,6 +468,19 @@ impl DraftModel {
                     .contains(&layer)
                     .then_some(mtp.sliding_window_size),
             });
+            // The block's key and value stay BF16: at the block's 8 rows their 256-row packed walk
+            // measured slower (26.5 us against 19.5), where every other projection, the context
+            // pair at a round's few fed rows included, measured as fast or faster packed.
+            let layer = layers.last().expect("the layer was just pushed");
+            dense.extend([
+                (layer.query, q_width, hidden),
+                (layer.context_key, kv_width, hidden),
+                (layer.context_value, kv_width, hidden),
+                (layer.out, hidden, q_width),
+                (layer.gate, intermediate, hidden),
+                (layer.up, intermediate, hidden),
+                (layer.down, hidden, intermediate),
+            ]);
         }
         // The fusion rows' softmax over the taps, in fp32 and rounded to BF16 as the reference
         // keeps them.
@@ -494,6 +513,7 @@ impl DraftModel {
         let z_width = 2 * markov + 2 * hidden;
         let rnn = up.mat("markov_head.rnn_proj.weight", 3 * markov, z_width)?;
         let rnn_weight = keep(rnn.pointer, 3 * markov * z_width * 2);
+        dense.push((rnn_weight, 3 * markov, z_width));
         let rnn_bias = keep(
             up.vector("markov_head.rnn_proj.bias", 3 * markov)?,
             6 * markov,
@@ -501,6 +521,7 @@ impl DraftModel {
         let (fold_weight, fold_bias) = fold(shared, &up, head, hidden, markov)?;
         let rank_vocab = shared.plan.rank_vocab();
         let fold_weight = keep(fold_weight, rank_vocab * markov * 2);
+        dense.push((fold_weight, rank_vocab, markov));
         let fold_bias = keep(fold_bias, rank_vocab * 2);
         Ok(Self {
             kernels,
@@ -526,6 +547,7 @@ impl DraftModel {
             rank: markov,
             eps: mtp.rms_norm_eps as f32,
             theta: mtp.rope_theta as f32,
+            dense,
             allocations,
             bytes,
         })
@@ -534,6 +556,11 @@ impl DraftModel {
     /// The device bytes the drafter's weights take on this rank.
     pub(super) fn device_bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// The matrices the rank may pack in place: see the field.
+    pub(super) fn dense_matrices(&self) -> &[(Deviceptr, usize, usize)] {
+        &self.dense
     }
 
     /// The most drafts a block proposes.

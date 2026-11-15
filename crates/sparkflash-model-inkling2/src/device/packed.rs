@@ -144,8 +144,10 @@ impl Packed {
 /// The rank's packed matrices, by the device pointer of the slot each replaced.
 pub(super) struct DenseWeights {
     packed: HashMap<u64, Packed>,
-    /// Every matrix's offsets and escapes.
-    arena: Option<Deviceptr>,
+    /// The form [DENSE_ENV] chose, which every later [Self::pack] keeps to.
+    form: DenseForm,
+    /// Each packed set's offsets and escapes: the served plan's, then the drafter's.
+    arenas: Vec<Deviceptr>,
     /// A BF16 matrix's worth, for the prompt tiles: the widest packed matrix but the head,
     /// which only the GEMVs read.
     scratch: Option<(Deviceptr, usize)>,
@@ -155,10 +157,11 @@ pub(super) struct DenseWeights {
 }
 
 impl DenseWeights {
-    pub(super) fn none() -> Self {
+    pub(super) fn none(form: DenseForm) -> Self {
         Self {
             packed: HashMap::new(),
-            arena: None,
+            form,
+            arenas: Vec::new(),
             scratch: None,
             bf16_bytes: 0,
             packed_bytes: 0,
@@ -172,9 +175,107 @@ impl DenseWeights {
 
     /// The allocations to free.
     pub(super) fn allocations(&self) -> impl Iterator<Item = Deviceptr> + '_ {
-        self.arena
-            .into_iter()
+        self.arenas
+            .iter()
+            .copied()
             .chain(self.scratch.map(|(pointer, _)| pointer))
+    }
+
+    /// Packs `matrices`, (slot, rows, columns) BF16 slots that only the GEMV walks and the
+    /// prompt tiles ([Shared::bf16_rows]) read, in place, and adds them: the ones the form takes,
+    /// none under [DenseForm::Bf16]. The first call allocates the scratch at `scratch_bytes` (at
+    /// least [MIN_SCRATCH]); later ones pack through it. On an error this call's allocations are
+    /// freed and the set is as it was.
+    ///
+    /// Returns the BF16 bytes the matrices packed here replaced and their packed bytes.
+    ///
+    /// # Errors
+    /// A driver failure, a slot already packed, or a matrix whose packed rows do not unpack to
+    /// its BF16 rows.
+    pub(super) fn pack(
+        &mut self,
+        cuda: &Cuda,
+        kernels: &Kernels,
+        matrices: &[(Deviceptr, usize, usize)],
+        scratch_bytes: usize,
+    ) -> Result<(usize, usize), String> {
+        if self.form == DenseForm::Bf16 {
+            return Ok((0, 0));
+        }
+        let mut candidates = Vec::new();
+        for &(pointer, rows, columns) in matrices {
+            if !packable(rows, columns) || !(pointer.0 as usize).is_multiple_of(ALIGN) {
+                continue;
+            }
+            if self.packed.contains_key(&pointer.0) {
+                return Err(format!("the dense slot at {:#x} is packed twice", pointer.0));
+            }
+            candidates.push(Candidate {
+                pointer,
+                rows,
+                columns,
+                offsets: Vec::new(),
+            });
+        }
+        if candidates.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut total = 0usize;
+        let fresh = self.scratch.is_none();
+        let (scratch, bytes) = match self.scratch {
+            Some(scratch) => scratch,
+            None => {
+                let bytes = scratch_bytes.max(MIN_SCRATCH);
+                (cuda.alloc(bytes, &mut total)?, bytes)
+            }
+        };
+        let widest_rows = candidates.iter().map(|m| m.rows).max().unwrap_or(1);
+        let held = cuda.alloc(widest_rows * 4, &mut total).and_then(|counts| {
+            match cuda.alloc(ALIGN, &mut total) {
+                Ok(differ) => Ok((counts, differ)),
+                Err(error) => {
+                    cuda.free_buffers(&[&counts]);
+                    Err(error)
+                }
+            }
+        });
+        let (counts, differ) = match held {
+            Ok(held) => held,
+            Err(error) => {
+                if fresh {
+                    cuda.free_buffers(&[&scratch]);
+                }
+                return Err(error);
+            }
+        };
+        let mut arena = None;
+        let packed = pack_in_place(
+            cuda,
+            kernels,
+            &mut candidates,
+            (counts, differ),
+            (scratch, bytes),
+            &mut arena,
+        );
+        cuda.free_buffers(&[&counts, &differ]);
+        match packed {
+            Ok((packed, bf16_bytes, packed_bytes)) => {
+                self.packed.extend(packed);
+                self.arenas.extend(arena);
+                self.scratch = Some((scratch, bytes));
+                self.bf16_bytes += bf16_bytes;
+                self.packed_bytes += packed_bytes;
+                Ok((bf16_bytes, packed_bytes))
+            }
+            Err(error) => {
+                let mut held: Vec<Deviceptr> = arena.into_iter().collect();
+                if fresh {
+                    held.push(scratch);
+                }
+                cuda.free_buffers(&held.iter().collect::<Vec<_>>());
+                Err(error)
+            }
+        }
     }
 
     /// One line for the boot log.
@@ -246,75 +347,35 @@ pub(super) fn pack_dense(
     weights: &Weights,
     form: DenseForm,
 ) -> Result<DenseWeights, String> {
+    let mut dense = DenseWeights::none(form);
     if form == DenseForm::Bf16 || plans.is_empty() {
-        return Ok(DenseWeights::none());
+        return Ok(dense);
     }
     let served = plans[0].served();
     let (slots, head) = dense_slots(plans);
     let mut candidates = Vec::new();
+    // The scratch holds the widest matrix but the head as BF16 (what a prompt tile unpacks) and
+    // is what the load packs through, a group of rows at a time.
+    let mut scratch_bytes = 0usize;
     for index in slots {
         let spec = served.rank_spec_at(index);
         let slot = weights.get(index);
         let [rows, columns] = spec.shape[..] else {
             continue;
         };
-        if spec.dtype != DType::BF16
-            || !packable(rows, columns)
-            || slot.bytes != rows * columns * 2
-            || !(slot.pointer.0 as usize).is_multiple_of(ALIGN)
-        {
+        if spec.dtype != DType::BF16 || slot.bytes != rows * columns * 2 {
             continue;
         }
-        candidates.push((index, Candidate {
-            pointer: slot.pointer,
-            rows,
-            columns,
-            offsets: Vec::new(),
-        }));
-    }
-    if candidates.is_empty() {
-        return Ok(DenseWeights::none());
-    }
-    let mut total = 0usize;
-    // The scratch holds the widest matrix but the head as BF16 (what a prompt tile unpacks) and
-    // is what the load packs through, a group of rows at a time.
-    let scratch_bytes = candidates
-        .iter()
-        .filter(|(index, _)| Some(*index) != head)
-        .map(|(_, matrix)| matrix.rows * matrix.columns * 2)
-        .max()
-        .unwrap_or(0)
-        .max(MIN_SCRATCH);
-    let widest_rows = candidates.iter().map(|(_, m)| m.rows).max().unwrap_or(1);
-    let counts = cuda.alloc(widest_rows * 4, &mut total)?;
-    let differ = cuda.alloc(ALIGN, &mut total)?;
-    let scratch = cuda.alloc(scratch_bytes, &mut total)?;
-    let mut matrices: Vec<Candidate> = candidates.into_iter().map(|(_, matrix)| matrix).collect();
-    let mut arena = None;
-    let packed = pack_in_place(
-        cuda,
-        kernels,
-        &mut matrices,
-        (counts, differ),
-        (scratch, scratch_bytes),
-        &mut arena,
-    );
-    cuda.free_buffers(&[&counts, &differ]);
-    match packed {
-        Ok((packed, bf16_bytes, packed_bytes)) => Ok(DenseWeights {
-            packed,
-            arena,
-            scratch: Some((scratch, scratch_bytes)),
-            bf16_bytes,
-            packed_bytes,
-        }),
-        Err(error) => {
-            let mut held = vec![scratch];
-            held.extend(arena);
-            cuda.free_buffers(&held.iter().collect::<Vec<_>>());
-            Err(error)
+        if Some(index) != head
+            && packable(rows, columns)
+            && (slot.pointer.0 as usize).is_multiple_of(ALIGN)
+        {
+            scratch_bytes = scratch_bytes.max(rows * columns * 2);
         }
+        candidates.push((slot.pointer, rows, columns));
     }
+    dense.pack(cuda, kernels, &candidates, scratch_bytes)?;
+    Ok(dense)
 }
 
 /// [pack_dense]'s passes: count every matrix's escapes, lay out one arena (a matrix's offsets,
