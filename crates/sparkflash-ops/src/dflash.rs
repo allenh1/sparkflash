@@ -283,7 +283,7 @@ impl GpuDflash2 {
         }
         let kernels = Dflash2Kernels::load(cuda)?;
         let quantize = kernels.quantize;
-        let source = single_file_source(directory)?;
+        let source = single_file_source(directory, DRAFT_SHARD)?;
         let uploader = DraftUploader::new(cuda, &source);
         let hidden = config.hidden_size;
         let conv = |prefix: String| -> Result<GpuConv, String> {
@@ -422,7 +422,7 @@ impl GpuDflash2 {
 /// The rows or columns `first..first + count` of a matrix: a rank's share of a tensor-parallel
 /// drafter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Part {
+pub enum Part {
     Rows(usize, usize),
     Columns(usize, usize),
 }
@@ -458,24 +458,34 @@ impl Part {
     }
 }
 
-/// Uploads the drafter's own tensors from its one safetensors file.
-struct DraftUploader<'a> {
+/// Uploads a drafter's own BF16 tensors from its one safetensors file ([single_file_source]): the
+/// DFlash 2 drafters' here, and Inkling-2's DSpark drafter in its arm.
+pub struct DraftUploader<'a> {
     cuda: &'a Cuda,
     source: &'a dyn WeightSource,
 }
 
 impl<'a> DraftUploader<'a> {
-    fn new(cuda: &'a Cuda, source: &'a dyn WeightSource) -> Self {
+    #[must_use]
+    pub fn new(cuda: &'a Cuda, source: &'a dyn WeightSource) -> Self {
         Self { cuda, source }
     }
 
-    fn bytes(&self, bytes: &[u8]) -> Result<Deviceptr, String> {
+    /// `bytes` in a device allocation of their own.
+    ///
+    /// # Errors
+    /// The allocation or the copy.
+    pub fn bytes(&self, bytes: &[u8]) -> Result<Deviceptr, String> {
         let pointer = self.cuda.alloc(bytes.len().max(4), &mut 0)?;
         self.cuda.copy_htod(&pointer, bytes)?;
         Ok(pointer)
     }
 
-    fn read(&self, name: &str, expected: usize) -> Result<Vec<u8>, String> {
+    /// Tensor `name`'s bytes, which must be `expected` long.
+    ///
+    /// # Errors
+    /// A tensor the source cannot read, or one of another length.
+    pub fn read(&self, name: &str, expected: usize) -> Result<Vec<u8>, String> {
         let bytes = self.source.read(name).map_err(|error| error.to_string())?;
         if bytes.len() != expected {
             return Err(format!(
@@ -486,12 +496,20 @@ impl<'a> DraftUploader<'a> {
         Ok(bytes)
     }
 
-    fn vector(&self, name: &str, elements: usize) -> Result<Deviceptr, String> {
+    /// A BF16 vector of `elements` on the device.
+    ///
+    /// # Errors
+    /// As [Self::read] and [Self::bytes].
+    pub fn vector(&self, name: &str, elements: usize) -> Result<Deviceptr, String> {
         let bytes = self.read(name, elements * 2)?;
         self.bytes(&bytes)
     }
 
-    fn mat(&self, name: &str, rows: usize, columns: usize) -> Result<GpuMat, String> {
+    /// A row-major BF16 matrix on the device.
+    ///
+    /// # Errors
+    /// As [Self::read] and [Self::bytes].
+    pub fn mat(&self, name: &str, rows: usize, columns: usize) -> Result<GpuMat, String> {
         let bytes = self.read(name, rows * columns * 2)?;
         Ok(GpuMat {
             pointer: self.bytes(&bytes)?,
@@ -500,7 +518,11 @@ impl<'a> DraftUploader<'a> {
         })
     }
 
-    fn mat_part(
+    /// One [Part] of a row-major BF16 matrix on the device.
+    ///
+    /// # Errors
+    /// A part outside the matrix, and as [Self::read] and [Self::bytes].
+    pub fn mat_part(
         &self,
         name: &str,
         (rows, columns): (usize, usize),
@@ -564,32 +586,40 @@ impl<'a> DraftUploader<'a> {
     }
 }
 
-/// A source over the drafter's one file, its index made from the file's own header. Every
-/// tensor must be BF16: the uploader checks byte lengths, and only the dtype tells a BF16 matrix
-/// from an F16 one of the same shape.
-fn single_file_source(directory: &Path) -> Result<SafeTensorsSource, String> {
-    let path = directory.join(DRAFT_SHARD);
-    let mut file = std::fs::File::open(&path)
-        .map_err(|error| format!("cannot open {DRAFT_SHARD}: {error}"))?;
-    let file_len = file
+/// A source over a drafter's one file `file` in `directory` ([DRAFT_SHARD] for the DFlash 2
+/// drafters, the checkpoint's `mtp.safetensors` for Inkling-2's), its index made from the file's
+/// own header, since the checkpoint's index does not list it. Every tensor must be BF16: the
+/// uploader checks byte lengths, and only the dtype tells a BF16 matrix from an F16 one of the
+/// same shape.
+///
+/// # Errors
+/// A file that cannot be read, a header that is not a safetensors header, or a tensor that is
+/// not BF16.
+pub fn single_file_source(directory: &Path, file: &str) -> Result<SafeTensorsSource, String> {
+    let path = directory.join(file);
+    let mut handle =
+        std::fs::File::open(&path).map_err(|error| format!("cannot open {file}: {error}"))?;
+    let file_len = handle
         .metadata()
-        .map_err(|error| format!("cannot stat {DRAFT_SHARD}: {error}"))?
+        .map_err(|error| format!("cannot stat {file}: {error}"))?
         .len();
     let mut length = [0u8; 8];
-    file.read_exact(&mut length)
-        .map_err(|error| format!("cannot read {DRAFT_SHARD}'s header length: {error}"))?;
+    handle
+        .read_exact(&mut length)
+        .map_err(|error| format!("cannot read {file}'s header length: {error}"))?;
     let header_len = u64::from_le_bytes(length);
     // Bounded before the buffer is sized, so a corrupt length costs an error, not an allocation.
     if header_len > MAX_HEADER_BYTES || header_len > file_len.saturating_sub(8) {
         return Err(format!(
-            "{DRAFT_SHARD} declares a {header_len}-byte header in a {file_len}-byte file"
+            "{file} declares a {header_len}-byte header in a {file_len}-byte file"
         ));
     }
     let mut prefix = vec![0u8; 8 + header_len as usize];
     prefix[..8].copy_from_slice(&length);
-    file.read_exact(&mut prefix[8..])
-        .map_err(|error| format!("cannot read {DRAFT_SHARD}'s header: {error}"))?;
-    let header = SafeTensorsHeader::from_container(&prefix, file_len, DRAFT_SHARD)
+    handle
+        .read_exact(&mut prefix[8..])
+        .map_err(|error| format!("cannot read {file}'s header: {error}"))?;
+    let header = SafeTensorsHeader::from_container(&prefix, file_len, file)
         .map_err(|error| error.to_string())?;
     if let Some((name, tensor)) = header.tensors.iter().find(|(_, t)| t.dtype != "BF16") {
         return Err(format!("{name} is {}, not BF16", tensor.dtype));
@@ -597,7 +627,7 @@ fn single_file_source(directory: &Path) -> Result<SafeTensorsSource, String> {
     let weight_map = header
         .tensors
         .keys()
-        .map(|name| (name.clone(), DRAFT_SHARD.to_owned()))
+        .map(|name| (name.clone(), file.to_owned()))
         .collect();
     Ok(SafeTensorsSource::new(
         directory,
