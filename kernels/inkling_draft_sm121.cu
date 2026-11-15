@@ -17,8 +17,8 @@
 // Inkling-2-Small's DSpark drafter (the checkpoint's mtp.safetensors; the forward is written up in
 // docs/models/inkling2-small-drafter.md). The five-layer block's projections run on the token
 // image's GEMV and the arm's prompt projections, and its attention on DFlash 2's block attention
-// (kernels/dflash2_sm121.cu, q4d_attn_span), on the drafter's own weights. This file holds the
-// rest:
+// (kernels/dflash2_sm121.cu, q4d_attn_span_part / _merge), on the drafter's own weights. This
+// file holds the rest:
 //
 //   - inkling_draft_capture: one of the eight target taps, a stream row rounded to BF16.
 //   - inkling_draft_mix_norm: a fusion row's weighted sum of a row's eight taps, RMS-normed.

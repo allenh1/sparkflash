@@ -375,6 +375,7 @@ Attribution:
   fusion and context projections) and DSpark (the Markov head) above. No SGLang
   or DFlash source is copied; the Rust and CUDA code is an independent
   implementation. The block attention is this repository's DFlash 2 kernel
-  (q4d_attn_span in kernels/dflash2_sm121.cu, section 8). The drafter weights
+  (q4d_attn_span_part and q4d_attn_span_merge in kernels/dflash2_sm121.cu,
+  section 8). The drafter weights
   are Thinking Machines' and are loaded from the operator's copy, not
   redistributed.
