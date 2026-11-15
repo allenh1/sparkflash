@@ -38,7 +38,7 @@
 
 use sparkflash_model::backend::BackendError;
 
-use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step};
+use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step, TauRule};
 
 use super::*;
 
@@ -918,6 +918,26 @@ pub(super) fn walk_rows(
     }
     probe(shared, "chunk embed_norm", scratch.x, rows, hidden)?;
 
+    // A layer's per-row scale table: null for a layer that does not scale (its kernels take the
+    // scalar `tau`, 1 at every position), otherwise the rule's factor at each row's position. The
+    // full layers share one rule, so the table goes up once a walk: an upload from pageable memory
+    // waits for the stream, and one a layer left the GPU idle between layers.
+    let mut uploaded_tau: Option<TauRule> = None;
+    let mut tau_table = |rule: TauRule| -> Result<Deviceptr, BackendError> {
+        if rule == TauRule::One {
+            return Ok(Deviceptr(0));
+        }
+        if uploaded_tau != Some(rule) {
+            let taus: Vec<f32> = (0..rows).map(|row| rule.at(position + row)).collect();
+            run(shared
+                .cuda
+                .copy_htod(&scratch.taus, &row_bytes(&taus))
+                .map_err(|error| error.to_string()))?;
+            uploaded_tau = Some(rule);
+        }
+        Ok(scratch.taus)
+    };
+
     for (index, layer) in schedule.layers().iter().enumerate() {
         // The drafter's taps of this layer: every row's stream as the layer starts on it.
         if let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer.index)?))) {
@@ -1218,12 +1238,7 @@ pub(super) fn walk_rows(
                             // chunk's rows differ. It is the plan's own rule, evaluated here,
                             // which is what keeps a chunk's score the score the row-at-a-time
                             // walk computes.
-                            let taus: Vec<f32> =
-                                (0..rows).map(|row| layer.tau.at(position + row)).collect();
-                            run(shared
-                                .cuda
-                                .copy_htod(&scratch.taus, &row_bytes(&taus))
-                                .map_err(|error| error.to_string()))?;
+                            let taus = tau_table(layer.tau)?;
                             run(shared.attention_chunk(
                                 scratch,
                                 index,
@@ -1237,7 +1252,7 @@ pub(super) fn walk_rows(
                                 scratch.sink,
                                 clips,
                                 scratch.attn_bf16,
-                                scratch.taus,
+                                taus,
                                 rows,
                                 position,
                                 kv_heads,
@@ -1252,12 +1267,7 @@ pub(super) fn walk_rows(
                             // The decode step's attention, each row against its own prefix: the
                             // split arena's passes are the decode step's, and the rows' scales are
                             // the plan's rule at each row's position, as the decode step takes it.
-                            let taus: Vec<f32> =
-                                (0..rows).map(|row| layer.tau.at(position + row)).collect();
-                            run(shared
-                                .cuda
-                                .copy_htod(&scratch.taus, &row_bytes(&taus))
-                                .map_err(|error| error.to_string()))?;
+                            let taus = tau_table(layer.tau)?;
                             run(shared.attention_rows(
                                 scratch,
                                 index,
@@ -1271,7 +1281,7 @@ pub(super) fn walk_rows(
                                 scratch.sink,
                                 clips,
                                 scratch.attn_bf16,
-                                scratch.taus,
+                                taus,
                                 rows,
                                 position,
                                 kv_heads,
