@@ -311,6 +311,14 @@ pub(super) enum Rows<'s, 'a> {
     /// given. The sequence stages run each lane's row through the decode step's own launch on
     /// that lane's state, so a lane's row is the bits its decode step alone would give it.
     Lanes(&'s mut [&'a mut State]),
+    /// A speculative verify: an anchor and its drafts at consecutive positions of one sequence,
+    /// every row answered, each row the bits its own decode step would give it. The walk is
+    /// [PrefillWalk::Chunk], whose projections and band are the decode step's sums; the
+    /// convolutions are a chunk's, which take the decode entry's order; the attention is the
+    /// decode step's split walk over a split arena, each row against its own prefix; and the head
+    /// is the batched GEMV, whose row is the one-row launch's. Each layer's convolution inputs
+    /// are left in the [VerifyTails], so the session can keep any leading run of the rows.
+    Verify(&'s mut State, VerifyTails),
 }
 
 /// Rows of a chunk the text model takes from an image rather than from the embedding table.
@@ -358,9 +366,30 @@ pub(super) fn walk_rows(
             chunk.rows
         )));
     }
-    // A chunk answers its last row; lanes answer every row, one a lane.
+    // A chunk answers its last row; lanes answer every row, one a lane, and a verify every row.
     let answers = match &sequences {
         Rows::Chunk(_) => 1,
+        Rows::Verify(_, tails) => {
+            if rows > tails.rows {
+                return Err(device_error(format!(
+                    "a verify of {rows} rows is deeper than the {} rows its tails hold",
+                    tails.rows
+                )));
+            }
+            if walk != PrefillWalk::Chunk {
+                return Err(device_error(
+                    "a verify's rows are the decode step's sums: it walks PrefillWalk::Chunk",
+                ));
+            }
+            if tails.history != config.conv_history().max(1) {
+                return Err(device_error(format!(
+                    "the verify's tails hold {} history rows and the convolutions read {}",
+                    tails.history,
+                    config.conv_history().max(1)
+                )));
+            }
+            rows
+        }
         Rows::Lanes(states) => {
             if states.len() != rows {
                 return Err(device_error(format!(
@@ -385,7 +414,7 @@ pub(super) fn walk_rows(
     let groups = heads / kv_heads;
     let history = config.conv_history().max(1);
     let position = match &sequences {
-        Rows::Chunk(state) => state.position,
+        Rows::Chunk(state) | Rows::Verify(state, _) => state.position,
         Rows::Lanes(_) => 0,
     };
     let scratch = &chunk.scratch;
@@ -574,7 +603,7 @@ pub(super) fn walk_rows(
                     };
                     let slot_index = conv_slot(slot);
                     match &sequences {
-                        Rows::Chunk(state) => {
+                        Rows::Chunk(state) | Rows::Verify(state, _) => {
                             // The seam: this slot's history in the row layout the chunk reads,
                             // and the tail this launch leaves back in the layout the next decode
                             // step reads.
@@ -595,6 +624,7 @@ pub(super) fn walk_rows(
                                 channels,
                                 history,
                             ))?;
+                            keep_tail(shared, &sequences, chunk, index, slot_index, rows)?;
                             run(shared.conv_history(
                                 chunk
                                     .conv_head(slot_index)
@@ -654,7 +684,7 @@ pub(super) fn walk_rows(
                     )?;
                     let slot_index = conv_slot(slot);
                     match &sequences {
-                        Rows::Chunk(state) => {
+                        Rows::Chunk(state) | Rows::Verify(state, _) => {
                             run(shared.conv_history(
                                 state.conv[index][slot_index],
                                 chunk.conv_head(slot_index),
@@ -671,6 +701,7 @@ pub(super) fn walk_rows(
                                 kv_width,
                                 history,
                             ))?;
+                            keep_tail(shared, &sequences, chunk, index, slot_index, rows)?;
                             run(shared.conv_history(
                                 chunk
                                     .conv_head(slot_index)
@@ -705,7 +736,10 @@ pub(super) fn walk_rows(
                     previous_conv = Some(slot);
                 }
                 (Op::KvStore, _) => match &sequences {
-                    Rows::Chunk(state) => run(shared.launch(
+                    // A verify's rows land where its decode steps would store them; the rows it
+                    // does not keep are past the position the session leaves, and the next rows
+                    // stored there overwrite them before any row reads them.
+                    Rows::Chunk(state) | Rows::Verify(state, _) => run(shared.launch(
                         shared.kernels.kv_store,
                         (flat(kv_width), rows as u32, 1),
                         (ELEMENT_BLOCK, 1, 1),
@@ -761,6 +795,40 @@ pub(super) fn walk_rows(
                                 .copy_htod(&scratch.taus, &row_bytes(&taus))
                                 .map_err(|error| error.to_string()))?;
                             run(shared.attention_chunk(
+                                scratch,
+                                index,
+                                scratch.q,
+                                scratch.gate,
+                                state.keys[index],
+                                state.values[index],
+                                state.tables[index],
+                                scratch.rel,
+                                bank,
+                                scratch.sink,
+                                clips,
+                                scratch.attn_bf16,
+                                scratch.taus,
+                                rows,
+                                position,
+                                kv_heads,
+                                groups,
+                                if sliding { layer.window } else { 0 },
+                                if sliding { cache_rows } else { 0 },
+                                layer.rel_extent,
+                                layer.tau.at(position),
+                            ))?;
+                        }
+                        Rows::Verify(state, _) => {
+                            // The decode step's attention, each row against its own prefix: the
+                            // split arena's passes are the decode step's, and the rows' scales are
+                            // the plan's rule at each row's position, as the decode step takes it.
+                            let taus: Vec<f32> =
+                                (0..rows).map(|row| layer.tau.at(position + row)).collect();
+                            run(shared
+                                .cuda
+                                .copy_htod(&scratch.taus, &row_bytes(&taus))
+                                .map_err(|error| error.to_string()))?;
+                            run(shared.attention_rows(
                                 scratch,
                                 index,
                                 scratch.q,
@@ -1007,9 +1075,9 @@ pub(super) fn walk_rows(
                         rank_vocab,
                         hidden,
                     ))?,
-                    // The lanes' rows through the batched GEMV, whose row is the one-row
-                    // launch's bits.
-                    Rows::Lanes(_) => project(
+                    // The lanes' or a verify's rows through the batched GEMV, whose row is the
+                    // one-row launch's bits.
+                    Rows::Lanes(_) | Rows::Verify(..) => project(
                         shared,
                         PrefillWalk::Chunk,
                         matrix,
@@ -1058,7 +1126,7 @@ pub(super) fn walk_rows(
     }
 
     match &mut sequences {
-        Rows::Chunk(state) => {
+        Rows::Chunk(state) | Rows::Verify(state, _) => {
             state.blocks = blocks;
             state.position += rows;
         }
@@ -1084,6 +1152,29 @@ pub(super) fn walk_rows(
         .map(|pair| bf16_to_f32(u16::from_le_bytes(*pair)))
         .collect();
     Ok(values.chunks(unpadded).map(<[f32]>::to_vec).collect())
+}
+
+/// A verify's copy of one layer's convolution input as the launch read it: the history rows
+/// before its first row, then its own rows. Nothing for any other walk.
+fn keep_tail(
+    shared: &Shared,
+    sequences: &Rows<'_, '_>,
+    chunk: &Chunk,
+    layer: usize,
+    slot: usize,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let Rows::Verify(_, tails) = sequences else {
+        return Ok(());
+    };
+    shared
+        .cuda
+        .copy_dtod_async(
+            &tails.at(layer, slot),
+            &chunk.conv_head(slot),
+            (tails.history + rows) * tails.channels(slot) * std::mem::size_of::<f32>(),
+        )
+        .map_err(device_error)
 }
 
 /// The convolution state slot a schedule's conv target names.
