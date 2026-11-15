@@ -134,16 +134,32 @@ pub fn parse_fabric_schedule(value: &str) -> Option<FabricSchedule> {
     }
 }
 
+/// The schedule a selector names: unset or empty is the switched default, and anything the
+/// parser does not recognise is an error naming the value, never a silent fall-through.
+///
+/// # Errors
+///
+/// The value is set but is not one of the two schedules this build implements.
+pub fn fabric_schedule_from_value(value: Option<&str>) -> Result<FabricSchedule, String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(FabricSchedule::OneShotAllToAll),
+        Some(text) => parse_fabric_schedule(text).ok_or_else(|| {
+            format!("{FABRIC_SCHEDULE_ENV}={text}: expected switched or switchless")
+        }),
+    }
+}
+
 /// The fabric schedule this process was configured to run, from [`FABRIC_SCHEDULE_ENV`].
 ///
-/// An unset or unrecognised value is the switched default, so a typo cannot silently change the
-/// recipe; a caller that needs to reject a typo parses the CLI flag instead (which does).
-#[must_use]
-pub fn fabric_schedule_from_env() -> FabricSchedule {
-    std::env::var(FABRIC_SCHEDULE_ENV)
-        .ok()
-        .and_then(|value| parse_fabric_schedule(&value))
-        .unwrap_or(FabricSchedule::OneShotAllToAll)
+/// An unset (or empty) value is the switched default. A value that is set but unrecognised is
+/// refused rather than served as switched: silently choosing the other decomposition on a typo
+/// would run a different recipe than the operator asked for.
+///
+/// # Errors
+///
+/// The variable is set but names no schedule this build implements.
+pub fn fabric_schedule_from_env() -> Result<FabricSchedule, String> {
+    fabric_schedule_from_value(std::env::var(FABRIC_SCHEDULE_ENV).ok().as_deref())
 }
 
 /// The CLI flag spelling of a schedule: what --fabric-schedule accepts and the launcher writes.
@@ -311,7 +327,12 @@ impl Default for HostArgs {
 
 impl HostArgs {
     fn parse(args: &[&str]) -> Result<Self, String> {
-        let mut parsed = Self::default();
+        let mut parsed = Self {
+            // The environment selects the recipe for a hand-run rank; --fabric-schedule overrides
+            // it below, and a bad env value is refused here rather than served as switched.
+            fabric_schedule: fabric_schedule_from_env()?,
+            ..Self::default()
+        };
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -2674,7 +2695,12 @@ impl TpCollective {
             transport,
             seq: AtomicU64::new(0),
             world,
-            label: format!("tcp-hostonly/world{world}"),
+            // The label is what the evidence record reports as `collective`; naming the schedule
+            // there is how a run proves which decomposition its exchanges ran (issue #19).
+            label: format!(
+                "tcp-hostonly/{}/world{world}",
+                fabric_schedule_name(fabric_schedule)
+            ),
             calls: AtomicU64::new(0),
             elements: AtomicU64::new(0),
             ms: AtomicU64::new(0),
@@ -4909,6 +4935,24 @@ mod tests {
                 FabricSchedule::HairpinRingReduceScatterAllGather,
             );
             assert_eq!(ring.len(), world);
+            // The evidence names the schedule the collectives ran: a test that compared only the
+            // tokens would still pass if the schedule were ignored, so pin the label too.
+            for outcome in &switched {
+                assert!(
+                    outcome.collective_label.contains("switched"),
+                    "rank {} ran {}",
+                    outcome.rank,
+                    outcome.collective_label
+                );
+            }
+            for outcome in &ring {
+                assert!(
+                    outcome.collective_label.contains("switchless"),
+                    "rank {} ran {}",
+                    outcome.rank,
+                    outcome.collective_label
+                );
+            }
             for (switched, ring) in switched.iter().zip(&ring) {
                 assert_eq!(
                     ring.step_tokens, switched.step_tokens,
@@ -5325,6 +5369,36 @@ mod tests {
         ])
         .expect_err("a typo is refused");
         assert!(error.contains("switched"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_environment_schedule_is_refused_not_served_as_switched() {
+        // A typo in SPARKFLASH_FABRIC_SCHEDULE must fail the run, not quietly run the other
+        // decomposition: the two schedules move different bytes and are not interchangeable.
+        assert_eq!(
+            fabric_schedule_from_value(None),
+            Ok(FabricSchedule::OneShotAllToAll),
+            "unset is the switched default"
+        );
+        assert_eq!(
+            fabric_schedule_from_value(Some("  ")),
+            Ok(FabricSchedule::OneShotAllToAll),
+            "an empty export is the default"
+        );
+        for (written, expected) in [
+            (
+                "switchless",
+                FabricSchedule::HairpinRingReduceScatterAllGather,
+            ),
+            ("hairpin", FabricSchedule::HairpinRingReduceScatterAllGather),
+            ("one-shot", FabricSchedule::OneShotAllToAll),
+        ] {
+            assert_eq!(fabric_schedule_from_value(Some(written)), Ok(expected));
+        }
+        let error = fabric_schedule_from_value(Some("switchles")).expect_err("typo refused");
+        assert!(error.contains("switchles"), "{error}");
+        assert!(error.contains(FABRIC_SCHEDULE_ENV), "{error}");
+        assert!(error.contains("switched or switchless"), "{error}");
     }
 
     #[test]

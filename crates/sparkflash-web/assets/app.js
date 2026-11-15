@@ -1536,22 +1536,27 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Each collective reduce-scatters to the chunk owners, then all-gathers back: same arithmetic, one fabric crossing per byte.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Cross-rank collectives reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
   },
 ];
 
 const FABRIC_SHAPE_NAMES = { switched: "a 200G switch", ring: "a direct ring", pairs: "two-node pairs", unknown: "unrecognised wiring" };
 
+// The saved schedule may be an alias the config accepts (one-shot, hairpin, ring). The cards are
+// keyed by the canonical name, so an alias must not leave both cards unselected.
+const FABRIC_ALIASES = { switched: "switched", "one-shot": "switched", oneshot: "switched", "one_shot": "switched", switchless: "switchless", hairpin: "switchless", ring: "switchless", "hairpin-ring": "switchless" };
+const canonicalFabric = (value) => FABRIC_ALIASES[String(value || "").trim().toLowerCase()] || "switched";
+
 function fabricPicker(state, model) {
   const setup = model.setup;
   const config = state.config;
-  const chosen = (config.cluster && config.cluster.fabric_schedule) || "switched";
+  const chosen = canonicalFabric(config.cluster && config.cluster.fabric_schedule);
   const measured = setup && setup.fabric ? setup.fabric : null;
   const shape = measured ? measured.shape : null;
   const recommended = shape === "switched" ? "switched" : shape === "ring" ? "switchless" : null;
   const parts = ['<div class="fabric">'];
   parts.push('<div class="fabric-head"><div><h3 class="fabric-title">Fabric</h3>' +
-    '<p class="fabric-sub">How the four Sparks are cabled. The schedule the collectives run follows this choice.</p></div>');
+    '<p class="fabric-sub">How the four Sparks are cabled. The cross-rank collectives follow this choice.</p></div>');
   if (measured) {
     if (!measured.links_measured) {
       parts.push('<span class="tag warn">Ports not probed</span>');

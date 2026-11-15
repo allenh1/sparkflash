@@ -52,7 +52,17 @@ const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop", "swap"];
 
 /// What a conversion must not overlap: a launch, stop or swap, or the checkpoint changing
 /// under it.
-const CONVERT_EXCLUSIVE: &[&str] = &["launch", "stop", "swap", "download", "sync-model"];
+const CONVERT_EXCLUSIVE: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "download",
+    "sync-model",
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
+];
 
 /// What a launch must not overlap: anything that changes the files the ranks start from.
 /// Background `prepare-*` jobs are deliberately absent: sharding another model may continue
@@ -68,6 +78,11 @@ const LAUNCH_EXCLUSIVE: &[&str] = &[
     "convert-r1",
     "convert-r2",
     "convert-r3",
+    // A port job can drop the link the ranks are starting over.
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
 ];
 
 /// What a model download or copy must not overlap: the other one, or a conversion reading it.
@@ -83,6 +98,11 @@ const MODEL_EXCLUSIVE: &[&str] = &[
     "prepare-r1",
     "prepare-r2",
     "prepare-r3",
+    // A port job can drop the link a model transfer is running over.
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
 ];
 
 /// How long one node check may take, on top of the SSH connect timeout.
@@ -100,6 +120,15 @@ const NETWORK_SETUP_EXCLUSIVE: &[&str] = &[
     "download",
     "sync-model",
     "sync-software",
+    // They read model bytes over the same links and can be cut by a netplan apply.
+    "convert-r0",
+    "convert-r1",
+    "convert-r2",
+    "convert-r3",
+    "prepare-r0",
+    "prepare-r1",
+    "prepare-r2",
+    "prepare-r3",
 ];
 
 /// How long a stop or its confirmation through the launcher may take.
@@ -964,23 +993,30 @@ fn run_fabric_probe(
     probe: &dyn SshProbe,
     probes: &[ProbeResult],
 ) -> Option<inspect::Fabric> {
-    let peers = inspect::planned_peers(config, probes)?;
+    let addresses = inspect::probe_addresses(config, probes)?;
     let world = probes.len();
     let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs + FABRIC_SECS);
     let results: Vec<Option<inspect::FabricProbe>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..world)
             .map(|rank| {
-                let peers: Vec<(usize, String)> = peers
+                let peers: Vec<(usize, String)> = addresses
                     .iter()
                     .enumerate()
                     .filter(|(index, _)| *index != rank)
-                    .map(|(index, address)| (index, address.clone()))
+                    .flat_map(|(index, list)| {
+                        list.iter().map(move |address| (index, address.clone()))
+                    })
                     .collect();
-                let netdevs: Vec<String> = probes[rank]
+                let rails = probes[rank]
                     .as_ref()
-                    .map(|facts| facts.rails().into_iter().map(|rail| rail.netdev).collect())
+                    .map(|facts| facts.rails())
                     .unwrap_or_default();
-                let command = fabric_probe_command(config, rank, &netdevs, &peers);
+                let netdevs: Vec<String> = rails.iter().map(|rail| rail.netdev.clone()).collect();
+                let own: Vec<(String, String)> = rails
+                    .iter()
+                    .map(|rail| (rail.netdev.clone(), rail.ip.to_string()))
+                    .collect();
+                let command = fabric_probe_command(config, rank, &netdevs, &peers, &own);
                 scope.spawn(move || {
                     probe
                         .capture(&command, timeout)
@@ -1038,23 +1074,30 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
-    let fixes: Vec<(usize, String)> = web
-        .last_inspect
+    // The fixes are the ones the last check computed, including their netplan bodies. Replaying
+    // them against a configuration that has since changed would write another machine's
+    // addresses to this rank, so a report taken for a different configuration is refused.
+    let report = web.last_inspect.read().expect("inspect lock").clone();
+    let inspected_for = web
+        .last_inspect_config
         .read()
         .expect("inspect lock")
-        .as_ref()
-        .map(|report| {
-            report
-                .nodes
-                .iter()
-                .filter_map(|node| {
-                    node.network_fix_remote
-                        .clone()
-                        .map(|remote| (node.rank, remote))
-                })
-                .collect()
+        .clone();
+    let Some(report) = report.filter(|_| inspected_for.as_ref() == Some(&config)) else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check was taken of a different configuration; check the nodes again",
+        );
+    };
+    let fixes: Vec<(usize, String)> = report
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.network_fix_remote
+                .clone()
+                .map(|remote| (node.rank, remote))
         })
-        .unwrap_or_default();
+        .collect();
     if fixes.is_empty() {
         return api_error(
             StatusCode::CONFLICT,
@@ -1063,14 +1106,30 @@ async fn network_setup(State(web): State<WebState>) -> Response {
     }
     let mut started = Vec::new();
     for (rank, remote) in fixes {
-        let command = network_fix_command(&config, rank, &remote);
+        let Some(command) = network_fix_command(&config, rank, &remote) else {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("rank {rank} is not in the saved configuration any more"),
+            );
+        };
         match web
             .jobs
             .start_exclusive(command, NETWORK_SETUP_EXCLUSIVE)
             .await
         {
             Ok(id) => started.push(id),
-            Err(error) => return api_error(StatusCode::CONFLICT, error.message),
+            Err(error) => {
+                // Earlier ranks are already running their jobs; say so rather than dropping the
+                // ids silently.
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{} ({} job(s) had already started and are still running)",
+                        error.message,
+                        started.len()
+                    ),
+                );
+            }
         }
     }
     accepted_jobs(&web, &started)
@@ -2213,7 +2272,7 @@ mod tests {
                     // Ports cabled but unconfigured: nothing answers.
                     return Ok((0..4)
                         .filter(|peer| *peer != rank)
-                        .map(|peer| format!("ping {peer} no\n"))
+                        .map(|peer| format!("ping {peer} dev{rank} no\n"))
                         .collect());
                 }
                 // A fully switched fabric: this rank's port reaches every other rank.
@@ -2223,7 +2282,9 @@ mod tests {
                 let mut reply = String::new();
                 for peer in 0..4 {
                     if peer != rank {
-                        reply.push_str(&format!("link {peer} dev{rank} ok\nping {peer} ok\n"));
+                        reply.push_str(&format!(
+                            "link {peer} dev{rank} ok\nping {peer} dev{rank} ok\n"
+                        ));
                     }
                 }
                 return Ok(reply);
@@ -3173,6 +3234,103 @@ mod tests {
         let jobs = body["jobs"].as_array().expect("jobs array");
         assert_eq!(jobs.len(), 1, "{body}");
         assert_eq!(jobs[0]["kind"], "network-setup-r3");
+
+        // The job that started carries the port fix for that rank: the SSH destination and the
+        // `sudo -n` wrapper, not some other node's netplan.
+        let listed = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/jobs")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        let job = listed
+            .as_array()
+            .and_then(|jobs| jobs.iter().find(|job| job["kind"] == "network-setup-r3"))
+            .expect("the port job is listed");
+        let command = job["command"].as_str().expect("command");
+        assert!(command.starts_with("ssh "), "{command}");
+        assert!(command.contains("spark3"), "{command}");
+        assert!(command.contains("sudo -n bash -c"), "{command}");
+        assert!(command.contains("netplan apply"), "{command}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_a_report_taken_of_another_configuration() {
+        // The fixes replay the netplan body the last check computed, including its addresses.
+        // Saving a different configuration between the check and the button must not write the
+        // old machine's fast-network address onto whatever now runs at that rank.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let state = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/state")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        let mut config: SparkConfig =
+            serde_json::from_value(state["config"].clone()).expect("config");
+        config.web.ssh_timeout_secs += 1;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"config": config}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("different configuration")),
+            "{body}"
+        );
     }
 
     #[tokio::test]

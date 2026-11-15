@@ -1372,7 +1372,7 @@ fn epoch_args(
         &ids,
         "--forward-lean",
         "--fabric-schedule",
-        crate::tp4_host::fabric_schedule_name(crate::tp4_host::fabric_schedule_from_env()),
+        crate::tp4_host::fabric_schedule_name(options.fabric_schedule),
     ]
     .iter()
     .map(|arg| (*arg).to_owned())

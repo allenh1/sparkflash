@@ -152,7 +152,9 @@ impl ChainArgs {
         let mut forward_lean = false;
         let mut forward_perf_probe = false;
         let mut forward_perf_probe_nosync = false;
-        let mut fabric_schedule = FabricSchedule::OneShotAllToAll;
+        // The env selects it for a hand-run stage; --fabric-schedule overrides it below, and an
+        // unknown env value is refused rather than served as switched.
+        let mut fabric_schedule = crate::tp4_host::fabric_schedule_from_env()?;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];

@@ -49,6 +49,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sparkflash_comm::layout::FabricSchedule;
 use sparkflash_comm::{TcpTransport, Transport};
 use sparkflash_device::converted::find_converted_rank_file;
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpCollective, TpLayout, TpRuntime, Wire};
@@ -98,6 +99,9 @@ struct GlmArgs {
     wire: Wire,
     /// The NCCL communicator as the collective's device leg; the default where it applies.
     nccl: bool,
+    /// The collective fabric this rank runs (issue #19): every rank of a group must carry the
+    /// same value. The flag overrides `SPARKFLASH_FABRIC_SCHEDULE`, which overrides switched.
+    fabric_schedule: FabricSchedule,
 }
 
 impl GlmArgs {
@@ -125,6 +129,7 @@ impl GlmArgs {
             adaptive: false,
             wire: Wire::F32,
             nccl: false,
+            fabric_schedule: crate::tp4_host::fabric_schedule_from_env()?,
         };
         let mut index = 0;
         while index < args.len() {
@@ -175,6 +180,13 @@ impl GlmArgs {
                         "nccl" => true,
                         other => return Err(format!("--collective {other}: tcp or nccl")),
                     });
+                }
+                "--fabric-schedule" => {
+                    let value = take()?;
+                    parsed.fabric_schedule = crate::tp4_host::parse_fabric_schedule(value)
+                        .ok_or_else(|| {
+                            format!("--fabric-schedule {value}: expected switched or switchless")
+                        })?;
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -394,7 +406,7 @@ fn run_rank(args: &GlmArgs) -> Result<(), String> {
         layout.world_size,
         transport,
         args.wire,
-        crate::tp4_host::fabric_schedule_from_env(),
+        args.fabric_schedule,
     );
     if let Some(reduce) = reduce {
         collective = Box::new(DeviceExchange::new(collective, reduce)?) as Box<dyn TpCollective>;

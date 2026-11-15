@@ -30,9 +30,12 @@ Everything here is on four DGX Spark GB10 nodes, TP=4, one rack.
 
 ## Two schedules: the switched one-shot and the switchless ring
 
-Every collective runs one of two transfer decompositions, selected by `FabricSchedule` and exposed
-by the `--fabric-schedule switched|switchless` flag, the `[cluster].fabric_schedule` configuration
-field and the `SPARKFLASH_FABRIC_SCHEDULE` environment variable (issue #19):
+Every collective that runs on the rank-to-rank exchange takes one of two transfer decompositions,
+selected by `FabricSchedule` and exposed by the `--fabric-schedule switched|switchless` flag, the
+`[cluster].fabric_schedule` configuration field and the `SPARKFLASH_FABRIC_SCHEDULE` environment
+variable (issue #19). The device arm's hot per-layer all-reduce is not one of them: it enqueues on
+NCCL (`SPARK_COMM_REDUCE=nccl`, the device default), so the schedule shapes the barriers, the
+embedding/token gathers and the host reference arm's reductions:
 
 - **OneShotAllToAll** (switched, the default): every rank posts its whole bf16 payload to all
   `world - 1` peers over the 200 Gb/s switch and reduces locally in canonical rank order. It moves
@@ -58,7 +61,9 @@ Set it in `sparkflash.toml`:
 fabric_schedule = "switchless"
 ~~~
 
-or per run on the CLI (`--fabric-schedule switchless`, `hairpin` and `ring` are aliases). The web
+or per run on the CLI (`--fabric-schedule switchless`, `hairpin` and `ring` are aliases). Every rank
+of one group must run the same value: the collective does not negotiate it on the wire, so a rank
+started by hand with a different value disagrees with its peers at the first exchange. The web
 Setup page offers the same choice as a card in step 2 (**Connect the fast network**), which also
 measures the wiring with ARP probes and can set it to match, and the four-node launcher forwards the
 value to every rank; the host twin's `--fabric-schedule` covers the CPU test path. Both schedules

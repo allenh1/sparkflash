@@ -373,9 +373,10 @@ pub fn fabric_probe_command(
     rank: usize,
     netdevs: &[String],
     peers: &[(usize, String)],
+    own: &[(String, String)],
 ) -> CommandSpec {
     let node = &config.cluster.nodes[rank];
-    let args = inspect::fabric_probe_args(netdevs, peers);
+    let args = inspect::fabric_probe_args(netdevs, peers, own);
     let label = format!("Probe the fast ports on {}", node.ssh);
     if node.local {
         let mut argv = vec![
@@ -411,32 +412,32 @@ pub fn fabric_probe_command(
 /// rank runs the same way so both paths exercise the same script. Per-rank kinds let the four
 /// ranks be configured at once; each refuses to start while a launch is running.
 #[must_use]
-pub fn network_fix_command(config: &SparkConfig, rank: usize, remote: &str) -> CommandSpec {
-    let node = &config.cluster.nodes[rank];
+pub fn network_fix_command(config: &SparkConfig, rank: usize, remote: &str) -> Option<CommandSpec> {
+    let node = config.cluster.nodes.get(rank)?;
     let script = format!("sudo -n bash -c {}", shell_quote(remote));
     let label = format!("Set up the fast ports on {}", node.ssh);
     let kind = format!("network-setup-r{rank}");
     if node.local {
-        return CommandSpec {
+        return Some(CommandSpec {
             program: "bash".to_owned(),
             args: vec!["-c".to_owned(), script],
             env: BTreeMap::new(),
             cwd: None,
             label,
             kind,
-        };
+        });
     }
     let mut ssh_args = batch_ssh_args(config);
     ssh_args.push(config.ssh_destination(rank));
     ssh_args.push(script);
-    CommandSpec {
+    Some(CommandSpec {
         program: "ssh".to_owned(),
         args: ssh_args,
         env: BTreeMap::new(),
         cwd: None,
         label,
         kind,
-    }
+    })
 }
 
 /// Downloads `model.id` into the Hugging Face cache on the lead with `scripts/hf-download.py`,
@@ -909,6 +910,73 @@ mod tests {
             .expect("destination");
         assert!(remote.args[at + 1].starts_with("bash -c '"));
         assert_eq!(remote.args.len(), at + 2);
+    }
+
+    #[test]
+    fn the_fabric_probe_and_the_port_fix_quote_their_arguments() {
+        let config = SparkConfig::default();
+        let netdevs = vec!["enp1s0f0np0".to_owned()];
+        let peers = vec![(1usize, "10.0.0.3".to_owned())];
+        let own = vec![("enp1s0f0np0".to_owned(), "10.0.0.1".to_owned())];
+        let local = fabric_probe_command(&config, 0, &netdevs, &peers, &own);
+        assert_eq!(local.program, "bash");
+        assert_eq!(local.kind, "fabric-probe");
+        assert_eq!(local.args[0], "-c");
+        assert_eq!(local.args[2], "sparkflash-fabric");
+        assert_eq!(
+            local.args[3..],
+            [
+                "ndev=enp1s0f0np0",
+                "peer=1:10.0.0.3",
+                "own=enp1s0f0np0:10.0.0.1"
+            ]
+        );
+
+        let remote = fabric_probe_command(&config, 2, &netdevs, &peers, &own);
+        assert_eq!(remote.program, "ssh");
+        assert!(remote.args.iter().any(|arg| arg == "BatchMode=yes"));
+        let destination = config.ssh_destination(2);
+        let at = remote
+            .args
+            .iter()
+            .position(|arg| *arg == destination)
+            .expect("destination");
+        let line = &remote.args[at + 1];
+        assert!(
+            line.starts_with("bash -c '"),
+            "the script is one quoted argument: {line}"
+        );
+        assert!(line.contains("sparkflash-fabric"), "{line}");
+        assert!(
+            line.contains("peer=1:10.0.0.3"),
+            "the peer argument is carried: {line}"
+        );
+        assert_eq!(
+            remote.args.len(),
+            at + 2,
+            "one command argument, nothing after it"
+        );
+
+        // The port fix carries a heredoc body; it must reach the remote shell as one quoted
+        // argument with its single quotes escaped, never split into shell words here.
+        let body = "tee /etc/netplan/60-sparkflash-fabric.yaml > /dev/null <<'EOF'\nnetwork:\n  version: 2\nEOF\nnetplan apply\n";
+        let fix = network_fix_command(&config, 2, body).expect("rank 2 exists");
+        assert_eq!(fix.kind, "network-setup-r2");
+        let at = fix
+            .args
+            .iter()
+            .position(|arg| *arg == destination)
+            .expect("destination");
+        let script = &fix.args[at + 1];
+        assert!(
+            script.starts_with("sudo -n bash -c '") && script.ends_with('\''),
+            "the body is one quoted argument to sudo: {script}"
+        );
+        assert!(script.contains("netplan apply"), "{script}");
+        assert!(
+            network_fix_command(&config, 9, body).is_none(),
+            "a rank outside the configuration is refused, never an index panic"
+        );
     }
 
     #[test]

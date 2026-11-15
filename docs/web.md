@@ -73,7 +73,9 @@ while the model downloads, for example).
 | :-- | :-- | :-- |
 | 1. Find your Sparks | **Use these Sparks** | Saves this Spark as rank 0 (`local = true`) and the three picked ones as ranks 1-3 |
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
+| 2. Connect the fast network | Card: **Switched 200G** / **Switchless ring** | `PUT /api/config`: saves the fabric schedule the collectives run (the card marked **Detected** matches the measured wiring) |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
+| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that runs the check's netplan/sysctl fix under `sudo -n` |
 | 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
@@ -103,21 +105,34 @@ cards describe the two wirings this build supports, and the check tells you whic
 
 - **Switched 200G** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
   every peer and reduces locally, the one-shot all-to-all schedule;
-- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with the
-  0<->2 and 1<->3 ConnectX-7 hairpin diagonals, and each collective reduce-scatters to the chunk
+- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with
+  the 0<->2 and 1<->3 ConnectX-7 hairpin diagonals, and each collective reduce-scatters to the chunk
   owners and all-gathers the reduced chunks back. It is the same arithmetic, bit for bit, with
-  each element crossing the fabric once instead of once per peer.
+  `2 * (world - 1)` payload element writes cluster-wide against `world * (world - 1)` for the
+  one-shot: half the fabric bytes at world 4.
 
-When the node check runs it also probes the wiring: each Spark ARPs for every other Spark from each
-of its fast ports (`arping`) and pings it once. From the answers the console classifies the fabric as
-a switch (every port answers for every peer), the ring (each port answers for exactly one
-neighbour, forming 0-1-2-3-0), two-node pairs, or unrecognised wiring, and records what it
-measured next to the cards. When the measured wiring and the saved schedule disagree, a **Use the
-measured fabric** button writes the matching choice. Matching the schedule to the wiring is not
-required for correctness — it is the difference between the one-shot schedule doing its full
-all-to-all over a ring and the ring schedule doing chunked transfers — but it is the fast path for
-both wirings. Without `arping` on the Sparks the wiring cannot be identified; only reachability is
-checked. Reachability of every pair is always required and is reported per rank.
+The schedule governs the collectives that run on the rank-to-rank reference transport: the
+barriers, the embedding and token gathers, and the host reference arm's reductions. The device
+arm's hot per-layer all-reduce enqueues on NCCL (`SPARK_COMM_REDUCE=nccl`, the device default) and
+is not re-decomposed by this value; `docs/rdma-exchange.md` describes which path each arm takes.
+
+When the node check runs it also probes the wiring: each Spark ARPs and pings every fast-network
+address of every other Spark from each of its fast ports (`arping`, then `ping -I`). A port that
+answers is a cable: from the answers the console classifies the fabric as a switch (every port
+answers for every peer), the ring (each of every Spark's two ports answers for exactly one
+neighbour, forming 0-1-2-3-0), two-node pairs (both ports reach the same Spark), or unrecognised
+wiring, and records what it measured next to the cards. When the measured wiring and the saved
+schedule disagree, a **Use the measured fabric** button writes the matching choice. Matching the
+schedule to the wiring is not required for correctness — the one-shot schedule runs its full
+all-to-all over a ring and the ring schedule does chunked transfers on a switch — but it is the
+fast path for both wirings. Without `arping` on the Sparks the wiring cannot be identified; only
+reachability is checked.
+
+Reachability is reported per rank and its severity follows the measured wiring. On a switch every
+pair must answer, and a pair that does not is an error. On a ring a Spark that does not answer is
+an error only when a cable was measured to it; an unreachable non-neighbour is a warning, because
+that traffic crosses the ConnectX-7 hairpin and a shared subnet with `arp_ignore=1` answers an
+address only on the port that owns it.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`) on every
@@ -127,8 +142,10 @@ Spark over SSH under `sudo -n` and applies them. The manual commands remain avai
 The choice is saved as `[cluster].fabric_schedule` and exported to every rank as
 `SPARKFLASH_FABRIC_SCHEDULE`, so a web-driven launch and a hand-written one run the same recipe.
 `one-shot`, `hairpin` and `ring` are accepted aliases; an unknown name is refused when the
-configuration is saved. A one-node Qwen plan has no collectives, so the selector does not change
-it.
+configuration is saved, and a hand-run `sparkflash serve --fabric-schedule` (or the exported
+variable) refuses one too rather than serving the other decomposition. Every rank of one group
+must carry the same value: the collective does not negotiate it. A one-node Qwen plan has no
+collectives, so the selector does not change it.
 
 Before offering **Download**, the console checks the snapshot for `model.id` in the Hugging
 Face cache. A complete snapshot marks the step done and shows **Already in the Hugging Face
@@ -218,9 +235,8 @@ atomically (a sibling temp file, then rename). See
 | `[model]` | Architecture (`weights`), Hugging Face model `id`, checkpoint (empty: looked up in the hub cache), hub cache, tokenizer, converted weights, cubins |
 | `[engine]` | How the weights run (`kind`, `device`) |
 | `[runtime]` | `SPARK_MAX_SEQ_LEN` and `SPARKFLASH_LANES` |
-| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, and the rank list: exactly four nodes for V4.1, exactly one local node for Qwen |
+| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, the rank list (exactly four nodes for V4.1, exactly one local node for Qwen) and `fabric_schedule` (switched/switchless) |
 | `[paths]` | Checkout, binary, launcher, NCCL library, log root on every node |
-| `[cluster]` | the four nodes, peers, base port, HTTP bind and `fabric_schedule` (switched/switchless) |
 | `[network]` | `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, extra rank environment |
 | `[web]` | Control-plane bind, rank 0 URL, extra allowed `Host` names, discovery/SSH timeouts, advertising |
 | `[stats]` | Sampling interval, in-memory retention, idle snapshot path and flush interval |
@@ -486,6 +502,7 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
 | `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
+| `POST /api/network/setup` | Apply the last check's fast-port fix on every rank that needs it, one `network-setup-r{rank}` job per rank under `sudo -n`; 409 without a check taken of the saved configuration, or when nothing needs fixing |
 | `GET /api/models` | Models in the lead's hub cache with each one's `fit`, plus the cluster they were judged against, the swap shelf, the family list and each model's prepared ranks |
 | `GET /api/models/search?q=&family=` | Hub search folded with the lead's cache, each result with its per-width `fit`; empty `q` lists the cache or the family's default term |
 | `GET /api/models/inspect?id=` | One model's profile and `fit`: the cached entry, or its Hub `config.json` when it is not cached |

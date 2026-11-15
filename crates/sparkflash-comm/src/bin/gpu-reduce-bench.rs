@@ -328,8 +328,12 @@ struct Args {
     /// Print exactly one JSON object on stdout.
     #[arg(long)]
     json: bool,
-    #[arg(long, default_value = "switched")]
-    fabric_schedule: String,
+    /// Which fabric decomposition this run measures, for the host arm and the record: `switched`
+    /// (the one-shot all-to-all) or `switchless` (the hairpin ring). The value is refused when it
+    /// is neither, and the emitted record names it, so an evidence row states which path its calls
+    /// took.
+    #[arg(long, default_value = "switched", value_parser = parse_schedule)]
+    fabric_schedule: FabricSchedule,
     /// Measure only the device (GPU->GPU) arm: skip the host transport and the host reduce arm.
     /// This is the gate's shape; it also means --addrs is not needed.
     #[arg(long = "device-only")]
@@ -546,6 +550,25 @@ fn compare(want: &[u16], got: &[u16]) -> (usize, u32, bool) {
     (differing, max_ulp, all_finite)
 }
 
+/// Parses `--fabric-schedule`: the two decompositions this build implements, by name or alias.
+fn parse_schedule(raw: &str) -> Result<FabricSchedule, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "switched" | "one-shot" | "oneshot" | "one_shot" => Ok(FabricSchedule::OneShotAllToAll),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => {
+            Ok(FabricSchedule::HairpinRingReduceScatterAllGather)
+        }
+        other => Err(format!("{other}: expected switched or switchless")),
+    }
+}
+
+/// The canonical name of a schedule, for the run record.
+fn schedule_name(schedule: FabricSchedule) -> &'static str {
+    match schedule {
+        FabricSchedule::OneShotAllToAll => "switched",
+        FabricSchedule::HairpinRingReduceScatterAllGather => "switchless",
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     match run(&args) {
@@ -656,16 +679,8 @@ fn run(args: &Args) -> Result<bool, String> {
         let want = expected(args.world, elements);
         if let Some(transport) = host_transport.as_ref() {
             let mut payload = contribution(args.rank, elements);
-            let layout = CollectiveLayout::new(
-                args.world,
-                elements,
-                match args.fabric_schedule.as_str() {
-                    "switched" => FabricSchedule::OneShotAllToAll,
-                    "switchless" => FabricSchedule::HairpinRingReduceScatterAllGather,
-                    other => panic!("unknown schedule {other}"),
-                },
-            )
-            .map_err(|error| format!("layout: {error}"))?;
+            let layout = CollectiveLayout::new(args.world, elements, args.fabric_schedule)
+                .map_err(|error| format!("layout: {error}"))?;
             let mut seq = 0u64;
             let mut host_us: Vec<Duration> = Vec::with_capacity(args.samples);
             for _ in 0..args.warmup {
@@ -841,10 +856,11 @@ fn run(args: &Args) -> Result<bool, String> {
         .collect::<Vec<_>>()
         .join(",");
     let document = format!(
-        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\",\"env\":{{{env_json}}}}},\"arms\":[{}]}}",
+        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"fabric_schedule\":\"{}\",\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\",\"env\":{{{env_json}}}}},\"arms\":[{}]}}",
         json_escape(&host),
         args.rank,
         args.world,
+        schedule_name(args.fabric_schedule),
         args.device_only,
         json_escape(api.library_name()),
         json_escape(&version),

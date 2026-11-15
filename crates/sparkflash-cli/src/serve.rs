@@ -138,6 +138,7 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_api::{AppState, Metrics};
+use sparkflash_comm::layout::FabricSchedule;
 #[cfg(feature = "cuda")]
 use sparkflash_device::CudaSession;
 use sparkflash_device::{DeviceEngine, DeviceSession, FakeSession};
@@ -548,6 +549,13 @@ fn parse_numerics_profile(raw: &str) -> Result<NumericsProfile, String> {
     NumericsProfile::parse(raw).map_err(|error| error.to_string())
 }
 
+/// Parses `--fabric-schedule`, refusing a name that is not one of the two schedules this build
+/// implements: a typo must not pick the other decomposition silently.
+fn parse_fabric_schedule_flag(raw: &str) -> Result<FabricSchedule, String> {
+    crate::tp4_host::parse_fabric_schedule(raw)
+        .ok_or_else(|| format!("{raw}: expected switched or switchless"))
+}
+
 /// Resolves the numerics identity a serve path reports and prints its boot line.
 ///
 /// Every path that builds an `AppState` calls this with what it actually runs - the model, the
@@ -693,6 +701,11 @@ pub struct ServeOptions {
     /// `None` is the default and keeps the server open, exactly as before. The key is never
     /// logged; a missing or wrong one gets the OpenAI 401 envelope.
     pub api_key: Option<String>,
+    /// The collective fabric every rank of this group runs: `switched` (the default, the 200G
+    /// switch and the one-shot all-to-all) or `switchless` (the direct-attach ring, reduce-scatter
+    /// plus all-gather). The launcher exports the same value as `SPARKFLASH_FABRIC_SCHEDULE`; a
+    /// hand-run rank selects it with `--fabric-schedule`, which overrides the environment.
+    pub fabric_schedule: FabricSchedule,
     /// The browser cross-origin policy, or `None` to serve the pre-CORS surface.
     ///
     /// The default is [CorsConfig::any], the same permissive default the reference vLLM server
@@ -1107,6 +1120,9 @@ impl ServeOptions {
                 tp4,
                 recurrence,
                 api_key: cli.api_key,
+                fabric_schedule: cli
+                    .fabric_schedule
+                    .unwrap_or(FabricSchedule::OneShotAllToAll),
                 cors,
                 device_token_dir: cli.device_token_dir,
                 device_token_derived_claim: cli.device_token_derived_claim,
@@ -1252,6 +1268,18 @@ struct ServeArgs {
     /// probes, readiness probes and local scrapers.
     #[arg(long, value_name = "KEY", env = "SPARKFLASH_SERVE_API_KEY")]
     api_key: Option<String>,
+    /// The collective fabric this server's ranks run on: `switched` (the default, the 200G
+    /// switch and the one-shot all-to-all) or `switchless` (the direct-attach ring,
+    /// reduce-scatter + all-gather). Every rank of one group must run the same value, or their
+    /// collectives disagree; the launcher writes it for all four. An unknown name is refused
+    /// rather than served as `switched`.
+    #[arg(
+        long,
+        value_name = "SCHEDULE",
+        env = "SPARKFLASH_FABRIC_SCHEDULE",
+        value_parser = parse_fabric_schedule_flag
+    )]
+    fabric_schedule: Option<FabricSchedule>,
     /// Allow browser requests only from this origin; repeat for several. Default: any origin.
     ///
     /// The default matches the reference vLLM server, which mounts a CORS middleware answering
@@ -3940,6 +3968,9 @@ pub struct Tp4RankConfig {
     pub context: usize,
     /// The startup and control deadline.
     pub timeout: Duration,
+    /// The collective fabric every rank of this group runs (issue #19). Every rank must carry the
+    /// same value: the transfer decomposition is not negotiated on the wire.
+    pub fabric_schedule: FabricSchedule,
 }
 
 #[cfg(feature = "tp4-serve")]
@@ -3973,6 +4004,7 @@ fn tp4_rank_config(
             .context
             .unwrap_or(sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT),
         timeout,
+        fabric_schedule: options.fabric_schedule,
     })
 }
 
@@ -4079,7 +4111,7 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
         element_limit: config.element_limit,
         resident_cache: true,
         timeout: config.timeout,
-        fabric_schedule: crate::tp4_host::fabric_schedule_from_env(),
+        fabric_schedule: config.fabric_schedule,
     })
     .map_err(|error| format!("TP=4 rank {} open failed: {error}", config.rank))?;
     Ok(Box::new(HostTp4Rank { rank }))
@@ -4467,7 +4499,7 @@ fn open_pack_collective(
         config.world_size,
         transport,
         Wire::F32,
-        crate::tp4_host::fabric_schedule_from_env(),
+        config.fabric_schedule,
     );
     if let Some(reduce) = reduce {
         collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
@@ -9740,6 +9772,36 @@ mod tests {
         assert!(options.device_cubin.is_none());
         assert!(options.synthetic);
         assert!(options.checkpoint.is_none());
+    }
+
+    #[test]
+    fn the_fabric_schedule_flag_parses_and_a_typo_is_refused() {
+        let plain = ServeOptions::parse(vec!["--synthetic".to_owned()]).expect("parses");
+        assert_eq!(plain.fabric_schedule, FabricSchedule::OneShotAllToAll);
+        for (written, expected) in [
+            (
+                "switchless",
+                FabricSchedule::HairpinRingReduceScatterAllGather,
+            ),
+            ("ring", FabricSchedule::HairpinRingReduceScatterAllGather),
+            ("switched", FabricSchedule::OneShotAllToAll),
+        ] {
+            let options = ServeOptions::parse(vec![
+                "--synthetic".to_owned(),
+                "--fabric-schedule".to_owned(),
+                written.to_owned(),
+            ])
+            .expect("parses");
+            assert_eq!(options.fabric_schedule, expected, "{written}");
+        }
+        let error = ServeOptions::parse(vec![
+            "--synthetic".to_owned(),
+            "--fabric-schedule".to_owned(),
+            "switchles".to_owned(),
+        ])
+        .expect_err("a typo must not be served as switched");
+        assert!(error.contains("switchles"), "{error}");
+        assert!(error.contains("switched or switchless"), "{error}");
     }
 
     #[test]
