@@ -968,10 +968,122 @@ fn the_expert_mix_matches_the_host_exactly() {
             u(1),
             u(slots),
             u(width),
+            // No grouping: one mix of every slot.
+            0,
+            0,
+            0,
         ],
     )
     .expect("expert_mix launch");
     let device = download_f32(&cuda, &out, width);
     // A scaled sum of f32 rows in one order is the same operation on both sides.
     assert_eq!(host, device, "expert_mix is not the host's mix");
+}
+
+/// The row expert split's grouped mix is the expert-parallel walk's arithmetic: each of the
+/// four ranks' mixes (its own picks, the others' shares zero) folded from 0.0 in rank order,
+/// which is the exchange's sum.
+#[test]
+fn the_grouped_expert_mix_is_the_expert_parallel_mix_and_sum() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let (width, slots, rows, owners, owner_experts) = (1152usize, 8usize, 3usize, 4usize, 96usize);
+    let mut rng = Lcg::new(0x5eed);
+    let partials = rng.values(rows * slots * width);
+    let scales = rng.values(rows * slots);
+    // Distinct picks a row, spread over the owners unevenly, as the router's are.
+    let picks: Vec<i32> = (0..rows * slots)
+        .map(|at| ((at * 53 + (at / slots) * 7) % (owners * owner_experts)) as i32)
+        .collect();
+    let mut host = vec![0f32; rows * width];
+    for row in 0..rows {
+        let span = row * slots..(row + 1) * slots;
+        let block = &partials[row * slots * width..(row + 1) * slots * width];
+        let target = &mut host[row * width..(row + 1) * width];
+        for owner in 0..owners {
+            let masked: Vec<f32> = span
+                .clone()
+                .map(|at| {
+                    if picks[at] as usize / owner_experts == owner {
+                        scales[at]
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let mix = reference::expert_mix(block, &masked, slots, width);
+            for (total, value) in target.iter_mut().zip(mix) {
+                *total += value;
+            }
+        }
+    }
+
+    let (_, kernel) = kernel(&cuda, "inkling_expert_mix");
+    let partials_device = upload_f32(&cuda, &partials);
+    let scales_device = upload_f32(&cuda, &scales);
+    let picks_bytes: Vec<u8> = picks.iter().flat_map(|pick| pick.to_le_bytes()).collect();
+    let picks_device = upload(&cuda, &picks_bytes);
+    let out = upload_zeros(&cuda, rows * width);
+    cuda.launch(
+        kernel,
+        (width.div_ceil(256) as u32, rows as u32, 1),
+        (256, 1, 1),
+        &[
+            out.0,
+            partials_device.0,
+            scales_device.0,
+            u(rows),
+            u(slots),
+            u(width),
+            picks_device.0,
+            u(owner_experts),
+            u(owners),
+        ],
+    )
+    .expect("grouped expert_mix launch");
+    let device = download_f32(&cuda, &out, rows * width);
+    let differ = host
+        .iter()
+        .zip(&device)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differ, 0,
+        "the grouped mix is not the expert-parallel mix and sum"
+    );
+}
+
+/// The join lays each row's gathered runs side by side, word for word.
+#[test]
+fn the_join_lays_the_ranks_runs_side_by_side() {
+    let Some(cuda) = open() else {
+        return;
+    };
+    let (rows, words, world) = (5usize, 3usize, 4usize);
+    // 16-byte words of four f32 each; every value names its rank, row and position.
+    let source: Vec<f32> = (0..world * rows * words * 4).map(|at| at as f32).collect();
+    let (_, kernel) = kernel(&cuda, "inkling_join_pieces");
+    let source_device = upload_f32(&cuda, &source);
+    let out = upload_zeros(&cuda, source.len());
+    cuda.launch(
+        kernel,
+        (1, 1, 1),
+        (256, 1, 1),
+        &[out.0, source_device.0, u(rows), u(words), u(world)],
+    )
+    .expect("join launch");
+    let device = download_f32(&cuda, &out, source.len());
+    let piece = words * 4;
+    for row in 0..rows {
+        for rank in 0..world {
+            for at in 0..piece {
+                assert_eq!(
+                    device[(row * world + rank) * piece + at],
+                    source[(rank * rows + row) * piece + at],
+                    "row {row} rank {rank} element {at}"
+                );
+            }
+        }
+    }
 }

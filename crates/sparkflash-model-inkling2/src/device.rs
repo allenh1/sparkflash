@@ -61,7 +61,7 @@ use crate::device_plan::{
 };
 use crate::forward::trace_on;
 use crate::host::choose;
-use crate::tensor::InklingTensorPlan;
+use crate::tensor::{ExpertSplit, InklingTensorPlan};
 use crate::vision::SpanCheck;
 use sparkflash_ops::sampler::Sampler;
 
@@ -70,7 +70,10 @@ mod draft;
 mod packed;
 mod tower;
 
-use chunk::{Injection, Rows, exchange_gather, exchange_sum, walk_rows};
+use chunk::{
+    BandOut, Injection, Rows, band_exchange, band_mix, exchange_gather, exchange_sum, gather_runs,
+    walk_rows,
+};
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::{DenseForm, DenseWeights, pack_dense};
@@ -579,6 +582,9 @@ struct Kernels {
     sum_slots: Entry,
     swiglu: Entry,
     expert_mix: Entry,
+    /// The row expert split's gathered runs side by side: [world][rows][piece] to
+    /// [rows][world * piece].
+    join_pieces: Entry,
     residual_add: Entry,
     logit_softcap: Entry,
     widen: Entry,
@@ -723,6 +729,7 @@ impl Kernels {
             sum_slots: load(token, "q4e_sum_slots")?,
             swiglu: load(inkling, "inkling_softcapped_swiglu")?,
             expert_mix: load(inkling, "inkling_expert_mix")?,
+            join_pieces: load(inkling, "inkling_join_pieces")?,
             residual_add: load(inkling, "inkling_residual_add")?,
             logit_softcap: load(inkling, "inkling_logit_softcap")?,
             widen: load(inkling, "inkling_widen_f32")?,
@@ -2361,6 +2368,32 @@ impl InklingDeviceBackend {
         // here rather than at the first long prompt so a shape it refuses is an open-time error
         // and not a request the server has already admitted.
         let prefill = InklingDevicePlan::build(&config, tp, Pass::Prefill, prefill_chunk, context)?;
+        if config.expert_split == ExpertSplit::Rows {
+            // The row split gathers the ranks' activation runs and mix rows on the device leg in
+            // whole 16-byte words, and only the quantised bands read the gathered layout.
+            if tp.world() > 1 && !exchange.has_device_leg() {
+                return Err("a row expert split gathers on the device leg, which this \
+                            exchange does not have"
+                    .to_owned());
+            }
+            if let Some(layer) = plan
+                .layers()
+                .iter()
+                .find(|layer| layer.experts == ExpertBody::Bf16)
+            {
+                return Err(format!(
+                    "layer {}: a row expert split has no BF16 expert band",
+                    layer.index
+                ));
+            }
+            let (width, rows) = (plan.expert_intermediate(), plan.expert_down().rows);
+            if !(width * 2).is_multiple_of(16) || !(rows * 4).is_multiple_of(16) {
+                return Err(format!(
+                    "a row expert split's pieces ({width} columns, {rows} rows a rank) are not \
+                     whole 16-byte words"
+                ));
+            }
+        }
         let (attention, mma_shared) = AttentionWalk::select(
             &config,
             plan.rank_heads() / plan.rank_kv_heads().max(1),
@@ -3014,8 +3047,10 @@ fn expert_scales(
                 let (w2, w2_scales) = (codes(Op::ExpertDown, 0)?, codes(Op::ExpertDown, 1)?);
                 let w13_bytes = codes_bytes(2 * intermediate, hidden, ExpertBody::NvFp4);
                 let w13_scale_bytes = scales_bytes(2 * intermediate, hidden, ExpertBody::NvFp4);
-                let w2_bytes = codes_bytes(hidden, intermediate, ExpertBody::NvFp4);
-                let w2_scale_bytes = scales_bytes(hidden, intermediate, ExpertBody::NvFp4);
+                let down_shape = plan.expert_down();
+                let w2_bytes = codes_bytes(down_shape.rows, down_shape.columns, ExpertBody::NvFp4);
+                let w2_scale_bytes =
+                    scales_bytes(down_shape.rows, down_shape.columns, ExpertBody::NvFp4);
                 // One w13 row: hidden / 2 code bytes and hidden / 16 block scales.
                 let (code_row, scale_row) = (hidden / 2, hidden / 16);
                 let mut pointers = Vec::with_capacity(gate_up.len() * MMA_TABLE_ENTRIES);
@@ -3405,9 +3440,12 @@ impl Scratch {
         let router_logits = take(rows * config.n_routed_experts, 4);
         let indices = take(rows * top_k, 4);
         let shares = take(rows * top_k, 4);
-        let band = take(rows * top_k * 2 * activation, 4);
-        let activation_buffer = take(rows * top_k * activation, 4);
-        let partials = take(rows * top_k * hidden, 4);
+        // The row split's down projection lands in the band once the activation has read it,
+        // and its gathered activation runs and mix rows wait in `partials` (see BandOut).
+        let down = plan.expert_down();
+        let band = take(rows * top_k * (2 * activation).max(down.rows), 4);
+        let activation_buffer = take(rows * top_k * activation.max(down.columns), 4);
+        let partials = take(rows * top_k * hidden.max(down.columns), 4);
         let scales = take(rows * top_k, 4);
         let mixed_head = take((rows + history) * hidden, 4);
         let mixed = mixed_head + history * hidden * 4;
@@ -4973,8 +5011,9 @@ impl InklingDeviceSession {
                     }
                     (Op::Collective(Collective::ExpertDelta), _) => {
                         // Each rank mixed its own experts and zeroed the slots it does not own,
-                        // so the sum over ranks is the layer's whole expert contribution.
-                        self.all_reduce(&shared, self.state.scratch.mixed, hidden)?;
+                        // so the sum over ranks is the layer's whole expert contribution; under
+                        // the row split each rank mixed its own rows, which the gather joins.
+                        band_exchange(&shared, &self.state.scratch, 1)?;
                     }
                     (Op::Collective(_), _) => {}
                     (op, target) => {
@@ -5297,21 +5336,7 @@ impl InklingDeviceSession {
             .cuda
             .copy_htod(&self.state.scratch.scales, &scale_bytes)
             .map_err(Self::fail)?;
-        shared
-            .launch(
-                shared.kernels.expert_mix,
-                (flat(hidden), 1, 1),
-                (ELEMENT_BLOCK, 1, 1),
-                &[
-                    self.state.scratch.mixed.0,
-                    partials.0,
-                    self.state.scratch.scales.0,
-                    1,
-                    top_k as u64,
-                    hidden as u64,
-                ],
-            )
-            .map_err(Self::fail)?;
+        band_mix(shared, &self.state.scratch, 1)?;
         if trace_on() && layer == 0 {
             eprintln!("[inkling] row router layer 0 slots {selected:?} shares {shares:?}");
             self.rms(shared, "row band", self.state.scratch.mixed, hidden)?;
@@ -5407,7 +5432,15 @@ impl InklingDeviceSession {
             scale_2.map(|scale| scale.device_gate_up),
         )?;
         // Every slot's activation, owned or not: a slot another rank holds reads a stale band
-        // row, and its share below is zero.
+        // row, and its share below is zero. Under the row split it is this rank's run of every
+        // slot's columns, which the gather joins into whole rows before the down projection.
+        let out = BandOut::of(shared, &self.state.scratch, 1);
+        let run = top_k * intermediate * std::mem::size_of::<f32>();
+        let swiglu_out = if out.gathers {
+            partials.offset(shared.exchange.rank() * run)
+        } else {
+            activated
+        };
         shared
             .launch(
                 shared.kernels.swiglu,
@@ -5415,19 +5448,29 @@ impl InklingDeviceSession {
                 (ELEMENT_BLOCK, 1, 1),
                 &[
                     band.0,
-                    activated.0,
+                    swiglu_out.0,
                     intermediate as u64,
                     bits(config.mlp_gate_softcap as f32),
                     bits(config.mlp_up_softcap as f32),
                 ],
             )
             .map_err(Self::fail)?;
+        if out.gathers {
+            gather_runs(
+                shared,
+                partials,
+                Some(activated),
+                top_k,
+                intermediate * std::mem::size_of::<f32>(),
+            )?;
+        }
+        let down_shape = shared.plan.expert_down();
         projection(
             down,
             activated,
-            partials,
-            hidden,
-            intermediate,
+            out.down,
+            down_shape.rows,
+            down_shape.columns,
             true,
             scale_2.map(|scale| scale.device_down),
         )?;
@@ -5448,22 +5491,8 @@ impl InklingDeviceSession {
                 ],
             )
             .map_err(Self::fail)?;
-        shared
-            .launch(
-                shared.kernels.expert_mix,
-                (flat(hidden), 1, 1),
-                (ELEMENT_BLOCK, 1, 1),
-                &[
-                    self.state.scratch.mixed.0,
-                    partials.0,
-                    self.state.scratch.scales.0,
-                    1,
-                    top_k as u64,
-                    hidden as u64,
-                ],
-            )
-            .map_err(Self::fail)?;
-        if trace_on() && layer == 0 {
+        band_mix(shared, &self.state.scratch, 1)?;
+        if trace_on() && layer == 0 && !out.gathers {
             self.rms(shared, "row band", self.state.scratch.mixed, hidden)?;
         }
         Ok(())

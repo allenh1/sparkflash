@@ -78,7 +78,7 @@
 //     projection that follows reads f32, so this is the one conversion between them. It is the
 //     inverse of what inkling_kv_store does on the key/value path.
 //
-//   inkling_expert_mix(out, partials, scales, slots, width)
+//   inkling_expert_mix(out, partials, scales, rows, slots, width, indices, owner_experts, owners)
 //     partials  [rows][slots][width] f32, one selected expert's projection a slot
 //     scales    [rows][slots] f32, the expert's share of the mix
 //     out       [rows][width] f32
@@ -87,6 +87,15 @@
 //     on the expert, and the sum is the layer's MLP output. It is a plain sum of scaled rows, in
 //     slot order, so the host's sequential f32 sum and this kernel agree to the last bit. A slot
 //     with a zero share (another rank's expert) is skipped rather than multiplied by zero.
+//     With owners > 0 (the row expert split, where one rank holds every slot's rows), each of the
+//     `owners` expert-parallel ranks' mixes - the slots whose expert indices[row][slot] /
+//     owner_experts names it - is that sum, and they are folded in ascending rank order from 0.0:
+//     an expert-parallel rank's local mix and its exchange's sum, term for term.
+//
+//   inkling_join_pieces(dst, src, rows, piece, world)
+//     src  [world][rows][piece] 16-byte words, dst [rows][world * piece]
+//     The ranks' gathered runs of a row side by side, so a row each rank computed a run of
+//     reads as one row. A copy: it rounds nothing.
 
 #include <cstdint>
 
@@ -240,7 +249,10 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
     const float* __restrict__ scales,
     int rows,
     int slots,
-    int width) {
+    int width,
+    const int* __restrict__ indices,
+    int owner_experts,
+    int owners) {
     OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows || slots <= 0 || width <= 0) {
@@ -248,20 +260,46 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
     }
     const float* band = partials + (uint64_t)row * slots * width;
     const float* shares = scales + (uint64_t)row * slots;
+    const int* picks = indices != nullptr ? indices + (uint64_t)row * slots : nullptr;
+    const bool grouped = owners > 0 && owner_experts > 0 && picks != nullptr;
     float* target = out + (uint64_t)row * width;
     for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
          column += gridDim.x * INKLING_EPI_BLOCK) {
-        float value = 0.0f;
-        for (int slot = 0; slot < slots; ++slot) {
-            // A zero share is a slot another rank computed, whose partial here is whatever the
-            // buffer last held: skipping it is the sum with that term's +-0 for any finite stale
-            // value, and keeps a stale non-finite one out of the row.
-            const float share = shares[slot];
-            if (share != 0.0f) {
-                value = __fadd_rn(value, __fmul_rn(share, band[(uint64_t)slot * width + column]));
+        float total = 0.0f;
+        for (int owner = 0; owner < (grouped ? owners : 1); ++owner) {
+            float value = 0.0f;
+            for (int slot = 0; slot < slots; ++slot) {
+                // A zero share is a slot another rank computed, whose partial here is whatever
+                // the buffer last held: skipping it is the sum with that term's +-0 for any
+                // finite stale value, and keeps a stale non-finite one out of the row.
+                const float share = shares[slot];
+                if (share != 0.0f && (!grouped || picks[slot] / owner_experts == owner)) {
+                    value =
+                        __fadd_rn(value, __fmul_rn(share, band[(uint64_t)slot * width + column]));
+                }
             }
+            // Ungrouped, the one mix is the row; grouped, the ranks' mixes fold from 0.0.
+            total = grouped ? __fadd_rn(total, value) : value;
         }
-        target[column] = value;
+        target[column] = total;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_join_pieces(
+    uint4* __restrict__ dst,
+    const uint4* __restrict__ src,
+    long long rows,
+    int piece,
+    int world) {
+    OPT_PDL_ENTRY();
+    const long long wide = (long long)world * piece;
+    const long long total = rows * wide;
+    for (long long at = (long long)blockIdx.x * blockDim.x + threadIdx.x; at < total;
+         at += (long long)gridDim.x * blockDim.x) {
+        const long long row = at / wide;
+        const int within = (int)(at - row * wide);
+        const int rank = within / piece;
+        dst[at] = src[((long long)rank * rows + row) * piece + (within - rank * piece)];
     }
 }
 

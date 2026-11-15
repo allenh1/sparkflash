@@ -171,6 +171,152 @@ pub(super) fn exchange_gather(
         .map_err(device_error)
 }
 
+/// The row expert split's all-gather ([ExpertSplit::Rows]).
+///
+/// Every rank wrote its `rows` runs of `piece` bytes at `base + rank * rows * piece`; the device
+/// leg brings the peers' runs in beside it, and with `joined` the join lays each row's runs side
+/// by side there, rank-major, so a row every rank computed a run of reads as one row. One row's
+/// runs already are the row, which is why a one-row gather into its destination needs no join.
+/// Both are copies: the words arrive as they left.
+pub(super) fn gather_runs(
+    shared: &Shared,
+    base: Deviceptr,
+    joined: Option<Deviceptr>,
+    rows: usize,
+    piece: usize,
+) -> Result<(), BackendError> {
+    let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
+    let run = rows * piece;
+    if world > 1 {
+        shared
+            .exchange
+            .exchange_on_device(0, base.0 + (rank * run) as u64, base.0, run)
+            .map_err(device_error)?;
+    }
+    let Some(joined) = joined else {
+        return Ok(());
+    };
+    // The open refuses a split whose pieces are not whole 16-byte words.
+    let words = piece / 16;
+    shared
+        .launch(
+            shared.kernels.join_pieces,
+            (flat(rows * world * words), 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[joined.0, base.0, rows as u64, words as u64, world as u64],
+        )
+        .map_err(device_error)
+}
+
+/// Where a band's down projection lands and where this rank's mix rows wait for the exchange.
+///
+/// The expert-parallel splits project into `partials` and mix the residual-wide rows into
+/// `mixed`, which the exchange sums. The row split projects into the band (its activation has
+/// read it by then) and mixes its own rows into its run of a staging buffer: `mixed` itself for
+/// one row, whose runs are the row, and otherwise `partials`, which the activation's join has
+/// read by then and which the exchange's join reads back into `mixed`.
+pub(super) struct BandOut {
+    /// The down projection's output, [slot][rows].
+    pub(super) down: Deviceptr,
+    /// The mix's output, [row][width] at this rank's run.
+    pub(super) mix: Deviceptr,
+    /// The gather's base, under the row split.
+    pub(super) staging: Deviceptr,
+    /// The mix's width: the residual, or this rank's rows of it.
+    pub(super) width: usize,
+    /// Whether the exchange gathers (the row split) rather than sums.
+    pub(super) gathers: bool,
+}
+
+impl BandOut {
+    pub(super) fn of(shared: &Shared, scratch: &Scratch, rows: usize) -> Self {
+        let down = shared.plan.expert_down();
+        if shared.config.expert_split != ExpertSplit::Rows {
+            return Self {
+                down: scratch.partials,
+                mix: scratch.mixed,
+                staging: scratch.mixed,
+                width: shared.hidden(),
+                gathers: false,
+            };
+        }
+        let staging = if rows == 1 {
+            scratch.mixed
+        } else {
+            scratch.partials
+        };
+        let run = rows * down.rows * std::mem::size_of::<f32>();
+        Self {
+            down: scratch.band,
+            mix: staging.offset(shared.exchange.rank() * run),
+            staging,
+            width: down.rows,
+            gathers: true,
+        }
+    }
+}
+
+/// The band's mix over `rows` rows of `partials` [row][slot][width] into `out`.
+///
+/// Under the row split one rank holds every pick's rows, so the mix folds each expert-parallel
+/// owner's picks from zero and those in rank order (inkling_expert_mix's grouped form): the
+/// expert-parallel rank's local mix and its exchange's sum, term for term.
+pub(super) fn band_mix(
+    shared: &Shared,
+    scratch: &Scratch,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let out = BandOut::of(shared, scratch, rows);
+    let (indices, owner_experts, owners) = if out.gathers {
+        (
+            scratch.indices.0,
+            shared.plan.parallel_experts(),
+            shared.exchange.world(),
+        )
+    } else {
+        (0, 0, 0)
+    };
+    shared
+        .launch(
+            shared.kernels.expert_mix,
+            (flat(out.width), rows as u32, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                out.mix.0,
+                out.down.0,
+                scratch.scales.0,
+                rows as u64,
+                shared.config.num_experts_per_tok as u64,
+                out.width as u64,
+                indices,
+                owner_experts as u64,
+                owners as u64,
+            ],
+        )
+        .map_err(device_error)
+}
+
+/// The band's exchange: the sum of the ranks' mixes, or under the row split the gather of
+/// their rows into `mixed`.
+pub(super) fn band_exchange(
+    shared: &Shared,
+    scratch: &Scratch,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let out = BandOut::of(shared, scratch, rows);
+    if !out.gathers {
+        return exchange_sum(shared, scratch.mixed, rows * shared.hidden());
+    }
+    let joined = (rows > 1).then_some(scratch.mixed);
+    gather_runs(
+        shared,
+        out.staging,
+        joined,
+        rows,
+        out.width * std::mem::size_of::<f32>(),
+    )
+}
+
 /// The bytes of an i32 vector, little-endian.
 fn word_bytes(values: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
@@ -1010,11 +1156,16 @@ pub(super) fn walk_rows(
                 }
                 (Op::Collective(Collective::ExpertDelta), _) => {
                     // The mix is local until this point: the probe reads the rank's own share of
-                    // the sum, which is the number the row-at-a-time walk's own mix prints.
-                    if index == 0 {
+                    // the sum, which is the number the row-at-a-time walk's own mix prints (the
+                    // row split's rows wait in a staging run, so it reads the exchanged row).
+                    let gathers = BandOut::of(shared, scratch, rows).gathers;
+                    if index == 0 && !gathers {
                         probe(shared, "chunk band", scratch.mixed, rows, hidden)?;
                     }
-                    exchange_sum(shared, scratch.mixed, rows * hidden)?;
+                    band_exchange(shared, scratch, rows)?;
+                    if index == 0 && gathers {
+                        probe(shared, "chunk band", scratch.mixed, rows, hidden)?;
+                    }
                 }
                 (Op::Collective(_), _) => {}
                 (op, target) => {
@@ -1281,22 +1432,24 @@ fn run_band_mma(
     let intermediate = shared.plan.expert_intermediate();
     let hidden = config.hidden_size;
     let (first, owned) = shared.plan.expert_range();
+    let down = shared.plan.expert_down();
     let meta = shared.experts[layer.index].as_ref().ok_or_else(|| {
         device_error(format!(
             "layer {}: an NVFP4 band with no expert scales",
             layer.index
         ))
     })?;
-    if !hidden.is_multiple_of(MOE_DOWN_COLUMNS)
+    if !down.rows.is_multiple_of(MOE_DOWN_COLUMNS)
         || !hidden.is_multiple_of(MOE_K_STAGE)
         || !intermediate.is_multiple_of(MOE_GATE_UP_COLUMNS)
-        || !intermediate.is_multiple_of(MOE_K_STAGE)
+        || !down.columns.is_multiple_of(MOE_K_STAGE)
         || owned > MOE_MAX_EXPERTS
     {
         return Err(device_error(format!(
             "layer {}: the grouped MMA's tiles do not cover hidden {hidden}, intermediate \
-             {intermediate} and {owned} experts a rank; PREFILL=chunk walks this band",
-            layer.index
+             {intermediate}, a down projection of {} by {} and {owned} experts a rank; \
+             PREFILL=chunk walks this band",
+            layer.index, down.rows, down.columns
         )));
     }
     let slots = rows * top_k;
@@ -1369,8 +1522,16 @@ fn run_band_mma(
         )
         .map_err(device_error)?;
     let grid_items = u32::try_from(items).map_err(device_error)?;
-    // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly.
-    let activated_plane = (slots * intermediate) as u64;
+    // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
+    // row split they are this rank's run of every slot's columns, both planes of it together, so
+    // the gather and the join move them as 2 * slots rows of a run each.
+    let out = BandOut::of(shared, scratch, rows);
+    let run = slots * intermediate * std::mem::size_of::<f32>();
+    let activated = if out.gathers {
+        scratch.partials.offset(shared.exchange.rank() * run)
+    } else {
+        scratch.activation
+    };
     shared
         .launch(
             shared.kernels.moe_gate_up,
@@ -1384,8 +1545,8 @@ fn run_band_mma(
                 scratch.item_count.0,
                 scratch.band.0,
                 elements as u64,
-                scratch.activation.0,
-                activated_plane,
+                activated.0,
+                (slots * intermediate) as u64,
                 top_k as u64,
                 hidden as u64,
                 intermediate as u64,
@@ -1394,10 +1555,19 @@ fn run_band_mma(
             ],
         )
         .map_err(device_error)?;
+    if out.gathers {
+        gather_runs(
+            shared,
+            scratch.partials,
+            Some(scratch.activation),
+            2 * slots,
+            intermediate * std::mem::size_of::<u16>(),
+        )?;
+    }
     shared
         .launch(
             shared.kernels.moe_down,
-            ((hidden / MOE_DOWN_COLUMNS) as u32, grid_items, 1),
+            ((down.rows / MOE_DOWN_COLUMNS) as u32, grid_items, 1),
             (MOE_THREADS, 1, 1),
             &[
                 meta.mma_table.0,
@@ -1406,34 +1576,19 @@ fn run_band_mma(
                 scratch.items.0,
                 scratch.item_count.0,
                 scratch.activation.0,
-                activated_plane,
+                (slots * down.columns) as u64,
                 shared.route_ones.0,
-                scratch.partials.0,
+                out.down.0,
                 top_k as u64,
-                hidden as u64,
-                intermediate as u64,
+                down.rows as u64,
+                down.columns as u64,
                 // Every slot reads the same [top_k] ones.
                 0,
             ],
         )
         .map_err(device_error)?;
-    // The mix is local; the all-reduce that follows it completes the sum over the ranks.
-    shared
-        .launch(
-            shared.kernels.expert_mix,
-            (flat(hidden), rows as u32, 1),
-            (ELEMENT_BLOCK, 1, 1),
-            &[
-                scratch.mixed.0,
-                scratch.partials.0,
-                scratch.scales.0,
-                rows as u64,
-                top_k as u64,
-                hidden as u64,
-            ],
-        )
-        .map_err(device_error)?;
-    Ok(())
+    // The mix is local; the exchange that follows it completes the sum over the ranks.
+    band_mix(shared, scratch, rows)
 }
 
 /// The routed band over a chunk: one launch an expert over the rows that selected it.
@@ -1534,6 +1689,7 @@ fn run_band_chunk(
 
     if !hidden.is_multiple_of(PAIR_RUN)
         || !intermediate.is_multiple_of(PAIR_RUN)
+        || !shared.plan.expert_down().columns.is_multiple_of(PAIR_RUN)
         || !MXFP8_BLOCK.is_multiple_of(PAIR_RUN)
     {
         return Err(device_error(format!(
@@ -1547,10 +1703,12 @@ fn run_band_chunk(
     let down_codes = weight(down.weights[0]);
     let down_scales = down.weights.get(1).map(|index| weight(*index));
     let meta = shared.experts[layer.index].as_ref();
+    let shape = shared.plan.expert_down();
+    let out = BandOut::of(shared, scratch, rows);
     let expert_bytes = codes_bytes(2 * intermediate, hidden, layer.experts);
     let expert_scale_bytes = scales_bytes(2 * intermediate, hidden, layer.experts);
-    let down_bytes = codes_bytes(hidden, intermediate, layer.experts);
-    let down_scale_bytes = scales_bytes(hidden, intermediate, layer.experts);
+    let down_bytes = codes_bytes(shape.rows, shape.columns, layer.experts);
+    let down_scale_bytes = scales_bytes(shape.rows, shape.columns, layer.experts);
 
     for (local, &(start, count)) in bounds.iter().enumerate() {
         if count == 0 {
@@ -1625,8 +1783,17 @@ fn run_band_chunk(
     // The activation is elementwise over the whole band, whatever selected it. A slot is a grid
     // row, and a wide chunk has more slots than a grid has rows, so the band goes in runs of
     // GRID_ROWS slots: the same element is the same arithmetic whichever launch carries it.
+    // Under the row split each slot's activation is this rank's run of its columns, which the
+    // gather joins into whole rows before the down projection.
     let slots = rows * top_k;
     let byte = std::mem::size_of::<f32>();
+    let activated = if out.gathers {
+        scratch
+            .partials
+            .offset(shared.exchange.rank() * slots * intermediate * byte)
+    } else {
+        scratch.activation
+    };
     let mut first_slot = 0usize;
     while first_slot < slots {
         let take = (slots - first_slot).min(GRID_ROWS);
@@ -1637,10 +1804,7 @@ fn run_band_chunk(
                 (ELEMENT_BLOCK, 1, 1),
                 &[
                     scratch.band.offset(first_slot * 2 * intermediate * byte).0,
-                    scratch
-                        .activation
-                        .offset(first_slot * intermediate * byte)
-                        .0,
+                    activated.offset(first_slot * intermediate * byte).0,
                     intermediate as u64,
                     bits(config.mlp_gate_softcap as f32),
                     bits(config.mlp_up_softcap as f32),
@@ -1649,6 +1813,15 @@ fn run_band_chunk(
             .map_err(device_error)?;
         first_slot += take;
     }
+    if out.gathers {
+        gather_runs(
+            shared,
+            scratch.partials,
+            Some(scratch.activation),
+            slots,
+            intermediate * byte,
+        )?;
+    }
 
     if layer.index == 0 {
         probe_band(
@@ -1656,7 +1829,7 @@ fn run_band_chunk(
             "chunk swiglu",
             scratch.activation,
             &entries,
-            intermediate,
+            shape.columns,
         )?;
     }
 
@@ -1692,12 +1865,11 @@ fn run_band_chunk(
                             down_codes.offset(local * down_bytes),
                             scratch
                                 .activation
-                                .offset(slot * intermediate * std::mem::size_of::<f32>()),
-                            scratch
-                                .partials
-                                .offset(slot * hidden * std::mem::size_of::<f32>()),
-                            hidden,
-                            intermediate,
+                                .offset(slot * shape.columns * std::mem::size_of::<f32>()),
+                            out.down
+                                .offset(slot * shape.rows * std::mem::size_of::<f32>()),
+                            shape.rows,
+                            shape.columns,
                         )
                         .map_err(device_error)?;
                     let _ = row;
@@ -1717,15 +1889,15 @@ fn run_band_chunk(
                 shared
                     .launch(
                         entry,
-                        (pair_grid(hidden), 1, 1),
+                        (pair_grid(shape.rows), 1, 1),
                         (ELEMENT_BLOCK, 1, 1),
                         &[
                             down_codes.offset(local * down_bytes).0,
                             scale_pointer.0,
                             scratch.activation.0,
-                            scratch.partials.0,
-                            hidden as u64,
-                            intermediate as u64,
+                            out.down.0,
+                            shape.rows as u64,
+                            shape.columns as u64,
                             last,
                             plan.0,
                             count as u64,
@@ -1737,24 +1909,9 @@ fn run_band_chunk(
     }
 
     if layer.index == 0 {
-        probe_band(shared, "chunk down", scratch.partials, &entries, hidden)?;
+        probe_band(shared, "chunk down", out.down, &entries, shape.rows)?;
     }
 
-    // The mix is local; the all-reduce that follows it completes the sum over the ranks.
-    shared
-        .launch(
-            shared.kernels.expert_mix,
-            (flat(hidden), rows as u32, 1),
-            (ELEMENT_BLOCK, 1, 1),
-            &[
-                scratch.mixed.0,
-                scratch.partials.0,
-                scratch.scales.0,
-                rows as u64,
-                top_k as u64,
-                hidden as u64,
-            ],
-        )
-        .map_err(device_error)?;
-    Ok(())
+    // The mix is local; the exchange that follows it completes the sum over the ranks.
+    band_mix(shared, scratch, rows)
 }

@@ -366,6 +366,17 @@ pub enum Target {
     Band(BandOp),
 }
 
+/// One expert's down projection on a rank ([InklingDevicePlan::expert_down]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertDown {
+    /// The output rows the rank computes.
+    pub rows: usize,
+    /// The contraction columns a row sums.
+    pub columns: usize,
+    /// The first residual row of the rank's output.
+    pub first_row: usize,
+}
+
 /// One scheduled launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
@@ -706,14 +717,49 @@ impl InklingDevicePlan {
     }
 
     /// The intermediate columns of one expert this rank computes: the released width, or its
-    /// quarter at TP4 under [ExpertSplit::Intermediate]. Every band, MMA table and scratch
-    /// buffer sizes its expert rows from this, never from the configuration's width.
+    /// quarter at TP4 under [ExpertSplit::Intermediate] and [ExpertSplit::Rows]. Every gate/up
+    /// band, MMA table and scratch buffer sizes its expert rows from this, never from the
+    /// configuration's width; the down projection's shape is [Self::expert_down].
     #[must_use]
     pub fn expert_intermediate(&self) -> usize {
         match self.config.expert_split {
             ExpertSplit::Experts => self.config.moe_intermediate_size,
-            ExpertSplit::Intermediate => self.config.moe_intermediate_size / self.tp.world().max(1),
+            ExpertSplit::Intermediate | ExpertSplit::Rows => {
+                self.config.moe_intermediate_size / self.tp.world().max(1)
+            }
         }
+    }
+
+    /// The down projection one expert has on this rank: its output rows, its contraction
+    /// columns, and the first residual row it writes. Whole under [ExpertSplit::Experts]; the
+    /// rank's intermediate columns of every row under [ExpertSplit::Intermediate]; and under
+    /// [ExpertSplit::Rows] the rank's quarter of the residual rows with every column, which the
+    /// ranks' gathered activations feed.
+    #[must_use]
+    pub fn expert_down(&self) -> ExpertDown {
+        let hidden = self.config.hidden_size;
+        match self.config.expert_split {
+            ExpertSplit::Experts | ExpertSplit::Intermediate => ExpertDown {
+                rows: hidden,
+                columns: self.expert_intermediate(),
+                first_row: 0,
+            },
+            ExpertSplit::Rows => {
+                let rows = hidden / self.tp.world().max(1);
+                ExpertDown {
+                    rows,
+                    columns: self.config.moe_intermediate_size,
+                    first_row: self.tp.rank() * rows,
+                }
+            }
+        }
+    }
+
+    /// The experts one expert-parallel rank would own: the run whose mix [ExpertSplit::Rows]
+    /// rebuilds, so its fold over the ranks is the expert-parallel exchange's.
+    #[must_use]
+    pub fn parallel_experts(&self) -> usize {
+        self.config.n_routed_experts / self.tp.world().max(1)
     }
 
     /// The routed experts this rank owns: the first global index and the count.
@@ -723,15 +769,16 @@ impl InklingDevicePlan {
     /// same eight experts everywhere - so the band skips the slots outside this range and addresses
     /// its own weights and per-expert scales with the index less the first.
     ///
-    /// Under [ExpertSplit::Intermediate] every rank holds every expert, so the run is all of
-    /// them from zero and each rank computes all eight picks at [Self::expert_intermediate].
+    /// Under [ExpertSplit::Intermediate] and [ExpertSplit::Rows] every rank holds every expert,
+    /// so the run is all of them from zero and each rank computes all eight picks at
+    /// [Self::expert_intermediate].
     #[must_use]
     pub fn expert_range(&self) -> (usize, usize) {
         let count = self.rank_experts();
         if count == 0 {
             return (0, 0);
         }
-        if self.config.expert_split == ExpertSplit::Intermediate {
+        if self.config.expert_split.every_expert() {
             return (0, count);
         }
         let first = self.tp.rank() * count;

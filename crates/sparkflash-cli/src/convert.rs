@@ -73,7 +73,7 @@ fn emit_progress(done: u64, total: u64, detail: &str) {
 }
 
 /// Usage string for `sparkflash convert`.
-pub const USAGE: &str = "sparkflash convert (--checkpoint DIR | --model ORG/REPO) [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--expert-split experts|intermediate] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
+pub const USAGE: &str = "sparkflash convert (--checkpoint DIR | --model ORG/REPO) [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--expert-split experts|intermediate|rows] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
 
 /// Entry point called by `main.rs`.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
