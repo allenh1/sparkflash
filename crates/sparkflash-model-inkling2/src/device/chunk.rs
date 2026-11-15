@@ -25,7 +25,8 @@
 //!   chunk's first rows those are the rows the previous launch ended on. The four
 //!   convolution inputs therefore carry three history rows in front of their first row, filled
 //!   by [crate::device_plan]'s companion kernel [Shared::conv_history] from the decode
-//!   history, and written back the same way. A cold start's history is zeros, which is the
+//!   history, and written back the same way; a verify keeps its rows instead and its round's
+//!   settle writes the history back from them. A cold start's history is zeros, which is the
 //!   release's "no such sample", so one mechanism serves both cases.
 //! * **The block-summary stack.** The stack is a token's residual chain, not a history: every
 //!   row of a chunk builds its own from layer zero. So the stack is indexed by row here, one
@@ -1105,15 +1106,18 @@ pub(super) fn walk_rows(
                                 channels,
                                 history,
                             ))?;
-                            keep_tail(shared, &sequences, chunk, index, slot_index, rows)?;
-                            run(shared.conv_history(
-                                chunk
-                                    .conv_head(slot_index)
-                                    .offset(rows * channels * std::mem::size_of::<f32>()),
-                                state.conv[index][slot_index],
-                                channels,
-                                false,
-                            ))?;
+                            // A verify keeps its rows instead, and the round's settle restores the
+                            // history from them.
+                            if !keep_tail(shared, &sequences, chunk, index, slot_index, rows)? {
+                                run(shared.conv_history(
+                                    chunk
+                                        .conv_head(slot_index)
+                                        .offset(rows * channels * std::mem::size_of::<f32>()),
+                                    state.conv[index][slot_index],
+                                    channels,
+                                    false,
+                                ))?;
+                            }
                         }
                         Rows::Lanes(states) => {
                             // A lane's previous samples are its own history, not the row above
@@ -1182,15 +1186,16 @@ pub(super) fn walk_rows(
                                 kv_width,
                                 history,
                             ))?;
-                            keep_tail(shared, &sequences, chunk, index, slot_index, rows)?;
-                            run(shared.conv_history(
-                                chunk
-                                    .conv_head(slot_index)
-                                    .offset(rows * kv_width * std::mem::size_of::<f32>()),
-                                state.conv[index][slot_index],
-                                kv_width,
-                                false,
-                            ))?;
+                            if !keep_tail(shared, &sequences, chunk, index, slot_index, rows)? {
+                                run(shared.conv_history(
+                                    chunk
+                                        .conv_head(slot_index)
+                                        .offset(rows * kv_width * std::mem::size_of::<f32>()),
+                                    state.conv[index][slot_index],
+                                    kv_width,
+                                    false,
+                                ))?;
+                            }
                         }
                         Rows::Lanes(states) => {
                             let byte = std::mem::size_of::<f32>();
@@ -1660,7 +1665,9 @@ pub(super) fn walk_rows(
 }
 
 /// A verify's copy of one layer's convolution input as the launch read it: the history rows
-/// before its first row, then its own rows. Nothing for any other walk.
+/// before its first row, then its own rows. Nothing for any other walk. Answers whether it kept
+/// them: a verify leaves the sequence's history as it was, for the round's settle to restore
+/// from these rows, and every other walk writes its tail back to the history itself.
 fn keep_tail(
     shared: &Shared,
     sequences: &Rows<'_, '_>,
@@ -1668,9 +1675,9 @@ fn keep_tail(
     layer: usize,
     slot: usize,
     rows: usize,
-) -> Result<(), BackendError> {
+) -> Result<bool, BackendError> {
     let Rows::Verify(_, tails) = sequences else {
-        return Ok(());
+        return Ok(false);
     };
     shared
         .cuda
@@ -1679,7 +1686,8 @@ fn keep_tail(
             &chunk.conv_head(slot),
             (tails.history + rows) * tails.channels(slot) * std::mem::size_of::<f32>(),
         )
-        .map_err(device_error)
+        .map_err(device_error)?;
+    Ok(true)
 }
 
 /// The convolution state slot a schedule's conv target names.

@@ -634,6 +634,9 @@ struct Kernels {
     summary_push: Entry,
     /// Convert a convolution history between the decode layout and a chunk's row layout.
     conv_history: Entry,
+    /// Every one of a verify's histories back to the decode layout from its kept rows, in one
+    /// launch ([InklingDeviceSession::settle]).
+    conv_restore: Entry,
 }
 
 impl Kernels {
@@ -754,6 +757,7 @@ impl Kernels {
             short_conv_dynamic_rows: load(inkling, "inkling_short_conv_dynamic")?,
             summary_push: load(inkling, "inkling_summary_push")?,
             conv_history: load(inkling, "inkling_conv_history_copy")?,
+            conv_restore: load(inkling, "inkling_conv_history_restore")?,
             _modules: modules,
         })
     }
@@ -3729,8 +3733,9 @@ impl Chunk {
 /// before the verify's first row and the verify's own rows, in the row layout a chunk reads
 /// (`[history + rows][channels]`, the key and value slots the cache width, the attention and MLP
 /// slots the hidden width). The histories after a leading run of `kept` rows are the `history`
-/// rows from row `kept` on, which is what [InklingDeviceSession::settle] leaves when the caller
-/// fed fewer of the drafts than the verify ran.
+/// rows from row `kept` on, which is what [InklingDeviceSession::settle] restores every slot's
+/// history from, however many of the drafts the caller fed: the verify leaves the state's
+/// histories as they were before it.
 #[derive(Debug, Clone, Copy)]
 struct VerifyTails {
     base: Deviceptr,
@@ -3778,32 +3783,67 @@ impl VerifyTails {
 }
 
 /// A sequence's verify buffer: a split chunk buffer as deep as its deepest round, every row
-/// answered, and the [VerifyTails] that let it keep a leading run of the rows.
+/// answered, the [VerifyTails] that let it keep a leading run of the rows, and the restore's
+/// table: for every (layer, slot) of `conv`, the slot's tail, the sequence's history it
+/// restores, and its channels.
 struct VerifyBuffer {
     chunk: Chunk,
     tails: VerifyTails,
+    restore: Deviceptr,
+    entries: usize,
 }
 
 impl VerifyBuffer {
-    fn allocate(shared: &Shared, rows: usize) -> Result<Self, String> {
+    fn allocate(shared: &Shared, rows: usize, conv: &[[Deviceptr; 4]]) -> Result<Self, String> {
         let chunk = Chunk::allocate(shared, rows, rows, true)?;
+        let free_chunk = || {
+            let pointers = chunk.buffers();
+            shared.cuda.free_buffers(&[&pointers[0], &pointers[1]]);
+        };
         let mut total = 0usize;
         let base = shared
             .cuda
             .alloc(VerifyTails::bytes(rows, shared), &mut total)
+            .inspect_err(|_| free_chunk())?;
+        let tails = VerifyTails::new(shared, base, rows);
+        let mut table = Vec::with_capacity(conv.len() * 4 * 3 * 8);
+        for (layer, slots) in conv.iter().enumerate() {
+            for (slot, history) in slots.iter().enumerate() {
+                for word in [
+                    tails.at(layer, slot).0,
+                    history.0,
+                    tails.channels(slot) as u64,
+                ] {
+                    table.extend_from_slice(&word.to_le_bytes());
+                }
+            }
+        }
+        let entries = conv.len() * 4;
+        let restore = shared
+            .cuda
+            .alloc(table.len().max(8), &mut total)
+            .and_then(|restore| {
+                shared
+                    .cuda
+                    .copy_htod(&restore, &table)
+                    .map(|()| restore)
+                    .inspect_err(|_| shared.cuda.free_buffers(&[&restore]))
+            })
             .inspect_err(|_| {
-                let pointers = chunk.buffers();
-                shared.cuda.free_buffers(&[&pointers[0], &pointers[1]]);
+                free_chunk();
+                shared.cuda.free_buffers(&[&base]);
             })?;
         Ok(Self {
             chunk,
-            tails: VerifyTails::new(shared, base, rows),
+            tails,
+            restore,
+            entries,
         })
     }
 
-    fn buffers(&self) -> [Deviceptr; 3] {
+    fn buffers(&self) -> [Deviceptr; 4] {
         let [arena, summaries] = self.chunk.buffers();
-        [arena, summaries, self.tails.base]
+        [arena, summaries, self.tails.base, self.restore]
     }
 }
 
@@ -4398,7 +4438,10 @@ impl InklingDeviceSession {
     fn verify_rows(&mut self, chunk: &[u32]) -> Result<Vec<Vec<f32>>, BackendError> {
         if self.verify.is_none() {
             let rows = self.speculator.max_depth() + 1;
-            self.verify = Some(VerifyBuffer::allocate(&self.shared, rows).map_err(Self::fail)?);
+            self.verify = Some(
+                VerifyBuffer::allocate(&self.shared, rows, &self.state.conv)
+                    .map_err(Self::fail)?,
+            );
         }
         let verify = self
             .verify
@@ -4417,8 +4460,10 @@ impl InklingDeviceSession {
     }
 
     /// Ends the last round at the rows fed: the cache keeps them, and the convolution histories
-    /// and the position go back to the last fed row. The rows past it stay in the cache, past the
-    /// position, where the next rows stored overwrite them before any row reads them.
+    /// and the position go to the last fed row. The rows past it stay in the cache, past the
+    /// position, where the next rows stored overwrite them before any row reads them. The verify
+    /// left the histories as they were before it, so every one is restored here from the tails,
+    /// all of them in one launch, whether the caller fed every row or fewer.
     fn settle(&mut self) -> Result<(), BackendError> {
         let Some(round) = self.round.take() else {
             return Ok(());
@@ -4427,28 +4472,29 @@ impl InklingDeviceSession {
             .observe(&[], round.chunk.len() - 1, round.fed);
         // The verify left every row's taps; the drafter keeps the rows the caller fed.
         self.inject(round.fed, round.start)?;
-        if round.fed == round.chunk.len() {
-            return Ok(());
-        }
-        let tails = self
+        let verify = self
             .verify
             .as_ref()
-            .ok_or_else(|| Self::fail("a round settled with no verify buffer"))?
-            .tails;
-        let byte = std::mem::size_of::<f32>();
-        for (layer, slots) in self.state.conv.iter().enumerate() {
-            for (slot, history) in slots.iter().enumerate() {
-                let channels = tails.channels(slot);
-                self.shared
-                    .conv_history(
-                        tails.at(layer, slot).offset(round.fed * channels * byte),
-                        *history,
-                        channels,
-                        false,
-                    )
-                    .map_err(Self::fail)?;
-            }
-        }
+            .ok_or_else(|| Self::fail("a round settled with no verify buffer"))?;
+        let entries = u32::try_from(verify.entries)
+            .ok()
+            .filter(|entries| (1..=MAX_GRID_Y).contains(entries))
+            .ok_or_else(|| Self::fail(format!("{} histories to restore", verify.entries)))?;
+        let shared = &self.shared;
+        let widest = verify.tails.channels(0).max(verify.tails.channels(2));
+        shared
+            .launch(
+                shared.kernels.conv_restore,
+                (flat(widest * verify.tails.history), entries, 1),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    verify.restore.0,
+                    u64::from(entries),
+                    shared.kernel_width() as u64,
+                    round.fed as u64,
+                ],
+            )
+            .map_err(Self::fail)?;
         self.state.position = round.start + round.fed;
         Ok(())
     }

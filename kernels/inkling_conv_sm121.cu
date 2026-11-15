@@ -68,6 +68,14 @@
 //     the second; zero does the reverse. A chunk reads its history in the row form and writes
 //     the next decode step's back in the channel form.
 //
+//   inkling_conv_history_restore(table, entries, kernel, row)
+//     table    [entries][3] u64: a row-form history's base ([rows][channels] f32), the
+//              channel-form history it restores, and its channels
+//     row      the base row each restored history starts at
+//     Every entry's channel-form history from its row-form rows row .. row + kernel - 2, entry
+//     y on the grid's y: what inkling_conv_history_copy with to_pad zero does for one entry, for
+//     all of a verify's histories in one launch.
+//
 //   inkling_block_residual(summaries, partial, queries, out, blocks, hidden, nq, eps,
 //                          summary_stride)
 //     summaries  [rows][summary_stride] f32, of which row r's stack is the first
@@ -571,6 +579,25 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     }
 }
 
+// One history's conversion between the two layouts (inkling_conv_history_copy), this thread's
+// elements first, first + step, ... of its channels * history.
+__device__ __forceinline__ void inkling_conv_history_move(const float* __restrict__ source,
+                                                          float* __restrict__ destination,
+                                                          int channels, int history, int to_pad,
+                                                          int first, int step) {
+    for (int index = first; index < channels * history; index += step) {
+        const int channel = index / history;
+        // Both layouts are oldest first, so this is a transpose and not a reversal: tap j of a
+        // channel and column j of a row are the same sample.
+        const int tap = index - channel * history;
+        if (to_pad != 0) {
+            destination[(uint64_t)tap * channels + channel] = source[index];
+        } else {
+            destination[index] = source[(uint64_t)tap * channels + channel];
+        }
+    }
+}
+
 // The convolution history in the other layout, either way.
 //
 // The decode entry keeps one channel's taps together, because a decode step advances every
@@ -587,17 +614,25 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_conv_history
     if (kernel < 1 || kernel > INKLING_MAX_KERNEL || channels <= 0) {
         return;
     }
-    const int history = kernel - 1;
-    for (int index = blockIdx.x * INKLING_BLOCK + threadIdx.x; index < channels * history;
-         index += gridDim.x * INKLING_BLOCK) {
-        const int channel = index / history;
-        // Both layouts are oldest first, so this is a transpose and not a reversal: tap j of a
-        // channel and column j of a row are the same sample.
-        const int tap = index - channel * history;
-        if (to_pad != 0) {
-            destination[(uint64_t)tap * channels + channel] = source[index];
-        } else {
-            destination[index] = source[(uint64_t)tap * channels + channel];
-        }
+    inkling_conv_history_move(source, destination, channels, kernel - 1, to_pad,
+                              blockIdx.x * INKLING_BLOCK + threadIdx.x, gridDim.x * INKLING_BLOCK);
+}
+
+extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_conv_history_restore(
+    const unsigned long long* __restrict__ table,
+    int entries,
+    int kernel,
+    int row) {
+    OPT_PDL_ENTRY();
+    if (kernel < 1 || kernel > INKLING_MAX_KERNEL || (int)blockIdx.y >= entries || row < 0) {
+        return;
     }
+    const unsigned long long* entry = table + 3ull * blockIdx.y;
+    const int channels = (int)entry[2];
+    if (channels <= 0) {
+        return;
+    }
+    inkling_conv_history_move(reinterpret_cast<const float*>(entry[0]) + (uint64_t)row * channels,
+                              reinterpret_cast<float*>(entry[1]), channels, kernel - 1, 0,
+                              blockIdx.x * INKLING_BLOCK + threadIdx.x, gridDim.x * INKLING_BLOCK);
 }
