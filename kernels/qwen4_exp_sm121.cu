@@ -528,6 +528,303 @@ extern "C" __global__ void q4e_gemv4_bf16(
     }
 }
 
+// The packed BF16 form (kernels/bf16_packed_sm121.cuh): its walks repeat q4e_dot_chunk's sums
+// above, so it is included after them.
+#include "bf16_packed_sm121.cuh"
+
+// q4e_gemv_bf16 over a packed matrix: the same rows a warp, the same groups along the grid's y,
+// the same sums over the same words, from the packed bytes. Columns are a multiple of 256 and x
+// is 16-byte aligned (the host refuses anything else: there is no column walk to fall back on).
+extern "C" __global__ void q4e_gemv_packed(const unsigned char* __restrict__ w,
+                                           const unsigned int* __restrict__ offsets,
+                                           const unsigned int* __restrict__ entries,
+                                           const float* __restrict__ x, float* __restrict__ y,
+                                           int rows, int columns, int batch,
+                                           unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const unsigned long long group = (unsigned long long)blockIdx.y * (batch > 1 ? batch : 1);
+    x += group * columns;
+    y += group * rows;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int stride = gridDim.x * warps;
+    if (batch <= 1) {
+        for (int row = blockIdx.x * warps + warp; row < rows; row += stride) {
+            const Q4ePackedRow packed = q4e_packed_row(w, offsets, entries, row, columns, row_bytes);
+            float total = q4e_packed_row_dot(packed, x, columns, lane);
+            total = q4e_warp_sum(total);
+            if (lane == 0) {
+                y[row] = total;
+            }
+        }
+        return;
+    }
+    if (batch > Q4E_MAX_BATCH) {
+        return;
+    }
+    for (int row = (blockIdx.x * warps + warp) * 2; row < rows; row += stride * 2) {
+        const bool second = row + 1 < rows;
+        const Q4ePackedRow pair[2] = {
+            q4e_packed_row(w, offsets, entries, row, columns, row_bytes),
+            q4e_packed_row(w, offsets, entries, second ? row + 1 : row, columns, row_bytes)};
+        float totals[2][Q4E_MAX_BATCH];
+        q4e_packed_rows_dot_batch<2>(pair, x, columns, lane, batch, totals);
+#pragma unroll
+        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+            if (t < batch) {
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
+                if (lane == 0) {
+                    y[(unsigned long long)t * rows + row] = first_sum;
+                    if (second) {
+                        y[(unsigned long long)t * rows + row + 1] = second_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Where q4e_gemv4_packed's row `global_row` of the four matrices stacked lands, as
+// q4e_gemv4_locate places it: its packed row, its output, its row there and that output's rows.
+__device__ __forceinline__ void q4e_gemv4_packed_locate(
+    int global_row, const unsigned char* const (&w)[4], const unsigned int* const (&offsets)[4],
+    const unsigned int* const (&entries)[4], float* const (&y)[4], const int (&r)[4], int columns,
+    unsigned long long row_bytes, Q4ePackedRow* row, float** out, int* local_row,
+    int* out_rows) {
+    // Constant indices in every branch, so the four-pointer arrays stay in registers.
+    const int r01 = r[0] + r[1];
+    const int r012 = r01 + r[2];
+    if (global_row < r[0]) {
+        *local_row = global_row;
+        *out_rows = r[0];
+        *out = y[0];
+        *row = q4e_packed_row(w[0], offsets[0], entries[0], *local_row, columns, row_bytes);
+    } else if (global_row < r01) {
+        *local_row = global_row - r[0];
+        *out_rows = r[1];
+        *out = y[1];
+        *row = q4e_packed_row(w[1], offsets[1], entries[1], *local_row, columns, row_bytes);
+    } else if (global_row < r012) {
+        *local_row = global_row - r01;
+        *out_rows = r[2];
+        *out = y[2];
+        *row = q4e_packed_row(w[2], offsets[2], entries[2], *local_row, columns, row_bytes);
+    } else {
+        *local_row = global_row - r012;
+        *out_rows = r[3];
+        *out = y[3];
+        *row = q4e_packed_row(w[3], offsets[3], entries[3], *local_row, columns, row_bytes);
+    }
+}
+
+// q4e_gemv4_bf16 over four packed matrices that read the same x: each row's sum is the one
+// q4e_gemv_packed (and so q4e_gemv_bf16) gives it.
+extern "C" __global__ void q4e_gemv4_packed(
+    const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1,
+    const unsigned char* __restrict__ w2, const unsigned char* __restrict__ w3,
+    const unsigned int* __restrict__ o0, const unsigned int* __restrict__ o1,
+    const unsigned int* __restrict__ o2, const unsigned int* __restrict__ o3,
+    const unsigned int* __restrict__ e0, const unsigned int* __restrict__ e1,
+    const unsigned int* __restrict__ e2, const unsigned int* __restrict__ e3,
+    const float* __restrict__ x, float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3, int r0, int r1, int r2, int r3, int columns,
+    int batch, unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const unsigned char* const w[4] = {w0, w1, w2, w3};
+    const unsigned int* const offsets[4] = {o0, o1, o2, o3};
+    const unsigned int* const entries[4] = {e0, e1, e2, e3};
+    float* const y[4] = {y0, y1, y2, y3};
+    const int r[4] = {r0, r1, r2, r3};
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int stride = gridDim.x * warps;
+    const int total_rows = r0 + r1 + r2 + r3;
+    if (batch <= 1) {
+        for (int global_row = blockIdx.x * warps + warp; global_row < total_rows;
+             global_row += stride) {
+            Q4ePackedRow row;
+            float* out;
+            int local_row;
+            int out_rows;
+            q4e_gemv4_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                    &row, &out, &local_row, &out_rows);
+            float total = q4e_packed_row_dot(row, x, columns, lane);
+            total = q4e_warp_sum(total);
+            if (lane == 0) {
+                out[local_row] = total;
+            }
+        }
+        return;
+    }
+    if (batch > Q4E_MAX_BATCH) {
+        return;
+    }
+    for (int global_row = (blockIdx.x * warps + warp) * 2; global_row < total_rows;
+         global_row += stride * 2) {
+        const bool second = global_row + 1 < total_rows;
+        Q4ePackedRow pair[2];
+        float* out[2];
+        int local_row[2];
+        int out_rows[2];
+        q4e_gemv4_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                &pair[0], &out[0], &local_row[0], &out_rows[0]);
+        q4e_gemv4_packed_locate(second ? global_row + 1 : global_row, w, offsets, entries, y, r,
+                                columns, row_bytes, &pair[1], &out[1], &local_row[1],
+                                &out_rows[1]);
+        float totals[2][Q4E_MAX_BATCH];
+        q4e_packed_rows_dot_batch<2>(pair, x, columns, lane, batch, totals);
+#pragma unroll
+        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+            if (t < batch) {
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
+                if (lane == 0) {
+                    out[0][(unsigned long long)t * out_rows[0] + local_row[0]] = first_sum;
+                    if (second) {
+                        out[1][(unsigned long long)t * out_rows[1] + local_row[1]] = second_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Packs `rows` BF16 rows (columns a multiple of 256) a warp a row. With `packed` null it only
+// counts: counts[row] = the row's escapes. Otherwise it writes the packed rows `row_bytes` apart
+// and each row's escapes from entries[offsets[row]] on, in walk order. Offsets and counts are the
+// caller's for these rows (it offsets the pointers to a group's first row).
+extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ source,
+                                         unsigned char* __restrict__ packed,
+                                         const unsigned int* __restrict__ offsets,
+                                         unsigned int* __restrict__ entries,
+                                         unsigned int* __restrict__ counts, int rows, int columns,
+                                         unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int chunks = columns >> 3;
+    for (int row = blockIdx.x * warps + warp; row < rows; row += gridDim.x * warps) {
+        const unsigned short* src = source + (unsigned long long)row * columns;
+        unsigned char* a = packed != nullptr ? packed + (unsigned long long)row * row_bytes : nullptr;
+        unsigned char* b = a != nullptr ? a + columns : nullptr;
+        unsigned char* c = b != nullptr ? b + columns / 2 : nullptr;
+        unsigned int written = packed != nullptr ? offsets[row] : 0u;
+        unsigned int escapes = 0;
+        int chunk = lane;
+        int step = 0;
+        unsigned long long a_off = 0;
+        while (chunk < chunks) {
+            const int n = chunk + 96 < chunks ? 4 : (chunk + 32 < chunks ? 2 : 1);
+            unsigned short words[32];
+            unsigned int top = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (j < n) {
+                    const uint4 value =
+                        *reinterpret_cast<const uint4*>(src + (chunk + 32 * j) * 8);
+                    const unsigned int parts[4] = {value.x, value.y, value.z, value.w};
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const unsigned short word =
+                            (unsigned short)((k & 1) ? parts[k >> 1] >> 16 : parts[k >> 1] & 0xFFFFu);
+                        words[j * 8 + k] = word;
+                        top = max(top, (unsigned int)(word >> 7) & 0xFFu);
+                    }
+                }
+            }
+            unsigned int mine = 0;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < n * 8 && top - ((words[i] >> 7) & 0xFFu) >= Q4E_PACKED_ESCAPE) {
+                    ++mine;
+                }
+            }
+            // Each lane's escapes go after the lower lanes' at this step, so the list is in walk
+            // order whatever the warp's timing.
+            unsigned int before = mine;
+#pragma unroll
+            for (int delta = 1; delta < 32; delta <<= 1) {
+                const unsigned int up = __shfl_up_sync(0xFFFFFFFFu, before, delta);
+                if (lane >= delta) {
+                    before += up;
+                }
+            }
+            const unsigned int step_total = __shfl_sync(0xFFFFFFFFu, before, 31);
+            before -= mine;
+            if (a != nullptr) {
+                unsigned int at = written + before;
+                unsigned char* a_lane = a + a_off + (unsigned long long)lane * n * 8;
+                unsigned char* b_lane = b + a_off / 2 + (unsigned long long)lane * n * 4;
+                for (int j = 0; j < n; ++j) {
+                    unsigned int nib = 0;
+                    for (int k = 0; k < 8; ++k) {
+                        const unsigned short word = words[j * 8 + k];
+                        unsigned int off = top - ((word >> 7) & 0xFFu);
+                        if (off >= Q4E_PACKED_ESCAPE) {
+                            off = Q4E_PACKED_ESCAPE;
+                            const unsigned int column = (unsigned int)((chunk + 32 * j) * 8 + k);
+                            entries[at++] = (column << 16) | word;
+                        }
+                        a_lane[j * 8 + k] = (unsigned char)(((word >> 8) & 0x80u) | (word & 0x7Fu));
+                        nib |= off << ((k & 3) * 8 + (k >> 2) * 4);
+                    }
+                    *reinterpret_cast<unsigned int*>(b_lane + j * 4) = nib;
+                }
+                c[step * 32 + lane] = (unsigned char)top;
+            }
+            written += step_total;
+            escapes += step_total;
+            a_off += 32ull * n * 8;
+            chunk += 32 * n;
+            ++step;
+        }
+        if (a != nullptr) {
+            const int used = columns + columns / 2 + 32 * step;
+            for (int p = used + lane; p < (int)row_bytes; p += 32) {
+                a[p] = 0;
+            }
+        } else if (lane == 0) {
+            counts[row] = escapes;
+        }
+    }
+}
+
+// Rebuilds `rows` packed rows a warp a row: into `out` as BF16 when it is not null, and against
+// `expected` when that is not null, adding the differing words to *differ. Offsets are the
+// caller's for these rows.
+extern "C" __global__ void q4e_unpack_bf16(const unsigned char* __restrict__ packed,
+                                           const unsigned int* __restrict__ offsets,
+                                           const unsigned int* __restrict__ entries,
+                                           unsigned short* __restrict__ out,
+                                           const unsigned short* __restrict__ expected,
+                                           unsigned int* __restrict__ differ, int rows,
+                                           int columns, unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (int row = blockIdx.x * warps + warp; row < rows; row += gridDim.x * warps) {
+        const Q4ePackedRow rows_of[1] = {
+            q4e_packed_row(packed, offsets, entries, row, columns, row_bytes)};
+        Q4ePackedWords words{
+            out != nullptr
+                ? reinterpret_cast<uint4*>(out + (unsigned long long)row * columns)
+                : nullptr,
+            expected != nullptr
+                ? reinterpret_cast<const uint4*>(expected + (unsigned long long)row * columns)
+                : nullptr,
+            0u};
+        q4e_packed_walk<1>(rows_of, columns, lane, words);
+        if (words.differ != 0) {
+            atomicAdd(differ, words.differ);
+        }
+    }
+}
+
 // `scales`, when there are any, holds one factor a row for the finished sum.
 struct Q4eTgStore {
     float* y;
