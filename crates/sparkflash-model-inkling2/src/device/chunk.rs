@@ -1006,38 +1006,69 @@ pub(super) fn walk_rows(
                     // A projection's inner width is the width its weight multiplies: the stream
                     // for every projection but the attention output's, which contracts the heads.
                     let attention_width = heads * head_dim;
-                    let (input, out, width, inner) = match projection {
-                        Projection::Query => (scratch.q_in, scratch.q, attention_width, hidden),
-                        Projection::Gate => (scratch.q_in, scratch.gate, attention_width, hidden),
-                        Projection::Key => (
+                    let io = |projection: Projection| match projection {
+                        Projection::Query => Ok((scratch.q_in, scratch.q, attention_width, hidden)),
+                        Projection::Gate => {
+                            Ok((scratch.q_in, scratch.gate, attention_width, hidden))
+                        }
+                        Projection::Key => Ok((
                             if sliding { scratch.q_in } else { scratch.k_in },
                             scratch.k,
                             kv_width,
                             hidden,
-                        ),
-                        Projection::Value => (
+                        )),
+                        Projection::Value => Ok((
                             if sliding { scratch.q_in } else { scratch.v_in },
                             scratch.v,
                             kv_width,
                             hidden,
-                        ),
+                        )),
                         Projection::Relative => {
-                            (scratch.q_in, scratch.rel, heads * config.d_rel, hidden)
+                            Ok((scratch.q_in, scratch.rel, heads * config.d_rel, hidden))
                         }
-                        Projection::Sink => (scratch.q_in, scratch.sink, heads, hidden),
+                        Projection::Sink => Ok((scratch.q_in, scratch.sink, heads, hidden)),
                         Projection::AttentionOut => {
-                            (scratch.attn, scratch.delta, hidden, attention_width)
+                            Ok((scratch.attn, scratch.delta, hidden, attention_width))
                         }
-                        Projection::Router => (
+                        Projection::Router => Ok((
                             scratch.q_in,
                             scratch.router_logits,
                             config.n_routed_experts,
                             hidden,
-                        ),
-                        Projection::Head => {
-                            return Err(device_error("the head is an epilogue step"));
-                        }
+                        )),
+                        Projection::Head => Err(device_error("the head is an epilogue step")),
                     };
+                    let (input, out, width, inner) = io(projection)?;
+                    // A few rows on the batched GEMV (a verify, a handful of lanes) take the
+                    // projections that follow over the same input with this one, up to four a
+                    // launch, as the decode step does: a sliding layer's six attention
+                    // projections are two launches rather than six. Each row's sums are its own
+                    // launch's bits (Shared::gemv_fused).
+                    if walk == PrefillWalk::Chunk && rows <= BATCH_ROWS {
+                        let mut parts = [(Deviceptr(0), Deviceptr(0), 0usize); GEMV_FUSED];
+                        parts[0] = (matrix, out, width);
+                        let mut fused = 1;
+                        while fused < GEMV_FUSED {
+                            let Some(next) = layer.steps.get(cursor + fused) else {
+                                break;
+                            };
+                            let (Op::Gemv, Target::Project(following)) = (next.op, next.target)
+                            else {
+                                break;
+                            };
+                            let (next_input, next_out, next_width, next_inner) = io(following)?;
+                            if next_input.0 != input.0 || next_inner != inner {
+                                break;
+                            }
+                            parts[fused] = (weight(next.weights[0]), next_out, next_width);
+                            fused += 1;
+                        }
+                        if fused > 1 {
+                            run(shared.gemv_fused(&parts[..fused], input, inner, rows))?;
+                            cursor += fused;
+                            continue;
+                        }
+                    }
                     project(shared, walk, matrix, input, out, width, inner, rows)?;
                     if index == 0 && matches!(projection, Projection::AttentionOut) {
                         probe(shared, "chunk attention_out", out, rows, width)?;

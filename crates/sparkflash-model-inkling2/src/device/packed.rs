@@ -511,13 +511,14 @@ impl Shared {
         )
     }
 
-    /// Up to four packed matrices over one row, as one launch: q4e_gemv4_bf16's walk and bits.
-    /// `parts` holds (matrix, output, rows).
+    /// Up to four packed matrices over `batch` rows, as one launch: q4e_gemv4_bf16's walk and
+    /// bits. `parts` holds (matrix, output, rows).
     pub(super) fn gemv4_packed(
         &self,
         parts: &[(Packed, Deviceptr, usize)],
         input: Deviceptr,
         columns: usize,
+        batch: usize,
     ) -> Result<(), String> {
         let fused = super::GEMV_FUSED;
         if parts.is_empty() || parts.len() > fused {
@@ -538,7 +539,7 @@ impl Shared {
         }
         args[12] = input.0;
         args[21] = columns as u64;
-        args[22] = 1;
+        args[22] = batch as u64;
         args[23] = parts[0].0.row_bytes as u64;
         let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
         self.launch(

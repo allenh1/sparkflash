@@ -930,22 +930,29 @@ impl Shared {
         )
     }
 
-    /// Up to four dense BF16 projections of one row that read the same input, as one launch.
+    /// Up to four dense BF16 projections of `batch` rows that read the same input, as one launch.
     ///
     /// `q4e_gemv4_bf16` walks the matrices' rows stacked, and each row's sum is the one
-    /// [Self::gemv] computes - the same row dot and warp sum over the same input - so a fused
-    /// group is the bits of its projections launched one at a time. A slot past `parts` has no
-    /// rows. `parts` holds (weight, output, rows).
+    /// [Self::gemv_batch] computes - the same row dot and warp sum over the same input, a
+    /// batch's weight rows two a warp with each row's sums its own - so a fused group is the bits
+    /// of its projections launched one at a time. A slot past `parts` has no rows. `parts` holds
+    /// (weight, output, rows); input is `[batch][columns]` and each output `[batch][rows]`.
     fn gemv_fused(
         &self,
         parts: &[(Deviceptr, Deviceptr, usize)],
         input: Deviceptr,
         columns: usize,
+        batch: usize,
     ) -> Result<(), String> {
         if parts.is_empty() || parts.len() > GEMV_FUSED {
             return Err(format!(
                 "a fused projection takes 1 to {GEMV_FUSED} matrices, not {}",
                 parts.len()
+            ));
+        }
+        if !(1..=BATCH_ROWS).contains(&batch) {
+            return Err(format!(
+                "a fused projection carries 1 to {BATCH_ROWS} rows, not {batch}"
             ));
         }
         // (w0..w3, x, y0..y3, r0..r3, columns, batch): an absent slot is a null matrix of no rows.
@@ -956,11 +963,11 @@ impl Shared {
             .filter_map(|(weight, out, rows)| Some((self.dense.get(*weight)?, *out, *rows)))
             .collect();
         if packed.len() == parts.len() {
-            return self.gemv4_packed(&packed, input, columns);
+            return self.gemv4_packed(&packed, input, columns, batch);
         }
         if !packed.is_empty() {
             for (weight, out, rows) in parts {
-                self.gemv(*weight, input, *out, *rows, columns)?;
+                self.gemv_batch(*weight, input, *out, *rows, columns, batch, 1)?;
             }
             return Ok(());
         }
@@ -972,7 +979,7 @@ impl Shared {
         }
         args[GEMV_FUSED] = input.0;
         args[3 * GEMV_FUSED + 1] = columns as u64;
-        args[3 * GEMV_FUSED + 2] = 1;
+        args[3 * GEMV_FUSED + 2] = batch as u64;
         let total: usize = parts.iter().map(|(_, _, rows)| rows).sum();
         self.launch(
             self.kernels.gemv4,
@@ -4752,7 +4759,7 @@ impl InklingDeviceSession {
                             fused += 1;
                         }
                         if fused > 1 {
-                            run(shared.gemv_fused(&parts[..fused], input, columns))?;
+                            run(shared.gemv_fused(&parts[..fused], input, columns, 1))?;
                             cursor += fused;
                             continue;
                         }
