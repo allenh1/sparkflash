@@ -200,7 +200,10 @@ impl Tp4Run {
         .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let drafter = if backend.wants_drafter() {
             let bytes = backend.load_drafter(&self.checkpoint).map_err(|error| {
-                format!("TP{}/rank{}: the DSpark drafter: {error}", self.world, self.rank)
+                format!(
+                    "TP{}/rank{}: the DSpark drafter: {error}",
+                    self.world, self.rank
+                )
             })?;
             format!(", DSpark drafter {bytes} bytes")
         } else {

@@ -336,7 +336,11 @@ impl DraftModel {
             }
             tap_layers[slot] = *layer;
         }
-        if mtp.local_layer_ids.iter().any(|layer| *layer >= mtp.num_hidden_layers) {
+        if mtp
+            .local_layer_ids
+            .iter()
+            .any(|layer| *layer >= mtp.num_hidden_layers)
+        {
             return Err(format!(
                 "local layers {:?} outside the drafter's {}",
                 mtp.local_layer_ids, mtp.num_hidden_layers
@@ -391,9 +395,8 @@ impl DraftModel {
             let key_norm = vector("self_attn.k_norm.weight", HEAD_DIM)?;
             let context_key_norm = vector("self_attn.k_norm_ctx.weight", HEAD_DIM)?;
             let mut part = |tail: &str, shape: (usize, usize), part: Part| {
-                up.mat_part(&name(tail), shape, part).map(|matrix| {
-                    keep(matrix.pointer, matrix.rows * matrix.columns * 2)
-                })
+                up.mat_part(&name(tail), shape, part)
+                    .map(|matrix| keep(matrix.pointer, matrix.rows * matrix.columns * 2))
             };
             let rows = |count: usize| Part::Rows(rank * count, count);
             let columns = |count: usize| Part::Columns(rank * count, count);
@@ -402,8 +405,16 @@ impl DraftModel {
                 post_norm,
                 fusion_norm,
                 query: part("self_attn.q_proj.weight", (q_total, hidden), rows(q_width))?,
-                key: part("self_attn.k_proj.weight", (kv_total, hidden), rows(kv_width))?,
-                value: part("self_attn.v_proj.weight", (kv_total, hidden), rows(kv_width))?,
+                key: part(
+                    "self_attn.k_proj.weight",
+                    (kv_total, hidden),
+                    rows(kv_width),
+                )?,
+                value: part(
+                    "self_attn.v_proj.weight",
+                    (kv_total, hidden),
+                    rows(kv_width),
+                )?,
                 context_key: part(
                     "self_attn.k_proj_ctx.weight",
                     (kv_total, hidden),
@@ -414,7 +425,11 @@ impl DraftModel {
                     (kv_total, hidden),
                     rows(kv_width),
                 )?,
-                out: part("self_attn.o_proj.weight", (hidden, q_total), columns(q_width))?,
+                out: part(
+                    "self_attn.o_proj.weight",
+                    (hidden, q_total),
+                    columns(q_width),
+                )?,
                 query_norm,
                 key_norm,
                 context_key_norm,
@@ -470,7 +485,10 @@ impl DraftModel {
         let z_width = 2 * markov + 2 * hidden;
         let rnn = up.mat("markov_head.rnn_proj.weight", 3 * markov, z_width)?;
         let rnn_weight = keep(rnn.pointer, 3 * markov * z_width * 2);
-        let rnn_bias = keep(up.vector("markov_head.rnn_proj.bias", 3 * markov)?, 6 * markov);
+        let rnn_bias = keep(
+            up.vector("markov_head.rnn_proj.bias", 3 * markov)?,
+            6 * markov,
+        );
         let (fold_weight, fold_bias) = fold(shared, &up, head, hidden, markov)?;
         let rank_vocab = shared.plan.rank_vocab();
         let fold_weight = keep(fold_weight, rank_vocab * markov * 2);
@@ -669,7 +687,11 @@ impl DraftState {
             .layers
             .iter()
             .map(|layer| {
-                let ring = layer.window.unwrap_or(shared.context).min(shared.context).max(1);
+                let ring = layer
+                    .window
+                    .unwrap_or(shared.context)
+                    .min(shared.context)
+                    .max(1);
                 (
                     layout.take(ring * kv_width * f),
                     layout.take(ring * kv_width * f),
@@ -936,7 +958,15 @@ impl DraftState {
             shared.launch(
                 kernels.norm,
                 (groups as u32, 1, 1),
-                (if group < BLOCK as usize { HEAD_DIM as u32 } else { BLOCK }, 1, 1),
+                (
+                    if group < BLOCK as usize {
+                        HEAD_DIM as u32
+                    } else {
+                        BLOCK
+                    },
+                    1,
+                    1,
+                ),
                 &[input.0, weight.0, out.0, group as u64, bits(model.eps)],
             )
         };
@@ -979,7 +1009,13 @@ impl DraftState {
 
         for (index, layer) in model.layers.iter().enumerate() {
             let (key_ring, value_ring, ring) = self.rings[index];
-            run(norm(self.block, layer.input_norm, self.normed, rows, hidden))?;
+            run(norm(
+                self.block,
+                layer.input_norm,
+                self.normed,
+                rows,
+                hidden,
+            ))?;
             for (weight, out, width) in [
                 (layer.query, self.queries, q_width),
                 (layer.key, self.keys, kv_width),
@@ -1025,7 +1061,9 @@ impl DraftState {
             }
             // Every row sees the same keys: the window's (or the whole context's) committed
             // positions before the block, and the block's own rows.
-            let lowest = layer.window.map_or(0, |window| position.saturating_sub(window));
+            let lowest = layer
+                .window
+                .map_or(0, |window| position.saturating_sub(window));
             run(shared.launch(
                 kernels.attention,
                 (heads as u32, rows as u32, 1),
@@ -1122,7 +1160,13 @@ impl DraftState {
                     hidden as u64,
                 ],
             ))?;
-            run(shared.gemv(model.rnn_weight, self.z, self.projected, 3 * markov, z_width))?;
+            run(shared.gemv(
+                model.rnn_weight,
+                self.z,
+                self.projected,
+                3 * markov,
+                z_width,
+            ))?;
             run(shared.launch(
                 kernels.markov_gates,
                 (1, 1, 1),
@@ -1135,7 +1179,13 @@ impl DraftState {
                     markov as u64,
                 ],
             ))?;
-            run(shared.gemv(model.fold_weight, self.latent, self.product, rank_vocab, markov))?;
+            run(shared.gemv(
+                model.fold_weight,
+                self.latent,
+                self.product,
+                rank_vocab,
+                markov,
+            ))?;
             run(shared.launch(
                 kernels.markov_logits,
                 (self.parts as u32, 1, 1),
@@ -1171,12 +1221,7 @@ impl DraftState {
             kernels.markov_last,
             (1, 1, 1),
             (32, 1, 1),
-            &[
-                self.slots.0,
-                world as u64,
-                self.tokens.0,
-                depth as u64,
-            ],
+            &[self.slots.0, world as u64, self.tokens.0, depth as u64],
         ))?;
         run(shared.cuda.synchronize())?;
         run(shared.exchange.check_device())?;

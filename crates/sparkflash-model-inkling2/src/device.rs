@@ -70,8 +70,8 @@ mod draft;
 mod tower;
 
 use chunk::{Injection, Rows, exchange_gather, exchange_sum, walk_rows};
-use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 pub use draft::DRAFT_FILE;
+use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 pub use tower::InklingVisionTower;
 
 /// The backend name the diagnostics use.
