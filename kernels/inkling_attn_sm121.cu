@@ -502,6 +502,139 @@ __device__ __forceinline__ uint64_t inkling_attn_cache_row(int64_t slot, int cac
     return cache_rows > 0 ? (uint64_t)((uint32_t)slot % (uint32_t)cache_rows) : (uint64_t)slot;
 }
 
+// A KV group's prepared queries, inkling_attn_query for each of its heads in the lane layout
+// and zeros for the slots past `groups` (their sums are never stored). MG >= groups.
+template <int MG>
+__device__ __forceinline__ void inkling_group_queries(
+    const float* __restrict__ q,
+    const float* __restrict__ rel_proj,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ rel_scale,
+    int row,
+    int heads,
+    int head0,
+    int head_dim,
+    int groups,
+    int d_rel,
+    float qk_clip,
+    float rel_clip,
+    float tau,
+    float (&qv)[MG][INKLING_MAX_HEAD_DIM / 32],
+    float (&rv)[MG]) {
+    const uint64_t row_offset = (uint64_t)row * heads * head_dim;
+#pragma unroll
+    for (int g = 0; g < MG; ++g) {
+        const int head = head0 + g;
+        if (g < groups) {
+            inkling_attn_query(q + row_offset + (uint64_t)head * head_dim,
+                               rel_proj + (uint64_t)row * heads * d_rel, q_scale, rel_scale, head,
+                               head_dim, d_rel, qk_clip, rel_clip, tau, qv[g], rv[g]);
+        } else {
+#pragma unroll
+            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                qv[g][step] = 0.0f;
+            }
+            rv[g] = 0.0f;
+        }
+    }
+}
+
+// A KV head's learned key gain for the lane's dims.
+__device__ __forceinline__ void inkling_key_gain(const float* __restrict__ k_scale, int kv_head,
+                                                 int head_dim,
+                                                 float (&gain)[INKLING_MAX_HEAD_DIM / 32]) {
+    const unsigned int lane = threadIdx.x & 31u;
+#pragma unroll
+    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+        const int dim = (int)lane + 32 * step;
+        gain[step] =
+            dim < head_dim && k_scale != nullptr ? k_scale[(uint64_t)kv_head * head_dim + dim] : 1.0f;
+    }
+}
+
+// The lane's BF16 of keys `index` .. `index + RUN - 1` of a row's range (those before `end`),
+// the row's first visible slot `first`.
+__device__ __forceinline__ void inkling_score_load(
+    const __nv_bfloat16* __restrict__ keys,
+    int64_t first,
+    int64_t index,
+    int64_t end,
+    int cache_rows,
+    uint64_t kv_stride,
+    uint64_t kv_offset,
+    int head_dim,
+    __nv_bfloat16 (&loaded)[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32]) {
+    const unsigned int lane = threadIdx.x & 31u;
+#pragma unroll
+    for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
+        if (index + i < end) {
+            const __nv_bfloat16* krow =
+                keys + inkling_attn_cache_row(first + index + i, cache_rows) * kv_stride + kv_offset;
+#pragma unroll
+            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                const int dim = (int)lane + 32 * step;
+                loaded[i][step] = dim < head_dim ? krow[dim] : __float2bfloat16(0.0f);
+            }
+        }
+    }
+}
+
+// One key's score for every head of the group: the key's learned gain and its clip gain
+// (`k_gain`, inkling_attn_key_scales'), the dot over sqrt(head_dim) and the relative bias of a key
+// `distance` positions back. Lane 2g returns head g's score.
+template <int MG>
+__device__ __forceinline__ float inkling_group_score(
+    const __nv_bfloat16 (&key)[INKLING_MAX_HEAD_DIM / 32],
+    const float (&gain)[INKLING_MAX_HEAD_DIM / 32],
+    float k_gain,
+    const float (&qv)[MG][INKLING_MAX_HEAD_DIM / 32],
+    const float (&rv)[MG],
+    const __nv_bfloat16* __restrict__ rel_bank,
+    int64_t distance,
+    int rel_extent,
+    int d_rel,
+    int head_dim,
+    float inv_dim) {
+    const unsigned int lane = threadIdx.x & 31u;
+    float kv[INKLING_MAX_HEAD_DIM / 32];
+#pragma unroll
+    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+        const int dim = (int)lane + 32 * step;
+        kv[step] = dim < head_dim ? __fmul_rn(__bfloat162float(key[step]), gain[step]) : 0.0f;
+        kv[step] = __fmul_rn(kv[step], k_gain);
+    }
+    const bool biased = d_rel > 0 && rel_extent > 0 && distance >= 0 && distance < rel_extent;
+    const float bank =
+        biased && lane < (unsigned int)d_rel
+            ? __bfloat162float(rel_bank[(uint64_t)lane * rel_extent + (uint64_t)distance])
+            : 0.0f;
+    // Sums 0-7: a head's dot; 8-15: its relative bias.
+    float sums[2 * INKLING_MAX_GROUPS];
+#pragma unroll
+    for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
+        sums[g] = 0.0f;
+        sums[INKLING_MAX_GROUPS + g] = 0.0f;
+    }
+#pragma unroll
+    for (int g = 0; g < MG; ++g) {
+        float dot = 0.0f;
+#pragma unroll
+        for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+            dot = __fadd_rn(dot, __fmul_rn(qv[g][step], kv[step]));
+        }
+        sums[g] = dot;
+        sums[INKLING_MAX_GROUPS + g] = lane < (unsigned int)d_rel ? __fmul_rn(rv[g], bank) : 0.0f;
+    }
+    // Lane 2g holds head g's dot, lane 16 + 2g its bias.
+    const float total = inkling_attn_warp_sums<2 * INKLING_MAX_GROUPS>(sums);
+    const float bias = __shfl_sync(0xffffffffu, total, (lane + 16u) & 31u);
+    float score = __fmul_rn(total, inv_dim);
+    if (biased) {
+        score = __fadd_rn(score, bias);
+    }
+    return score;
+}
+
 // grid (ceil(span / (RUN * WARPS)), kv_heads), block 32 * INKLING_SCORE_WARPS: slots
 // scale_first .. scale_first + span.
 extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_attn_key_scales(
@@ -625,53 +758,20 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
         return;
     }
     const float row_tau = tau_rows != nullptr ? tau_rows[row] : tau;
-    const uint64_t row_offset = (uint64_t)row * heads * head_dim;
     float qv[INKLING_MAX_GROUPS][INKLING_MAX_HEAD_DIM / 32];
     float rv[INKLING_MAX_GROUPS];
-#pragma unroll
-    for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-        const int head = kv_head * groups + g;
-        if (g < groups) {
-            inkling_attn_query(q + row_offset + (uint64_t)head * head_dim,
-                               rel_proj + (uint64_t)row * heads * d_rel, q_scale, rel_scale, head,
-                               head_dim, d_rel, qk_clip, rel_clip, row_tau, qv[g], rv[g]);
-        } else {
-#pragma unroll
-            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                qv[g][step] = 0.0f;
-            }
-            rv[g] = 0.0f;
-        }
-    }
+    inkling_group_queries<INKLING_MAX_GROUPS>(q, rel_proj, q_scale, rel_scale, row, heads,
+                                              kv_head * groups, head_dim, groups, d_rel, qk_clip,
+                                              rel_clip, row_tau, qv, rv);
     const float inv_dim = 1.0f / sqrtf((float)head_dim);
     const uint64_t kv_stride = (uint64_t)kv_heads * head_dim;
     const uint64_t kv_offset = (uint64_t)kv_head * head_dim;
     const float* gains = key_gains + (uint64_t)kv_head * scale_stride - scale_first;
     float gain[INKLING_MAX_HEAD_DIM / 32];
-#pragma unroll
-    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-        const int dim = (int)lane + 32 * step;
-        gain[step] =
-            dim < head_dim && k_scale != nullptr ? k_scale[(uint64_t)kv_head * head_dim + dim] : 1.0f;
-    }
-    // loaded[i][step]: this lane's BF16 of key `at + i`, dim lane + 32 step.
+    inkling_key_gain(k_scale, kv_head, head_dim, gain);
+    // loaded[i][step]: this lane's BF16 of key `begin + i`, dim lane + 32 step.
     __nv_bfloat16 loaded[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
-    const auto load = [&](int64_t at) {
-#pragma unroll
-        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
-            if (at + i < end) {
-                const __nv_bfloat16* krow =
-                    keys + inkling_attn_cache_row(first + at + i, cache_rows) * kv_stride +
-                    kv_offset;
-#pragma unroll
-                for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                    const int dim = (int)lane + 32 * step;
-                    loaded[i][step] = dim < head_dim ? krow[dim] : __float2bfloat16(0.0f);
-                }
-            }
-        }
-    };
-    load(begin);
+    inkling_score_load(keys, first, begin, end, cache_rows, kv_stride, kv_offset, head_dim, loaded);
     for (;;) {
         __nv_bfloat16 run[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
 #pragma unroll
@@ -683,52 +783,19 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
         }
         const int64_t next = begin + stride;
         if (next < end) {
-            load(next);
+            inkling_score_load(keys, first, next, end, cache_rows, kv_stride, kv_offset, head_dim,
+                               loaded);
         }
 #pragma unroll
         for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
             const int64_t index = begin + i;
             if (index < end) {
                 const int64_t slot = first + index;
-                const float k_gain = gains[slot];
-                float kv[INKLING_MAX_HEAD_DIM / 32];
-#pragma unroll
-                for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                    const int dim = (int)lane + 32 * step;
-                    kv[step] =
-                        dim < head_dim ? __fmul_rn(__bfloat162float(run[i][step]), gain[step]) : 0.0f;
-                    kv[step] = __fmul_rn(kv[step], k_gain);
-                }
-                const int64_t distance = (int64_t)position - slot;
-                const bool biased =
-                    d_rel > 0 && rel_extent > 0 && distance >= 0 && distance < rel_extent;
-                const float bank =
-                    biased && lane < (unsigned int)d_rel
-                        ? __bfloat162float(
-                              rel_bank[(uint64_t)lane * rel_extent + (uint64_t)distance])
-                        : 0.0f;
-                // Sums 0-7: a head's dot; 8-15: its relative bias.
-                float sums[2 * INKLING_MAX_GROUPS];
-#pragma unroll
-                for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-                    float dot = 0.0f;
-#pragma unroll
-                    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                        dot = __fadd_rn(dot, __fmul_rn(qv[g][step], kv[step]));
-                    }
-                    sums[g] = dot;
-                    sums[INKLING_MAX_GROUPS + g] =
-                        lane < (unsigned int)d_rel ? __fmul_rn(rv[g], bank) : 0.0f;
-                }
-                // Lane 2g holds head g's dot, lane 16 + 2g its bias.
-                const float total = inkling_attn_warp_sums<2 * INKLING_MAX_GROUPS>(sums);
-                const float bias = __shfl_sync(0xffffffffu, total, (lane + 16u) & 31u);
+                const float score = inkling_group_score<INKLING_MAX_GROUPS>(
+                    run[i], gain, gains[slot], qv, rv, rel_bank, (int64_t)position - slot,
+                    rel_extent, d_rel, head_dim, inv_dim);
                 const int g = (int)(lane >> 1);
                 if ((lane & 1u) == 0 && g < groups) {
-                    float score = __fmul_rn(total, inv_dim);
-                    if (biased) {
-                        score = __fadd_rn(score, bias);
-                    }
                     const int head = kv_head * groups + g;
                     scores[((uint64_t)row * heads + head) * pass_slots + (index - pass_first)] =
                         score;
@@ -1009,60 +1076,211 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
 #define INKLING_PART_LANES (INKLING_MAX_HEAD_DIM / INKLING_PART_DIMS)
 #define INKLING_PART_STRIDE (INKLING_PART_THREADS / INKLING_PART_LANES)
 
-// The largest of `value` across the block, for each of the first `count` entries.
+// The largest of `value` across the first four warps of the block, for each of the first
+// `count` entries. Every thread of the block keeps the barriers; only `active` ones (the first
+// INKLING_PART_THREADS, warp-uniform) take part.
 template <int K>
 __device__ __forceinline__ void inkling_part_block_max(float (&value)[K], float (&shared)[4][K],
-                                                       int count) {
+                                                       int count, bool active) {
     const unsigned int lane = threadIdx.x & 31u;
     const int warp = threadIdx.x >> 5;
+    if (active) {
 #pragma unroll
-    for (int g = 0; g < K; ++g) {
-        if (g < count) {
+        for (int g = 0; g < K; ++g) {
+            if (g < count) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                value[g] = fmaxf(value[g], __shfl_xor_sync(0xffffffffu, value[g], offset));
-            }
-            if (lane == 0) {
-                shared[warp][g] = value[g];
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    value[g] = fmaxf(value[g], __shfl_xor_sync(0xffffffffu, value[g], offset));
+                }
+                if (lane == 0) {
+                    shared[warp][g] = value[g];
+                }
             }
         }
     }
     __syncthreads();
+    if (active) {
 #pragma unroll
-    for (int g = 0; g < K; ++g) {
-        if (g < count) {
-            value[g] = fmaxf(fmaxf(shared[0][g], shared[1][g]), fmaxf(shared[2][g], shared[3][g]));
+        for (int g = 0; g < K; ++g) {
+            if (g < count) {
+                value[g] =
+                    fmaxf(fmaxf(shared[0][g], shared[1][g]), fmaxf(shared[2][g], shared[3][g]));
+            }
         }
     }
     __syncthreads();
 }
 
-// The sum of `value` across the block, the same way.
+// The sum of `value` across the same threads, the same way.
 template <int K>
 __device__ __forceinline__ void inkling_part_block_sum(float (&value)[K], float (&shared)[4][K],
-                                                       int count) {
+                                                       int count, bool active) {
     const unsigned int lane = threadIdx.x & 31u;
     const int warp = threadIdx.x >> 5;
+    if (active) {
 #pragma unroll
-    for (int g = 0; g < K; ++g) {
-        if (g < count) {
+        for (int g = 0; g < K; ++g) {
+            if (g < count) {
 #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                value[g] += __shfl_xor_sync(0xffffffffu, value[g], offset);
-            }
-            if (lane == 0) {
-                shared[warp][g] = value[g];
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    value[g] += __shfl_xor_sync(0xffffffffu, value[g], offset);
+                }
+                if (lane == 0) {
+                    shared[warp][g] = value[g];
+                }
             }
         }
     }
     __syncthreads();
+    if (active) {
 #pragma unroll
-    for (int g = 0; g < K; ++g) {
-        if (g < count) {
-            value[g] = (shared[0][g] + shared[1][g]) + (shared[2][g] + shared[3][g]);
+        for (int g = 0; g < K; ++g) {
+            if (g < count) {
+                value[g] = (shared[0][g] + shared[1][g]) + (shared[2][g] + shared[3][g]);
+            }
         }
     }
     __syncthreads();
+}
+
+// What a run's partial needs in shared memory, for MG heads a group.
+template <int MG>
+struct InklingPartShared {
+    float weights[MG][INKLING_PART_KEYS];
+    float scales[INKLING_PART_KEYS];
+    float block[4][MG];
+    float sums[INKLING_PART_STRIDE][MG][INKLING_MAX_HEAD_DIM];
+};
+
+// A run's partial from the scores its first INKLING_PART_THREADS threads hold (keys t and
+// t + INKLING_PART_THREADS of the run on thread t, read once for the maximum and the terms):
+// the run's largest score a head, each key's term against it, their sum and the value sums
+// weighted by the terms and the keys' value scales, written to `out` (the run's partial of the
+// group's first head; a head's is `head_stride` floats on). The run is keys `slot` ..
+// `slot + n - 1`, their value scales at `scale_row`. Threads past INKLING_PART_THREADS keep
+// the block's barriers only, so a block of any width computes the same bits.
+template <int MG, int UNROLL>
+__device__ __forceinline__ void inkling_part_run(
+    InklingPartShared<MG>& shared,
+    const float (&held)[MG][INKLING_PART_HELD],
+    int n,
+    int groups,
+    const __nv_bfloat16* __restrict__ values,
+    const float* __restrict__ scale_row,
+    int value_norm,
+    int64_t slot,
+    int cache_rows,
+    uint64_t kv_stride,
+    uint64_t kv_offset,
+    int head_dim,
+    float* __restrict__ out,
+    uint64_t head_stride) {
+    const bool active = threadIdx.x < INKLING_PART_THREADS;
+    float largest[MG];
+#pragma unroll
+    for (int g = 0; g < MG; ++g) {
+        largest[g] = -INFINITY;
+        if (g < groups && active) {
+#pragma unroll
+            for (int k = 0; k < INKLING_PART_HELD; ++k) {
+                const int i = threadIdx.x + k * INKLING_PART_THREADS;
+                if (i < n) {
+                    largest[g] = fmaxf(largest[g], held[g][k]);
+                }
+            }
+        }
+    }
+    inkling_part_block_max(largest, shared.block, groups, active);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        shared.scales[i] = value_norm != 0 ? scale_row[i] : 1.0f;
+    }
+    float total[MG];
+#pragma unroll
+    for (int g = 0; g < MG; ++g) {
+        total[g] = 0.0f;
+        if (g < groups && active) {
+            // An all -inf run (no key can carry weight) adds nothing; exp(-inf - -inf) is NaN.
+            const bool live = largest[g] != -INFINITY;
+#pragma unroll
+            for (int k = 0; k < INKLING_PART_HELD; ++k) {
+                const int i = threadIdx.x + k * INKLING_PART_THREADS;
+                if (i < n) {
+                    const float term = live ? expf(held[g][k] - largest[g]) : 0.0f;
+                    shared.weights[g][i] = term;
+                    total[g] += term;
+                }
+            }
+        }
+    }
+    inkling_part_block_sum(total, shared.block, groups, active);
+
+    // The weighted value sums: thread t takes dims 8 (t % 16) .. + 7 of keys t / 16, + 8, ...
+    const int lane = threadIdx.x % INKLING_PART_LANES;
+    const int key_lane = threadIdx.x / INKLING_PART_LANES;
+    const int dim0 = lane * INKLING_PART_DIMS;
+    const bool owns = active && dim0 < head_dim;
+    const __nv_bfloat16* column = values + kv_offset + (owns ? dim0 : 0);
+    if (owns) {
+        float acc[MG][INKLING_PART_DIMS];
+#pragma unroll
+        for (int g = 0; g < MG; ++g) {
+#pragma unroll
+            for (int j = 0; j < INKLING_PART_DIMS; ++j) {
+                acc[g][j] = 0.0f;
+            }
+        }
+#pragma unroll(UNROLL)
+        for (int i = key_lane; i < n; i += INKLING_PART_STRIDE) {
+            const uint64_t cache_row = inkling_attn_cache_row(slot + i, cache_rows);
+            const uint4 packed = *reinterpret_cast<const uint4*>(column + cache_row * kv_stride);
+            const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
+            float value[INKLING_PART_DIMS];
+#pragma unroll
+            for (int pair = 0; pair < INKLING_PART_DIMS / 2; ++pair) {
+                const float2 two = __bfloat1622float2(pairs[pair]);
+                value[2 * pair] = two.x * shared.scales[i];
+                value[2 * pair + 1] = two.y * shared.scales[i];
+            }
+#pragma unroll
+            for (int g = 0; g < MG; ++g) {
+                if (g < groups) {
+                    const float weight = shared.weights[g][i];
+#pragma unroll
+                    for (int j = 0; j < INKLING_PART_DIMS; ++j) {
+                        acc[g][j] = fmaf(weight, value[j], acc[g][j]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < MG; ++g) {
+            if (g < groups) {
+#pragma unroll
+                for (int j = 0; j < INKLING_PART_DIMS; ++j) {
+                    shared.sums[key_lane][g][dim0 + j] = acc[g][j];
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if (!active) {
+        return;
+    }
+    for (int index = threadIdx.x; index < groups * head_dim; index += INKLING_PART_THREADS) {
+        const int g = index / head_dim;
+        const int dim = index - g * head_dim;
+        float value = 0.0f;
+#pragma unroll
+        for (int k = 0; k < INKLING_PART_STRIDE; ++k) {
+            value += shared.sums[k][g][dim];
+        }
+        float* at = out + (uint64_t)g * head_stride;
+        if (dim == 0) {
+            at[0] = largest[g];
+            at[1] = total[g];
+        }
+        at[2 + dim] = value;
+    }
 }
 
 // grid (kv_heads, rows, ceil(pass span / INKLING_PART_KEYS)), INKLING_PART_THREADS threads: the
@@ -1092,10 +1310,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     int scale_stride,
     int part_stride) {
     OPT_PDL_ENTRY();
-    __shared__ float weights[INKLING_MAX_GROUPS][INKLING_PART_KEYS];
-    __shared__ float scales[INKLING_PART_KEYS];
-    __shared__ float block[4][INKLING_MAX_GROUPS];
-    __shared__ float sums[INKLING_PART_STRIDE][INKLING_MAX_GROUPS][INKLING_MAX_HEAD_DIM];
+    __shared__ InklingPartShared<INKLING_MAX_GROUPS> shared;
     const int kv_head = blockIdx.x;
     const int row = blockIdx.y;
     if (kv_head >= kv_heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
@@ -1114,119 +1329,166 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     }
     const int n = (int)(end - begin);
     const int head0 = kv_head * groups;
-
-    // The run's largest score a head, then each key's term against it. A thread reads its keys'
-    // scores (t and t + INKLING_PART_THREADS) once, for the maximum and the terms both.
     float held[INKLING_MAX_GROUPS][INKLING_PART_HELD];
-    float largest[INKLING_MAX_GROUPS];
 #pragma unroll
     for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-        largest[g] = -INFINITY;
-        if (g < groups) {
-            const float* score_row = scores + ((uint64_t)row * heads + head0 + g) * pass_slots +
-                                     (begin - pass_first);
+        const float* score_row =
+            scores + ((uint64_t)row * heads + head0 + g) * pass_slots + (begin - pass_first);
 #pragma unroll
-            for (int k = 0; k < INKLING_PART_HELD; ++k) {
-                const int i = threadIdx.x + k * INKLING_PART_THREADS;
-                held[g][k] = i < n ? score_row[i] : -INFINITY;
-                if (i < n) {
-                    largest[g] = fmaxf(largest[g], held[g][k]);
-                }
-            }
+        for (int k = 0; k < INKLING_PART_HELD; ++k) {
+            const int i = threadIdx.x + k * INKLING_PART_THREADS;
+            held[g][k] = g < groups && i < n ? score_row[i] : -INFINITY;
         }
     }
-    inkling_part_block_max(largest, block, groups);
-    const float* scale_row = value_scales + (uint64_t)kv_head * scale_stride - scale_first + first;
-    for (int i = threadIdx.x; i < n; i += INKLING_PART_THREADS) {
-        scales[i] = value_norm != 0 ? scale_row[begin + i] : 1.0f;
-    }
-    float total[INKLING_MAX_GROUPS];
-#pragma unroll
-    for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-        total[g] = 0.0f;
-        if (g < groups) {
-            // An all -inf run (no key can carry weight) adds nothing; exp(-inf - -inf) is NaN.
-            const bool live = largest[g] != -INFINITY;
-#pragma unroll
-            for (int k = 0; k < INKLING_PART_HELD; ++k) {
-                const int i = threadIdx.x + k * INKLING_PART_THREADS;
-                if (i < n) {
-                    const float term = live ? expf(held[g][k] - largest[g]) : 0.0f;
-                    weights[g][i] = term;
-                    total[g] += term;
-                }
-            }
-        }
-    }
-    inkling_part_block_sum(total, block, groups);
+    const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.z;
+    const uint64_t head_stride = (uint64_t)part_stride * (2 + (uint64_t)head_dim);
+    inkling_part_run<INKLING_MAX_GROUPS, 4>(
+        shared, held, n, groups, values,
+        value_scales + (uint64_t)kv_head * scale_stride - scale_first + first + begin, value_norm,
+        first + begin, cache_rows, (uint64_t)kv_heads * head_dim, (uint64_t)kv_head * head_dim,
+        head_dim,
+        parts + ((uint64_t)row * heads + head0) * head_stride + run * (2 + (uint64_t)head_dim),
+        head_stride);
+}
 
-    // The weighted value sums: thread t takes dims 8 (t % 16) .. + 7 of keys t / 16, + 8, ...
-    const int lane = threadIdx.x % INKLING_PART_LANES;
-    const int key_lane = threadIdx.x / INKLING_PART_LANES;
-    const int dim0 = lane * INKLING_PART_DIMS;
-    const bool owns = dim0 < head_dim;
-    const uint64_t kv_stride = (uint64_t)kv_heads * head_dim;
-    const __nv_bfloat16* column = values + (uint64_t)kv_head * head_dim + (owns ? dim0 : 0);
-    float acc[INKLING_MAX_GROUPS][INKLING_PART_DIMS];
-#pragma unroll
-    for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-#pragma unroll
-        for (int j = 0; j < INKLING_PART_DIMS; ++j) {
-            acc[g][j] = 0.0f;
-        }
+// The scored partial: inkling_attn_scores and inkling_attn_part of one run in one block, the
+// scores kept in shared memory. A long row's runs are many more blocks than the SMs hold, and
+// there the scores' round trip through DRAM and the second launch are what the split pays for:
+// at 93k keys a full layer's two launches move its keys and values at 184 GB/s, this one at
+// 205. Every number is the two kernels' own: warp w scores the run's sub-runs of
+// INKLING_SCORE_RUN keys w, w + WARPS, ... with inkling_group_score, and inkling_part_run takes
+// the run from those scores as inkling_attn_part reads them. A short row is a few blocks, so the
+// host keeps the two launches there (the scores spread over many more blocks).
+#define INKLING_SCORED_WARPS 8
+#define INKLING_SCORED_GROUPS 6
+
+// grid (kv_heads, rows, ceil(pass span / INKLING_PART_KEYS)), 32 * INKLING_SCORED_WARPS threads;
+// the arguments are inkling_attn_scores' and inkling_attn_part's. groups <=
+// INKLING_SCORED_GROUPS (the host refuses wider groups the launch).
+extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORED_WARPS) inkling_attn_scored_part(
+    const float* __restrict__ q,
+    const __nv_bfloat16* __restrict__ keys,
+    const __nv_bfloat16* __restrict__ values,
+    const float* __restrict__ rel_proj,
+    const __nv_bfloat16* __restrict__ rel_bank,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const float* __restrict__ rel_scale,
+    const float* __restrict__ key_gains,
+    const float* __restrict__ value_scales,
+    float* __restrict__ parts,
+    int heads,
+    int kv_heads,
+    int head_dim,
+    int groups,
+    int rows,
+    int first_position,
+    int window,
+    int cache_rows,
+    int rel_extent,
+    int d_rel,
+    float qk_clip,
+    float rel_clip,
+    float tau,
+    const float* __restrict__ tau_rows,
+    int value_norm,
+    long long pass_first,
+    int pass_slots,
+    long long scale_first,
+    int scale_stride,
+    int part_stride) {
+    constexpr int MG = INKLING_SCORED_GROUPS;
+    OPT_PDL_ENTRY();
+    __shared__ InklingPartShared<MG> shared;
+    const int kv_head = blockIdx.x;
+    const int row = blockIdx.y;
+    if (kv_head >= kv_heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
+        head_dim % INKLING_PART_DIMS != 0 || d_rel < 0 || d_rel > INKLING_MAX_D_REL ||
+        groups <= 0 || groups > MG) {
+        return;
     }
-    if (owns) {
-#pragma unroll 4
-        for (int i = key_lane; i < n; i += INKLING_PART_STRIDE) {
-            const uint64_t cache_row = inkling_attn_cache_row(first + begin + i, cache_rows);
-            const uint4 packed = *reinterpret_cast<const uint4*>(column + cache_row * kv_stride);
-            const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
-            float value[INKLING_PART_DIMS];
+    const int position = first_position + row;
+    const int64_t first = inkling_attn_first_slot(position, window);
+    const int64_t count = (int64_t)position - first + 1;
+    const int64_t begin = pass_first + (int64_t)blockIdx.z * INKLING_PART_KEYS;
+    int64_t end = begin + INKLING_PART_KEYS;
+    end = end < pass_first + pass_slots ? end : pass_first + pass_slots;
+    end = end < count ? end : count;
+    if (begin >= end) {
+        return;
+    }
+    const int n = (int)(end - begin);
+    const int head0 = kv_head * groups;
+    const unsigned int lane = threadIdx.x & 31u;
+    const int warp = threadIdx.x >> 5;
+    const uint64_t kv_stride = (uint64_t)kv_heads * head_dim;
+    const uint64_t kv_offset = (uint64_t)kv_head * head_dim;
+
+    // The scores, a warp's first keys in flight while it prepares the queries.
+    constexpr int STRIDE = INKLING_SCORED_WARPS * INKLING_SCORE_RUN;
+    int64_t at = begin + (int64_t)warp * INKLING_SCORE_RUN;
+    __nv_bfloat16 loaded[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
+    if (at < end) {
+        inkling_score_load(keys, first, at, end, cache_rows, kv_stride, kv_offset, head_dim, loaded);
+    }
+    float qv[MG][INKLING_MAX_HEAD_DIM / 32];
+    float rv[MG];
+    inkling_group_queries<MG>(q, rel_proj, q_scale, rel_scale, row, heads, head0, head_dim, groups,
+                              d_rel, qk_clip, rel_clip, tau_rows != nullptr ? tau_rows[row] : tau,
+                              qv, rv);
+    const float inv_dim = 1.0f / sqrtf((float)head_dim);
+    const float* gains = key_gains + (uint64_t)kv_head * scale_stride - scale_first;
+    float gain[INKLING_MAX_HEAD_DIM / 32];
+    inkling_key_gain(k_scale, kv_head, head_dim, gain);
+    for (; at < end; at += STRIDE) {
+        __nv_bfloat16 run[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
 #pragma unroll
-            for (int pair = 0; pair < INKLING_PART_DIMS / 2; ++pair) {
-                const float2 two = __bfloat1622float2(pairs[pair]);
-                value[2 * pair] = two.x * scales[i];
-                value[2 * pair + 1] = two.y * scales[i];
-            }
+        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
 #pragma unroll
-            for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-                if (g < groups) {
-                    const float weight = weights[g][i];
-#pragma unroll
-                    for (int j = 0; j < INKLING_PART_DIMS; ++j) {
-                        acc[g][j] = fmaf(weight, value[j], acc[g][j]);
-                    }
-                }
+            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                run[i][step] = loaded[i][step];
             }
         }
+        if (at + STRIDE < end) {
+            inkling_score_load(keys, first, at + STRIDE, end, cache_rows, kv_stride, kv_offset,
+                               head_dim, loaded);
+        }
 #pragma unroll
-        for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-            if (g < groups) {
-#pragma unroll
-                for (int j = 0; j < INKLING_PART_DIMS; ++j) {
-                    sums[key_lane][g][dim0 + j] = acc[g][j];
+        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
+            const int64_t index = at + i;
+            if (index < end) {
+                const int64_t slot = first + index;
+                const float score =
+                    inkling_group_score<MG>(run[i], gain, gains[slot], qv, rv, rel_bank,
+                                            (int64_t)position - slot, rel_extent, d_rel, head_dim,
+                                            inv_dim);
+                const int g = (int)(lane >> 1);
+                if ((lane & 1u) == 0 && g < groups) {
+                    shared.weights[g][index - begin] = score;
                 }
             }
         }
     }
     __syncthreads();
-    const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.z;
-    for (int index = threadIdx.x; index < groups * head_dim; index += INKLING_PART_THREADS) {
-        const int g = index / head_dim;
-        const int dim = index - g * head_dim;
-        float value = 0.0f;
+
+    // The partial, the scores read as inkling_attn_part reads them.
+    float held[MG][INKLING_PART_HELD];
 #pragma unroll
-        for (int k = 0; k < INKLING_PART_STRIDE; ++k) {
-            value += sums[k][g][dim];
+    for (int g = 0; g < MG; ++g) {
+#pragma unroll
+        for (int k = 0; k < INKLING_PART_HELD; ++k) {
+            const int i = (int)threadIdx.x + k * INKLING_PART_THREADS;
+            held[g][k] = g < groups && i < n ? shared.weights[g][i] : -INFINITY;
         }
-        float* out = parts + (((uint64_t)row * heads + head0 + g) * part_stride + run) *
-                                 (2 + (uint64_t)head_dim);
-        if (dim == 0) {
-            out[0] = largest[g];
-            out[1] = total[g];
-        }
-        out[2 + dim] = value;
     }
+    const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.z;
+    const uint64_t head_stride = (uint64_t)part_stride * (2 + (uint64_t)head_dim);
+    inkling_part_run<MG, 8>(
+        shared, held, n, groups, values,
+        value_scales + (uint64_t)kv_head * scale_stride - scale_first + first + begin, value_norm,
+        first + begin, cache_rows, kv_stride, kv_offset, head_dim,
+        parts + ((uint64_t)row * heads + head0) * head_stride + run * (2 + (uint64_t)head_dim),
+        head_stride);
 }
 
 // The runs one merge block holds factors for in shared memory: a 1M-key row's 4,096 runs of

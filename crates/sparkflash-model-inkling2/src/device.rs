@@ -121,6 +121,14 @@ const MIX_STATE: usize = 2 + 128;
 /// INKLING_PART_THREADS in kernels/inkling_attn_sm121.cu).
 const PART_KEYS: usize = 256;
 const PART_THREADS: u32 = 128;
+/// The scored partial (inkling_attn_scored_part): its threads (32 * INKLING_SCORED_WARPS), the
+/// widest group it holds (INKLING_SCORED_GROUPS), and the runs a row's pass needs before it
+/// takes the pass. Below that the pass's runs are too few blocks to beat the scores spread over
+/// [SCORE_GRID] blocks and a part launch: it measured 7% slower at 16k keys and 4% faster at 32k,
+/// 7-8% at 93k-262k. Either way the bits are the same.
+const SCORED_THREADS: u32 = 256;
+const SCORED_GROUPS: usize = 6;
+const SCORED_RUNS: usize = 128;
 /// The scores one decode split-walk pass may hold across its heads: ~175k keys, so a sliding
 /// layer is one pass and a full layer at a million positions a handful.
 const SCORE_BUDGET: usize = 1 << 21;
@@ -587,8 +595,10 @@ struct Kernels {
     attention_scores: Entry,
     attention_mix: Entry,
     /// The split-key decode walk: a run of a row's keys a block after the split walk's scores,
-    /// then the runs merged in order.
+    /// then the runs merged in order. `attention_scored` is a long pass's scores and parts in
+    /// one launch.
     attention_part: Entry,
+    attention_scored: Entry,
     attention_merge: Entry,
     /// The tensor-core prompt walk: each row's query side as the exact walks compute it, then the
     /// shared MMA body over it. `attention_mma` is loaded only when the walk runs
@@ -708,6 +718,7 @@ impl Kernels {
             attention_scores: load(inkling, "inkling_attn_scores")?,
             attention_mix: load(inkling, "inkling_attn_mix")?,
             attention_part: load(inkling, "inkling_attn_part")?,
+            attention_scored: load(inkling, "inkling_attn_scored_part")?,
             attention_merge: load(inkling, "inkling_attn_merge")?,
             attention_prepare: load(inkling, "inkling_attn_prepare")?,
             attention_mma,
@@ -1831,44 +1842,51 @@ impl Shared {
                     scale_stride,
                 )
             };
-            self.launch(
-                self.kernels.attention_scores,
-                (
-                    grid_blocks(span, SCORE_KEYS).min(score_grid(rows)),
-                    kv_heads as u32,
-                    rows as u32,
-                ),
-                (SCORE_BLOCK, 1, 1),
-                &[
-                    queries.0,
-                    keys.0,
-                    relative.0,
-                    bank.0,
-                    clip.query.0,
-                    0,
-                    clip.relative.0,
-                    key_gains.0,
-                    scratch.scores.0,
-                    heads as u64,
-                    kv_heads as u64,
-                    config.head_dim as u64,
-                    groups as u64,
-                    rows as u64,
-                    first_position as u64,
-                    window as u64,
-                    cache_rows as u64,
-                    rel_extent as u64,
-                    config.d_rel as u64,
-                    qk_clip,
-                    bits(config.rel_l2_clip_threshold as f32),
-                    bits(tau),
-                    taus.0,
-                    pass_first as u64,
-                    pass_slots as u64,
-                    scale_first as u64,
-                    scale_stride as u64,
-                ],
-            )?;
+            // A long pass's runs score and take their partials in one launch; the exact mix
+            // still reads the scores buffer, so under Check both run.
+            let scored = parts.is_some()
+                && groups <= SCORED_GROUPS
+                && span.div_ceil(PART_KEYS) >= SCORED_RUNS;
+            if exact || !scored {
+                self.launch(
+                    self.kernels.attention_scores,
+                    (
+                        grid_blocks(span, SCORE_KEYS).min(score_grid(rows)),
+                        kv_heads as u32,
+                        rows as u32,
+                    ),
+                    (SCORE_BLOCK, 1, 1),
+                    &[
+                        queries.0,
+                        keys.0,
+                        relative.0,
+                        bank.0,
+                        clip.query.0,
+                        0,
+                        clip.relative.0,
+                        key_gains.0,
+                        scratch.scores.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        qk_clip,
+                        bits(config.rel_l2_clip_threshold as f32),
+                        bits(tau),
+                        taus.0,
+                        pass_first as u64,
+                        pass_slots as u64,
+                        scale_first as u64,
+                        scale_stride as u64,
+                    ],
+                )?;
+            }
             if exact {
                 self.launch(
                     self.kernels.attention_mix,
@@ -1900,7 +1918,50 @@ impl Shared {
                     ],
                 )?;
             }
-            if let Some(parts) = parts {
+            if let Some(parts) = parts.filter(|_| scored) {
+                self.launch(
+                    self.kernels.attention_scored,
+                    (
+                        kv_heads as u32,
+                        rows as u32,
+                        span.div_ceil(PART_KEYS) as u32,
+                    ),
+                    (SCORED_THREADS, 1, 1),
+                    &[
+                        queries.0,
+                        keys.0,
+                        values.0,
+                        relative.0,
+                        bank.0,
+                        clip.query.0,
+                        0,
+                        clip.relative.0,
+                        key_gains.0,
+                        value_scales.0,
+                        parts.parts.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        config.head_dim as u64,
+                        groups as u64,
+                        rows as u64,
+                        first_position as u64,
+                        window as u64,
+                        cache_rows as u64,
+                        rel_extent as u64,
+                        config.d_rel as u64,
+                        qk_clip,
+                        bits(config.rel_l2_clip_threshold as f32),
+                        bits(tau),
+                        taus.0,
+                        1,
+                        pass_first as u64,
+                        pass_slots as u64,
+                        scale_first as u64,
+                        scale_stride as u64,
+                        parts.stride as u64,
+                    ],
+                )?;
+            } else if let Some(parts) = parts {
                 self.launch(
                     self.kernels.attention_part,
                     (
