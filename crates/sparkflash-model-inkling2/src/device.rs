@@ -71,8 +71,7 @@ mod packed;
 mod tower;
 
 use chunk::{
-    BandOut, Injection, Rows, band_exchange, band_mix, exchange_gather, exchange_sum, gather_runs,
-    walk_rows,
+    BandOut, Injection, Rows, band_exchange, band_mix, exchange_gather, exchange_sum, walk_rows,
 };
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
@@ -5343,14 +5342,9 @@ impl InklingDeviceSession {
         }
         Ok(())
     }
-    /// The routed band of a quantised layer with the router's choice left on the device.
-    ///
-    /// Every launch covers the band's top-k slots at once (grid y), and a block whose slot names
-    /// an expert another rank holds exits: [ExpertBody::NvFp4] and [ExpertBody::MxFp8] read the
-    /// selection through `indices`, the NVFP4 scale_2 through the layer's device vector, and the
-    /// mix's shares come from inkling_band_shares. Each row is the same body the host-steered
-    /// loop launched one expert at a time, so the band's bits are that loop's; what is gone is the
-    /// readback of the selection that made every layer wait for the host.
+    /// The routed band of a quantised layer with the router's choice left on the device: the
+    /// one-row case of [chunk::run_steered_band], which a verify's rows and small fused lanes
+    /// share.
     fn run_device_band(
         &mut self,
         shared: &Shared,
@@ -5358,142 +5352,10 @@ impl InklingDeviceSession {
         gate_up: &Step,
         down: &Step,
     ) -> Result<(), BackendError> {
-        let config = &shared.config;
-        let schedule = &shared.plan.layers()[layer];
-        let top_k = config.num_experts_per_tok;
-        let intermediate = shared.plan.expert_intermediate();
-        let hidden = config.hidden_size;
-        let (first, owned) = shared.plan.expert_range();
-        let indices = self.state.scratch.indices;
-        let band = self.state.scratch.band;
-        let activated = self.state.scratch.activation;
-        let partials = self.state.scratch.partials;
-        let weight = |step: &Step, at: usize| {
-            step.weights
-                .get(at)
-                .map_or(Deviceptr(0), |index| self.weight(*index))
-        };
-        let scale_2 = shared.experts[layer].as_ref();
-        let projection = |step: &Step,
-                          input: Deviceptr,
-                          out: Deviceptr,
-                          rows: usize,
-                          columns: usize,
-                          per_slot: bool,
-                          factor: Option<Deviceptr>|
-         -> Result<(), BackendError> {
-            let (entry, tail) = match schedule.experts {
-                ExpertBody::NvFp4 => (
-                    shared.kernels.expert_nvfp4_band,
-                    factor
-                        .ok_or_else(|| {
-                            Self::fail(format!(
-                                "layer {layer}: an NVFP4 band has no scale_2 vector"
-                            ))
-                        })?
-                        .0,
-                ),
-                _ => (shared.kernels.expert_mxfp8_band, MXFP8_BLOCK as u64),
-            };
-            if !columns.is_multiple_of(BAND_RUN) || !MXFP8_BLOCK.is_multiple_of(BAND_RUN) {
-                return Err(Self::fail(format!(
-                    "layer {layer}: a band row of {columns} columns (MXFP8 block \
-                     {MXFP8_BLOCK}) is not whole runs of the {BAND_RUN} columns a thread reads"
-                )));
-            }
-            shared
-                .launch(
-                    entry,
-                    (rows.div_ceil(BAND_ROWS) as u32, top_k as u32, 1),
-                    (ELEMENT_BLOCK, 1, 1),
-                    &[
-                        weight(step, 0).0,
-                        weight(step, 1).0,
-                        input.0,
-                        out.0,
-                        rows as u64,
-                        columns as u64,
-                        tail,
-                        indices.0,
-                        first as u64,
-                        owned as u64,
-                        u64::from(per_slot),
-                    ],
-                )
-                .map_err(Self::fail)
-        };
-        projection(
-            gate_up,
-            self.state.scratch.normed,
-            band,
-            2 * intermediate,
-            hidden,
-            false,
-            scale_2.map(|scale| scale.device_gate_up),
-        )?;
-        // Every slot's activation, owned or not: a slot another rank holds reads a stale band
-        // row, and its share below is zero. Under the row split it is this rank's run of every
-        // slot's columns, which the gather joins into whole rows before the down projection.
-        let out = BandOut::of(shared, &self.state.scratch, 1);
-        let run = top_k * intermediate * std::mem::size_of::<f32>();
-        let swiglu_out = if out.gathers {
-            partials.offset(shared.exchange.rank() * run)
-        } else {
-            activated
-        };
-        shared
-            .launch(
-                shared.kernels.swiglu,
-                (flat(intermediate), top_k as u32, 1),
-                (ELEMENT_BLOCK, 1, 1),
-                &[
-                    band.0,
-                    swiglu_out.0,
-                    intermediate as u64,
-                    bits(config.mlp_gate_softcap as f32),
-                    bits(config.mlp_up_softcap as f32),
-                ],
-            )
-            .map_err(Self::fail)?;
-        if out.gathers {
-            gather_runs(
-                shared,
-                partials,
-                Some(activated),
-                top_k,
-                intermediate * std::mem::size_of::<f32>(),
-            )?;
-        }
-        let down_shape = shared.plan.expert_down();
-        projection(
-            down,
-            activated,
-            out.down,
-            down_shape.rows,
-            down_shape.columns,
-            true,
-            scale_2.map(|scale| scale.device_down),
-        )?;
-        shared
-            .launch(
-                shared.kernels.band_shares,
-                (1, 1, 1),
-                (SHARES_BLOCK, 1, 1),
-                &[
-                    indices.0,
-                    self.state.scratch.shares.0,
-                    self.state.scratch.scales.0,
-                    top_k as u64,
-                    first as u64,
-                    owned as u64,
-                    // A decode step's experts take the matvec, which reads no plan.
-                    0,
-                ],
-            )
-            .map_err(Self::fail)?;
-        band_mix(shared, &self.state.scratch, 1)?;
-        if trace_on() && layer == 0 && !out.gathers {
-            self.rms(shared, "row band", self.state.scratch.mixed, hidden)?;
+        let scratch = &self.state.scratch;
+        chunk::run_steered_band(shared, scratch, layer, gate_up, down, scratch.normed, 1)?;
+        if trace_on() && layer == 0 && !BandOut::of(shared, scratch, 1).gathers {
+            self.rms(shared, "row band", scratch.mixed, shared.config.hidden_size)?;
         }
         Ok(())
     }

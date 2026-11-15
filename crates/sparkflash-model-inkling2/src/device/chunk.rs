@@ -317,6 +317,181 @@ pub(super) fn band_exchange(
     )
 }
 
+/// The most rows the chunk walk steers on the device ([run_steered_band]): a verify's anchor and
+/// up to seven drafts, or up to eight fused lanes. A wider chunk groups its pairs by expert on the
+/// host ([run_band_chunk]), which reads an expert once for all the rows that chose it.
+pub(super) const STEERED_BAND_ROWS: usize = 8;
+
+/// The routed band of a quantised layer over `rows` rows of `input` [row][hidden], with the
+/// router's choice left on the device.
+///
+/// Every launch covers the rows' top-k slots at once (grid y, slot `row * top_k + k`), and a block
+/// whose slot names an expert another rank holds exits: [ExpertBody::NvFp4] and
+/// [ExpertBody::MxFp8] read the selection through `indices`, the NVFP4 scale_2 through the layer's
+/// device vector, and the mix's shares come from inkling_band_shares. A slot's every output is the
+/// pair walk's and the host-steered loop's sum, term for term, so the band's bits are theirs;
+/// what is gone is the readback of the selection that made every layer wait for the host, and a
+/// launch an expert. A decode step is its one-row case.
+pub(super) fn run_steered_band(
+    shared: &Shared,
+    scratch: &Scratch,
+    layer: usize,
+    gate_up: &Step,
+    down: &Step,
+    input: Deviceptr,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let config = &shared.config;
+    let schedule = &shared.plan.layers()[layer];
+    let top_k = config.num_experts_per_tok;
+    let slots = rows * top_k;
+    let intermediate = shared.plan.expert_intermediate();
+    let hidden = config.hidden_size;
+    let (first, owned) = shared.plan.expert_range();
+    let byte = std::mem::size_of::<f32>();
+    let weight = |step: &Step, at: usize| {
+        step.weights
+            .get(at)
+            .map_or(Deviceptr(0), |index| shared.weights.get(*index).pointer)
+    };
+    let scale_2 = shared.experts[layer].as_ref();
+    // `row_slots` is the slots that read one input row: a token's top-k for the gate/up
+    // projection, which reads its row of the stream, and 1 for the down projection, which reads
+    // the slot's own activation.
+    let projection = |step: &Step,
+                      input: Deviceptr,
+                      out: Deviceptr,
+                      outputs: usize,
+                      columns: usize,
+                      row_slots: usize,
+                      factor: Option<Deviceptr>|
+     -> Result<(), BackendError> {
+        let (entry, tail) = match schedule.experts {
+            ExpertBody::NvFp4 => (
+                shared.kernels.expert_nvfp4_band,
+                factor
+                    .ok_or_else(|| {
+                        device_error(format!(
+                            "layer {layer}: an NVFP4 band has no scale_2 vector"
+                        ))
+                    })?
+                    .0,
+            ),
+            ExpertBody::MxFp8 => (shared.kernels.expert_mxfp8_band, MXFP8_BLOCK as u64),
+            ExpertBody::Bf16 => {
+                return Err(device_error(format!(
+                    "layer {layer}: a BF16 expert band is steered on the host"
+                )));
+            }
+        };
+        if !columns.is_multiple_of(BAND_RUN) || !MXFP8_BLOCK.is_multiple_of(BAND_RUN) {
+            return Err(device_error(format!(
+                "layer {layer}: a band row of {columns} columns (MXFP8 block {MXFP8_BLOCK}) is \
+                 not whole runs of the {BAND_RUN} columns a thread reads"
+            )));
+        }
+        shared
+            .launch(
+                entry,
+                (
+                    outputs.div_ceil(BAND_ROWS) as u32,
+                    u32::try_from(slots).map_err(device_error)?,
+                    1,
+                ),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    weight(step, 0).0,
+                    weight(step, 1).0,
+                    input.0,
+                    out.0,
+                    outputs as u64,
+                    columns as u64,
+                    tail,
+                    scratch.indices.0,
+                    first as u64,
+                    owned as u64,
+                    row_slots as u64,
+                ],
+            )
+            .map_err(device_error)
+    };
+    projection(
+        gate_up,
+        input,
+        scratch.band,
+        2 * intermediate,
+        hidden,
+        top_k,
+        scale_2.map(|scale| scale.device_gate_up),
+    )?;
+    // Every slot's activation, owned or not: a slot another rank holds reads a stale band row,
+    // and its share below is zero. Under the row split it is this rank's run of every slot's
+    // columns, which the gather joins into whole rows before the down projection.
+    let out = BandOut::of(shared, scratch, rows);
+    let activated = if out.gathers {
+        scratch
+            .partials
+            .offset(shared.exchange.rank() * slots * intermediate * byte)
+    } else {
+        scratch.activation
+    };
+    shared
+        .launch(
+            shared.kernels.swiglu,
+            (
+                flat(intermediate),
+                u32::try_from(slots).map_err(device_error)?,
+                1,
+            ),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                scratch.band.0,
+                activated.0,
+                intermediate as u64,
+                bits(config.mlp_gate_softcap as f32),
+                bits(config.mlp_up_softcap as f32),
+            ],
+        )
+        .map_err(device_error)?;
+    if out.gathers {
+        gather_runs(
+            shared,
+            scratch.partials,
+            Some(scratch.activation),
+            slots,
+            intermediate * byte,
+        )?;
+    }
+    let shape = shared.plan.expert_down();
+    projection(
+        down,
+        scratch.activation,
+        out.down,
+        shape.rows,
+        shape.columns,
+        1,
+        scale_2.map(|scale| scale.device_down),
+    )?;
+    shared
+        .launch(
+            shared.kernels.band_shares,
+            (1, 1, 1),
+            (SHARES_BLOCK, 1, 1),
+            &[
+                scratch.indices.0,
+                scratch.shares.0,
+                scratch.scales.0,
+                slots as u64,
+                first as u64,
+                owned as u64,
+                // The steered band reads no plan.
+                0,
+            ],
+        )
+        .map_err(device_error)?;
+    band_mix(shared, scratch, rows)
+}
+
 /// The bytes of an i32 vector, little-endian.
 fn word_bytes(values: &[i32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
@@ -1609,6 +1784,20 @@ fn run_band_chunk(
     let weights = &shared.weights;
     let weight = |index: usize| weights.get(index).pointer;
     let _ = activation;
+    // A few rows (a verify, small fused lanes) pick few enough experts that grouping them buys
+    // nothing, and the grouping's readback made each such layer drain the device and wait for the
+    // host: those take the decode step's own steered band.
+    if rows <= STEERED_BAND_ROWS && layer.experts != ExpertBody::Bf16 {
+        return run_steered_band(
+            shared,
+            scratch,
+            layer.index,
+            gate_up,
+            down,
+            scratch.q_in,
+            rows,
+        );
+    }
 
     let mut index_bytes = vec![0u8; rows * top_k * std::mem::size_of::<i32>()];
     shared

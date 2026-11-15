@@ -283,9 +283,10 @@ __device__ __forceinline__ float inkling_group_row_sum(float (&v)[INKLING_GROUP]
 // waits for it: blockIdx.x is a group of INKLING_GROUP_ROWS rows and blockIdx.y the band slot.
 // indices[slot] is the global expert; this rank holds the contiguous run [first, first + owned)
 // of them, indexed from zero, and a block whose slot names an expert outside the run exits (the
-// mix gives that slot no share). The input is one row for every slot (the gate/up projection
-// reads the token's stream) or a row a slot (the down projection reads the slot's activation):
-// `per_slot` picks which. columns is a multiple of 16 (the arm refuses any other width).
+// mix gives that slot no share). Slot s reads input row s / row_slots: a token's top-k slots
+// share its row of the stream (the gate/up projection, row_slots = top-k, which covers a verify's
+// or a few lanes' rows in one launch), and the down projection's slots each read their own
+// activation (row_slots = 1). columns is a multiple of 16 (the arm refuses any other width).
 // grid (ceil(rows / INKLING_GROUP_ROWS), slots), block INKLING_MOE_BLOCK.
 extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_expert_band(
     const unsigned char* __restrict__ codes,
@@ -298,7 +299,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     const int* __restrict__ indices,
     int first,
     int owned,
-    int per_slot) {
+    int row_slots) {
     OPT_PDL_ENTRY();
     const int slot = blockIdx.y;
     const int local = indices[slot] - first;
@@ -319,7 +320,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
         codes + ((uint64_t)local * rows + live) * packed;
     const unsigned char* __restrict__ row_scales =
         scales + ((uint64_t)local * rows + live) * scale_columns;
-    x += per_slot ? (uint64_t)slot * columns : 0;
+    x += (uint64_t)(slot / (row_slots > 0 ? row_slots : 1)) * columns;
     float v[INKLING_GROUP];
 #pragma unroll
     for (int i = 0; i < INKLING_GROUP; ++i) {
@@ -404,7 +405,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     const int* __restrict__ indices,
     int first,
     int owned,
-    int per_slot) {
+    int row_slots) {
     OPT_PDL_ENTRY();
     const int slot = blockIdx.y;
     const int local = indices[slot] - first;
@@ -419,7 +420,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
         codes + ((uint64_t)local * rows + live) * columns;
     const unsigned char* __restrict__ row_scales =
         scales + ((uint64_t)local * rows + live) * scale_columns;
-    x += per_slot ? (uint64_t)slot * columns : 0;
+    x += (uint64_t)(slot / (row_slots > 0 ? row_slots : 1)) * columns;
     float v[INKLING_GROUP];
 #pragma unroll
     for (int i = 0; i < INKLING_GROUP; ++i) {
