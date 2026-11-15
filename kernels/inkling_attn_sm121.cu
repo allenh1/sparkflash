@@ -1806,7 +1806,10 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORED_WARPS) inkling_
     const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.z;
     const uint64_t head_stride = (uint64_t)part_stride * (2 + (uint64_t)head_dim);
     const InklingCacheRows cache{values + kv_offset, first + begin, cache_rows, kv_stride};
-    inkling_part_run<MG, 8, 1>(
+    // The value sums take both halves of the block, a half every other head (the same bits as
+    // one half taking them all); with one, half the block waits out the slowest phase.
+    constexpr int QUARTERS = 32 * INKLING_SCORED_WARPS / INKLING_PART_THREADS;
+    inkling_part_run<MG, 8, QUARTERS>(
         shared, held, n, groups, cache, head_dim,
         parts + ((uint64_t)row * heads + head0) * head_stride + run * (2 + (uint64_t)head_dim),
         head_stride);
