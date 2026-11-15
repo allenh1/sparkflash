@@ -101,6 +101,7 @@ struct ChainArgs {
     /// block's wall is the host's and the device time arrives from one run-end event harvest
     /// (diagnostics only: same separate perf file, its mode line says which wall clock it used).
     forward_perf_probe_nosync: bool,
+    fabric_schedule: FabricSchedule,
 }
 
 /// When the device arm should capture per-step CUDA graphs.
@@ -146,6 +147,7 @@ impl ChainArgs {
         let mut forward_lean = false;
         let mut forward_perf_probe = false;
         let mut forward_perf_probe_nosync = false;
+        let mut fabric_schedule = FabricSchedule::OneShotAllToAll;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -250,6 +252,13 @@ impl ChainArgs {
                 "--forward-lean" => forward_lean = true,
                 "--forward-perf-probe" => forward_perf_probe = true,
                 "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
+                "--fabric-schedule" => {
+                    fabric_schedule = match take("--fabric-schedule")?.as_str() {
+                        "switched" => FabricSchedule::OneShotAllToAll,
+                        "switchless" => FabricSchedule::HairpinRingReduceScatterAllGather,
+                        other => return Err(format!("unknown schedule {other}")),
+                    };
+                }
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
                     unsafe {
@@ -389,6 +398,7 @@ impl ChainArgs {
             forward_lean,
             forward_perf_probe,
             forward_perf_probe_nosync,
+            fabric_schedule,
         })
     }
 }
@@ -632,7 +642,7 @@ fn comm_smoke(args: &ChainArgs) -> Result<serde_json::Value, String> {
     let transport = open_transport(args)?;
     let connected_ms = started.elapsed().as_millis() as u64;
     let mut buffer: Vec<u16> = vec![bf16_bits((args.rank + 1) as f32); SMOKE_ELEMENTS];
-    let layout = CollectiveLayout::new(args.world, SMOKE_ELEMENTS, FabricSchedule::OneShotAllToAll)
+    let layout = CollectiveLayout::new(args.world, SMOKE_ELEMENTS, args.fabric_schedule)
         .map_err(|error| format!("collective layout: {error}"))?;
     let reduced = Instant::now();
     transport
@@ -710,7 +720,7 @@ fn collective_walk(
     let layers = config.n_layers;
     let elements = config.dim;
     let world = args.world;
-    let mut collective = LayerCollective::new(transport, layers);
+    let mut collective = LayerCollective::new(transport, layers, args.fabric_schedule);
     let steps_total = args.warmup_steps + args.decode_steps.max(1);
     let mut rows = Vec::with_capacity(steps_total);
     for step in 0..steps_total {
@@ -1607,14 +1617,16 @@ impl CollectiveCounter {
 struct LayerCollective {
     transport: TcpTransport,
     counter: CollectiveCounter,
+    fabric_schedule: FabricSchedule,
 }
 
 #[allow(dead_code)]
 impl LayerCollective {
-    fn new(transport: TcpTransport, layers: usize) -> Self {
+    fn new(transport: TcpTransport, layers: usize, fabric_schedule: FabricSchedule) -> Self {
         Self {
             transport,
             counter: CollectiveCounter::new(layers),
+            fabric_schedule,
         }
     }
 
@@ -1627,7 +1639,7 @@ impl LayerCollective {
         let layout = CollectiveLayout::new(
             self.transport.world_size(),
             buffer.len(),
-            FabricSchedule::OneShotAllToAll,
+            self.fabric_schedule,
         )
         .map_err(|error| {
             format!(
