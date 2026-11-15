@@ -1227,9 +1227,19 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     }
 }
 
+// The runs one merge block holds factors for in shared memory: a 1M-key row's 4,096 runs of
+// INKLING_PART_KEYS. A row with more takes the one-thread-a-dim walk.
+#define INKLING_MERGE_RUNS 4096
+
 // grid (heads, rows), INKLING_MAX_HEAD_DIM threads (thread d owns dim d): merges a head's runs
 // in run order, the sink opening the softmax as it opens the exact walks', divides and applies
 // the gate.
+//
+// The block shares what every dim needs: the threads take the runs' maxima congruent to their
+// index (fmaxf returns one of its operands, so the largest is the same in any order) and then
+// each run's factor exp(largest_r - largest), into shared memory. Each dim's thread then folds
+// the denominator and its value sum over the runs in run order with those factors, the fmaf
+// chain the one-thread walk ran.
 extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_merge(
     const float* __restrict__ gate,
     const float* __restrict__ sink,
@@ -1245,7 +1255,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     const int dim = threadIdx.x;
-    if (head >= heads || row >= rows || dim >= head_dim) {
+    if (head >= heads || row >= rows) {
         return;
     }
     const uint64_t row_head = (uint64_t)row * heads + head;
@@ -1256,17 +1266,67 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
     const uint64_t width = 2 + (uint64_t)head_dim;
     const float* part = parts + row_head * part_stride * width;
     const bool sunk = sink != nullptr;
+    if (runs > INKLING_MERGE_RUNS) {
+        if (dim >= head_dim) {
+            return;
+        }
+        float largest = sunk ? sink[row_head] : -INFINITY;
+        for (int r = 0; r < runs; ++r) {
+            largest = fmaxf(largest, part[r * width]);
+        }
+        float denominator = 0.0f;
+        float acc = 0.0f;
+        if (largest != -INFINITY) {
+            denominator = sunk ? expf(sink[row_head] - largest) : 0.0f;
+            for (int r = 0; r < runs; ++r) {
+                const float* at = part + r * width;
+                const float factor = at[0] != -INFINITY ? expf(at[0] - largest) : 0.0f;
+                denominator = fmaf(at[1], factor, denominator);
+                acc = fmaf(at[2 + dim], factor, acc);
+            }
+        }
+        const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+        const float gated = __fmul_rn(__fmul_rn(acc, inverse),
+                                      inkling_attn_sigmoid(gate[row_head * head_dim + dim]));
+        out[row_head * head_dim + dim] = __float2bfloat16_rn(gated);
+        return;
+    }
+    __shared__ float factors[INKLING_MERGE_RUNS];
+    __shared__ float warp_largest[INKLING_MAX_HEAD_DIM / 32];
+    float mine = -INFINITY;
+    for (int r = threadIdx.x; r < runs; r += blockDim.x) {
+        mine = fmaxf(mine, part[r * width]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        mine = fmaxf(mine, __shfl_xor_sync(0xFFFFFFFFu, mine, offset));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        warp_largest[threadIdx.x >> 5] = mine;
+    }
+    __syncthreads();
     float largest = sunk ? sink[row_head] : -INFINITY;
-    for (int r = 0; r < runs; ++r) {
-        largest = fmaxf(largest, part[r * width]);
+    for (int w = 0; w < (int)((blockDim.x + 31) >> 5); ++w) {
+        largest = fmaxf(largest, warp_largest[w]);
+    }
+    if (largest != -INFINITY) {
+        for (int r = threadIdx.x; r < runs; r += blockDim.x) {
+            const float top = part[r * width];
+            factors[r] = top != -INFINITY ? expf(top - largest) : 0.0f;
+        }
+    }
+    __syncthreads();
+    if (dim >= head_dim) {
+        return;
     }
     float denominator = 0.0f;
     float acc = 0.0f;
     if (largest != -INFINITY) {
         denominator = sunk ? expf(sink[row_head] - largest) : 0.0f;
+#pragma unroll 8
         for (int r = 0; r < runs; ++r) {
             const float* at = part + r * width;
-            const float factor = at[0] != -INFINITY ? expf(at[0] - largest) : 0.0f;
+            const float factor = factors[r];
             denominator = fmaf(at[1], factor, denominator);
             acc = fmaf(at[2 + dim], factor, acc);
         }
