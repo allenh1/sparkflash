@@ -70,6 +70,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "opt_pdl_sm121.cuh"
+
 #define INKLING_MAX_HEAD_DIM 128
 #define INKLING_MAX_D_REL 32
 
@@ -355,6 +357,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_decode(
     float tau,
     int value_norm,
     float eps) {
+    OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     if (head >= heads) {
         return;
@@ -402,6 +405,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prefill(
     int value_norm,
     float eps,
     const float* __restrict__ tau_rows) {
+    OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     if (head >= heads || row >= rows) {
@@ -515,6 +519,7 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
     long long scale_first,
     int span,
     int scale_stride) {
+    OPT_PDL_ENTRY();
     const int kv_head = blockIdx.y;
     if (kv_head >= kv_heads || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM) {
         return;
@@ -596,6 +601,7 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
     int pass_slots,
     long long scale_first,
     int scale_stride) {
+    OPT_PDL_ENTRY();
     const int kv_head = blockIdx.y;
     const int row = blockIdx.z;
     if (kv_head >= kv_heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
@@ -767,6 +773,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
     int scale_stride,
     int first_pass,
     int last_pass) {
+    OPT_PDL_ENTRY();
     // A key's terms, a warp's own copy: (grows, factor, weight, value scale).
     __shared__ float4 terms[INKLING_MAX_HEAD_DIM / 32][32];
     const int head = blockIdx.x;
@@ -1034,6 +1041,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     long long scale_first,
     int scale_stride,
     int part_stride) {
+    OPT_PDL_ENTRY();
     __shared__ float weights[INKLING_MAX_GROUPS][INKLING_PART_KEYS];
     __shared__ float scales[INKLING_PART_KEYS];
     __shared__ float block[4][INKLING_MAX_GROUPS];
@@ -1176,6 +1184,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
     int first_position,
     int window,
     int part_stride) {
+    OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     const int dim = threadIdx.x;
@@ -1267,6 +1276,7 @@ extern "C" __global__ void __launch_bounds__(32) inkling_attn_prepare(
     float rel_clip,
     float tau,
     const float* __restrict__ tau_rows) {
+    OPT_PDL_ENTRY();
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     if (head >= heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
@@ -1458,6 +1468,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_GROUPS * 32, 1) inkling
     int d_rel,
     long long scale_first,
     int scale_stride) {
+    OPT_PDL_ENTRY();
     if (kv_heads <= 0 || heads % kv_heads != 0 || heads / kv_heads > INKLING_MAX_GROUPS ||
         (int)blockDim.x != heads / kv_heads * 32 || d_rel < 0 || d_rel > INKLING_MMA_D_REL) {
         return;

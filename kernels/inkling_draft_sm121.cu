@@ -46,6 +46,8 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+
+#include "opt_pdl_sm121.cuh"
 #include <math_constants.h>
 
 // The drafter's head width: one rotary pair a thread of a half-head.
@@ -156,6 +158,7 @@ __device__ __forceinline__ void ikd_rope_pair(float* head, int index, int dim, f
 extern "C" __global__ void inkling_draft_capture(const float* __restrict__ stream,
                                                  __nv_bfloat16* __restrict__ taps, int hidden,
                                                  int stride, int taps_per_row, int slot) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     const float* from = stream + (unsigned long long)row * stride;
     __nv_bfloat16* into = taps + ((unsigned long long)row * taps_per_row + slot) * hidden;
@@ -173,6 +176,7 @@ extern "C" __global__ void inkling_draft_mix_norm(const __nv_bfloat16* __restric
                                                   const __nv_bfloat16* __restrict__ weight,
                                                   float* __restrict__ out, int hidden,
                                                   int taps_per_row, float eps) {
+    OPT_PDL_ENTRY();
     __shared__ float scratch[32];
     if (hidden > (int)blockDim.x * IKD_MAX_PER_THREAD) {
         return;
@@ -209,6 +213,7 @@ extern "C" __global__ void inkling_draft_mix_norm(const __nv_bfloat16* __restric
 // (hidden / 256, rows - 1).
 extern "C" __global__ void inkling_draft_masks(const __nv_bfloat16* __restrict__ mask,
                                                float* __restrict__ block, int hidden) {
+    OPT_PDL_ENTRY();
     float* into = block + (unsigned long long)(blockIdx.y + 1) * hidden;
     for (int column = blockIdx.x * blockDim.x + threadIdx.x; column < hidden;
          column += blockDim.x * gridDim.x) {
@@ -218,6 +223,7 @@ extern "C" __global__ void inkling_draft_masks(const __nv_bfloat16* __restrict__
 
 // values = bf16(values), in place.
 extern "C" __global__ void inkling_draft_round(float* __restrict__ values, int count) {
+    OPT_PDL_ENTRY();
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
          index += blockDim.x * gridDim.x) {
         values[index] = ikd_bf16(values[index]);
@@ -232,6 +238,7 @@ extern "C" __global__ void inkling_draft_round(float* __restrict__ values, int c
 extern "C" __global__ void inkling_draft_norm(const float* __restrict__ x,
                                               const __nv_bfloat16* __restrict__ weight,
                                               float* __restrict__ out, int group, float eps) {
+    OPT_PDL_ENTRY();
     __shared__ float scratch[32];
     const unsigned long long start = (unsigned long long)blockIdx.x * group;
     float square = 0.0f;
@@ -249,6 +256,7 @@ extern "C" __global__ void inkling_draft_norm(const float* __restrict__ x,
 // A residual add of a projection's sums: dst = bf16(dst + bf16(src)).
 extern "C" __global__ void inkling_draft_add_round(float* __restrict__ dst,
                                                    const float* __restrict__ src, int count) {
+    OPT_PDL_ENTRY();
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
          index += blockDim.x * gridDim.x) {
         dst[index] = ikd_bf16(dst[index] + ikd_bf16(src[index]));
@@ -260,6 +268,7 @@ extern "C" __global__ void inkling_draft_add_round(float* __restrict__ dst,
 extern "C" __global__ void inkling_draft_swiglu(const float* __restrict__ gate,
                                                 const float* __restrict__ up,
                                                 float* __restrict__ out, int count) {
+    OPT_PDL_ENTRY();
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < count;
          index += blockDim.x * gridDim.x) {
         const float g = ikd_bf16(gate[index]);
@@ -273,6 +282,7 @@ extern "C" __global__ void inkling_draft_swiglu(const float* __restrict__ gate,
 // floats apart and `dim` wide heads, row t at position + t. Grid (heads, rows), dim / 2 threads.
 extern "C" __global__ void inkling_draft_rope(float* __restrict__ rows, int dim, int position,
                                               float theta, int stride) {
+    OPT_PDL_ENTRY();
     float* head = rows + (unsigned long long)blockIdx.y * stride + blockIdx.x * dim;
     const float at = (float)(position + (int)blockIdx.y);
     for (int index = threadIdx.x; index < dim / 2; index += blockDim.x) {
@@ -291,6 +301,7 @@ extern "C" __global__ void inkling_draft_context(const float* __restrict__ keys,
                                                  float* __restrict__ key_ring,
                                                  float* __restrict__ value_ring, int kv_heads,
                                                  int position, int ring, float eps, float theta) {
+    OPT_PDL_ENTRY();
     __shared__ float head[IKD_HEAD_DIM];
     __shared__ float scratch[32];
     if (blockDim.x != IKD_HEAD_DIM) {
@@ -327,6 +338,7 @@ extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
                                                       int step, const float* __restrict__ row,
                                                       const float* __restrict__ fused, int rank,
                                                       int hidden) {
+    OPT_PDL_ENTRY();
     int token;
     if (step == 0) {
         token = anchor;
@@ -360,6 +372,7 @@ extern "C" __global__ void inkling_draft_markov_gates(const float* __restrict__ 
                                                       const __nv_bfloat16* __restrict__ bias,
                                                       float* __restrict__ state,
                                                       float* __restrict__ latent, int rank) {
+    OPT_PDL_ENTRY();
     for (int index = threadIdx.x; index < rank; index += blockDim.x) {
         const float gate_in = ikd_bf16(projected[index] + __bfloat162float(bias[index]));
         const float candidate_in =
@@ -385,6 +398,7 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
                                                        int count, int first_id, int valid,
                                                        float cap, float* __restrict__ part_values,
                                                        int* __restrict__ part_ids) {
+    OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
     float best = -CUDART_INF_F;
@@ -424,6 +438,7 @@ extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ 
                                                       const int* __restrict__ part_ids, int parts,
                                                       float* __restrict__ slots, int rank,
                                                       int world) {
+    OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
     float best = -CUDART_INF_F;
@@ -451,6 +466,7 @@ extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ 
 // The last step's pick, into tokens[step]. One thread.
 extern "C" __global__ void inkling_draft_markov_last(const float* __restrict__ slots, int world,
                                                      unsigned* __restrict__ tokens, int step) {
+    OPT_PDL_ENTRY();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         tokens[step] = (unsigned)ikd_pick(slots, world);
     }

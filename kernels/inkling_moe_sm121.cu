@@ -36,6 +36,8 @@
 
 #include <cuda_runtime.h>
 
+#include "opt_pdl_sm121.cuh"
+
 #ifndef INKLING_MOE_BLOCK
 #define INKLING_MOE_BLOCK 256
 #endif
@@ -134,6 +136,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     int columns,
     float scale_2,
     const int* __restrict__ plan) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.x;
     if (row >= rows || columns <= 0) {
         return;
@@ -296,6 +299,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     int first,
     int owned,
     int per_slot) {
+    OPT_PDL_ENTRY();
     const int slot = blockIdx.y;
     const int local = indices[slot] - first;
     if (local < 0 || local >= owned || columns <= 0) {
@@ -363,6 +367,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     int columns,
     int block,
     const int* __restrict__ plan) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.x;
     if (row >= rows || columns <= 0 || block <= 0) {
         return;
@@ -400,6 +405,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     int first,
     int owned,
     int per_slot) {
+    OPT_PDL_ENTRY();
     const int slot = blockIdx.y;
     const int local = indices[slot] - first;
     if (local < 0 || local >= owned || columns <= 0 || block <= 0) {
@@ -627,6 +633,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_nvfp4_ex
     float scale_2,
     const int* __restrict__ plan,
     int count) {
+    OPT_PDL_ENTRY();
     if (columns <= 0 || count <= 0) {
         return;
     }
@@ -648,6 +655,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_MOE_BLOCK) inkling_mxfp8_ex
     int block,
     const int* __restrict__ plan,
     int count) {
+    OPT_PDL_ENTRY();
     if (columns <= 0 || count <= 0 || block <= 0) {
         return;
     }
@@ -668,6 +676,7 @@ extern "C" __global__ void __launch_bounds__(64) inkling_band_shares(
     int first,
     int owned,
     int* __restrict__ local) {
+    OPT_PDL_ENTRY();
     for (int slot = blockIdx.x * blockDim.x + threadIdx.x; slot < slots;
          slot += gridDim.x * blockDim.x) {
         const int expert = indices[slot] - first;
@@ -694,6 +703,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_ROUTER_THREADS) inkling_rou
     int experts,
     int top_k,
     float route_scale) {
+    OPT_PDL_ENTRY();
     if (experts <= 0 || top_k <= 0 || top_k > experts || top_k > 64) {
         return;
     }

@@ -92,6 +92,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "opt_pdl_sm121.cuh"
+
 #include "m4_common_sm121.cuh"
 // inkling_tanh, inkling_sigmoid and the softcapped SwiGLU expression, shared with the grouped
 // MMA's gate_up epilogue (q4p_moe_gate_up_capped).
@@ -105,6 +107,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapp
     int width,
     float gate_cap,
     float up_cap) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     const int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x;
     if (column >= width) {
@@ -123,6 +126,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_so
     int padded_vocab,
     int unpadded_vocab,
     float cap) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.x;
     if (row >= rows || unpadded_vocab > padded_vocab) {
         return;
@@ -155,6 +159,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_kv_store
     int position,
     int width,
     int cache_rows) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows || width <= 0) {
         return;
@@ -178,6 +183,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_residual
     float* __restrict__ out,
     int rows,
     int width) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows || width <= 0) {
         return;
@@ -198,6 +204,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_summary_
     int hidden,
     int blocks,
     int block_stride) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (hidden <= 0) {
         return;
@@ -215,6 +222,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_widen_f3
     const __nv_bfloat16* __restrict__ src,
     float* __restrict__ dst,
     int count) {
+    OPT_PDL_ENTRY();
     for (int index = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; index < count;
          index += gridDim.x * INKLING_EPI_BLOCK) {
         dst[index] = __bfloat162float(src[index]);
@@ -229,6 +237,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_m
     int rows,
     int slots,
     int width) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows || slots <= 0 || width <= 0) {
         return;
@@ -258,6 +267,7 @@ extern "C" __global__ void __launch_bounds__(128) inkling_nvfp4_quantize_4_6(
     uint8_t* __restrict__ scales,
     int rows,
     int columns) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.x;
     if (row >= rows || (columns & 15) != 0) {
         return;

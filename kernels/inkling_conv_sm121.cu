@@ -84,6 +84,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "opt_pdl_sm121.cuh"
+
 #define INKLING_MAX_KERNEL 8
 #define INKLING_MAX_BLOCKS 16
 #define INKLING_BLOCK 256
@@ -116,6 +118,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv(
     int channels,
     int kernel,
     int lead) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows) {
         return;
@@ -157,6 +160,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     float* __restrict__ out,
     int channels,
     int kernel) {
+    OPT_PDL_ENTRY();
     if (kernel < 1 || kernel > INKLING_MAX_KERNEL) {
         return;
     }
@@ -199,6 +203,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     int kernel,
     int head_dim,
     int lead) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     if (row >= rows || head_dim <= 0) {
         return;
@@ -258,6 +263,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_short_conv_d
     int channels,
     int kernel,
     int head_dim) {
+    OPT_PDL_ENTRY();
     if (kernel < 1 || kernel > INKLING_MAX_KERNEL || head_dim <= 0) {
         return;
     }
@@ -378,6 +384,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     int nq,
     float eps,
     int summary_stride) {
+    OPT_PDL_ENTRY();
     const int query_index = blockIdx.x;
     const int sequence_row = blockIdx.z;
     if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0) {
@@ -441,6 +448,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     int nq,
     float eps,
     int summary_stride) {
+    OPT_PDL_ENTRY();
     const int row = blockIdx.x;
     const int query_index = blockIdx.y;
     const int sequence_row = blockIdx.z;
@@ -480,6 +488,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     int hidden,
     int nq,
     int summary_stride) {
+    OPT_PDL_ENTRY();
     const int query_index = blockIdx.y;
     const int sequence_row = blockIdx.z;
     if (query_index >= nq || blocks < 0 || blocks > INKLING_MAX_BLOCKS || hidden <= 0) {
@@ -528,6 +537,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_conv_history
     int channels,
     int kernel,
     int to_pad) {
+    OPT_PDL_ENTRY();
     if (kernel < 1 || kernel > INKLING_MAX_KERNEL || channels <= 0) {
         return;
     }
