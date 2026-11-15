@@ -1558,7 +1558,7 @@ function fabricPicker(state, model) {
   // the saved schedule matches the wiring: that would be a success note next to the errors.
   const reached = measured && Array.isArray(measured.reachable) ? measured.reachable : [];
   const unreachable = reached.some((peers, rank) =>
-    Array.isArray(peers) && reached.some((_, peer) => peer !== rank && !peers.includes(peer)));
+    !Array.isArray(peers) || reached.some((_, peer) => peer !== rank && !peers.includes(peer)));
   const parts = ['<div class="fabric">'];
   parts.push('<div class="fabric-head"><div><h3 class="fabric-title">Fabric</h3>' +
     '<p class="fabric-sub">How the four Sparks are cabled. The cross-rank collectives follow this choice.</p></div>');

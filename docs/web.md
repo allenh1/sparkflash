@@ -157,7 +157,9 @@ wiring was not measured and reports the ping result alone.
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
 ring a `/32` route for every peer through the port that reaches it plus `ip_forward=1` so the
-Spark in between relays the diagonals) on every Spark over SSH under `sudo -n` and applies them.
+Spark in between relays the diagonals; that switch is the kernel-wide `net.ipv4.ip_forward`, and
+the only routes the command adds are the per-peer ones) on every Spark over SSH under `sudo -n`
+and applies them.
 The routes are worked out from the measured wiring, so after a pass that changes addresses, check
 again: a second pass may be offered to add them. The manual commands remain available behind
 **Prefer to run the commands yourself**.
