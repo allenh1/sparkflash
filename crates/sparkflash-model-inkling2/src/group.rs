@@ -205,7 +205,8 @@ pub struct MasterRank {
 /// cannot send until the collective is whole. The hub binds before the 97 GB load, so a worker
 /// whose load finishes first finds its listener; then rank 0 reads its own file, and then the
 /// vision tower from `checkpoint` (the released directory: the rank files hold only the text
-/// model) when the checkpoint has one and [VISION_ENV] does not turn it off.
+/// model) when the checkpoint has one and [VISION_ENV] does not turn it off, and the DSpark
+/// drafter's share from the same directory when the rank drafts with it.
 ///
 /// # Errors
 /// A rank file that does not open, a transport that does not connect, a peer that never joins,
@@ -246,6 +247,7 @@ pub fn open_master(
         exchange,
     )
     .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+    let drafter = load_drafter(&mut device, checkpoint, group)?;
     let weight_bytes = device.weight_bytes();
     let tower = if vision {
         let source = sparkflash_weights::safetensors::open_checkpoint(checkpoint)
@@ -277,7 +279,7 @@ pub fn open_master(
         None
     };
     let banner = format!(
-        "TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{tower}, Inkling device arm",
+        "TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{tower}{drafter}, Inkling device arm",
         group.world,
         group.rank,
         descriptor.id,
@@ -298,6 +300,27 @@ pub fn open_master(
         weight_bytes,
         banner,
     })
+}
+
+/// Loads this rank's share of the DSpark drafter from `checkpoint` when the rank drafts with it
+/// (SPARKFLASH_INKLING_DRAFT=dspark), and answers the boot line's note of it.
+fn load_drafter(
+    device: &mut InklingDeviceBackend,
+    checkpoint: &Path,
+    group: &GroupOptions,
+) -> Result<String, String> {
+    if !device.wants_drafter() {
+        return Ok(String::new());
+    }
+    let bytes = device.load_drafter(checkpoint).map_err(|error| {
+        format!(
+            "TP{}/rank{}: the DSpark drafter: {error} (set {}=off to step without it)",
+            group.world,
+            group.rank,
+            crate::device::DRAFT_ENV
+        )
+    })?;
+    Ok(format!(", DSpark drafter ({bytes} bytes)"))
 }
 
 /// The boot line's word for how many requests a group steps at once.
@@ -323,6 +346,7 @@ pub fn run_worker(
     config: &Inkling2Config,
     group: &GroupOptions,
     context: usize,
+    checkpoint: &Path,
 ) -> Result<(), String> {
     let converted = group.rank_file()?;
     let transport = transport(group)?;
@@ -351,7 +375,7 @@ pub fn run_worker(
     let opened = std::time::Instant::now();
     let source = RankFileSource::open(&converted, config, layout)
         .map_err(|error| format!("{}: {error}", converted.display()))?;
-    let backend = InklingDeviceBackend::open_rank_file(
+    let mut backend = InklingDeviceBackend::open_rank_file(
         descriptor.clone(),
         config.clone(),
         &source,
@@ -360,8 +384,9 @@ pub fn run_worker(
         exchange,
     )
     .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+    let drafter = load_drafter(&mut backend, checkpoint, group)?;
     println!(
-        "sparkflash serve: TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}, Inkling device arm worker",
+        "sparkflash serve: TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{drafter}, Inkling device arm worker",
         group.world,
         group.rank,
         descriptor.id,

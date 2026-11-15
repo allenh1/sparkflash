@@ -1,7 +1,9 @@
 # Inkling 2 Small's drafter (`mtp.safetensors`): the forward a port has to reproduce
 
-Status: **a reference for the device drafter, not yet implemented.** Written 2026-11-14 from the
-public sources in §14. The equations are restated, not copied; the one Python excerpt (§3, the
+Status: **the reference the device drafter follows** (`SPARKFLASH_INKLING_DRAFT=dspark`,
+`crates/sparkflash-model-inkling2/src/device/draft.rs` and `kernels/inkling_draft_sm121.cu`;
+measurements in [the TP4 note, "DSpark drafting"](inkling2-small-tp4.md)). Written 2026-11-14
+from the public sources in §14. The equations are restated, not copied; the one Python excerpt (§3, the
 tap capture) quotes SGLang, Apache License 2.0, Copyright 2023-2024 SGLang Team. The engine's own
 drafters (DeepSeek's DSpark stage, GLM's DFlash2) differ in shape, and §1-§12 are what this
 checkpoint needs.

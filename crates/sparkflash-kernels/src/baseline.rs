@@ -166,8 +166,8 @@ mod tests {
         let pins = pins().expect("the embedded baseline parses");
         assert_eq!(
             pins.len(),
-            48,
-            "the baseline pins forty-eight kernels: {pins:?}"
+            49,
+            "the baseline pins forty-nine kernels: {pins:?}"
         );
         // m4_abi stays frozen (D26); this test only reads its name list and proves the baseline the
         // chain verifies against covers every kernel the ABI module exposes.

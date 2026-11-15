@@ -45,6 +45,9 @@ pub struct Tp4Run {
     pub addresses: Vec<SocketAddr>,
     /// This rank's converted file.
     pub converted: PathBuf,
+    /// The released checkpoint's directory, which holds the DSpark drafter's file the rank files
+    /// do not; read only when the rank drafts with it (SPARKFLASH_INKLING_DRAFT=dspark).
+    pub checkpoint: PathBuf,
     /// The admitted context, in tokens.
     pub context: usize,
     /// How many times the prompt is walked, each in a fresh session on the one open rank: the
@@ -186,7 +189,7 @@ impl Tp4Run {
         let tp = TpPlan::new(self.world, self.rank)
             .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
         let opened = Instant::now();
-        let backend = InklingDeviceBackend::open_rank_file(
+        let mut backend = InklingDeviceBackend::open_rank_file(
             descriptor.clone(),
             config.clone(),
             &source,
@@ -195,8 +198,16 @@ impl Tp4Run {
             exchange,
         )
         .map_err(|error| format!("TP{}/rank{}: {error}", self.world, self.rank))?;
+        let drafter = if backend.wants_drafter() {
+            let bytes = backend.load_drafter(&self.checkpoint).map_err(|error| {
+                format!("TP{}/rank{}: the DSpark drafter: {error}", self.world, self.rank)
+            })?;
+            format!(", DSpark drafter {bytes} bytes")
+        } else {
+            String::new()
+        };
         let banner = format!(
-            "TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms)",
+            "TP{}/rank{} {} on {} ({} weight bytes{drafter}, opened in {} ms)",
             self.world,
             self.rank,
             descriptor.id,
@@ -521,6 +532,7 @@ mod tests {
             world,
             addresses: vec![address(); addresses],
             converted: std::path::PathBuf::from("/nonexistent"),
+            checkpoint: std::path::PathBuf::from("/nonexistent-checkpoint"),
             context: 16,
             passes: 1,
             cuts: 0,

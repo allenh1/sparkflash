@@ -48,7 +48,7 @@ pub(super) fn serve(
     let config = Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
         .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
     if group.rank != 0 {
-        sparkflash_model_inkling2::run_worker(&descriptor, &config, group, context)?;
+        sparkflash_model_inkling2::run_worker(&descriptor, &config, group, context, &checkpoint.directory)?;
         return Ok(ExitCode::SUCCESS);
     }
     let master = sparkflash_model_inkling2::open_master(

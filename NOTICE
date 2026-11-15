@@ -326,6 +326,7 @@ Attribution:
   crates/sparkflash-model-glm5-next/config/ is Z.ai's config.json from
   zai-org/GLM-5.3-Flash, MIT License.
 
+--------------------------------------------------------------------------------
 10. Thinking Machines Inkling-2 and Hugging Face Transformers (Inkling-2-Small)
 --------------------------------------------------------------------------------
 Repositories & Models:
@@ -334,6 +335,15 @@ Repositories & Models:
   no license for them is claimed here)
 - https://github.com/huggingface/transformers (Copyright 2026 the HuggingFace
   Team, Apache License, Version 2.0)
+- https://github.com/sgl-project/sglang, branch inkling-2-small-support at
+  778fb834e745bffd9a303ff388435fb44b644746 (Copyright 2023-2024 SGLang Team,
+  Apache License, Version 2.0)
+- https://github.com/z-lab/dflash (Copyright (c) 2026 Z Lab, MIT License)
+Papers:
+- DFlare (Zhang et al.): per-layer adaptive fusion of target-layer features and
+  heterogeneous context keys and values for block drafting. arXiv:2606.02091.
+- DSpark (DeepSeek): a semi-autoregressive RNN Markov head over a parallel
+  draft block. arXiv:2607.05147.
 
 Attribution:
 - The Inkling-2 vision path in crates/sparkflash-model-inkling2/src/vision.rs
@@ -354,3 +364,17 @@ Attribution:
   implementation of that arithmetic, held to the host reference above; they
   reuse this repository's DeepSeek vision GEMM and attention kernels
   (kernels/opt_vision_sm121.cu).
+- The DSpark drafter in crates/sparkflash-model-inkling2/src/device/draft.rs and
+  kernels/inkling_draft_sm121.cu (the checkpoint's mtp.safetensors: the eight
+  target taps, the softmax fusion rows, the per-layer fused context keys and
+  values, five bidirectional block layers over a 1,024-position window and the
+  whole context, and the rnn_hidden Markov head folded through the target head)
+  follows SGLang's Inkling-2 drafter (python/sglang/srt/models/inkling2_mtp.py
+  and python/sglang/srt/speculative/dspark_components/), which was read for the
+  arithmetic, with the methods of DFlash (block drafting), DFlare (the layer
+  fusion and context projections) and DSpark (the Markov head) above. No SGLang
+  or DFlash source is copied; the Rust and CUDA code is an independent
+  implementation. The block attention is this repository's DFlash 2 kernel
+  (q4d_attn_span in kernels/dflash2_sm121.cu, section 8). The drafter weights
+  are Thinking Machines' and are loaded from the operator's copy, not
+  redistributed.

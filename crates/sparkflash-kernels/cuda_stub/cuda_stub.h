@@ -540,6 +540,19 @@ __device__ __forceinline__ float sinf(float value) {
     return 0.0f;
 }
 
+// The drafter's accurate rotary and its tanh gates (kernels/inkling_draft_sm121.cu); like the
+// rest of this stub they only let the probe type-check, and nvcc uses its own definitions.
+__device__ __forceinline__ void sincosf(float value, float *sine, float *cosine) {
+    (void)value;
+    *sine = 0.0f;
+    *cosine = 1.0f;
+}
+
+__device__ __forceinline__ float tanhf(float value) {
+    (void)value;
+    return 0.0f;
+}
+
 __device__ __forceinline__ float exp2f(float value) {
     (void)value;
     return 1.0f;

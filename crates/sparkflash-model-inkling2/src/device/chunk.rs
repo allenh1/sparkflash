@@ -190,7 +190,7 @@ fn word_bytes(values: &[i32]) -> Vec<u8> {
 /// those two projections are one or two blocks wide, and a launch a group left a 4,096-row chunk
 /// 512 serial launches a layer on them - 8.5 s of a 9.5 s tensor prefill.
 #[allow(clippy::too_many_arguments)]
-fn project(
+pub(super) fn project(
     shared: &Shared,
     walk: PrefillWalk,
     weight: Deviceptr,
@@ -350,6 +350,7 @@ pub(super) fn walk_rows(
     tokens: &[u32],
     walk: PrefillWalk,
     images: &[Injection],
+    taps: Option<TapSink>,
 ) -> Result<Vec<Vec<f32>>, BackendError> {
     let config = &shared.config;
     let plan = &shared.plan;
@@ -494,6 +495,10 @@ pub(super) fn walk_rows(
     probe(shared, "chunk embed_norm", scratch.x, rows, hidden)?;
 
     for (index, layer) in schedule.layers().iter().enumerate() {
+        // The drafter's taps of this layer: every row's stream as the layer starts on it.
+        if let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer.index)?))) {
+            sink.capture(shared, scratch.x, rows, slot)?;
+        }
         let sliding = layer.sliding;
         let cache_rows = layer.kv_rows;
         let clips = shared.clip[index];
@@ -1046,10 +1051,12 @@ pub(super) fn walk_rows(
     let rank_vocab = plan.rank_vocab();
     let padded = rank_vocab * shared.exchange.world();
     let unpadded = config.unpadded_vocab_size.min(padded).max(1);
+    let mut output_queries: Option<Deviceptr> = None;
     for step in schedule.epilogue() {
         match (step.op, step.target) {
             (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
                 let queries = weight(step.weights[0]);
+                output_queries = Some(queries);
                 run(shared.block_residual(
                     chunk.summaries.offset(first * summary_stride * byte),
                     scratch.x.offset(first * hidden * byte),
@@ -1064,6 +1071,30 @@ pub(super) fn walk_rows(
             (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
                 let gain = weight(step.weights[0]);
                 run(shared.rmsnorm(scratch.final_row, gain, scratch.final_row, answers, hidden))?;
+                if let Some(sink) = taps {
+                    if answers == rows {
+                        sink.capture(shared, scratch.final_row, rows, FINAL_TAP)?;
+                    } else {
+                        // A chunk answers its last row, and the drafter's last tap is every row's
+                        // normed output: the same per-row chain over all of them, into a buffer
+                        // the epilogue no longer reads.
+                        let queries = output_queries.ok_or_else(|| {
+                            device_error("the epilogue norms before its output residual")
+                        })?;
+                        run(shared.block_residual(
+                            chunk.summaries,
+                            scratch.x,
+                            queries,
+                            scratch.q_in,
+                            blocks,
+                            1,
+                            rows,
+                            summary_stride,
+                        ))?;
+                        run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
+                        sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
+                    }
+                }
             }
             (Op::Gemv, Target::Project(Projection::Head)) => {
                 let matrix = weight(step.weights[0]);

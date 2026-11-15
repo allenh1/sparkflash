@@ -1240,3 +1240,39 @@ prompt, the 25 greedy ids match the deployed fast walk's.
 | served decode, 2,223-token prompt | 26.1 tokens/s | 26.0 tokens/s |
 | served decode, 78,540-token prompt | — | 22.5 tokens/s |
 | served decode, 99,848-token prompt | 19.0 tokens/s | 21.4 tokens/s |
+
+### DSpark drafting
+
+`SPARKFLASH_INKLING_DRAFT=dspark` drafts with the release's own drafter (`mtp.safetensors` beside
+the checkpoint's `config.json`, on every rank), whose forward
+[the drafter note](inkling2-small-drafter.md) restates. `SPARKFLASH_INKLING_DRAFT_DEPTH` is the
+drafts a round (default 7, at most the block's 7). The arm has three parts:
+
+* **Taps.** Every prompt chunk, decode step and verify row writes the target's eight features
+  into a tap buffer: the residual entering layers 5, 11, 17, 23, 29, 35 and 41, and the
+  final-normed row, each rounded to BF16.
+* **Injection.** As rows commit, each of the drafter's five layers mixes the eight taps with its
+  fusion row, normalises them, and stores their context keys and values. The sliding layers keep
+  the last 1,024 positions; the full layer keeps the whole context.
+* **The draft.** It is one forward of the five layers over the anchor and seven mask rows,
+  attending to the context and to the block. The `rnn_hidden` Markov head then picks each draft
+  in turn. Its output projection is folded into the vocabulary rows once, at load
+  (`bf16(W_lm W_ho)`), so a step costs a 256-wide GEMV, not a 4,608-wide one.
+
+The round is the verify walk prompt-lookup drafting uses, so every token is the token plain
+decoding computes, whatever the sampler. A drafter costs a rank about 0.97 GB of weights, plus
+its full layer's context keys and values (2 GB at 1M positions) and the tap buffer (604 MB at an
+8,192-row chunk). Lanes refuse any drafter: a pending round's state is one session's, and a fused
+step would walk it.
+
+On the four ranks, greedy, the ids are plain decoding's at every depth:
+
+| prompt | plain | depth 3 | depth 7 |
+|---|---|---|---|
+| repeating 5K prompt, 96 tokens | 39 ms a token | 22.5 ms (4.0 tokens in a 90 ms round) | 16.0 ms (8.0 in 128 ms) |
+| 93,159-token text, 24 tokens | 44.5 ms | 41.4 ms (3.0 in 124 ms) | 45.8 ms (4.0 in 183 ms) |
+
+At 93K, verifying an 8-row round costs four plain steps. Each row routes its own eight experts,
+so eight rows read about 59 distinct experts against one row's 8, and every row walks the full
+layers' keys. The drafter therefore stays off by default, and depth 3 is the choice when it is
+on.

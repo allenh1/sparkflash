@@ -34,6 +34,7 @@
 //! refused rather than run without its exchanges: a rank that computed its own expert subset and
 //! never reduced it would answer with a quarter of each token's MoE.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use sparkflash_kernels::cuda_driver::{
@@ -65,9 +66,12 @@ use crate::vision::SpanCheck;
 use sparkflash_ops::sampler::Sampler;
 
 mod chunk;
+mod draft;
 mod tower;
 
 use chunk::{Injection, Rows, exchange_gather, exchange_sum, walk_rows};
+use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
+pub use draft::DRAFT_FILE;
 pub use tower::InklingVisionTower;
 
 /// The backend name the diagnostics use.
@@ -774,6 +778,8 @@ struct Shared {
     /// The drafter a sequence speculates with and the most drafts a round verifies
     /// ([DRAFT_ENV]); `None` steps a token at a time.
     draft: Option<(Drafter, usize)>,
+    /// The DSpark drafter's weights, once [InklingDeviceBackend::load_drafter] loaded them.
+    dspark: Option<DraftModel>,
     /// The vision tower, on rank 0 when it was loaded ([InklingDeviceBackend::load_vision]): the
     /// one rank that encodes a prompt's images, whose rows the group's sum then broadcasts.
     vision: Option<Mutex<InklingVisionTower>>,
@@ -1885,6 +1891,9 @@ impl Drop for Shared {
         pointers.extend(self.exchange_slots);
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
         self.cuda.free_buffers(&refs);
+        if let Some(mut drafter) = self.dspark.take() {
+            drafter.free(&self.cuda);
+        }
         if let Some(tower) = self.vision.take() {
             match tower.into_inner() {
                 Ok(mut tower) => tower.free(&self.cuda),
@@ -2029,6 +2038,22 @@ impl InklingDeviceBackend {
                 depth + 1
             ));
         }
+        // The DSpark block proposes at most its rows less the anchor's.
+        if let Some((Drafter::Dspark, depth)) = draft {
+            let block = config
+                .mtp
+                .as_ref()
+                .ok_or_else(|| {
+                    format!("{DRAFT_ENV}=dspark and this checkpoint describes no drafter")
+                })?
+                .block_size;
+            if depth + 1 > block {
+                return Err(format!(
+                    "{DRAFT_DEPTH_ENV}={depth}: the DSpark block of {block} rows drafts at most {}",
+                    block.saturating_sub(1)
+                ));
+            }
+        }
         // The decode schedule is built for the chunk too: the two address the same sliding
         // rings, and a ring is sized by the widest write into it.
         let plan = InklingDevicePlan::build_for_chunk(
@@ -2106,6 +2131,7 @@ impl InklingDeviceBackend {
                 prefill_chunk,
                 prefill_walk,
                 draft,
+                dspark: None,
                 vision: None,
             }),
         })
@@ -2147,6 +2173,38 @@ impl InklingDeviceBackend {
         Ok(bytes)
     }
 
+    /// Whether this rank drafts with the checkpoint's DSpark drafter ([DRAFT_ENV]=dspark), which
+    /// [Self::load_drafter] must load before a session opens.
+    #[must_use]
+    pub fn wants_drafter(&self) -> bool {
+        matches!(self.shared.draft, Some((Drafter::Dspark, _)))
+    }
+
+    /// Loads the DSpark drafter onto this rank from `directory`'s [DRAFT_FILE] (the released
+    /// checkpoint's: the rank files hold only the text model). Every rank of a group loads its
+    /// share, and before any session or lanes open.
+    ///
+    /// Returns the device bytes the drafter's weights take.
+    ///
+    /// # Errors
+    /// A rank that was not asked to draft with it, a session already open, or the drafter's own
+    /// load ([DraftModel::load]).
+    pub fn load_drafter(&mut self, directory: &Path) -> Result<usize, String> {
+        if !self.wants_drafter() {
+            return Err(format!(
+                "the DSpark drafter loads when {DRAFT_ENV}=dspark; this rank drafts with {:?}",
+                self.shared.draft.map(|(drafter, _)| drafter)
+            ));
+        }
+        let shared = Arc::get_mut(&mut self.shared)
+            .ok_or("the drafter loads before any session or lanes open on this rank")?;
+        shared.cuda.make_current()?;
+        let model = DraftModel::load(shared, directory)?;
+        let bytes = model.device_bytes();
+        shared.dspark = Some(model);
+        Ok(bytes)
+    }
+
     /// What this rank checks of a prompt's image spans before it prefills them; a group's rank 0
     /// runs it before it broadcasts a request, so a span no rank would take is refused before any
     /// rank starts.
@@ -2174,8 +2232,9 @@ impl ModelBackend for InklingDeviceBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Images run when this rank holds the tower ([Self::load_vision]); the drafter is in the
-        // checkpoint and in this tree's host reference but has no device path yet.
+        // Images run when this rank holds the tower ([Self::load_vision]). Speculation is the
+        // session's own ([DRAFT_ENV]): a round verifies its drafts on the device and feeds the
+        // caller one token at a time, so the engine sees plain steps.
         Capabilities {
             vision: self.shared.vision.is_some(),
             ..self.descriptor.capabilities
@@ -2202,6 +2261,19 @@ impl InklingDeviceBackend {
             return Err(BackendError::new(
                 DEVICE,
                 "fused lanes need at least one row a step",
+            ));
+        }
+        // A lane's round leaves its state past the drafts until the lane settles, and a fused
+        // step walks every lane's state as it stands: drafting serves one request at a time.
+        if max_batch > 1
+            && let Some((drafter, _)) = self.shared.draft
+        {
+            return Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "{DRAFT_ENV} drafts ({drafter:?}) one request at a time and fused lanes step \
+                     {max_batch}: serve one lane, or set {DRAFT_ENV}=off"
+                ),
             ));
         }
         Ok(InklingLanes {
@@ -2356,6 +2428,7 @@ impl FusedArm for InklingLanes {
                 &tokens,
                 PrefillWalk::Chunk,
                 &[],
+                None,
             )?
         };
         Ok(members
@@ -3183,6 +3256,8 @@ struct InklingDeviceSession {
     round: Option<Round>,
     /// What this request's drafts have been worth.
     speculator: Speculator,
+    /// The DSpark drafter's context for this sequence, when the rank drafts with it.
+    drafter: Option<DraftState>,
 }
 
 /// The device state one prefill chunk walks in: `rows` rows of every scratch buffer, and a working
@@ -3385,9 +3460,12 @@ enum Drafter {
     /// Prompt lookup: the tokens that followed the latest earlier occurrence of the history's
     /// last n-gram ([sparkflash_model::spec::lookup_draft]).
     Lookup,
+    /// The checkpoint's own DSpark block drafter ([draft]), loaded from its [DRAFT_FILE].
+    Dspark,
 }
 
-/// The drafter, unset or `off` for none: `lookup` (prompt lookup).
+/// The drafter, unset or `off` for none: `lookup` (prompt lookup) or `dspark` (the checkpoint's
+/// block drafter, whose block bounds the depth at seven).
 pub const DRAFT_ENV: &str = "SPARKFLASH_INKLING_DRAFT";
 /// The most drafts a round verifies, `1..=MAX_DRAFT_DEPTH`; [DEFAULT_DRAFT_DEPTH] unset.
 pub const DRAFT_DEPTH_ENV: &str = "SPARKFLASH_INKLING_DRAFT_DEPTH";
@@ -3402,9 +3480,11 @@ fn draft_from_env() -> Result<Option<(Drafter, usize)>, String> {
     let drafter = match std::env::var(DRAFT_ENV).ok().as_deref() {
         None | Some("" | "off") => return Ok(None),
         Some("lookup") => Drafter::Lookup,
+        Some("dspark") => Drafter::Dspark,
         Some(other) => {
             return Err(format!(
-                "{DRAFT_ENV}={other} is not a drafter: use lookup (prompt lookup) or off"
+                "{DRAFT_ENV}={other} is not a drafter: use lookup (prompt lookup), dspark (the \
+                 checkpoint's block drafter) or off"
             ));
         }
     };
@@ -3478,6 +3558,9 @@ impl Drop for InklingDeviceSession {
         if let Some(verify) = &self.verify {
             pointers.extend(verify.buffers());
         }
+        if let Some(drafter) = &self.drafter {
+            pointers.extend(drafter.buffers());
+        }
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
         self.shared.cuda.free_buffers(&refs);
     }
@@ -3517,9 +3600,11 @@ impl ModelSession for InklingDeviceSession {
         if self.state.position >= self.shared.context {
             return Err(BackendError::new("context", "the context is exhausted"));
         }
-        let drafts = self.draft(token);
+        let drafts = self.draft(token)?;
         if drafts.is_empty() {
+            let position = self.state.position;
             let logits = self.step(token)?;
+            self.inject(1, position)?;
             return Ok(self.decoded(token, logits));
         }
         let start = self.state.position;
@@ -3610,6 +3695,9 @@ impl InklingDeviceSession {
             self.state
                 .reset(&self.shared)
                 .map_err(|error| BackendError::new(DEVICE, error))?;
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.reset();
+            }
             self.history.clear();
             self.held_images.clear();
             self.last_logits.clear();
@@ -3716,6 +3804,7 @@ impl InklingDeviceSession {
             logits = if take == 1 && walk != PrefillWalk::Tensor && images.is_empty() {
                 self.step(slice[0])?
             } else {
+                let taps = self.drafter.as_ref().map(DraftState::sink);
                 // The rows walk forwards an image row as a one-row chunk of the exact walk.
                 let walk = if walk.chunked() {
                     walk
@@ -3731,10 +3820,12 @@ impl InklingDeviceSession {
                     slice,
                     walk,
                     &images,
+                    taps,
                 )?
                 .pop()
                 .ok_or_else(|| Self::fail("a chunk answered no row"))?
             };
+            self.inject(take, first)?;
             self.history.extend_from_slice(slice);
             forwarded += take;
         }
@@ -3816,7 +3907,24 @@ impl InklingDeviceSession {
             .make_current()
             .map_err(|error| BackendError::new(DEVICE, error))?;
         let state = State::allocate(shared).map_err(|error| BackendError::new(DEVICE, error))?;
+        let drafter = match (shared.draft, shared.dspark.as_ref()) {
+            (Some((Drafter::Dspark, _)), Some(model)) => Some(
+                DraftState::allocate(shared, model)
+                    .map_err(|error| BackendError::new(DEVICE, error))?,
+            ),
+            (Some((Drafter::Dspark, _)), None) => {
+                return Err(BackendError::new(
+                    DEVICE,
+                    format!(
+                        "{DRAFT_ENV}=dspark and this rank has not loaded the drafter \
+                         (InklingDeviceBackend::load_drafter)"
+                    ),
+                ));
+            }
+            _ => None,
+        };
         Ok(Self {
+            drafter,
             shared: Arc::clone(shared),
             state,
             chunk: None,
@@ -3838,6 +3946,9 @@ impl InklingDeviceSession {
             .reset(&self.shared)
             .map_err(|error| BackendError::new(DEVICE, error))?;
         self.round = None;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.reset();
+        }
         self.history.clear();
         self.held_images.clear();
         self.last_logits.clear();
@@ -3858,9 +3969,9 @@ impl InklingDeviceSession {
 
     /// The drafts to verify after `anchor`: none without a drafter, and never more than the
     /// context has room for past the anchor.
-    fn draft(&self, anchor: u32) -> Vec<u32> {
+    fn draft(&mut self, anchor: u32) -> Result<Vec<u32>, BackendError> {
         let Some((drafter, _)) = self.shared.draft else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let room = self.shared.context.saturating_sub(self.state.position + 1);
         let depth = self.speculator.depth(&[], room);
@@ -3870,9 +3981,43 @@ impl InklingDeviceSession {
                 context.extend_from_slice(&self.history);
                 context.push(anchor);
                 let (shortest, longest) = LOOKUP_NGRAMS;
-                lookup_draft(&context, shortest, longest, depth)
+                Ok(lookup_draft(&context, shortest, longest, depth))
+            }
+            Drafter::Dspark => {
+                if depth == 0 {
+                    return Ok(Vec::new());
+                }
+                let shared = Arc::clone(&self.shared);
+                let (Some(model), Some(drafter)) = (shared.dspark.as_ref(), self.drafter.as_mut())
+                else {
+                    return Err(Self::fail("a DSpark round with no drafter on this rank"));
+                };
+                // The anchor sits at the position the sequence steps next; the drafter's context
+                // holds every row before it.
+                if drafter.committed() != self.state.position {
+                    return Err(Self::fail(format!(
+                        "the drafter's context ends at {} and the anchor is at {}",
+                        drafter.committed(),
+                        self.state.position
+                    )));
+                }
+                drafter.draft(&shared, model, anchor, depth.min(model.max_depth()))
             }
         }
+    }
+
+    /// The drafter's context takes the walked rows `position..position + rows`, whose taps the
+    /// walk just left: a prompt's chunk, a step's row, or the fed rows of a verify.
+    fn inject(&mut self, rows: usize, position: usize) -> Result<(), BackendError> {
+        let Some(drafter) = self.drafter.as_mut() else {
+            return Ok(());
+        };
+        let shared = Arc::clone(&self.shared);
+        let model = shared
+            .dspark
+            .as_ref()
+            .ok_or_else(|| Self::fail("a drafter state with no drafter on this rank"))?;
+        drafter.inject(&shared, model, rows, position)
     }
 
     /// Walks `chunk` (an anchor and its drafts) as one verify and answers every row's logits;
@@ -3894,6 +4039,7 @@ impl InklingDeviceSession {
             chunk,
             PrefillWalk::Chunk,
             &[],
+            self.drafter.as_ref().map(DraftState::sink),
         )
     }
 
@@ -3906,6 +4052,8 @@ impl InklingDeviceSession {
         };
         self.speculator
             .observe(&[], round.chunk.len() - 1, round.fed);
+        // The verify left every row's taps; the drafter keeps the rows the caller fed.
+        self.inject(round.fed, round.start)?;
         if round.fed == round.chunk.len() {
             return Ok(());
         }
@@ -4086,8 +4234,12 @@ impl InklingDeviceSession {
             }
         }
 
+        let taps = self.drafter.as_ref().map(DraftState::sink);
         for (index, schedule) in plan.layers().iter().enumerate() {
             let layer = schedule.index;
+            if let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer)?))) {
+                sink.capture(&shared, self.state.scratch.x, 1, slot)?;
+            }
             if trace_on() {
                 eprintln!(
                     "[inkling] layer {layer} sliding={} blocks={}",
@@ -4554,6 +4706,9 @@ impl InklingDeviceSession {
                         1,
                         hidden,
                     ))?;
+                    if let Some(sink) = taps {
+                        sink.capture(&shared, self.state.scratch.final_row, 1, FINAL_TAP)?;
+                    }
                 }
                 (Op::Gemv, Target::Project(Projection::Head)) => {
                     self.rms(&shared, "final_norm", self.state.scratch.final_row, hidden)?;

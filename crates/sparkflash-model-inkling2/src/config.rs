@@ -144,6 +144,8 @@ pub struct InklingMtpConfig {
     pub target_layer_ids: Vec<usize>,
     /// RoPE base.
     pub rope_theta: f64,
+    /// The stage's RMSNorm epsilon.
+    pub rms_norm_eps: f64,
 }
 
 /// The stored format of each class of weights.
@@ -593,6 +595,7 @@ fn parse_mtp(root: &Value) -> Result<Option<InklingMtpConfig>, ConfigError> {
         markov_rank: optional_usize(config, "markov_rank")?.unwrap_or(0),
         target_layer_ids: usize_list(config.get("target_layer_ids"))?,
         rope_theta: optional_f64(config, "rope_theta")?.unwrap_or(1_000_000.0),
+        rms_norm_eps: optional_f64(config, "rms_norm_eps")?.unwrap_or(1e-6),
     }))
 }
 

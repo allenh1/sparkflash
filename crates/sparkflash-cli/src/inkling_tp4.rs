@@ -88,6 +88,7 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         world: args.world,
         addresses: args.peers.clone(),
         converted,
+        checkpoint: args.model.clone(),
         context: args.context,
         passes: args.passes,
         cuts: args.cuts,
