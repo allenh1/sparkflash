@@ -47,6 +47,7 @@
 //     out      [rows][width] f32
 //
 //   inkling_logit_softcap(logits, out, rows, padded_vocab, unpadded_vocab, cap)
+//     grid     (any number of column blocks, rows), block INKLING_EPI_BLOCK
 //     logits   [rows][padded_vocab] f32
 //     out      [rows][unpadded_vocab] BF16
 //
@@ -118,7 +119,9 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapp
         inkling_softcapped_swiglu_value(source[2 * column], source[2 * column + 1], gate_cap, up_cap);
 }
 
-// The final softcap and the unpadded slice in one pass.
+// The final softcap and the unpadded slice in one pass: grid (column blocks, rows), a block
+// striding over its row's entries gridDim.x blocks apart. Each entry is its own value, so the
+// grid changes only which thread writes it.
 extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_softcap(
     const float* __restrict__ logits,
     __nv_bfloat16* __restrict__ out,
@@ -127,13 +130,14 @@ extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_so
     int unpadded_vocab,
     float cap) {
     OPT_PDL_ENTRY();
-    const int row = blockIdx.x;
+    const int row = blockIdx.y;
     if (row >= rows || unpadded_vocab > padded_vocab) {
         return;
     }
     const float* source = logits + (uint64_t)row * padded_vocab;
     __nv_bfloat16* target = out + (uint64_t)row * unpadded_vocab;
-    for (int entry = threadIdx.x; entry < unpadded_vocab; entry += INKLING_EPI_BLOCK) {
+    for (int entry = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; entry < unpadded_vocab;
+         entry += gridDim.x * INKLING_EPI_BLOCK) {
         const float value = source[entry];
         target[entry] = __float2bfloat16_rn(cap > 0.0f ? cap * inkling_tanh(value / cap) : value);
     }

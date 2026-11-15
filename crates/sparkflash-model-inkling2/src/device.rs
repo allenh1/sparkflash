@@ -4891,7 +4891,7 @@ impl InklingDeviceSession {
                     let unpadded = config.unpadded_vocab_size.min(padded).max(1);
                     run(shared.launch(
                         shared.kernels.logit_softcap,
-                        (1, 1, 1),
+                        (flat(unpadded), 1, 1),
                         (ELEMENT_BLOCK, 1, 1),
                         &[
                             self.state.scratch.logits_full.0,

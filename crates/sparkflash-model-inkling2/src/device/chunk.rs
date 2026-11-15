@@ -1140,7 +1140,7 @@ pub(super) fn walk_rows(
             (Op::LogitSoftcap, _) => {
                 run(shared.launch(
                     shared.kernels.logit_softcap,
-                    (answers as u32, 1, 1),
+                    (flat(unpadded), answers as u32, 1),
                     (ELEMENT_BLOCK, 1, 1),
                     &[
                         scratch.logits_full.0,
