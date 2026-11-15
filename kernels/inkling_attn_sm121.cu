@@ -1001,6 +1001,8 @@ extern "C" __global__ void __launch_bounds__(INKLING_MAX_HEAD_DIM) inkling_attn_
 
 #define INKLING_PART_KEYS 256
 #define INKLING_PART_THREADS 128
+// The scores a thread holds a head: keys t, t + THREADS, ... of the run.
+#define INKLING_PART_HELD (INKLING_PART_KEYS / INKLING_PART_THREADS)
 // A thread of the value sum owns 8 consecutive dims (one 16-byte load a value row); 16 of them
 // cover a 128-wide head, so the block takes 8 keys at once.
 #define INKLING_PART_DIMS 8
@@ -1111,7 +1113,9 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     const int n = (int)(end - begin);
     const int head0 = kv_head * groups;
 
-    // The run's largest score a head, then each key's term against it.
+    // The run's largest score a head, then each key's term against it. A thread reads its keys'
+    // scores (t and t + INKLING_PART_THREADS) once, for the maximum and the terms both.
+    float held[INKLING_MAX_GROUPS][INKLING_PART_HELD];
     float largest[INKLING_MAX_GROUPS];
 #pragma unroll
     for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
@@ -1119,8 +1123,13 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
         if (g < groups) {
             const float* score_row = scores + ((uint64_t)row * heads + head0 + g) * pass_slots +
                                      (begin - pass_first);
-            for (int i = threadIdx.x; i < n; i += INKLING_PART_THREADS) {
-                largest[g] = fmaxf(largest[g], score_row[i]);
+#pragma unroll
+            for (int k = 0; k < INKLING_PART_HELD; ++k) {
+                const int i = threadIdx.x + k * INKLING_PART_THREADS;
+                held[g][k] = i < n ? score_row[i] : -INFINITY;
+                if (i < n) {
+                    largest[g] = fmaxf(largest[g], held[g][k]);
+                }
             }
         }
     }
@@ -1134,14 +1143,16 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
         total[g] = 0.0f;
         if (g < groups) {
-            const float* score_row = scores + ((uint64_t)row * heads + head0 + g) * pass_slots +
-                                     (begin - pass_first);
             // An all -inf run (no key can carry weight) adds nothing; exp(-inf - -inf) is NaN.
             const bool live = largest[g] != -INFINITY;
-            for (int i = threadIdx.x; i < n; i += INKLING_PART_THREADS) {
-                const float term = live ? expf(score_row[i] - largest[g]) : 0.0f;
-                weights[g][i] = term;
-                total[g] += term;
+#pragma unroll
+            for (int k = 0; k < INKLING_PART_HELD; ++k) {
+                const int i = threadIdx.x + k * INKLING_PART_THREADS;
+                if (i < n) {
+                    const float term = live ? expf(held[g][k] - largest[g]) : 0.0f;
+                    weights[g][i] = term;
+                    total[g] += term;
+                }
             }
         }
     }
