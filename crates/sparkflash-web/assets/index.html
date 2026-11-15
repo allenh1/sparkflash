@@ -34,6 +34,7 @@ limitations under the License.
     <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 5.5v-.5a1.5 1.5 0 0 0-1.5-1.5H6A1.5 1.5 0 0 0 4.5 5v8A1.5 1.5 0 0 0 6 14.5h.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-convert" viewBox="0 0 24 24"><path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5L19.5 6.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 2.5 20h19z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M12 10v4.5M12 17.2v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
   </svg>
 
@@ -415,15 +416,9 @@ limitations under the License.
             </details>
 
             <details class="section">
-              <summary>Fabric and SSH</summary>
+              <summary>NCCL and SSH</summary>
               <div class="fields">
-                <label class="field">
-                  <span>Fabric topology <em>switchless = direct-attach ring</em></span>
-                  <select id="fabric-schedule">
-                    <option value="switched">Switched 200G (one-shot all-to-all)</option>
-                    <option value="switchless">Switchless ring (hairpin reduce-scatter + all-gather)</option>
-                  </select>
-                </label>
+                <p class="field span-2 section-note">The fabric topology is picked in step 2 of the guide, where the check measures what is cabled.</p>
                 <label class="field"><span>NCCL_IB_HCA</span><input id="nccl-ib-hca" type="text" placeholder="e.g. rocep1s0f1,roceP2p1s0f1"></label>
                 <label class="field"><span>NCCL_SOCKET_IFNAME</span><input id="nccl-socket-ifname" type="text" placeholder="e.g. enp1s0f1np1"></label>
                 <label class="field"><span>NCCL_IB_GID_INDEX</span><input id="nccl-gid" type="number" min="0" max="65535"></label>

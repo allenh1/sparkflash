@@ -59,7 +59,8 @@ fabric_schedule = "switchless"
 ~~~
 
 or per run on the CLI (`--fabric-schedule switchless`, `hairpin` and `ring` are aliases). The web
-Setup page offers the same choice under **Fabric and SSH**, and the four-node launcher forwards the
+Setup page offers the same choice as a card in step 2 (**Connect the fast network**), which also
+measures the wiring with ARP probes and can set it to match, and the four-node launcher forwards the
 value to every rank; the host twin's `--fabric-schedule` covers the CPU test path. Both schedules
 are exercised over TCP and the in-process loopback in the host-twin tests, which assert the ring
 selects the same tokens and the same logits bits as the switched schedule at world 2 and 4.

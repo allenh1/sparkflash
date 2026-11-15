@@ -365,6 +365,80 @@ pub fn inspect_command(
     }
 }
 
+/// The read-only link probe for a rank: which ports answer which peers. Bash on this Spark for
+/// the local rank, `ssh` otherwise. Read-only; safe to run at any time.
+#[must_use]
+pub fn fabric_probe_command(
+    config: &SparkConfig,
+    rank: usize,
+    netdevs: &[String],
+    peers: &[(usize, String)],
+) -> CommandSpec {
+    let node = &config.cluster.nodes[rank];
+    let args = inspect::fabric_probe_args(netdevs, peers);
+    let label = format!("Probe the fast ports on {}", node.ssh);
+    if node.local {
+        let mut argv = vec![
+            "-c".to_owned(),
+            inspect::FABRIC_PROBE_SCRIPT.to_owned(),
+            "sparkflash-fabric".to_owned(),
+        ];
+        argv.extend(args);
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args: argv,
+            env: BTreeMap::new(),
+            cwd: None,
+            label,
+            kind: "fabric-probe".to_owned(),
+        };
+    }
+    let mut ssh_args = batch_ssh_args(config);
+    ssh_args.push(config.ssh_destination(rank));
+    ssh_args.push(inspect::fabric_probe_remote_command(&args));
+    CommandSpec {
+        program: "ssh".to_owned(),
+        args: ssh_args,
+        env: BTreeMap::new(),
+        cwd: None,
+        label,
+        kind: "fabric-probe".to_owned(),
+    }
+}
+
+/// Applies the fast-port configuration the last check computed for a rank, under passwordless
+/// sudo. `remote` is the command without sudo prefixes, made for `sudo -n bash -c`; the local
+/// rank runs the same way so both paths exercise the same script. Per-rank kinds let the four
+/// ranks be configured at once; each refuses to start while a launch is running.
+#[must_use]
+pub fn network_fix_command(config: &SparkConfig, rank: usize, remote: &str) -> CommandSpec {
+    let node = &config.cluster.nodes[rank];
+    let script = format!("sudo -n bash -c {}", shell_quote(remote));
+    let label = format!("Set up the fast ports on {}", node.ssh);
+    let kind = format!("network-setup-r{rank}");
+    if node.local {
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), script],
+            env: BTreeMap::new(),
+            cwd: None,
+            label,
+            kind,
+        };
+    }
+    let mut ssh_args = batch_ssh_args(config);
+    ssh_args.push(config.ssh_destination(rank));
+    ssh_args.push(script);
+    CommandSpec {
+        program: "ssh".to_owned(),
+        args: ssh_args,
+        env: BTreeMap::new(),
+        cwd: None,
+        label,
+        kind,
+    }
+}
+
 /// Downloads `model.id` into the Hugging Face cache on the lead with `scripts/hf-download.py`,
 /// resuming whatever an earlier download left.
 ///

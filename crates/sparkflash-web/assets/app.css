@@ -828,6 +828,59 @@ input:user-invalid { border-color: rgba(208, 59, 59, 0.6); }
 .findings li.warning::before { background: var(--warn); }
 .ssh-state.warnish { color: var(--warn); }
 .ssh-state.warnish::before { background: var(--warn); }
+
+/* Fabric picker (step 2) */
+
+.fabric { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); padding: 14px 16px; margin: 2px 0 14px; }
+
+.fabric-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+
+.fabric-title { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 0.01em; }
+
+.fabric-sub { margin: 2px 0 0; color: var(--text-2); font-size: 12.5px; }
+
+.fabric-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
+
+@media (max-width: 720px) { .fabric-cards { grid-template-columns: 1fr; } }
+
+.fabric-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong); background: var(--surface-3); color: var(--text-2); font: inherit; text-align: left; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease; }
+
+.fabric-card:hover { border-color: var(--accent); color: var(--text); }
+
+.fabric-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.fabric-card.selected { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+
+.fabric-card-top { display: flex; align-items: center; gap: 8px; }
+
+.fabric-card-title { font-weight: 600; color: var(--text); font-size: 13px; }
+
+.fabric-check { width: 16px; height: 16px; margin-left: auto; color: var(--accent-hover); }
+
+.fabric-card-body { font-size: 12.5px; line-height: 1.45; }
+
+.fabric-ok { color: var(--good-text); }
+
+.fabric-links { margin-top: 10px; font-size: 12.5px; color: var(--text-2); }
+
+.fabric-links summary { cursor: pointer; color: var(--muted); user-select: none; }
+
+.fabric-links summary:hover { color: var(--text-2); }
+
+.fabric-links-list { list-style: none; margin: 10px 0 2px; padding: 0; display: flex; flex-direction: column; gap: 5px; font-family: var(--mono); font-size: 12px; }
+
+.fabric-links-list .host-name { font-family: var(--font); margin-right: 10px; }
+
+.host-meta.host-warn { color: var(--warn); }
+
+.fabric-manual { margin-top: 12px; }
+
+.fabric-manual summary { cursor: pointer; color: var(--muted); font-size: 12.5px; user-select: none; }
+
+.fabric-manual summary:hover { color: var(--text-2); }
+
+.section-note { margin: 0; color: var(--muted); font-size: 12px; align-self: center; }
+
 .table.compact td { padding-top: 8px; padding-bottom: 8px; vertical-align: top; }
 .table.compact .mono { font-size: 12px; color: var(--text-2); }
 

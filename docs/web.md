@@ -98,15 +98,31 @@ to the V4.1 values and restore four `[cluster].nodes` under **Advanced settings*
 
 ### Fabric topology
 
-**Advanced settings → Fabric and SSH → Fabric topology** selects how the ranks' collectives cross
-the fabric:
+Step 2 of the guide (**Connect the fast network**) is where the fabric schedule is chosen. The two
+cards describe the two wirings this build supports, and the check tells you which one is cabled:
 
-- **switched** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
+- **Switched 200G** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
   every peer and reduces locally, the one-shot all-to-all schedule;
-- **switchless** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with the
+- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with the
   0<->2 and 1<->3 ConnectX-7 hairpin diagonals, and each collective reduce-scatters to the chunk
   owners and all-gathers the reduced chunks back. It is the same arithmetic, bit for bit, with
   each element crossing the fabric once instead of once per peer.
+
+When the node check runs it also probes the wiring: each Spark ARPs for every other Spark from each
+of its fast ports (`arping`) and pings it once. From the answers the console classifies the fabric as
+a switch (every port answers for every peer), the ring (each port answers for exactly one
+neighbour, forming 0-1-2-3-0), two-node pairs, or unrecognised wiring, and records what it
+measured next to the cards. When the measured wiring and the saved schedule disagree, a **Use the
+measured fabric** button writes the matching choice. Matching the schedule to the wiring is not
+required for correctness — it is the difference between the one-shot schedule doing its full
+all-to-all over a ring and the ring schedule doing chunked transfers — but it is the fast path for
+both wirings. Without `arping` on the Sparks the wiring cannot be identified; only reachability is
+checked. Reachability of every pair is always required and is reported per rank.
+
+Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
+settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`) on every
+Spark over SSH under `sudo -n` and applies them. The manual commands remain available behind
+**Prefer to run the commands yourself**.
 
 The choice is saved as `[cluster].fabric_schedule` and exported to every rank as
 `SPARKFLASH_FABRIC_SCHEDULE`, so a web-driven launch and a hand-written one run the same recipe.

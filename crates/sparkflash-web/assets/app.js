@@ -439,7 +439,6 @@ function paintConfig(config, report, force = false) {
   setValue("ssh-options", (config.cluster.ssh_options || []).join("\n"));
   setValue("http-bind", config.cluster.http_bind);
   setValue("base-port", config.cluster.base_port);
-  setValue("fabric-schedule", config.cluster.fabric_schedule || "switched");
   setValue("nccl-ib-hca", config.network.nccl_ib_hca);
   setValue("nccl-socket-ifname", config.network.nccl_socket_ifname);
   setValue("nccl-gid", config.network.nccl_ib_gid_index ?? "");
@@ -1088,7 +1087,7 @@ function collectConfig() {
     ...config.cluster,
     http_bind: $("http-bind").value.trim(),
     base_port: numberValue("base-port", config.cluster.base_port),
-    fabric_schedule: $("fabric-schedule").value,
+    fabric_schedule: (S.state && S.state.config && S.state.config.cluster.fabric_schedule) || "switched",
     ssh_user: $("ssh-user").value.trim(),
     ssh_options: lines("ssh-options"),
     nodes: [],
@@ -1228,7 +1227,7 @@ const GUIDE_NEEDS = {
 // Jobs whose result changes what the node check finds.
 const isSetupJob = (kind) =>
   ["download", "sync-software", "sync-model", "launch", "swap"].includes(kind) ||
-  kind.startsWith("convert-") || kind.startsWith("prepare-");
+  kind.startsWith("convert-") || kind.startsWith("prepare-") || kind.startsWith("network-setup-");
 
 function latestJob(match) {
   let found = null;
@@ -1526,11 +1525,115 @@ function waitingForCheck() {
     (S.inspectBusy ? "" : '<div class="guide-actions"><button class="btn" type="button" data-act="check">Check the Sparks</button></div>');
 }
 
+// Step 2: how the Sparks are cabled. The check measures the wiring from each port; this card is
+// the one place the schedule is chosen, because the whole collective schedule depends on it.
+const FABRIC_CHOICES = [
+  {
+    id: "switched",
+    title: "Switched 200G",
+    body: "A switch joins every port to every other port. Each Spark posts its whole chunk to every peer and reduces locally (one-shot all-to-all).",
+  },
+  {
+    id: "switchless",
+    title: "Switchless ring",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Each collective reduce-scatters to the chunk owners, then all-gathers back: same arithmetic, one fabric crossing per byte.",
+  },
+];
+
+const FABRIC_SHAPE_NAMES = { switched: "a 200G switch", ring: "a direct ring", pairs: "two-node pairs", unknown: "unrecognised wiring" };
+
+function fabricPicker(state, model) {
+  const setup = model.setup;
+  const config = state.config;
+  const chosen = (config.cluster && config.cluster.fabric_schedule) || "switched";
+  const measured = setup && setup.fabric ? setup.fabric : null;
+  const shape = measured ? measured.shape : null;
+  const recommended = shape === "switched" ? "switched" : shape === "ring" ? "switchless" : null;
+  const parts = ['<div class="fabric">'];
+  parts.push('<div class="fabric-head"><div><h3 class="fabric-title">Fabric</h3>' +
+    '<p class="fabric-sub">How the four Sparks are cabled. The schedule the collectives run follows this choice.</p></div>');
+  if (measured) {
+    if (!measured.links_measured) {
+      parts.push('<span class="tag warn">Ports not probed</span>');
+    } else {
+      const match = recommended && recommended === chosen;
+      parts.push('<span class="tag ' + (match ? "good" : "warn") + '">Measured: ' + esc(FABRIC_SHAPE_NAMES[shape] || "unknown wiring") + "</span>");
+    }
+  }
+  parts.push("</div>");
+  parts.push('<div class="fabric-cards" role="radiogroup" aria-label="Fabric schedule">');
+  for (const choice of FABRIC_CHOICES) {
+    const selected = chosen === choice.id;
+    const detected = recommended === choice.id;
+    parts.push(
+      '<button type="button" class="fabric-card' + (selected ? " selected" : "") + '" role="radio" aria-checked="' + selected + '" data-act="choose-fabric" data-fabric="' + choice.id + '">' +
+        '<span class="fabric-card-top"><span class="fabric-card-title">' + esc(choice.title) + "</span>" +
+        (detected ? '<span class="tag next">Detected</span>' : "") +
+        (selected ? '<svg class="fabric-check" aria-hidden="true"><use href="#i-check"/></svg>' : "") +
+        "</span>" +
+        '<span class="fabric-card-body">' + esc(choice.body) + "</span>" +
+      "</button>"
+    );
+  }
+  parts.push("</div>");
+  if (measured && !measured.links_measured) {
+    parts.push('<p class="guide-note">The ports answered no ARP probe. Install <code>iputils-arping</code> on every Spark, then check again and the wiring will be identified automatically.</p>');
+  } else if (recommended && recommended !== chosen) {
+    parts.push('<div class="guide-actions"><span class="guide-hint">The measured wiring is ' + esc(FABRIC_SHAPE_NAMES[shape]) + '; the saved schedule is ' + esc(chosen) + '.</span><button class="btn btn-primary" type="button" data-act="choose-fabric" data-fabric="' + recommended + '">Use the measured fabric</button></div>');
+  } else if (measured && recommended === chosen) {
+    parts.push('<p class="guide-note fabric-ok">The saved schedule matches the measured wiring.</p>');
+  } else if (measured && shape === "pairs") {
+    parts.push('<p class="guide-note">Each Spark has both fast ports wired to the same Spark: two-node pairs, not a ring. The collectives still run, but ranks across the pairs fall back to the slow path. Rewire to 0-1-2-3-0 with the 0-2 and 1-3 hairpins for the full ring.</p>');
+  } else if (measured && shape === "unknown") {
+    parts.push('<p class="guide-note">The measured links match neither a switch nor the ring. Check that every fast port has a cable and an address, then check again.</p>');
+  }
+  if (measured && measured.links && measured.links.length) {
+    parts.push(measuredLinks(setup, measured));
+  }
+  parts.push("</div>");
+  return parts.join("");
+}
+
+function measuredLinks(setup, measured) {
+  const names = (setup.nodes || []).map((node) => node.hostname || node.ssh);
+  const nameOf = (rank) => esc(names[rank] || ("rank " + rank));
+  const byRank = new Map();
+  for (const link of measured.links) {
+    if (!byRank.has(link.rank)) byRank.set(link.rank, []);
+    byRank.get(link.rank).push(link);
+  }
+  const rows = [...byRank.entries()].sort((a, b) => a[0] - b[0]).map(([rank, links]) => {
+    const ports = links
+      .slice()
+      .sort((a, b) => a.netdev.localeCompare(b.netdev))
+      .map((link) => esc(link.netdev) + " &rarr; " + nameOf(link.peer))
+      .join(" · ");
+    return '<li><span class="host-name">' + nameOf(rank) + '</span><span class="host-meta">' + ports + "</span></li>";
+  });
+  const reached = measured.reachable || [];
+  for (let rank = 0; rank < reached.length; rank += 1) {
+    const reachedBy = reached[rank];
+    if (!Array.isArray(reachedBy)) continue;
+    const missing = [];
+    for (let peer = 0; peer < reached.length; peer += 1) {
+      if (peer !== rank && !reachedBy.includes(peer)) missing.push(peer);
+    }
+    if (missing.length) {
+      rows.push('<li><span class="host-name">' + nameOf(rank) + '</span><span class="host-meta host-warn">cannot reach ' + missing.map(nameOf).join(", ") + "</span></li>");
+    }
+  }
+  return '<details class="fabric-links"><summary>What the link check measured</summary><ul class="fabric-links-list">' + rows.join("") + "</ul></details>";
+}
+
 function networkBody(state, model) {
   const setup = model.setup;
-  if (!setup) return waitingForCheck();
   const config = state.config;
   const parts = [];
+  parts.push(fabricPicker(state, model));
+  if (!setup) {
+    parts.push(waitingForCheck());
+    return parts.join("");
+  }
   parts.push('<table class="table compact"><thead><tr><th>Spark</th><th>Fast ports</th><th></th></tr></thead><tbody>' +
     setup.nodes.map((node) => {
       const problems = setup.findings.filter((finding) => finding.rank === node.rank);
@@ -1541,12 +1644,22 @@ function networkBody(state, model) {
         "<td>" + rails + '</td><td class="num"><span class="ssh-state ' + (worst === "warn" ? "warnish" : worst) + '">' + esc(label) + "</span></td></tr>";
     }).join("") + "</tbody></table>");
   parts.push(findingsList(setup.findings, config));
-  for (const node of setup.nodes) {
-    if (!node.network_fix) continue;
-    parts.push(codeBlock("Run on " + esc(node.hostname || node.ssh) + ": sign in there, or first type <code>ssh " + esc(node.ssh) + "</code> in a terminal on this Spark", node.network_fix));
+  const fixable = setup.nodes.filter((node) => node.network_fix);
+  const portJob = runningJob((job) => job.kind.startsWith("network-setup-"));
+  if (portJob) {
+    parts.push(progressBar(portJob, "Configuring the fast ports…"));
+  } else {
+    parts.push(failureNote(latestJob((job) => job.kind.startsWith("network-setup-")), "Setting up the ports"));
+    if (fixable.length) {
+      const names = fixable.map((node) => node.hostname || node.ssh).join(", ");
+      parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="setup-ports"><svg><use href="#i-bolt"/></svg>Set up the ports</button>',
+        "Writes the port addresses, MTU and ARP settings on " + esc(names) + " and applies them with netplan. The fast ports drop for a moment."));
+    }
   }
-  if (setup.nodes.some((node) => node.network_fix)) {
-    parts.push('<p class="guide-note">The commands set each port\'s address and the jumbo frames the fast network needs, and keep them after a restart. Press Check again when they have run.</p>');
+  if (fixable.length) {
+    parts.push('<details class="fabric-manual"><summary>Prefer to run the commands yourself</summary>' +
+      fixable.map((node) => codeBlock("Run on " + esc(node.hostname || node.ssh) + " in a terminal", node.network_fix)).join("") +
+      "</details>");
   }
   const plan = setup.plan;
   if (plan) {
@@ -1555,10 +1668,30 @@ function networkBody(state, model) {
       (plan.nccl_ib_gid_index === null || plan.nccl_ib_gid_index === undefined ? "" : ", GID index " + plan.nccl_ib_gid_index) +
       ", reaching the Sparks at " + esc(plan.peers.join(", ")) + "." + (applied ? " These settings are saved." : "") + "</p>");
     if (!applied) {
-      parts.push('<div class="guide-actions"><span class="guide-hint"></span><button class="btn btn-primary" type="button" data-act="apply-network">Use these settings</button></div>');
+      parts.push('<div class="guide-actions"><span class="guide-hint">Writes the NCCL environment and peer addresses into the saved configuration.</span><button class="btn btn-primary" type="button" data-act="apply-network">Use these settings</button></div>');
     }
   }
   return parts.join("");
+}
+
+
+async function chooseFabric(schedule) {
+  if (schedule !== "switched" && schedule !== "switchless") return;
+  const state = S.state;
+  if (!state || !state.config) return;
+  const current = (state.config.cluster && state.config.cluster.fabric_schedule) || "switched";
+  if (current === schedule) return;
+  const config = JSON.parse(JSON.stringify(state.config));
+  config.cluster.fabric_schedule = schedule;
+  try {
+    await api("/api/config", { method: "PUT", body: JSON.stringify({ config }) });
+    toast(schedule === "switchless" ? "Switchless ring selected." : "Switched fabric selected.");
+    // refreshState() repaints the form only when there are no unsaved edits; the fabric
+    // cards read the saved schedule, so they update either way.
+    await refreshState();
+  } catch (error) {
+    toast("Not saved: " + error.message, true);
+  }
 }
 
 async function applyNetwork() {
@@ -2117,6 +2250,12 @@ function bindGuide() {
         break;
       case "apply-network":
         applyNetwork();
+        break;
+      case "choose-fabric":
+        chooseFabric(action.dataset.fabric);
+        break;
+      case "setup-ports":
+        postAction("/api/network/setup", undefined, false);
         break;
       case "install":
         if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);

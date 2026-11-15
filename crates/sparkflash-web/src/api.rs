@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{
     CommandSpec, ServeAction, SyncTarget, SyncWhat, convert_command, download_command,
-    inspect_command, local_hostname, prepare_command, prepared_probe_command, serve_action_command,
-    sync_command,
+    fabric_probe_command, inspect_command, local_hostname, network_fix_command, prepare_command,
+    prepared_probe_command, serve_action_command, sync_command,
 };
 use crate::config::{
     MAX_CONCURRENCY, MODEL_PROFILES, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID,
@@ -87,6 +87,20 @@ const MODEL_EXCLUSIVE: &[&str] = &[
 
 /// How long one node check may take, on top of the SSH connect timeout.
 const INSPECT_SECS: u64 = 60;
+
+/// How long the per-rank link probe may take, on top of the SSH connect timeout.
+const FABRIC_SECS: u64 = 20;
+
+/// What a fast-port setup must not overlap: a launch or stop, and the jobs that move model bytes,
+/// since reconfiguring the ports can drop in-flight transfers.
+const NETWORK_SETUP_EXCLUSIVE: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "download",
+    "sync-model",
+    "sync-software",
+];
 
 /// How long a stop or its confirmation through the launcher may take.
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -531,6 +545,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/discover", post(discover))
         .route("/api/inspect", post(inspect_nodes))
         .route("/api/network/apply", post(apply_network))
+        .route("/api/network/setup", post(network_setup))
         .route("/api/models", get(models))
         .route("/api/models/search", get(models_search))
         .route("/api/models/inspect", get(models_inspect))
@@ -932,7 +947,54 @@ fn run_inspect(config: &SparkConfig, probe: &dyn SshProbe) -> SetupReport {
             })
             .collect()
     });
-    inspect::analyze(config, &probes, lead_model_complete(config), now_ms())
+    let fabric = run_fabric_probe(config, probe, &probes);
+    inspect::analyze_fabric(
+        config,
+        &probes,
+        fabric,
+        lead_model_complete(config),
+        now_ms(),
+    )
+}
+
+/// Measures which fast port reaches which Spark: one read-only probe per node, run in parallel,
+/// `None` when the ranks have no usable fast port to probe from.
+fn run_fabric_probe(
+    config: &SparkConfig,
+    probe: &dyn SshProbe,
+    probes: &[ProbeResult],
+) -> Option<inspect::Fabric> {
+    let peers = inspect::planned_peers(config, probes)?;
+    let world = probes.len();
+    let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs + FABRIC_SECS);
+    let results: Vec<Option<inspect::FabricProbe>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..world)
+            .map(|rank| {
+                let peers: Vec<(usize, String)> = peers
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != rank)
+                    .map(|(index, address)| (index, address.clone()))
+                    .collect();
+                let netdevs: Vec<String> = probes[rank]
+                    .as_ref()
+                    .map(|facts| facts.rails().into_iter().map(|rail| rail.netdev).collect())
+                    .unwrap_or_default();
+                let command = fabric_probe_command(config, rank, &netdevs, &peers);
+                scope.spawn(move || {
+                    probe
+                        .capture(&command, timeout)
+                        .ok()
+                        .map(|text| inspect::parse_fabric(rank, &text))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(None))
+            .collect()
+    });
+    Some(inspect::fabric_from_probes(results, world))
 }
 
 /// Whether the lead holds the whole checkpoint: a download left no `.incomplete` blob behind, or
@@ -967,6 +1029,51 @@ async fn apply_network(State(web): State<WebState>) -> Response {
     };
     plan.apply(&mut config);
     store_config(&web, config)
+}
+
+/// Applies the fast-port configuration the last check computed on every node that needs it: one
+/// SSH job per node running under `sudo -n`. Refuses when nothing is waiting to be applied.
+async fn network_setup(State(web): State<WebState>) -> Response {
+    let config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    let fixes: Vec<(usize, String)> = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .map(|report| {
+            report
+                .nodes
+                .iter()
+                .filter_map(|node| {
+                    node.network_fix_remote
+                        .clone()
+                        .map(|remote| (node.rank, remote))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if fixes.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the fast ports already match the plan; check the nodes to recompute",
+        );
+    }
+    let mut started = Vec::new();
+    for (rank, remote) in fixes {
+        let command = network_fix_command(&config, rank, &remote);
+        match web
+            .jobs
+            .start_exclusive(command, NETWORK_SETUP_EXCLUSIVE)
+            .await
+        {
+            Ok(id) => started.push(id),
+            Err(error) => return api_error(StatusCode::CONFLICT, error.message),
+        }
+    }
+    accepted_jobs(&web, &started)
 }
 
 /// Downloads the configured model into the lead's Hugging Face cache.
@@ -2058,7 +2165,19 @@ mod tests {
         }
     }
 
-    struct FakeSsh;
+    /// A healthy four-Spark cluster. When `fresh_rank` is set, that rank's fast ports are
+    /// reported as cabled but unconfigured (no addresses, MTU 1500), which is the state the
+    /// one-click port fix exists for.
+    struct FakeSsh {
+        fresh_rank: Option<usize>,
+    }
+    impl FakeSsh {
+        fn fresh_node_text(rank: usize) -> String {
+            format!(
+                "host spark-{rank}\nport rocep1s0f1 ACTIVE 200\ngid rocep1s0f1 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1\ngid rocep1s0f1 1 RoCE_v2 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1\nport roceP2p1s0f1 ACTIVE 200\ngid roceP2p1s0f1 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0006 enP2p1s0f1np1\narp all 0 0\nlink enp1s0f1np1 1500 up 0 0\nlink enP2p1s0f1np1 1500 up 0 0\n"
+            )
+        }
+    }
     impl SshProbe for FakeSsh {
         fn probe(&self, _command: &CommandSpec) -> ProbeOutcome {
             ProbeOutcome {
@@ -2089,8 +2208,31 @@ mod tests {
                     })
                     .expect("an ssh destination")
             };
-            if rank == 3 {
+            if command.kind == "fabric-probe" {
+                if self.fresh_rank == Some(rank) {
+                    // Ports cabled but unconfigured: nothing answers.
+                    return Ok((0..4)
+                        .filter(|peer| *peer != rank)
+                        .map(|peer| format!("ping {peer} no\n"))
+                        .collect());
+                }
+                // A fully switched fabric: this rank's port reaches every other rank.
+                if rank == 3 {
+                    return Err("Permission denied (publickey).".to_owned());
+                }
+                let mut reply = String::new();
+                for peer in 0..4 {
+                    if peer != rank {
+                        reply.push_str(&format!("link {peer} dev{rank} ok\nping {peer} ok\n"));
+                    }
+                }
+                return Ok(reply);
+            }
+            if rank == 3 && self.fresh_rank.is_none() {
                 return Err("Permission denied (publickey).".to_owned());
+            }
+            if self.fresh_rank == Some(rank) {
+                return Ok(Self::fresh_node_text(rank));
             }
             let rank = u8::try_from(rank).expect("rank");
             Ok(crate::inspect::tests::node_text(
@@ -2105,10 +2247,33 @@ mod tests {
         test_state_with(dir, false, None)
     }
 
+    fn test_state_with_ssh(
+        dir: &std::path::Path,
+        exists: bool,
+        load_error: Option<String>,
+        ssh: Arc<dyn SshProbe>,
+    ) -> WebState {
+        test_state_inner(dir, exists, load_error, ssh)
+    }
+
     fn test_state_with(
         dir: &std::path::Path,
         exists: bool,
         load_error: Option<String>,
+    ) -> WebState {
+        test_state_inner(
+            dir,
+            exists,
+            load_error,
+            Arc::new(FakeSsh { fresh_rank: None }),
+        )
+    }
+
+    fn test_state_inner(
+        dir: &std::path::Path,
+        exists: bool,
+        load_error: Option<String>,
+        ssh: Arc<dyn SshProbe>,
     ) -> WebState {
         let mut config = SparkConfig::default();
         // Never the real ~/.cache: each test's hub cache starts empty.
@@ -2124,7 +2289,7 @@ mod tests {
             load_error,
             exists,
             discovery: Arc::new(FakeDiscovery),
-            ssh: Arc::new(FakeSsh),
+            ssh,
             jobs: Arc::new(JobManager::new()),
             stats,
             telemetry: Arc::new(TelemetrySource::new("http://127.0.0.1:9")),
@@ -2967,6 +3132,64 @@ mod tests {
                 "{uri}: {body}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn network_setup_requires_a_check_and_only_touches_nodes_that_need_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state);
+
+        // Nothing checked yet: the endpoint refuses rather than guess.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Rank 3 is the only node whose ports are unconfigured; exactly one job starts.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        let jobs = body["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 1, "{body}");
+        assert_eq!(jobs[0]["kind"], "network-setup-r3");
+    }
+
+    #[tokio::test]
+    async fn network_setup_conflicts_when_the_ports_are_already_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state(dir.path()));
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     fn post_json(uri: &str, body: &str) -> Request<Body> {
