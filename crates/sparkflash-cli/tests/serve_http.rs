@@ -114,6 +114,21 @@ impl SyntheticServer {
         delay_ms: u64,
         keep_alive_ms: Option<u64>,
     ) -> Self {
+        let spec = serde_json::json!({
+            "pieces": pieces,
+            "finish_reason": "stop",
+            "delay_ms": delay_ms,
+        });
+        Self::start_scripted_spec(extra, env, &spec, keep_alive_ms)
+    }
+
+    /// Starts the debug-build scripted engine from a whole SPARKFLASH_SERVE_SCRIPT spec.
+    fn start_scripted_spec(
+        extra: &[&str],
+        env: &[(&str, &str)],
+        spec: &serde_json::Value,
+        keep_alive_ms: Option<u64>,
+    ) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "sparkflash-serve-script-{}-{}",
@@ -122,12 +137,7 @@ impl SyntheticServer {
         ));
         std::fs::create_dir_all(&dir).expect("script directory");
         let script = dir.join("script.json");
-        let spec = serde_json::json!({
-            "pieces": pieces,
-            "finish_reason": "stop",
-            "delay_ms": delay_ms,
-        });
-        std::fs::write(&script, serde_json::to_vec(&spec).expect("script JSON"))
+        std::fs::write(&script, serde_json::to_vec(spec).expect("script JSON"))
             .expect("script file");
         let tokenizer = sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path();
         let mut args = vec!["--synthetic", "--bind", "127.0.0.1:0"];
@@ -2630,6 +2640,64 @@ fn a_refused_device_window_is_fail_closed_and_names_the_reason() {
         derived_server.log()
     );
     assert_eq!(response.json()["choices"][0]["text"], expected.as_str());
+}
+
+#[test]
+fn a_drain_that_times_out_ends_the_process_whatever_is_stuck() {
+    // The drain timeout bounds a shutdown. A request still in flight when it fires is abandoned,
+    // and so is a backend that cannot let go: here the engine's last owner blocks a minute as it
+    // drops, the way a rank whose peers are gone blocks in a collective, and a C exit handler
+    // blocks a minute too, the way the CUDA driver's and NCCL's teardown wait on that rank's
+    // stuck threads. The process must still exit just after the timeout, not when either lets go.
+    let spec = serde_json::json!({
+        "pieces": ["a", "b", "c", "d", "e"],
+        "finish_reason": "stop",
+        "delay_ms": 2000,
+        "stall_on_drop_ms": 60000,
+        "stall_at_exit_ms": 60000,
+    });
+    let mut server = SyntheticServer::start_scripted_spec(
+        &[],
+        &[("SPARKFLASH_SERVE_DRAIN_TIMEOUT_MS", "300")],
+        &spec,
+        None,
+    );
+    let address = server
+        .base
+        .strip_prefix("http://")
+        .expect("the server prints an http URL")
+        .to_owned();
+    let body = chat_body(serde_json::json!({"stream": true}));
+    let mut stream = TcpStream::connect(&address).expect("connect to the test server");
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .expect("read timeout");
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("write the streaming request");
+    let mut head = [0u8; 256];
+    let read = stream
+        .read(&mut head)
+        .expect("read the first response bytes");
+    assert!(read > 0, "log: {}", server.log());
+    server.send_sigterm();
+    let status = server
+        .wait_for_exit(Duration::from_secs(15))
+        .expect("the server exits once its drain times out, not when the engine lets go");
+    assert!(
+        !status.success(),
+        "a drain that timed out is a failed exit: {status:?}\n{}",
+        server.log()
+    );
+    let log = server.log();
+    assert!(
+        log.contains("phase=drain_timeout") && log.contains("forced_exit=1"),
+        "missing the forced exit in:\n{log}"
+    );
 }
 
 #[test]

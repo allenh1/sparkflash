@@ -6591,6 +6591,8 @@ struct ScriptedEngineSpec {
     pieces: Vec<String>,
     finish_reason: FinishReason,
     delay_ms: Option<u64>,
+    stall_on_drop_ms: Option<u64>,
+    stall_at_exit_ms: Option<u64>,
 }
 
 /// Reads the debug-build wire seed, when it is set.
@@ -6602,9 +6604,12 @@ fn scripted_engine_spec() -> Option<Result<ScriptedEngineSpec, String>> {
 
 /// Parses the debug-build wire seed.
 ///
-/// Shape: {"pieces": ["first content piece", ...], "finish_reason": "stop", "delay_ms": 0}.
-/// The pieces are handed to the mock engine as its content deltas, so the wire test controls
-/// the exact token boundaries the streaming parser sees.
+/// Shape: {"pieces": ["first content piece", ...], "finish_reason": "stop", "delay_ms": 0,
+/// "stall_on_drop_ms": 0, "stall_at_exit_ms": 0}. The pieces are handed to the mock engine as its
+/// content deltas, so the wire test controls the exact token boundaries the streaming parser sees;
+/// `stall_on_drop_ms` makes the engine's last owner block that long as it drops, like a rank whose
+/// peers are gone, and `stall_at_exit_ms` makes the C exit handlers block that long, like the CUDA
+/// driver's and NCCL's teardown waiting on that rank's stuck threads.
 #[cfg(debug_assertions)]
 fn parse_scripted_engine(path: &Path) -> Result<ScriptedEngineSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|error| {
@@ -6644,11 +6649,35 @@ fn parse_scripted_engine(path: &Path) -> Result<ScriptedEngineSpec, String> {
         }
     };
     let delay_ms = value.get("delay_ms").and_then(serde_json::Value::as_u64);
+    let stall_on_drop_ms = value
+        .get("stall_on_drop_ms")
+        .and_then(serde_json::Value::as_u64);
+    let stall_at_exit_ms = value
+        .get("stall_at_exit_ms")
+        .and_then(serde_json::Value::as_u64);
     Ok(ScriptedEngineSpec {
         pieces,
         finish_reason,
         delay_ms,
+        stall_on_drop_ms,
+        stall_at_exit_ms,
     })
+}
+
+/// Registers a C exit handler that blocks `stall_ms` (debug-build wire seed).
+#[cfg(debug_assertions)]
+fn stall_at_exit(stall_ms: u64) -> Result<(), String> {
+    static STALL_MS: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn stall() {
+        std::thread::sleep(Duration::from_millis(STALL_MS.load(Ordering::Relaxed)));
+    }
+    STALL_MS.store(stall_ms, Ordering::Relaxed);
+    // SAFETY: the handler captures nothing and only sleeps.
+    if unsafe { libc::atexit(stall) } == 0 {
+        Ok(())
+    } else {
+        Err("atexit refused the scripted exit stall".to_owned())
+    }
 }
 
 /// The debug-build keep-alive override, in milliseconds.
@@ -6675,6 +6704,15 @@ fn run_scripted(
         .with_finish_reason(scripted.finish_reason);
     if let Some(delay_ms) = scripted.delay_ms {
         engine = engine.with_delay(Duration::from_millis(delay_ms));
+    }
+    if let Some(stall_ms) = scripted.stall_on_drop_ms {
+        engine = engine.with_stall_on_drop(Duration::from_millis(stall_ms));
+    }
+    if let Some(stall_ms) = scripted.stall_at_exit_ms
+        && let Err(error) = stall_at_exit(stall_ms)
+    {
+        eprintln!("sparkflash serve: {error}");
+        return ExitCode::FAILURE;
     }
     eprintln!(
         "sparkflash serve: debug scripted engine (no checkpoint): {} content piece(s), keep-alive {:?} ms",
@@ -6784,7 +6822,19 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
             print_stage_timing_ledger();
             print_exchange_stats();
             print_plan_stats();
-            ExitCode::FAILURE
+            // Forced means the process ends here. Returning would drop the runtime and the
+            // backend, and both wait for the request the drain gave up on; on a rank whose peers
+            // are gone that is a collective that never completes, and the process outlived its
+            // own timeout until it was killed. `std::process::exit` is not enough either: it
+            // still runs the C exit handlers and library destructors (the CUDA driver's, NCCL's),
+            // and those wait on the same stuck threads, so rank 0 sat in a futex inside `exit`.
+            // `_exit` skips them; the kernel releases the GPU context and the RDMA resources the
+            // way it does for a kill.
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            // SAFETY: `_exit` takes no pointers and does not return; everything this process
+            // must say is flushed above.
+            unsafe { libc::_exit(1) }
         }
     }
 }

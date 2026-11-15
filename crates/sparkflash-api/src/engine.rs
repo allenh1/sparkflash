@@ -816,6 +816,18 @@ pub struct MockEngine {
     vocab_size: Option<usize>,
     /// What this mock answers for [`InferenceEngine::health`]; `None` is healthy.
     unhealthy: Option<String>,
+    /// Shared by every clone, so only the last one to go stalls ([`MockEngine::with_stall_on_drop`]).
+    stall_on_drop: Option<Arc<StallOnDrop>>,
+}
+
+/// Blocks the thread that drops it ([`MockEngine::with_stall_on_drop`]).
+#[derive(Debug)]
+struct StallOnDrop(Duration);
+
+impl Drop for StallOnDrop {
+    fn drop(&mut self) {
+        std::thread::sleep(self.0);
+    }
 }
 
 impl MockEngine {
@@ -839,6 +851,7 @@ impl MockEngine {
             prompt_logprobs: None,
             vocab_size: None,
             unhealthy: None,
+            stall_on_drop: None,
         }
     }
 
@@ -929,6 +942,17 @@ impl MockEngine {
     #[must_use]
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Makes the last clone of this mock block the thread that drops it for `stall`.
+    ///
+    /// A real backend can do that: a rank whose peers are gone can sit in a collective that never
+    /// completes, and whatever drops it waits with it. The serve tests use this to prove that a
+    /// drain which times out still ends the process.
+    #[must_use]
+    pub fn with_stall_on_drop(mut self, stall: Duration) -> Self {
+        self.stall_on_drop = Some(Arc::new(StallOnDrop(stall)));
         self
     }
 
