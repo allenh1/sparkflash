@@ -570,9 +570,13 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
     }
 }
 
-// grid (ceil(span / (RUN * WARPS)), kv_heads, rows), block 32 * INKLING_SCORE_WARPS: a warp
-// scores RUN keys for every query head of one KV group (groups <= INKLING_MAX_GROUPS), so a key
-// row is loaded once a group.
+// grid (blocks, kv_heads, rows), block 32 * INKLING_SCORE_WARPS: a warp scores runs of RUN keys
+// for every query head of one KV group (groups <= INKLING_MAX_GROUPS), so a key row is loaded
+// once a group. Warp w of block b takes the run at (b * WARPS + w) * RUN and every
+// gridDim.x * WARPS * RUN keys after it, so any grid covers the pass; the host caps gridDim.x
+// (SCORE_GRID in device.rs) and a long pass's warps then walk many runs. A warp prepares its
+// queries once, and the next run's key loads are in flight while it scores the current one.
+// Every score is the same arithmetic whatever the grid: only which warp computes it changes.
 extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_attn_scores(
     const float* __restrict__ q,
     const __nv_bfloat16* __restrict__ keys,
@@ -613,9 +617,10 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
     const int position = first_position + row;
     const int64_t first = inkling_attn_first_slot(position, window);
     const int64_t count = (int64_t)position - first + 1;
-    const int64_t begin =
-        pass_first + ((int64_t)blockIdx.x * INKLING_SCORE_WARPS + warp) * INKLING_SCORE_RUN;
     const int64_t end = pass_first + pass_slots < count ? pass_first + pass_slots : count;
+    const int64_t stride = (int64_t)gridDim.x * INKLING_SCORE_WARPS * INKLING_SCORE_RUN;
+    int64_t begin =
+        pass_first + ((int64_t)blockIdx.x * INKLING_SCORE_WARPS + warp) * INKLING_SCORE_RUN;
     if (begin >= end) {
         return;
     }
@@ -642,57 +647,98 @@ extern "C" __global__ void __launch_bounds__(32 * INKLING_SCORE_WARPS) inkling_a
     const uint64_t kv_stride = (uint64_t)kv_heads * head_dim;
     const uint64_t kv_offset = (uint64_t)kv_head * head_dim;
     const float* gains = key_gains + (uint64_t)kv_head * scale_stride - scale_first;
+    float gain[INKLING_MAX_HEAD_DIM / 32];
 #pragma unroll
-    for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
-        const int64_t index = begin + i;
-        if (index < end) {
-            const int64_t slot = first + index;
-            const __nv_bfloat16* krow =
-                keys + inkling_attn_cache_row(slot, cache_rows) * kv_stride + kv_offset;
-            const float k_gain = gains[slot];
-            float kv[INKLING_MAX_HEAD_DIM / 32];
+    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+        const int dim = (int)lane + 32 * step;
+        gain[step] =
+            dim < head_dim && k_scale != nullptr ? k_scale[(uint64_t)kv_head * head_dim + dim] : 1.0f;
+    }
+    // loaded[i][step]: this lane's BF16 of key `at + i`, dim lane + 32 step.
+    __nv_bfloat16 loaded[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
+    const auto load = [&](int64_t at) {
 #pragma unroll
-            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                const int dim = (int)lane + 32 * step;
-                const float gain = dim < head_dim && k_scale != nullptr
-                                       ? k_scale[(uint64_t)kv_head * head_dim + dim]
-                                       : 1.0f;
-                kv[step] = dim < head_dim ? __fmul_rn(__bfloat162float(krow[dim]), gain) : 0.0f;
-                kv[step] = __fmul_rn(kv[step], k_gain);
-            }
-            const int64_t distance = (int64_t)position - slot;
-            const bool biased =
-                d_rel > 0 && rel_extent > 0 && distance >= 0 && distance < rel_extent;
-            const float bank = biased && lane < (unsigned int)d_rel
-                                   ? __bfloat162float(
-                                         rel_bank[(uint64_t)lane * rel_extent + (uint64_t)distance])
-                                   : 0.0f;
-            // Sums 0-7: a head's dot; 8-15: its relative bias.
-            float sums[2 * INKLING_MAX_GROUPS];
-#pragma unroll
-            for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
-                float dot = 0.0f;
+        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
+            if (at + i < end) {
+                const __nv_bfloat16* krow =
+                    keys + inkling_attn_cache_row(first + at + i, cache_rows) * kv_stride +
+                    kv_offset;
 #pragma unroll
                 for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
-                    dot = __fadd_rn(dot, __fmul_rn(qv[g][step], kv[step]));
+                    const int dim = (int)lane + 32 * step;
+                    loaded[i][step] = dim < head_dim ? krow[dim] : __float2bfloat16(0.0f);
                 }
-                sums[g] = dot;
-                sums[INKLING_MAX_GROUPS + g] =
-                    lane < (unsigned int)d_rel ? __fmul_rn(rv[g], bank) : 0.0f;
-            }
-            // Lane 2g holds head g's dot, lane 16 + 2g its bias.
-            const float total = inkling_attn_warp_sums<2 * INKLING_MAX_GROUPS>(sums);
-            const float bias = __shfl_sync(0xffffffffu, total, (lane + 16u) & 31u);
-            const int g = (int)(lane >> 1);
-            if ((lane & 1u) == 0 && g < groups) {
-                float score = __fmul_rn(total, inv_dim);
-                if (biased) {
-                    score = __fadd_rn(score, bias);
-                }
-                const int head = kv_head * groups + g;
-                scores[((uint64_t)row * heads + head) * pass_slots + (index - pass_first)] = score;
             }
         }
+    };
+    load(begin);
+    for (;;) {
+        __nv_bfloat16 run[INKLING_SCORE_RUN][INKLING_MAX_HEAD_DIM / 32];
+#pragma unroll
+        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
+#pragma unroll
+            for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                run[i][step] = loaded[i][step];
+            }
+        }
+        const int64_t next = begin + stride;
+        if (next < end) {
+            load(next);
+        }
+#pragma unroll
+        for (int i = 0; i < INKLING_SCORE_RUN; ++i) {
+            const int64_t index = begin + i;
+            if (index < end) {
+                const int64_t slot = first + index;
+                const float k_gain = gains[slot];
+                float kv[INKLING_MAX_HEAD_DIM / 32];
+#pragma unroll
+                for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                    const int dim = (int)lane + 32 * step;
+                    kv[step] =
+                        dim < head_dim ? __fmul_rn(__bfloat162float(run[i][step]), gain[step]) : 0.0f;
+                    kv[step] = __fmul_rn(kv[step], k_gain);
+                }
+                const int64_t distance = (int64_t)position - slot;
+                const bool biased =
+                    d_rel > 0 && rel_extent > 0 && distance >= 0 && distance < rel_extent;
+                const float bank =
+                    biased && lane < (unsigned int)d_rel
+                        ? __bfloat162float(
+                              rel_bank[(uint64_t)lane * rel_extent + (uint64_t)distance])
+                        : 0.0f;
+                // Sums 0-7: a head's dot; 8-15: its relative bias.
+                float sums[2 * INKLING_MAX_GROUPS];
+#pragma unroll
+                for (int g = 0; g < INKLING_MAX_GROUPS; ++g) {
+                    float dot = 0.0f;
+#pragma unroll
+                    for (int step = 0; step < INKLING_MAX_HEAD_DIM / 32; ++step) {
+                        dot = __fadd_rn(dot, __fmul_rn(qv[g][step], kv[step]));
+                    }
+                    sums[g] = dot;
+                    sums[INKLING_MAX_GROUPS + g] =
+                        lane < (unsigned int)d_rel ? __fmul_rn(rv[g], bank) : 0.0f;
+                }
+                // Lane 2g holds head g's dot, lane 16 + 2g its bias.
+                const float total = inkling_attn_warp_sums<2 * INKLING_MAX_GROUPS>(sums);
+                const float bias = __shfl_sync(0xffffffffu, total, (lane + 16u) & 31u);
+                const int g = (int)(lane >> 1);
+                if ((lane & 1u) == 0 && g < groups) {
+                    float score = __fmul_rn(total, inv_dim);
+                    if (biased) {
+                        score = __fadd_rn(score, bias);
+                    }
+                    const int head = kv_head * groups + g;
+                    scores[((uint64_t)row * heads + head) * pass_slots + (index - pass_first)] =
+                        score;
+                }
+            }
+        }
+        if (next >= end) {
+            break;
+        }
+        begin = next;
     }
 }
 

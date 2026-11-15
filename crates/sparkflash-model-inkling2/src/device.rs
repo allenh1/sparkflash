@@ -95,6 +95,11 @@ const ATTENTION_BLOCK: u32 = 32;
 /// (32 * INKLING_SCORE_WARPS), and the keys one block covers (INKLING_SCORE_RUN a warp).
 const SCORE_BLOCK: u32 = 128;
 const SCORE_KEYS: usize = 16;
+/// The most blocks a row's score launch takes along its keys: inkling_attn_scores strides its
+/// warps over the pass, so past this a warp walks several runs with the next run's loads in
+/// flight instead of the grid growing. 96 (four blocks an SM with two KV heads) measured best at
+/// 1k, 5k, 93k and 262k keys; the grid changes which warp scores a key, never its bits.
+const SCORE_GRID: u32 = 96;
 /// The threads one (head, row) of the split walk's recurrence runs (INKLING_MAX_HEAD_DIM: a dim a
 /// thread).
 const MIX_BLOCK: u32 = 128;
@@ -1784,7 +1789,11 @@ impl Shared {
             };
             self.launch(
                 self.kernels.attention_scores,
-                (grid_blocks(span, SCORE_KEYS), kv_heads as u32, rows as u32),
+                (
+                    grid_blocks(span, SCORE_KEYS).min(SCORE_GRID),
+                    kv_heads as u32,
+                    rows as u32,
+                ),
                 (SCORE_BLOCK, 1, 1),
                 &[
                     queries.0,
