@@ -1536,7 +1536,7 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0, with the 0 to 2 and 1 to 3 hairpins. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the ConnectX-7 hairpin on the Spark between them. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
   },
 ];
 
@@ -1586,7 +1586,13 @@ function fabricPicker(state, model) {
   } else if (recommended && recommended !== chosen) {
     parts.push('<div class="guide-actions"><span class="guide-hint">The measured wiring is ' + esc(FABRIC_SHAPE_NAMES[shape]) + '; the saved schedule is ' + esc(chosen) + '.</span><button class="btn btn-primary" type="button" data-act="choose-fabric" data-fabric="' + recommended + '">Use the measured fabric</button></div>');
   } else if (measured && recommended === chosen) {
-    parts.push('<p class="guide-note fabric-ok">The saved schedule matches the measured wiring.</p>');
+    // A ring's non-neighbours are not cabled to each other: the ConnectX-7 hairpin on the Spark
+    // between the two cables forwards them, and the launch dials every rank, so the note says
+    // what the check has to see rather than implying the cables alone carry the traffic.
+    const hairpin = shape === "ring"
+      ? " Non-neighbours are reached through the ConnectX-7 hairpin on the Spark between the two cables; every Spark has to answer before the launch can connect to it."
+      : "";
+    parts.push('<p class="guide-note fabric-ok">The saved schedule matches the measured wiring.' + hairpin + "</p>");
   } else if (measured && shape === "pairs") {
     parts.push('<p class="guide-note">Each Spark has both fast ports wired to the same Spark: two-node pairs, not a ring. The collectives still run, but ranks across the pairs fall back to the slow path. Rewire to 0-1-2-3-0 with the 0-2 and 1-3 hairpins for the full ring.</p>');
   } else if (measured && shape === "unknown") {
@@ -1617,7 +1623,7 @@ function measuredLinks(setup, measured) {
     }
     const ports = [...byPeer.entries()]
       .sort((a, b) => a[0] - b[0])
-      .map(([peer, netdevs]) => nameOf(peer) + " via " + netdevs.sort().map(esc).join(", "))
+      .map(([peer, netdevs]) => nameOf(peer) + " via " + [...new Set(netdevs)].sort().map(esc).join(", "))
       .join(" · ");
     return '<li><span class="host-name">' + nameOf(rank) + '</span><span class="host-meta">' + ports + "</span></li>";
   });
@@ -1700,6 +1706,10 @@ async function chooseFabric(schedule) {
     // refreshState() repaints the form only when there are no unsaved edits; the fabric
     // cards read the saved schedule, so they update either way.
     await refreshState();
+    // The findings were computed against the old schedule, and a schedule that no longer matches
+    // the wiring is one of them. Check again so step 2 shows one verdict, not the old one plus
+    // the new choice.
+    await inspect(true);
   } catch (error) {
     toast("Not saved: " + error.message, true);
   }

@@ -37,7 +37,7 @@ use crate::config::{
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
 use crate::fit::Cluster;
 use crate::hf::{self, CachedModel, RemoteModel};
-use crate::inspect::{self, Check, ProbeResult, SetupReport};
+use crate::inspect::{self, Check, ProbeResult, SetupReport, Severity};
 use crate::jobs::{JobManager, JobStatus, JobSummary};
 use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 
@@ -47,8 +47,17 @@ use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 pub const ACTION_HEADER: &str = "x-sparkflash-web";
 
 /// The cluster actions that change whether the group runs; one at a time. A swap is the
-/// in-process stop, switch and launch sequence, so it is exclusive with both.
-const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop", "swap"];
+/// in-process stop, switch and launch sequence, so it is exclusive with both. A fast-port setup
+/// can drop the links a running group talks over, so it excludes these as well.
+const CLUSTER_STATE_KINDS: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
+];
 
 /// What a conversion must not overlap: a launch, stop or swap, or the checkpoint changing
 /// under it.
@@ -1109,6 +1118,20 @@ async fn network_setup(State(web): State<WebState>) -> Response {
             "rank 0 is online; stop the cluster before reconfiguring the fast ports",
         );
     }
+    // A port job holds its rank's own kind, so it cannot start twice; the other ranks of the
+    // same pass have different kinds, so a second click would start them again while the first
+    // pass is still running. One pass at a time.
+    if let Some(id) = web.jobs.running_in(&[
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
+    ]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("port setup job {id} is already running"),
+        );
+    }
     let fixes: Vec<(usize, String)> = report
         .nodes
         .iter()
@@ -1119,9 +1142,33 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         })
         .collect();
     if fixes.is_empty() {
+        // Nothing to apply. That is only "the ports already match" when the check compared every
+        // node: one that did not answer, or one whose problem no port fix can write, leaves this
+        // button with nothing to do and must be named instead of certified.
+        let waiting: Vec<String> = report
+            .nodes
+            .iter()
+            .filter(|node| {
+                !node.reachable
+                    || (node.network_fix.is_none()
+                        && report.findings.iter().any(|finding| {
+                            finding.rank == Some(node.rank) && finding.severity == Severity::Error
+                        }))
+            })
+            .map(|node| node.hostname.clone().unwrap_or_else(|| node.ssh.clone()))
+            .collect();
+        if waiting.is_empty() {
+            return api_error(
+                StatusCode::CONFLICT,
+                "the fast ports already match the plan; check the nodes to recompute",
+            );
+        }
         return api_error(
             StatusCode::CONFLICT,
-            "the fast ports already match the plan; check the nodes to recompute",
+            format!(
+                "the last check still reports a problem on {}; fix it and check the nodes again",
+                waiting.join(", ")
+            ),
         );
     }
     let mut started = Vec::new();
@@ -2351,6 +2398,57 @@ mod tests {
         }
     }
 
+    /// A four-Spark cluster where every node answers and every fast port is already configured,
+    /// so the node check finds nothing for the port fix to write.
+    struct HealthySsh;
+    impl SshProbe for HealthySsh {
+        fn probe(&self, _command: &CommandSpec) -> ProbeOutcome {
+            ProbeOutcome {
+                ok: true,
+                message: String::new(),
+            }
+        }
+
+        fn capture(
+            &self,
+            command: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            if command.kind == "prepared" {
+                return Ok("ready".to_owned());
+            }
+            let rank = if command.program == "bash" {
+                0
+            } else {
+                (1..4)
+                    .find(|rank| {
+                        command
+                            .args
+                            .iter()
+                            .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                    })
+                    .expect("an ssh destination")
+            };
+            if command.kind == "fabric-probe" {
+                let mut reply = String::new();
+                for peer in 0..4 {
+                    if peer != rank {
+                        reply.push_str(&format!(
+                            "link {peer} dev{rank} ok\nping {peer} dev{rank} ok\n"
+                        ));
+                    }
+                }
+                return Ok(reply);
+            }
+            let rank = u8::try_from(rank).expect("rank");
+            Ok(crate::inspect::tests::node_text(
+                &format!("spark-{rank}"),
+                11 + rank,
+                21 + rank,
+            ))
+        }
+    }
+
     fn test_state(dir: &std::path::Path) -> WebState {
         test_state_with(dir, false, None)
     }
@@ -3383,6 +3481,36 @@ mod tests {
     #[tokio::test]
     async fn network_setup_conflicts_when_the_ports_are_already_configured() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(HealthySsh),
+        ));
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("already match the plan"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_does_not_certify_a_node_the_check_could_not_compare() {
+        // Rank 3 does not answer the node check, so its ports were never compared with the plan.
+        // Nothing is left for the button to apply, and the answer must name the node instead of
+        // claiming its ports already match.
+        let dir = tempfile::tempdir().expect("tempdir");
         let app = test_router(test_state(dir.path()));
         let response = app
             .clone()
@@ -3395,6 +3523,50 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("still reports a problem on"), "{error}");
+        assert!(!error.contains("already match"), "{error}");
+    }
+
+    #[test]
+    fn a_port_setup_and_the_cluster_state_actions_exclude_each_other() {
+        // NETWORK_SETUP_EXCLUSIVE names what a port job must wait for; CLUSTER_STATE_KINDS is
+        // what a stop waits for. The two directions have to cover each other or one of them can
+        // start while the other is running.
+        for kind in [
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
+        ] {
+            assert!(
+                CLUSTER_STATE_KINDS.contains(&kind),
+                "a stop must wait for {kind}"
+            );
+        }
+        // The port jobs stay out of their own list on purpose: one pass runs four of them at
+        // once, so only the cluster-state actions have to be in both directions.
+        for kind in ["launch", "stop", "swap"] {
+            assert!(
+                NETWORK_SETUP_EXCLUSIVE.contains(&kind),
+                "a port job must wait for {kind}"
+            );
+        }
+        assert!(
+            !NETWORK_SETUP_EXCLUSIVE
+                .iter()
+                .any(|kind| kind.starts_with("network-setup-")),
+            "one port-setup pass starts the four ranks together"
+        );
+        for kind in ["download", "sync-model", "sync-software"] {
+            assert!(
+                NETWORK_SETUP_EXCLUSIVE.contains(&kind),
+                "a port job must wait for {kind}"
+            );
+        }
     }
 
     fn post_json(uri: &str, body: &str) -> Request<Body> {

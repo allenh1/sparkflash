@@ -40,8 +40,11 @@
 //!    |______ hairpin ____|
 //! ~~~
 //!
-//! On the switchless fabric the diagonal is programmed into the ConnectX-7 eSwitch, so every
-//! transfer above is a single hop; on the switched fabric every transfer is a switch hop.
+//! On the switched fabric every transfer is a switch hop. On a switchless fabric a diagonal
+//! transfer crosses the two cables through the ConnectX-7 of the Spark between them, which
+//! forwards it inside the ASIC (its hairpin, or relay), so the sender still posts one transfer;
+//! that forwarding has to be programmed; without it a bare DAC ring has no path to a
+//! non-neighbour, and the reference transport opens a connection to every rank.
 
 use std::ops::Range;
 

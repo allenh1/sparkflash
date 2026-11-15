@@ -105,11 +105,14 @@ cards describe the two wirings this build supports, and the check tells you whic
 
 - **Switched 200G** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
   every peer and reduces locally, the one-shot all-to-all schedule;
-- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with
-  the 0<->2 and 1<->3 ConnectX-7 hairpin diagonals, and each collective reduce-scatters to the chunk
-  owners and all-gathers the reduced chunks back. It is the same arithmetic, bit for bit, with
-  `2 * (world - 1)` payload element writes cluster-wide against `world * (world - 1)` for the
-  one-shot: half the fabric bytes at world 4.
+- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs, and
+  each collective reduce-scatters to the chunk owners and all-gathers the reduced chunks back. It
+  is the same arithmetic, bit for bit, with `2 * (world - 1)` payload element writes cluster-wide
+  against `world * (world - 1)` for the one-shot: half the fabric bytes at world 4. A Spark has no
+  cable to the rank opposite it, so those transfers cross the two cables in between and are
+  forwarded inside the ConnectX-7 of the Spark between them (its hairpin, also called a relay);
+  that forwarding is programmed, not implied by the cable: until it is, traffic to a non-neighbour
+  has no path.
 
 The schedule governs the layout-based all-reduces on the rank-to-rank reference transport: the
 host reference arm's per-layer reductions and the barriers. The gathers keep their own
@@ -117,23 +120,30 @@ one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduc
 (`SPARK_COMM_REDUCE=nccl`, the device default) without being re-decomposed by this value;
 `docs/rdma-exchange.md` describes which path each arm takes.
 
-When the node check runs it also probes the wiring: each Spark ARPs and pings every fast-network
-address of every other Spark from each of its fast ports (`arping`, then `ping -I`). A port that
-answers is a cable: from the answers the console classifies the fabric as a switch (every port
-answers for every peer), the ring (each of every Spark's two ports answers for exactly one
-neighbour, forming 0-1-2-3-0), two-node pairs (both ports reach the same Spark), or unrecognised
-wiring, and records what it measured next to the cards. When the measured wiring and the saved
-schedule disagree, a **Use the measured fabric** button writes the matching choice. Matching the
-schedule to the wiring is not required for correctness — the one-shot schedule runs its full
-all-to-all over a ring and the ring schedule does chunked transfers on a switch — but it is the
-fast path for both wirings. Without `arping` on the Sparks the wiring cannot be identified; only
-reachability is checked.
+When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
+every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective
+address (`ping -I`). A port that answers an address is a cable: from the answers the console
+classifies the fabric as a switch (every port answers for every peer), the ring (each of every
+Spark's two ports answers for exactly one neighbour, forming 0-1-2-3-0), two-node pairs (both
+ports reach the same Spark), or unrecognised wiring, and records what it measured next to the
+cards. The ARP answers are the cable map; the pings are the reachability the transport needs, and
+the two can disagree: a ring's non-neighbour has no cable and answers only where the hairpin
+forwards it, and a fabric that forwards ARP as well measures as a switch even when it is cabled
+as a ring. When the measured wiring and the saved schedule disagree, a **Use the measured fabric**
+button writes the matching choice and checks the Sparks again, so the findings agree with the new
+choice. Matching the schedule to the wiring is not required for correctness — the one-shot
+schedule runs its full all-to-all over a ring and the ring schedule does chunked transfers on a
+switch — but it is the fast path for both wirings. Without `arping` on the Sparks the cable map
+cannot be identified; only reachability is checked.
 
-Reachability is reported per rank and its severity follows the measured wiring. On a switch every
-pair must answer, and a pair that does not is an error. On a ring a Spark that does not answer is
-an error only when a cable was measured to it; an unreachable non-neighbour is a warning, because
-that traffic crosses the ConnectX-7 hairpin and a shared subnet with `arp_ignore=1` answers an
-address only on the port that owns it.
+Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
+launch opens a connection to every rank before it starts, so a peer that does not answer stops it
+whatever the cables are. The message says what to look at. On a switch, and for a neighbour on a
+ring, it is the cable or the address. For a ring's non-neighbour it is the ConnectX-7 hairpin on
+the Spark between the two cables: the cable alone gives no path, so that forwarding has to be
+enabled before the check passes. Wiring that is none of the named shapes says so, and its
+silent pairs are errors too. When `arping` could not run, the finding says the wiring was not
+measured and reports the ping result alone.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`) on every

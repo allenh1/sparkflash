@@ -875,9 +875,9 @@ pub fn analyze_fabric(
     // config; the shapes below compare it with the measurements.
     let schedule = crate::config::fabric_schedule_name(&config.cluster.fabric_schedule);
     if let Some(fabric) = &fabric {
-        // The peers each rank has a measured link to: the pairs a cable actually joins. On a ring
-        // a non-neighbour is reached through the hairpin, so an unreachable one is a warning, not
-        // a broken cable.
+        // The peers each rank has a measured link to: the pairs a cable actually joins. A
+        // non-neighbour on a ring is not a broken cable, so the message below names the hairpin
+        // that has to forward it instead.
         let mut linked: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); fabric.reachable.len()];
         for link in &fabric.links {
             if let Some(set) = linked.get_mut(link.rank) {
@@ -906,49 +906,55 @@ pub fn analyze_fabric(
                     continue;
                 }
                 let neighbour = linked.get(rank).is_some_and(|set| set.contains(&peer));
-                // A cable was measured to the peer, or the topology leaves no other path: the
-                // pair must answer. A ring's non-neighbour is different: its traffic crosses the
-                // ConnectX-7 hairpin, and with arp_ignore=1 on a shared subnet an address answers
-                // only on the port that owns it, so a failed ping there is a warning.
-                let severity = match fabric.shape {
-                    FabricShape::Switched | FabricShape::Pairs => Severity::Error,
-                    FabricShape::Ring | FabricShape::Unknown if neighbour => Severity::Error,
-                    FabricShape::Ring | FabricShape::Unknown => Severity::Warning,
-                };
+                // The reference transport opens a connection to every rank's address before the
+                // launch can start, so a peer that does not answer is an error whatever the cables
+                // measure; only the message depends on the shape. A ring's non-neighbour is
+                // reached through the ConnectX-7 hairpin on the Spark between the two cables,
+                // which has to forward that address: a bare DAC does not carry it, so the check
+                // must not pass the guide on a ring whose diagonals are silent.
                 let message = match fabric.shape {
-                    FabricShape::Pairs if !neighbour => format!(
-                        "{} cannot reach {} over the fast network; the four Sparks are wired as \
-                         two pairs, so a rank in the other pair has no fast path.",
+                    _ if !fabric.links_measured => format!(
+                        "{} cannot reach {} over the fast network. The wiring could not be \
+                         measured on {}, so this is the reachability result alone; the launch \
+                         opens a connection to every rank and needs {} to answer.",
+                        name(rank),
+                        name(peer),
                         name(rank),
                         name(peer)
                     ),
                     FabricShape::Ring if !neighbour => format!(
-                        "{} cannot ping {} over the fast network. {} is not cabled directly to \
-                         {}; the ring reaches it through the ConnectX-7 hairpin, so the switchless \
-                         schedule needs that hairpin to forward this address (with arp_ignore=1 on \
-                         a shared subnet an address answers only on the port that owns it).",
+                        "{} cannot reach {} over the fast network. {} is not cabled directly to \
+                         {}; the ring reaches it through the ConnectX-7 hairpin on the Spark \
+                         between the two cables, which has to forward that address. The cable on \
+                         its own gives no path, and the launch opens a connection to every rank, \
+                         so enable that forwarding and check again.",
                         name(rank),
                         name(peer),
                         name(peer),
                         name(rank)
                     ),
-                    FabricShape::Unknown if !neighbour => format!(
-                        "{} cannot reach {} over the fast network, and the measured wiring shows \
-                         no cable to it; the fabric is not one of the named shapes, so the run \
-                         would have no fast path for that pair.",
+                    FabricShape::Pairs if !neighbour => format!(
+                        "{} cannot reach {} over the fast network; the four Sparks are wired as \
+                         two pairs, so a rank in the other pair has no fast path. The launch \
+                         opens a connection to every rank.",
                         name(rank),
                         name(peer)
                     ),
                     _ => format!(
-                        "{} cannot reach {} over the fast network; every pair must reach each \
-                         other before NCCL can use the fabric.",
+                        "{} cannot reach {} over the fast network{}. The launch opens a connection \
+                         to every rank and needs this one.",
                         name(rank),
-                        name(peer)
+                        name(peer),
+                        if fabric.shape == FabricShape::Unknown && !neighbour {
+                            ", and no cable was measured to it"
+                        } else {
+                            ""
+                        }
                     ),
                 };
                 findings.push(Finding {
                     rank: Some(rank),
-                    severity,
+                    severity: Severity::Error,
                     message,
                 });
             }
@@ -1572,10 +1578,12 @@ pub struct FabricProbe {
 }
 
 /// Reads one node's link probe output: the links that answered, the peers it reached, and whether
-/// arping was available. Unknown or malformed lines are skipped.
+/// arping was available. The probe prints one `link` line per port per *address*, so a peer with
+/// four addresses repeats the same (port, peer) pair; it is recorded once. Unknown or malformed
+/// lines are skipped.
 #[must_use]
 pub fn parse_fabric(rank: usize, text: &str) -> FabricProbe {
-    let mut links = Vec::new();
+    let mut links: Vec<FabricLink> = Vec::new();
     let mut reached = Vec::new();
     let mut links_measured = true;
     for line in text.lines() {
@@ -1588,7 +1596,11 @@ pub fn parse_fabric(rank: usize, text: &str) -> FabricProbe {
                 else {
                     continue;
                 };
-                if state == "ok" {
+                if state == "ok"
+                    && !links
+                        .iter()
+                        .any(|link| link.netdev == netdev && link.peer == peer)
+                {
                     links.push(FabricLink {
                         rank,
                         netdev: netdev.to_owned(),
@@ -2310,10 +2322,11 @@ link enp1s0f1np1 1500 up 0 0
     }
 
     #[test]
-    fn a_ring_that_cannot_ping_its_diagonals_is_a_warning_not_an_error() {
+    fn a_ring_that_cannot_ping_its_diagonals_blocks_the_launch() {
         // The ring reaches its two neighbours over the DACs and the opposite rank through the
-        // hairpin. A ping that only travels the DACs is expected on a shared subnet with
-        // arp_ignore=1, so it must not block the guide; the neighbours must still answer.
+        // hairpin on the Spark between the two cables. The launch opens a connection to every
+        // rank before it starts, so a silent diagonal is an error that names the hairpin, not a
+        // warning the guide can walk past.
         let probes = cluster();
         let ring = Fabric {
             links: ring_links(),
@@ -2333,7 +2346,8 @@ link enp1s0f1np1 1500 up 0 0
             true,
             1,
         );
-        // The default schedule is switched: the check advises switchless.
+        // The default schedule is switched: the check advises switchless, and the silent
+        // diagonals stop the guide.
         assert!(
             warnings(&report)
                 .iter()
@@ -2341,33 +2355,44 @@ link enp1s0f1np1 1500 up 0 0
             "{:?}",
             report.findings
         );
-        assert!(errors(&report).is_empty(), "{:?}", errors(&report));
+        let stopped = errors(&report);
         assert!(
-            warnings(&report)
+            stopped
                 .iter()
-                .any(|m| m.contains("spark0 cannot ping spark2") && m.contains("hairpin")),
-            "{:?}",
-            report.findings
+                .any(|m| m.contains("spark0 cannot reach spark2") && m.contains("hairpin")),
+            "{stopped:?}"
         );
+        assert!(!report.network_ok(), "{:?}", report.findings);
 
-        // The same ring with the switchless schedule saved: no advice, still no errors.
+        // A ring whose diagonals do answer is a working fabric: saving switchless leaves no
+        // finding at all.
+        let forwarding = Fabric {
+            reachable: vec![
+                Some(vec![1, 2, 3]),
+                Some(vec![0, 2, 3]),
+                Some(vec![0, 1, 3]),
+                Some(vec![0, 1, 2]),
+            ],
+            ..ring
+        };
         let mut config = SparkConfig::default();
         config.cluster.fabric_schedule = "switchless".to_owned();
-        let report = analyze_fabric(&config, &probes, Some(ring.clone()), true, 1);
+        let report = analyze_fabric(&config, &probes, Some(forwarding), true, 1);
+        assert!(errors(&report).is_empty(), "{:?}", errors(&report));
         assert!(
             !warnings(&report)
                 .iter()
-                .any(|m| m.contains("choose switchless")),
+                .any(|m| m.contains("choose switchless") || m.contains("cannot reach")),
             "{:?}",
             report.findings
         );
-        assert!(errors(&report).is_empty(), "{:?}", errors(&report));
     }
 
     #[test]
     fn a_linked_neighbour_that_does_not_answer_is_an_error() {
         // Rank 0 is cabled to rank 3 (port1 -> 3) but only pings 1: the cable works, the address
-        // does not, so the guide must stop for it. The 0-2 diagonal is only a warning.
+        // does not, so the guide must stop for it. The 0-2 diagonal is not cabled at all, so it
+        // stops the guide too, with the hairpin message.
         let probes = cluster();
         let ring = Fabric {
             links: ring_links(),
@@ -2389,10 +2414,66 @@ link enp1s0f1np1 1500 up 0 0
             "{errors:?}"
         );
         assert!(
-            !errors
+            errors
                 .iter()
-                .any(|m| m.contains("spark0 cannot reach spark2")),
+                .any(|m| m.contains("spark0 cannot reach spark2") && m.contains("hairpin")),
             "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn an_unchecked_node_that_does_not_answer_does_not_claim_a_missing_cable() {
+        // arping missing (or unable to open its socket) leaves the links unmeasured. The pings
+        // still say which Sparks answer, and the message must not assert a cable is absent when
+        // nothing measured the cables.
+        let probes = cluster();
+        let unmeasured = Fabric {
+            links: Vec::new(),
+            reachable: vec![Some(vec![1]), Some(vec![0]), Some(vec![3]), Some(vec![2])],
+            shape: FabricShape::Unknown,
+            links_measured: false,
+        };
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(unmeasured), true, 1);
+        let errors = errors(&report);
+        let message = errors
+            .iter()
+            .find(|m| m.contains("spark0 cannot reach spark3"))
+            .expect("the ping failure is reported");
+        assert!(message.contains("could not be measured"), "{message}");
+        assert!(!message.contains("no cable was measured"), "{message}");
+    }
+
+    #[test]
+    fn a_peer_that_answers_on_every_address_is_one_link() {
+        let probe = parse_fabric(
+            2,
+            "arping missing
+link 1 enp1s0f1np1 ok
+link 1 enp1s0f1np1 ok
+link 1 enP2p1s0f1np1 ok
+link 3 enp1s0f1np1 ok
+",
+        );
+        assert!(!probe.measured, "the arping line is honoured");
+        assert_eq!(
+            probe.links,
+            vec![
+                FabricLink {
+                    rank: 2,
+                    netdev: "enp1s0f1np1".to_owned(),
+                    peer: 1,
+                },
+                FabricLink {
+                    rank: 2,
+                    netdev: "enP2p1s0f1np1".to_owned(),
+                    peer: 1,
+                },
+                FabricLink {
+                    rank: 2,
+                    netdev: "enp1s0f1np1".to_owned(),
+                    peer: 3,
+                },
+            ]
         );
     }
 

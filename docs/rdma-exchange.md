@@ -49,9 +49,14 @@ and the gathers keep their own one-segment-to-every-peer exchange either way:
   summation order, so the two schedules return identical bits.
 
 The schedule also classifies each peer link: switched runs every transfer over `SwitchFabric`, while
-the ring labels its peers `RingEdge` or `HairpinDiagonal`. On the switchless fabric the diagonal is
-programmed into the ConnectX-7 eSwitch, so a diagonal transfer is a single hop. The schedule driver
-in `crates/sparkflash-comm/src/exchange.rs` executes the transfer list and the reduction, so the
+the ring labels its peers `RingEdge` or `HairpinDiagonal`. On a switchless fabric a diagonal
+transfer crosses the two cables through the ConnectX-7 of the Spark between them, which forwards it
+inside the ASIC (the hairpin, or relay); the sender still posts one transfer to the opposite rank,
+and that forwarding has to be programmed for the fabric. Until it is, a bare DAC ring has no path
+for the traffic to a non-neighbour, and the rank-to-rank reference transport — which opens a
+connection to every rank before the group starts — needs every peer to answer; the web check
+reports a silent one as an error naming what to enable (`docs/web.md`). The schedule driver in
+`crates/sparkflash-comm/src/exchange.rs` executes the transfer list and the reduction, so the
 loopback, TCP and RDMA `Exchange` backends all run the same protocol; the layout knows the chunk
 ranges, the transfer list and the expected write count without a backend.
 
