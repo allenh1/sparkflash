@@ -100,6 +100,13 @@ const SCORE_KEYS: usize = 16;
 /// flight instead of the grid growing. 96 (four blocks an SM with two KV heads) measured best at
 /// 1k, 5k, 93k and 262k keys; the grid changes which warp scores a key, never its bits.
 const SCORE_GRID: u32 = 96;
+
+/// A score launch's blocks a row along its keys: [SCORE_GRID] shared by the rows, so a verify's
+/// rows are resident together and walk the same keys at once (block b of every row starts at the
+/// same key and strides the same), and all but the first find each key in L2 instead of DRAM.
+fn score_grid(rows: usize) -> u32 {
+    SCORE_GRID.div_ceil(u32::try_from(rows.max(1)).unwrap_or(u32::MAX)).max(1)
+}
 /// The threads one (head, row) of the split walk's recurrence runs (INKLING_MAX_HEAD_DIM: a dim a
 /// thread).
 const MIX_BLOCK: u32 = 128;
@@ -1790,7 +1797,7 @@ impl Shared {
             self.launch(
                 self.kernels.attention_scores,
                 (
-                    grid_blocks(span, SCORE_KEYS).min(SCORE_GRID),
+                    grid_blocks(span, SCORE_KEYS).min(score_grid(rows)),
                     kv_heads as u32,
                     rows as u32,
                 ),
@@ -1861,8 +1868,8 @@ impl Shared {
                     self.kernels.attention_part,
                     (
                         kv_heads as u32,
-                        span.div_ceil(PART_KEYS) as u32,
                         rows as u32,
+                        span.div_ceil(PART_KEYS) as u32,
                     ),
                     (PART_THREADS, 1, 1),
                     &[

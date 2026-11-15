@@ -1065,10 +1065,12 @@ __device__ __forceinline__ void inkling_part_block_sum(float (&value)[K], float 
     __syncthreads();
 }
 
-// grid (kv_heads, ceil(pass span / INKLING_PART_KEYS), rows), INKLING_PART_THREADS threads: the
+// grid (kv_heads, rows, ceil(pass span / INKLING_PART_KEYS)), INKLING_PART_THREADS threads: the
 // runs of this pass's keys [pass_first, pass_first + pass_slots) of each row's own range, whose
 // scores inkling_attn_scores wrote. pass_first is a multiple of INKLING_PART_KEYS, so run
-// pass_first / INKLING_PART_KEYS + blockIdx.y is the run's place in the row. Needs head_dim a
+// pass_first / INKLING_PART_KEYS + blockIdx.z is the run's place in the row. The rows sit
+// beside each other in the grid, so a verify's rows read a run's values together and all but
+// the first find them in L2; which block takes a (row, run) never changes its bits. Needs head_dim a
 // multiple of 8 and at most INKLING_MAX_HEAD_DIM (the host refuses any other shape).
 extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_part(
     const __nv_bfloat16* __restrict__ values,
@@ -1095,7 +1097,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     __shared__ float block[4][INKLING_MAX_GROUPS];
     __shared__ float sums[INKLING_PART_STRIDE][INKLING_MAX_GROUPS][INKLING_MAX_HEAD_DIM];
     const int kv_head = blockIdx.x;
-    const int row = blockIdx.z;
+    const int row = blockIdx.y;
     if (kv_head >= kv_heads || row >= rows || head_dim <= 0 || head_dim > INKLING_MAX_HEAD_DIM ||
         head_dim % INKLING_PART_DIMS != 0 || groups <= 0 || groups > INKLING_MAX_GROUPS) {
         return;
@@ -1103,7 +1105,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
     const int position = first_position + row;
     const int64_t first = inkling_attn_first_slot(position, window);
     const int64_t count = (int64_t)position - first + 1;
-    const int64_t begin = pass_first + (int64_t)blockIdx.y * INKLING_PART_KEYS;
+    const int64_t begin = pass_first + (int64_t)blockIdx.z * INKLING_PART_KEYS;
     int64_t end = begin + INKLING_PART_KEYS;
     end = end < pass_first + pass_slots ? end : pass_first + pass_slots;
     end = end < count ? end : count;
@@ -1208,7 +1210,7 @@ extern "C" __global__ void __launch_bounds__(INKLING_PART_THREADS) inkling_attn_
         }
     }
     __syncthreads();
-    const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.y;
+    const uint64_t run = (uint64_t)(pass_first / INKLING_PART_KEYS) + blockIdx.z;
     for (int index = threadIdx.x; index < groups * head_dim; index += INKLING_PART_THREADS) {
         const int g = index / head_dim;
         const int dim = index - g * head_dim;

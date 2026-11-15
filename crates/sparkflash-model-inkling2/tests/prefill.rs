@@ -1147,7 +1147,7 @@ fn run_split_case(cuda: &Cuda, case: &SplitCase, seed: u64) {
         .expect("attn_mix launch");
         cuda.launch(
             part,
-            (KV_HEADS as u32, span.div_ceil(PART_KEYS) as u32, 1),
+            (KV_HEADS as u32, 1, span.div_ceil(PART_KEYS) as u32),
             (128, 1, 1),
             &[
                 values_device.0,
