@@ -1458,3 +1458,41 @@ After the 93K prompt the greedy ids agree for 15 tokens and part at the 16th.
 Teacher-forced on the D117 text against expert parallelism: top-1 agrees on 12 of 12 cuts, top-5
 overlap 4-5, mean abs logit difference 0.08-0.37 a row (max 2.37), KL at most 1.19e-2 nats (mean
 4.1e-3). That is the size of D119's distance, and 2,253,663 of the 2,400,696 logits differ.
+
+### A verify's rows read the keys together; the residual's statistics hold their row
+
+Two more changes move no bit:
+
+* **A verify's rows walk the same keys at once.** A verify scores and sums all its rows over the
+  same full-layer keys. The score grid gave each row its own 96 blocks, though, and the part grid
+  put the rows on its slowest axis. Each row therefore read the keys and values from DRAM after
+  the row before it had left L2. The 96 score blocks are now shared by the rows, and the part grid
+  takes the rows on y and the runs on z. A verify's rows are resident together, and all but the
+  first find the keys in L2. Which block or warp takes a key never changes its bits, and a decode
+  step (one row) launches the grids it did.
+* **`inkling_block_residual_stats` holds its row.** It read its query only after the previous
+  grid ended and read its row twice, once for the sum of squares and once for the dot. A thread
+  now loads its share of the query (a weight) before the PDL wait and holds its share of the row
+  in registers for both passes. The loads are predicated rather than cut short by a break, so all
+  of a pass's loads are in flight at once. The additions are `inkling_residual_row`'s in the same
+  order. A row wider than 32 values a thread keeps the two-pass walk.
+
+On the four ranks, in one session, the teacher-forced logits were identical on all twelve cuts,
+and every run's greedy ids equalled plain decoding's:
+
+| on the four ranks, same session | before | after |
+|---|---|---|
+| plain decode step, repeating 5K prompt | 33.85 ms | 33.77 ms |
+| depth-3 verify, repeating 5K prompt | 85.3 ms (20.66 ms a token) | 84.7 ms (20.52 ms a token) |
+| depth-3 verify after the 93K prompt | 110.3 ms (33.57 ms a token) | 105.0 ms (31.96 ms a token) |
+
+DSpark against plain decoding on this build:
+
+| prompt | plain | depth 3 | depth 7 |
+|---|---|---|---|
+| repeating 5K prompt, 96 tokens | 33.77 ms a token | 20.52 ms (4.1 tokens in an 84.7 ms round) | 15.41 ms (7.9 in 122.0 ms) |
+| 93,159-token text, 24 tokens | 37.74 ms | 31.96 ms (3.3 in 105.0 ms) | 33.30 ms (4.6 in 153.2 ms) |
+
+Depth 3 now beats plain decoding after the 93K prompt as well, by 15%. The drafter stays opt-in.
+It costs a rank about 3.6 GB at 1M positions, lanes refuse it, and its gain rests on how many
+drafts the text accepts.
