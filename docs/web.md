@@ -96,6 +96,24 @@ With an existing four-Spark configuration, the same button is offered on step 1 
 replaces the cluster plan. To return to four Sparks, set `model.weights` and `engine.kind` back
 to the V4.1 values and restore four `[cluster].nodes` under **Advanced settings**.
 
+### Fabric topology
+
+**Advanced settings → Fabric and SSH → Fabric topology** selects how the ranks' collectives cross
+the fabric:
+
+- **switched** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
+  every peer and reduces locally, the one-shot all-to-all schedule;
+- **switchless** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs with the
+  0<->2 and 1<->3 ConnectX-7 hairpin diagonals, and each collective reduce-scatters to the chunk
+  owners and all-gathers the reduced chunks back. It is the same arithmetic, bit for bit, with
+  each element crossing the fabric once instead of once per peer.
+
+The choice is saved as `[cluster].fabric_schedule` and exported to every rank as
+`SPARKFLASH_FABRIC_SCHEDULE`, so a web-driven launch and a hand-written one run the same recipe.
+`one-shot`, `hairpin` and `ring` are accepted aliases; an unknown name is refused when the
+configuration is saved. A one-node Qwen plan has no collectives, so the selector does not change
+it.
+
 Before offering **Download**, the console checks the snapshot for `model.id` in the Hugging
 Face cache. A complete snapshot marks the step done and shows **Already in the Hugging Face
 cache** with its size and revision, so the next step is ready without a network transfer. An
@@ -186,6 +204,7 @@ atomically (a sibling temp file, then rename). See
 | `[runtime]` | `SPARK_MAX_SEQ_LEN` and `SPARKFLASH_LANES` |
 | `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, and the rank list: exactly four nodes for V4.1, exactly one local node for Qwen |
 | `[paths]` | Checkout, binary, launcher, NCCL library, log root on every node |
+| `[cluster]` | the four nodes, peers, base port, HTTP bind and `fabric_schedule` (switched/switchless) |
 | `[network]` | `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, extra rank environment |
 | `[web]` | Control-plane bind, rank 0 URL, extra allowed `Host` names, discovery/SSH timeouts, advertising |
 | `[stats]` | Sampling interval, in-memory retention, idle snapshot path and flush interval |

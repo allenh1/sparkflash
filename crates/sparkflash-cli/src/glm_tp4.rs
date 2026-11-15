@@ -389,7 +389,13 @@ fn run_rank(args: &GlmArgs) -> Result<(), String> {
         }
         Some(Box::new(transport) as Box<dyn Transport>)
     };
-    let (mut collective, gather) = tp4_seams(layout.rank, layout.world_size, transport, args.wire);
+    let (mut collective, gather) = tp4_seams(
+        layout.rank,
+        layout.world_size,
+        transport,
+        args.wire,
+        crate::tp4_host::fabric_schedule_from_env(),
+    );
     if let Some(reduce) = reduce {
         collective = Box::new(DeviceExchange::new(collective, reduce)?) as Box<dyn TpCollective>;
     }

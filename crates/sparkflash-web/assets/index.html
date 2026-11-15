@@ -417,6 +417,13 @@ limitations under the License.
             <details class="section">
               <summary>Fabric and SSH</summary>
               <div class="fields">
+                <label class="field">
+                  <span>Fabric topology <em>switchless = direct-attach ring</em></span>
+                  <select id="fabric-schedule">
+                    <option value="switched">Switched 200G (one-shot all-to-all)</option>
+                    <option value="switchless">Switchless ring (hairpin reduce-scatter + all-gather)</option>
+                  </select>
+                </label>
                 <label class="field"><span>NCCL_IB_HCA</span><input id="nccl-ib-hca" type="text" placeholder="e.g. rocep1s0f1,roceP2p1s0f1"></label>
                 <label class="field"><span>NCCL_SOCKET_IFNAME</span><input id="nccl-socket-ifname" type="text" placeholder="e.g. enp1s0f1np1"></label>
                 <label class="field"><span>NCCL_IB_GID_INDEX</span><input id="nccl-gid" type="number" min="0" max="65535"></label>

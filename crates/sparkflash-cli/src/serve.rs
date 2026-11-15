@@ -4079,6 +4079,7 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
         element_limit: config.element_limit,
         resident_cache: true,
         timeout: config.timeout,
+        fabric_schedule: crate::tp4_host::fabric_schedule_from_env(),
     })
     .map_err(|error| format!("TP=4 rank {} open failed: {error}", config.rank))?;
     Ok(Box::new(HostTp4Rank { rank }))
@@ -4461,8 +4462,13 @@ fn open_pack_collective(
     } else {
         None
     };
-    let (mut collective, gather) =
-        crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
+    let (mut collective, gather) = crate::tp4_host::tp4_seams(
+        config.rank,
+        config.world_size,
+        transport,
+        Wire::F32,
+        crate::tp4_host::fabric_schedule_from_env(),
+    );
     if let Some(reduce) = reduce {
         collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
     }

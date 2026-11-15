@@ -439,6 +439,7 @@ function paintConfig(config, report, force = false) {
   setValue("ssh-options", (config.cluster.ssh_options || []).join("\n"));
   setValue("http-bind", config.cluster.http_bind);
   setValue("base-port", config.cluster.base_port);
+  setValue("fabric-schedule", config.cluster.fabric_schedule || "switched");
   setValue("nccl-ib-hca", config.network.nccl_ib_hca);
   setValue("nccl-socket-ifname", config.network.nccl_socket_ifname);
   setValue("nccl-gid", config.network.nccl_ib_gid_index ?? "");
@@ -1087,6 +1088,7 @@ function collectConfig() {
     ...config.cluster,
     http_bind: $("http-bind").value.trim(),
     base_port: numberValue("base-port", config.cluster.base_port),
+    fabric_schedule: $("fabric-schedule").value,
     ssh_user: $("ssh-user").value.trim(),
     ssh_options: lines("ssh-options"),
     nodes: [],

@@ -120,6 +120,21 @@ pub const MAX_CONCURRENCY: usize = 32;
 /// The default config path, relative to the lead node's working directory.
 pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 
+/// The canonical spelling of a fabric schedule selector, or None for an unknown one.
+///
+/// The two schedules are the switched one-shot all-to-all and the switchless hairpin ring
+/// (issue #19). The aliases exist because the docs, the CLI and the UI grew different words for
+/// the same two recipes; they all canonicalise here, so the saved TOML, the exported
+/// `SPARKFLASH_FABRIC_SCHEDULE` and the launcher's `--fabric-schedule` always agree.
+#[must_use]
+pub fn canonical_fabric_schedule(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "switched" | "one-shot" | "oneshot" | "one_shot" => Some("switched"),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => Some("switchless"),
+        _ => None,
+    }
+}
+
 /// One checkpoint family this build knows how to run, and the selector pair that runs it.
 ///
 /// The Hugging Face cache is the source of model *instances*; this table is the source of model
@@ -454,6 +469,11 @@ pub struct ClusterConfig {
     pub http_bind: String,
     /// The first collective port; rank R uses `base_port + R`.
     pub base_port: u16,
+    /// The fabric topology the ranks' collectives run on: `switched` (the 200G switch, one-shot
+    /// all-to-all) or `switchless` (the direct-attach ring with ConnectX-7 hairpin diagonals,
+    /// reduce-scatter + all-gather). Exported to every rank as
+    /// `SPARKFLASH_FABRIC_SCHEDULE`; `one-shot`/`hairpin`/`ring` are accepted aliases.
+    pub fabric_schedule: String,
     /// The account used for passwordless SSH, empty for the current user.
     pub ssh_user: String,
     /// Extra SSH options, e.g. `-o StrictHostKeyChecking=accept-new`.
@@ -467,6 +487,7 @@ impl Default for ClusterConfig {
         Self {
             http_bind: "0.0.0.0:8000".to_owned(),
             base_port: 29601,
+            fabric_schedule: "switched".to_owned(),
             ssh_user: std::env::var("USER").unwrap_or_else(|_| "spark".to_owned()),
             ssh_options: vec![
                 "-o".to_owned(),
@@ -708,6 +729,12 @@ impl SparkConfig {
             return Err(ConfigError::new(format!(
                 "runtime.max_context_tokens must be in 1..={max_context} for {:?}, got {}",
                 self.model.weights, self.runtime.max_context_tokens
+            )));
+        }
+        if canonical_fabric_schedule(&self.cluster.fabric_schedule).is_none() {
+            return Err(ConfigError::new(format!(
+                "cluster.fabric_schedule {:?} is not a fabric topology (switched or switchless)",
+                self.cluster.fabric_schedule
             )));
         }
         if !(1..=MAX_CONCURRENCY).contains(&self.runtime.max_concurrency) {
@@ -1591,6 +1618,12 @@ impl SparkConfig {
                 nccl_lib.display().to_string(),
             );
         }
+        env.insert(
+            "SPARKFLASH_FABRIC_SCHEDULE".to_owned(),
+            canonical_fabric_schedule(&self.cluster.fabric_schedule)
+                .unwrap_or("switched")
+                .to_owned(),
+        );
         if !self.network.nccl_ib_hca.trim().is_empty() {
             env.insert("NCCL_IB_HCA".to_owned(), self.network.nccl_ib_hca.clone());
         }
@@ -2365,6 +2398,52 @@ mod tests {
         assert_eq!(config.cluster.nodes.len(), WORLD_SIZE);
         assert!(text.contains("max_concurrency"));
         assert!(text.contains("_sparkflash._tcp.local."));
+    }
+
+    #[test]
+    fn the_fabric_topology_selects_the_ring_and_reaches_every_rank() {
+        // Issue #19: the switchless ring is a topology choice in the saved config, and the
+        // launcher exports it to every rank. Every alias canonicalises to one of the two
+        // schedules, so the TOML, the exported variable and the launcher flag cannot disagree.
+        for (written, canonical) in [
+            ("switched", "switched"),
+            ("one-shot", "switched"),
+            ("switchless", "switchless"),
+            ("hairpin", "switchless"),
+            ("ring", "switchless"),
+        ] {
+            assert_eq!(
+                canonical_fabric_schedule(written),
+                Some(canonical),
+                "{written}"
+            );
+        }
+        assert_eq!(canonical_fabric_schedule("mesh"), None);
+
+        let mut config = SparkConfig::default();
+        config.cluster.fabric_schedule = "switchless".to_owned();
+        config.validate().expect("switchless validates");
+        assert_eq!(
+            config
+                .launch_env()
+                .get("SPARKFLASH_FABRIC_SCHEDULE")
+                .map(String::as_str),
+            Some("switchless"),
+            "the launcher must export the ring to every rank"
+        );
+
+        config.cluster.fabric_schedule = "mesh".to_owned();
+        let error = config
+            .validate()
+            .expect_err("an unknown topology is refused");
+        assert!(error.message.contains("fabric_schedule"), "{error}");
+    }
+
+    #[test]
+    fn the_example_config_documents_the_switchless_ring() {
+        let text = include_str!("../../../sparkflash.toml.example");
+        assert!(text.contains("fabric_schedule"));
+        assert!(text.contains("switchless"));
     }
 
     #[test]

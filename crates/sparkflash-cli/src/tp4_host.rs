@@ -113,8 +113,50 @@ pub const TP4_PROMPT_LOGPROBS_SPAN: usize = 64;
 /// released checkpoint has 72 columns and divides the same way.
 const TWIN_MOE_INTER_DIM: usize = 128;
 
+/// The environment variable the launcher and the web Setup page set to select the fabric
+/// topology: switchless (or hairpin/ring) runs the switchless hairpin ring; unset or switched
+/// runs the switched one-shot all-to-all. The per-run --fabric-schedule flag overrides it.
+pub const FABRIC_SCHEDULE_ENV: &str = "SPARKFLASH_FABRIC_SCHEDULE";
+
+/// Maps a user-facing fabric schedule name to the schedule; None for an unknown name.
+///
+/// The names are deliberately forgiving: the Setup page writes switched/switchless, while the
+/// docs also say one-shot, hairpin and ring. They all mean one of the two schedules this build
+/// implements, never a third one.
+#[must_use]
+pub fn parse_fabric_schedule(value: &str) -> Option<FabricSchedule> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "switched" | "one-shot" | "oneshot" | "one_shot" => Some(FabricSchedule::OneShotAllToAll),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => {
+            Some(FabricSchedule::HairpinRingReduceScatterAllGather)
+        }
+        _ => None,
+    }
+}
+
+/// The fabric schedule this process was configured to run, from [`FABRIC_SCHEDULE_ENV`].
+///
+/// An unset or unrecognised value is the switched default, so a typo cannot silently change the
+/// recipe; a caller that needs to reject a typo parses the CLI flag instead (which does).
+#[must_use]
+pub fn fabric_schedule_from_env() -> FabricSchedule {
+    std::env::var(FABRIC_SCHEDULE_ENV)
+        .ok()
+        .and_then(|value| parse_fabric_schedule(&value))
+        .unwrap_or(FabricSchedule::OneShotAllToAll)
+}
+
+/// The CLI flag spelling of a schedule: what --fabric-schedule accepts and the launcher writes.
+#[must_use]
+pub fn fabric_schedule_name(schedule: FabricSchedule) -> &'static str {
+    match schedule {
+        FabricSchedule::OneShotAllToAll => "switched",
+        FabricSchedule::HairpinRingReduceScatterAllGather => "switchless",
+    }
+}
+
 /// The usage line for the tp4-host stage.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-host --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29601 (--fixture DIR | --checkpoint DIR) [--prompt TEXT | --prompt-tokens 3,7,11] [--max-tokens 4] [--tokenizer PATH] [--evidence-dir DIR] [--resident-cache] [--profile] [--bench-steps N] [--record-seams] [--reference-check]; tp4-host --write-fixture DIR writes the 40-layer tiny twin, and one rank binds comm-base-port + tp-rank";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-host --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29601 (--fixture DIR | --checkpoint DIR) [--prompt TEXT | --prompt-tokens 3,7,11] [--max-tokens 4] [--tokenizer PATH] [--evidence-dir DIR] [--resident-cache] [--profile] [--bench-steps N] [--record-seams] [--reference-check] [--fabric-schedule switched|switchless]; tp4-host --write-fixture DIR writes the 40-layer tiny twin, and one rank binds comm-base-port + tp-rank";
 
 /// One rank's collected evidence.
 #[derive(Debug, Clone)]
@@ -237,6 +279,9 @@ struct HostArgs {
     resident_cache: bool,
     profile: bool,
     bench_steps: usize,
+    /// Which fabric schedule the collectives run: the switched one-shot all-to-all or the
+    /// switchless hairpin ring (issue #19). Selected by `--fabric-schedule`.
+    fabric_schedule: FabricSchedule,
 }
 
 impl Default for HostArgs {
@@ -259,6 +304,7 @@ impl Default for HostArgs {
             resident_cache: false,
             profile: false,
             bench_steps: 0,
+            fabric_schedule: FabricSchedule::OneShotAllToAll,
         }
     }
 }
@@ -322,6 +368,12 @@ impl HostArgs {
                 }
                 "--record-seams" => parsed.record_seams = true,
                 "--reference-check" => parsed.reference_check = true,
+                "--fabric-schedule" => {
+                    let value = take("--fabric-schedule")?;
+                    parsed.fabric_schedule = parse_fabric_schedule(&value).ok_or_else(|| {
+                        format!("--fabric-schedule {value}: expected switched or switchless")
+                    })?;
+                }
                 other => return Err(format!("unknown argument {other}")),
             }
             index += 1;
@@ -435,6 +487,7 @@ fn run_checked(args: &[&str]) -> Result<ExitCode, String> {
                 .unwrap_or(false),
         bench_steps: parsed.bench_steps,
         tokenizer: parsed.tokenizer.clone(),
+        fabric_schedule: parsed.fabric_schedule,
     };
     let tcp_config = if parsed.world == 1 {
         None
@@ -538,6 +591,7 @@ struct RankInput {
     profile: bool,
     bench_steps: usize,
     tokenizer: Option<PathBuf>,
+    fabric_schedule: FabricSchedule,
 }
 
 /// One rank's configuration for the TP=4 host path.
@@ -562,6 +616,8 @@ pub struct Tp4RankConfig {
     pub resident_cache: bool,
     /// Per-collective read timeout.
     pub timeout: Duration,
+    /// Which fabric schedule the collectives run (switched one-shot or switchless hairpin ring).
+    pub fabric_schedule: FabricSchedule,
 }
 
 impl Default for Tp4RankConfig {
@@ -575,6 +631,7 @@ impl Default for Tp4RankConfig {
             element_limit: ELEMENT_LIMIT,
             resident_cache: true,
             timeout: Duration::from_secs(180),
+            fabric_schedule: FabricSchedule::OneShotAllToAll,
         }
     }
 }
@@ -934,6 +991,7 @@ impl Tp4Rank {
             profile: false,
             bench_steps: 0,
             tokenizer: None,
+            fabric_schedule: config.fabric_schedule,
         };
         Self::open_input_with_transport(
             &input,
@@ -1018,7 +1076,11 @@ impl Tp4Rank {
         // Connect the collective transport only AFTER the resident cache fill has completed on
         // this rank, so all four ranks load in parallel and no rank blocks on another during fill.
         let transport = connect_transport()?;
-        let collective = Arc::new(TpCollective::new(input.world, transport));
+        let collective = Arc::new(TpCollective::new(
+            input.world,
+            transport,
+            input.fabric_schedule,
+        ));
         // With the attention shard on, the engine reads plan slices (the rank's row block of
         // head.weight today) through the rank's WeightSource, and the logits are rebuilt by the exact
         // f32-bits gather over this rank's transport. Behind the hatch the engine keeps the
@@ -2598,10 +2660,16 @@ struct TpCollective {
     gather_calls: AtomicU64,
     gather_elements: AtomicU64,
     gather_ms: AtomicU64,
+    /// The fabric schedule every collective this rank issues runs (issue #19).
+    fabric_schedule: FabricSchedule,
 }
 
 impl TpCollective {
-    fn new(world: usize, transport: Option<Box<dyn Transport>>) -> Self {
+    fn new(
+        world: usize,
+        transport: Option<Box<dyn Transport>>,
+        fabric_schedule: FabricSchedule,
+    ) -> Self {
         Self {
             transport,
             seq: AtomicU64::new(0),
@@ -2613,6 +2681,7 @@ impl TpCollective {
             gather_calls: AtomicU64::new(0),
             gather_elements: AtomicU64::new(0),
             gather_ms: AtomicU64::new(0),
+            fabric_schedule,
         }
     }
 
@@ -2628,9 +2697,8 @@ impl TpCollective {
         }
         let started = Instant::now();
         let mut buffer: Vec<u16> = values.iter().map(|value| f32_to_bf16_rn(*value)).collect();
-        let layout =
-            CollectiveLayout::new(self.world, buffer.len(), FabricSchedule::OneShotAllToAll)
-                .map_err(|error| format!("collective layout: {error}"))?;
+        let layout = CollectiveLayout::new(self.world, buffer.len(), self.fabric_schedule)
+            .map_err(|error| format!("collective layout: {error}"))?;
         let seq = self.seq.fetch_add(1, Ordering::SeqCst);
         let transport = self
             .transport
@@ -2726,8 +2794,9 @@ pub(crate) fn tp4_seams(
     world: usize,
     transport: Option<Box<dyn Transport>>,
     wire: Wire,
+    fabric_schedule: FabricSchedule,
 ) -> Seams {
-    let collective = Arc::new(TpCollective::new(world, transport));
+    let collective = Arc::new(TpCollective::new(world, transport, fabric_schedule));
     let reduce = Tp4Seam {
         rank,
         world,
@@ -4127,6 +4196,7 @@ mod tests {
         prompt: Vec<u32>,
         max_tokens: usize,
         resident_cache: bool,
+        fabric_schedule: FabricSchedule,
     ) -> Vec<RankOutcome> {
         let _range = PORT_RANGE_LOCK
             .lock()
@@ -4160,6 +4230,7 @@ mod tests {
                             profile: false,
                             bench_steps: 0,
                             tokenizer: None,
+                            fabric_schedule,
                         };
                         run_rank(&input, Some(transport)).expect("rank")
                     })
@@ -4181,6 +4252,7 @@ mod tests {
         prompt: Vec<u32>,
         max_tokens: usize,
         resident_cache: bool,
+        fabric_schedule: FabricSchedule,
     ) -> Vec<RankOutcome> {
         let tcp = run_two_to_four_ranks(
             Wiring::Tcp,
@@ -4188,9 +4260,16 @@ mod tests {
             prompt.clone(),
             max_tokens,
             resident_cache,
+            fabric_schedule,
         );
-        let loopback =
-            run_two_to_four_ranks(Wiring::Loopback, world, prompt, max_tokens, resident_cache);
+        let loopback = run_two_to_four_ranks(
+            Wiring::Loopback,
+            world,
+            prompt,
+            max_tokens,
+            resident_cache,
+            fabric_schedule,
+        );
         assert_eq!(tcp.len(), loopback.len());
         for (tcp, loopback) in tcp.iter().zip(&loopback) {
             assert_eq!(tcp.rank, loopback.rank);
@@ -4206,7 +4285,12 @@ mod tests {
     }
 
     /// One four-rank session over the tiny fixture with the test's own per-rank closure.
-    fn run_four_rank_sessions<T, F>(fixture: &std::path::Path, prompt: &[u32], action: F) -> Vec<T>
+    fn run_four_rank_sessions<T, F>(
+        fixture: &std::path::Path,
+        prompt: &[u32],
+        fabric_schedule: FabricSchedule,
+        action: F,
+    ) -> Vec<T>
     where
         T: Send,
         F: Fn(usize, &mut Tp4Rank) -> T + Send + Sync,
@@ -4237,6 +4321,7 @@ mod tests {
                             profile: false,
                             bench_steps: 0,
                             tokenizer: None,
+                            fabric_schedule,
                         };
                         let mut api =
                             Tp4Rank::open_input(&input, Some(Box::new(transport)), ELEMENT_LIMIT)
@@ -4324,30 +4409,35 @@ mod tests {
         let prompt: Vec<u32> = vec![3, 7, 11, 19, 23, 29];
         let selection = Some(3usize);
         let rounds = 2usize;
-        let sessions = run_four_rank_sessions(directory.path(), &prompt, |rank, api| {
-            let mut merged_rounds = Vec::new();
-            for _ in 0..rounds {
-                api.begin_request(Tp4Sampling::default()).expect("begin");
-                let started = Instant::now();
-                let outcome = match api.prefill_prompt_logprobs(&prompt, selection) {
-                    Ok((step, merged)) => {
-                        assert!(
-                            step.token.is_some(),
-                            "rank {rank} prefill still selects a generation token"
-                        );
-                        Ok(merged)
-                    }
-                    Err(error) => Err(error.to_string()),
+        let sessions = run_four_rank_sessions(
+            directory.path(),
+            &prompt,
+            FabricSchedule::OneShotAllToAll,
+            |rank, api| {
+                let mut merged_rounds = Vec::new();
+                for _ in 0..rounds {
+                    api.begin_request(Tp4Sampling::default()).expect("begin");
+                    let started = Instant::now();
+                    let outcome = match api.prefill_prompt_logprobs(&prompt, selection) {
+                        Ok((step, merged)) => {
+                            assert!(
+                                step.token.is_some(),
+                                "rank {rank} prefill still selects a generation token"
+                            );
+                            Ok(merged)
+                        }
+                        Err(error) => Err(error.to_string()),
+                    };
+                    merged_rounds.push((outcome, started.elapsed().as_millis() as u64));
+                }
+                let serial = if rank == 0 {
+                    Some(serial_prompt_logprobs(api, &prompt, selection))
+                } else {
+                    None
                 };
-                merged_rounds.push((outcome, started.elapsed().as_millis() as u64));
-            }
-            let serial = if rank == 0 {
-                Some(serial_prompt_logprobs(api, &prompt, selection))
-            } else {
-                None
-            };
-            (merged_rounds, serial)
-        });
+                (merged_rounds, serial)
+            },
+        );
         let expected = sessions[0].1.as_ref().expect("rank 0 serial reference");
         assert_eq!(expected.len(), prompt.len() - 1);
         let mut probe_rounds: Vec<serde_json::Value> = Vec::with_capacity(rounds);
@@ -4443,20 +4533,25 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let fixture = write_twin_fixture(directory.path()).expect("fixture");
         let prompt: Vec<u32> = vec![5, 13, 17, 31];
-        let sessions = run_four_rank_sessions(directory.path(), &prompt, |_rank, api| {
-            // The pre-collective refusal must not poison the group: the next request runs.
-            api.begin_request(Tp4Sampling::default()).expect("begin");
-            let started = Instant::now();
-            let refused = match api.prefill_prompt_logprobs(&prompt, Some(1_000)) {
-                Ok((_, merged)) => panic!("over-wide request unexpectedly merged {merged:?}"),
-                Err(error) => error.to_string(),
-            };
-            let refusal_ms = started.elapsed().as_millis() as u64;
-            api.begin_request(Tp4Sampling::default())
-                .expect("begin again");
-            let recovered = api.prefill_prompt_logprobs(&prompt, Some(1));
-            (refused, refusal_ms, recovered.is_ok())
-        });
+        let sessions = run_four_rank_sessions(
+            directory.path(),
+            &prompt,
+            FabricSchedule::OneShotAllToAll,
+            |_rank, api| {
+                // The pre-collective refusal must not poison the group: the next request runs.
+                api.begin_request(Tp4Sampling::default()).expect("begin");
+                let started = Instant::now();
+                let refused = match api.prefill_prompt_logprobs(&prompt, Some(1_000)) {
+                    Ok((_, merged)) => panic!("over-wide request unexpectedly merged {merged:?}"),
+                    Err(error) => error.to_string(),
+                };
+                let refusal_ms = started.elapsed().as_millis() as u64;
+                api.begin_request(Tp4Sampling::default())
+                    .expect("begin again");
+                let recovered = api.prefill_prompt_logprobs(&prompt, Some(1));
+                (refused, refusal_ms, recovered.is_ok())
+            },
+        );
         for (rank, (refused, _, recovered)) in sessions.iter().enumerate() {
             assert!(
                 refused.contains("bounded candidate budget"),
@@ -4689,7 +4784,7 @@ mod tests {
 
     #[test]
     fn world_one_reduce_is_a_strict_bit_no_op() {
-        let collective = TpCollective::new(1, None);
+        let collective = TpCollective::new(1, None, FabricSchedule::OneShotAllToAll);
         let mut values = vec![1.0f32 / 3.0, -7.0e-8, 12345.678];
         let before: Vec<u32> = values.iter().map(|value| value.to_bits()).collect();
         collective.all_reduce_f32(&mut values).expect("reduce");
@@ -4712,7 +4807,8 @@ mod tests {
 
     #[test]
     fn two_ranks_produce_the_reference_token_sequence() {
-        let outcomes = tcp_matching_loopback(2, vec![3, 7, 11], 2, false);
+        let outcomes =
+            tcp_matching_loopback(2, vec![3, 7, 11], 2, false, FabricSchedule::OneShotAllToAll);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].generated, outcomes[1].generated);
         assert_eq!(outcomes[0].step_tokens, outcomes[1].step_tokens);
@@ -4745,7 +4841,8 @@ mod tests {
         // reference engine computes the replicated layout, so the reference source must read
         // the whole tensors from the checkpoint. This is the real --resident-cache path that
         // the twin tests used to skip (they ran with the cache off).
-        let outcomes = tcp_matching_loopback(2, vec![3, 7, 11], 2, true);
+        let outcomes =
+            tcp_matching_loopback(2, vec![3, 7, 11], 2, true, FabricSchedule::OneShotAllToAll);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(
             outcomes[0].attention_shard, "head-row+wq_b-head+wo_a-group/world2",
@@ -4773,7 +4870,8 @@ mod tests {
 
     #[test]
     fn four_ranks_produce_the_reference_token_sequence() {
-        let outcomes = tcp_matching_loopback(4, vec![3, 7], 2, false);
+        let outcomes =
+            tcp_matching_loopback(4, vec![3, 7], 2, false, FabricSchedule::OneShotAllToAll);
         assert_eq!(outcomes.len(), 4);
         for outcome in &outcomes[1..] {
             assert_eq!(outcome.step_tokens, outcomes[0].step_tokens);
@@ -4785,6 +4883,57 @@ mod tests {
             reference.reference_tokens
         );
         assert!(reference.seam_comparisons >= 40);
+    }
+
+    /// Issue #19: the switchless hairpin ring must produce the same bits as the switched one-shot
+    /// schedule. The ring is a different transfer decomposition (reduce-scatter to chunk owners,
+    /// then all-gather of the reduced chunks) and a different physical-link classification, but the
+    /// canonical rank-order sum is unchanged, so every rank's logits and selected tokens have to be
+    /// identical to the switched schedule's.
+    #[test]
+    fn the_switchless_hairpin_ring_matches_the_switched_schedule() {
+        for world in [2usize, 4] {
+            let prompt = vec![3, 7, 11];
+            let switched = tcp_matching_loopback(
+                world,
+                prompt.clone(),
+                2,
+                false,
+                FabricSchedule::OneShotAllToAll,
+            );
+            let ring = tcp_matching_loopback(
+                world,
+                prompt,
+                2,
+                false,
+                FabricSchedule::HairpinRingReduceScatterAllGather,
+            );
+            assert_eq!(ring.len(), world);
+            for (switched, ring) in switched.iter().zip(&ring) {
+                assert_eq!(
+                    ring.step_tokens, switched.step_tokens,
+                    "world {world} rank {}: the ring must select the same tokens",
+                    ring.rank
+                );
+                assert_eq!(
+                    ring.step_logits_sha256, switched.step_logits_sha256,
+                    "world {world} rank {}: the ring must produce the same logits bits",
+                    ring.rank
+                );
+            }
+            for rank in &ring[1..] {
+                assert_eq!(
+                    rank.step_tokens, ring[0].step_tokens,
+                    "world {world} rank {}: ranks disagree on tokens",
+                    rank.rank
+                );
+                assert_eq!(
+                    rank.step_logits_sha256, ring[0].step_logits_sha256,
+                    "world {world} rank {}: ranks disagree on logits bits",
+                    rank.rank
+                );
+            }
+        }
     }
 
     /// GLM's sharded host forward on the tiny fixture, one thread per rank, with `seams(rank)` built
@@ -4859,7 +5008,7 @@ mod tests {
             .forward(&mut whole.new_state(), &tokens)
             .expect("forward");
         let one = glm_ranks(&source, 1, &tokens, |rank| {
-            tp4_seams(rank, 1, None, Wire::Bf16)
+            tp4_seams(rank, 1, None, Wire::Bf16, FabricSchedule::OneShotAllToAll)
         });
         assert_eq!(bits(&one[0].0.concat()), bits(&plain.concat()), "one rank");
         assert_eq!(
@@ -4892,7 +5041,13 @@ mod tests {
                 .expect("loopback cluster");
                 let ranks = glm_ranks(&source, world, &tokens, |rank| {
                     let transport = wired(wiring, rank, world, base_port, &cluster);
-                    tp4_seams(rank, world, Some(transport), wire)
+                    tp4_seams(
+                        rank,
+                        world,
+                        Some(transport),
+                        wire,
+                        FabricSchedule::OneShotAllToAll,
+                    )
                 });
                 for (rank, (ours, theirs)) in ranks.iter().zip(&in_process).enumerate() {
                     assert_eq!(
@@ -4967,6 +5122,7 @@ mod tests {
             profile: false,
             bench_steps: 0,
             tokenizer: None,
+            fabric_schedule: FabricSchedule::OneShotAllToAll,
         };
         let mut rank = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("rank");
         assert_eq!(rank.rank(), 0);
@@ -5084,6 +5240,7 @@ mod tests {
             profile: false,
             bench_steps: 0,
             tokenizer: None,
+            fabric_schedule: FabricSchedule::OneShotAllToAll,
         };
         let mut chunked = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("chunked rank");
         let mut looped = Tp4Rank::open_input(&input, None, ELEMENT_LIMIT).expect("token-loop rank");
@@ -5138,6 +5295,39 @@ mod tests {
     }
 
     #[test]
+    fn the_fabric_schedule_flag_selects_the_ring_and_rejects_a_typo() {
+        let defaults =
+            HostArgs::parse(&["--fixture", "/tmp/twin", "--prompt-tokens", "3"]).expect("parse");
+        assert_eq!(defaults.fabric_schedule, FabricSchedule::OneShotAllToAll);
+        for alias in ["switchless", "hairpin", "ring"] {
+            let parsed = HostArgs::parse(&[
+                "--fixture",
+                "/tmp/twin",
+                "--prompt-tokens",
+                "3",
+                "--fabric-schedule",
+                alias,
+            ])
+            .expect("parse");
+            assert_eq!(
+                parsed.fabric_schedule,
+                FabricSchedule::HairpinRingReduceScatterAllGather,
+                "alias {alias}"
+            );
+        }
+        let error = HostArgs::parse(&[
+            "--fixture",
+            "/tmp/twin",
+            "--prompt-tokens",
+            "3",
+            "--fabric-schedule",
+            "mesh",
+        ])
+        .expect_err("a typo is refused");
+        assert!(error.contains("switched"), "{error}");
+    }
+
+    #[test]
     fn the_world_one_bench_mode_runs_prefill_then_decodes_and_records_tokens_per_second() {
         let directory = tempfile::tempdir().expect("tempdir");
         write_twin_fixture(directory.path()).expect("fixture");
@@ -5154,6 +5344,7 @@ mod tests {
             profile: false,
             bench_steps: 4,
             tokenizer: None,
+            fabric_schedule: FabricSchedule::OneShotAllToAll,
         };
         let outcome = run_rank(&input, None).expect("bench rank");
         assert_eq!(outcome.world, 1);

@@ -39,7 +39,7 @@ use sparkflash_comm::transport::Transport;
 use crate::tp4_resident;
 
 /// How the stage was invoked.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--engram-tokenizer FILE] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync]";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--engram-tokenizer FILE] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync] [--fabric-schedule switched|switchless]";
 
 /// The parsed argv.
 #[derive(Debug)]
@@ -101,6 +101,11 @@ struct ChainArgs {
     /// block's wall is the host's and the device time arrives from one run-end event harvest
     /// (diagnostics only: same separate perf file, its mode line says which wall clock it used).
     forward_perf_probe_nosync: bool,
+    /// --fabric-schedule: which schedule every layout this run builds executes. `switched` (the
+    /// default) is the one-shot all-to-all; `switchless` is the hairpin ring that reduce-scatters
+    /// to chunk owners and all-gathers back (issue #19). It selects the transport-level schedule
+    /// (host reduce, gathers, barriers, smokes); the NCCL device reduce is its own backend,
+    /// selected by SPARK_COMM_REDUCE, and picks its own NCCL topology.
     fabric_schedule: FabricSchedule,
 }
 
@@ -253,11 +258,11 @@ impl ChainArgs {
                 "--forward-perf-probe" => forward_perf_probe = true,
                 "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
                 "--fabric-schedule" => {
-                    fabric_schedule = match take("--fabric-schedule")?.as_str() {
-                        "switched" => FabricSchedule::OneShotAllToAll,
-                        "switchless" => FabricSchedule::HairpinRingReduceScatterAllGather,
-                        other => return Err(format!("unknown schedule {other}")),
-                    };
+                    let value = take("--fabric-schedule")?;
+                    fabric_schedule =
+                        crate::tp4_host::parse_fabric_schedule(&value).ok_or_else(|| {
+                            format!("--fabric-schedule {value}: expected switched or switchless")
+                        })?;
                 }
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
@@ -484,6 +489,7 @@ fn build_token_request<'a>(
     crate::tp4_forward::TokenStageRequest {
         rank: args.rank,
         world: args.world,
+        fabric_schedule: args.fabric_schedule,
         arm: header.arm,
         evidence: header.evidence,
         header: header.clone(),

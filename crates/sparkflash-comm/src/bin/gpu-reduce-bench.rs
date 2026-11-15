@@ -656,13 +656,16 @@ fn run(args: &Args) -> Result<bool, String> {
         let want = expected(args.world, elements);
         if let Some(transport) = host_transport.as_ref() {
             let mut payload = contribution(args.rank, elements);
-            let layout =
-                CollectiveLayout::new(args.world, elements, match args.fabric_schedule.as_str() {
+            let layout = CollectiveLayout::new(
+                args.world,
+                elements,
+                match args.fabric_schedule.as_str() {
                     "switched" => FabricSchedule::OneShotAllToAll,
                     "switchless" => FabricSchedule::HairpinRingReduceScatterAllGather,
                     other => panic!("unknown schedule {other}"),
-                })
-                    .map_err(|error| format!("layout: {error}"))?;
+                },
+            )
+            .map_err(|error| format!("layout: {error}"))?;
             let mut seq = 0u64;
             let mut host_us: Vec<Duration> = Vec::with_capacity(args.samples);
             for _ in 0..args.warmup {

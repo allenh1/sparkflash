@@ -56,6 +56,8 @@
 #   SPARKFLASH_DRAIN_TIMEOUT_MS  rank-0 drain deadline (default 30000)
 #   SPARK_MAX_SEQ_LEN      served sequence window (forwarded to every rank; the web UI sets it)
 #   SPARKFLASH_LANES       concurrent sequence slots (forwarded to every rank; the web UI sets it)
+#   SPARKFLASH_FABRIC_SCHEDULE  switched (default) or switchless: the ring topology for the
+#                               collective's cross-rank traffic (forwarded to every rank)
 #   SPARKFLASH_PREFILL_*, SPARKFLASH_BATCH_*, SPARKFLASH_DECODE_*  scheduler knobs (forwarded to
 #                          every rank: the ranks must agree on every tick)
 #   SPARKFLASH_DEVICE_TOKEN_DIR  token window (or live window parent) served by rank 0
@@ -174,6 +176,9 @@ rank_env() {
         printf ' %s=%q' "$var" "${!var}"
     done
     [ -n "${SPARKFLASH_EXCHANGE:-}" ] && printf ' SPARKFLASH_EXCHANGE=%q' "$SPARKFLASH_EXCHANGE"
+    # The switchless ring selector (issue #19). Every rank runs the same fabric schedule, so a
+    # value that reached only rank 0 would make the group's collectives disagree.
+    [ -n "${SPARKFLASH_FABRIC_SCHEDULE:-}" ] && printf ' SPARKFLASH_FABRIC_SCHEDULE=%q' "$SPARKFLASH_FABRIC_SCHEDULE"
     # V4.1 reads the generic name; GLM reads its own. Setting both lets the same plan start
     # either model without the launcher having to guess which arm will read it.
     [ -n "$CONVERTED_DIR" ] && printf ' SPARKFLASH_CONVERTED_DIR=%s SPARKFLASH_GLM_CONVERTED_DIR=%s' "$CONVERTED_DIR" "$CONVERTED_DIR"

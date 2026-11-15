@@ -67,6 +67,12 @@ max_concurrency = 32
 http_bind = "0.0.0.0:8000"
 # Rank R uses base_port + R for the engine collectives.
 base_port = 29601
+# The fabric the collective runs on. "switched" is the 200G RoCEv2 switch with the one-shot
+# all-to-all schedule. "switchless" is the direct-attach ring: rank 0-1-2-3-0 over the DACs plus
+# the 0<->2 and 1<->3 ConnectX-7 hairpin diagonals, reduced with reduce-scatter + all-gather so
+# each element crosses the fabric once instead of being posted to every peer. It is forwarded to
+# every rank as SPARKFLASH_FABRIC_SCHEDULE; "one-shot", "hairpin" and "ring" are accepted aliases.
+fabric_schedule = "switched"
 # Empty means the user running the control plane.
 ssh_user = ""
 ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
