@@ -1311,6 +1311,27 @@ on all twelve D117 cuts, and the greedy ids of both prompts below equal.
 | served decode, 2,223-token prompt | 26.0 tokens/s | — | 26.2 tokens/s |
 | served decode, 99,848-token prompt | 21.4 tokens/s | — | 22.2 tokens/s |
 
+### Programmatic dependent launch for the Inkling kernels
+
+The `inkling_` kernels launch with programmatic stream serialization, as the `opt_`, `q4e_`,
+`q4p_` and `dory_` kernels already did. Each one opens with `OPT_PDL_ENTRY`
+(`griddepcontrol.launch_dependents`, then `griddepcontrol.wait`). A kernel's launch and block
+setup then overlap the tail of the grid before it, but the kernel reads and writes nothing until
+that grid has completed. `tests/pdl_entry.rs` holds every prefixed kernel to the wait.
+`SPARKFLASH_PDL=0` turns it off for every prefix.
+
+It was checked against the previous build on the four ranks, as above. Teacher-forced logits were
+identical on all twelve cuts, and the greedy ids of both prompts were equal.
+
+| on the four ranks | fused projections and residual | and PDL |
+|---|---|---|
+| decode step, repeating 5K prompt (batch arm, same session) | 37.45 ms | 35.57 ms |
+| decode step after the 93K prompt (batch arm) | 42.7 ms | 40.7 ms |
+| served decode, 2,223-token prompt | 26.2 tokens/s | 28.6 tokens/s |
+| served decode, 99,848-token prompt | 22.2 tokens/s | 23.1 tokens/s |
+| served decode, 127,603-token prompt | 20.7 tokens/s | 22.5 tokens/s |
+| served time to first token, 99,848-token prompt | 156 s | 134 s |
+
 ### Experts split by intermediate columns (opt-in, not the default)
 
 Expert parallelism gives each rank 96 whole experts, so a decode row's eight experts land on the
