@@ -28,6 +28,63 @@ per rank, and a spin. On the vendor's numbers that projected ~11 us per exchange
 
 Everything here is on four DGX Spark GB10 nodes, TP=4, one rack.
 
+## Two schedules: the switched one-shot and the switchless ring
+
+Every collective that runs on the rank-to-rank exchange takes one of two transfer decompositions,
+selected by `FabricSchedule` and exposed by the `--fabric-schedule switched|switchless` flag, the
+`[cluster].fabric_schedule` configuration field and the `SPARKFLASH_FABRIC_SCHEDULE` environment
+variable (issue #19). The device arm's hot per-layer all-reduce is not one of them: it enqueues on
+NCCL (`SPARK_COMM_REDUCE=nccl`, the device default), so the schedule shapes the layout-based
+all-reduces on the reference transport - the host arm's per-layer reductions and the barriers -
+and the gathers keep their own one-segment-to-every-peer exchange either way. That transport is
+ordinary IP, so the routes a switchless setup writes carry it; NCCL's queue pairs do not use them,
+which is why a bare-ring device run also needs an NCCL that stays on the cabled peers or
+`SPARK_COMM_REDUCE=tcp` (see `docs/web.md`):
+
+- **OneShotAllToAll** (switched, the default): every rank posts its whole bf16 payload to all
+  `world - 1` peers over the 200 Gb/s switch and reduces locally in canonical rank order. It moves
+  `world * (world - 1) * elements` element writes cluster-wide.
+- **HairpinRingReduceScatterAllGather** (switchless): the buffer is split into one chunk per rank,
+  each rank sends its contribution of chunk c to the owner of c (a ring neighbour, or the opposite
+  rank across the diagonal through the Spark between the two cables), the owner accumulates ranks
+  0 + 1 + 2 + 3 in order
+  and rounds once, and the owners all-gather the reduced chunks back. It moves
+  `2 * (world - 1) * elements` element writes - half the traffic at world 4 - and never changes the
+  summation order, so the two schedules return identical bits.
+
+The schedule also classifies each peer link: switched runs every transfer over `SwitchFabric`, while
+the ring labels its peers `RingEdge` or `HairpinDiagonal`. On a switchless fabric a diagonal
+transfer crosses the two cables through the Spark between them, which forwards it — in the ASIC or
+in its host stack, depending on what the fabric runs (the web port setup routes the address through
+that Spark and turns on forwarding); the sender still posts one transfer to the opposite rank. Until
+that forwarding is in place a bare DAC ring has no path for the traffic to a non-neighbour, and the
+rank-to-rank reference transport — which opens a connection to every rank before the group starts —
+needs every peer to answer; the web check reports a silent one as an error naming what to enable
+(`docs/web.md`). The schedule driver in
+`crates/sparkflash-comm/src/exchange.rs` executes the transfer list and the reduction, so the
+loopback, TCP and RDMA `Exchange` backends all run the same protocol; the layout knows the chunk
+ranges, the transfer list and the expected write count without a backend.
+
+Set it in `sparkflash.toml`:
+
+~~~toml
+[cluster]
+fabric_schedule = "switchless"
+~~~
+
+or per run on the CLI (`--fabric-schedule switchless`, `hairpin` and `ring` are aliases). The
+precedence is the `--fabric-schedule` flag, then `SPARKFLASH_FABRIC_SCHEDULE`; the web console's
+saved `[cluster].fabric_schedule` is exported as that variable by a console-driven launch (and
+overrides a stale entry in `[network].env`), while a hand-run launch reads the variable from its
+own environment. `sparkflash serve` itself does not read `sparkflash.toml`. Every rank of one group
+must run the same value: the collective does not negotiate it on the wire, so a rank started by
+hand with a different value disagrees with its peers at the first exchange. The web
+Setup page offers the same choice as a card in step 2 (**Connect the fast network**), which also
+measures the wiring with ARP probes and can set it to match, and the four-node launcher forwards the
+value to every rank; the host twin's `--fabric-schedule` covers the CPU test path. Both schedules
+are exercised over TCP and the in-process loopback in the host-twin tests, which assert the ring
+selects the same tokens and the same logits bits as the switched schedule at world 2 and 4.
+
 ## What the hardware allowed
 
 The plan depends on a NIC writing into memory the GPU reads, without `nvidia-peermem`. That is the

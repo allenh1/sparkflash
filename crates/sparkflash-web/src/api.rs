@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{
     CommandSpec, ServeAction, SyncTarget, SyncWhat, convert_command, download_command,
-    inspect_command, local_hostname, prepare_command, prepared_probe_command, serve_action_command,
+    fabric_ping_command, fabric_probe_command, inspect_command, local_hostname,
+    network_fix_command, prepare_command, prepared_probe_command, serve_action_command,
     sync_command,
 };
 use crate::config::{
@@ -37,7 +38,7 @@ use crate::config::{
 use crate::discovery::{DiscoveryReport, NodeDiscovery, SshProbe, report_nodes};
 use crate::fit::Cluster;
 use crate::hf::{self, CachedModel, RemoteModel};
-use crate::inspect::{self, Check, ProbeResult, SetupReport};
+use crate::inspect::{self, Check, ProbeResult, SetupReport, Severity};
 use crate::jobs::{JobManager, JobStatus, JobSummary};
 use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 
@@ -47,12 +48,31 @@ use crate::stats::{MAX_SERIES_POINTS, StatsStore, TelemetrySource, now_ms};
 pub const ACTION_HEADER: &str = "x-sparkflash-web";
 
 /// The cluster actions that change whether the group runs; one at a time. A swap is the
-/// in-process stop, switch and launch sequence, so it is exclusive with both.
-const CLUSTER_STATE_KINDS: &[&str] = &["launch", "stop", "swap"];
+/// in-process stop, switch and launch sequence, so it is exclusive with both. A fast-port setup
+/// can drop the links a running group talks over, so it excludes these as well.
+const CLUSTER_STATE_KINDS: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
+];
 
 /// What a conversion must not overlap: a launch, stop or swap, or the checkpoint changing
 /// under it.
-const CONVERT_EXCLUSIVE: &[&str] = &["launch", "stop", "swap", "download", "sync-model"];
+const CONVERT_EXCLUSIVE: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "download",
+    "sync-model",
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
+];
 
 /// What a launch must not overlap: anything that changes the files the ranks start from.
 /// Background `prepare-*` jobs are deliberately absent: sharding another model may continue
@@ -68,6 +88,11 @@ const LAUNCH_EXCLUSIVE: &[&str] = &[
     "convert-r1",
     "convert-r2",
     "convert-r3",
+    // A port job can drop the link the ranks are starting over.
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
 ];
 
 /// What a model download or copy must not overlap: the other one, or a conversion reading it.
@@ -83,10 +108,52 @@ const MODEL_EXCLUSIVE: &[&str] = &[
     "prepare-r1",
     "prepare-r2",
     "prepare-r3",
+    // A port job can drop the link a model transfer is running over.
+    "network-setup-r0",
+    "network-setup-r1",
+    "network-setup-r2",
+    "network-setup-r3",
 ];
 
 /// How long one node check may take, on top of the SSH connect timeout.
 const INSPECT_SECS: u64 = 60;
+
+/// How long the per-rank link probe may take, on top of the SSH connect timeout. The probe
+/// ARPs and pings every fast address of every peer from every fast port, and each unanswered
+/// attempt can burn its one-second wait: two ports, two addresses per peer and three peers is
+/// twelve ARP attempts plus twelve pings in the worst case. The deadline must outlast that, or a
+/// disconnected fabric would be reported as an unfinished probe instead of a measured one.
+const FABRIC_SECS: u64 = 60;
+
+/// What a fast-port setup must not overlap: a launch or stop, and the jobs that move model bytes,
+/// since reconfiguring the ports can drop in-flight transfers.
+const NETWORK_SETUP_EXCLUSIVE: &[&str] = &[
+    "launch",
+    "stop",
+    "swap",
+    "download",
+    "sync-model",
+    "sync-software",
+    // They read model bytes over the same links and can be cut by a netplan apply.
+    "convert-r0",
+    "convert-r1",
+    "convert-r2",
+    "convert-r3",
+    "prepare-r0",
+    "prepare-r1",
+    "prepare-r2",
+    "prepare-r3",
+];
+
+/// How old the last node check may be when its port fixes are applied. The fixes carry the
+/// addresses and routes the check measured and run as root, so a stale report must not be
+/// replayed onto a cluster that has since changed under it.
+const NETWORK_SETUP_MAX_AGE_MS: u64 = 10 * 60 * 1000;
+
+/// How long after a launch or swap the fast ports are left alone. The launcher job finishes when
+/// the script returns, while rank 0 binds about half a minute later and the telemetry takes
+/// another sample, so "rank 0 is online" is not yet a usable gate in that window.
+const LAUNCH_SETTLE_MS: u64 = 5 * 60 * 1000;
 
 /// How long a stop or its confirmation through the launcher may take.
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -139,6 +206,10 @@ pub struct WebState {
     /// provisioner inspect once, instead of reusing a report that describes other nodes or paths.
     last_inspect_config: Arc<RwLock<Option<SparkConfig>>>,
     inspect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One port-setup pass at a time: the four per-rank jobs need different kinds (so the job
+    /// manager's own-kind rule cannot serialize two passes), and two requests must not interleave
+    /// between their rank starts.
+    port_setup_lock: Arc<tokio::sync::Mutex<()>>,
     advertised: Option<String>,
     hostname: String,
 }
@@ -170,6 +241,7 @@ impl WebState {
             last_inspect: Arc::new(RwLock::new(None)),
             last_inspect_config: Arc::new(RwLock::new(None)),
             inspect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            port_setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             advertised: init.advertised,
             hostname: local_hostname(),
         }
@@ -362,8 +434,24 @@ impl WebState {
                 .clone();
             report.filter(|_| inspected_for.as_ref() == Some(&config))
         };
+        // A port pass rewrites the fast ports; a check in the middle of it records a cluster that
+        // is half-configured. The next ten-second pass takes the report instead. The pass lock
+        // also keeps a pass from registering a job between this check and the inspect.
+        let _pass = self.port_setup_lock.lock().await;
         let report = match cached {
             Some(report) if !software_changed_since(&jobs, report.checked_ms) => report,
+            _ if self
+                .jobs
+                .running_in(&[
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ])
+                .is_some() =>
+            {
+                return Ok(());
+            }
             _ => self.inspect_now().await?,
         };
         let lead_ready = report
@@ -381,9 +469,21 @@ impl WebState {
             return Ok(());
         }
         let command = sync_command(&config, SyncWhat::Software, &sync_targets(self, &config))?;
+        // The copy runs over the fast addresses, so a port pass that resets those ports must stop
+        // it: the same exclusion the manual Deploy button uses, in both directions.
         let _ = self
             .jobs
-            .start_exclusive(command, &["launch", "sync-software"])
+            .start_exclusive(
+                command,
+                &[
+                    "launch",
+                    "sync-software",
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ],
+            )
             .await;
         Ok(())
     }
@@ -531,6 +631,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/discover", post(discover))
         .route("/api/inspect", post(inspect_nodes))
         .route("/api/network/apply", post(apply_network))
+        .route("/api/network/setup", post(network_setup))
         .route("/api/models", get(models))
         .route("/api/models/search", get(models_search))
         .route("/api/models/inspect", get(models_inspect))
@@ -903,6 +1004,22 @@ async fn discover(State(web): State<WebState>) -> Response {
 
 /// Checks every node (in parallel, read-only) and keeps the report for the state view.
 async fn inspect_nodes(State(web): State<WebState>) -> Response {
+    // A port pass must not register a job between this check and the inspect, and an inspect must
+    // not run while a pass's jobs are applying: hold the pass lock across both, then the check.
+    let _pass = web.port_setup_lock.lock().await;
+    // The automatic check after a port pass covers the running case; a manual check in the middle
+    // would store a half-applied cluster as the report the port fixes replay.
+    if let Some(id) = web.jobs.running_in(&[
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
+    ]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("port setup job {id} is running; check the Sparks when it finishes"),
+        );
+    }
     match web.inspect_now().await {
         Ok(report) => Json(report).into_response(),
         Err(message) => api_error(StatusCode::CONFLICT, message),
@@ -932,7 +1049,105 @@ fn run_inspect(config: &SparkConfig, probe: &dyn SshProbe) -> SetupReport {
             })
             .collect()
     });
-    inspect::analyze(config, &probes, lead_model_complete(config), now_ms())
+    let fabric = run_fabric_probe(config, probe, &probes);
+    inspect::analyze_fabric(
+        config,
+        &probes,
+        fabric,
+        lead_model_complete(config),
+        now_ms(),
+    )
+}
+
+/// Measures which fast port reaches which Spark: one read-only probe per node, run in parallel,
+/// `None` when the ranks have no usable fast port to probe from.
+fn run_fabric_probe(
+    config: &SparkConfig,
+    probe: &dyn SshProbe,
+    probes: &[ProbeResult],
+) -> Option<inspect::Fabric> {
+    let addresses = inspect::probe_addresses(config, probes)?;
+    let primaries = inspect::planned_peers(config, probes)?;
+    let world = probes.len();
+    let timeout = std::time::Duration::from_secs(config.web.ssh_timeout_secs + FABRIC_SECS);
+    let results: Vec<Option<inspect::FabricProbe>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..world)
+            .map(|rank| {
+                let peers: Vec<(usize, String)> = addresses
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != rank)
+                    .flat_map(|(index, list)| {
+                        list.iter().map(move |address| (index, address.clone()))
+                    })
+                    .collect();
+                let pings: Vec<(usize, String)> = primaries
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != rank)
+                    .map(|(index, address)| (index, address.clone()))
+                    .collect();
+                let rails = probes[rank]
+                    .as_ref()
+                    .map(|facts| facts.rails())
+                    .unwrap_or_default();
+                // One attempt per netdev: the two halves of a cabled port are distinct netdevs
+                // with their own addresses, and both answer the same neighbour.
+                let mut netdevs: Vec<String> =
+                    rails.iter().map(|rail| rail.netdev.clone()).collect();
+                netdevs.sort();
+                netdevs.dedup();
+                // The cable map needs a raw socket (arping, under sudo); the reachability pings
+                // do not, so a host without passwordless sudo still has its peers checked.
+                let arping = fabric_probe_command(config, rank, &netdevs, &peers);
+                let ping = fabric_ping_command(config, rank, &netdevs, &pings);
+                scope.spawn(move || {
+                    let text = probe.capture(&ping, timeout).ok()?;
+                    // A Spark without ping cannot report reachability; that is a broken check,
+                    // not every peer being dead.
+                    if text.contains("ping missing") {
+                        return None;
+                    }
+                    let reached = inspect::parse_fabric(rank, &text).reached;
+                    let arping = probe
+                        .capture(&arping, timeout)
+                        .ok()
+                        .map(|text| inspect::parse_fabric(rank, &text));
+                    Some(inspect::FabricProbe {
+                        links: arping
+                            .as_ref()
+                            .map(|probe| probe.links.clone())
+                            .unwrap_or_default(),
+                        reached,
+                        measured: arping.as_ref().is_some_and(|probe| probe.measured),
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or(None))
+            .collect()
+    });
+    Some(inspect::fabric_from_probes(results, world))
+}
+
+/// Whether the console believes the group is up: a launch or swap that succeeded and no stop since.
+/// The telemetry sample is the other signal; this one survives a sampler gap, a console that has
+/// just restarted, and a serve URL the sampler cannot read.
+fn cluster_believed_running(jobs: &[JobSummary]) -> bool {
+    let finished = |kinds: &[&str], succeeded_only: bool| {
+        jobs.iter()
+            .filter(|job| kinds.contains(&job.kind.as_str()))
+            .filter(|job| !succeeded_only || job.status == JobStatus::Succeeded)
+            .filter_map(|job| job.finished_ms)
+            .max()
+    };
+    let launched = finished(&["launch", "swap"], true);
+    // A stop that failed can leave ranks running (the launcher prompts the whole group under
+    // `set -e`), so only a successful stop clears it; the operator can retry the stop.
+    let stopped = finished(&["stop"], true);
+    launched.is_some_and(|launched| stopped.is_none_or(|stopped| launched > stopped))
 }
 
 /// Whether the lead holds the whole checkpoint: a download left no `.incomplete` blob behind, or
@@ -949,6 +1164,9 @@ fn lead_model_complete(config: &SparkConfig) -> bool {
 
 /// Writes the NCCL settings and peer addresses the last check derived into the configuration.
 async fn apply_network(State(web): State<WebState>) -> Response {
+    // Same snapshot rule as the port setup: the plan and the configuration it was taken of are
+    // written by one inspect, so read them while no inspect can be half-way through.
+    let _inspect = web.inspect_lock.lock().await;
     let plan = web
         .last_inspect
         .read()
@@ -965,8 +1183,239 @@ async fn apply_network(State(web): State<WebState>) -> Response {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
+    // The plan is what the check measured; replaying it onto a configuration that has changed
+    // since would write another cluster's addresses, exactly as the port setup refuses to do.
+    let inspected_for = web
+        .last_inspect_config
+        .read()
+        .expect("inspect lock")
+        .clone();
+    if inspected_for.as_ref() != Some(&config) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check was taken of a different configuration; check the nodes again",
+        );
+    }
+    let checked_ms = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .map_or(0, |report| report.checked_ms);
+    if now_ms().saturating_sub(checked_ms) > NETWORK_SETUP_MAX_AGE_MS {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check is more than ten minutes old; check the nodes again before \
+             saving its settings",
+        );
+    }
     plan.apply(&mut config);
     store_config(&web, config)
+}
+
+/// Applies the fast-port configuration the last check computed on every node that needs it: one
+/// SSH job per node running under `sudo -n`. Refuses when nothing is waiting to be applied.
+async fn network_setup(State(web): State<WebState>) -> Response {
+    // One pass at a time. The four per-rank jobs have different kinds, so the job manager's
+    // own-kind rule cannot serialize two concurrent requests; hold a lock across the whole pass
+    // (the jobs themselves keep running after it is released, which the pre-check below sees).
+    let _pass = web.port_setup_lock.lock().await;
+    // The report and the configuration it was taken of are written by one inspect under this
+    // lock, so reading both while holding it cannot pair an old report with a new configuration.
+    let _inspect = web.inspect_lock.lock().await;
+    let config = match web.usable_config() {
+        Ok(config) => config,
+        Err(message) => return api_error(StatusCode::CONFLICT, message),
+    };
+    // The fixes are the ones the last check computed, including their netplan bodies. Replaying
+    // them against a configuration that has since changed would write another machine's
+    // addresses to this rank, so a report taken for a different configuration is refused.
+    let report = web.last_inspect.read().expect("inspect lock").clone();
+    let inspected_for = web
+        .last_inspect_config
+        .read()
+        .expect("inspect lock")
+        .clone();
+    let Some(report) = report.filter(|_| inspected_for.as_ref() == Some(&config)) else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check was taken of a different configuration; check the nodes again",
+        );
+    };
+    // The config was not the only thing that could change since the check: an address, a lease or
+    // a cable could have. Ten minutes is long enough to read the report and click the button.
+    if now_ms().saturating_sub(report.checked_ms) > NETWORK_SETUP_MAX_AGE_MS {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check is more than ten minutes old; check the nodes again before \
+             writing its fixes",
+        );
+    }
+    // netplan apply drops the fast ports for a moment, so a serving cluster would lose the links
+    // its collectives are mid-transfer on. Rank 0 answering is the positive signal; the job
+    // history covers a console that has not sampled yet, or one whose telemetry cannot reach it.
+    if web.stats.latest().is_some_and(|sample| sample.online) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "rank 0 is online; stop the cluster before reconfiguring the fast ports",
+        );
+    }
+    // A launch that just finished is still booting: netplan apply now would drop the links the
+    // group is coming up over. The telemetry gate above only fires once the sampler has seen the
+    // server, which is later than the job ending. Only a launch the console still believes in
+    // counts: a stop since (or a launch that failed) means nothing is coming up.
+    let jobs = web.jobs.list();
+    let believed = cluster_believed_running(&jobs);
+    let launched_ms = jobs
+        .iter()
+        .filter(|job| {
+            matches!(job.kind.as_str(), "launch" | "swap") && job.status == JobStatus::Succeeded
+        })
+        .filter_map(|job| job.finished_ms)
+        .max();
+    if believed
+        && launched_ms.is_some_and(|finished| now_ms().saturating_sub(finished) < LAUNCH_SETTLE_MS)
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the cluster was launched less than five minutes ago and may still be coming up; wait until it answers or stop it before reconfiguring the fast ports",
+        );
+    }
+    if believed {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the cluster was launched and has not been stopped; stop it before reconfiguring the fast ports",
+        );
+    }
+    // A cluster-wide error means the plan itself is invalid (two Sparks on one address, say):
+    // its routes must not be derived or written as root, whatever per-rank fixes it also has.
+    if let Some(message) = report
+        .findings
+        .iter()
+        .find(|finding| finding.rank.is_none() && finding.severity == Severity::Error)
+        .map(|finding| finding.message.clone())
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "the last check reports a problem no port fix can write: {message}; fix it and \
+                 check the nodes again"
+            ),
+        );
+    }
+    // A Spark that did not answer leaves the plan incomplete: its addresses are unknown, so a
+    // free address the fix hands to a reachable rank could collide with one it already has.
+    let unreachable: Vec<String> = report
+        .nodes
+        .iter()
+        .filter(|node| !node.reachable)
+        .map(|node| node.hostname.clone().unwrap_or_else(|| node.ssh.clone()))
+        .collect();
+    if !unreachable.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} did not answer the last check, so the plan is incomplete; check the Sparks \
+                 again",
+                unreachable.join(", ")
+            ),
+        );
+    }
+    // A port job holds its rank's own kind, so it cannot start twice; the other ranks of the
+    // same pass have different kinds, so a second click would start them again while the first
+    // pass is still running. One pass at a time.
+    if let Some(id) = web.jobs.running_in(&[
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
+    ]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("port setup job {id} is already running"),
+        );
+    }
+    let fixes: Vec<(usize, String)> = report
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.network_fix_remote
+                .clone()
+                .map(|remote| (node.rank, remote))
+        })
+        .collect();
+    if fixes.is_empty() {
+        // Nothing to apply. That is only "the ports already match" when the check compared every
+        // node: one that did not answer, or one whose problem no port fix can write, leaves this
+        // button with nothing to do and must be named instead of certified.
+        let waiting: Vec<String> = report
+            .nodes
+            .iter()
+            .filter(|node| {
+                !node.reachable
+                    || (node.network_fix.is_none()
+                        && report.findings.iter().any(|finding| {
+                            finding.rank == Some(node.rank) && finding.severity == Severity::Error
+                        }))
+            })
+            .map(|node| node.hostname.clone().unwrap_or_else(|| node.ssh.clone()))
+            .collect();
+        // A cluster-wide error (two Sparks on one address, for instance) is a problem no port
+        // fix can write either, so "already match" would be wrong for it too.
+        let cluster_error = report
+            .findings
+            .iter()
+            .find(|finding| finding.rank.is_none() && finding.severity == Severity::Error)
+            .map(|finding| finding.message.clone());
+        if !waiting.is_empty() {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!(
+                    "the last check still reports a problem on {}; fix it and check the nodes again",
+                    waiting.join(", ")
+                ),
+            );
+        }
+        if let Some(message) = cluster_error {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("the last check still reports a problem: {message}"),
+            );
+        }
+        return api_error(
+            StatusCode::CONFLICT,
+            "the fast ports already match the plan; check the nodes to recompute",
+        );
+    }
+    let mut started = Vec::new();
+    for (rank, remote) in fixes {
+        let Some(command) = network_fix_command(&config, rank, &remote) else {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("rank {rank} is not in the saved configuration any more"),
+            );
+        };
+        match web
+            .jobs
+            .start_exclusive(command, NETWORK_SETUP_EXCLUSIVE)
+            .await
+        {
+            Ok(id) => started.push(id),
+            Err(error) => {
+                // Earlier ranks are already running their jobs; say so rather than dropping the
+                // ids silently.
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{} ({} job(s) had already started and are still running)",
+                        error.message,
+                        started.len()
+                    ),
+                );
+            }
+        }
+    }
+    accepted_jobs(&web, &started)
 }
 
 /// Downloads the configured model into the lead's Hugging Face cache.
@@ -1105,7 +1554,15 @@ async fn sync(State(web): State<WebState>, Json(request): Json<SyncRequest>) -> 
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
     let exclusive: &[&str] = match request.what {
-        SyncWhat::Software => &["launch", "swap"],
+        // A port job can cut the link the copy is running over.
+        SyncWhat::Software => &[
+            "launch",
+            "swap",
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
+        ],
         SyncWhat::Model => MODEL_EXCLUSIVE,
     };
     match web.jobs.start_exclusive(command, exclusive).await {
@@ -1642,7 +2099,18 @@ async fn prepare_model(State(web): State<WebState>, Json(request): Json<ModelReq
         let command = prepare_command(&target, rank);
         match web
             .jobs
-            .start_exclusive(command, &["download", "sync-model", "swap"])
+            .start_exclusive(
+                command,
+                &[
+                    "download",
+                    "sync-model",
+                    "swap",
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ],
+            )
             .await
         {
             Ok(id) => started.push(id),
@@ -1706,6 +2174,10 @@ async fn swap(State(web): State<WebState>, Json(request): Json<ModelRequest>) ->
         "convert-r1",
         "convert-r2",
         "convert-r3",
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
     ]) {
         return api_error(
             StatusCode::CONFLICT,
@@ -1768,6 +2240,10 @@ async fn swap(State(web): State<WebState>, Json(request): Json<ModelRequest>) ->
             "convert-r1",
             "convert-r2",
             "convert-r3",
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
         ],
         &scope,
     ) {
@@ -2058,7 +2534,19 @@ mod tests {
         }
     }
 
-    struct FakeSsh;
+    /// A healthy four-Spark cluster. When `fresh_rank` is set, that rank's fast ports are
+    /// reported as cabled but unconfigured (no addresses, MTU 1500), which is the state the
+    /// one-click port fix exists for.
+    struct FakeSsh {
+        fresh_rank: Option<usize>,
+    }
+    impl FakeSsh {
+        fn fresh_node_text(rank: usize) -> String {
+            format!(
+                "host spark-{rank}\nport rocep1s0f1 ACTIVE 200\ngid rocep1s0f1 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1\ngid rocep1s0f1 1 RoCE_v2 fe80:0000:0000:0000:4ebb:47ff:fe00:0002 enp1s0f1np1\nport roceP2p1s0f1 ACTIVE 200\ngid roceP2p1s0f1 0 IB/RoCE_v1 fe80:0000:0000:0000:4ebb:47ff:fe00:0006 enP2p1s0f1np1\narp all 0 0\nlink enp1s0f1np1 1500 up 0 0\nlink enP2p1s0f1np1 1500 up 0 0\n"
+            )
+        }
+    }
     impl SshProbe for FakeSsh {
         fn probe(&self, _command: &CommandSpec) -> ProbeOutcome {
             ProbeOutcome {
@@ -2077,20 +2565,94 @@ mod tests {
             if command.kind == "prepared" {
                 return Ok("ready".to_owned());
             }
-            let rank = if command.program == "bash" {
-                0
-            } else {
-                (1..4)
-                    .find(|rank| {
-                        command
-                            .args
-                            .iter()
-                            .any(|arg| arg.ends_with(&format!("spark{rank}")))
-                    })
-                    .expect("an ssh destination")
-            };
-            if rank == 3 {
+            // The local rank's commands carry no ssh destination; a link probe runs under
+            // `sudo -n`, so the program is not the way to tell it either.
+            let rank = (1..4)
+                .find(|rank| {
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                })
+                .unwrap_or(0);
+            if command.kind == "fabric-probe" {
+                if self.fresh_rank == Some(rank) {
+                    // Ports cabled but unconfigured: nothing answers.
+                    return Ok((0..4)
+                        .filter(|peer| *peer != rank)
+                        .map(|peer| format!("ping {peer} dev{rank} no\n"))
+                        .collect());
+                }
+                // A fully switched fabric: this rank's port reaches every other rank.
+                if rank == 3 {
+                    return Err("Permission denied (publickey).".to_owned());
+                }
+                let mut reply = String::new();
+                for peer in 0..4 {
+                    if peer != rank {
+                        reply.push_str(&format!(
+                            "link {peer} dev{rank} 198.51.100.{} ok\nping {peer} dev{rank} ok\n",
+                            21 + peer
+                        ));
+                    }
+                }
+                return Ok(reply);
+            }
+            if rank == 3 && self.fresh_rank.is_none() {
                 return Err("Permission denied (publickey).".to_owned());
+            }
+            if self.fresh_rank == Some(rank) {
+                return Ok(Self::fresh_node_text(rank));
+            }
+            let rank = u8::try_from(rank).expect("rank");
+            Ok(crate::inspect::tests::node_text(
+                &format!("spark-{rank}"),
+                11 + rank,
+                21 + rank,
+            ))
+        }
+    }
+
+    /// A four-Spark cluster where every node answers and every fast port is already configured,
+    /// so the node check finds nothing for the port fix to write.
+    struct HealthySsh;
+    impl SshProbe for HealthySsh {
+        fn probe(&self, _command: &CommandSpec) -> ProbeOutcome {
+            ProbeOutcome {
+                ok: true,
+                message: String::new(),
+            }
+        }
+
+        fn capture(
+            &self,
+            command: &CommandSpec,
+            _timeout: std::time::Duration,
+        ) -> Result<String, String> {
+            if command.kind == "prepared" {
+                return Ok("ready".to_owned());
+            }
+            // The local rank's commands carry no ssh destination; a link probe runs under
+            // `sudo -n`, so the program is not the way to tell it either.
+            let rank = (1..4)
+                .find(|rank| {
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                })
+                .unwrap_or(0);
+            if command.kind == "fabric-probe" {
+                let mut reply = String::new();
+                for peer in 0..4 {
+                    if peer != rank {
+                        reply.push_str(&format!(
+                            "link {peer} dev{rank} 198.51.100.{} ok\nping {peer} dev{rank} ok\n",
+                            21 + peer
+                        ));
+                    }
+                }
+                return Ok(reply);
             }
             let rank = u8::try_from(rank).expect("rank");
             Ok(crate::inspect::tests::node_text(
@@ -2105,10 +2667,33 @@ mod tests {
         test_state_with(dir, false, None)
     }
 
+    fn test_state_with_ssh(
+        dir: &std::path::Path,
+        exists: bool,
+        load_error: Option<String>,
+        ssh: Arc<dyn SshProbe>,
+    ) -> WebState {
+        test_state_inner(dir, exists, load_error, ssh)
+    }
+
     fn test_state_with(
         dir: &std::path::Path,
         exists: bool,
         load_error: Option<String>,
+    ) -> WebState {
+        test_state_inner(
+            dir,
+            exists,
+            load_error,
+            Arc::new(FakeSsh { fresh_rank: None }),
+        )
+    }
+
+    fn test_state_inner(
+        dir: &std::path::Path,
+        exists: bool,
+        load_error: Option<String>,
+        ssh: Arc<dyn SshProbe>,
     ) -> WebState {
         let mut config = SparkConfig::default();
         // Never the real ~/.cache: each test's hub cache starts empty.
@@ -2124,7 +2709,7 @@ mod tests {
             load_error,
             exists,
             discovery: Arc::new(FakeDiscovery),
-            ssh: Arc::new(FakeSsh),
+            ssh,
             jobs: Arc::new(JobManager::new()),
             stats,
             telemetry: Arc::new(TelemetrySource::new("http://127.0.0.1:9")),
@@ -2969,6 +3554,588 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn network_setup_requires_a_check_and_only_touches_nodes_that_need_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state);
+
+        // Nothing checked yet: the endpoint refuses rather than guess.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Rank 3 is the only node whose ports are unconfigured; exactly one job starts.
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = body_json(response).await;
+        let jobs = body["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 1, "{body}");
+        assert_eq!(jobs[0]["kind"], "network-setup-r3");
+
+        // The job that started carries the port fix for that rank: the SSH destination and the
+        // `sudo -n` wrapper, not some other node's netplan.
+        let listed = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/jobs")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        let job = listed
+            .as_array()
+            .and_then(|jobs| jobs.iter().find(|job| job["kind"] == "network-setup-r3"))
+            .expect("the port job is listed");
+        let command = job["command"].as_str().expect("command");
+        assert!(command.starts_with("ssh "), "{command}");
+        assert!(command.contains("spark3"), "{command}");
+        assert!(command.contains("sudo -n bash -c"), "{command}");
+        assert!(command.contains("netplan apply"), "{command}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_a_report_taken_of_another_configuration() {
+        // The fixes replay the netplan body the last check computed, including its addresses.
+        // Saving a different configuration between the check and the button must not write the
+        // old machine's fast-network address onto whatever now runs at that rank.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state);
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let state = body_json(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/state")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response"),
+        )
+        .await;
+        let mut config: SparkConfig =
+            serde_json::from_value(state["config"].clone()).expect("config");
+        config.web.ssh_timeout_secs += 1;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .header(ACTION_HEADER, "1")
+                    .uri("/api/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"config": config}).to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("different configuration")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_setup_conflicts_when_the_ports_are_already_configured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(HealthySsh),
+        ));
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // The API-level check really runs the classifier: the fake's four ports each answer every
+        // peer, which is a switched fabric.
+        let report = body_json(response).await;
+        assert_eq!(report["fabric"]["shape"], "switched", "{report}");
+        assert_eq!(report["fabric"]["links_measured"], true, "{report}");
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("already match the plan"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_does_not_certify_a_node_the_check_could_not_compare() {
+        // Rank 3 does not answer the node check, so its ports were never compared with the plan.
+        // Nothing is left for the button to apply, and the answer must name the node instead of
+        // claiming its ports already match.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = test_router(test_state(dir.path()));
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        // The plan is incomplete because a Spark did not answer; that is refused before any
+        // "already match" answer.
+        assert!(error.contains("did not answer the last check"), "{error}");
+        assert!(!error.contains("already match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_a_report_older_than_ten_minutes() {
+        // The fixes replay the addresses and routes measured at check time under root. The
+        // configuration check cannot see a host that changed since, so the age is bounded too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            report.checked_ms = 1;
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("more than ten minutes old"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_does_not_certify_a_cluster_wide_error() {
+        // Two Sparks on one address is a finding with no rank, and no port fix can write it. The
+        // "already match the plan" answer would be wrong while it stands.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(dir.path(), false, None, Arc::new(HealthySsh));
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            report.findings.push(inspect::Finding {
+                rank: None,
+                severity: Severity::Error,
+                message: "Two Sparks have the same fast-network address".to_owned(),
+            });
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("Two Sparks have the same"), "{error}");
+        assert!(!error.contains("already match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_node_check_is_refused_while_a_port_pass_runs() {
+        // A check in the middle of a port pass records a half-applied cluster, and its fixes are
+        // what the port setup later replays.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        let app = test_router(state.clone());
+        let spec = CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 1".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            label: "Port setup on spark0".to_owned(),
+            kind: "network-setup-r0".to_owned(),
+        };
+        let _ = state
+            .jobs
+            .start_exclusive(spec, &[])
+            .await
+            .expect("port job");
+        let response = app
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("port setup job"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_is_allowed_again_after_the_cluster_is_stopped() {
+        // The settle window is about a launch that is still coming up. A stop after it means
+        // nothing is, and refusing the port fix for five minutes would be wrong.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        for kind in ["launch", "stop"] {
+            let spec = CommandSpec {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "true".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                label: kind.to_owned(),
+                kind: kind.to_owned(),
+            };
+            let id = state.jobs.start_exclusive(spec, &[]).await.expect("job");
+            loop {
+                let detail = state.jobs.get(id).expect("job");
+                if detail.summary.status.is_done() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_an_incomplete_plan_even_with_a_per_rank_fix() {
+        // Rank 3 did not answer, so its addresses are unknown: a fix that also allocates a free
+        // address on another rank could collide with one it already has.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            assert!(
+                report.nodes.iter().any(|node| !node.reachable),
+                "the fixture has an unreachable Spark"
+            );
+            let node = report.nodes.first_mut().expect("rank 0");
+            node.network_fix = Some("sudo ip link set mtu 9000 dev enp1s0f1np1".to_owned());
+            node.network_fix_remote = Some("ip link set mtu 9000 dev enp1s0f1np1".to_owned());
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("did not answer the last check"), "{error}");
+        assert!(
+            state
+                .jobs
+                .list()
+                .iter()
+                .all(|job| !job.kind.starts_with("network-setup-")),
+            "no port job may start for an incomplete plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_a_plan_the_check_marks_invalid() {
+        // A cluster-wide error (two Sparks on one address) invalidates the plan; a per-rank fix
+        // in the same report must not be applied as root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            assert!(
+                report.nodes.iter().any(|node| node.network_fix.is_some()),
+                "the fixture has a port fix to apply"
+            );
+            report.findings.push(inspect::Finding {
+                rank: None,
+                severity: Severity::Error,
+                message: "Two Sparks have the same fast-network address".to_owned(),
+            });
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("no port fix can write"), "{error}");
+        assert!(
+            state
+                .jobs
+                .list()
+                .iter()
+                .all(|job| !job.kind.starts_with("network-setup-")),
+            "no port job may start for an invalid plan"
+        );
+    }
+
+    #[test]
+    fn a_launch_that_was_not_stopped_keeps_the_ports_alone() {
+        let job = |kind: &str, status: JobStatus, finished_ms: u64| JobSummary {
+            id: finished_ms,
+            kind: kind.to_owned(),
+            label: String::new(),
+            command: String::new(),
+            status,
+            started_ms: 0,
+            finished_ms: Some(finished_ms),
+            exit_code: None,
+            last_line: None,
+            progress: None,
+        };
+        assert!(!cluster_believed_running(&[]));
+        assert!(cluster_believed_running(&[job(
+            "launch",
+            JobStatus::Succeeded,
+            10
+        )]));
+        assert!(cluster_believed_running(&[job(
+            "swap",
+            JobStatus::Succeeded,
+            10
+        )]));
+        assert!(!cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Succeeded, 20),
+        ]));
+        // A stop that ran before the launch does not count, and a stop attempt after it does.
+        assert!(cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Succeeded, 5),
+        ]));
+        // A failed stop may leave ranks running, so it does not clear the belief.
+        assert!(cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Failed, 20),
+        ]));
+        // A launch that failed started nothing to protect.
+        assert!(!cluster_believed_running(&[job(
+            "launch",
+            JobStatus::Failed,
+            10
+        )]));
+    }
+
+    #[tokio::test]
+    async fn network_setup_waits_for_a_launch_that_is_still_coming_up() {
+        // The launcher job ends when the script returns; rank 0 binds later and the telemetry
+        // samples later still, so a port setup in that window would drop the links the group is
+        // booting over.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let spec = CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), "true".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            label: "Launch".to_owned(),
+            kind: "launch".to_owned(),
+        };
+        let id = state
+            .jobs
+            .start_exclusive(spec, &[])
+            .await
+            .expect("launch job");
+        loop {
+            let detail = state.jobs.get(id).expect("job");
+            if detail.summary.status.is_done() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("may still be coming up"), "{error}");
+    }
+
+    #[test]
+    fn a_port_setup_and_the_cluster_state_actions_exclude_each_other() {
+        // NETWORK_SETUP_EXCLUSIVE names what a port job must wait for; CLUSTER_STATE_KINDS is
+        // what a stop waits for. The two directions have to cover each other or one of them can
+        // start while the other is running.
+        for kind in [
+            "network-setup-r0",
+            "network-setup-r1",
+            "network-setup-r2",
+            "network-setup-r3",
+        ] {
+            assert!(
+                CLUSTER_STATE_KINDS.contains(&kind),
+                "a stop must wait for {kind}"
+            );
+        }
+        // The port jobs stay out of their own list on purpose: one pass runs four of them at
+        // once, so only the cluster-state actions have to be in both directions.
+        for kind in ["launch", "stop", "swap"] {
+            assert!(
+                NETWORK_SETUP_EXCLUSIVE.contains(&kind),
+                "a port job must wait for {kind}"
+            );
+        }
+        assert!(
+            !NETWORK_SETUP_EXCLUSIVE
+                .iter()
+                .any(|kind| kind.starts_with("network-setup-")),
+            "one port-setup pass starts the four ranks together"
+        );
+        for kind in ["download", "sync-model", "sync-software"] {
+            assert!(
+                NETWORK_SETUP_EXCLUSIVE.contains(&kind),
+                "a port job must wait for {kind}"
+            );
+        }
+    }
+
     fn post_json(uri: &str, body: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -3048,8 +4215,15 @@ mod tests {
                 )))
             })
             .collect();
-        *web.last_inspect.write().expect("inspect lock") =
-            Some(inspect::analyze(&config, &probes, true, 1));
+        *web.last_inspect.write().expect("inspect lock") = Some(inspect::analyze(
+            &config,
+            &probes,
+            true,
+            crate::stats::now_ms(),
+        ));
+        // A real check records the configuration it measured; the apply refuses a report of
+        // another one.
+        *web.last_inspect_config.write().expect("inspect lock") = Some(config.clone());
         let app = test_router(web.clone());
         let response = app
             .oneshot(post_json("/api/network/apply", "{}"))

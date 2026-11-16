@@ -39,7 +39,7 @@ use sparkflash_comm::transport::Transport;
 use crate::tp4_resident;
 
 /// How the stage was invoked.
-pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--engram-tokenizer FILE] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync]";
+pub const USAGE: &str = "sparkflash device-chain --run-stage tp4-chain (--checkpoint DIR | --tensor-index FILE) --tp-rank R --tp-world-size 4 --evidence-dir DIR [--plan-only] [--upload] [--comm-peers IP,IP,IP,IP] [--comm-base-port 29601] [--comm-timeout 120] [--comm-connect-timeout 120] [--comm-smoke] [--decode-steps N] [--prompt-tokens N] [--cubin-dir DIR] [--engram-tokenizer FILE] [--forward --forward-preflight --kernel-cubin-dir DIR --token-ids ID,ID --forward-reference-ids ID,ID] [--native-rounding none|combine|mhc|shared|both|LIST] [--forward-native-dense-parity [LAYER[:POSITION]]] [--forward-lean] [--forward-perf-probe] [--forward-perf-probe-nosync] [--fabric-schedule switched|switchless]";
 
 /// The parsed argv.
 #[derive(Debug)]
@@ -101,6 +101,13 @@ struct ChainArgs {
     /// block's wall is the host's and the device time arrives from one run-end event harvest
     /// (diagnostics only: same separate perf file, its mode line says which wall clock it used).
     forward_perf_probe_nosync: bool,
+    /// --fabric-schedule: which schedule every layout this run builds executes. `switched` (the
+    /// default) is the one-shot all-to-all; `switchless` is the hairpin ring that reduce-scatters
+    /// to chunk owners and all-gathers back (issue #19). It selects the transport-level schedule
+    /// (host reduce, barriers, smokes); the NCCL device reduce is its own backend, selected by
+    /// SPARK_COMM_REDUCE, and picks its own NCCL topology. Resolved at parse time: the flag wins,
+    /// and without it the environment decides ([`crate::tp4_host::FABRIC_SCHEDULE_ENV`]).
+    fabric_schedule: FabricSchedule,
 }
 
 /// When the device arm should capture per-step CUDA graphs.
@@ -146,6 +153,9 @@ impl ChainArgs {
         let mut forward_lean = false;
         let mut forward_perf_probe = false;
         let mut forward_perf_probe_nosync = false;
+        // The flag wins; without it the environment decides when the stage runs, so a bad env
+        // value cannot block a run that names the schedule on the command line.
+        let mut fabric_schedule = None;
         let mut index = 0;
         while index < args.len() {
             let flag = args[index];
@@ -250,6 +260,14 @@ impl ChainArgs {
                 "--forward-lean" => forward_lean = true,
                 "--forward-perf-probe" => forward_perf_probe = true,
                 "--forward-perf-probe-nosync" => forward_perf_probe_nosync = true,
+                "--fabric-schedule" => {
+                    let value = take("--fabric-schedule")?;
+                    fabric_schedule = Some(
+                        crate::tp4_host::parse_fabric_schedule(&value).ok_or_else(|| {
+                            format!("--fabric-schedule {value}: expected switched or switchless")
+                        })?,
+                    );
+                }
                 "--verify-weights" => {
                     #[allow(unused_unsafe)]
                     unsafe {
@@ -389,6 +407,10 @@ impl ChainArgs {
             forward_lean,
             forward_perf_probe,
             forward_perf_probe_nosync,
+            fabric_schedule: match fabric_schedule {
+                Some(schedule) => schedule,
+                None => crate::tp4_host::fabric_schedule_from_env()?,
+            },
         })
     }
 }
@@ -474,6 +496,7 @@ fn build_token_request<'a>(
     crate::tp4_forward::TokenStageRequest {
         rank: args.rank,
         world: args.world,
+        fabric_schedule: args.fabric_schedule,
         arm: header.arm,
         evidence: header.evidence,
         header: header.clone(),
@@ -632,7 +655,7 @@ fn comm_smoke(args: &ChainArgs) -> Result<serde_json::Value, String> {
     let transport = open_transport(args)?;
     let connected_ms = started.elapsed().as_millis() as u64;
     let mut buffer: Vec<u16> = vec![bf16_bits((args.rank + 1) as f32); SMOKE_ELEMENTS];
-    let layout = CollectiveLayout::new(args.world, SMOKE_ELEMENTS, FabricSchedule::OneShotAllToAll)
+    let layout = CollectiveLayout::new(args.world, SMOKE_ELEMENTS, args.fabric_schedule)
         .map_err(|error| format!("collective layout: {error}"))?;
     let reduced = Instant::now();
     transport
@@ -710,7 +733,7 @@ fn collective_walk(
     let layers = config.n_layers;
     let elements = config.dim;
     let world = args.world;
-    let mut collective = LayerCollective::new(transport, layers);
+    let mut collective = LayerCollective::new(transport, layers, args.fabric_schedule);
     let steps_total = args.warmup_steps + args.decode_steps.max(1);
     let mut rows = Vec::with_capacity(steps_total);
     for step in 0..steps_total {
@@ -1607,14 +1630,16 @@ impl CollectiveCounter {
 struct LayerCollective {
     transport: TcpTransport,
     counter: CollectiveCounter,
+    fabric_schedule: FabricSchedule,
 }
 
 #[allow(dead_code)]
 impl LayerCollective {
-    fn new(transport: TcpTransport, layers: usize) -> Self {
+    fn new(transport: TcpTransport, layers: usize, fabric_schedule: FabricSchedule) -> Self {
         Self {
             transport,
             counter: CollectiveCounter::new(layers),
+            fabric_schedule,
         }
     }
 
@@ -1627,7 +1652,7 @@ impl LayerCollective {
         let layout = CollectiveLayout::new(
             self.transport.world_size(),
             buffer.len(),
-            FabricSchedule::OneShotAllToAll,
+            self.fabric_schedule,
         )
         .map_err(|error| {
             format!(

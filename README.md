@@ -148,7 +148,7 @@ and checks every Spark after each one, so it always shows what is done and what 
 | Step                                  | What happens                                                                                                                                                                              |
 |:--------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1. Find your Sparks                   | Pick your other three Sparks from the ones on the network. If this Spark can't sign in to one yet, the page shows the one command that fixes it.                                          |
-| 2. Connect the fast network           | Checks the cables and works out the dual-rail NCCL settings from what each Spark reports. If a port still needs an address or a larger MTU, it shows the commands to paste on that Spark. |
+| 2. Connect the fast network           | Checks the cables and works out the dual-rail NCCL settings from what each Spark reports. **Set up the ports** writes what a port still needs (an address, MTU 9000, the ARP settings, and on a ring the routes and forwarding) over SSH; the same commands can be copied instead. |
 | 3. Deploy the server                  | Copies the same binary, its GPU kernels and NCCL from this Spark automatically when a copy is missing or older.                                                                            |
 | 4. Download the model                 | Fetches [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) (510 GB) onto this Spark, with progress. An interrupted download resumes where it stopped.          |
 | 5. Copy the model to the other Sparks | Copies it over the fast network to all three at once.                                                                                                                                     |
@@ -194,12 +194,17 @@ Step 2 reads every Spark's RoCE devices and works out the settings for you:
 | `NCCL_IB_GID_INDEX` | the GID slot holding the ports' RoCE v2 IPv4 addresses (3 on DGX OS) |
 | each Spark's peer address | that Spark's address on the same interface |
 
-It also checks that every port links at 200 Gb/s, uses MTU 9000, and, when a Spark's two
-interfaces share a subnet, that each answers ARP only for its own address (`arp_ignore=1`,
-`arp_announce=2`). The console never changes a Spark's network itself. When something needs
-fixing, it shows a short script for that Spark, to paste into a terminal there, which writes
-`/etc/netplan/60-sparkflash-fabric.yaml` (and `/etc/sysctl.d/60-sparkflash-fabric.conf` when ARP
-needs it) and applies it:
+It also checks that every port links at 200 Gb/s, uses MTU 9000, and, on every Spark with more than
+one fast lane, that each port answers ARP only for its own address (`arp_ignore=1`,
+`arp_announce=2`). ARP is layer 2, so the setting matters even when a Spark's two ports are on
+different subnets: without it a port answers for its sibling's address and the measured cabling
+means nothing. **Set up the ports** applies the fix on each Spark under passwordless
+`sudo -n` (locally on the lead, over SSH on the others); the same commands are shown for copying
+into a terminal on that Spark. They write
+`/etc/netplan/60-sparkflash-fabric.yaml` (the addresses and MTU, and on a ring a `/32` route for
+every fast address of every peer) and `/etc/sysctl.d/60-sparkflash-fabric.conf` (the ARP
+settings, and on a ring `ip_forward=1` with loose `rp_filter=2` so the Spark in between relays
+the diagonals), then apply them:
 
 ```bash
 sudo tee /etc/netplan/60-sparkflash-fabric.yaml > /dev/null <<'EOF'
@@ -223,8 +228,8 @@ sudo netplan apply
 ```
 
 New addresses join the subnet the other Sparks' fast ports already use, or `10.200.0.0/24` when
-none has one yet. After pasting, press **Check again**, then **Use these settings**, which saves
-the NCCL values and peer addresses into `sparkflash.toml`.
+none has one yet. Press **Set up the ports** (or paste the commands), then **Check again**, then
+**Use these settings**, which saves the NCCL values and peer addresses into `sparkflash.toml`.
 
 ### Manual setup
 

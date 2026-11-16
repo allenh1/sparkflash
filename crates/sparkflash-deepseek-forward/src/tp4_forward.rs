@@ -2527,6 +2527,10 @@ pub struct TokenStageRequest<'a> {
     pub rank: usize,
     /// The world size (4).
     pub world: usize,
+    /// The fabric schedule this run's collectives use: the switched one-shot all-to-all (the
+    /// default) or the switchless hairpin ring (issue #19). Carried as a value so the loop, the
+    /// chain's bootstrap and the evidence cannot disagree about it.
+    pub fabric_schedule: sparkflash_comm::layout::FabricSchedule,
     /// The arm this run takes, decided ONCE by the caller from the two raw switches
     /// ([crate::layer_device::decide_layer_arm]) before any device work. The loop, the chain's
     /// bootstrap and the record all read this field; nothing below re-reads the environment.
@@ -4140,7 +4144,7 @@ fn run_layer_attention_output(
     parity: &mut NativeDenseParity,
     scratch: &mut AttentionOutputScratch,
 ) -> Result<Layer0AttentionOutput, String> {
-    use sparkflash_comm::layout::{CollectiveLayout, FabricSchedule};
+    use sparkflash_comm::layout::CollectiveLayout;
     use sparkflash_kernels::bf16a_mxfp8w_wo_a_launch as wo_a_launch;
     use sparkflash_kernels::mxfp8_dense_launch;
     use sparkflash_kernels::mxfp8_gemv_launch;
@@ -4366,7 +4370,7 @@ fn run_layer_attention_output(
                 .iter()
                 .map(|pair| u16::from_le_bytes(*pair)),
         );
-        let layout = CollectiveLayout::new(request.world, HIDDEN, FabricSchedule::OneShotAllToAll)
+        let layout = CollectiveLayout::new(request.world, HIDDEN, request.fabric_schedule)
             .map_err(|error| format!("layer-0 attention output: collective layout: {error}"))?;
         let reduce_sequence = ATTENTION_REDUCE_SEQ.wrapping_sub(body.position as u64);
         reduce
@@ -5085,7 +5089,7 @@ fn run_layer_moe_routed(
     transport: &TcpTransport,
     reduce: &ForwardReduce<'_>,
 ) -> Result<Layer0MoeRouted, String> {
-    use sparkflash_comm::layout::{CollectiveLayout, FabricSchedule};
+    use sparkflash_comm::layout::CollectiveLayout;
     use sparkflash_comm::transport::Transport;
     use sparkflash_kernels::cuda_driver::KernelId;
     use sparkflash_kernels::{
@@ -5402,9 +5406,8 @@ fn run_layer_moe_routed(
                     .iter()
                     .map(|pair| u16::from_le_bytes(*pair))
                     .collect();
-                let layout =
-                    CollectiveLayout::new(request.world, dim, FabricSchedule::OneShotAllToAll)
-                        .map_err(|error| format!("MoE: collective layout: {error}"))?;
+                let layout = CollectiveLayout::new(request.world, dim, request.fabric_schedule)
+                    .map_err(|error| format!("MoE: collective layout: {error}"))?;
                 let reduce_sequence = MOE_REDUCE_SEQ;
                 reduce
                     .all_reduce_bf16(&mut words, reduce_sequence, &layout)
@@ -16708,7 +16711,7 @@ fn run_forward_loop(
         let barrier_layout = sparkflash_comm::layout::CollectiveLayout::new(
             request.world,
             1,
-            sparkflash_comm::layout::FabricSchedule::OneShotAllToAll,
+            request.fabric_schedule,
         )
         .map_err(|error| format!("forward reduce: reduce-path barrier layout: {error}"))?;
         transport
@@ -19391,10 +19394,9 @@ fn run_forward_loop(
     // was still posting prefill-gather frames.
     let timer = BlockTimer::start(probe_on);
     {
-        use sparkflash_comm::layout::{CollectiveLayout, FabricSchedule};
-        let barrier_layout =
-            CollectiveLayout::new(request.world, 8, FabricSchedule::OneShotAllToAll)
-                .map_err(|error| format!("forward loop end barrier layout: {error}"))?;
+        use sparkflash_comm::layout::CollectiveLayout;
+        let barrier_layout = CollectiveLayout::new(request.world, 8, request.fabric_schedule)
+            .map_err(|error| format!("forward loop end barrier layout: {error}"))?;
         let mut barrier = vec![(request.rank as u16).wrapping_add(1); 8];
         transport
             .all_reduce_bf16(&mut barrier, FORWARD_BARRIER_SEQ, &barrier_layout)
@@ -19899,6 +19901,7 @@ mod tests {
         TokenStageRequest {
             rank: 0,
             world: 4,
+            fabric_schedule: sparkflash_comm::layout::FabricSchedule::OneShotAllToAll,
             n_layers: 40,
             positions: 1,
             evidence_dir: dir,

@@ -20,9 +20,9 @@
 //!   payload to all three peers and each rank reduces locally in canonical rank order.
 //! * FabricSchedule::HairpinRingReduceScatterAllGather - the switchless schedule. The buffer is
 //!   split into one chunk per rank; every rank sends its contribution of chunk c to the owner of
-//!   c (its ring neighbour or, for the opposite rank, straight across the ConnectX-7 hairpin
-//!   diagonal), the owner accumulates ranks 0 + 1 + 2 + 3 in order and rounds once, then
-//!   all-gathers the reduced chunk back. This moves 2 * (world - 1) * num_elements element
+//!   c (its ring neighbour, or the opposite rank through the Spark between the two cables), the
+//!   owner accumulates ranks 0 + 1 + 2 + 3 in order and rounds once, then all-gathers the reduced
+//!   chunk back. This moves 2 * (world - 1) * num_elements element
 //!   writes cluster-wide against world * (world - 1) * num_elements for the one-shot, i.e. half
 //!   the traffic on four ranks, without ever changing the summation order.
 //!
@@ -40,8 +40,12 @@
 //!    |______ hairpin ____|
 //! ~~~
 //!
-//! On the switchless fabric the diagonal is programmed into the ConnectX-7 eSwitch, so every
-//! transfer above is a single hop; on the switched fabric every transfer is a switch hop.
+//! On the switched fabric every transfer is a switch hop. On a switchless fabric a diagonal
+//! transfer crosses the two cables through the Spark between them, so the sender still posts one
+//! transfer; that Spark has to forward it, which the web port setup does by routing the address
+//! through it and turning on forwarding (the ConnectX-7 can also do it in the ASIC). Without it a
+//! bare DAC ring has no path to a non-neighbour, and the reference transport opens a connection to
+//! every rank.
 
 use std::ops::Range;
 
@@ -70,7 +74,7 @@ pub enum FabricLink {
     SwitchFabric,
     /// A direct DAC to the previous or next rank of the 0-1-2-3-0 ring.
     RingEdge,
-    /// The direct diagonal (0<->2, 1<->3) forwarded inside the ConnectX-7 ASIC.
+    /// The diagonal (0<->2, 1<->3), forwarded by the Spark between the two cables.
     HairpinDiagonal,
 }
 
@@ -241,7 +245,12 @@ impl CollectiveLayout {
             FabricSchedule::HairpinRingReduceScatterAllGather => {
                 let forward = (to + self.world_size - from) % self.world_size;
                 let distance = forward.min(self.world_size - forward);
-                if self.world_size.is_multiple_of(2) && distance == self.world_size / 2 {
+                // A pair has no opposite rank: its only peer is the ring neighbour. At world 4
+                // (and any larger even world) the opposite rank is a diagonal.
+                if self.world_size > 2
+                    && self.world_size.is_multiple_of(2)
+                    && distance == self.world_size / 2
+                {
                     Some(FabricLink::HairpinDiagonal)
                 } else {
                     Some(FabricLink::RingEdge)
@@ -391,6 +400,11 @@ mod tests {
         assert_eq!(hairpin.link_between(3, 0), Some(FabricLink::RingEdge));
         assert_eq!(hairpin.link_between(0, 0), None);
         assert_eq!(hairpin.link_between(0, 4), None);
+
+        // A pair has no opposite rank: its only peer is the ring neighbour.
+        let pair = CollectiveLayout::hairpin_ring(2, 8).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(pair.link_between(0, 1), Some(FabricLink::RingEdge));
+        assert_eq!(pair.link_between(1, 0), Some(FabricLink::RingEdge));
 
         let switched = CollectiveLayout::one_shot(4, 8).unwrap_or_else(|error| panic!("{error}"));
         for from in 0..4 {

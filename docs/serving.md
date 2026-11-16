@@ -36,9 +36,13 @@ a device that used to hold a peer's address, makes every connection to that addr
 30 s after launch with `IBV_WC_RETRY_EXC_ERR`, while ping and ssh still work because ordinary
 traffic re-resolves it. Before launching, `ip neigh show <address>` on every node should give the
 MAC in that peer's `/sys/class/net/<netdev>/address`; pinging the address from each netdev
-refreshes a stale entry. If a node's two netdevs share a subnet, each must answer ARP only for its
-own address (`arp_ignore=1`), or peers can cache the other half's MAC. Index 1 (RoCE v2 over the
-IPv6 link-local address) derives the MAC from the address and does not use the ARP cache.
+refreshes a stale entry. A node with more than one fast lane — one cabled port is already two
+netdevs — must answer ARP only for the port the request arrived on (`arp_ignore=1`,
+`arp_announce=2`): ARP is layer 2, so without it a peer's other port answers on the wrong cable even
+when the two ports have different subnets, and the console's cable map and a ring's routes need the
+address to belong to one cable. Index 1
+(RoCE v2 over the IPv6 link-local address) derives the MAC from the address and does not use the
+ARP cache.
 
 ### Converting the weights
 
@@ -196,6 +200,7 @@ Defaults are what the numbers in [performance.md](performance.md) were measured 
 | `SPARKFLASH_GLM_PREFILL_EXACT=0` | Put GLM's router and indexer projections on the tensor cores too, instead of the token GEMV (`on` by default): the same 316 tok/s at a 6.1k-token prompt when it was measured, without the guarantee that expert choice and selected tokens are the decode path's |
 | `SPARKFLASH_GLM_PREFILL_ACTIVATION=fp8\|split\|bf16` | How GLM's bulk prefill GEMMs take their activations: `fp8` (the default for the release, which quantises them) as the release's E4M3 codes into an E4M3 x E4M3 MMA; `split` as a bf16 head and remainder (the first version's arithmetic); `bf16` the head alone. Any other value, and `fp8` on a release that does not quantise activations, refuses at startup |
 | `SPARKFLASH_TWO_SHOT_ROWS=N` | The fewest rows a tensor-parallel step sums with the two-shot all-reduce (reduce-scatter, then gather) instead of the one-shot exchange (default 16; 0 never). Read by the DeepSeek, GLM-5.3-Flash and Qwen3.8 device arms; a value that is not a row count refuses |
+| `SPARKFLASH_FABRIC_SCHEDULE=switchless` | Which decomposition the rank-to-rank reference-transport all-reduces use (`switched`, the default one-shot all-to-all, or `switchless`, the hairpin ring; `one-shot`/`hairpin`/`ring` are aliases). `--fabric-schedule` overrides it, every rank of a group must carry the same value, and a value that is neither refuses at startup (issue #19, docs/rdma-exchange.md) |
 | `SPARKFLASH_SEQUENCE_PARALLEL=0`, `SPARKFLASH_SEQUENCE_OVERLAP=0` | Qwen3.8 at TP=2/TP=4: run a prefill chunk's hyper-connections and PLE reads replicated on every rank instead of on each rank's own rows, or run a sequence-parallel chunk on one stream instead of as two halves whose collectives overlap the other half's compute (both `1` by default, bit-identical either way). GLM-5.3-Flash at TP=4 reads `SPARKFLASH_SEQUENCE_PARALLEL` for its bulk prefill chunks' hyper-connections the same way, on one stream: overlapped halves measured slower there ([glm53-flash](models/glm53-flash.md#bulk-prefill)). Set the same on every rank; a value other than 0 or 1 refuses |
 | `SPARKFLASH_ENGRAM_DIRECT=off` | Read the Engram tables through the page cache instead of with `O_DIRECT` (`on` by default). Through the cache, the ~200 GB of random lookups keep each node's memory full and the kernel reclaiming while it decodes. A table that cannot be read with `O_DIRECT` is refused at startup unless this is `off` |
 | `SPARKFLASH_ENGRAM_SHARD=off` | Read every Engram column of a prompt chunk on every rank instead of a quarter of them each, exchanged on the device (`on` by default). Either way the arena holds the same bytes and the output is the same; sharded, each node issues a quarter of the chunk's random reads. A decode step does not shard: see the note below |

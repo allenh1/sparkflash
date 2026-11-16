@@ -73,7 +73,9 @@ while the model downloads, for example).
 | :-- | :-- | :-- |
 | 1. Find your Sparks | **Use these Sparks** | Saves this Spark as rank 0 (`local = true`) and the three picked ones as ranks 1-3 |
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
+| 2. Connect the fast network | Card: **Switched 200G** / **Switchless ring** | `PUT /api/config`: saves the fabric schedule the collectives run (the card marked **Detected** matches the measured wiring) |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
+| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one job per rank that needs a fix (the lead runs locally, the others over SSH), running the check's netplan/sysctl fix under `sudo -n` (refused while the console believes the group is running: rank 0 answers, or a launch/swap has not been stopped) |
 | 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
@@ -95,6 +97,102 @@ re-runs it. The console starts the software copy itself when a copy is missing o
 With an existing four-Spark configuration, the same button is offered on step 1 and asks before it
 replaces the cluster plan. To return to four Sparks, set `model.weights` and `engine.kind` back
 to the V4.1 values and restore four `[cluster].nodes` under **Advanced settings**.
+
+### Fabric topology
+
+Step 2 of the guide (**Connect the fast network**) is where the fabric schedule is chosen. The two
+cards describe the two wirings this build supports, and the check tells you which one is cabled:
+
+- **Switched 200G** (the default) is the 200 Gb/s RoCEv2 switch: every rank posts its whole payload to
+  every peer and reduces locally, the one-shot all-to-all schedule;
+- **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs, and
+  each collective reduce-scatters to the chunk owners and all-gathers the reduced chunks back. It
+  is the same arithmetic, bit for bit, with `2 * (world - 1) * elements` payload element writes
+  cluster-wide against `world * (world - 1) * elements` for the one-shot: half the element writes
+  at world 4. A Spark has no cable to the rank opposite it, so those transfers cross the two cables in
+  between and are forwarded by the Spark between them: the port setup routes each non-neighbour's
+  address through that Spark and turns on forwarding, so a bare DAC ring carries the transport's
+  traffic for every rank. A fabric that forwards in the ConnectX-7 itself (the vendor's switchless
+  tooling) needs no host relay; the check sees either one as reachable.
+
+The schedule governs the layout-based all-reduces on the rank-to-rank reference transport: the
+host reference arm's per-layer reductions and the barriers. The gathers keep their own
+one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduce enqueues on NCCL
+(`SPARK_COMM_REDUCE=nccl`, the device default) without being re-decomposed by this value;
+`docs/rdma-exchange.md` describes which path each arm takes.
+
+The routes the port setup writes carry the reference transport, whose connections are ordinary IP.
+They are worked out from the measured cables: the collective addresses have to share the one subnet
+the check plans (that is what the peers and NCCL are told), while each cable's next hop only has to
+be inside its own port's subnet, so a ring may address its two segments separately.
+The device arm's NCCL is not: it opens its own RDMA queue pairs and cannot use those routes, so a
+bare-ring device run also needs an NCCL that stays on the cabled peers (`NCCL_ALGO=Ring` with a
+switchless NCCL build, where the two non-neighbours are never opened). A packed arm can instead
+keep the partials on the host seam with `SPARK_COMM_REDUCE=tcp`, but the launcher pins that
+variable to `nccl` for a V4.1 device run, so the workaround does not reach that path. The check
+cannot see which NCCL is installed.
+
+When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
+every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective
+address (`ping -I`). The ARP half needs a raw socket, which a distribution install does not grant,
+so it runs under `sudo -n`; the pings run unprivileged. Without passwordless sudo the check still
+sees whether every Spark answers, but it cannot identify the wiring (and a ring cannot be routed by
+the console, since its routes come from the cable map). A port that answers an address is a cable: from the answers the console
+classifies the fabric as a switch (every port answers for every peer), the ring (each of every
+Spark's two ports answers for exactly one neighbour, forming 0-1-2-3-0), two-node pairs (both
+ports reach the same Spark), or unrecognised wiring, and records what it measured next to the
+cards. The ARP answers are the cable map; the pings are the reachability the transport needs, and
+the two can disagree: a ring's non-neighbour has no cable and answers only where the Spark between
+the cables forwards it, and a fabric that forwards ARP as well measures as a switch even when it is
+cabled as a ring. When the measured wiring and the saved schedule disagree, a **Use the measured
+fabric** button writes the matching choice and checks the Sparks again, so the findings agree with
+the new choice. Matching the schedule to the wiring is not required for correctness — the one-shot
+schedule runs its full all-to-all over a ring and the ring schedule does chunked transfers on a
+switch — but it is the fast path for both wirings. Without `arping` (or where it cannot open a raw
+socket) the cable map cannot be identified, but the pings still run and reachability is checked.
+When even the pings cannot run — an SSH failure, a timeout — there is no reachability result
+either, and the step is blocked with an error saying the fabric is unverified rather than
+certifying it.
+
+Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
+launch opens a connection to every rank before it starts, so a peer that does not answer stops it
+whatever the cables are. The message says what to look at. On a switch it is the cable or the
+address. On a ring it is the route to that address: a neighbour's collective address can sit on
+its other port, and a non-neighbour's goes through the Spark between the cables, so **Set up the
+ports** writes those routes and turns on forwarding. A ring whose addresses still do not answer
+after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering:
+a relayed packet can leave by the other half of a port, and when a receiver's route to that source
+is pinned to a different netdev strict filtering drops it, so the port setup sets `rp_filter=2`
+(loose), which still validates the source, and the check warns while it is strict. The finding
+stays.
+
+Wiring that is none of the named shapes says so, and its silent pairs are errors too. When
+`arping` could not run (missing, or unable to open a raw socket), the finding says the wiring was
+not measured and reports the ping result alone. When the pings cannot run, the finding is an error:
+the wiring and the launch's connections are unverified until they do.
+
+Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
+settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
+ring a `/32` route for every fast address of every peer through the port that reaches it plus
+`ip_forward=1` and loose `rp_filter=2` so the Spark in between relays the diagonals; the
+forwarding switch is the kernel-wide `net.ipv4.ip_forward`, and the only routes the command adds
+are those per-address ones) on every Spark that needs a fix — the lead locally, the others over
+SSH — under `sudo -n`, and applies them.
+The routes are worked out from the measured wiring, so they are only written once the wiring could be
+measured unambiguously: a pass that has to set the ARP sysctls first (the default `arp_ignore=0`
+lets every port answer for every address, so the cable map means nothing) hardens the ports, and
+the check that follows the job then offers the routes. After a pass that changes addresses or the
+ARP settings, check again: a second pass adds them. The manual commands remain available behind
+**Prefer to run the commands yourself**.
+
+The choice is saved as `[cluster].fabric_schedule` and exported to every rank as
+`SPARKFLASH_FABRIC_SCHEDULE` by the console's launch; a hand-run launcher must export the same
+variable itself, because `sparkflash serve` does not read `sparkflash.toml`.
+`one-shot`, `hairpin` and `ring` are accepted aliases; an unknown name is refused when the
+configuration is saved, and a hand-run `sparkflash serve --fabric-schedule` (or the exported
+variable) refuses one too rather than serving the other decomposition. Every rank of one group
+must carry the same value: the collective does not negotiate it. A one-node Qwen plan has no
+collectives, so the selector does not change it.
 
 Before offering **Download**, the console checks the snapshot for `model.id` in the Hugging
 Face cache. A complete snapshot marks the step done and shows **Already in the Hugging Face
@@ -184,7 +282,7 @@ atomically (a sibling temp file, then rename). See
 | `[model]` | Architecture (`weights`), Hugging Face model `id`, checkpoint (empty: looked up in the hub cache), hub cache, tokenizer, converted weights, cubins |
 | `[engine]` | How the weights run (`kind`, `device`) |
 | `[runtime]` | `SPARK_MAX_SEQ_LEN` and `SPARKFLASH_LANES` |
-| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, and the rank list: exactly four nodes for V4.1, exactly one local node for Qwen |
+| `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, the rank list (exactly four nodes for V4.1, exactly one local node for Qwen) and `fabric_schedule` (switched/switchless) |
 | `[paths]` | Checkout, binary, launcher, NCCL library, log root on every node |
 | `[network]` | `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, extra rank environment |
 | `[web]` | Control-plane bind, rank 0 URL, extra allowed `Host` names, discovery/SSH timeouts, advertising |
@@ -451,6 +549,7 @@ fresh control plane does not draw everything served so far as a one-sample spike
 | `POST /api/discover` | mDNS browse + concurrent SSH probes |
 | `POST /api/inspect` | Node check on every configured node; the report is also kept in `/api/state` as `setup` |
 | `POST /api/network/apply` | Save the last check's fabric plan (NCCL values and peers) into the config; 409 without one |
+| `POST /api/network/setup` | Apply the last check's fast-port fix on every rank that needs it, one `network-setup-r{rank}` job per rank under `sudo -n`; 409 without a check taken of the saved configuration, or when nothing needs fixing |
 | `GET /api/models` | Models in the lead's hub cache with each one's `fit`, plus the cluster they were judged against, the swap shelf, the family list and each model's prepared ranks |
 | `GET /api/models/search?q=&family=` | Hub search folded with the lead's cache, each result with its per-width `fit`; empty `q` lists the cache or the family's default term |
 | `GET /api/models/inspect?id=` | One model's profile and `fit`: the cached entry, or its Hub `config.json` when it is not cached |

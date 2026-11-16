@@ -59,6 +59,8 @@ struct Args {
     mode: Mode,
     stagger_us: u64,
     overlap_us: u64,
+    /// Which fabric decomposition the host transport measures.
+    schedule: FabricSchedule,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,7 @@ impl Args {
             mode: Mode::Sync,
             stagger_us: 0,
             overlap_us: 0,
+            schedule: FabricSchedule::OneShotAllToAll,
         };
         let mut argv = std::env::args().skip(1);
         while let Some(flag) = argv.next() {
@@ -124,10 +127,14 @@ impl Args {
                 "--overlap-us" => {
                     args.overlap_us = value("--overlap-us")?.parse().map_err(|e| format!("{e}"))?;
                 }
+                "--fabric-schedule" => {
+                    args.schedule = parse_schedule(&value("--fabric-schedule")?)?;
+                }
                 "--help" | "-h" => {
                     return Err(
                         "usage: comm-reduce-bench --rank R [--addrs a,b,c,d | --base-port P] \
---elements 5120 --samples 200 --warmup 20 --mode sync|async --stagger-us 0 --overlap-us 0"
+--elements 5120 --samples 200 --warmup 20 --mode sync|async --stagger-us 0 --overlap-us 0 \
+[--fabric-schedule switched|switchless]"
                             .to_owned(),
                     );
                 }
@@ -137,7 +144,32 @@ impl Args {
         if args.samples == 0 {
             return Err("--samples must be positive".to_owned());
         }
+        // The launcher's variable is the documented selector; an empty value is the default and a
+        // value that names neither schedule is refused, never measured as switched.
+        if !std::env::args().any(|arg| arg == "--fabric-schedule") {
+            let value = std::env::var("SPARKFLASH_FABRIC_SCHEDULE").ok();
+            if let Some(text) = value
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                args.schedule = parse_schedule(text)?;
+            }
+        }
         Ok(args)
+    }
+}
+
+/// Parses the fabric schedule names and their aliases.
+fn parse_schedule(raw: &str) -> Result<FabricSchedule, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "switched" | "one-shot" | "oneshot" | "one_shot" => Ok(FabricSchedule::OneShotAllToAll),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => {
+            Ok(FabricSchedule::HairpinRingReduceScatterAllGather)
+        }
+        other => Err(format!(
+            "--fabric-schedule {other}: expected switched or switchless"
+        )),
     }
 }
 
@@ -255,8 +287,7 @@ fn main() {
         }
     };
     let connect_ms = connect_started.elapsed().as_secs_f64() * 1000.0;
-    let layout = match CollectiveLayout::new(world, args.elements, FabricSchedule::OneShotAllToAll)
-    {
+    let layout = match CollectiveLayout::new(world, args.elements, args.schedule) {
         Ok(layout) => layout,
         Err(error) => {
             eprintln!("comm-reduce-bench: layout: {error}");

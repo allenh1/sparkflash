@@ -328,6 +328,12 @@ struct Args {
     /// Print exactly one JSON object on stdout.
     #[arg(long)]
     json: bool,
+    /// Which fabric decomposition this run measures, for the host arm and the record: `switched`
+    /// (the one-shot all-to-all) or `switchless` (the hairpin ring). Unset means
+    /// `SPARKFLASH_FABRIC_SCHEDULE`, then `switched`; a value that is neither is refused rather
+    /// than measured as switched, and the emitted record names the schedule the calls took.
+    #[arg(long, value_name = "SCHEDULE", value_parser = parse_schedule)]
+    fabric_schedule: Option<FabricSchedule>,
     /// Measure only the device (GPU->GPU) arm: skip the host transport and the host reduce arm.
     /// This is the gate's shape; it also means --addrs is not needed.
     #[arg(long = "device-only")]
@@ -544,6 +550,46 @@ fn compare(want: &[u16], got: &[u16]) -> (usize, u32, bool) {
     (differing, max_ulp, all_finite)
 }
 
+/// The environment variable the launcher and the web Setup page set to choose the fabric.
+const FABRIC_SCHEDULE_ENV: &str = "SPARKFLASH_FABRIC_SCHEDULE";
+
+/// The schedule this run measures: the flag, then the launcher's environment variable, then the
+/// switched default. An empty variable is unset, and a value that names neither schedule is
+/// refused rather than measured as switched.
+fn resolve_schedule(flag: Option<FabricSchedule>) -> Result<FabricSchedule, String> {
+    if let Some(schedule) = flag {
+        return Ok(schedule);
+    }
+    let value = std::env::var(FABRIC_SCHEDULE_ENV).ok();
+    match value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(FabricSchedule::OneShotAllToAll),
+        Some(text) => parse_schedule(text),
+    }
+}
+
+/// Parses `--fabric-schedule`: the two decompositions this build implements, by name or alias.
+fn parse_schedule(raw: &str) -> Result<FabricSchedule, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "switched" | "one-shot" | "oneshot" | "one_shot" => Ok(FabricSchedule::OneShotAllToAll),
+        "switchless" | "hairpin" | "ring" | "hairpin-ring" => {
+            Ok(FabricSchedule::HairpinRingReduceScatterAllGather)
+        }
+        other => Err(format!("{other}: expected switched or switchless")),
+    }
+}
+
+/// The canonical name of a schedule, for the run record.
+fn schedule_name(schedule: FabricSchedule) -> &'static str {
+    match schedule {
+        FabricSchedule::OneShotAllToAll => "switched",
+        FabricSchedule::HairpinRingReduceScatterAllGather => "switchless",
+    }
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
     match run(&args) {
@@ -559,6 +605,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> Result<bool, String> {
+    // The host arm's decomposition: the flag, else the launcher's variable, else switched.
+    let schedule = resolve_schedule(args.fabric_schedule)?;
     if args.check_nccl {
         let api = NcclApi::load().map_err(|error| format!("{error}"))?;
         println!(
@@ -654,9 +702,8 @@ fn run(args: &Args) -> Result<bool, String> {
         let want = expected(args.world, elements);
         if let Some(transport) = host_transport.as_ref() {
             let mut payload = contribution(args.rank, elements);
-            let layout =
-                CollectiveLayout::new(args.world, elements, FabricSchedule::OneShotAllToAll)
-                    .map_err(|error| format!("layout: {error}"))?;
+            let layout = CollectiveLayout::new(args.world, elements, schedule)
+                .map_err(|error| format!("layout: {error}"))?;
             let mut seq = 0u64;
             let mut host_us: Vec<Duration> = Vec::with_capacity(args.samples);
             for _ in 0..args.warmup {
@@ -832,10 +879,11 @@ fn run(args: &Args) -> Result<bool, String> {
         .collect::<Vec<_>>()
         .join(",");
     let document = format!(
-        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\",\"env\":{{{env_json}}}}},\"arms\":[{}]}}",
+        "{{\"host\":\"{}\",\"rank\":{},\"world\":{},\"fabric_schedule\":\"{}\",\"device_only\":{},\"connect_ms\":{connect_ms:.1},\"nccl\":{{\"library\":\"{}\",\"version\":\"{}\",\"env\":{{{env_json}}}}},\"arms\":[{}]}}",
         json_escape(&host),
         args.rank,
         args.world,
+        schedule_name(schedule),
         args.device_only,
         json_escape(api.library_name()),
         json_escape(&version),

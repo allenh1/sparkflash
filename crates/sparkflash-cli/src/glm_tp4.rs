@@ -49,6 +49,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sparkflash_comm::layout::FabricSchedule;
 use sparkflash_comm::{TcpTransport, Transport};
 use sparkflash_device::converted::find_converted_rank_file;
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpCollective, TpLayout, TpRuntime, Wire};
@@ -64,7 +65,7 @@ use crate::tp4_host::{logits_sha256, parse_list, tcp_config, tp4_seams};
 use crate::tp4_reduce::{DeviceExchange, open_exchange_reduce};
 
 /// The stage's arguments.
-pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE or the checkpoint's config.json; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl, the default where it applies, exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
+pub const USAGE: &str = "sparkflash device-chain --run-stage glm-tp4 --tp-rank N --tp-world-size N --comm-peers IP,IP,... --comm-base-port 29701 (--converted DIR | --checkpoint DIR) [--config FILE] (--prompt TEXT --tokenizer PATH | --prompt-tokens 3,7,11) [--tokenizer PATH] [--max-tokens 16] [--streams 1,2,4,8] [--wire f32|bf16] [--collective tcp|nccl] [--fabric-schedule switched|switchless] [--draft 0,3] [--dflash2 DIR [--depth fixed|adaptive] | --draft-oracle]; the weights come from DIR's rank-R-of-W.bin or the checkpoint, the configuration from FILE or the checkpoint's config.json; each stream count runs in turn on the one load, and a tokenizer also decodes what the rank generates; nccl, the default where it applies, exchanges the partials on the devices and needs the f32 wire and a world of 2 or more; each draft count past 0 decodes speculatively with the MTP layer, or with DIR's DFlash 2 drafter, or as the first run (of 0 drafts) decoded, which every verify must keep, a stream's drafts and its next token one verify of at most 8 rows a step; adaptive verifies only the block drafts its confidence judges worth their rows";
 
 /// One `flag`'s numeric value.
 fn number<T: std::str::FromStr>(flag: &str, text: &str) -> Result<T, String>
@@ -98,6 +99,10 @@ struct GlmArgs {
     wire: Wire,
     /// The NCCL communicator as the collective's device leg; the default where it applies.
     nccl: bool,
+    /// The collective fabric this rank runs (issue #19): every rank of a group must carry the
+    /// same value. The flag overrides `SPARKFLASH_FABRIC_SCHEDULE`, which overrides switched;
+    /// `None` means the environment decides when the rank runs.
+    fabric_schedule: Option<FabricSchedule>,
 }
 
 impl GlmArgs {
@@ -125,6 +130,7 @@ impl GlmArgs {
             adaptive: false,
             wire: Wire::F32,
             nccl: false,
+            fabric_schedule: None,
         };
         let mut index = 0;
         while index < args.len() {
@@ -175,6 +181,14 @@ impl GlmArgs {
                         "nccl" => true,
                         other => return Err(format!("--collective {other}: tcp or nccl")),
                     });
+                }
+                "--fabric-schedule" => {
+                    let value = take()?;
+                    parsed.fabric_schedule = Some(
+                        crate::tp4_host::parse_fabric_schedule(value).ok_or_else(|| {
+                            format!("--fabric-schedule {value}: expected switched or switchless")
+                        })?,
+                    );
                 }
                 other => return Err(format!("unknown argument {other}")),
             }
@@ -389,7 +403,16 @@ fn run_rank(args: &GlmArgs) -> Result<(), String> {
         }
         Some(Box::new(transport) as Box<dyn Transport>)
     };
-    let (mut collective, gather) = tp4_seams(layout.rank, layout.world_size, transport, args.wire);
+    let (mut collective, gather) = tp4_seams(
+        layout.rank,
+        layout.world_size,
+        transport,
+        args.wire,
+        match args.fabric_schedule {
+            Some(schedule) => schedule,
+            None => crate::tp4_host::fabric_schedule_from_env()?,
+        },
+    );
     if let Some(reduce) = reduce {
         collective = Box::new(DeviceExchange::new(collective, reduce)?) as Box<dyn TpCollective>;
     }
