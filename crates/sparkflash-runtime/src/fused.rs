@@ -567,8 +567,15 @@ impl<A: FusedArm> ModelSession for FusedSession<A> {
             .unwrap_or_default()
     }
 
+    /// The caller's history: the slot's, less the run this handle has not answered yet. The slot
+    /// fed the run's tokens when it stepped, and gives them back before this handle's next job
+    /// ([Self::drop_run]), so until then the slot's history runs past what the caller fed.
     fn reusable_prefix(&self) -> Option<&[u32]> {
-        self.prefix(self.live().history)
+        self.prefix(
+            self.live()
+                .history
+                .and_then(|held| held.checked_sub(self.run.len())),
+        )
     }
 
     fn rewind_prefix(&self) -> Option<&[u32]> {
@@ -1434,6 +1441,22 @@ mod tests {
         // A park with a run outstanding gives it back and waits, so the record is the caller's.
         session.park();
         assert_eq!(session.reusable_prefix(), Some(&[1, 2, 3, 9][..]));
+    }
+
+    /// A request that ends inside a run still names its history before it parks: the host decides
+    /// whether to keep the sequence from that, before the park gives the run back.
+    #[test]
+    fn a_run_left_unused_is_not_in_the_callers_history() {
+        let (_arm, engine) = rounds();
+        let mut session = engine.open().expect("a slot");
+        session.prefill(&[1]).unwrap();
+        // One walk answers 2 and holds 3, 4 and 5; the caller stops after the first answer.
+        assert_eq!(session.decode(2).unwrap().next_token, Some(3));
+        assert_eq!(session.reusable_prefix(), Some(&[1, 2][..]));
+        session.decode(3).unwrap();
+        assert_eq!(session.reusable_prefix(), Some(&[1, 2, 3][..]));
+        session.park();
+        assert_eq!(session.reusable_prefix(), Some(&[1, 2, 3][..]));
     }
 
     #[test]

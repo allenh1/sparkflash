@@ -49,7 +49,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -220,7 +220,15 @@ impl HostDriver {
             let handle = std::thread::Builder::new()
                 .name(format!("sparkflash-host-engine-{worker}"))
                 .spawn(move || {
-                    host_thread(backend, codec, queued, ready, thread_metrics, &pool, by_text);
+                    host_thread(
+                        backend,
+                        codec,
+                        queued,
+                        ready,
+                        thread_metrics,
+                        &pool,
+                        by_text,
+                    );
                 })
                 .map_err(|error| format!("cannot start host engine worker {worker}: {error}"))?;
             handles.push(handle);
@@ -599,9 +607,16 @@ struct Held {
 /// sequences kept and the ones the workers are serving, at most `capacity` in all, and the least
 /// recently used kept one goes first. At one worker that is the serial driver's rule: a held
 /// sequence the request cannot continue is dropped before the next one opens.
+///
+/// A sequence on its way back ([Lease::keep]) is in neither list while its session parks, and a
+/// park may wait for the engine's current step. A request claims only once none is on its way:
+/// otherwise the next turn of a conversation that just answered would find the pool full and no
+/// continuation, and take another conversation's kept sequence.
 struct HeldPool {
     capacity: usize,
     state: Mutex<PoolState>,
+    /// Signalled when a sequence on its way back is kept.
+    returned: Condvar,
 }
 
 struct PoolState {
@@ -609,6 +624,8 @@ struct PoolState {
     kept: Vec<(u64, Held)>,
     /// The sequences the workers are serving.
     serving: usize,
+    /// The served sequences whose sessions are parking on their way back to `kept`.
+    parking: usize,
     clock: u64,
 }
 
@@ -633,8 +650,10 @@ impl HeldPool {
             state: Mutex::new(PoolState {
                 kept: Vec::new(),
                 serving: 0,
+                parking: 0,
                 clock: 0,
             }),
+            returned: Condvar::new(),
         }
     }
 
@@ -648,6 +667,13 @@ impl HeldPool {
     /// The sequence `job` starts from, and the lease the worker serves it under.
     fn claim(&self, job: &Job, codec: &dyn PromptCodec, by_text: bool) -> (Lease<'_>, Claim) {
         let mut state = self.state();
+        // A sequence on its way back may be the one this request continues.
+        while state.parking > 0 {
+            state = self
+                .returned
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         // The furthest continuation wins, the most recently kept among equals.
         let best = state
             .kept
@@ -685,14 +711,26 @@ impl Lease<'_> {
     /// Keeps the request's sequence for the next request that continues it.
     /// Keeps `held` for a later request. The request is over, so the session may give its
     /// memory up for another that needs it ([ModelSession::park]).
+    ///
+    /// Claims wait while it parks ([HeldPool]).
     fn keep(mut self, mut held: Held) {
-        held.session.park();
-        self.kept = true;
+        self.pool.state().parking += 1;
+        // A panicking park must not leave every later claim waiting.
+        let parked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| held.session.park()));
+        self.kept = parked.is_ok();
         let mut state = self.pool.state();
-        state.serving = state.serving.saturating_sub(1);
-        state.clock += 1;
-        let tick = state.clock;
-        state.kept.push((tick, held));
+        state.parking = state.parking.saturating_sub(1);
+        if parked.is_ok() {
+            state.serving = state.serving.saturating_sub(1);
+            state.clock += 1;
+            let tick = state.clock;
+            state.kept.push((tick, held));
+        }
+        drop(state);
+        self.pool.returned.notify_all();
+        if let Err(panic) = parked {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 

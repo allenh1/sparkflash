@@ -10,8 +10,11 @@ MODE tiny (a pool one short sequence fills): two conversations in turn; the seco
 first's memory, so the first's next turn is cold (cached 0) and still answered.
 A third argument `sampled` sends temperature 1.0, top_p 0.95 and seed 12345 instead of greedy: a
 seeded sample is a function of the row, the seed and the position, so it too must equal alone.
+With LOG set to rank 0's log, every continued turn must also be the host's own prefix reuse (its
+"prefix reuse by" line): a sequence the host dropped can still look continued when its next turn
+lands on the same lane and the arm rewinds it alone.
 Prints RESULT lines and one VERDICT line."""
-import concurrent.futures as cf, hashlib, json, sys, time, urllib.request
+import concurrent.futures as cf, hashlib, json, os, sys, time, urllib.request
 
 port, mode = int(sys.argv[1]), sys.argv[2]
 SAMPLED = len(sys.argv) > 3 and sys.argv[3] == "sampled"
@@ -62,6 +65,25 @@ def show(label, a):
             digest(a)), flush=True)
 
 
+def reuses():
+    """How many prompts the host has continued so far, by rank 0's log (None without LOG)."""
+    log = os.environ.get("LOG")
+    if not log:
+        return None
+    with open(log, errors="replace") as lines:
+        return sum("sparkflash serve: prefix reuse by" in line for line in lines)
+
+
+def host_continued(before, want):
+    """Checks that the host itself continued `want` prompts since `before` ([reuses])."""
+    after = reuses()
+    if before is None or after is None:
+        return True
+    good = after - before == want
+    print("CHECK the host continued %d of %d prompts itself: %s" % (after - before, want, good), flush=True)
+    return good
+
+
 def turn2(topic, first):
     return [{"role": "user", "content": topic},
             {"role": "assistant", "content": first["content"]},
@@ -99,8 +121,10 @@ if mode == "full":
         firsts = list(pool.map(lambda t: ask([{"role": "user", "content": t}]), TOPICS))
     for i, a in enumerate(firsts):
         show("turn1 c%d" % i, a)
+    before = reuses()
     with cf.ThreadPoolExecutor(4) as pool:
         seconds = list(pool.map(lambda i: ask(turn2(TOPICS[i], firsts[i])), range(4)))
+    ok &= host_continued(before, 4)
     for i, a in enumerate(seconds):
         show("turn2 c%d" % i, a)
         hit = "error" not in a and a["cached"] > 0
@@ -118,8 +142,10 @@ else:
     print("CHECK a2 is cold after b1 took a's memory, and answered: %s" % good, flush=True)
     # A conversation alone in the pool continues: b's next turn after a2 took b's memory is cold,
     # but a's third turn right after a2 continues a2's lane.
+    before = reuses()
     a3 = ask(turn2(TOPICS[0], a1) + [{"role": "assistant", "content": a2.get("content", "")},
                                        {"role": "user", "content": "Thanks."}], 32)
+    ok &= host_continued(before, 1)
     show("tiny a3", a3)
     good = "error" not in a3 and a3["cached"] > 0
     ok &= good

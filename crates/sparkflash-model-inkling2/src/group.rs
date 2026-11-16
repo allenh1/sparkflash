@@ -72,6 +72,7 @@ use crate::collective::connect_rank;
 use crate::config::Inkling2Config;
 use crate::convert::RankFileSource;
 use crate::device::{InklingDeviceBackend, InklingLanes};
+use crate::forward::trace_on;
 use crate::vision::SpanCheck;
 
 /// The switch for rank 0's vision tower: `on` (the default) loads it from the checkpoint when the
@@ -705,11 +706,6 @@ fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
         sampling.seed = sampler.seed;
     }
     sampling
-}
-
-/// Whether the arm's trace is on.
-fn trace_on() -> bool {
-    std::env::var_os("SPARKFLASH_INKLING_TRACE").is_some()
 }
 
 #[cfg(test)]

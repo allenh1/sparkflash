@@ -125,6 +125,8 @@ struct Recorder {
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Sessions keep the end of their last prompt and rewind to it, as the Inkling arm does.
     rewinds: bool,
+    /// How long a park takes, as a fused session's does while the engine finishes a step.
+    park: Duration,
 }
 
 impl Recorder {
@@ -309,6 +311,10 @@ impl ModelSession for PrefixSession {
 
     fn cached_tokens(&self) -> usize {
         self.cached
+    }
+
+    fn park(&mut self) {
+        std::thread::sleep(self.recorder.park);
     }
 }
 
@@ -792,7 +798,67 @@ async fn concurrent_conversations_each_find_their_own_prefix() {
     // room (a's) and the pool never holds more than two.
     let c = answer(&driver, request("c1", vec![11, 12], 2)).await;
     assert_eq!(c.cached, 0);
-    assert!(recorder.most_alive() <= 2, "{} alive", recorder.most_alive());
+    assert!(
+        recorder.most_alive() <= 2,
+        "{} alive",
+        recorder.most_alive()
+    );
     let b3 = answer(&driver, request("b3", b1.clone(), 1)).await;
-    assert_eq!(b3.cached, 0, "a prompt that only repeats b's first turn parts from its reply");
+    assert_eq!(
+        b3.cached, 0,
+        "a prompt that only repeats b's first turn parts from its reply"
+    );
+}
+
+/// A conversation's next turn may arrive while its last one's sequence is still parking on its way
+/// back to the pool. The turn waits for it: it must not find the pool full, see no continuation,
+/// and take the other conversation's room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_sent_while_its_sequence_parks_still_continues_it() {
+    let recorder = Arc::new(Recorder {
+        park: Duration::from_millis(300),
+        ..Recorder::default()
+    });
+    let driver = HostDriver::start(
+        Box::new(PrefixBackend {
+            descriptor: descriptor(),
+            recorder: Arc::clone(&recorder),
+        }),
+        Arc::new(Codec),
+        HostOptions {
+            max_tokens: 8,
+            concurrency: 2,
+            ..HostOptions::default()
+        },
+    )
+    .expect("the host driver starts");
+    let a1 = vec![5u32, 6, 7];
+    let a = answer(&driver, request("a1", a1.clone(), 2)).await;
+    let b = answer(&driver, request("b1", vec![8u32, 9], 2)).await;
+    let mut a2 = a1;
+    a2.extend_from_slice(&emitted(&a.text));
+    a2.push(3);
+    // Read a2 only to its end, as a client does: its worker parks the sequence after that.
+    let mut events = driver.generate(request("a2", a2.clone(), 2));
+    let mut text = String::new();
+    while let Some(event) = events.next().await {
+        match event {
+            EngineEvent::ContentDelta(delta) => text.push_str(&delta),
+            EngineEvent::Finished { .. } => break,
+            _ => {}
+        }
+    }
+    let mut a3 = a2;
+    a3.extend_from_slice(&emitted(&text));
+    a3.push(4);
+    let held = a3.len() - 1;
+    let continued = answer(&driver, request("a3", a3, 2)).await;
+    drop(events);
+    assert_eq!(continued.cached, held, "a3 continues a's sequence");
+    let mut b2 = vec![8u32, 9];
+    b2.extend_from_slice(&emitted(&b.text));
+    b2.push(5);
+    let held = b2.len() - 1;
+    let kept = answer(&driver, request("b2", b2, 2)).await;
+    assert_eq!(kept.cached, held, "b's sequence was not taken");
 }
