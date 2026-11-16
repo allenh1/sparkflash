@@ -157,6 +157,20 @@ impl Sampler {
         chosen
     }
 
+    /// The row with the request's penalties applied, the way [Self::choose] rewrites it before
+    /// any temperature, or `None` when they change nothing (the row stands as it is). A caller
+    /// that samples its own way (the Gumbel paths) takes its scores from here.
+    #[must_use]
+    pub fn penalized(&self, logits: &[f32], sampling: &Sampling) -> Option<Vec<f32>> {
+        let generated = &self.history[self.prompt_len..];
+        if penalties_are_neutral(sampling, &self.history, generated) {
+            return None;
+        }
+        let mut scores = logits.to_vec();
+        apply_penalties(&mut scores, &self.history, generated, sampling);
+        Some(scores)
+    }
+
     /// Whether [Self::choose] takes the row's [argmax] as it stands: a greedy request whose
     /// penalties change nothing yet. A caller that has that argmax already needs no row.
     #[must_use]

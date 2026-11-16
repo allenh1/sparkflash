@@ -96,6 +96,11 @@ pub enum Tp4ControlFrame {
         /// that encodes holds them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<Tp4DeviceImage>,
+        /// A sampled request's sampler: every rank's drafter perturbs its picks with the noise
+        /// rank 0's sample takes, so every rank drafts the same ids. `None` (and a frame from a
+        /// rank 0 that predates the field) is greedy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sampler: Option<Tp4FrameSampler>,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {
@@ -168,6 +173,19 @@ impl Tp4ControlFrame {
             Self::Error { .. } => "Error",
         }
     }
+}
+
+/// A request's sampler as [Tp4ControlFrame::Request] carries it, in [Tp4DeviceAdmit]'s fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp4FrameSampler {
+    /// The temperature's f32 bits (0 is greedy); bits keep the frame `Eq`.
+    pub temperature_bits: u32,
+    /// The nucleus threshold's f32 bits.
+    pub top_p_bits: u32,
+    /// The candidate count (0 keeps every token).
+    pub top_k: u32,
+    /// The sampler seed every rank draws its noise from.
+    pub seed: u64,
 }
 
 /// One request on the device path, with its sampler, as a device tick admits it.

@@ -57,6 +57,10 @@ pub struct Tp4Run {
     /// 1..=cuts, each prefilled in a fresh session, so two prefill walks can be compared on the
     /// logits they give at the same positions of the same text. Zero scores nothing.
     pub cuts: usize,
+    /// The decode passes' sampling: [Self::greedy] unless `--sample` names a temperature, cut and
+    /// seed (the scored cuts and the rewind check stay greedy). Every rank is given the same, so
+    /// a sampled request's drafter noise is the same on each.
+    pub sampling: Sampling,
     /// Where rank 0 writes the scored logit rows: f32 little-endian, one row a cut, in cut order.
     pub dump: Option<PathBuf>,
     /// After the passes, the last pass's session is handed the prompt and then its own first
@@ -379,7 +383,7 @@ impl Tp4Run {
         let mut session = backend
             .open_session()
             .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
-        session.set_sampling(Self::greedy());
+        session.set_sampling(self.sampling);
         Ok(session)
     }
 
@@ -564,6 +568,8 @@ pub struct Tp4Args {
     pub text: Option<String>,
     /// Whether `--text` is rendered through the chat template (`--chat`).
     pub chat: bool,
+    /// The decode passes' sampling ([Tp4Run::sampling], `--sample T,TOP_P,TOP_K,SEED`).
+    pub sampling: Sampling,
 }
 
 impl Tp4Args {
@@ -587,6 +593,7 @@ impl Tp4Args {
         let mut cuts = 0usize;
         let mut dump = None;
         let mut rewind = 0usize;
+        let mut sampling = Tp4Run::greedy();
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
             let mut value = || -> Result<String, String> {
@@ -614,6 +621,8 @@ impl Tp4Args {
                         .parse::<usize>()
                         .map_err(|error| format!("--context: {error}"))?;
                 }
+                // The decode passes sample: temperature, top_p, top_k and seed, comma separated.
+                "--sample" => sampling = parse_sample(&value()?)?,
                 "--decode" => {
                     decode = value()?
                         .parse::<usize>()
@@ -709,8 +718,41 @@ impl Tp4Args {
             tokenizer,
             text,
             chat,
+            sampling,
         })
     }
+}
+
+/// `--sample T,TOP_P,TOP_K,SEED`: a temperature above zero, a top_p in (0, 1], a top_k (0 keeps
+/// every token) and a seed.
+fn parse_sample(value: &str) -> Result<Sampling, String> {
+    let parts: Vec<&str> = value.split(',').collect();
+    let [temperature, top_p, top_k, seed] = parts.as_slice() else {
+        return Err(format!("--sample {value}: want T,TOP_P,TOP_K,SEED"));
+    };
+    let temperature: f32 = temperature
+        .parse()
+        .map_err(|error| format!("--sample temperature: {error}"))?;
+    let top_p: f32 = top_p
+        .parse()
+        .map_err(|error| format!("--sample top_p: {error}"))?;
+    let in_range = temperature > 0.0 && top_p > 0.0 && top_p <= 1.0;
+    if !in_range {
+        return Err(format!(
+            "--sample {value}: the temperature must be above 0 and top_p in (0, 1]"
+        ));
+    }
+    Ok(Sampling {
+        temperature,
+        top_p,
+        top_k: top_k
+            .parse()
+            .map_err(|error| format!("--sample top_k: {error}"))?,
+        seed: seed
+            .parse()
+            .map_err(|error| format!("--sample seed: {error}"))?,
+        ..Sampling::default()
+    })
 }
 
 #[cfg(test)]
@@ -733,6 +775,7 @@ mod tests {
             cuts: 0,
             dump: None,
             rewind: 0,
+            sampling: Tp4Run::greedy(),
         }
     }
 

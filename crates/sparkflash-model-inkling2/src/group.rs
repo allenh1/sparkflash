@@ -58,7 +58,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sparkflash_comm::control::{
-    Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, control_read_is_idle,
+    Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
+    control_read_is_idle,
 };
 use sparkflash_comm::tcp::TcpConfig;
 use sparkflash_model::backend::{
@@ -430,7 +431,10 @@ fn mirror(control: &mut Tp4ControlWorker, backend: &dyn ModelBackend) -> Result<
         };
         match frame {
             Tp4ControlFrame::Request {
-                prompt_ids, images, ..
+                prompt_ids,
+                images,
+                sampler,
+                ..
             } => {
                 let images = frame_images(images)?;
                 let held = match session.as_mut() {
@@ -441,7 +445,7 @@ fn mirror(control: &mut Tp4ControlWorker, backend: &dyn ModelBackend) -> Result<
                             .map_err(|error| format!("open a sequence: {error}"))?,
                     ),
                 };
-                held.set_sampling(greedy());
+                held.set_sampling(frame_sampling(sampler));
                 if trace_on() {
                     eprintln!("[inkling] serve worker prefill {:?}", prompt_ids);
                 }
@@ -778,6 +782,7 @@ impl ModelBackend for GroupBackend {
             check: self.check.clone(),
             open: false,
             fed: Vec::new(),
+            sampler: None,
         }))
     }
 }
@@ -796,6 +801,8 @@ struct GroupSession {
     open: bool,
     /// The tokens this request fed, for the trace line a gate compares with the batch arm.
     fed: Vec<u32>,
+    /// The request's sampler as the next Request frame carries it ([frame_sampler]).
+    sampler: Option<Tp4FrameSampler>,
 }
 
 impl GroupSession {
@@ -807,6 +814,7 @@ impl GroupSession {
 
 impl ModelSession for GroupSession {
     fn set_sampling(&mut self, sampling: Sampling) {
+        self.sampler = frame_sampler(&sampling);
         self.inner.set_sampling(sampling);
     }
 
@@ -833,6 +841,7 @@ impl ModelSession for GroupSession {
             speculative: false,
             cached_tokens: 0,
             images: image_frames(images),
+            sampler: self.sampler,
         })?;
         self.open = true;
         self.inner.prefill_images(tokens, images)
@@ -888,6 +897,32 @@ impl Drop for GroupSession {
 /// session still wants a deterministic configuration before its first step.
 fn greedy() -> Sampling {
     crate::Tp4Run::greedy()
+}
+
+/// A sampled request's sampler for the Request frame, `None` for a greedy one: the workers need
+/// its temperature and seed for the drafter's noise ([crate::host::gumbel_sampler]); the
+/// penalties stay on rank 0, which alone chooses the tokens.
+fn frame_sampler(sampling: &Sampling) -> Option<Tp4FrameSampler> {
+    let gumbel = crate::host::gumbel_sampler(sampling)?;
+    Some(Tp4FrameSampler {
+        temperature_bits: gumbel.temperature.to_bits(),
+        top_p_bits: gumbel.top_p.to_bits(),
+        top_k: gumbel.top_k,
+        seed: gumbel.seed,
+    })
+}
+
+/// A mirror rank's sampling from the Request frame: rank 0's temperature, cut and seed, greedy
+/// without one.
+fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
+    let mut sampling = greedy();
+    if let Some(sampler) = sampler {
+        sampling.temperature = f32::from_bits(sampler.temperature_bits);
+        sampling.top_p = f32::from_bits(sampler.top_p_bits);
+        sampling.top_k = i32::try_from(sampler.top_k).unwrap_or(0);
+        sampling.seed = sampler.seed;
+    }
+    sampling
 }
 
 /// Whether the arm's trace is on.
@@ -1039,6 +1074,7 @@ mod tests {
                 check: SpanCheck::new(None, false),
                 open: false,
                 fed: Vec::new(),
+                sampler: None,
             };
             session.prefill(&[1, 2, 3]).expect("the prefill");
             session.decode(4).expect("the first decode");
@@ -1056,6 +1092,7 @@ mod tests {
                 check: SpanCheck::new(None, false),
                 open: false,
                 fed: Vec::new(),
+                sampler: None,
             };
             session.prefill(&[9]).expect("the second prefill");
             wait_for(

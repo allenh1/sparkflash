@@ -37,6 +37,7 @@ pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
 pub mod fused;
+pub mod gumbel;
 pub mod numerics;
 pub mod parts;
 pub mod prof;

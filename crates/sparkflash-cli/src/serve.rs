@@ -5454,6 +5454,7 @@ fn run_tp4_request(
         speculative: sampling.speculative,
         cached_tokens: cached,
         images: Vec::new(),
+        sampler: None,
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
@@ -5813,6 +5814,7 @@ fn tp4_worker_loop(
                 speculative,
                 cached_tokens,
                 images,
+                sampler: _,
             }) => {
                 // This group's images travel in DeviceTick admissions; a serial Request that names
                 // spans has no path here, and reading its placeholders as text would answer from a

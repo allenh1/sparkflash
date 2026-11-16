@@ -703,6 +703,8 @@ pub(super) struct DraftState {
     part_ids: Deviceptr,
     /// Each step-logits block's mass: its sum of exp(logit - the block's best).
     part_sums: Deviceptr,
+    /// Each step-logits block's best perturbed score under a sampled request's noise.
+    part_scores: Deviceptr,
     slots: Deviceptr,
     tokens: Deviceptr,
     /// The probability the step's softmax gave each pick, beside [Self::tokens].
@@ -773,6 +775,7 @@ impl DraftState {
         let part_values = layout.take(parts * f);
         let part_ids = layout.take(parts * 4);
         let part_sums = layout.take(parts * f);
+        let part_scores = layout.take(parts * f);
         let slots = layout.take(world * PICK_SLOT * f);
         let tokens = layout.take(rows * 4);
         let confidence = layout.take(rows * f);
@@ -817,6 +820,7 @@ impl DraftState {
             part_values: at(part_values),
             part_ids: at(part_ids),
             part_sums: at(part_sums),
+            part_scores: at(part_scores),
             slots: at(slots),
             tokens: at(tokens),
             confidence: at(confidence),
@@ -987,11 +991,17 @@ impl DraftState {
 
     /// Up to `depth` drafts after `anchor`, the token at position [Self::committed], and the
     /// probability the drafter gave each: the block through the five layers, its rows' base
-    /// logits through the head, and the Markov head's greedy steps.
+    /// logits through the head, and the Markov head's steps.
     ///
-    /// A draft's probability is its step's softmax at the pick, over the logits the pick was the
-    /// largest of. It is computed on the device from the values every rank exchanged, so every
-    /// rank reads the same floats and a depth chosen from them is the same on each.
+    /// A step picks its largest logit, or under `noise` (a sampled request's 1/T and seed,
+    /// [sparkflash_model::gumbel::GumbelSampler::draft_noise]) the largest of
+    /// `logit / T + G(seed, index, id)` over every id, `index` the sequence index the draft lands
+    /// at: the noise the target's sample takes, so a draft the drafter's distribution shares with
+    /// the target's tends to be the target's sample. Every rank must be given the same noise.
+    ///
+    /// A draft's probability is its step's softmax at the step's largest logit (the pick itself
+    /// unless noise moved it). It is computed on the device from the values every rank exchanged,
+    /// so every rank reads the same floats and a depth chosen from them is the same on each.
     ///
     /// # Errors
     /// A sequence with no committed row (the Markov head's feature is the last one's), a depth
@@ -1002,6 +1012,7 @@ impl DraftState {
         model: &DraftModel,
         anchor: u32,
         depth: usize,
+        noise: Option<(f32, u64)>,
     ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         if depth == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -1240,6 +1251,8 @@ impl DraftState {
         let padded = rank_vocab * world;
         let valid = config.unpadded_vocab_size.min(padded).max(1);
         let cap = config.final_logit_softcap.unwrap_or(0.0) as f32;
+        let (inv_t, seed) = noise.filter(|(inv_t, _)| *inv_t > 0.0).unwrap_or((0.0, 0));
+        let noisy = inv_t > 0.0;
         run(shared.cuda.memset_d8_async(self.state, 0, markov * f))?;
         for step in 0..depth {
             run(shared.launch(
@@ -1260,6 +1273,7 @@ impl DraftState {
                     markov as u64,
                     hidden as u64,
                     self.confidence.0,
+                    u64::from(noisy),
                 ],
             ))?;
             run(shared.gemv(
@@ -1303,6 +1317,11 @@ impl DraftState {
                     self.part_values.0,
                     self.part_ids.0,
                     self.part_sums.0,
+                    bits(inv_t),
+                    seed,
+                    // The draft of step `step` lands after the anchor and the drafts before it.
+                    (position + 1 + step) as u64,
+                    self.part_scores.0,
                 ],
             ))?;
             run(shared.launch(
@@ -1317,6 +1336,7 @@ impl DraftState {
                     shared.exchange.rank() as u64,
                     world as u64,
                     self.part_sums.0,
+                    if noisy { self.part_scores.0 } else { 0 },
                 ],
             ))?;
             exchange_sum(shared, self.slots, world * PICK_SLOT)?;
@@ -1331,6 +1351,7 @@ impl DraftState {
                 self.tokens.0,
                 depth as u64,
                 self.confidence.0,
+                u64::from(noisy),
             ],
         ))?;
         run(shared.cuda.synchronize())?;

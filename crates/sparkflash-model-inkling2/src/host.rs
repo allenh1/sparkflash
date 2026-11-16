@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use sparkflash_model::gumbel::GumbelSampler;
 use sparkflash_model::{
     BackendError, Capabilities, ModelBackend, ModelDescriptor, ModelSession, Sampling, StepOutput,
 };
@@ -225,10 +226,15 @@ impl Inkling2HostSession {
 
 /// The next token under one request's sampling, or `None` at an end-of-generation id.
 ///
-/// The penalties, temperature, top-k, top-p and the draw are the shared served sampler's (the
-/// one Dory and the DeepSeek host group use), so a request's options are applied rather than
-/// accepted and ignored, and each step draws a fresh number from the sequence's own stream. The
-/// device arm calls the same function, so the two backends answer a request identically.
+/// The penalties are the shared served sampler's (the one Dory and the DeepSeek host group use),
+/// and a greedy request takes its argmax. A request with a temperature is sampled by Gumbel-max
+/// with counter-based noise ([sparkflash_model::gumbel], DeepSeek's device sampler): the token at
+/// sequence index `t` is the argmax of `logit / T + G(seed, t, id)` over the request's top-k and
+/// top-p cut, an exact sample of the cut distribution that is a function of the row, the seed and
+/// the index alone. A verify's row and a plain step's row at the same index therefore give the
+/// same token, and a drafter that perturbs with the same noise proposes what the target will
+/// sample. The device arm calls the same function, so the two backends answer a request
+/// identically.
 pub(crate) fn choose(
     config: &Inkling2Config,
     sampler: &mut Sampler,
@@ -238,5 +244,33 @@ pub(crate) fn choose(
     if logits.is_empty() {
         return None;
     }
-    config.next_token(sampler.choose(logits, sampling))
+    let chosen = match gumbel_sampler(sampling) {
+        None => sampler.choose(logits, sampling),
+        Some(gumbel) => {
+            let scores = sampler.penalized(logits, sampling);
+            // The token lands after every id the sequence has consumed.
+            let position = u32::try_from(sampler.history().len()).unwrap_or(u32::MAX);
+            gumbel.pick_row(scores.as_deref().unwrap_or(logits), position)
+        }
+    };
+    config.next_token(chosen)
+}
+
+/// The Gumbel parameters of a request that samples, `None` for a greedy one (temperature zero,
+/// below it or NaN). A top-k at or past the vocabulary, or at or below zero, keeps every token.
+pub(crate) fn gumbel_sampler(sampling: &Sampling) -> Option<GumbelSampler> {
+    let temperature = sampling.temperature;
+    if temperature.is_nan() || temperature <= 0.0 {
+        return None;
+    }
+    Some(GumbelSampler {
+        temperature,
+        top_p: if sampling.top_p.is_nan() {
+            1.0
+        } else {
+            sampling.top_p
+        },
+        top_k: u32::try_from(sampling.top_k).unwrap_or(0),
+        seed: sampling.seed,
+    })
 }

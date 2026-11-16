@@ -317,6 +317,7 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             speculative: true,
             cached_tokens: 0,
             images: Vec::new(),
+            sampler: None,
         },
         Tp4ControlFrame::Request {
             prompt_ids: vec![9, 8],
@@ -325,6 +326,7 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             speculative: false,
             cached_tokens: 0,
             images: Vec::new(),
+            sampler: None,
         },
         // A fused group's prompt with an image span: the spans travel, the canvas does not.
         Tp4ControlFrame::LaneRequest {

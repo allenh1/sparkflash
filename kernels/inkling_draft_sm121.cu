@@ -48,6 +48,7 @@
 #include <cuda_runtime.h>
 
 #include "opt_pdl_sm121.cuh"
+#include "opt_sample_sm121.cuh"
 #include <math_constants.h>
 
 // The drafter's head width: one rotary pair a thread of a half-head.
@@ -120,12 +121,14 @@ __device__ void ikd_block_best(float& value, int& id, float* s_value, int* s_id)
     }
 }
 
-// The best of the ranks' (value, id) slots after the group's sum.
-__device__ __forceinline__ int ikd_pick(const float* __restrict__ slots, int world) {
-    float best = slots[0];
+// The best of the ranks' (value, id) slots after the group's sum: the logit, or under a sampled
+// request's noise (`noisy`) the perturbed score in word 3.
+__device__ __forceinline__ int ikd_pick(const float* __restrict__ slots, int world, int noisy) {
+    const int field = noisy ? 3 : 0;
+    float best = slots[field];
     int id = (int)slots[1];
     for (int rank = 1; rank < world; ++rank) {
-        const float value = slots[rank * IKD_PICK_SLOT];
+        const float value = slots[rank * IKD_PICK_SLOT + field];
         const int other = (int)slots[rank * IKD_PICK_SLOT + 1];
         if (ikd_above(value, other, best, id)) {
             best = value;
@@ -347,9 +350,9 @@ extern "C" __global__ void inkling_draft_context(const float* __restrict__ keys,
 }
 
 // The Markov head's step input z = [s; W1[x]; h; f] (rank, rank, hidden, hidden values), BF16
-// values: x is `anchor` at step 0 and otherwise the pick of the last step's slots, which block 0
-// records at tokens[step] with its probability at confidence[step]. h is the step's normed block
-// row, rounded here; s and f already hold BF16 values. Grid (width / 256).
+// values: x is `anchor` at step 0 and otherwise the pick of the last step's slots (`noisy` as
+// ikd_pick), which block 0 records at tokens[step] with its probability at confidence[step]. h is
+// the step's normed block row, rounded here; s and f already hold BF16 values. Grid (width / 256).
 extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
                                                       const float* __restrict__ state,
                                                       const __nv_bfloat16* __restrict__ embed,
@@ -357,13 +360,14 @@ extern "C" __global__ void inkling_draft_markov_input(float* __restrict__ z,
                                                       const float* __restrict__ slots, int world,
                                                       int step, const float* __restrict__ row,
                                                       const float* __restrict__ fused, int rank,
-                                                      int hidden, float* __restrict__ confidence) {
+                                                      int hidden, float* __restrict__ confidence,
+                                                      int noisy) {
     OPT_PDL_ENTRY();
     int token;
     if (step == 0) {
         token = anchor;
     } else {
-        token = ikd_pick(slots, world);
+        token = ikd_pick(slots, world, noisy);
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             tokens[step] = (unsigned)token;
             confidence[step] = ikd_confidence(slots, world);
@@ -415,19 +419,30 @@ extern "C" __global__ void inkling_draft_markov_gates(const float* __restrict__ 
 // v = bf16(bf16(U) + bf16(b_f + W_f l)), softcapped as the target's (bf16(cap * tanh(v / cap)),
 // none when cap is 0), ids at or past `valid` masked. `base` is the block row's head sums U and
 // `product` the fold's sums W_f l. Grid (count / (blockDim.x * IKD_LOGIT_PER_THREAD)).
+//
+// A sampled request (`inv_t` > 0) picks by the serving sampler's Gumbel-max rule instead, over
+// the full tempered distribution: each block's pick is its best fmaf(v, inv_t, G(seed, position,
+// id)), into part_ids with its score in part_scores, where `position` is the sequence index the
+// draft lands at; part_values keeps the block's largest logit, which the mass is relative to. The
+// target perturbs its row with the same noise, so a draft from a distribution close to the
+// target's tends to be the token the target samples.
 extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__ base,
                                                        const float* __restrict__ product,
                                                        const __nv_bfloat16* __restrict__ bias,
                                                        int count, int first_id, int valid,
                                                        float cap, float* __restrict__ part_values,
                                                        int* __restrict__ part_ids,
-                                                       float* __restrict__ part_sums) {
+                                                       float* __restrict__ part_sums, float inv_t,
+                                                       unsigned long long seed, int position,
+                                                       float* __restrict__ part_scores) {
     OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
     float values[IKD_LOGIT_PER_THREAD];
     float best = -CUDART_INF_F;
     int best_id = 0x7fffffff;
+    float score = -CUDART_INF_F;
+    int score_id = 0x7fffffff;
     const int start = blockIdx.x * blockDim.x * IKD_LOGIT_PER_THREAD;
 #pragma unroll
     for (int i = 0; i < IKD_LOGIT_PER_THREAD; ++i) {
@@ -449,9 +464,20 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
                 best = value;
                 best_id = id;
             }
+            if (inv_t > 0.0f && value > -CUDART_INF_F) {
+                const float noisy = fmaf(value, inv_t,
+                                         opt_sample_gumbel(seed, (uint32_t)position, (uint32_t)id));
+                if (ikd_above(noisy, id, score, score_id)) {
+                    score = noisy;
+                    score_id = id;
+                }
+            }
         }
     }
     ikd_block_best(best, best_id, s_value, s_id);
+    if (inv_t > 0.0f) {
+        ikd_block_best(score, score_id, s_value, s_id);
+    }
     float mass = 0.0f;
 #pragma unroll
     for (int i = 0; i < IKD_LOGIT_PER_THREAD; ++i) {
@@ -462,32 +488,47 @@ extern "C" __global__ void inkling_draft_markov_logits(const float* __restrict__
     mass = ikd_block_sum(mass, s_value);
     if (threadIdx.x == 0) {
         part_values[blockIdx.x] = best;
-        part_ids[blockIdx.x] = best_id;
+        part_ids[blockIdx.x] = inv_t > 0.0f ? score_id : best_id;
         part_sums[blockIdx.x] = mass;
+        if (inv_t > 0.0f) {
+            part_scores[blockIdx.x] = score;
+        }
     }
 }
 
 // This rank's best of `parts` block bests into its slot of `world` pick slots ((value, id, mass,
 // 0) each), every other slot zero, so the group's sum leaves each rank's best in its own slot on
-// every rank. The mass is the blocks' masses (`part_sums`) rescaled to the rank's best. One
-// block.
+// every rank. The mass is the blocks' masses (`part_sums`) rescaled to the rank's best. Under a
+// sampled request's noise (`part_scores` not null) the id is the blocks' best perturbed pick and
+// word 3 its score, while the value stays the rank's largest logit for the mass. One block.
 extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ part_values,
                                                       const int* __restrict__ part_ids, int parts,
                                                       float* __restrict__ slots, int rank,
                                                       int world,
-                                                      const float* __restrict__ part_sums) {
+                                                      const float* __restrict__ part_sums,
+                                                      const float* __restrict__ part_scores) {
     OPT_PDL_ENTRY();
     __shared__ float s_value[32];
     __shared__ int s_id[32];
     float best = -CUDART_INF_F;
     int best_id = 0x7fffffff;
+    float score = -CUDART_INF_F;
+    int score_id = 0x7fffffff;
     for (int part = threadIdx.x; part < parts; part += blockDim.x) {
         if (ikd_above(part_values[part], part_ids[part], best, best_id)) {
             best = part_values[part];
             best_id = part_ids[part];
         }
+        if (part_scores != nullptr && ikd_above(part_scores[part], part_ids[part], score, score_id)) {
+            score = part_scores[part];
+            score_id = part_ids[part];
+        }
     }
     ikd_block_best(best, best_id, s_value, s_id);
+    if (part_scores != nullptr) {
+        ikd_block_best(score, score_id, s_value, s_id);
+        best_id = score_id;
+    }
     float mass = 0.0f;
     for (int part = threadIdx.x; part < parts; part += blockDim.x) {
         if (part_values[part] > -CUDART_INF_F) {
@@ -505,19 +546,21 @@ extern "C" __global__ void inkling_draft_markov_local(const float* __restrict__ 
             value = (float)best_id;
         } else if (owner == rank && field == 2) {
             value = mass;
+        } else if (owner == rank && field == 3 && part_scores != nullptr) {
+            value = score;
         }
         slots[index] = value;
     }
 }
 
-// The last step's pick, into tokens[step], and its probability, into confidence[step]. One
-// thread.
+// The last step's pick (`noisy` as ikd_pick), into tokens[step], and its probability, into
+// confidence[step]. One thread.
 extern "C" __global__ void inkling_draft_markov_last(const float* __restrict__ slots, int world,
                                                      unsigned* __restrict__ tokens, int step,
-                                                     float* __restrict__ confidence) {
+                                                     float* __restrict__ confidence, int noisy) {
     OPT_PDL_ENTRY();
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        tokens[step] = (unsigned)ikd_pick(slots, world);
+        tokens[step] = (unsigned)ikd_pick(slots, world, noisy);
         confidence[step] = ikd_confidence(slots, world);
     }
 }

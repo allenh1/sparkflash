@@ -5219,8 +5219,13 @@ impl InklingDeviceSession {
                         self.state.position
                     )));
                 }
+                // A sampled request's drafts take the noise its sample takes.
+                let noise = crate::host::gumbel_sampler(&self.sampling).map(|gumbel| {
+                    let (inv_t, seed) = gumbel.draft_noise();
+                    (f32::from_bits(inv_t as u32), seed)
+                });
                 let (mut drafts, confidence) =
-                    drafter.draft(&shared, model, anchor, chain.min(model.max_depth()))?;
+                    drafter.draft(&shared, model, anchor, chain.min(model.max_depth()), noise)?;
                 drafts.truncate(self.speculator.depth(&confidence, room));
                 Ok((drafts, confidence))
             }

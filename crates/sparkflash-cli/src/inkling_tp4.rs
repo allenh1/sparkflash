@@ -94,6 +94,7 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         cuts: args.cuts,
         dump: args.dump.clone(),
         rewind: args.rewind,
+        sampling: args.sampling,
     };
     let outcome = run.execute(
         &sparkflash_model_inkling2::descriptor(),
