@@ -428,8 +428,22 @@ impl WebState {
                 .clone();
             report.filter(|_| inspected_for.as_ref() == Some(&config))
         };
+        // A port pass rewrites the fast ports; a check in the middle of it records a cluster that
+        // is half-configured. The next ten-second pass takes the report instead.
         let report = match cached {
             Some(report) if !software_changed_since(&jobs, report.checked_ms) => report,
+            _ if self
+                .jobs
+                .running_in(&[
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ])
+                .is_some() =>
+            {
+                return Ok(());
+            }
             _ => self.inspect_now().await?,
         };
         let lead_ready = report
@@ -447,9 +461,21 @@ impl WebState {
             return Ok(());
         }
         let command = sync_command(&config, SyncWhat::Software, &sync_targets(self, &config))?;
+        // The copy runs over the fast addresses, so a port pass that resets those ports must stop
+        // it: the same exclusion the manual Deploy button uses, in both directions.
         let _ = self
             .jobs
-            .start_exclusive(command, &["launch", "sync-software"])
+            .start_exclusive(
+                command,
+                &[
+                    "launch",
+                    "sync-software",
+                    "network-setup-r0",
+                    "network-setup-r1",
+                    "network-setup-r2",
+                    "network-setup-r3",
+                ],
+            )
             .await;
         Ok(())
     }
@@ -970,6 +996,19 @@ async fn discover(State(web): State<WebState>) -> Response {
 
 /// Checks every node (in parallel, read-only) and keeps the report for the state view.
 async fn inspect_nodes(State(web): State<WebState>) -> Response {
+    // The automatic check after a port pass covers this; a manual check in the middle would store
+    // a half-applied cluster as the report the port fixes replay.
+    if let Some(id) = web.jobs.running_in(&[
+        "network-setup-r0",
+        "network-setup-r1",
+        "network-setup-r2",
+        "network-setup-r3",
+    ]) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("port setup job {id} is running; check the Sparks when it finishes"),
+        );
+    }
     match web.inspect_now().await {
         Ok(report) => Json(report).into_response(),
         Err(message) => api_error(StatusCode::CONFLICT, message),
@@ -1110,6 +1149,19 @@ async fn apply_network(State(web): State<WebState>) -> Response {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
     };
+    // The plan is what the check measured; replaying it onto a configuration that has changed
+    // since would write another cluster's addresses, exactly as the port setup refuses to do.
+    let inspected_for = web
+        .last_inspect_config
+        .read()
+        .expect("inspect lock")
+        .clone();
+    if inspected_for.as_ref() != Some(&config) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check was taken of a different configuration; check the nodes again",
+        );
+    }
     plan.apply(&mut config);
     store_config(&web, config)
 }
@@ -3684,6 +3736,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_node_check_is_refused_while_a_port_pass_runs() {
+        // A check in the middle of a port pass records a half-applied cluster, and its fixes are
+        // what the port setup later replays.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        let app = test_router(state.clone());
+        let spec = CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 1".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            label: "Port setup on spark0".to_owned(),
+            kind: "network-setup-r0".to_owned(),
+        };
+        let _ = state
+            .jobs
+            .start_exclusive(spec, &[])
+            .await
+            .expect("port job");
+        let response = app
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("port setup job"), "{error}");
+    }
+
+    #[tokio::test]
     async fn network_setup_is_allowed_again_after_the_cluster_is_stopped() {
         // The settle window is about a launch that is still coming up. A stop after it means
         // nothing is, and refusing the port fix for five minutes would be wrong.
@@ -3946,6 +4030,9 @@ mod tests {
             .collect();
         *web.last_inspect.write().expect("inspect lock") =
             Some(inspect::analyze(&config, &probes, true, 1));
+        // A real check records the configuration it measured; the apply refuses a report of
+        // another one.
+        *web.last_inspect_config.write().expect("inspect lock") = Some(config.clone());
         let app = test_router(web.clone());
         let response = app
             .oneshot(post_json("/api/network/apply", "{}"))

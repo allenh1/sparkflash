@@ -93,9 +93,11 @@ curl -s -X POST -H 'x-sparkflash-web: 1' http://127.0.0.1:8790/api/inspect
 Check the JSON response:
 
 - `nodes[].network_fix`: if non-null on any rank, it contains the exact `netplan` / `sysctl` commands
-  needed on that Spark (MTU 9000, fast-subnet IPv4 address, or `arp_ignore=1` / `arp_announce=2`).
-  Run those commands on the respective Spark (or ask the user to run them if `sudo` requires a
-  password), then re-run `POST /api/inspect`.
+  needed on that Spark (MTU 9000, fast-subnet IPv4 address, `arp_ignore=1` / `arp_announce=2`, and
+  on a ring a `/32` route for every fast address of every peer plus `ip_forward=1` and loose
+  `rp_filter=2`). Apply them with `POST /api/network/setup` (the console's **Set up the ports**
+  button runs one SSH job per rank under `sudo -n`), or run the commands on the Spark if `sudo`
+  requires a password, then re-run `POST /api/inspect`.
 - `findings`: verify there are no entries with `"severity": "error"`.
 - `plan`: once present and error-free, apply the detected dual-rail RoCE settings (`NCCL_IB_HCA`,
   `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, and per-rank `peer` IPs) to `sparkflash.toml`:

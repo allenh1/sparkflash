@@ -75,7 +75,7 @@ while the model downloads, for example).
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
 | 2. Connect the fast network | Card: **Switched 200G** / **Switchless ring** | `PUT /api/config`: saves the fabric schedule the collectives run (the card marked **Detected** matches the measured wiring) |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
-| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that needs a fix, running the check's netplan/sysctl fix under `sudo -n` (refused while rank 0 is serving) |
+| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that needs a fix, running the check's netplan/sysctl fix under `sudo -n` (refused while the console believes the group is running: rank 0 answers, or a launch/swap has not been stopped) |
 | 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |
@@ -151,14 +151,14 @@ socket) the cable map cannot be identified; only reachability is checked.
 
 Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
 launch opens a connection to every rank before it starts, so a peer that does not answer stops it
-whatever the cables are. The message says what to look at. On a switch, and for a neighbour on a
-ring, it is the cable or the address. For a ring's non-neighbour it is the relay through the
-Spark between the two cables: the cable alone gives no path, so **Set up the ports** writes the
-route through that Spark and turns on forwarding before the check passes. A ring whose diagonals
-still do not answer after the ports are set up has a missing cable or a wrong address, and the
-finding stays. Wiring that is none of the named shapes says so, and its silent pairs are errors
-too. When `arping` could not run (missing, or unable to open a raw socket), the finding says the
-wiring was not measured and reports the ping result alone.
+whatever the cables are. The message says what to look at. On a switch it is the cable or the
+address. On a ring it is the route to that address: a neighbour's collective address can sit on
+its other port, and a non-neighbour's goes through the Spark between the cables, so **Set up the
+ports** writes those routes and turns on forwarding. A ring whose addresses still do not answer
+after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering
+(the check names that too), and the finding stays. Wiring that is none of the named shapes says
+so, and its silent pairs are errors too. When `arping` could not run (missing, or unable to open a
+raw socket), the finding says the wiring was not measured and reports the ping result alone.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a

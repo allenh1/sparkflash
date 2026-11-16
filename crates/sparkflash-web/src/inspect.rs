@@ -58,6 +58,7 @@ for dev in /sys/class/infiniband/*; do
 done
 echo "arp all $(cat /proc/sys/net/ipv4/conf/all/arp_ignore 2>/dev/null || echo 0) $(cat /proc/sys/net/ipv4/conf/all/arp_announce 2>/dev/null || echo 0)"
 echo "forward $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)"
+echo "rpfilter $(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0)"
 for net in /sys/class/net/*; do
   name=${net##*/}
   [ -e "$net/device" ] || continue
@@ -228,6 +229,9 @@ pub struct NodeFacts {
     pub arp_all: (u8, u8),
     /// Whether `net.ipv4.ip_forward` is on, which a ring's relayed diagonals need.
     pub forward: bool,
+    /// `net.ipv4.conf.all.rp_filter`: 1 (strict) drops the traffic a relay forwards, 2 (loose)
+    /// passes it, 0 disables the check.
+    pub rp_filter: u8,
     /// Files by label (`binary`, `nccl`, `converted`, `manifest`); `None` when absent.
     pub files: BTreeMap<String, Option<FileFact>>,
     /// Trees by label (`cubins`, `checkpoint`); `None` when absent.
@@ -271,6 +275,7 @@ pub fn parse_facts(text: &str) -> NodeFacts {
                 facts.arp_all = (ignore.parse().unwrap_or(0), announce.parse().unwrap_or(0));
             }
             ("forward", [on]) => facts.forward = *on == "1",
+            ("rpfilter", [value]) => facts.rp_filter = value.parse().unwrap_or(0),
             ("link", [name, mtu, state, ignore, announce]) => facts.links.push(NetLink {
                 name: (*name).to_owned(),
                 mtu: mtu.parse().unwrap_or(0),
@@ -842,6 +847,26 @@ pub fn analyze_fabric(
                     });
                 }
             }
+            // A ring's diagonals are forwarded by the Spark between the cables, and strict
+            // reverse-path filtering drops exactly those packets: name it as the cause rather than
+            // letting the check blame the cables.
+            if fabric
+                .as_ref()
+                .is_some_and(|fabric| fabric.shape == FabricShape::Ring)
+                && facts.rp_filter == 1
+            {
+                findings.push(Finding {
+                    rank: Some(rank),
+                    severity: Severity::Error,
+                    message: format!(
+                        "{} has strict reverse-path filtering \
+                         (net.ipv4.conf.all.rp_filter=1), which drops the traffic a bare ring \
+                         relays through a Spark. Run the network command shown for it (it sets \
+                         rp_filter=2), then check again.",
+                        name(rank)
+                    ),
+                });
+            }
             let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
             if shares_subnet(&rails) && !arp_ok(facts, &netdevs) {
                 findings.push(Finding {
@@ -937,16 +962,14 @@ pub fn analyze_fabric(
                         name(peer),
                         name(peer)
                     ),
-                    FabricShape::Ring if !neighbour => format!(
-                        "{} cannot reach {} over the fast network. {} is not cabled directly to \
-                         {}; the ring reaches it through the Spark between the two cables, and \
-                         the launch opens a connection to every rank. Set the ports up: the \
-                         command writes a route through that Spark and turns on forwarding, so a \
-                         bare DAC ring can carry the traffic, then check again.",
+                    FabricShape::Ring => format!(
+                        "{} cannot reach {} over the fast network. The ring needs a route to that \
+                         address on the cable that reaches it: a neighbour's collective address \
+                         can sit on its other port, and a non-neighbour goes through the Spark \
+                         between the two cables. Set the ports up: the command writes those \
+                         routes and turns on forwarding, then check again.",
                         name(rank),
-                        name(peer),
-                        name(peer),
-                        name(rank)
+                        name(peer)
                     ),
                     FabricShape::Pairs if !neighbour => format!(
                         "{} cannot reach {} over the fast network; the four Sparks are wired as \
@@ -1302,7 +1325,13 @@ fn shares_subnet(rails: &[Rail]) -> bool {
 }
 
 fn arp_ok(facts: &NodeFacts, netdevs: &[&str]) -> bool {
-    netdevs.iter().all(|netdev| facts.arp(netdev) == (1, 2))
+    netdevs.iter().all(|netdev| {
+        let (ignore, announce) = facts.arp(netdev);
+        // 1 and 2 both restrict a reply to the port that owns the address (a hardened host may
+        // pin 2); anything else needs the fix, which writes 1/2. Announcing at least 1 avoids
+        // advertising another port's address.
+        (1..=2).contains(&ignore) && announce >= 1
+    })
 }
 
 /// One route the port setup pins on a Spark: a peer's collective address on the port that reaches
@@ -1501,6 +1530,8 @@ fn network_fixes(
         // keeps the switch for a reboot even when only the ARP settings need rewriting.
         let routing_forwarding = required.iter().any(|route| route.via.is_some());
         let needs_forwarding = routing_forwarding && !facts.forward;
+        // Loose reverse-path filtering is part of the relay: strict drops the forwarded packets.
+        let strict_rp = routing_forwarding && facts.rp_filter == 1;
         let mut ports: Vec<(String, String)> = Vec::new();
         let mut needs_netplan = !unaddressed.is_empty() || routes_missing;
         for rail in &rails {
@@ -1547,7 +1578,7 @@ fn network_fixes(
         let needs_arp = lanes.len() > 1
             && (shares_subnet(&rails) || !unaddressed.is_empty())
             && !arp_ok(facts, &lanes);
-        let needs_sysctl = needs_arp || needs_forwarding;
+        let needs_sysctl = needs_arp || needs_forwarding || strict_rp;
         if !needs_netplan && !needs_sysctl {
             fixes.push(None);
             continue;
@@ -1585,7 +1616,7 @@ fn network_fixes(
             body.push_str(&format!("sudo tee {SYSCTL_FILE} > /dev/null <<'EOF'\n"));
             body.push_str("net.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2\n");
             if routing_forwarding {
-                body.push_str("net.ipv4.ip_forward = 1\n");
+                body.push_str("net.ipv4.ip_forward = 1\nnet.ipv4.conf.all.rp_filter = 2\n");
             }
             body.push_str("EOF\n");
             body.push_str(&format!("sudo sysctl -p {SYSCTL_FILE}\n"));
@@ -2859,6 +2890,7 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             assert!(fix.contains("scope: link"), "{fix}");
             assert!(fix.contains("via: 198.51.100."), "{fix}");
             assert!(fix.contains("net.ipv4.ip_forward = 1"), "{fix}");
+            assert!(fix.contains("net.ipv4.conf.all.rp_filter = 2"), "{fix}");
             let remote = node.network_fix_remote.as_deref().expect("remote");
             assert_eq!(remote.lines().next(), Some("set -e"), "{remote}");
             assert!(
@@ -2894,6 +2926,35 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             node.contains("to: 198.51.100.23/32") && node.contains("via: 198.51.100.12"),
             "{node}"
         );
+    }
+
+    #[test]
+    fn strict_reverse_path_filtering_is_named_as_the_cause_on_a_ring() {
+        // The relay forwards packets whose source route names the other half of a port; strict
+        // rp_filter drops them, so the finding has to say that instead of blaming the cable.
+        let mut probes = cluster();
+        for facts in probes.iter_mut().flatten() {
+            facts.rp_filter = 1;
+        }
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(ring_fabric()),
+            true,
+            1,
+        );
+        let errors = errors(&report);
+        assert!(
+            errors
+                .iter()
+                .any(|m| m.contains("rp_filter=1") && m.contains("rp_filter=2")),
+            "{errors:?}"
+        );
+        let fix = report.nodes[0]
+            .network_fix
+            .as_deref()
+            .expect("a port fix is offered");
+        assert!(fix.contains("net.ipv4.conf.all.rp_filter = 2"), "{fix}");
     }
 
     #[test]
