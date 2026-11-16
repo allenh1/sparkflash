@@ -190,7 +190,7 @@ fn the_device_arm_refuses_a_context_past_the_window() {
 /// steps drop the lanes to one and check that path too.
 #[test]
 fn fused_lanes_step_as_each_lane_decodes_alone() {
-    use sparkflash_model::FusedArm;
+    use sparkflash_runtime::FusedArm;
 
     if !backend_available() {
         return;

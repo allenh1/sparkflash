@@ -41,19 +41,19 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
     SideStream, StreamEvent,
 };
-use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
+use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
 use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{
-    Capabilities, DepthPolicy, FusedArm, ModelDescriptor, Speculator, StepCost, TpPlan,
-    lookup_draft,
+    Capabilities, DepthPolicy, ModelDescriptor, Speculator, StepCost, TpPlan, lookup_draft,
 };
 use sparkflash_ops::gemv::CudaHandle;
+use sparkflash_runtime::{ExpertUnionWall, FusedArm, Opened, RoundArm, StepWall, run_round};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
@@ -68,7 +68,7 @@ use crate::forward::trace_on;
 use crate::host::choose;
 use crate::tensor::{ExpertSplit, InklingTensorPlan};
 use crate::vision::SpanCheck;
-use sparkflash_ops::sampler::Sampler;
+use sparkflash_ops::sampler::{Sampler, SamplerMark};
 
 mod chunk;
 mod draft;
@@ -76,7 +76,8 @@ mod packed;
 mod tower;
 
 use chunk::{
-    BandOut, Injection, Rows, band_exchange, band_mix, exchange_gather, exchange_sum, walk_rows,
+    BandOut, Injection, Rows, Segment, band_exchange, band_mix, exchange_gather, exchange_sum,
+    walk_rows,
 };
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
@@ -3133,9 +3134,19 @@ impl InklingDeviceBackend {
                 "fused lanes need at least one row a step",
             ));
         }
+        let joint = sparkflash_runtime::joint_rounds()
+            .map_err(|error| BackendError::new("config", error))?;
+        let config = &self.shared.config;
         Ok(InklingLanes {
             shared: Arc::clone(&self.shared),
             buffer: Mutex::new(None),
+            joint: Mutex::new(None),
+            joint_rounds: joint && self.shared.draft.is_some(),
+            wall: ExpertUnionWall {
+                experts: config.n_routed_experts,
+                top_k: config.num_experts_per_tok,
+                ..JOINT_WALL
+            },
             max_batch,
         })
     }
@@ -3158,8 +3169,27 @@ impl InklingDeviceBackend {
 pub struct InklingLanes {
     shared: Arc<Shared>,
     buffer: Mutex<Option<Chunk>>,
+    /// The shared walk's buffer when drafting lanes verify together: a split buffer whose every
+    /// row is answered, as wide as the widest walk so far.
+    joint: Mutex<Option<Chunk>>,
+    /// Whether drafting lanes verify together ([sparkflash_runtime::JOINT_ROUNDS_ENV]).
+    joint_rounds: bool,
+    /// What a shared walk costs, for the row share.
+    wall: ExpertUnionWall,
     max_batch: usize,
 }
+
+/// A shared walk's cost at TP4 on four GB10-class nodes, fit to the 93k-token gate: a plain step
+/// 29.6 ms and a four-row verify 61.5 ms, at 1.03 ms a distinct expert the trace measured; each
+/// lane past the first adds its 8.9 ms draft. The expert counts are the checkpoint's.
+const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
+    fixed_ms: 18.6,
+    expert_ms: 1.03,
+    row_ms: 2.7,
+    seq_ms: 8.9,
+    experts: 0,
+    top_k: 0,
+};
 
 /// One request's state in [InklingLanes]: a session the engine owns.
 pub struct InklingLane {
@@ -3178,10 +3208,106 @@ impl std::fmt::Debug for InklingLanes {
 impl Drop for InklingLanes {
     fn drop(&mut self) {
         let held = self.buffer.get_mut().ok().and_then(Option::take);
-        if let Some(chunk) = held {
+        let joint = self.joint.get_mut().ok().and_then(Option::take);
+        for chunk in held.into_iter().chain(joint) {
             let pointers = chunk.buffers();
             self.shared.cuda.free_buffers(&[&pointers[0], &pointers[1]]);
         }
+    }
+}
+
+impl RoundArm for InklingLanes {
+    type Member = InklingLane;
+
+    fn open(&self, member: &mut InklingLane, token: u32) -> Result<Opened, BackendError> {
+        member.session.open_round(token)
+    }
+
+    /// One walk of every lane's segment: its anchor and the drafts it was given, at its own
+    /// positions, through the verify's per-sequence stages on its own state and tails
+    /// ([Rows::Segments]).
+    fn verify(
+        &self,
+        round: &mut [(&mut InklingLane, u32, usize)],
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        let shared = &self.shared;
+        let mut tokens = Vec::new();
+        let mut shapes = Vec::with_capacity(round.len());
+        for (lane, token, depth) in round.iter_mut() {
+            let session = &lane.session;
+            let opening = session
+                .opening
+                .as_ref()
+                .ok_or_else(|| BackendError::new(DEVICE, "a lane walks a round it never opened"))?;
+            let depth = (*depth).min(opening.drafts.len());
+            let tails = session
+                .verify
+                .as_ref()
+                .map(|verify| verify.tails)
+                .ok_or_else(|| BackendError::new(DEVICE, "a lane walks with no verify buffer"))?;
+            tokens.push(*token);
+            tokens.extend_from_slice(&opening.drafts[..depth]);
+            shapes.push((depth, tails, session.drafter.as_ref().map(DraftState::sink)));
+        }
+        let rows = {
+            let mut joint = self.joint.lock().map_err(|_| {
+                BackendError::new(DEVICE, "the joint walk's buffer lock is poisoned")
+            })?;
+            if joint
+                .as_ref()
+                .is_some_and(|chunk| chunk.rows < tokens.len())
+            {
+                let old = joint.take().expect("the joint buffer was just checked");
+                let pointers = old.buffers();
+                shared.cuda.free_buffers(&[&pointers[0], &pointers[1]]);
+            }
+            if joint.is_none() {
+                // As wide as every lane's deepest round, so it opens once.
+                let widest = self.max_batch * (shared.draft.map_or(0, |(_, depth)| depth) + 1);
+                let width = widest.max(tokens.len());
+                *joint = Some(
+                    Chunk::allocate(shared, width, width, true)
+                        .map_err(|error| BackendError::new(DEVICE, error))?,
+                );
+            }
+            let chunk = joint.as_mut().expect("the joint buffer was just opened");
+            let mut segments: Vec<Segment<'_>> = round
+                .iter_mut()
+                .zip(&shapes)
+                .map(|((lane, _, _), &(depth, tails, taps))| Segment {
+                    state: &mut lane.session.state,
+                    tails,
+                    rows: depth + 1,
+                    taps,
+                })
+                .collect();
+            walk_rows(
+                shared,
+                Rows::Segments(&mut segments),
+                chunk,
+                &tokens,
+                PrefillWalk::Chunk,
+                &[],
+                None,
+            )?
+        };
+        let mut rows = rows.into_iter();
+        round
+            .iter_mut()
+            .zip(shapes)
+            .map(|((lane, _, _), (depth, _, _))| {
+                let mine: Vec<Vec<f32>> = rows.by_ref().take(depth + 1).collect();
+                lane.session.close(depth, mine)
+            })
+            .collect()
+    }
+
+    fn wall(&self) -> &dyn StepWall {
+        &self.wall
+    }
+
+    fn budget(&self, seqs: usize) -> usize {
+        seqs * self.shared.draft.map_or(0, |(_, depth)| depth)
     }
 }
 
@@ -3241,11 +3367,16 @@ impl FusedArm for InklingLanes {
         answer
     }
 
-    /// With the drafter on, each lane decodes on its own, one after another: a lane's round
-    /// leaves its state past the drafts until the lane settles, and a fused walk reads every
-    /// lane's state as it stands. A lane's tokens are then the ones it would decode alone.
+    /// With the drafter on, the lanes' rounds verify in one walk ([run_round]): each lane opens
+    /// its round, the walk's rows are shared among the chains, and every lane's anchor and drafts
+    /// are one segment of the walk. A lone lane, or with [sparkflash_runtime::JOINT_ROUNDS_ENV]
+    /// off every lane, decodes on its own with its own depth. A lane's tokens are the ones it
+    /// would decode alone either way.
     fn step(&self, members: &mut [(InklingLane, u32)]) -> Result<Vec<StepOutput>, BackendError> {
         self.bind()?;
+        if members.len() > 1 && self.joint_rounds {
+            return run_round(self, members);
+        }
         if members.len() == 1 || self.shared.draft.is_some() {
             return members
                 .iter_mut()
@@ -3310,6 +3441,14 @@ impl FusedArm for InklingLanes {
         slot.session.speculation()
     }
 
+    fn ready(&self, slot: &InklingLane, token: u32) -> bool {
+        slot.session.held(token)
+    }
+
+    fn give_back(&self, slot: &mut InklingLane, count: usize) -> Result<(), BackendError> {
+        slot.session.give_back(count)
+    }
+
     /// A prompt that neither continues the history nor rewinds into it starts over, and the
     /// chunks the lane holds go back to the pool first.
     fn room(&self, slot: &InklingLane, prompt: Option<&[u32]>) -> bool {
@@ -3323,9 +3462,8 @@ impl FusedArm for InklingLanes {
                 session.state.room(tokens.len(), !keeps)
             }
             None => {
-                let rows = session.state.position
-                    + 1
-                    + self.shared.draft.map_or(0, |(_, depth)| depth);
+                let rows =
+                    session.state.position + 1 + self.shared.draft.map_or(0, |(_, depth)| depth);
                 session.state.room(rows, false)
             }
         }
@@ -3881,12 +4019,7 @@ impl LaneMemory {
                 }
                 first
             };
-            tables.push(
-                shared
-                    .attention
-                    .split()
-                    .then(|| (table(), table())),
-            );
+            tables.push(shared.attention.split().then(|| (table(), table())));
         }
         let draft = match (shared.draft, shared.dspark.as_ref()) {
             (Some((Drafter::Dspark, _)), Some(model)) => {
@@ -4065,7 +4198,11 @@ impl State {
         let memory = Arc::clone(&self.lane.memory);
         let mut pool = memory.pool();
         let want = rows + READ_PAST;
-        if self.lane.span.ensure(&*shared.cuda, &memory.shape, &mut pool, want)? {
+        if self
+            .lane
+            .span
+            .ensure(&*shared.cuda, &memory.shape, &mut pool, want)?
+        {
             return Ok(());
         }
         Err(Self::short(&memory, &self.lane.span, &pool, want))
@@ -4489,6 +4626,8 @@ struct InklingDeviceSession {
     verify: Option<VerifyBuffer>,
     /// The last verify, while its drafts are fed back.
     round: Option<Round>,
+    /// A round opened for a shared walk that has not run yet.
+    opening: Option<Opening>,
     /// What this request's drafts have been worth.
     speculator: Speculator,
     /// The DSpark drafter's context for this sequence, when the rank drafts with it.
@@ -4798,6 +4937,21 @@ struct Round {
     rows: Vec<Vec<f32>>,
     /// The rows the caller has fed: the anchor, then each draft it fed in turn.
     fed: usize,
+    /// The sampler as it stood before each draft fed after the anchor, so the last answers can be
+    /// given back ([InklingDeviceSession::give_back]).
+    marks: Vec<SamplerMark>,
+}
+
+/// A round opened for a shared walk ([InklingLanes]' [RoundArm::open]): the sequence settled and
+/// drafted, and waits for the walk that verifies its anchor and the drafts it is given.
+#[derive(Debug, Clone)]
+struct Opening {
+    /// The anchor's position, where the walk starts this sequence's rows.
+    start: usize,
+    anchor: u32,
+    /// The whole chain the drafter made, the walk's share of it first.
+    drafts: Vec<u32>,
+    confidence: Vec<f32>,
 }
 
 /// The drafter a sequence speculates with ([DRAFT_ENV]).
@@ -4995,6 +5149,7 @@ impl ModelSession for InklingDeviceSession {
         {
             let logits = round.rows[round.fed].clone();
             round.fed += 1;
+            round.marks.push(self.sampler.mark());
             return Ok(self.decoded(token, logits));
         }
         self.settle()?;
@@ -5031,6 +5186,7 @@ impl ModelSession for InklingDeviceSession {
             confidence,
             rows,
             fed: 1,
+            marks: Vec::new(),
         });
         Ok(self.decoded(token, logits))
     }
@@ -5392,6 +5548,7 @@ impl InklingDeviceSession {
             sampler: Sampler::new(),
             verify: None,
             round: None,
+            opening: None,
             speculator: Speculator::new(
                 shared.draft.map_or(0, |(_, depth)| depth),
                 shared.depth_policy.clone(),
@@ -5456,6 +5613,7 @@ impl InklingDeviceSession {
             boundary.position = None;
         }
         self.round = None;
+        self.opening = None;
         if let Some(drafter) = self.drafter.as_mut() {
             drafter.reset();
         }
@@ -5465,6 +5623,110 @@ impl InklingDeviceSession {
         self.cached = 0;
         self.sampler.reset();
         Ok(())
+    }
+
+    /// Whether the last verify holds the row a step fed `token` takes: its next draft.
+    fn held(&self, token: u32) -> bool {
+        self.round
+            .as_ref()
+            .is_some_and(|round| round.chunk.get(round.fed) == Some(&token))
+    }
+
+    /// Rolls back the last `count` drafts the caller was answered and never used
+    /// ([FusedArm::give_back]): the history, the sampler and the round's fed rows go back to
+    /// where they stood, so the round settles at the caller's last token.
+    fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let round = self
+            .round
+            .as_mut()
+            .filter(|round| round.marks.len() >= count)
+            .ok_or_else(|| {
+                Self::fail(format!(
+                    "{count} answers to give back, and the round holds fewer"
+                ))
+            })?;
+        for _ in 0..count {
+            let mark = round.marks.pop().expect("the marks were just counted");
+            self.sampler.rewind(mark);
+            self.history.pop();
+            round.fed -= 1;
+        }
+        self.last_logits = round.rows[round.fed - 1].clone();
+        Ok(())
+    }
+
+    /// Opens this sequence's round on `token` for a shared walk ([RoundArm::open]): the step the
+    /// last verify holds, or the last round settled and the next chain drafted whole, with the
+    /// chance each leading run of it is accepted. The walk's share of the chain comes later
+    /// ([Self::close]).
+    fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
+        if self.held(token) {
+            return self.decode(token).map(Opened::Held);
+        }
+        self.settle()?;
+        self.opening = None;
+        if self.state.position >= self.shared.context {
+            return Err(BackendError::new("context", "the context is exhausted"));
+        }
+        if token as usize >= self.shared.config.vocab_size {
+            return Err(Self::fail(format!(
+                "token {token} is outside the vocabulary {}",
+                self.shared.config.vocab_size
+            )));
+        }
+        let rows = self.state.position + 1 + self.shared.draft.map_or(0, |(_, depth)| depth);
+        self.state
+            .grow(&self.shared, rows)
+            .map_err(|error| BackendError::new("context", error))?;
+        if self.verify.is_none() {
+            let rows = self.speculator.max_depth() + 1;
+            self.verify = Some(
+                VerifyBuffer::allocate(&self.shared, rows, &self.state.conv).map_err(Self::fail)?,
+            );
+        }
+        let (drafts, confidence) = self.draft_chain(token)?;
+        let room = self.shared.context.saturating_sub(self.state.position + 1);
+        let mut chain = self.speculator.chain(&confidence, room);
+        chain.truncate(drafts.len());
+        self.opening = Some(Opening {
+            start: self.state.position,
+            anchor: token,
+            drafts,
+            confidence,
+        });
+        Ok(Opened::Round(chain))
+    }
+
+    /// The opened round's walk ran, verifying its anchor and the first `depth` drafts into
+    /// `rows`: the round takes them, and the anchor's step is answered.
+    fn close(&mut self, depth: usize, rows: Vec<Vec<f32>>) -> Result<StepOutput, BackendError> {
+        let opening = self
+            .opening
+            .take()
+            .ok_or_else(|| Self::fail("a shared walk closed a round nobody opened"))?;
+        let mut chunk = Vec::with_capacity(depth + 1);
+        chunk.push(opening.anchor);
+        chunk.extend_from_slice(&opening.drafts[..depth.min(opening.drafts.len())]);
+        if rows.len() != chunk.len() {
+            return Err(Self::fail(format!(
+                "a walk of {} rows answered {}",
+                chunk.len(),
+                rows.len()
+            )));
+        }
+        let logits = rows[0].clone();
+        self.round = Some(Round {
+            start: opening.start,
+            chunk,
+            confidence: opening.confidence,
+            rows,
+            fed: 1,
+            marks: Vec::new(),
+        });
+        Ok(self.decoded(opening.anchor, logits))
     }
 
     /// The bookkeeping of one decoded token whose logits a step computed: the history, the
@@ -5481,6 +5743,17 @@ impl InklingDeviceSession {
     /// made: none without a drafter, never more than the context has room for past the anchor,
     /// and of DSpark's chain the leading drafts the depth policy picks from those probabilities.
     fn draft(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+        let (mut drafts, confidence) = self.draft_chain(anchor)?;
+        if matches!(self.shared.draft, Some((Drafter::Dspark, _))) {
+            let room = self.shared.context.saturating_sub(self.state.position + 1);
+            drafts.truncate(self.speculator.depth(&confidence, room));
+        }
+        Ok((drafts, confidence))
+    }
+
+    /// The drafts after `anchor` before any depth is picked: DSpark's whole chain, with the
+    /// probability it gave each draft, or prompt lookup's drafts at the policy's depth.
+    fn draft_chain(&mut self, anchor: u32) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         let Some((drafter, _)) = self.shared.draft else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -5521,10 +5794,7 @@ impl InklingDeviceSession {
                     let (inv_t, seed) = gumbel.draft_noise();
                     (f32::from_bits(inv_t as u32), seed)
                 });
-                let (mut drafts, confidence) =
-                    drafter.draft(&shared, model, anchor, chain.min(model.max_depth()), noise)?;
-                drafts.truncate(self.speculator.depth(&confidence, room));
-                Ok((drafts, confidence))
+                drafter.draft(&shared, model, anchor, chain.min(model.max_depth()), noise)
             }
         }
     }

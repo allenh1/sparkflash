@@ -358,9 +358,11 @@ pub(super) fn band_exchange(
 }
 
 /// The most rows the chunk walk steers on the device ([run_steered_band]): a verify's anchor and
-/// up to seven drafts, or up to eight fused lanes. A wider chunk groups its pairs by expert on the
-/// host ([run_band_chunk]).
-pub(super) const STEERED_BAND_ROWS: usize = 8;
+/// its drafts, fused lanes, or a shared walk of four lanes' verifies at the deepest drafter
+/// depth (four times sixteen rows). A wider chunk groups its pairs by expert on the host
+/// ([run_band_chunk]), whose bits the steered band's equal; the steered band's buffers are the
+/// chunk's, sized by its rows.
+pub(super) const STEERED_BAND_ROWS: usize = 64;
 
 /// The fewest rows whose steered band is planned by expert ([run_steered_band]). Four rows' 32
 /// top-8 picks name about 30 experts, so reading each once saves next to nothing and the plan's
@@ -783,6 +785,24 @@ pub(super) enum Rows<'s, 'a> {
     /// is the batched GEMV, whose row is the one-row launch's. Each layer's convolution inputs
     /// are left in the [VerifyTails], so the session can keep any leading run of the rows.
     Verify(&'s mut State, VerifyTails),
+    /// Several sequences' verifies in one walk ([sparkflash_runtime::run_round]): each segment is
+    /// one sequence's anchor and drafts at its consecutive positions, the segments' rows one after
+    /// another in the order given. Each segment's sequence stages are the verify's on its own
+    /// state, tails and drafter taps, so each row is the bits its own decode step would give it.
+    /// A segment's convolutions read and leave their rows in its own tails, so the shared input
+    /// rows are never written over.
+    Segments(&'s mut [Segment<'a>]),
+}
+
+/// One sequence's rows in a [Rows::Segments] walk.
+pub(super) struct Segment<'a> {
+    pub state: &'a mut State,
+    /// The sequence's verify tails: its convolutions' history and rows, for its settle.
+    pub tails: VerifyTails,
+    /// The anchor and the drafts verified with it.
+    pub rows: usize,
+    /// The sequence's drafter taps, when it drafts with DSpark.
+    pub taps: Option<TapSink>,
 }
 
 /// Rows of a chunk the text model takes from an image rather than from the embedding table.
@@ -959,6 +979,36 @@ pub(super) fn walk_rows(
             }
             rows
         }
+        Rows::Segments(segments) => {
+            let given: usize = segments.iter().map(|segment| segment.rows).sum();
+            if given != rows {
+                return Err(device_error(format!(
+                    "segments of {given} rows were given {rows} tokens"
+                )));
+            }
+            if walk != PrefillWalk::Chunk {
+                return Err(device_error(
+                    "a verify's rows are the decode step's sums: segments walk PrefillWalk::Chunk",
+                ));
+            }
+            for segment in segments.iter() {
+                let tails = &segment.tails;
+                if segment.rows == 0 || segment.rows > tails.rows {
+                    return Err(device_error(format!(
+                        "a segment of {} rows, and its tails hold 1..={}",
+                        segment.rows, tails.rows
+                    )));
+                }
+                if tails.history != config.conv_history().max(1) {
+                    return Err(device_error(format!(
+                        "a segment's tails hold {} history rows and the convolutions read {}",
+                        tails.history,
+                        config.conv_history().max(1)
+                    )));
+                }
+            }
+            rows
+        }
     };
     if answers > chunk.answers {
         return Err(device_error(format!(
@@ -975,7 +1025,37 @@ pub(super) fn walk_rows(
     let history = config.conv_history().max(1);
     let position = match &sequences {
         Rows::Chunk(state) | Rows::Verify(state, _) => state.position,
-        Rows::Lanes(_) => 0,
+        Rows::Lanes(_) | Rows::Segments(_) => 0,
+    };
+    // Each row's absolute position, for the scale tables: a segment's rows are at its own.
+    let row_positions: Vec<usize> = match &sequences {
+        Rows::Segments(segments) => segments
+            .iter()
+            .flat_map(|segment| (0..segment.rows).map(|row| segment.state.position + row))
+            .collect(),
+        _ => (0..rows).map(|row| position + row).collect(),
+    };
+    // Each segment's first row in the walk.
+    let offsets: Vec<usize> = match &sequences {
+        Rows::Segments(segments) => segments
+            .iter()
+            .scan(0, |first, segment| {
+                let at = *first;
+                *first += segment.rows;
+                Some(at)
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    // Where the drafter's taps go: the walk's one sink over every row, or each segment's own over
+    // its rows.
+    let sinks: Vec<(TapSink, usize, usize)> = match &sequences {
+        Rows::Segments(segments) => segments
+            .iter()
+            .zip(&offsets)
+            .filter_map(|(segment, &first)| segment.taps.map(|sink| (sink, first, segment.rows)))
+            .collect(),
+        _ => taps.map(|sink| (sink, 0, rows)).into_iter().collect(),
     };
     let scratch = &chunk.scratch;
     let weights = &shared.weights;
@@ -1108,7 +1188,7 @@ pub(super) fn walk_rows(
             return Ok(Deviceptr(0));
         }
         if uploaded_tau != Some(rule) {
-            let taus: Vec<f32> = (0..rows).map(|row| rule.at(position + row)).collect();
+            let taus: Vec<f32> = row_positions.iter().map(|&at| rule.at(at)).collect();
             run(shared
                 .cuda
                 .copy_htod(&scratch.taus, &row_bytes(&taus))
@@ -1120,8 +1200,17 @@ pub(super) fn walk_rows(
 
     for (index, layer) in schedule.layers().iter().enumerate() {
         // The drafter's taps of this layer: every row's stream as the layer starts on it.
-        if let Some((sink, slot)) = taps.and_then(|sink| Some((sink, sink.slot(layer.index)?))) {
-            sink.capture(shared, scratch.x, rows, slot)?;
+        for &(sink, first, count) in &sinks {
+            if let Some(slot) = sink.slot(layer.index) {
+                sink.capture(
+                    shared,
+                    scratch
+                        .x
+                        .offset(first * hidden * std::mem::size_of::<f32>()),
+                    count,
+                    slot,
+                )?;
+            }
         }
         let sliding = layer.sliding;
         let cache_rows = layer.kv_rows;
@@ -1301,6 +1390,22 @@ pub(super) fn walk_rows(
                                 ))?;
                             }
                         }
+                        Rows::Segments(segments) => {
+                            for (segment, &first) in segments.iter().zip(&offsets) {
+                                let tail = segment.tails.at(index, slot_index);
+                                segment_input(
+                                    shared, chunk, segment, index, slot_index, first, channels,
+                                )?;
+                                run(shared.short_conv_rows(
+                                    tail,
+                                    taps,
+                                    out.offset(first * channels * std::mem::size_of::<f32>()),
+                                    segment.rows,
+                                    channels,
+                                    history,
+                                ))?;
+                            }
+                        }
                         Rows::Lanes(states) => {
                             // A lane's previous samples are its own history, not the row above
                             // it, so each row takes the decode step's launch on its lane's state.
@@ -1379,6 +1484,24 @@ pub(super) fn walk_rows(
                                 ))?;
                             }
                         }
+                        Rows::Segments(segments) => {
+                            let byte = std::mem::size_of::<f32>();
+                            for (segment, &first) in segments.iter().zip(&offsets) {
+                                let tail = segment.tails.at(index, slot_index);
+                                segment_input(
+                                    shared, chunk, segment, index, slot_index, first, kv_width,
+                                )?;
+                                run(shared.short_conv_dynamic_rows(
+                                    tail,
+                                    static_taps,
+                                    scratch.taps.offset(first * taps * byte),
+                                    out.offset(first * kv_width * byte),
+                                    segment.rows,
+                                    kv_width,
+                                    history,
+                                ))?;
+                            }
+                        }
                         Rows::Lanes(states) => {
                             let byte = std::mem::size_of::<f32>();
                             for (row, state) in states.iter().enumerate() {
@@ -1424,6 +1547,29 @@ pub(super) fn walk_rows(
                             if sliding { cache_rows as u64 } else { 0 },
                         ],
                     ))?,
+                    Rows::Segments(segments) => {
+                        // Each segment's rows land where its verify alone would store them.
+                        let byte = std::mem::size_of::<f32>();
+                        for (segment, &first) in segments.iter().zip(&offsets) {
+                            let at = first * kv_width * byte;
+                            let state = &segment.state;
+                            run(shared.launch(
+                                shared.kernels.kv_store,
+                                (flat(kv_width), segment.rows as u32, 1),
+                                (ELEMENT_BLOCK, 1, 1),
+                                &[
+                                    scratch.k_next.offset(at).0,
+                                    scratch.v_next.offset(at).0,
+                                    state.keys[index].0,
+                                    state.values[index].0,
+                                    segment.rows as u64,
+                                    state.position as u64,
+                                    kv_width as u64,
+                                    if sliding { cache_rows as u64 } else { 0 },
+                                ],
+                            ))?;
+                        }
+                    }
                     Rows::Lanes(states) => {
                         // Each lane's row lands in its own cache at its own position, as the
                         // decode step stores it: the slot wrapped here, no ring for the entry.
@@ -1546,6 +1692,46 @@ pub(super) fn walk_rows(
                                 layer.rel_extent,
                                 layer.tau.at(position),
                             ))?;
+                        }
+                        Rows::Segments(segments) => {
+                            // Each segment's rows as its verify alone runs them: the decode
+                            // step's attention, each row against its own prefix, the segments
+                            // one after another through the walk's split arena.
+                            let taus = tau_table(layer.tau)?;
+                            let byte = std::mem::size_of::<f32>();
+                            let query_width = heads * head_dim;
+                            for (segment, &first) in segments.iter().zip(&offsets) {
+                                let state = &segment.state;
+                                let at = state.position;
+                                let segment_taus = if taus.0 == 0 {
+                                    taus
+                                } else {
+                                    taus.offset(first * byte)
+                                };
+                                run(shared.attention_rows(
+                                    scratch,
+                                    index,
+                                    scratch.q.offset(first * query_width * byte),
+                                    scratch.gate.offset(first * query_width * byte),
+                                    state.keys[index],
+                                    state.values[index],
+                                    state.tables[index],
+                                    scratch.rel.offset(first * heads * config.d_rel * byte),
+                                    bank,
+                                    scratch.sink.offset(first * heads * byte),
+                                    clips,
+                                    scratch.attn_bf16.offset(first * query_width * 2),
+                                    segment_taus,
+                                    segment.rows,
+                                    at,
+                                    kv_heads,
+                                    groups,
+                                    if sliding { layer.window } else { 0 },
+                                    if sliding { cache_rows } else { 0 },
+                                    layer.rel_extent,
+                                    layer.tau.at(at),
+                                ))?;
+                            }
                         }
                         Rows::Lanes(states) => {
                             // Each lane's row against its own cache, through the decode step's
@@ -1775,9 +1961,16 @@ pub(super) fn walk_rows(
             (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
                 let gain = weight(step.weights[0]);
                 run(shared.rmsnorm(scratch.final_row, gain, scratch.final_row, answers, hidden))?;
-                if let Some(sink) = taps {
+                if let Some(&(sink, _, _)) = sinks.first() {
                     if answers == rows {
-                        sink.capture(shared, scratch.final_row, rows, FINAL_TAP)?;
+                        for &(sink, first, count) in &sinks {
+                            sink.capture(
+                                shared,
+                                scratch.final_row.offset(first * hidden * byte),
+                                count,
+                                FINAL_TAP,
+                            )?;
+                        }
                     } else {
                         // A chunk answers its last row, and the drafter's last tap is every row's
                         // normed output: the same per-row chain over all of them, into a buffer
@@ -1813,7 +2006,7 @@ pub(super) fn walk_rows(
                     ))?,
                     // The lanes' or a verify's rows through the batched GEMV, whose row is the
                     // one-row launch's bits.
-                    Rows::Lanes(_) | Rows::Verify(..) => project(
+                    Rows::Lanes(_) | Rows::Verify(..) | Rows::Segments(_) => project(
                         shared,
                         PrefillWalk::Chunk,
                         matrix,
@@ -1872,6 +2065,12 @@ pub(super) fn walk_rows(
                 state.position += 1;
             }
         }
+        Rows::Segments(segments) => {
+            for segment in segments.iter_mut() {
+                segment.state.blocks = blocks;
+                segment.state.position += segment.rows;
+            }
+        }
     }
     run(shared.cuda.synchronize().map_err(|error| error.to_string()))?;
     // As the decode step: a doorbell round that was given up is reported before a read-back.
@@ -1914,6 +2113,36 @@ fn keep_tail(
         )
         .map_err(device_error)?;
     Ok(true)
+}
+
+/// A segment's convolution input in its own tails, as a verify's launch reads it: the sequence's
+/// history rows, then the segment's rows of the walk's input (`first` on). The launch then reads
+/// the tails in place, and they are what the sequence's settle restores from.
+fn segment_input(
+    shared: &Shared,
+    chunk: &Chunk,
+    segment: &Segment<'_>,
+    layer: usize,
+    slot: usize,
+    first: usize,
+    channels: usize,
+) -> Result<(), BackendError> {
+    let byte = std::mem::size_of::<f32>();
+    let tail = segment.tails.at(layer, slot);
+    shared
+        .conv_history(segment.state.conv[layer][slot], tail, channels, true)
+        .map_err(device_error)?;
+    let history = segment.tails.history;
+    shared
+        .cuda
+        .copy_dtod_async(
+            &tail.offset(history * channels * byte),
+            &chunk
+                .conv_head(slot)
+                .offset((history + first) * channels * byte),
+            segment.rows * channels * byte,
+        )
+        .map_err(device_error)
 }
 
 /// The convolution state slot a schedule's conv target names.

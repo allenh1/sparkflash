@@ -203,65 +203,26 @@ impl DecodeShare {
 /// The modelled wall of a shared speculative step over several sequences that verify drafted rows
 /// (ms): the step's rows over the measured two-band model, plus that model's per-sequence term
 /// ([super::spec::SEQ_MS] unless the profile names its own). Only the ratios matter to
-/// [share_rows], so a measured band moves the depth the share picks, never the step itself.
+/// [share_rows], so a measured band moves the depth the share picks, never the step itself. The
+/// share itself reads [super::spec::band]; this stays for the tests that pin the model.
+#[cfg(test)]
 fn multi_step_ms(seqs: usize, drafts: usize, model: super::spec::StepModel) -> f64 {
     // The step's rows are every sequence's anchor plus the drafts verified with it: the count the
     // trace's `decode R rows` records and the fit used. The per-sequence term is charged past the
     // first (the model's own intercept covers it), which is what the fit's `seqs - 1` feature is.
-    super::spec::batch_step_ms(model, seqs + drafts) + model.4 * (seqs - 1) as f64
+    use sparkflash_runtime::StepWall as _;
+    super::spec::band(model).ms(seqs, seqs + drafts)
 }
 
-/// Shares up to `budget` verify rows among the sequences' drafts, the likeliest accepted first:
-/// each row goes to the sequence whose next draft has the highest chain probability (the lowest
-/// sequence on a tie), while that is at least `floor`. A sequence's chain falls with depth, so
-/// each count of rows holds the most expected accepted drafts it can; of those counts the step
-/// takes the one with the most expected tokens a modelled millisecond ([multi_step_ms]). A row
-/// reads its own six experts a layer (rows rarely share one), so a draft is worth its row only
-/// while its chance beats the step's token rate times a row's cost.
+/// Shares up to `budget` verify rows among the sequences' drafts: the workspace's one row share
+/// ([sparkflash_runtime::share_rows]) over this arm's two-band model.
 fn share_rows(
     chains: &[Vec<f64>],
     budget: usize,
     floor: f64,
     model: super::spec::StepModel,
 ) -> Vec<usize> {
-    let seqs = chains.len();
-    let mut depths = vec![0usize; seqs];
-    let mut order = Vec::with_capacity(budget);
-    for _ in 0..budget {
-        let mut best: Option<(usize, f64)> = None;
-        for (index, (chain, &depth)) in chains.iter().zip(&depths).enumerate() {
-            if let Some(&p) = chain.get(depth)
-                && p >= floor
-                && best.is_none_or(|(_, q)| p > q)
-            {
-                best = Some((index, p));
-            }
-        }
-        match best {
-            Some((index, p)) => {
-                depths[index] += 1;
-                order.push((index, p));
-            }
-            None => break,
-        }
-    }
-    if seqs == 0 {
-        return depths;
-    }
-    let mut tokens = seqs as f64;
-    let (mut keep, mut best_rate) = (0, tokens / multi_step_ms(seqs, 0, model));
-    for (count, &(_, p)) in (1..).zip(&order) {
-        tokens += p;
-        let rate = tokens / multi_step_ms(seqs, count, model);
-        if rate > best_rate {
-            (keep, best_rate) = (count, rate);
-        }
-    }
-    depths.fill(0);
-    for &(index, _) in &order[..keep] {
-        depths[index] += 1;
-    }
-    depths
+    sparkflash_runtime::share_rows(chains, budget, floor, &super::spec::band(model))
 }
 
 /// Exact prefill rows per tick while no sequence decodes: a long prompt runs over many ticks, so

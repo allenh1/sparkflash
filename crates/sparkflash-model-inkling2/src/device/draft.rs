@@ -295,7 +295,10 @@ impl DraftModel {
     /// Which layers keep a ring as long as the whole context (a full layer without
     /// [DRAFT_WINDOW_ENV]): a session's lane holds those ([DraftState::allocate]).
     pub(super) fn whole_context_rings(&self) -> Vec<bool> {
-        self.layers.iter().map(|layer| layer.window.is_none()).collect()
+        self.layers
+            .iter()
+            .map(|layer| layer.window.is_none())
+            .collect()
     }
 
     /// The bytes one position adds to a layer's key ring (and as many to its value ring).
@@ -850,7 +853,8 @@ impl DraftState {
                 .map(|(index, (own, ring))| match own {
                     Some((keys, values)) => (at(keys), at(values), ring),
                     None => {
-                        let (keys, values) = lane[index].expect("a ring outside the arena is the lane's");
+                        let (keys, values) =
+                            lane[index].expect("a ring outside the arena is the lane's");
                         (keys, values, ring)
                     }
                 })

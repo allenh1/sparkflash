@@ -38,6 +38,8 @@
 #                       other ids (default: on); forwarded to every rank
 #   SPARKFLASH_LANE_MEMORY_MB the memory a rank's sessions' caches share (default: one whole
 #                       context's); forwarded to every rank, which must refuse the same growth
+#   SPARKFLASH_JOINT_ROUNDS off runs drafting lanes' rounds one after another instead of in one
+#                       shared walk (default: on); forwarded to every rank, whose walks must match
 SITE=${INKLING_SITE:-$HOME/inkling-bin/site.env}
 # shellcheck disable=SC1090
 [ -f "$SITE" ] && source "$SITE"
@@ -69,6 +71,7 @@ RANK_ENV+=(SPARK_COMM_PEERS="$SPARK_COMM_PEERS" SPARK_COMM_CONTROL_PORT="$SPARK_
 [ -n "${SPARKFLASH_RAIL_DEVICES:-}" ] && RANK_ENV+=(SPARKFLASH_RAIL_DEVICES="$SPARKFLASH_RAIL_DEVICES")
 [ -n "${SPARKFLASH_REUSE_BY_TEXT:-}" ] && RANK_ENV+=(SPARKFLASH_REUSE_BY_TEXT="$SPARKFLASH_REUSE_BY_TEXT")
 [ -n "${SPARKFLASH_LANE_MEMORY_MB:-}" ] && RANK_ENV+=(SPARKFLASH_LANE_MEMORY_MB="$SPARKFLASH_LANE_MEMORY_MB")
+[ -n "${SPARKFLASH_JOINT_ROUNDS:-}" ] && RANK_ENV+=(SPARKFLASH_JOINT_ROUNDS="$SPARKFLASH_JOINT_ROUNDS")
 [ -n "${SPARKFLASH_NCCL_LIB:-}" ] && RANK_ENV+=(LD_LIBRARY_PATH="$SPARKFLASH_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
 for name in $(compgen -v | grep '^NCCL_'); do
   RANK_ENV+=("$name=${!name}")

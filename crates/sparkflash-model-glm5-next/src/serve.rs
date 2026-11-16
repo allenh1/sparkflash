@@ -41,11 +41,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sparkflash_model::{
-    BackendError, Capabilities, DepthPolicy, FusedArm, FusedEngine, ModelBackend, ModelDescriptor,
-    ModelSession, PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
+    BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
+    PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
+use sparkflash_runtime::{FusedArm, FusedEngine};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
@@ -73,7 +74,7 @@ struct Shared {
     spec: OnceLock<SpecConfig>,
 }
 
-/// The arm that steps GLM slots together, behind [sparkflash_model::FusedEngine].
+/// The arm that steps GLM slots together, behind [sparkflash_runtime::FusedEngine].
 ///
 /// A slot is a whole [Glm5NextSession] minus its rank: the sequence, the sampler and the history.
 /// The engine's thread is the only stepper, so the rank lock is taken once a step, and a batch of

@@ -2424,6 +2424,7 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-model",
  "sparkflash-model-deepseek-v41",
+ "sparkflash-runtime",
  "sparkflash-vision",
  "tempfile",
 ]
@@ -2572,6 +2573,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-serve",
  "sparkflash-weights",
  "tempfile",
@@ -2592,6 +2594,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-vision",
  "sparkflash-weights",
  "tempfile",
@@ -2617,6 +2620,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-serve",
  "sparkflash-vision",
  "sparkflash-weights",
@@ -2638,6 +2642,14 @@ dependencies = [
  "sparkflash-weights",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sparkflash-runtime"
+version = "0.1.0"
+dependencies = [
+ "sparkflash-comm",
+ "sparkflash-model",
 ]
 
 [[package]]

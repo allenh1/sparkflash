@@ -287,7 +287,8 @@ the mechanism there; never copy it into the arm.
 | the descriptor a pack reports (window and vocabulary from the checkpoint) | `sparkflash_model::arm::PackIdentity` |
 | a session's KV claim and the `--concurrency`/`--kv-budget-gib` admission | `sparkflash_model::arm::KvPlan`, printed and refused by `pack::admit` |
 | which drafts a verify keeps, the tokens it queues, the depth, the counters | `sparkflash_model::spec::{verdict, Queue, Speculator}` |
-| sessions stepped together as one pass over the weights (`--fuse-batch`) | `sparkflash_model::fused::{FusedArm, FusedEngine}` |
+| sessions stepped together as one pass over the weights (`--fuse-batch`), lanes and multi-token runs | `sparkflash_runtime::{FusedArm, FusedEngine}` ([engine/03-runtime.md](engine/03-runtime.md)) |
+| several sequences' drafts verified in one walk, and the rows each is given | `sparkflash_runtime::{RoundArm, run_round, share_rows, StepWall}` |
 | splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 

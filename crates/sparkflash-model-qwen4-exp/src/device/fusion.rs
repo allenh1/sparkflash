@@ -14,18 +14,17 @@
 
 //! The Qwen4-Exp arm behind the shared fused engine.
 //!
-//! The engine ([sparkflash_model::FusedEngine]) owns the slots and the thread; this file is what
+//! The engine ([sparkflash_runtime::FusedEngine]) owns the slots and the thread; this file is what
 //! it calls. A slot is a whole [DeviceSequence] - its caches, its sampler and its history - and a
 //! step is one batch over the members' rows through the pack's own [BatchBuffers].
 
 use std::sync::{Arc, Mutex};
 
-use sparkflash_model::{
-    BackendError, FusedArm, ModelSession as _, Sampling, Speculation, StepOutput,
-};
+use sparkflash_model::{BackendError, ModelSession as _, Sampling, Speculation, StepOutput};
 
 use super::batch::BatchBuffers;
 use super::{DeviceSequence, SequenceShared};
+use sparkflash_runtime::FusedArm;
 
 /// The arm the engine steps.
 pub(super) struct QwenFusion {

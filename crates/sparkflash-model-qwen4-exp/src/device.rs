@@ -2134,7 +2134,7 @@ pub struct Qwen4ExpDeviceBackend {
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
     /// session runs its own forward on its own stream, the one-row-a-session path.
-    fused: Option<Arc<sparkflash_model::FusedEngine<fusion::QwenFusion>>>,
+    fused: Option<Arc<sparkflash_runtime::FusedEngine<fusion::QwenFusion>>>,
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -2791,7 +2791,7 @@ impl Qwen4ExpDeviceBackend {
             self.context_limit,
             capacity,
         ));
-        self.fused = Some(sparkflash_model::FusedEngine::start(arm, capacity)?);
+        self.fused = Some(sparkflash_runtime::FusedEngine::start(arm, capacity)?);
         Ok(())
     }
 

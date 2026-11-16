@@ -1045,11 +1045,14 @@ bits it would decode alone: every request at widths 2 and 4 returns its width-1 
 Serving now defaults to four lanes (`LANES=4` in `scripts/inkling-serve-group.sh`; `LANES=1` is
 the serial engine). Three changes make that the right default at a 1M context:
 
-* **Lanes draft.** With a drafter loaded (DSpark), each member of a step runs its own session's
-  speculative round, one member after another. A lane's tokens are its alone-run's bits, and the
-  drafter's acceptance holds; the lanes share the engine, the pool and the prefix cache, but not a
-  multi-row verify (a verify is already ~30 distinct experts at four rows, so packing two lanes'
-  verifies together would mostly add expert reads).
+* **Lanes draft together.** With a drafter loaded (DSpark), the lanes that need a round in the
+  same step draft their chains and verify them in one walk (joint rounds,
+  `sparkflash_runtime::rounds`; `SPARKFLASH_JOINT_ROUNDS=off` runs each lane's round on its own).
+  The runtime shares the verify rows across the lanes by DeepSeek's row share, each row to the
+  draft likeliest accepted while it pays. Each lane accepts from its own rows, so its tokens are
+  its alone-run's bits. A lane's accepted run goes back to its handle whole (multi-token runs,
+  [engine/03-runtime.md](../engine/03-runtime.md)), so the lanes need their next round at the same
+  step.
 * **Lanes keep their conversations.** The host's prefix pool (`HeldPool` in
   `sparkflash-serve/src/host.rs`) is shared by every worker. A finished request parks its session
   in its slot (`ModelSession::park`, `Work::Park`), and the next request claims the slot whose
@@ -1078,9 +1081,10 @@ Served at 1M positions with DSpark (adaptive depth, at most 7), four 160-token g
 | second turns at once | | each continues its own lane (cached 27-30 of its prompt) |
 | MemAvailable, lead, lowest | 7 GiB | 14 GiB |
 
-Every answer, alone and together, is the one-lane build's text (the same digests). The four at
-once barely beat one request's speed in aggregate: the members draft one after another, and a
-speculative round already reads most of the experts a fused row would share. What concurrency buys
+Every answer, alone and together, is the one-lane build's text (the same digests). These four at
+once barely beat one request's speed in aggregate, because each member then drafted on its own.
+Joint rounds raise it to 54.5-56.3 tok/s greedy (51.9 sampled) against 43.2 for that build on the
+same gate, and 42.9 with them off; every answer is still the same text. What concurrency also buys
 is that four clients are served without queueing behind each other and that each keeps its own
 conversation. Memory falls with it, because an idle lane backs nothing: the one-lane build held its
 1M cache from the start.

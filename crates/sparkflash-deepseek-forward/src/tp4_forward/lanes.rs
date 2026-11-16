@@ -216,7 +216,14 @@ impl Lanes<'_> {
             let (low, high) = self.spans.split_at_mut(dst);
             (&mut high[0], &low[src])
         };
-        dst_span.copy_prefix(self.cuda, &self.shape, &mut self.pool, src_span, rows, floor)
+        dst_span.copy_prefix(
+            self.cuda,
+            &self.shape,
+            &mut self.pool,
+            src_span,
+            rows,
+            floor,
+        )
     }
 
     /// Returns every chunk of lane `lane` to the pool. The device must be idle: nothing queued may
@@ -248,10 +255,8 @@ impl Drop for Lanes<'_> {
             let _ = self.release(lane);
         }
         self.pool.drain(self.cuda);
-        self.cuda.vmm_free(
-            Deviceptr(self.base),
-            self.shape.stride * self.spans.len(),
-        );
+        self.cuda
+            .vmm_free(Deviceptr(self.base), self.shape.stride * self.spans.len());
     }
 }
 

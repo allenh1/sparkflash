@@ -16,6 +16,7 @@
 members = [
     "crates/sparkflash-trace",
     "crates/sparkflash-model",
+    "crates/sparkflash-runtime",
     "crates/sparkflash-model-deepseek-v41",
     "crates/sparkflash-deepseek-forward",
     "crates/sparkflash-model-qwen4-exp",
@@ -49,6 +50,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 sparkflash-trace = { path = "crates/sparkflash-trace" }
 sparkflash-model = { path = "crates/sparkflash-model" }
+sparkflash-runtime = { path = "crates/sparkflash-runtime" }
 sparkflash-model-deepseek-v41 = { path = "crates/sparkflash-model-deepseek-v41" }
 sparkflash-deepseek-forward = { path = "crates/sparkflash-deepseek-forward" }
 sparkflash-model-qwen4-exp = { path = "crates/sparkflash-model-qwen4-exp" }

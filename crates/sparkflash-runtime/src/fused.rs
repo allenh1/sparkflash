@@ -46,8 +46,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
-use crate::vision::{ImageSpan, VisionImage};
+use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
+use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 /// What a model exposes for its sessions to be fused.
 ///
@@ -170,6 +170,39 @@ pub trait FusedArm: Send + Sync + 'static {
         self.renew(slot)
     }
 
+    /// Whether the slot already holds its answer for a step fed `token` - a verify's row the
+    /// round kept - so stepping it costs no device work. The default holds none.
+    ///
+    /// After a step the engine keeps feeding each member the token it just chose while this
+    /// says yes, and hands the whole run to the member's handle in one reply: a drafting arm's
+    /// member drains its round in one engine step, so every member starts its next round at the
+    /// same step and one walk serves them all. An arm that answers yes must support
+    /// [FusedArm::give_back] for the answers fed that way.
+    fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
+        let _ = (slot, token);
+        false
+    }
+
+    /// The caller never used the last `count` steps the slot answered (its run ended early: a stop
+    /// string, the token limit, a forced token): roll them back, so the slot's history ends where
+    /// the caller's does. They are always answers [FusedArm::ready] said were held, so they lie in
+    /// the round that produced them. The default refuses any count but zero, as an arm that holds
+    /// no answers never runs more than one step a reply.
+    ///
+    /// # Errors
+    /// An arm that cannot give back what it was asked to.
+    fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
+        let _ = slot;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(BackendError::new(
+                "fused",
+                format!("this arm holds no answers to give {count} back"),
+            ))
+        }
+    }
+
     /// The most members one pass may hold, when the model's batch is narrower than the pool.
     ///
     /// A step's rows are one a member, so a model whose combined row buffers hold four rows
@@ -200,6 +233,9 @@ enum Work {
     Decode { token: u32 },
     /// The slot's request is over: what it holds may be given up for another ([FusedArm::release]).
     Park,
+    /// The handle never used the last `count` answers of its run ([FusedArm::give_back]); posted
+    /// before the job that follows them.
+    GiveBack { count: usize },
     /// End the engine thread.
     Shutdown,
 }
@@ -211,8 +247,9 @@ struct Job {
     reply: Reply,
 }
 
-/// Where a job's answer goes.
-type Reply = Sender<Result<StepOutput, BackendError>>;
+/// Where a job's answer goes: a prompt's first step, or a decode's run (its step, then every step
+/// the slot already held, [FusedArm::ready]).
+type Reply = Sender<Result<Vec<StepOutput>, BackendError>>;
 
 /// A decode job waiting for its batch: its slot, its token and its caller.
 type Waiting = (usize, u32, Reply);
@@ -279,6 +316,10 @@ pub struct FusedSession<A: FusedArm> {
     fed: Vec<u32>,
     /// What the slot held after this handle's last job.
     kept: Kept,
+    /// The rest of the last decode's run, answered here while the caller feeds the token each
+    /// answer chose; `next` is the token the last answer chose.
+    run: std::collections::VecDeque<StepOutput>,
+    next: Option<u32>,
 }
 
 impl<A: FusedArm> FusedEngine<A> {
@@ -347,6 +388,8 @@ impl<A: FusedArm> FusedEngine<A> {
             fresh: true,
             fed: Vec::new(),
             kept: Kept::default(),
+            run: std::collections::VecDeque::new(),
+            next: None,
         })
     }
 
@@ -387,7 +430,19 @@ impl<A: FusedArm> Drop for FusedEngine<A> {
 }
 
 impl<A: FusedArm> FusedSession<A> {
-    fn ask(&mut self, work: Work) -> Result<StepOutput, BackendError> {
+    /// Gives the unused rest of the last run back before the next job ([Work::GiveBack]), and
+    /// says whether there was any.
+    fn drop_run(&mut self) -> bool {
+        let count = self.run.len();
+        self.run.clear();
+        self.next = None;
+        if count > 0 {
+            self.post(Work::GiveBack { count });
+        }
+        count > 0
+    }
+
+    fn ask(&mut self, work: Work) -> Result<Vec<StepOutput>, BackendError> {
         let (reply, answer) = channel();
         self.engine
             .jobs
@@ -440,6 +495,7 @@ impl<A: FusedArm> Drop for FusedSession<A> {
     fn drop(&mut self) {
         // Parked before the slot goes back to the list: the jobs run in order, so the next
         // handle's first job finds the slot parked and takes it back.
+        self.drop_run();
         self.post(Work::Park);
         self.engine.release(self.slot);
     }
@@ -463,24 +519,45 @@ impl<A: FusedArm> ModelSession for FusedSession<A> {
             return Err(BackendError::new("fused", "an empty prompt has no logits"));
         }
         self.fresh = false;
-        let answer = self.ask(Work::Prefill {
-            tokens: tokens.to_vec(),
-            images: images.to_vec(),
-            sampling: self.sampling,
-        });
-        if answer.is_ok() {
+        self.drop_run();
+        let answer = self
+            .ask(Work::Prefill {
+                tokens: tokens.to_vec(),
+                images: images.to_vec(),
+                sampling: self.sampling,
+            })
+            .and_then(first);
+        if let Ok(step) = &answer {
             self.fed.clear();
             self.fed.extend_from_slice(tokens);
+            self.next = step.next_token;
         }
         answer
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        let answer = self.ask(Work::Decode { token });
-        if answer.is_ok() {
+        // The run's next answer is the step this token would get, while the caller feeds the
+        // token the last answer chose.
+        if self.next == Some(token)
+            && let Some(step) = self.run.pop_front()
+        {
             self.fed.push(token);
+            self.next = step.next_token;
+            return Ok(step);
         }
-        answer
+        self.drop_run();
+        let answer = self.ask(Work::Decode { token });
+        match answer {
+            Ok(steps) => {
+                self.fed.push(token);
+                let mut steps = std::collections::VecDeque::from(steps);
+                let step = steps.pop_front().unwrap_or_default();
+                self.next = step.next_token;
+                self.run = steps;
+                Ok(step)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn speculation(&self) -> Speculation {
@@ -507,8 +584,23 @@ impl<A: FusedArm> ModelSession for FusedSession<A> {
     }
 
     fn park(&mut self) {
-        self.post(Work::Park);
+        // A run cut short is given back before the park, and waited for: the pool claims the
+        // next request against the slot's record, which must hold the caller's history, not the
+        // run's.
+        if self.drop_run() {
+            let _ = self.ask(Work::Park);
+        } else {
+            self.post(Work::Park);
+        }
     }
+}
+
+/// A prompt's reply is its one step.
+fn first(steps: Vec<StepOutput>) -> Result<StepOutput, BackendError> {
+    steps
+        .into_iter()
+        .next()
+        .ok_or_else(|| BackendError::new("fused", "the engine answered no step"))
 }
 
 /// The engine thread: collect the waiting jobs, run the prompts, step the rest together.
@@ -568,7 +660,13 @@ fn run<A: FusedArm>(
                     idle.busy(job.slot);
                     decodes.push((job.slot, token, job.reply));
                 }
-                Work::Park => idle.park(job.slot),
+                Work::Park => {
+                    idle.park(job.slot);
+                    let _ = job.reply.send(Ok(Vec::new()));
+                }
+                Work::GiveBack { count } => {
+                    give_back(&*arm, &mut pool, &stats, job.slot, count);
+                }
             }
         }
         if !decodes.is_empty() {
@@ -696,7 +794,7 @@ fn prefill<A: FusedArm>(
     stats: &[Arc<Mutex<Record>>],
     slot: usize,
     prompt: Prompt<'_>,
-    reply: Sender<Result<StepOutput, BackendError>>,
+    reply: Reply,
 ) {
     let Some(mut state) = pool[slot].take() else {
         let _ = reply.send(Err(BackendError::new(
@@ -716,7 +814,26 @@ fn prefill<A: FusedArm>(
     })();
     record(arm, &state, &stats[slot], true);
     pool[slot] = Some(state);
-    let _ = reply.send(answer);
+    let _ = reply.send(answer.map(|step| vec![step]));
+}
+
+/// Rolls back the answers a handle's run left unused ([FusedArm::give_back]). A slot that cannot
+/// is renewed: its next prompt starts over rather than continuing a history its caller never saw.
+fn give_back<A: FusedArm>(
+    arm: &A,
+    pool: &mut [Option<A::Slot>],
+    stats: &[Arc<Mutex<Record>>],
+    slot: usize,
+    count: usize,
+) {
+    let Some(mut state) = pool[slot].take() else {
+        return;
+    };
+    if arm.give_back(&mut state, count).is_err() {
+        let _ = arm.renew(&mut state);
+    }
+    record(arm, &state, &stats[slot], true);
+    pool[slot] = Some(state);
 }
 
 /// Steps the waiting members in one pass, one row each, and answers every job.
@@ -744,17 +861,41 @@ fn step<A: FusedArm>(
             }
         }
     }
-    let answer = arm.step(&mut members);
+    let answer = arm.step(&mut members).map(|steps| {
+        // Each member's run: its step, then every step its slot already holds, fed the token the
+        // step before chose. A step that fails here ends that member's run where it stands.
+        members
+            .iter_mut()
+            .zip(steps)
+            .map(|(member, step)| {
+                let mut run = vec![step];
+                while let Some(token) = run.last().and_then(|step| step.next_token)
+                    && arm.ready(&member.0, token)
+                {
+                    member.1 = token;
+                    match arm
+                        .step(std::slice::from_mut(member))
+                        .ok()
+                        .and_then(|mut steps| steps.pop())
+                    {
+                        Some(step) => run.push(step),
+                        None => break,
+                    }
+                }
+                run
+            })
+            .collect::<Vec<_>>()
+    });
     for (index, (state, _)) in members.into_iter().enumerate() {
         let slot = slots[index];
         record(arm, &state, &stats[slot], false);
         pool[slot] = Some(state);
     }
     match answer {
-        Ok(steps) => {
+        Ok(runs) => {
             for (index, reply) in replies.into_iter().enumerate() {
-                let step = steps.get(index).cloned().unwrap_or_default();
-                let _ = reply.send(Ok(step));
+                let run = runs.get(index).cloned().unwrap_or_default();
+                let _ = reply.send(Ok(run));
             }
         }
         Err(error) => {
@@ -990,7 +1131,11 @@ mod tests {
     fn a_slot_that_keeps_its_history_reports_it_and_continues_it() {
         let engine = FusedEngine::start(Arc::new(Keeper), 1).expect("the engine starts");
         let mut first = engine.open().expect("a slot");
-        assert_eq!(first.reusable_prefix(), None, "a fresh handle holds nothing");
+        assert_eq!(
+            first.reusable_prefix(),
+            None,
+            "a fresh handle holds nothing"
+        );
         first.prefill(&[1, 2, 3]).expect("the prefill");
         first.decode(4).expect("the decode");
         assert_eq!(first.reusable_prefix(), Some(&[1, 2, 3, 4][..]));
@@ -1119,7 +1264,11 @@ mod tests {
         // Five ids do not fit beside six held: the first conversation, parked longest, goes.
         third.prefill(&[7, 8, 9, 10, 11]).expect("room is made");
         assert_eq!(arm.released.load(Ordering::Relaxed), 1);
-        assert_eq!(first.reusable_prefix(), Some(&[][..]), "the parked sequence is given up");
+        assert_eq!(
+            first.reusable_prefix(),
+            Some(&[][..]),
+            "the parked sequence is given up"
+        );
         assert_eq!(second.reusable_prefix(), Some(&[4, 5, 6][..]));
         // The third conversation's step needs a sixth id: only the parked second conversation
         // can give it, and does.
@@ -1130,7 +1279,10 @@ mod tests {
         // A busy slot is never given up: with the first conversation back and nothing parked
         // holding anything, a prompt that does not fit is refused.
         first.prefill(&[1, 2]).expect("two more ids fit");
-        assert!(second.prefill(&[4]).is_err(), "no parked sequence holds anything");
+        assert!(
+            second.prefill(&[4]).is_err(),
+            "no parked sequence holds anything"
+        );
         assert_eq!(arm.released.load(Ordering::Relaxed), 2);
         assert_eq!(first.reusable_prefix(), Some(&[1, 2][..]));
     }
@@ -1152,5 +1304,155 @@ mod tests {
             Ok(())
         );
         drop(second);
+    }
+
+    /// A drafting toy: a step that is not held runs a "round" that holds the next `HELD` answers,
+    /// each the fed token plus one, so a run drains them in one engine step.
+    struct Rounds {
+        walks: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct Drafting {
+        history: Vec<u32>,
+        held: usize,
+    }
+
+    const HELD: usize = 3;
+
+    impl FusedArm for Rounds {
+        type Slot = Drafting;
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            Ok(Drafting::default())
+        }
+
+        fn holds_request(&self, slot: &Self::Slot) -> bool {
+            !slot.history.is_empty()
+        }
+
+        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            *slot = Drafting::default();
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            *slot = Drafting {
+                history: tokens.to_vec(),
+                held: 0,
+            };
+            Ok(StepOutput {
+                next_token: tokens.last().map(|token| token + 1),
+                ..StepOutput::default()
+            })
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    if slot.held > 0 {
+                        slot.held -= 1;
+                    } else {
+                        self.walks.fetch_add(1, Ordering::SeqCst);
+                        slot.held = HELD;
+                    }
+                    slot.history.push(*token);
+                    StepOutput {
+                        // The round ends the turn at 50.
+                        next_token: Some(*token + 1).filter(|next| *next != 50),
+                        ..StepOutput::default()
+                    }
+                })
+                .collect())
+        }
+
+        fn ready(&self, slot: &Self::Slot, _token: u32) -> bool {
+            slot.held > 0
+        }
+
+        fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
+            let keep =
+                slot.history.len().checked_sub(count).ok_or_else(|| {
+                    BackendError::new("toy", "gave back more than the slot was fed")
+                })?;
+            slot.history.truncate(keep);
+            slot.held += count;
+            Ok(())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+
+        fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            Some(&slot.history)
+        }
+    }
+
+    fn rounds() -> (Arc<Rounds>, Arc<FusedEngine<Rounds>>) {
+        let arm = Arc::new(Rounds {
+            walks: AtomicUsize::new(0),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 2).expect("the engine starts");
+        (arm, engine)
+    }
+
+    #[test]
+    fn a_run_answers_its_held_rows_without_the_engine() {
+        let (arm, engine) = rounds();
+        let mut session = engine.open().expect("a slot");
+        assert_eq!(session.prefill(&[1]).unwrap().next_token, Some(2));
+        // One walk answers 2 and holds 3, 4 and 5: the handle answers those itself.
+        for token in 2..=5 {
+            assert_eq!(session.decode(token).unwrap().next_token, Some(token + 1));
+        }
+        assert_eq!(arm.walks.load(Ordering::SeqCst), 1);
+        assert_eq!(session.reusable_prefix(), Some(&[1, 2, 3, 4, 5][..]));
+        // The next token is past the round: a new walk.
+        assert_eq!(session.decode(6).unwrap().next_token, Some(7));
+        assert_eq!(arm.walks.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_run_cut_short_gives_its_unused_answers_back() {
+        let (arm, engine) = rounds();
+        let mut session = engine.open().expect("a slot");
+        session.prefill(&[1]).unwrap();
+        session.decode(2).unwrap();
+        session.decode(3).unwrap();
+        // The caller forces 9 where the run chose 4: the two unused answers go back first, and 9
+        // is then a held step of the same round.
+        assert_eq!(session.decode(9).unwrap().next_token, Some(10));
+        assert_eq!(arm.walks.load(Ordering::SeqCst), 1);
+        // A park with a run outstanding gives it back and waits, so the record is the caller's.
+        session.park();
+        assert_eq!(session.reusable_prefix(), Some(&[1, 2, 3, 9][..]));
+    }
+
+    #[test]
+    fn a_run_stops_at_the_end_of_the_turn() {
+        let (_arm, engine) = rounds();
+        let mut session = engine.open().expect("a slot");
+        session.prefill(&[47]).unwrap();
+        // 48 then 49, whose step ends the turn: the run holds no answer past it.
+        assert_eq!(session.decode(48).unwrap().next_token, Some(49));
+        assert_eq!(session.decode(49).unwrap().next_token, None);
+        session.park();
+        assert_eq!(session.reusable_prefix(), Some(&[47, 48, 49][..]));
+    }
+
+    #[test]
+    fn an_arm_that_holds_nothing_refuses_a_give_back() {
+        let (arm, _engine) = toy();
+        let mut slot = 0;
+        assert!(arm.give_back(&mut slot, 0).is_ok());
+        assert!(arm.give_back(&mut slot, 1).is_err());
     }
 }

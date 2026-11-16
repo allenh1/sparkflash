@@ -160,6 +160,15 @@ pub enum Tp4ControlFrame {
         /// `(lane, token)` a member.
         members: Vec<(u32, u32)>,
     },
+    /// Rank 0 -> every worker of a fused group: lane `lane`'s caller never used the last `count`
+    /// answers of its run, so the lane rolls them back within its round (the shared engine's
+    /// give-back), before the frame that follows.
+    LaneGiveBack {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+        /// The answers to roll back.
+        count: u32,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -184,6 +193,7 @@ impl Tp4ControlFrame {
             Self::LaneRequest { .. } => "LaneRequest",
             Self::LaneRelease { .. } => "LaneRelease",
             Self::LaneStep { .. } => "LaneStep",
+            Self::LaneGiveBack { .. } => "LaneGiveBack",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }

@@ -36,7 +36,6 @@ pub mod config;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
-pub mod fused;
 pub mod gumbel;
 pub mod numerics;
 pub mod parts;
@@ -72,7 +71,6 @@ pub use descriptor::{
     model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
-pub use fused::{FusedArm, FusedEngine, FusedSession};
 pub use numerics::{ConfigKey, NumericsIdentity, NumericsProfile, NumericsStatus};
 pub use parts::{Part, PartSet, Target, built, is_built};
 pub use prof::StageProfiler;

@@ -266,6 +266,24 @@ impl Speculator {
         want.min(room).min(self.max_depth)
     }
 
+    /// The chance that drafts `0..=j` are all accepted, for each draft of `confidence` the caller
+    /// has `room` for: the policy's calibrated chain, or certainty up to [Self::max_depth] without
+    /// a policy (an MTP layer offers no probabilities, so its whole chain is wanted). A row share
+    /// across sequences weighs these (`sparkflash_runtime::share`); the caller cuts the chain to
+    /// the drafts it holds.
+    #[must_use]
+    pub fn chain(&self, confidence: &[f32], room: usize) -> Vec<f64> {
+        let limit = room.min(self.max_depth);
+        match self.policy.as_ref() {
+            Some(policy) => {
+                let mut chain = policy.chain(confidence);
+                chain.truncate(limit);
+                chain
+            }
+            None => vec![1.0; limit],
+        }
+    }
+
     /// Records one round: `offered` drafts verified, `kept - 1` of them accepted.
     ///
     /// A round that offered nothing is not a verify step, which is why a plain step's accounting

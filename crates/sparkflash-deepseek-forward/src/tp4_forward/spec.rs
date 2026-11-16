@@ -1691,14 +1691,25 @@ pub(super) const SEQ_MS: f64 = 2.3;
 /// milliseconds) is this model's target: one shared step, in rows and in sequences.
 pub(super) type StepModel = (f64, f64, f64, f64, f64);
 
-/// The modelled wall of a shared step over the given number of verified rows (ms).
+/// The modelled wall of a shared step over the given number of verified rows (ms), for the tests
+/// that pin the model.
+#[cfg(test)]
 #[must_use]
 pub(super) fn batch_step_ms(model: StepModel, rows: usize) -> f64 {
-    let (a0, a1, b0, b1, _) = model;
-    if rows <= BAND_ROWS {
-        a0 + a1 * rows as f64
-    } else {
-        b0 + b1 * rows as f64
+    band(model).rows_ms(rows)
+}
+
+/// The step model as the shared row share's wall ([sparkflash_runtime::BandWall]).
+#[must_use]
+pub(super) fn band(model: StepModel) -> sparkflash_runtime::BandWall {
+    let (a0, a1, b0, b1, seq_ms) = model;
+    sparkflash_runtime::BandWall {
+        a0,
+        a1,
+        b0,
+        b1,
+        seq_ms,
+        band_rows: BAND_ROWS,
     }
 }
 

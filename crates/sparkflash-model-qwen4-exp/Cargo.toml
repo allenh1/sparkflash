@@ -22,6 +22,7 @@ description = "Qwen3.8-Flash-Next (Qwen4-Exp) pack: NVFP4 checkpoint, n-gram PLE
 
 [dependencies]
 sparkflash-model = { workspace = true }
+sparkflash-runtime = { workspace = true }
 sparkflash-weights = { workspace = true }
 sparkflash-engram = { workspace = true }
 sparkflash-kernels = { workspace = true }

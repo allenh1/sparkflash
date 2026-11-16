@@ -8,10 +8,13 @@ afterwards on a cold lane is not required: greedy continued turns may differ fro
 MODE alone: only the references, for another server to match.
 MODE tiny (a pool one short sequence fills): two conversations in turn; the second takes the
 first's memory, so the first's next turn is cold (cached 0) and still answered.
+A third argument `sampled` sends temperature 1.0, top_p 0.95 and seed 12345 instead of greedy: a
+seeded sample is a function of the row, the seed and the position, so it too must equal alone.
 Prints RESULT lines and one VERDICT line."""
 import concurrent.futures as cf, hashlib, json, sys, time, urllib.request
 
 port, mode = int(sys.argv[1]), sys.argv[2]
+SAMPLED = len(sys.argv) > 3 and sys.argv[3] == "sampled"
 URL = "http://127.0.0.1:%d/v1/chat/completions" % port
 TOPICS = [
     "Explain how a hash table handles collisions, with a small Python example.",
@@ -23,8 +26,11 @@ FOLLOW = "Now say the same thing in exactly three sentences."
 
 
 def ask(messages, tokens=160):
-    body = json.dumps({"model": "thinkingmachines/Inkling-2-Small", "temperature": 0,
-                       "max_tokens": tokens, "messages": messages}).encode()
+    request = {"model": "thinkingmachines/Inkling-2-Small", "temperature": 0,
+               "max_tokens": tokens, "messages": messages}
+    if SAMPLED:
+        request.update({"temperature": 1.0, "top_p": 0.95, "seed": 12345})
+    body = json.dumps(request).encode()
     req = urllib.request.Request(URL, data=body, headers={"content-type": "application/json"})
     t0 = time.time()
     try:

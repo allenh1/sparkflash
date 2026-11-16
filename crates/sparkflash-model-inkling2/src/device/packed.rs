@@ -208,7 +208,10 @@ impl DenseWeights {
                 continue;
             }
             if self.packed.contains_key(&pointer.0) {
-                return Err(format!("the dense slot at {:#x} is packed twice", pointer.0));
+                return Err(format!(
+                    "the dense slot at {:#x} is packed twice",
+                    pointer.0
+                ));
             }
             candidates.push(Candidate {
                 pointer,
