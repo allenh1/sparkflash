@@ -372,6 +372,47 @@ extern "C" __global__ void q4e_argmax_slices(const float* __restrict__ logits,
     }
 }
 
+// q4e_argmax_slices, and the pick's softmax probability into probs[blockIdx.x]: 1 / sum_j
+// e^(logit_j - best), NaN logits left out. The token is the one q4e_argmax_slices writes, so a
+// draft that reports how sure it is drafts the same tokens. A row whose best is not finite (all
+// NaN, or an infinity) reports 0, which a depth policy reads as no confidence.
+extern "C" __global__ void q4e_argmax_prob_slices(const float* __restrict__ logits,
+                                                  int* __restrict__ tokens,
+                                                  float* __restrict__ probs, int world, int rows,
+                                                  int local) {
+    OPT_PDL_ENTRY();
+    __shared__ float shared_value[32];
+    __shared__ int shared_index[32];
+    __shared__ float scratch[1024];
+    const int row = blockIdx.x;
+    float value = -INFINITY;
+    int index = 0x7FFFFFFF;
+    for (int rank = 0; rank < world; ++rank) {
+        const float* slice = logits + ((unsigned long long)rank * rows + row) * local;
+#pragma unroll 4
+        for (int j = threadIdx.x; j < local; j += blockDim.x) {
+            q4e_take_better(slice[j], rank * local + j, &value, &index);
+        }
+    }
+    q4e_block_best(&value, &index, shared_value, shared_index);
+    float total = 0.0f;
+    if (isfinite(value)) {
+        for (int rank = 0; rank < world; ++rank) {
+            const float* slice = logits + ((unsigned long long)rank * rows + row) * local;
+#pragma unroll 4
+            for (int j = threadIdx.x; j < local; j += blockDim.x) {
+                const float logit = slice[j];
+                total += isnan(logit) ? 0.0f : __expf(logit - value);
+            }
+        }
+    }
+    total = q4e_block_sum(total, scratch);
+    if (threadIdx.x == 0) {
+        tokens[row] = isnan(logits[(unsigned long long)row * local]) ? 0 : index;
+        probs[row] = (isfinite(value) && total > 0.0f) ? 1.0f / total : 0.0f;
+    }
+}
+
 // y = W x, with W in BF16 [rows, columns] and x/y in f32 ([batch, columns] -> [batch, rows]).
 //
 // The grid's y dimension carries independent groups of `batch` tokens: group blockIdx.y reads

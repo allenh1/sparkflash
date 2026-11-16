@@ -58,6 +58,8 @@ pub const SUPPORTED_MODEL_TYPES: &[&str] = &[
     "qwen3_5_moe",
     "qwen3_5_moe_text",
     "glm5_next",
+    "dory",
+    "inkling2",
 ];
 
 /// What the CLI's CPU host reference cannot execute in a checkpoint; empty when it can run it.

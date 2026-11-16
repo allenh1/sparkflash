@@ -700,6 +700,10 @@ struct Limits {
     max_context_tokens: usize,
     max_concurrency: usize,
     world_size: usize,
+    /// The fused lanes a lane group steps by default.
+    group_lanes: usize,
+    /// The widest prefill chunk Inkling's arm takes.
+    max_prefill_chunk: usize,
 }
 
 #[derive(Serialize)]
@@ -719,6 +723,14 @@ struct SupportedModel {
     engine: &'static str,
     context_tokens: usize,
     requires_conversion: bool,
+    /// Whether the family's group steps concurrent requests as fused lanes, with the drafting
+    /// and lane-memory knobs.
+    lane_group: bool,
+    /// Whether the lane group drafts when `runtime.drafting` is the default: GLM's MTP layer
+    /// does, Inkling's DSpark drafter is opt-in.
+    drafts_by_default: bool,
+    /// Whether the arm reads `runtime.prefill_chunk` (Inkling-2-Small).
+    prefill_chunk: bool,
 }
 
 #[derive(Serialize)]
@@ -741,6 +753,8 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
         max_context_tokens: config.max_context_tokens(),
         max_concurrency: MAX_CONCURRENCY,
         world_size: config.world_size(),
+        group_lanes: crate::config::GROUP_LANES,
+        max_prefill_chunk: crate::config::MAX_PREFILL_CHUNK,
     };
     Json(StateView {
         now_ms: now_ms(),
@@ -770,6 +784,9 @@ async fn state_snapshot(State(web): State<WebState>) -> Json<StateView> {
                     engine: profile.engine,
                     context_tokens: profile.context_tokens,
                     requires_conversion: profile.requires_conversion,
+                    lane_group: profile.lane_group,
+                    drafts_by_default: profile.weights == crate::config::GLM_WEIGHTS_ID,
+                    prefill_chunk: profile.weights == crate::config::INKLING_WEIGHTS_ID,
                 })
                 .collect(),
             solo: SoloDefaults {

@@ -220,7 +220,7 @@ pub fn cubin_available() -> bool {
 pub use architecture::{architecture_from_carried, architecture_from_json, tiny_architecture};
 pub use codec::GlmCodec;
 pub use config::{ConfigError, Glm5NextConfig, IndexerKind, LayerKind, MlpKind, VisionConfig};
-pub use device::{DFLASH2_STEP_COST, DeviceRank, DeviceSequence, MAX_ROWS};
+pub use device::{DFLASH2_STEP_COST, DeviceRank, DeviceSequence, MAX_ROWS, MTP_STEP_COST};
 pub use forward::{Glm5NextWeights, ReferenceState};
 pub use serve::Glm5NextDeviceBackend;
 pub use tensor::{Glm5NextTensorPlan, Role, Split};

@@ -51,7 +51,7 @@ use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::group::{frame_sampling, sampler_frame};
 use sparkflash_runtime::{
     ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, GroupWire, Opened, RoundArm, StepWall,
-    mirror_lanes, run_round,
+    mirror_until_the_group_ends, run_round, watched_hub,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -654,38 +654,42 @@ impl Glm5NextDeviceBackend {
     /// [Self::enable_fusion] on rank 0 of a group: every lane's prompt, step, give-back and
     /// release is broadcast through `hub` before it runs here, and each worker replays them
     /// ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same sequence on
-    /// every rank and the collectives inside a step line up.
+    /// every rank and the collectives inside a step line up. A worker whose socket closes ends this
+    /// process, and so does a failure here after a frame went out
+    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
     ///
     /// # Errors
-    /// As [Self::enable_fusion].
+    /// As [Self::enable_fusion], or a watch that cannot start.
     pub fn enable_group_fusion(
         &mut self,
         capacity: usize,
-        hub: Arc<Mutex<Tp4ControlHub>>,
+        hub: Tp4ControlHub,
     ) -> Result<(), BackendError> {
         let wire = GlmWire {
             context: self.context_limit,
         };
-        let arm = Arc::new(GroupLanes::new(self.lanes()?, hub, wire));
+        let arm = Arc::new(GroupLanes::new(self.lanes()?, watched_hub(hub)?, wire));
         self.fused = Some(Fused::Group(FusedEngine::start(arm, capacity)?));
         Ok(())
     }
 
     /// A worker of a group: replays rank 0's lane frames over `capacity` lanes of this rank's own
-    /// until the control channel ends. Configure speculation first, as rank 0 does.
+    /// until the group can no longer serve, then ends the process
+    /// ([sparkflash_runtime::mirror_until_the_group_ends]). Configure speculation first, as rank 0
+    /// does.
     ///
     /// # Errors
-    /// The arm's configuration, a frame the ranks disagree on, or the channel's end.
+    /// The arm's configuration, before any frame.
     pub fn mirror_group(
         &self,
         control: &mut Tp4ControlWorker,
         capacity: usize,
-    ) -> Result<(), String> {
+    ) -> Result<std::convert::Infallible, String> {
         let lanes = self.lanes().map_err(|error| error.to_string())?;
         let wire = GlmWire {
             context: self.context_limit,
         };
-        mirror_lanes(control, &lanes, &wire, capacity)
+        mirror_until_the_group_ends(control, &lanes, &wire, capacity)
     }
 
     /// The fused arm over this rank: its slots, joint rounds and walk cost.
@@ -715,6 +719,20 @@ impl Glm5NextDeviceBackend {
     #[must_use]
     pub fn fused(&self) -> bool {
         self.fused.is_some()
+    }
+
+    /// Whether this rank drafts with a block drafter, and the most drafts it proposes after a
+    /// token ([DeviceRank::max_drafts]).
+    ///
+    /// # Errors
+    /// A poisoned rank lock.
+    pub fn drafting_limits(&self) -> Result<(bool, usize), BackendError> {
+        let rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        Ok((rank.has_block_drafter(), rank.max_drafts()))
     }
 
     /// Draft with this rank's MTP layer, verifying at most `drafts` tokens a step.
@@ -982,8 +1000,9 @@ impl Glm5NextSession {
         self.settle(&rank, &chunk, &confidence, rows)
     }
 
-    /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows, with
-    /// the confidence the depth was chosen from (the last round's).
+    /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows
+    /// ([DeviceRank::draft_chain]), with the drafter's confidence in each draft it proposed, which
+    /// the depth was chosen from and the round's verdict calibrates.
     fn draft_after(
         &mut self,
         rank: &DeviceRank,
@@ -995,21 +1014,18 @@ impl Glm5NextSession {
             .sequence
             .capacity()
             .saturating_sub(self.sequence.position() + 1);
-        let confidence = self.confidence.clone();
-        let depth = self
-            .spec
-            .as_ref()
-            .map_or(0, |spec| spec.depth(&confidence, room));
-        let drafts = if depth == 0 {
-            Vec::new()
-        } else {
-            let drafted = {
-                let mut batch = [(&mut self.sequence, anchor)];
-                rank.draft(&self.shared.tp, &self.shared.gather, &mut batch, depth)?
-            };
-            drafted.into_iter().next().unwrap_or_default()
+        let (drafts, confidence) = match self.spec.as_ref() {
+            Some(spec) => rank.draft_chain(
+                &self.shared.tp,
+                &self.shared.gather,
+                &mut self.sequence,
+                anchor,
+                spec,
+                room,
+            )?,
+            None => (Vec::new(), Vec::new()),
         };
-        self.confidence = self.sequence.draft_confidence().to_vec();
+        self.confidence.clone_from(&confidence);
         let mut chunk = Vec::with_capacity(drafts.len() + 1);
         chunk.push(anchor);
         chunk.extend_from_slice(&drafts);

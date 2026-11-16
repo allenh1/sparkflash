@@ -866,9 +866,8 @@ pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, Str
 ///
 /// The fields are the typed ones ([sparkflash_model::profile::SpeculationProfile]) and the
 /// environment names that set them are declared in [sparkflash_model::profile::ENV_OVERRIDES], so
-/// a switch here is a documented field rather than a new variable read at the point of use: a
-/// block drafter's depth is adaptive (it reports a confidence a draft), the MTP layer's is fixed
-/// (it reports none).
+/// a switch here is a documented field rather than a new variable read at the point of use. The
+/// drafts and their depth rule are [glm_drafting]'s, which the four-rank group reads too.
 fn apply_speculation(
     backend: &mut sparkflash_model_glm5_next::Glm5NextDeviceBackend,
     profile: &ModelProfile,
@@ -880,30 +879,85 @@ fn apply_speculation(
             .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
         eprintln!("sparkflash serve: GLM drafting with the DFlash 2 drafter {drafter}");
     }
-    if spec.enabled != Some(true) {
-        return Ok(());
-    }
-    // Two drafts is what the former harness default was and what the MTP layer pays for; a block
-    // drafter's block is longer, so a fixed depth is an operator's choice either way.
-    let drafts = spec.depth.unwrap_or(2);
-    let policy = spec.drafter.as_ref().map(|_| {
-        sparkflash_model::DepthPolicy::adaptive(
-            drafts,
-            sparkflash_model_glm5_next::DFLASH2_STEP_COST,
-        )
-    });
-    backend
-        .enable_speculation(drafts, policy)
+    let (block, most) = backend
+        .drafting_limits()
         .map_err(|error| error.to_string())?;
-    eprintln!(
-        "sparkflash serve: GLM speculating {drafts} draft(s) a step, {}",
-        if spec.drafter.is_some() {
-            "adaptive depth"
-        } else {
-            "fixed depth"
+    let Some(drafting) = glm_drafting(spec, block, most)? else {
+        return Ok(());
+    };
+    eprintln!("sparkflash serve: GLM speculating {}", drafting.label());
+    backend
+        .enable_speculation(drafting.drafts, Some(drafting.policy))
+        .map_err(|error| error.to_string())
+}
+
+/// How a GLM rank drafts: the most drafts a step verifies and the shared depth rule over them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GlmDrafting {
+    /// The most drafts a step proposes and verifies after its token.
+    pub(crate) drafts: usize,
+    /// [sparkflash_model::DepthPolicy::from_speculation] over [Self::drafts].
+    pub(crate) policy: sparkflash_model::DepthPolicy,
+}
+
+impl GlmDrafting {
+    /// For the serve log: the chain and its rule.
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "up to {} draft(s) a step, {} depth",
+            self.drafts,
+            if self.policy.is_adaptive() { "adaptive" } else { "fixed" }
+        )
+    }
+}
+
+/// The GLM arm's drafting from the profile's speculation section, for a rank with a block drafter
+/// (`block`) or the MTP layer, drafting at most `most`. `None` drafts nothing.
+///
+/// Either drafter says how sure it is of each draft (the block drafter's selector, the MTP
+/// layer's softmax), so the depth is DeepSeek's: adaptive unless `speculation.depth_policy` says
+/// fixed (`SPARKFLASH_GLM_DRAFT_POLICY`), at least `speculation.min_depth`, against the drafter's
+/// own step cost. The chain is `speculation.drafts` (`SPARKFLASH_GLM_DRAFTS`), else the whole
+/// block for a block drafter, else `speculation.depth` (`SPARKFLASH_GLM_SPEC_DEPTH`; the carried
+/// profile says 3), else 2. `speculation.enabled=false` (`SPARKFLASH_GLM_SPEC=off`) drafts
+/// nothing.
+///
+/// # Errors
+/// A chain past what the rank drafts, or a draft count asked for with speculation off.
+pub(crate) fn glm_drafting(
+    spec: &sparkflash_model::profile::SpeculationProfile,
+    block: bool,
+    most: usize,
+) -> Result<Option<GlmDrafting>, String> {
+    let drafts = match (spec.enabled, spec.drafts) {
+        (Some(false), None | Some(0)) => return Ok(None),
+        (Some(false), Some(drafts)) => {
+            return Err(format!(
+                "speculation.enabled=false with speculation.drafts={drafts}: say one or the other"
+            ));
         }
-    );
-    Ok(())
+        (_, Some(drafts)) => drafts,
+        (_, None) if block => most,
+        (_, None) => spec.depth.unwrap_or(2),
+    };
+    if drafts == 0 {
+        return Ok(None);
+    }
+    if drafts > most {
+        return Err(format!(
+            "{drafts} drafts a step (speculation.drafts or speculation.depth) is past the {most}              this rank's {} drafts",
+            if block { "block drafter" } else { "MTP layer" }
+        ));
+    }
+    let cost = if block {
+        sparkflash_model_glm5_next::DFLASH2_STEP_COST
+    } else {
+        sparkflash_model_glm5_next::MTP_STEP_COST
+    };
+    Ok(Some(GlmDrafting {
+        drafts,
+        policy: sparkflash_model::DepthPolicy::from_speculation(spec, drafts, cost),
+    }))
 }
 
 /// The one KV admission rule every single-node arm runs before it uploads a weight.

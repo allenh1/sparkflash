@@ -1192,22 +1192,87 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
 }
 
 #[test]
-fn the_glm_group_drafts_nothing_when_speculation_is_off_and_refuses_a_count_then() {
-    use sparkflash_model::profile::SpeculationProfile;
+fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() {
+    use pack::{GlmArm, PackArm, glm_drafting};
+    use sparkflash_model::profile::{DepthMode, SpeculationProfile};
+    let drafts = |spec: &SpeculationProfile, block, most| {
+        glm_drafting(spec, block, most).map(|drafting| {
+            drafting.map(|drafting| (drafting.drafts, drafting.policy.is_adaptive()))
+        })
+    };
+    // The carried profile: the MTP layer's chain of three, adaptive as DeepSeek's is, and a block
+    // drafter's whole block.
+    let carried = GlmArm::profile_from(|_| None).expect("the carried profile").speculation;
+    assert_eq!(drafts(&carried, false, 15), Ok(Some((3, true))));
+    assert_eq!(drafts(&carried, true, 7), Ok(Some((7, true))));
+    // The environment picks the chain and the rule.
+    let env = GlmArm::profile_from(|name| match name {
+        "SPARKFLASH_GLM_DRAFTS" => Some("2".to_owned()),
+        "SPARKFLASH_GLM_DRAFT_POLICY" => Some("fixed".to_owned()),
+        _ => None,
+    })
+    .expect("the profile under the environment")
+    .speculation;
+    assert_eq!(env.depth_policy, Some(DepthMode::Fixed));
+    assert_eq!(drafts(&env, false, 15), Ok(Some((2, false))));
     let spec = |enabled, drafts| SpeculationProfile {
         enabled,
         drafts,
         ..SpeculationProfile::default()
     };
-    // The defaults: the whole block over a block drafter, else the MTP layer's two.
-    assert_eq!(glm_group_drafts(&spec(None, None), true, 7), Ok(7));
-    assert_eq!(glm_group_drafts(&spec(Some(true), None), false, 3), Ok(2));
-    assert_eq!(glm_group_drafts(&spec(None, Some(1)), false, 3), Ok(1));
+    assert_eq!(drafts(&spec(None, None), false, 15), Ok(Some((2, true))));
     // SPARKFLASH_GLM_SPEC=off decodes a token a step, as drafts=0 does.
-    assert_eq!(glm_group_drafts(&spec(Some(false), None), true, 7), Ok(0));
-    assert_eq!(glm_group_drafts(&spec(Some(false), Some(0)), true, 7), Ok(0));
-    assert!(glm_group_drafts(&spec(Some(false), Some(2)), true, 7)
+    assert_eq!(drafts(&spec(Some(false), None), true, 7), Ok(None));
+    assert_eq!(drafts(&spec(Some(false), Some(0)), true, 7), Ok(None));
+    assert_eq!(drafts(&spec(None, Some(0)), false, 15), Ok(None));
+    assert!(drafts(&spec(Some(false), Some(2)), true, 7)
         .is_err_and(|error| error.contains("speculation.enabled=false")));
-    assert!(glm_group_drafts(&spec(None, Some(8)), true, 7)
-        .is_err_and(|error| error.contains("from 0 to 7")));
+    assert!(drafts(&spec(None, Some(8)), true, 7)
+        .is_err_and(|error| error.contains("past the 7")));
+}
+
+#[test]
+fn a_one_request_rank_gets_the_whole_sampler_and_a_penalized_request_does_not_draft() {
+    let (replies, _answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
+    let job = |temperature: f32, repetition_penalty: f32, replies| Job {
+        prompt_tokens: vec![100, 200],
+        forced_tokens: Vec::new(),
+        max_tokens: 6,
+        temperature,
+        top_p: 0.9,
+        top_k: 40,
+        repetition_penalty,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.25,
+        skip_special_tokens: true,
+        seed: 7,
+        logprobs: LogprobsRequest {
+            sample: None,
+            prompt: None,
+            token_ids: Vec::new(),
+        },
+        stop: Vec::new(),
+        enqueued_at: Instant::now(),
+        replies,
+    };
+    let sampled = tp4_sampling(&job(0.7, 1.1, replies.clone()));
+    assert_eq!(
+        sampled.sampling,
+        sparkflash_model::Sampling {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            repetition_penalty: 1.1,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.25,
+            seed: 7,
+            prompt_len: 2,
+        }
+    );
+    assert!(!sampled.speculative);
+    // Greedy, but a penalty moves the argmax the device verify would take.
+    assert!(!tp4_sampling(&job(0.0, 1.0, replies.clone())).speculative);
+    let mut plain = job(0.0, 1.0, replies);
+    plain.frequency_penalty = 0.0;
+    assert!(tp4_sampling(&plain).speculative);
 }

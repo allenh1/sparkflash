@@ -3997,33 +3997,20 @@ pub struct Tp4Step {
 /// begin_request instead. Sampling changes only which token rank 0 chooses; it does not change the
 /// forward arithmetic, and workers keep the greedy default because they ignore next_token.
 #[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Tp4Sampling {
-    /// The request temperature.
-    pub temperature: f32,
-    /// The request seed.
-    pub seed: u64,
+    /// The request's whole sampler: temperature, top-p, top-k, the three penalties and the seed.
+    /// A rank honours all of it or refuses the request.
+    pub sampling: sparkflash_model::Sampling,
     /// Whether each step's logits row is read (a request for logprobs). Without it a rank whose
     /// pick is the row's argmax may take it on the device and leave the row there; the token is
     /// the same.
     pub logits: bool,
     /// Whether the rank may decode the request speculatively: rank 0 sets it for a request whose
     /// tokens are each its row's argmax and whose rows are never read (no temperature, no
-    /// logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
+    /// penalty, no logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
     /// decodes a token a step.
     pub speculative: bool,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Default for Tp4Sampling {
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            seed: 0,
-            logits: false,
-            speculative: false,
-        }
-    }
 }
 
 /// The evidence counters the rank's extraction exposes.
@@ -4178,10 +4165,22 @@ struct HostTp4Rank {
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for HostTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        // The host rank decodes greedily (it refuses a temperature), so top-p and top-k change
+        // nothing; a penalty would move its argmax, and it has none to apply.
+        let request = &sampling.sampling;
+        if request.repetition_penalty != 1.0
+            || request.presence_penalty != 0.0
+            || request.frequency_penalty != 0.0
+        {
+            return Err(
+                "repetition, presence and frequency penalties are not served on the TP=4 host                  path"
+                    .to_owned(),
+            );
+        }
         self.rank
             .begin_request(crate::tp4_host::Tp4Sampling {
-                temperature: sampling.temperature,
-                seed: sampling.seed,
+                temperature: request.temperature,
+                seed: request.seed,
             })
             .map_err(|error| error.to_string())
     }
@@ -4389,26 +4388,15 @@ impl GlmTp4Rank {
             .sequence
             .capacity()
             .saturating_sub(self.sequence.position() + 1);
-        let count = self.spec.max_depth().min(room);
-        let mut drafted = if count == 0 {
-            Vec::new()
-        } else {
-            let mut batch = [(&mut self.sequence, token)];
-            self.rank
-                .draft(&self.tp, &self.gather, &mut batch, count)
-                .map_err(|error| format!("the GLM rank's draft failed: {error}"))?
-                .pop()
-                .unwrap_or_default()
-        };
-        // A block drafter proposes its whole block and says how sure it is of each draft; the
-        // policy weighs those against a row's cost and shortens the chain (the MTP layer has no
-        // confidences, so this leaves its drafts alone).
-        let confidence = self.sequence.draft_confidence().to_vec();
+        // The drafter says how sure it is of each draft; an adaptive policy stops the MTP layer
+        // and shortens the chain by those against a row's cost, as the fused lanes do.
+        let (drafted, confidence) = self
+            .rank
+            .draft_chain(&self.tp, &self.gather, &mut self.sequence, token, &self.spec, room)
+            .map_err(|error| format!("the GLM rank's draft failed: {error}"))?;
         // What the drafter offered, then what the policy thought the rows were worth.
-        let proposed = drafted.len();
-        let depth = self.spec.depth(&confidence, count);
-        drafted.truncate(depth);
-        let gated = proposed - drafted.len();
+        let proposed = confidence.len();
+        let gated = proposed.saturating_sub(drafted.len());
         let chunk: Vec<u32> = std::iter::once(token).chain(drafted).collect();
         let mut batch = [(&mut self.sequence, chunk.as_slice())];
         let picks = self
@@ -4472,11 +4460,7 @@ impl Tp4RankApi for GlmTp4Rank {
         // depends on its prompt, which this call does not see, and a chat turn's prompt begins with
         // everything the previous one left in the window.
         self.sampler.reset();
-        self.sampling = sparkflash_model::Sampling {
-            temperature: sampling.temperature,
-            seed: sampling.seed,
-            ..sparkflash_model::Sampling::default()
-        };
+        self.sampling = sampling.sampling;
         self.logits = sampling.logits;
         self.speculative = sampling.speculative && self.spec.max_depth() > 0;
         if self.speculative && (self.logits || !self.sampler.takes_argmax(&self.sampling)) {
@@ -4669,9 +4653,10 @@ struct GlmLoadedRank {
     tp: TpRuntime,
     gather: BitGatherHandle,
     config: sparkflash_model_glm5_next::Glm5NextConfig,
-    /// How many drafts a drafting request verifies after each token; 0 decodes a token a step.
-    drafts: usize,
-    /// Whether a DFlash 2 block drafter is loaded, which makes the depth adaptive.
+    /// How many drafts a drafting request verifies after each token at most, and the depth rule;
+    /// `None` decodes a token a step ([pack::glm_drafting]).
+    drafting: Option<pack::GlmDrafting>,
+    /// Whether a DFlash 2 block drafter is loaded.
     block: bool,
     origin: String,
     started: Instant,
@@ -4679,15 +4664,14 @@ struct GlmLoadedRank {
 
 #[cfg(feature = "tp4-serve")]
 impl GlmLoadedRank {
-    /// The shared speculator's depth rule for this rank's drafts: adaptive over a block drafter,
-    /// because it says how sure it is of each draft, else fixed.
+    /// The most drafts a step verifies; 0 decodes a token a step.
+    fn drafts(&self) -> usize {
+        self.drafting.as_ref().map_or(0, |drafting| drafting.drafts)
+    }
+
+    /// The shared speculator's depth rule for this rank's drafts.
     fn depth_policy(&self) -> Option<sparkflash_model::DepthPolicy> {
-        self.block.then(|| {
-            sparkflash_model::DepthPolicy::adaptive(
-                self.drafts,
-                sparkflash_model_glm5_next::DFLASH2_STEP_COST,
-            )
-        })
+        self.drafting.as_ref().map(|drafting| drafting.policy.clone())
     }
 
     /// Announces the load and answers how long it took.
@@ -4798,10 +4782,8 @@ fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
     // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
     // token, which is what takes this arm past the MTP layer's two drafts. Its depth is the
     // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
-    let mut profile = sparkflash_model::ModelProfile::default();
-    profile
-        .apply_process_env()
-        .map_err(|error| error.to_string())?;
+    // The carried profile under the environment, as the single-GPU arm reads it.
+    let profile = <pack::GlmArm as pack::PackArm>::profile()?;
     if let Some(drafter) = profile.speculation.drafter.as_deref() {
         rank.load_block_drafter(std::path::Path::new(drafter))
             .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
@@ -4814,43 +4796,25 @@ fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
     // block reads, unless the profile keeps it on the token path (`prefill.drafting_prompt`).
     rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(true));
     let block = rank.has_block_drafter();
-    let drafts = glm_group_drafts(&profile.speculation, block, rank.max_drafts())?;
+    let drafting = pack::glm_drafting(&profile.speculation, block, rank.max_drafts())?;
+    if config.rank == 0 {
+        eprintln!(
+            "sparkflash serve: GLM group drafting: {}",
+            drafting
+                .as_ref()
+                .map_or_else(|| "off".to_owned(), pack::GlmDrafting::label)
+        );
+    }
     Ok(GlmLoadedRank {
         rank,
         tp,
         gather,
         config: glm_config,
-        drafts,
+        drafting,
         block,
         origin,
         started,
     })
-}
-
-/// How many drafts a GLM group rank verifies after each token: the whole block when a block
-/// drafter is loaded, else the MTP layer's 2 (the harness's best at one stream); 0 decodes a
-/// token a step, which `speculation.enabled=false` (SPARKFLASH_GLM_SPEC=off) asks for too.
-///
-/// # Errors
-/// A draft count past what the rank drafts, or one asked for with speculation turned off.
-#[cfg(feature = "tp4-serve")]
-fn glm_group_drafts(
-    spec: &sparkflash_model::profile::SpeculationProfile,
-    block: bool,
-    most: usize,
-) -> Result<usize, String> {
-    match (spec.enabled, spec.drafts) {
-        (Some(false), None | Some(0)) => Ok(0),
-        (Some(false), Some(drafts)) => Err(format!(
-            "speculation.enabled=false with speculation.drafts={drafts}: say one or the other"
-        )),
-        (_, None) if block => Ok(most),
-        (_, None) => Ok(2.min(most)),
-        (_, Some(drafts)) if drafts <= most => Ok(drafts),
-        (_, Some(drafts)) => Err(format!(
-            "speculation.drafts={drafts} is not a draft count from 0 to {most}"
-        )),
-    }
 }
 
 /// Opens one GLM-5.3-Flash rank of the serve-owned group serving one request at a time.
@@ -4865,7 +4829,7 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
     let sequence = if loaded.block {
         rank.new_block_drafting_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
-    } else if loaded.drafts > 0 {
+    } else if loaded.drafts() > 0 {
         rank.new_drafting_sequence(config.context)
             .map_err(|error| {
                 format!("the GLM request window: {error} (speculation.drafts=0 drafts nothing)")
@@ -4874,7 +4838,7 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         rank.new_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
     };
-    let spec = sparkflash_model::Speculator::new(loaded.drafts, loaded.depth_policy());
+    let spec = sparkflash_model::Speculator::new(loaded.drafts(), loaded.depth_policy());
     let load_ms = loaded.announce(config);
     let GlmLoadedRank {
         rank,
@@ -4917,7 +4881,7 @@ fn open_glm_lanes(
 ) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
     let loaded = load_glm_tp4_rank(config)?;
     let policy = loaded.depth_policy();
-    let drafts = loaded.drafts;
+    let drafts = loaded.drafts();
     loaded.announce(config);
     let mut backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend::from_rank(
         loaded.config,
@@ -4934,7 +4898,7 @@ fn open_glm_lanes(
         let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
             .map_err(|error| format!("rank 0 control channel: {error}"))?;
         backend
-            .enable_group_fusion(lanes, Arc::new(std::sync::Mutex::new(hub)))
+            .enable_group_fusion(lanes, hub)
             .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
         eprintln!(
             "sparkflash serve: GLM rank 0 steps {lanes} fused lanes over {} ranks, {drafts} draft(s)",
@@ -4943,8 +4907,7 @@ fn open_glm_lanes(
         return Ok(Some(Box::new(backend)));
     }
     let mut control = tp4_control_worker(config)?;
-    backend.mirror_group(&mut control, lanes)?;
-    Ok(None)
+    match backend.mirror_group(&mut control, lanes)? {}
 }
 
 /// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
@@ -5017,11 +4980,7 @@ impl QwenTp4Rank {
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for QwenTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-        let request = sparkflash_model::Sampling {
-            temperature: sampling.temperature,
-            seed: sampling.seed,
-            ..sparkflash_model::Sampling::default()
-        };
+        let request = sampling.sampling;
         if sampling.speculative && (sampling.logits || !Sampler::new().takes_argmax(&request)) {
             return Err(
                 "a speculative request must take each row's argmax and read no row; this one \
@@ -5537,6 +5496,35 @@ fn classify_tp4_request_error(message: String) -> Tp4RequestError {
     }
 }
 
+/// The sampler a one-request group's rank 0 runs `job` with: the request's whole sampler, and
+/// whether its tokens may be drafted and verified on the device.
+#[cfg(feature = "tp4-serve")]
+fn tp4_sampling(job: &Job) -> Tp4Sampling {
+    let logits = job.logprobs.wants_sample();
+    Tp4Sampling {
+        sampling: sparkflash_model::Sampling {
+            temperature: job.temperature,
+            top_p: job.top_p,
+            top_k: job.top_k,
+            repetition_penalty: job.repetition_penalty,
+            presence_penalty: job.presence_penalty,
+            frequency_penalty: job.frequency_penalty,
+            seed: job.seed,
+            prompt_len: job.prompt_tokens.len(),
+        },
+        logits,
+        // The sampler's greedy rule: zero, below it or NaN draws nothing. A penalty moves the
+        // argmax a verify takes on the device. A forced request never speculates: a kept draft
+        // would be emitted in place of the forced token.
+        speculative: (job.temperature.is_nan() || job.temperature <= 0.0)
+            && job.repetition_penalty == 1.0
+            && job.presence_penalty == 0.0
+            && job.frequency_penalty == 0.0
+            && !logits
+            && job.forced_tokens.is_empty(),
+    }
+}
+
 /// Runs one request on rank 0 while every worker runs the same ids.
 #[cfg(feature = "tp4-serve")]
 fn run_tp4_request(
@@ -5559,17 +5547,7 @@ fn run_tp4_request(
             )));
         }
     };
-    let logits = job.logprobs.wants_sample();
-    let sampling = Tp4Sampling {
-        temperature: job.temperature,
-        seed: job.seed,
-        logits,
-        // The sampler's greedy rule: zero, below it or NaN draws nothing. A forced request never
-        // speculates: a kept draft would be emitted in place of the forced token.
-        speculative: (job.temperature.is_nan() || job.temperature <= 0.0)
-            && !logits
-            && job.forced_tokens.is_empty(),
-    };
+    let sampling = tp4_sampling(&job);
     rank.begin_request(sampling)?;
     let max_tokens = u32::try_from(job.max_tokens).unwrap_or(u32::MAX);
     // One rank decides what every rank may keep, and the frame carries the decision: two ranks

@@ -269,6 +269,17 @@ pub const DFLASH2_STEP_COST: StepCost = StepCost {
     prior_tokens_per_ms: 0.046,
 };
 
+/// The modelled wall of an MTP round that drafts and verifies `depth` drafts (ms), for
+/// [DepthPolicy](sparkflash_model::DepthPolicy): the one-token step at 34.0 ms and 9.0 ms a draft,
+/// its MTP pass and its verify row together, since the MTP layer drafts one token a pass. Fit to
+/// one stream's 34.0, 43.5, 52 and 61 ms rounds at 0 to 3 drafts over the NCCL leg
+/// (docs/models/glm53-flash.md); the first round assumes the 45 tok/s it made at 2.
+pub const MTP_STEP_COST: StepCost = StepCost {
+    step_ms: 34.0,
+    row_ms: 9.0,
+    prior_tokens_per_ms: 0.045,
+};
+
 /// The side of a block-scaled FP8 tile the kernels read (Q4E_FP8_BLOCK).
 const FP8_BLOCK: usize = 128;
 /// The dynamic shared memory of the bulk E4M3 x E4M3 GEMMs in the prefill and MoE images
@@ -454,6 +465,8 @@ fn append(into: &mut Vec<u8>, bytes: Vec<u8>) {
 struct Kernels {
     embed: Kernel,
     argmax: Kernel,
+    /// [Self::argmax] that also reports the pick's softmax probability: an MTP draft's confidence.
+    argmax_prob: Kernel,
     gemv_bf16: Kernel,
     gemv_fp8: Kernel,
     /// The E4M3 copy of the LM head drafts score with ([DeviceRank::draft_head]): its quantizer
@@ -621,6 +634,7 @@ impl Kernels {
         Ok(Self {
             embed: named("q4e_embed")?,
             argmax: named("q4e_argmax_slices")?,
+            argmax_prob: named("q4e_argmax_prob_slices")?,
             gemv_bf16: decode("q4e_gemv_tiled_bf16_parts")?,
             gemv_fp8: decode("q4e_gemv_tiled_e4m3_block")?,
             quantize_e4m3: named("q4e_quantize_e4m3_rows")?,
@@ -1727,6 +1741,9 @@ struct Scratch {
     /// drafts follow, iteration `i + 1` the argmax of iteration `i`'s logits, which the device
     /// writes and the next iteration's embedding reads with no host round trip.
     drafted: HostMapped,
+    /// `[MAX_ROWS][MAX_ROWS]` f32 beside [Self::drafted]: entry `[i + 1][row]` the probability
+    /// the MTP layer gave its draft `i + 1`, which the depth policy reads as its confidence.
+    draft_probs: HostMapped,
     /// A step's token ids, a u32 a row, which its one embedding launch reads in place
     /// ([DeviceRank::embed_rows]).
     step_tokens: HostMapped,
@@ -2101,9 +2118,9 @@ impl DeviceSequence {
         self.lane.memory.lanes.room(&self.lane.span, rows, reset)
     }
 
-    /// The block drafter's confidence in each of the sequence's last drafts, in `(0, 1]`: the
-    /// selector's probability for its pick among the row's candidates. Empty after an MTP draft,
-    /// which keeps none.
+    /// The drafter's confidence in each of the sequence's last drafts: the block drafter's
+    /// selector's probability for its pick among the row's candidates, in `(0, 1]`, or the MTP
+    /// layer's softmax probability of its argmax (0 for a row whose logits have no finite best).
     #[must_use]
     pub fn draft_confidence(&self) -> &[f32] {
         &self.confidence
@@ -2233,6 +2250,10 @@ impl Prefetch {
         }))
     }
 }
+
+/// Asked after each MTP pass with the probability of every row's newest draft: true drafts
+/// another pass. [DeviceRank::draft_while] takes it.
+pub type KeepDrafting<'a> = &'a mut dyn FnMut(&[f32]) -> bool;
 
 impl DeviceRank {
     /// Upload rank `layout.rank`'s slice of the text model.
@@ -2737,6 +2758,7 @@ impl DeviceRank {
             logits: memory.floats(world * rows * (config.vocab_size / world))?,
             logits_host: memory.mapped(world * rows * (config.vocab_size / world) * 4)?,
             drafted: memory.mapped(rows * rows * 4)?,
+            draft_probs: memory.mapped(rows * rows * 4)?,
             step_tokens: memory.mapped(rows * 4)?,
             mtp_tokens: memory.mapped(rows * 4)?,
             picks: memory.mapped(rows * 4)?,
@@ -5719,6 +5741,28 @@ impl DeviceRank {
             .collect())
     }
 
+    /// [Self::argmax_rows], and each pick's softmax probability into `probs`, an f32 a row.
+    fn argmax_prob_rows(
+        &self,
+        rows: usize,
+        tokens: Deviceptr,
+        probs: Deviceptr,
+    ) -> Result<(), BackendError> {
+        self.launch(
+            self.kernels.argmax_prob,
+            (rows as u32, 1, 1),
+            ARGMAX_BLOCK,
+            &[
+                self.scratch.logits.0,
+                tokens.0,
+                probs.0,
+                self.layout.world_size as u64,
+                rows as u64,
+                self.lm_head.rows as u64,
+            ],
+        )
+    }
+
     /// The argmax of each of `rows` rows of the gathered logits into `tokens`, a u32 a row.
     fn argmax_rows(&self, rows: usize, tokens: Deviceptr) -> Result<(), BackendError> {
         self.launch(
@@ -5952,6 +5996,26 @@ impl DeviceRank {
         batch: &mut [(&mut DeviceSequence, u32)],
         count: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
+        self.draft_while(tp, gather, batch, count, None)
+    }
+
+    /// [Self::draft] of at most `count` drafts, where the MTP layer stops early: after each draft
+    /// short of `count`, `more` sees each row's probabilities so far and the layer drafts another
+    /// only while it asks for one for some row. Each pass is the same whatever `more` answers, so
+    /// a draft it lets run is the token [Self::draft] would have drafted; every rank sees the same
+    /// probabilities and stops at the same pass. Reading them waits for the stream once a pass. A
+    /// block drafter proposes its whole block in one pass and ignores `more`.
+    ///
+    /// # Errors
+    /// As [Self::draft].
+    pub fn draft_while(
+        &self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        batch: &mut [(&mut DeviceSequence, u32)],
+        count: usize,
+        mut more: Option<KeepDrafting<'_>>,
+    ) -> Result<Vec<Vec<u32>>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
         if batch.iter().any(|(sequence, _)| sequence.block.is_some()) {
             return self.draft_blocks((tp, gather, device_leg), batch, count);
@@ -6008,6 +6072,8 @@ impl DeviceRank {
                 .write_at(at(0, row), &next.to_le_bytes())
                 .map_err(cuda_error)?;
         }
+        let probs_at = |iteration: usize, row: usize| (iteration * MAX_ROWS + row) * 4;
+        let mut drafted_count = count;
         for iteration in 0..count {
             self.embed_drafted(iteration, rows)?;
             if iteration == 0 {
@@ -6051,7 +6117,11 @@ impl DeviceRank {
             self.norm_rows((s.mtp_x, hidden), mtp.head_norm, (s.mtp_out, hidden), rows)?;
             if device_leg {
                 self.lm_head(tp, s.mtp_out, rows, (true, true))?;
-                self.argmax_rows(rows, s.drafted.device().offset(at(iteration + 1, 0)))?;
+                self.argmax_prob_rows(
+                    rows,
+                    s.drafted.device().offset(at(iteration + 1, 0)),
+                    s.draft_probs.device().offset(probs_at(iteration + 1, 0)),
+                )?;
             } else {
                 let logits = self.logits(tp, gather, s.mtp_out, rows, (false, true))?;
                 for (row, values) in logits.iter().enumerate() {
@@ -6060,12 +6130,37 @@ impl DeviceRank {
                     s.drafted
                         .write_at(at(iteration + 1, row), &(token as u32).to_le_bytes())
                         .map_err(cuda_error)?;
+                    s.draft_probs
+                        .write_at(
+                            probs_at(iteration + 1, row),
+                            &pick_probability(values, token).to_le_bytes(),
+                        )
+                        .map_err(cuda_error)?;
                 }
+            }
+            let Some(more) = more.as_deref_mut() else {
+                continue;
+            };
+            if iteration + 1 == count {
+                break;
+            }
+            self.cuda
+                .synchronize_stream(&self.stream)
+                .map_err(cuda_error)?;
+            let mut wanted = false;
+            for row in 0..rows {
+                let probs = Self::read_probs(&s.draft_probs, row, iteration + 1, probs_at)?;
+                wanted |= more(&probs);
+            }
+            if !wanted {
+                drafted_count = iteration + 1;
+                break;
             }
         }
         self.cuda
             .synchronize_stream(&self.stream)
             .map_err(cuda_error)?;
+        let count = drafted_count;
         let mut drafts: Vec<Vec<u32>> = vec![Vec::with_capacity(count); rows];
         let mut picked = [0u8; 4];
         for iteration in 1..=count {
@@ -6076,10 +6171,68 @@ impl DeviceRank {
                 drafted.push(u32::from_le_bytes(picked));
             }
         }
-        for (sequence, _) in batch.iter_mut() {
-            sequence.confidence.clear();
+        for (row, (sequence, _)) in batch.iter_mut().enumerate() {
+            sequence.confidence = Self::read_probs(&s.draft_probs, row, count, probs_at)?;
         }
         Ok(drafts)
+    }
+
+    /// Row `row`'s probabilities of its first `count` MTP drafts, `[1..=count][row]` of `probs`.
+    fn read_probs(
+        probs: &HostMapped,
+        row: usize,
+        count: usize,
+        at: impl Fn(usize, usize) -> usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let mut word = [0u8; 4];
+        (1..=count)
+            .map(|iteration| {
+                probs.read_at(at(iteration, row), &mut word).map_err(cuda_error)?;
+                Ok(f32::from_le_bytes(word))
+            })
+            .collect()
+    }
+
+    /// [Self::draft_while] under `spec`'s depth rule, after `anchor`, for one sequence: the drafts
+    /// it would verify and the drafter's confidence in each draft it proposed (as many as
+    /// [DeviceSequence::draft_confidence] holds, which may be more than the drafts kept).
+    ///
+    /// The drafter proposes up to the speculator's depth within `room`; an adaptive policy stops
+    /// the MTP layer once the drafts so far are all it would verify, and cuts the chain to the
+    /// depth it picks from the proposed drafts' own confidences. Every serving shape of the arm
+    /// drafts here, so they all verify the same chains.
+    ///
+    /// # Errors
+    /// As [Self::draft].
+    pub fn draft_chain(
+        &self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        anchor: u32,
+        spec: &sparkflash_model::Speculator,
+        room: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+        let count = spec.max_depth().min(room);
+        if count == 0 {
+            sequence.confidence.clear();
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut more = |probs: &[f32]| spec.depth(probs, count) >= probs.len();
+        let more: Option<KeepDrafting<'_>> = if spec.is_adaptive() {
+            Some(&mut more)
+        } else {
+            None
+        };
+        let mut drafted = {
+            let mut batch = [(&mut *sequence, anchor)];
+            self.draft_while(tp, gather, &mut batch, count, more)?
+                .pop()
+                .unwrap_or_default()
+        };
+        let confidence = sequence.draft_confidence().to_vec();
+        drafted.truncate(spec.depth(&confidence, count));
+        Ok((drafted, confidence))
     }
 
     /// [Self::draft] for block-drafting sequences: each sequence's block after its `next` runs
@@ -6320,6 +6473,21 @@ impl Drop for DeviceRank {
     }
 }
 
+
+/// The softmax probability of `values[pick]`, as q4e_argmax_prob_slices takes it: 1 over the sum
+/// of e^(value - best), NaN values left out, and 0 when the best is not finite.
+fn pick_probability(values: &[f32], pick: usize) -> f32 {
+    let best = values.get(pick).copied().unwrap_or(f32::NAN);
+    if !best.is_finite() {
+        return 0.0;
+    }
+    let total: f32 = values
+        .iter()
+        .filter(|value| !value.is_nan())
+        .map(|value| (value - best).exp())
+        .sum();
+    if total > 0.0 { 1.0 / total } else { 0.0 }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

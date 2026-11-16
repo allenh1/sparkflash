@@ -24,13 +24,21 @@
 //! This came from Inkling's group (`sparkflash-model-inkling2/src/group.rs`); what stays with an
 //! arm is its [GroupWire]: what rank 0 refuses before it broadcasts, how a request's sampler
 //! crosses the wire, and how a worker reads a prompt's image spans.
+//!
+//! A group that cannot stay in step stops as a whole rather than hang. Each frame is either
+//! refused before it is broadcast, on rank 0 alone, or run on every rank. Once a frame has gone
+//! out, a failure on rank 0's own half leaves the workers past it, inside collectives rank 0
+//! will not join. Rank 0 then broadcasts [Tp4ControlFrame::Error] and ends its process
+//! ([end_group]). A worker ends its own when its mirror fails or when rank 0's control socket
+//! closes, even while it waits in a collective ([mirror_until_the_group_ends]). Rank 0 ends when
+//! a worker's socket closes ([watched_hub]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sparkflash_comm::control::{
     Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
-    control_read_is_idle,
+    control_read_is_idle, exit_now, watch_leader, watch_workers,
 };
 use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
@@ -146,6 +154,52 @@ pub fn no_room(rows: usize) -> BackendError {
              pool)"
         ),
     )
+}
+
+/// What rank 0 does when its own half of a broadcast frame failed: the group is out of step.
+pub type Split = fn(&str) -> !;
+
+/// Ends rank 0's process when its group is out of step ([Split]). Rank 0's exit closes every
+/// control socket, which ends each worker's process in turn, collective or not.
+pub fn end_group(why: &str) -> ! {
+    eprintln!("sparkflash serve: rank 0: the group is out of step and cannot serve, exiting: {why}");
+    exit_now(1)
+}
+
+/// Rank 0's hub, watched: a worker whose control socket closes ends rank 0 too
+/// ([watch_workers]), so a dead rank fails the server instead of leaving its requests in a
+/// collective.
+///
+/// # Errors
+/// A watch that cannot start.
+pub fn watched_hub(hub: Tp4ControlHub) -> Result<Arc<Mutex<Tp4ControlHub>>, BackendError> {
+    watch_workers(&hub).map_err(|error| BackendError::new("group", error))?;
+    Ok(Arc::new(Mutex::new(hub)))
+}
+
+/// Set never: the lanes' rank 0 says no End, so any close of its socket ends a worker.
+static NO_END: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Runs a worker's [mirror_lanes] and then ends its process: a mirror only ever stops when the
+/// group can no longer serve. A watch on rank 0's control socket ends the process too while it
+/// waits in a collective rank 0 will never join.
+pub fn mirror_until_the_group_ends<A: FusedArm, W: GroupWire>(
+    control: &mut Tp4ControlWorker,
+    arm: &A,
+    wire: &W,
+    lanes: usize,
+) -> ! {
+    let rank = control.rank;
+    if let Err(error) = watch_leader(&control.stream, rank as usize, &NO_END, || {}) {
+        eprintln!("sparkflash serve: rank {rank}: {error}");
+        exit_now(1);
+    }
+    let error = match mirror_lanes(control, arm, wire, lanes) {
+        Ok(()) => "the control channel ended".to_owned(),
+        Err(error) => error,
+    };
+    eprintln!("sparkflash serve: rank {rank}: the group cannot serve, exiting: {error}");
+    exit_now(1)
 }
 
 /// Broadcasts one frame to the group.
@@ -290,6 +344,8 @@ pub struct GroupLanes<A: FusedArm, W: GroupWire> {
     wire: W,
     /// The next lane number [FusedArm::open_slot] hands out.
     next: AtomicU32,
+    /// What a failure after a broadcast does ([end_group] unless [Self::with_split]).
+    split: Split,
 }
 
 /// One lane of [GroupLanes]: the inner arm's slot and the number the workers know it by. The
@@ -312,7 +368,15 @@ impl<A: FusedArm, W: GroupWire> GroupLanes<A, W> {
             hub,
             wire,
             next: AtomicU32::new(0),
+            split: end_group,
         }
+    }
+
+    /// Splits the group with `split` instead of ending the process, for a test.
+    #[must_use]
+    pub fn with_split(mut self, split: Split) -> Self {
+        self.split = split;
+        self
     }
 
     /// The wrapped arm.
@@ -322,6 +386,22 @@ impl<A: FusedArm, W: GroupWire> GroupLanes<A, W> {
 
     fn send(&self, frame: &Tp4ControlFrame) -> Result<(), BackendError> {
         broadcast(&self.hub, frame)
+    }
+
+    /// `result` of a frame that may have reached the workers: a failure leaves them past rank 0,
+    /// so the group ends ([Split]) once it has been told why.
+    fn in_step<T>(&self, result: Result<T, BackendError>) -> Result<T, BackendError> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self.send(&Tp4ControlFrame::Error {
+                    code: "group_out_of_step".to_owned(),
+                    message: message.clone(),
+                });
+                (self.split)(&message)
+            }
+        }
     }
 
     fn slot(lane: &mut GroupLane<A::Slot>) -> Result<&mut A::Slot, BackendError> {
@@ -386,14 +466,20 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 slot.lane
             );
         }
-        self.send(&Tp4ControlFrame::LaneRequest {
-            lane: slot.lane,
-            prompt_ids: tokens.to_vec(),
-            images: image_frames(images),
-            keep: !std::mem::take(&mut slot.renewed),
-            sampler: slot.sampler,
-        })?;
-        self.arm.prefill_images(Self::slot(slot)?, tokens, images)
+        let lane = slot.lane;
+        let keep = !std::mem::take(&mut slot.renewed);
+        let sampler = slot.sampler;
+        let inner = Self::slot(slot)?;
+        self.in_step(
+            self.send(&Tp4ControlFrame::LaneRequest {
+                lane,
+                prompt_ids: tokens.to_vec(),
+                images: image_frames(images),
+                keep,
+                sampler,
+            })
+            .and_then(|()| self.arm.prefill_images(inner, tokens, images)),
+        )
     }
 
     fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
@@ -439,7 +525,7 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
         for ((lane, _), (inner, _)) in members.iter_mut().zip(stepping) {
             lane.slot = Some(inner);
         }
-        answer
+        self.in_step(answer)
     }
 
     /// Local: rank 0's lane holds what every rank's does.
@@ -470,10 +556,11 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 slot.lane
             );
         }
-        self.send(&Tp4ControlFrame::LaneGiveBack {
+        // Rank 0's lane has given back: a worker that never hears of it is past rank 0.
+        self.in_step(self.send(&Tp4ControlFrame::LaneGiveBack {
             lane: slot.lane,
             count: frame_count,
-        })
+        }))
     }
 
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
@@ -502,8 +589,12 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 slot.lane
             );
         }
-        self.send(&Tp4ControlFrame::LaneRelease { lane: slot.lane })?;
-        self.arm.release(Self::slot(slot)?)?;
+        let lane = slot.lane;
+        let inner = Self::slot(slot)?;
+        self.in_step(
+            self.send(&Tp4ControlFrame::LaneRelease { lane })
+                .and_then(|()| self.arm.release(inner)),
+        )?;
         slot.renewed = true;
         Ok(())
     }
@@ -585,11 +676,12 @@ mod tests {
 
     /// A toy lane arm: a slot is the tokens its lane has consumed, and the record is every
     /// prompt, step and give-back in the order the arm ran them. `refuses` makes it refuse every
-    /// give-back, as GLM's arm does.
+    /// give-back, as GLM's arm does; `fails` fails every step, as a driver error on one rank does.
     #[derive(Default)]
     struct ToyLanes {
         record: Mutex<Vec<String>>,
         refuses: bool,
+        fails: bool,
     }
 
     impl FusedArm for ToyLanes {
@@ -628,6 +720,9 @@ mod tests {
         }
 
         fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            if self.fails {
+                return Err(BackendError::new("toy", "the device failed"));
+            }
             let mut rows = Vec::new();
             for (slot, token) in members.iter_mut() {
                 slot.push(*token);
@@ -817,5 +912,56 @@ mod tests {
             .expect("the worker finishes")
             .expect_err("a lane outside the pool is refused");
         assert!(error.contains("out of step"), "{error}");
+    }
+
+    fn splits(why: &str) -> ! {
+        panic!("the group split: {why}")
+    }
+
+    #[test]
+    fn a_step_that_fails_on_rank_zero_alone_tells_the_workers_and_ends_the_group() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        let mirrored = Arc::new(ToyLanes::default());
+        let worker = {
+            let mirrored = Arc::clone(&mirrored);
+            thread::spawn(move || {
+                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                    .expect("a control connection");
+                control.handshake().expect("the handshake");
+                mirror_lanes(&mut control, mirrored.as_ref(), &Wire { context: 64 }, 1)
+            })
+        };
+        let hub = Arc::new(Mutex::new(
+            Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
+                .expect("the hub"),
+        ));
+        let failing = ToyLanes {
+            fails: true,
+            ..ToyLanes::default()
+        };
+        let lanes = GroupLanes::new(failing, Arc::clone(&hub), Wire { context: 64 }).with_split(splits);
+        let mut lane = lanes.open_slot().expect("lane 0");
+        lanes.prefill(&mut lane, &[1, 2]).expect("the prompt");
+        let mut members = vec![(lane, 3u32)];
+        // The worker has stepped past rank 0, so rank 0 does not hand the error back to serve on.
+        let split = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lanes.step(&mut members);
+        }))
+        .expect_err("the failed step splits the group");
+        let why = split
+            .downcast_ref::<String>()
+            .expect("the split's message");
+        assert!(why.contains("the device failed"), "{why}");
+        let error = worker
+            .join()
+            .expect("the worker finishes")
+            .expect_err("rank 0's error ends the worker");
+        assert!(error.contains("group_out_of_step"), "{error}");
+        assert!(error.contains("the device failed"), "{error}");
+        assert_eq!(
+            *mirrored.record.lock().expect("the record"),
+            vec!["prefill [1, 2]".to_owned(), "step [[1, 2, 3]]".to_owned()]
+        );
     }
 }

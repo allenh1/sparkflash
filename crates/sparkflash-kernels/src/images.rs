@@ -216,6 +216,7 @@ impl Image {
         match self {
             Self::Qwen4Exp => &[
                 "q4e_add",
+                "q4e_argmax_prob_slices",
                 "q4e_argmax_slices",
                 "q4e_copy_flat",
                 "q4e_decode_f8e4m3",

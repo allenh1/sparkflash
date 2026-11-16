@@ -212,14 +212,70 @@ With drafting off (`SPARKFLASH_GLM_DRAFTS=0`) the lanes run 27.2 tok/s alone gre
 sampled, 53.9-55.2 and 43.8-44.2 four at once.
 
 Every greedy answer alone equals the one-request server's, drafting or not, and four at once
-equal alone, greedy and sampled. A sampled answer is the same with drafting on or off. It is not
-always the one-request server's (two of the four prompts differ): that path's `Tp4Sampling` carries
-only the temperature and the seed, so it samples without the request's `top_p`, `top_k` and
-penalties. The lanes' sampler frame carries all of them.
+equal alone, greedy and sampled. A sampled answer is the same with drafting on or off.
+
+The one-request path's `Tp4Sampling` used to carry only the temperature and the seed, so it
+sampled without the request's `top_p`, `top_k` and penalties, and two of the four gate prompts
+answered differently from the lanes. It now carries the whole `Sampling` (`tp4_sampling`), and a
+request with a penalty does not draft. DeepSeek's host rank, which has no penalty sampler, refuses
+a request that sets one rather than ignoring it.
 
 The group used to ignore `speculation.enabled`. It read only `speculation.drafts`, so
 `SPARKFLASH_GLM_SPEC=off` was accepted and changed nothing. `enabled=false` now drafts nothing,
-and is refused beside a draft count (`glm_group_drafts`).
+and is refused beside a draft count (`pack::glm_drafting`).
+
+#### How deep the MTP layer drafts
+
+The group's chain used to be a fixed two MTP drafts, a constant in the CLI. It now comes from the
+profile, as every other drafting arm's does (`pack::glm_drafting`): `speculation.drafts`
+(`SPARKFLASH_GLM_DRAFTS`), else the whole block for a DFlash 2 drafter, else `speculation.depth`
+(three in the carried profile). The depth policy is the shared `DepthPolicy`, adaptive unless
+`speculation.depth_policy = "fixed"` (`SPARKFLASH_GLM_DRAFT_POLICY`), with `speculation.min_depth`
+(`SPARKFLASH_GLM_DRAFT_MIN_DEPTH`) as its floor, weighed against `MTP_STEP_COST`.
+
+The MTP layer drafts one token a pass, so its passes are what an early stop saves. Its head now
+writes each draft's probability beside the token (`q4e_argmax_prob_slices`, the same argmax plus
+the softmax of the pick). After every pass short of the chain, `DeviceRank::draft_while` asks the
+policy whether any row wants another draft and stops when none does. The lanes and the
+one-request path both choose a round's depth from that round's own probabilities
+(`DeviceRank::draft_chain`). The lanes used to choose from the previous round's, which calibrated
+one round's confidence against another round's outcome.
+
+The gate served GLM four ways on the same build. Every greedy answer equals the one-request
+server's, and four at once equals alone in each:
+
+| Serve | Alone, four prompts | Four at once | Streamed, prose / code / 4.3k prompt |
+| --- | --- | --- | --- |
+| one request at a time | 46.2 tok/s | refused by design | 47.9 / 49.1 / 49.7 tok/s |
+| lanes, adaptive over 3 (default) | 44.0 | 56.3, 56.7 | 47.8 / 48.4 / 47.7 |
+| lanes, fixed 2 (the old constant) | 43.1 | 60.5, 57.6 | 46.5 / 47.7 / 47.8 |
+| lanes, adaptive over 4 | 44.7 | 57.2, 56.4 | 47.9 / 46.9 / 49.6 |
+
+The three depths sit within run-to-run noise of each other: adaptive is ahead alone by 1-3%, and
+the fixed two is ahead four at once in one run of two. Nothing measured better than the shared
+default, so the profile keeps it. Sampled, the lanes run 37.8 tok/s alone and 47.3-47.4 four at
+once; the one-request path, which drafts no sampled request, runs 25.5, and its sampled answers
+now equal the lanes'.
+
+#### When one rank fails
+
+A lane frame is refused before it is broadcast or runs on every rank. Two failures fall outside
+that: a frame that fails on rank 0 after the workers have it, and a rank that dies. Either leaves
+the ranks out of step, and a group that is out of step cannot serve another token, so it now
+stops as a whole:
+
+- `GroupLanes::in_step` wraps every step, prefill, give-back and release that follows a
+  broadcast. On an error it tells the workers (`Error { code: "group_out_of_step" }`) and ends
+  rank 0 (`end_group`).
+- A worker mirrors until the group ends (`mirror_until_the_group_ends`), and watches rank 0's
+  socket (`control::watch_leader`). It exits when rank 0 goes away.
+- Rank 0's hub watches the workers' sockets (`watched_hub`, `control::watch_workers`). It exits
+  when one closes.
+
+DeepSeek's device ranks already worked this way, and the watchers moved from its `device.rs` into
+`sparkflash-comm` unchanged. GLM's and Inkling's lane groups now share them. In the gate, killing
+one GLM rank (rank 2) or one Inkling rank (rank 3, launched through the console's
+`serve-four-node.sh`) left no rank running a second later.
 
 Two more fixes came out of this gate:
 

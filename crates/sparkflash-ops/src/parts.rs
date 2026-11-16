@@ -453,10 +453,10 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::LmHead,
         Image::Qwen4Exp,
-        &[sym(
-            "q4e_argmax_slices",
-            &[Precision::Bf16, Precision::Fp8E4M3],
-        )],
+        &[
+            sym("q4e_argmax_slices", &[Precision::Bf16, Precision::Fp8E4M3]),
+            sym("q4e_argmax_prob_slices", &[Precision::Bf16, Precision::Fp8E4M3]),
+        ],
         false,
     ),
     sm121(

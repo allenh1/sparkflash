@@ -236,6 +236,13 @@ impl Speculator {
         self.max_depth
     }
 
+    /// Whether the depth follows the drafts' confidences, so a drafter that proposes one draft a
+    /// pass may stop once the policy wants no more.
+    #[must_use]
+    pub fn is_adaptive(&self) -> bool {
+        self.policy.as_ref().is_some_and(DepthPolicy::is_adaptive)
+    }
+
     /// What this sequence's drafts have been worth so far.
     ///
     /// A request reports its own counts, so a serving adapter resets the speculator when it

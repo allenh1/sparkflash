@@ -36,6 +36,9 @@ pub mod rounds;
 pub mod share;
 
 pub use fused::{FusedArm, FusedEngine, FusedSession};
-pub use group::{GroupLane, GroupLanes, GroupWire, mirror_lanes};
+pub use group::{
+    GroupLane, GroupLanes, GroupWire, Split, end_group, mirror_lanes, mirror_until_the_group_ends,
+    watched_hub,
+};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};

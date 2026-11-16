@@ -703,3 +703,98 @@ impl Tp4ControlWorker {
         read_control_pixels(&mut self.stream, bytes)
     }
 }
+
+/// Ends the process now, without the C exit handlers. CUDA's handlers tear the context down,
+/// which waits for the kernels in flight, and a collective whose peer has gone never finishes:
+/// a rank whose group failed would stay up, holding its memory and its port. Rust runs no
+/// destructors on exit either, so only the standard streams need flushing.
+pub fn exit_now(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: _exit takes no pointers and does not return.
+    unsafe { libc::_exit(code) }
+}
+
+/// Exits rank 0 when a worker's control socket closes. A dead rank must fail the server, not
+/// leave its requests waiting in a collective.
+///
+/// # Errors
+/// A stream that cannot be cloned for the watch, or a thread that cannot start.
+pub fn watch_workers(hub: &Tp4ControlHub) -> Result<(), String> {
+    for (rank, stream) in hub.streams.iter().enumerate() {
+        let Some(stream) = stream else { continue };
+        let mut probe = stream
+            .try_clone()
+            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+        std::thread::Builder::new()
+            .name(format!("sparkflash-watch-r{rank}"))
+            .spawn(move || {
+                // Workers send nothing after Hello: any read that is not a timeout is the end.
+                let mut byte = [0u8; 1];
+                loop {
+                    match probe.read(&mut byte) {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Ok(0) | Err(_) => {
+                            eprintln!(
+                                "sparkflash serve: rank {rank} closed its control channel; the group cannot serve, exiting"
+                            );
+                            exit_now(1);
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Exits a worker when rank 0's control socket closes, even while the worker waits in a
+/// collective. A close after `ended` is set (rank 0 said End) is the group's clean end, and the
+/// watch stops; `last_words` runs just before an exit.
+///
+/// # Errors
+/// A stream that cannot be cloned for the watch, or a thread that cannot start.
+pub fn watch_leader(
+    stream: &TcpStream,
+    rank: usize,
+    ended: &'static std::sync::atomic::AtomicBool,
+    last_words: fn(),
+) -> Result<(), String> {
+    let probe = stream
+        .try_clone()
+        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    std::thread::Builder::new()
+        .name("sparkflash-watch-r0".to_owned())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                match probe.peek(&mut byte) {
+                    // Frames are waiting for the rank's own thread: look again once it has read
+                    // them.
+                    Ok(n) if n > 0 => std::thread::sleep(Duration::from_millis(200)),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    _ => {
+                        if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        eprintln!(
+                            "sparkflash serve: rank {rank}: rank 0 closed the control channel, exiting"
+                        );
+                        last_words();
+                        exit_now(1);
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    Ok(())
+}

@@ -44,6 +44,12 @@
 #   SPARKFLASH_CONVERTED_DIR  directory of `sparkflash convert` rank files on every node (fast boot)
 #   SPARKFLASH_MODEL       packed model selector, e.g. glm5.3-flash-fp8: adds --model
 #   SPARKFLASH_CONTEXT     packed model context window: adds --context
+#   SPARKFLASH_CONCURRENCY a packed group's fused lanes: N > 1 adds --concurrency N --fuse-batch,
+#                          1 serves one request at a time (unset: the arm's default, four lanes for
+#                          GLM and one request for Inkling)
+#   SPARKFLASH_GROUP_FORM  tp4 or rank: which group flags the ranks take (default: rank for an
+#                          Inkling-2 model, whose device group is `--rank/--peer/--world`, tp4 for
+#                          every other model, whose group is `--tp4-rank`)
 #   NCCL_*                 every NCCL_ variable set here is passed to every rank (NCCL_IB_HCA,
 #                          NCCL_SOCKET_IFNAME, NCCL_IB_GID_INDEX, ...)
 # Options:
@@ -92,12 +98,36 @@ DEVICE_TOKEN_DERIVED_CLAIM="${SPARKFLASH_DEVICE_TOKEN_DERIVED_CLAIM:-0}"
 CUBINS="${SPARKFLASH_CUBINS:-}"
 NCCL_LIB="${SPARKFLASH_NCCL_LIB:-}"
 CONVERTED_DIR="${SPARKFLASH_CONVERTED_DIR:-}"
+CONCURRENCY="${SPARKFLASH_CONCURRENCY:-}"
 
 read -r -a NODES <<< "$NODES_RAW"
 read -r -a LOCAL_RANKS <<< "${SPARK_LOCAL_RANKS:-}"
 die() { printf 'serve-four-node: %s\n' "$*" >&2; exit 1; }
 
 [ "${#NODES[@]}" -eq 4 ] || die "SPARK_NODES needs exactly 4 addresses in rank order, got ${#NODES[@]}"
+# The Inkling-2 device group takes its own flags (`--rank R --peer host:port,... --world 4
+# --converted DIR`); every other group is a `--tp4-rank` group.
+case "$MODEL" in
+    *inkling2*|*Inkling-2*) DEFAULT_FORM=rank ;;
+    *) DEFAULT_FORM=tp4 ;;
+esac
+GROUP_FORM="${SPARKFLASH_GROUP_FORM:-$DEFAULT_FORM}"
+case "$GROUP_FORM" in
+    tp4) ;;
+    rank)
+        [ -n "$MODEL" ] || die "SPARKFLASH_GROUP_FORM=rank needs SPARKFLASH_MODEL: the default V4.1 engine is a --tp4-rank group"
+        # The Inkling arm carries its kernels in the binary; a cubin directory here would be
+        # accepted and never read.
+        [ -z "$CUBINS" ] || die "SPARKFLASH_CUBINS is the V4.1 kernel directory; the --rank group's kernels are built into the binary, so unset it"
+        [ -n "$CONVERTED_DIR" ] || [ "$MODE" = stop ] || [ "$MODE" = status ] \
+            || die "SPARKFLASH_GROUP_FORM=rank needs SPARKFLASH_CONVERTED_DIR: the --rank group boots from its converted rank files"
+        ;;
+    *) die "SPARKFLASH_GROUP_FORM must be tp4 or rank, got '$GROUP_FORM'" ;;
+esac
+if [ -n "$CONCURRENCY" ]; then
+    case "$CONCURRENCY" in ''|*[!0-9]*|0) die "SPARKFLASH_CONCURRENCY must be a positive lane count, got '$CONCURRENCY'" ;; esac
+    [ -n "$MODEL" ] || die "SPARKFLASH_CONCURRENCY sets a packed group's lanes; the V4.1 engine reads SPARKFLASH_LANES"
+fi
 # Only a start reads the weights; stop and status work without them.
 if [ "$MODE" = print ] || [ "$MODE" = launch ]; then
     [ -n "$CHECKPOINT" ] || die "SPARKFLASH_CHECKPOINT is required"
@@ -191,7 +221,10 @@ rank_env() {
     # exchange opens, and SPARKFLASH_DEVICE_GATHER and SPARKFLASH_TWO_SHOT_ROWS choose whether a
     # rank takes the exchange's slot path at all. A value that reaches rank 0 alone makes one rank
     # a different program from its peers, which is the same split as a rank that stood down.
-    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX)' || true); do
+    # The lanes' shared cache pool and joint drafting rounds (GLM and Inkling) and Inkling's own
+    # arm switches are the same kind of knob: a rank that walked a different schedule from its
+    # peers would meet them at the wrong collective.
+    for knob in $(compgen -e | grep -E '^SPARKFLASH_(PREFILL|BATCH|DECODE|ENGRAM|GLM|QWEN4|INKLING|SPEC|DRAFTS|RAIL_DEVICES|DEVICE_GATHER|TWO_SHOT_ROWS|ONESHOT|HEAD_SCREEN|MOE|INDEX|LANE_MEMORY_MB|JOINT_ROUNDS|REUSE_BY_TEXT)' || true); do
         printf ' %s=%q' "$knob" "${!knob}"
     done
     return 0
@@ -206,9 +239,29 @@ rank_command() {
     # The V4.1 engine is the default; a packed four-rank arm (GLM) is selected by --model.
     [ -n "$MODEL" ] && printf ' --model %s' "$MODEL"
     [ -n "$CONTEXT" ] && printf ' --context %s' "$CONTEXT"
-    printf ' --tp4-rank %s --tp4-world-size 4 --tp4-peers %s' "$rank" "$PEERS"
-    printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
-    [ -n "$CUBINS" ] && printf ' --tp4-device %s' "$CUBINS"
+    if [ "$GROUP_FORM" = rank ]; then
+        # Every rank's collective listens on the base port of its own address, as the Inkling
+        # site launcher (scripts/inkling-serve-group.sh) runs it.
+        local peer_ports="" peer
+        for peer in ${PEERS//,/ }; do
+            peer_ports+="${peer_ports:+,}$peer:$BASE_PORT"
+        done
+        printf ' --converted %s --peer %s --world 4 --rank %s --control-port %s' \
+            "$CONVERTED_DIR" "$peer_ports" "$rank" "$CONTROL_PORT"
+    else
+        printf ' --tp4-rank %s --tp4-world-size 4 --tp4-peers %s' "$rank" "$PEERS"
+        printf ' --tp4-base-port %s --tp4-control-port %s' "$BASE_PORT" "$CONTROL_PORT"
+        [ -n "$CUBINS" ] && printf ' --tp4-device %s' "$CUBINS"
+    fi
+    if [ -n "$CONCURRENCY" ]; then
+        if [ "$CONCURRENCY" -gt 1 ]; then
+            printf ' --concurrency %s --fuse-batch' "$CONCURRENCY"
+        elif [ "$GROUP_FORM" = tp4 ]; then
+            # A --tp4-rank group that opens lanes steps four of them unless told otherwise;
+            # Inkling's --rank group serves one request at a time by default.
+            printf ' --concurrency 1'
+        fi
+    fi
     if [ "$rank" -eq 0 ]; then
         printf ' --bind %s' "$HTTP_BIND"
         if [ -n "$DEVICE_TOKEN_DIR" ]; then
@@ -275,10 +328,17 @@ case "$MODE" in
         # A binary built without the serving feature accepts no --tp4-rank and exits in the
         # background, which used to look like a successful launch. Refuse before starting.
         help_text=$("$BIN" serve --help 2>&1 || true)
-        case "$help_text" in
-            *--tp4-rank*) ;;
-            *) die "$BIN was built without the tp4-serve feature" ;;
-        esac
+        if [ "$GROUP_FORM" = tp4 ]; then
+            case "$help_text" in
+                *--tp4-rank*) ;;
+                *) die "$BIN was built without the tp4-serve feature" ;;
+            esac
+        else
+            case "$help_text" in
+                *--rank*) ;;
+                *) die "$BIN serves no --rank group" ;;
+            esac
+        fi
         local_plan="$LOG_ROOT/$RUN_ID/local-commands.txt"
         mkdir -p "$LOG_ROOT/$RUN_ID"
         print_plan > "$local_plan"
@@ -291,7 +351,7 @@ case "$MODE" in
         sleep 2
         failed=0
         for rank in 0 1 2 3; do
-            if ! remote "$rank" "pgrep -f '[t]p4-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+            if ! remote "$rank" "pgrep -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s exited immediately\n' "$rank" >&2
                 remote "$rank" "tail -n 25 '$LOG_ROOT/$RUN_ID/rank$rank.log'" >&2 || true
                 failed=1
@@ -299,7 +359,7 @@ case "$MODE" in
         done
         if [ "$failed" != 0 ]; then
             for rank in 0 1 2 3; do
-                remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .* --tp4-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+                remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
             done
             die "one or more ranks failed to start"
         fi
@@ -309,16 +369,17 @@ case "$MODE" in
     stop)
         for rank in 0 1 2 3; do
             # SIGTERM is the drain signal: rank 0 turns /readyz 503, finishes in-flight requests and
-            # exits 0. The pattern is the exact rank flag, so no other serve process is matched.
+            # exits 0. The pattern is the exact rank flag (`--tp4-rank R` or `--rank R`), so no
+            # other serve process is matched.
             # The bracket keeps the pattern from matching the shell that carries it.
-            remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .* --tp4-rank $rank ' >/dev/null 2>&1 || true" || true
+            remote "$rank" "pkill -TERM -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null 2>&1 || true" || true
             printf 'serve-four-node: rank %s SIGTERM sent\n' "$rank"
         done
         printf 'serve-four-node: in-flight requests drain for up to %s ms\n' "$DRAIN_TIMEOUT_MS"
         ;;
     status)
         for rank in 0 1 2 3; do
-            if remote "$rank" "pgrep -f '[t]p4-rank $rank ' >/dev/null" >/dev/null 2>&1; then
+            if remote "$rank" "pgrep -f '[s]parkflash serve --checkpoint .*-rank $rank ' >/dev/null" >/dev/null 2>&1; then
                 printf 'serve-four-node: rank %s running on %s\n' "$rank" "${NODES[$rank]}"
             else
                 printf 'serve-four-node: rank %s not running on %s\n' "$rank" "${NODES[$rank]}"
