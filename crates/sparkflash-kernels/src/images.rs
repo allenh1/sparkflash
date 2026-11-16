@@ -286,6 +286,8 @@ impl Image {
                 "q4p_moe_down",
                 "q4p_moe_down_fp8",
                 "q4p_moe_down_mx8",
+                "q4p_moe_down_runs",
+                "q4p_moe_down_runs_mx8",
                 "q4p_moe_gate_up",
                 "q4p_moe_gate_up_capped",
                 "q4p_moe_gate_up_capped_mx8",

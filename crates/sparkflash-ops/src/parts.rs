@@ -1046,6 +1046,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
             pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
             pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            // The down passes over the row split's gathered runs, with no join before them.
+            pre("q4p_moe_down_runs", &[Precision::NvFp4]),
+            pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
         ],
         false,
     ),
@@ -1175,6 +1178,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
             pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
             pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            // The down passes over the row split's gathered runs, with no join before them.
+            pre("q4p_moe_down_runs", &[Precision::NvFp4]),
+            pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
         ],
         false,
     ),

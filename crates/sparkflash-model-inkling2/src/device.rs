@@ -650,6 +650,9 @@ struct Kernels {
     /// The same two passes over the MXFP8 layers' E4M3 bytes and ue8m0 codes ([Mxfp8Walk::Mma]).
     moe_gate_up_mx8: Entry,
     moe_down_mx8: Entry,
+    /// The two down passes over the row split's gathered activation runs, unjoined.
+    moe_down_runs: Entry,
+    moe_down_runs_mx8: Entry,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the chunk's slots sorted by
     /// this rank's expert into the items the MMA passes walk.
     moe_plan: Entry,
@@ -760,6 +763,8 @@ impl Kernels {
             moe_down: load(experts, "q4p_moe_down")?,
             moe_gate_up_mx8: load(experts, "q4p_moe_gate_up_capped_mx8")?,
             moe_down_mx8: load(experts, "q4p_moe_down_mx8")?,
+            moe_down_runs: load(experts, "q4p_moe_down_runs")?,
+            moe_down_runs_mx8: load(experts, "q4p_moe_down_runs_mx8")?,
             moe_plan: load(moe_plan, "moe_plan")?,
             embed: load(token, "q4e_embed")?,
             rmsnorm: load(token, "q4e_rmsnorm")?,
@@ -3661,7 +3666,19 @@ impl Scratch {
         let down = plan.expert_down();
         let band = take(rows * top_k * (2 * activation).max(down.rows), 4);
         let activation_buffer = take(rows * top_k * activation.max(down.columns), 4);
-        let partials = take(rows * top_k * hidden.max(down.columns), 4);
+        // The expert-parallel splits project each slot's residual-wide row into `partials`. The
+        // row split never does: it holds every rank's activation runs of every slot there (f32,
+        // or the MMA walk's two bf16 planes, the same bytes) and later every rank's mix rows,
+        // which at Inkling's shapes is half of a residual-wide row a slot.
+        let partials = if config.expert_split == ExpertSplit::Rows {
+            let world = shared.exchange.world();
+            take(
+                (rows * top_k * activation * world).max(rows * down.rows * world),
+                4,
+            )
+        } else {
+            take(rows * top_k * hidden.max(down.columns), 4)
+        };
         let scales = take(rows * top_k, 4);
         let mixed_head = take((rows + history) * hidden, 4);
         let mixed = mixed_head + history * hidden * 4;

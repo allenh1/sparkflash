@@ -782,14 +782,20 @@ struct Q4pSoftcapSwiglu {
 // form's; each weight is the pair walk's f32 product rounded to bf16 (q4p_e4m3x2_scaled), exact
 // under the scale codes the host admits. The scale word of stages 2p and 2p + 1 is the same four
 // bytes, block 2ks the low byte of the stage's half. Two stages, not three (Q4P_STAGES_MX8).
-template <bool GATE_UP, class Epi = Q4pSiluSwiglu, bool MX8 = false>
+//
+// RUNS (down only) reads an A that is still in runs of `a_piece` columns: columns
+// r * a_piece .. (r + 1) * a_piece of every slot sit at a_src + r * a_piece_stride, a slot's row
+// a_piece wide, the remainder plane a_plane on. `a_piece` is a whole number of stages, so a stage
+// never straddles two runs and each stage copies the elements the joined row holds there.
+template <bool GATE_UP, class Epi = Q4pSiluSwiglu, bool MX8 = false, bool RUNS = false>
 __device__ __forceinline__ void q4p_moe_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ sorted, const int4* __restrict__ items,
     const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ a_src,
     unsigned long long a_plane, const float* __restrict__ route_weights, void* __restrict__ out,
     unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride,
-    const Epi epi = Epi()) {
+    const Epi epi = Epi(), int a_piece = 0, unsigned long long a_piece_stride = 0) {
+    static_assert(!(RUNS && GATE_UP), "only the down pass reads runs");
     constexpr int kStages = MX8 ? Q4P_STAGES_MX8 : Q4P_STAGES;
     // The words of one staged weight row: 64 E2M1 nibbles or 64 E4M3 bytes.
     constexpr int kRowWords = MX8 ? 16 : 8;
@@ -828,8 +834,12 @@ __device__ __forceinline__ void q4p_moe_body(
     const int a_slot = s_slot[a_row];
     const __nv_bfloat16* a_base = a_src;
     if (a_slot >= 0) {
-        a_base = GATE_UP ? a_src + (unsigned long long)(a_slot / topk) * hidden
-                         : a_src + (unsigned long long)a_slot * intermediate;
+        if constexpr (RUNS) {
+            a_base = a_src + (unsigned long long)a_slot * a_piece;
+        } else {
+            a_base = GATE_UP ? a_src + (unsigned long long)(a_slot / topk) * hidden
+                             : a_src + (unsigned long long)a_slot * intermediate;
+        }
     }
     const uint32_t a_dst = (uint32_t)(a_row * Q4P_BK + ((a_chunk ^ ((a_row & 1) << 2)) * 8));
     const int b_row = tid >> 1;
@@ -864,9 +874,18 @@ __device__ __forceinline__ void q4p_moe_body(
     }
     auto load = [&](int buffer, int ks) {
         Q4pStageOf<MX8>& st = stages[buffer];
-        om_cp16(om_smem(&st.a[0][a_dst]), a_base + ks * Q4P_BK + a_chunk * 8, a_slot >= 0);
-        om_cp16(om_smem(&st.a[1][a_dst]), a_base + a_plane + ks * Q4P_BK + a_chunk * 8,
-                a_slot >= 0);
+        if constexpr (RUNS) {
+            const int k0 = ks * Q4P_BK;
+            const int run = k0 / a_piece;
+            const __nv_bfloat16* at = a_base + (unsigned long long)run * a_piece_stride +
+                                      (k0 - run * a_piece) + a_chunk * 8;
+            om_cp16(om_smem(&st.a[0][a_dst]), at, a_slot >= 0);
+            om_cp16(om_smem(&st.a[1][a_dst]), at + a_plane, a_slot >= 0);
+        } else {
+            om_cp16(om_smem(&st.a[0][a_dst]), a_base + ks * Q4P_BK + a_chunk * 8, a_slot >= 0);
+            om_cp16(om_smem(&st.a[1][a_dst]), a_base + a_plane + ks * Q4P_BK + a_chunk * 8,
+                    a_slot >= 0);
+        }
         if constexpr (MX8) {
             const unsigned char* src = b_base + ks * Q4P_BK + b_half * 32;
             om_cp16(om_smem(&st.b[mx_dst0]), src, true);
@@ -1107,6 +1126,40 @@ extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_mx8(
     q4p_moe_body<false, Q4pSiluSwiglu, true>(table, scales, sorted, items, item_count, activated,
                                              activated_plane, route_weights, partials, 0, topk,
                                              hidden, intermediate, weight_stride);
+}
+
+// q4p_moe_down over an activation the row expert split has gathered but not joined
+// (Inkling-2-Small): rank r's run holds columns r * a_piece .. (r + 1) * a_piece of every slot,
+// both planes, at activated + r * a_piece_stride (q4p_moe_body's RUNS). Each stage copies the
+// elements the joined row holds at its columns, so the partials are q4p_moe_down's bit for bit
+// and the join's copy of the whole activation is gone. Grid (hidden / 128, max items), 256 threads.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride,
+    int a_piece, unsigned long long a_piece_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, false, true>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride, Q4pSiluSwiglu(), a_piece,
+        a_piece_stride);
+}
+
+// q4p_moe_down_runs over MXFP8 weights, as q4p_moe_down_mx8 reads them.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs_mx8(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride,
+    int a_piece, unsigned long long a_piece_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, true, true>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride, Q4pSiluSwiglu(), a_piece,
+        a_piece_stride);
 }
 
 // K-stage pairs a q4p_moe_rows lane has in flight: 16 bytes of a packed row each (128 columns).

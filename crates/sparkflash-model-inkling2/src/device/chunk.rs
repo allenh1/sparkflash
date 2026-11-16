@@ -1866,7 +1866,7 @@ fn run_band_mma(
     let grid_items = u32::try_from(items).map_err(device_error)?;
     // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
     // row split they are this rank's run of every slot's columns, both planes of it together, so
-    // the gather and the join move them as 2 * slots rows of a run each.
+    // the gather moves them as 2 * slots rows of a run each.
     let out = BandOut::of(shared, scratch, rows);
     let run = slots * intermediate * std::mem::size_of::<f32>();
     let activated = if out.gathers {
@@ -1897,43 +1897,57 @@ fn run_band_mma(
             ],
         )
         .map_err(device_error)?;
+    // Under the row split the down pass reads the gathered runs where they land (rank r's run of
+    // both planes at r * run, a slot's row `intermediate` wide): the stages copy the elements a
+    // joined row holds at their columns, so no join copies the activation first.
+    let grid = ((down.rows / MOE_DOWN_COLUMNS) as u32, grid_items, 1);
+    let head = [
+        meta.table.0,
+        meta.scales.0,
+        scratch.plan.0,
+        scratch.items.0,
+        scratch.item_count.0,
+    ];
+    let tail = [
+        shared.route_ones.0,
+        out.down.0,
+        top_k as u64,
+        down.rows as u64,
+        down.columns as u64,
+        // Every slot reads the same [top_k] ones.
+        0,
+    ];
     if out.gathers {
         gather_runs(
             shared,
             scratch.partials,
-            Some(scratch.activation),
+            None,
             2 * slots,
             intermediate * std::mem::size_of::<u16>(),
         )?;
-    }
-    let down_kernel = if mx8 {
-        shared.kernels.moe_down_mx8
+        let kernel = if mx8 {
+            shared.kernels.moe_down_runs_mx8
+        } else {
+            shared.kernels.moe_down_runs
+        };
+        let source = [scratch.partials.0, (slots * intermediate) as u64];
+        let runs = [intermediate as u64, (2 * slots * intermediate) as u64];
+        let args: Vec<u64> = [&head[..], &source, &tail, &runs].concat();
+        shared
+            .launch(kernel, grid, (MOE_THREADS, 1, 1), &args)
+            .map_err(device_error)?;
     } else {
-        shared.kernels.moe_down
-    };
-    shared
-        .launch(
-            down_kernel,
-            ((down.rows / MOE_DOWN_COLUMNS) as u32, grid_items, 1),
-            (MOE_THREADS, 1, 1),
-            &[
-                meta.table.0,
-                meta.scales.0,
-                scratch.plan.0,
-                scratch.items.0,
-                scratch.item_count.0,
-                scratch.activation.0,
-                (slots * down.columns) as u64,
-                shared.route_ones.0,
-                out.down.0,
-                top_k as u64,
-                down.rows as u64,
-                down.columns as u64,
-                // Every slot reads the same [top_k] ones.
-                0,
-            ],
-        )
-        .map_err(device_error)?;
+        let kernel = if mx8 {
+            shared.kernels.moe_down_mx8
+        } else {
+            shared.kernels.moe_down
+        };
+        let source = [scratch.activation.0, (slots * down.columns) as u64];
+        let args: Vec<u64> = [&head[..], &source, &tail].concat();
+        shared
+            .launch(kernel, grid, (MOE_THREADS, 1, 1), &args)
+            .map_err(device_error)?;
+    }
     // The mix is local; the exchange that follows it completes the sum over the ranks.
     band_mix(shared, scratch, rows)
 }
