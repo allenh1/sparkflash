@@ -122,8 +122,9 @@ one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduc
 `docs/rdma-exchange.md` describes which path each arm takes.
 
 The routes the port setup writes carry the reference transport, whose connections are ordinary IP.
-They are worked out from the one subnet the check plans for the collective addresses; a Spark's
-addresses have to stay on that subnet for the routes to be written.
+They are worked out from the measured cables: the collective addresses have to share the one subnet
+the check plans (that is what the peers and NCCL are told), while each cable's next hop only has to
+be inside its own port's subnet, so a ring may address its two segments separately.
 The device arm's NCCL is not: it opens its own RDMA queue pairs and cannot use those routes, so a
 bare-ring device run also needs an NCCL that stays on the cabled peers (`NCCL_ALGO=Ring` with a
 switchless NCCL build, where the two non-neighbours are never opened). A packed arm can instead
@@ -156,16 +157,17 @@ address. On a ring it is the route to that address: a neighbour's collective add
 its other port, and a non-neighbour's goes through the Spark between the cables, so **Set up the
 ports** writes those routes and turns on forwarding. A ring whose addresses still do not answer
 after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering
-(the check names that too), and the finding stays. Wiring that is none of the named shapes says
+(the check warns about that, and the port setup sets it to loose), and the finding stays. Wiring that is none of the named shapes says
 so, and its silent pairs are errors too. When `arping` could not run (missing, or unable to open a
 raw socket), the finding says the wiring was not measured and reports the ping result alone.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
 ring a `/32` route for every fast address of every peer through the port that reaches it plus
-`ip_forward=1` so the Spark in between relays the diagonals; that switch is the kernel-wide
-`net.ipv4.ip_forward`, and the only routes the command adds are those per-address ones) on every
-Spark over SSH under `sudo -n` and applies them.
+`ip_forward=1` and loose `rp_filter=2` so the Spark in between relays the diagonals; the
+forwarding switch is the kernel-wide `net.ipv4.ip_forward`, and the only routes the command adds
+are those per-address ones) on every Spark that needs a fix — the lead locally, the others over
+SSH — under `sudo -n`, and applies them.
 The routes are worked out from the measured wiring, so they are only written once the wiring could be
 measured unambiguously: a pass that has to set the ARP sysctls first (the default `arp_ignore=0`
 lets every port answer for every address, so the cable map means nothing) hardens the ports, and

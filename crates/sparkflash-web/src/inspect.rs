@@ -871,9 +871,10 @@ pub fn analyze_fabric(
                 }
             }
             let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
-            // The ring's routes send traffic out the half of a port that does not own the source
-            // address, so strict reverse-path filtering drops it: name that as the cause instead
-            // of letting the check blame the cables.
+            // The ring's routes can send traffic out the half of a port that does not own the
+            // source address, and strict reverse-path filtering drops that traffic when the
+            // reverse route names the sibling. Whether it does depends on which half the routes
+            // picked, so this is a warning with the fix, never a blocked guide.
             if fabric
                 .as_ref()
                 .is_some_and(|fabric| fabric.shape == FabricShape::Ring && fabric.links_measured)
@@ -881,12 +882,13 @@ pub fn analyze_fabric(
             {
                 findings.push(Finding {
                     rank: Some(rank),
-                    severity: Severity::Error,
+                    severity: Severity::Warning,
                     message: format!(
-                        "{} has strict reverse-path filtering on its fast ports, which drops the \
-                         traffic the ring's routes send out the other half of a port (a direct \
-                         neighbour and a diagonal alike). Run the network command shown for it \
-                         (it sets rp_filter=2), then check again.",
+                        "{} uses strict reverse-path filtering on its fast ports. A ring route \
+                         can leave by the half of a port that does not own the source address, \
+                         and strict filtering drops that traffic; the network command shown for it \
+                         sets rp_filter=2 (loose), which still checks the source. Run it if a peer \
+                         stops answering after the routes go in.",
                         name(rank)
                     ),
                 });
@@ -948,6 +950,23 @@ pub fn analyze_fabric(
                 set.insert(link.peer);
             }
         }
+        // What the port setup can actually route with the measured cables, so a finding never
+        // prescribes a command that cannot help.
+        let planned = fabric_routes(probes, Some(fabric));
+        let planned_route = |rank: usize, peer: usize| -> bool {
+            let target = probes
+                .get(peer)
+                .and_then(|probe| probe.as_ref().ok())
+                .and_then(|facts| {
+                    let rails = facts.rails();
+                    facts.primary_rail(&rails).map(|rail| rail.ip)
+                });
+            target.is_some_and(|target| {
+                planned
+                    .get(rank)
+                    .is_some_and(|routes| routes.iter().any(|route| route.to == target))
+            })
+        };
         for (rank, reached) in fabric.reachable.iter().enumerate() {
             // The node answered the main probe but not the link probe: say so instead of
             // silently showing a wiring verdict computed from the other nodes alone.
@@ -985,12 +1004,20 @@ pub fn analyze_fabric(
                         name(peer),
                         name(peer)
                     ),
-                    FabricShape::Ring => format!(
+                    FabricShape::Ring if planned_route(rank, peer) => format!(
                         "{} cannot reach {} over the fast network. The ring needs a route to that \
                          address on the cable that reaches it: a neighbour's collective address \
                          can sit on its other port, and a non-neighbour goes through the Spark \
                          between the two cables. Set the ports up: the command writes those \
                          routes and turns on forwarding, then check again.",
+                        name(rank),
+                        name(peer)
+                    ),
+                    FabricShape::Ring => format!(
+                        "{} cannot reach {} over the fast network, and the measured cables give \
+                         the port setup no route to that address: a cable, a port address or the \
+                         Spark between the two cables is missing. Check the wiring, then check \
+                         again.",
                         name(rank),
                         name(peer)
                     ),
@@ -1461,16 +1488,22 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
             list
         })
         .collect();
-    // Netplan refuses a next hop outside the port's subnet, so only an answer from the fabric
-    // subnet can be a next hop. The plan already puts every collective address on one subnet.
-    let subnet = probes.iter().flatten().find_map(|facts| {
-        let rails = facts.rails();
-        let primary = facts.primary_rail(&rails)?;
-        Some((
-            Ipv4Addr::from(network(primary.ip, primary.prefix?)),
-            primary.prefix?,
-        ))
-    });
+    // Netplan refuses a next hop outside the *port's* subnet, so a candidate next hop is only
+    // usable when it is in the subnet of the netdev the answer arrived on. A ring may address
+    // each cable segment separately; only the collective addresses have to share one subnet.
+    let mut port_subnets: Vec<BTreeMap<String, (Ipv4Addr, u8)>> = vec![BTreeMap::new(); world];
+    for (rank, probe) in probes.iter().enumerate() {
+        if let Ok(facts) = probe {
+            for rail in facts.rails() {
+                if let Some(prefix) = rail.prefix {
+                    port_subnets[rank].insert(
+                        rail.netdev.clone(),
+                        (Ipv4Addr::from(network(rail.ip, prefix)), prefix),
+                    );
+                }
+            }
+        }
+    }
     // Every cable, with the peer address that answered on it. The smallest port and address win,
     // so the two ends of one cable agree on the next hop.
     let mut cables: Vec<BTreeMap<usize, Cable>> = vec![BTreeMap::new(); world];
@@ -1481,8 +1514,8 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
         let Ok(address) = link.address.parse::<Ipv4Addr>() else {
             continue;
         };
-        if let Some((fabric, prefix)) = subnet
-            && Ipv4Addr::from(network(address, prefix)) != fabric
+        if let Some((fabric, prefix)) = port_subnets[link.rank].get(link.netdev.as_str())
+            && Ipv4Addr::from(network(address, *prefix)) != *fabric
         {
             continue;
         }
@@ -3041,12 +3074,24 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             true,
             1,
         );
-        let stopped = errors(&report);
+        // A warning with the fix, not a blocked guide: whether strict filtering breaks a given
+        // ring depends on which half the route happened to pick.
         assert!(
-            stopped
+            report
+                .findings
                 .iter()
-                .any(|m| m.contains("strict reverse-path filtering") && m.contains("rp_filter=2")),
-            "{stopped:?}"
+                .any(|f| f.severity == Severity::Warning && f.message.contains("rp_filter=2")),
+            "{:?}",
+            report.findings
+        );
+        // The unreachable diagonals (the routes are not installed in this fixture) are errors, but
+        // none of them is about reverse-path filtering.
+        assert!(
+            !errors(&report)
+                .iter()
+                .any(|m| m.contains("reverse-path filtering")),
+            "{:?}",
+            errors(&report)
         );
         let fix = report.nodes[0]
             .network_fix
@@ -3071,12 +3116,123 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             1,
         );
         assert!(
-            errors(&report)
+            report
+                .findings
                 .iter()
-                .any(|m| m.contains("strict reverse-path filtering")),
+                .any(|f| f.severity == Severity::Warning
+                    && f.message.contains("strict reverse-path filtering")),
             "{:?}",
             report.findings
         );
+    }
+
+    /// The cluster fixture with each rank's second cable on its own subnet: only the collective
+    /// addresses share one /24, which the plan requires.
+    fn two_subnet_cluster() -> Vec<ProbeResult> {
+        let mut probes = cluster();
+        for (rank, probe) in probes.iter_mut().enumerate() {
+            let facts = probe.as_mut().expect("facts");
+            let second = Ipv4Addr::new(198, 51, 200, u8::try_from(11 + rank).expect("host"));
+            for gid in facts
+                .gids
+                .iter_mut()
+                .filter(|gid| gid.device == "rocep1s0f1")
+            {
+                gid.ipv4 = Some(second);
+            }
+            for address in facts
+                .addresses
+                .iter_mut()
+                .filter(|address| address.netdev == "enp1s0f1np1")
+            {
+                address.ip = second;
+                address.prefix = 24;
+            }
+        }
+        probes
+    }
+
+    /// A ring over the two-subnet fixture: the primary port faces the next rank, the second port
+    /// (on its own /24) faces the previous one.
+    fn two_subnet_ring() -> Fabric {
+        let mut links = Vec::new();
+        for rank in 0..4usize {
+            let next = (rank + 1) % 4;
+            let previous = (rank + 3) % 4;
+            links.push(FabricLink {
+                rank,
+                netdev: "enP2p1s0f1np1".to_owned(),
+                peer: next,
+                address: format!("198.51.100.{}", 21 + next),
+            });
+            links.push(FabricLink {
+                rank,
+                netdev: "enp1s0f1np1".to_owned(),
+                peer: previous,
+                address: format!("198.51.200.{}", 11 + previous),
+            });
+        }
+        Fabric {
+            links,
+            reachable: vec![
+                Some(vec![1, 3]),
+                Some(vec![0, 2]),
+                Some(vec![1, 3]),
+                Some(vec![0, 2]),
+            ],
+            shape: FabricShape::Ring,
+            links_measured: true,
+        }
+    }
+
+    #[test]
+    fn a_ring_finding_does_not_prescribe_a_route_the_cables_cannot_give() {
+        // With no cable path to a peer, "Set up the ports" cannot help; the finding has to say
+        // the wiring is what blocks the route.
+        let mut fabric = ring_fabric();
+        fabric
+            .links
+            .retain(|link| !(link.rank == 0 && link.peer == 3));
+        fabric.reachable = vec![
+            Some(vec![1]),
+            Some(vec![0, 2]),
+            Some(vec![1, 3]),
+            Some(vec![0, 2]),
+        ];
+        let report = analyze_fabric(&SparkConfig::default(), &cluster(), Some(fabric), true, 1);
+        let message = errors(&report)
+            .into_iter()
+            .find(|message| message.contains("spark0 cannot reach spark3"))
+            .expect("the missing neighbour is reported");
+        assert!(message.contains("no route to that address"), "{message}");
+    }
+
+    #[test]
+    fn a_ring_may_address_each_cable_segment_separately() {
+        // Netplan only needs a next hop inside the subnet of the port it leaves by; the collective
+        // addresses are the ones the plan requires on one subnet. A ring with one /24 per cable
+        // therefore has to route, not silently drop the second cable's links.
+        let probes = two_subnet_cluster();
+        let fabric = two_subnet_ring();
+        let routes = fabric_routes(&probes, Some(&fabric));
+        for rank in 0..4usize {
+            for peer in 0..4usize {
+                if peer == rank {
+                    continue;
+                }
+                let primary = Ipv4Addr::new(198, 51, 100, u8::try_from(21 + peer).expect("host"));
+                assert!(
+                    routes[rank].iter().any(|route| route.to == primary),
+                    "rank {rank} lacks a route to peer {peer}: {routes:?}"
+                );
+            }
+        }
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(fabric), true, 1);
+        let fix = report.nodes[0].network_fix.as_deref().expect("routes");
+        // Rank 0's previous neighbour (rank 3) is on the other subnet: its /32 goes through the
+        // address that answered on that cable, which is inside that port's subnet.
+        assert!(fix.contains("to: 198.51.100.24/32"), "{fix}");
+        assert!(fix.contains("via: 198.51.200.14"), "{fix}");
     }
 
     #[test]

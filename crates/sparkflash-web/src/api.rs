@@ -205,6 +205,10 @@ pub struct WebState {
     /// provisioner inspect once, instead of reusing a report that describes other nodes or paths.
     last_inspect_config: Arc<RwLock<Option<SparkConfig>>>,
     inspect_lock: Arc<tokio::sync::Mutex<()>>,
+    /// One port-setup pass at a time: the four per-rank jobs need different kinds (so the job
+    /// manager's own-kind rule cannot serialize two passes), and two requests must not interleave
+    /// between their rank starts.
+    port_setup_lock: Arc<tokio::sync::Mutex<()>>,
     advertised: Option<String>,
     hostname: String,
 }
@@ -236,6 +240,7 @@ impl WebState {
             last_inspect: Arc::new(RwLock::new(None)),
             last_inspect_config: Arc::new(RwLock::new(None)),
             inspect_lock: Arc::new(tokio::sync::Mutex::new(())),
+            port_setup_lock: Arc::new(tokio::sync::Mutex::new(())),
             advertised: init.advertised,
             hostname: local_hostname(),
         }
@@ -1184,6 +1189,10 @@ async fn apply_network(State(web): State<WebState>) -> Response {
 /// Applies the fast-port configuration the last check computed on every node that needs it: one
 /// SSH job per node running under `sudo -n`. Refuses when nothing is waiting to be applied.
 async fn network_setup(State(web): State<WebState>) -> Response {
+    // One pass at a time. The four per-rank jobs have different kinds, so the job manager's
+    // own-kind rule cannot serialize two concurrent requests; hold a lock across the whole pass
+    // (the jobs themselves keep running after it is released, which the pre-check below sees).
+    let _pass = web.port_setup_lock.lock().await;
     let config = match web.usable_config() {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
