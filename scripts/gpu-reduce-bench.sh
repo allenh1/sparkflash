@@ -89,6 +89,9 @@ WARMUP=${SPARK_REDUCE_WARMUP:-20}
 MODE=${SPARK_REDUCE_MODE:-batch}
 BATCH=${SPARK_REDUCE_BATCH:-40}
 BYTES=${SPARK_REDUCE_BYTES:-10240,20480}
+# The host arm's fabric decomposition; the bench also reads SPARKFLASH_FABRIC_SCHEDULE itself, so
+# an operator's exported value reaches the nodes with this default.
+SCHEDULE=${SPARKFLASH_FABRIC_SCHEDULE:-switched}
 RUN_TIMEOUT_S=${SPARK_REDUCE_TIMEOUT:-600}
 ALLOW_BUSY=${SPARK_WSB_ALLOW_BUSY:-0}
 # The S2-a collectives gate (see the header). 10,240 B is 5,120 bf16, the served per-layer payload.
@@ -187,7 +190,7 @@ run() {
     say "launching four ranks: payloads $BYTES, mode $MODE batch $BATCH, samples $SAMPLES warmup $WARMUP"
     local r
     for r in 0 1 2 3; do
-        remote_bg "$r" "cd '$REMOTE_DIR' && nohup env LD_LIBRARY_PATH='$REMOTE_DIR/lib'$(nccl_env) './bin/gpu-reduce-bench' --rank $r --world 4 --addrs '$ADDRS' --control '$CONTROL' --bytes $BYTES --samples $SAMPLES --warmup $WARMUP --mode $MODE --batch $BATCH --json > 'bench-rank$r.json' 2> 'bench-rank$r.err' < /dev/null & echo \$! > 'bench-rank$r.pid'"
+        remote_bg "$r" "cd '$REMOTE_DIR' && nohup env LD_LIBRARY_PATH='$REMOTE_DIR/lib' SPARKFLASH_FABRIC_SCHEDULE='$SCHEDULE'$(nccl_env) './bin/gpu-reduce-bench' --rank $r --world 4 --addrs '$ADDRS' --control '$CONTROL' --bytes $BYTES --samples $SAMPLES --warmup $WARMUP --mode $MODE --batch $BATCH --json > 'bench-rank$r.json' 2> 'bench-rank$r.err' < /dev/null & echo \$! > 'bench-rank$r.pid'"
     done
     local waited=0 ready=0
     while [ "$waited" -lt "$RUN_TIMEOUT_S" ]; do

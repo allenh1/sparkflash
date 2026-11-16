@@ -1064,6 +1064,22 @@ fn run_fabric_probe(
     Some(inspect::fabric_from_probes(results, world))
 }
 
+/// Whether the console believes the group is up: a launch or swap that succeeded and no stop since.
+/// The telemetry sample is the other signal; this one survives a sampler gap, a console that has
+/// just restarted, and a serve URL the sampler cannot read.
+fn cluster_believed_running(jobs: &[JobSummary]) -> bool {
+    let finished = |kinds: &[&str], succeeded_only: bool| {
+        jobs.iter()
+            .filter(|job| kinds.contains(&job.kind.as_str()))
+            .filter(|job| !succeeded_only || job.status == JobStatus::Succeeded)
+            .filter_map(|job| job.finished_ms)
+            .max()
+    };
+    let launched = finished(&["launch", "swap"], true);
+    let stopped = finished(&["stop"], false);
+    launched.is_some_and(|launched| stopped.is_none_or(|stopped| launched > stopped))
+}
+
 /// Whether the lead holds the whole checkpoint: a download left no `.incomplete` blob behind, or
 /// `model.checkpoint` names a directory that exists.
 fn lead_model_complete(config: &SparkConfig) -> bool {
@@ -1130,7 +1146,8 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         );
     }
     // netplan apply drops the fast ports for a moment, so a serving cluster would lose the links
-    // its collectives are mid-transfer on.
+    // its collectives are mid-transfer on. Rank 0 answering is the positive signal; the job
+    // history covers a console that has not sampled yet, or one whose telemetry cannot reach it.
     if web.stats.latest().is_some_and(|sample| sample.online) {
         return api_error(
             StatusCode::CONFLICT,
@@ -1151,6 +1168,12 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         return api_error(
             StatusCode::CONFLICT,
             "the cluster was launched less than five minutes ago and may still be coming up; wait until it answers or stop it before reconfiguring the fast ports",
+        );
+    }
+    if cluster_believed_running(&web.jobs.list()) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the cluster was launched and has not been stopped; stop it before reconfiguring the fast ports",
         );
     }
     // A port job holds its rank's own kind, so it cannot start twice; the other ranks of the
@@ -2410,7 +2433,8 @@ mod tests {
                 for peer in 0..4 {
                     if peer != rank {
                         reply.push_str(&format!(
-                            "link {peer} dev{rank} ok\nping {peer} dev{rank} ok\n"
+                            "link {peer} dev{rank} 198.51.100.{} ok\nping {peer} dev{rank} ok\n",
+                            21 + peer
                         ));
                     }
                 }
@@ -2465,7 +2489,8 @@ mod tests {
                 for peer in 0..4 {
                     if peer != rank {
                         reply.push_str(&format!(
-                            "link {peer} dev{rank} ok\nping {peer} dev{rank} ok\n"
+                            "link {peer} dev{rank} 198.51.100.{} ok\nping {peer} dev{rank} ok\n",
+                            21 + peer
                         ));
                     }
                 }
@@ -3524,6 +3549,11 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        // The API-level check really runs the classifier: the fake's four ports each answer every
+        // peer, which is a switched fabric.
+        let report = body_json(response).await;
+        assert_eq!(report["fabric"]["shape"], "switched", "{report}");
+        assert_eq!(report["fabric"]["links_measured"], true, "{report}");
         let response = app
             .oneshot(post_json("/api/network/setup", "{}"))
             .await
@@ -3597,6 +3627,52 @@ mod tests {
             .unwrap_or_default()
             .to_owned();
         assert!(error.contains("more than ten minutes old"), "{error}");
+    }
+
+    #[test]
+    fn a_launch_that_was_not_stopped_keeps_the_ports_alone() {
+        let job = |kind: &str, status: JobStatus, finished_ms: u64| JobSummary {
+            id: finished_ms,
+            kind: kind.to_owned(),
+            label: String::new(),
+            command: String::new(),
+            status,
+            started_ms: 0,
+            finished_ms: Some(finished_ms),
+            exit_code: None,
+            last_line: None,
+            progress: None,
+        };
+        assert!(!cluster_believed_running(&[]));
+        assert!(cluster_believed_running(&[job(
+            "launch",
+            JobStatus::Succeeded,
+            10
+        )]));
+        assert!(cluster_believed_running(&[job(
+            "swap",
+            JobStatus::Succeeded,
+            10
+        )]));
+        assert!(!cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Succeeded, 20),
+        ]));
+        // A stop that ran before the launch does not count, and a stop attempt after it does.
+        assert!(cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Succeeded, 5),
+        ]));
+        assert!(!cluster_believed_running(&[
+            job("launch", JobStatus::Succeeded, 10),
+            job("stop", JobStatus::Failed, 20),
+        ]));
+        // A launch that failed started nothing to protect.
+        assert!(!cluster_believed_running(&[job(
+            "launch",
+            JobStatus::Failed,
+            10
+        )]));
     }
 
     #[tokio::test]

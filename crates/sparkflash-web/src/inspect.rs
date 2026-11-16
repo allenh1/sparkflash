@@ -1353,18 +1353,22 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
     let Some(fabric) = fabric.filter(|fabric| fabric.shape == FabricShape::Ring) else {
         return routes;
     };
-    let primaries: Vec<Option<Ipv4Addr>> = probes
+    // Every fast address the nodes report, per rank. The transport does not bind a source
+    // address, so a connection can leave with any of a Spark's addresses as its source; the peer
+    // then has to route that address back, and therefore every address of every peer needs a
+    // route, not only the collective.
+    let addresses: Vec<Vec<Ipv4Addr>> = probes
         .iter()
         .map(|probe| {
-            probe.as_ref().ok().and_then(|facts| {
-                let rails = facts.rails();
-                facts.primary_rail(&rails).map(|rail| rail.ip)
-            })
+            let mut list: Vec<Ipv4Addr> = probe
+                .as_ref()
+                .map(|facts| facts.rails().iter().map(|rail| rail.ip).collect())
+                .unwrap_or_default();
+            list.sort_unstable();
+            list.dedup();
+            list
         })
         .collect();
-    if primaries.iter().any(Option::is_none) {
-        return routes;
-    }
     // Netplan refuses a next hop outside the port's subnet, so only an answer from the fabric
     // subnet can be a next hop. The plan already puts every collective address on one subnet.
     let subnet = probes.iter().flatten().find_map(|facts| {
@@ -1403,40 +1407,37 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
             }
         }
     }
-    for rank in 0..world {
-        if primaries[rank].is_none() {
-            continue;
+    // The next hop that reaches a peer at all: its own address on the shared cable, or the Spark
+    // cabled to both ends for a diagonal. Every address of that peer goes through it, because a
+    // Spark accepts a packet addressed to any of its addresses on any of its ports.
+    let reach = |rank: usize, peer: usize| -> Option<Cable> {
+        if let Some(cable) = cables[rank].get(&peer) {
+            return Some(cable.clone());
         }
-        for (peer, target) in primaries.iter().enumerate() {
-            let Some(target) = target else {
-                continue;
-            };
+        let relay = (0..world).find(|candidate| {
+            *candidate != rank
+                && *candidate != peer
+                && cables[rank].contains_key(candidate)
+                && cables[*candidate].contains_key(&peer)
+        })?;
+        cables[rank].get(&relay).cloned()
+    };
+    for (rank, mine) in routes.iter_mut().enumerate() {
+        for (peer, targets) in addresses.iter().enumerate() {
             if peer == rank {
                 continue;
             }
-            let direct = cables[rank].get(&peer).map(|cable| FabricRoute {
-                to: *target,
-                // A next hop equal to the destination is the destination itself, which a gateway
-                // may not be: that cable carries the address itself, so a link route is right.
-                via: (cable.next_hop != *target).then_some(cable.next_hop),
-                netdev: cable.netdev.clone(),
-            });
-            let route = direct.or_else(|| {
-                let relay = (0..world).find(|candidate| {
-                    *candidate != rank
-                        && *candidate != peer
-                        && cables[rank].contains_key(candidate)
-                        && cables[*candidate].contains_key(&peer)
-                })?;
-                let hop = cables[rank].get(&relay)?;
-                Some(FabricRoute {
+            let Some(hop) = reach(rank, peer) else {
+                continue;
+            };
+            for target in targets {
+                mine.push(FabricRoute {
                     to: *target,
-                    via: Some(hop.next_hop),
+                    // A next hop equal to the destination is the destination itself, which a
+                    // gateway may not be: that cable carries the address, so a link route is right.
+                    via: (hop.next_hop != *target).then_some(hop.next_hop),
                     netdev: hop.netdev.clone(),
-                })
-            });
-            if let Some(route) = route {
-                routes[rank].push(route);
+                });
             }
         }
     }
@@ -1448,9 +1449,9 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
 /// A port that DHCP addresses keeps DHCP. A port without an address gets one on the subnet the
 /// other Sparks use (a free host number), or on 10.200.0.0/24 when none has an address yet. Both
 /// lanes of a node land on one subnet, so the ARP settings come with any address change. On a ring
-/// the same command pins every peer's collective address to the port that reaches it (a diagonal
-/// through the Spark in between) and turns on forwarding, so a bare DAC ring carries the
-/// rank-to-rank transport's connections to every rank.
+/// the same command pins every peer's fast addresses to a next hop on a cable that reaches that
+/// peer (a diagonal through the Spark in between) and turns on forwarding, so a bare DAC ring
+/// carries the rank-to-rank transport's connections to every rank in both directions.
 fn network_fixes(
     probes: &[ProbeResult],
     fabric: Option<&Fabric>,

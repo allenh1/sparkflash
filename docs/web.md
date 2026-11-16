@@ -122,6 +122,8 @@ one-segment-to-every-peer exchange, and the device arm's hot per-layer all-reduc
 `docs/rdma-exchange.md` describes which path each arm takes.
 
 The routes the port setup writes carry the reference transport, whose connections are ordinary IP.
+They are worked out from the one subnet the check plans for the collective addresses; a Spark's
+addresses have to stay on that subnet for the routes to be written.
 The device arm's NCCL is not: it opens its own RDMA queue pairs and cannot use those routes, so a
 bare-ring device run also needs an NCCL that stays on the cabled peers (`NCCL_ALGO=Ring` with a
 switchless NCCL build, where the two non-neighbours are never opened) or `SPARK_COMM_REDUCE=tcp`,
@@ -158,10 +160,10 @@ wiring was not measured and reports the ping result alone.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
-ring a `/32` route for every peer through the port that reaches it plus `ip_forward=1` so the
-Spark in between relays the diagonals; that switch is the kernel-wide `net.ipv4.ip_forward`, and
-the only routes the command adds are the per-peer ones) on every Spark over SSH under `sudo -n`
-and applies them.
+ring a `/32` route for every fast address of every peer through the port that reaches it plus
+`ip_forward=1` so the Spark in between relays the diagonals; that switch is the kernel-wide
+`net.ipv4.ip_forward`, and the only routes the command adds are those per-address ones) on every
+Spark over SSH under `sudo -n` and applies them.
 The routes are worked out from the measured wiring, so after a pass that changes addresses, check
 again: a second pass may be offered to add them. The manual commands remain available behind
 **Prefer to run the commands yourself**.

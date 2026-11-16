@@ -74,7 +74,7 @@ pub enum FabricLink {
     SwitchFabric,
     /// A direct DAC to the previous or next rank of the 0-1-2-3-0 ring.
     RingEdge,
-    /// The direct diagonal (0<->2, 1<->3) forwarded inside the ConnectX-7 ASIC.
+    /// The diagonal (0<->2, 1<->3), forwarded by the Spark between the two cables.
     HairpinDiagonal,
 }
 

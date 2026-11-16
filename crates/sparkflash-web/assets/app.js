@@ -1580,7 +1580,9 @@ function fabricPicker(state, model) {
     if (!measured.links_measured) {
       parts.push('<span class="tag warn">Ports not probed</span>');
     } else {
-      const match = recommended && recommended === chosen;
+      // Green only when the saved choice matches the wiring and the wiring reaches every Spark;
+      // a green badge above "cannot reach" errors contradicts them.
+      const match = recommended && recommended === chosen && !unreachable;
       parts.push('<span class="tag ' + (match ? "good" : "warn") + '">Measured: ' + esc(FABRIC_SHAPE_NAMES[shape] || "unknown wiring") + "</span>");
     }
   }
@@ -1738,8 +1740,11 @@ async function chooseFabric(schedule) {
     await refreshState();
     // The findings were computed against the old schedule, and a schedule that no longer matches
     // the wiring is one of them. Check again so step 2 shows one verdict, not the old one plus
-    // the new choice.
-    await inspect(true);
+    // the new choice — but not in the middle of a port pass, which would record a half-applied
+    // cluster; the finished-job check picks that up.
+    if (!S.jobs.some((job) => job.status === "running" && job.kind.startsWith("network-setup-"))) {
+      await inspect(true);
+    }
   } catch (error) {
     // The choice is saved; only the refresh failed. Do not report that as a failed save.
     toast("Saved, but the page could not refresh: " + error.message, true);
