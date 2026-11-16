@@ -97,6 +97,24 @@ const RESIDUAL_ROWS: usize = 17;
 /// of the one-block form, which then walks its rows one after another. A chunk's pairs fill
 /// the device already.
 const RESIDUAL_SPLIT_PAIRS: usize = 8;
+/// The f32s of a sequence row's share of [Scratch::residual_stats]: the two-launch form's
+/// (inverse, score) for up to three queries over [RESIDUAL_ROWS] rows. The chained form
+/// (`inkling_block_residual_chain_*`, [RESIDUAL_CHAIN_ENV]) carries its scores through the same
+/// rows, a walk taking one form or the other.
+const RESIDUAL_STATS_ROW: usize = 3 * RESIDUAL_ROWS * 2;
+/// The summary rows the chained form holds (`INKLING_CHAIN_SUMMARIES`): a thread keeps the next
+/// call's dots a summary row in registers through its whole pass.
+const RESIDUAL_CHAIN_SUMMARIES: usize = 8;
+/// The chained form's entries, by a call's query count and the next call's:
+/// `inkling_block_residual_chain_q<queries>_n<next>`.
+const RESIDUAL_CHAIN_PAIRS: [(usize, usize, &str); 6] = [
+    (1, 0, "inkling_block_residual_chain_q1_n0"),
+    (1, 1, "inkling_block_residual_chain_q1_n1"),
+    (1, 3, "inkling_block_residual_chain_q1_n3"),
+    (3, 0, "inkling_block_residual_chain_q3_n0"),
+    (3, 1, "inkling_block_residual_chain_q3_n1"),
+    (3, 3, "inkling_block_residual_chain_q3_n3"),
+];
 /// The threads the serial attention body runs: one warp a head.
 const ATTENTION_BLOCK: u32 = 32;
 /// The threads a block of the split walk's key-scale and score launches runs
@@ -367,6 +385,37 @@ fn rewind_request(value: Option<&str>) -> Result<bool, String> {
         "a prompt that keeps the last prompt and parts from its reply rewinds to the prompt's end",
         "it starts over",
     )
+}
+
+/// The switch for the chunk walk's block residuals (`inkling_block_residual_chain_*`). Unset, empty
+/// or `on` runs every residual of a walk over more than [RESIDUAL_SPLIT_PAIRS] rows as one block a
+/// row for all of the call's queries, its mix pass also scoring the next call's queries against
+/// the summary rows, so a call reads its stack once. `off` runs each call as the one-block form,
+/// which reads the stack twice for every query. The bits are the same either way. A model whose
+/// stack outgrows the chained form ([RESIDUAL_CHAIN_SUMMARIES] summary rows) stands down to the
+/// one-block form when the switch is unset and is refused under `on`. Anything else is refused.
+pub const RESIDUAL_CHAIN_ENV: &str = "SPARKFLASH_INKLING_RESIDUAL_CHAIN";
+
+/// What [RESIDUAL_CHAIN_ENV] asks for over a stack of at most `summaries` summary rows: `true`
+/// chains the residuals.
+fn residual_chain_request(value: Option<&str>, summaries: usize) -> Result<bool, String> {
+    let on = default_on(
+        RESIDUAL_CHAIN_ENV,
+        value,
+        "a walk's residuals each read their summary stack once",
+        "each call reads its stack twice for every query",
+    )?;
+    if !on || summaries <= RESIDUAL_CHAIN_SUMMARIES {
+        return Ok(on);
+    }
+    if value == Some("on") {
+        return Err(format!(
+            "{RESIDUAL_CHAIN_ENV}=on: the chained block residual holds \
+             {RESIDUAL_CHAIN_SUMMARIES} summary rows and this model's stack grows to {summaries}; \
+             unset it or set it off"
+        ));
+    }
+    Ok(false)
 }
 
 /// The switch between attention walks: `fast`, `split`, `serial` or `check`. Unset or empty
@@ -721,6 +770,9 @@ struct Kernels {
     /// then the softmax and the mix.
     block_residual_stats: Entry,
     block_residual_mix: Entry,
+    /// The chunk walk's chained form: one block a row for every query, the stack read once; one
+    /// entry a pair of [RESIDUAL_CHAIN_PAIRS], in its order.
+    block_residual_chain: Vec<Entry>,
     short_conv: Entry,
     short_conv_dynamic: Entry,
     kv_store: Entry,
@@ -912,6 +964,10 @@ impl Kernels {
             block_residual: load(inkling, "inkling_block_residual")?,
             block_residual_stats: load(inkling, "inkling_block_residual_stats")?,
             block_residual_mix: load(inkling, "inkling_block_residual_mix")?,
+            block_residual_chain: RESIDUAL_CHAIN_PAIRS
+                .iter()
+                .map(|&(_, _, name)| load(inkling, name))
+                .collect::<Result<_, _>>()?,
             short_conv: load(inkling, "inkling_short_conv_decode")?,
             short_conv_dynamic: load(inkling, "inkling_short_conv_dynamic_decode")?,
             kv_store: load(inkling, "inkling_kv_store")?,
@@ -1096,6 +1152,8 @@ struct Shared {
     prefill_walk: PrefillWalk,
     /// Whether a session keeps the prompt-boundary checkpoint ([REWIND_ENV]).
     rewind: bool,
+    /// Whether a chunk walk chains its block residuals ([RESIDUAL_CHAIN_ENV]).
+    residual_chain: bool,
     /// The drafter a sequence speculates with and the most drafts a round verifies
     /// ([DRAFT_ENV]); `None` steps a token at a time.
     draft: Option<(Drafter, usize)>,
@@ -1436,6 +1494,63 @@ impl Shared {
                 hidden as u64,
                 queries_count as u64,
                 summary_stride as u64,
+            ],
+        )
+    }
+
+    /// The chained block residual (`inkling_block_residual_chain_*`, [RESIDUAL_CHAIN_ENV]): one
+    /// block a row for all `queries_count` queries, the same bits as [Self::block_residual].
+    ///
+    /// `carry` is the arena's [Scratch::residual_stats]. Its first `carried` stack rows are taken
+    /// as scored against these queries by the previous call; the rest are read for their
+    /// statistics. With `next` (the next call's queries and their count), the mix pass scores
+    /// them against the summary rows into `carry` for that call.
+    #[allow(clippy::too_many_arguments)]
+    fn block_residual_chain(
+        &self,
+        summaries: Deviceptr,
+        partial: Deviceptr,
+        queries: Deviceptr,
+        out: Deviceptr,
+        carry: Deviceptr,
+        blocks: usize,
+        queries_count: usize,
+        carried: usize,
+        next: Option<(Deviceptr, usize)>,
+        rows: usize,
+        summary_stride: usize,
+    ) -> Result<(), String> {
+        let next_count = next.map_or(0, |(_, count)| count);
+        let entry = RESIDUAL_CHAIN_PAIRS
+            .iter()
+            .position(|&(queries, next, _)| (queries, next) == (queries_count, next_count))
+            .filter(|_| blocks <= RESIDUAL_CHAIN_SUMMARIES && carried <= blocks)
+            .ok_or_else(|| {
+                format!(
+                    "the chained block residual reads {blocks} summary rows ({carried} carried) \
+                     for {queries_count} queries and scores {next_count}: its kernels hold \
+                     {RESIDUAL_CHAIN_SUMMARIES} summary rows for the query counts {:?}; \
+                     {RESIDUAL_CHAIN_ENV}=off runs the one-block form",
+                    RESIDUAL_CHAIN_PAIRS.map(|(queries, next, _)| (queries, next))
+                )
+            })?;
+        self.launch(
+            self.kernels.block_residual_chain[entry],
+            (rows as u32, 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                summaries.0,
+                partial.0,
+                queries.0,
+                out.0,
+                carry.0,
+                next.map_or(0, |(queries, _)| queries.0),
+                blocks as u64,
+                self.hidden() as u64,
+                bits(self.config.architecture.norm_epsilon as f32),
+                summary_stride as u64,
+                carried as u64,
+                RESIDUAL_STATS_ROW as u64,
             ],
         )
     }
@@ -2621,6 +2736,18 @@ impl InklingDeviceBackend {
         }
         let depth_policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
         let rewind = rewind_request(std::env::var(REWIND_ENV).ok().as_deref())?;
+        // A stack grows one row a block boundary (layer % block == 0).
+        let summaries = config
+            .num_hidden_layers
+            .div_ceil(config.n_layers_per_attn_res_block.max(1));
+        let chain_switch = std::env::var(RESIDUAL_CHAIN_ENV).ok();
+        let residual_chain = residual_chain_request(chain_switch.as_deref(), summaries)?;
+        if !residual_chain && chain_switch.as_deref() != Some("off") {
+            eprintln!(
+                "inkling: the block residuals run unchained: the chained form holds \
+                 {RESIDUAL_CHAIN_SUMMARIES} summary rows and the stack grows to {summaries}"
+            );
+        }
         // The decode schedule is built for the chunk too: the two address the same sliding
         // rings, and a ring is sized by the widest write into it.
         let plan = InklingDevicePlan::build_for_chunk(
@@ -2754,6 +2881,7 @@ impl InklingDeviceBackend {
                 prefill_chunk,
                 prefill_walk,
                 rewind,
+                residual_chain,
                 draft,
                 depth_policy,
                 dspark: None,
@@ -3680,7 +3808,8 @@ struct Scratch {
     /// layer.
     rows: Deviceptr,
     /// The two-launch residual's statistics: `[rows][3][RESIDUAL_ROWS][2]`, each stack row's
-    /// RMS inverse and score.
+    /// RMS inverse and score ([RESIDUAL_STATS_ROW] a row). A chained walk carries its scores
+    /// here instead.
     residual_stats: Deviceptr,
     /// The single-row walk's norms: three consecutive `[hidden]` slabs a row.
     normed: Deviceptr,
@@ -3820,7 +3949,7 @@ impl Scratch {
         };
         let x = take(rows * hidden, 4);
         let block_inputs = take(rows * 3 * hidden, 4);
-        let residual_stats = take(rows * 3 * RESIDUAL_ROWS * 2, 4);
+        let residual_stats = take(rows * RESIDUAL_STATS_ROW, 4);
         let normed = take(3 * hidden, 4);
         let q_in = take(rows * hidden, 4);
         let k_in = take(rows * hidden, 4);
@@ -6070,7 +6199,7 @@ mod tests {
         ActivationPlanes, AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV,
         DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK,
         LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, depth_policy_from_env, mma_attention_shared,
-        overlap_request, rewind_request,
+        overlap_request, residual_chain_request, rewind_request,
     };
     use crate::config::Inkling2Config;
 
@@ -6136,18 +6265,34 @@ mod tests {
     }
 
     #[test]
-    fn the_rewind_switch_turns_off_only_by_name_and_refuses_other_values() {
-        for value in [None, Some(""), Some("on")] {
-            assert_eq!(rewind_request(value), Ok(true), "{value:?}");
+    fn the_on_by_default_switches_turn_off_only_by_name_and_refuse_other_values() {
+        // Over Inkling-2-Small's stack: 48 layers in blocks of 6.
+        fn chain(value: Option<&str>) -> Result<bool, String> {
+            residual_chain_request(value, 8)
         }
-        assert_eq!(rewind_request(Some("off")), Ok(false));
-        for value in ["1", "0", "yes", "OFF"] {
-            let refusal = rewind_request(Some(value)).unwrap_err();
-            assert!(
-                refusal.contains("use on") && refusal.contains("or off"),
-                "{refusal}"
-            );
+        for request in [rewind_request, chain] {
+            for value in [None, Some(""), Some("on")] {
+                assert_eq!(request(value), Ok(true), "{value:?}");
+            }
+            assert_eq!(request(Some("off")), Ok(false));
+            for value in ["1", "0", "yes", "OFF"] {
+                let refusal = request(Some(value)).unwrap_err();
+                assert!(
+                    refusal.contains("use on") && refusal.contains("or off"),
+                    "{refusal}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_chained_residual_stands_down_unset_and_refuses_on_past_its_stack() {
+        for value in [None, Some(""), Some("off")] {
+            assert_eq!(residual_chain_request(value, 9), Ok(false), "{value:?}");
+        }
+        let refusal = residual_chain_request(Some("on"), 9).unwrap_err();
+        assert!(refusal.contains("unset it or set it off"), "{refusal}");
+        assert_eq!(residual_chain_request(Some("on"), 8), Ok(true));
     }
 
     #[test]

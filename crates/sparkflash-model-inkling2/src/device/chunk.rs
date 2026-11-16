@@ -762,6 +762,101 @@ pub(super) struct Injection {
     pub count: usize,
 }
 
+/// A walk's block residuals chained ([RESIDUAL_CHAIN_ENV]): every call's queries in walk order, so
+/// each call scores the next call's against the summary rows while its mix reads them, and what
+/// the carry ([Scratch::residual_stats]) holds now.
+struct ResidualChain {
+    /// Every residual call's queries and their count, in the order the walk makes them.
+    calls: Vec<(Deviceptr, usize)>,
+    /// The call the walk makes next.
+    next: usize,
+    /// The queries the carry is scored against, and over how many summary rows.
+    carried: Option<(Deviceptr, usize)>,
+}
+
+impl ResidualChain {
+    /// The calls `schedule` makes: each layer's attention and MLP inputs (three queries on a full
+    /// layer's attention, one elsewhere), then the epilogue's output.
+    fn new(schedule: &InklingDevicePlan, weights: &Weights) -> Self {
+        let mut calls = Vec::new();
+        for layer in schedule.layers() {
+            for step in &layer.steps {
+                match (step.op, step.target) {
+                    (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => calls.push((
+                        weights.get(step.weights[0]).pointer,
+                        if layer.sliding { 1 } else { 3 },
+                    )),
+                    (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
+                        calls.push((weights.get(step.weights[0]).pointer, 1));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for step in schedule.epilogue() {
+            if let (Op::BlockResidual, Target::Input(ResidualInput::Output)) =
+                (step.op, step.target)
+            {
+                calls.push((weights.get(step.weights[0]).pointer, 1));
+            }
+        }
+        Self {
+            calls,
+            next: 0,
+            carried: None,
+        }
+    }
+
+    /// One residual call over `rows` rows. A call the walk makes in its order scores the next
+    /// call's queries; one it repeats (the drafter's tap of the output) neither scores nor moves
+    /// the chain, and takes the carry when its queries are the ones the carry was scored against.
+    #[allow(clippy::too_many_arguments)]
+    fn residual(
+        &mut self,
+        shared: &Shared,
+        summaries: Deviceptr,
+        partial: Deviceptr,
+        queries: Deviceptr,
+        count: usize,
+        out: Deviceptr,
+        carry: Deviceptr,
+        blocks: usize,
+        rows: usize,
+        summary_stride: usize,
+    ) -> Result<(), String> {
+        let carried = match self.carried {
+            Some((scored, over)) if scored == queries => over.min(blocks),
+            _ => 0,
+        };
+        let in_order = self.calls.get(self.next) == Some(&(queries, count));
+        let next = if in_order {
+            self.calls.get(self.next + 1).copied()
+        } else {
+            None
+        };
+        shared.block_residual_chain(
+            summaries,
+            partial,
+            queries,
+            out,
+            carry,
+            blocks,
+            count,
+            carried,
+            next,
+            rows,
+            summary_stride,
+        )?;
+        if in_order {
+            self.next += 1;
+        }
+        if let Some((queries, _)) = next {
+            self.carried = Some((queries, blocks));
+        }
+        Ok(())
+    }
+}
+
 /// Run the chunk schedule over `tokens` and answer the logits: the last row's for a chunk, every
 /// row's for fused lanes.
 ///
@@ -849,6 +944,51 @@ pub(super) fn walk_rows(
     let run = |result: Result<(), String>| result.map_err(device_error);
     let summary_stride = chunk.summary_stride;
     let mut blocks = 0usize;
+    // The walk's block residuals chained ([RESIDUAL_CHAIN_ENV]) over more rows than the two-launch
+    // form takes; a decode-sized walk keeps the per-call forms. `first` is the residual's first
+    // row, where its share of the carry starts.
+    let mut chain = (shared.residual_chain && rows > RESIDUAL_SPLIT_PAIRS)
+        .then(|| ResidualChain::new(schedule, weights));
+    #[allow(clippy::too_many_arguments)]
+    let residual = |chain: &mut Option<ResidualChain>,
+                    summaries: Deviceptr,
+                    partial: Deviceptr,
+                    queries: Deviceptr,
+                    count: usize,
+                    out: Deviceptr,
+                    blocks: usize,
+                    first: usize,
+                    rows: usize|
+     -> Result<(), BackendError> {
+        let stats = scratch
+            .residual_stats
+            .offset(first * RESIDUAL_STATS_ROW * std::mem::size_of::<f32>());
+        run(match chain {
+            Some(chain) => chain.residual(
+                shared,
+                summaries,
+                partial,
+                queries,
+                count,
+                out,
+                stats,
+                blocks,
+                rows,
+                summary_stride,
+            ),
+            None => shared.block_residual(
+                summaries,
+                partial,
+                queries,
+                out,
+                scratch.residual_stats,
+                blocks,
+                count,
+                rows,
+                summary_stride,
+            ),
+        })
+    };
 
     for step in schedule.prologue() {
         match (step.op, step.target) {
@@ -957,17 +1097,17 @@ pub(super) fn walk_rows(
             match (step.op, step.target) {
                 (Op::BlockResidual, Target::Input(ResidualInput::Attention)) => {
                     let queries = weight(step.weights[0]);
-                    run(shared.block_residual(
+                    residual(
+                        &mut chain,
                         chunk.summaries,
                         scratch.x,
                         queries,
-                        scratch.rows,
-                        scratch.residual_stats,
-                        blocks,
                         if sliding { 1 } else { 3 },
+                        scratch.rows,
+                        blocks,
+                        0,
                         rows,
-                        summary_stride,
-                    ))?;
+                    )?;
                 }
                 (Op::RmsNorm, Target::Norm(role)) => {
                     let gain = weight(step.weights[0]);
@@ -1436,17 +1576,17 @@ pub(super) fn walk_rows(
                 }
                 (Op::BlockResidual, Target::Input(ResidualInput::Mlp)) => {
                     let queries = weight(step.weights[0]);
-                    run(shared.block_residual(
+                    residual(
+                        &mut chain,
                         chunk.summaries,
                         scratch.x,
                         queries,
-                        scratch.rows,
-                        scratch.residual_stats,
-                        blocks,
                         1,
+                        scratch.rows,
+                        blocks,
+                        0,
                         rows,
-                        summary_stride,
-                    ))?;
+                    )?;
                 }
                 (Op::Router, _) => {
                     let bias = weight(step.weights[0]);
@@ -1544,17 +1684,17 @@ pub(super) fn walk_rows(
             (Op::BlockResidual, Target::Input(ResidualInput::Output)) => {
                 let queries = weight(step.weights[0]);
                 output_queries = Some(queries);
-                run(shared.block_residual(
+                residual(
+                    &mut chain,
                     chunk.summaries.offset(first * summary_stride * byte),
                     scratch.x.offset(first * hidden * byte),
                     queries,
-                    scratch.final_row,
-                    scratch.residual_stats,
-                    blocks,
                     1,
+                    scratch.final_row,
+                    blocks,
+                    first,
                     answers,
-                    summary_stride,
-                ))?;
+                )?;
             }
             (Op::RmsNorm, Target::Norm(NormRole::Final)) => {
                 let gain = weight(step.weights[0]);
@@ -1569,17 +1709,17 @@ pub(super) fn walk_rows(
                         let queries = output_queries.ok_or_else(|| {
                             device_error("the epilogue norms before its output residual")
                         })?;
-                        run(shared.block_residual(
+                        residual(
+                            &mut chain,
                             chunk.summaries,
                             scratch.x,
                             queries,
-                            scratch.q_in,
-                            scratch.residual_stats,
-                            blocks,
                             1,
+                            scratch.q_in,
+                            blocks,
+                            0,
                             rows,
-                            summary_stride,
-                        ))?;
+                        )?;
                         run(shared.rmsnorm(scratch.q_in, gain, scratch.q_in, rows, hidden))?;
                         sink.capture(shared, scratch.q_in, rows, FINAL_TAP)?;
                     }

@@ -579,6 +579,259 @@ extern "C" __global__ void __launch_bounds__(INKLING_BLOCK) inkling_block_residu
     }
 }
 
+// The chunk walk's block residual: one block a sequence row for all of a call's queries, and the
+// next call's scores against the summary rows carried forward.
+//
+// The one-block form reads a row's stack twice for every query, once for the statistics and once
+// for the mix, so a three-query call reads it six times. A summary row does not change once it is
+// pushed, and its RMS inverse and its score against a query depend on nothing else. So the mix
+// pass, which reads every summary element anyway, also sums the next call's dots over the summary
+// rows; the next call takes the statistics of the rows it is handed and reads only the rest (its
+// partial row, and a row pushed since) before it reads its stack once for the mix.
+//
+// Every number is the one-block form's: a row's squares and dots are summed per thread over
+// index = threadIdx.x + k * INKLING_BLOCK in ascending k, a warp's sum by the same xor shuffle and
+// the warps' in warp order as inkling_conv_block_sum, each score scaled as inkling_residual_row
+// scales it, and the softmax and the mix are the same arithmetic in the same orders.
+//
+//   carry          [sequence rows][carry_stride] f32: the RMS inverse of stack rows
+//                  0..INKLING_MAX_BLOCKS, then INKLING_CHAIN_QUERIES runs of as many scores.
+//                  Rows 0..carried-1 are read as this call's queries' (the caller's promise that
+//                  the previous call scored them); with NEXT > 0, summary rows 0..blocks-1 are
+//                  written against next_queries after the block's own reads.
+//   next_queries   [NEXT][hidden] f32, the next call's learned queries; null with NEXT 0.
+//
+// Grid (sequence rows), INKLING_BLOCK threads. A call's query count NQ and the next call's NEXT are
+// compile-time, one entry a pair (inkling_block_residual_chain_q<NQ>_n<NEXT>), and the stack holds
+// at most INKLING_CHAIN_SUMMARIES summary rows: a thread keeps NEXT dots a summary row across its
+// whole pass, so the bound is what keeps those in registers and several blocks on an SM.
+#define INKLING_CHAIN_QUERIES 3
+#define INKLING_CHAIN_SUMMARIES 8
+#define INKLING_CHAIN_WARPS (INKLING_BLOCK / 32)
+
+__device__ __forceinline__ float inkling_chain_warp_sum(float value) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+// The warps' sums of one value in warp order, as inkling_conv_block_sum adds them.
+__device__ __forceinline__ float inkling_chain_warps_total(const float* slots) {
+    float total = slots[0];
+#pragma unroll
+    for (int warp = 1; warp < INKLING_CHAIN_WARPS; ++warp) {
+        total += slots[warp];
+    }
+    return total;
+}
+
+template <int NQ, int NEXT>
+__device__ __forceinline__ void inkling_block_residual_chain_body(
+    const float* __restrict__ summaries,
+    const float* __restrict__ partial,
+    const float* __restrict__ queries,
+    float* __restrict__ out,
+    float* __restrict__ carry,
+    const float* __restrict__ next_queries,
+    int blocks,
+    int hidden,
+    float eps,
+    int summary_stride,
+    int carried,
+    int carry_stride) {
+    static_assert(NQ >= 1 && NQ <= INKLING_CHAIN_QUERIES && NEXT >= 0 &&
+                      NEXT <= INKLING_CHAIN_QUERIES,
+                  "a call scores one to three queries and the next zero to three");
+    const int sequence_row = blockIdx.x;
+    if (blocks < 0 || blocks > INKLING_CHAIN_SUMMARIES || hidden <= 0 || carried < 0 ||
+        carried > blocks ||
+        carry_stride < (INKLING_MAX_BLOCKS + 1) * (1 + INKLING_CHAIN_QUERIES)) {
+        return;
+    }
+    summaries += (uint64_t)sequence_row * summary_stride;
+    if (partial != nullptr) {
+        partial += (uint64_t)sequence_row * hidden;
+    }
+    out += (uint64_t)sequence_row * NQ * hidden;
+    carry += (uint64_t)sequence_row * carry_stride;
+    const int rows = blocks + (partial != nullptr ? 1 : 0);
+    if (rows <= 0) {
+        return;
+    }
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    __shared__ float inv_norm[INKLING_CHAIN_SUMMARIES + 1];
+    __shared__ float scores[NQ][INKLING_CHAIN_SUMMARIES + 1];
+    __shared__ float probabilities[NQ][INKLING_CHAIN_SUMMARIES + 1];
+    __shared__ float square_slots[INKLING_CHAIN_WARPS];
+    __shared__ float dot_slots[NQ][INKLING_CHAIN_WARPS];
+    __shared__ float next_slots[(NEXT > 0 ? NEXT : 1) * INKLING_CHAIN_SUMMARIES][INKLING_CHAIN_WARPS];
+
+    if ((int)threadIdx.x < carried) {
+        inv_norm[threadIdx.x] = carry[threadIdx.x];
+#pragma unroll
+        for (int query = 0; query < NQ; ++query) {
+            scores[query][threadIdx.x] =
+                carry[(INKLING_MAX_BLOCKS + 1) * (1 + query) + threadIdx.x];
+        }
+    }
+    const float scale = 1.0f / sqrtf((float)hidden);
+
+    // The statistics of the rows not handed over, as inkling_residual_row forms them, every
+    // query's dot reduced at once.
+    for (int row = carried; row < rows; ++row) {
+        const float* source = row < blocks ? summaries + (uint64_t)row * hidden : partial;
+        float squares = 0.0f;
+        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+            const float value = source[index];
+            squares = __fadd_rn(squares, __fmul_rn(value, value));
+        }
+        squares = inkling_chain_warp_sum(squares);
+        if (lane == 0u) {
+            square_slots[warp] = squares;
+        }
+        __syncthreads();
+        const float mean = __fdiv_rn(inkling_chain_warps_total(square_slots), (float)hidden);
+        const float inverse = __fdiv_rn(1.0f, sqrtf(__fadd_rn(mean, eps)));
+        float dots[NQ];
+#pragma unroll
+        for (int query = 0; query < NQ; ++query) {
+            dots[query] = 0.0f;
+        }
+        for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+            const float value = source[index];
+#pragma unroll
+            for (int query = 0; query < NQ; ++query) {
+                dots[query] =
+                    __fadd_rn(dots[query], __fmul_rn(queries[(uint64_t)query * hidden + index],
+                                                     __fmul_rn(value, inverse)));
+            }
+        }
+#pragma unroll
+        for (int query = 0; query < NQ; ++query) {
+            const float sum = inkling_chain_warp_sum(dots[query]);
+            if (lane == 0u) {
+                dot_slots[query][warp] = sum;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            inv_norm[row] = inverse;
+#pragma unroll
+            for (int query = 0; query < NQ; ++query) {
+                scores[query][row] = __fmul_rn(inkling_chain_warps_total(dot_slots[query]), scale);
+            }
+        }
+    }
+    __syncthreads();
+    if ((int)threadIdx.x < NQ) {
+        inkling_residual_softmax(scores[threadIdx.x], probabilities[threadIdx.x], rows);
+    }
+    __syncthreads();
+
+    // The mix, every query's from one read of each element, and the next call's dots over the
+    // summary rows from the same reads.
+    float next_dots[NEXT > 0 ? NEXT : 1][INKLING_CHAIN_SUMMARIES];
+#pragma unroll
+    for (int query = 0; query < NEXT; ++query) {
+#pragma unroll
+        for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
+            next_dots[query][row] = 0.0f;
+        }
+    }
+    for (int index = threadIdx.x; index < hidden; index += INKLING_BLOCK) {
+        float mixed[NQ];
+        float next_query[NEXT > 0 ? NEXT : 1];
+#pragma unroll
+        for (int query = 0; query < NQ; ++query) {
+            mixed[query] = 0.0f;
+        }
+#pragma unroll
+        for (int query = 0; query < NEXT; ++query) {
+            next_query[query] = next_queries[(uint64_t)query * hidden + index];
+        }
+#pragma unroll
+        for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
+            if (row < blocks) {
+                const float value =
+                    __fmul_rn(summaries[(uint64_t)row * hidden + index], inv_norm[row]);
+#pragma unroll
+                for (int query = 0; query < NQ; ++query) {
+                    mixed[query] =
+                        __fadd_rn(mixed[query], __fmul_rn(probabilities[query][row], value));
+                }
+#pragma unroll
+                for (int query = 0; query < NEXT; ++query) {
+                    next_dots[query][row] =
+                        __fadd_rn(next_dots[query][row], __fmul_rn(next_query[query], value));
+                }
+            }
+        }
+        if (partial != nullptr) {
+            const float value = __fmul_rn(partial[index], inv_norm[blocks]);
+#pragma unroll
+            for (int query = 0; query < NQ; ++query) {
+                mixed[query] =
+                    __fadd_rn(mixed[query], __fmul_rn(probabilities[query][blocks], value));
+            }
+        }
+#pragma unroll
+        for (int query = 0; query < NQ; ++query) {
+            out[(uint64_t)query * hidden + index] = mixed[query];
+        }
+    }
+    if constexpr (NEXT > 0) {
+#pragma unroll
+        for (int query = 0; query < NEXT; ++query) {
+#pragma unroll
+            for (int row = 0; row < INKLING_CHAIN_SUMMARIES; ++row) {
+                if (row < blocks) {
+                    const float sum = inkling_chain_warp_sum(next_dots[query][row]);
+                    if (lane == 0u) {
+                        next_slots[query * INKLING_CHAIN_SUMMARIES + row][warp] = sum;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        // Every read of the carry above is done: its rows are written for the next call.
+        if ((int)threadIdx.x < blocks) {
+            carry[threadIdx.x] = inv_norm[threadIdx.x];
+        }
+        for (int cell = threadIdx.x; cell < NEXT * blocks; cell += INKLING_BLOCK) {
+            const int query = cell / blocks;
+            const int row = cell - query * blocks;
+            carry[(INKLING_MAX_BLOCKS + 1) * (1 + query) + row] = __fmul_rn(
+                inkling_chain_warps_total(next_slots[query * INKLING_CHAIN_SUMMARIES + row]),
+                scale);
+        }
+    }
+}
+
+#define INKLING_CHAIN_ENTRY(NQ, NEXT)                                                             \
+    extern "C" __global__ void __launch_bounds__(INKLING_BLOCK)                                   \
+        inkling_block_residual_chain_q##NQ##_n##NEXT(                                             \
+            const float* __restrict__ summaries, const float* __restrict__ partial,               \
+            const float* __restrict__ queries, float* __restrict__ out,                           \
+            float* __restrict__ carry, const float* __restrict__ next_queries, int blocks,        \
+            int hidden, float eps, int summary_stride, int carried, int carry_stride) {           \
+        OPT_PDL_ENTRY();                                                                          \
+        inkling_block_residual_chain_body<NQ, NEXT>(summaries, partial, queries, out, carry,      \
+                                                    next_queries, blocks, hidden, eps,            \
+                                                    summary_stride, carried, carry_stride);       \
+    }
+
+// The pairs Inkling-2-Small's walk makes: a sliding layer's attention (one query) and a full
+// layer's (three), each layer's MLP (one), the output (one), and the next call's of each.
+INKLING_CHAIN_ENTRY(1, 0)
+INKLING_CHAIN_ENTRY(1, 1)
+INKLING_CHAIN_ENTRY(1, 3)
+INKLING_CHAIN_ENTRY(3, 0)
+INKLING_CHAIN_ENTRY(3, 1)
+INKLING_CHAIN_ENTRY(3, 3)
+
 // One history's conversion between the two layouts (inkling_conv_history_copy), this thread's
 // elements first, first + step, ... of its channels * history.
 __device__ __forceinline__ void inkling_conv_history_move(const float* __restrict__ source,
