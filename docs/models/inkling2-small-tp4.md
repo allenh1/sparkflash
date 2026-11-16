@@ -259,8 +259,9 @@ canonical for shared parts.
   checkpoint. `--inspect` reads a file back. The Hub resolver needs an entry for the repo
   and its sibling `mtp.safetensors`.
 * `--expert-split intermediate` writes the other expert layout: every rank holds all 384
-  experts at a quarter of their intermediate width, not 96 whole experts. It is opt-in and
-  changes bits; §15, "Experts split by intermediate columns", has the measurements.
+  experts at a quarter of their intermediate width, not 96 whole experts. It changes bits and is
+  the layout served since 2026-11-16 (D122); §15, "Experts split by intermediate columns", has
+  the measurements.
 
 ### 5. Serving, tokenizer and KV
 
@@ -1446,7 +1447,7 @@ from.
 
 The served rows are single runs.
 
-### Experts split by intermediate columns (opt-in, not the default)
+### Experts split by intermediate columns (served since 2026-11-16, D122)
 
 Expert parallelism gives each rank 96 whole experts, so a decode row's eight experts land on the
 ranks unevenly: one rank often holds three or four of them while another holds none. A profile
@@ -1502,7 +1503,24 @@ Teacher-forced on twelve cuts of the 6,000-token text:
 | row split against exact (D117, for scale) | 12 of 12 | 4-5 | 0.057-0.339 | 2.03 | 1.55e-2 (4.58e-3) |
 
 So the split sits as far from exact as the row split does. After the 93K prompt its greedy ids
-agree with the row split's for 15 tokens and part at the 16th. It stays opt-in at conversion.
+agree with the row split's for 15 tokens and part at the 16th.
+
+The maintainer took the split for serving on 2026-11-16 (D122). The gate before the swap ran the
+served binary on both file sets in one window, with DSpark at adaptive depth 7 on the split:
+
+| on the four ranks, served build | row split | intermediate split |
+|---|---|---|
+| repeating 5K prompt | 7.24-7.90 s | 5.28-5.39 s |
+| its decode step, plain (two runs) | 26.00, 26.55 ms | 25.25, 26.33 ms |
+| its decode step, DSpark d7 | | 13.19 ms (81 of 82 drafts accepted, ids equal to plain) |
+| 93K prompt | | 67.5 s |
+| its decode step, plain / DSpark d7 | | 29.26 / 24.96 ms (ids and logits digest equal) |
+
+The split's digest repeats run to run (`ec85a691b74bbc6b` on the repeating prompt) and DSpark
+emits plain decoding's ids and logits on it, so speculation stays lossless. Each host keeps the
+row files as `converted-rows`; moving them back to `converted` restores the row split's bits.
+The converter's default is unchanged (expert parallelism); the split is still named with
+`--expert-split intermediate`.
 
 ### A verify's rows read the keys together; the residual's statistics hold their row
 
