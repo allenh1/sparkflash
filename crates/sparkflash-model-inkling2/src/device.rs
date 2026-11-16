@@ -3228,9 +3228,8 @@ fn expert_scales(
     weights: &Weights,
     mxfp8: Mxfp8Walk,
 ) -> Result<ExpertTables, String> {
-    let mma_mx8 = |layer: &LayerSchedule| {
-        mxfp8 == Mxfp8Walk::Mma && layer.experts == ExpertBody::MxFp8
-    };
+    let mma_mx8 =
+        |layer: &LayerSchedule| mxfp8 == Mxfp8Walk::Mma && layer.experts == ExpertBody::MxFp8;
     let (_, owned) = plan.expert_range();
     for layer in plan.layers().iter().filter(|layer| mma_mx8(layer)) {
         admit_mxfp8_scales(cuda, layer, weights)?;
@@ -3403,13 +3402,14 @@ fn mma_pointers(
     // hidden and hidden / 32).
     let (code_row, scale_row) = (codes_bytes(1, hidden, body), scales_bytes(1, hidden, body));
     if body == ExpertBody::MxFp8 {
-        // The MXFP8 tile reads a row's ue8m0 codes four at a time, two of its 64-column stages a
-        // word, so a row it walks is whole 128-column runs.
-        let run = 4 * MXFP8_BLOCK;
+        // The MXFP8 tile walks a row in 64-column stages and takes a stage's two ue8m0 codes from
+        // the half of the aligned word that holds them, so a row it walks is whole stages: its
+        // codes then start on a two-byte boundary and a pair never straddles two words.
+        let run = 2 * MXFP8_BLOCK;
         if !hidden.is_multiple_of(run) || !down_shape.columns.is_multiple_of(run) {
             return Err(format!(
-                "layer {}: the MXFP8 MMA walks rows of whole {run}-column runs, and the experts' \
-                 rows are {hidden} and {} wide; {MXFP8_ENV}=pairs walks this band",
+                "layer {}: the MXFP8 MMA walks rows of whole {run}-column stages, and the \
+                 experts' rows are {hidden} and {} wide; {MXFP8_ENV}=pairs walks this band",
                 layer.index, down_shape.columns
             ));
         }

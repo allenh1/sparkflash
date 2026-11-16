@@ -782,8 +782,12 @@ struct Q4pSoftcapSwiglu {
 // A lane's B fragments cover the same columns as the NVFP4 form's - packed columns 8t..8t+7 and
 // 32+8t..32+8t+7 of the stage - so the A fragments, the MMA chain and the epilogue are the NVFP4
 // form's; each weight is the pair walk's f32 product rounded to bf16 (q4p_e4m3x2_scaled), exact
-// under the scale codes the host admits. The scale word of stages 2p and 2p + 1 is the same four
-// bytes, block 2ks the low byte of the stage's half. Two stages, not three (Q4P_STAGES_MX8).
+// under the scale codes the host admits. A stage's two codes are the half of the aligned word that
+// holds them: a row's codes start on a two-byte boundary, since a row is a whole number of 64-column
+// stages, so the pair never straddles two words. A row whose codes start on a four-byte boundary
+// (a whole number of 128-column runs, as every row of the released split) takes half ks & 1 of the
+// word stages 2p and 2p + 1 share; one that starts two bytes in (the intermediate split's 576-column
+// down rows, every other row) the other half. Two stages, not three (Q4P_STAGES_MX8).
 //
 // RUNS (down only) reads an A that is still in runs of `a_piece` columns: columns
 // r * a_piece .. (r + 1) * a_piece of every slot sit at a_src + r * a_piece_stride, a slot's row
@@ -870,18 +874,17 @@ __device__ __forceinline__ void q4p_moe_body(
     const uint32_t mx_dst0 = (uint32_t)(b_row * 16 + (((2 * b_half) ^ mx_swizzle) * 4));
     const uint32_t mx_dst1 = (uint32_t)(b_row * 16 + (((2 * b_half + 1) ^ mx_swizzle) * 4));
     // Scale rows: threads 0..127 each own one weight row's word.
-    const unsigned char* sc_base = nullptr;
-    if (tid < Q4P_BN) {
+    auto scale_base = [&](int row) -> const unsigned char* {
         if (GATE_UP) {
-            const int which = tid < Q4P_BN / 2 ? 1 : 3;
-            const unsigned long long row = (unsigned long long)(n0 + (tid & (Q4P_BN / 2 - 1)));
-            sc_base = (const unsigned char*)table[expert * 6 + which] +
-                      row * (Epi::kGateUpRows * scale_row);
-        } else {
-            sc_base = (const unsigned char*)table[expert * 6 + 5] +
-                      (unsigned long long)(n0 + tid) * scale_row;
+            const int which = row < Q4P_BN / 2 ? 1 : 3;
+            const unsigned long long at = (unsigned long long)(n0 + (row & (Q4P_BN / 2 - 1)));
+            return (const unsigned char*)table[expert * 6 + which] +
+                   at * (Epi::kGateUpRows * scale_row);
         }
-    }
+        return (const unsigned char*)table[expert * 6 + 5] +
+               (unsigned long long)(n0 + row) * scale_row;
+    };
+    const unsigned char* sc_base = tid < Q4P_BN ? scale_base(tid) : nullptr;
     auto load = [&](int buffer, int ks) {
         Stage& st = stages[buffer];
         const __nv_bfloat16* at;
@@ -902,7 +905,9 @@ __device__ __forceinline__ void q4p_moe_body(
             om_cp16(om_smem(&st.b[mx_dst0]), src, true);
             om_cp16(om_smem(&st.b[mx_dst1]), src + 16, true);
             if (sc_base != nullptr) {
-                q4p_cp4(om_smem(&st.s[tid]), sc_base + (ks >> 1) * 4);
+                // The aligned word holding this stage's two codes.
+                q4p_cp4(om_smem(&st.s[tid]),
+                        (const void*)((uintptr_t)(sc_base + 2 * ks) & ~(uintptr_t)3));
             }
         } else {
             om_cp16(om_smem(&st.b[b_dst]), b_base + ks * (Q4P_BK / 2) + b_half * 16, true);
@@ -933,8 +938,16 @@ __device__ __forceinline__ void q4p_moe_body(
     // Both m16 tiles' rows have the parity of g, so one swizzle serves all four row reads.
     const int a_sw = (g & 1) << 2;
     const int b_sw = ((g >> 2) & 1) << 2;
-    // MXFP8: the chunk swizzle of the lane's rows (64 j + 8 warp + g share bit 1 with g).
+    // MXFP8: the chunk swizzle of the lane's rows (64 j + 8 warp + g share bit 1 with g), and
+    // whether each row's codes start two bytes into a word.
     const int mx_sw = ((g >> 1) & 1) << 1;
+    int mx_half[2] = {0, 0};
+    if constexpr (MX8) {
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            mx_half[j] = (int)(((uintptr_t)scale_base(64 * j + 8 * warp + g) >> 1) & 1);
+        }
+    }
     for (int ks = 0; ks < ksteps; ++ks) {
         om_wait<kStages - 2>();
         __syncthreads();
@@ -956,7 +969,7 @@ __device__ __forceinline__ void q4p_moe_body(
                     &b_row_words[(((t >> 1) ^ mx_sw) * 4) + (t & 1) * 2]);
                 const uint2 hi = *reinterpret_cast<const uint2*>(
                     &b_row_words[(((2 + (t >> 1)) ^ mx_sw) * 4) + (t & 1) * 2]);
-                const uint32_t sw = st.s[row] >> (16 * (ks & 1));
+                const uint32_t sw = st.s[row] >> (16 * ((mx_half[j] + ks) & 1));
                 const float s_lo = q4p_ue8m0(sw);
                 const float s_hi = q4p_ue8m0(sw >> 8);
 #pragma unroll
