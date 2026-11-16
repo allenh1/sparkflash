@@ -211,6 +211,25 @@ pub struct Tp4FrameSampler {
     pub top_k: u32,
     /// The sampler seed every rank draws its noise from.
     pub seed: u64,
+    /// The repetition penalty's f32 bits: 1.0, and a frame without the field, is none. A group
+    /// whose workers pick what rank 0 picks (their picks decide what a verify keeps) needs the
+    /// penalties as much as the draw.
+    #[serde(default = "Tp4FrameSampler::no_repetition_penalty")]
+    pub repetition_penalty_bits: u32,
+    /// The presence penalty's f32 bits (0.0 is none).
+    #[serde(default)]
+    pub presence_penalty_bits: u32,
+    /// The frequency penalty's f32 bits (0.0 is none).
+    #[serde(default)]
+    pub frequency_penalty_bits: u32,
+}
+
+impl Tp4FrameSampler {
+    /// The bits of a repetition penalty that changes nothing.
+    #[must_use]
+    pub fn no_repetition_penalty() -> u32 {
+        1.0f32.to_bits()
+    }
 }
 
 /// One request on the device path, with its sampler, as a device tick admits it.
@@ -325,8 +344,8 @@ pub enum Tp4ControlError {
     UnexpectedFrame {
         /// What the receiver expected.
         expected: &'static str,
-        /// What it got.
-        got: Tp4ControlFrame,
+        /// What it got, boxed so the error stays small beside the frames it reports.
+        got: Box<Tp4ControlFrame>,
     },
     /// A Hello named a rank outside the group or a rank that already joined.
     BadRank {
@@ -539,7 +558,7 @@ impl Tp4ControlHub {
                     let Tp4ControlFrame::Hello { rank } = frame else {
                         return Err(Tp4ControlError::UnexpectedFrame {
                             expected: "Hello",
-                            got: frame,
+                            got: Box::new(frame),
                         });
                     };
                     let rank = usize::try_from(rank).unwrap_or(usize::MAX);
@@ -664,7 +683,7 @@ impl Tp4ControlWorker {
             }
             other => Err(Tp4ControlError::UnexpectedFrame {
                 expected: "Ready",
-                got: other,
+                got: Box::new(other),
             }),
         }
     }

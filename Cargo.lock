@@ -2570,6 +2570,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sparkflash-api",
+ "sparkflash-comm",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",

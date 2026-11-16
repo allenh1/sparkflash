@@ -24,10 +24,10 @@
 //!
 //! The prefill logits of the first two must agree with the plain session's, and every generated
 //! token of the two-slot run must equal the one-slot run's, member by member. The fixture's config
-//! carries an MTP layer, and a fused session never speculates, which is why the token comparison
-//! is against the fused one-slot run rather than the plain session: speculation is verified to be
-//! token-identical by construction, and mixing the two questions would hide a batch fault behind
-//! a draft.
+//! carries an MTP layer, so fused members draft: two members verify their rounds in one batch
+//! (`sparkflash_runtime::run_round`), and a lone member decodes as the plain session does. The
+//! batch is compared against the fused one-slot run first, so a batch fault is not hidden behind a
+//! draft, and the one-slot run against the plain session.
 //!
 //! The test skips - loudly - without a cubin or a CUDA driver. Once the device opens, a mismatch
 //! fails the test.
@@ -170,6 +170,10 @@ fn a_fused_batch_emits_what_its_members_emit_alone() {
     let one_a = one.prefill(PROMPT_A).expect("the fused prefill");
     compare("prefill A", &plain_prefill.logits, &one_a.logits);
     let alone_a = generate(&mut *one, one_a.next_token);
+    assert_eq!(
+        alone_a, plain_tokens,
+        "a lone fused member decoded other tokens than the plain session"
+    );
     let mut two = single.open_session().expect("a second fused session");
     let two_b = two.prefill(PROMPT_B).expect("the fused prefill");
     let alone_b = generate(&mut *two, two_b.next_token);
@@ -186,11 +190,17 @@ fn a_fused_batch_emits_what_its_members_emit_alone() {
     let (batched_a, batched_b) = std::thread::scope(|scope| {
         let first = scope.spawn(|| {
             let step = first.prefill(PROMPT_A).expect("the batched prefill");
-            (step.logits.clone(), generate(&mut *first, step.next_token))
+            let tokens = generate(&mut *first, step.next_token);
+            let drafted = first.speculation().verify_steps;
+            assert!(drafted > 0, "the first member never drafted");
+            (step.logits.clone(), tokens)
         });
         let second = scope.spawn(|| {
             let step = second.prefill(PROMPT_B).expect("the batched prefill");
-            (step.logits.clone(), generate(&mut *second, step.next_token))
+            let tokens = generate(&mut *second, step.next_token);
+            let drafted = second.speculation().verify_steps;
+            assert!(drafted > 0, "the second member never drafted");
+            (step.logits.clone(), tokens)
         });
         (
             first.join().expect("the first member's thread"),

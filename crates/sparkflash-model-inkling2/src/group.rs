@@ -692,6 +692,9 @@ fn frame_sampler(sampling: &Sampling) -> Option<Tp4FrameSampler> {
         top_p_bits: gumbel.top_p.to_bits(),
         top_k: gumbel.top_k,
         seed: gumbel.seed,
+        repetition_penalty_bits: Tp4FrameSampler::no_repetition_penalty(),
+        presence_penalty_bits: 0.0f32.to_bits(),
+        frequency_penalty_bits: 0.0f32.to_bits(),
     })
 }
 

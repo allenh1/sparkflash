@@ -42,6 +42,14 @@ fn a_group_refuses_the_host_drivers_knobs() {
         ] {
             let mut args = vec!["--model", model];
             args.extend_from_slice(extra);
+            // GLM's group steps --fuse-batch lanes (PackArm::OPEN_LANES); Qwen's serves one
+            // request at a time.
+            if model == sparkflash_model_glm5_next::MODEL_ID && extra.contains(&"--fuse-batch") {
+                let options =
+                    ServeOptions::parse(tp4_args(&args)).expect("the GLM group steps fused lanes");
+                assert!(options.fuse_batch && options.concurrency == 2);
+                continue;
+            }
             let error = ServeOptions::parse(tp4_args(&args))
                 .expect_err("a group serves one request at a time");
             for flag in flags {
@@ -50,6 +58,29 @@ fn a_group_refuses_the_host_drivers_knobs() {
             assert!(error.contains("tensor-parallel group"), "{error}");
         }
     }
+}
+
+#[test]
+fn the_glm_group_steps_fused_lanes_unless_told_one_at_a_time() {
+    let glm = sparkflash_model_glm5_next::MODEL_ID;
+    // No flags: the group's arm opens lanes, so it steps four of them.
+    let options = ServeOptions::parse(tp4_args(&["--model", glm])).expect("parses");
+    assert!(options.fuse_batch, "the GLM group fuses by default");
+    assert_eq!(options.concurrency, pack::GROUP_LANES);
+    // --fuse-batch alone takes the same default lane count.
+    let options = ServeOptions::parse(tp4_args(&["--model", glm, "--fuse-batch"])).expect("parses");
+    assert!(options.fuse_batch && options.concurrency == pack::GROUP_LANES);
+    // --concurrency 1 is the opt-out: one request at a time through the group driver.
+    let options =
+        ServeOptions::parse(tp4_args(&["--model", glm, "--concurrency", "1"])).expect("parses");
+    assert!(!options.fuse_batch && options.concurrency == 1);
+    // A group whose arm opens no lanes keeps one request at a time.
+    let options = ServeOptions::parse(tp4_args(&["--model", sparkflash_model_qwen4_exp::MODEL_ID]))
+        .expect("parses");
+    assert!(!options.fuse_batch && options.concurrency == 1);
+    // One node keeps the host driver's default.
+    let options = ServeOptions::parse(["--model".to_owned(), glm.to_owned()]).expect("parses");
+    assert!(!options.fuse_batch && options.concurrency == 1);
 }
 
 #[test]
@@ -354,6 +385,9 @@ fn control_frames_round_trip_on_a_loopback_socket() {
                 top_p_bits: 0.9f32.to_bits(),
                 top_k: 20,
                 seed: 11,
+                repetition_penalty_bits: 1.1f32.to_bits(),
+                presence_penalty_bits: 0.5f32.to_bits(),
+                frequency_penalty_bits: 0.0f32.to_bits(),
             }),
         },
         Tp4ControlFrame::Token { token_id: 7 },
@@ -1155,4 +1189,25 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
     let error = check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
         .expect_err("a 16-patch tower is refused");
     assert!(error.contains("vision patch 16"), "{error}");
+}
+
+#[test]
+fn the_glm_group_drafts_nothing_when_speculation_is_off_and_refuses_a_count_then() {
+    use sparkflash_model::profile::SpeculationProfile;
+    let spec = |enabled, drafts| SpeculationProfile {
+        enabled,
+        drafts,
+        ..SpeculationProfile::default()
+    };
+    // The defaults: the whole block over a block drafter, else the MTP layer's two.
+    assert_eq!(glm_group_drafts(&spec(None, None), true, 7), Ok(7));
+    assert_eq!(glm_group_drafts(&spec(Some(true), None), false, 3), Ok(2));
+    assert_eq!(glm_group_drafts(&spec(None, Some(1)), false, 3), Ok(1));
+    // SPARKFLASH_GLM_SPEC=off decodes a token a step, as drafts=0 does.
+    assert_eq!(glm_group_drafts(&spec(Some(false), None), true, 7), Ok(0));
+    assert_eq!(glm_group_drafts(&spec(Some(false), Some(0)), true, 7), Ok(0));
+    assert!(glm_group_drafts(&spec(Some(false), Some(2)), true, 7)
+        .is_err_and(|error| error.contains("speculation.enabled=false")));
+    assert!(glm_group_drafts(&spec(None, Some(8)), true, 7)
+        .is_err_and(|error| error.contains("from 0 to 7")));
 }

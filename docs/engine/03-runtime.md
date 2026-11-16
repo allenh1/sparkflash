@@ -65,7 +65,9 @@ and the arms:
 | `ledger` (next) | per arm, which strategies run natively, looped or off; printed at boot | new |
 
 Device memory for lanes stays in `sparkflash_kernels::lane_memory` (it needs the driver); the
-runtime only asks an arm's sequence whether it has room.
+runtime only asks an arm's sequence whether it has room (`FusedArm::room`). An arm lays out
+what grows with a sequence once (`Layout`), and one `LanePool` a rank backs, refuses and releases
+every sequence's span from a fixed budget: Inkling's and GLM's sequences both use it.
 
 Below the runtime, `sparkflash-ops` gets one projection entry point that picks row GEMV, batched
 GEMV, packed or the wide tile from shape, rows and precision, so tensor-core prefill is a
@@ -110,8 +112,8 @@ loop pipeline (which uses only the policy pieces).
 | step | state |
 | --- | --- |
 | 1. parallel drafts, Inkling | done: joint rounds, on by default (`SPARKFLASH_JOINT_ROUNDS=off` opts out) |
-| 2. generic group mirror | core done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling is its first user. Qwen and GLM groups need step 3 first |
-| 3. Qwen and GLM on the contract | planned |
+| 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's `--tp4-rank` group serve through it |
+| 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's group steps four lanes by default, on Inkling's lane memory |
 | 4. prefill scheduler | planned |
 | 5. projection dispatcher | planned |
 | 6. typed plans executed | planned |
@@ -145,9 +147,96 @@ pool full and no continuation, and take another conversation's kept sequence. Cl
 while a sequence is on its way back (`HeldPool` in `sparkflash-serve`), and
 `a_turn_sent_while_its_sequence_parks_still_continues_it` fails without the wait.
 
-### Step 2: what is left
+### Step 2: what was left
 
-The mirror is generic, but only Inkling serves through it. Qwen's fused lanes refuse a
-tensor-parallel group (`enable_fusion`), and the pack-path group serves through DeepSeek's
-`Tp4Driver` one request at a time. Moving them onto `GroupLanes` means each arm's group session
-becomes a `FusedArm` slot (step 3), then a `GroupWire` of a few dozen lines each.
+The mirror was generic, but only Inkling served through it: Qwen's fused lanes refuse a
+tensor-parallel group (`enable_fusion`), and the pack-path groups served through DeepSeek's
+`Tp4Driver` one request at a time. Step 3 moved GLM's group onto `GroupLanes`. Qwen's group still
+serves one request at a time; its arm sets no `PackArm::OPEN_LANES` yet.
+
+### Step 3: Qwen and GLM on the contract
+
+Both arms' fused slots are `RoundArm`s: a drafting member opens its round with the runtime, and
+members whose rounds are open verify together in one walk (`run_round`, the expert-union wall
+deciding when splitting is cheaper). Qwen3.8 at TP=1 from the converted rank, four lanes, the
+served lanes gate (`lanes-gate.py`: four prompts alone, then four at once twice):
+
+| | alone | four at once |
+| --- | --- | --- |
+| unfused, one lane | 42.3 tok/s | 42.6 tok/s |
+| fused, joint rounds | 40.7 tok/s | 64.3-64.8 tok/s greedy, 41.2 sampled |
+| fused, joint rounds off | 18.1 tok/s | 46.5-46.6 tok/s |
+
+Every answer alone, joint rounds on or off, equals the unfused server's, and four at once equal
+alone. A lone lane runs at 18 tok/s with joint rounds off, against 42 unfused. This is a speed
+gap, not a correctness one, and it is not yet explained.
+
+GLM's group (`--tp4-rank`, `--fuse-batch --concurrency N`) opens every rank as `N` lanes
+(`PackArm::OPEN_LANES`, `open_glm_lanes`). Rank 0 serves its backend through the host driver
+exactly as one node does (`serve_backend`). Every lane's prompt, step, give-back and release is
+broadcast before it runs, and each worker replays them over its own lanes (`mirror_lanes`).
+
+The ranks load and draft through the same loader as the one-request group (`load_glm_tp4_rank`):
+the converted rank, the latent cache, and the DFlash 2 drafter with its adaptive depth. The two
+shapes therefore serve the same tokens.
+
+The workers' sampler must pick what rank 0 picks, because the picks decide how many drafts a
+verify keeps, so the frame now carries the whole sampler (`sampler_frame`, penalties included).
+GLM's arm serves text, so `GlmWire` refuses images.
+
+Fused lanes are the GLM group's default: `--tp4-rank` with no `--concurrency` steps
+four lanes (`pack::GROUP_LANES`). An explicit `--concurrency 1` is the opt-out. It serves one
+request at a time through `Tp4Driver`, which answers a third concurrent request with a 503.
+
+A lane's sparse caches (every DSA layer's latent, scales and indexer rows, and the MTP layer's in
+a drafting sequence) are a span of Inkling's lane memory. The KDA state and the drafter's scratch
+stay plain allocations, because they do not grow. Each sequence reserves its whole capacity's
+span, and a rank backs it from one `LanePool` only as far as the sequence has reached, plus a
+1,024-row margin for draft writes and tile reads (`DeviceRank::back`). At 1M positions every
+sequence allocated 18.2 GiB eagerly. Now four lanes share one full sequence's worth, so one
+request can reach 1M while the others run, and a growth past the pool is refused on every rank
+alike (`runtime.lane_memory_mb` sets the budget). A small context's pool holds at least sixteen
+lanes' first chunks (`lane_memory::FLOOR_LANES`).
+
+GLM at TP=4, DFlash 2 drafting, the served lanes gate on the cluster:
+
+| | alone, greedy | alone, sampled | four at once, greedy | four at once, sampled |
+| --- | --- | --- | --- | --- |
+| `--concurrency 1` | 44.3 tok/s | 27.6 tok/s (no drafting) | one request at a time | one request at a time |
+| default, four lanes | 43.2 tok/s | 37.3 tok/s | 57.3-57.7 tok/s | 47.1-47.5 tok/s |
+| joint rounds off | 43.1 tok/s | | 43.4-44.0 tok/s | |
+
+The one-request group drafts only for a greedy request (`GlmTp4Rank` takes the device's argmax);
+a sampled one decodes a token a step with its logits row on the host. The lanes draft both.
+With drafting off (`SPARKFLASH_GLM_DRAFTS=0`) the lanes run 27.2 tok/s alone greedy and 25.0
+sampled, 53.9-55.2 and 43.8-44.2 four at once.
+
+Every greedy answer alone equals the one-request server's, drafting or not, and four at once
+equal alone, greedy and sampled. A sampled answer is the same with drafting on or off. It is not
+always the one-request server's (two of the four prompts differ): that path's `Tp4Sampling` carries
+only the temperature and the seed, so it samples without the request's `top_p`, `top_k` and
+penalties. The lanes' sampler frame carries all of them.
+
+The group used to ignore `speculation.enabled`. It read only `speculation.drafts`, so
+`SPARKFLASH_GLM_SPEC=off` was accepted and changed nothing. `enabled=false` now drafts nothing,
+and is refused beside a draft count (`glm_group_drafts`).
+
+Two more fixes came out of this gate:
+
+- **A give-back ran after the broadcast.** Rank 0 now gives a run back before it broadcasts the
+  next job, so the workers replay the same rollback.
+- **A sampled verify drew past its first disagreement.** The sampler's draw depends on the seed
+  and the number of draws so far. A verify that chose every row then drew more often than the
+  one-token steps it stands in for, so seeded output depended on how many drafts a round
+  verified. `Sampler::choose_verify` stops at the first row that disagrees
+  (`a_verify_draws_as_the_one_token_steps_it_stands_in_for`).
+
+Two fixes came out of the gate:
+
+- **Qwen's NVFP4 snapshot was refused.** `hf_quant_config.json` is ModelOpt's export, which only
+  restates `config.json`'s `quantization_config`. Since Inkling's parameter-group reader, it was
+  being read as Inkling's own document. It is now read only when it names parameter groups or
+  changes nothing the config set
+  (`a_modelopt_export_beside_the_config_keeps_the_configs_formats`).
+- **The three penalty fields made `Tp4ControlError` too large.** `UnexpectedFrame` now boxes the
+  frame it reports.

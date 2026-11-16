@@ -157,6 +157,36 @@ impl Sampler {
         chosen
     }
 
+    /// The model's choice at each row of a verify, in order, up to the first that disagrees with
+    /// the draft after it; `drafts` are the tokens the rows after the first consumed.
+    ///
+    /// Every later row's prefix holds a token the model did not choose, so no row past the
+    /// disagreement draws: a seeded draw then depends only on the tokens emitted, never on how
+    /// many drafts the round verified. An agreed draft is in the history while the row after it
+    /// is chosen and is forgotten after, so a penalty sees what the one-token steps this verify
+    /// stands in for would have seen; the steps that feed those tokens record them again.
+    /// [sparkflash_model::spec::verdict] over the picks keeps what the rows agreed with.
+    #[must_use]
+    pub fn choose_verify<'a>(
+        &mut self,
+        rows: impl IntoIterator<Item = &'a [f32]>,
+        drafts: &[u32],
+        sampling: &Sampling,
+    ) -> Vec<u32> {
+        let history = self.history.len();
+        let mut picks = Vec::with_capacity(drafts.len() + 1);
+        for row in rows {
+            let pick = self.choose(row, sampling);
+            picks.push(pick);
+            match drafts.get(picks.len() - 1) {
+                Some(&draft) if draft == pick => self.history.push(draft),
+                _ => break,
+            }
+        }
+        self.truncate(history);
+        picks
+    }
+
     /// The row with the request's penalties applied, the way [Self::choose] rewrites it before
     /// any temperature, or `None` when they change nothing (the row stands as it is). A caller
     /// that samples its own way (the Gumbel paths) takes its scores from here.
@@ -423,6 +453,54 @@ mod tests {
         // A flat row over six tokens drawing only one id sixteen times would be a broken draw.
         let distinct: std::collections::BTreeSet<u32> = left.iter().copied().collect();
         assert!(distinct.len() > 1, "the draw never moved: {distinct:?}");
+    }
+
+    #[test]
+    fn a_verify_draws_as_the_one_token_steps_it_stands_in_for() {
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|row| {
+                (0..8)
+                    .map(|id| ((id * 7 + row * 3) % 5) as f32 * 0.3)
+                    .collect()
+            })
+            .collect();
+        let mut request = sampling(1.0);
+        request.seed = 11;
+        request.repetition_penalty = 1.2;
+        // One token a step: each row chosen after the tokens before it were recorded.
+        let mut steps = Sampler::new();
+        steps.record_prompt(&[3]);
+        let mut emitted = Vec::new();
+        for row in &rows {
+            let token = steps.choose(row, &request);
+            steps.record(token);
+            emitted.push(token);
+        }
+        // A verify whose drafts are the emitted tokens up to `agreed`, then a wrong one, then
+        // more rows: its picks are the steps' up to the disagreement, and its draws as many.
+        for agreed in 0..rows.len() - 1 {
+            let mut drafts: Vec<u32> = emitted[..agreed].to_vec();
+            drafts.push(emitted[agreed] ^ 1);
+            drafts.extend_from_slice(&emitted[agreed + 1..rows.len() - 1]);
+            let mut verify = Sampler::new();
+            verify.record_prompt(&[3]);
+            let picks = verify.choose_verify(rows.iter().map(Vec::as_slice), &drafts, &request);
+            assert_eq!(picks, emitted[..=agreed], "{agreed} agreed");
+            assert_eq!(
+                verify.history(),
+                &[3],
+                "the agreed drafts are forgotten again"
+            );
+            // The steps that feed the kept tokens then draw on from where the steps would.
+            for &token in &emitted[..=agreed] {
+                verify.record(token);
+            }
+            assert_eq!(
+                verify.choose(&rows[agreed + 1], &request),
+                emitted[agreed + 1],
+                "the draw after {agreed} agreed"
+            );
+        }
     }
 
     #[test]

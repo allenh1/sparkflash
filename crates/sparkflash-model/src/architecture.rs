@@ -900,7 +900,18 @@ impl Architecture {
                 .map_err(|error| ConfigError::Json(format!("{}: {error}", quant.display())))?;
             let value: Value = serde_json::from_str(&text)
                 .map_err(|error| ConfigError::Json(error.to_string()))?;
-            architecture.apply_quant_config(&value)?;
+            // Two documents share the name. Inkling's lists parameter groups, the only place its
+            // per-layer split is written, so it is applied. ModelOpt's export (Qwen3.8's NVFP4
+            // release) restates the quantization_config that config.json carries and this parse
+            // has already read, so that reading stands. Any other document is refused.
+            let model = object(&value, "model").unwrap_or(&value);
+            let export = object(&value, "quantization")
+                .is_some_and(|quantization| quantization.get("quant_algo").is_some());
+            let read = architecture.quantization.dense_format != WeightFormat::Bf16
+                || architecture.quantization.expert_format != WeightFormat::Bf16;
+            if model.get("parameter_groups").is_some() || !(export && read) {
+                architecture.apply_quant_config(&value)?;
+            }
         }
         let generation = dir.join("generation_config.json");
         if generation.is_file() {
@@ -3156,6 +3167,42 @@ mod tests {
         let architecture =
             Architecture::from_json(&document.to_string()).expect("the released Qwen config");
         assert_eq!(architecture.quantization.expert, None);
+    }
+
+    #[test]
+    fn a_modelopt_export_beside_the_config_keeps_the_configs_formats() {
+        // Qwen3.8's NVFP4 release ships ModelOpt's hf_quant_config.json beside a config.json
+        // that already carries the same quantization_config: the directory opens with the
+        // config's formats. A document that is neither that export nor Inkling's parameter
+        // groups is still refused.
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-architecture-quant-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(directory.join("config.json"), QWEN).expect("config.json");
+        std::fs::write(
+            directory.join("hf_quant_config.json"),
+            r#"{"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "MIXED_PRECISION", "group_size": 16}}"#,
+        )
+        .expect("hf_quant_config.json");
+        let architecture =
+            Architecture::from_checkpoint_dir(&directory).expect("the released Qwen directory");
+        let alone = Architecture::from_json(QWEN).expect("the released Qwen config");
+        assert_eq!(
+            architecture.quantization.expert_format,
+            alone.quantization.expert_format
+        );
+        assert_eq!(
+            architecture.quantization.dense_format,
+            alone.quantization.dense_format
+        );
+        std::fs::write(directory.join("hf_quant_config.json"), r#"{"model": {}}"#)
+            .expect("hf_quant_config.json");
+        Architecture::from_checkpoint_dir(&directory)
+            .expect_err("a document with neither form is refused");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

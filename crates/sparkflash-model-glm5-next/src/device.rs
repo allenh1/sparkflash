@@ -95,6 +95,7 @@ use sparkflash_kernels::cuda_driver::{
     RunStream, SideStream, StreamEvent,
 };
 use sparkflash_kernels::images;
+use sparkflash_kernels::lane_memory::{LanePool, LaneSpan, Layout};
 use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::gdn::{
@@ -193,7 +194,7 @@ impl LatentCache {
 /// Returns `(latent elements, f32 scale floats)`: the E4M3 latent is one code a element and one
 /// f32 scale a whole [FP8_BLOCK]-wide tile, while the f32 latent is four bytes a element and no
 /// scales. The representation is resolved exactly as [LatentCache::quantises] does it; this is
-/// the allocation [DeviceRank::sparse_state] makes from the same pair.
+/// the caches [SparseParts::plan] lays out from the same pair.
 fn latent_row(config: &Glm5NextConfig, quantise: bool) -> (usize, usize) {
     let width = config.kv_lora_rank;
     (
@@ -1788,6 +1789,143 @@ pub struct DeviceSequence {
     /// The block drafter's confidence in each of the sequence's last drafts.
     confidence: Vec<f32>,
     memory: Allocations,
+    /// The sparse layers' caches, backed as the sequence grows.
+    lane: SequenceLane,
+}
+
+/// Rows past a step's last position a sequence's lane backs too: the MTP layer's drafts write
+/// up to a step's rows past it, and a kernel that reads a whole tile past the position never
+/// reaches memory nothing backs.
+const LANE_READ_PAST: usize = 1024;
+
+/// A lane grows in steps of this many rows, so a decode step rarely maps anything.
+const LANE_QUANTUM: usize = 2048;
+
+/// Where a rank's sequences of one kind keep the caches that grow with their context, and the
+/// memory behind them ([LanePool], the backing Inkling's lanes use too).
+///
+/// A sequence reserves a span of virtual memory as long as its whole capacity's sparse caches
+/// (every DSA layer's latent, scales and indexer rows, and the MTP layer's in a drafting
+/// sequence), and physical memory backs the span only as far as the sequence has reached
+/// ([DeviceRank::back]). The chunks come from one pool the rank's sequences share, so several
+/// sequences hold together what one whole context would: the budget is one full sequence's worth
+/// unless `runtime.lane_memory_mb` (SPARKFLASH_LANE_MEMORY_MB) says otherwise. It is a number,
+/// the same on every rank, so every rank of a group refuses the same growth.
+///
+/// The KDA layers' state and the drafters' scratch stay plain allocations: they do not grow.
+struct SequenceLanes {
+    cuda: Arc<CudaHandle>,
+    lanes: LanePool,
+    /// Each layer's caches, `None` for a KDA layer.
+    layers: Vec<Option<SparseParts>>,
+    /// The MTP layer's, in a drafting sequence.
+    mtp: Option<SparseParts>,
+}
+
+impl Drop for SequenceLanes {
+    fn drop(&mut self) {
+        // Every sequence has given its chunks back by now: each holds this pool.
+        let _ = self.cuda.make_current();
+        self.lanes.pool().drain(&**self.cuda);
+    }
+}
+
+/// Which sequences share one [SequenceLanes]: those that draft with the MTP layer or not, of one
+/// capacity.
+type LaneKey = (bool, usize);
+
+/// One DSA layer's caches in a lane, as offsets from the span's base.
+#[derive(Debug, Clone, Copy)]
+struct SparseParts {
+    latent: usize,
+    latent_scales: Option<usize>,
+    /// The indexer's keys, gates and pooled keys, for a layer with an indexer.
+    index: Option<[usize; 3]>,
+}
+
+impl SparseParts {
+    /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
+    fn plan(
+        layout: &mut Layout,
+        config: &Glm5NextConfig,
+        dsa: &DeviceDsa,
+        capacity: usize,
+    ) -> Self {
+        // The latent is the release's E4M3 activation when the projections quantise theirs, and
+        // f32 for a BF16 release.
+        let (elements, scale_floats) = latent_row(config, dsa.quantise);
+        let latent_row = if dsa.quantise { elements } else { elements * 4 };
+        let latent = layout.part(capacity * latent_row, latent_row, 0);
+        let latent_scales = dsa
+            .quantise
+            .then(|| layout.part(capacity * scale_floats * 4, scale_floats * 4, 0));
+        let index = dsa.indexer.is_some().then(|| {
+            let row = config.index_head_dim * 4;
+            let kpool = config.index_kpool.max(1);
+            [
+                layout.part(capacity * row, row, 0),
+                layout.part(capacity * row, row, 0),
+                // A pooled row covers `kpool` positions; a position adds its share, rounded up.
+                layout.part(capacity / kpool * row, row.div_ceil(kpool), 0),
+            ]
+        });
+        Self {
+            latent,
+            latent_scales,
+            index,
+        }
+    }
+
+    /// The layer's state in the lane at `base`.
+    fn layer(self, base: Deviceptr) -> SequenceLayer {
+        let index = |part: usize| {
+            self.index
+                .map_or(Deviceptr(0), |index| base.offset(index[part]))
+        };
+        SequenceLayer::Sparse {
+            latent: base.offset(self.latent),
+            latent_scales: self
+                .latent_scales
+                .map_or(Deviceptr(0), |offset| base.offset(offset)),
+            index_keys: index(0),
+            index_gates: index(1),
+            pooled: index(2),
+        }
+    }
+}
+
+/// One sequence's span of its [SequenceLanes].
+struct SequenceLane {
+    memory: Arc<SequenceLanes>,
+    span: LaneSpan,
+}
+
+impl SequenceLane {
+    /// Gives every chunk back to the pool, once the device is done with them.
+    fn release(&mut self) -> Result<(), BackendError> {
+        if self.span.mapped() == 0 {
+            return Ok(());
+        }
+        let cuda = &self.memory.cuda;
+        cuda.synchronize().map_err(cuda_error)?;
+        self.memory
+            .lanes
+            .release(&***cuda, &mut self.span)
+            .map_err(cuda_error)
+    }
+}
+
+impl Drop for SequenceLane {
+    fn drop(&mut self) {
+        // A sequence can be returned to its pool from a worker thread that has not touched the
+        // device yet, as [Allocations] does.
+        let _ = self.memory.cuda.make_current();
+        let _ = self.release();
+        self.memory.cuda.vmm_free(
+            Deviceptr(self.span.base()),
+            self.memory.lanes.shape().stride,
+        );
+    }
 }
 
 /// What a drafting sequence keeps for the MTP layer: its caches, whose position `q` pairs the
@@ -1955,6 +2093,14 @@ impl DeviceSequence {
         self.capacity
     }
 
+    /// Whether the rank's pool can back this sequence for `rows` positions now, counting the
+    /// chunks a reset gives back first when `reset`: the answer [DeviceRank::back] would give.
+    #[must_use]
+    pub fn room(&self, rows: usize, reset: bool) -> bool {
+        let rows = rows.min(self.capacity) + LANE_READ_PAST;
+        self.lane.memory.lanes.room(&self.lane.span, rows, reset)
+    }
+
     /// The block drafter's confidence in each of the sequence's last drafts, in `(0, 1]`: the
     /// selector's probability for its pick among the row's candidates. Empty after an MTP draft,
     /// which keeps none.
@@ -2001,6 +2147,8 @@ pub struct DeviceRank {
     mtp: Option<DeviceMtp>,
     /// The DFlash 2 block drafter, once [DeviceRank::load_block_drafter] loads one.
     block: Option<BlockDrafter>,
+    /// The sequences' [SequenceLanes], one a kind, each planned on first use.
+    lanes: Mutex<Vec<(LaneKey, Arc<SequenceLanes>)>>,
     scratch: Scratch,
     /// Whether a block-drafting sequence's prompt runs through the bulk chunk
     /// (`prefill.drafting_prompt`, on by default) rather than the token path.
@@ -2245,6 +2393,7 @@ impl DeviceRank {
             layers,
             mtp,
             block: None,
+            lanes: Mutex::new(Vec::new()),
             scratch,
             prefill,
             drafting_prefill: true,
@@ -2659,10 +2808,10 @@ impl DeviceRank {
     }
 
     /// Puts `sequence` back at position 0 with no history, the state [Self::new_sequence] opens
-    /// one in, keeping its window: a server that holds one window between requests skips the
-    /// allocation, 18.2 GiB a rank at the 1M default. As in a fresh window, only the convolution
-    /// history and the recurrent memory are cleared; the caches are read below the position only,
-    /// and a block drafter's rings are zeroed.
+    /// one in, keeping its span and its plain allocations. The lane's chunks go back to the pool
+    /// (up to 18.2 GiB a rank at the 1M default) for any sequence to grow into. As in a fresh
+    /// window, the convolution history and the recurrent memory are cleared, and the caches come
+    /// back zeroed as the next prompt grows; a block drafter's rings are zeroed.
     ///
     /// # Errors
     /// When the device refuses a copy.
@@ -2697,6 +2846,8 @@ impl DeviceRank {
                     .map_err(cuda_error)?;
             }
         }
+        // The lane's rows go back to the pool, and come back zeroed as the next prompt grows.
+        sequence.lane.release()?;
         sequence.position = 0;
         sequence.pending = None;
         sequence.logits_at = None;
@@ -2827,30 +2978,44 @@ impl DeviceRank {
                 config.max_position_embeddings
             )));
         }
+        let drafting = drafting && self.mtp.is_some();
+        let lanes = self.sequence_lanes(capacity, drafting)?;
+        let base = self
+            .cuda
+            .vmm_reserve(lanes.lanes.shape().stride)
+            .map_err(cuda_error)?;
+        let lane = SequenceLane {
+            span: LaneSpan::new(base.0, lanes.lanes.shape()),
+            memory: Arc::clone(&lanes),
+        };
         let mut memory = Allocations::new(Arc::clone(&self.cuda));
         let head = config.linear_head_dim;
         let history = config.linear_conv_kernel_dim.saturating_sub(1);
         let layers = self
             .layers
             .iter()
-            .map(|layer| {
-                Ok(match &layer.branch {
-                    DeviceBranch::Linear(kda) => SequenceLayer::Linear {
+            .zip(&lanes.layers)
+            .map(|(layer, parts)| {
+                Ok(match (&layer.branch, parts) {
+                    (DeviceBranch::Linear(kda), _) => SequenceLayer::Linear {
                         conv: memory.bytes(history * 3 * kda.width * 4)?,
                         recurrent: memory.bytes(kda.heads * head * head * 4)?,
                         spare: memory.floats(kda.heads * head * head)?,
                     },
-                    DeviceBranch::Sparse(dsa) => self.sparse_state(&mut memory, dsa, capacity)?,
+                    (DeviceBranch::Sparse(_), Some(parts)) => parts.layer(base),
+                    (DeviceBranch::Sparse(_), None) => {
+                        return Err(refusal("a sparse layer the lane has no caches for"));
+                    }
                 })
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
-        let drafter = match &self.mtp {
-            Some(mtp) if drafting => Some(SequenceDrafter {
-                layer: self.sparse_state(&mut memory, &mtp.dsa, capacity)?,
+        let drafter = match lanes.mtp {
+            Some(parts) => Some(SequenceDrafter {
+                layer: parts.layer(base),
                 hidden: memory.floats(MAX_ROWS * config.hidden_size)?,
                 last: None,
             }),
-            _ => None,
+            None => None,
         };
         let mut sequence = DeviceSequence {
             position: 0,
@@ -2862,45 +3027,91 @@ impl DeviceRank {
             block: None,
             confidence: Vec::new(),
             memory,
+            lane,
         };
         self.clear(&mut sequence)?;
         Ok(sequence)
     }
 
-    /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
-    fn sparse_state(
+    /// The [SequenceLanes] of sequences of `capacity` positions that draft with the MTP layer or
+    /// not, planned on first use.
+    fn sequence_lanes(
         &self,
-        memory: &mut Allocations,
-        dsa: &DeviceDsa,
         capacity: usize,
-    ) -> Result<SequenceLayer, BackendError> {
-        let config = &self.config;
-        let index_dim = config.index_head_dim;
-        // The latent is the release's E4M3 activation when the projections quantise theirs, and
-        // f32 for a BF16 release.
-        let (latent_elements, latent_scale_floats) = latent_row(config, dsa.quantise);
-        let (latent, latent_scales) = if dsa.quantise {
-            (
-                memory.bytes(capacity * latent_elements)?,
-                memory.floats(capacity * latent_scale_floats)?,
-            )
-        } else {
-            (memory.floats(capacity * latent_elements)?, Deviceptr(0))
-        };
-        let mut index = |floats: usize| {
-            if dsa.indexer.is_some() {
-                memory.floats(floats)
-            } else {
-                Ok(Deviceptr(0))
-            }
-        };
-        Ok(SequenceLayer::Sparse {
-            index_keys: index(capacity * index_dim)?,
-            index_gates: index(capacity * index_dim)?,
-            pooled: index(capacity / config.index_kpool * index_dim)?,
-            latent,
-            latent_scales,
-        })
+        drafting: bool,
+    ) -> Result<Arc<SequenceLanes>, BackendError> {
+        let mut planned = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (drafting, capacity);
+        if let Some((_, lanes)) = planned.iter().find(|(planned, _)| *planned == key) {
+            return Ok(Arc::clone(lanes));
+        }
+        let granularity = self.cuda.vmm_granularity().ok_or_else(|| {
+            refusal("the device has no virtual memory management for the sequences' caches")
+        })?;
+        let mut layout = Layout::default();
+        let layers = self
+            .layers
+            .iter()
+            .map(|layer| match &layer.branch {
+                DeviceBranch::Linear(_) => None,
+                DeviceBranch::Sparse(dsa) => {
+                    Some(SparseParts::plan(&mut layout, &self.config, dsa, capacity))
+                }
+            })
+            .collect();
+        let mtp = self
+            .mtp
+            .as_ref()
+            .filter(|_| drafting)
+            .map(|mtp| SparseParts::plan(&mut layout, &self.config, &mtp.dsa, capacity));
+        let shape = layout.finish(granularity, LANE_QUANTUM);
+        let budget = LanePool::budget(
+            &shape,
+            capacity + LANE_READ_PAST,
+            sparkflash_model::active_profile().runtime.lane_memory_mb,
+        );
+        let lanes = Arc::new(SequenceLanes {
+            cuda: Arc::clone(&self.cuda),
+            lanes: LanePool::new(shape, budget),
+            layers,
+            mtp,
+        });
+        if self.layout.rank == 0 {
+            eprintln!(
+                "[glm5] rank 0: {}sequences of {capacity} positions back their caches as they \
+                 grow: {}",
+                if drafting { "drafting " } else { "" },
+                lanes.lanes.describe()
+            );
+        }
+        planned.push((key, Arc::clone(&lanes)));
+        Ok(lanes)
+    }
+
+    /// Backs `sequence`'s lane for `rows` positions and the rows past them a step reads or a
+    /// draft writes ([LANE_READ_PAST]).
+    ///
+    /// # Errors
+    /// The pool's refusal when it has too few chunks left ([LanePool::grow]), or a driver
+    /// failure.
+    fn back(&self, sequence: &mut DeviceSequence, rows: usize) -> Result<(), BackendError> {
+        let rows = rows.min(sequence.capacity) + LANE_READ_PAST;
+        let lane = &mut sequence.lane;
+        if rows <= lane.span.backed() {
+            return Ok(());
+        }
+        // Zeroing the new chunks needs this rank's context on the calling thread, which a fused
+        // engine thread has not made current before a prefill.
+        self.make_current()?;
+        lane.memory
+            .lanes
+            .grow(&**self.cuda, &mut lane.span, rows)
+            .map_err(refusal)?;
+        // The chunks were zeroed on the default stream, which the run stream does not wait for.
+        self.cuda.synchronize().map_err(cuda_error)
     }
 
     fn launch(
@@ -4834,6 +5045,7 @@ impl DeviceRank {
                 "the sequence's verify is not committed; commit it before its next step",
             ));
         }
+        self.back(sequence, sequence.position + tokens.len())?;
         let device_leg = self.collective(tp, gather)?;
         let chunk = self.prefill_rows;
         // A block drafter's first block reads the prompt's last `window_left` positions: a chunk
@@ -5159,6 +5371,10 @@ impl DeviceRank {
                     "the sequence's verify is not committed; commit it before its next step",
                 ));
             }
+        }
+        for (sequence, tokens) in batch.iter_mut() {
+            let end = sequence.position + tokens.len();
+            self.back(sequence, end)?;
         }
         let mut logits: Vec<Vec<R>> = batch
             .iter()
@@ -6109,7 +6325,7 @@ mod tests {
     use super::*;
     use sparkflash_model::architecture::AttentionKind;
 
-    /// The per-position sparse caches [DeviceRank::sparse_state] allocates for `config`: every
+    /// The per-position sparse caches [SparseParts::plan] lays out for `config`: every
     /// backbone MLA layer, each layer that owns an indexer, and the MTP stage (which the device
     /// always builds with its own indexer).
     fn allocated_sparse_per_token(config: &Glm5NextConfig, quantise: bool) -> u64 {
@@ -6169,7 +6385,7 @@ mod tests {
         assert_eq!(
             crate::single_rank_kv_plan(&config).per_token(),
             allocated_sparse_per_token(&config, auto),
-            "the admitted plan and `sparse_state` agree on the tiny fixture"
+            "the admitted plan and `SparseParts::plan` agree on the tiny fixture"
         );
 
         // With a whole-tile latent the per-tensor choice changes the allocation, and the plan

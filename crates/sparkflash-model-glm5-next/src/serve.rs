@@ -40,13 +40,19 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler};
+use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
-use sparkflash_runtime::{FusedArm, FusedEngine};
+use sparkflash_runtime::group::{frame_sampling, sampler_frame};
+use sparkflash_runtime::{
+    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, GroupWire, Opened, RoundArm, StepWall,
+    mirror_lanes, run_round,
+};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
@@ -80,18 +86,98 @@ struct Shared {
 /// The engine's thread is the only stepper, so the rank lock is taken once a step, and a batch of
 /// members is one [DeviceRank::forward_batch_greedy] call: the wide stages read the weights once
 /// for every member's row.
+///
+/// With a drafter configured the members draft as they would alone and verify together
+/// ([run_round]): each drafts its chain, the walk's rows are shared among the chains, and one
+/// [DeviceRank::verify_batch] runs every member's token and the drafts it was given.
 pub struct GlmFusion {
     shared: Arc<Shared>,
     context_limit: usize,
+    /// Whether drafting members verify their rounds in one walk
+    /// ([sparkflash_runtime::JOINT_ROUNDS_ENV]); off, each member's round runs alone.
+    joint_rounds: bool,
+    /// What a shared walk costs, for the row share.
+    wall: ExpertUnionWall,
 }
 
-/// The TP=1 device backend: one GLM-5.3-Flash rank on this host's GPU.
+/// A shared walk's cost at TP=4 on four GB10-class nodes, from the device harness: a plain step
+/// 31.6 ms, about 0.75 ms a distinct expert, and the block drafter's 4.6-5 ms a stream for each
+/// member past the first. The expert counts are the checkpoint's.
+const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
+    fixed_ms: 25.0,
+    expert_ms: 0.75,
+    row_ms: 0.3,
+    seq_ms: 5.0,
+    experts: 0,
+    top_k: 0,
+};
+
+/// The device backend: one GLM-5.3-Flash rank on this host's GPU, alone or one of a
+/// tensor-parallel group.
 pub struct Glm5NextDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
     context_limit: usize,
-    /// Set by [Glm5NextDeviceBackend::enable_fusion]: sessions become handles on this engine.
-    fused: Option<Arc<FusedEngine<GlmFusion>>>,
+    /// Set by [Glm5NextDeviceBackend::enable_fusion] or [Glm5NextDeviceBackend::enable_group_fusion]:
+    /// sessions become handles on this engine.
+    fused: Option<Fused>,
+}
+
+/// The engine a fused backend's sessions are handles on.
+enum Fused {
+    /// This rank alone.
+    Local(Arc<FusedEngine<GlmFusion>>),
+    /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs.
+    Group(Arc<FusedEngine<GroupLanes<GlmFusion, GlmWire>>>),
+}
+
+/// What GLM's group refuses and carries ([GroupWire]): rank 0 refuses a prompt over the context
+/// or with images (the vision tower is not loaded) before it broadcasts, and a request's whole
+/// sampler crosses ([sampler_frame]) because every rank's picks decide what its verify keeps.
+pub struct GlmWire {
+    context: usize,
+}
+
+impl GroupWire for GlmWire {
+    fn name(&self) -> &'static str {
+        "glm"
+    }
+
+    fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
+        if !images.is_empty() {
+            return Err(BackendError::new(
+                "request",
+                "the GLM arm serves text: its vision tower is not loaded",
+            ));
+        }
+        if tokens.len() > self.context {
+            return Err(BackendError::new(
+                "context",
+                format!(
+                    "the prompt needs {} positions, {} remain",
+                    tokens.len(),
+                    self.context
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sampler(&self, sampling: &Sampling) -> Option<Tp4FrameSampler> {
+        sampler_frame(sampling)
+    }
+
+    fn sampling(&self, sampler: Option<Tp4FrameSampler>) -> Sampling {
+        frame_sampling(sampler)
+    }
+
+    fn images(&self, frames: Vec<Tp4DeviceImage>) -> Result<Vec<VisionImage>, String> {
+        if frames.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("the GLM arm serves text: a frame named image spans".to_owned())
+        }
+    }
 }
 
 impl GlmFusion {
@@ -116,9 +202,84 @@ impl GlmFusion {
             spec: spec.map(|spec| Speculator::new(spec.drafts, spec.policy.clone())),
             pending: Queue::new(),
             confidence: Vec::new(),
+            opening: None,
             consumed: Vec::new(),
             prefill_cached: 0,
         })
+    }
+
+    /// The drafter the slots draft with, if one is configured.
+    fn spec(&self) -> Option<&SpecConfig> {
+        self.shared.spec.get()
+    }
+}
+
+impl RoundArm for GlmFusion {
+    type Member = Glm5NextSession;
+
+    fn open(&self, member: &mut Glm5NextSession, token: u32) -> Result<Opened, BackendError> {
+        if let Some(step) = member.feed(token)? {
+            return Ok(Opened::Held(step));
+        }
+        member.open_round(token)
+    }
+
+    /// One [DeviceRank::verify_batch] over every member's token and the drafts it was given, then
+    /// each member keeps what the model chose, as its round alone would.
+    fn verify(
+        &self,
+        round: &mut [(&mut Glm5NextSession, u32, usize)],
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        let mut openings = Vec::with_capacity(round.len());
+        for (member, _, depth) in round.iter_mut() {
+            let (mut chunk, confidence) = member.opening.take().ok_or_else(|| {
+                BackendError::new("glm5_device", "a member walks a round it never opened")
+            })?;
+            chunk.truncate(*depth + 1);
+            openings.push((chunk, confidence));
+        }
+        let mut rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let rows = {
+            let mut batch: Vec<(&mut DeviceSequence, &[u32])> = round
+                .iter_mut()
+                .zip(&openings)
+                .map(|((member, _, _), (chunk, _))| (&mut member.sequence, chunk.as_slice()))
+                .collect();
+            rank.verify_batch(&self.shared.tp, &self.shared.gather, &mut batch)?
+        };
+        if rows.len() != round.len() {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "a verify of {} members answered {}",
+                    round.len(),
+                    rows.len()
+                ),
+            ));
+        }
+        round
+            .iter_mut()
+            .zip(openings)
+            .zip(rows)
+            .map(|(((member, _, _), (chunk, confidence)), rows)| {
+                member.settle(&rank, &chunk, &confidence, rows)
+            })
+            .collect()
+    }
+
+    fn wall(&self) -> &dyn StepWall {
+        &self.wall
+    }
+
+    /// A walk is one rank step of at most [crate::device::MAX_ROWS] rows, a row each member's
+    /// token.
+    fn budget(&self, seqs: usize) -> usize {
+        let depth = self.spec().map_or(0, |spec| spec.drafts);
+        (seqs * depth).min(crate::device::MAX_ROWS.saturating_sub(seqs))
     }
 }
 
@@ -126,9 +287,7 @@ impl FusedArm for GlmFusion {
     type Slot = Glm5NextSession;
 
     fn open_slot(&self) -> Result<Glm5NextSession, BackendError> {
-        // A fused batch and a drafter are different trades on the same step, and this arm runs
-        // one of them: [Glm5NextDeviceBackend::enable_fusion] refuses to combine them.
-        self.slot(None)
+        self.slot(self.spec())
     }
 
     fn holds_request(&self, slot: &Glm5NextSession) -> bool {
@@ -136,8 +295,27 @@ impl FusedArm for GlmFusion {
     }
 
     fn renew(&self, slot: &mut Glm5NextSession) -> Result<(), BackendError> {
-        *slot = self.slot(None)?;
+        *slot = self.slot(self.spec())?;
         Ok(())
+    }
+
+    /// Whether the rank's lane pool can back the slot's next job now, as the prefill or step
+    /// would find it: a prompt that does not extend what the slot holds starts a fresh sequence,
+    /// and the chunks this one holds go back to the pool first.
+    fn room(&self, slot: &Glm5NextSession, prompt: Option<&[u32]>) -> bool {
+        let sequence = &slot.sequence;
+        match prompt {
+            Some(tokens) => {
+                let keeps = slot
+                    .reusable_prefix()
+                    .is_some_and(|held| held.len() < tokens.len() && tokens.starts_with(held));
+                sequence.room(tokens.len(), !keeps)
+            }
+            None => {
+                let drafts = self.spec().map_or(0, |spec| spec.drafts);
+                sequence.room(sequence.position() + 1 + drafts, false)
+            }
+        }
     }
 
     fn set_sampling(&self, slot: &mut Glm5NextSession, sampling: Sampling) {
@@ -152,10 +330,22 @@ impl FusedArm for GlmFusion {
         slot.prefill(tokens)
     }
 
+    /// Drafting members verify their rounds in one walk ([run_round]); a lone member, or every
+    /// member with [sparkflash_runtime::JOINT_ROUNDS_ENV] off, runs its round alone. Members that
+    /// draft nothing are one row each of one [DeviceRank::forward_batch_greedy].
     fn step(
         &self,
         members: &mut [(Glm5NextSession, u32)],
     ) -> Result<Vec<StepOutput>, BackendError> {
+        if self.spec().is_some() {
+            if members.len() > 1 && self.joint_rounds {
+                return run_round(self, members);
+            }
+            return members
+                .iter_mut()
+                .map(|(slot, token)| slot.decode(*token))
+                .collect();
+        }
         let mut rank = self
             .shared
             .rank
@@ -193,6 +383,16 @@ impl FusedArm for GlmFusion {
 
     fn speculation(&self, slot: &Glm5NextSession) -> Speculation {
         slot.speculation()
+    }
+
+    /// A kept draft's answer is held. The caches have consumed it already and a GLM sequence
+    /// cannot rewind, so an unused run is not given back: the engine renews the slot (the default
+    /// [FusedArm::give_back] refuses), which its next prompt would do anyway, since the arm keeps
+    /// no history.
+    fn ready(&self, slot: &Glm5NextSession, token: u32) -> bool {
+        slot.pending
+            .front()
+            .is_some_and(|front| front.token == token)
     }
 
     fn max_batch(&self) -> usize {
@@ -384,7 +584,14 @@ impl Glm5NextDeviceBackend {
         Self::from_rank(config, rank, tp, gather, context_limit)
     }
 
-    fn from_rank(
+    /// The backend over a rank the caller has already loaded, with the collectives that place it
+    /// in its group: the four-rank serve path loads its rank once (converted file, latent cache,
+    /// drafter) and serves it through this backend's sessions.
+    ///
+    /// # Errors
+    /// A context outside the model's window, or a collective whose rank or world disagrees with
+    /// the rank's layout.
+    pub fn from_rank(
         config: Glm5NextConfig,
         rank: DeviceRank,
         tp: TpRuntime,
@@ -432,24 +639,76 @@ impl Glm5NextDeviceBackend {
     /// The host driver gives every request its own session, so without this N workers read the
     /// rank's 82 GB N times for N rows. With it each session is a handle on one engine thread,
     /// which batches whatever is waiting into a single `forward_batch_greedy`. Call it before
-    /// the first session opens, and before any session drafts: this arm does one or the other.
+    /// the first session opens and after [Self::enable_speculation], if the sessions draft: then
+    /// their rounds verify together.
     ///
     /// # Errors
-    /// A slot the rank cannot allocate, a thread that cannot start, or a rank already told to
-    /// draft.
+    /// A slot the rank cannot allocate, a thread that cannot start, or a
+    /// [sparkflash_runtime::JOINT_ROUNDS_ENV] that is neither on nor off.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        if self.shared.spec.get().is_some() {
-            return Err(BackendError::new(
-                "glm5_device",
-                "a fused batch verifies no drafts; choose fusion or speculation",
-            ));
-        }
-        let arm = Arc::new(GlmFusion {
+        let arm = Arc::new(self.lanes()?);
+        self.fused = Some(Fused::Local(FusedEngine::start(arm, capacity)?));
+        Ok(())
+    }
+
+    /// [Self::enable_fusion] on rank 0 of a group: every lane's prompt, step, give-back and
+    /// release is broadcast through `hub` before it runs here, and each worker replays them
+    /// ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same sequence on
+    /// every rank and the collectives inside a step line up.
+    ///
+    /// # Errors
+    /// As [Self::enable_fusion].
+    pub fn enable_group_fusion(
+        &mut self,
+        capacity: usize,
+        hub: Arc<Mutex<Tp4ControlHub>>,
+    ) -> Result<(), BackendError> {
+        let wire = GlmWire {
+            context: self.context_limit,
+        };
+        let arm = Arc::new(GroupLanes::new(self.lanes()?, hub, wire));
+        self.fused = Some(Fused::Group(FusedEngine::start(arm, capacity)?));
+        Ok(())
+    }
+
+    /// A worker of a group: replays rank 0's lane frames over `capacity` lanes of this rank's own
+    /// until the control channel ends. Configure speculation first, as rank 0 does.
+    ///
+    /// # Errors
+    /// The arm's configuration, a frame the ranks disagree on, or the channel's end.
+    pub fn mirror_group(
+        &self,
+        control: &mut Tp4ControlWorker,
+        capacity: usize,
+    ) -> Result<(), String> {
+        let lanes = self.lanes().map_err(|error| error.to_string())?;
+        let wire = GlmWire {
+            context: self.context_limit,
+        };
+        mirror_lanes(control, &lanes, &wire, capacity)
+    }
+
+    /// The fused arm over this rank: its slots, joint rounds and walk cost.
+    fn lanes(&self) -> Result<GlmFusion, BackendError> {
+        let joint = sparkflash_runtime::joint_rounds()
+            .map_err(|error| BackendError::new("config", error))?;
+        let config = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?
+            .config()
+            .clone();
+        Ok(GlmFusion {
             shared: Arc::clone(&self.shared),
             context_limit: self.context_limit,
-        });
-        self.fused = Some(FusedEngine::start(arm, capacity)?);
-        Ok(())
+            joint_rounds: joint,
+            wall: ExpertUnionWall {
+                experts: config.n_routed_experts,
+                top_k: config.num_experts_per_tok,
+                ..JOINT_WALL
+            },
+        })
     }
 
     /// Whether this backend steps its sessions together.
@@ -466,7 +725,7 @@ impl Glm5NextDeviceBackend {
     /// [ModelBackend::open_session].
     ///
     /// # Errors
-    /// When the rank has no MTP layer.
+    /// When the rank has no MTP layer, or its sessions are already fused.
     pub fn enable_speculation(
         &mut self,
         drafts: usize,
@@ -478,7 +737,7 @@ impl Glm5NextDeviceBackend {
         if self.fused.is_some() {
             return Err(BackendError::new(
                 "glm5_device",
-                "a fused batch verifies no drafts; choose fusion or speculation",
+                "speculation is configured before fusion: the fused slots are already open",
             ));
         }
         let has_mtp = {
@@ -585,10 +844,18 @@ impl ModelBackend for Glm5NextDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        if let Some(engine) = &self.fused {
-            return engine
-                .open()
-                .map(|session| Box::new(session) as Box<dyn ModelSession>);
+        match &self.fused {
+            Some(Fused::Local(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            Some(Fused::Group(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            None => {}
         }
         let spec = self.shared.spec.get().cloned();
         let rank = self
@@ -613,6 +880,7 @@ impl ModelBackend for Glm5NextDeviceBackend {
                 .map(|spec| Speculator::new(spec.drafts, spec.policy.clone())),
             pending: Queue::new(),
             confidence: Vec::new(),
+            opening: None,
             consumed: Vec::new(),
             prefill_cached: 0,
         }))
@@ -638,6 +906,9 @@ pub struct Glm5NextSession {
     pending: Queue,
     /// The drafter's confidence in each of the last round's drafts.
     confidence: Vec<f32>,
+    /// A round opened for a shared walk: its token and drafts, and the confidence its depth was
+    /// chosen from ([GlmFusion]'s [RoundArm::open]).
+    opening: Option<(Vec<u32>, Vec<f32>)>,
     /// Every token this sequence has forwarded, oldest first: every prefill's fresh tokens and
     /// every decode's. A request that extends this list forwards only what it adds.
     consumed: Vec<u32>,
@@ -697,11 +968,27 @@ impl Glm5NextSession {
         if self.spec.is_none() {
             return self.step(&[anchor]);
         }
-        let mut rank = self
-            .shared
+        let shared = Arc::clone(&self.shared);
+        let mut rank = shared
             .rank
             .lock()
             .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let (chunk, confidence) = self.draft_after(&rank, anchor)?;
+        let rows = {
+            let mut batch = [(&mut self.sequence, chunk.as_slice())];
+            rank.verify_batch(&shared.tp, &shared.gather, &mut batch)?
+        };
+        let rows = rows.into_iter().next().unwrap_or_default();
+        self.settle(&rank, &chunk, &confidence, rows)
+    }
+
+    /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows, with
+    /// the confidence the depth was chosen from (the last round's).
+    fn draft_after(
+        &mut self,
+        rank: &DeviceRank,
+        anchor: u32,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
         // A draft writes the MTP caches past what the sequence keeps, so a chain longer than the
         // room left would draft past the window.
         let room = self
@@ -726,31 +1013,92 @@ impl Glm5NextSession {
         let mut chunk = Vec::with_capacity(drafts.len() + 1);
         chunk.push(anchor);
         chunk.extend_from_slice(&drafts);
-        let rows = {
-            let mut batch = [(&mut self.sequence, chunk.as_slice())];
-            rank.verify_batch(&self.shared.tp, &self.shared.gather, &mut batch)?
-        };
-        let rows = rows.into_iter().next().unwrap_or_default();
-        let picks: Vec<u32> = rows
-            .iter()
-            .map(|row| self.sampler.choose(row, &self.sampling))
-            .collect();
-        let kept = verdict(&chunk, &picks);
+        Ok((chunk, confidence))
+    }
+
+    /// A verify of `chunk` answered `rows`: keep what the model chose, give the rest back before
+    /// the rank's next step, and queue the kept rows for the `decode` calls that feed them.
+    fn settle(
+        &mut self,
+        rank: &DeviceRank,
+        chunk: &[u32],
+        confidence: &[f32],
+        rows: Vec<Vec<f32>>,
+    ) -> Result<StepOutput, BackendError> {
+        // Rows past the first disagreement draw nothing, so a seeded answer does not depend on
+        // how many drafts the round verified.
+        let picks =
+            self.sampler
+                .choose_verify(rows.iter().map(Vec::as_slice), &chunk[1..], &self.sampling);
+        let kept = verdict(chunk, &picks);
         if chunk.len() > 1 {
             // Give back the rows the model did not keep, before this rank's next step.
             rank.commit(&mut self.sequence, kept)?;
         }
         if let Some(spec) = self.spec.as_mut() {
-            spec.observe(&confidence, chunk.len() - 1, kept);
+            spec.observe(confidence, chunk.len() - 1, kept);
         }
         let eos = &self.shared.eos;
-        self.pending.extend_round(&chunk, &picks, &rows, kept, eos);
+        self.pending.extend_round(chunk, &picks, &rows, kept, eos);
         let next_token = picks.first().copied().filter(|token| !eos.contains(token));
         Ok(StepOutput {
             logits: rows.first().cloned().unwrap_or_default(),
             next_token,
             draft: Vec::new(),
         })
+    }
+
+    /// The caller fed `token`: it joins the history, and the answer a verify already holds for
+    /// it is returned. `None` says the token still needs a round.
+    ///
+    /// # Errors
+    /// A token other than the one the verify kept: the caches have consumed that one already.
+    fn feed(&mut self, token: u32) -> Result<Option<StepOutput>, BackendError> {
+        self.sampler.record(token);
+        self.consumed.push(token);
+        // A verify already consumed this token and produced the answer: hand back the row it
+        // sampled, exactly as the one-token step it stands in for would have.
+        let Some(front) = self.pending.front() else {
+            return Ok(None);
+        };
+        let expected = front.token;
+        let Some(next) = self.pending.pop(token) else {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the engine fed token {token} where the verify produced {expected}; a \
+                     check that did not accept the drafts must be re-drafted"
+                ),
+            ));
+        };
+        Ok(Some(StepOutput {
+            logits: next.logits,
+            next_token: next.next_token,
+            draft: Vec::new(),
+        }))
+    }
+
+    /// Opens this sequence's round on `token` for a shared walk: drafts its chain as
+    /// [Self::round] would and reports the chance each leading run of it is accepted. The chain
+    /// waits in [Self::opening] for the walk's share of it.
+    ///
+    /// # Errors
+    /// A device failure while drafting.
+    fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let rank = shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let (chunk, confidence) = self.draft_after(&rank, token)?;
+        let drafts = chunk.len() - 1;
+        let mut chain = self
+            .spec
+            .as_ref()
+            .map_or_else(Vec::new, |spec| spec.chain(&self.confidence, drafts));
+        chain.truncate(drafts);
+        self.opening = Some((chunk, confidence));
+        Ok(Opened::Round(chain))
     }
 }
 
@@ -854,26 +1202,8 @@ impl ModelSession for Glm5NextSession {
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        self.sampler.record(token);
-        self.consumed.push(token);
-        // A verify already consumed this token and produced the answer: hand back the row it
-        // sampled, exactly as the one-token step it stands in for would have.
-        if let Some(front) = self.pending.front() {
-            let expected = front.token;
-            let Some(next) = self.pending.pop(token) else {
-                return Err(BackendError::new(
-                    "glm5_device",
-                    format!(
-                        "the engine fed token {token} where the verify produced {expected}; a \
-                         check that did not accept the drafts must be re-drafted"
-                    ),
-                ));
-            };
-            return Ok(StepOutput {
-                logits: next.logits,
-                next_token: next.next_token,
-                draft: Vec::new(),
-            });
+        if let Some(step) = self.feed(token)? {
+            return Ok(step);
         }
         self.round(token)
     }

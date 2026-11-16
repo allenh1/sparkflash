@@ -529,6 +529,133 @@ impl LaneSpan {
     }
 }
 
+/// The lanes a default [LanePool::budget] can always start together: the most any arm steps
+/// (Dory's recurrence group drafts up to 16).
+pub const FLOOR_LANES: usize = 16;
+
+/// One rank's lanes: the [LaneShape] every lane of the rank shares and the [ChunkPool] their
+/// chunks come from, which the rank's sequences share under a lock. An arm lays its sequence
+/// state out once ([Layout]), each sequence reserves one span of [LaneShape::stride] bytes and
+/// keeps a [LaneSpan] over it, and this backs, refuses and releases the spans' rows.
+#[derive(Debug)]
+pub struct LanePool {
+    shape: LaneShape,
+    pool: std::sync::Mutex<ChunkPool>,
+}
+
+impl LanePool {
+    /// A pool of `budget_bytes` ([Self::budget]) behind lanes of `shape`.
+    #[must_use]
+    pub fn new(shape: LaneShape, budget_bytes: usize) -> Self {
+        let pool = ChunkPool::new(shape.granularity, budget_bytes);
+        Self {
+            shape,
+            pool: std::sync::Mutex::new(pool),
+        }
+    }
+
+    /// The bytes a pool of lanes of `shape` holds: `configured_mb` MiB when the profile sets it
+    /// (`runtime.lane_memory_mb`, SPARKFLASH_LANE_MEMORY_MB), else what one sequence of `rows`
+    /// positions holds, so several sequences share what one whole context would. Either way it
+    /// is a number, the same on every rank of a group, so every rank refuses the same growth.
+    ///
+    /// The default is never less than [FLOOR_LANES] lanes' first backing step. Every part of a
+    /// lane takes whole chunks, so at a short context one sequence's worth may be a single chunk
+    /// and a second lane could not start at all. The budget only caps what the lanes map, and a
+    /// sequence never maps more than its own span, so the floor costs nothing until several
+    /// lanes grow at once.
+    #[must_use]
+    pub fn budget(shape: &LaneShape, rows: usize, configured_mb: Option<usize>) -> usize {
+        configured_mb.map_or_else(
+            || {
+                let whole = shape.chunks_for(rows, 0);
+                let starts = FLOOR_LANES * shape.chunks_for(1, 0);
+                whole.max(starts) * shape.granularity
+            },
+            |mb| mb << 20,
+        )
+    }
+
+    /// The lanes' layout.
+    #[must_use]
+    pub fn shape(&self) -> &LaneShape {
+        &self.shape
+    }
+
+    /// The pool, locked.
+    pub fn pool(&self) -> std::sync::MutexGuard<'_, ChunkPool> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Backs `span` for a sequence of `rows` positions.
+    ///
+    /// # Errors
+    /// [Self::short]'s refusal when the pool has too few chunks left, or a driver failure.
+    pub fn grow(
+        &self,
+        device: &impl ChunkDevice,
+        span: &mut LaneSpan,
+        rows: usize,
+    ) -> Result<(), String> {
+        let mut pool = self.pool();
+        if span.ensure(device, &self.shape, &mut pool, rows)? {
+            return Ok(());
+        }
+        Err(self.short(span, &pool, rows))
+    }
+
+    /// Whether the pool can back `rows` positions in `span` now, counting the chunks a reset
+    /// gives back first when `reset`.
+    #[must_use]
+    pub fn room(&self, span: &LaneSpan, rows: usize, reset: bool) -> bool {
+        let pool = self.pool();
+        if reset {
+            self.shape.chunks_for(rows, 0) <= pool.spare() + span.mapped()
+        } else {
+            span.fits(&self.shape, &pool, rows)
+        }
+    }
+
+    /// The refusal of a span that needs more chunks for `rows` positions than `pool` has spare.
+    #[must_use]
+    pub fn short(&self, span: &LaneSpan, pool: &ChunkPool, rows: usize) -> String {
+        let chunk = self.shape.granularity;
+        format!(
+            "lane memory: {rows} positions need {} MiB more and the sequences' pool has {} MiB of \
+             {} MiB spare (runtime.lane_memory_mb / SPARKFLASH_LANE_MEMORY_MB sets it)",
+            (span.chunks_needed(&self.shape, rows) * chunk) >> 20,
+            (pool.spare() * chunk) >> 20,
+            (pool.budget() * chunk) >> 20
+        )
+    }
+
+    /// Returns every chunk `span` holds to the pool. Nothing queued may still read the span.
+    ///
+    /// # Errors
+    /// A driver failure unmapping a chunk.
+    pub fn release(&self, device: &impl ChunkDevice, span: &mut LaneSpan) -> Result<(), String> {
+        if span.mapped() == 0 {
+            return Ok(());
+        }
+        let mut pool = self.pool();
+        span.release(device, &self.shape, &mut pool)
+    }
+
+    /// One line for the boot log: a lane's span, the pool and the chunk size.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let chunk = self.shape.granularity;
+        format!(
+            "{} MiB a lane at most, a {} MiB pool, {} KiB chunks",
+            self.shape.stride >> 20,
+            (self.pool().budget() * chunk) >> 20,
+            chunk >> 10
+        )
+    }
+}
+
 /// Rounds `value` up to a multiple of `to`.
 #[must_use]
 pub fn round_up(value: usize, to: usize) -> usize {
@@ -626,6 +753,33 @@ mod tests {
         assert_eq!(pool.spare(), 4);
         assert!(second.ensure(&device, &shape, &mut pool, 32).unwrap());
         assert_eq!(pool.mapped(), 3);
+    }
+
+    #[test]
+    fn a_lane_pool_refuses_alike_and_counts_a_reset_as_room() {
+        let shape = shape();
+        // A whole 4096-row sequence's worth is 320 chunks (256 of store, 64 of ring); at 32
+        // rows it would be three, and the floor lets FLOOR_LANES lanes take their first 16 rows
+        // (two chunks each).
+        assert_eq!(LanePool::budget(&shape, 4096, None), 320 * 1024);
+        assert_eq!(LanePool::budget(&shape, 32, None), FLOOR_LANES * 2 * 1024);
+        assert_eq!(LanePool::budget(&shape, 32, Some(2)), 2 << 20);
+        // A pool of one 32-row sequence's three chunks.
+        let lanes = LanePool::new(shape.clone(), 3 * 1024);
+        let device = Fake::default();
+        let mut first = LaneSpan::new(0, &shape);
+        let mut second = LaneSpan::new(shape.stride as u64, &shape);
+        lanes.grow(&device, &mut first, 32).unwrap();
+        let refusal = lanes.grow(&device, &mut second, 32).unwrap_err();
+        assert!(refusal.contains("SPARKFLASH_LANE_MEMORY_MB"), "{refusal}");
+        assert_eq!(second.mapped(), 0);
+        assert!(!lanes.room(&second, 32, false));
+        // A reset of the first gives its chunks back before it grows again.
+        assert!(lanes.room(&first, 32, true));
+        lanes.release(&device, &mut first).unwrap();
+        assert_eq!(first.mapped(), 0);
+        lanes.grow(&device, &mut second, 32).unwrap();
+        assert!(lanes.describe().contains("KiB chunks"));
     }
 
     #[test]

@@ -89,6 +89,51 @@ pub fn image_frames(images: &[VisionImage]) -> Vec<Tp4DeviceImage> {
         .collect()
 }
 
+/// A request's whole sampler as the frames carry it, `None` for the greedy default every worker
+/// assumes without one.
+///
+/// This is for a group whose workers pick what rank 0 picks: their picks decide what a verify
+/// keeps, so a worker that drew differently, or weighed a repetition differently, would keep a
+/// different chain and fall out of step. Every field crosses; only the prompt's length, which
+/// each rank's sampler counts from the prompt it prefills, does not.
+#[must_use]
+pub fn sampler_frame(sampling: &Sampling) -> Option<Tp4FrameSampler> {
+    let greedy = Sampling {
+        prompt_len: sampling.prompt_len,
+        ..Sampling::default()
+    };
+    if *sampling == greedy {
+        return None;
+    }
+    Some(Tp4FrameSampler {
+        temperature_bits: sampling.temperature.to_bits(),
+        top_p_bits: sampling.top_p.to_bits(),
+        top_k: u32::from_ne_bytes(sampling.top_k.to_ne_bytes()),
+        seed: sampling.seed,
+        repetition_penalty_bits: sampling.repetition_penalty.to_bits(),
+        presence_penalty_bits: sampling.presence_penalty.to_bits(),
+        frequency_penalty_bits: sampling.frequency_penalty.to_bits(),
+    })
+}
+
+/// A worker's sampling from [sampler_frame]'s frame: the greedy default without one.
+#[must_use]
+pub fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
+    let Some(sampler) = sampler else {
+        return Sampling::default();
+    };
+    Sampling {
+        temperature: f32::from_bits(sampler.temperature_bits),
+        top_p: f32::from_bits(sampler.top_p_bits),
+        top_k: i32::from_ne_bytes(sampler.top_k.to_ne_bytes()),
+        repetition_penalty: f32::from_bits(sampler.repetition_penalty_bits),
+        presence_penalty: f32::from_bits(sampler.presence_penalty_bits),
+        frequency_penalty: f32::from_bits(sampler.frequency_penalty_bits),
+        seed: sampler.seed,
+        prompt_len: 0,
+    }
+}
+
 /// The refusal of a prompt of `rows` positions (or a step) the lanes' memory cannot hold beside
 /// the sequences being served: the engine has already given up every idle one.
 #[must_use]
@@ -405,10 +450,19 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
     }
 
     /// Broadcast: every rank rolls the same lane back by the same count.
+    ///
+    /// Unlike a prompt or a step, rank 0 runs it before it is sent. A give-back is the lane's own
+    /// bookkeeping, with no collective for the workers to meet, so the order is free. An arm that
+    /// refuses it (GLM's holds no answers to give back) refuses on every rank alike, and the
+    /// engine renews the slot instead. Sending first would end every worker on that refusal,
+    /// while rank 0 renewed and stepped on into a collective no worker would join.
     fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
         if count == 0 {
             return Ok(());
         }
+        let frame_count = u32::try_from(count)
+            .map_err(|_| BackendError::new("group", format!("{count} answers to give back")))?;
+        self.arm.give_back(Self::slot(slot)?, count)?;
         if self.wire.trace() {
             eprintln!(
                 "[{}] serve rank 0 lane {} gives back {count}",
@@ -416,13 +470,10 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 slot.lane
             );
         }
-        let frame_count = u32::try_from(count)
-            .map_err(|_| BackendError::new("group", format!("{count} answers to give back")))?;
         self.send(&Tp4ControlFrame::LaneGiveBack {
             lane: slot.lane,
             count: frame_count,
-        })?;
-        self.arm.give_back(Self::slot(slot)?, count)
+        })
     }
 
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
@@ -533,10 +584,12 @@ mod tests {
     }
 
     /// A toy lane arm: a slot is the tokens its lane has consumed, and the record is every
-    /// prompt, step and give-back in the order the arm ran them.
+    /// prompt, step and give-back in the order the arm ran them. `refuses` makes it refuse every
+    /// give-back, as GLM's arm does.
     #[derive(Default)]
     struct ToyLanes {
         record: Mutex<Vec<String>>,
+        refuses: bool,
     }
 
     impl FusedArm for ToyLanes {
@@ -588,6 +641,12 @@ mod tests {
         }
 
         fn give_back(&self, slot: &mut Self::Slot, count: usize) -> Result<(), BackendError> {
+            if self.refuses {
+                return Err(BackendError::new(
+                    "toy",
+                    "this arm holds no answers to give back",
+                ));
+            }
             slot.truncate(slot.len().saturating_sub(count));
             self.record
                 .lock()
@@ -599,6 +658,35 @@ mod tests {
         fn speculation(&self, _slot: &Self::Slot) -> Speculation {
             Speculation::default()
         }
+    }
+
+    #[test]
+    fn a_whole_sampler_crosses_the_frame_and_greedy_sends_none() {
+        assert_eq!(
+            sampler_frame(&Sampling {
+                prompt_len: 9,
+                ..Sampling::default()
+            }),
+            None
+        );
+        assert_eq!(frame_sampling(None), Sampling::default());
+        let sampled = Sampling {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: -1,
+            repetition_penalty: 1.1,
+            presence_penalty: 0.5,
+            frequency_penalty: 0.25,
+            seed: 11,
+            prompt_len: 0,
+        };
+        assert_eq!(frame_sampling(sampler_frame(&sampled)), sampled);
+        // A greedy request with a penalty is not the default: its argmax moves.
+        let penalized = Sampling {
+            repetition_penalty: 1.2,
+            ..Sampling::default()
+        };
+        assert_eq!(frame_sampling(sampler_frame(&penalized)), penalized);
     }
 
     #[test]
@@ -660,6 +748,69 @@ mod tests {
             .broadcast(&Tp4ControlFrame::LaneStep {
                 members: vec![(5, 1)],
             })
+            .expect("the frame is written");
+        let error = worker
+            .join()
+            .expect("the worker finishes")
+            .expect_err("a lane outside the pool is refused");
+        assert!(error.contains("out of step"), "{error}");
+    }
+
+    #[test]
+    fn a_give_back_the_arm_refuses_never_reaches_the_workers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+        let address = listener.local_addr().expect("the bound address");
+        let refusing = || ToyLanes {
+            refuses: true,
+            ..ToyLanes::default()
+        };
+        let mirrored = Arc::new(refusing());
+        let worker = {
+            let mirrored = Arc::clone(&mirrored);
+            thread::spawn(move || {
+                let mut control = Tp4ControlWorker::connect(address, 1, 2, Duration::from_secs(5))
+                    .expect("a control connection");
+                control.handshake().expect("the handshake");
+                mirror_lanes(&mut control, mirrored.as_ref(), &Wire { context: 64 }, 1)
+            })
+        };
+        let hub = Arc::new(Mutex::new(
+            Tp4ControlHub::start_with_listener(listener, 2, Duration::from_secs(5))
+                .expect("the hub"),
+        ));
+        let lanes = GroupLanes::new(refusing(), Arc::clone(&hub), Wire { context: 64 });
+        let mut lane = lanes.open_slot().expect("lane 0");
+        lanes.prefill(&mut lane, &[1, 2]).expect("the prompt");
+        let mut members = vec![(lane, 3u32)];
+        lanes.step(&mut members).expect("the step");
+        let (mut lane, _) = members.pop().expect("lane 0");
+        // The engine renews a slot whose give-back is refused, and steps on.
+        lanes
+            .give_back(&mut lane, 2)
+            .expect_err("the arm refuses the give-back");
+        lanes.renew(&mut lane).expect("the lane renews");
+        lanes.prefill(&mut lane, &[5]).expect("the renewed prompt");
+        let mut members = vec![(lane, 6u32)];
+        lanes
+            .step(&mut members)
+            .expect("the step after the renewal");
+        let expected = vec![
+            "prefill [1, 2]".to_owned(),
+            "step [[1, 2, 3]]".to_owned(),
+            "prefill [5]".to_owned(),
+            "step [[5, 6]]".to_owned(),
+        ];
+        wait_for(
+            || *mirrored.record.lock().expect("the record") == expected,
+            "mirror the renewed lane's prompt and step, with no give-back",
+        );
+        assert!(
+            !worker.is_finished(),
+            "the refused give-back ended the worker"
+        );
+        hub.lock()
+            .expect("the hub")
+            .broadcast(&Tp4ControlFrame::LaneRelease { lane: 9 })
             .expect("the frame is written");
         let error = worker
             .join()

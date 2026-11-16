@@ -56,6 +56,8 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
+use sparkflash_runtime::Opened;
+
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
@@ -2790,7 +2792,7 @@ impl Qwen4ExpDeviceBackend {
             Arc::clone(&self.shared),
             self.context_limit,
             capacity,
-        ));
+        )?);
         self.fused = Some(sparkflash_runtime::FusedEngine::start(arm, capacity)?);
         Ok(())
     }
@@ -3091,6 +3093,9 @@ struct DeviceSequence {
     context_limit: usize,
     /// Verified answers whose tokens the engine has not consumed yet, oldest first.
     spec_queue: Vec<SpecPending>,
+    /// The verified answers the engine consumed since the last forward, oldest first: what a run
+    /// its caller ended early gives back ([Self::give_back]).
+    spec_served: Vec<SpecPending>,
     /// The MTP module's proposals for the positions after the last step, oldest first.
     spec_drafts: Vec<u32>,
     /// The DFlash 2 drafter's confidence in each of `spec_drafts`.
@@ -5302,6 +5307,7 @@ impl DeviceSequence {
             draft: buffers.draft,
             context_limit,
             spec_queue: Vec::new(),
+            spec_served: Vec::new(),
             spec_drafts: Vec::new(),
             spec_confidence: Vec::new(),
             // The chain is as wide as the drafter that fills it: the MTP pair is two rows by
@@ -5567,6 +5573,8 @@ impl DeviceSequence {
         hashers: &std::sync::Arc<Vec<Option<crate::ngram::PleHasher>>>,
     ) -> Result<StepOutput, BackendError> {
         let vocab = self.backend.config.vocab_size;
+        // The answers served from the last verify are behind this forward now.
+        self.spec_served.clear();
         // The model's choice at each row, in order, up to the first that disagrees with the draft
         // after it: every later row's prefix holds a token the model did not choose. An agreed
         // draft is in the sampler's history before the row after it is chosen, and no row past
@@ -5674,6 +5682,136 @@ impl DeviceSequence {
     }
 }
 
+impl DeviceSequence {
+    /// The caller fed `token`: it joins the history, and the step its last verify already holds
+    /// for it is answered with no device work. A verify holding a different token gives its chain
+    /// back, and `None` says the token still needs a forward.
+    ///
+    /// # Errors
+    /// A driver failure while the chain's state is given back.
+    fn feed(&mut self, token: u32) -> Result<Option<StepOutput>, BackendError> {
+        self.sampler.record(token);
+        self.consumed.push(token);
+        // A verified chain already fed the model this token, and its logits here are the ones the
+        // last step read back; only the choice of the following token is left to make.
+        if let Some(front) = self.spec_queue.first() {
+            if front.token == token {
+                let mut pending = self.spec_queue.remove(0);
+                let step = StepOutput {
+                    next_token: pending.next_token,
+                    logits: std::mem::take(&mut pending.logits),
+                    draft: Vec::new(),
+                };
+                self.spec_served.push(pending);
+                return Ok(Some(step));
+            }
+            // The caller fed something else, so every position past this one is a token the model
+            // never chose: hand them all back and resume from where this one belongs.
+            let pending = self
+                .spec_queue
+                .drain(..)
+                .next()
+                .expect("the queue was not empty");
+            self.spec_served.clear();
+            self.unwind(&pending)?;
+        }
+        Ok(None)
+    }
+
+    /// Puts the sequence back where `pending`'s token belongs, as if it had never been fed: the
+    /// convolution windows and recurrent state after the verify's rows before it, the n-gram
+    /// windows replayed past them, and no drafts.
+    ///
+    /// # Errors
+    /// A driver failure.
+    fn unwind(&mut self, pending: &SpecPending) -> Result<(), BackendError> {
+        self.restore_states(pending.region)?;
+        self.rollback_recurrent(pending.region + 1)?;
+        self.ple_hashers = (*pending.hashers).clone();
+        for row in &pending.replay {
+            self.push_hashers(*row)?;
+        }
+        self.position = pending.position;
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        Ok(())
+    }
+
+    /// Whether the last verify already holds the step fed `token`.
+    pub(super) fn holds(&self, token: u32) -> bool {
+        self.spec_queue
+            .first()
+            .is_some_and(|pending| pending.token == token)
+    }
+
+    /// The caller never used the last `count` steps this sequence answered from its verify: the
+    /// tokens fed for them leave the history and the sampler, and the state goes back to where
+    /// the first of them belongs ([Self::unwind]).
+    ///
+    /// # Errors
+    /// More answers than the last verify served, or a driver failure.
+    pub(super) fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let served = self.spec_served.len();
+        if count > served {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("{count} answers to give back, and the last verify served {served}"),
+            ));
+        }
+        let pending = self
+            .spec_served
+            .drain(served - count..)
+            .next()
+            .expect("the served answers were just counted");
+        self.spec_queue.clear();
+        self.unwind(&pending)?;
+        self.consumed.truncate(self.consumed.len() - count);
+        let history = self.sampler.history().len();
+        self.sampler.truncate(history - count);
+        Ok(())
+    }
+
+    /// Opens this sequence's round on `token` for a shared walk ([sparkflash_runtime::RoundArm]):
+    /// the step its last verify holds, or the chance each leading run of its drafts is accepted.
+    /// The drafts stay here until the walk takes its share of them ([Self::take_drafts]).
+    ///
+    /// # Errors
+    /// A driver failure while a chain is given back.
+    pub(super) fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = self.feed(token)? {
+            return Ok(Opened::Held(step));
+        }
+        let mut chain = self
+            .spec
+            .chain(&self.spec_confidence, self.spec_drafts.len());
+        chain.truncate(self.spec_drafts.len());
+        Ok(Opened::Round(chain))
+    }
+
+    /// The first `depth` drafts of the opened round and the drafter's confidence in each, for the
+    /// walk that verifies them; the rest are dropped.
+    pub(super) fn take_drafts(&mut self, depth: usize) -> (Vec<u32>, Vec<f32>) {
+        let mut drafts = std::mem::take(&mut self.spec_drafts);
+        let mut confidence = std::mem::take(&mut self.spec_confidence);
+        drafts.truncate(depth);
+        confidence.truncate(depth);
+        (drafts, confidence)
+    }
+
+    /// Records `token` as fed, for a walk that runs it without drafts.
+    pub(super) fn feed_plain(&mut self, token: u32) {
+        self.sampler.record(token);
+        self.consumed.push(token);
+    }
+}
+
 impl ModelBackend for Qwen4ExpDeviceBackend {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -5763,6 +5901,7 @@ impl ModelSession for DeviceSequence {
         // is re-drafted from the new end below, like a fresh prompt's.
         self.spec_drafts.clear();
         self.spec_confidence.clear();
+        self.spec_served.clear();
         let tokens = &tokens[reused..];
         // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
         // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
@@ -5824,35 +5963,8 @@ impl ModelSession for DeviceSequence {
             .cuda
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        self.sampler.record(token);
-        self.consumed.push(token);
-        // A verified chain already fed the model this token, and its logits here are the ones the
-        // last step read back; only the choice of the following token is left to make.
-        if let Some(front) = self.spec_queue.first() {
-            if front.token == token {
-                let pending = self.spec_queue.remove(0);
-                return Ok(StepOutput {
-                    next_token: pending.next_token,
-                    logits: pending.logits,
-                    draft: Vec::new(),
-                });
-            }
-            // The caller fed something else, so every position past this one is a token the model
-            // never chose: hand them all back and resume from where this one belongs.
-            let pending = self
-                .spec_queue
-                .drain(..)
-                .next()
-                .expect("the queue was not empty");
-            self.restore_states(pending.region)?;
-            self.rollback_recurrent(pending.region + 1)?;
-            self.ple_hashers = (*pending.hashers).clone();
-            for row in &pending.replay {
-                self.push_hashers(*row)?;
-            }
-            self.position = pending.position;
-            self.spec_drafts.clear();
-            self.spec_confidence.clear();
+        if let Some(step) = self.feed(token)? {
+            return Ok(step);
         }
         // Offer the drafts as the chain's later tokens. A step the policy gave no drafts is the
         // same call with one row - the verify path agrees with nothing and gives nothing back -

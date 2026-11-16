@@ -863,6 +863,18 @@ impl ServeOptions {
         // A registry model name selects a pack; the default DeepSeek arm is a pack identity but
         // not a PackArm, so the packed-model flag checks below are keyed on `is_arm`.
         let pack = cli.model.as_deref().and_then(pack::Pack::named);
+        // A `--tp4-rank` group whose arm opens its ranks as lanes steps [pack::GROUP_LANES] fused
+        // lanes unless the operator gives --concurrency (1 serves one request at a time).
+        #[cfg(feature = "tp4-serve")]
+        let group_lanes = cli.tp4_rank.is_some() && pack.is_some_and(pack::Pack::opens_group_lanes);
+        #[cfg(not(feature = "tp4-serve"))]
+        let group_lanes = false;
+        let fuse_batch = cli.fuse_batch || (group_lanes && cli.concurrency.is_none());
+        let concurrency = cli.concurrency.unwrap_or(if group_lanes && fuse_batch {
+            pack::GROUP_LANES
+        } else {
+            1
+        });
         let packed = pack.is_some_and(pack::Pack::is_arm);
         let group = group_from_cli(
             cli.rank,
@@ -940,7 +952,7 @@ impl ServeOptions {
             }
             // Fused lanes are the one way a group serves several requests: rank 0 sends each lane's
             // prompt and every step's members, so the ranks step the same rows in the same order.
-            if cli.concurrency != 1 && !cli.fuse_batch {
+            if concurrency != 1 && !fuse_batch {
                 return Err(
                     "--concurrency cannot be combined with --rank unless --fuse-batch steps the requests as lanes: the group runs one sequence across every rank, so a second worker would interleave two different token sequences"
                         .to_owned(),
@@ -1038,23 +1050,23 @@ impl ServeOptions {
         // The generic host driver's concurrency is a packed-model knob: each worker opens its own
         // session, which the V4.1 reference engine does not do (it has the continuous batching
         // scheduler above). Refusing the combination is better than silently running serial.
-        if cli.concurrency == 0 {
+        if concurrency == 0 {
             return Err("--concurrency must be at least 1".to_owned());
         }
-        if cli.concurrency > sparkflash_serve::host::DEFAULT_QUEUE {
+        if concurrency > sparkflash_serve::host::DEFAULT_QUEUE {
             return Err(format!(
                 "--concurrency {} exceeds the {}-request host queue",
-                cli.concurrency,
+                concurrency,
                 sparkflash_serve::host::DEFAULT_QUEUE
             ));
         }
         // The Inkling device group fuses its own lanes: rank 0's engine steps every waiting
         // request's row in one walk and broadcasts each step, so the group takes both knobs.
-        let fused_group = cli.fuse_batch && group.is_some();
-        if cli.fuse_batch && !packed && !fused_group {
+        let fused_group = fuse_batch && group.is_some();
+        if fuse_batch && !packed && !fused_group {
             return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
         }
-        if cli.fuse_batch && cli.concurrency < 2 {
+        if fuse_batch && concurrency < 2 {
             return Err("--fuse-batch needs --concurrency of at least 2".to_owned());
         }
         if cli.kv_budget_gib.is_some() && !packed {
@@ -1068,7 +1080,7 @@ impl ServeOptions {
         }
         // Dory's latent-recurrence group holds one sequence lane a concurrent request on every
         // rank; one Dory process stays serial.
-        if !packed && cli.concurrency != 1 && cli.recurrence_rank.is_none() && !fused_group {
+        if !packed && concurrency != 1 && cli.recurrence_rank.is_none() && !fused_group {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -1205,8 +1217,8 @@ impl ServeOptions {
                 let unapplied = pack.unapplied(
                     in_group,
                     group.is_some(),
-                    cli.concurrency,
-                    cli.fuse_batch,
+                    concurrency,
+                    fuse_batch,
                     cli.kv_budget_gib.is_some(),
                 );
                 if !unapplied.is_empty() {
@@ -1214,7 +1226,8 @@ impl ServeOptions {
                         "--model {model} {} does not apply {}; it is refused rather than ignored",
                         if in_group {
                             "in a tensor-parallel group, which serves one request at a time \
-                             unless it is the Inkling device group stepping --fuse-batch lanes,"
+                             unless it is the Inkling device group or the GLM group stepping \
+                             --fuse-batch lanes,"
                         } else {
                             "at TP=1"
                         },
@@ -1225,8 +1238,8 @@ impl ServeOptions {
         }
         // A fused group opens one lane a concurrent request on every rank.
         let group = group.map(|mut group| {
-            if cli.fuse_batch {
-                group.lanes = cli.concurrency;
+            if fuse_batch {
+                group.lanes = concurrency;
             }
             group
         });
@@ -1248,8 +1261,8 @@ impl ServeOptions {
                 numerics: cli.numerics,
                 continuous_batching: cli.continuous_batching,
                 max_batch,
-                concurrency: cli.concurrency,
-                fuse_batch: cli.fuse_batch,
+                concurrency,
+                fuse_batch,
                 kv_budget_gib: cli.kv_budget_gib,
                 element_limit,
                 engine: cli.engine,
@@ -1459,16 +1472,20 @@ struct ServeArgs {
     /// How many packed-model requests the generic host driver runs at once.
     ///
     /// Each worker owns one session, so this is concurrent execution, not a fused batch. The
-    /// default is 1 (one request at a time); the flag is refused without --model because the
-    /// V4.1 engine's concurrency knob is --continuous-batching/--max-batch.
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    concurrency: usize,
+    /// default is 1 (one request at a time), except in a --tp4-rank group whose arm steps fused
+    /// lanes (GLM), which serves four at once unless this says otherwise (1: one at a time). The
+    /// flag is refused without --model because the V4.1 engine's concurrency knob is
+    /// --continuous-batching/--max-batch.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
     /// Step the packed model's concurrent sessions as one batch over the weights (--model only).
     ///
     /// Each decode step reads the model's weights once for every session; a fused batch reads
     /// them once for all of them, which is the only way concurrent requests add throughput on a
-    /// step bound by weight traffic. Requires --concurrency above 1. A member keeps its drafter -
-    /// its verify's rows join the same pass - and a prefill still runs alone.
+    /// step bound by weight traffic. Requires --concurrency above 1, which a --tp4-rank group whose
+    /// arm steps lanes (GLM) defaults to four, and that group fuses unless --concurrency is given.
+    /// A member keeps its drafter - its verify's rows join the same pass - and a prefill still
+    /// runs alone.
     #[arg(long)]
     fuse_batch: bool,
     /// How much KV memory the packed model's session caches may claim, in GiB.
@@ -4642,13 +4659,59 @@ fn open_pack_collective(
     Ok((tp, BitGatherHandle::new(gather)))
 }
 
-/// Opens one GLM-5.3-Flash rank of the serve-owned TP=4 group.
+/// One GLM-5.3-Flash rank of a group as it comes off the disk: its weights, drafter and
+/// collective, and the drafting the profile asks of it. Both of the group's serving shapes open
+/// their rank here: one request at a time ([open_glm_tp4_rank]) and fused lanes
+/// ([open_glm_lanes]).
+#[cfg(feature = "tp4-serve")]
+struct GlmLoadedRank {
+    rank: DeviceRank,
+    tp: TpRuntime,
+    gather: BitGatherHandle,
+    config: sparkflash_model_glm5_next::Glm5NextConfig,
+    /// How many drafts a drafting request verifies after each token; 0 decodes a token a step.
+    drafts: usize,
+    /// Whether a DFlash 2 block drafter is loaded, which makes the depth adaptive.
+    block: bool,
+    origin: String,
+    started: Instant,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl GlmLoadedRank {
+    /// The shared speculator's depth rule for this rank's drafts: adaptive over a block drafter,
+    /// because it says how sure it is of each draft, else fixed.
+    fn depth_policy(&self) -> Option<sparkflash_model::DepthPolicy> {
+        self.block.then(|| {
+            sparkflash_model::DepthPolicy::adaptive(
+                self.drafts,
+                sparkflash_model_glm5_next::DFLASH2_STEP_COST,
+            )
+        })
+    }
+
+    /// Announces the load and answers how long it took.
+    fn announce(&self, rank: &Tp4RankConfig) -> u64 {
+        let load_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {}; {} collective",
+            rank.rank,
+            rank.world_size,
+            load_ms as f64 / 1000.0,
+            self.origin,
+            self.tp.label()
+        );
+        load_ms
+    }
+}
+
+/// Loads one GLM-5.3-Flash rank of the serve-owned group.
 ///
 /// The weights come from the checkpoint directory (or its index's parent), the configuration from
 /// its `config.json` or the carried release, and the collective from the same TCP seams the
 /// `glm-tp4` harness uses ([open_pack_collective]).
 #[cfg(feature = "tp4-serve")]
-fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
     let started = Instant::now();
     let directory = pack::checkpoint_directory(&config.checkpoint);
     let glm_config = pack::read_config::<pack::GlmArm>(&directory)?;
@@ -4751,31 +4814,58 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
     // block reads, unless the profile keeps it on the token path (`prefill.drafting_prompt`).
     rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(true));
     let block = rank.has_block_drafter();
-    let most = rank.max_drafts();
-    // How many drafts a greedy request verifies after each token: the whole block when a block
-    // drafter is loaded, else the MTP layer's 2 (the harness's best at one stream); 0 decodes a
-    // token a step.
-    let drafts = match profile.speculation.drafts {
-        None if block => most,
-        None => 2.min(most),
-        Some(drafts) if drafts <= most => drafts,
-        Some(drafts) => {
-            return Err(format!(
-                "speculation.drafts={drafts} is not a draft count from 0 to {most}"
-            ));
-        }
-    };
-    // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
-    // token, which is what takes this arm past the MTP layer's two drafts. The depth is the
-    // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
+    let drafts = glm_group_drafts(&profile.speculation, block, rank.max_drafts())?;
+    Ok(GlmLoadedRank {
+        rank,
+        tp,
+        gather,
+        config: glm_config,
+        drafts,
+        block,
+        origin,
+        started,
+    })
+}
+
+/// How many drafts a GLM group rank verifies after each token: the whole block when a block
+/// drafter is loaded, else the MTP layer's 2 (the harness's best at one stream); 0 decodes a
+/// token a step, which `speculation.enabled=false` (SPARKFLASH_GLM_SPEC=off) asks for too.
+///
+/// # Errors
+/// A draft count past what the rank drafts, or one asked for with speculation turned off.
+#[cfg(feature = "tp4-serve")]
+fn glm_group_drafts(
+    spec: &sparkflash_model::profile::SpeculationProfile,
+    block: bool,
+    most: usize,
+) -> Result<usize, String> {
+    match (spec.enabled, spec.drafts) {
+        (Some(false), None | Some(0)) => Ok(0),
+        (Some(false), Some(drafts)) => Err(format!(
+            "speculation.enabled=false with speculation.drafts={drafts}: say one or the other"
+        )),
+        (_, None) if block => Ok(most),
+        (_, None) => Ok(2.min(most)),
+        (_, Some(drafts)) if drafts <= most => Ok(drafts),
+        (_, Some(drafts)) => Err(format!(
+            "speculation.drafts={drafts} is not a draft count from 0 to {most}"
+        )),
+    }
+}
+
+/// Opens one GLM-5.3-Flash rank of the serve-owned group serving one request at a time.
+#[cfg(feature = "tp4-serve")]
+fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let loaded = load_glm_tp4_rank(config)?;
+    let rank = &loaded.rank;
     // The window every request resets and reuses. Allocating it per request cost every rank about a
     // second of a short prompt's first token at the 1M default; here a window that does not fit
     // beside the weights is refused at startup, not at the first request. A drafting window also
     // keeps the MTP layer's caches, and a block-drafting one the drafter's own.
-    let sequence = if block {
+    let sequence = if loaded.block {
         rank.new_block_drafting_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
-    } else if drafts > 0 {
+    } else if loaded.drafts > 0 {
         rank.new_drafting_sequence(config.context)
             .map_err(|error| {
                 format!("the GLM request window: {error} (speculation.drafts=0 drafts nothing)")
@@ -4784,23 +4874,15 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         rank.new_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
     };
-    let spec = sparkflash_model::Speculator::new(
-        drafts,
-        block.then(|| {
-            sparkflash_model::DepthPolicy::adaptive(
-                drafts,
-                sparkflash_model_glm5_next::DFLASH2_STEP_COST,
-            )
-        }),
-    );
-    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    eprintln!(
-        "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}; {} collective",
-        config.rank,
-        config.world_size,
-        load_ms as f64 / 1000.0,
-        tp.label()
-    );
+    let spec = sparkflash_model::Speculator::new(loaded.drafts, loaded.depth_policy());
+    let load_ms = loaded.announce(config);
+    let GlmLoadedRank {
+        rank,
+        tp,
+        gather,
+        config: glm_config,
+        ..
+    } = loaded;
     Ok(Box::new(GlmTp4Rank {
         eos: glm_config.eos_token_ids.clone(),
         rank,
@@ -4817,6 +4899,52 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         steps: 0,
         last_step_ms: 0,
     }))
+}
+
+/// Opens one GLM-5.3-Flash rank of the serve-owned group stepping `lanes` fused lanes
+/// ([Glm5NextDeviceBackend::enable_group_fusion]).
+///
+/// The rank drafts as [open_glm_tp4_rank]'s does, so the two shapes serve the same tokens. Rank 0
+/// answers its backend, which broadcasts every lane's frames through the control hub before it
+/// runs them; a worker mirrors those frames over its own `lanes` lanes and answers `None` only if
+/// the channel's end is clean, which it never is: rank 0's exit ends it with an error.
+///
+/// [Glm5NextDeviceBackend::enable_group_fusion]: sparkflash_model_glm5_next::Glm5NextDeviceBackend::enable_group_fusion
+#[cfg(feature = "tp4-serve")]
+fn open_glm_lanes(
+    config: &Tp4RankConfig,
+    lanes: usize,
+) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    let loaded = load_glm_tp4_rank(config)?;
+    let policy = loaded.depth_policy();
+    let drafts = loaded.drafts;
+    loaded.announce(config);
+    let mut backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend::from_rank(
+        loaded.config,
+        loaded.rank,
+        loaded.tp,
+        loaded.gather,
+        config.context,
+    )
+    .map_err(|error| error.to_string())?;
+    backend
+        .enable_speculation(drafts, policy)
+        .map_err(|error| error.to_string())?;
+    if config.rank == 0 {
+        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
+            .map_err(|error| format!("rank 0 control channel: {error}"))?;
+        backend
+            .enable_group_fusion(lanes, Arc::new(std::sync::Mutex::new(hub)))
+            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
+        eprintln!(
+            "sparkflash serve: GLM rank 0 steps {lanes} fused lanes over {} ranks, {drafts} draft(s)",
+            config.world_size
+        );
+        return Ok(Some(Box::new(backend)));
+    }
+    let mut control = tp4_control_worker(config)?;
+    backend.mirror_group(&mut control, lanes)?;
+    Ok(None)
 }
 
 /// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.

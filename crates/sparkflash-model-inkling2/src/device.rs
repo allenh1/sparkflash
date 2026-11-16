@@ -44,7 +44,7 @@ use sparkflash_kernels::cuda_driver::{
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
-use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
+use sparkflash_kernels::lane_memory::{LanePool, LaneSpan, Layout};
 use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
@@ -1198,14 +1198,10 @@ impl Shared {
         }
         let memory = Arc::new(LaneMemory::plan(self)?);
         if trace_on() || self.exchange.rank() == 0 {
-            let chunk = memory.shape.granularity;
             eprintln!(
-                "[inkling] rank {}: session caches back as they grow: {} MiB a lane at most, a \
-                 {} MiB pool, {} KiB chunks",
+                "[inkling] rank {}: session caches back as they grow: {}",
                 self.exchange.rank(),
-                memory.shape.stride >> 20,
-                (memory.pool().budget() * chunk) >> 20,
-                chunk >> 10
+                memory.lanes.describe()
             );
         }
         *lanes = Some(Arc::clone(&memory));
@@ -2654,7 +2650,7 @@ impl Drop for Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            memory.pool().drain(&*self.cuda);
+            memory.lanes.pool().drain(&*self.cuda);
         }
         if let Some(mut drafter) = self.dspark.take() {
             drafter.free(&self.cuda);
@@ -3978,14 +3974,13 @@ const LANE_QUANTUM: usize = 2048;
 /// A sliding layer's ring, the convolution histories and the scratch stay plain allocations:
 /// they do not grow with the context.
 struct LaneMemory {
-    shape: LaneShape,
+    lanes: LanePool,
     /// Each layer's key and value parts, `None` for a sliding layer.
     kv: Vec<Option<(usize, usize)>>,
     /// Each layer's [KeyTables] parts (gains, scales), where the layer keeps tables.
     tables: Vec<Option<(usize, usize)>>,
     /// Each drafter layer's key and value ring, `None` for one that keeps a window.
     draft: Vec<Option<(usize, usize)>>,
-    pool: Mutex<ChunkPool>,
 }
 
 impl LaneMemory {
@@ -4041,26 +4036,17 @@ impl LaneMemory {
             _ => Vec::new(),
         };
         let shape = layout.finish(granularity, LANE_QUANTUM);
-        let budget = sparkflash_model::active_profile()
-            .runtime
-            .lane_memory_mb
-            .map_or_else(
-                || shape.chunks_for(shared.context + READ_PAST, 0) * granularity,
-                |mb| mb << 20,
-            );
+        let budget = LanePool::budget(
+            &shape,
+            shared.context + READ_PAST,
+            sparkflash_model::active_profile().runtime.lane_memory_mb,
+        );
         Ok(Self {
-            shape,
+            lanes: LanePool::new(shape, budget),
             kv,
             tables,
             draft,
-            pool: Mutex::new(ChunkPool::new(granularity, budget)),
         })
-    }
-
-    fn pool(&self) -> std::sync::MutexGuard<'_, ChunkPool> {
-        self.pool
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -4094,9 +4080,9 @@ impl State {
         let hidden = shared.hidden();
         let mut total = 0usize;
         let memory = shared.lane_memory()?;
-        let base = cuda.vmm_reserve(memory.shape.stride)?;
+        let base = cuda.vmm_reserve(memory.lanes.shape().stride)?;
         let lane = Lane {
-            span: LaneSpan::new(base.0, &memory.shape),
+            span: LaneSpan::new(base.0, memory.lanes.shape()),
             memory: Arc::clone(&memory),
         };
         let kv_bytes = |rows: usize, width: usize| rows.max(1) * width * 2;
@@ -4195,41 +4181,19 @@ impl State {
     /// # Errors
     /// A pool with too few chunks left, or a driver failure.
     fn grow(&mut self, shared: &Shared, rows: usize) -> Result<(), String> {
-        let memory = Arc::clone(&self.lane.memory);
-        let mut pool = memory.pool();
-        let want = rows + READ_PAST;
-        if self
-            .lane
-            .span
-            .ensure(&*shared.cuda, &memory.shape, &mut pool, want)?
-        {
-            return Ok(());
-        }
-        Err(Self::short(&memory, &self.lane.span, &pool, want))
+        let lane = &mut self.lane;
+        lane.memory
+            .lanes
+            .grow(&*shared.cuda, &mut lane.span, rows + READ_PAST)
     }
 
     /// Whether the pool can back `rows` positions here now, counting the chunks a reset gives
     /// back first when `reset`.
     fn room(&self, rows: usize, reset: bool) -> bool {
-        let memory = &self.lane.memory;
-        let pool = memory.pool();
-        let want = rows + READ_PAST;
-        if reset {
-            memory.shape.chunks_for(want, 0) <= pool.spare() + self.lane.span.mapped()
-        } else {
-            self.lane.span.fits(&memory.shape, &pool, want)
-        }
-    }
-
-    fn short(memory: &LaneMemory, span: &LaneSpan, pool: &ChunkPool, rows: usize) -> String {
-        let chunk = memory.shape.granularity;
-        format!(
-            "lane memory: {rows} positions need {} MiB more and the sessions' pool has {} MiB of \
-             {} MiB spare (runtime.lane_memory_mb / SPARKFLASH_LANE_MEMORY_MB sets it)",
-            (span.chunks_needed(&memory.shape, rows) * chunk) >> 20,
-            (pool.spare() * chunk) >> 20,
-            (pool.budget() * chunk) >> 20
-        )
+        self.lane
+            .memory
+            .lanes
+            .room(&self.lane.span, rows + READ_PAST, reset)
     }
 
     /// Gives every chunk the lane holds back to the pool, once the device is done with them.
@@ -4238,11 +4202,8 @@ impl State {
             return Ok(());
         }
         shared.cuda.synchronize()?;
-        let memory = Arc::clone(&self.lane.memory);
-        let mut pool = memory.pool();
-        self.lane
-            .span
-            .release(&*shared.cuda, &memory.shape, &mut pool)
+        let lane = &mut self.lane;
+        lane.memory.lanes.release(&*shared.cuda, &mut lane.span)
     }
 
     /// The allocations this state owns outside its lane.
@@ -4267,7 +4228,7 @@ impl State {
         let _ = self.release(shared);
         shared.cuda.vmm_free(
             Deviceptr(self.lane.span.base()),
-            self.lane.memory.shape.stride,
+            self.lane.memory.lanes.shape().stride,
         );
     }
 
