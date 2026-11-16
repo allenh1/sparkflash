@@ -166,8 +166,11 @@ ring a `/32` route for every fast address of every peer through the port that re
 `ip_forward=1` so the Spark in between relays the diagonals; that switch is the kernel-wide
 `net.ipv4.ip_forward`, and the only routes the command adds are those per-address ones) on every
 Spark over SSH under `sudo -n` and applies them.
-The routes are worked out from the measured wiring, so after a pass that changes addresses, check
-again: a second pass may be offered to add them. The manual commands remain available behind
+The routes are worked out from the measured wiring, so they are only written once the wiring could be
+measured unambiguously: a pass that has to set the ARP sysctls first (the default `arp_ignore=0`
+lets every port answer for every address, so the cable map means nothing) hardens the ports, and
+the check that follows the job then offers the routes. After a pass that changes addresses or the
+ARP settings, check again: a second pass adds them. The manual commands remain available behind
 **Prefer to run the commands yourself**.
 
 The choice is saved as `[cluster].fabric_schedule` and exported to every rank as

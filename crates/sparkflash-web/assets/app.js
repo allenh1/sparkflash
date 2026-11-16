@@ -1549,7 +1549,7 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the Spark between them, and the port setup routes them there. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the element writes at four Sparks.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the Spark between them, and the port setup routes them there. The host reference transport's all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the element writes at four Sparks.",
   },
 ];
 
@@ -1577,7 +1577,7 @@ function fabricPicker(state, model) {
     !Array.isArray(peers) || reached.some((_, peer) => peer !== rank && !peers.includes(peer)));
   const parts = ['<div class="fabric">'];
   parts.push('<div class="fabric-head"><div><h3 class="fabric-title">Fabric</h3>' +
-    '<p class="fabric-sub">How the four Sparks are cabled. The cross-rank collectives follow this choice.</p></div>');
+    '<p class="fabric-sub">How the four Sparks are cabled. The host reference transport’s cross-rank all-reduces follow this choice; the device arm’s hot per-layer reduce runs on NCCL.</p></div>');
   if (measured) {
     if (!measured.links_measured) {
       parts.push('<span class="tag warn">Ports not probed</span>');
@@ -1735,6 +1735,10 @@ async function chooseFabric(schedule) {
     toast("Not saved: " + error.message, true);
     return;
   }
+  // The save succeeded, so the local state has to show it even if the refresh below fails:
+  // otherwise the next form save copies the old value back over the new one.
+  if (state.config && state.config.cluster) state.config.cluster.fabric_schedule = schedule;
+  renderGuide();
   toast(schedule === "switchless" ? "Switchless ring selected." : "Switched fabric selected.");
   try {
     // refreshState() repaints the form only when there are no unsaved edits; the fabric

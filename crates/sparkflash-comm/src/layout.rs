@@ -245,7 +245,12 @@ impl CollectiveLayout {
             FabricSchedule::HairpinRingReduceScatterAllGather => {
                 let forward = (to + self.world_size - from) % self.world_size;
                 let distance = forward.min(self.world_size - forward);
-                if self.world_size.is_multiple_of(2) && distance == self.world_size / 2 {
+                // A pair has no opposite rank: its only peer is the ring neighbour. At world 4
+                // (and any larger even world) the opposite rank is a diagonal.
+                if self.world_size > 2
+                    && self.world_size.is_multiple_of(2)
+                    && distance == self.world_size / 2
+                {
                     Some(FabricLink::HairpinDiagonal)
                 } else {
                     Some(FabricLink::RingEdge)
@@ -395,6 +400,11 @@ mod tests {
         assert_eq!(hairpin.link_between(3, 0), Some(FabricLink::RingEdge));
         assert_eq!(hairpin.link_between(0, 0), None);
         assert_eq!(hairpin.link_between(0, 4), None);
+
+        // A pair has no opposite rank: its only peer is the ring neighbour.
+        let pair = CollectiveLayout::hairpin_ring(2, 8).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(pair.link_between(0, 1), Some(FabricLink::RingEdge));
+        assert_eq!(pair.link_between(1, 0), Some(FabricLink::RingEdge));
 
         let switched = CollectiveLayout::one_shot(4, 8).unwrap_or_else(|error| panic!("{error}"));
         for from in 0..4 {

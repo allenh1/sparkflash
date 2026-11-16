@@ -75,8 +75,10 @@ base_port = 29601
 # writes at four ranks. A bare DAC
 # ring has no path to a non-neighbour until the Spark between the two cables forwards it, and the
 # launch opens a connection to every rank (the web check reports a silent one); the web port setup
-# routes the diagonals through that Spark and turns on forwarding. It is forwarded to every rank as
-# SPARKFLASH_FABRIC_SCHEDULE; "one-shot", "hairpin" and "ring" are accepted aliases.
+# routes the diagonals through that Spark and turns on forwarding. A launch from the web console
+# exports this value to every rank as SPARKFLASH_FABRIC_SCHEDULE; a hand-run launcher takes the
+# variable (or --fabric-schedule) from its own environment. "one-shot", "hairpin" and "ring" are
+# accepted aliases.
 fabric_schedule = "switched"
 # Empty means the user running the control plane.
 ssh_user = ""

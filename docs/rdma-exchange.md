@@ -73,11 +73,12 @@ fabric_schedule = "switchless"
 ~~~
 
 or per run on the CLI (`--fabric-schedule switchless`, `hairpin` and `ring` are aliases). The
-precedence is the `--fabric-schedule` flag, then `SPARKFLASH_FABRIC_SCHEDULE`, then
-`[cluster].fabric_schedule`; the launcher exports the saved value, which also overrides a stale
-entry in `[network].env`. Every rank of one group must run the same value: the collective does not
-negotiate it on the wire, so a rank started by hand with a different value disagrees with its peers
-at the first exchange. The web
+precedence is the `--fabric-schedule` flag, then `SPARKFLASH_FABRIC_SCHEDULE`; the web console's
+saved `[cluster].fabric_schedule` is exported as that variable by a console-driven launch (and
+overrides a stale entry in `[network].env`), while a hand-run launch reads the variable from its
+own environment. `sparkflash serve` itself does not read `sparkflash.toml`. Every rank of one group
+must run the same value: the collective does not negotiate it on the wire, so a rank started by
+hand with a different value disagrees with its peers at the first exchange. The web
 Setup page offers the same choice as a card in step 2 (**Connect the fast network**), which also
 measures the wiring with ARP probes and can set it to match, and the four-node launcher forwards the
 value to every rank; the host twin's `--fabric-schedule` covers the CPU test path. Both schedules

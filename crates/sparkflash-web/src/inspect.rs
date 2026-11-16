@@ -62,7 +62,7 @@ echo "rpfilter $(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 0
 for net in /sys/class/net/*; do
   name=${net##*/}
   [ -e "$net/device" ] || continue
-  echo "link $name $(cat "$net/mtu") $(cat "$net/operstate") $(cat "/proc/sys/net/ipv4/conf/$name/arp_ignore" 2>/dev/null || echo 0) $(cat "/proc/sys/net/ipv4/conf/$name/arp_announce" 2>/dev/null || echo 0)"
+  echo "link $name $(cat "$net/mtu") $(cat "$net/operstate") $(cat "/proc/sys/net/ipv4/conf/$name/arp_ignore" 2>/dev/null || echo 0) $(cat "/proc/sys/net/ipv4/conf/$name/arp_announce" 2>/dev/null || echo 0) $(cat "/proc/sys/net/ipv4/conf/$name/rp_filter" 2>/dev/null || echo 0)"
 done
 ip -4 -o addr show 2>/dev/null | awk '{d = "static"; for (i = 1; i <= NF; i++) if ($i == "dynamic") d = "dynamic"; print "addr", $2, $4, d}'
 ip -4 route show 2>/dev/null | sed 's/^/route /'
@@ -111,7 +111,8 @@ pub const FABRIC_MTU: u32 = 9000;
 
 /// The metric the fabric's host routes are written with. It has to be higher than the connected
 /// route of the address itself: the check picks the rail the kernel sources the fast subnet from
-/// by the lowest metric, and a host route must not change which rail that is.
+/// by the lowest metric, and a host route must not change which rail that is. A `/32` with this
+/// metric is the port setup's own route, so a re-cable that no longer needs it removes it.
 const FABRIC_ROUTE_METRIC: u32 = 200;
 
 /// The subnet suggested when no node has a fast-network address yet.
@@ -156,6 +157,8 @@ pub struct NetLink {
     pub arp_ignore: u8,
     /// Its own `arp_announce`.
     pub arp_announce: u8,
+    /// Its own `rp_filter`; the kernel uses the larger of this and `all`.
+    pub rp_filter: u8,
 }
 
 /// One IPv4 address.
@@ -282,6 +285,15 @@ pub fn parse_facts(text: &str) -> NodeFacts {
                 up: *state == "up",
                 arp_ignore: ignore.parse().unwrap_or(0),
                 arp_announce: announce.parse().unwrap_or(0),
+                rp_filter: 0,
+            }),
+            ("link", [name, mtu, state, ignore, announce, rp]) => facts.links.push(NetLink {
+                name: (*name).to_owned(),
+                mtu: mtu.parse().unwrap_or(0),
+                up: *state == "up",
+                arp_ignore: ignore.parse().unwrap_or(0),
+                arp_announce: announce.parse().unwrap_or(0),
+                rp_filter: rp.parse().unwrap_or(0),
             }),
             ("addr", [netdev, cidr, origin]) => {
                 let Some((ip, prefix)) = cidr.split_once('/') else {
@@ -422,6 +434,17 @@ impl NodeFacts {
 
     fn link(&self, name: &str) -> Option<&NetLink> {
         self.links.iter().find(|link| link.name == name)
+    }
+
+    /// Whether any of these ports is under strict reverse-path filtering. The kernel takes the
+    /// larger of the port's own value and `all`, so a per-interface 1 with `all=0` is strict too.
+    fn rp_strict(&self, netdevs: &[&str]) -> bool {
+        netdevs.iter().any(|netdev| {
+            self.link(netdev)
+                .map_or(0, |link| link.rp_filter)
+                .max(self.rp_filter)
+                == 1
+        })
     }
 
     /// The effective `arp_ignore` / `arp_announce` of a netdev: the larger of `all` and its own.
@@ -847,27 +870,27 @@ pub fn analyze_fabric(
                     });
                 }
             }
-            // A ring's diagonals are forwarded by the Spark between the cables, and strict
-            // reverse-path filtering drops exactly those packets: name it as the cause rather than
-            // letting the check blame the cables.
+            let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
+            // The ring's routes send traffic out the half of a port that does not own the source
+            // address, so strict reverse-path filtering drops it: name that as the cause instead
+            // of letting the check blame the cables.
             if fabric
                 .as_ref()
                 .is_some_and(|fabric| fabric.shape == FabricShape::Ring)
-                && facts.rp_filter == 1
+                && facts.rp_strict(&netdevs)
             {
                 findings.push(Finding {
                     rank: Some(rank),
                     severity: Severity::Error,
                     message: format!(
-                        "{} has strict reverse-path filtering \
-                         (net.ipv4.conf.all.rp_filter=1), which drops the traffic a bare ring \
-                         relays through a Spark. Run the network command shown for it (it sets \
-                         rp_filter=2), then check again.",
+                        "{} has strict reverse-path filtering on its fast ports, which drops the \
+                         traffic the ring's routes send out the other half of a port (a direct \
+                         neighbour and a diagonal alike). Run the network command shown for it \
+                         (it sets rp_filter=2), then check again.",
                         name(rank)
                     ),
                 });
             }
-            let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
             if shares_subnet(&rails) && !arp_ok(facts, &netdevs) {
                 findings.push(Finding {
                     rank: Some(rank),
@@ -1364,6 +1387,18 @@ fn same_host_route(have: &Route, route: &FabricRoute) -> bool {
         && have.via == via
 }
 
+/// Whether a route is one the setup wrote: a host route with the setup's metric. iproute2 prints a
+/// /32 destination with or without the prefix.
+fn is_fabric_host_route(route: &Route) -> bool {
+    route.metric == FABRIC_ROUTE_METRIC
+        && route
+            .destination
+            .strip_suffix("/32")
+            .unwrap_or(&route.destination)
+            .parse::<Ipv4Addr>()
+            .is_ok()
+}
+
 /// Whether the node already carries every route.
 fn routes_installed(facts: &NodeFacts, routes: &[FabricRoute]) -> bool {
     routes
@@ -1393,6 +1428,22 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
     let Some(fabric) = fabric.filter(|fabric| fabric.shape == FabricShape::Ring) else {
         return routes;
     };
+    // The map is only a cable map once every port answers ARP for its own address. With
+    // arp_ignore=0 a peer answers for every one of its addresses on every cable, so "it answered
+    // here" does not say which cable the address is on, and routing from that map writes next
+    // hops that the same pass's arp_ignore=1 then makes unresolvable. The ARP settings go in
+    // first; the next check measures the cables and these routes are written then.
+    let measurable = probes.iter().all(|probe| match probe {
+        Ok(facts) => {
+            let rails = facts.rails();
+            let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
+            netdevs.is_empty() || arp_ok(facts, &netdevs)
+        }
+        Err(_) => false,
+    });
+    if !measurable {
+        return routes;
+    }
     // Every fast address the nodes report, per rank. The transport does not bind a source
     // address, so a connection can leave with any of a Spark's addresses as its source; the peer
     // then has to route that address back, and therefore every address of every peer needs a
@@ -1526,14 +1577,31 @@ fn network_fixes(
         let unaddressed = facts.unaddressed();
         let required = &routes_by_rank[rank];
         let routes_missing = !required.is_empty() && !routes_installed(facts, required);
+        // A route the setup wrote that the measured fabric no longer needs: the netplan file is
+        // rewritten without it, so a re-cable to a switch does not leave the ring's detours (or a
+        // black hole once a next hop moves) behind.
+        let obsolete_routes = facts
+            .routes
+            .iter()
+            .filter(|route| is_fabric_host_route(route))
+            .any(|have| !required.iter().any(|route| same_host_route(have, route)));
         // The ring's relay is on whenever any route goes through another Spark. The sysctl file
         // keeps the switch for a reboot even when only the ARP settings need rewriting.
-        let routing_forwarding = required.iter().any(|route| route.via.is_some());
+        // The relay is on when a route goes through another Spark: either one this check derived,
+        // or one the setup already wrote (a route with a next hop and the setup's metric). The
+        // second case keeps the forwarding switch in the file when only the ARP settings need a
+        // rewrite, even though an unhardened host's map derives no routes.
+        let routing_forwarding = required.iter().any(|route| route.via.is_some())
+            || facts
+                .routes
+                .iter()
+                .any(|route| is_fabric_host_route(route) && route.via.is_some());
         let needs_forwarding = routing_forwarding && !facts.forward;
         // Loose reverse-path filtering is part of the relay: strict drops the forwarded packets.
-        let strict_rp = routing_forwarding && facts.rp_filter == 1;
+        let port_names: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
+        let strict_rp = routing_forwarding && facts.rp_strict(&port_names);
         let mut ports: Vec<(String, String)> = Vec::new();
-        let mut needs_netplan = !unaddressed.is_empty() || routes_missing;
+        let mut needs_netplan = !unaddressed.is_empty() || routes_missing || obsolete_routes;
         for rail in &rails {
             if rail.mtu.is_some_and(|mtu| mtu < FABRIC_MTU) {
                 needs_netplan = true;
@@ -1768,10 +1836,10 @@ for spec in "${pings[@]}"; do
 done
 wait
 sort "$out"
-# A present-but-unusable arping (no CAP_NET_RAW, or a refused raw socket) is not a missing
-# cable: every attempt fails, which would otherwise read as "nothing is plugged in". Say so
-# instead, and the check reports the wiring as unmeasured.
-if [ "$have_arping" = 1 ] && grep -qiE 'operation not permitted|permission denied' "$errs"; then
+# An arping that fails on every attempt *and says why* is a broken tool, not a missing cable
+# (no CAP_NET_RAW, a refused socket, an unknown interface, a different implementation). Say so
+# instead, and the check reports the wiring as unmeasured rather than blaming the cables.
+if [ "$have_arping" = 1 ] && [ -s "$errs" ] && ! grep -q '^link .* ok$' "$out"; then
   echo "arping unusable"
 fi
 exit 0
@@ -2517,6 +2585,18 @@ link enp1s0f1np1 1500 up 0 0
         );
         assert!(probe.links.is_empty(), "{text}");
         assert!(probe.reached.is_empty(), "{text}");
+
+        // A different failure (an unknown interface, say) is the same story: the tool rather than
+        // the cables.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_stub(
+            &dir.path().join("bin"),
+            "arping",
+            "echo 'arping: unknown interface: dev0' >&2\nexit 2\n",
+        );
+        write_stub(&dir.path().join("bin"), "ping", "exit 1\n");
+        let text = run_probe(dir.path(), &["ndev=dev0", "peer=1:10.0.0.3"]);
+        assert!(text.contains("arping unusable"), "{text}");
     }
 
     #[test]
@@ -2930,8 +3010,9 @@ link 3 enp1s0f1np1 198.51.100.13 ok
 
     #[test]
     fn strict_reverse_path_filtering_is_named_as_the_cause_on_a_ring() {
-        // The relay forwards packets whose source route names the other half of a port; strict
-        // rp_filter drops them, so the finding has to say that instead of blaming the cable.
+        // The ring's routes send traffic out the half of a port that does not own the source
+        // address; strict rp_filter drops it, so the finding says that instead of blaming the
+        // cable.
         let mut probes = cluster();
         for facts in probes.iter_mut().flatten() {
             facts.rp_filter = 1;
@@ -2943,18 +3024,148 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             true,
             1,
         );
-        let errors = errors(&report);
+        let stopped = errors(&report);
         assert!(
-            errors
+            stopped
                 .iter()
-                .any(|m| m.contains("rp_filter=1") && m.contains("rp_filter=2")),
-            "{errors:?}"
+                .any(|m| m.contains("strict reverse-path filtering") && m.contains("rp_filter=2")),
+            "{stopped:?}"
         );
         let fix = report.nodes[0]
             .network_fix
             .as_deref()
             .expect("a port fix is offered");
         assert!(fix.contains("net.ipv4.conf.all.rp_filter = 2"), "{fix}");
+
+        // The kernel takes the larger of the port's own value and `all`, so a per-port 1 with
+        // `all=0` is strict too.
+        let mut probes = cluster();
+        for facts in probes.iter_mut().flatten() {
+            facts.rp_filter = 0;
+            for link in &mut facts.links {
+                link.rp_filter = 1;
+            }
+        }
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(ring_fabric()),
+            true,
+            1,
+        );
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|m| m.contains("strict reverse-path filtering")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn routes_wait_for_the_arp_settings_that_make_the_cable_map_unambiguous() {
+        // With arp_ignore=0 every port of a peer answers for every address, so an answer does not
+        // say which cable the address is on. Routing from that map writes next hops the same
+        // pass's arp_ignore=1 then makes unresolvable; the ARP settings go in first.
+        let mut probes = cluster();
+        for facts in probes.iter_mut().flatten() {
+            facts.arp_all = (0, 0);
+        }
+        let fabric = ring_fabric();
+        assert!(
+            fabric_routes(&probes, Some(&fabric))
+                .iter()
+                .all(Vec::is_empty),
+            "an ARP-fluxy map must not be routed"
+        );
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(fabric.clone()),
+            true,
+            1,
+        );
+        let fix = report.nodes[0].network_fix.as_deref().expect("an ARP fix");
+        assert!(fix.contains("arp_ignore"), "{fix}");
+        assert!(!fix.contains("routes:"), "{fix}");
+
+        // The next check, with the settings in place, measures the cables and routes them.
+        for facts in probes.iter_mut().flatten() {
+            facts.arp_all = (1, 2);
+        }
+        let routes = fabric_routes(&probes, Some(&fabric));
+        assert!(routes.iter().all(|list| !list.is_empty()), "{routes:?}");
+    }
+
+    #[test]
+    fn stale_ring_routes_are_removed_when_the_fabric_is_no_longer_a_ring() {
+        // A ring writes /32 routes; re-cabled to a switch they are obsolete, and the check has to
+        // rewrite the netplan without them instead of certifying the fabric.
+        let mut probes = cluster();
+        let mut links = Vec::new();
+        for rank in 0..4usize {
+            for peer in 0..4usize {
+                if peer != rank {
+                    links.push(FabricLink {
+                        rank,
+                        netdev: "enP2p1s0f1np1".to_owned(),
+                        peer,
+                        address: format!("198.51.100.{}", 21 + peer),
+                    });
+                }
+            }
+        }
+        let fabric = Fabric {
+            links,
+            reachable: vec![
+                Some(vec![1, 2, 3]),
+                Some(vec![0, 2, 3]),
+                Some(vec![0, 1, 3]),
+                Some(vec![0, 1, 2]),
+            ],
+            shape: FabricShape::Switched,
+            links_measured: true,
+        };
+        for (rank, probe) in probes.iter_mut().enumerate() {
+            let facts = probe.as_mut().expect("facts");
+            let peer = (rank + 1) % 4;
+            facts.routes.push(Route {
+                destination: format!("198.51.100.{}", 21 + peer),
+                netdev: "enP2p1s0f1np1".to_owned(),
+                via: Some(format!("198.51.100.{}", 21 + ((rank + 3) % 4))),
+                metric: FABRIC_ROUTE_METRIC,
+                dhcp: false,
+            });
+        }
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(fabric.clone()),
+            true,
+            1,
+        );
+        for node in &report.nodes {
+            let fix = node.network_fix.as_deref().expect("a cleanup fix");
+            assert!(fix.contains("netplan apply"), "{fix}");
+            assert!(
+                !fix.contains("routes:"),
+                "the stale routes are rewritten away: {fix}"
+            );
+        }
+        // Once they are gone the check converges.
+        for facts in probes.iter_mut().flatten() {
+            facts.routes.retain(|route| !is_fabric_host_route(route));
+        }
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(fabric), true, 1);
+        assert!(
+            report.nodes.iter().all(|node| node.network_fix.is_none()),
+            "{:?}",
+            report
+                .nodes
+                .iter()
+                .map(|node| (&node.network_fix, node.rank))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
