@@ -751,3 +751,48 @@ async fn a_turn_that_parts_from_the_reply_rewinds_past_the_held_image() {
     );
     assert_eq!(recorder.most_alive(), 1);
 }
+
+/// Two workers keep their sequences in common: each conversation's next turn continues its own,
+/// whichever worker takes it, and a third conversation takes the least recently used one's room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_conversations_each_find_their_own_prefix() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = HostDriver::start(
+        Box::new(PrefixBackend {
+            descriptor: descriptor(),
+            recorder: Arc::clone(&recorder),
+        }),
+        Arc::new(Codec),
+        HostOptions {
+            max_tokens: 8,
+            concurrency: 2,
+            ..HostOptions::default()
+        },
+    )
+    .expect("the host driver starts");
+    let turn = |prompt: &[u32], reply: &str, next: u32| {
+        let mut follow = prompt.to_vec();
+        follow.extend_from_slice(&emitted(reply));
+        follow.push(next);
+        follow
+    };
+    let a1 = vec![5u32, 6, 7];
+    let b1 = vec![8u32, 9];
+    let a = answer(&driver, request("a1", a1.clone(), 2)).await;
+    let b = answer(&driver, request("b1", b1.clone(), 2)).await;
+    // The turns alternate, so a worker that kept only its own last sequence would miss half.
+    for (id, prompt, reply, next) in [("a2", &a1, &a.text, 3u32), ("b2", &b1, &b.text, 4)] {
+        let follow = turn(prompt, reply, next);
+        let held = follow.len() - 1;
+        let answered = answer(&driver, request(id, follow, 2)).await;
+        assert_eq!(answered.cached, held, "{id} continues its own conversation");
+    }
+    assert_eq!(recorder.prefills()[2..], [vec![3], vec![4]]);
+    // A third conversation: two sequences are kept, so it takes the least recently used one's
+    // room (a's) and the pool never holds more than two.
+    let c = answer(&driver, request("c1", vec![11, 12], 2)).await;
+    assert_eq!(c.cached, 0);
+    assert!(recorder.most_alive() <= 2, "{} alive", recorder.most_alive());
+    let b3 = answer(&driver, request("b3", b1.clone(), 1)).await;
+    assert_eq!(b3.cached, 0, "a prompt that only repeats b's first turn parts from its reply");
+}

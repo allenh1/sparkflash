@@ -2,7 +2,7 @@
 
 Status: **the device arm serves HTTP as a four-rank group on four Sparks: text and images,
 chunked tensor-core prefill to a million positions, and concurrent requests through fused lanes
-(§15). The DSpark drafter is the outstanding milestone; the numerics entry for the TP4
+(§15), which draft with DSpark and keep their conversations. The numerics entry for the TP4
 configuration is not registered.**
 
 
@@ -1024,7 +1024,8 @@ the teacher-forced logits of the 6,000-token text are identical.
 ### Concurrency: fused lanes
 
 `LANES=N` (`--concurrency N --fuse-batch`) serves N requests at once through the workspace's
-`FusedEngine`, the engine Dory and Qwen use. Requests are admitted within a 300 µs window. A prefill
+`FusedEngine`, the engine Qwen and GLM use (Dory's recurrence group has its own scheduler).
+Requests are admitted within a 300 µs window. A prefill
 runs alone, and the decodes due together run as one multi-row step that reads each weight once for
 every lane. Rank 0 broadcasts each lane's prompt (`LaneRequest`) and each fused step's members in
 its own order (`LaneStep`), so every rank steps the same rows in the same order. A lane decodes the
@@ -1037,9 +1038,60 @@ bits it would decode alone: every request at widths 2 and 4 returns its width-1 
 | 4 | 39.0 tok/s | 9.9-10.6 tok/s | 0.18-0.64 s |
 
 (Four requests, 64 greedy tokens each; width 1 runs them one after another;
-`scripts/inkling-lanes-probe.py --widths 1,2,4`.) Each lane holds its
-own cache, 8.04 GiB a rank at 1M positions, so `LANES` is paired with a smaller `CONTEXT`: eight
-lanes at 131,072 hold 8 GiB a rank in all.
+`scripts/inkling-lanes-probe.py --widths 1,2,4`; plain decoding, before the three changes below.)
+
+#### Lanes draft, keep their conversations, and back their caches as they grow
+
+Serving now defaults to four lanes (`LANES=4` in `scripts/inkling-serve-group.sh`; `LANES=1` is
+the serial engine). Three changes make that the right default at a 1M context:
+
+* **Lanes draft.** With a drafter loaded (DSpark), each member of a step runs its own session's
+  speculative round, one member after another. A lane's tokens are its alone-run's bits, and the
+  drafter's acceptance holds; the lanes share the engine, the pool and the prefix cache, but not a
+  multi-row verify (a verify is already ~30 distinct experts at four rows, so packing two lanes'
+  verifies together would mostly add expert reads).
+* **Lanes keep their conversations.** The host's prefix pool (`HeldPool` in
+  `sparkflash-serve/src/host.rs`) is shared by every worker. A finished request parks its session
+  in its slot (`ModelSession::park`, `Work::Park`), and the next request claims the slot whose
+  kept tokens are its longest prefix, else the least recently used one. A kept lane continues: on a
+  group, rank 0's `LaneRequest` carries `keep`, so the workers skip the renew and every rank
+  extends the same cache. The sampler travels with the request, so a kept lane samples on every
+  rank as rank 0 does.
+* **Caches back as they grow.** `sparkflash_kernels::lane_memory` is DeepSeek's lane backing made
+  shared (`deepseek-forward`'s `tp4_forward/lanes.rs` now runs on it): each lane reserves virtual
+  memory for the whole context, and 2 MiB chunks from one pool are mapped (and zeroed) as its
+  rows grow, in 2,048-row steps plus 1,024 rows past the position (tiles read past it and the
+  drafter's block writes past it). Inkling's lane memory is the full layers' keys and values,
+  their key-scale tables and DSpark's whole-context rings; the sliding layers and scratch stay
+  per session. The pool is one full-context lane by default (10.1 GiB at 1M with DSpark) and the
+  same on every rank, so every rank makes the same decisions. `SPARKFLASH_LANE_MEMORY_MB`
+  (`runtime.lane_memory_mb`) sets it. When a lane needs chunks the pool lacks, the engine releases
+  the least recently parked slot that holds a conversation (`LaneRelease` on a group) until it
+  fits; a prompt or step that still cannot fit is refused on rank 0 before anything is broadcast.
+
+Served at 1M positions with DSpark (adaptive depth, at most 7), four 160-token greedy answers:
+
+| | one lane (lda) | four lanes |
+| --- | --- | --- |
+| each request alone (first after launch; not an A/B) | 28.7-37.0 tok/s | 35.9-50.6 tok/s |
+| the four at once | | 10.6-10.9 tok/s each, 42.4 tok/s aggregate |
+| second turns at once | | each continues its own lane (cached 27-30 of its prompt) |
+| MemAvailable, lead, lowest | 7 GiB | 14 GiB |
+
+Every answer, alone and together, is the one-lane build's text (the same digests). The four at
+once barely beat one request's speed in aggregate: the members draft one after another, and a
+speculative round already reads most of the experts a fused row would share. What concurrency buys
+is that four clients are served without queueing behind each other and that each keeps its own
+conversation. Memory falls with it, because an idle lane backs nothing: the one-lane build held its
+1M cache from the start.
+
+Reclaim is checked with a pool that holds one short conversation but not two
+(`SPARKFLASH_LANE_MEMORY_MB=120`): after `a1` and `b1`, `a2` runs cold (`b1` took `a`'s chunks) and
+answers its one-lane text, and `a3` then continues `a2` (cached 47 of 56). Batch decoding is
+unchanged: plain decoding's digest is `ec85a691b74bbc6b`, DSpark's ids equal plain's (greedy and
+sampled), and the 93K text's ids equal the previous build's. The gate is
+`scripts/inkling-lanes-gate.py PORT full|tiny|alone` (four topics alone and together, concurrent second turns, the
+small-pool reclaim).
 
 ### Images (D118)
 
@@ -1557,7 +1609,7 @@ DSpark against plain decoding on this build:
 | 93,159-token text, 24 tokens | 37.74 ms | 31.96 ms (3.3 in 105.0 ms) | 33.30 ms (4.6 in 153.2 ms) |
 
 Depth 3 now beats plain decoding after the 93K prompt as well, by 15%. The drafter stays opt-in.
-It costs a rank about 3.6 GB at 1M positions, lanes refuse it, and its gain rests on how many
+It costs a rank about 3.6 GB at 1M positions (lanes now take it; §"Lanes draft"), and its gain rests on how many
 drafts the text accepts.
 
 ### The dense projections in a lossless packed form

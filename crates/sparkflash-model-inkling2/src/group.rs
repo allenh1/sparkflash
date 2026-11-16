@@ -483,7 +483,8 @@ fn mirror(control: &mut Tp4ControlWorker, backend: &dyn ModelBackend) -> Result<
 /// Mirrors rank 0's lane frames onto this rank's own pool of `lanes` fused lanes.
 ///
 /// The pool is opened up front, as rank 0's engine opens its own, so lane `n` is the same slot on
-/// every rank. A `LaneRequest` forgets what the lane held and prefills it; a `LaneStep` steps its
+/// every rank. A `LaneRequest` forgets what the lane held, unless rank 0 kept its own, and
+/// prefills it with rank 0's sampler; a `LaneStep` steps its
 /// members in the frame's order, which is the step's row order on every rank and so the order the
 /// collectives inside it line up in.
 fn mirror_lanes<A: FusedArm>(
@@ -515,6 +516,8 @@ fn mirror_lanes<A: FusedArm>(
                 lane,
                 prompt_ids,
                 images,
+                keep,
+                sampler,
             } => {
                 let images =
                     frame_images(images).map_err(|error| format!("lane {lane}: {error}"))?;
@@ -522,16 +525,27 @@ fn mirror_lanes<A: FusedArm>(
                     .get_mut(lane as usize)
                     .and_then(Option::as_mut)
                     .ok_or_else(|| out_of_step(lane))?;
-                if arm.holds_request(slot) {
+                if !keep && arm.holds_request(slot) {
                     arm.renew(slot)
                         .map_err(|error| format!("lane {lane}: renew: {error}"))?;
                 }
-                arm.set_sampling(slot, greedy());
+                arm.set_sampling(slot, frame_sampling(sampler));
                 if trace_on() {
                     eprintln!("[inkling] serve worker lane {lane} prefill {prompt_ids:?}");
                 }
                 arm.prefill_images(slot, &prompt_ids, &images)
                     .map_err(|error| format!("lane {lane}: prefill: {error}"))?;
+            }
+            Tp4ControlFrame::LaneRelease { lane } => {
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                if trace_on() {
+                    eprintln!("[inkling] serve worker lane {lane} release");
+                }
+                arm.release(slot)
+                    .map_err(|error| format!("lane {lane}: release: {error}"))?;
             }
             Tp4ControlFrame::LaneStep { members } => {
                 let mut stepping = Vec::with_capacity(members.len());
@@ -556,7 +570,7 @@ fn mirror_lanes<A: FusedArm>(
             }
             other => {
                 return Err(format!(
-                    "the fused worker expected LaneRequest, LaneStep or Error, not {}",
+                    "the fused worker expected LaneRequest, LaneRelease, LaneStep or Error, not {}",
                     other.kind()
                 ));
             }
@@ -585,6 +599,11 @@ pub struct GroupLanes<A: FusedArm> {
 pub struct GroupLane<S> {
     lane: u32,
     slot: Option<S>,
+    /// Whether the engine renewed the slot since its last prompt: the workers renew theirs only
+    /// then, so a kept lane continues on every rank alike.
+    renewed: bool,
+    /// The request's sampler for the workers ([frame_sampler]).
+    sampler: Option<Tp4FrameSampler>,
 }
 
 impl<A: FusedArm> GroupLanes<A> {
@@ -619,6 +638,8 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
         Ok(GroupLane {
             lane,
             slot: Some(self.arm.open_slot()?),
+            renewed: false,
+            sampler: None,
         })
     }
 
@@ -628,12 +649,15 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
             .is_some_and(|inner| self.arm.holds_request(inner))
     }
 
-    /// Local: a worker renews its own lane when the next `LaneRequest` names it.
+    /// Local: a worker renews its own lane when the next `LaneRequest` says this one was.
     fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
-        self.arm.renew(Self::slot(slot)?)
+        self.arm.renew(Self::slot(slot)?)?;
+        slot.renewed = true;
+        Ok(())
     }
 
     fn set_sampling(&self, slot: &mut Self::Slot, sampling: Sampling) {
+        slot.sampler = frame_sampler(&sampling);
         if let Some(inner) = slot.slot.as_mut() {
             self.arm.set_sampling(inner, sampling);
         }
@@ -651,6 +675,9 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
     ) -> Result<StepOutput, BackendError> {
         // Refuse before the broadcast, as the serial session does.
         admit(self.context, &self.check, tokens, images)?;
+        if !self.arm.room(Self::slot(slot)?, Some(tokens)) {
+            return Err(no_room(tokens.len()));
+        }
         if trace_on() {
             eprintln!(
                 "[inkling] serve rank 0 lane {} prefill {tokens:?}",
@@ -661,6 +688,8 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
             lane: slot.lane,
             prompt_ids: tokens.to_vec(),
             images: image_frames(images),
+            keep: !std::mem::take(&mut slot.renewed),
+            sampler: slot.sampler,
         })?;
         self.arm.prefill_images(Self::slot(slot)?, tokens, images)
     }
@@ -687,6 +716,17 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
                 }
             }
         }
+        // Every rank grows the same lanes the same way, so a step without room fails here, before
+        // the broadcast, and not on the workers.
+        if stepping
+            .iter()
+            .any(|(inner, _)| !self.arm.room(inner, None))
+        {
+            for ((lane, _), (inner, _)) in members.iter_mut().zip(stepping) {
+                lane.slot = Some(inner);
+            }
+            return Err(no_room(1));
+        }
         if trace_on() {
             eprintln!("[inkling] serve rank 0 step {lanes:?}");
         }
@@ -706,9 +746,59 @@ impl<A: FusedArm> FusedArm for GroupLanes<A> {
             .unwrap_or_default()
     }
 
+    fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+        self.arm.history(slot.slot.as_ref()?)
+    }
+
+    fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
+        slot.slot
+            .as_ref()
+            .is_some_and(|inner| self.arm.room(inner, prompt))
+    }
+
+    /// Broadcast: every rank gives up the same lane's memory, so their pools stay alike.
+    fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+        if trace_on() {
+            eprintln!("[inkling] serve rank 0 lane {} release", slot.lane);
+        }
+        self.send(&Tp4ControlFrame::LaneRelease { lane: slot.lane })?;
+        self.arm.release(Self::slot(slot)?)?;
+        slot.renewed = true;
+        Ok(())
+    }
+
+    fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+        self.arm.rewind_prefix(slot.slot.as_ref()?)
+    }
+
+    fn held_images<'s>(&self, slot: &'s Self::Slot) -> &'s [ImageSpan] {
+        slot.slot
+            .as_ref()
+            .map_or(&[], |inner| self.arm.held_images(inner))
+    }
+
+    fn cached_tokens(&self, slot: &Self::Slot) -> usize {
+        slot.slot
+            .as_ref()
+            .map_or(0, |inner| self.arm.cached_tokens(inner))
+    }
+
     fn max_batch(&self) -> usize {
         self.arm.max_batch()
     }
+}
+
+/// The refusal of a prompt of `rows` positions (or a step) the lanes' memory cannot hold beside
+/// the sequences being served: the engine has already given up every idle one.
+fn no_room(rows: usize) -> BackendError {
+    BackendError::new(
+        "context",
+        format!(
+            "the sessions' lane memory has no room for {rows} more positions beside the \
+             sequences being served (runtime.lane_memory_mb / SPARKFLASH_LANE_MEMORY_MB sets the \
+             pool)"
+        ),
+    )
 }
 
 /// What rank 0 refuses before it broadcasts a prompt: one longer than the admitted `context`, or

@@ -41,6 +41,7 @@ use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
     SideStream, StreamEvent,
 };
+use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
@@ -1175,11 +1176,39 @@ struct Shared {
     /// The vision tower, on rank 0 when it was loaded ([InklingDeviceBackend::load_vision]): the
     /// one rank that encodes a prompt's images, whose rows the group's sum then broadcasts.
     vision: Option<Mutex<InklingVisionTower>>,
+    /// The sessions' lane memory, planned when the first session opens (the drafter loads
+    /// before it, and its rings are part of a lane).
+    lanes: Mutex<Option<Arc<LaneMemory>>>,
 }
 
 impl Shared {
     fn hidden(&self) -> usize {
         self.config.hidden_size
+    }
+
+    /// The sessions' [LaneMemory], planned on first use.
+    fn lane_memory(&self) -> Result<Arc<LaneMemory>, String> {
+        let mut lanes = self
+            .lanes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(memory) = lanes.as_ref() {
+            return Ok(Arc::clone(memory));
+        }
+        let memory = Arc::new(LaneMemory::plan(self)?);
+        if trace_on() || self.exchange.rank() == 0 {
+            let chunk = memory.shape.granularity;
+            eprintln!(
+                "[inkling] rank {}: session caches back as they grow: {} MiB a lane at most, a \
+                 {} MiB pool, {} KiB chunks",
+                self.exchange.rank(),
+                memory.shape.stride >> 20,
+                (memory.pool().budget() * chunk) >> 20,
+                chunk >> 10
+            );
+        }
+        *lanes = Some(Arc::clone(&memory));
+        Ok(memory)
     }
 
     /// What this rank checks of a prompt's image spans; the rank that encodes needs the canvases.
@@ -2618,6 +2647,14 @@ impl Drop for Shared {
         pointers.extend(self.exchange_slots);
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
         self.cuda.free_buffers(&refs);
+        if let Some(memory) = self
+            .lanes
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            memory.pool().drain(&*self.cuda);
+        }
         if let Some(mut drafter) = self.dspark.take() {
             drafter.free(&self.cuda);
         }
@@ -2939,6 +2976,7 @@ impl InklingDeviceBackend {
                 depth_policy,
                 dspark: None,
                 vision: None,
+                lanes: Mutex::new(None),
             }),
         })
     }
@@ -3095,19 +3133,6 @@ impl InklingDeviceBackend {
                 "fused lanes need at least one row a step",
             ));
         }
-        // A lane's round leaves its state past the drafts until the lane settles, and a fused
-        // step walks every lane's state as it stands: drafting serves one request at a time.
-        if max_batch > 1
-            && let Some((drafter, _)) = self.shared.draft
-        {
-            return Err(BackendError::new(
-                DEVICE,
-                format!(
-                    "{DRAFT_ENV} drafts ({drafter:?}) one request at a time and fused lanes step \
-                     {max_batch}: serve one lane, or set {DRAFT_ENV}=off"
-                ),
-            ));
-        }
         Ok(InklingLanes {
             shared: Arc::clone(&self.shared),
             buffer: Mutex::new(None),
@@ -3216,19 +3241,30 @@ impl FusedArm for InklingLanes {
         answer
     }
 
+    /// With the drafter on, each lane decodes on its own, one after another: a lane's round
+    /// leaves its state past the drafts until the lane settles, and a fused walk reads every
+    /// lane's state as it stands. A lane's tokens are then the ones it would decode alone.
     fn step(&self, members: &mut [(InklingLane, u32)]) -> Result<Vec<StepOutput>, BackendError> {
         self.bind()?;
-        if let [(lane, token)] = members {
-            return Ok(vec![lane.session.decode(*token)?]);
+        if members.len() == 1 || self.shared.draft.is_some() {
+            return members
+                .iter_mut()
+                .map(|(lane, token)| lane.session.decode(*token))
+                .collect();
         }
         let shared = &self.shared;
-        for (lane, token) in members.iter() {
+        for (lane, token) in members.iter_mut() {
             if lane.session.state.position >= shared.context {
                 return Err(BackendError::new(
                     "context",
                     "a lane's context is exhausted",
                 ));
             }
+            let rows = lane.session.state.position + 1;
+            lane.session
+                .state
+                .grow(shared, rows)
+                .map_err(|error| BackendError::new("context", error))?;
             if *token as usize >= shared.config.vocab_size {
                 return Err(BackendError::new(
                     DEVICE,
@@ -3270,8 +3306,53 @@ impl FusedArm for InklingLanes {
             .collect())
     }
 
-    fn speculation(&self, _slot: &InklingLane) -> Speculation {
-        Speculation::default()
+    fn speculation(&self, slot: &InklingLane) -> Speculation {
+        slot.session.speculation()
+    }
+
+    /// A prompt that neither continues the history nor rewinds into it starts over, and the
+    /// chunks the lane holds go back to the pool first.
+    fn room(&self, slot: &InklingLane, prompt: Option<&[u32]>) -> bool {
+        let session = &slot.session;
+        match prompt {
+            Some(tokens) => {
+                let keeps = tokens.starts_with(&session.history)
+                    || session.rewind_prefix().is_some_and(|prefix| {
+                        prefix.len() < tokens.len() && tokens.starts_with(prefix)
+                    });
+                session.state.room(tokens.len(), !keeps)
+            }
+            None => {
+                let rows = session.state.position
+                    + 1
+                    + self.shared.draft.map_or(0, |(_, depth)| depth);
+                session.state.room(rows, false)
+            }
+        }
+    }
+
+    /// Forgets the lane's sequence, which gives its chunks back to the pool.
+    fn release(&self, slot: &mut InklingLane) -> Result<(), BackendError> {
+        self.bind()?;
+        slot.session.forget()
+    }
+
+    /// A lane keeps its sequence between requests as a session alone does: the next prompt that
+    /// starts with it forwards only the rest ([InklingDeviceSession::prompt]).
+    fn history<'s>(&self, slot: &'s InklingLane) -> Option<&'s [u32]> {
+        slot.session.reusable_prefix()
+    }
+
+    fn rewind_prefix<'s>(&self, slot: &'s InklingLane) -> Option<&'s [u32]> {
+        slot.session.rewind_prefix()
+    }
+
+    fn held_images<'s>(&self, slot: &'s InklingLane) -> &'s [ImageSpan] {
+        slot.session.held_images()
+    }
+
+    fn cached_tokens(&self, slot: &InklingLane) -> usize {
+        slot.session.cached_tokens()
     }
 
     fn max_batch(&self) -> usize {
@@ -3738,8 +3819,127 @@ struct KeyTables {
     stride: usize,
 }
 
+/// Rows past the furthest position a walk writes that a session backs too: attention reads whole
+/// key tiles past a position (and masks them), and the drafter's block writes its rows past it.
+const READ_PAST: usize = 1024;
+
+/// A session's lane grows in steps of this many rows, so a decode step rarely maps anything.
+const LANE_QUANTUM: usize = 2048;
+
+/// Where every session keeps the state that grows with its context, and the memory behind it
+/// ([sparkflash_kernels::lane_memory], the backing DeepSeek's lanes use too).
+///
+/// A session reserves a span of virtual memory as long as a whole context's full-layer keys and
+/// values, their [KeyTables] and the drafter's full-layer rings, and physical memory backs the
+/// span only as far as the sequence has reached ([State::grow]). The chunks come from one pool a
+/// rank's sessions share, so several conversations hold together what one whole context would:
+/// the budget is one full context's worth unless `runtime.lane_memory_mb`
+/// (SPARKFLASH_LANE_MEMORY_MB) says otherwise. It is a number, the same on every rank, so every
+/// rank of a group refuses the same growth.
+///
+/// A sliding layer's ring, the convolution histories and the scratch stay plain allocations:
+/// they do not grow with the context.
+struct LaneMemory {
+    shape: LaneShape,
+    /// Each layer's key and value parts, `None` for a sliding layer.
+    kv: Vec<Option<(usize, usize)>>,
+    /// Each layer's [KeyTables] parts (gains, scales), where the layer keeps tables.
+    tables: Vec<Option<(usize, usize)>>,
+    /// Each drafter layer's key and value ring, `None` for one that keeps a window.
+    draft: Vec<Option<(usize, usize)>>,
+    pool: Mutex<ChunkPool>,
+}
+
+impl LaneMemory {
+    fn plan(shared: &Shared) -> Result<Self, String> {
+        let granularity = shared
+            .cuda
+            .vmm_granularity()
+            .ok_or("the device has no virtual memory management for the sessions' caches")?;
+        let mut layout = Layout::default();
+        let plan = &shared.plan;
+        let row = shared.kv_width() * 2;
+        let mut kv = Vec::with_capacity(plan.layers().len());
+        let mut tables = Vec::with_capacity(plan.layers().len());
+        for layer in plan.layers() {
+            if layer.sliding {
+                kv.push(None);
+                tables.push(None);
+                continue;
+            }
+            let rows = layer.kv_rows.max(1);
+            kv.push(Some((
+                layout.part(rows * row, row, 0),
+                layout.part(rows * row, row, 0),
+            )));
+            // A table is `[kv head][row]`: each head's rows are a part of their own.
+            let mut table = || {
+                let heads = plan.rank_kv_heads().max(1);
+                let first = layout.reserve(heads * rows * 4);
+                for head in 0..heads {
+                    layout.region(first + head * rows * 4, rows * 4, 4, 0);
+                }
+                first
+            };
+            tables.push(
+                shared
+                    .attention
+                    .split()
+                    .then(|| (table(), table())),
+            );
+        }
+        let draft = match (shared.draft, shared.dspark.as_ref()) {
+            (Some((Drafter::Dspark, _)), Some(model)) => {
+                let row = model.ring_row_bytes();
+                model
+                    .whole_context_rings()
+                    .into_iter()
+                    .map(|whole| {
+                        whole.then(|| {
+                            let rows = shared.context.max(1);
+                            (
+                                layout.part(rows * row, row, 0),
+                                layout.part(rows * row, row, 0),
+                            )
+                        })
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let shape = layout.finish(granularity, LANE_QUANTUM);
+        let budget = sparkflash_model::active_profile()
+            .runtime
+            .lane_memory_mb
+            .map_or_else(
+                || shape.chunks_for(shared.context + READ_PAST, 0) * granularity,
+                |mb| mb << 20,
+            );
+        Ok(Self {
+            shape,
+            kv,
+            tables,
+            draft,
+            pool: Mutex::new(ChunkPool::new(granularity, budget)),
+        })
+    }
+
+    fn pool(&self) -> std::sync::MutexGuard<'_, ChunkPool> {
+        self.pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One session's span of the [LaneMemory].
+struct Lane {
+    memory: Arc<LaneMemory>,
+    span: LaneSpan,
+}
+
 /// One session's device state.
 struct State {
+    lane: Lane,
     keys: Vec<Deviceptr>,
     values: Vec<Deviceptr>,
     /// Each full layer's [KeyTables] when a split or fast walk reads them; `None` on a sliding
@@ -3760,33 +3960,37 @@ impl State {
         let cuda = &shared.cuda;
         let hidden = shared.hidden();
         let mut total = 0usize;
+        let memory = shared.lane_memory()?;
+        let base = cuda.vmm_reserve(memory.shape.stride)?;
+        let lane = Lane {
+            span: LaneSpan::new(base.0, &memory.shape),
+            memory: Arc::clone(&memory),
+        };
         let kv_bytes = |rows: usize, width: usize| rows.max(1) * width * 2;
         let mut keys = Vec::with_capacity(plan.layers().len());
         let mut values = Vec::with_capacity(plan.layers().len());
         let mut tables = Vec::with_capacity(plan.layers().len());
-        for layer in plan.layers() {
-            let bytes = kv_bytes(layer.kv_rows, shared.kv_width());
-            let key = cuda.alloc(bytes, &mut total)?;
-            let value = cuda.alloc(bytes, &mut total)?;
-            cuda.memset_d8_async(key, 0, bytes)?;
-            cuda.memset_d8_async(value, 0, bytes)?;
-            keys.push(key);
-            values.push(value);
+        for (index, layer) in plan.layers().iter().enumerate() {
+            // A full layer's rows are the lane's, zeroed as they are backed.
+            if let Some((key, value)) = memory.kv[index] {
+                keys.push(base.offset(key));
+                values.push(base.offset(value));
+            } else {
+                let bytes = kv_bytes(layer.kv_rows, shared.kv_width());
+                let key = cuda.alloc(bytes, &mut total)?;
+                let value = cuda.alloc(bytes, &mut total)?;
+                cuda.memset_d8_async(key, 0, bytes)?;
+                cuda.memset_d8_async(value, 0, bytes)?;
+                keys.push(key);
+                values.push(value);
+            }
             // A slot's entries are written when its key is stored and read only after, so the
             // tables need no clearing.
-            tables.push(
-                (!layer.sliding && shared.attention.split())
-                    .then(|| -> Result<KeyTables, String> {
-                        let stride = layer.kv_rows.max(1);
-                        let bytes = plan.rank_kv_heads().max(1) * stride * 4;
-                        Ok(KeyTables {
-                            gains: cuda.alloc(bytes, &mut total)?,
-                            scales: cuda.alloc(bytes, &mut total)?,
-                            stride,
-                        })
-                    })
-                    .transpose()?,
-            );
+            tables.push(memory.tables[index].map(|(gains, scales)| KeyTables {
+                gains: base.offset(gains),
+                scales: base.offset(scales),
+                stride: layer.kv_rows.max(1),
+            }));
         }
         let mut conv = Vec::with_capacity(plan.layers().len());
         for _ in 0..plan.layers().len() {
@@ -3815,6 +4019,7 @@ impl State {
         let scratch = Scratch::allocate(shared, &mut total)?;
         cuda.synchronize()?;
         Ok(Self {
+            lane,
             keys,
             values,
             tables,
@@ -3830,10 +4035,15 @@ impl State {
 
     fn reset(&mut self, shared: &Shared) -> Result<(), String> {
         for (index, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
+            if self.lane.memory.kv[index].is_some() {
+                continue;
+            }
             let bytes = shared.plan.layers()[index].kv_rows.max(1) * shared.kv_width() * 2;
             shared.cuda.memset_d8_async(*key, 0, bytes)?;
             shared.cuda.memset_d8_async(*value, 0, bytes)?;
         }
+        // The lane's rows go back to the pool, and come back zeroed as the next prompt grows.
+        self.release(shared)?;
         for slots in &self.conv {
             for (slot, bytes) in slots.iter().zip(shared.conv_slot_bytes()) {
                 shared.cuda.memset_d8_async(*slot, 0, bytes)?;
@@ -3845,6 +4055,94 @@ impl State {
         self.blocks = 0;
         self.position = 0;
         Ok(())
+    }
+
+    /// Backs the lane for a sequence of `rows` positions and the rows a walk reads past them.
+    ///
+    /// # Errors
+    /// A pool with too few chunks left, or a driver failure.
+    fn grow(&mut self, shared: &Shared, rows: usize) -> Result<(), String> {
+        let memory = Arc::clone(&self.lane.memory);
+        let mut pool = memory.pool();
+        let want = rows + READ_PAST;
+        if self.lane.span.ensure(&*shared.cuda, &memory.shape, &mut pool, want)? {
+            return Ok(());
+        }
+        Err(Self::short(&memory, &self.lane.span, &pool, want))
+    }
+
+    /// Whether the pool can back `rows` positions here now, counting the chunks a reset gives
+    /// back first when `reset`.
+    fn room(&self, rows: usize, reset: bool) -> bool {
+        let memory = &self.lane.memory;
+        let pool = memory.pool();
+        let want = rows + READ_PAST;
+        if reset {
+            memory.shape.chunks_for(want, 0) <= pool.spare() + self.lane.span.mapped()
+        } else {
+            self.lane.span.fits(&memory.shape, &pool, want)
+        }
+    }
+
+    fn short(memory: &LaneMemory, span: &LaneSpan, pool: &ChunkPool, rows: usize) -> String {
+        let chunk = memory.shape.granularity;
+        format!(
+            "lane memory: {rows} positions need {} MiB more and the sessions' pool has {} MiB of \
+             {} MiB spare (runtime.lane_memory_mb / SPARKFLASH_LANE_MEMORY_MB sets it)",
+            (span.chunks_needed(&memory.shape, rows) * chunk) >> 20,
+            (pool.spare() * chunk) >> 20,
+            (pool.budget() * chunk) >> 20
+        )
+    }
+
+    /// Gives every chunk the lane holds back to the pool, once the device is done with them.
+    fn release(&mut self, shared: &Shared) -> Result<(), String> {
+        if self.lane.span.mapped() == 0 {
+            return Ok(());
+        }
+        shared.cuda.synchronize()?;
+        let memory = Arc::clone(&self.lane.memory);
+        let mut pool = memory.pool();
+        self.lane
+            .span
+            .release(&*shared.cuda, &memory.shape, &mut pool)
+    }
+
+    /// The allocations this state owns outside its lane.
+    fn buffers(&self) -> Vec<Deviceptr> {
+        let memory = &self.lane.memory;
+        let mut pointers: Vec<Deviceptr> = Vec::new();
+        for (index, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
+            if memory.kv[index].is_none() {
+                pointers.extend([*key, *value]);
+            }
+        }
+        for taps in &self.conv {
+            pointers.extend(taps.iter().copied());
+        }
+        pointers.push(self.summaries);
+        pointers.push(self.scratch.arena);
+        pointers
+    }
+
+    /// Gives the lane back: its chunks to the pool and its span to the device.
+    fn free_lane(&mut self, shared: &Shared) {
+        let _ = self.release(shared);
+        shared.cuda.vmm_free(
+            Deviceptr(self.lane.span.base()),
+            self.lane.memory.shape.stride,
+        );
+    }
+
+    /// The drafter's whole-context rings in this lane, by drafter layer.
+    fn draft_rings(&self) -> Vec<Option<(Deviceptr, Deviceptr)>> {
+        let base = Deviceptr(self.lane.span.base());
+        self.lane
+            .memory
+            .draft
+            .iter()
+            .map(|ring| ring.map(|(keys, values)| (base.offset(keys), base.offset(values))))
+            .collect()
     }
 }
 
@@ -4649,18 +4947,9 @@ impl Drop for InklingDeviceSession {
     /// 8.04 GiB a rank, and a session that leaked it would spend the whole budget in a request or
     /// two.
     fn drop(&mut self) {
-        let state = &self.state;
-        let mut pointers: Vec<Deviceptr> = Vec::new();
-        pointers.extend(state.keys.iter().copied());
-        pointers.extend(state.values.iter().copied());
-        for tables in state.tables.iter().flatten() {
-            pointers.extend([tables.gains, tables.scales]);
-        }
-        for taps in &state.conv {
-            pointers.extend(taps.iter().copied());
-        }
-        pointers.push(state.summaries);
-        pointers.push(state.scratch.arena);
+        let shared = Arc::clone(&self.shared);
+        self.state.free_lane(&shared);
+        let mut pointers = self.state.buffers();
         if let Some(chunk) = &self.chunk {
             pointers.extend(chunk.buffers());
         }
@@ -4712,6 +5001,11 @@ impl ModelSession for InklingDeviceSession {
         if self.state.position >= self.shared.context {
             return Err(BackendError::new("context", "the context is exhausted"));
         }
+        // The round's token and every draft it may verify.
+        let rows = self.state.position + 1 + self.shared.draft.map_or(0, |(_, depth)| depth);
+        self.state
+            .grow(&self.shared, rows)
+            .map_err(|error| BackendError::new("context", error))?;
         let (drafts, confidence) = self.draft(token)?;
         if drafts.is_empty() {
             let position = self.state.position;
@@ -4860,6 +5154,9 @@ impl InklingDeviceSession {
                 ),
             ));
         }
+        self.state
+            .grow(&self.shared, tokens.len())
+            .map_err(|error| BackendError::new("context", error))?;
         // The penalties count the whole prompt, the reused prefix included: it is one request.
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
@@ -5067,7 +5364,7 @@ impl InklingDeviceSession {
         let state = State::allocate(shared).map_err(|error| BackendError::new(DEVICE, error))?;
         let drafter = match (shared.draft, shared.dspark.as_ref()) {
             (Some((Drafter::Dspark, _)), Some(model)) => Some(
-                DraftState::allocate(shared, model)
+                DraftState::allocate(shared, model, &state.draft_rings())
                     .map_err(|error| BackendError::new(DEVICE, error))?,
             ),
             (Some((Drafter::Dspark, _)), None) => {

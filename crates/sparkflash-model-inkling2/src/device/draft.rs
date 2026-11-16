@@ -292,6 +292,17 @@ fn step_weight(steps: &[Step], op: Op, target: Option<Target>) -> Option<usize> 
 }
 
 impl DraftModel {
+    /// Which layers keep a ring as long as the whole context (a full layer without
+    /// [DRAFT_WINDOW_ENV]): a session's lane holds those ([DraftState::allocate]).
+    pub(super) fn whole_context_rings(&self) -> Vec<bool> {
+        self.layers.iter().map(|layer| layer.window.is_none()).collect()
+    }
+
+    /// The bytes one position adds to a layer's key ring (and as many to its value ring).
+    pub(super) fn ring_row_bytes(&self) -> usize {
+        self.kv_heads * HEAD_DIM * std::mem::size_of::<f32>()
+    }
+
     /// Loads the drafter from `directory`'s [DRAFT_FILE] onto this rank: the block's shares, the
     /// fusion weights, the Markov head, and its fold against this rank's head slice.
     ///
@@ -751,7 +762,14 @@ impl DraftState {
     /// A sequence's drafter state: a full layer's rings hold the whole context, a local layer's
     /// its window (and a widest chunk past it under [REWIND_ENV], so a rewind still finds the
     /// window before the boundary), and the tap buffer the widest chunk a prompt walks.
-    pub(super) fn allocate(shared: &Shared, model: &DraftModel) -> Result<Self, String> {
+    ///
+    /// A full layer's whole-context rings are the session's lane's (`lane`, by layer, from
+    /// [DraftModel::whole_context_rings]), backed as the sequence grows; the rest is one arena.
+    pub(super) fn allocate(
+        shared: &Shared,
+        model: &DraftModel,
+        lane: &[Option<(Deviceptr, Deviceptr)>],
+    ) -> Result<Self, String> {
         let hidden = model.hidden;
         let kv_width = model.kv_heads * HEAD_DIM;
         let q_width = model.heads * HEAD_DIM;
@@ -762,10 +780,11 @@ impl DraftState {
         let parts = rank_vocab.div_ceil(BLOCK as usize * LOGIT_PER_THREAD);
         let mut layout = Layout { bytes: 0 };
         let f = std::mem::size_of::<f32>();
-        let rings: Vec<(Region, Region, usize)> = model
+        let rings: Vec<(Option<(Region, Region)>, usize)> = model
             .layers
             .iter()
-            .map(|layer| {
+            .enumerate()
+            .map(|(index, layer)| {
                 let rewind_rows = if shared.rewind {
                     shared.prefill_chunk.saturating_sub(1)
                 } else {
@@ -776,9 +795,14 @@ impl DraftState {
                     .map_or(shared.context, |window| window + rewind_rows)
                     .min(shared.context)
                     .max(1);
+                let in_lane = lane.get(index).copied().flatten().is_some();
                 (
-                    layout.take(ring * kv_width * f),
-                    layout.take(ring * kv_width * f),
+                    (!in_lane).then(|| {
+                        (
+                            layout.take(ring * kv_width * f),
+                            layout.take(ring * kv_width * f),
+                        )
+                    }),
                     ring,
                 )
             })
@@ -822,7 +846,14 @@ impl DraftState {
             arena,
             rings: rings
                 .into_iter()
-                .map(|(keys, values, ring)| (at(keys), at(values), ring))
+                .enumerate()
+                .map(|(index, (own, ring))| match own {
+                    Some((keys, values)) => (at(keys), at(values), ring),
+                    None => {
+                        let (keys, values) = lane[index].expect("a ring outside the arena is the lane's");
+                        (keys, values, ring)
+                    }
+                })
                 .collect(),
             sink: TapSink {
                 capture: model.kernels.capture,

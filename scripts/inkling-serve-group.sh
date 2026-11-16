@@ -28,17 +28,19 @@
 # the memory. The tensor-core chunked prefill is the default; PREFILL=chunk keeps a prompt's rows
 # on the decode step's bits and PREFILL=rows forces the row-at-a-time walk.
 #
-# LANES=N (N >= 2) steps N concurrent requests together as fused lanes on every rank. Each lane is
-# a whole sequence, so each holds its own cache: at the full window that is 8 GiB a lane a rank,
-# and only one or two lanes fit beside the weights. Pair LANES with a smaller CONTEXT - eight
-# lanes at CONTEXT=131072 hold 8 GiB a rank in all.
+# LANES=N (default 4) serves N requests at once as fused lanes on every rank: each keeps its own
+# conversation, so a client's next turn continues the lane that holds it, and a lane drafts with
+# DSpark as a request alone does. The lanes' caches are backed as they grow, from one pool a
+# rank's lanes share: one whole CONTEXT's worth unless SPARKFLASH_LANE_MEMORY_MB says otherwise.
+# A lane that needs more takes it from the conversation that has idled longest. LANES=1 serves
+# one request at a time.
 set -uo pipefail
 source "$(dirname "$0")/inkling-env.sh"
 CKPT=${CKPT:-$MODEL_DIR/ckpt}
 CONVERTED=${CONVERTED:-$MODEL_DIR/converted}
 CONTEXT=${CONTEXT:-1048576}
 BIND=${BIND:-0.0.0.0:8000}
-LANES=${LANES:-1}
+LANES=${LANES:-4}
 
 common=(
   --model inkling2

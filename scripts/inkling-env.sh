@@ -36,6 +36,8 @@
 #                       with SPARK_COMM_RAIL_COUNT=1 only rail0 carries the rows
 #   SPARKFLASH_REUSE_BY_TEXT 0 stops a held reply from continuing a prompt that spells it with
 #                       other ids (default: on); forwarded to every rank
+#   SPARKFLASH_LANE_MEMORY_MB the memory a rank's sessions' caches share (default: one whole
+#                       context's); forwarded to every rank, which must refuse the same growth
 SITE=${INKLING_SITE:-$HOME/inkling-bin/site.env}
 # shellcheck disable=SC1090
 [ -f "$SITE" ] && source "$SITE"
@@ -66,6 +68,7 @@ RANK_ENV+=(SPARK_COMM_PEERS="$SPARK_COMM_PEERS" SPARK_COMM_CONTROL_PORT="$SPARK_
 [ -n "${SPARK_COMM_RAIL_COUNT:-}" ] && RANK_ENV+=(SPARK_COMM_RAIL_COUNT="$SPARK_COMM_RAIL_COUNT")
 [ -n "${SPARKFLASH_RAIL_DEVICES:-}" ] && RANK_ENV+=(SPARKFLASH_RAIL_DEVICES="$SPARKFLASH_RAIL_DEVICES")
 [ -n "${SPARKFLASH_REUSE_BY_TEXT:-}" ] && RANK_ENV+=(SPARKFLASH_REUSE_BY_TEXT="$SPARKFLASH_REUSE_BY_TEXT")
+[ -n "${SPARKFLASH_LANE_MEMORY_MB:-}" ] && RANK_ENV+=(SPARKFLASH_LANE_MEMORY_MB="$SPARKFLASH_LANE_MEMORY_MB")
 [ -n "${SPARKFLASH_NCCL_LIB:-}" ] && RANK_ENV+=(LD_LIBRARY_PATH="$SPARKFLASH_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
 for name in $(compgen -v | grep '^NCCL_'); do
   RANK_ENV+=("$name=${!name}")

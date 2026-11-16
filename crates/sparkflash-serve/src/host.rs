@@ -14,11 +14,12 @@
 
 //! The generic host driver.
 //!
-//! The driver owns one backend and one sequence per worker. A worker keeps its sequence between
-//! requests when the backend says the sequence can continue from the prefix the next prompt shares
+//! The driver owns one backend and the sequences its workers keep between requests ([HeldPool]).
+//! A sequence is kept when the backend says it can continue from the prefix a later prompt shares
 //! with it ([ModelSession::reusable_prefix]), so a chat turn prefills only the text it added
-//! instead of the whole conversation. A prompt that does not extend the held tokens gets a fresh
-//! session; the two are equivalent, and only the work differs.
+//! instead of the whole conversation. A request takes the kept sequence its prompt continues
+//! furthest, whichever worker served it last; a prompt that continues none gets a fresh session;
+//! the two are equivalent, and only the work differs.
 //!
 //! Two cases continue a held sequence although the ids differ. A client that sends the model's
 //! reply back as text has it re-encoded, and the tokenizer may spell a word with other ids than the
@@ -36,9 +37,10 @@
 //! which preserves the serial one-job-at-a-time behavior. A value above 1 is for backends whose
 //! sessions are independent; a backend whose sessions share mutable engine state must serialize
 //! that state itself (the Qwen device arm gives each session its own stream, so their kernels can
-//! overlap). A backend that only supports one live session must stay at 1. With more than one
-//! worker a request is served by whichever worker takes it, so a prefix is reused only when the
-//! same worker sees the next request.
+//! overlap). A backend that only supports one live session must stay at 1. The kept sequences are
+//! the workers' in common, at most `concurrency` of them with the ones being served: an agent's
+//! next turn finds its conversation whichever worker takes it, and a new conversation takes the
+//! room of the least recently used kept one.
 //!
 //! This adapter is intentionally smaller than the V4.1 reference driver. It supports text
 //! requests, stop strings, sample logprobs and the standard usage/timing envelope. Prompt
@@ -46,8 +48,8 @@
 //! that asks for them receives a typed engine error rather than an invented payload.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -205,10 +207,12 @@ impl HostDriver {
         let (ready, reported) = std::sync::mpsc::channel();
         let metrics = Arc::new(Metrics::new());
         let backend: Arc<dyn ModelBackend> = Arc::from(backend);
+        let pool = Arc::new(HeldPool::new(options.concurrency));
         let mut handles = Vec::with_capacity(options.concurrency);
         for worker in 0..options.concurrency {
             let backend = Arc::clone(&backend);
             let codec = Arc::clone(&codec);
+            let pool = Arc::clone(&pool);
             let queued = queued.clone();
             let ready = ready.clone();
             let thread_metrics = Arc::clone(&metrics);
@@ -216,7 +220,7 @@ impl HostDriver {
             let handle = std::thread::Builder::new()
                 .name(format!("sparkflash-host-engine-{worker}"))
                 .spawn(move || {
-                    host_thread(backend, codec, queued, ready, thread_metrics, by_text);
+                    host_thread(backend, codec, queued, ready, thread_metrics, &pool, by_text);
                 })
                 .map_err(|error| format!("cannot start host engine worker {worker}: {error}"))?;
             handles.push(handle);
@@ -529,6 +533,7 @@ fn host_thread(
     jobs: Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     metrics: Arc<Metrics>,
+    pool: &HeldPool,
     by_text: bool,
 ) {
     if ready.send(Ok(())).is_err() {
@@ -538,9 +543,6 @@ fn host_thread(
     // report per worker, and a clone held by a worker that later hangs would keep the channel
     // open after the reports it needs have already arrived.
     drop(ready);
-    // The sequence this worker last served, kept for the next request when the backend says it
-    // can continue from the prefix that request shares with it.
-    let mut held: Option<Held> = None;
     while let Ok(job) = jobs.recv() {
         metrics.request_admitted();
         let replies = job.replies.clone();
@@ -550,7 +552,7 @@ fn host_thread(
                 codec.as_ref(),
                 job,
                 &metrics,
-                &mut held,
+                pool,
                 by_text,
             )
         }));
@@ -587,6 +589,120 @@ struct Held {
     /// A request whose prompt is exactly the held history has nothing left to forward, so only
     /// this step can answer it: the retry of a request whose client left once its prefill was done.
     pending: Option<(Sampling, StepOutput)>,
+}
+
+/// The sequences kept between requests, every worker's in common.
+///
+/// A request takes the kept sequence its prompt continues furthest ([continuation]), so an
+/// agent's next turn finds its conversation whichever worker serves it. A sequence no request
+/// continues stays for one that does, until a fresh sequence needs its room: the pool counts the
+/// sequences kept and the ones the workers are serving, at most `capacity` in all, and the least
+/// recently used kept one goes first. At one worker that is the serial driver's rule: a held
+/// sequence the request cannot continue is dropped before the next one opens.
+struct HeldPool {
+    capacity: usize,
+    state: Mutex<PoolState>,
+}
+
+struct PoolState {
+    /// The kept sequences, each with the tick it was last kept at.
+    kept: Vec<(u64, Held)>,
+    /// The sequences the workers are serving.
+    serving: usize,
+    clock: u64,
+}
+
+/// What a request starts from: a kept sequence and how the request continues it, or a fresh
+/// sequence and the kept one whose room it takes (dropped before the fresh one opens).
+enum Claim {
+    Continue(Held, Continuation),
+    Fresh(Option<Held>),
+}
+
+/// A worker's share of the pool while it serves a request: the request's sequence goes back with
+/// [Lease::keep], and a lease dropped without it gives its count back.
+struct Lease<'p> {
+    pool: &'p HeldPool,
+    kept: bool,
+}
+
+impl HeldPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(PoolState {
+                kept: Vec::new(),
+                serving: 0,
+                clock: 0,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        // The pool holds no invariant a panicking worker could break halfway: take it as it is.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The sequence `job` starts from, and the lease the worker serves it under.
+    fn claim(&self, job: &Job, codec: &dyn PromptCodec, by_text: bool) -> (Lease<'_>, Claim) {
+        let mut state = self.state();
+        // The furthest continuation wins, the most recently kept among equals.
+        let best = state
+            .kept
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (used, held))| {
+                continuation(held, job, codec, by_text).map(|plan| (index, *used, plan))
+            })
+            .max_by_key(|(_, used, plan)| (plan.covered, *used));
+        let claim = match best {
+            Some((index, _, plan)) => Claim::Continue(state.kept.swap_remove(index).1, plan),
+            None if state.kept.len() + state.serving >= self.capacity => {
+                let oldest = state
+                    .kept
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(index, _)| index);
+                Claim::Fresh(oldest.map(|index| state.kept.swap_remove(index).1))
+            }
+            None => Claim::Fresh(None),
+        };
+        state.serving += 1;
+        (
+            Lease {
+                pool: self,
+                kept: false,
+            },
+            claim,
+        )
+    }
+}
+
+impl Lease<'_> {
+    /// Keeps the request's sequence for the next request that continues it.
+    /// Keeps `held` for a later request. The request is over, so the session may give its
+    /// memory up for another that needs it ([ModelSession::park]).
+    fn keep(mut self, mut held: Held) {
+        held.session.park();
+        self.kept = true;
+        let mut state = self.pool.state();
+        state.serving = state.serving.saturating_sub(1);
+        state.clock += 1;
+        let tick = state.clock;
+        state.kept.push((tick, held));
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            let mut state = self.pool.state();
+            state.serving = state.serving.saturating_sub(1);
+        }
+    }
 }
 
 /// How a request continues the held sequence.
@@ -785,7 +901,7 @@ fn run_request(
     codec: &dyn PromptCodec,
     job: Job,
     metrics: &Metrics,
-    held: &mut Option<Held>,
+    pool: &HeldPool,
     by_text: bool,
 ) -> Result<(), String> {
     // A request whose client is already gone, such as a retry queued behind the request it
@@ -799,18 +915,15 @@ fn run_request(
         );
     }
     let started = Instant::now();
-    let kept = held.take();
-    let plan = kept
-        .as_ref()
-        .and_then(|kept| continuation(kept, &job, codec, by_text));
-    // A held sequence this request cannot continue is dropped before the next one opens, never
+    let (lease, claim) = pool.claim(&job, codec, by_text);
+    // A kept sequence whose room a fresh one takes is dropped before the fresh one opens, never
     // after: a session owns its whole cache, and at a long context two of them do not fit (an
     // Inkling rank at the 1M window holds 8 GiB a session beside a chunk scratch, and opening the
     // second ran the lead out of memory).
-    let (mut session, pending, plan) = match (kept, plan) {
-        (Some(kept), Some(plan)) => (kept.session, kept.pending, plan),
-        (kept, _) => {
-            drop(kept);
+    let (mut session, pending, plan) = match claim {
+        Claim::Continue(kept, plan) => (kept.session, kept.pending, plan),
+        Claim::Fresh(evicted) => {
+            drop(evicted);
             let session = backend
                 .open_session()
                 .map_err(|error| format!("the backend could not open a sequence: {error}"))?;
@@ -863,7 +976,7 @@ fn run_request(
             Some(step) => Some((sampling_for(job.sampling, handed), step)),
             None => pending,
         };
-        *held = Some(Held { session, pending });
+        lease.keep(Held { session, pending });
     }
     ending.map_err(Ending::message)
 }

@@ -232,6 +232,12 @@ pub trait ModelSession: Send {
     fn cached_tokens(&self) -> usize {
         0
     }
+
+    /// Says the request is over and the adapter keeps the session for a later one: whatever the
+    /// sequence holds may be given up for another sequence that needs the memory, after which
+    /// [`Self::reusable_prefix`] no longer names it. The default does nothing, for a session that
+    /// holds its memory until it is dropped.
+    fn park(&mut self) {}
 }
 
 /// How a model runs on one host.

@@ -129,8 +129,9 @@ pub enum Tp4ControlFrame {
         /// The canvas bytes after the frame.
         bytes: u64,
     },
-    /// Rank 0 -> every worker of a fused group: lane `lane` takes a new request's prompt. A lane
-    /// that still holds an earlier request forgets it first, on every rank alike.
+    /// Rank 0 -> every worker of a fused group: lane `lane` takes a request's prompt. A lane that
+    /// still holds an earlier request forgets it first, on every rank alike, unless `keep` says
+    /// rank 0's lane kept it to continue.
     LaneRequest {
         /// The lane, `0..lanes`, in the order rank 0's pool opened them.
         lane: u32,
@@ -139,6 +140,19 @@ pub enum Tp4ControlFrame {
         /// The prompt's image spans, as [Tp4ControlFrame::Request] carries them.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<Tp4DeviceImage>,
+        /// Whether the lane keeps what it holds: the prompt then continues it, or the lane
+        /// rewinds or starts over itself, as rank 0's lane does with the same history.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
+        /// The request's sampler, as [Tp4ControlFrame::Request] carries it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sampler: Option<Tp4FrameSampler>,
+    },
+    /// Rank 0 -> every worker of a fused group: lane `lane` is idle and gives up what it holds,
+    /// so another lane can grow; its next request starts over.
+    LaneRelease {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
     },
     /// Rank 0 -> every worker of a fused group: one step of these lanes, each consuming the token
     /// rank 0 sampled for it, in this order - the order is the step's row order on every rank.
@@ -168,6 +182,7 @@ impl Tp4ControlFrame {
             Self::DeviceTick { .. } => "DeviceTick",
             Self::DevicePixels { .. } => "DevicePixels",
             Self::LaneRequest { .. } => "LaneRequest",
+            Self::LaneRelease { .. } => "LaneRelease",
             Self::LaneStep { .. } => "LaneStep",
             Self::End => "End",
             Self::Error { .. } => "Error",

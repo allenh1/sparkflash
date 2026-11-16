@@ -340,6 +340,21 @@ fn control_frames_round_trip_on_a_loopback_socket() {
                 best_width: 80,
                 key: sparkflash_comm::control::Tp4DeviceImage::hex_key(&[0xab; 32]),
             }],
+            keep: false,
+            sampler: None,
+        },
+        // A kept lane's next turn, with its sampler.
+        Tp4ControlFrame::LaneRequest {
+            lane: 1,
+            prompt_ids: vec![5, 6, 7],
+            images: Vec::new(),
+            keep: true,
+            sampler: Some(sparkflash_comm::control::Tp4FrameSampler {
+                temperature_bits: 0.7f32.to_bits(),
+                top_p_bits: 0.9f32.to_bits(),
+                top_k: 20,
+                seed: 11,
+            }),
         },
         Tp4ControlFrame::Token { token_id: 7 },
         Tp4ControlFrame::End,

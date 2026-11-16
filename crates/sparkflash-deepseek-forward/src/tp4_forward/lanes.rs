@@ -32,6 +32,7 @@
 //! sequence holds its compressed stores and index keys plus a few chunks of each window ring.
 
 use super::*;
+use sparkflash_kernels::lane_memory::{ChunkPool, LaneShape, LaneSpan, Layout};
 
 /// The physical memory every lane's chunks may hold together (SPARKFLASH_LANE_MEMORY_MB overrides
 /// it). A fixed number, not the device's free memory: every rank runs the same scheduler, so every
@@ -51,41 +52,6 @@ pub(super) const SLIDE_STEP: usize = 4096;
 /// steps.
 pub(super) fn slide_floor(pos: usize) -> usize {
     pos.saturating_sub(SLIDE_KEEP) / SLIDE_STEP * SLIDE_STEP
-}
-
-/// One part of the lane layout: `len` bytes at `offset`, of which a sequence of `rows` positions
-/// touches the first `max(rows, min_rows) * row_bytes` (all of it when `row_bytes` is 0). A window
-/// ring `slides`: below the lane's floor its rows are not read again.
-#[derive(Clone, Copy, Debug)]
-struct Region {
-    offset: usize,
-    len: usize,
-    row_bytes: usize,
-    min_rows: usize,
-    slides: bool,
-}
-
-impl Region {
-    /// The bytes from `offset` a sequence of `rows` positions touches.
-    fn touched(&self, rows: usize) -> usize {
-        if self.row_bytes == 0 {
-            self.len
-        } else {
-            self.len.min(rows.max(self.min_rows) * self.row_bytes)
-        }
-    }
-
-    /// The bytes `[from, to)` from `offset` a sequence of `rows` positions still reads when its
-    /// window rings start at row `floor`.
-    fn live(&self, rows: usize, floor: usize) -> (usize, usize) {
-        let to = self.touched(rows);
-        let from = if self.slides {
-            (floor * self.row_bytes).min(to)
-        } else {
-            0
-        };
-        (from, to)
-    }
 }
 
 /// Where each part of a lane starts, relative to the lane's base.
@@ -146,24 +112,16 @@ pub(super) struct LaneGeometry {
     pub(super) engram_rows: usize,
 }
 
-/// Every lane's state: the reservation, the layout and the chunk pool.
+/// Every lane's state: the reservation, the layout and the chunk pool ([sparkflash_kernels::
+/// lane_memory] holds the backing every lane arm shares).
 pub(super) struct Lanes<'a> {
     cuda: &'a Cuda,
     base: u64,
-    stride: usize,
-    granularity: usize,
-    regions: Vec<Region>,
+    shape: LaneShape,
     offsets: Offsets,
-    /// Per lane, the physical chunk behind each chunk of its stride (0: none).
-    chunks: Vec<Vec<u64>>,
-    /// Per lane, the rows [Self::ensure] has backed.
-    backed: Vec<usize>,
-    /// Per lane, the first row its window rings still back ([Self::slide]).
-    floor: Vec<usize>,
-    /// Chunks created and unmapped, ready for the next lane that grows.
-    free: Vec<u64>,
-    created: usize,
-    budget: usize,
+    /// Per lane, its span of the reservation and the chunks behind it.
+    spans: Vec<LaneSpan>,
+    pool: ChunkPool,
     pub(super) host: Vec<LaneHost>,
     /// The lane whose pointers and counters the DeviceLayer holds.
     pub(super) selected: usize,
@@ -171,12 +129,12 @@ pub(super) struct Lanes<'a> {
 
 impl Lanes<'_> {
     pub(super) fn count(&self) -> usize {
-        self.chunks.len()
+        self.spans.len()
     }
 
     /// Lane `lane`'s pointers.
     pub(super) fn pointers(&self, lane: usize) -> LanePointers {
-        let base = self.base + (lane * self.stride) as u64;
+        let base = self.base + (lane * self.shape.stride) as u64;
         let at = |offset: usize| base + offset as u64;
         let o = self.offsets;
         LanePointers {
@@ -192,62 +150,20 @@ impl Lanes<'_> {
 
     /// The rows lane `lane` has backed.
     pub(super) fn backed(&self, lane: usize) -> usize {
-        self.backed.get(lane).copied().unwrap_or(0)
+        self.spans.get(lane).map_or(0, LaneSpan::backed)
     }
 
     /// The first row lane `lane`'s window rings still back.
     pub(super) fn floor(&self, lane: usize) -> usize {
-        self.floor.get(lane).copied().unwrap_or(0)
-    }
-
-    /// Chunks not yet promised to any lane: the pool's free ones and those the budget can still
-    /// create.
-    pub(super) fn spare_chunks(&self) -> usize {
-        self.free.len() + self.budget.saturating_sub(self.created)
-    }
-
-    /// The chunks lane `lane` would have to map to back `rows` rows.
-    pub(super) fn chunks_needed(&self, lane: usize, rows: usize) -> usize {
-        let rows = rows.div_ceil(ROW_QUANTUM) * ROW_QUANTUM;
-        self.wanted(lane, rows, self.floor[lane])
-            .iter()
-            .zip(&self.chunks[lane])
-            .filter(|&(&want, &mapped)| want && mapped == 0)
-            .count()
+        self.spans.get(lane).map_or(0, LaneSpan::floor)
     }
 
     /// Whether one sequence of `rows` positions fits the budget with every other lane empty: its
     /// stores for every row, and its window rings from the floor of row `rows - ahead` (a tick
     /// backs up to `ahead` rows before its lane's floor slides).
     pub(super) fn fits(&self, rows: usize, ahead: usize) -> bool {
-        let rows = rows.div_ceil(ROW_QUANTUM) * ROW_QUANTUM;
-        let floor = slide_floor(rows.saturating_sub(ahead));
-        let wanted = self.wanted(0, rows, floor);
-        wanted.iter().filter(|&&want| want).count() <= self.budget
-    }
-
-    /// Which of lane `lane`'s chunks hold bytes a sequence of `rows` rows reads with its window
-    /// rings from row `floor`.
-    fn wanted(&self, lane: usize, rows: usize, floor: usize) -> Vec<bool> {
-        let mut wanted = vec![false; self.chunks[lane].len()];
-        for region in &self.regions {
-            let (first, end) = self.chunk_span(region, rows, floor);
-            wanted[first..end].fill(true);
-        }
-        wanted
-    }
-
-    /// The chunk indices `[first, end)` holding `region`'s live bytes at `rows` rows and window
-    /// floor `floor`.
-    fn chunk_span(&self, region: &Region, rows: usize, floor: usize) -> (usize, usize) {
-        let (from, to) = region.live(rows, floor);
-        if from == to {
-            return (0, 0);
-        }
-        (
-            (region.offset + from) / self.granularity,
-            (region.offset + to).div_ceil(self.granularity),
-        )
+        let floor = slide_floor(self.shape.quantized(rows).saturating_sub(ahead));
+        self.shape.chunks_for(rows, floor) <= self.pool.budget()
     }
 
     /// Backs lane `lane` for sequences of up to `rows` positions. Returns false, mapping nothing
@@ -256,57 +172,19 @@ impl Lanes<'_> {
     /// # Errors
     /// A driver failure creating, mapping or zeroing a chunk.
     pub(super) fn ensure(&mut self, lane: usize, rows: usize) -> Result<bool, String> {
-        if lane >= self.count() {
-            return Err(format!("lanes: lane {lane} of {}", self.count()));
-        }
-        if rows <= self.backed[lane] {
-            return Ok(true);
-        }
-        let rows = rows.div_ceil(ROW_QUANTUM) * ROW_QUANTUM;
-        if self.chunks_needed(lane, rows) > self.spare_chunks() {
-            return Ok(false);
-        }
-        let lane_base = self.base + (lane * self.stride) as u64;
-        let floor = self.floor[lane];
-        for index in 0..self.regions.len() {
-            let (first, end) = self.chunk_span(&self.regions[index], rows, floor);
-            for chunk in first..end {
-                if self.chunks[lane][chunk] != 0 {
-                    continue;
-                }
-                let handle = match self.free.pop() {
-                    Some(handle) => handle,
-                    None => {
-                        let handle = self.cuda.vmm_create(self.granularity)?;
-                        self.created += 1;
-                        handle
-                    }
-                };
-                let at = Deviceptr(lane_base + (chunk * self.granularity) as u64);
-                if let Err(error) = self.cuda.vmm_map(at, self.granularity, handle) {
-                    self.free.push(handle);
-                    return Err(format!("lanes: lane {lane} chunk {chunk}: {error}"));
-                }
-                self.chunks[lane][chunk] = handle;
-                // A chunk may come from another lane (or another process's freed memory): every
-                // part starts zeroed, as the single sequence's allocations did.
-                self.cuda.memset_d8_async(at, 0, self.granularity)?;
-            }
-        }
-        self.backed[lane] = rows;
-        Ok(true)
+        let count = self.count();
+        let span = self
+            .spans
+            .get_mut(lane)
+            .ok_or_else(|| format!("lanes: lane {lane} of {count}"))?;
+        span.ensure(self.cuda, &self.shape, &mut self.pool, rows)
+            .map_err(|error| format!("lanes: lane {lane}: {error}"))
     }
 
     /// The chunks lane `lane` would give back if its window rings started at row `floor`: those
     /// it maps that no part reads from there on.
     pub(super) fn slid_chunks(&self, lane: usize, floor: usize) -> Vec<usize> {
-        if floor <= self.floor[lane] {
-            return Vec::new();
-        }
-        let wanted = self.wanted(lane, self.backed[lane], floor);
-        (0..self.chunks[lane].len())
-            .filter(|&chunk| self.chunks[lane][chunk] != 0 && !wanted[chunk])
-            .collect()
+        self.spans[lane].slid_chunks(&self.shape, floor)
     }
 
     /// Moves lane `lane`'s window floor to row `floor`, returning [Self::slid_chunks] to the
@@ -315,18 +193,7 @@ impl Lanes<'_> {
     /// # Errors
     /// A driver failure unmapping a chunk.
     pub(super) fn slide(&mut self, lane: usize, floor: usize) -> Result<usize, String> {
-        let slid = self.slid_chunks(lane, floor);
-        let lane_base = self.base + (lane * self.stride) as u64;
-        for &chunk in &slid {
-            let handle = std::mem::take(&mut self.chunks[lane][chunk]);
-            self.cuda.vmm_unmap(
-                Deviceptr(lane_base + (chunk * self.granularity) as u64),
-                self.granularity,
-            )?;
-            self.free.push(handle);
-        }
-        self.floor[lane] = self.floor[lane].max(floor);
-        Ok(slid.len())
+        self.spans[lane].slide(self.cuda, &self.shape, &mut self.pool, floor)
     }
 
     /// Copies every part lane `src` holds for positions `..rows` into lane `dst` (the window rings
@@ -342,23 +209,14 @@ impl Lanes<'_> {
         rows: usize,
         floor: usize,
     ) -> Result<bool, String> {
-        if !self.ensure(dst, rows)? {
-            return Ok(false);
-        }
-        let dst_base = self.base + (dst * self.stride) as u64;
-        let src_base = self.base + (src * self.stride) as u64;
-        for region in &self.regions {
-            let (from, to) = region.live(rows, floor);
-            if from < to {
-                let at = (region.offset + from) as u64;
-                self.cuda.copy_dtod_async(
-                    &Deviceptr(dst_base + at),
-                    &Deviceptr(src_base + at),
-                    to - from,
-                )?;
-            }
-        }
-        Ok(true)
+        let (dst_span, src_span) = if dst < src {
+            let (low, high) = self.spans.split_at_mut(src);
+            (&mut low[dst], &high[0])
+        } else {
+            let (low, high) = self.spans.split_at_mut(dst);
+            (&mut high[0], &low[src])
+        };
+        dst_span.copy_prefix(self.cuda, &self.shape, &mut self.pool, src_span, rows, floor)
     }
 
     /// Returns every chunk of lane `lane` to the pool. The device must be idle: nothing queued may
@@ -367,20 +225,7 @@ impl Lanes<'_> {
     /// # Errors
     /// A driver failure unmapping a chunk.
     pub(super) fn release(&mut self, lane: usize) -> Result<(), String> {
-        let lane_base = self.base + (lane * self.stride) as u64;
-        for chunk in 0..self.chunks[lane].len() {
-            let handle = std::mem::take(&mut self.chunks[lane][chunk]);
-            if handle == 0 {
-                continue;
-            }
-            self.cuda.vmm_unmap(
-                Deviceptr(lane_base + (chunk * self.granularity) as u64),
-                self.granularity,
-            )?;
-            self.free.push(handle);
-        }
-        self.backed[lane] = 0;
-        self.floor[lane] = 0;
+        self.spans[lane].release(self.cuda, &self.shape, &mut self.pool)?;
         if let Some(host) = self.host.get_mut(lane) {
             host.positions_begun = 0;
             host.appended_rows.iter_mut().for_each(|count| *count = 0);
@@ -390,73 +235,24 @@ impl Lanes<'_> {
 
     /// The physical bytes the lanes hold and may hold.
     pub(super) fn memory(&self) -> (usize, usize) {
-        let mapped: usize = self
-            .chunks
-            .iter()
-            .map(|lane| lane.iter().filter(|&&handle| handle != 0).count())
-            .sum();
-        (mapped * self.granularity, self.budget * self.granularity)
+        let mapped: usize = self.spans.iter().map(LaneSpan::mapped).sum();
+        let granularity = self.shape.granularity;
+        (mapped * granularity, self.pool.budget() * granularity)
     }
 }
 
 impl Drop for Lanes<'_> {
     fn drop(&mut self) {
         let _ = self.cuda.synchronize();
-        for lane in 0..self.chunks.len() {
+        for lane in 0..self.spans.len() {
             let _ = self.release(lane);
         }
-        for handle in self.free.drain(..) {
-            self.cuda.vmm_release(handle);
-        }
-        self.cuda
-            .vmm_free(Deviceptr(self.base), self.stride * self.chunks.len());
+        self.pool.drain(self.cuda);
+        self.cuda.vmm_free(
+            Deviceptr(self.base),
+            self.shape.stride * self.spans.len(),
+        );
     }
-}
-
-/// The lane layout as it is built: the next free offset and the regions so far.
-#[derive(Default)]
-struct Layout {
-    cursor: usize,
-    regions: Vec<Region>,
-}
-
-impl Layout {
-    /// The offset of `len` fresh bytes (256-byte aligned, the slab's alignment).
-    fn reserve(&mut self, len: usize) -> usize {
-        let offset = round_up(self.cursor, 256);
-        self.cursor = offset + len;
-        offset
-    }
-
-    fn region(&mut self, offset: usize, len: usize, row_bytes: usize, min_rows: usize) {
-        self.regions.push(Region {
-            offset,
-            len,
-            row_bytes,
-            min_rows,
-            slides: false,
-        });
-    }
-
-    /// A window ring's region: it slides.
-    fn window(&mut self, offset: usize, len: usize, row_bytes: usize) {
-        self.region(offset, len, row_bytes, 0);
-        if let Some(region) = self.regions.last_mut() {
-            region.slides = true;
-        }
-    }
-
-    /// [Self::reserve] and one region over it.
-    fn part(&mut self, len: usize, row_bytes: usize, min_rows: usize) -> usize {
-        let offset = self.reserve(len);
-        self.region(offset, len, row_bytes, min_rows);
-        offset
-    }
-}
-
-/// Rounds `value` up to a multiple of `to`.
-fn round_up(value: usize, to: usize) -> usize {
-    value.div_ceil(to) * to
 }
 
 impl<'a> DeviceLayer<'a> {
@@ -525,8 +321,8 @@ impl<'a> DeviceLayer<'a> {
             stage.1 = layout.reserve(draft_rows * latent / 32);
             layout.window(stage.1, draft_rows * latent / 32, latent / 32);
         }
-        let Layout { cursor, regions } = layout;
-        let stride = round_up(cursor, granularity);
+        let shape = layout.finish(granularity, ROW_QUANTUM);
+        let stride = shape.stride;
         let offsets = Offsets {
             kv_ring,
             wkv,
@@ -572,16 +368,12 @@ impl<'a> DeviceLayer<'a> {
         let lanes = Lanes {
             cuda,
             base,
-            stride,
-            granularity,
-            regions,
+            spans: (0..count)
+                .map(|lane| LaneSpan::new(base + (lane * stride) as u64, &shape))
+                .collect(),
+            shape,
             offsets,
-            chunks: vec![vec![0; stride / granularity]; count],
-            backed: vec![0; count],
-            floor: vec![0; count],
-            free: Vec::new(),
-            created: 0,
-            budget: budget_bytes / granularity,
+            pool: ChunkPool::new(granularity, budget_bytes),
             host: vec![
                 LaneHost {
                     positions_begun: 0,

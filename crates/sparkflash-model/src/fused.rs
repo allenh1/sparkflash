@@ -26,11 +26,16 @@
 //! are the ones it would see alone: [FusedArm::step] is one row a member, so a member's
 //! arithmetic does not depend on its neighbours.
 //!
-//! Two limits. A prefill takes the engine: the prompt chunks of two requests are not batched, so
-//! a prompt runs to its first token while the other members' decodes wait. And a fused session
-//! does not report a reusable prefix, because the engine owns the slot; the host driver's
-//! append-only reuse ([D66](../../../docs/DECISIONS.md)) is off in this mode, which is the trade
-//! a deployment makes for sharing the pass.
+//! A prefill takes the engine: the prompt chunks of two requests are not batched, so a prompt runs
+//! to its first token while the other members' decodes wait.
+//!
+//! A fused session reports a reusable prefix when its arm keeps one ([FusedArm::history]): the
+//! engine then hands the slot's next prompt to the arm as it stands, the arm continues what the
+//! prompt shares with the slot or starts over, as its own session would, and the host driver's
+//! append-only reuse ([D66](../../../docs/DECISIONS.md)) works as it does for a serial session.
+//! The engine publishes each slot's held lengths after every job ([Kept]); the handle keeps the
+//! ids it fed, so it can name the prefix without the engine copying a history a step. An arm that
+//! keeps nothing (the default) has its slot renewed before every prompt.
 //!
 //! DeepSeek's tensor-parallel driver is the same shape at four ranks: a slot a request, one step
 //! a batch, a reply a job. The arm supplies the arithmetic through [FusedArm]; nothing here knows
@@ -42,7 +47,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
-use crate::vision::VisionImage;
+use crate::vision::{ImageSpan, VisionImage};
 
 /// What a model exposes for its sessions to be fused.
 ///
@@ -111,6 +116,60 @@ pub trait FusedArm: Send + Sync + 'static {
     /// A slot's speculative counters for the request it is serving.
     fn speculation(&self, slot: &Self::Slot) -> Speculation;
 
+    /// The tokens a slot's sequence holds and can continue from, as
+    /// [ModelSession::reusable_prefix] names them for a session.
+    ///
+    /// `None` (the default) says the slot keeps nothing a later prompt may reuse, and the engine
+    /// renews it before its next prompt. An arm that answers continues a slot itself: its prefill
+    /// reuses what the prompt shares with the history, or starts over. The history must be the
+    /// slot's last prompt followed by the tokens stepped since, cut to the length reported: the
+    /// handle names it from the ids it fed.
+    fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+        let _ = slot;
+        None
+    }
+
+    /// A shorter prefix of [FusedArm::history] the slot can go back to, as
+    /// [ModelSession::rewind_prefix] names it.
+    fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+        let _ = slot;
+        None
+    }
+
+    /// The image spans [FusedArm::history] holds, as [ModelSession::held_images] names them.
+    fn held_images<'s>(&self, slot: &'s Self::Slot) -> &'s [ImageSpan] {
+        let _ = slot;
+        &[]
+    }
+
+    /// How many of the last prompt's tokens the slot already held, as
+    /// [ModelSession::cached_tokens] counts them.
+    fn cached_tokens(&self, slot: &Self::Slot) -> usize {
+        let _ = slot;
+        0
+    }
+
+    /// Whether the slot can take `prompt` (or, for `None`, its next step) with the memory the arm
+    /// has spare now. The default always can, for an arm whose slots own their memory whole.
+    ///
+    /// The engine asks before a job runs, and when the answer is no it gives back the slot that
+    /// has idled longest ([FusedArm::release]) and asks again, so several conversations share
+    /// memory one long one would fill. An arm whose prefill or step fails on a slot without room
+    /// must answer here as that failure would.
+    fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
+        let _ = (slot, prompt);
+        true
+    }
+
+    /// Gives up what an idle slot holds, so another can grow: its sequence is forgotten and the
+    /// next prompt starts over. The default renews it.
+    ///
+    /// # Errors
+    /// A backend failure.
+    fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+        self.renew(slot)
+    }
+
     /// The most members one pass may hold, when the model's batch is narrower than the pool.
     ///
     /// A step's rows are one a member, so a model whose combined row buffers hold four rows
@@ -139,6 +198,8 @@ enum Work {
     },
     /// Consume one token of a request already prefilled.
     Decode { token: u32 },
+    /// The slot's request is over: what it holds may be given up for another ([FusedArm::release]).
+    Park,
     /// End the engine thread.
     Shutdown,
 }
@@ -156,6 +217,40 @@ type Reply = Sender<Result<StepOutput, BackendError>>;
 /// A decode job waiting for its batch: its slot, its token and its caller.
 type Waiting = (usize, u32, Reply);
 
+/// What a slot holds after its last job, as the engine publishes it: the lengths of
+/// [FusedArm::history] and [FusedArm::rewind_prefix], the images the history holds and the last
+/// prompt's hit. The handle names the prefixes from the ids it fed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Kept {
+    history: Option<usize>,
+    rewind: Option<usize>,
+    images: Vec<ImageSpan>,
+    cached: usize,
+}
+
+/// A slot's record after its last job: its speculative counters and what it holds.
+#[derive(Debug, Clone, Default)]
+struct Record {
+    speculation: Speculation,
+    kept: Kept,
+}
+
+/// Each slot's record, refreshed by the engine after every job: a handle cannot read its slot.
+type Records = Vec<Arc<Mutex<Record>>>;
+
+/// Refreshes `cell` from `state` after a job; a prompt (`prompt`) may change the images too.
+fn record<A: FusedArm>(arm: &A, state: &A::Slot, cell: &Mutex<Record>, prompt: bool) {
+    if let Ok(mut cell) = cell.lock() {
+        cell.speculation = arm.speculation(state);
+        cell.kept.history = arm.history(state).map(<[u32]>::len);
+        cell.kept.rewind = arm.rewind_prefix(state).map(<[u32]>::len);
+        cell.kept.cached = arm.cached_tokens(state);
+        if prompt {
+            cell.kept.images = arm.held_images(state).to_vec();
+        }
+    }
+}
+
 /// The engine thread and the slots of its pool.
 pub struct FusedEngine<A: FusedArm> {
     /// The arm, kept alive with the engine: the thread holds its own share, but the pool's slots
@@ -166,19 +261,24 @@ pub struct FusedEngine<A: FusedArm> {
     free: Mutex<Vec<usize>>,
     wake: Condvar,
     thread: Mutex<Option<JoinHandle<()>>>,
-    /// Each slot's speculative counters, refreshed by the engine after every step: a handle
-    /// cannot read its slot, so this is how a request reports what its drafts were worth.
-    stats: Vec<Arc<Mutex<Speculation>>>,
+    /// Each slot's record, refreshed by the engine after every job: a handle cannot read its
+    /// slot, so this is how a request reports what its drafts were worth and what it holds.
+    stats: Records,
 }
 
 /// A request's session: a handle that posts to the engine thread instead of running the model.
 pub struct FusedSession<A: FusedArm> {
     slot: usize,
     engine: Arc<FusedEngine<A>>,
-    stats: Arc<Mutex<Speculation>>,
+    stats: Arc<Mutex<Record>>,
     sampling: Sampling,
     /// Whether this handle has posted a prompt yet.
     fresh: bool,
+    /// The ids this handle fed its slot: its last prompt and every token decoded since. The slot's
+    /// history is a prefix of them ([FusedArm::history]).
+    fed: Vec<u32>,
+    /// What the slot held after this handle's last job.
+    kept: Kept,
 }
 
 impl<A: FusedArm> FusedEngine<A> {
@@ -200,8 +300,8 @@ impl<A: FusedArm> FusedEngine<A> {
         for _ in 0..capacity {
             pool.push(Some(arm.open_slot()?));
         }
-        let stats: Vec<Arc<Mutex<Speculation>>> = (0..capacity)
-            .map(|_| Arc::new(Mutex::new(Speculation::default())))
+        let stats: Records = (0..capacity)
+            .map(|_| Arc::new(Mutex::new(Record::default())))
             .collect();
         let (jobs, inbox) = channel::<Job>();
         let thread_stats = stats.clone();
@@ -245,6 +345,8 @@ impl<A: FusedArm> FusedEngine<A> {
             stats: Arc::clone(&self.stats[slot]),
             sampling: Sampling::default(),
             fresh: true,
+            fed: Vec::new(),
+            kept: Kept::default(),
         })
     }
 
@@ -295,14 +397,50 @@ impl<A: FusedArm> FusedSession<A> {
                 reply,
             })
             .map_err(|_| BackendError::new("fused", "the engine thread has stopped"))?;
-        answer
+        let answer = answer
             .recv()
-            .map_err(|_| BackendError::new("fused", "the engine thread has stopped"))?
+            .map_err(|_| BackendError::new("fused", "the engine thread has stopped"))?;
+        if let Ok(cell) = self.stats.lock() {
+            self.kept.clone_from(&cell.kept);
+        }
+        answer
+    }
+
+    /// The first `length` ids this handle fed, when it has fed that many.
+    fn prefix(&self, length: Option<usize>) -> Option<&[u32]> {
+        if self.fresh {
+            return None;
+        }
+        length
+            .filter(|length| *length <= self.fed.len())
+            .map(|length| &self.fed[..length])
+    }
+
+    /// The slot's record as it stands: the engine may have given a parked slot's sequence up
+    /// since this handle's last job.
+    fn live(&self) -> Kept {
+        self.stats
+            .lock()
+            .map(|cell| cell.kept.clone())
+            .unwrap_or_default()
+    }
+
+    /// Posts a job whose answer nobody waits for.
+    fn post(&self, work: Work) {
+        let (reply, _) = channel();
+        let _ = self.engine.jobs.send(Job {
+            slot: self.slot,
+            work,
+            reply,
+        });
     }
 }
 
 impl<A: FusedArm> Drop for FusedSession<A> {
     fn drop(&mut self) {
+        // Parked before the slot goes back to the list: the jobs run in order, so the next
+        // handle's first job finds the slot parked and takes it back.
+        self.post(Work::Park);
         self.engine.release(self.slot);
     }
 }
@@ -325,19 +463,51 @@ impl<A: FusedArm> ModelSession for FusedSession<A> {
             return Err(BackendError::new("fused", "an empty prompt has no logits"));
         }
         self.fresh = false;
-        self.ask(Work::Prefill {
+        let answer = self.ask(Work::Prefill {
             tokens: tokens.to_vec(),
             images: images.to_vec(),
             sampling: self.sampling,
-        })
+        });
+        if answer.is_ok() {
+            self.fed.clear();
+            self.fed.extend_from_slice(tokens);
+        }
+        answer
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        self.ask(Work::Decode { token })
+        let answer = self.ask(Work::Decode { token });
+        if answer.is_ok() {
+            self.fed.push(token);
+        }
+        answer
     }
 
     fn speculation(&self) -> Speculation {
-        self.stats.lock().map(|stats| *stats).unwrap_or_default()
+        self.stats
+            .lock()
+            .map(|record| record.speculation)
+            .unwrap_or_default()
+    }
+
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        self.prefix(self.live().history)
+    }
+
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        self.prefix(self.live().rewind)
+    }
+
+    fn held_images(&self) -> &[ImageSpan] {
+        &self.kept.images
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.kept.cached
+    }
+
+    fn park(&mut self) {
+        self.post(Work::Park);
     }
 }
 
@@ -347,8 +517,9 @@ fn run<A: FusedArm>(
     inbox: std::sync::mpsc::Receiver<Job>,
     mut pool: Vec<Option<A::Slot>>,
     capacity: usize,
-    stats: Vec<Arc<Mutex<Speculation>>>,
+    stats: Records,
 ) {
+    let mut idle = Idle::new(capacity);
     loop {
         let Ok(first) = inbox.recv() else {
             return;
@@ -383,14 +554,131 @@ fn run<A: FusedArm>(
                         images: &images,
                         sampling,
                     };
+                    idle.busy(job.slot);
+                    let mut room = Room {
+                        arm: &*arm,
+                        pool: &mut pool,
+                        stats: &stats,
+                        idle: &mut idle,
+                    };
+                    room.make(job.slot, Some(&tokens));
                     prefill(&*arm, &mut pool, &stats, job.slot, prompt, job.reply);
                 }
-                Work::Decode { token } => decodes.push((job.slot, token, job.reply)),
+                Work::Decode { token } => {
+                    idle.busy(job.slot);
+                    decodes.push((job.slot, token, job.reply));
+                }
+                Work::Park => idle.park(job.slot),
             }
         }
         if !decodes.is_empty() {
-            step(&*arm, &mut pool, &stats, decodes);
+            let mut room = Room {
+                arm: &*arm,
+                pool: &mut pool,
+                stats: &stats,
+                idle: &mut idle,
+            };
+            let decodes = room.steps(decodes);
+            if !decodes.is_empty() {
+                step(&*arm, &mut pool, &stats, decodes);
+            }
         }
+    }
+}
+
+/// When each parked slot was parked, in the engine's job order.
+struct Idle {
+    parked: Vec<Option<u64>>,
+    clock: u64,
+}
+
+impl Idle {
+    fn new(capacity: usize) -> Self {
+        Self {
+            parked: vec![None; capacity],
+            clock: 0,
+        }
+    }
+
+    fn park(&mut self, slot: usize) {
+        self.clock += 1;
+        if let Some(parked) = self.parked.get_mut(slot) {
+            *parked = Some(self.clock);
+        }
+    }
+
+    fn busy(&mut self, slot: usize) {
+        if let Some(parked) = self.parked.get_mut(slot) {
+            *parked = None;
+        }
+    }
+}
+
+/// What the engine reclaims memory with: the parked slots, least recently parked first.
+struct Room<'r, A: FusedArm> {
+    arm: &'r A,
+    pool: &'r mut [Option<A::Slot>],
+    stats: &'r [Arc<Mutex<Record>>],
+    idle: &'r mut Idle,
+}
+
+impl<A: FusedArm> Room<'_, A> {
+    /// Gives up parked slots, the longest parked first, until `slot` has room for `prompt` (or
+    /// its next step). False when every parked slot is given up and there is still no room: the
+    /// job then fails as the arm refuses it.
+    fn make(&mut self, slot: usize, prompt: Option<&[u32]>) -> bool {
+        loop {
+            let Some(state) = self.pool[slot].as_ref() else {
+                return false;
+            };
+            if self.arm.room(state, prompt) {
+                return true;
+            }
+            let victim = self
+                .idle
+                .parked
+                .iter()
+                .enumerate()
+                .filter(|&(other, parked)| {
+                    other != slot
+                        && parked.is_some()
+                        && self.pool[other]
+                            .as_ref()
+                            .is_some_and(|state| self.arm.holds_request(state))
+                })
+                .min_by_key(|&(_, parked)| *parked)
+                .map(|(other, _)| other);
+            let Some(victim) = victim else {
+                return false;
+            };
+            let Some(mut state) = self.pool[victim].take() else {
+                return false;
+            };
+            let released = self.arm.release(&mut state);
+            record(self.arm, &state, &self.stats[victim], true);
+            self.pool[victim] = Some(state);
+            if released.is_err() {
+                return false;
+            }
+        }
+    }
+
+    /// The decodes that have room for their step; the rest are answered with the refusal their
+    /// step would have been.
+    fn steps(&mut self, decodes: Vec<Waiting>) -> Vec<Waiting> {
+        let mut kept = Vec::with_capacity(decodes.len());
+        for (slot, token, reply) in decodes {
+            if self.make(slot, None) {
+                kept.push((slot, token, reply));
+            } else {
+                let _ = reply.send(Err(BackendError::new(
+                    "context",
+                    "no memory is left for this sequence's next step, and no idle sequence holds \
+                     any to give back",
+                )));
+            }
+        }
+        kept
     }
 }
 
@@ -405,7 +693,7 @@ struct Prompt<'a> {
 fn prefill<A: FusedArm>(
     arm: &A,
     pool: &mut [Option<A::Slot>],
-    stats: &[Arc<Mutex<Speculation>>],
+    stats: &[Arc<Mutex<Record>>],
     slot: usize,
     prompt: Prompt<'_>,
     reply: Sender<Result<StepOutput, BackendError>>,
@@ -418,15 +706,15 @@ fn prefill<A: FusedArm>(
         return;
     };
     let answer = (|| {
-        if arm.holds_request(&state) {
+        // A slot whose arm keeps its history goes to the prompt as it stands: the arm continues
+        // what the prompt shares with it, or starts over.
+        if arm.holds_request(&state) && arm.history(&state).is_none() {
             arm.renew(&mut state)?;
         }
         arm.set_sampling(&mut state, prompt.sampling);
         arm.prefill_images(&mut state, prompt.tokens, prompt.images)
     })();
-    if let Ok(mut cell) = stats[slot].lock() {
-        *cell = arm.speculation(&state);
-    }
+    record(arm, &state, &stats[slot], true);
     pool[slot] = Some(state);
     let _ = reply.send(answer);
 }
@@ -435,7 +723,7 @@ fn prefill<A: FusedArm>(
 fn step<A: FusedArm>(
     arm: &A,
     pool: &mut [Option<A::Slot>],
-    stats: &[Arc<Mutex<Speculation>>],
+    stats: &[Arc<Mutex<Record>>],
     decodes: Vec<Waiting>,
 ) {
     let mut slots = Vec::with_capacity(decodes.len());
@@ -459,9 +747,7 @@ fn step<A: FusedArm>(
     let answer = arm.step(&mut members);
     for (index, (state, _)) in members.into_iter().enumerate() {
         let slot = slots[index];
-        if let Ok(mut cell) = stats[slot].lock() {
-            *cell = arm.speculation(&state);
-        }
+        record(arm, &state, &stats[slot], false);
         pool[slot] = Some(state);
     }
     match answer {
@@ -629,6 +915,224 @@ mod tests {
             2,
             "the new prompt's own count, not the last request's"
         );
+    }
+
+    /// An arm whose slot is its history: a prompt that extends it forwards only the rest.
+    struct Keeper;
+
+    /// A [Keeper] slot: the ids it holds and how many of the last prompt's it reused.
+    #[derive(Default)]
+    struct Held {
+        ids: Vec<u32>,
+        cached: usize,
+    }
+
+    impl FusedArm for Keeper {
+        type Slot = Held;
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            Ok(Held::default())
+        }
+
+        fn holds_request(&self, slot: &Self::Slot) -> bool {
+            !slot.ids.is_empty()
+        }
+
+        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            *slot = Held::default();
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            slot.cached = if tokens.starts_with(&slot.ids) {
+                slot.ids.len()
+            } else {
+                0
+            };
+            slot.ids = tokens.to_vec();
+            Ok(StepOutput::default())
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    slot.ids.push(*token);
+                    StepOutput::default()
+                })
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+
+        fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            Some(&slot.ids)
+        }
+
+        fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            slot.ids.get(..1)
+        }
+
+        fn cached_tokens(&self, slot: &Self::Slot) -> usize {
+            slot.cached
+        }
+    }
+
+    #[test]
+    fn a_slot_that_keeps_its_history_reports_it_and_continues_it() {
+        let engine = FusedEngine::start(Arc::new(Keeper), 1).expect("the engine starts");
+        let mut first = engine.open().expect("a slot");
+        assert_eq!(first.reusable_prefix(), None, "a fresh handle holds nothing");
+        first.prefill(&[1, 2, 3]).expect("the prefill");
+        first.decode(4).expect("the decode");
+        assert_eq!(first.reusable_prefix(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(first.rewind_prefix(), Some(&[1][..]));
+        // The host keeps the handle and hands it the next turn: the slot is not renewed, so the
+        // arm sees the prompt extend what it holds.
+        first.prefill(&[1, 2, 3, 4, 5]).expect("the next turn");
+        assert_eq!(first.cached_tokens(), 4);
+        assert_eq!(first.reusable_prefix(), Some(&[1, 2, 3, 4, 5][..]));
+        // A prompt that parts from the history starts over inside the arm.
+        first.prefill(&[9]).expect("another conversation");
+        assert_eq!(first.cached_tokens(), 0);
+        assert_eq!(first.reusable_prefix(), Some(&[9][..]));
+    }
+
+    /// A [Keeper] whose slots share a budget of `limit` ids, counted by what each slot holds.
+    struct Budget {
+        limit: usize,
+        held: Mutex<Vec<usize>>,
+        released: AtomicUsize,
+    }
+
+    /// A [Budget] slot: its number, and the ids it holds.
+    struct Counted {
+        index: usize,
+        ids: Vec<u32>,
+    }
+
+    impl Budget {
+        fn used_besides(&self, index: usize) -> usize {
+            let held = self.held.lock().unwrap();
+            held.iter()
+                .enumerate()
+                .filter(|&(other, _)| other != index)
+                .map(|(_, count)| count)
+                .sum()
+        }
+
+        fn hold(&self, slot: &Counted) {
+            self.held.lock().unwrap()[slot.index] = slot.ids.len();
+        }
+    }
+
+    impl FusedArm for Budget {
+        type Slot = Counted;
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            let mut held = self.held.lock().unwrap();
+            held.push(0);
+            Ok(Counted {
+                index: held.len() - 1,
+                ids: Vec::new(),
+            })
+        }
+
+        fn holds_request(&self, slot: &Self::Slot) -> bool {
+            !slot.ids.is_empty()
+        }
+
+        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            slot.ids.clear();
+            self.hold(slot);
+            Ok(())
+        }
+
+        fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            self.released.fetch_add(1, Ordering::Relaxed);
+            self.renew(slot)
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            if !self.room(slot, Some(tokens)) {
+                return Err(BackendError::new("context", "no room"));
+            }
+            slot.ids = tokens.to_vec();
+            self.hold(slot);
+            Ok(StepOutput::default())
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    slot.ids.push(*token);
+                    self.hold(slot);
+                    StepOutput::default()
+                })
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+
+        fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            Some(&slot.ids)
+        }
+
+        fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
+            let wants = prompt.map_or(slot.ids.len() + 1, <[u32]>::len);
+            self.used_besides(slot.index) + wants <= self.limit
+        }
+    }
+
+    #[test]
+    fn a_slot_short_of_memory_takes_it_from_the_longest_parked_one() {
+        let arm = Arc::new(Budget {
+            limit: 8,
+            held: Mutex::new(Vec::new()),
+            released: AtomicUsize::new(0),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 3).expect("the engine starts");
+        let mut first = engine.open().expect("a slot");
+        let mut second = engine.open().expect("a slot");
+        let mut third = engine.open().expect("a slot");
+        first.prefill(&[1, 2, 3]).expect("the first conversation");
+        second.prefill(&[4, 5, 6]).expect("the second conversation");
+        first.park();
+        second.park();
+        // Five ids do not fit beside six held: the first conversation, parked longest, goes.
+        third.prefill(&[7, 8, 9, 10, 11]).expect("room is made");
+        assert_eq!(arm.released.load(Ordering::Relaxed), 1);
+        assert_eq!(first.reusable_prefix(), Some(&[][..]), "the parked sequence is given up");
+        assert_eq!(second.reusable_prefix(), Some(&[4, 5, 6][..]));
+        // The third conversation's step needs a sixth id: only the parked second conversation
+        // can give it, and does.
+        third.decode(12).expect("the step");
+        assert_eq!(arm.released.load(Ordering::Relaxed), 2);
+        assert_eq!(second.reusable_prefix(), Some(&[][..]));
+        assert_eq!(third.reusable_prefix(), Some(&[7, 8, 9, 10, 11, 12][..]));
+        // A busy slot is never given up: with the first conversation back and nothing parked
+        // holding anything, a prompt that does not fit is refused.
+        first.prefill(&[1, 2]).expect("two more ids fit");
+        assert!(second.prefill(&[4]).is_err(), "no parked sequence holds anything");
+        assert_eq!(arm.released.load(Ordering::Relaxed), 2);
+        assert_eq!(first.reusable_prefix(), Some(&[1, 2][..]));
     }
 
     #[test]
