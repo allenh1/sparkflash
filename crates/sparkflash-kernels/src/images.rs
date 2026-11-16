@@ -318,8 +318,8 @@ impl Image {
             ],
             Self::Dflash2 => &[
                 "q4d_attn",
+                "q4d_attn_span_chunk",
                 "q4d_attn_span_merge",
-                "q4d_attn_span_part",
                 "q4d_block_embed",
                 "q4d_capture",
                 "q4d_conv",

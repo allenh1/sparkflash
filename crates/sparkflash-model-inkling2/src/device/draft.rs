@@ -79,14 +79,16 @@ const INJECT_ROWS: usize = 1024;
 const HEAD_DIM: usize = 128;
 /// Threads of a norm, mix-norm, gate or pick block (a multiple of 32, and hidden <= 32 a thread).
 const BLOCK: u32 = 256;
-/// The walks the block attention splits a query's keys into (Q4D_ATTN_WARPS): key k goes to walk
-/// k % ATTENTION_WALKS.
-const ATTENTION_WALKS: usize = 8;
-/// The floats one walk leaves for the merge (Q4D_ATTN_PART).
+/// The contiguous runs the block attention splits a span's keys into, a block each
+/// (q4d_attn_span_chunk). 48 measured as fast as 96 or 192 at a 93k span and fastest at a local
+/// layer's, on Inkling's shapes at TP4.
+const ATTENTION_CHUNKS: usize = 48;
+/// The floats one run leaves for the merge (Q4D_ATTN_PART).
 const ATTENTION_PART: usize = HEAD_DIM + 4;
-/// The queries, a warp each, one block of the attention's first stage walks a span for. Four
-/// measured about 6% faster than eight or sixteen at a 93k span, on Inkling's shapes at TP4.
-const ATTENTION_QUERIES: usize = 4;
+/// The queries a warp of the attention's first stage holds (Q4D_SPAN_QUERIES).
+const ATTENTION_QUERIES: usize = 8;
+/// The most queries of a key head one block holds: a warp's worth per 32 threads, 1,024 threads.
+const ATTENTION_MAX_QUERIES: usize = ATTENTION_QUERIES * 32;
 /// The logits one step-logits thread scores (IKD_LOGIT_PER_THREAD).
 const LOGIT_PER_THREAD: usize = 8;
 /// The floats a rank's pick slot takes (IKD_PICK_SLOT).
@@ -128,7 +130,7 @@ impl DraftKernels {
         if dflash.is_empty() {
             return Err(
                 "this build has no DFlash 2 cubin: the drafter's block attention is \
-                 kernels/dflash2_sm121.cu's q4d_attn_span_part and q4d_attn_span_merge"
+                 kernels/dflash2_sm121.cu's q4d_attn_span_chunk and q4d_attn_span_merge"
                     .to_owned(),
             );
         }
@@ -153,7 +155,7 @@ impl DraftKernels {
             markov_logits: load(inkling, "inkling_draft_markov_logits")?,
             markov_local: load(inkling, "inkling_draft_markov_local")?,
             markov_last: load(inkling, "inkling_draft_markov_last")?,
-            attention_part: load(dflash, "q4d_attn_span_part")?,
+            attention_part: load(dflash, "q4d_attn_span_chunk")?,
             attention_merge: load(dflash, "q4d_attn_span_merge")?,
             _modules: modules,
         })
@@ -344,6 +346,14 @@ impl DraftModel {
         if !heads.is_multiple_of(kv_heads) {
             return Err(format!(
                 "{heads} query heads a rank do not group over {kv_heads} key/value heads"
+            ));
+        }
+        if (heads / kv_heads) * mtp.block_size > ATTENTION_MAX_QUERIES {
+            return Err(format!(
+                "{} queries of a key head ({heads} query heads over {kv_heads} key/value heads, \
+                 {} block rows): the block attention holds at most {ATTENTION_MAX_QUERIES}",
+                (heads / kv_heads) * mtp.block_size,
+                mtp.block_size
             ));
         }
         let intermediate = mtp.intermediate_size / world;
@@ -710,7 +720,7 @@ pub(super) struct DraftState {
     keys: Deviceptr,
     values: Deviceptr,
     attention: Deviceptr,
-    /// Each query's walks of the block attention, `[rows][heads][ATTENTION_WALKS]` of
+    /// Each query's runs of the block attention, `[rows][heads][ATTENTION_CHUNKS]` of
     /// ATTENTION_PART floats.
     attention_parts: Deviceptr,
     delta: Deviceptr,
@@ -785,7 +795,7 @@ impl DraftState {
         let values = layout.take(rows * kv_width * f);
         let attention = layout.take(rows * q_width * f);
         let attention_parts =
-            layout.take(rows * model.heads * ATTENTION_WALKS * ATTENTION_PART * f);
+            layout.take(rows * model.heads * ATTENTION_CHUNKS * ATTENTION_PART * f);
         let delta = layout.take(rows * hidden * f);
         let gate = layout.take(rows * model.intermediate * f);
         let up = layout.take(rows * model.intermediate * f);
@@ -1178,20 +1188,20 @@ impl DraftState {
             }
             // Every row sees the same keys: the window's (or the whole context's) committed
             // positions before the block, and the block's own rows. A block of the first stage
-            // walks one of a key head's ATTENTION_WALKS strides of them for ATTENTION_QUERIES of
-            // the queries reading that head, so the span is read once a block, not once a query.
+            // walks one of a key head's ATTENTION_CHUNKS runs of them for every query reading
+            // that head, so the span is read once, not once a query.
             let lowest = layer
                 .window
                 .map_or(0, |window| position.saturating_sub(window));
             let group_queries = (heads / kv_heads) * rows;
             run(shared.launch(
                 kernels.attention_part,
+                (kv_heads as u32, ATTENTION_CHUNKS as u32, 1),
                 (
-                    kv_heads as u32,
-                    ATTENTION_WALKS as u32,
-                    group_queries.div_ceil(ATTENTION_QUERIES) as u32,
+                    (group_queries.div_ceil(ATTENTION_QUERIES) * 32) as u32,
+                    1,
+                    1,
                 ),
-                ((ATTENTION_QUERIES * 32) as u32, 1, 1),
                 &[
                     self.queries.0,
                     key_ring.0,
@@ -1218,6 +1228,7 @@ impl DraftState {
                     self.attention.0,
                     heads as u64,
                     HEAD_DIM as u64,
+                    ATTENTION_CHUNKS as u64,
                 ],
             ))?;
             run(elementwise(

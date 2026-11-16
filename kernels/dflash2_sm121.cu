@@ -28,8 +28,8 @@
 //   - q4d_kv_ring: the context keys and values of committed positions, appended to a layer's
 //     ring.
 //   - q4d_attn: the block's non-causal sliding-window GQA over the ring and its own keys, and
-//     q4d_attn_span_part / q4d_attn_span_merge, the same over one span of the ring for every row
-//     (Inkling's drafter), with a key head's span read once a block for many queries.
+//     q4d_attn_span_chunk / q4d_attn_span_merge, the same over one span of the ring for every row
+//     (Inkling's drafter), with a key head's span read once a block for all its queries.
 //   - q4d_topk_partial / q4d_topk_final: the target head's top candidates for each draft row, and
 //     at TP the merge of the ranks' candidates for their slices of the vocabulary.
 //   - q4d_select: the candidate selector's greedy walk through the candidates' transition
@@ -227,8 +227,7 @@ __device__ __forceinline__ void q4d_attn_walk_batches(
 // One query's online softmax over keys first, first + stride, ... of `total`: key k below
 // `context` is the ring's committed position lowest + k, the rest the block's own rows. A lane holds
 // four of the head's dims, at `offset` floats into a key or value row of kv_width. A walk that sees
-// no key leaves max -inf, sum 0 and acc 0. q4d_attn_row and q4d_attn_span_part walk the same keys
-// in the same order with this, so a query's walks carry the same bits in either.
+// no key leaves max -inf, sum 0 and acc 0.
 __device__ __forceinline__ void q4d_attn_walk(const float4 query,
                                               const float* __restrict__ key_ring,
                                               const float* __restrict__ value_ring,
@@ -345,76 +344,176 @@ extern "C" __global__ void q4d_attn(const float* __restrict__ queries,
                  blockIdx.x, row);
 }
 
-// The floats one walk of q4d_attn_span_part leaves: its acc (Q4D_HEAD_DIM), max and sum, padded
+// The floats one chunk of q4d_attn_span_chunk leaves: its acc (Q4D_HEAD_DIM), max and sum, padded
 // to a float4.
 #define Q4D_ATTN_PART (Q4D_HEAD_DIM + 4)
+// A q4d_attn_span_chunk warp's queries and the keys it scores at a time: one (query, key) pair a
+// lane.
+#define Q4D_SPAN_QUERIES 8
+#define Q4D_SPAN_KEYS 4
 
 // The draft block's attention over one span of committed positions for every row (Inkling's
 // drafter, which anchors its windows at the block, not at each row): each row attends to
-// [lowest, base) and to all `block_rows` of the block's own keys, in two stages so a key head's
-// span is read once a block for many queries rather than once for every query.
+// [lowest, base) and to all `block_rows` of the block's own keys, in two stages.
 //
-// Stage one: block (key_head, residue, chunk), `warps` warps a block, walks keys residue,
-// residue + Q4D_ATTN_WARPS, ... (q4d_attn_row's warp `residue` at Q4D_ATTN_WARPS warps) for query
-// chunk * warps + warp of the key head's group, numbered row-major over (row, head of the group).
-// Every warp of a block reads the same keys. The walk's acc, max and sum go to
-// part[((row * heads + head) * Q4D_ATTN_WARPS + residue) * Q4D_ATTN_PART]. Grid (kv_heads,
-// Q4D_ATTN_WARPS, chunks).
-extern "C" __global__ void q4d_attn_span_part(const float* __restrict__ queries,
-                                              const float* __restrict__ key_ring,
-                                              const float* __restrict__ value_ring,
-                                              const float* __restrict__ block_keys,
-                                              const float* __restrict__ block_values,
-                                              float* __restrict__ part, int heads, int kv_heads,
-                                              int head_dim, int base, int lowest, int ring,
-                                              int block_rows, float scale) {
-    const int lane = threadIdx.x & 31;
-    const int warps = blockDim.x >> 5;
+// Stage one: block (key_head, chunk) walks the chunk-th of gridDim.y contiguous runs of those
+// keys, read once a block for every query of the key head's group. Warp w holds queries
+// w * Q4D_SPAN_QUERIES .. + Q4D_SPAN_QUERIES - 1, numbered row-major over (row, head of the group);
+// blockDim covers the group's queries. A batch's 32 (query, key) dot products are summed by a
+// transpose reduction (31 shuffles; lane L ends with the pair L = (L / Q4D_SPAN_KEYS,
+// L % Q4D_SPAN_KEYS)); each query's softmax steps once over the batch's keys, and each weight is
+// taken once by its pair's lane and broadcast. At Inkling's TP4 shape (48 queries of a key head)
+// this walk measured 1.06 ms over a 93,159-key span against 2.70 ms for a warp a query reading
+// the span once per four queries, and 20.5 against 28.5 us over a local layer's 1,032 keys. The
+// chunk's acc, max and sum go to part[((row * heads + head) * gridDim.y + chunk) * Q4D_ATTN_PART].
+// Grid (kv_heads, chunks).
+extern "C" __global__ void q4d_attn_span_chunk(const float* __restrict__ queries,
+                                               const float* __restrict__ key_ring,
+                                               const float* __restrict__ value_ring,
+                                               const float* __restrict__ block_keys,
+                                               const float* __restrict__ block_values,
+                                               float* __restrict__ part, int heads, int kv_heads,
+                                               int head_dim, int base, int lowest, int ring,
+                                               int block_rows, float scale) {
+    static_assert(Q4D_SPAN_QUERIES * Q4D_SPAN_KEYS == 32, "one (query, key) pair a lane");
     if (head_dim != Q4D_HEAD_DIM || heads % kv_heads != 0) {
         return;
     }
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
     const int group = heads / kv_heads;
+    const int queries_total = group * block_rows;
     const int key_head = blockIdx.x;
-    const int residue = blockIdx.y;
-    const int index = blockIdx.z * warps + (threadIdx.x >> 5);
-    if (index >= group * block_rows) {
-        return;
-    }
-    const int row = index / group;
-    const int head = key_head * group + index % group;
-    const float4 query = *reinterpret_cast<const float4*>(
-        queries + (unsigned long long)row * heads * head_dim + head * head_dim + lane * 4);
+    const int chunk = blockIdx.y;
+    const int chunks = gridDim.y;
     const int context = max(0, base - lowest);
-    float running_max = -CUDART_INF_F;
-    float running_sum = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    q4d_attn_walk(query, key_ring, value_ring, block_keys, block_values, kv_heads * head_dim,
-                  key_head * head_dim + lane * 4, lowest, ring, context, context + block_rows,
-                  residue, Q4D_ATTN_WARPS, scale, running_max, running_sum, acc);
-    float* at = part + ((unsigned long long)(row * heads + head) * Q4D_ATTN_WARPS + residue) *
-                           Q4D_ATTN_PART;
-    *reinterpret_cast<float4*>(at + lane * 4) = make_float4(acc[0], acc[1], acc[2], acc[3]);
-    if (lane == 0) {
-        at[Q4D_HEAD_DIM] = running_max;
-        at[Q4D_HEAD_DIM + 1] = running_sum;
+    const int total = context + block_rows;
+    const int per = (total + chunks - 1) / chunks;
+    const int first = min(total, chunk * per);
+    const int last = min(total, first + per);
+    const int kv_width = kv_heads * head_dim;
+    const int offset = key_head * head_dim + lane * 4;
+    const int own_query = lane / Q4D_SPAN_KEYS;
+    const int own_key = lane % Q4D_SPAN_KEYS;
+    float4 query[Q4D_SPAN_QUERIES];
+    float running_max[Q4D_SPAN_QUERIES];
+    float running_sum[Q4D_SPAN_QUERIES];
+    float acc[Q4D_SPAN_QUERIES][4];
+#pragma unroll
+    for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+        // A warp's queries past the group's repeat its last one, and are not written.
+        const int index = min(warp * Q4D_SPAN_QUERIES + i, queries_total - 1);
+        const int row = index / group;
+        const int head = key_head * group + index % group;
+        query[i] = *reinterpret_cast<const float4*>(
+            queries + (unsigned long long)row * heads * head_dim + head * head_dim + lane * 4);
+        running_max[i] = -CUDART_INF_F;
+        running_sum[i] = 0.0f;
+        acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.0f;
+    }
+    for (int base_key = first; base_key < last; base_key += Q4D_SPAN_KEYS) {
+        float4 k[Q4D_SPAN_KEYS];
+        float4 v[Q4D_SPAN_KEYS];
+#pragma unroll
+        for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+            // A key past the run's end loads the batch's first key, which is in range, and gets
+            // no weight.
+            const int key = base_key + j < last ? base_key + j : base_key;
+            const bool in_ring = key < context;
+            const int slot = in_ring ? (lowest + key) % ring : key - context;
+            const unsigned long long at = (unsigned long long)slot * kv_width + offset;
+            k[j] = *reinterpret_cast<const float4*>((in_ring ? key_ring : block_keys) + at);
+            v[j] = *reinterpret_cast<const float4*>((in_ring ? value_ring : block_values) + at);
+        }
+        float dot[32];
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+            for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                dot[i * Q4D_SPAN_KEYS + j] = q4d_attn_dot(query[i], k[j]);
+            }
+        }
+        // Each round halves the sums a lane holds: it keeps the half its lane bit names and adds
+        // its partner's share of it.
+#pragma unroll
+        for (int width = 16; width >= 1; width >>= 1) {
+            const bool upper = (lane & width) != 0;
+#pragma unroll
+            for (int t = 0; t < width; ++t) {
+                const float send = upper ? dot[t] : dot[t + width];
+                const float keep = upper ? dot[t + width] : dot[t];
+                dot[t] = __fadd_rn(keep, __shfl_xor_sync(0xFFFFFFFFu, send, width));
+            }
+        }
+        const float scaled =
+            base_key + own_key < last ? __fmul_rn(dot[0], scale) : -CUDART_INF_F;
+        float batch_max = scaled;
+#pragma unroll
+        for (int width = Q4D_SPAN_KEYS / 2; width >= 1; width >>= 1) {
+            batch_max = fmaxf(batch_max, __shfl_xor_sync(0xFFFFFFFFu, batch_max, width));
+        }
+        float own_max = 0.0f;
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+            const float next_max = fmaxf(
+                running_max[i], __shfl_sync(0xFFFFFFFFu, batch_max, i * Q4D_SPAN_KEYS));
+            const float correction = __expf(running_max[i] - next_max);
+            running_sum[i] = __fmul_rn(running_sum[i], correction);
+#pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                acc[i][d] = __fmul_rn(acc[i][d], correction);
+            }
+            running_max[i] = next_max;
+            own_max = own_query == i ? next_max : own_max;
+        }
+        const float own_weight = __expf(scaled - own_max);
+#pragma unroll
+        for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+#pragma unroll
+            for (int j = 0; j < Q4D_SPAN_KEYS; ++j) {
+                const float weight =
+                    __shfl_sync(0xFFFFFFFFu, own_weight, i * Q4D_SPAN_KEYS + j);
+                running_sum[i] = __fadd_rn(running_sum[i], weight);
+                acc[i][0] = __fmaf_rn(weight, v[j].x, acc[i][0]);
+                acc[i][1] = __fmaf_rn(weight, v[j].y, acc[i][1]);
+                acc[i][2] = __fmaf_rn(weight, v[j].z, acc[i][2]);
+                acc[i][3] = __fmaf_rn(weight, v[j].w, acc[i][3]);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < Q4D_SPAN_QUERIES; ++i) {
+        const int index = warp * Q4D_SPAN_QUERIES + i;
+        if (index >= queries_total) {
+            break;
+        }
+        const int row = index / group;
+        const int head = key_head * group + index % group;
+        float* at =
+            part + ((unsigned long long)(row * heads + head) * chunks + chunk) * Q4D_ATTN_PART;
+        *reinterpret_cast<float4*>(at + lane * 4) =
+            make_float4(acc[i][0], acc[i][1], acc[i][2], acc[i][3]);
+        if (lane == 0) {
+            at[Q4D_HEAD_DIM] = running_max[i];
+            at[Q4D_HEAD_DIM + 1] = running_sum[i];
+        }
     }
 }
 
-// Stage two: query (row, head)'s Q4D_ATTN_WARPS walks merged in q4d_attn_row's order into its
-// output, so a row carries the bits q4d_attn_row gives it at Q4D_ATTN_WARPS warps. Grid (heads,
-// block_rows), one warp.
+// Stage two: query (row, head)'s `chunks` parts merged, in chunk order, into its output. Grid
+// (heads, block_rows), one warp.
 extern "C" __global__ void q4d_attn_span_merge(const float* __restrict__ part,
-                                               float* __restrict__ out, int heads, int head_dim) {
+                                               float* __restrict__ out, int heads, int head_dim,
+                                               int chunks) {
     const int lane = threadIdx.x & 31;
     if (head_dim != Q4D_HEAD_DIM || threadIdx.x >= 32) {
         return;
     }
     const int head = blockIdx.x;
     const int row = blockIdx.y;
-    const float* at =
-        part + (unsigned long long)(row * heads + head) * Q4D_ATTN_WARPS * Q4D_ATTN_PART;
+    const float* at = part + (unsigned long long)(row * heads + head) * chunks * Q4D_ATTN_PART;
     q4d_attn_merge(at + Q4D_HEAD_DIM, at + Q4D_HEAD_DIM + 1, Q4D_ATTN_PART, at, Q4D_ATTN_PART,
-                   Q4D_ATTN_WARPS, lane,
+                   chunks, lane,
                    out + (unsigned long long)row * heads * head_dim + head * head_dim + lane * 4);
 }
 

@@ -2117,8 +2117,45 @@ the window moves acceptance and never an emitted id: every run below equalled th
 The full layer is what drafts a copy from far back. Without it the repeating prompt, where
 speculation pays most, falls to a third of its speed. A window only wins where nothing is copied
 from beyond it, so the default stays `full`. The 93K rows show what the layer's read costs at that
-length: about 1 ms a token (4.5%), more than its 186 MB a pass at the DRAM floor would. Its
-attention walk reads each key span once per four queries (`ATTENTION_QUERIES`), so twelve blocks
-read the same span. A walk that holds a key head's every query against one read would take that
-cost without giving up the long-range copies. It changes only the drafter's sums, so speculation
-stays lossless, but it is not built yet.
+length: about 1 ms a token (4.5%), more than its 186 MB a pass at the DRAM floor would. The old
+attention walk read each key span once per four queries, so twelve blocks read the same span.
+
+### The drafter's attention reads each key span once
+
+`q4d_attn_span_chunk` (in `dflash2_sm121.cu`) replaces that walk. The grid is (key head, chunk):
+each block walks one contiguous run of keys for all of its key head's queries (6 heads × 8 block
+rows = 48 a rank), one warp per eight queries. A batch of four keys gives a warp 32 dot products,
+summed by a transpose reduction so lane L ends with pair L. The running softmax steps once per
+query per batch, and each weight is broadcast from its pair's lane. `q4d_attn_span_merge` then
+folds the 48 chunks (`ATTENTION_CHUNKS`). Contiguous chunks matter: giving the old walk more
+blocks over strided spans made it slower. The drafter refuses to load a checkpoint with more than
+256 queries per key head (`ATTENTION_MAX_QUERIES`). Only the Inkling drafter launches these
+kernels.
+
+| one full-layer pass, 8 block rows, one rank | old walk | span chunks |
+|---|---|---|
+| 93K keys | 2.70 ms | 1.06 ms |
+| 5K keys | 110 µs | 49 µs |
+| 1K keys | 28.5 µs | 20.5 µs |
+
+The new walk adds in a different order, so the drafter's sums move in their last bits and
+acceptance moves by a draft or two either way. Emitted ids never move: plain decoding's digest is
+`ec85a691b74bbc6b` as before, and DSpark's ids equal plain decoding's on every text below,
+greedy and sampled.
+
+| DSpark adaptive depth 7, served files, ids equal in every row | old ms a token | new | ms a round old / new |
+|---|---|---|---|
+| repeating 5K prompt, 96 tokens (twice) | 11.38 / 11.42 | 11.53 / 11.48 | |
+| 93,159-token text, 96 tokens (twice) | 22.99 / 23.21 | 23.46 / 23.75 | 87.4 / 85.7 |
+| score text, 192 tokens | 21.86 | 21.99 | 67.4 / 64.6 |
+| decode check text, 192 tokens | 12.97 | 12.88 | 88.5 / 87.9 |
+| pf7 split text, 192 tokens | 11.84 | 11.78 | 83.7 / 83.3 |
+| r2 split text, 192 tokens | 11.27 | 11.29 | 82.8 / 83.0 |
+| 6K check text, 192 tokens | 17.17 | 16.94 | 96.5 / 95.1 |
+| 46K text, 192 tokens | 22.71 | 21.99 | 66.7 / 70.0 |
+
+A round is equal or faster wherever the round count holds; tokens a second move with acceptance,
+which shifts both ways (93K: 65 then 63 of about 100 drafts; 46K: 65 then 60 rounds). Net it is
+about 0.4% faster a token across the texts, inside run-to-run noise. The ~1 ms the full layer cost
+at 93K is now about 0.4 ms. It is kept: it costs nothing, it never moves an id, and the gap grows
+with context.
