@@ -2041,3 +2041,38 @@ On the repeating prompt the sampled ids are greedy's: every step's top token hol
 nucleus. The 93K text's sampled ids leave greedy's at the third token, so that row is the one that
 tests a real draw. `inkling-tp4 --sample T,TOP_P,TOP_K,SEED` sets a run's decode sampling. The
 served group sends the request's sampler in its request frame, so every rank draws the same noise.
+
+### A verify's expert items, one pair a group
+
+A stage ledger of the served build (rank 0, PDL off, so each kernel's span is its own work) puts
+a depth-7 round on the repeating prompt at 14.6 ms of device time a token. The expert items walk
+(`inkling_*_expert_items`, five rows and up) is 9.4 ms of that. Inside it, the down projection
+took 611 µs a layer, nearly the 670 µs of gate/up, although it reads half the bytes. Its rows are
+576 columns, so a block's work is short. It walked four pairs a group, and their accumulators held
+it to 128 registers and two blocks an SM. An item holds one slot or a few, so the extra pairs
+bought nothing. The items walk now takes one pair a group (`INKLING_ITEM_PAIRS`). Each pair's sum
+is its own chain in either grouping, so no output word moves. The prefill pair walk keeps four.
+
+| micro-bench, one layer, eight rows' 64 slots, L2 flushed | four pairs | one pair |
+|---|---|---|
+| NVFP4 gate/up, 1,152 x 4,608 a rank | 993 µs | 920 µs |
+| NVFP4 down, 4,608 x 576 | 796 µs | 548 µs |
+| MXFP8 down | 1,035 µs | 800 µs |
+
+Every output word equalled the band's one-pair matvec. At one row the walk is the band's speed
+within 5%, so plain decoding keeps the band.
+
+| on the four ranks, served files, DSpark adaptive depth 7 | four pairs | one pair |
+|---|---|---|
+| repeating 5K prompt, 96 tokens (twice each) | 12.76 / 12.76 ms a token | 11.52 / 11.59 ms |
+| 93,159-token text, 48 tokens (twice each, interleaved) | 26.23 / 26.00 ms | 24.89 / 25.47 ms |
+
+The digests were the deployed build's (`ec85a691b74bbc6b` on the repeating prompt,
+`2f09c281b606c98e` at 93K at 48 tokens), and DSpark's ids equalled plain decoding's.
+
+The ledger's other lines bound what is left for the drafter. A round runs two head-sized GEMVs of
+about 1.6 ms: the verify's eight rows and the drafter's base logits. Both are at the DRAM floor.
+The seven Markov fold steps are 94 µs each. The drafter's five layers read its 649 MB of packed
+projections once a round. E4M3 copies of those projections and of the fold would save about 1 ms
+of a 105 ms round, and a copy of the head would cost 238 MB a rank, so the E4M3 drafter is not
+built.
