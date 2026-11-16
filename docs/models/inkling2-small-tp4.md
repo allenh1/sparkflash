@@ -1775,3 +1775,39 @@ Four ranks, row split, batch arm, one session, each prompt twice:
 All three give the same bits. The teacher-forced logits are identical to the D120 build's in
 every value, with the halves and without them. The repeating prompt's decode digest is
 `90f777a3c48a6bc4` and the 93K prompt's is `c6e0ef10fd49a8e0` in every column.
+
+### The experts' activation as its head alone (opt-in, not the default)
+
+Under D117 an f32 activation enters the routed-expert MMA as two BF16 planes, its head and its
+remainder, both multiplied through the same weight fragments into one f32 accumulator. That keeps
+16 significant bits and costs two MMAs and two activation loads a K step, and under the row split
+the SwiGLU rows cross the wire as both planes.
+
+`SPARKFLASH_INKLING_PLANES=head` runs the head-only forms of the six expert passes
+(`q4p_moe_gate_up_capped_head`, `q4p_moe_down_head`, and the `_mx8` and `_runs` forms of each):
+`q4p_moe_body` with `PLANES` 1 stages the head plane alone, gate_up writes only the head of its
+SwiGLU rows, and the row split gathers half the bytes. The MXFP8 form's head-only stage is
+12.5 KB, so it keeps three stages, not two. Unset or `both` keeps both planes and every bit of the
+build before: the teacher-forced logits are identical and the 93K prompt's digest is
+`c6e0ef10fd49a8e0`. `head` named under any walk but `tensor` is refused, as is any other value.
+
+The head alone is a different sum, since the activation keeps 8 significant bits, so it stays
+opt-in until the maintainer decides.
+
+| on the four ranks, row split | both planes (default) | head only |
+|---|---|---|
+| 6,000-token text, twelve teacher-forced cuts | 8.53 s | 7.74 s |
+| 93K prompt | 81.0 s | 72.2 s |
+| prompt tokens a second at 93K | 1,150 | 1,290 |
+
+The distance, teacher-forced on twelve cuts of the 6,000-token text (the D117 method):
+
+| | top-1 | top-5 overlap | mean abs logit difference a cut | max | KL max (mean), nats |
+|---|---|---|---|---|---|
+| head only against exact | 12 of 12 | 4-5 | 0.071-0.420 | 2.84 | 1.32e-2 (3.50e-3) |
+| head only against both planes | 12 of 12 | 4-5 | 0.074-0.400 | 2.81 | 1.88e-2 (5.23e-3) |
+| both planes against exact (D117, for scale) | 12 of 12 | 4-5 | 0.057-0.339 | 2.03 | 1.55e-2 (4.58e-3) |
+
+So the head alone moves the logits about a quarter further from exact than both planes do, with
+a KL to exact of the same size. After the 93K prompt the greedy ids agree for 15 tokens and part
+at the 16th, as the intermediate split's do.

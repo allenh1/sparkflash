@@ -1049,6 +1049,13 @@ pub const CATALOGUE: &[PartKernel] = &[
             // The down passes over the row split's gathered runs, with no join before them.
             pre("q4p_moe_down_runs", &[Precision::NvFp4]),
             pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
+            // The six passes' head-only forms (SPARKFLASH_INKLING_PLANES=head).
+            pre("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
+            pre("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
+            pre("q4p_moe_down_head", &[Precision::NvFp4]),
+            pre("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
+            pre("q4p_moe_down_runs_head", &[Precision::NvFp4]),
+            pre("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
         ],
         false,
     ),
@@ -1181,6 +1188,13 @@ pub const CATALOGUE: &[PartKernel] = &[
             // The down passes over the row split's gathered runs, with no join before them.
             pre("q4p_moe_down_runs", &[Precision::NvFp4]),
             pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
+            // The six passes' head-only forms (SPARKFLASH_INKLING_PLANES=head).
+            pre("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
+            pre("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
+            pre("q4p_moe_down_head", &[Precision::NvFp4]),
+            pre("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
+            pre("q4p_moe_down_runs_head", &[Precision::NvFp4]),
+            pre("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
         ],
         false,
     ),

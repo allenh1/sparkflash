@@ -257,6 +257,62 @@ impl Mxfp8Walk {
     }
 }
 
+/// The switch for the activation the tensor walk's routed-expert MMA reads ([ActivationPlanes]):
+/// unset or `both` (the default) keeps its bf16 head and remainder planes, `head` the head alone.
+/// `head` is bit-changing and opt-in; it is refused where no MMA band runs (any other walk), as is
+/// an unknown value.
+pub const PLANES_ENV: &str = "SPARKFLASH_INKLING_PLANES";
+
+/// The activation operand of the tensor walk's routed-expert MMA: the expert input into gate_up
+/// and the SwiGLU rows into down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationPlanes {
+    /// The bf16 head and the bf16 remainder of each f32 value, 16 significant bits, both through
+    /// the same weight fragments into one f32 accumulator.
+    Both,
+    /// The bf16 head alone (the q4p `_head` passes): half the MMAs and half the activation bytes
+    /// gathered under the row split, and 8 significant bits.
+    Head,
+}
+
+impl ActivationPlanes {
+    /// The operand [PLANES_ENV] names under `walk`.
+    pub fn from_env(walk: PrefillWalk) -> Result<Self, String> {
+        Self::parse(std::env::var(PLANES_ENV).ok().as_deref(), walk)
+    }
+
+    fn parse(value: Option<&str>, walk: PrefillWalk) -> Result<Self, String> {
+        match (value, walk) {
+            (None | Some("" | "both"), _) => Ok(Self::Both),
+            (Some("head"), PrefillWalk::Tensor) => Ok(Self::Head),
+            (Some("head"), other) => Err(format!(
+                "{PLANES_ENV}=head is the routed-expert MMA's operand under {PREFILL_ENV}=tensor, \
+                 and the walk is {other:?}, which runs no MMA band; unset {PLANES_ENV}"
+            )),
+            (Some(other), _) => Err(format!(
+                "{PLANES_ENV}={other} is not an activation operand: use both (the default) or \
+                 head (bit-changing, the bf16 head alone)"
+            )),
+        }
+    }
+
+    /// The bf16 planes an activation row carries.
+    pub(crate) fn count(self) -> usize {
+        match self {
+            Self::Both => 2,
+            Self::Head => 1,
+        }
+    }
+
+    /// A pass's kernel: `both`'s name, or `head`'s.
+    fn pick(self, both: &'static str, head: &'static str) -> &'static str {
+        match self {
+            Self::Both => both,
+            Self::Head => head,
+        }
+    }
+}
+
 /// The switch for the row split's two-halves band under [PrefillWalk::Tensor] (BandOverlap):
 /// unset or `on` runs a chunk's band as two halves of its rows with each half's gathers on a side
 /// stream, `off` runs it whole with its gathers on the run's stream. The bits are the same either
@@ -715,8 +771,12 @@ struct Kernels {
 
 impl Kernels {
     /// `mma_shared` is the tensor-core attention's dynamic shared memory, or `None` when the walk
-    /// does not run.
-    fn load(cuda: &Cuda, mma_shared: Option<u32>) -> Result<Self, String> {
+    /// does not run; `planes` picks the routed-expert MMA's passes.
+    fn load(
+        cuda: &Cuda,
+        mma_shared: Option<u32>,
+        planes: ActivationPlanes,
+    ) -> Result<Self, String> {
         let inkling = inkling_cubin();
         let token = qwen4_exp_cubin();
         if inkling.is_empty() {
@@ -781,12 +841,30 @@ impl Kernels {
         Ok(Self {
             wide: Entry { kernel: wide },
             split_bf16: load(experts, "q4p_split_bf16")?,
-            moe_gate_up: load(experts, "q4p_moe_gate_up_capped")?,
-            moe_down: load(experts, "q4p_moe_down")?,
-            moe_gate_up_mx8: load(experts, "q4p_moe_gate_up_capped_mx8")?,
-            moe_down_mx8: load(experts, "q4p_moe_down_mx8")?,
-            moe_down_runs: load(experts, "q4p_moe_down_runs")?,
-            moe_down_runs_mx8: load(experts, "q4p_moe_down_runs_mx8")?,
+            moe_gate_up: load(
+                experts,
+                planes.pick("q4p_moe_gate_up_capped", "q4p_moe_gate_up_capped_head"),
+            )?,
+            moe_down: load(experts, planes.pick("q4p_moe_down", "q4p_moe_down_head"))?,
+            moe_gate_up_mx8: load(
+                experts,
+                planes.pick(
+                    "q4p_moe_gate_up_capped_mx8",
+                    "q4p_moe_gate_up_capped_mx8_head",
+                ),
+            )?,
+            moe_down_mx8: load(
+                experts,
+                planes.pick("q4p_moe_down_mx8", "q4p_moe_down_mx8_head"),
+            )?,
+            moe_down_runs: load(
+                experts,
+                planes.pick("q4p_moe_down_runs", "q4p_moe_down_runs_head"),
+            )?,
+            moe_down_runs_mx8: load(
+                experts,
+                planes.pick("q4p_moe_down_runs_mx8", "q4p_moe_down_runs_mx8_head"),
+            )?,
             moe_plan: load(moe_plan, "moe_plan")?,
             embed: load(token, "q4e_embed")?,
             rmsnorm: load(token, "q4e_rmsnorm")?,
@@ -960,6 +1038,8 @@ struct Shared {
     mma: Vec<Option<MmaTable>>,
     /// How a prompt chunk's MXFP8 experts are walked ([MXFP8_ENV]).
     mxfp8_walk: Mxfp8Walk,
+    /// The routed-expert MMA's activation operand ([PLANES_ENV]).
+    planes: ActivationPlanes,
     /// The allocation every ExpertScale's device vectors and MmaTable's tables are offsets into.
     expert_arena: Deviceptr,
     /// [top_k] ones in that arena: the routing weights the grouped MMA's down pass multiplies by.
@@ -2458,6 +2538,7 @@ impl InklingDeviceBackend {
         }
         let prefill_walk = PrefillWalk::from_env()?;
         let mxfp8_walk = Mxfp8Walk::from_env(prefill_walk)?;
+        let planes = ActivationPlanes::from_env(prefill_walk)?;
         let dense_form = DenseForm::from_env()?;
         let chunk_widths = ChunkWidths::from_env(context)?;
         let prefill_chunk = chunk_widths.widest();
@@ -2537,7 +2618,7 @@ impl InklingDeviceBackend {
             prefill_walk,
         )?;
         let cuda = CudaHandle::new(Cuda::load()?);
-        let kernels = Kernels::load(&cuda, mma_shared)?;
+        let kernels = Kernels::load(&cuda, mma_shared, planes)?;
         let weights = weights(&cuda, plan.served())?;
         let dense = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
         eprintln!("[inkling] rank {}: {}", tp.rank(), dense.summary());
@@ -2610,6 +2691,7 @@ impl InklingDeviceBackend {
                 experts,
                 mma,
                 mxfp8_walk,
+                planes,
                 expert_arena,
                 route_ones,
                 overlap,
@@ -5788,9 +5870,10 @@ impl InklingDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV,
-        DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk,
-        PrefillWalk, depth_policy_from_env, mma_attention_shared, overlap_request,
+        ActivationPlanes, AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV,
+        DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK,
+        LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, depth_policy_from_env, mma_attention_shared,
+        overlap_request,
     };
     use crate::config::Inkling2Config;
 
@@ -5814,6 +5897,34 @@ mod tests {
             assert!(Mxfp8Walk::parse(Some("mma"), prefill).is_err());
         }
         assert!(Mxfp8Walk::parse(Some("tensor"), PrefillWalk::Tensor).is_err());
+    }
+
+    #[test]
+    fn the_head_only_operand_is_opt_in_under_the_tensor_walk_alone() {
+        for prefill in [
+            PrefillWalk::Tensor,
+            PrefillWalk::Chunk,
+            PrefillWalk::Rows,
+            PrefillWalk::Gemm,
+        ] {
+            for value in [None, Some(""), Some("both")] {
+                assert_eq!(
+                    ActivationPlanes::parse(value, prefill),
+                    Ok(ActivationPlanes::Both)
+                );
+            }
+        }
+        assert_eq!(
+            ActivationPlanes::parse(Some("head"), PrefillWalk::Tensor),
+            Ok(ActivationPlanes::Head)
+        );
+        // Where no MMA band runs, naming the head is refused, not ignored.
+        for prefill in [PrefillWalk::Chunk, PrefillWalk::Rows, PrefillWalk::Gemm] {
+            assert!(ActivationPlanes::parse(Some("head"), prefill).is_err());
+        }
+        assert!(ActivationPlanes::parse(Some("bf16"), PrefillWalk::Tensor).is_err());
+        assert_eq!(ActivationPlanes::Both.count(), 2);
+        assert_eq!(ActivationPlanes::Head.count(), 1);
     }
 
     #[test]

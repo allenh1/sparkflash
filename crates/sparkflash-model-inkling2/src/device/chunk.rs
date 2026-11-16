@@ -1890,9 +1890,11 @@ fn run_band_mma(
         .map_err(device_error)?;
     let grid_items = u32::try_from(items).map_err(device_error)?;
     // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
-    // row split they are this rank's run of every slot's columns, both planes of it together, so
-    // the gather moves them as 2 * slots rows of a run each.
-    let run = slots * intermediate * std::mem::size_of::<f32>();
+    // row split they are this rank's run of every slot's columns, its planes together, so the
+    // gather moves them as planes * slots rows of a run each (the head-only operand writes and
+    // moves one plane).
+    let planes = shared.planes.count();
+    let run = planes * slots * intermediate * std::mem::size_of::<u16>();
     let activated = if out.gathers {
         scratch.partials.offset(shared.exchange.rank() * run)
     } else {
@@ -1946,7 +1948,7 @@ fn run_band_mma(
             shared,
             scratch.partials,
             None,
-            2 * slots,
+            planes * slots,
             intermediate * std::mem::size_of::<u16>(),
         )?;
         let kernel = if mx8 {
@@ -1955,7 +1957,7 @@ fn run_band_mma(
             shared.kernels.moe_down_runs
         };
         let source = [scratch.partials.0, (slots * intermediate) as u64];
-        let runs = [intermediate as u64, (2 * slots * intermediate) as u64];
+        let runs = [intermediate as u64, (planes * slots * intermediate) as u64];
         let args: Vec<u64> = [&head[..], &source, &tail, &runs].concat();
         shared
             .launch(kernel, grid, (MOE_THREADS, 1, 1), &args)
@@ -2042,6 +2044,9 @@ fn run_band_halves(
     let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
     let int = std::mem::size_of::<i32>();
     let word = std::mem::size_of::<f32>();
+    // A slot's activation run: `planes` bf16 values a column.
+    let planes = shared.planes.count();
+    let element = planes * std::mem::size_of::<u16>();
     let elements = rows * hidden;
     let mut places = Vec::with_capacity(2);
     let (mut first_item, mut runs, mut mixes) = (0, scratch.partials, scratch.activation);
@@ -2063,7 +2068,7 @@ fn run_band_halves(
             mixes,
         });
         first_item += items;
-        runs = runs.offset(world * slots * intermediate * word);
+        runs = runs.offset(world * slots * intermediate * element);
         mixes = mixes.offset(world * half_rows * down.rows * word);
     }
     let plan_of = |place: &HalfPlace| {
@@ -2106,7 +2111,7 @@ fn run_band_halves(
                 ],
             )
             .map_err(device_error)?;
-        let run = place.slots * intermediate * word;
+        let run = place.slots * intermediate * element;
         shared
             .launch(
                 band.gate_up,
@@ -2169,7 +2174,7 @@ fn run_band_halves(
                     down.columns as u64,
                     0,
                     intermediate as u64,
-                    (2 * place.slots * intermediate) as u64,
+                    (planes * place.slots * intermediate) as u64,
                 ],
             )
             .map_err(device_error)?;
@@ -2208,7 +2213,7 @@ fn run_band_halves(
         gate_up(place)?;
         gather(
             place.runs,
-            place.slots * intermediate * word,
+            place.slots * intermediate * element,
             &overlap.gathered[place.half],
         )?;
     }

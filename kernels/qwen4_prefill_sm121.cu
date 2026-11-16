@@ -675,15 +675,17 @@ extern "C" __global__ void q4p_split_bf16(const float* __restrict__ x,
 // s: NVFP4, the four E4M3 block scales of each weight row for this stage, one word a row. MXFP8,
 //    the word holding the row's ue8m0 codes for this stage's two 32-column blocks and the other
 //    stage of its pair (stages 2p and 2p + 1 share a word, so the four-byte copy stays aligned).
-template <bool MX8>
+// PLANES 1 (the head-only form) stages the head plane alone.
+template <bool MX8, int PLANES = 2>
 struct Q4pStageOf {
-    __nv_bfloat16 a[2][Q4P_MOE_ROWS * Q4P_BK];
+    __nv_bfloat16 a[PLANES][Q4P_MOE_ROWS * Q4P_BK];
     uint32_t b[Q4P_BN * (MX8 ? 16 : 8)];
     uint32_t s[Q4P_BN];
 };
 using Q4pStage = Q4pStageOf<false>;
 // An MXFP8 stage is 16.5 KB, so three of them pass the 48 KB a block may hold statically; two keep
-// the two blocks an SM the NVFP4 form runs.
+// the two blocks an SM the NVFP4 form runs. Its head-only stage is 12.5 KB, so that form keeps
+// three.
 #define Q4P_STAGES_MX8 2
 
 // A ue8m0 code as the f32 power of two the pair walk multiplies by (inkling_ue8m0): the code is
@@ -787,7 +789,13 @@ struct Q4pSoftcapSwiglu {
 // r * a_piece .. (r + 1) * a_piece of every slot sit at a_src + r * a_piece_stride, a slot's row
 // a_piece wide, the remainder plane a_plane on. `a_piece` is a whole number of stages, so a stage
 // never straddles two runs and each stage copies the elements the joined row holds there.
-template <bool GATE_UP, class Epi = Q4pSiluSwiglu, bool MX8 = false, bool RUNS = false>
+//
+// PLANES 1 is the head-only form (Inkling-2-Small's opt-in SPARKFLASH_INKLING_PLANES=head): A is
+// its bf16 head plane alone, a_plane unread, and gate_up writes only the head of its SwiGLU rows
+// (out_plane unwritten). Half the MMAs and half the activation bytes, and a different sum: the
+// activation keeps 8 significant bits where the two planes keep 16.
+template <bool GATE_UP, class Epi = Q4pSiluSwiglu, bool MX8 = false, bool RUNS = false,
+          int PLANES = 2>
 __device__ __forceinline__ void q4p_moe_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ sorted, const int4* __restrict__ items,
@@ -796,10 +804,12 @@ __device__ __forceinline__ void q4p_moe_body(
     unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride,
     const Epi epi = Epi(), int a_piece = 0, unsigned long long a_piece_stride = 0) {
     static_assert(!(RUNS && GATE_UP), "only the down pass reads runs");
-    constexpr int kStages = MX8 ? Q4P_STAGES_MX8 : Q4P_STAGES;
+    static_assert(PLANES == 1 || PLANES == 2, "an activation is its head or head and remainder");
+    constexpr int kStages = MX8 && PLANES == 2 ? Q4P_STAGES_MX8 : Q4P_STAGES;
     // The words of one staged weight row: 64 E2M1 nibbles or 64 E4M3 bytes.
     constexpr int kRowWords = MX8 ? 16 : 8;
-    __shared__ __align__(16) Q4pStageOf<MX8> stages[kStages];
+    using Stage = Q4pStageOf<MX8, PLANES>;
+    __shared__ __align__(16) Stage stages[kStages];
     __shared__ uint32_t lut[MX8 ? 1 : 256];
     __shared__ int s_slot[Q4P_MOE_ROWS];
     if ((int)blockIdx.y >= *item_count) {
@@ -873,18 +883,19 @@ __device__ __forceinline__ void q4p_moe_body(
         }
     }
     auto load = [&](int buffer, int ks) {
-        Q4pStageOf<MX8>& st = stages[buffer];
+        Stage& st = stages[buffer];
+        const __nv_bfloat16* at;
         if constexpr (RUNS) {
             const int k0 = ks * Q4P_BK;
             const int run = k0 / a_piece;
-            const __nv_bfloat16* at = a_base + (unsigned long long)run * a_piece_stride +
-                                      (k0 - run * a_piece) + a_chunk * 8;
-            om_cp16(om_smem(&st.a[0][a_dst]), at, a_slot >= 0);
-            om_cp16(om_smem(&st.a[1][a_dst]), at + a_plane, a_slot >= 0);
+            at = a_base + (unsigned long long)run * a_piece_stride + (k0 - run * a_piece) +
+                 a_chunk * 8;
         } else {
-            om_cp16(om_smem(&st.a[0][a_dst]), a_base + ks * Q4P_BK + a_chunk * 8, a_slot >= 0);
-            om_cp16(om_smem(&st.a[1][a_dst]), a_base + a_plane + ks * Q4P_BK + a_chunk * 8,
-                    a_slot >= 0);
+            at = a_base + ks * Q4P_BK + a_chunk * 8;
+        }
+        om_cp16(om_smem(&st.a[0][a_dst]), at, a_slot >= 0);
+        if constexpr (PLANES == 2) {
+            om_cp16(om_smem(&st.a[1][a_dst]), at + a_plane, a_slot >= 0);
         }
         if constexpr (MX8) {
             const unsigned char* src = b_base + ks * Q4P_BK + b_half * 32;
@@ -932,7 +943,7 @@ __device__ __forceinline__ void q4p_moe_body(
             load(next % kStages, next);
         }
         om_commit();
-        const Q4pStageOf<MX8>& st = stages[ks % kStages];
+        const Stage& st = stages[ks % kStages];
         uint32_t bf[2][4][2];
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
@@ -972,7 +983,7 @@ __device__ __forceinline__ void q4p_moe_body(
         for (int mt = 0; mt < 2; ++mt) {
             const int r0 = mt * 16 + g;
 #pragma unroll
-            for (int plane = 0; plane < 2; ++plane) {
+            for (int plane = 0; plane < PLANES; ++plane) {
                 const __nv_bfloat16* a = st.a[plane];
                 const uint4 lo0 = *reinterpret_cast<const uint4*>(&a[r0 * Q4P_BK + ((t ^ a_sw) * 8)]);
                 const uint4 hi0 =
@@ -1021,7 +1032,9 @@ __device__ __forceinline__ void q4p_moe_body(
                 q4p_split2(a0, a1, head, rest);
                 const unsigned long long at = (unsigned long long)slot * intermediate + column;
                 *reinterpret_cast<__nv_bfloat162*>(&activated[at]) = head;
-                *reinterpret_cast<__nv_bfloat162*>(&activated[out_plane + at]) = rest;
+                if constexpr (PLANES == 2) {
+                    *reinterpret_cast<__nv_bfloat162*>(&activated[out_plane + at]) = rest;
+                }
             }
         }
     } else {
@@ -1157,6 +1170,88 @@ extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs_mx8(
     int a_piece, unsigned long long a_piece_stride) {
     OPT_PDL_ENTRY();
     q4p_moe_body<false, Q4pSiluSwiglu, true, true>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride, Q4pSiluSwiglu(), a_piece,
+        a_piece_stride);
+}
+
+// The head-only forms of Inkling-2-Small's six passes (q4p_moe_body's PLANES 1, the opt-in
+// SPARKFLASH_INKLING_PLANES=head): the same arguments, the activation's head plane alone. Each
+// gate_up writes the head of its SwiGLU rows and leaves `activated_plane` unwritten; each down
+// pass reads the head and leaves `activated_plane` unread.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_gate_up_capped_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ x,
+    unsigned long long x_plane, __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, int topk, int hidden, int intermediate, float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<true, Q4pSoftcapSwiglu, false, false, 1>(
+        table, scales, sorted, items, item_count, x, x_plane, nullptr, activated, activated_plane,
+        topk, hidden, intermediate, 0, Q4pSoftcapSwiglu{gate_cap, up_cap});
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_gate_up_capped_mx8_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ x,
+    unsigned long long x_plane, __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, int topk, int hidden, int intermediate, float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<true, Q4pSoftcapSwiglu, true, false, 1>(
+        table, scales, sorted, items, item_count, x, x_plane, nullptr, activated, activated_plane,
+        topk, hidden, intermediate, 0, Q4pSoftcapSwiglu{gate_cap, up_cap});
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, false, false, 1>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_mx8_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, true, false, 1>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride,
+    int a_piece, unsigned long long a_piece_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, false, true, 1>(
+        table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
+        partials, 0, topk, hidden, intermediate, weight_stride, Q4pSiluSwiglu(), a_piece,
+        a_piece_stride);
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_runs_mx8_head(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride,
+    int a_piece, unsigned long long a_piece_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, true, true, 1>(
         table, scales, sorted, items, item_count, activated, activated_plane, route_weights,
         partials, 0, topk, hidden, intermediate, weight_stride, Q4pSiluSwiglu(), a_piece,
         a_piece_stride);
