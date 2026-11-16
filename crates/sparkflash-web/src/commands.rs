@@ -379,14 +379,17 @@ pub fn fabric_probe_command(
     let args = inspect::fabric_probe_args(netdevs, peers, pings);
     let label = format!("Probe the fast ports on {}", node.ssh);
     if node.local {
+        // arping needs a raw socket; the port setup needs the same passwordless sudo.
         let mut argv = vec![
+            "-n".to_owned(),
+            "bash".to_owned(),
             "-c".to_owned(),
             inspect::FABRIC_PROBE_SCRIPT.to_owned(),
             "sparkflash-fabric".to_owned(),
         ];
         argv.extend(args);
         return CommandSpec {
-            program: "bash".to_owned(),
+            program: "sudo".to_owned(),
             args: argv,
             env: BTreeMap::new(),
             cwd: None,
@@ -919,12 +922,14 @@ mod tests {
         let peers = vec![(1usize, "10.0.0.3".to_owned())];
         let pings = vec![(1usize, "10.0.0.3".to_owned())];
         let local = fabric_probe_command(&config, 0, &netdevs, &peers, &pings);
-        assert_eq!(local.program, "bash");
+        assert_eq!(local.program, "sudo", "a raw socket needs root");
         assert_eq!(local.kind, "fabric-probe");
-        assert_eq!(local.args[0], "-c");
-        assert_eq!(local.args[2], "sparkflash-fabric");
+        assert_eq!(local.args[0], "-n");
+        assert_eq!(local.args[1], "bash");
+        assert_eq!(local.args[2], "-c");
+        assert_eq!(local.args[4], "sparkflash-fabric");
         assert_eq!(
-            local.args[3..],
+            local.args[5..],
             ["ndev=enp1s0f0np0", "peer=1:10.0.0.3", "ping=1:10.0.0.3"]
         );
 
@@ -939,8 +944,8 @@ mod tests {
             .expect("destination");
         let line = &remote.args[at + 1];
         assert!(
-            line.starts_with("bash -c '"),
-            "the script is one quoted argument: {line}"
+            line.starts_with("sudo -n bash -c '"),
+            "the script is one quoted argument under sudo: {line}"
         );
         assert!(line.contains("sparkflash-fabric"), "{line}");
         assert!(

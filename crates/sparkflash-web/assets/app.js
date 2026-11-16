@@ -1237,6 +1237,17 @@ function latestJob(match) {
   return found;
 }
 
+// The port pass starts four jobs at once, one per rank, so the highest id is the highest rank,
+// not the latest outcome. Look for a failure in the newest pass (the four start together).
+function failedPortJob() {
+  const jobs = S.jobs.filter((job) => job.kind.startsWith("network-setup-"));
+  if (!jobs.length) return null;
+  const newest = Math.max(...jobs.map((job) => job.started_ms || 0));
+  return jobs
+    .filter((job) => newest - (job.started_ms || 0) < 15000 && job.status === "failed")
+    .sort((a, b) => (a.started_ms || 0) - (b.started_ms || 0))[0] || null;
+}
+
 const runningJob = (match) => S.jobs.find((job) => job.status === "running" && match(job));
 const ofKind = (kind) => (job) => job.kind === kind;
 const isConvert = (job) => job.kind.startsWith("convert-");
@@ -1536,7 +1547,7 @@ const FABRIC_CHOICES = [
   {
     id: "switchless",
     title: "Switchless ring",
-    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the Spark between them, and the port setup routes them there. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the fabric bytes at four Sparks.",
+    body: "Direct-attach ring 0 to 1 to 2 to 3 to 0; the 0 to 2 and 1 to 3 diagonals go through the Spark between them, and the port setup routes them there. Cross-rank all-reduces reduce-scatter to the chunk owners, then all-gather back: same arithmetic, half the element writes at four Sparks.",
   },
 ];
 
@@ -1553,7 +1564,10 @@ function fabricPicker(state, model) {
   const chosen = canonicalFabric(config.cluster && config.cluster.fabric_schedule);
   const measured = setup && setup.fabric ? setup.fabric : null;
   const shape = measured ? measured.shape : null;
-  const recommended = shape === "switched" ? "switched" : shape === "ring" ? "switchless" : null;
+  // Nothing is "Detected" when the ports could not be probed: the shape is a guess then.
+  const recommended = measured && measured.links_measured
+    ? (shape === "switched" ? "switched" : shape === "ring" ? "switchless" : null)
+    : null;
   // A rank that cannot reach a peer is a finding the step blocks on. The cards must not also say
   // the saved schedule matches the wiring: that would be a success note next to the errors.
   const reached = measured && Array.isArray(measured.reachable) ? measured.reachable : [];
@@ -1587,7 +1601,7 @@ function fabricPicker(state, model) {
   }
   parts.push("</div>");
   if (measured && !measured.links_measured) {
-    parts.push('<p class="guide-note">The ports answered no ARP probe. Install <code>iputils-arping</code> on every Spark and let it open a raw socket, then check again and the wiring will be identified automatically.</p>');
+    parts.push('<p class="guide-note">The ports answered no ARP probe. Install <code>iputils-arping</code> on every Spark and allow passwordless <code>sudo -n</code>; the check runs it with a raw socket. Then check again and the wiring will be identified automatically.</p>');
   } else if (recommended && recommended !== chosen) {
     parts.push('<div class="guide-actions"><span class="guide-hint">The measured wiring is ' + esc(FABRIC_SHAPE_NAMES[shape]) + '; the saved schedule is ' + esc(chosen) + '.</span><button class="btn btn-primary" type="button" data-act="choose-fabric" data-fabric="' + recommended + '">Use the measured fabric</button></div>');
   } else if (measured && recommended === chosen && !unreachable) {
@@ -1671,7 +1685,13 @@ function networkBody(state, model) {
   if (portJob) {
     parts.push(progressBar(portJob, "Configuring the fast ports…"));
   } else {
-    parts.push(failureNote(latestJob((job) => job.kind.startsWith("network-setup-")), "Setting up the ports"));
+    const failed = failedPortJob();
+    let what = "Setting up the ports";
+    if (failed) {
+      const node = (setup.nodes || [])[Number(failed.kind.slice(-1))];
+      if (node) what += " on " + (node.hostname || node.ssh);
+    }
+    parts.push(failureNote(failed, what));
     if (fixable.length) {
       const names = fixable.map((node) => node.hostname || node.ssh).join(", ");
       parts.push(actionRow('<button class="btn btn-primary" type="button" data-act="setup-ports"><svg><use href="#i-bolt"/></svg>Set up the ports</button>',

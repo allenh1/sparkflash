@@ -108,6 +108,11 @@ pub const SYSCTL_FILE: &str = "/etc/sysctl.d/60-sparkflash-fabric.conf";
 /// The MTU the fast ports should run.
 pub const FABRIC_MTU: u32 = 9000;
 
+/// The metric the fabric's host routes are written with. It has to be higher than the connected
+/// route of the address itself: the check picks the rail the kernel sources the fast subnet from
+/// by the lowest metric, and a host route must not change which rail that is.
+const FABRIC_ROUTE_METRIC: u32 = 200;
+
 /// The subnet suggested when no node has a fast-network address yet.
 const DEFAULT_SUBNET: (Ipv4Addr, u8) = (Ipv4Addr::new(10, 200, 0, 0), 24);
 
@@ -1302,20 +1307,46 @@ struct FabricRoute {
     netdev: String,
 }
 
-/// Whether the node already carries every route.
-fn routes_installed(facts: &NodeFacts, routes: &[FabricRoute]) -> bool {
-    routes.iter().all(|route| {
-        let destination = format!("{}/32", route.to);
-        let via = route.via.map(|via| via.to_string());
-        facts.routes.iter().any(|have| {
-            have.destination == destination && have.netdev == route.netdev && have.via == via
-        })
-    })
+/// Whether `have` is the host route `route`. iproute2 prints a /32 destination without the
+/// prefix (both `10.0.0.7` and `10.0.0.7/32` are the same route), and the setup compares what the
+/// node reports against what it wrote.
+fn same_host_route(have: &Route, route: &FabricRoute) -> bool {
+    let (destination, prefix) = have
+        .destination
+        .split_once('/')
+        .map_or((have.destination.as_str(), 32), |(destination, prefix)| {
+            (destination, prefix.parse().unwrap_or(0))
+        });
+    let via = route.via.map(|via| via.to_string());
+    destination.parse::<Ipv4Addr>() == Ok(route.to)
+        && prefix == 32
+        && have.netdev == route.netdev
+        && have.via == via
 }
 
-/// The routes a ring needs, per rank. A neighbour's collective address is reached over the cable
-/// that carries it; a diagonal goes through a Spark cabled to both ends, the lowest-numbered one,
-/// so both directions of a pair cross the same relay.
+/// Whether the node already carries every route.
+fn routes_installed(facts: &NodeFacts, routes: &[FabricRoute]) -> bool {
+    routes
+        .iter()
+        .all(|route| facts.routes.iter().any(|have| same_host_route(have, route)))
+}
+
+/// One cable, as the probe saw it: the port it leaves by and the peer address that answered on
+/// it. That address is the next hop, and it need not be the peer's collective address: a Spark's
+/// two ports are on two segments and each address lives on one of them, so the address that
+/// answers on this cable is the peer's address on this cable. A packet whose destination is any of
+/// the peer's addresses is delivered to the peer wherever it arrives, so this next hop reaches the
+/// collective address too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Cable {
+    netdev: String,
+    next_hop: Ipv4Addr,
+}
+
+/// The routes a ring needs, per rank. Every peer's collective address is pinned to a next hop that
+/// is on the cable that reaches it: the peer itself when the two Sparks are cabled, and otherwise a
+/// Spark cabled to both ends (the lowest-numbered one, so both directions of a pair use it), which
+/// forwards the packet over its own cable.
 fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<FabricRoute>> {
     let world = probes.len();
     let mut routes: Vec<Vec<FabricRoute>> = vec![Vec::new(); world];
@@ -1334,53 +1365,78 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
     if primaries.iter().any(Option::is_none) {
         return routes;
     }
-    // The port that carries each peer's collective address, per rank: a cable answers for the
-    // address of the half it reaches.
-    let mut direct: Vec<BTreeMap<usize, (String, Ipv4Addr)>> = vec![BTreeMap::new(); world];
+    // Netplan refuses a next hop outside the port's subnet, so only an answer from the fabric
+    // subnet can be a next hop. The plan already puts every collective address on one subnet.
+    let subnet = probes.iter().flatten().find_map(|facts| {
+        let rails = facts.rails();
+        let primary = facts.primary_rail(&rails)?;
+        Some((
+            Ipv4Addr::from(network(primary.ip, primary.prefix?)),
+            primary.prefix?,
+        ))
+    });
+    // Every cable, with the peer address that answered on it. The smallest port and address win,
+    // so the two ends of one cable agree on the next hop.
+    let mut cables: Vec<BTreeMap<usize, Cable>> = vec![BTreeMap::new(); world];
     for link in &fabric.links {
+        if link.rank >= world || link.peer >= world || link.rank == link.peer {
+            continue;
+        }
         let Ok(address) = link.address.parse::<Ipv4Addr>() else {
             continue;
         };
-        if primaries.get(link.peer).copied().flatten() != Some(address) {
+        if let Some((fabric, prefix)) = subnet
+            && Ipv4Addr::from(network(address, prefix)) != fabric
+        {
             continue;
         }
-        direct[link.rank]
-            .entry(link.peer)
-            .or_insert_with(|| (link.netdev.clone(), address));
+        let cable = Cable {
+            netdev: link.netdev.clone(),
+            next_hop: address,
+        };
+        match cables[link.rank].get(&link.peer) {
+            Some(have)
+                if (have.netdev.as_str(), have.next_hop)
+                    <= (cable.netdev.as_str(), cable.next_hop) => {}
+            _ => {
+                cables[link.rank].insert(link.peer, cable);
+            }
+        }
     }
     for rank in 0..world {
         if primaries[rank].is_none() {
             continue;
         }
-        for peer in 0..world {
-            let Some(target) = primaries[peer] else {
+        for (peer, target) in primaries.iter().enumerate() {
+            let Some(target) = target else {
                 continue;
             };
             if peer == rank {
                 continue;
             }
-            if let Some((netdev, _)) = direct[rank].get(&peer) {
-                routes[rank].push(FabricRoute {
-                    to: target,
-                    via: None,
-                    netdev: netdev.clone(),
-                });
-                continue;
-            }
-            let relay = (0..world).find(|candidate| {
-                *candidate != rank
-                    && *candidate != peer
-                    && direct[rank].contains_key(candidate)
-                    && direct[*candidate].contains_key(&peer)
+            let direct = cables[rank].get(&peer).map(|cable| FabricRoute {
+                to: *target,
+                // A next hop equal to the destination is the destination itself, which a gateway
+                // may not be: that cable carries the address itself, so a link route is right.
+                via: (cable.next_hop != *target).then_some(cable.next_hop),
+                netdev: cable.netdev.clone(),
             });
-            if let Some(relay) = relay
-                && let (Some((netdev, _)), Some(hop)) = (direct[rank].get(&relay), primaries[relay])
-            {
-                routes[rank].push(FabricRoute {
-                    to: target,
-                    via: Some(hop),
-                    netdev: netdev.clone(),
-                });
+            let route = direct.or_else(|| {
+                let relay = (0..world).find(|candidate| {
+                    *candidate != rank
+                        && *candidate != peer
+                        && cables[rank].contains_key(candidate)
+                        && cables[*candidate].contains_key(&peer)
+                })?;
+                let hop = cables[rank].get(&relay)?;
+                Some(FabricRoute {
+                    to: *target,
+                    via: Some(hop.next_hop),
+                    netdev: hop.netdev.clone(),
+                })
+            });
+            if let Some(route) = route {
+                routes[rank].push(route);
             }
         }
     }
@@ -1501,6 +1557,7 @@ fn network_fixes(
                         } else {
                             yaml.push_str("          scope: link\n");
                         }
+                        yaml.push_str(&format!("          metric: {FABRIC_ROUTE_METRIC}\n"));
                     }
                 }
             }
@@ -1697,10 +1754,13 @@ pub fn fabric_probe_args(
 }
 
 /// The remote command line that runs the link probe with the given args under bash.
+///
+/// It runs under `sudo -n`: `arping` needs a raw socket, and distributions install it without the
+/// capability. The port setup already needs passwordless sudo, so this is the same requirement.
 #[must_use]
 pub fn fabric_probe_remote_command(args: &[String]) -> String {
     let mut line = format!(
-        "bash -c {} sparkflash-fabric",
+        "sudo -n bash -c {} sparkflash-fabric",
         shell_quote(FABRIC_PROBE_SCRIPT)
     );
     for arg in args {
@@ -2682,51 +2742,86 @@ link 3 enp1s0f1np1 198.51.100.13 ok
         );
     }
 
-    /// The collective addresses of the `cluster()` fixture, in rank order.
-    fn primaries() -> [String; 4] {
-        (21..=24)
-            .map(|last| format!("198.51.100.{last}"))
-            .collect::<Vec<_>>()
-            .try_into()
-            .expect("four")
-    }
-
-    /// A four-Spark ring measured from `cluster()`: each rank answers its two neighbours on its two
-    /// cabled ports, for the neighbours' collective addresses.
+    /// A four-Spark ring measured from `cluster()` the way the hardware presents it: each Spark's
+    /// two ports are on two segments, an address lives on one of them, and the primary (the second
+    /// rail, lowest route metric) is on the port that faces the next rank. So the cable to the next
+    /// rank carries the next rank's *other* address, and the cable to the previous rank carries its
+    /// collective address.
     fn ring_fabric() -> Fabric {
-        let primaries = primaries();
         let mut links = Vec::new();
         for rank in 0..4usize {
-            for (netdev, peer) in [
-                ("enp1s0f1np1", (rank + 1) % 4),
-                ("enP2p1s0f1np1", (rank + 3) % 4),
-            ] {
-                links.push(FabricLink {
-                    rank,
-                    netdev: netdev.to_owned(),
-                    peer,
-                    address: primaries[peer].clone(),
-                });
-            }
+            let next = (rank + 1) % 4;
+            let previous = (rank + 3) % 4;
+            links.push(FabricLink {
+                rank,
+                netdev: "enP2p1s0f1np1".to_owned(),
+                peer: next,
+                address: format!("198.51.100.{}", 11 + next),
+            });
+            links.push(FabricLink {
+                rank,
+                netdev: "enp1s0f1np1".to_owned(),
+                peer: previous,
+                address: format!("198.51.100.{}", 21 + previous),
+            });
         }
         Fabric {
             links,
-            reachable: vec![
-                Some(vec![1, 3]),
-                Some(vec![0, 2]),
-                Some(vec![1, 3]),
-                Some(vec![0, 2]),
-            ],
+            reachable: vec![Some(vec![1]), Some(vec![2]), Some(vec![3]), Some(vec![0])],
             shape: FabricShape::Ring,
             links_measured: true,
         }
     }
 
     #[test]
+    fn a_host_route_matches_with_and_without_the_prefix_length() {
+        // iproute2 prints a /32 destination as the bare address, so the convergence check has to
+        // accept both forms (and still reject a route with the wrong next hop or port).
+        let target = FabricRoute {
+            to: Ipv4Addr::new(198, 51, 100, 22),
+            via: Some(Ipv4Addr::new(198, 51, 100, 12)),
+            netdev: "enp1s0f1np1".to_owned(),
+        };
+        let route = |destination: &str, netdev: &str, via: Option<&str>| Route {
+            destination: destination.to_owned(),
+            netdev: netdev.to_owned(),
+            via: via.map(str::to_owned),
+            metric: 0,
+            dhcp: false,
+        };
+        assert!(same_host_route(
+            &route("198.51.100.22", "enp1s0f1np1", Some("198.51.100.12")),
+            &target
+        ));
+        assert!(same_host_route(
+            &route("198.51.100.22/32", "enp1s0f1np1", Some("198.51.100.12")),
+            &target
+        ));
+        assert!(!same_host_route(
+            &route("198.51.100.22", "enP2p1s0f1np1", Some("198.51.100.12")),
+            &target
+        ));
+        assert!(!same_host_route(
+            &route("198.51.100.22", "enp1s0f1np1", Some("198.51.100.13")),
+            &target
+        ));
+        assert!(!same_host_route(
+            &route("198.51.100.23", "enp1s0f1np1", Some("198.51.100.12")),
+            &target
+        ));
+        // A link route is not the same as a route through a next hop.
+        assert!(!same_host_route(
+            &route("198.51.100.22", "enp1s0f1np1", None),
+            &target
+        ));
+    }
+
+    #[test]
     fn a_ring_setup_pins_every_peer_route_and_enables_forwarding() {
-        // A bare ring has no cable between opposite Sparks. The port setup has to pin each peer's
-        // collective address to the port that reaches it (a neighbour directly, a diagonal via the
-        // Spark in between) and turn on forwarding, or the transport cannot connect to every rank.
+        // A bare ring has no cable between opposite Sparks, and a neighbour's collective address
+        // may sit on its other cable. The port setup has to pin every peer's collective address to
+        // a next hop on the cable that reaches it (the peer's address on that cable, or the Spark
+        // in between) and turn on forwarding, or the transport cannot connect to every rank.
         let probes = cluster();
         let report = analyze_fabric(
             &SparkConfig::default(),
@@ -2747,12 +2842,35 @@ link 3 enp1s0f1np1 198.51.100.13 ok
                 !remote.lines().any(|line| line.starts_with("sudo ")),
                 "{remote}"
             );
+            // Every peer gets a route: the other three collective addresses must all be there.
+            for peer in 0..4usize {
+                if peer == node.rank {
+                    continue;
+                }
+                let destination = format!("to: 198.51.100.{}/32", 21 + peer);
+                assert!(
+                    fix.contains(&destination),
+                    "rank {} lacks {destination}: {fix}",
+                    node.rank
+                );
+            }
         }
-        // Rank 0's neighbours are 1 and 3; rank 2 is reached through one of them.
+        // Rank 0: the cable to rank 1 carries rank 1's other address (12), so the route to rank 1's
+        // collective address (22) goes via it; rank 3's collective address (24) is on that cable
+        // itself; rank 2 is not cabled to rank 0 and is reached through rank 1.
         let node = report.nodes[0].network_fix.as_deref().expect("fix");
-        assert!(node.contains("to: 198.51.100.22/32"), "{node}");
-        assert!(node.contains("to: 198.51.100.23/32"), "{node}");
-        assert!(node.contains("via: 198.51.100.22"), "{node}");
+        assert!(
+            node.contains("to: 198.51.100.22/32") && node.contains("via: 198.51.100.12"),
+            "{node}"
+        );
+        assert!(
+            node.contains("to: 198.51.100.24/32") && node.contains("scope: link"),
+            "{node}"
+        );
+        assert!(
+            node.contains("to: 198.51.100.23/32") && node.contains("via: 198.51.100.12"),
+            "{node}"
+        );
     }
 
     #[test]
@@ -2766,11 +2884,12 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             let facts = probe.as_mut().expect("facts");
             facts.forward = true;
             for route in &routes[rank] {
+                // iproute2 prints a host route without the /32; that is what the probe parses.
                 facts.routes.push(Route {
-                    destination: format!("{}/32", route.to),
+                    destination: route.to.to_string(),
                     netdev: route.netdev.clone(),
                     via: route.via.map(|via| via.to_string()),
-                    metric: 0,
+                    metric: FABRIC_ROUTE_METRIC,
                     dhcp: false,
                 });
             }

@@ -108,8 +108,8 @@ cards describe the two wirings this build supports, and the check tells you whic
 - **Switchless ring** is the direct-attach ring: the four Sparks chain 0-1-2-3-0 over the DACs, and
   each collective reduce-scatters to the chunk owners and all-gathers the reduced chunks back. It
   is the same arithmetic, bit for bit, with `2 * (world - 1) * elements` payload element writes
-  cluster-wide against `world * (world - 1) * elements` for the one-shot: half the traffic at world
-  4. A Spark has no cable to the rank opposite it, so those transfers cross the two cables in
+  cluster-wide against `world * (world - 1) * elements` for the one-shot: half the element writes
+  at world 4. A Spark has no cable to the rank opposite it, so those transfers cross the two cables in
   between and are forwarded by the Spark between them: the port setup routes each non-neighbour's
   address through that Spark and turns on forwarding, so a bare DAC ring carries the transport's
   traffic for every rank. A fabric that forwards in the ConnectX-7 itself (the vendor's switchless
@@ -129,7 +129,9 @@ which keeps the partials on the host seam. The check cannot see which NCCL is in
 
 When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
 every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective
-address (`ping -I`). A port that answers an address is a cable: from the answers the console
+address (`ping -I`). `arping` needs a raw socket, which a distribution install does not grant, so
+the probe runs under `sudo -n` like the port setup; without passwordless sudo the check cannot
+identify the wiring. A port that answers an address is a cable: from the answers the console
 classifies the fabric as a switch (every port answers for every peer), the ring (each of every
 Spark's two ports answers for exactly one neighbour, forming 0-1-2-3-0), two-node pairs (both
 ports reach the same Spark), or unrecognised wiring, and records what it measured next to the

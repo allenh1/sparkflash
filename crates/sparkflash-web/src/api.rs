@@ -149,6 +149,11 @@ const NETWORK_SETUP_EXCLUSIVE: &[&str] = &[
 /// replayed onto a cluster that has since changed under it.
 const NETWORK_SETUP_MAX_AGE_MS: u64 = 10 * 60 * 1000;
 
+/// How long after a launch or swap the fast ports are left alone. The launcher job finishes when
+/// the script returns, while rank 0 binds about half a minute later and the telemetry takes
+/// another sample, so "rank 0 is online" is not yet a usable gate in that window.
+const LAUNCH_SETTLE_MS: u64 = 5 * 60 * 1000;
+
 /// How long a stop or its confirmation through the launcher may take.
 const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
@@ -1130,6 +1135,22 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         return api_error(
             StatusCode::CONFLICT,
             "rank 0 is online; stop the cluster before reconfiguring the fast ports",
+        );
+    }
+    // A launch that just finished is still booting: netplan apply now would drop the links the
+    // group is coming up over. The telemetry gate above only fires once the sampler has seen the
+    // server, which is later than the job ending.
+    let launched_ms = web
+        .jobs
+        .list()
+        .iter()
+        .filter(|job| matches!(job.kind.as_str(), "launch" | "swap"))
+        .filter_map(|job| job.finished_ms)
+        .max();
+    if launched_ms.is_some_and(|finished| now_ms().saturating_sub(finished) < LAUNCH_SETTLE_MS) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the cluster was launched less than five minutes ago and may still be coming up; wait until it answers or stop it before reconfiguring the fast ports",
         );
     }
     // A port job holds its rank's own kind, so it cannot start twice; the other ranks of the
@@ -2363,18 +2384,16 @@ mod tests {
             if command.kind == "prepared" {
                 return Ok("ready".to_owned());
             }
-            let rank = if command.program == "bash" {
-                0
-            } else {
-                (1..4)
-                    .find(|rank| {
-                        command
-                            .args
-                            .iter()
-                            .any(|arg| arg.ends_with(&format!("spark{rank}")))
-                    })
-                    .expect("an ssh destination")
-            };
+            // The local rank's commands carry no ssh destination; a link probe runs under
+            // `sudo -n`, so the program is not the way to tell it either.
+            let rank = (1..4)
+                .find(|rank| {
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                })
+                .unwrap_or(0);
             if command.kind == "fabric-probe" {
                 if self.fresh_rank == Some(rank) {
                     // Ports cabled but unconfigured: nothing answers.
@@ -2431,18 +2450,16 @@ mod tests {
             if command.kind == "prepared" {
                 return Ok("ready".to_owned());
             }
-            let rank = if command.program == "bash" {
-                0
-            } else {
-                (1..4)
-                    .find(|rank| {
-                        command
-                            .args
-                            .iter()
-                            .any(|arg| arg.ends_with(&format!("spark{rank}")))
-                    })
-                    .expect("an ssh destination")
-            };
+            // The local rank's commands carry no ssh destination; a link probe runs under
+            // `sudo -n`, so the program is not the way to tell it either.
+            let rank = (1..4)
+                .find(|rank| {
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg.ends_with(&format!("spark{rank}")))
+                })
+                .unwrap_or(0);
             if command.kind == "fabric-probe" {
                 let mut reply = String::new();
                 for peer in 0..4 {
@@ -3580,6 +3597,59 @@ mod tests {
             .unwrap_or_default()
             .to_owned();
         assert!(error.contains("more than ten minutes old"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_waits_for_a_launch_that_is_still_coming_up() {
+        // The launcher job ends when the script returns; rank 0 binds later and the telemetry
+        // samples later still, so a port setup in that window would drop the links the group is
+        // booting over.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let spec = CommandSpec {
+            program: "bash".to_owned(),
+            args: vec!["-c".to_owned(), "true".to_owned()],
+            env: BTreeMap::new(),
+            cwd: None,
+            label: "Launch".to_owned(),
+            kind: "launch".to_owned(),
+        };
+        let id = state
+            .jobs
+            .start_exclusive(spec, &[])
+            .await
+            .expect("launch job");
+        loop {
+            let detail = state.jobs.get(id).expect("job");
+            if detail.summary.status.is_done() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("may still be coming up"), "{error}");
     }
 
     #[test]
