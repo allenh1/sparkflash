@@ -985,10 +985,10 @@ pub fn analyze_fabric(
                     rank: Some(rank),
                     severity: Severity::Error,
                     message: format!(
-                        "the fast-network check did not complete on {} (it runs under \
-                         `sudo -n` and needs iputils-arping); the wiring and the launch's \
-                         connections to every rank are unverified. Fix the check, then check \
-                         again.",
+                        "the fast-network check did not complete on {} (its reachability pings \
+                         did not run: an SSH failure or a timeout); the wiring and the launch's \
+                         connections to every rank are unverified. Check the connection to that \
+                         Spark, then check again.",
                         name(rank)
                     ),
                 });
@@ -1306,10 +1306,12 @@ fn plan_fabric(
     for (rank, rails) in rails_by_rank.iter().enumerate() {
         for rail in rails {
             match seen.insert(rail.ip, rank) {
+                // Cluster-wide on purpose: no port fix can write a duplicate address, so the
+                // port setup must refuse the plan however much per-rank work it also has.
                 Some(first) if first == rank => {
                     duplicate = true;
                     findings.push(Finding {
-                        rank: Some(rank),
+                        rank: None,
                         severity: Severity::Error,
                         message: format!(
                             "{} uses the fast address {} on two ports. Give every port its own.",
@@ -1321,7 +1323,7 @@ fn plan_fabric(
                 Some(first) => {
                     duplicate = true;
                     findings.push(Finding {
-                        rank: Some(rank),
+                        rank: None,
                         severity: Severity::Error,
                         message: format!(
                             "{} and {} both use the fast address {}. Give every port its own.",
@@ -2626,6 +2628,14 @@ link enp1s0f1np1 1500 up 0 0
             errors(&report)
                 .iter()
                 .any(|message| message.contains("198.51.100.11")),
+            "{:?}",
+            report.findings
+        );
+        // Cluster-wide, so /api/network/setup refuses to write routes derived from it.
+        assert!(
+            report.findings.iter().any(|finding| finding.rank.is_none()
+                && finding.severity == Severity::Error
+                && finding.message.contains("198.51.100.11")),
             "{:?}",
             report.findings
         );

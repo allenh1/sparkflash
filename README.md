@@ -194,9 +194,11 @@ Step 2 reads every Spark's RoCE devices and works out the settings for you:
 | `NCCL_IB_GID_INDEX` | the GID slot holding the ports' RoCE v2 IPv4 addresses (3 on DGX OS) |
 | each Spark's peer address | that Spark's address on the same interface |
 
-It also checks that every port links at 200 Gb/s, uses MTU 9000, and, when a Spark's two
-interfaces share a subnet, that each answers ARP only for its own address (`arp_ignore=1`,
-`arp_announce=2`). **Set up the ports** applies the fix on each Spark under passwordless
+It also checks that every port links at 200 Gb/s, uses MTU 9000, and, on every Spark with more than
+one fast lane, that each port answers ARP only for its own address (`arp_ignore=1`,
+`arp_announce=2`). ARP is layer 2, so the setting matters even when a Spark's two ports are on
+different subnets: without it a port answers for its sibling's address and the measured cabling
+means nothing. **Set up the ports** applies the fix on each Spark under passwordless
 `sudo -n` (locally on the lead, over SSH on the others); the same commands are shown for copying
 into a terminal on that Spark. They write
 `/etc/netplan/60-sparkflash-fabric.yaml` (the addresses and MTU, and on a ring a `/32` route for

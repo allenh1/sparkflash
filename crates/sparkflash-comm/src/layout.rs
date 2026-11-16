@@ -20,9 +20,9 @@
 //!   payload to all three peers and each rank reduces locally in canonical rank order.
 //! * FabricSchedule::HairpinRingReduceScatterAllGather - the switchless schedule. The buffer is
 //!   split into one chunk per rank; every rank sends its contribution of chunk c to the owner of
-//!   c (its ring neighbour or, for the opposite rank, straight across the ConnectX-7 hairpin
-//!   diagonal), the owner accumulates ranks 0 + 1 + 2 + 3 in order and rounds once, then
-//!   all-gathers the reduced chunk back. This moves 2 * (world - 1) * num_elements element
+//!   c (its ring neighbour, or the opposite rank through the Spark between the two cables), the
+//!   owner accumulates ranks 0 + 1 + 2 + 3 in order and rounds once, then all-gathers the reduced
+//!   chunk back. This moves 2 * (world - 1) * num_elements element
 //!   writes cluster-wide against world * (world - 1) * num_elements for the one-shot, i.e. half
 //!   the traffic on four ranks, without ever changing the summation order.
 //!

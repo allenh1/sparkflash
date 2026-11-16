@@ -160,12 +160,16 @@ whatever the cables are. The message says what to look at. On a switch it is the
 address. On a ring it is the route to that address: a neighbour's collective address can sit on
 its other port, and a non-neighbour's goes through the Spark between the cables, so **Set up the
 ports** writes those routes and turns on forwarding. A ring whose addresses still do not answer
-after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering
-(the check warns about that, and the port setup sets it to loose), and the finding stays. Wiring that is none of the named shapes says
-so, and its silent pairs are errors too. When `arping` could not run (missing, or unable to open a
-raw socket), the finding says the wiring was not measured and reports the ping result alone. When
-the whole probe could not run, the finding is an error: the wiring and the launch's connections are
-unverified until it does.
+after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering:
+a relayed packet can leave by the other half of a port, and when a receiver's route to that source
+is pinned to a different netdev strict filtering drops it, so the port setup sets `rp_filter=2`
+(loose), which still validates the source, and the check warns while it is strict. The finding
+stays.
+
+Wiring that is none of the named shapes says so, and its silent pairs are errors too. When
+`arping` could not run (missing, or unable to open a raw socket), the finding says the wiring was
+not measured and reports the ping result alone. When the pings cannot run, the finding is an error:
+the wiring and the launch's connections are unverified until they do.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a

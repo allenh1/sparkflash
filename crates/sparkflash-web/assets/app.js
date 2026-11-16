@@ -1684,7 +1684,11 @@ function networkBody(state, model) {
         "<td>" + rails + '</td><td class="num"><span class="ssh-state ' + (worst === "warn" ? "warnish" : worst) + '">' + esc(label) + "</span></td></tr>";
     }).join("") + "</tbody></table>");
   parts.push(findingsList(setup.findings, config));
-  const fixable = setup.nodes.filter((node) => node.network_fix);
+  // A cluster-wide error (two Sparks on one address, say) is a problem no port fix can write:
+  // the API refuses the pass, so do not offer it.
+  const clusterError = (setup.findings || []).some(
+    (finding) => finding.severity === "error" && (finding.rank === null || finding.rank === undefined));
+  const fixable = clusterError ? [] : setup.nodes.filter((node) => node.network_fix);
   const portJob = runningJob((job) => job.kind.startsWith("network-setup-"));
   if (portJob) {
     parts.push(progressBar(portJob, "Configuring the fast ports…"));
