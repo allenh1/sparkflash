@@ -1811,3 +1811,49 @@ The distance, teacher-forced on twelve cuts of the 6,000-token text (the D117 me
 So the head alone moves the logits about a quarter further from exact than both planes do, with
 a KL to exact of the same size. After the 93K prompt the greedy ids agree for 15 tokens and part
 at the 16th, as the intermediate split's do.
+
+### Rewinding to the last prompt's end (D121)
+
+A chat client sends the whole conversation every turn. When the reply comes back in the ids the
+model wrote, or in ids the byte match above takes, the held sequence extends and only the new turn
+runs. When it does not, because the client renders the reply again in a form the match cannot
+take (a reasoning block dropped, a template that re-spells the turn) or regenerates the answer to
+the same prompt, the prompt keeps the last prompt and parts from the reply after it, and the whole
+conversation ran cold: 91.6 s at 93K.
+
+A session now keeps a checkpoint at the end of every prompt (`Boundary` in `device.rs`): the state
+its cache rows do not hold, which is each layer's four convolution histories and the DSpark
+drafter's Markov feature, in one allocation. A position's keys and values stay in the cache until
+a later position's write lands on their slot. A sliding ring holds its window and a widest chunk,
+so the rows before the boundary survive while the positions written past it (the reply, and a
+verify's drafts past its last fed token) number at most a widest chunk; under the switch the
+drafter's local rings are opened as wide (window + widest chunk - 1 rows, 32 KiB a row).
+
+A next prompt that starts with the last prompt, goes past it, and carries the last prompt's images
+where it held them takes the session back there: the checkpoint is copied back, the history and
+position are cut to the boundary, and the rest of the prompt is forwarded. The host driver offers
+it (`ModelSession::rewind_prefix`) when the prompt neither extends the held ids nor matches them by
+text, prints `prefix reuse by rewind`, and reports the boundary as the hit; the group sends the
+one point to every rank, so they rewind together. A reply longer than a widest chunk past the
+boundary makes the session offer no rewind, and the prompt runs as it would have.
+
+`SPARKFLASH_INKLING_REWIND=off` keeps no checkpoint and opens the drafter's rings at their window,
+and the prompt then runs cold. Any value other than on or off is refused.
+
+Four ranks, row split, batch arm (`--rewind 512`: a prompt, 24 greedy ids, then the prompt and
+512 other ids):
+
+| prompt held, then forwarded | cold | rewound |
+|---|---|---|
+| 6,356 ids, then 512 | 6.47 s | 1.25 s |
+| the same under the served launch (DSpark depth 7, 4,096-row chunks) | 6.56 s | 1.25 s |
+| 93,159 ids, then 512 | 91.6 s | 1.40 s |
+
+The bits are those of a session that held the prompt and was then given the next one with no
+reply in between. Under `--rewind` the batch arm runs that session too, and against it the
+rewound session's logits are equal in every value, with the same decode digest
+(`62483efcb3086f59`) and greedy ids, on the plain launch and on the served one. Against a cold
+prefill of the whole second prompt the logits differ (largest 2.06 at 6K, 1.13 at 93K) and the
+greedy ids agree: the rewound prompt's chunks start at the boundary rather than at row 0, and a
+prompt row's bits depend on where its chunk starts, as they do for any prompt that extends a held
+sequence (D66). Under `off` the second prompt is a cold prefill in every value.

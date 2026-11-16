@@ -851,6 +851,12 @@ impl ModelSession for GroupSession {
         self.inner.reusable_prefix()
     }
 
+    /// Rank 0's point. Every worker holds the same history and checkpoint from the same frames,
+    /// so each rewinds to the same point when the prompt reaches it.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        self.inner.rewind_prefix()
+    }
+
     fn cached_tokens(&self) -> usize {
         self.inner.cached_tokens()
     }

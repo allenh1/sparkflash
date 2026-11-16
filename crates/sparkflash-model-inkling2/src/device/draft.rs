@@ -714,7 +714,8 @@ pub(super) struct DraftState {
 
 impl DraftState {
     /// A sequence's drafter state: a full layer's rings hold the whole context, a local layer's
-    /// its window, and the tap buffer the widest chunk a prompt walks.
+    /// its window (and a widest chunk past it under [REWIND_ENV], so a rewind still finds the
+    /// window before the boundary), and the tap buffer the widest chunk a prompt walks.
     pub(super) fn allocate(shared: &Shared, model: &DraftModel) -> Result<Self, String> {
         let hidden = model.hidden;
         let kv_width = model.kv_heads * HEAD_DIM;
@@ -730,9 +731,14 @@ impl DraftState {
             .layers
             .iter()
             .map(|layer| {
+                let rewind_rows = if shared.rewind {
+                    shared.prefill_chunk.saturating_sub(1)
+                } else {
+                    0
+                };
                 let ring = layer
                     .window
-                    .unwrap_or(shared.context)
+                    .map_or(shared.context, |window| window + rewind_rows)
                     .min(shared.context)
                     .max(1);
                 (
@@ -833,6 +839,29 @@ impl DraftState {
     /// bytes; nothing reads a position at or past [Self::committed].
     pub(super) fn reset(&mut self) {
         self.committed = 0;
+    }
+
+    /// The Markov feature of the last committed row and its bytes: what a prompt-boundary
+    /// checkpoint copies, since the rings hold every other piece of the context.
+    pub(super) fn feature(&self, model: &DraftModel) -> (Deviceptr, usize) {
+        (self.feature, model.hidden * std::mem::size_of::<f32>())
+    }
+
+    /// Takes the context back to `position`, once the caller has copied that position's feature
+    /// back ([Self::feature]). The rings keep the rows before it: nothing past it is read until a
+    /// later inject writes it again.
+    ///
+    /// # Errors
+    /// A position past the context the rings hold.
+    pub(super) fn rewind(&mut self, position: usize) -> Result<(), String> {
+        if position > self.committed {
+            return Err(format!(
+                "the drafter's context ends at {} and cannot rewind to {position}",
+                self.committed
+            ));
+        }
+        self.committed = position;
+        Ok(())
     }
 
     /// The positions whose context the rings hold.

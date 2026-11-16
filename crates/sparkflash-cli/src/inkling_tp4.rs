@@ -93,6 +93,7 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         passes: args.passes,
         cuts: args.cuts,
         dump: args.dump.clone(),
+        rewind: args.rewind,
     };
     let outcome = run.execute(
         &sparkflash_model_inkling2::descriptor(),
@@ -132,6 +133,35 @@ fn execute(args: &Tp4Args) -> Result<(), String> {
         println!(
             "inkling-tp4: rank {} score length {} best {:?} next {:?}",
             outcome.rank, score.length, score.best, score.next
+        );
+    }
+    if let Some(check) = &outcome.rewind {
+        let verdict = |equal: bool| if equal { "EQUAL" } else { "DIFFER" };
+        let ids = |other: &[u32]| {
+            if check.rewound_ids == other {
+                "equal".to_string()
+            } else {
+                format!("differ {:?} vs {:?}", check.rewound_ids, other)
+            }
+        };
+        println!(
+            "inkling-tp4: rank {} rewind: {} ids, {} held (extended {} held), rewound {} ms vs \
+             cold {} ms; against extended: logits {}, decode digest {:016x} vs {:016x}, ids {}; \
+             against cold: logits {} (max difference {}), decode digest {:016x}, ids {}",
+            outcome.rank,
+            check.tokens,
+            check.cached,
+            check.extended_cached,
+            check.rewound_ms,
+            check.cold_ms,
+            verdict(check.extended_equal),
+            check.rewound_digest,
+            check.extended_digest,
+            ids(&check.extended_ids),
+            verdict(check.logits_equal),
+            check.max_difference,
+            check.cold_digest,
+            ids(&check.cold_ids),
         );
     }
     if let Some(codec) = &codec {

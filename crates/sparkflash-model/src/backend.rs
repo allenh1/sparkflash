@@ -202,6 +202,17 @@ pub trait ModelSession: Send {
         None
     }
 
+    /// A shorter prefix of [`Self::reusable_prefix`] the sequence can go back to, when it can.
+    ///
+    /// A session that kept its state at an earlier point (the end of its last prompt, say) may
+    /// take a prompt that starts with these tokens and parts from the rest of its history: it
+    /// rewinds to them and forwards the rest, and reports them as the hit. An adapter offers it
+    /// such a prompt only when the prompt goes past them. `None` - the default - says the session
+    /// has no such point.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        None
+    }
+
     /// How many of the last [`Self::prefill`]'s tokens the sequence already held.
     ///
     /// This is what the request reports as its cache hit. The default is zero, for a session

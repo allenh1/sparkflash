@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sparkflash_comm::tcp::TcpConfig;
-use sparkflash_model::backend::{ModelBackend, Sampling, Speculation};
+use sparkflash_model::backend::{ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::{ModelDescriptor, TpPlan};
 use sparkflash_weights::tp::TpLayout;
 
@@ -59,6 +59,45 @@ pub struct Tp4Run {
     pub cuts: usize,
     /// Where rank 0 writes the scored logit rows: f32 little-endian, one row a cut, in cut order.
     pub dump: Option<PathBuf>,
+    /// After the passes, the last pass's session is handed the prompt and then its own first
+    /// `rewind` ids, a second prompt that keeps the first and parts from the reply after it, and
+    /// a session that holds the prompt with no reply after it and a fresh session the same: the
+    /// prompt-boundary rewind against the held prompt extended and against a cold prefill
+    /// ([Tp4Outcome::rewind]). Zero checks nothing.
+    pub rewind: usize,
+}
+
+/// A second prompt on the last pass's session against the same prompt on a fresh one.
+#[derive(Debug, Clone)]
+pub struct RewindCheck {
+    /// The second prompt's length.
+    pub tokens: usize,
+    /// The ids the kept session reported it already held: the first prompt's length when it
+    /// rewound, none when it started over.
+    pub cached: usize,
+    /// The ids a third session held when it was handed the second prompt straight after the
+    /// first, with no reply between: the first prompt's length.
+    pub extended_cached: usize,
+    /// The kept session's prefill wall time, and the fresh one's.
+    pub rewound_ms: u128,
+    pub cold_ms: u128,
+    /// The largest difference between the rewound and the cold prefill's logits; zero when they
+    /// are the same bits.
+    pub max_difference: f32,
+    /// Whether the rewound and the cold prefill gave the same bits. A walk whose bits depend on
+    /// where a chunk starts gives other bits from a boundary than from the start, as any prefix
+    /// reuse does.
+    pub logits_equal: bool,
+    /// Whether the rewound prefill gave the bits of the extended one, which forwards the same
+    /// ids from the same boundary: a rewind that restores the boundary exactly gives them.
+    pub extended_equal: bool,
+    /// Each session's ids and decode digest from the second prompt on.
+    pub rewound_ids: Vec<u32>,
+    pub extended_ids: Vec<u32>,
+    pub cold_ids: Vec<u32>,
+    pub rewound_digest: u64,
+    pub extended_digest: u64,
+    pub cold_digest: u64,
 }
 
 /// One scored prefix.
@@ -124,6 +163,8 @@ pub struct Tp4Outcome {
     pub speculation: Speculation,
     /// The scored prefixes ([Tp4Run::cuts]), in cut order.
     pub scores: Vec<Score>,
+    /// The rewind check ([Tp4Run::rewind]), when one was asked for.
+    pub rewind: Option<RewindCheck>,
 }
 
 impl Tp4Run {
@@ -240,53 +281,18 @@ impl Tp4Run {
         );
         let mut prefill_ms = Vec::with_capacity(self.passes);
         let mut walked = None;
+        let mut kept = None;
         for pass in 0..self.passes {
-            let mut session = backend.open_session().map_err(|error| {
-                format!("TP{}/rank{}: {}", self.world, self.rank, error.message())
-            })?;
-            session.set_sampling(Self::greedy());
-
+            // The last pass's session is dropped before the next opens: at a long context two
+            // sessions' caches do not fit a rank.
+            drop(kept.take());
+            let mut session = self.open(&backend)?;
             let started = Instant::now();
-            let first = session.prefill(prompt).map_err(|error| {
-                format!(
-                    "TP{}/rank{} prefill: {}",
-                    self.world,
-                    self.rank,
-                    error.message()
-                )
-            })?;
+            let first = self.prefill(session.as_mut(), prompt, "prefill")?;
             prefill_ms.push(started.elapsed().as_millis());
             let best = best_of(&first.logits);
-            let mut generated = Vec::with_capacity(decode + 1);
-            let mut next = first.next_token.ok_or_else(|| {
-                format!(
-                    "TP{}/rank{}: the prefill chose no token",
-                    self.world, self.rank
-                )
-            })?;
-            generated.push(next);
-            let mut decode_ms = Vec::with_capacity(decode);
-            let mut decode_digest = DIGEST_BASIS;
-            for _ in 0..decode {
-                let started = Instant::now();
-                let step = session.decode(next).map_err(|error| {
-                    format!(
-                        "TP{}/rank{} decode: {}",
-                        self.world,
-                        self.rank,
-                        error.message()
-                    )
-                })?;
-                decode_ms.push(started.elapsed().as_millis());
-                decode_digest = digest_logits(decode_digest, &step.logits);
-                next = step.next_token.ok_or_else(|| {
-                    format!(
-                        "TP{}/rank{}: a decode chose no token",
-                        self.world, self.rank
-                    )
-                })?;
-                generated.push(next);
-            }
+            let (generated, decode_ms, decode_digest) =
+                self.decode_steps(session.as_mut(), &first, decode)?;
             // Every pass walks the same ids greedily, so a pass that chose differently is a state
             // leak between sessions, which is a bug and not a report.
             if let Some((earlier, _, _, _, _, _)) = &walked
@@ -305,9 +311,16 @@ impl Tp4Run {
                 decode_digest,
                 session.speculation(),
             ));
+            kept = Some(session);
         }
         let (generated, decode_ms, logits, best, decode_digest, speculation) =
             walked.expect("a run walks at least once");
+        let rewind = match kept.take() {
+            Some(session) if self.rewind > 0 => {
+                Some(self.rewind_check(&backend, session, prompt, decode)?)
+            }
+            _ => None,
+        };
         let mut scores = Vec::with_capacity(self.cuts);
         let mut rows: Vec<u8> = Vec::new();
         for cut in 1..=self.cuts {
@@ -357,6 +370,141 @@ impl Tp4Run {
             decode_digest,
             speculation,
             scores,
+            rewind,
+        })
+    }
+
+    /// A fresh greedy session on `backend`.
+    fn open(&self, backend: &InklingDeviceBackend) -> Result<Box<dyn ModelSession>, String> {
+        let mut session = backend
+            .open_session()
+            .map_err(|error| format!("TP{}/rank{}: {}", self.world, self.rank, error.message()))?;
+        session.set_sampling(Self::greedy());
+        Ok(session)
+    }
+
+    /// `tokens` prefilled on `session`, a failure named by `what`.
+    fn prefill(
+        &self,
+        session: &mut dyn ModelSession,
+        tokens: &[u32],
+        what: &str,
+    ) -> Result<StepOutput, String> {
+        session.prefill(tokens).map_err(|error| {
+            format!(
+                "TP{}/rank{} {what}: {}",
+                self.world,
+                self.rank,
+                error.message()
+            )
+        })
+    }
+
+    /// `decode` greedy steps after `first`: the ids chosen (the prompt's and each step's), each
+    /// step's wall time, and the steps' logits as one digest.
+    fn decode_steps(
+        &self,
+        session: &mut dyn ModelSession,
+        first: &StepOutput,
+        decode: usize,
+    ) -> Result<(Vec<u32>, Vec<u128>, u64), String> {
+        let mut generated = Vec::with_capacity(decode + 1);
+        let mut next = first.next_token.ok_or_else(|| {
+            format!(
+                "TP{}/rank{}: the prefill chose no token",
+                self.world, self.rank
+            )
+        })?;
+        generated.push(next);
+        let mut decode_ms = Vec::with_capacity(decode);
+        let mut digest = DIGEST_BASIS;
+        for _ in 0..decode {
+            let started = Instant::now();
+            let step = session.decode(next).map_err(|error| {
+                format!(
+                    "TP{}/rank{} decode: {}",
+                    self.world,
+                    self.rank,
+                    error.message()
+                )
+            })?;
+            decode_ms.push(started.elapsed().as_millis());
+            digest = digest_logits(digest, &step.logits);
+            next = step.next_token.ok_or_else(|| {
+                format!(
+                    "TP{}/rank{}: a decode chose no token",
+                    self.world, self.rank
+                )
+            })?;
+            generated.push(next);
+        }
+        Ok((generated, decode_ms, digest))
+    }
+
+    /// The rewind check ([Self::rewind]): `kept`, which holds `prompt` and its reply, is handed
+    /// the prompt and then the prompt's first ids, then dropped; a fresh session is handed the
+    /// prompt and then the same second prompt, with no reply between; and a fresh session is
+    /// handed the second prompt alone.
+    fn rewind_check(
+        &self,
+        backend: &InklingDeviceBackend,
+        mut kept: Box<dyn ModelSession>,
+        prompt: &[u32],
+        decode: usize,
+    ) -> Result<RewindCheck, String> {
+        let mut second = prompt.to_vec();
+        second.extend_from_slice(&prompt[..self.rewind.min(prompt.len())]);
+        kept.set_sampling(Self::greedy());
+        let started = Instant::now();
+        let rewound = self.prefill(kept.as_mut(), &second, "rewound prefill")?;
+        let rewound_ms = started.elapsed().as_millis();
+        let cached = kept.cached_tokens();
+        let (rewound_ids, _, rewound_digest) =
+            self.decode_steps(kept.as_mut(), &rewound, decode)?;
+        drop(kept);
+        // The second prompt extends the held first, so it forwards the same ids from the same
+        // boundary: a rewind that restores the boundary's state exactly gives these bits.
+        let mut extended_session = self.open(backend)?;
+        extended_session.set_sampling(Self::greedy());
+        self.prefill(extended_session.as_mut(), prompt, "extended first prefill")?;
+        let extended = self.prefill(extended_session.as_mut(), &second, "extended prefill")?;
+        let extended_cached = extended_session.cached_tokens();
+        let (extended_ids, _, extended_digest) =
+            self.decode_steps(extended_session.as_mut(), &extended, decode)?;
+        drop(extended_session);
+        let mut cold_session = self.open(backend)?;
+        let started = Instant::now();
+        let cold = self.prefill(cold_session.as_mut(), &second, "cold prefill")?;
+        let cold_ms = started.elapsed().as_millis();
+        let (cold_ids, _, cold_digest) = self.decode_steps(cold_session.as_mut(), &cold, decode)?;
+        let same_bits = |a: &StepOutput, b: &StepOutput| {
+            a.logits.len() == b.logits.len()
+                && a.logits
+                    .iter()
+                    .zip(&b.logits)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        };
+        let max_difference = rewound
+            .logits
+            .iter()
+            .zip(&cold.logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        Ok(RewindCheck {
+            tokens: second.len(),
+            cached,
+            extended_cached,
+            rewound_ms,
+            cold_ms,
+            max_difference,
+            logits_equal: same_bits(&rewound, &cold),
+            extended_equal: same_bits(&rewound, &extended),
+            rewound_ids,
+            extended_ids,
+            cold_ids,
+            rewound_digest,
+            extended_digest,
+            cold_digest,
         })
     }
 }
@@ -408,6 +556,8 @@ pub struct Tp4Args {
     pub cuts: usize,
     /// Where rank 0 writes the scored rows ([Tp4Run::dump], `--dump-logits`).
     pub dump: Option<PathBuf>,
+    /// The rewind check's second-prompt ids ([Tp4Run::rewind], `--rewind`).
+    pub rewind: usize,
     /// The tokenizer for `--text` (`--tokenizer`).
     pub tokenizer: Option<PathBuf>,
     /// A sentence to tokenize instead of `--prompt` (`--text`).
@@ -436,6 +586,7 @@ impl Tp4Args {
         let mut passes = 1usize;
         let mut cuts = 0usize;
         let mut dump = None;
+        let mut rewind = 0usize;
         let mut rest = args.peekable();
         while let Some(flag) = rest.next() {
             let mut value = || -> Result<String, String> {
@@ -484,6 +635,14 @@ impl Tp4Args {
                         .map_err(|error| format!("--cuts: {error}"))?;
                 }
                 "--dump-logits" => dump = Some(PathBuf::from(value()?)),
+                // After the passes, the last pass's session is handed the prompt and its own first
+                // N ids, and a fresh session the same: a rewind to the prompt's end against a cold
+                // prefill, bit for bit.
+                "--rewind" => {
+                    rewind = value()?
+                        .parse::<usize>()
+                        .map_err(|error| format!("--rewind: {error}"))?;
+                }
                 "--chat" => chat = true,
                 "--tokenizer" => tokenizer = Some(PathBuf::from(value()?)),
                 "--text" => text = Some(value()?),
@@ -546,6 +705,7 @@ impl Tp4Args {
             passes,
             cuts,
             dump,
+            rewind,
             tokenizer,
             text,
             chat,
@@ -572,6 +732,7 @@ mod tests {
             passes: 1,
             cuts: 0,
             dump: None,
+            rewind: 0,
         }
     }
 

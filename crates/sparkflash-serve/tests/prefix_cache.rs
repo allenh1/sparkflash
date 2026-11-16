@@ -116,6 +116,8 @@ struct Recorder {
     sessions: Mutex<(usize, usize)>,
     /// When set, every prefill waits on it; the test opens it by dropping the sender.
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Sessions keep the end of their last prompt and rewind to it, as the Inkling arm does.
+    rewinds: bool,
 }
 
 impl Recorder {
@@ -147,6 +149,7 @@ impl ModelBackend for PrefixBackend {
             recorder: Arc::clone(&self.recorder),
             consumed: Vec::new(),
             cached: 0,
+            boundary: None,
         }))
     }
 }
@@ -157,6 +160,8 @@ struct PrefixSession {
     recorder: Arc<Recorder>,
     consumed: Vec<u32>,
     cached: usize,
+    /// The last prompt's end, when the recorder's sessions rewind.
+    boundary: Option<usize>,
 }
 
 impl PrefixSession {
@@ -198,14 +203,23 @@ impl ModelSession for PrefixSession {
         {
             let _ = gate.recv();
         }
-        // The driver only hands a kept sequence a prompt that extends it; anything else is a
-        // backend contract violation, as it is on the real arm.
-        let reused = self
+        // The driver only hands a kept sequence a prompt that extends it, or one that goes past
+        // its rewind point; anything else is a backend contract violation, as it is on the real
+        // arm.
+        let mut reused = self
             .consumed
             .iter()
             .zip(tokens)
             .take_while(|(held, given)| held == given)
             .count();
+        if reused != self.consumed.len()
+            && let Some(point) = self.rewind_prefix().map(<[u32]>::len)
+            && reused >= point
+            && point < tokens.len()
+        {
+            self.consumed.truncate(point);
+            reused = point;
+        }
         if reused != self.consumed.len() || reused >= tokens.len() {
             return Err(BackendError::new(
                 "toy",
@@ -219,6 +233,9 @@ impl ModelSession for PrefixSession {
             .push(tokens[reused..].to_vec());
         self.cached = reused;
         self.consumed.extend_from_slice(&tokens[reused..]);
+        if self.recorder.rewinds {
+            self.boundary = Some(self.consumed.len());
+        }
         Ok(self.step())
     }
 
@@ -229,6 +246,12 @@ impl ModelSession for PrefixSession {
 
     fn reusable_prefix(&self) -> Option<&[u32]> {
         Some(self.consumed.as_slice())
+    }
+
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        self.boundary
+            .filter(|point| *point < self.consumed.len())
+            .map(|point| &self.consumed[..point])
     }
 
     fn cached_tokens(&self) -> usize {
@@ -446,6 +469,63 @@ async fn a_prompt_whose_bytes_differ_from_the_held_reply_starts_a_fresh_sequence
     let second = answer(&driver, request("b", other.clone(), 2)).await;
     assert_eq!(second.cached, 0);
     assert_eq!(recorder.prefills(), vec![vec![5, 6, 7], other]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_that_keeps_the_held_prompt_and_parts_from_its_reply_rewinds() {
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ..Recorder::default()
+    });
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, first_turn()).await;
+
+    // The client renders the reply with other ids that spell other bytes, then the next turn:
+    // the sequence goes back to the end of the first prompt and forwards the rest.
+    let next = vec![5u32, 6, 7, 30, 31, 9];
+    let second = answer(&driver, request("b", next.clone(), 2)).await;
+    assert_eq!(second.cached, 3, "the held prompt");
+    assert_eq!(second.usage_cached, 3);
+    assert_eq!(second.usage_miss, 3);
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7], vec![30, 31, 9]],
+        "only the prompt past the rewind point was forwarded"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    let cold = host_driver(Arc::new(Recorder::default()));
+    let own = answer(&cold, request("cold", next, 2)).await;
+    assert_eq!(second.text, own.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_that_parts_before_the_rewind_point_or_stops_at_it_starts_fresh() {
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ..Recorder::default()
+    });
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, first_turn()).await;
+
+    // `5 6 8` parts inside the held prompt.
+    let parted = answer(&driver, request("b", vec![5, 6, 8, 9], 2)).await;
+    assert_eq!(parted.cached, 0);
+    answer(&driver, first_turn()).await;
+    // `5 6 7` is the held prompt with nothing past it: a rewind would hold no logits for it.
+    let stopped = answer(&driver, request("c", vec![5, 6, 7], 2)).await;
+    assert_eq!(stopped.cached, 0);
+    assert_eq!(
+        recorder.prefills(),
+        vec![
+            vec![5, 6, 7],
+            vec![5, 6, 8, 9],
+            vec![5, 6, 7],
+            vec![5, 6, 7]
+        ],
+        "each was prefilled whole"
+    );
+    assert_eq!(recorder.most_alive(), 1);
 }
 
 /// Starts `prompt` on a driver whose prefill waits, reads the request's start, leaves, and lets

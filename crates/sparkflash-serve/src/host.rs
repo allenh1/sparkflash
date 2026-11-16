@@ -600,6 +600,9 @@ struct Continuation {
     covered: usize,
     /// The session has nothing left to forward and answers from its pending step.
     resume: bool,
+    /// The session goes back to its rewind point ([ModelSession::rewind_prefix]) and forwards
+    /// the prompt past it.
+    rewound: bool,
 }
 
 impl Continuation {
@@ -609,6 +612,7 @@ impl Continuation {
         held: 0,
         covered: 0,
         resume: false,
+        rewound: false,
     };
 }
 
@@ -619,6 +623,9 @@ impl Continuation {
 /// nothing left to forward has no other logits for the last token. Images must lie past what is
 /// held, since a held history is ids only and cannot match an image's pixels, and a re-spelled
 /// prompt carries none because the re-spelling would move their spans.
+///
+/// A prompt that does neither may still go past the session's rewind point
+/// ([ModelSession::rewind_prefix]) with no image before it: the session goes back there.
 fn continuation(
     kept: &Held,
     job: &Job,
@@ -630,13 +637,17 @@ fn continuation(
         .reusable_prefix()
         .filter(|history| !history.is_empty())?;
     let prompt = job.prompt_tokens.as_slice();
+    let respelling = || {
+        (by_text && job.images.is_empty())
+            .then(|| respelled_prompt(codec, history, prompt))
+            .flatten()
+    };
     let (respelled, covered) = if prompt.starts_with(history) {
         (None, history.len())
-    } else if by_text && job.images.is_empty() {
-        let (ids, covered) = respelled_prompt(codec, history, prompt)?;
+    } else if let Some((ids, covered)) = respelling() {
         (Some(ids), covered)
     } else {
-        return None;
+        return rewound(kept, job);
     };
     if job.images.iter().any(|image| image.span.start < covered) {
         return None;
@@ -654,6 +665,33 @@ fn continuation(
         held: history.len(),
         covered,
         resume,
+        rewound: false,
+    })
+}
+
+/// How `job` continues `kept` from the session's rewind point, when its prompt keeps the point's
+/// tokens, goes past them, and carries no image before their end.
+fn rewound(kept: &Held, job: &Job) -> Option<Continuation> {
+    let point = kept
+        .session
+        .rewind_prefix()
+        .filter(|point| !point.is_empty())?;
+    let prompt = job.prompt_tokens.as_slice();
+    if prompt.len() <= point.len()
+        || !prompt.starts_with(point)
+        || job
+            .images
+            .iter()
+            .any(|image| image.span.start < point.len())
+    {
+        return None;
+    }
+    Some(Continuation {
+        respelled: None,
+        held: point.len(),
+        covered: point.len(),
+        resume: false,
+        rewound: true,
     })
 }
 
@@ -775,6 +813,13 @@ fn run_request(
             plan.covered,
             job.prompt_tokens.len(),
             ids.len() - plan.held,
+        );
+    }
+    if plan.rewound {
+        eprintln!(
+            "sparkflash serve: prefix reuse by rewind: the prompt keeps the held prompt of {} ids and parts from the reply after it; {} to forward",
+            plan.held,
+            job.prompt_tokens.len() - plan.held,
         );
     }
     if plan.resume {
