@@ -1243,10 +1243,10 @@ function failedPortJob() {
   const jobs = S.jobs.filter((job) => job.kind.startsWith("network-setup-"));
   if (!jobs.length) return null;
   const newest = Math.max(...jobs.map((job) => job.started_ms || 0));
-  // A pass starts its four jobs within a second; five seconds keeps a quick retry from being
-  // mistaken for the same pass, and the latest failure is the one that matters.
+  // A pass starts its four jobs within a second. 2.5 s keeps a fast retry from being mistaken
+  // for the same pass, and the latest failure is the one that matters.
   return jobs
-    .filter((job) => newest - (job.started_ms || 0) < 5000 && job.status === "failed")
+    .filter((job) => newest - (job.started_ms || 0) < 2500 && job.status === "failed")
     .sort((a, b) => (b.started_ms || 0) - (a.started_ms || 0))[0] || null;
 }
 
@@ -1766,6 +1766,12 @@ async function applyNetwork() {
     toast("Network settings saved");
     await refreshState();
     paintConfig(S.state.config, S.state.discovery, true);
+    // Saving the plan changes the configuration the last check was taken of, so the report (and
+    // the port fix's staleness check) now belong to the old one. Check again, unless a port pass
+    // is running: that one will finish and re-check on its own.
+    if (!S.jobs.some((job) => job.status === "running" && job.kind.startsWith("network-setup-"))) {
+      await inspect(true);
+    }
   } catch (error) {
     toast(error.message, true);
   }

@@ -373,10 +373,9 @@ pub fn fabric_probe_command(
     rank: usize,
     netdevs: &[String],
     peers: &[(usize, String)],
-    pings: &[(usize, String)],
 ) -> CommandSpec {
     let node = &config.cluster.nodes[rank];
-    let args = inspect::fabric_probe_args(netdevs, peers, pings);
+    let args = inspect::fabric_probe_args(netdevs, peers);
     let label = format!("Probe the fast ports on {}", node.ssh);
     if node.local {
         // arping needs a raw socket; the port setup needs the same passwordless sudo.
@@ -400,6 +399,48 @@ pub fn fabric_probe_command(
     let mut ssh_args = batch_ssh_args(config);
     ssh_args.push(config.ssh_destination(rank));
     ssh_args.push(inspect::fabric_probe_remote_command(&args));
+    CommandSpec {
+        program: "ssh".to_owned(),
+        args: ssh_args,
+        env: BTreeMap::new(),
+        cwd: None,
+        label,
+        kind: "fabric-probe".to_owned(),
+    }
+}
+
+/// The read-only reachability pings for a rank. Unprivileged (ping needs no raw socket), so a
+/// Spark without passwordless sudo still has its peers checked. Bash on this Spark for the local
+/// rank, `ssh` otherwise.
+#[must_use]
+pub fn fabric_ping_command(
+    config: &SparkConfig,
+    rank: usize,
+    netdevs: &[String],
+    pings: &[(usize, String)],
+) -> CommandSpec {
+    let node = &config.cluster.nodes[rank];
+    let args = inspect::fabric_ping_args(netdevs, pings);
+    let label = format!("Ping the fast ports on {}", node.ssh);
+    if node.local {
+        let mut argv = vec![
+            "-c".to_owned(),
+            inspect::FABRIC_PING_SCRIPT.to_owned(),
+            "sparkflash-fabric-ping".to_owned(),
+        ];
+        argv.extend(args);
+        return CommandSpec {
+            program: "bash".to_owned(),
+            args: argv,
+            env: BTreeMap::new(),
+            cwd: None,
+            label,
+            kind: "fabric-probe".to_owned(),
+        };
+    }
+    let mut ssh_args = batch_ssh_args(config);
+    ssh_args.push(config.ssh_destination(rank));
+    ssh_args.push(inspect::fabric_ping_remote_command(&args));
     CommandSpec {
         program: "ssh".to_owned(),
         args: ssh_args,
@@ -921,19 +962,36 @@ mod tests {
         let netdevs = vec!["enp1s0f0np0".to_owned()];
         let peers = vec![(1usize, "10.0.0.3".to_owned())];
         let pings = vec![(1usize, "10.0.0.3".to_owned())];
-        let local = fabric_probe_command(&config, 0, &netdevs, &peers, &pings);
+        let local = fabric_probe_command(&config, 0, &netdevs, &peers);
         assert_eq!(local.program, "sudo", "a raw socket needs root");
         assert_eq!(local.kind, "fabric-probe");
         assert_eq!(local.args[0], "-n");
         assert_eq!(local.args[1], "bash");
         assert_eq!(local.args[2], "-c");
         assert_eq!(local.args[4], "sparkflash-fabric");
-        assert_eq!(
-            local.args[5..],
-            ["ndev=enp1s0f0np0", "peer=1:10.0.0.3", "ping=1:10.0.0.3"]
-        );
+        assert_eq!(local.args[5..], ["ndev=enp1s0f0np0", "peer=1:10.0.0.3"]);
 
-        let remote = fabric_probe_command(&config, 2, &netdevs, &peers, &pings);
+        // The pings need no privilege, so they run as the operator.
+        let ping = fabric_ping_command(&config, 0, &netdevs, &pings);
+        assert_eq!(ping.program, "bash");
+        assert_eq!(ping.kind, "fabric-probe");
+        assert_eq!(ping.args[0], "-c");
+        assert_eq!(ping.args[2], "sparkflash-fabric-ping");
+        assert_eq!(ping.args[3..], ["ndev=enp1s0f0np0", "ping=1:10.0.0.3"]);
+        let ping_remote = fabric_ping_command(&config, 2, &netdevs, &pings);
+        let at = ping_remote
+            .args
+            .iter()
+            .position(|arg| *arg == config.ssh_destination(2))
+            .expect("destination");
+        let line = &ping_remote.args[at + 1];
+        assert!(
+            line.starts_with("bash -c '"),
+            "the ping script is one quoted argument: {line}"
+        );
+        assert!(!line.contains("sudo"), "{line}");
+
+        let remote = fabric_probe_command(&config, 2, &netdevs, &peers);
         assert_eq!(remote.program, "ssh");
         assert!(remote.args.iter().any(|arg| arg == "BatchMode=yes"));
         let destination = config.ssh_destination(2);

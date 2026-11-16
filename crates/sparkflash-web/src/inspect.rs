@@ -893,14 +893,17 @@ pub fn analyze_fabric(
                     ),
                 });
             }
-            if shares_subnet(&rails) && !arp_ok(facts, &netdevs) {
+            // ARP is layer 2, so a port can answer for a sibling's address whichever subnets
+            // the ports use; the setting is needed on every multi-lane host, not only a shared
+            // subnet.
+            if netdevs.len() > 1 && !arp_ok(facts, &netdevs) {
                 findings.push(Finding {
                     rank: Some(rank),
                     severity: Severity::Warning,
                     message: format!(
-                        "{} has two fast lanes on one subnet without arp_ignore=1 and \
-                             arp_announce=2, so replies can leave by the wrong lane. Run the \
-                             network command shown for it.",
+                        "{} has more than one fast lane without arp_ignore=1 and \
+                             arp_announce=2 on its ports, so one port can answer for a sibling's \
+                             address. Run the network command shown for it.",
                         name(rank)
                     ),
                 });
@@ -935,6 +938,10 @@ pub fn analyze_fabric(
     } else {
         None
     };
+    // A network command for every node whose ports need addresses, MTU, ARP settings or the
+    // routes a ring needs. Computed before the fabric findings so a message can tell whether the
+    // command it names actually exists for that rank.
+    let fixes = network_fixes(probes, fabric.as_ref(), &name);
 
     // The link check measures what the cables actually are: a switch, a
     // direct ring, or something to fix. The schedule is a hint from the
@@ -953,6 +960,7 @@ pub fn analyze_fabric(
         // What the port setup can actually route with the measured cables, so a finding never
         // prescribes a command that cannot help.
         let planned = fabric_routes(probes, Some(fabric));
+        let measurable = cables_measurable(probes);
         let planned_route = |rank: usize, peer: usize| -> bool {
             let target = probes
                 .get(peer)
@@ -968,6 +976,7 @@ pub fn analyze_fabric(
             })
         };
         for (rank, reached) in fabric.reachable.iter().enumerate() {
+            let has_fix = fixes.get(rank).is_some_and(Option::is_some);
             // The node answered the main probe but not the link probe. That is not a warning:
             // the link check is the only reachability measurement, so an unverified fabric must
             // not read as ready and let a launch start.
@@ -1008,13 +1017,30 @@ pub fn analyze_fabric(
                         name(peer),
                         name(peer)
                     ),
-                    FabricShape::Ring if planned_route(rank, peer) => format!(
+                    FabricShape::Ring if !measurable => format!(
+                        "{} cannot reach {} over the fast network, and the cable map cannot be \
+                         measured until every port answers ARP only for its own address \
+                         (arp_ignore=1, arp_announce=2). The port setup hardens the ports; the \
+                         check after it writes the ring's routes. Set the ports up, then check \
+                         again.",
+                        name(rank),
+                        name(peer)
+                    ),
+                    FabricShape::Ring if planned_route(rank, peer) && has_fix => format!(
                         "{} cannot reach {} over the fast network. The ring needs a route to that \
                          address on the cable that reaches it: a neighbour's collective address \
                          can sit on its other port, and a non-neighbour goes through the Spark \
                          between the two cables. Set the ports up: the command writes those \
                          routes and turns on forwarding, then check again.",
                         name(rank),
+                        name(peer)
+                    ),
+                    FabricShape::Ring if planned_route(rank, peer) => format!(
+                        "{} cannot reach {} over the fast network. The route to that address is \
+                         already written, so the traffic is dropped on the way: check {}'s own \
+                         findings (its ARP and forwarding settings) and the cable.",
+                        name(rank),
+                        name(peer),
                         name(peer)
                     ),
                     FabricShape::Ring => format!(
@@ -1238,9 +1264,6 @@ pub fn analyze_fabric(
         });
     }
 
-    // A network command for every node whose ports need addresses, MTU, ARP settings or the
-    // routes a ring needs.
-    let fixes = network_fixes(probes, fabric.as_ref(), &name);
     for (node, fix) in nodes.iter_mut().zip(fixes) {
         if let Some((text, remote)) = fix {
             node.network_fix = Some(text);
@@ -1409,23 +1432,14 @@ fn network(ip: Ipv4Addr, prefix: u8) -> u32 {
     u32::from(ip) & mask
 }
 
-fn shares_subnet(rails: &[Rail]) -> bool {
-    let subnets: Vec<u32> = rails
-        .iter()
-        .filter_map(|rail| rail.prefix.map(|prefix| network(rail.ip, prefix)))
-        .collect();
-    let unique: BTreeSet<&u32> = subnets.iter().collect();
-    unique.len() < subnets.len()
-}
-
 fn arp_ok(facts: &NodeFacts, netdevs: &[&str]) -> bool {
     netdevs.iter().all(|netdev| {
         let (ignore, announce) = facts.arp(netdev);
-        // 1 and 2 restrict a reply to the port that owns the address, and 3 additionally only
-        // suppresses replies for host-scope addresses, so a hardened host may pin any of them.
-        // 0 (and 8, which never replies) needs the fix, which writes 1/2. Announcing at least 1
-        // avoids advertising another port's address.
-        (1..=3).contains(&ignore) && announce >= 1
+        // Only modes 1 and 2 restrict a reply to the port that owns the address: mode 3 lets any
+        // interface answer for a global address (net/ipv4/arp.c), which is the flux this setting
+        // exists to stop. Announce mode 2 is the documented one; mode 1 can still announce a
+        // sibling's address when it is in the target's subnet.
+        (1..=2).contains(&ignore) && announce >= 2
     })
 }
 
@@ -1493,6 +1507,19 @@ struct Cable {
     next_hop: Ipv4Addr,
 }
 
+/// Whether every port's ARP settings are the restrictive ones that make a cable map unambiguous: a
+/// peer answers only on the port that owns the address, so an answer says which cable it is on.
+fn cables_measurable(probes: &[ProbeResult]) -> bool {
+    probes.iter().all(|probe| match probe {
+        Ok(facts) => {
+            let rails = facts.rails();
+            let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
+            netdevs.is_empty() || arp_ok(facts, &netdevs)
+        }
+        Err(_) => false,
+    })
+}
+
 /// The routes a ring needs, per rank. Every peer's collective address is pinned to a next hop that
 /// is on the cable that reaches it: the peer itself when the two Sparks are cabled, and otherwise a
 /// Spark cabled to both ends (the lowest-numbered one, so both directions of a pair use it), which
@@ -1508,15 +1535,7 @@ fn fabric_routes(probes: &[ProbeResult], fabric: Option<&Fabric>) -> Vec<Vec<Fab
     // here" does not say which cable the address is on, and routing from that map writes next
     // hops that the same pass's arp_ignore=1 then makes unresolvable. The ARP settings go in
     // first; the next check measures the cables and these routes are written then.
-    let measurable = probes.iter().all(|probe| match probe {
-        Ok(facts) => {
-            let rails = facts.rails();
-            let netdevs: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
-            netdevs.is_empty() || arp_ok(facts, &netdevs)
-        }
-        Err(_) => false,
-    });
-    if !measurable {
+    if !cables_measurable(probes) {
         return routes;
     }
     // Every fast address the nodes report, per rank. The transport does not bind a source
@@ -1789,6 +1808,13 @@ fn network_fixes(
         if needs_sysctl {
             body.push_str(&format!("sudo tee {SYSCTL_FILE} > /dev/null <<'EOF'\n"));
             body.push_str("net.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2\n");
+            // The kernel takes the larger of `all` and the port's own value, so a port pinned
+            // higher (a hardening file) keeps it unless the port itself is set too.
+            for lane in &lanes {
+                body.push_str(&format!(
+                    "net.ipv4.conf.{lane}.arp_ignore = 1\nnet.ipv4.conf.{lane}.arp_announce = 2\n"
+                ));
+            }
             if routing_forwarding {
                 body.push_str("net.ipv4.ip_forward = 1\nnet.ipv4.conf.all.rp_filter = 2\n");
             }
@@ -1889,23 +1915,20 @@ pub fn remote_command(args: &[String]) -> String {
 
 /// The read-only link probe: which port of this Spark answers each peer.
 ///
-/// Arguments are repeatable: `ndev=<netdev>` for each fast port, `peer=<rank>:<address>`
-/// for every fast address of every other Spark (one per rail: a cabled port is two PCIe halves,
-/// so a two-cable ring presents four netdevs and four addresses per Spark), and
-/// `ping=<rank>:<address>` for the collective address of every other Spark. Prints one
-/// `link <rank> <netdev> ok|no` line per port per address, one `ping <rank> <netdev> ok|no`
-/// line per port, and `arping missing` when the tool is absent (only the ping lines then carry
-/// information and the shape stays unknown). Every attempt runs in parallel: a disconnected
-/// four-port fabric would otherwise spend a second per unanswered ARP twice over.
+/// Arguments are repeatable: `ndev=<netdev>` for each fast port and `peer=<rank>:<address>` for
+/// every fast address of every other Spark (one per rail: a cabled port is two PCIe halves, so a
+/// two-cable ring presents four netdevs and four addresses per Spark). Prints one
+/// `link <rank> <netdev> <address> ok|no` line per port per address, and `arping missing` or
+/// `arping unusable` when the tool cannot be used (the check then reports the map as unmeasured).
+/// It runs under `sudo -n`: arping needs a raw socket. The reachability pings are a separate
+/// script ([FABRIC_PING_SCRIPT]) because they need no privilege. Every attempt runs in parallel.
 pub const FABRIC_PROBE_SCRIPT: &str = r#"export LC_ALL=C
 devs=()
 peers=()
-pings=()
 for arg in "$@"; do
   case "$arg" in
     ndev=*) devs+=("${arg#ndev=}") ;;
     peer=*) peers+=("${arg#peer=}") ;;
-    ping=*) pings+=("${arg#ping=}") ;;
   esac
 done
 have_arping=1
@@ -1931,6 +1954,48 @@ if [ "$have_arping" = 1 ]; then
     done
   done
 fi
+wait
+sort "$out"
+# An arping that fails on every attempt *and says why* is a broken tool, not a missing cable
+# (no CAP_NET_RAW, a refused socket, an unknown interface, a different implementation). Say so
+# instead, and the check reports the wiring as unmeasured rather than blaming the cables.
+if [ "$have_arping" = 1 ] && [ -s "$errs" ] && ! grep -q '^link .* ok$' "$out"; then
+  echo "arping unusable"
+fi
+exit 0
+"#;
+
+/// The arguments for [`FABRIC_PROBE_SCRIPT`] for one rank: this rank's ports as `ndev=`
+/// entries and every peer address as a `peer=` entry (a cabled port is two rails, so a peer may
+/// appear twice per cable).
+#[must_use]
+pub fn fabric_probe_args(netdevs: &[String], peers: &[(usize, String)]) -> Vec<String> {
+    let mut args = Vec::with_capacity(netdevs.len() + peers.len());
+    for netdev in netdevs {
+        args.push(format!("ndev={netdev}"));
+    }
+    for (rank, address) in peers {
+        args.push(format!("peer={rank}:{address}"));
+    }
+    args
+}
+
+/// The read-only reachability pings: each fast port pings each peer's collective address.
+///
+/// Arguments are repeatable: `ndev=<netdev>` and `ping=<rank>:<address>`. Prints one
+/// `ping <rank> <netdev> ok|no` line per port. It runs unprivileged, so a Spark without
+/// passwordless sudo still tells the check whether its peers answer.
+pub const FABRIC_PING_SCRIPT: &str = r#"export LC_ALL=C
+devs=()
+pings=()
+for arg in "$@"; do
+  case "$arg" in
+    ndev=*) devs+=("${arg#ndev=}") ;;
+    ping=*) pings+=("${arg#ping=}") ;;
+  esac
+done
+out=$(mktemp) || exit 0
+trap 'rm -f "$out"' EXIT
 for spec in "${pings[@]}"; do
   peer=${spec%%:*}
   addr=${spec#*:}
@@ -1946,30 +2011,16 @@ for spec in "${pings[@]}"; do
 done
 wait
 sort "$out"
-# An arping that fails on every attempt *and says why* is a broken tool, not a missing cable
-# (no CAP_NET_RAW, a refused socket, an unknown interface, a different implementation). Say so
-# instead, and the check reports the wiring as unmeasured rather than blaming the cables.
-if [ "$have_arping" = 1 ] && [ -s "$errs" ] && ! grep -q '^link .* ok$' "$out"; then
-  echo "arping unusable"
-fi
 exit 0
 "#;
 
-/// The arguments for [`FABRIC_PROBE_SCRIPT`] for one rank: this rank's ports as `ndev=`
-/// entries, every peer address as a `peer=` entry (a cabled port is two rails, so a peer may
-/// appear twice per cable), and each peer's collective address as a `ping=` entry.
+/// The arguments for [`FABRIC_PING_SCRIPT`]: this rank's ports and each peer's collective
+/// address.
 #[must_use]
-pub fn fabric_probe_args(
-    netdevs: &[String],
-    peers: &[(usize, String)],
-    pings: &[(usize, String)],
-) -> Vec<String> {
-    let mut args = Vec::with_capacity(netdevs.len() + peers.len() + pings.len());
+pub fn fabric_ping_args(netdevs: &[String], pings: &[(usize, String)]) -> Vec<String> {
+    let mut args = Vec::with_capacity(netdevs.len() + pings.len());
     for netdev in netdevs {
         args.push(format!("ndev={netdev}"));
-    }
-    for (rank, address) in peers {
-        args.push(format!("peer={rank}:{address}"));
     }
     for (rank, address) in pings {
         args.push(format!("ping={rank}:{address}"));
@@ -1980,12 +2031,26 @@ pub fn fabric_probe_args(
 /// The remote command line that runs the link probe with the given args under bash.
 ///
 /// It runs under `sudo -n`: `arping` needs a raw socket, and distributions install it without the
-/// capability. The port setup already needs passwordless sudo, so this is the same requirement.
+/// capability. The reachability pings run unprivileged ([`fabric_ping_remote_command`]).
 #[must_use]
 pub fn fabric_probe_remote_command(args: &[String]) -> String {
     let mut line = format!(
         "sudo -n bash -c {} sparkflash-fabric",
         shell_quote(FABRIC_PROBE_SCRIPT)
+    );
+    for arg in args {
+        line.push(' ');
+        line.push_str(&shell_quote(arg));
+    }
+    line
+}
+
+/// The remote command line that runs the reachability pings with the given args under bash.
+#[must_use]
+pub fn fabric_ping_remote_command(args: &[String]) -> String {
+    let mut line = format!(
+        "bash -c {} sparkflash-fabric-ping",
+        shell_quote(FABRIC_PING_SCRIPT)
     );
     for arg in args {
         line.push(' ');
@@ -2625,9 +2690,31 @@ link enp1s0f1np1 1500 up 0 0
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    /// Runs the reachability ping script under bash with the given stubs first on PATH.
+    #[cfg(unix)]
+    fn run_ping_script(dir: &std::path::Path, args: &[&str]) -> String {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        let path = format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display());
+        let mut command = std::process::Command::new("bash");
+        command
+            .arg("-c")
+            .arg(FABRIC_PING_SCRIPT)
+            .arg("sparkflash-fabric-ping")
+            .args(args)
+            .env("PATH", path);
+        let output = command.output().expect("bash runs the witness");
+        assert!(
+            output.status.success(),
+            "ping script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     #[cfg(unix)]
     #[test]
-    fn the_probe_script_measures_links_and_pings_without_a_self_check() {
+    fn the_probe_script_measures_links_without_a_self_check() {
         // The script itself, not just the parser: a stub arping answers only one peer address and
         // a stub ping answers both. The output must carry one link line per port per address and
         // one ping line per port, and must never claim the tool is unusable merely because a host
@@ -2652,8 +2739,6 @@ link enp1s0f1np1 1500 up 0 0
                 "peer=1:10.1.0.3",
                 "peer=2:10.0.0.5",
                 "peer=2:10.1.0.5",
-                "ping=1:10.0.0.3",
-                "ping=2:10.0.0.5",
             ],
         );
         assert!(
@@ -2665,7 +2750,6 @@ link enp1s0f1np1 1500 up 0 0
             text.contains("link 2 enp1s0f0np0 10.0.0.5 no"),
             "an address that did not answer is a no, not a missing line: {text}"
         );
-        assert!(text.contains("ping 2 enp1s0f0np0 ok"), "{text}");
         assert!(!text.contains("arping missing"), "{text}");
         assert!(
             !text.contains("arping unusable"),
@@ -2679,13 +2763,26 @@ link enp1s0f1np1 1500 up 0 0
             8,
             "{text}"
         );
-        // And one ping line per (collective address x port).
+
+        // The reachability pings are their own unprivileged script: one line per (collective
+        // address x port).
+        let pings = run_ping_script(
+            dir.path(),
+            &[
+                "ndev=enp1s0f0np0",
+                "ndev=enP2p1s0f0np0",
+                "ping=1:10.0.0.3",
+                "ping=2:10.0.0.5",
+            ],
+        );
+        assert!(pings.contains("ping 2 enp1s0f0np0 ok"), "{pings}");
         assert_eq!(
-            text.lines()
+            pings
+                .lines()
                 .filter(|line| line.starts_with("ping "))
                 .count(),
             4,
-            "{text}"
+            "{pings}"
         );
 
         // A fabric where nothing answers: every link is a no, and the parser reports it as an
@@ -2693,10 +2790,7 @@ link enp1s0f1np1 1500 up 0 0
         let dir = tempfile::tempdir().expect("tempdir");
         write_stub(&dir.path().join("bin"), "arping", "exit 1\n");
         write_stub(&dir.path().join("bin"), "ping", "exit 1\n");
-        let text = run_probe(
-            dir.path(),
-            &["ndev=enp1s0f0np0", "peer=1:10.0.0.3", "ping=1:10.0.0.3"],
-        );
+        let text = run_probe(dir.path(), &["ndev=enp1s0f0np0", "peer=1:10.0.0.3"]);
         let probe = parse_fabric(0, &text);
         assert!(probe.links.is_empty(), "{text}");
         assert!(probe.reached.is_empty(), "{text}");
@@ -2744,10 +2838,10 @@ link enp1s0f1np1 1500 up 0 0
 
     #[test]
     fn the_probe_arguments_name_ports_peers_and_collective_addresses() {
+        let netdevs = ["enp1s0f0np0".to_owned(), "enp1s0f1np1".to_owned()];
         let args = fabric_probe_args(
-            &["enp1s0f0np0".to_owned(), "enp1s0f1np1".to_owned()],
+            &netdevs,
             &[(1, "10.0.0.3".to_owned()), (1, "10.1.0.3".to_owned())],
-            &[(1, "10.0.0.3".to_owned())],
         );
         assert_eq!(
             args,
@@ -2756,8 +2850,12 @@ link enp1s0f1np1 1500 up 0 0
                 "ndev=enp1s0f1np1",
                 "peer=1:10.0.0.3",
                 "peer=1:10.1.0.3",
-                "ping=1:10.0.0.3",
             ]
+        );
+        let pings = fabric_ping_args(&netdevs, &[(1, "10.0.0.3".to_owned())]);
+        assert_eq!(
+            pings,
+            vec!["ndev=enp1s0f0np0", "ndev=enp1s0f1np1", "ping=1:10.0.0.3",]
         );
     }
 
@@ -3527,9 +3625,10 @@ link 3 enp1s0f1np1 198.51.100.13 ok
     }
 
     #[test]
-    fn a_hardened_arp_ignore_of_three_still_converges() {
-        // Mode 3 also restricts replies to the owning port (it only suppresses host-scope
-        // addresses), so a hardened 3 must not leave the ARP fix offered forever.
+    fn an_arp_ignore_of_three_is_not_hardening() {
+        // Mode 3 lets any interface answer for a global address (the kernel only suppresses
+        // host-scope ones), so it must still count as unhardened: otherwise the routes would be
+        // derived from a fluxy map. The fix sets the ports themselves as well as `all`.
         let mut probes = cluster();
         for facts in probes.iter_mut().flatten() {
             for link in &mut facts.links {
@@ -3537,8 +3636,12 @@ link 3 enp1s0f1np1 198.51.100.13 ok
                 link.arp_announce = 1;
             }
         }
-        let routes = fabric_routes(&probes, Some(&ring_fabric()));
-        assert!(routes.iter().all(|list| !list.is_empty()), "{routes:?}");
+        assert!(
+            fabric_routes(&probes, Some(&ring_fabric()))
+                .iter()
+                .all(Vec::is_empty),
+            "mode 3 is not a cable map"
+        );
         let report = analyze_fabric(
             &SparkConfig::default(),
             &probes,
@@ -3546,13 +3649,31 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             true,
             1,
         );
+        let fix = report.nodes[0]
+            .network_fix
+            .as_deref()
+            .expect("an ARP fix is offered");
         assert!(
-            !report
-                .findings
+            fix.contains("net.ipv4.conf.enp1s0f1np1.arp_ignore = 1"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("net.ipv4.conf.enP2p1s0f1np1.arp_announce = 2"),
+            "{fix}"
+        );
+
+        // With modes 1/2 on the ports the map is measurable and the routes follow.
+        for facts in probes.iter_mut().flatten() {
+            for link in &mut facts.links {
+                link.arp_ignore = 1;
+                link.arp_announce = 2;
+            }
+        }
+        assert!(
+            fabric_routes(&probes, Some(&ring_fabric()))
                 .iter()
-                .any(|finding| finding.message.contains("arp_ignore")),
-            "{:?}",
-            report.findings
+                .all(|list| !list.is_empty()),
+            "mode 1/2 is a cable map"
         );
     }
 

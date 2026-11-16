@@ -134,9 +134,10 @@ cannot see which NCCL is installed.
 
 When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
 every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective
-address (`ping -I`). `arping` needs a raw socket, which a distribution install does not grant, so
-the probe runs under `sudo -n` like the port setup; without passwordless sudo the check cannot
-identify the wiring. A port that answers an address is a cable: from the answers the console
+address (`ping -I`). The ARP half needs a raw socket, which a distribution install does not grant,
+so it runs under `sudo -n`; the pings run unprivileged. Without passwordless sudo the check still
+sees whether every Spark answers, but it cannot identify the wiring (and a ring cannot be routed by
+the console, since its routes come from the cable map). A port that answers an address is a cable: from the answers the console
 classifies the fabric as a switch (every port answers for every peer), the ring (each of every
 Spark's two ports answers for exactly one neighbour, forming 0-1-2-3-0), two-node pairs (both
 ports reach the same Spark), or unrecognised wiring, and records what it measured next to the
@@ -149,9 +150,9 @@ the new choice. Matching the schedule to the wiring is not required for correctn
 schedule runs its full all-to-all over a ring and the ring schedule does chunked transfers on a
 switch — but it is the fast path for both wirings. Without `arping` (or where it cannot open a raw
 socket) the cable map cannot be identified, but the pings still run and reachability is checked.
-When the probe itself cannot run at all — no passwordless `sudo -n`, an SSH failure, a timeout —
-there is no reachability result either, and the step is blocked with an error saying the fabric is
-unverified rather than certifying it.
+When even the pings cannot run — an SSH failure, a timeout — there is no reachability result
+either, and the step is blocked with an error saying the fabric is unverified rather than
+certifying it.
 
 Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
 launch opens a connection to every rank before it starts, so a peer that does not answer stops it

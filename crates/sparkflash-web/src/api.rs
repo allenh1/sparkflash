@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::commands::{
     CommandSpec, ServeAction, SyncTarget, SyncWhat, convert_command, download_command,
-    fabric_probe_command, inspect_command, local_hostname, network_fix_command, prepare_command,
-    prepared_probe_command, serve_action_command, sync_command,
+    fabric_ping_command, fabric_probe_command, inspect_command, local_hostname,
+    network_fix_command, prepare_command, prepared_probe_command, serve_action_command,
+    sync_command,
 };
 use crate::config::{
     MAX_CONCURRENCY, MODEL_PROFILES, QWEN_CONTEXT_TOKENS, QWEN_ENGINE_ID, QWEN_MODEL_ID,
@@ -1091,12 +1092,27 @@ fn run_fabric_probe(
                     rails.iter().map(|rail| rail.netdev.clone()).collect();
                 netdevs.sort();
                 netdevs.dedup();
-                let command = fabric_probe_command(config, rank, &netdevs, &peers, &pings);
+                // The cable map needs a raw socket (arping, under sudo); the reachability pings
+                // do not, so a host without passwordless sudo still has its peers checked.
+                let arping = fabric_probe_command(config, rank, &netdevs, &peers);
+                let ping = fabric_ping_command(config, rank, &netdevs, &pings);
                 scope.spawn(move || {
-                    probe
-                        .capture(&command, timeout)
+                    let reached = probe
+                        .capture(&ping, timeout)
                         .ok()
-                        .map(|text| inspect::parse_fabric(rank, &text))
+                        .map(|text| inspect::parse_fabric(rank, &text).reached)?;
+                    let arping = probe
+                        .capture(&arping, timeout)
+                        .ok()
+                        .map(|text| inspect::parse_fabric(rank, &text));
+                    Some(inspect::FabricProbe {
+                        links: arping
+                            .as_ref()
+                            .map(|probe| probe.links.clone())
+                            .unwrap_or_default(),
+                        reached,
+                        measured: arping.as_ref().is_some_and(|probe| probe.measured),
+                    })
                 })
             })
             .collect();
