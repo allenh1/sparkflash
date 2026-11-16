@@ -435,7 +435,9 @@ impl WebState {
             report.filter(|_| inspected_for.as_ref() == Some(&config))
         };
         // A port pass rewrites the fast ports; a check in the middle of it records a cluster that
-        // is half-configured. The next ten-second pass takes the report instead.
+        // is half-configured. The next ten-second pass takes the report instead. The pass lock
+        // also keeps a pass from registering a job between this check and the inspect.
+        let _pass = self.port_setup_lock.lock().await;
         let report = match cached {
             Some(report) if !software_changed_since(&jobs, report.checked_ms) => report,
             _ if self
@@ -1002,8 +1004,11 @@ async fn discover(State(web): State<WebState>) -> Response {
 
 /// Checks every node (in parallel, read-only) and keeps the report for the state view.
 async fn inspect_nodes(State(web): State<WebState>) -> Response {
-    // The automatic check after a port pass covers this; a manual check in the middle would store
-    // a half-applied cluster as the report the port fixes replay.
+    // A port pass must not register a job between this check and the inspect, and an inspect must
+    // not run while a pass's jobs are applying: hold the pass lock across both, then the check.
+    let _pass = web.port_setup_lock.lock().await;
+    // The automatic check after a port pass covers the running case; a manual check in the middle
+    // would store a half-applied cluster as the report the port fixes replay.
     if let Some(id) = web.jobs.running_in(&[
         "network-setup-r0",
         "network-setup-r1",
@@ -1097,10 +1102,13 @@ fn run_fabric_probe(
                 let arping = fabric_probe_command(config, rank, &netdevs, &peers);
                 let ping = fabric_ping_command(config, rank, &netdevs, &pings);
                 scope.spawn(move || {
-                    let reached = probe
-                        .capture(&ping, timeout)
-                        .ok()
-                        .map(|text| inspect::parse_fabric(rank, &text).reached)?;
+                    let text = probe.capture(&ping, timeout).ok()?;
+                    // A Spark without ping cannot report reachability; that is a broken check,
+                    // not every peer being dead.
+                    if text.contains("ping missing") {
+                        return None;
+                    }
+                    let reached = inspect::parse_fabric(rank, &text).reached;
                     let arping = probe
                         .capture(&arping, timeout)
                         .ok()
@@ -1156,6 +1164,9 @@ fn lead_model_complete(config: &SparkConfig) -> bool {
 
 /// Writes the NCCL settings and peer addresses the last check derived into the configuration.
 async fn apply_network(State(web): State<WebState>) -> Response {
+    // Same snapshot rule as the port setup: the plan and the configuration it was taken of are
+    // written by one inspect, so read them while no inspect can be half-way through.
+    let _inspect = web.inspect_lock.lock().await;
     let plan = web
         .last_inspect
         .read()
@@ -1209,6 +1220,9 @@ async fn network_setup(State(web): State<WebState>) -> Response {
     // own-kind rule cannot serialize two concurrent requests; hold a lock across the whole pass
     // (the jobs themselves keep running after it is released, which the pre-check below sees).
     let _pass = web.port_setup_lock.lock().await;
+    // The report and the configuration it was taken of are written by one inspect under this
+    // lock, so reading both while holding it cannot pair an old report with a new configuration.
+    let _inspect = web.inspect_lock.lock().await;
     let config = match web.usable_config() {
         Ok(config) => config,
         Err(message) => return api_error(StatusCode::CONFLICT, message),
@@ -1286,6 +1300,24 @@ async fn network_setup(State(web): State<WebState>) -> Response {
             format!(
                 "the last check reports a problem no port fix can write: {message}; fix it and \
                  check the nodes again"
+            ),
+        );
+    }
+    // A Spark that did not answer leaves the plan incomplete: its addresses are unknown, so a
+    // free address the fix hands to a reachable rank could collide with one it already has.
+    let unreachable: Vec<String> = report
+        .nodes
+        .iter()
+        .filter(|node| !node.reachable)
+        .map(|node| node.hostname.clone().unwrap_or_else(|| node.ssh.clone()))
+        .collect();
+    if !unreachable.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "{} did not answer the last check, so the plan is incomplete; check the Sparks \
+                 again",
+                unreachable.join(", ")
             ),
         );
     }
@@ -3714,7 +3746,9 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_owned();
-        assert!(error.contains("still reports a problem on"), "{error}");
+        // The plan is incomplete because a Spark did not answer; that is refused before any
+        // "already match" answer.
+        assert!(error.contains("did not answer the last check"), "{error}");
         assert!(!error.contains("already match"), "{error}");
     }
 
@@ -3865,6 +3899,50 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn network_setup_refuses_an_incomplete_plan_even_with_a_per_rank_fix() {
+        // Rank 3 did not answer, so its addresses are unknown: a fix that also allocates a free
+        // address on another rank could collide with one it already has.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state(dir.path());
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            assert!(
+                report.nodes.iter().any(|node| !node.reachable),
+                "the fixture has an unreachable Spark"
+            );
+            let node = report.nodes.first_mut().expect("rank 0");
+            node.network_fix = Some("sudo ip link set mtu 9000 dev enp1s0f1np1".to_owned());
+            node.network_fix_remote = Some("ip link set mtu 9000 dev enp1s0f1np1".to_owned());
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("did not answer the last check"), "{error}");
+        assert!(
+            state
+                .jobs
+                .list()
+                .iter()
+                .all(|job| !job.kind.starts_with("network-setup-")),
+            "no port job may start for an incomplete plan"
+        );
     }
 
     #[tokio::test]

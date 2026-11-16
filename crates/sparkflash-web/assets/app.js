@@ -1238,10 +1238,18 @@ function latestJob(match) {
 }
 
 // The port pass starts four jobs at once, one per rank, so the highest id is the highest rank,
-// not the latest outcome. Look for a failure in the newest pass (the four start together).
+// not the latest outcome. The ids this console got back for its own pass are exact, however
+// slowly the four registered; without them, fall back to the newest jobs by start time.
 function failedPortJob() {
   const jobs = S.jobs.filter((job) => job.kind.startsWith("network-setup-"));
   if (!jobs.length) return null;
+  if (Array.isArray(S.portPass) && S.portPass.length) {
+    const mine = jobs.filter((job) => S.portPass.includes(job.id));
+    if (mine.length) {
+      return mine.filter((job) => job.status === "failed")
+        .sort((a, b) => (b.started_ms || 0) - (a.started_ms || 0))[0] || null;
+    }
+  }
   const newest = Math.max(...jobs.map((job) => job.started_ms || 0));
   // A pass starts its four jobs within a second. 2.5 s keeps a fast retry from being mistaken
   // for the same pass, and the latest failure is the one that matters.
@@ -2343,7 +2351,12 @@ function bindGuide() {
         chooseFabric(action.dataset.fabric);
         break;
       case "setup-ports":
-        if (requireSaved()) postAction("/api/network/setup", undefined, false);
+        if (requireSaved()) {
+          postAction("/api/network/setup", undefined, false).then((result) => {
+            const jobs = result && Array.isArray(result.jobs) ? result.jobs : [];
+            if (jobs.length) S.portPass = jobs.map((job) => job.id);
+          });
+        }
         break;
       case "install":
         if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);
@@ -2421,8 +2434,10 @@ async function postAction(path, body, follow = true) {
       toast("Request accepted");
     }
     await refreshState();
+    return result;
   } catch (error) {
     toast(error.message, true);
+    return null;
   }
 }
 

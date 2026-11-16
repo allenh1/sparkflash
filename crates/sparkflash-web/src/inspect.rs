@@ -1778,7 +1778,9 @@ fn network_fixes(
             fixes.push(None);
             continue;
         }
-        let mut body = String::from("set -e\n");
+        // The remote copy needs fail-fast; the paste-to-terminal text must not, because an
+        // interactive shell would keep errexit for every later command.
+        let mut body = String::new();
         if needs_netplan {
             let mut yaml = String::from("network:\n  version: 2\n  ethernets:\n");
             for (netdev, line) in &ports {
@@ -1827,13 +1829,15 @@ fn network_fixes(
             body.push_str("sudo netplan apply\n");
         }
         // The paste-into-a-terminal variant prompts for a password via sudo; the copy that
-        // runs over SSH under `sudo -n bash -c` must not carry the sudo prefix, so it is dropped.
-        let remote = body
-            .lines()
-            .map(|line| line.strip_prefix("sudo ").unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
+        // runs over SSH under `sudo -n bash -c` must not carry the sudo prefix, so it is dropped,
+        // and that copy fails fast.
+        let remote = format!(
+            "set -e\n{}",
+            body.lines()
+                .map(|line| line.strip_prefix("sudo ").unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ) + "\n";
         let text = format!(
             "# Run on {} in a terminal (it asks for your password).\n{body}",
             name(rank)
@@ -1988,6 +1992,10 @@ pub fn fabric_probe_args(netdevs: &[String], peers: &[(usize, String)]) -> Vec<S
 /// `ping <rank> <netdev> ok|no` line per port. It runs unprivileged, so a Spark without
 /// passwordless sudo still tells the check whether its peers answer.
 pub const FABRIC_PING_SCRIPT: &str = r#"export LC_ALL=C
+if ! command -v ping >/dev/null 2>&1; then
+  echo "ping missing"
+  exit 0
+fi
 devs=()
 pings=()
 for arg in "$@"; do

@@ -186,7 +186,8 @@ ARP settings, check again: a second pass adds them. The manual commands remain a
 **Prefer to run the commands yourself**.
 
 The choice is saved as `[cluster].fabric_schedule` and exported to every rank as
-`SPARKFLASH_FABRIC_SCHEDULE`, so a web-driven launch and a hand-written one run the same recipe.
+`SPARKFLASH_FABRIC_SCHEDULE` by the console's launch; a hand-run launcher must export the same
+variable itself, because `sparkflash serve` does not read `sparkflash.toml`.
 `one-shot`, `hairpin` and `ring` are accepted aliases; an unknown name is refused when the
 configuration is saved, and a hand-run `sparkflash serve --fabric-schedule` (or the exported
 variable) refuses one too rather than serving the other decomposition. Every rank of one group
