@@ -2076,3 +2076,22 @@ The seven Markov fold steps are 94 µs each. The drafter's five layers read its 
 projections once a round. E4M3 copies of those projections and of the fold would save about 1 ms
 of a 105 ms round, and a copy of the head would cost 238 MB a rank, so the E4M3 drafter is not
 built.
+
+### The packed dense GEMVs' verify rows, split in token halves (neutral end to end)
+
+A batched `q4e_gemv_packed` / `q4e_gemv4_packed` warp took two rows against every token, so half
+the grid's warps sat idle and a lane held sixteen sums (`q4e_gemv4_packed` at 167 registers, one
+block an SM). A work item is now a pair of rows and one half of the tokens (`q4e_batch_half`):
+every warp works and a lane holds eight sums (127 registers). A (row, token) sum is the same walk,
+so no output word moves. Only Inkling launches these kernels.
+
+| on the four ranks, served files, DSpark adaptive depth 7 | before | after |
+|---|---|---|
+| repeating 5K prompt, 96 tokens (twice each, interleaved) | 11.57 / 11.91 ms a token | 11.63 / 11.46 ms |
+| 93,159-token text, 48 tokens (twice each, interleaved) | 25.06 / 25.13 ms | 24.85 / 25.51 ms |
+| 93K prefill | 67.2 / 67.7 s | 67.0 / 67.6 s |
+
+Digests (`ec85a691b74bbc6b`, `2f09c281b606c98e`) and ids are unchanged, and DSpark's ids equal
+plain decoding's. The difference is inside run-to-run noise: the dense projections were already
+near the DRAM floor, and the idle warps had been hiding behind the weight stream. It is kept for
+the lower register count and because it costs nothing.
