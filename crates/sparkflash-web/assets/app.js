@@ -1243,9 +1243,11 @@ function failedPortJob() {
   const jobs = S.jobs.filter((job) => job.kind.startsWith("network-setup-"));
   if (!jobs.length) return null;
   const newest = Math.max(...jobs.map((job) => job.started_ms || 0));
+  // A pass starts its four jobs within a second; five seconds keeps a quick retry from being
+  // mistaken for the same pass, and the latest failure is the one that matters.
   return jobs
-    .filter((job) => newest - (job.started_ms || 0) < 15000 && job.status === "failed")
-    .sort((a, b) => (a.started_ms || 0) - (b.started_ms || 0))[0] || null;
+    .filter((job) => newest - (job.started_ms || 0) < 5000 && job.status === "failed")
+    .sort((a, b) => (b.started_ms || 0) - (a.started_ms || 0))[0] || null;
 }
 
 const runningJob = (match) => S.jobs.find((job) => job.status === "running" && match(job));
@@ -2183,7 +2185,12 @@ function renderGuide() {
 }
 
 async function inspect(quiet = false) {
-  if (S.inspectBusy) return;
+  // A request while a check is in flight would record the config of the older call (a fabric just
+  // chosen, say). Remember it and run once more when this check finishes.
+  if (S.inspectBusy) {
+    S.inspectAgain = true;
+    return;
+  }
   S.inspectBusy = true;
   S.inspectedFor = JSON.stringify(S.state?.config?.cluster?.nodes || null);
   const button = $("setup-check");
@@ -2200,6 +2207,10 @@ async function inspect(quiet = false) {
     S.inspectBusy = false;
     button.classList.remove("busy");
     renderGuide();
+    if (S.inspectAgain) {
+      S.inspectAgain = false;
+      inspect(true);
+    }
   }
 }
 

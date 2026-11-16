@@ -931,11 +931,10 @@ pub fn analyze_fabric(
                 let message = match fabric.shape {
                     _ if !fabric.links_measured => format!(
                         "{} cannot reach {} over the fast network. The wiring could not be \
-                         measured on {}, so this is the reachability result alone; the launch \
-                         opens a connection to every rank and needs {} to answer.",
+                         measured, so this is the reachability result alone; the launch opens a \
+                         connection to every rank and needs {} to answer.",
                         name(rank),
                         name(peer),
-                        name(rank),
                         name(peer)
                     ),
                     FabricShape::Ring if !neighbour => format!(
@@ -974,6 +973,18 @@ pub fn analyze_fabric(
                     message,
                 });
             }
+        }
+        // A probe that could not measure the cables has to say so in the report itself, not only
+        // in the browser's picker: /api/state is what other consumers read.
+        if !fabric.links_measured {
+            findings.push(Finding {
+                rank: None,
+                severity: Severity::Warning,
+                message: "The wiring could not be measured (a link probe did not run, or arping \
+                          is missing or cannot open a raw socket on a Spark), so only \
+                          reachability was checked."
+                    .to_owned(),
+            });
         }
         // arping present and every attempt answered nothing: either the ports are all
         // disconnected, or the tool cannot open a raw socket (no CAP_NET_RAW). Say which is
@@ -1486,7 +1497,10 @@ fn network_fixes(
         let unaddressed = facts.unaddressed();
         let required = &routes_by_rank[rank];
         let routes_missing = !required.is_empty() && !routes_installed(facts, required);
-        let needs_forwarding = required.iter().any(|route| route.via.is_some()) && !facts.forward;
+        // The ring's relay is on whenever any route goes through another Spark. The sysctl file
+        // keeps the switch for a reboot even when only the ARP settings need rewriting.
+        let routing_forwarding = required.iter().any(|route| route.via.is_some());
+        let needs_forwarding = routing_forwarding && !facts.forward;
         let mut ports: Vec<(String, String)> = Vec::new();
         let mut needs_netplan = !unaddressed.is_empty() || routes_missing;
         for rail in &rails {
@@ -1570,7 +1584,7 @@ fn network_fixes(
         if needs_sysctl {
             body.push_str(&format!("sudo tee {SYSCTL_FILE} > /dev/null <<'EOF'\n"));
             body.push_str("net.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2\n");
-            if needs_forwarding {
+            if routing_forwarding {
                 body.push_str("net.ipv4.ip_forward = 1\n");
             }
             body.push_str("EOF\n");
@@ -2697,6 +2711,14 @@ link enp1s0f1np1 1500 up 0 0
             .expect("the ping failure is reported");
         assert!(message.contains("could not be measured"), "{message}");
         assert!(!message.contains("no cable was measured"), "{message}");
+        // The report itself says the wiring was not measured, not only the browser picker.
+        assert!(
+            warnings(&report)
+                .iter()
+                .any(|m| m.contains("wiring could not be measured")),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -2872,6 +2894,40 @@ link 3 enp1s0f1np1 198.51.100.13 ok
             node.contains("to: 198.51.100.23/32") && node.contains("via: 198.51.100.12"),
             "{node}"
         );
+    }
+
+    #[test]
+    fn a_sysctl_rewrite_keeps_the_rings_forwarding() {
+        // An ARP-only pass rewrites the sysctl file. On a ring that file also has to keep
+        // ip_forward, or a reboot drops the relay the diagonals go through.
+        let mut probes = cluster();
+        let fabric = ring_fabric();
+        let routes = fabric_routes(&probes, Some(&fabric));
+        for (rank, probe) in probes.iter_mut().enumerate() {
+            let facts = probe.as_mut().expect("facts");
+            facts.forward = true;
+            facts.arp_all = (0, 0);
+            for link in &mut facts.links {
+                link.arp_ignore = 0;
+                link.arp_announce = 0;
+            }
+            for route in &routes[rank] {
+                facts.routes.push(Route {
+                    destination: route.to.to_string(),
+                    netdev: route.netdev.clone(),
+                    via: route.via.map(|via| via.to_string()),
+                    metric: FABRIC_ROUTE_METRIC,
+                    dhcp: false,
+                });
+            }
+        }
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(fabric), true, 1);
+        let fix = report.nodes[0]
+            .network_fix
+            .as_deref()
+            .expect("an ARP fix is offered");
+        assert!(fix.contains("arp_ignore"), "{fix}");
+        assert!(fix.contains("net.ipv4.ip_forward = 1"), "{fix}");
     }
 
     #[test]

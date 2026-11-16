@@ -126,8 +126,10 @@ They are worked out from the one subnet the check plans for the collective addre
 addresses have to stay on that subnet for the routes to be written.
 The device arm's NCCL is not: it opens its own RDMA queue pairs and cannot use those routes, so a
 bare-ring device run also needs an NCCL that stays on the cabled peers (`NCCL_ALGO=Ring` with a
-switchless NCCL build, where the two non-neighbours are never opened) or `SPARK_COMM_REDUCE=tcp`,
-which keeps the partials on the host seam. The check cannot see which NCCL is installed.
+switchless NCCL build, where the two non-neighbours are never opened). A packed arm can instead
+keep the partials on the host seam with `SPARK_COMM_REDUCE=tcp`, but the launcher pins that
+variable to `nccl` for a V4.1 device run, so the workaround does not reach that path. The check
+cannot see which NCCL is installed.
 
 When the node check runs it also probes the wiring: from each of its fast ports every Spark ARPs
 every fast-network address of every other Spark (`arping -I`) and pings each Spark's collective

@@ -1156,21 +1156,27 @@ async fn network_setup(State(web): State<WebState>) -> Response {
     }
     // A launch that just finished is still booting: netplan apply now would drop the links the
     // group is coming up over. The telemetry gate above only fires once the sampler has seen the
-    // server, which is later than the job ending.
+    // server, which is later than the job ending. Only a launch the console still believes in
+    // counts: a stop since (or a launch that failed) means nothing is coming up.
+    let believed = cluster_believed_running(&web.jobs.list());
     let launched_ms = web
         .jobs
         .list()
         .iter()
-        .filter(|job| matches!(job.kind.as_str(), "launch" | "swap"))
+        .filter(|job| {
+            matches!(job.kind.as_str(), "launch" | "swap") && job.status == JobStatus::Succeeded
+        })
         .filter_map(|job| job.finished_ms)
         .max();
-    if launched_ms.is_some_and(|finished| now_ms().saturating_sub(finished) < LAUNCH_SETTLE_MS) {
+    if believed
+        && launched_ms.is_some_and(|finished| now_ms().saturating_sub(finished) < LAUNCH_SETTLE_MS)
+    {
         return api_error(
             StatusCode::CONFLICT,
             "the cluster was launched less than five minutes ago and may still be coming up; wait until it answers or stop it before reconfiguring the fast ports",
         );
     }
-    if cluster_believed_running(&web.jobs.list()) {
+    if believed {
         return api_error(
             StatusCode::CONFLICT,
             "the cluster was launched and has not been stopped; stop it before reconfiguring the fast ports",
@@ -1215,18 +1221,31 @@ async fn network_setup(State(web): State<WebState>) -> Response {
             })
             .map(|node| node.hostname.clone().unwrap_or_else(|| node.ssh.clone()))
             .collect();
-        if waiting.is_empty() {
+        // A cluster-wide error (two Sparks on one address, for instance) is a problem no port
+        // fix can write either, so "already match" would be wrong for it too.
+        let cluster_error = report
+            .findings
+            .iter()
+            .find(|finding| finding.rank.is_none() && finding.severity == Severity::Error)
+            .map(|finding| finding.message.clone());
+        if !waiting.is_empty() {
             return api_error(
                 StatusCode::CONFLICT,
-                "the fast ports already match the plan; check the nodes to recompute",
+                format!(
+                    "the last check still reports a problem on {}; fix it and check the nodes again",
+                    waiting.join(", ")
+                ),
+            );
+        }
+        if let Some(message) = cluster_error {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("the last check still reports a problem: {message}"),
             );
         }
         return api_error(
             StatusCode::CONFLICT,
-            format!(
-                "the last check still reports a problem on {}; fix it and check the nodes again",
-                waiting.join(", ")
-            ),
+            "the fast ports already match the plan; check the nodes to recompute",
         );
     }
     let mut started = Vec::new();
@@ -3627,6 +3646,86 @@ mod tests {
             .unwrap_or_default()
             .to_owned();
         assert!(error.contains("more than ten minutes old"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_does_not_certify_a_cluster_wide_error() {
+        // Two Sparks on one address is a finding with no rank, and no port fix can write it. The
+        // "already match the plan" answer would be wrong while it stands.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(dir.path(), false, None, Arc::new(HealthySsh));
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            report.findings.push(inspect::Finding {
+                rank: None,
+                severity: Severity::Error,
+                message: "Two Sparks have the same fast-network address".to_owned(),
+            });
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("Two Sparks have the same"), "{error}");
+        assert!(!error.contains("already match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn network_setup_is_allowed_again_after_the_cluster_is_stopped() {
+        // The settle window is about a launch that is still coming up. A stop after it means
+        // nothing is, and refusing the port fix for five minutes would be wrong.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        for kind in ["launch", "stop"] {
+            let spec = CommandSpec {
+                program: "bash".to_owned(),
+                args: vec!["-c".to_owned(), "true".to_owned()],
+                env: BTreeMap::new(),
+                cwd: None,
+                label: kind.to_owned(),
+                kind: kind.to_owned(),
+            };
+            let id = state.jobs.start_exclusive(spec, &[]).await.expect("job");
+            loop {
+                let detail = state.jobs.get(id).expect("job");
+                if detail.summary.status.is_done() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[test]
