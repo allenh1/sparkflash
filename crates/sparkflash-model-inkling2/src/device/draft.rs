@@ -47,6 +47,26 @@ use super::*;
 /// The drafter's file in the checkpoint directory; the checkpoint's index does not list it.
 pub const DRAFT_FILE: &str = "mtp.safetensors";
 
+/// A window for the drafter's full-attention layers: unset or `full` (the default) reads the
+/// whole context, a count of positions reads only that many before the block, as a local layer
+/// does. The drafter only proposes tokens, so the window moves acceptance, never an emitted
+/// token. Anything else is refused.
+pub(crate) const DRAFT_WINDOW_ENV: &str = "SPARKFLASH_INKLING_DRAFT_WINDOW";
+
+/// The full layers' window [DRAFT_WINDOW_ENV] names; `None` reads the whole context.
+fn full_window(value: Option<&str>) -> Result<Option<usize>, String> {
+    match value {
+        None | Some("" | "full") => Ok(None),
+        Some(text) => match text.parse::<usize>() {
+            Ok(window) if window > 0 => Ok(Some(window)),
+            _ => Err(format!(
+                "{DRAFT_WINDOW_ENV}={text} is not a window: use full (the default: the drafter's \
+                 full layers read the whole context) or a positive count of positions"
+            )),
+        },
+    }
+}
+
 /// The taps a committed row carries: seven pre-layer partials, then the post-final-norm hidden.
 pub(super) const TAPS: usize = 8;
 /// The tap slot of the post-final-norm hidden.
@@ -158,7 +178,8 @@ struct DraftLayer {
     gate: Deviceptr,
     up: Deviceptr,
     down: Deviceptr,
-    /// A local layer's window; `None` for a full layer, which reads the whole context.
+    /// A local layer's window, or a full layer's under [DRAFT_WINDOW_ENV]; `None` for a full
+    /// layer that reads the whole context.
     window: Option<usize>,
 }
 
@@ -363,6 +384,7 @@ impl DraftModel {
         if !mtp.local_layer_ids.is_empty() && mtp.sliding_window_size == 0 {
             return Err("the drafter's local layers have no window".to_owned());
         }
+        let full_window = full_window(std::env::var(DRAFT_WINDOW_ENV).ok().as_deref())?;
         let prologue = shared.plan.prologue();
         let embed_table =
             step_weight(prologue, Op::Embed, None).ok_or("the schedule embeds no token")?;
@@ -463,10 +485,11 @@ impl DraftModel {
                     (hidden, mtp.intermediate_size),
                     columns(intermediate),
                 )?,
-                window: mtp
-                    .local_layer_ids
-                    .contains(&layer)
-                    .then_some(mtp.sliding_window_size),
+                window: if mtp.local_layer_ids.contains(&layer) {
+                    Some(mtp.sliding_window_size)
+                } else {
+                    full_window
+                },
             });
             // The block's key and value stay BF16: at the block's 8 rows their 256-row packed walk
             // measured slower (26.5 us against 19.5), where every other projection, the context
@@ -1385,5 +1408,21 @@ impl DraftState {
             )));
         }
         Ok((drafts, confidence))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_window;
+
+    #[test]
+    fn full_window_reads_full_or_a_count_and_refuses_the_rest() {
+        assert_eq!(full_window(None), Ok(None));
+        assert_eq!(full_window(Some("")), Ok(None));
+        assert_eq!(full_window(Some("full")), Ok(None));
+        assert_eq!(full_window(Some("8192")), Ok(Some(8192)));
+        for bad in ["0", "-1", "8k", "window"] {
+            assert!(full_window(Some(bad)).is_err(), "{bad} was taken");
+        }
     }
 }

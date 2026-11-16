@@ -2095,3 +2095,30 @@ Digests (`ec85a691b74bbc6b`, `2f09c281b606c98e`) and ids are unchanged, and DSpa
 plain decoding's. The difference is inside run-to-run noise: the dense projections were already
 near the DRAM floor, and the idle warps had been hiding behind the weight stream. It is kept for
 the lower register count and because it costs nothing.
+
+### The drafter's full layer keeps the whole context (a window is a diagnostic, not a default)
+
+Four of the drafter's five layers are local (a 1,024 window). Layer 2 reads the whole context,
+2 KB a position a rank (two key/value heads in f32), so 186 MB a pass at 93K.
+`SPARKFLASH_INKLING_DRAFT_WINDOW` (unset or `full`, the default; a positive count; anything else
+refused) gives that layer a window as the local ones have. The drafter only proposes tokens, so
+the window moves acceptance and never an emitted id: every run below equalled the unset run's ids.
+
+| DSpark adaptive depth 7, 96 tokens | drafts accepted | ms a token |
+|---|---|---|
+| repeating 5K prompt, full | 81 of 82 | 11.51 |
+| repeating 5K prompt, window 4,096 | 31 of 129 | 36.26 |
+| repeating 5K prompt, window 1,024 | 34 of 120 | 33.91 |
+| 93,159-token text, full (twice) | 65 of 100 | 22.98 / 23.11 |
+| 93,159-token text, window 16,384 | 65 of 97 | 22.01 |
+| 93,159-token text, window 4,096 | 64 of 98 | 22.58 |
+| 93,159-token text, window 1,024 | 63 of 96 | 22.64 |
+
+The full layer is what drafts a copy from far back. Without it the repeating prompt, where
+speculation pays most, falls to a third of its speed. A window only wins where nothing is copied
+from beyond it, so the default stays `full`. The 93K rows show what the layer's read costs at that
+length: about 1 ms a token (4.5%), more than its 186 MB a pass at the DRAM floor would. Its
+attention walk reads each key span once per four queries (`ATTENTION_QUERIES`), so twelve blocks
+read the same span. A walk that holds a key head's every query against one read would take that
+cost without giving up the long-range copies. It changes only the drafter's sums, so speculation
+stays lossless, but it is not built yet.
