@@ -1732,3 +1732,46 @@ the deployed build, top-1 agrees on 12 of 12 and KL is at most 2.3e-3 nats. Agai
 1.55e-2 nats (mean 4.58e-3) against 1.52e-2 (mean 4.55e-3), and a mean absolute logit difference
 of 0.057-0.339 a cut against 0.056-0.339. The 93K prompt's 24 greedy ids and the repeating
 prompt's 96 are the deployed build's.
+
+### The row split's band in two halves, its gathers under the compute
+
+Under the row split a layer's band makes two all-gathers on the wire: every rank's run of the
+SwiGLU rows before the down pass (about 36 ms at 8,192 rows on NCCL) and every rank's run of the
+mix rows after it (about 12 ms). Both sat on the run's stream, so the GPU waited through them.
+
+A chunk of 512 rows or more now runs its band as two halves of its rows (`run_band_halves` in
+`device/chunk.rs`). The run's stream computes gate_up for half 0, then for half 1, then down and
+mix for each half once its activation is in, and then each half's join once its mix rows are.
+The four gathers go on a side stream in the same order on every rank: half 0's activation under
+half 1's gate_up, half 1's under half 0's down and mix, and half 0's mix rows under half 1's down.
+The side stream waits for the run's stream before each gather, and the run's stream waits for the
+last gather before the next layer's exchange, so the group still issues its collectives one at a
+time and in one order.
+
+Each half is planned and run as a chunk of its own rows would be. A grouped-MMA output depends
+only on its own slot's row and its K order (the chunk-width invariance the tensor walk keeps),
+and the mix and the join work row by row, so the halves give every bit the whole band gives.
+Only where the runs wait changes: the activation runs are half-major in `partials`, and the mix
+rows wait in `activation`, which the down pass over the runs leaves unread.
+
+Two smaller changes come with it, also bit for bit. The down pass reads the gathered runs where
+they land (`q4p_moe_down_runs` and its `_mx8` form), so the join that copied the whole activation
+first is gone. The row split's `partials` holds the larger of the gathered runs and the mix rows,
+not a hidden-wide row a slot, which is half the bytes.
+
+`SPARKFLASH_INKLING_OVERLAP=off` runs the band whole on the run's stream. Unset or `on` runs the
+halves wherever they can run: the row split, more than one rank, the device leg and the tensor
+walk. `on` named anywhere else is refused, as is any other value.
+
+Four ranks, row split, batch arm, one session, each prompt twice:
+
+| on the four ranks | D120 build | runs read in place | and the halves |
+|---|---|---|---|
+| 93K prompt | 93.4 s, 92.6 s | 91.0 s, 91.3 s | 81.1 s, 81.2 s |
+| prompt tokens a second at 93K | 1,001 | 1,022 | 1,148 |
+| repeating 5K prompt | | 6.78 s | 6.39 s |
+| 6,000-token text, twelve teacher-forced cuts | 9.46 s | 9.34 s | 8.54 s |
+
+All three give the same bits. The teacher-forced logits are identical to the D120 build's in
+every value, with the halves and without them. The repeating prompt's decode digest is
+`90f777a3c48a6bc4` and the 93K prompt's is `c6e0ef10fd49a8e0` in every column.

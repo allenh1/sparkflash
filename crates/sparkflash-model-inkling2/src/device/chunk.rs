@@ -948,6 +948,9 @@ pub(super) fn walk_rows(
         let cache_rows = layer.kv_rows;
         let clips = shared.clip[index];
         let mut previous_conv: Option<ConvSlot> = None;
+        // Whether this layer's band already gathered its mix rows into `mixed` (run_band_halves),
+        // which is then what its ExpertDelta collective would have done.
+        let mut band_gathered = false;
         let mut cursor = 0usize;
         while cursor < layer.steps.len() {
             let step = &layer.steps[cursor];
@@ -1473,7 +1476,7 @@ pub(super) fn walk_rows(
                         ExpertBody::Bf16 => false,
                     };
                     if walk == PrefillWalk::Tensor && mma {
-                        run_band_mma(shared, chunk, layer, rows)?;
+                        band_gathered = run_band_mma(shared, chunk, layer, rows)?;
                     } else {
                         run_band_chunk(shared, chunk, layer, step, activation, down, rows)?;
                     }
@@ -1491,7 +1494,9 @@ pub(super) fn walk_rows(
                     if index == 0 && !gathers {
                         probe(shared, "chunk band", scratch.mixed, rows, hidden)?;
                     }
-                    band_exchange(shared, scratch, rows)?;
+                    if !band_gathered {
+                        band_exchange(shared, scratch, rows)?;
+                    }
                     if index == 0 && gathers {
                         probe(shared, "chunk band", scratch.mixed, rows, hidden)?;
                     }
@@ -1760,7 +1765,7 @@ fn run_band_mma(
     chunk: &Chunk,
     layer: &LayerSchedule,
     rows: usize,
-) -> Result<(), BackendError> {
+) -> Result<bool, BackendError> {
     let config = &shared.config;
     let scratch = &chunk.scratch;
     let top_k = config.num_experts_per_tok;
@@ -1831,6 +1836,26 @@ fn run_band_mma(
             &[scratch.q_in.0, scratch.band.0, elements as u64],
         )
         .map_err(device_error)?;
+    let out = BandOut::of(shared, scratch, rows);
+    if out.gathers
+        && rows >= OVERLAP_ROWS
+        && let Some(overlap) = shared.overlap.as_ref()
+    {
+        let overlap = overlap
+            .lock()
+            .map_err(|_| device_error("the band overlap's lock is poisoned"))?;
+        let band = HalvesBand {
+            meta,
+            gate_up: gate_up_kernel,
+            down: if mx8 {
+                shared.kernels.moe_down_runs_mx8
+            } else {
+                shared.kernels.moe_down_runs
+            },
+        };
+        run_band_halves(shared, scratch, &band, &overlap, rows)?;
+        return Ok(true);
+    }
     shared
         .launch(
             shared.kernels.moe_plan,
@@ -1867,7 +1892,6 @@ fn run_band_mma(
     // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
     // row split they are this rank's run of every slot's columns, both planes of it together, so
     // the gather moves them as 2 * slots rows of a run each.
-    let out = BandOut::of(shared, scratch, rows);
     let run = slots * intermediate * std::mem::size_of::<f32>();
     let activated = if out.gathers {
         scratch.partials.offset(shared.exchange.rank() * run)
@@ -1949,7 +1973,274 @@ fn run_band_mma(
             .map_err(device_error)?;
     }
     // The mix is local; the exchange that follows it completes the sum over the ranks.
-    band_mix(shared, scratch, rows)
+    band_mix(shared, scratch, rows)?;
+    Ok(false)
+}
+
+/// The fewest rows whose row-split band runs as two halves ([run_band_halves]): below it a
+/// half's gathers are too short to hide anything behind.
+const OVERLAP_ROWS: usize = 512;
+
+/// The kernels and table one layer's halves run.
+struct HalvesBand {
+    meta: MmaTable,
+    gate_up: Entry,
+    /// The down pass over the gathered runs (q4p_moe_down_runs or its MXFP8 form).
+    down: Entry,
+}
+
+/// One half's places in the chunk's scratch ([run_band_halves]).
+struct HalfPlace {
+    /// 0 or 1: which of the two item counts the half's plan writes.
+    half: usize,
+    first_row: usize,
+    rows: usize,
+    first_slot: usize,
+    slots: usize,
+    items: usize,
+    first_item: usize,
+    /// The half's activation runs in `partials`, [rank][plane][slot][intermediate].
+    runs: Deviceptr,
+    /// The half's mix rows in `activation`, [rank][row][down rows].
+    mixes: Deviceptr,
+}
+
+/// The row split's band over a chunk as two halves of its rows, each half's two gathers on the
+/// overlap's side stream while the run's stream computes the other half.
+///
+/// The run's stream: gate_up of half 0, gate_up of half 1, down and mix of half 0 once its
+/// activation is gathered, down and mix of half 1 once its activation is, then each half's join
+/// once its mix rows are gathered. The side stream, in the same order on every rank: half 0's
+/// activation gather (after its gate_up), half 1's (after its gate_up), half 0's mix gather
+/// (after its mix), half 1's (after its mix). So half 0's activation crosses the wire under half
+/// 1's gate_up, half 1's under half 0's down and mix, and half 0's mix rows under half 1's down.
+/// Every collective of the band is on the side stream, the side stream follows the run's stream
+/// up to each gather, and the run's stream waits for the last of them before the next layer's
+/// exchange, so the group still issues its collectives one at a time in one order.
+///
+/// A half is planned and run as a chunk of its own rows would be. Every output element of the
+/// grouped MMA depends on its own slot's row and its K order alone (the chunk-width invariance
+/// the tensor walk keeps), and the mix and the join are per row, so the halves give every bit the
+/// whole chunk's band gives. Only where the runs wait differs: the activation runs are half-major
+/// in `partials`, and the mix rows wait in `activation` (which the down pass over the runs leaves
+/// unread), so half 0's mix rows cannot land on half 1's runs before half 1's down pass reads
+/// them.
+fn run_band_halves(
+    shared: &Shared,
+    scratch: &Scratch,
+    band: &HalvesBand,
+    overlap: &BandOverlap,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let config = &shared.config;
+    let cuda = &shared.cuda;
+    let top_k = config.num_experts_per_tok;
+    let intermediate = shared.plan.expert_intermediate();
+    let hidden = config.hidden_size;
+    let (_, owned) = shared.plan.expert_range();
+    let down = shared.plan.expert_down();
+    let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
+    let int = std::mem::size_of::<i32>();
+    let word = std::mem::size_of::<f32>();
+    let elements = rows * hidden;
+    let mut places = Vec::with_capacity(2);
+    let (mut first_item, mut runs, mut mixes) = (0, scratch.partials, scratch.activation);
+    for (half, (first_row, half_rows)) in [(0, rows / 2), (rows / 2, rows - rows / 2)]
+        .into_iter()
+        .enumerate()
+    {
+        let slots = half_rows * top_k;
+        let items = moe_items(slots, owned);
+        places.push(HalfPlace {
+            half,
+            first_row,
+            rows: half_rows,
+            first_slot: first_row * top_k,
+            slots,
+            items,
+            first_item,
+            runs,
+            mixes,
+        });
+        first_item += items;
+        runs = runs.offset(world * slots * intermediate * word);
+        mixes = mixes.offset(world * half_rows * down.rows * word);
+    }
+    let plan_of = |place: &HalfPlace| {
+        (
+            scratch.plan.offset(place.first_slot * 2 * int),
+            scratch.items.offset(place.first_item * 4 * int),
+            scratch.item_count.offset(place.half * int),
+        )
+    };
+    let gate_up = |place: &HalfPlace| -> Result<(), BackendError> {
+        let (plan, items, count) = plan_of(place);
+        shared
+            .launch(
+                shared.kernels.moe_plan,
+                (1, 1, 1),
+                (
+                    sparkflash_model::active_profile().plan.block_threads(),
+                    1,
+                    1,
+                ),
+                &[
+                    scratch.local.offset(place.first_slot * int).0,
+                    plan.0,
+                    items.0,
+                    count.0,
+                    0,
+                    place.slots as u64,
+                    owned as u64,
+                    top_k as u64,
+                    MOE_ROWS as u64,
+                    place.items as u64,
+                    0,
+                    MOE_PLAN_DROP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    hidden as u64,
+                ],
+            )
+            .map_err(device_error)?;
+        let run = place.slots * intermediate * word;
+        shared
+            .launch(
+                band.gate_up,
+                (
+                    (intermediate / MOE_GATE_UP_COLUMNS) as u32,
+                    u32::try_from(place.items).map_err(device_error)?,
+                    1,
+                ),
+                (MOE_THREADS, 1, 1),
+                &[
+                    band.meta.table.0,
+                    band.meta.scales.0,
+                    plan.0,
+                    items.0,
+                    count.0,
+                    // The half's rows of the input's head plane; its remainder plane is the whole
+                    // chunk's `elements` on, where split_bf16 wrote it.
+                    scratch
+                        .band
+                        .offset(place.first_row * hidden * std::mem::size_of::<u16>())
+                        .0,
+                    elements as u64,
+                    place.runs.offset(rank * run).0,
+                    (place.slots * intermediate) as u64,
+                    top_k as u64,
+                    hidden as u64,
+                    intermediate as u64,
+                    bits(config.mlp_gate_softcap as f32),
+                    bits(config.mlp_up_softcap as f32),
+                ],
+            )
+            .map_err(device_error)
+    };
+    let down_and_mix = |place: &HalfPlace| -> Result<(), BackendError> {
+        let (plan, items, count) = plan_of(place);
+        // The band's input is read by both halves' gate_up passes, which the run's stream has
+        // finished by now, so the projection lands in the band as the whole chunk's does.
+        let projected = scratch.band.offset(place.first_slot * down.rows * word);
+        shared
+            .launch(
+                band.down,
+                (
+                    (down.rows / MOE_DOWN_COLUMNS) as u32,
+                    u32::try_from(place.items).map_err(device_error)?,
+                    1,
+                ),
+                (MOE_THREADS, 1, 1),
+                &[
+                    band.meta.table.0,
+                    band.meta.scales.0,
+                    plan.0,
+                    items.0,
+                    count.0,
+                    place.runs.0,
+                    (place.slots * intermediate) as u64,
+                    shared.route_ones.0,
+                    projected.0,
+                    top_k as u64,
+                    down.rows as u64,
+                    down.columns as u64,
+                    0,
+                    intermediate as u64,
+                    (2 * place.slots * intermediate) as u64,
+                ],
+            )
+            .map_err(device_error)?;
+        shared
+            .launch(
+                shared.kernels.expert_mix,
+                (flat(down.rows), place.rows as u32, 1),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    place.mixes.offset(rank * place.rows * down.rows * word).0,
+                    projected.0,
+                    scratch.scales.offset(place.first_slot * word).0,
+                    place.rows as u64,
+                    top_k as u64,
+                    down.rows as u64,
+                    scratch.indices.offset(place.first_slot * int).0,
+                    shared.plan.parallel_experts() as u64,
+                    world as u64,
+                ],
+            )
+            .map_err(device_error)
+    };
+    let side = &overlap.side;
+    let fail = |error: String| device_error(error);
+    // A half's `run` bytes a rank at `base`, gathered on the side stream once the run's stream
+    // has written this rank's, and `done` marked behind them.
+    let gather = |base: Deviceptr, run: usize, done: &StreamEvent| -> Result<(), BackendError> {
+        cuda.side_follow_run(side).map_err(fail)?;
+        shared
+            .exchange
+            .exchange_on_device(side.raw(), base.0 + (rank * run) as u64, base.0, run)
+            .map_err(device_error)?;
+        cuda.side_mark(side, done).map_err(fail)
+    };
+    for place in &places {
+        gate_up(place)?;
+        gather(
+            place.runs,
+            place.slots * intermediate * word,
+            &overlap.gathered[place.half],
+        )?;
+    }
+    for place in &places {
+        cuda.run_wait(&overlap.gathered[place.half]).map_err(fail)?;
+        down_and_mix(place)?;
+        gather(
+            place.mixes,
+            place.rows * down.rows * word,
+            &overlap.mixed[place.half],
+        )?;
+    }
+    // The open refuses a split whose pieces are not whole 16-byte words.
+    let words = down.rows * word / 16;
+    for place in &places {
+        cuda.run_wait(&overlap.mixed[place.half]).map_err(fail)?;
+        shared
+            .launch(
+                shared.kernels.join_pieces,
+                (flat(place.rows * world * words), 1, 1),
+                (ELEMENT_BLOCK, 1, 1),
+                &[
+                    scratch.mixed.offset(place.first_row * hidden * word).0,
+                    place.mixes.0,
+                    place.rows as u64,
+                    words as u64,
+                    world as u64,
+                ],
+            )
+            .map_err(device_error)?;
+    }
+    Ok(())
 }
 
 /// The routed band over a chunk: one launch an expert over the rows that selected it.

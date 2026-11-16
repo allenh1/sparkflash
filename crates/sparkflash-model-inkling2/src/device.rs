@@ -39,6 +39,7 @@ use std::sync::{Arc, Mutex};
 
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
+    SideStream, StreamEvent,
 };
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
@@ -253,6 +254,27 @@ impl Mxfp8Walk {
                  default) or pairs (the exact pair walk)"
             )),
         }
+    }
+}
+
+/// The switch for the row split's two-halves band under [PrefillWalk::Tensor] (BandOverlap):
+/// unset or `on` runs a chunk's band as two halves of its rows with each half's gathers on a side
+/// stream, `off` runs it whole with its gathers on the run's stream. The bits are the same either
+/// way. `on` named where the halves cannot run (another split or walk, one rank, no device leg) is
+/// refused, as is an unknown value.
+pub const OVERLAP_ENV: &str = "SPARKFLASH_INKLING_OVERLAP";
+
+/// What [OVERLAP_ENV] asks for: `None` (unset or empty, the halves wherever they run),
+/// `Some(true)` (`on`, refused where they cannot) or `Some(false)` (`off`).
+fn overlap_request(value: Option<&str>) -> Result<Option<bool>, String> {
+    match value {
+        None | Some("") => Ok(None),
+        Some("on") => Ok(Some(true)),
+        Some("off") => Ok(Some(false)),
+        Some(other) => Err(format!(
+            "{OVERLAP_ENV}={other} is not a band overlap: use on (the default where the row \
+             split's tensor walk runs) or off (the whole band, its gathers on the run's stream)"
+        )),
     }
 }
 
@@ -883,6 +905,33 @@ struct MmaTable {
     scales: Deviceptr,
 }
 
+/// The side stream and events of the row split's two-halves band (chunk::run_band_halves), made
+/// at open: the band's four gathers run on `side` while the run's stream computes the other half.
+struct BandOverlap {
+    /// At the context's greatest priority: a gather that queues behind the other half's grids
+    /// holds up the peers too.
+    side: SideStream,
+    /// Marked on `side` once a half's activation runs are gathered.
+    gathered: [StreamEvent; 2],
+    /// Marked on `side` once a half's mix rows are gathered.
+    mixed: [StreamEvent; 2],
+}
+
+// SAFETY: a stream and events of the backend's context. The band's lock gives them to one chunk
+// at a time, on the thread that runs it, as the run's own stream is.
+unsafe impl Send for BandOverlap {}
+
+impl BandOverlap {
+    fn new(cuda: &Cuda) -> Result<Self, String> {
+        let event = || cuda.stream_event();
+        Ok(Self {
+            side: cuda.side_stream_urgent()?,
+            gathered: [event()?, event()?],
+            mixed: [event()?, event()?],
+        })
+    }
+}
+
 /// The pointers a q4p MMA table holds a local expert, and the outer scales.
 const MMA_TABLE_ENTRIES: usize = 6;
 const MMA_SCALES: usize = 3;
@@ -915,6 +964,8 @@ struct Shared {
     expert_arena: Deviceptr,
     /// [top_k] ones in that arena: the routing weights the grouped MMA's down pass multiplies by.
     route_ones: Deviceptr,
+    /// The row split's two-halves band ([OVERLAP_ENV]), or `None` where the band runs whole.
+    overlap: Option<Mutex<BandOverlap>>,
     context: usize,
     /// The peers' slots a device-leg collective lands in: a world of the widest payload, a
     /// chunk's residual rows. `None` when the exchange has no device leg.
@@ -2507,6 +2558,24 @@ impl InklingDeviceBackend {
         } else {
             None
         };
+        let halves_run = config.expert_split == ExpertSplit::Rows
+            && exchange.world() > 1
+            && exchange.has_device_leg()
+            && prefill_walk == PrefillWalk::Tensor;
+        let overlap = match overlap_request(std::env::var(OVERLAP_ENV).ok().as_deref())? {
+            Some(true) if !halves_run => {
+                return Err(format!(
+                    "{OVERLAP_ENV}=on runs the row expert split's band over more than one rank on \
+                     the device leg under {PREFILL_ENV}=tensor, and this group is {:?} over {} \
+                     ranks under {prefill_walk:?}",
+                    config.expert_split,
+                    exchange.world()
+                ));
+            }
+            Some(false) => None,
+            _ if halves_run => Some(Mutex::new(BandOverlap::new(&cuda)?)),
+            _ => None,
+        };
         // Every launch, device copy and collective of a step queues on the default stream, and
         // the only reads back are stream-ordered copies, so nothing needs the driver's
         // per-launch drain; SPARKFLASH_SYNC_LAUNCHES=1 brings it back. The Qwen and Dory arms
@@ -2543,6 +2612,7 @@ impl InklingDeviceBackend {
                 mxfp8_walk,
                 expert_arena,
                 route_ones,
+                overlap,
                 context,
                 exchange_slots,
                 exchange,
@@ -3692,11 +3762,11 @@ impl Scratch {
         let final_row = take(answers * hidden, 4);
         let plan = take(rows * top_k * 2, 4);
         let local = take(rows * top_k, 4);
-        let items = take(
-            chunk::moe_items(rows * top_k, shared.plan.expert_range().1) * 4,
-            4,
-        );
-        let item_count = take(1, 4);
+        // The two-halves band plans each half on its own: two counts, and up to one more short
+        // item and one more item an expert than the whole chunk's plan.
+        let owned = shared.plan.expert_range().1;
+        let items = take((chunk::moe_items(rows * top_k, owned) + owned + 1) * 4, 4);
+        let item_count = take(2, 4);
         let taus = take(rows, 4);
         let attention_pass = attention_pass_slots(rows, heads, split);
         let kv_heads = shared.plan.rank_kv_heads();
@@ -5720,7 +5790,7 @@ mod tests {
     use super::{
         AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV,
         DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk,
-        PrefillWalk, depth_policy_from_env, mma_attention_shared,
+        PrefillWalk, depth_policy_from_env, mma_attention_shared, overlap_request,
     };
     use crate::config::Inkling2Config;
 
@@ -5744,6 +5814,17 @@ mod tests {
             assert!(Mxfp8Walk::parse(Some("mma"), prefill).is_err());
         }
         assert!(Mxfp8Walk::parse(Some("tensor"), PrefillWalk::Tensor).is_err());
+    }
+
+    #[test]
+    fn the_band_overlap_is_on_unless_turned_off_and_refuses_other_values() {
+        assert_eq!(overlap_request(None), Ok(None));
+        assert_eq!(overlap_request(Some("")), Ok(None));
+        assert_eq!(overlap_request(Some("on")), Ok(Some(true)));
+        assert_eq!(overlap_request(Some("off")), Ok(Some(false)));
+        for value in ["1", "0", "halves", "ON"] {
+            assert!(overlap_request(Some(value)).is_err(), "{value}");
+        }
     }
 
     #[test]
