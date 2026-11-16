@@ -196,8 +196,9 @@ Step 2 reads every Spark's RoCE devices and works out the settings for you:
 
 It also checks that every port links at 200 Gb/s, uses MTU 9000, and, when a Spark's two
 interfaces share a subnet, that each answers ARP only for its own address (`arp_ignore=1`,
-`arp_announce=2`). **Set up the ports** applies the fix over SSH under passwordless `sudo -n`;
-the same commands are shown for copying into a terminal on that Spark. They write
+`arp_announce=2`). **Set up the ports** applies the fix on each Spark under passwordless
+`sudo -n` (locally on the lead, over SSH on the others); the same commands are shown for copying
+into a terminal on that Spark. They write
 `/etc/netplan/60-sparkflash-fabric.yaml` (the addresses and MTU, and on a ring a `/32` route for
 every fast address of every peer) and `/etc/sysctl.d/60-sparkflash-fabric.conf` (the ARP
 settings, and on a ring `ip_forward=1` with loose `rp_filter=2` so the Spark in between relays

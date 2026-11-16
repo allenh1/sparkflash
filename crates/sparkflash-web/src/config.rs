@@ -1698,6 +1698,12 @@ impl SparkConfig {
         for (key, value) in &self.network.env {
             env.insert(key.clone(), value.clone());
         }
+        // The typed field is the authority here too: a stale SPARKFLASH_FABRIC_SCHEDULE in
+        // [network].env must not make a solo launch refuse at startup.
+        env.insert(
+            "SPARKFLASH_FABRIC_SCHEDULE".to_owned(),
+            fabric_schedule_name(&self.cluster.fabric_schedule).to_owned(),
+        );
         env
     }
 
@@ -2448,6 +2454,16 @@ mod tests {
                 .map(String::as_str),
             Some("switchless"),
             "the saved field wins over a leftover environment entry"
+        );
+        // The solo launcher exports the same typed value: a stale entry must not make a
+        // single-Spark launch refuse at startup.
+        assert_eq!(
+            typed
+                .local_launch_env()
+                .get("SPARKFLASH_FABRIC_SCHEDULE")
+                .map(String::as_str),
+            Some("switchless"),
+            "the solo launcher exports the saved field too"
         );
 
         let mut config = SparkConfig::default();

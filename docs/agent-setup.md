@@ -96,8 +96,9 @@ Check the JSON response:
   needed on that Spark (MTU 9000, fast-subnet IPv4 address, `arp_ignore=1` / `arp_announce=2`, and
   on a ring a `/32` route for every fast address of every peer plus `ip_forward=1` and loose
   `rp_filter=2`). Apply them with `POST /api/network/setup` (the console's **Set up the ports**
-  button runs one SSH job per rank under `sudo -n`), or run the commands on the Spark if `sudo`
-  requires a password, then re-run `POST /api/inspect`.
+  button runs one job per rank that needs it, under `sudo -n`; the lead runs locally and the others
+  over SSH), or run the commands on the Spark if `sudo` requires a password, then re-run
+  `POST /api/inspect`.
 - `findings`: verify there are no entries with `"severity": "error"`.
 - `plan`: once present and error-free, apply the detected dual-rail RoCE settings (`NCCL_IB_HCA`,
   `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, and per-rank `peer` IPs) to `sparkflash.toml`:

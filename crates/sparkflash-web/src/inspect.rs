@@ -876,7 +876,7 @@ pub fn analyze_fabric(
             // of letting the check blame the cables.
             if fabric
                 .as_ref()
-                .is_some_and(|fabric| fabric.shape == FabricShape::Ring)
+                .is_some_and(|fabric| fabric.shape == FabricShape::Ring && fabric.links_measured)
                 && facts.rp_strict(&netdevs)
             {
                 findings.push(Finding {
@@ -1350,10 +1350,11 @@ fn shares_subnet(rails: &[Rail]) -> bool {
 fn arp_ok(facts: &NodeFacts, netdevs: &[&str]) -> bool {
     netdevs.iter().all(|netdev| {
         let (ignore, announce) = facts.arp(netdev);
-        // 1 and 2 both restrict a reply to the port that owns the address (a hardened host may
-        // pin 2); anything else needs the fix, which writes 1/2. Announcing at least 1 avoids
-        // advertising another port's address.
-        (1..=2).contains(&ignore) && announce >= 1
+        // 1 and 2 restrict a reply to the port that owns the address, and 3 additionally only
+        // suppresses replies for host-scope addresses, so a hardened host may pin any of them.
+        // 0 (and 8, which never replies) needs the fix, which writes 1/2. Announcing at least 1
+        // avoids advertising another port's address.
+        (1..=3).contains(&ignore) && announce >= 1
     })
 }
 
@@ -1579,12 +1580,24 @@ fn network_fixes(
         let routes_missing = !required.is_empty() && !routes_installed(facts, required);
         // A route the setup wrote that the measured fabric no longer needs: the netplan file is
         // rewritten without it, so a re-cable to a switch does not leave the ring's detours (or a
-        // black hole once a next hop moves) behind.
-        let obsolete_routes = facts
-            .routes
-            .iter()
-            .filter(|route| is_fabric_host_route(route))
-            .any(|have| !required.iter().any(|route| same_host_route(have, route)));
+        // black hole once a next hop moves) behind. Only a *measured* wiring may delete routes:
+        // an unmeasured fabric (arping missing, a probe that did not run) says nothing about
+        // whether the ring is still there, and removing its routes would break it.
+        let replaceable = match fabric {
+            Some(fabric) if fabric.links_measured => match fabric.shape {
+                FabricShape::Switched => true,
+                // A measured ring still needs its routes; only extras are removable.
+                FabricShape::Ring => !required.is_empty(),
+                _ => false,
+            },
+            _ => false,
+        };
+        let obsolete_routes = replaceable
+            && facts
+                .routes
+                .iter()
+                .filter(|route| is_fabric_host_route(route))
+                .any(|have| !required.iter().any(|route| same_host_route(have, route)));
         // The ring's relay is on whenever any route goes through another Spark. The sysctl file
         // keeps the switch for a reboot even when only the ARP settings need rewriting.
         // The relay is on when a route goes through another Spark: either one this check derived,
@@ -1718,15 +1731,19 @@ fn free_address(
     used: &BTreeSet<Ipv4Addr>,
 ) -> Ipv4Addr {
     let base = u32::from(subnet.0);
-    let hosts = if subnet.1 >= 31 {
+    // A /0 or a /31+ has no usable host range to sweep, and a malformed prefix must not shift by
+    // more than 31: one candidate is enough (the loop returns the first free one).
+    let prefix = u32::from(subnet.1.min(32));
+    let hosts: u64 = if prefix >= 31 {
         1
     } else {
-        (1u32 << (32 - u32::from(subnet.1))) - 2
+        (1u64 << (32 - prefix)) - 2
     };
-    let start = u32::try_from(11 + 10 * lane + rank).unwrap_or(11);
+    let start = 11u64 + 10 * lane as u64 + rank as u64;
     let mut host = start;
     loop {
-        let candidate = Ipv4Addr::from(base + 1 + (host - 1) % hosts.max(1));
+        let offset = u32::try_from((host - 1) % hosts.max(1)).unwrap_or(0);
+        let candidate = Ipv4Addr::from(base.wrapping_add(1).wrapping_add(offset));
         if !used.contains(&candidate) || host > start + hosts {
             return candidate;
         }
@@ -3166,6 +3183,83 @@ link 3 enp1s0f1np1 198.51.100.13 ok
                 .map(|node| (&node.network_fix, node.rank))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn an_unmeasured_fabric_never_deletes_the_routes_a_ring_already_has() {
+        // arping missing, sudo failing on one Spark, a probe timing out: the wiring could not be
+        // measured, which says nothing about whether the installed ring routes are still needed.
+        // Removing them would turn a working ring into an unreachable one.
+        let mut probes = cluster();
+        let ring = ring_fabric();
+        let routes = fabric_routes(&probes, Some(&ring));
+        for (rank, probe) in probes.iter_mut().enumerate() {
+            let facts = probe.as_mut().expect("facts");
+            facts.forward = true;
+            for route in &routes[rank] {
+                facts.routes.push(Route {
+                    destination: route.to.to_string(),
+                    netdev: route.netdev.clone(),
+                    via: route.via.map(|via| via.to_string()),
+                    metric: FABRIC_ROUTE_METRIC,
+                    dhcp: false,
+                });
+            }
+        }
+        let unmeasured = Fabric {
+            links: Vec::new(),
+            reachable: vec![None, None, None, None],
+            shape: FabricShape::Unknown,
+            links_measured: false,
+        };
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(unmeasured), true, 1);
+        for node in &report.nodes {
+            assert!(
+                node.network_fix.is_none(),
+                "rank {} would rewrite the netplan without its routes: {:?}",
+                node.rank,
+                node.network_fix
+            );
+        }
+    }
+
+    #[test]
+    fn a_hardened_arp_ignore_of_three_still_converges() {
+        // Mode 3 also restricts replies to the owning port (it only suppresses host-scope
+        // addresses), so a hardened 3 must not leave the ARP fix offered forever.
+        let mut probes = cluster();
+        for facts in probes.iter_mut().flatten() {
+            for link in &mut facts.links {
+                link.arp_ignore = 3;
+                link.arp_announce = 1;
+            }
+        }
+        let routes = fabric_routes(&probes, Some(&ring_fabric()));
+        assert!(routes.iter().all(|list| !list.is_empty()), "{routes:?}");
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(ring_fabric()),
+            true,
+            1,
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("arp_ignore")),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_free_address_survives_a_zero_or_malformed_prefix() {
+        // A /0 (or a malformed probe prefix) must not shift by 32 and panic the whole check.
+        let free = free_address((Ipv4Addr::UNSPECIFIED, 0), 0, 0, &BTreeSet::new());
+        assert_eq!(free, Ipv4Addr::new(0, 0, 0, 11));
+        let free = free_address((Ipv4Addr::new(198, 51, 100, 0), 24), 2, 1, &BTreeSet::new());
+        assert_eq!(free, Ipv4Addr::new(198, 51, 100, 23));
     }
 
     #[test]

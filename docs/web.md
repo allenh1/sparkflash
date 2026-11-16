@@ -75,7 +75,7 @@ while the model downloads, for example).
 | 1. Run this Spark only | **Run on this Spark only** | Saves a one-node TP=1 Qwen plan, with no SSH and no peers |
 | 2. Connect the fast network | Card: **Switched 200G** / **Switchless ring** | `PUT /api/config`: saves the fabric schedule the collectives run (the card marked **Detected** matches the measured wiring) |
 | 2. Connect the fast network | **Use these settings** | `POST /api/network/apply`: saves the NCCL values and peers the node check worked out |
-| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one SSH job per rank that needs a fix, running the check's netplan/sysctl fix under `sudo -n` (refused while the console believes the group is running: rank 0 answers, or a launch/swap has not been stopped) |
+| 2. Connect the fast network | **Set up the ports** | `POST /api/network/setup`: one job per rank that needs a fix (the lead runs locally, the others over SSH), running the check's netplan/sysctl fix under `sudo -n` (refused while the console believes the group is running: rank 0 answers, or a launch/swap has not been stopped) |
 | 3. Deploy the server | Automatic (**Deploy now** retries) | `scripts/sync-nodes.py` copies the same binary, cubins and NCCL library to the same paths |
 | 4. Download the model | **Download** | `scripts/hf-download.py` fetches `model.id` into the lead's Hugging Face cache |
 | 5. Copy the model to the other Sparks | **Copy** | `scripts/sync-nodes.py` copies the model's cache folder |

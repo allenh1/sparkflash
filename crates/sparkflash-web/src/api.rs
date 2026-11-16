@@ -1115,7 +1115,9 @@ fn cluster_believed_running(jobs: &[JobSummary]) -> bool {
             .max()
     };
     let launched = finished(&["launch", "swap"], true);
-    let stopped = finished(&["stop"], false);
+    // A stop that failed can leave ranks running (the launcher prompts the whole group under
+    // `set -e`), so only a successful stop clears it; the operator can retry the stop.
+    let stopped = finished(&["stop"], true);
     launched.is_some_and(|launched| stopped.is_none_or(|stopped| launched > stopped))
 }
 
@@ -1160,6 +1162,19 @@ async fn apply_network(State(web): State<WebState>) -> Response {
         return api_error(
             StatusCode::CONFLICT,
             "the last node check was taken of a different configuration; check the nodes again",
+        );
+    }
+    let checked_ms = web
+        .last_inspect
+        .read()
+        .expect("inspect lock")
+        .as_ref()
+        .map_or(0, |report| report.checked_ms);
+    if now_ms().saturating_sub(checked_ms) > NETWORK_SETUP_MAX_AGE_MS {
+        return api_error(
+            StatusCode::CONFLICT,
+            "the last node check is more than ten minutes old; check the nodes again before \
+             saving its settings",
         );
     }
     plan.apply(&mut config);
@@ -1210,10 +1225,9 @@ async fn network_setup(State(web): State<WebState>) -> Response {
     // group is coming up over. The telemetry gate above only fires once the sampler has seen the
     // server, which is later than the job ending. Only a launch the console still believes in
     // counts: a stop since (or a launch that failed) means nothing is coming up.
-    let believed = cluster_believed_running(&web.jobs.list());
-    let launched_ms = web
-        .jobs
-        .list()
+    let jobs = web.jobs.list();
+    let believed = cluster_believed_running(&jobs);
+    let launched_ms = jobs
         .iter()
         .filter(|job| {
             matches!(job.kind.as_str(), "launch" | "swap") && job.status == JobStatus::Succeeded
@@ -1232,6 +1246,22 @@ async fn network_setup(State(web): State<WebState>) -> Response {
         return api_error(
             StatusCode::CONFLICT,
             "the cluster was launched and has not been stopped; stop it before reconfiguring the fast ports",
+        );
+    }
+    // A cluster-wide error means the plan itself is invalid (two Sparks on one address, say):
+    // its routes must not be derived or written as root, whatever per-rank fixes it also has.
+    if let Some(message) = report
+        .findings
+        .iter()
+        .find(|finding| finding.rank.is_none() && finding.severity == Severity::Error)
+        .map(|finding| finding.message.clone())
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "the last check reports a problem no port fix can write: {message}; fix it and \
+                 check the nodes again"
+            ),
         );
     }
     // A port job holds its rank's own kind, so it cannot start twice; the other ranks of the
@@ -3812,6 +3842,59 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
+    #[tokio::test]
+    async fn network_setup_refuses_a_plan_the_check_marks_invalid() {
+        // A cluster-wide error (two Sparks on one address) invalidates the plan; a per-rank fix
+        // in the same report must not be applied as root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_state_with_ssh(
+            dir.path(),
+            false,
+            None,
+            Arc::new(FakeSsh {
+                fresh_rank: Some(3),
+            }),
+        );
+        let app = test_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(post_json("/api/inspect", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        {
+            let mut lock = state.last_inspect.write().expect("inspect lock");
+            let report = lock.as_mut().expect("a report");
+            assert!(
+                report.nodes.iter().any(|node| node.network_fix.is_some()),
+                "the fixture has a port fix to apply"
+            );
+            report.findings.push(inspect::Finding {
+                rank: None,
+                severity: Severity::Error,
+                message: "Two Sparks have the same fast-network address".to_owned(),
+            });
+        }
+        let response = app
+            .oneshot(post_json("/api/network/setup", "{}"))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let error = body_json(response).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(error.contains("no port fix can write"), "{error}");
+        assert!(
+            state
+                .jobs
+                .list()
+                .iter()
+                .all(|job| !job.kind.starts_with("network-setup-")),
+            "no port job may start for an invalid plan"
+        );
+    }
+
     #[test]
     fn a_launch_that_was_not_stopped_keeps_the_ports_alone() {
         let job = |kind: &str, status: JobStatus, finished_ms: u64| JobSummary {
@@ -3846,7 +3929,8 @@ mod tests {
             job("launch", JobStatus::Succeeded, 10),
             job("stop", JobStatus::Succeeded, 5),
         ]));
-        assert!(!cluster_believed_running(&[
+        // A failed stop may leave ranks running, so it does not clear the belief.
+        assert!(cluster_believed_running(&[
             job("launch", JobStatus::Succeeded, 10),
             job("stop", JobStatus::Failed, 20),
         ]));
@@ -4028,8 +4112,12 @@ mod tests {
                 )))
             })
             .collect();
-        *web.last_inspect.write().expect("inspect lock") =
-            Some(inspect::analyze(&config, &probes, true, 1));
+        *web.last_inspect.write().expect("inspect lock") = Some(inspect::analyze(
+            &config,
+            &probes,
+            true,
+            crate::stats::now_ms(),
+        ));
         // A real check records the configuration it measured; the apply refuses a report of
         // another one.
         *web.last_inspect_config.write().expect("inspect lock") = Some(config.clone());

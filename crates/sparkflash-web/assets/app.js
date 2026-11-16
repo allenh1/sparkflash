@@ -1723,6 +1723,8 @@ function networkBody(state, model) {
 
 async function chooseFabric(schedule) {
   if (schedule !== "switched" && schedule !== "switchless") return;
+  // The card saves the saved configuration, not the unsaved form; say so before it surprises.
+  if (!requireSaved()) return;
   const state = S.state;
   if (!state || !state.config) return;
   const current = (state.config.cluster && state.config.cluster.fabric_schedule) || "switched";
@@ -2331,7 +2333,7 @@ function bindGuide() {
         chooseFabric(action.dataset.fabric);
         break;
       case "setup-ports":
-        postAction("/api/network/setup", undefined, false);
+        if (requireSaved()) postAction("/api/network/setup", undefined, false);
         break;
       case "install":
         if (requireSaved()) postAction("/api/actions/sync", { what: "software" }, false);
