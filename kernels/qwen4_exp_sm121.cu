@@ -532,6 +532,18 @@ extern "C" __global__ void q4e_gemv4_bf16(
 // above, so it is included after them.
 #include "bf16_packed_sm121.cuh"
 
+// One half of a batch's tokens: the first ceil(batch / 2), or the rest. A batched packed walk
+// takes a pair of rows against one half, so it holds Q4E_HALF_BATCH sums a row.
+#define Q4E_HALF_BATCH ((Q4E_MAX_BATCH + 1) / 2)
+struct Q4eBatchHalf {
+    int first;
+    int count;
+};
+__device__ __forceinline__ Q4eBatchHalf q4e_batch_half(int batch, int which) {
+    const int lower = (batch + 1) / 2;
+    return which == 0 ? Q4eBatchHalf{0, lower} : Q4eBatchHalf{lower, batch - lower};
+}
+
 // q4e_gemv_bf16 over a packed matrix: the same rows a warp, the same groups along the grid's y,
 // the same sums over the same words, from the packed bytes. Columns are a multiple of 256 and x
 // is 16-byte aligned (the host refuses anything else: there is no column walk to fall back on).
@@ -563,22 +575,29 @@ extern "C" __global__ void q4e_gemv_packed(const unsigned char* __restrict__ w,
     if (batch > Q4E_MAX_BATCH) {
         return;
     }
-    for (int row = (blockIdx.x * warps + warp) * 2; row < rows; row += stride * 2) {
+    // A work item is a pair of rows and one half of the tokens, so the grid's one warp a row
+    // all work, each with half the sums in flight. The weights' second read is the first's
+    // block's, from L1; a (row, token) sum is the same walk either way.
+    for (int item = blockIdx.x * warps + warp; item < ((rows + 1) / 2) * 2; item += stride) {
+        const int row = (item >> 1) * 2;
+        const Q4eBatchHalf half = q4e_batch_half(batch, item & 1);
         const bool second = row + 1 < rows;
         const Q4ePackedRow pair[2] = {
             q4e_packed_row(w, offsets, entries, row, columns, row_bytes),
             q4e_packed_row(w, offsets, entries, second ? row + 1 : row, columns, row_bytes)};
-        float totals[2][Q4E_MAX_BATCH];
-        q4e_packed_rows_dot_batch<2>(pair, x, columns, lane, batch, totals);
+        float totals[2][Q4E_HALF_BATCH];
+        const float* __restrict__ xh = x + (unsigned long long)half.first * columns;
+        q4e_packed_rows_dot_batch<2, Q4E_HALF_BATCH>(pair, xh, columns, lane, half.count, totals);
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
-            if (t < batch) {
+        for (int t = 0; t < Q4E_HALF_BATCH; ++t) {
+            if (t < half.count) {
                 const float first_sum = q4e_warp_sum(totals[0][t]);
                 const float second_sum = q4e_warp_sum(totals[1][t]);
+                const unsigned long long token = (unsigned long long)(half.first + t);
                 if (lane == 0) {
-                    y[(unsigned long long)t * rows + row] = first_sum;
+                    y[token * rows + row] = first_sum;
                     if (second) {
-                        y[(unsigned long long)t * rows + row + 1] = second_sum;
+                        y[token * rows + row + 1] = second_sum;
                     }
                 }
             }
@@ -662,8 +681,11 @@ extern "C" __global__ void q4e_gemv4_packed(
     if (batch > Q4E_MAX_BATCH) {
         return;
     }
-    for (int global_row = (blockIdx.x * warps + warp) * 2; global_row < total_rows;
-         global_row += stride * 2) {
+    // Work items as in q4e_gemv_packed: a pair of rows and one half of the tokens.
+    for (int item = blockIdx.x * warps + warp; item < ((total_rows + 1) / 2) * 2;
+         item += stride) {
+        const int global_row = (item >> 1) * 2;
+        const Q4eBatchHalf half = q4e_batch_half(batch, item & 1);
         const bool second = global_row + 1 < total_rows;
         Q4ePackedRow pair[2];
         float* out[2];
@@ -674,17 +696,19 @@ extern "C" __global__ void q4e_gemv4_packed(
         q4e_gemv4_packed_locate(second ? global_row + 1 : global_row, w, offsets, entries, y, r,
                                 columns, row_bytes, &pair[1], &out[1], &local_row[1],
                                 &out_rows[1]);
-        float totals[2][Q4E_MAX_BATCH];
-        q4e_packed_rows_dot_batch<2>(pair, x, columns, lane, batch, totals);
+        float totals[2][Q4E_HALF_BATCH];
+        const float* __restrict__ xh = x + (unsigned long long)half.first * columns;
+        q4e_packed_rows_dot_batch<2, Q4E_HALF_BATCH>(pair, xh, columns, lane, half.count, totals);
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
-            if (t < batch) {
+        for (int t = 0; t < Q4E_HALF_BATCH; ++t) {
+            if (t < half.count) {
                 const float first_sum = q4e_warp_sum(totals[0][t]);
                 const float second_sum = q4e_warp_sum(totals[1][t]);
+                const unsigned long long token = (unsigned long long)(half.first + t);
                 if (lane == 0) {
-                    out[0][(unsigned long long)t * out_rows[0] + local_row[0]] = first_sum;
+                    out[0][token * out_rows[0] + local_row[0]] = first_sum;
                     if (second) {
-                        out[1][(unsigned long long)t * out_rows[1] + local_row[1]] = second_sum;
+                        out[1][token * out_rows[1] + local_row[1]] = second_sum;
                     }
                 }
             }

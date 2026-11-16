@@ -207,17 +207,17 @@ __device__ __forceinline__ float q4e_packed_row_dot(const Q4ePackedRow& row,
     return dot.total;
 }
 
-// R rows against `batch` vectors: q4e_rows_dot_bf16_batch's grouping, so a (row, token) sum is
-// the one-row walk's bits.
-template <int R>
+// R rows against `batch` vectors (at most T): q4e_rows_dot_bf16_batch's grouping, so a (row,
+// token) sum is the one-row walk's bits whichever tokens share the walk.
+template <int R, int T = Q4E_MAX_BATCH>
 struct Q4ePackedBatch {
     const float* __restrict__ x;
     int columns;
     int batch;
-    float (*totals)[Q4E_MAX_BATCH];
+    float (*totals)[T];
     __device__ __forceinline__ void quad(const uint4 (&v)[R][4], int chunk) {
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+        for (int t = 0; t < T; ++t) {
             if (t < batch) {
                 const float* xt = x + (unsigned long long)t * columns;
 #pragma unroll
@@ -232,7 +232,7 @@ struct Q4ePackedBatch {
     }
     __device__ __forceinline__ void pair(const uint4 (&v)[R][2], int chunk) {
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+        for (int t = 0; t < T; ++t) {
             if (t < batch) {
                 const float* xt = x + (unsigned long long)t * columns;
 #pragma unroll
@@ -245,7 +245,7 @@ struct Q4ePackedBatch {
     }
     __device__ __forceinline__ void single(const uint4 (&v)[R][1], int chunk) {
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+        for (int t = 0; t < T; ++t) {
             if (t < batch) {
                 const float* xt = x + (unsigned long long)t * columns;
 #pragma unroll
@@ -257,19 +257,19 @@ struct Q4ePackedBatch {
     }
 };
 
-template <int R>
+template <int R, int T = Q4E_MAX_BATCH>
 __device__ __forceinline__ void q4e_packed_rows_dot_batch(const Q4ePackedRow (&rows)[R],
                                                           const float* __restrict__ x,
                                                           int columns, int lane, int batch,
-                                                          float (*totals)[Q4E_MAX_BATCH]) {
+                                                          float (*totals)[T]) {
 #pragma unroll
     for (int r = 0; r < R; ++r) {
 #pragma unroll
-        for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
+        for (int t = 0; t < T; ++t) {
             totals[r][t] = 0.0f;
         }
     }
-    Q4ePackedBatch<R> dot{x, columns, batch, totals};
+    Q4ePackedBatch<R, T> dot{x, columns, batch, totals};
     q4e_packed_walk<R>(rows, columns, lane, dot);
 }
 
