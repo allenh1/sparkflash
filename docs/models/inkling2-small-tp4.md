@@ -978,6 +978,22 @@ thousand rows the MMA forms already read each expert's weights once a chunk, so 
 saves little, and the 16K prompt's extra time over 4K is attention over the growing context, not
 weights. The boost is kept because it is free in bits and buys a little at long prompts.
 
+That was before the MXFP8 layers took the grouped MMA (D120) and the row split's gathers went
+under the compute. Since then a chunk's fixed costs (each expert's weights read once a chunk, a
+collective's latency, a band's two halves) are a larger share of a long prompt, and the width
+matters. The 93K prompt on four ranks under the row split (batch arm, 131,072-position context):
+
+| chunk | prefill | prompt tok/s | lead's lowest MemAvailable |
+| --- | --- | --- | --- |
+| 4,096 fixed | 90.95 s | 1,024 | |
+| default (8,192 while 16,384 remain) | 81.1 s | 1,148 | |
+| 16,384 fixed | 76.8 s | 1,213 | 9.1 GB |
+
+The served launch fixes 4,096 rows at the 1M window to keep its memory margin, so its 93K prompt
+takes about 12 % longer than the default width would. The bits do not depend on the width (D117),
+so a wider pin at 1M is a question of memory alone: it is the maintainer's call, and its margin
+under a held 1M session has to be measured first.
+
 Decode, unchanged in arithmetic, is 39-40 ms a step after a five-token prompt, 45 ms after 4K and
 55-58 ms after 16K, against 112-147 ms when §14 was written. Three changes landed in between: the
 collectives moved from the TCP frames onto the device through NCCL (`RunReduce`, the communicator
@@ -1463,6 +1479,31 @@ Teacher-forced on the D117 text against expert parallelism: top-1 agrees on 12 o
 overlap 4-5, mean abs logit difference 0.08-0.37 a row (max 2.37), KL at most 1.19e-2 nats (mean
 4.1e-3). That is the size of D119's distance, and 2,253,663 of the 2,400,696 logits differ.
 
+Those figures are the token walk's. Under the tensor walk (D117, D120) the split's MXFP8 layers
+first took the pair walk: the MXFP8 tile read a stage's two ue8m0 codes as four bytes at the row's
+codes, and a 576-column down row holds 18 codes, so every other row's codes start two bytes into a
+word. The tile now copies the aligned word that holds the stage's pair and takes the half the row
+starts in, so it walks any row of whole 64-column stages, and the released split's rows read the
+same bytes as before: the teacher-forced logits and the 93K digest are unchanged. Against the row
+split (the files served since 11:05), the same build and launch:
+
+| on the four ranks, tensor walk | row split | intermediate split |
+|---|---|---|
+| repeating 5K prompt | 6.49 s | 5.88 s |
+| its decode step (88 steps after the first 8) | 26.03 ms | 25.1 ms (same 96 greedy ids) |
+| 93K prompt | 83.4 s | 81.0 s |
+
+Teacher-forced on twelve cuts of the 6,000-token text:
+
+| | top-1 | top-5 overlap | mean abs logit difference a cut | max | KL max (mean), nats |
+|---|---|---|---|---|---|
+| intermediate split against exact | 12 of 12 | 4-5 | 0.059-0.354 | 2.06 | 1.53e-2 (5.57e-3) |
+| intermediate split against the row split | 12 of 12 | 4-5 | 0.084-0.367 | 2.37 | 1.19e-2 (3.68e-3) |
+| row split against exact (D117, for scale) | 12 of 12 | 4-5 | 0.057-0.339 | 2.03 | 1.55e-2 (4.58e-3) |
+
+So the split sits as far from exact as the row split does. After the 93K prompt its greedy ids
+agree with the row split's for 15 tokens and part at the 16th. It stays opt-in at conversion.
+
 ### A verify's rows read the keys together; the residual's statistics hold their row
 
 Two more changes move no bit:
@@ -1775,6 +1816,90 @@ Four ranks, row split, batch arm, one session, each prompt twice:
 All three give the same bits. The teacher-forced logits are identical to the D120 build's in
 every value, with the halves and without them. The repeating prompt's decode digest is
 `90f777a3c48a6bc4` and the 93K prompt's is `c6e0ef10fd49a8e0` in every column.
+
+That left the layer's other collective on the run's stream: the attention delta's all-reduce, a
+scatter, a sum and a gather of every row's residual-wide partial, about 11.5 s exposed at 93K. It
+now runs in halves too. Under the overlap and the tensor-core attention, a chunk of 512 rows or
+more launches the attention's MMA twice, for the rows before a 16-row block's edge near the
+middle and for the rows from it. After each launch the run's stream widens that half's output
+and projects it, and the side stream sums the half's delta in `exchange_sum`'s two shots
+(`attention_half` in `device/chunk.rs`). So half 0's sum crosses the wire under half 1's
+attention, and the run's stream waits for the second sum before the convolution.
+
+A block of the MMA reads only its own 16 rows' query side, sink and gate, and takes its keys, its
+tiles and its bias distances from its first row's position, so at a block's edge every block is
+the one launch's block. The widen is per element, the projection per row, and each element's sum
+is the same fold in the same order whichever rows share the launch, so the bits do not move.
+Half 1's sum takes the slots past half 0's. `SPARKFLASH_INKLING_OVERLAP=off` runs it whole with
+the band, and the trace keeps the whole form, since it reads the projection back before its sum.
+
+| on the four ranks, interleaved | without (pf6) | the attention delta in halves |
+|---|---|---|
+| 93K prompt | 79.14 s, 79.21 s | 77.28 s, 77.31 s |
+| prompt tokens a second at 93K | 1,176 | 1,205 |
+| repeating 5K prompt | | 6.15 s |
+| 6,000-token text, twelve teacher-forced cuts | | 8.19 s |
+
+The teacher-forced logits are identical in every value, and the 93K and repeating prompts keep
+their digests. In a trace the exposed NCCL time at 93K falls from 19.7 s to 13.8 s, all of it now
+on the side stream where the other half's compute does not cover it. The compute beside a
+collective runs a little slower, so the prompt gains 1.9 s of the 5.9 s.
+
+### The block residuals read their summary stack once
+
+Every layer opens its attention and its MLP with a block residual: a softmax over the summary
+stack and the current stream, scored by the layer's queries (three on a full layer's attention,
+one elsewhere). The one-block form read the stack twice for each query, once to score it and once
+to mix it, and the walk's 97 calls a chunk took 7.01 s over the 13 chunks of the 93K prompt.
+
+A chunk walk now chains them (`inkling_block_residual_chain_*`). Each call's mix pass also scores
+the next call's queries against the summary rows it reads, and leaves the scores for that call in
+the residual's statistics rows. The next call then reads only the rows the stack gained since,
+and the stream. The query counts are compile-time entries, a call's and the next call's
+(`q1_n0` through `q3_n3`), so a thread keeps the next call's dots in registers: 40 to 116 a
+thread, against 175 for a first form with the counts at run time. Every score and mix is the
+one-block form's reduction in its order, so the bits are the same: the teacher-forced logits are
+identical in every value, and the 93K and repeating prompts keep their digests.
+
+Its kernels take 5.00 s at 93K against 7.01 s. End to end, that is inside the run-to-run noise
+of one interleaved pair (79.5 and 82.7 s chained, 81.0 and 81.8 s not).
+`SPARKFLASH_INKLING_RESIDUAL_CHAIN=off` runs the one-block form. A model whose stack outgrows the
+chained form's eight summary rows stands down to it when the switch is unset and is refused under
+`on`, and any other value is refused.
+
+### Where the 93K prompt's time goes now
+
+The 93K prompt took 132 s (706 prompt tokens a second) before D120. At default bits it now takes
+77.3 s (1,205), and 72.2 s with the opt-in head-only activation (measured before the attention
+halves). Rank 0's trace of the default build, a 77.1 s prefill span with 0.4 s of it idle:
+
+| stage | own time | share |
+|---|---|---|
+| NCCL send/recv (13.8 s of it exposed) | 16.0 s | 21 % |
+| NVFP4 expert gate_up and down (layers 0-39) | 24.0 s | 31 % |
+| attention MMA | 11.3 s | 15 % |
+| dense projections (`glm_prefill_bf16_wide`) | 5.9 s | 8 % |
+| MXFP8 expert gate_up and down (layers 40-47) | 5.4 s | 7 % |
+| block residuals | 5.0 s | 6 % |
+| residual add, row norms, short convolutions | 4.9 s | 6 % |
+
+These levers were looked at and not built:
+
+- The collectives on the direct-RDMA exchange over both rails. The exchange already carries every
+  sum of at most 256 KB, but a prompt chunk's rounds stay on NCCL over one rail until the lead's
+  second rail works. Every NCCL call above is on the side stream, and the exposed 13.8 s is the
+  most this could recover.
+- More query rows a key tile in the full layers' attention. The MMA block holds 86 KB of the
+  101 KB a block may take, at 212 registers a thread, so a wider query tile does not fit without
+  a new tile layout, and the kernel is bound by compute and imbalance, not by reading keys.
+- One launch for the projections that read one input (the query, gate, relative state and, on a
+  sliding layer, key and value). The narrow ones underfill the device: a 256-column projection
+  is 64 tiles on 48 SMs, 0.91 ms at 8,192 rows. Grouped, they would save about 0.9 ms a layer at
+  that width, about 0.5 s at 93K.
+- Folding the residual add into the convolution before it, or into the block residual after it.
+  Each saves one pass over the stream, about 0.5 ms a layer at 8,192 rows and about 0.6 s at 93K.
+
+Each of the last three is under the 2 % that separates two runs of the same build.
 
 ### The experts' activation as its head alone (opt-in, not the default)
 
