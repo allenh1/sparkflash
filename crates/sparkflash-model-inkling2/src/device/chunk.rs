@@ -70,40 +70,14 @@ pub(super) fn exchange_sum(
                  in whole groups of four"
             )));
         }
-        let bytes = elements * std::mem::size_of::<f32>();
-        let rank = shared.exchange.rank();
-        let sum = |own: u64, count: usize| {
-            let grid = (count / 4).div_ceil(SUM_BLOCK as usize) as u32;
-            shared
-                .launch(
-                    shared.kernels.sum_slots,
-                    (grid, 1, 1),
-                    (SUM_BLOCK, 1, 1),
-                    &[own, slots.0, count as u64, rank as u64, world as u64],
-                )
-                .map_err(device_error)
-        };
-        if bytes >= TWO_SHOT_FROM && elements.is_multiple_of(4 * world) {
-            // Two shots: this rank sums chunk `rank` (every peer's piece of it lands in the
-            // slots), then the summed chunks are shared in place. Each element is the same fold
-            // in the same order, so the bits are the one-shot's at half the bytes a rank.
-            let chunk = elements / world;
-            let mine = pointer.0 + (rank * chunk * std::mem::size_of::<f32>()) as u64;
-            shared
-                .exchange
-                .scatter_on_device(0, pointer.0, slots.0, bytes)
-                .map_err(device_error)?;
-            sum(mine, chunk)?;
-            return shared
-                .exchange
-                .exchange_on_device(0, mine, pointer.0, chunk * std::mem::size_of::<f32>())
-                .map_err(device_error);
+        if takes_two_shots(elements, world) {
+            return two_shots(shared, None, pointer, slots, elements);
         }
         shared
             .exchange
-            .exchange_on_device(0, pointer.0, slots.0, bytes)
+            .exchange_on_device(0, pointer.0, slots.0, elements * std::mem::size_of::<f32>())
             .map_err(device_error)?;
-        return sum(pointer.0, elements);
+        return sum_slots(shared, None, pointer.0, slots, elements);
     }
     let mut bytes = row_bytes(&vec![0f32; elements]);
     shared
@@ -120,6 +94,71 @@ pub(super) fn exchange_sum(
         .copy_htod(&pointer, &row_bytes(&values))
         .map_err(device_error)?;
     Ok(())
+}
+
+/// Whether [exchange_sum] of `elements` takes two shots ([two_shots]) rather than one.
+fn takes_two_shots(elements: usize, world: usize) -> bool {
+    elements * std::mem::size_of::<f32>() >= TWO_SHOT_FROM && elements.is_multiple_of(4 * world)
+}
+
+/// [exchange_sum]'s two shots of `elements` at `pointer`, on the run's stream or, under `side`,
+/// on that stream behind everything queued on the run's so far: this rank sums chunk `rank`
+/// (every peer's piece of it lands in the slots), then the summed chunks are shared in place. Each
+/// element is the same fold in the same order, so the bits are the one-shot's at half the bytes a
+/// rank.
+fn two_shots(
+    shared: &Shared,
+    side: Option<&SideStream>,
+    pointer: Deviceptr,
+    slots: Deviceptr,
+    elements: usize,
+) -> Result<(), BackendError> {
+    let (rank, world) = (shared.exchange.rank(), shared.exchange.world());
+    let float = std::mem::size_of::<f32>();
+    let chunk = elements / world;
+    let mine = pointer.0 + (rank * chunk * float) as u64;
+    if let Some(side) = side {
+        shared.cuda.side_follow_run(side).map_err(device_error)?;
+    }
+    let stream = side.map_or(0, SideStream::raw);
+    shared
+        .exchange
+        .scatter_on_device(stream, pointer.0, slots.0, elements * float)
+        .map_err(device_error)?;
+    sum_slots(shared, side, mine, slots, chunk)?;
+    shared
+        .exchange
+        .exchange_on_device(stream, mine, pointer.0, chunk * float)
+        .map_err(device_error)
+}
+
+/// q4e_sum_slots over `count` values at `own`: the slots' pieces and its own, in ascending rank
+/// order from zero, on the run's stream or on `side`.
+fn sum_slots(
+    shared: &Shared,
+    side: Option<&SideStream>,
+    own: u64,
+    slots: Deviceptr,
+    count: usize,
+) -> Result<(), BackendError> {
+    let grid = ((count / 4).div_ceil(SUM_BLOCK as usize) as u32, 1, 1);
+    let args = [
+        own,
+        slots.0,
+        count as u64,
+        shared.exchange.rank() as u64,
+        shared.exchange.world() as u64,
+    ];
+    let entry = shared.kernels.sum_slots;
+    match side {
+        None => shared.launch(entry, grid, (SUM_BLOCK, 1, 1), &args),
+        // The side stream already follows the run's (two_shots), and outside a graph segment
+        // side_launch always launches.
+        Some(side) => shared
+            .cuda
+            .side_launch(side, entry.kernel, grid, (SUM_BLOCK, 1, 1), &args),
+    }
+    .map_err(device_error)
 }
 
 /// The block q4e_sum_slots is written for (the token image's Q4E_BLOCK).
@@ -1418,6 +1457,35 @@ pub(super) fn walk_rows(
                             // which is what keeps a chunk's score the score the row-at-a-time
                             // walk computes.
                             let taus = tau_table(layer.tau)?;
+                            // Under the overlap the output, its projection and its delta's sum
+                            // run as two halves of the rows (attention_half), and the walk goes on
+                            // past them.
+                            let split = attention_split(shared, walk, layer, cursor, rows);
+                            let overlap = match (split, shared.overlap.as_ref()) {
+                                (Some(_), Some(overlap)) => Some(overlap.lock().map_err(|_| {
+                                    device_error("the band overlap's lock is poisoned")
+                                })?),
+                                _ => None,
+                            };
+                            let mut half = |first_row: usize, count: usize| match (
+                                overlap.as_deref(),
+                                split,
+                            ) {
+                                (Some(overlap), Some((_, projection))) => attention_half(
+                                    shared,
+                                    scratch,
+                                    walk,
+                                    weight(projection.weights[0]),
+                                    &overlap.side,
+                                    first_row,
+                                    count,
+                                )
+                                .map_err(|error| error.to_string()),
+                                _ => Err("an attention half with no overlap".to_owned()),
+                            };
+                            let halves = split.map(|(rows, _)| rows).zip(Some(
+                                &mut half as &mut dyn FnMut(usize, usize) -> Result<(), String>,
+                            ));
                             run(shared.attention_chunk(
                                 scratch,
                                 index,
@@ -1440,7 +1508,15 @@ pub(super) fn walk_rows(
                                 if sliding { cache_rows } else { 0 },
                                 layer.rel_extent,
                                 layer.tau.at(position),
+                                halves,
                             ))?;
+                            if let Some(overlap) = overlap.as_deref() {
+                                // The convolution reads the summed delta.
+                                run(shared.cuda.side_mark(&overlap.side, &overlap.summed))?;
+                                run(shared.cuda.run_wait(&overlap.summed))?;
+                                cursor += 4;
+                                continue;
+                            }
                         }
                         Rows::Verify(state, _) => {
                             // The decode step's attention, each row against its own prefix: the
@@ -2123,6 +2199,106 @@ fn run_band_mma(
 /// half's gathers are too short to hide anything behind.
 const OVERLAP_ROWS: usize = 512;
 
+/// Where a chunk's attention at `cursor` splits into the halves [attention_half] runs, and the
+/// output projection's step; `None` runs it whole. The halves run under the overlap (the row
+/// split's tensor walk on the device leg), the tensor-core attention, a chunk of at least
+/// [OVERLAP_ROWS] rows, and an attention the widen, the output projection and the delta's sum
+/// follow, as the plan lays every layer out. The trace reads the projection back before its sum,
+/// so it keeps the whole form.
+fn attention_split<'l>(
+    shared: &Shared,
+    walk: PrefillWalk,
+    layer: &'l LayerSchedule,
+    cursor: usize,
+    rows: usize,
+) -> Option<(usize, &'l Step)> {
+    if shared.overlap.is_none()
+        || shared.exchange_slots.is_none()
+        || walk != PrefillWalk::Tensor
+        || shared.attention != AttentionWalk::Fast
+        || trace_on()
+    {
+        return None;
+    }
+    let [widen, projection, sum] = layer.steps.get(cursor + 1..cursor + 4)? else {
+        return None;
+    };
+    let laid_out = matches!(widen.op, Op::Widen)
+        && matches!(
+            (projection.op, projection.target),
+            (Op::Gemv, Target::Project(Projection::AttentionOut))
+        )
+        && matches!(sum.op, Op::Collective(Collective::AttentionDelta));
+    if !laid_out {
+        return None;
+    }
+    Some((
+        split_rows(rows, shared.hidden(), shared.exchange.world())?,
+        projection,
+    ))
+}
+
+/// [attention_split]'s row: half the chunk's rows, down to an edge of the tensor-core walk's
+/// blocks, where each half's sum takes [exchange_sum]'s two shots.
+fn split_rows(rows: usize, hidden: usize, world: usize) -> Option<usize> {
+    if rows < OVERLAP_ROWS {
+        return None;
+    }
+    let split = rows / 2 / MMA_Q * MMA_Q;
+    (takes_two_shots(split * hidden, world) && takes_two_shots((rows - split) * hidden, world))
+        .then_some(split)
+}
+
+/// One half of a chunk's attention output, once its MMA is queued (Shared::attention_mma under
+/// halves): the widen and the output projection of its rows on the run's stream, then its delta's
+/// two-shot sum on the overlap's side stream behind them, so half 0's sum crosses the wire under
+/// half 1's attention. The widen is per element, every output of the projection is its own row's
+/// dot in its own K order, and every element's sum is the one fold in the one order whichever rows
+/// share its launch, so the halves give every bit the whole form gives. Half 1's slots are past
+/// half 0's, so none of its pieces lands where half 0's sum still reads. The walk marks the side
+/// stream after the second half and the run's stream waits for it before the convolution.
+fn attention_half(
+    shared: &Shared,
+    scratch: &Scratch,
+    walk: PrefillWalk,
+    matrix: Deviceptr,
+    side: &SideStream,
+    first_row: usize,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let hidden = shared.hidden();
+    let width = shared.heads() * shared.config.head_dim;
+    let float = std::mem::size_of::<f32>();
+    let attended = scratch.attn.offset(first_row * width * float);
+    shared
+        .launch(
+            shared.kernels.widen,
+            (flat(rows * width), 1, 1),
+            (ELEMENT_BLOCK, 1, 1),
+            &[
+                scratch
+                    .attn_bf16
+                    .offset(first_row * width * std::mem::size_of::<u16>())
+                    .0,
+                attended.0,
+                (rows * width) as u64,
+            ],
+        )
+        .map_err(device_error)?;
+    let delta = scratch.delta.offset(first_row * hidden * float);
+    project(shared, walk, matrix, attended, delta, hidden, width, rows)?;
+    let slots = shared
+        .exchange_slots
+        .ok_or_else(|| device_error("an attention half's sum has no device-leg slots"))?;
+    two_shots(
+        shared,
+        Some(side),
+        delta,
+        slots.offset(first_row * hidden * float),
+        rows * hidden,
+    )
+}
+
 /// The kernels and table one layer's halves run.
 struct HalvesBand {
     meta: MmaTable,
@@ -2725,4 +2901,27 @@ fn run_band_chunk(
 
     // The mix is local; the exchange that follows it completes the sum over the ranks.
     band_mix(shared, scratch, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_attention_halves_split_on_a_block_edge_where_both_sums_take_two_shots() {
+        // Inkling-2-Small's residual over four ranks.
+        let (hidden, world) = (4608, 4);
+        assert_eq!(split_rows(4096, hidden, world), Some(2048));
+        assert_eq!(split_rows(1000, hidden, world), Some(496));
+        assert_eq!(split_rows(OVERLAP_ROWS - 1, hidden, world), None);
+        for rows in OVERLAP_ROWS..=4096 {
+            let split = split_rows(rows, hidden, world).expect("every chunk this wide splits");
+            assert!(
+                split.is_multiple_of(MMA_Q) && split > 0 && split < rows,
+                "{rows}"
+            );
+        }
+        // A half that is not four ranks' whole groups of four would take one shot: whole form.
+        assert_eq!(split_rows(1000, 4605, world), None);
+    }
 }

@@ -333,8 +333,9 @@ impl ActivationPlanes {
 
 /// The switch for the row split's two-halves band under [PrefillWalk::Tensor] (BandOverlap):
 /// unset or `on` runs a chunk's band as two halves of its rows with each half's gathers on a side
-/// stream, `off` runs it whole with its gathers on the run's stream. The bits are the same either
-/// way. `on` named where the halves cannot run (another split or walk, one rank, no device leg) is
+/// stream, and its attention's output (under [AttentionWalk::Fast]) as two halves with each half's
+/// delta summed there; `off` runs both whole with their collectives on the run's stream. The bits
+/// are the same either way. `on` named where the halves cannot run (another split or walk, one rank, no device leg) is
 /// refused, as is an unknown value.
 pub const OVERLAP_ENV: &str = "SPARKFLASH_INKLING_OVERLAP";
 
@@ -540,6 +541,11 @@ const MMA_HEAD_DIM: usize = 128;
 const MMA_D_REL: usize = 16;
 const MMA_REL_STRIDE: usize = 52;
 const MMA_SHARED_LIMIT: usize = 101_376;
+
+/// Where a chunk's tensor-core attention splits its rows (a multiple of [MMA_Q]), and what runs
+/// over each half's rows once that half's MMA is queued, called as `(first_row, rows)`
+/// (chunk::attention_half).
+type AttentionHalves<'h> = (usize, &'h mut dyn FnMut(usize, usize) -> Result<(), String>);
 
 /// inkling_attn_mma's dynamic shared memory for `groups` query heads a kv head: q's BF16 head
 /// and remainder for the group's rows, a key and a value tile, the tile's key gains and value
@@ -1074,8 +1080,9 @@ struct MmaTable {
     scales: Deviceptr,
 }
 
-/// The side stream and events of the row split's two-halves band (chunk::run_band_halves), made
-/// at open: the band's four gathers run on `side` while the run's stream computes the other half.
+/// The side stream and events of the row split's two-halves passes, made at open: the band's four
+/// gathers (chunk::run_band_halves) and the attention delta's two sums (chunk::attention_half) run
+/// on `side` while the run's stream computes the other half.
 struct BandOverlap {
     /// At the context's greatest priority: a gather that queues behind the other half's grids
     /// holds up the peers too.
@@ -1084,6 +1091,8 @@ struct BandOverlap {
     gathered: [StreamEvent; 2],
     /// Marked on `side` once a half's mix rows are gathered.
     mixed: [StreamEvent; 2],
+    /// Marked on `side` once both halves of the attention delta are summed.
+    summed: StreamEvent,
 }
 
 // SAFETY: a stream and events of the backend's context. The band's lock gives them to one chunk
@@ -1097,6 +1106,7 @@ impl BandOverlap {
             side: cuda.side_stream_urgent()?,
             gathered: [event()?, event()?],
             mixed: [event()?, event()?],
+            summed: event()?,
         })
     }
 }
@@ -1871,9 +1881,11 @@ impl Shared {
     /// A prompt chunk's attention ([Self::attention_rows]'s arguments, `layer` the schedule's
     /// layer for [AttentionWalk::Check]'s line): the tensor-core walk under [AttentionWalk::Fast],
     /// the exact walk otherwise, and under [AttentionWalk::Check] the exact walk's output with the
-    /// tensor-core walk run beside it and the layer's largest difference printed.
+    /// tensor-core walk run beside it and the layer's largest difference printed. `halves` runs
+    /// the tensor-core walk's MMA as two launches ([Self::attention_mma]), which the other walks
+    /// refuse.
     #[allow(clippy::too_many_arguments)]
-    fn attention_chunk(
+    fn attention_chunk<'h>(
         &self,
         scratch: &Scratch,
         layer: usize,
@@ -1896,11 +1908,19 @@ impl Shared {
         cache_rows: usize,
         rel_extent: usize,
         tau: f32,
+        halves: Option<AttentionHalves<'h>>,
     ) -> Result<(), String> {
+        if halves.is_some() && self.attention != AttentionWalk::Fast {
+            return Err(format!(
+                "a chunk's attention runs as two halves on the tensor-core walk alone, and this \
+                 backend's walk is {:?}",
+                self.attention
+            ));
+        }
         if let Some(tables) = tables {
             self.store_key_tables(tables, keys, values, rows, first_position, kv_heads)?;
         }
-        let tensor = |into: Deviceptr| -> Result<(), String> {
+        let tensor = |into: Deviceptr, halves: Option<AttentionHalves<'h>>| -> Result<(), String> {
             let mma = scratch.mma.as_ref().ok_or_else(|| {
                 format!("a {rows}-row chunk arena holds no tensor-core attention buffers")
             })?;
@@ -1925,10 +1945,11 @@ impl Shared {
                 cache_rows,
                 rel_extent,
                 tau,
+                halves,
             )
         };
         if self.attention == AttentionWalk::Fast {
-            return tensor(out);
+            return tensor(out, halves);
         }
         self.attention_walk(
             scratch,
@@ -1959,7 +1980,7 @@ impl Shared {
         let check = scratch.mma.and_then(|mma| mma.check).ok_or_else(|| {
             "the check walk's arena holds no output beside the exact one".to_owned()
         })?;
-        tensor(check)?;
+        tensor(check, None)?;
         self.attention_compare(layer, out, check, rows, first_position)
     }
 
@@ -1967,6 +1988,12 @@ impl Shared {
     /// (inkling_attn_prepare), every visible key's clip gain and value scale (a full layer's
     /// [KeyTables], or the split walk's inkling_attn_key_scales over a sliding layer's whole
     /// range), then the MMA body (inkling_attn_mma).
+    ///
+    /// Under `halves` the body is two launches, the rows before the split and the rows from it,
+    /// each followed by the hook over its rows. A block of the body reads its own 16 rows' query
+    /// side, sink and gate, and takes its keys, tiles and bias distances from its first row's
+    /// position alone, so at a split on a block's edge every block is the one launch's block and
+    /// writes the same bits.
     #[allow(clippy::too_many_arguments)]
     fn attention_mma(
         &self,
@@ -1990,6 +2017,7 @@ impl Shared {
         cache_rows: usize,
         rel_extent: usize,
         tau: f32,
+        halves: Option<AttentionHalves<'_>>,
     ) -> Result<(), String> {
         let config = &self.config;
         let heads = self.heads();
@@ -1997,6 +2025,14 @@ impl Shared {
             .kernels
             .attention_mma
             .ok_or_else(|| "the tensor-core attention kernel was not loaded".to_owned())?;
+        if let Some((split, _)) = halves
+            && (split == 0 || split >= rows || !split.is_multiple_of(MMA_Q))
+        {
+            return Err(format!(
+                "a {rows}-row chunk's attention splits on a {MMA_Q}-row block's edge inside it, \
+                 not at row {split}"
+            ));
+        }
         let qk_clip = bits(config.qk_l2_clip_threshold as f32);
         self.launch(
             self.kernels.attention_prepare,
@@ -2060,33 +2096,50 @@ impl Shared {
             )?;
             (mma.gains, mma.scales, scale_first, mma.stride)
         };
-        self.launch(
-            entry,
-            (rows.div_ceil(MMA_Q) as u32, kv_heads as u32, 1),
-            ((groups * 32) as u32, 1, 1),
-            &[
-                mma.q.0,
-                keys.0,
-                values.0,
-                mma.rel.0,
-                bank.0,
-                sink.0,
-                gains.0,
-                scales.0,
-                gate.0,
-                out.0,
-                heads as u64,
-                kv_heads as u64,
-                rows as u64,
-                first_position as u64,
-                window as u64,
-                cache_rows as u64,
-                rel_extent as u64,
-                config.d_rel as u64,
-                scale_first as u64,
-                scale_stride as u64,
-            ],
-        )
+        // The rows from `first` on: every per-row operand at its row, the positions from its own.
+        let body = |first: usize, count: usize| {
+            let float = std::mem::size_of::<f32>();
+            let query = heads * MMA_HEAD_DIM;
+            self.launch(
+                entry,
+                (count.div_ceil(MMA_Q) as u32, kv_heads as u32, 1),
+                ((groups * 32) as u32, 1, 1),
+                &[
+                    mma.q.offset(first * query * float).0,
+                    keys.0,
+                    values.0,
+                    mma.rel.offset(first * heads * MMA_D_REL * float).0,
+                    bank.0,
+                    // No sink is a null pointer, which the body reads as none.
+                    if sink.0 == 0 {
+                        0
+                    } else {
+                        sink.offset(first * heads * float).0
+                    },
+                    gains.0,
+                    scales.0,
+                    gate.offset(first * query * float).0,
+                    out.offset(first * query * std::mem::size_of::<u16>()).0,
+                    heads as u64,
+                    kv_heads as u64,
+                    count as u64,
+                    (first_position + first) as u64,
+                    window as u64,
+                    cache_rows as u64,
+                    rel_extent as u64,
+                    config.d_rel as u64,
+                    scale_first as u64,
+                    scale_stride as u64,
+                ],
+            )
+        };
+        let Some((split, hook)) = halves else {
+            return body(0, rows);
+        };
+        body(0, split)?;
+        hook(0, split)?;
+        body(split, rows - split)?;
+        hook(split, rows - split)
     }
 
     /// [AttentionWalk::Check]'s line: the largest difference between the exact walk's output and
