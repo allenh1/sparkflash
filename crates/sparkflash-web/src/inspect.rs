@@ -968,14 +968,18 @@ pub fn analyze_fabric(
             })
         };
         for (rank, reached) in fabric.reachable.iter().enumerate() {
-            // The node answered the main probe but not the link probe: say so instead of
-            // silently showing a wiring verdict computed from the other nodes alone.
+            // The node answered the main probe but not the link probe. That is not a warning:
+            // the link check is the only reachability measurement, so an unverified fabric must
+            // not read as ready and let a launch start.
             if reached.is_none() && probes.get(rank).is_some_and(|probe| probe.is_ok()) {
                 findings.push(Finding {
                     rank: Some(rank),
-                    severity: Severity::Warning,
+                    severity: Severity::Error,
                     message: format!(
-                        "the link check did not complete on {}; the wiring could not be measured",
+                        "the fast-network check did not complete on {} (it runs under \
+                         `sudo -n` and needs iputils-arping); the wiring and the launch's \
+                         connections to every rank are unverified. Fix the check, then check \
+                         again.",
                         name(rank)
                     ),
                 });
@@ -1271,6 +1275,46 @@ fn plan_fabric(
     if rails_by_rank.len() != WORLD_SIZE || rails_by_rank.iter().any(Vec::is_empty) {
         return None;
     }
+    // Every fast address, not only the collective one, has to be unique: the routes the port
+    // setup writes are /32s, so two Sparks (or two ports of one Spark) on one address cannot be
+    // told apart and the fix would never converge.
+    let mut seen: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
+    let mut duplicate = false;
+    for (rank, rails) in rails_by_rank.iter().enumerate() {
+        for rail in rails {
+            match seen.insert(rail.ip, rank) {
+                Some(first) if first == rank => {
+                    duplicate = true;
+                    findings.push(Finding {
+                        rank: Some(rank),
+                        severity: Severity::Error,
+                        message: format!(
+                            "{} uses the fast address {} on two ports. Give every port its own.",
+                            name(rank),
+                            rail.ip
+                        ),
+                    });
+                }
+                Some(first) => {
+                    duplicate = true;
+                    findings.push(Finding {
+                        rank: Some(rank),
+                        severity: Severity::Error,
+                        message: format!(
+                            "{} and {} both use the fast address {}. Give every port its own.",
+                            name(first),
+                            name(rank),
+                            rail.ip
+                        ),
+                    });
+                }
+                None => {}
+            }
+        }
+    }
+    if duplicate {
+        return None;
+    }
     let mut primaries = Vec::new();
     for (probe, rails) in probes.iter().zip(rails_by_rank) {
         let facts = probe.as_ref().ok()?;
@@ -1415,16 +1459,19 @@ fn same_host_route(have: &Route, route: &FabricRoute) -> bool {
         && have.via == via
 }
 
-/// Whether a route is one the setup wrote: a host route with the setup's metric. iproute2 prints a
-/// /32 destination with or without the prefix.
+/// The address of a host route. iproute2 prints a /32 destination with or without the prefix.
+fn host_route_address(route: &Route) -> Option<Ipv4Addr> {
+    route
+        .destination
+        .strip_suffix("/32")
+        .unwrap_or(&route.destination)
+        .parse()
+        .ok()
+}
+
+/// Whether a route is one the setup wrote: a host route with the setup's metric.
 fn is_fabric_host_route(route: &Route) -> bool {
-    route.metric == FABRIC_ROUTE_METRIC
-        && route
-            .destination
-            .strip_suffix("/32")
-            .unwrap_or(&route.destination)
-            .parse::<Ipv4Addr>()
-            .is_ok()
+    route.metric == FABRIC_ROUTE_METRIC && host_route_address(route).is_some()
 }
 
 /// Whether the node already carries every route.
@@ -1600,6 +1647,13 @@ fn network_fixes(
         })
         .unwrap_or(DEFAULT_SUBNET);
     let routes_by_rank = fabric_routes(probes, fabric);
+    // The fast addresses of every Spark: a host route counts as the setup's own only when it
+    // points at one of them (a user's own metric-200 /32 is not ours to remove).
+    let fast: BTreeSet<Ipv4Addr> = probes
+        .iter()
+        .flatten()
+        .flat_map(|facts| facts.rails().into_iter().map(|rail| rail.ip))
+        .collect();
 
     let mut fixes = Vec::new();
     for (rank, probe) in probes.iter().enumerate() {
@@ -1625,11 +1679,15 @@ fn network_fixes(
             },
             _ => false,
         };
+        let ours = |route: &Route| {
+            is_fabric_host_route(route)
+                && host_route_address(route).is_some_and(|address| fast.contains(&address))
+        };
         let obsolete_routes = replaceable
             && facts
                 .routes
                 .iter()
-                .filter(|route| is_fabric_host_route(route))
+                .filter(|route| ours(route))
                 .any(|have| !required.iter().any(|route| same_host_route(have, route)));
         // The ring's relay is on whenever any route goes through another Spark. The sysctl file
         // keeps the switch for a reboot even when only the ARP settings need rewriting.
@@ -1641,7 +1699,7 @@ fn network_fixes(
             || facts
                 .routes
                 .iter()
-                .any(|route| is_fabric_host_route(route) && route.via.is_some());
+                .any(|route| ours(route) && route.via.is_some());
         let needs_forwarding = routing_forwarding && !facts.forward;
         // Loose reverse-path filtering is part of the relay: strict drops the forwarded packets.
         let port_names: Vec<&str> = rails.iter().map(|rail| rail.netdev.as_str()).collect();
@@ -1689,9 +1747,11 @@ fn network_fixes(
             .map(|rail| rail.netdev.as_str())
             .chain(unaddressed.iter().map(String::as_str))
             .collect();
-        let needs_arp = lanes.len() > 1
-            && (shares_subnet(&rails) || !unaddressed.is_empty())
-            && !arp_ok(facts, &lanes);
+        // The ARP hardening is needed whenever a Spark has more than one fast lane, not only
+        // when its own lanes share a subnet: ARP is layer 2, so with arp_ignore=0 a peer answers
+        // for any of its addresses on either cable and the measured cable map is ambiguous even
+        // between two separately addressed segments.
+        let needs_arp = lanes.len() > 1 && !arp_ok(facts, &lanes);
         let needs_sysctl = needs_arp || needs_forwarding || strict_rp;
         if !needs_netplan && !needs_sysctl {
             fixes.push(None);
@@ -2366,10 +2426,12 @@ link enp1s0f1np1 1500 up 0 0
         let report = analyze(&SparkConfig::default(), &probes, true, 1);
         assert!(report.plan.is_none());
         assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.message.contains("same fast-network address"))
+            report.findings.iter().any(|finding| {
+                finding.message.contains("both use the fast address")
+                    || finding.message.contains("same fast-network address")
+            }),
+            "{:?}",
+            report.findings
         );
     }
 
@@ -2472,6 +2534,37 @@ link enp1s0f1np1 1500 up 0 0
         let mut two_peers = ring_links();
         two_peers.push(fabric_link(0, "port0", 2));
         assert_eq!(shape_of(&two_peers, 4), FabricShape::Unknown);
+    }
+
+    #[test]
+    fn two_ports_cannot_share_a_fast_address() {
+        // The duplicate check used to look at the collective addresses only; a second-port
+        // collision produces conflicting /32 routes and a fix that never converges.
+        let mut probes = cluster();
+        let facts = probes[1].as_mut().expect("facts");
+        for gid in facts
+            .gids
+            .iter_mut()
+            .filter(|gid| gid.device == "rocep1s0f1")
+        {
+            gid.ipv4 = Some(Ipv4Addr::new(198, 51, 100, 11));
+        }
+        for address in facts
+            .addresses
+            .iter_mut()
+            .filter(|address| address.netdev == "enp1s0f1np1")
+        {
+            address.ip = Ipv4Addr::new(198, 51, 100, 11);
+        }
+        let report = analyze(&SparkConfig::default(), &probes, true, 1);
+        assert!(
+            errors(&report)
+                .iter()
+                .any(|message| message.contains("198.51.100.11")),
+            "{:?}",
+            report.findings
+        );
+        assert!(report.plan.is_none(), "{:?}", report.plan);
     }
 
     #[test]
@@ -3227,12 +3320,41 @@ link 3 enp1s0f1np1 198.51.100.13 ok
                 );
             }
         }
-        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(fabric), true, 1);
+        let report = analyze_fabric(
+            &SparkConfig::default(),
+            &probes,
+            Some(fabric.clone()),
+            true,
+            1,
+        );
         let fix = report.nodes[0].network_fix.as_deref().expect("routes");
         // Rank 0's previous neighbour (rank 3) is on the other subnet: its /32 goes through the
         // address that answered on that cable, which is inside that port's subnet.
         assert!(fix.contains("to: 198.51.100.24/32"), "{fix}");
         assert!(fix.contains("via: 198.51.200.14"), "{fix}");
+
+        // With the stock arp_ignore=0 the map is ambiguous, so no routes may be derived -- but
+        // the ARP fix that makes the next check measurable has to be offered (the two ports are
+        // on different subnets, so the shared-subnet warning does not apply).
+        let mut raw = two_subnet_cluster();
+        for facts in raw.iter_mut().flatten() {
+            facts.arp_all = (0, 0);
+            for link in &mut facts.links {
+                link.arp_ignore = 0;
+                link.arp_announce = 0;
+            }
+        }
+        assert!(
+            fabric_routes(&raw, Some(&fabric)).iter().all(Vec::is_empty),
+            "an ambiguous map must not be routed"
+        );
+        let report = analyze_fabric(&SparkConfig::default(), &raw, Some(fabric), true, 1);
+        let fix = report.nodes[0]
+            .network_fix
+            .as_deref()
+            .expect("the ARP hardening is offered even without a shared subnet");
+        assert!(fix.contains("arp_ignore"), "{fix}");
+        assert!(!fix.contains("routes:"), "{fix}");
     }
 
     #[test]
@@ -3338,6 +3460,31 @@ link 3 enp1s0f1np1 198.51.100.13 ok
                 .iter()
                 .map(|node| (&node.network_fix, node.rank))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unmeasured_link_check_blocks_the_guide() {
+        // The probe is the only reachability measurement; when it cannot run at all (no
+        // passwordless sudo, an SSH failure, a timeout) the fabric is unverified, which must not
+        // read as "done".
+        let probes = cluster();
+        let unmeasured = Fabric {
+            links: Vec::new(),
+            reachable: vec![None, None, None, None],
+            shape: FabricShape::Unknown,
+            links_measured: false,
+        };
+        let report = analyze_fabric(&SparkConfig::default(), &probes, Some(unmeasured), true, 1);
+        assert!(!errors(&report).is_empty(), "{:?}", report.findings);
+        assert!(!report.network_ok(), "{:?}", report.findings);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.message.contains("unverified")),
+            "{:?}",
+            report.findings
         );
     }
 

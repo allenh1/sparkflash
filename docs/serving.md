@@ -36,9 +36,12 @@ a device that used to hold a peer's address, makes every connection to that addr
 30 s after launch with `IBV_WC_RETRY_EXC_ERR`, while ping and ssh still work because ordinary
 traffic re-resolves it. Before launching, `ip neigh show <address>` on every node should give the
 MAC in that peer's `/sys/class/net/<netdev>/address`; pinging the address from each netdev
-refreshes a stale entry. If a node's two netdevs share a subnet, each must answer ARP only for its
-own address (`arp_ignore=1`), or peers can cache the other half's MAC. Index 1 (RoCE v2 over the
-IPv6 link-local address) derives the MAC from the address and does not use the ARP cache.
+refreshes a stale entry. A node with two cabled ports must answer ARP only for the address of the
+port the request arrived on (`arp_ignore=1`, `arp_announce=2`): ARP is layer 2, so without it a
+peer's other port answers on the wrong cable even when the two ports have different subnets, and
+the console's cable map and a ring's routes need the address to belong to one cable. Index 1
+(RoCE v2 over the IPv6 link-local address) derives the MAC from the address and does not use the
+ARP cache.
 
 ### Converting the weights
 

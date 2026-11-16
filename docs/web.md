@@ -148,7 +148,10 @@ fabric** button writes the matching choice and checks the Sparks again, so the f
 the new choice. Matching the schedule to the wiring is not required for correctness — the one-shot
 schedule runs its full all-to-all over a ring and the ring schedule does chunked transfers on a
 switch — but it is the fast path for both wirings. Without `arping` (or where it cannot open a raw
-socket) the cable map cannot be identified; only reachability is checked.
+socket) the cable map cannot be identified, but the pings still run and reachability is checked.
+When the probe itself cannot run at all — no passwordless `sudo -n`, an SSH failure, a timeout —
+there is no reachability result either, and the step is blocked with an error saying the fabric is
+unverified rather than certifying it.
 
 Reachability is reported per rank, and a Spark that does not answer is an error in every shape: a
 launch opens a connection to every rank before it starts, so a peer that does not answer stops it
@@ -159,7 +162,9 @@ ports** writes those routes and turns on forwarding. A ring whose addresses stil
 after the ports are set up has a missing cable, a wrong address, or strict reverse-path filtering
 (the check warns about that, and the port setup sets it to loose), and the finding stays. Wiring that is none of the named shapes says
 so, and its silent pairs are errors too. When `arping` could not run (missing, or unable to open a
-raw socket), the finding says the wiring was not measured and reports the ping result alone.
+raw socket), the finding says the wiring was not measured and reports the ping result alone. When
+the whole probe could not run, the finding is an error: the wiring and the launch's connections are
+unverified until it does.
 
 Step 2 can also configure the ports: **Set up the ports** writes the same netplan and sysctl
 settings the check needs (addresses or DHCP, MTU 9000, `arp_ignore=1`/`arp_announce=2`, and on a
