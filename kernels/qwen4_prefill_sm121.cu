@@ -26,7 +26,9 @@
 //     CTA multiplies one item by one panel of an expert's NVFP4 weights, decoding E2M1 x E4M3 to
 //     bf16 in registers (the product is exact in bf16) and applying weight_scale_2 in f32. The
 //     activations - the expert input and the SwiGLU rows between the passes - are a bf16 head and
-//     remainder, two MMAs a fragment, as the dense projections.
+//     remainder, two MMAs a fragment, as the dense projections. The _mx8 forms are the same body
+//     over MXFP8 weights (E4M3 bytes, a ue8m0 power of two a 32 columns): Inkling-2-Small's
+//     layers 40-47.
 //   - q4p_gdn_conv / q4p_gdn_conv_state, q4p_gdn_prep / q4p_gdn_scan / q4p_gdn_gate and
 //     q4p_kda_prep / q4p_kda_scan (Gated DeltaNet and Kimi Delta Attention) live in their own
 //     image, kernels/qwen4_scan_sm121.cu, not in this cubin.
@@ -57,6 +59,7 @@
 #include <cstdint>
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 // opt_mma_bf16_body, ob_mma and the cp.async helpers, shared with the DeepSeek prefill.
@@ -665,14 +668,42 @@ extern "C" __global__ void q4p_split_bf16(const float* __restrict__ x,
 // a: the item's 32 activation rows x 64 bf16, head plane then remainder plane, each 128-byte row
 //    as eight 16-byte chunks with the chunk index XOR 4 on odd rows, so the eight rows a
 //    quarter-warp's LDS.128 touches land on distinct banks.
-// b: 128 weight rows x 32 packed bytes (64 E2M1 codes), the two 16-byte halves swapped on rows
-//    with bit 2 set, so a warp's 32 word loads (8 rows x 4 words) are conflict-free.
-// s: the four E4M3 block scales of each weight row for this stage, one word a row.
-struct Q4pStage {
+// b: NVFP4, 128 weight rows x 32 packed bytes (64 E2M1 codes), the two 16-byte halves swapped on
+//    rows with bit 2 set, so a warp's 32 word loads (8 rows x 4 words) are conflict-free.
+//    MXFP8 (MX8), 128 weight rows x 64 E4M3 bytes, the four 16-byte chunks XOR 2 on rows with
+//    bit 1 set, so each half-warp's 16 eight-byte loads (4 rows x 4 lanes) cover the 32 banks once.
+// s: NVFP4, the four E4M3 block scales of each weight row for this stage, one word a row. MXFP8,
+//    the word holding the row's ue8m0 codes for this stage's two 32-column blocks and the other
+//    stage of its pair (stages 2p and 2p + 1 share a word, so the four-byte copy stays aligned).
+template <bool MX8>
+struct Q4pStageOf {
     __nv_bfloat16 a[2][Q4P_MOE_ROWS * Q4P_BK];
-    uint32_t b[Q4P_BN * 8];
+    uint32_t b[Q4P_BN * (MX8 ? 16 : 8)];
     uint32_t s[Q4P_BN];
 };
+using Q4pStage = Q4pStageOf<false>;
+// An MXFP8 stage is 16.5 KB, so three of them pass the 48 KB a block may hold statically; two keep
+// the two blocks an SM the NVFP4 form runs.
+#define Q4P_STAGES_MX8 2
+
+// A ue8m0 code as the f32 power of two the pair walk multiplies by (inkling_ue8m0): the code is
+// the biased exponent itself.
+__device__ __forceinline__ float q4p_ue8m0(unsigned int code) {
+    return __uint_as_float((code & 0xffu) << 23);
+}
+
+// Two E4M3 codes (the low 16 bits of `pair`, the even column low) times their block's power of
+// two, as a bf16x2: the f32 product the pair walk forms (its E4M3 value times inkling_ue8m0),
+// then rounded to bf16, which is exact under every scale code the host admits (all but 1 and 2,
+// where the smallest E4M3 step times 2^(code - 127) falls under bf16's subnormal step; code 0
+// scales to zero and an f32 overflow is infinite in both walks).
+__device__ __forceinline__ uint32_t q4p_e4m3x2_scaled(uint32_t pair, float scale) {
+    const __half2_raw raw =
+        __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(pair & 0xffffu), __NV_E4M3);
+    const float2 v = __half22float2(*reinterpret_cast<const __half2*>(&raw));
+    const __nv_bfloat162 r = __floats2bfloat162_rn(v.x * scale, v.y * scale);
+    return *reinterpret_cast<const uint32_t*>(&r);
+}
 
 __device__ __forceinline__ void q4p_cp4(uint32_t dst, const void* src) {
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src));
@@ -743,7 +774,15 @@ struct Q4pSoftcapSwiglu {
 // `a_plane` is the element offset of a_src's remainder plane; `out_plane` that of the SwiGLU
 // rows' remainder plane gate_up writes. `Epi` is gate_up's row layout and activation
 // (Q4pSiluSwiglu or Q4pSoftcapSwiglu); down ignores it.
-template <bool GATE_UP, class Epi = Q4pSiluSwiglu>
+//
+// MX8 reads MXFP8 weights instead (Inkling-2-Small's layers 40-47): an E4M3 byte a column and a
+// ue8m0 power of two a 32 columns, with no per-tensor scale (the table's outer scales are ones).
+// A lane's B fragments cover the same columns as the NVFP4 form's - packed columns 8t..8t+7 and
+// 32+8t..32+8t+7 of the stage - so the A fragments, the MMA chain and the epilogue are the NVFP4
+// form's; each weight is the pair walk's f32 product rounded to bf16 (q4p_e4m3x2_scaled), exact
+// under the scale codes the host admits. The scale word of stages 2p and 2p + 1 is the same four
+// bytes, block 2ks the low byte of the stage's half. Two stages, not three (Q4P_STAGES_MX8).
+template <bool GATE_UP, class Epi = Q4pSiluSwiglu, bool MX8 = false>
 __device__ __forceinline__ void q4p_moe_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ sorted, const int4* __restrict__ items,
@@ -751,8 +790,11 @@ __device__ __forceinline__ void q4p_moe_body(
     unsigned long long a_plane, const float* __restrict__ route_weights, void* __restrict__ out,
     unsigned long long out_plane, int topk, int hidden, int intermediate, int weight_stride,
     const Epi epi = Epi()) {
-    __shared__ __align__(16) Q4pStage stages[Q4P_STAGES];
-    __shared__ uint32_t lut[256];
+    constexpr int kStages = MX8 ? Q4P_STAGES_MX8 : Q4P_STAGES;
+    // The words of one staged weight row: 64 E2M1 nibbles or 64 E4M3 bytes.
+    constexpr int kRowWords = MX8 ? 16 : 8;
+    __shared__ __align__(16) Q4pStageOf<MX8> stages[kStages];
+    __shared__ uint32_t lut[MX8 ? 1 : 256];
     __shared__ int s_slot[Q4P_MOE_ROWS];
     if ((int)blockIdx.y >= *item_count) {
         return;
@@ -767,10 +809,13 @@ __device__ __forceinline__ void q4p_moe_body(
     // K and the output width of this pass.
     const int inner = GATE_UP ? hidden : intermediate;
     const int n0 = blockIdx.x * (GATE_UP ? Q4P_BN / 2 : Q4P_BN);
-    const int packed_row = inner >> 1;
-    const int scale_row = inner >> 4;
-    for (int code = tid; code < 256; code += blockDim.x) {
-        lut[code] = q4p_e2m1x2_bf16((unsigned int)code);
+    // A stored row's code bytes and scale bytes.
+    const int packed_row = MX8 ? inner : inner >> 1;
+    const int scale_row = MX8 ? inner >> 5 : inner >> 4;
+    if constexpr (!MX8) {
+        for (int code = tid; code < 256; code += blockDim.x) {
+            lut[code] = q4p_e2m1x2_bf16((unsigned int)code);
+        }
     }
     if (tid < Q4P_MOE_ROWS) {
         s_slot[tid] = tid < count ? sorted[first + tid] : -1;
@@ -800,6 +845,10 @@ __device__ __forceinline__ void q4p_moe_body(
                  (unsigned long long)(n0 + b_row) * packed_row;
     }
     const uint32_t b_dst = (uint32_t)(b_row * 8 + ((b_half ^ ((b_row >> 2) & 1)) * 4));
+    // MXFP8: a thread copies chunks 2 b_half and 2 b_half + 1 of its row, each at its swizzled place.
+    const int mx_swizzle = ((b_row >> 1) & 1) << 1;
+    const uint32_t mx_dst0 = (uint32_t)(b_row * 16 + (((2 * b_half) ^ mx_swizzle) * 4));
+    const uint32_t mx_dst1 = (uint32_t)(b_row * 16 + (((2 * b_half + 1) ^ mx_swizzle) * 4));
     // Scale rows: threads 0..127 each own one weight row's word.
     const unsigned char* sc_base = nullptr;
     if (tid < Q4P_BN) {
@@ -814,13 +863,22 @@ __device__ __forceinline__ void q4p_moe_body(
         }
     }
     auto load = [&](int buffer, int ks) {
-        Q4pStage& st = stages[buffer];
+        Q4pStageOf<MX8>& st = stages[buffer];
         om_cp16(om_smem(&st.a[0][a_dst]), a_base + ks * Q4P_BK + a_chunk * 8, a_slot >= 0);
         om_cp16(om_smem(&st.a[1][a_dst]), a_base + a_plane + ks * Q4P_BK + a_chunk * 8,
                 a_slot >= 0);
-        om_cp16(om_smem(&st.b[b_dst]), b_base + ks * (Q4P_BK / 2) + b_half * 16, true);
-        if (sc_base != nullptr) {
-            q4p_cp4(om_smem(&st.s[tid]), sc_base + ks * (Q4P_BK / 16));
+        if constexpr (MX8) {
+            const unsigned char* src = b_base + ks * Q4P_BK + b_half * 32;
+            om_cp16(om_smem(&st.b[mx_dst0]), src, true);
+            om_cp16(om_smem(&st.b[mx_dst1]), src + 16, true);
+            if (sc_base != nullptr) {
+                q4p_cp4(om_smem(&st.s[tid]), sc_base + (ks >> 1) * 4);
+            }
+        } else {
+            om_cp16(om_smem(&st.b[b_dst]), b_base + ks * (Q4P_BK / 2) + b_half * 16, true);
+            if (sc_base != nullptr) {
+                q4p_cp4(om_smem(&st.s[tid]), sc_base + ks * (Q4P_BK / 16));
+            }
         }
     };
 
@@ -836,7 +894,7 @@ __device__ __forceinline__ void q4p_moe_body(
 
     const int ksteps = inner / Q4P_BK;
 #pragma unroll
-    for (int s = 0; s < Q4P_STAGES - 1; ++s) {
+    for (int s = 0; s < kStages - 1; ++s) {
         if (s < ksteps) {
             load(s, s);
         }
@@ -845,28 +903,50 @@ __device__ __forceinline__ void q4p_moe_body(
     // Both m16 tiles' rows have the parity of g, so one swizzle serves all four row reads.
     const int a_sw = (g & 1) << 2;
     const int b_sw = ((g >> 2) & 1) << 2;
+    // MXFP8: the chunk swizzle of the lane's rows (64 j + 8 warp + g share bit 1 with g).
+    const int mx_sw = ((g >> 1) & 1) << 1;
     for (int ks = 0; ks < ksteps; ++ks) {
-        om_wait<Q4P_STAGES - 2>();
+        om_wait<kStages - 2>();
         __syncthreads();
-        const int next = ks + Q4P_STAGES - 1;
+        const int next = ks + kStages - 1;
         if (next < ksteps) {
-            load(next % Q4P_STAGES, next);
+            load(next % kStages, next);
         }
         om_commit();
-        const Q4pStage& st = stages[ks % Q4P_STAGES];
+        const Q4pStageOf<MX8>& st = stages[ks % kStages];
         uint32_t bf[2][4][2];
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             const int row = 64 * j + 8 * warp + g;
-            const uint32_t w0 = st.b[row * 8 + (t ^ b_sw)];
-            const uint32_t w1 = st.b[row * 8 + ((t + 4) ^ b_sw)];
-            const uint32_t sw = st.s[row];
-            const uint32_t s_lo = q4p_scale_pair(sw, (unsigned int)(t >> 1));
-            const uint32_t s_hi = q4p_scale_pair(sw, 2u + (unsigned int)(t >> 1));
+            if constexpr (MX8) {
+                // Columns 8t..8t+7 are chunk t / 2's bytes 8 (t & 1) on, columns 32+8t.. chunk
+                // 2 + t / 2's; their blocks are this stage's two, the stage's half of the word.
+                const uint32_t* b_row_words = &st.b[row * kRowWords];
+                const uint2 lo = *reinterpret_cast<const uint2*>(
+                    &b_row_words[(((t >> 1) ^ mx_sw) * 4) + (t & 1) * 2]);
+                const uint2 hi = *reinterpret_cast<const uint2*>(
+                    &b_row_words[(((2 + (t >> 1)) ^ mx_sw) * 4) + (t & 1) * 2]);
+                const uint32_t sw = st.s[row] >> (16 * (ks & 1));
+                const float s_lo = q4p_ue8m0(sw);
+                const float s_hi = q4p_ue8m0(sw >> 8);
 #pragma unroll
-            for (int kb = 0; kb < 4; ++kb) {
-                bf[j][kb][0] = q4p_bf16x2_mul(lut[(w0 >> (8 * kb)) & 0xffu], s_lo);
-                bf[j][kb][1] = q4p_bf16x2_mul(lut[(w1 >> (8 * kb)) & 0xffu], s_hi);
+                for (int kb = 0; kb < 4; ++kb) {
+                    const uint32_t wl = kb < 2 ? lo.x : lo.y;
+                    const uint32_t wh = kb < 2 ? hi.x : hi.y;
+                    bf[j][kb][0] = q4p_e4m3x2_scaled(wl >> (16 * (kb & 1)), s_lo);
+                    bf[j][kb][1] = q4p_e4m3x2_scaled(wh >> (16 * (kb & 1)), s_hi);
+                }
+            } else {
+                const uint32_t w0 = st.b[row * kRowWords + (t ^ b_sw)];
+                const uint32_t w1 = st.b[row * kRowWords + ((t + 4) ^ b_sw)];
+                const uint32_t sw = st.s[row];
+                const uint32_t s_lo = q4p_scale_pair(sw, (unsigned int)(t >> 1));
+                const uint32_t s_hi = q4p_scale_pair(sw, 2u + (unsigned int)(t >> 1));
+#pragma unroll
+                for (int kb = 0; kb < 4; ++kb) {
+                    bf[j][kb][0] = q4p_bf16x2_mul(lut[(w0 >> (8 * kb)) & 0xffu], s_lo);
+                    bf[j][kb][1] = q4p_bf16x2_mul(lut[(w1 >> (8 * kb)) & 0xffu], s_hi);
+                }
             }
         }
 #pragma unroll
@@ -995,6 +1075,38 @@ extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down(
     OPT_PDL_ENTRY();
     q4p_moe_body<false>(table, scales, sorted, items, item_count, activated, activated_plane,
                         route_weights, partials, 0, topk, hidden, intermediate, weight_stride);
+}
+
+// q4p_moe_gate_up_capped over MXFP8 weights (Inkling-2-Small's layers 40-47): the table's codes
+// are E4M3 bytes and its block scales ue8m0 codes a 32 columns, its outer scales ones. The
+// stored row widths (hidden, and down's intermediate) are whole 128-column runs, so a stage
+// pair's scale word stays in its row. Grid (intermediate / 64, max items), 256 threads.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_gate_up_capped_mx8(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ x,
+    unsigned long long x_plane, __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, int topk, int hidden, int intermediate, float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<true, Q4pSoftcapSwiglu, true>(table, scales, sorted, items, item_count, x,
+                                               x_plane, nullptr, activated, activated_plane, topk,
+                                               hidden, intermediate, 0,
+                                               Q4pSoftcapSwiglu{gate_cap, up_cap});
+}
+
+// q4p_moe_down over MXFP8 weights, as q4p_moe_gate_up_capped_mx8 reads them. Grid (hidden / 128,
+// max items), 256 threads.
+extern "C" __global__ __launch_bounds__(256, 2) void q4p_moe_down_mx8(
+    const unsigned long long* __restrict__ table, const float* __restrict__ scales,
+    const int* __restrict__ sorted, const int4* __restrict__ items,
+    const int* __restrict__ item_count, const __nv_bfloat16* __restrict__ activated,
+    unsigned long long activated_plane, const float* __restrict__ route_weights,
+    float* __restrict__ partials, int topk, int hidden, int intermediate, int weight_stride) {
+    OPT_PDL_ENTRY();
+    q4p_moe_body<false, Q4pSiluSwiglu, true>(table, scales, sorted, items, item_count, activated,
+                                             activated_plane, route_weights, partials, 0, topk,
+                                             hidden, intermediate, weight_stride);
 }
 
 // K-stage pairs a q4p_moe_rows lane has in flight: 16 bytes of a packed row each (128 columns).

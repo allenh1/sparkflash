@@ -1467,7 +1467,12 @@ pub(super) fn walk_rows(
                 (Op::ExpertGateUp, Target::Band(BandOp::GateUp)) => {
                     let activation = &layer.steps[cursor + 1];
                     let down = &layer.steps[cursor + 2];
-                    if walk == PrefillWalk::Tensor && layer.experts == ExpertBody::NvFp4 {
+                    let mma = match layer.experts {
+                        ExpertBody::NvFp4 => true,
+                        ExpertBody::MxFp8 => shared.mxfp8_walk == Mxfp8Walk::Mma,
+                        ExpertBody::Bf16 => false,
+                    };
+                    if walk == PrefillWalk::Tensor && mma {
                         run_band_mma(shared, chunk, layer, rows)?;
                     } else {
                         run_band_chunk(shared, chunk, layer, step, activation, down, rows)?;
@@ -1733,7 +1738,8 @@ pub(super) fn moe_items(slots: usize, owned: usize) -> usize {
     slots.div_ceil(MOE_ROWS) + owned.min(slots)
 }
 
-/// The routed band over a chunk on the tensor cores, for an NVFP4 layer under the `tensor` walk.
+/// The routed band over a chunk on the tensor cores, for an NVFP4 layer under the `tensor` walk
+/// and an MXFP8 one under [Mxfp8Walk::Mma].
 ///
 /// The kernels are Qwen's grouped W4A16 MMA as Qwen runs it: q4p_split_bf16 turns the expert
 /// input into a bf16 head and remainder, the shared plan (moe_plan) sorts the slots this rank owns
@@ -1746,7 +1752,9 @@ pub(super) fn moe_items(slots: usize, owned: usize) -> usize {
 /// The sums are the MMA's: E2M1 x E4M3 is exact in bf16, the activation carries 16 significant
 /// bits in its two planes, and the accumulation is f32 in the tile's order. That is a different
 /// rounding from the pair walk's f32 chain, which is why `chunk` stays the walk with the decode
-/// step's bits.
+/// step's bits. The MXFP8 layers take the same body over their E4M3 bytes and ue8m0 codes
+/// (q4p_moe_gate_up_capped_mx8, q4p_moe_down_mx8), each weight the pair walk's f32 product, exact
+/// in bf16 under the codes the open admitted, with ones for the outer scales.
 fn run_band_mma(
     shared: &Shared,
     chunk: &Chunk,
@@ -1760,15 +1768,22 @@ fn run_band_mma(
     let hidden = config.hidden_size;
     let (first, owned) = shared.plan.expert_range();
     let down = shared.plan.expert_down();
-    let meta = shared.experts[layer.index].as_ref().ok_or_else(|| {
+    let meta = shared.mma[layer.index].ok_or_else(|| {
         device_error(format!(
-            "layer {}: an NVFP4 band with no expert scales",
-            layer.index
+            "layer {}: a {:?} band with no grouped-MMA table",
+            layer.index, layer.experts
         ))
     })?;
+    let mx8 = layer.experts == ExpertBody::MxFp8;
+    let gate_up_kernel = if mx8 {
+        shared.kernels.moe_gate_up_mx8
+    } else {
+        shared.kernels.moe_gate_up
+    };
     if !down.rows.is_multiple_of(MOE_DOWN_COLUMNS)
         || !hidden.is_multiple_of(MOE_K_STAGE)
         || !intermediate.is_multiple_of(MOE_GATE_UP_COLUMNS)
+        || !intermediate.is_multiple_of(MOE_K_STAGE)
         || !down.columns.is_multiple_of(MOE_K_STAGE)
         || owned > MOE_MAX_EXPERTS
     {
@@ -1861,12 +1876,12 @@ fn run_band_mma(
     };
     shared
         .launch(
-            shared.kernels.moe_gate_up,
+            gate_up_kernel,
             ((intermediate / MOE_GATE_UP_COLUMNS) as u32, grid_items, 1),
             (MOE_THREADS, 1, 1),
             &[
-                meta.mma_table.0,
-                meta.mma_scales.0,
+                meta.table.0,
+                meta.scales.0,
                 scratch.plan.0,
                 scratch.items.0,
                 scratch.item_count.0,
@@ -1891,14 +1906,19 @@ fn run_band_mma(
             intermediate * std::mem::size_of::<u16>(),
         )?;
     }
+    let down_kernel = if mx8 {
+        shared.kernels.moe_down_mx8
+    } else {
+        shared.kernels.moe_down
+    };
     shared
         .launch(
-            shared.kernels.moe_down,
+            down_kernel,
             ((down.rows / MOE_DOWN_COLUMNS) as u32, grid_items, 1),
             (MOE_THREADS, 1, 1),
             &[
-                meta.mma_table.0,
-                meta.mma_scales.0,
+                meta.table.0,
+                meta.scales.0,
                 scratch.plan.0,
                 scratch.items.0,
                 scratch.item_count.0,

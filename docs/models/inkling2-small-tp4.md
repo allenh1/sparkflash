@@ -933,8 +933,10 @@ an Inkling form:
   SwiGLU as its epilogue, `inkling_softcap_sm121.cuh`, shared with the decode band) and
   `q4p_moe_down`, writing the `[slot][hidden]` partials the pair walk writes. The router's choice
   never leaves the device: `inkling_band_shares` writes the shares and the plan's local ids.
-* **MXFP8 experts (layers 40-47)** stay on the pair walk: no grouped MXFP8 MMA exists in the
-  workspace to reuse, and the eight layers are a small share of the chunk.
+* **MXFP8 experts (layers 40-47)** first stayed on the pair walk, since no grouped MXFP8 MMA
+  existed in the workspace to reuse. They now take the same grouped MMA over E4M3 bytes (D120,
+  "The MXFP8 layers on the grouped MMA" below); `SPARKFLASH_INKLING_MXFP8=pairs` keeps the pair
+  walk.
 
 Both MMA forms carry each f32 activation as a BF16 head and remainder (16 significant bits) and
 accumulate in f32 in the tile's order, so this is a declared precision change, not a
@@ -1688,3 +1690,45 @@ and 14.5 ms at 500K. Each walk is bound by its chain of folds, not by bandwidth.
 several queries measured slower, and an L2 prefetch of the next keys was 8% faster on the full
 layer and slower on the sliding ones. The drafter's LM head (1.63 ms) is at its DRAM floor.
 DSpark stays off by default. At a million positions it costs a rank about 3.6 GB.
+
+### The MXFP8 layers on the grouped MMA (D120)
+
+A trace of the 93K prompt under the row split put the MXFP8 layers' pair walk at 31 % of the
+prompt: 41.9 s of 132 s. An MXFP8 layer cost about 915 ms of expert time an 8,192-row chunk, an
+NVFP4 layer on the grouped MMA 34 ms. The pair walk is one launch an expert over the rows that
+chose it, after the router's picks are read back to the host.
+
+The MXFP8 layers now take the NVFP4 layers' grouped MMA (`q4p_moe_body` in
+`kernels/qwen4_prefill_sm121.cu`) in an `MX8` weight form, `q4p_moe_gate_up_capped_mx8` and
+`q4p_moe_down_mx8`. A stage holds 128 weight rows of 64 E4M3 bytes and the rows' ue8m0 codes,
+two stages instead of three so the shared memory stays where it was. Each weight is formed as the
+pair walk forms it, the E4M3 value times `2^(code - 127)` in f32, and then rounded to BF16. That
+rounding is exact except under codes 1 and 2, where the smallest E4M3 step times the power of two
+falls under BF16's subnormal step. The open reads every MXFP8 scale code (`admit_mxfp8_scales`)
+and refuses a checkpoint that holds either, naming `SPARKFLASH_INKLING_MXFP8=pairs`;
+Inkling-2-Small's codes are all admitted. The table's outer scales are ones, since MXFP8 stores
+no per-tensor scale.
+
+So the MXFP8 layers carry D117's declared precision: the activation as a BF16 head and
+remainder, f32 sums in the tile's order, against weights that are exactly the pair walk's.
+`SPARKFLASH_INKLING_MXFP8=pairs` keeps the pair walk, and under it every bit is the deployed
+build's: the teacher-forced logits are identical and the repeating prompt's decode digest is
+`0fe1437d677108a4`. `mma` named under any walk but `tensor` is refused, as is any other value.
+
+Four ranks, row split, batch arm, in one session:
+
+| on the four ranks | pair walk (deployed) | grouped MMA |
+|---|---|---|
+| 6,000-token text, twelve teacher-forced cuts | 13.0 s | 9.46 s |
+| repeating 5K prompt | 9.71 s | 6.93 s |
+| 93K prompt | 131.5 s, 131.8 s | 96.6 s |
+| prompt tokens a second at 93K | 708 | 964 |
+| decode step after the 93K prompt | 29.68, 29.45 ms | 29.50 ms |
+| decode step, repeating 5K prompt | 26.13 ms | 26.04 ms |
+
+The distance, teacher-forced on twelve cuts of the 6,000-token text (the D117 method): against
+the deployed build, top-1 agrees on 12 of 12 and KL is at most 2.3e-3 nats. Against the exact walk
+(`PREFILL=chunk`) the MMA is as far as the deployed build is: top-1 12 of 12 for both, KL at most
+1.55e-2 nats (mean 4.58e-3) against 1.52e-2 (mean 4.55e-3), and a mean absolute logit difference
+of 0.057-0.339 a cut against 0.056-0.339. The 93K prompt's 24 greedy ids and the repeating
+prompt's 96 are the deployed build's.

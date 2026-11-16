@@ -1026,8 +1026,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         false,
     ),
     // The genuine FP8 grouped prefill bodies. `q4p_moe_gate_up` and `q4p_moe_down` are the NVFP4
-    // grouped bodies, and `q4p_moe_rows_*` are their panel form: `q4p_moe_body` reads packed
-    // E2M1 codes and has no FP8 or BF16 weight mode, so they claim `NvFp4` only. A Qwen FP8
+    // grouped bodies, and `q4p_moe_rows_*` are their panel form: those read packed E2M1 codes and
+    // claim `NvFp4` only; the body's MXFP8 form is its own `_mx8` symbols. A Qwen FP8
     // chunk resolves the `_fp8` symbols in this image.
     sm121(
         Part::Moe,
@@ -1043,6 +1043,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
             // softcapped SwiGLU; its down pass is q4p_moe_down.
             pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
+            // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
+            pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
         ],
         false,
     ),
@@ -1169,6 +1172,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
             // softcapped SwiGLU; its down pass is q4p_moe_down.
             pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
+            // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
+            pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
         ],
         false,
     ),

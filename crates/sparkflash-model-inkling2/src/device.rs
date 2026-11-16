@@ -59,8 +59,8 @@ use crate::collective::{Exchange, Solo};
 use crate::config::Inkling2Config;
 use crate::convert::RankFileSource;
 use crate::device_plan::{
-    BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, NormRole, Op, Pass, Projection,
-    ResidualInput, Step, Target,
+    BandOp, Collective, ConvSlot, ExpertBody, InklingDevicePlan, LayerSchedule, NormRole, Op, Pass,
+    Projection, ResidualInput, Step, Target,
 };
 use crate::forward::trace_on;
 use crate::host::choose;
@@ -212,6 +212,47 @@ impl PrefillWalk {
     #[must_use]
     pub const fn chunked(self) -> bool {
         !matches!(self, Self::Rows)
+    }
+}
+
+/// The switch for the MXFP8 layers' routed experts under [PrefillWalk::Tensor] ([Mxfp8Walk]):
+/// `mma` (the default there) or `pairs`. Under the other walks they take the pair walk, and `mma`
+/// named there is refused, as is an unknown value.
+pub const MXFP8_ENV: &str = "SPARKFLASH_INKLING_MXFP8";
+
+/// How a prompt chunk's MXFP8 experts (Inkling-2-Small's layers 40-47) are walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mxfp8Walk {
+    /// The grouped MMA the NVFP4 layers take under the tensor walk, over MXFP8 weights
+    /// (q4p_moe_gate_up_capped_mx8 and q4p_moe_down_mx8): each weight exact in BF16, the
+    /// activation the tensor walk's BF16 head and remainder, accumulated in f32 in the tile's
+    /// order. Its table is built at open after every MXFP8 scale code is checked to keep the
+    /// weights exact ([admit_mxfp8_scales]).
+    Mma,
+    /// The exact pair walk, one launch an expert over the rows that chose it.
+    Pairs,
+}
+
+impl Mxfp8Walk {
+    /// The walk [MXFP8_ENV] names under `walk`: `Mma` under [PrefillWalk::Tensor] when it is
+    /// unset, `Pairs` under the others.
+    pub fn from_env(walk: PrefillWalk) -> Result<Self, String> {
+        Self::parse(std::env::var(MXFP8_ENV).ok().as_deref(), walk)
+    }
+
+    fn parse(value: Option<&str>, walk: PrefillWalk) -> Result<Self, String> {
+        match (value, walk) {
+            (None | Some("" | "mma"), PrefillWalk::Tensor) => Ok(Self::Mma),
+            (None | Some(""), _) | (Some("pairs"), _) => Ok(Self::Pairs),
+            (Some("mma"), other) => Err(format!(
+                "{MXFP8_ENV}=mma runs under {PREFILL_ENV}=tensor, and the walk is {other:?}, \
+                 whose experts keep their own arithmetic; unset {MXFP8_ENV} or set it to pairs"
+            )),
+            (Some(other), _) => Err(format!(
+                "{MXFP8_ENV}={other} is not an MXFP8 expert walk: use mma (the tensor walk's \
+                 default) or pairs (the exact pair walk)"
+            )),
+        }
     }
 }
 
@@ -606,6 +647,9 @@ struct Kernels {
     split_bf16: Entry,
     moe_gate_up: Entry,
     moe_down: Entry,
+    /// The same two passes over the MXFP8 layers' E4M3 bytes and ue8m0 codes ([Mxfp8Walk::Mma]).
+    moe_gate_up_mx8: Entry,
+    moe_down_mx8: Entry,
     /// The shared routed-expert plan (kernels/moe_plan_sm121.cu): the chunk's slots sorted by
     /// this rank's expert into the items the MMA passes walk.
     moe_plan: Entry,
@@ -714,6 +758,8 @@ impl Kernels {
             split_bf16: load(experts, "q4p_split_bf16")?,
             moe_gate_up: load(experts, "q4p_moe_gate_up_capped")?,
             moe_down: load(experts, "q4p_moe_down")?,
+            moe_gate_up_mx8: load(experts, "q4p_moe_gate_up_capped_mx8")?,
+            moe_down_mx8: load(experts, "q4p_moe_down_mx8")?,
             moe_plan: load(moe_plan, "moe_plan")?,
             embed: load(token, "q4e_embed")?,
             rmsnorm: load(token, "q4e_rmsnorm")?,
@@ -820,12 +866,16 @@ struct ExpertScale {
     /// by the expert the router chose without the host reading the choice.
     device_gate_up: Deviceptr,
     device_down: Deviceptr,
-    /// The layer's experts as the grouped MMA (q4p_moe_gate_up_capped / q4p_moe_down) reads them:
-    /// six pointers a local expert - w13's codes and block scales, the same two one row on (the
-    /// interleaved up rows), w2's codes and block scales - and three f32 outer scales, w13's for
-    /// the gate and the up and w2's for the down.
-    mma_table: Deviceptr,
-    mma_scales: Deviceptr,
+}
+
+/// A layer's experts as the grouped MMA (q4p_moe_gate_up_capped / q4p_moe_down, and their _mx8
+/// forms) reads them: six pointers a local expert - w13's codes and block scales, the same two one
+/// row on (the interleaved up rows), w2's codes and block scales - and three f32 outer scales,
+/// w13's for the gate and the up and w2's for the down (ones for MXFP8, which stores none).
+#[derive(Debug, Clone, Copy)]
+struct MmaTable {
+    table: Deviceptr,
+    scales: Deviceptr,
 }
 
 /// The pointers a q4p MMA table holds a local expert, and the outer scales.
@@ -851,7 +901,12 @@ struct Shared {
     clip: Vec<ClipScales>,
     clip_arena: Deviceptr,
     experts: Vec<Option<ExpertScale>>,
-    /// The allocation every ExpertScale's device vectors are offsets into.
+    /// Each layer's grouped-MMA table: the NVFP4 layers', and the MXFP8 layers' under
+    /// [Mxfp8Walk::Mma].
+    mma: Vec<Option<MmaTable>>,
+    /// How a prompt chunk's MXFP8 experts are walked ([MXFP8_ENV]).
+    mxfp8_walk: Mxfp8Walk,
+    /// The allocation every ExpertScale's device vectors and MmaTable's tables are offsets into.
     expert_arena: Deviceptr,
     /// [top_k] ones in that arena: the routing weights the grouped MMA's down pass multiplies by.
     route_ones: Deviceptr,
@@ -2346,6 +2401,7 @@ impl InklingDeviceBackend {
             ));
         }
         let prefill_walk = PrefillWalk::from_env()?;
+        let mxfp8_walk = Mxfp8Walk::from_env(prefill_walk)?;
         let dense_form = DenseForm::from_env()?;
         let chunk_widths = ChunkWidths::from_env(context)?;
         let prefill_chunk = chunk_widths.widest();
@@ -2430,7 +2486,12 @@ impl InklingDeviceBackend {
         let dense = pack_dense(&cuda, &kernels, &[&plan, &prefill], &weights, dense_form)?;
         eprintln!("[inkling] rank {}: {}", tp.rank(), dense.summary());
         let (clip, clip_arena) = widen_clips(&cuda, &kernels, &plan, &weights)?;
-        let (experts, expert_arena, route_ones) = expert_scales(&cuda, &plan, &weights)?;
+        let ExpertTables {
+            scales: experts,
+            mma,
+            arena: expert_arena,
+            route_ones,
+        } = expert_scales(&cuda, &plan, &weights, mxfp8_walk)?;
         let exchange_slots = if exchange.has_device_leg() {
             let widest = (prefill_chunk * config.hidden_size).max(plan.rank_vocab());
             let mut total = 0usize;
@@ -2473,6 +2534,8 @@ impl InklingDeviceBackend {
                 clip,
                 clip_arena,
                 experts,
+                mma,
+                mxfp8_walk,
                 expert_arena,
                 route_ones,
                 context,
@@ -2990,14 +3053,31 @@ fn widen_clips(
     Ok((clip, arena))
 }
 
+/// What [expert_scales] lays out: the NVFP4 layers' scales, every grouped-MMA table, the arena
+/// they all live in, and the [top_k] ones the MMA's down pass reads as routing weights.
+struct ExpertTables {
+    scales: Vec<Option<ExpertScale>>,
+    mma: Vec<Option<MmaTable>>,
+    arena: Deviceptr,
+    route_ones: Deviceptr,
+}
+
 /// Read the released per-expert scales off the device once, so a token's band does not have to,
-/// and lay out each NVFP4 layer's grouped-MMA table. Returns the scales, the arena they live in,
-/// and the [top_k] ones the MMA's down pass reads as routing weights.
+/// and lay out each NVFP4 layer's grouped-MMA table, and each MXFP8 layer's under
+/// [Mxfp8Walk::Mma] once its scale codes are admitted ([admit_mxfp8_scales]).
 fn expert_scales(
     cuda: &Cuda,
     plan: &InklingDevicePlan,
     weights: &Weights,
-) -> Result<(Vec<Option<ExpertScale>>, Deviceptr, Deviceptr), String> {
+    mxfp8: Mxfp8Walk,
+) -> Result<ExpertTables, String> {
+    let mma_mx8 = |layer: &LayerSchedule| {
+        mxfp8 == Mxfp8Walk::Mma && layer.experts == ExpertBody::MxFp8
+    };
+    let (_, owned) = plan.expert_range();
+    for layer in plan.layers().iter().filter(|layer| mma_mx8(layer)) {
+        admit_mxfp8_scales(cuda, layer, weights)?;
+    }
     let mut table = Vec::with_capacity(plan.layers().len());
     for layer in plan.layers() {
         if layer.experts != ExpertBody::NvFp4 {
@@ -3046,17 +3126,15 @@ fn expert_scales(
     // One arena for every layer's vectors and MMA tables, uploaded once. Each piece starts on an
     // 8-byte boundary, which the tables' pointers need.
     let words = |count: usize| count.next_multiple_of(2);
+    let mma_words = |owned: usize| words(owned * MMA_TABLE_ENTRIES * 2) + words(owned * MMA_SCALES);
     let floats: usize = table
         .iter()
         .flatten()
         .map(|(gate_up, down): &(Vec<f32>, Vec<f32>)| {
-            let owned = gate_up.len();
-            words(gate_up.len())
-                + words(down.len())
-                + words(owned * MMA_TABLE_ENTRIES * 2)
-                + words(owned * MMA_SCALES)
+            words(gate_up.len()) + words(down.len()) + mma_words(gate_up.len())
         })
         .sum::<usize>()
+        + plan.layers().iter().filter(|layer| mma_mx8(layer)).count() * mma_words(owned)
         + words(plan.config().num_experts_per_tok);
     let mut total = 0usize;
     let arena = cuda.alloc((floats * 4).max(4), &mut total)?;
@@ -3072,83 +3150,169 @@ fn expert_scales(
     // The down pass multiplies its sum by a slot's routing weight; the mix already applies the
     // shares, so the MMA reads one for every slot.
     let route_ones = place(&row_bytes(&vec![1.0f32; plan.config().num_experts_per_tok]))?;
-    let config = plan.config();
-    let (hidden, intermediate) = (config.hidden_size, plan.expert_intermediate());
     let mut scales = Vec::with_capacity(table.len());
+    let mut mma = Vec::with_capacity(table.len());
     for (layer, entry) in plan.layers().iter().zip(table) {
-        scales.push(match entry {
-            None => None,
+        // The outer scales a local expert's gate, up and down rows take.
+        let outer: Vec<f32> = match entry {
             Some((gate_up, down)) => {
                 let device_gate_up = place(&row_bytes(&gate_up))?;
                 let device_down = place(&row_bytes(&down))?;
-                let codes = |op: Op, which: usize| -> Result<Deviceptr, String> {
-                    layer
-                        .steps
-                        .iter()
-                        .find(|step| step.op == op)
-                        .and_then(|step| step.weights.get(which))
-                        .map(|index| weights.get(*index).pointer)
-                        .ok_or_else(|| {
-                            format!(
-                                "layer {}: no {op:?} weight {which} for the MMA table",
-                                layer.index
-                            )
-                        })
-                };
-                let (w13, w13_scales) = (codes(Op::ExpertGateUp, 0)?, codes(Op::ExpertGateUp, 1)?);
-                let (w2, w2_scales) = (codes(Op::ExpertDown, 0)?, codes(Op::ExpertDown, 1)?);
-                let w13_bytes = codes_bytes(2 * intermediate, hidden, ExpertBody::NvFp4);
-                let w13_scale_bytes = scales_bytes(2 * intermediate, hidden, ExpertBody::NvFp4);
-                let down_shape = plan.expert_down();
-                let w2_bytes = codes_bytes(down_shape.rows, down_shape.columns, ExpertBody::NvFp4);
-                let w2_scale_bytes =
-                    scales_bytes(down_shape.rows, down_shape.columns, ExpertBody::NvFp4);
-                // One w13 row: hidden / 2 code bytes and hidden / 16 block scales.
-                let (code_row, scale_row) = (hidden / 2, hidden / 16);
-                let mut pointers = Vec::with_capacity(gate_up.len() * MMA_TABLE_ENTRIES);
-                let mut outer = Vec::with_capacity(gate_up.len() * MMA_SCALES);
-                for local in 0..gate_up.len() {
-                    let codes = w13.offset(local * w13_bytes);
-                    let block = w13_scales.offset(local * w13_scale_bytes);
-                    pointers.extend([
-                        codes.0,
-                        block.0,
-                        codes.offset(code_row).0,
-                        block.offset(scale_row).0,
-                        w2.offset(local * w2_bytes).0,
-                        w2_scales.offset(local * w2_scale_bytes).0,
-                    ]);
-                    outer.extend([gate_up[local], gate_up[local], down[local]]);
-                }
-                // The tile copies 16 bytes of a row at a time and four bytes of its scales.
-                if pointers
-                    .chunks(MMA_TABLE_ENTRIES)
-                    .any(|row| row[0] % 16 != 0 || row[2] % 16 != 0 || row[4] % 16 != 0)
-                    || pointers.iter().any(|pointer| pointer % 4 != 0)
-                {
-                    return Err(format!(
-                        "layer {}: an expert's codes are not 16-byte aligned for the MMA tile",
-                        layer.index
-                    ));
-                }
-                let pointer_bytes: Vec<u8> = pointers
+                let outer = gate_up
                     .iter()
-                    .flat_map(|pointer| pointer.to_le_bytes())
+                    .zip(&down)
+                    .flat_map(|(gate_up, down)| [*gate_up, *gate_up, *down])
                     .collect();
-                let mma_table = place(&pointer_bytes)?;
-                let mma_scales = place(&row_bytes(&outer))?;
-                Some(ExpertScale {
+                scales.push(Some(ExpertScale {
                     gate_up,
                     down,
                     device_gate_up,
                     device_down,
-                    mma_table,
-                    mma_scales,
-                })
+                }));
+                outer
             }
-        });
+            // An MXFP8 expert stores no outer scale.
+            None if mma_mx8(layer) => {
+                scales.push(None);
+                vec![1.0; owned * MMA_SCALES]
+            }
+            None => {
+                scales.push(None);
+                mma.push(None);
+                continue;
+            }
+        };
+        let pointers = mma_pointers(plan, layer, weights, outer.len() / MMA_SCALES)?;
+        let pointer_bytes: Vec<u8> = pointers
+            .iter()
+            .flat_map(|pointer| pointer.to_le_bytes())
+            .collect();
+        mma.push(Some(MmaTable {
+            table: place(&pointer_bytes)?,
+            scales: place(&row_bytes(&outer))?,
+        }));
     }
-    Ok((scales, arena, route_ones))
+    Ok(ExpertTables {
+        scales,
+        mma,
+        arena,
+        route_ones,
+    })
+}
+
+/// A layer's grouped-MMA pointers for `owned` local experts ([MmaTable]), in its stored body.
+fn mma_pointers(
+    plan: &InklingDevicePlan,
+    layer: &LayerSchedule,
+    weights: &Weights,
+    owned: usize,
+) -> Result<Vec<u64>, String> {
+    let body = layer.experts;
+    let config = plan.config();
+    let (hidden, intermediate) = (config.hidden_size, plan.expert_intermediate());
+    let down_shape = plan.expert_down();
+    let w13_bytes = codes_bytes(2 * intermediate, hidden, body);
+    let w13_scale_bytes = scales_bytes(2 * intermediate, hidden, body);
+    let w2_bytes = codes_bytes(down_shape.rows, down_shape.columns, body);
+    let w2_scale_bytes = scales_bytes(down_shape.rows, down_shape.columns, body);
+    // A slot the table walks has to hold every local expert it names.
+    let slot = |op: Op, which: usize, expert_bytes: usize| -> Result<Deviceptr, String> {
+        let index = layer
+            .steps
+            .iter()
+            .find(|step| step.op == op)
+            .and_then(|step| step.weights.get(which))
+            .ok_or_else(|| {
+                format!(
+                    "layer {}: no {op:?} weight {which} for the MMA table",
+                    layer.index
+                )
+            })?;
+        let slot = weights.get(*index);
+        if slot.bytes < owned * expert_bytes {
+            return Err(format!(
+                "layer {}: {op:?} weight {which} holds {} bytes, not the {owned} experts of {} \
+                 bytes the MMA table walks",
+                layer.index, slot.bytes, expert_bytes
+            ));
+        }
+        Ok(slot.pointer)
+    };
+    let w13 = slot(Op::ExpertGateUp, 0, w13_bytes)?;
+    let w13_scales = slot(Op::ExpertGateUp, 1, w13_scale_bytes)?;
+    let w2 = slot(Op::ExpertDown, 0, w2_bytes)?;
+    let w2_scales = slot(Op::ExpertDown, 1, w2_scale_bytes)?;
+    // One w13 row: its code bytes and its block scales (NVFP4 hidden / 2 and hidden / 16, MXFP8
+    // hidden and hidden / 32).
+    let (code_row, scale_row) = (codes_bytes(1, hidden, body), scales_bytes(1, hidden, body));
+    if body == ExpertBody::MxFp8 {
+        // The MXFP8 tile reads a row's ue8m0 codes four at a time, two of its 64-column stages a
+        // word, so a row it walks is whole 128-column runs.
+        let run = 4 * MXFP8_BLOCK;
+        if !hidden.is_multiple_of(run) || !down_shape.columns.is_multiple_of(run) {
+            return Err(format!(
+                "layer {}: the MXFP8 MMA walks rows of whole {run}-column runs, and the experts' \
+                 rows are {hidden} and {} wide; {MXFP8_ENV}=pairs walks this band",
+                layer.index, down_shape.columns
+            ));
+        }
+    }
+    let mut pointers = Vec::with_capacity(owned * MMA_TABLE_ENTRIES);
+    for local in 0..owned {
+        let codes = w13.offset(local * w13_bytes);
+        let block = w13_scales.offset(local * w13_scale_bytes);
+        pointers.extend([
+            codes.0,
+            block.0,
+            codes.offset(code_row).0,
+            block.offset(scale_row).0,
+            w2.offset(local * w2_bytes).0,
+            w2_scales.offset(local * w2_scale_bytes).0,
+        ]);
+    }
+    // The tile copies 16 bytes of a row at a time and four bytes of its scales.
+    if pointers
+        .chunks(MMA_TABLE_ENTRIES)
+        .any(|row| row[0] % 16 != 0 || row[2] % 16 != 0 || row[4] % 16 != 0)
+        || pointers.iter().any(|pointer| pointer % 4 != 0)
+    {
+        return Err(format!(
+            "layer {}: an expert's codes are not 16-byte aligned for the MMA tile",
+            layer.index
+        ));
+    }
+    Ok(pointers)
+}
+
+/// Refuse an MXFP8 layer whose weights the grouped MMA would not hold exactly.
+///
+/// The MMA forms each weight as the pair walk does - the E4M3 value times 2^(code - 127) in f32 -
+/// and rounds it to BF16. An E4M3 value has at most four significant bits, so the rounding is
+/// exact (an f32 overflow is infinite in both) unless the product falls under BF16's subnormal
+/// step, 2^-133: the smallest E4M3 step is 2^-9, which happens for codes 1 and 2 alone. Code 0
+/// scales to zero in both walks. Every code of the layer's w13 and w2 is read once, at open.
+fn admit_mxfp8_scales(cuda: &Cuda, layer: &LayerSchedule, weights: &Weights) -> Result<(), String> {
+    for op in [Op::ExpertGateUp, Op::ExpertDown] {
+        let index = layer
+            .steps
+            .iter()
+            .find(|step| step.op == op)
+            .and_then(|step| step.weights.get(1))
+            .ok_or_else(|| format!("layer {}: no {op:?} block scales", layer.index))?;
+        let slot = weights.get(*index);
+        let mut codes = vec![0u8; slot.bytes];
+        cuda.copy_dtoh(&mut codes, &slot.pointer)
+            .map_err(|error| format!("layer {} {op:?} scales: {error}", layer.index))?;
+        if let Some(at) = codes.iter().position(|code| matches!(code, 1 | 2)) {
+            return Err(format!(
+                "layer {}: {op:?} scale code {} (byte {at}) puts the smallest E4M3 steps under \
+                 BF16's subnormal step, so the grouped MMA would not hold those weights exactly; \
+                 {MXFP8_ENV}=pairs walks the MXFP8 layers exactly",
+                layer.index, codes[at]
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The bytes one expert's stored codes occupy.
@@ -5538,10 +5702,32 @@ impl InklingDeviceSession {
 mod tests {
     use super::{
         AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV,
-        DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, PrefillWalk,
-        depth_policy_from_env, mma_attention_shared,
+        DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk,
+        PrefillWalk, depth_policy_from_env, mma_attention_shared,
     };
     use crate::config::Inkling2Config;
+
+    #[test]
+    fn the_mxfp8_walk_is_the_mma_under_the_tensor_walk_alone() {
+        for value in [None, Some(""), Some("mma")] {
+            assert_eq!(
+                Mxfp8Walk::parse(value, PrefillWalk::Tensor),
+                Ok(Mxfp8Walk::Mma)
+            );
+        }
+        assert_eq!(
+            Mxfp8Walk::parse(Some("pairs"), PrefillWalk::Tensor),
+            Ok(Mxfp8Walk::Pairs)
+        );
+        // The exact walks keep the pair walk, and naming the MMA there is refused, not ignored.
+        for prefill in [PrefillWalk::Chunk, PrefillWalk::Rows, PrefillWalk::Gemm] {
+            for value in [None, Some(""), Some("pairs")] {
+                assert_eq!(Mxfp8Walk::parse(value, prefill), Ok(Mxfp8Walk::Pairs));
+            }
+            assert!(Mxfp8Walk::parse(Some("mma"), prefill).is_err());
+        }
+        assert!(Mxfp8Walk::parse(Some("tensor"), PrefillWalk::Tensor).is_err());
+    }
 
     #[test]
     fn the_attention_walk_follows_the_prompt_walk_unless_one_is_named() {
