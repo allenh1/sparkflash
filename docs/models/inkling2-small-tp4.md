@@ -2000,3 +2000,44 @@ prefill of the whole second prompt the logits differ (largest 2.06 at 6K, 1.13 a
 greedy ids agree: the rewound prompt's chunks start at the boundary rather than at row 0, and a
 prompt row's bits depend on where its chunk starts, as they do for any prompt that extends a held
 sequence (D66). Under `off` the second prompt is a cold prefill in every value.
+
+### One sampler for both models; DSpark drafts with the target's noise (D123)
+
+A sampled request used to draw from the engine sampler: it sorted the row, took the cut and drew
+one uniform from a generator stepped in order. The drafter had no share in that draw. It drafted
+the argmax, so under sampling a draft was accepted only when the sample happened to be the
+argmax. Inkling now samples the way DeepSeek does: Gumbel-max with counter noise. The token at
+sequence index `t` is the argmax of `logit / T + G(seed, t, id)` over the cut. `G` is a hash of
+the seed, the index and the id, so it holds no state. Both models use one sampler,
+`sparkflash_model::gumbel::GumbelSampler`: DeepSeek's `tp4_forward/sample.rs` now re-exports
+it, a pure move, and DeepSeek's cubins match their pins.
+
+* **The host pick.** `pick_row` takes the whole logit row after the request's penalties
+  (`Sampler::penalized`). With temperature alone it takes the perturbed argmax over the tokens
+  within the noise's span of the best. With top_k or top_p it bounds the candidate list with a
+  512-bucket histogram of the scaled logits, takes DeepSeek's cut over that list, and widens to
+  a full sort only when the list cannot decide the cut. On 150K-wide rows it takes 0.25-0.6 ms
+  for a peaked row and 1.7 ms for a flat one, against 2.1-3.9 ms for the engine sampler's draw.
+* **The draft.** The drafter's Markov head adds the same `G` at the index each draft would land
+  on (`markov_logits`, `inv_t` and the seed). Each draft is then the sample of the drafter's own
+  tempered distribution under the target's noise, so a draft is accepted when it equals the
+  target's sample. The draft ignores the request's cut and penalties; a draft outside them is
+  rejected at verify. The depth policy's confidence stays the drafter's p(argmax).
+
+The emitted token at an index depends only on the target's logits, the cut and the seed. Plain
+and speculative decoding therefore emit the same ids for one seed. A seed's ids differ from the
+old draw's, because the random stream is a different one; greedy is unchanged.
+
+On the four ranks, served files (intermediate split), adaptive depth 7, one window:
+
+| run | plain | DSpark | ids |
+|---|---|---|---|
+| greedy, repeating 5K prompt, 96 tokens | 25.21 ms (digest `ec85a691b74bbc6b`, the deployed build's) | 12.76 ms, 81 of 82 drafts | equal |
+| T 1, top_p 0.95, seed 12345, same prompt | 26.12 ms | 13.19 ms, 81 of 82 | equal |
+| T 0.7, top_p 0.9, top_k 40, seed 777 | 26.18 ms | 13.03 ms, 81 of 81 | equal |
+| T 1, top_p 0.95, seed 4242, 93,159-token text, 48 tokens | 29.55 ms | 26.70 ms, 26 of 42 in 14 rounds | equal |
+
+On the repeating prompt the sampled ids are greedy's: every step's top token holds more than the
+nucleus. The 93K text's sampled ids leave greedy's at the third token, so that row is the one that
+tests a real draw. `inkling-tp4 --sample T,TOP_P,TOP_K,SEED` sets a run's decode sampling. The
+served group sends the request's sampler in its request frame, so every rank draws the same noise.
