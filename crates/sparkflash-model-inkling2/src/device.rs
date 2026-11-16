@@ -4766,6 +4766,11 @@ impl ModelSession for InklingDeviceSession {
         (past > 0 && past + drafts <= self.shared.prefill_chunk).then(|| &self.history[..point])
     }
 
+    /// The last prompt's images. The rewind point is that prompt's end, so it holds them all.
+    fn held_images(&self) -> &[ImageSpan] {
+        &self.held_images
+    }
+
     fn cached_tokens(&self) -> usize {
         self.cached
     }

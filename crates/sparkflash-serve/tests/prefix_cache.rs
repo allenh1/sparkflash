@@ -15,12 +15,14 @@
 //! The host driver's prefix cache: a kept sequence continues from the tokens it holds, so the
 //! next request prefills only what it added, and the hit is reported as such. A prompt that spells
 //! the held tokens' bytes with other ids continues them too, and a request whose client left after
-//! its prefill keeps its work for the retry.
+//! its prefill keeps its work for the retry. A sequence that holds images continues with a prompt
+//! that carries the same images at the same spans.
 
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use sparkflash_api::engine::{EngineEvent, EngineRequest, InferenceEngine};
+use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
 use sparkflash_model::{
     BackendError, Capabilities, ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling,
     StepOutput,
@@ -104,15 +106,20 @@ fn descriptor() -> ModelDescriptor {
         context_tokens: 256,
         max_output_tokens: 8,
         vocab_size: VOCAB,
-        capabilities: Capabilities::default(),
+        capabilities: Capabilities {
+            vision: true,
+            ..Capabilities::default()
+        },
     }
 }
 
-/// What the backend saw: one entry per forwarded prefill, the tokens it actually received, and
-/// how many sessions were alive at once (live now, and the most ever).
+/// What the backend saw: one entry per forwarded prefill, the tokens it actually received and the
+/// starts of the images it encoded, and how many sessions were alive at once (live now, and the
+/// most ever).
 #[derive(Default)]
 struct Recorder {
     prefills: Mutex<Vec<Vec<u32>>>,
+    encoded: Mutex<Vec<Vec<usize>>>,
     sessions: Mutex<(usize, usize)>,
     /// When set, every prefill waits on it; the test opens it by dropping the sender.
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
@@ -123,6 +130,10 @@ struct Recorder {
 impl Recorder {
     fn prefills(&self) -> Vec<Vec<u32>> {
         self.prefills.lock().expect("the recorder lock").clone()
+    }
+
+    fn encoded(&self) -> Vec<Vec<usize>> {
+        self.encoded.lock().expect("the recorder lock").clone()
     }
 
     fn most_alive(&self) -> usize {
@@ -148,6 +159,7 @@ impl ModelBackend for PrefixBackend {
         Ok(Box::new(PrefixSession {
             recorder: Arc::clone(&self.recorder),
             consumed: Vec::new(),
+            images: Vec::new(),
             cached: 0,
             boundary: None,
         }))
@@ -159,6 +171,8 @@ impl ModelBackend for PrefixBackend {
 struct PrefixSession {
     recorder: Arc<Recorder>,
     consumed: Vec<u32>,
+    /// The last prompt's images, which its end (the rewind point) holds too.
+    images: Vec<ImageSpan>,
     cached: usize,
     /// The last prompt's end, when the recorder's sessions rewind.
     boundary: Option<usize>,
@@ -194,6 +208,14 @@ impl ModelSession for PrefixSession {
     fn set_sampling(&mut self, _sampling: Sampling) {}
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        self.prefill_images(tokens, &[])
+    }
+
+    fn prefill_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
         if let Some(gate) = self
             .recorder
             .gate
@@ -226,13 +248,40 @@ impl ModelSession for PrefixSession {
                 "a prefill must extend the tokens this sequence holds",
             ));
         }
+        // The held tokens' images are the ones this sequence encoded there, so the prompt must
+        // carry those and no other.
+        let same = self
+            .images
+            .iter()
+            .all(|span| images.iter().any(|image| image.span == *span))
+            && images
+                .iter()
+                .all(|image| image.span.start >= reused || self.images.contains(&image.span));
+        if !same {
+            return Err(BackendError::new(
+                "toy",
+                "a prefill must carry the images this sequence holds",
+            ));
+        }
         self.recorder
             .prefills
             .lock()
             .expect("the recorder lock")
             .push(tokens[reused..].to_vec());
+        self.recorder
+            .encoded
+            .lock()
+            .expect("the recorder lock")
+            .push(
+                images
+                    .iter()
+                    .map(|image| image.span.start)
+                    .filter(|start| *start >= reused)
+                    .collect(),
+            );
         self.cached = reused;
         self.consumed.extend_from_slice(&tokens[reused..]);
+        self.images = images.iter().map(|image| image.span).collect();
         if self.recorder.rewinds {
             self.boundary = Some(self.consumed.len());
         }
@@ -252,6 +301,10 @@ impl ModelSession for PrefixSession {
         self.boundary
             .filter(|point| *point < self.consumed.len())
             .map(|point| &self.consumed[..point])
+    }
+
+    fn held_images(&self) -> &[ImageSpan] {
+        &self.images
     }
 
     fn cached_tokens(&self) -> usize {
@@ -344,6 +397,34 @@ fn host_driver_with(
 /// `5 6 7 10 11`.
 fn first_turn() -> EngineRequest {
     let mut first = request("a", vec![5, 6, 7], 2);
+    first.forced_tokens = vec![10, 11];
+    first
+}
+
+/// An image of three positions from `start` (a start delimiter, one row of one, an end) whose
+/// canvas is `key`.
+fn image(start: usize, key: u8) -> VisionImage {
+    VisionImage {
+        span: ImageSpan {
+            start,
+            grid: ImageGrid {
+                n_llm_h: 1,
+                n_llm_w: 1,
+                best_height: 1,
+                best_width: 1,
+                line_stride: 1,
+            },
+            key: [key; 32],
+        },
+        pixels: Arc::from(vec![key; 3]),
+    }
+}
+
+/// A first turn whose prompt `5 6 7 8` carries image `1` over `6 7 8` and that writes `10`,`11`,
+/// so the sequence holds `5 6 7 8 10 11` and the image.
+fn image_turn() -> EngineRequest {
+    let mut first = request("a", vec![5, 6, 7, 8], 2);
+    first.vision = vec![image(1, 1)];
     first.forced_tokens = vec![10, 11];
     first
 }
@@ -581,5 +662,92 @@ async fn a_retry_with_another_sampler_prefills_again() {
     let retry = answer(&driver, retry).await;
     assert_eq!(retry.cached, 0);
     assert_eq!(recorder.prefills(), vec![prompt.clone(), prompt]);
+    assert_eq!(recorder.most_alive(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_that_carries_the_held_image_again_prefills_only_what_it_added() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, image_turn()).await;
+
+    // An agent resends the conversation with its screenshot, then a new screenshot and a turn.
+    let next = vec![5u32, 6, 7, 8, 10, 11, 4, 3, 2, 9];
+    let images = vec![image(1, 1), image(6, 2)];
+    let mut second = request("b", next.clone(), 2);
+    second.vision.clone_from(&images);
+    let second = answer(&driver, second).await;
+    assert_eq!(second.cached, 6, "the prompt, its image and the reply");
+    assert_eq!(second.usage_cached, 6);
+    assert_eq!(second.usage_miss, 4);
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7, 8], vec![4, 3, 2, 9]],
+        "only the new image and turn were forwarded"
+    );
+    assert_eq!(
+        recorder.encoded(),
+        vec![vec![1], vec![6]],
+        "each image was encoded once"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    let cold = host_driver(Arc::new(Recorder::default()));
+    let mut own = request("cold", next, 2);
+    own.vision = images;
+    assert_eq!(answer(&cold, own).await.text, second.text);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_whose_held_image_differs_or_is_gone_starts_a_fresh_sequence() {
+    let recorder = Arc::new(Recorder::default());
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, image_turn()).await;
+
+    // Another canvas over the same placeholders: the ids match, the image does not.
+    let next = vec![5u32, 6, 7, 8, 10, 11, 9];
+    let mut other = request("b", next.clone(), 2);
+    other.vision = vec![image(1, 3)];
+    assert_eq!(answer(&driver, other).await.cached, 0);
+    answer(&driver, image_turn()).await;
+    // The same placeholders with no image at all.
+    assert_eq!(
+        answer(&driver, request("c", next.clone(), 2)).await.cached,
+        0
+    );
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7, 8], next.clone(), vec![5, 6, 7, 8], next],
+        "each was prefilled whole"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_that_parts_from_the_reply_rewinds_past_the_held_image() {
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ..Recorder::default()
+    });
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, image_turn()).await;
+
+    let next = vec![5u32, 6, 7, 8, 30, 31, 9];
+    let mut second = request("b", next.clone(), 2);
+    second.vision = vec![image(1, 1)];
+    let second = answer(&driver, second).await;
+    assert_eq!(second.cached, 4, "the held prompt and its image");
+    assert_eq!(second.usage_miss, 3);
+
+    // Another canvas before the rewind point cannot go back there.
+    answer(&driver, image_turn()).await;
+    let mut other = request("c", next.clone(), 2);
+    other.vision = vec![image(1, 3)];
+    assert_eq!(answer(&driver, other).await.cached, 0);
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7, 8], vec![30, 31, 9], vec![5, 6, 7, 8], next],
+        "only the rewound turn forwarded part of its prompt"
+    );
     assert_eq!(recorder.most_alive(), 1);
 }

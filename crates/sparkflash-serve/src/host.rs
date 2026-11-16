@@ -64,7 +64,7 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_model::telemetry::PrefixMatchPlan;
-use sparkflash_model::vision::VisionImage;
+use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{
     ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation, StepOutput,
 };
@@ -620,12 +620,13 @@ impl Continuation {
 ///
 /// The prompt must extend the held tokens, or, with `by_text`, spell their exact bytes and then
 /// extend them. Extend means strictly unless the held step answers the request: a session with
-/// nothing left to forward has no other logits for the last token. Images must lie past what is
-/// held, since a held history is ids only and cannot match an image's pixels, and a re-spelled
-/// prompt carries none because the re-spelling would move their spans.
+/// nothing left to forward has no other logits for the last token. The images inside the held
+/// tokens must be the ones the session holds there ([same_images_before]): a held history is ids,
+/// and an image's placeholders are the same ids whatever the image. A re-spelled prompt carries
+/// none and continues no history that holds one, because the re-spelling would move their spans.
 ///
 /// A prompt that does neither may still go past the session's rewind point
-/// ([ModelSession::rewind_prefix]) with no image before it: the session goes back there.
+/// ([ModelSession::rewind_prefix]) with the point's images before it: the session goes back there.
 fn continuation(
     kept: &Held,
     job: &Job,
@@ -636,9 +637,10 @@ fn continuation(
         .session
         .reusable_prefix()
         .filter(|history| !history.is_empty())?;
+    let held_images = kept.session.held_images();
     let prompt = job.prompt_tokens.as_slice();
     let respelling = || {
-        (by_text && job.images.is_empty())
+        (by_text && job.images.is_empty() && held_images.is_empty())
             .then(|| respelled_prompt(codec, history, prompt))
             .flatten()
     };
@@ -649,7 +651,7 @@ fn continuation(
     } else {
         return rewound(kept, job);
     };
-    if job.images.iter().any(|image| image.span.start < covered) {
+    if !same_images_before(held_images, &job.images, covered) {
         return None;
     }
     let handed = respelled.as_ref().map_or(prompt.len(), Vec::len);
@@ -670,7 +672,7 @@ fn continuation(
 }
 
 /// How `job` continues `kept` from the session's rewind point, when its prompt keeps the point's
-/// tokens, goes past them, and carries no image before their end.
+/// tokens, goes past them, and carries the point's images before their end and no other.
 fn rewound(kept: &Held, job: &Job) -> Option<Continuation> {
     let point = kept
         .session
@@ -679,10 +681,7 @@ fn rewound(kept: &Held, job: &Job) -> Option<Continuation> {
     let prompt = job.prompt_tokens.as_slice();
     if prompt.len() <= point.len()
         || !prompt.starts_with(point)
-        || job
-            .images
-            .iter()
-            .any(|image| image.span.start < point.len())
+        || !same_images_before(kept.session.held_images(), &job.images, point.len())
     {
         return None;
     }
@@ -693,6 +692,18 @@ fn rewound(kept: &Held, job: &Job) -> Option<Continuation> {
         resume: false,
         rewound: true,
     })
+}
+
+/// Whether `images` carry exactly the `held` images among those that start before `end`: every
+/// held span there comes back, content key and all, and no other image starts there.
+fn same_images_before(held: &[ImageSpan], images: &[VisionImage], end: usize) -> bool {
+    held.iter()
+        .filter(|span| span.start < end)
+        .all(|span| images.iter().any(|image| image.span == *span))
+        && images
+            .iter()
+            .filter(|image| image.span.start < end)
+            .all(|image| held.contains(&image.span))
 }
 
 /// `sampling` for a session handed `handed` prompt ids.

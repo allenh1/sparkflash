@@ -857,6 +857,11 @@ impl ModelSession for GroupSession {
         self.inner.rewind_prefix()
     }
 
+    /// Rank 0's images. The workers' come from the same frames, keys included.
+    fn held_images(&self) -> &[ImageSpan] {
+        self.inner.held_images()
+    }
+
     fn cached_tokens(&self) -> usize {
         self.inner.cached_tokens()
     }

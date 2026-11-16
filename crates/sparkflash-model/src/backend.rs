@@ -26,7 +26,7 @@
 
 use crate::capabilities::Capabilities;
 use crate::descriptor::ModelDescriptor;
-use crate::vision::VisionImage;
+use crate::vision::{ImageSpan, VisionImage};
 
 /// A backend failure.
 ///
@@ -211,6 +211,18 @@ pub trait ModelSession: Send {
     /// has no such point.
     fn rewind_prefix(&self) -> Option<&[u32]> {
         None
+    }
+
+    /// The images [`Self::reusable_prefix`] holds: their spans as they were fed, content keys
+    /// included.
+    ///
+    /// A history is ids, and an image's placeholders are the same ids whatever the image, so an
+    /// adapter continues a history that holds images only with a prompt that carries these same
+    /// images at these same spans. The ones that start before [`Self::rewind_prefix`]'s end are
+    /// the rewind point's. The default - none - suits a session that keeps no image with its
+    /// history: a prompt with an image inside the held tokens then starts a fresh sequence.
+    fn held_images(&self) -> &[ImageSpan] {
+        &[]
     }
 
     /// How many of the last [`Self::prefill`]'s tokens the sequence already held.
