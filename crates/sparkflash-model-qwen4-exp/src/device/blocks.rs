@@ -31,15 +31,13 @@
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
+use sparkflash_ops::indexer::IndexerPass;
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
     Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts, GpuMoe,
     MAX_SELECTED_TOKENS, full_attention_splits,
 };
-
-/// The indexer blocks one q4e_qsa_scores CTA scores for a row (Q4E_QSA_TILE).
-const QSA_TILE: usize = 64;
 
 impl DeviceSequence {
     /// One sparse-attention block over `batch` rows of `mixed`, whose positions start at
@@ -292,13 +290,13 @@ impl DeviceSequence {
         // block scores are a context's worth of floats (65,537 at the native window), and a
         // 512-token chunk of them would be 128 MiB of scratch for a stage that is not
         // bandwidth-bound on it.
-        // Every block the chunk's last row can see is pooled once, for all the rows.
-        let pooled_blocks = (position + batch) / ratio;
-        if pooled_blocks > 0 {
+        // Every block the chunk's last row can see is pooled once, for all the rows. The grids
+        // are the shared indexer's (IndexerPass), the rule the rank's boot plan names.
+        if let Some((grid, block)) = IndexerPass::new(position, batch, ratio).qsa_pool() {
             self.launch(
                 kernels.qsa_pool,
-                (pooled_blocks as u32, 1, 1),
-                (128, 1, 1),
+                grid,
+                block,
                 &[
                     index_keys.0,
                     index_k_norm.0,
@@ -315,14 +313,12 @@ impl DeviceSequence {
         while base < batch {
             let rows = ATTENTION_CHUNK.min(batch - base);
             let at = position + base;
+            let pass = IndexerPass::new(at, rows, ratio);
+            let (grid, block) = pass.scores();
             self.launch(
                 kernels.qsa_scores,
-                (
-                    ((at + rows) / ratio).div_ceil(QSA_TILE).max(1) as u32,
-                    rows as u32,
-                    1,
-                ),
-                (256, 1, 1),
+                grid,
+                block,
                 &[
                     self.index_query.offset(base * idx_q_width * 4).0,
                     self.qsa_pooled_keys.0,
@@ -335,10 +331,11 @@ impl DeviceSequence {
                 ],
             )?;
             self.prof_mark("sparse_score")?;
+            let (grid, block) = pass.per_row();
             self.launch(
                 kernels.qsa_pick,
-                (rows as u32, 1, 1),
-                (256, 1, 1),
+                grid,
+                block,
                 &[
                     self.qsa_block_scores.0,
                     self.selected.0,

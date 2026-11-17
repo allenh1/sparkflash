@@ -26,12 +26,6 @@ pub const GDN_QK_ROW: usize = 288;
 /// The conv history the scan carries in registers.
 pub const CONV_HISTORY: usize = 8;
 
-/// Tokens a Qwen sparse-attention query selects at most.
-pub const MAX_SELECTED_TOKENS: usize = 2304;
-
-/// The indexer blocks the selection kernel folds into.
-pub const MAX_BUDGET_BLOCKS: usize = 1024;
-
 /// Blocks the scan aims for: one an SM on GB10's forty-eight.
 const GDN_SCAN_TARGET_BLOCKS: usize = 48;
 

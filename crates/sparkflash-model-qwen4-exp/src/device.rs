@@ -194,12 +194,9 @@ mod prof {
     }
 }
 
-/// The QSA selection buffer the attention kernel reserves, in tokens.
-///
-/// Mirrors Q4E_MAX_SELECTED in kernels/qwen4_exp_sm121.cu. The released configuration selects at
-/// most 2,051 (512 complete blocks of four plus the incomplete tail), so the margin is small on
-/// purpose: a configuration that outgrows it is refused here rather than writing past the buffer.
-pub const MAX_SELECTED_TOKENS: usize = 2304;
+/// The QSA selection buffer and the selection kernel's pools: the shared indexer's
+/// (`Q4E_MAX_SELECTED`, `Q4E_MAX_BUDGET`), refused here when a configuration outgrows them.
+pub use sparkflash_ops::indexer::{MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 
 /// Per-row activation buffers a session exposes to a batch, in one canonical order.
 const SCRATCH_SLOTS: usize = 48;
@@ -252,8 +249,6 @@ pub const MAX_LOWRANK: usize = 1024;
 /// (Q4E_MAX_INTERMEDIATE).
 pub const MAX_INTERMEDIATE: usize = 1024;
 
-/// The number of indexer blocks the selection kernel folds into (Q4E_MAX_BUDGET).
-pub const MAX_BUDGET_BLOCKS: usize = 1024;
 /// The indexer heads (Q4E_QSA_MAX_HEADS) and channels a pooled key scores against.
 pub const MAX_INDEXER_HEADS: usize = 8;
 /// The widest indexer head the kernel holds (Q4E_QSA_HEAD_DIM).

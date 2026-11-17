@@ -232,16 +232,6 @@ pub struct SymbolLaunch {
     pub launch: KernelLaunch,
 }
 
-/// Qwen's `q4e_qsa_scores` pools a 64-block tile a grid row (`QSA_TILE` in the arm).
-const QSA_SCORE_TILE: usize = 64;
-/// `q4e_qsa_pool` runs 128 threads a pooled block (the Qwen arm's pool launch).
-const QSA_POOL_BLOCK: u32 = 128;
-/// The score and pick bodies of both released families run 256 threads a block
-/// (`Q4E_QSA_TILE`/`SCORE_TILE` are 64-pool score tiles inside that block).
-const INDEX_SCORE_BLOCK: u32 = 256;
-/// GLM's `q4e_glm_index_scores` tiles its pools 64 at a time (`SCORE_TILE` in the arm).
-const GLM_SCORE_TILE: usize = 64;
-
 /// The sparse-indexer pool, score and selection launcher.
 ///
 /// The indexer is three bodies in one pass - pool, score and pick - so this launcher carries
@@ -335,34 +325,27 @@ impl SparseIndexerLauncher {
     }
 }
 
-/// The grid and block one indexer symbol runs at, from its own released-arm rule.
+/// The grid and block one indexer symbol runs at: the shared rule the arms launch
+/// ([crate::indexer::IndexerPass]).
 ///
-/// A symbol this tree does not launch (the DeepSeek reference selection bodies) keeps the one
-/// head-block-a-position descriptor it had before, which is the shared validation fallback.
+/// A pass with no whole pool yet skips Qwen's pool launch; the descriptor keeps one block so the
+/// boot plan still names a launchable shape. A symbol this tree does not launch (the DeepSeek
+/// reference selection bodies) keeps the one head-block-a-position descriptor it had before,
+/// which is the shared validation fallback.
 fn indexer_geometry(
     symbol: &str,
     requirement: &PartRequirement,
     rows: usize,
     position: usize,
 ) -> ((u32, u32, u32), (u32, u32, u32)) {
-    let rows = rows.max(1);
-    let pool = requirement.geometry.ratio.max(1);
-    // The last row's pool count: a pool is visible to the row at or past it.
-    let pools = position.saturating_add(rows) / pool;
-    let pools = pools.max(1);
+    use crate::indexer::{IndexerPass, QSA_POOL_BLOCK};
+    let pass = IndexerPass::new(position, rows.max(1), requirement.geometry.ratio);
     match symbol {
-        "q4e_qsa_pool" => ((pools as u32, 1, 1), (QSA_POOL_BLOCK, 1, 1)),
-        "q4e_qsa_scores" => (
-            (pools.div_ceil(QSA_SCORE_TILE) as u32, rows as u32, 1),
-            (INDEX_SCORE_BLOCK, 1, 1),
-        ),
-        "q4e_qsa_pick" => ((rows as u32, 1, 1), (INDEX_SCORE_BLOCK, 1, 1)),
-        "q4e_glm_pool" => ((rows as u32, 1, 1), (INDEX_SCORE_BLOCK, 1, 1)),
-        "q4e_glm_index_scores" => (
-            (pools.div_ceil(GLM_SCORE_TILE) as u32, rows as u32, 1),
-            (INDEX_SCORE_BLOCK, 1, 1),
-        ),
-        "q4e_glm_pick" => ((rows as u32, 1, 1), (INDEX_SCORE_BLOCK, 1, 1)),
+        "q4e_qsa_pool" => pass
+            .qsa_pool()
+            .unwrap_or(((1, 1, 1), (QSA_POOL_BLOCK, 1, 1))),
+        "q4e_qsa_scores" | "q4e_glm_index_scores" => pass.scores(),
+        "q4e_qsa_pick" | "q4e_glm_pool" | "q4e_glm_pick" => pass.per_row(),
         _ => (
             (requirement.geometry.heads.max(1) as u32, 1, 1),
             (QSA_POOL_BLOCK, 1, 1),

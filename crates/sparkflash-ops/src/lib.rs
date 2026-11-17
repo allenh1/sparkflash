@@ -93,6 +93,7 @@ pub mod epilogue;
 pub mod error;
 pub mod gemm;
 pub mod images;
+pub mod indexer;
 pub mod launchers;
 pub mod naming;
 pub mod parity;

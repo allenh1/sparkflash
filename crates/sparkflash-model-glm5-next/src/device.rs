@@ -100,13 +100,12 @@ use sparkflash_kernels::lane_memory::{self, BackError, LanePlans, Layout, Sequen
 use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
-use sparkflash_ops::gdn::{
-    CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS,
-};
+use sparkflash_ops::gdn::{CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
+use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
@@ -327,20 +326,11 @@ const GEMV_GROUP_ROWS: usize = 512;
 const GEMV_GROUPS: usize = GEMV_GROUP_ROWS / MAX_ROWS;
 /// The most (copy, row) pairs of an `fn` projection q4e_mhc_post works out: Q4E_MHC_PAIRS a warp.
 const MHC_FUSED_PAIRS: usize = 8 * 12;
-/// Pools a block of q4e_glm_index_scores scores (Q4E_QSA_TILE).
-const SCORE_TILE: usize = 64;
 /// glm_prefill_exact_bf16's geometry (GPE_OUTS, GPE_ROWS, GPE_THREADS): the outputs and rows a
 /// block computes.
 const EXACT_OUTS: usize = 32;
 const EXACT_ROWS: usize = 32;
 const EXACT_THREADS: u32 = 128;
-/// glm_prefill_index_scores' geometry (GPI_HEADS, GPI_DIM, GPI_POOLS, GPI_ROWS, GPI_THREADS): the
-/// indexer shape it is compiled for, and the pools and rows a block scores.
-const INDEX_RUN_HEADS: usize = 32;
-const INDEX_RUN_DIM: usize = 128;
-const INDEX_RUN_POOLS: usize = 64;
-const INDEX_RUN_ROWS: usize = 32;
-const INDEX_RUN_THREADS: u32 = 128;
 /// glm_prefill_mla_attend's geometry (GMA_HEADS, GMA_LATENT): a rank's heads as one MMA's M, over
 /// the latent's four 128-column scale blocks.
 const GMA_HEADS: usize = 16;
@@ -4716,10 +4706,11 @@ impl DeviceRank {
                     (run.len * dim) as u64,
                 ],
             )?;
+            let (grid, block) = IndexerPass::new(run.position, run.len, pool).per_row();
             self.launch(
                 self.kernels.pool,
-                (run.len as u32, 1, 1),
-                BLOCK,
+                grid,
+                block.0,
                 &[
                     index_keys.0,
                     index_gates.0,
@@ -4765,22 +4756,20 @@ impl DeviceRank {
                 return Err(other_kind());
             };
             let (row, position) = (run.first, run.position);
-            // The last row scores the most pools; a block past a row's own pools is a no-op.
-            let last_pools = (position + run.len) / pool;
+            // The grids are the shared indexer's (IndexerPass), the rule the rank's boot plan
+            // names: the last row scores the most pools, and a block past a row's own pools is a
+            // no-op.
+            let pass = IndexerPass::new(position, run.len, pool);
             let query = s.index_query.offset(floats(row * heads * dim)).0;
             let weights = head_weights.offset(floats(row * heads)).0;
             let scores = s.scores.offset(floats(row * score_stride)).0;
-            if run.len > MAX_ROWS && heads == INDEX_RUN_HEADS && dim == INDEX_RUN_DIM {
+            if let Some((grid, block)) = pass.run_scores(heads, dim, MAX_ROWS) {
                 // A prefill run's rows share their pooled keys: glm_prefill_index_scores keeps a
                 // tile of them while it walks the rows, and computes the decode kernel's floats.
                 self.launch(
                     self.kernels.prefill_index_scores,
-                    (
-                        last_pools.div_ceil(INDEX_RUN_POOLS).max(1) as u32,
-                        run.len.div_ceil(INDEX_RUN_ROWS) as u32,
-                        1,
-                    ),
-                    INDEX_RUN_THREADS,
+                    grid,
+                    block.0,
                     &[
                         query,
                         weights,
@@ -4795,14 +4784,11 @@ impl DeviceRank {
                     ],
                 )?;
             } else {
+                let (grid, block) = pass.scores();
                 self.launch(
                     self.kernels.index_scores,
-                    (
-                        last_pools.div_ceil(SCORE_TILE).max(1) as u32,
-                        run.len as u32,
-                        1,
-                    ),
-                    BLOCK,
+                    grid,
+                    block.0,
                     &[
                         query,
                         weights,
@@ -4818,10 +4804,11 @@ impl DeviceRank {
                     ],
                 )?;
             }
+            let (grid, block) = pass.per_row();
             self.launch(
                 self.kernels.pick,
-                (run.len as u32, 1, 1),
-                BLOCK,
+                grid,
+                block.0,
                 &[
                     s.scores.offset(floats(row * score_stride)).0,
                     s.selected.offset(floats(row * MAX_SELECTED_TOKENS)).0,
