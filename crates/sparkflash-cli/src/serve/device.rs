@@ -1293,6 +1293,17 @@ pub(super) fn run(
     tp4: &Tp4ServeOptions,
     device: &DeviceServeOptions,
 ) -> ExitCode {
+    // Refuse an empty-embed binary here, before the control channel and the epoch. A binary
+    // built without nvcc (or with one model source that failed to compile) has every embedded
+    // image empty; the epoch would still bind, run its forward and reach the C3 collective walk,
+    // where the failure looks like a TCP stall with no line naming the build. The build script
+    // refuses the empty embed too, but a plain cargo build or a binary copied from elsewhere
+    // reaches this path, and a device launch must fail fast and say why. The CPU host path is
+    // untouched: only --tp4-device reaches this function.
+    if let Err(message) = sparkflash_kernels::images::require_embedded() {
+        eprintln!("sparkflash serve: --tp4-device: {message}");
+        return ExitCode::from(EXIT_REFUSED);
+    }
     // SAFETY: no thread has been started yet, so nothing reads the environment concurrently. The
     // epoch takes its DSpark branch from SPARKFLASH_DSPARK, and the router bounds max_tokens by
     // the context SPARK_MAX_SEQ_LEN names.

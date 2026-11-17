@@ -743,6 +743,65 @@ impl Image {
     }
 }
 
+/// Every image this build embeds when a CUDA frontend compiled the model sources.
+///
+/// [Image::Deepseek] is deliberately absent: its kernels are the shared PTX/cubin set loaded at
+/// run time from `SPARKFLASH_CUBINS`, and [Image::Rocenante] compiles its own image at run time.
+/// The build script's `sparkflash_model_cubin` cfg is all-or-nothing: if one model source fails
+/// to compile, every entry here is empty, even though nvcc was present and the build succeeded
+/// with a warning.
+pub const EMBEDDED_IMAGES: &[Image] = &[
+    Image::Qwen4Exp,
+    Image::Qwen4Attn,
+    Image::Qwen4Moe,
+    Image::Qwen4Prefill,
+    Image::Qwen4Scan,
+    Image::Dflash2,
+    Image::GlmPrefill,
+    Image::GlmAttention,
+    Image::GlmMoe,
+    Image::GlmDecode,
+    Image::MoePlan,
+    Image::Inkling,
+    Image::Dory,
+];
+
+/// The embedded images this binary lacks.
+///
+/// Empty on a build made with a working nvcc; every entry when the cfg is off. A caller on a
+/// path that launches device kernels uses this to refuse at start-up rather than fall through to
+/// the host twin (or a collective that deadlocks).
+#[must_use]
+pub fn missing_embedded() -> Vec<Image> {
+    EMBEDDED_IMAGES
+        .iter()
+        .copied()
+        .filter(|image| !image.available())
+        .collect()
+}
+
+/// Refuses a device path in a binary that carries no embedded image.
+///
+/// # Errors
+///
+/// A message naming every missing image, the target architecture and the two reasons the cfg can
+/// be off (no nvcc, or one model source failed to compile). It says the build is still usable for
+/// the CPU host path, so a caller does not read the refusal as a broken workspace.
+pub fn require_embedded() -> Result<(), String> {
+    let missing = missing_embedded();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<&str> = missing.iter().map(|image| image.name()).collect();
+    Err(format!(
+        "this build embeds no model cubins ({}) for {CUDA_ARCH}: it was built without nvcc, or a \
+         model source failed to compile while nvcc was present, so the all-or-nothing model-cubin \
+         cfg is off. The CPU host path still runs; the device path needs a rebuild on a host with \
+         nvcc (scripts/build-aarch64.sh refuses an empty-embed binary for this reason).",
+        names.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,7 +828,36 @@ mod tests {
             assert_eq!(image.available(), !image.bytes().is_empty());
         }
         assert_eq!(Image::TOKEN, Image::Qwen4Exp);
+        // The device-path guard: the list is every image a CUDA build should embed, and it
+        // excludes the two runtime images so a CPU-only build can never satisfy it by accident.
+        assert!(EMBEDDED_IMAGES.contains(&Image::MoePlan));
+        assert!(!EMBEDDED_IMAGES.contains(&Image::Deepseek));
+        assert!(!EMBEDDED_IMAGES.contains(&Image::Rocenante));
+        assert_eq!(
+            missing_embedded().len()
+                + EMBEDDED_IMAGES
+                    .iter()
+                    .filter(|image| image.available())
+                    .count(),
+            EMBEDDED_IMAGES.len(),
+            "missing_embedded must partition the embedded set"
+        );
+        // A build with no cfg and one with the full cfg are the two legal answers; a partially
+        // populated set would mean the all-or-nothing cfg changed without this guard.
+        let missing = missing_embedded().len();
+        assert!(
+            missing == 0 || missing == EMBEDDED_IMAGES.len(),
+            "the model-cubin cfg is all-or-nothing, so {missing} missing of {} is impossible",
+            EMBEDDED_IMAGES.len()
+        );
         assert_eq!(Image::ATTENTION, Image::Qwen4Attn);
+        // The device-path gate answers exactly the question its name asks, and its message names
+        // nvcc rather than leaving the operator to guess why a device launch refused.
+        assert_eq!(require_embedded().is_ok(), missing_embedded().is_empty());
+        if let Err(message) = require_embedded() {
+            assert!(message.contains("nvcc"), "{message}");
+            assert!(message.contains("CPU host path"), "{message}");
+        }
         assert_eq!(Image::ROUTED_EXPERTS, Image::Qwen4Moe);
         assert_eq!(Image::PREFILL, Image::Qwen4Prefill);
         assert_eq!(Image::SCAN, Image::Qwen4Scan);
