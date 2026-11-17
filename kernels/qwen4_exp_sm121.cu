@@ -1508,7 +1508,8 @@ __device__ __forceinline__ void q4e_rmsnorm_group(const float* src,
 extern "C" __global__ void q4e_rmsnorm(const float* x, const __nv_bfloat16* __restrict__ weight,
                                        float* out, int width, int group, float eps,
                                        int zero_centred, int weight_per_group) {
-    OPT_PDL_LAUNCH();
+    // The row it normalises was written by the previous grid: wait for it before the loads.
+    OPT_PDL_ENTRY();
     const int start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
     q4e_rmsnorm_group(x + start, weight, out + start, start, width, group, eps, zero_centred,
@@ -1524,7 +1525,8 @@ extern "C" __global__ void q4e_rmsnorm_rows(const float* x, const __nv_bfloat16*
                                             float* out, int width, int group, float eps,
                                             int zero_centred, int weight_per_group,
                                             int src_stride, int dst_stride) {
-    OPT_PDL_LAUNCH();
+    // The rows it normalises were written by the previous grid: wait for them before the loads.
+    OPT_PDL_ENTRY();
     const int row = blockIdx.y;
     const int group_start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
