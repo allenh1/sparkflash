@@ -45,7 +45,7 @@ use sparkflash_kernels::cuda_driver::{
 use sparkflash_kernels::images::{
     glm_prefill_cubin, inkling_cubin, moe_plan_cubin, qwen4_exp_cubin, qwen4_prefill_cubin,
 };
-use sparkflash_kernels::lane_memory::{LanePool, LaneSpan, Layout};
+use sparkflash_kernels::lane_memory::{SequenceLane, SequenceLanes};
 use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
@@ -1177,7 +1177,7 @@ struct Shared {
     vision: Option<Mutex<InklingVisionTower>>,
     /// The sessions' lane memory, planned when the first session opens (the drafter loads
     /// before it, and its rings are part of a lane).
-    lanes: Mutex<Option<Arc<LaneMemory>>>,
+    lanes: Mutex<Option<Arc<SequenceLanes<LaneParts>>>>,
 }
 
 impl Shared {
@@ -1185,8 +1185,8 @@ impl Shared {
         self.config.hidden_size
     }
 
-    /// The sessions' [LaneMemory], planned on first use.
-    fn lane_memory(&self) -> Result<Arc<LaneMemory>, String> {
+    /// The sessions' [SequenceLanes], planned on first use.
+    fn lane_memory(&self) -> Result<Arc<SequenceLanes<LaneParts>>, String> {
         let mut lanes = self
             .lanes
             .lock()
@@ -1194,12 +1194,12 @@ impl Shared {
         if let Some(memory) = lanes.as_ref() {
             return Ok(Arc::clone(memory));
         }
-        let memory = Arc::new(LaneMemory::plan(self)?);
+        let memory = Arc::new(LaneParts::plan(self)?);
         if trace_on() || self.exchange.rank() == 0 {
             eprintln!(
                 "[inkling] rank {}: session caches back as they grow: {}",
                 self.exchange.rank(),
-                memory.lanes.describe()
+                memory.describe()
             );
         }
         *lanes = Some(Arc::clone(&memory));
@@ -2618,7 +2618,7 @@ impl Drop for Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            memory.lanes.pool().drain(&*self.cuda);
+            memory.drain(&self.cuda);
         }
         if let Some(mut drafter) = self.dspark.take() {
             drafter.free(&self.cuda);
@@ -3980,11 +3980,8 @@ struct KeyTables {
 /// key tiles past a position (and masks them), and the drafter's block writes its rows past it.
 const READ_PAST: usize = 1024;
 
-/// A session's lane grows in steps of this many rows, so a decode step rarely maps anything.
-const LANE_QUANTUM: usize = 2048;
-
 /// Where every session keeps the state that grows with its context, and the memory behind it
-/// ([sparkflash_kernels::lane_memory], the backing DeepSeek's lanes use too).
+/// ([SequenceLanes], the lane memory GLM's and Qwen's sequences use too).
 ///
 /// A session reserves a span of virtual memory as long as a whole context's full-layer keys and
 /// values, their [KeyTables] and the drafter's full-layer rings, and physical memory backs the
@@ -3996,8 +3993,7 @@ const LANE_QUANTUM: usize = 2048;
 ///
 /// A sliding layer's ring, the convolution histories and the scratch stay plain allocations:
 /// they do not grow with the context.
-struct LaneMemory {
-    lanes: LanePool,
+struct LaneParts {
     /// Each layer's key and value parts, `None` for a sliding layer.
     kv: Vec<Option<(usize, usize)>>,
     /// Each layer's [KeyTables] parts (gains, scales), where the layer keeps tables.
@@ -4006,13 +4002,18 @@ struct LaneMemory {
     draft: Vec<Option<(usize, usize)>>,
 }
 
-impl LaneMemory {
-    fn plan(shared: &Shared) -> Result<Self, String> {
-        let granularity = shared
-            .cuda
-            .vmm_granularity()
-            .ok_or("the device has no virtual memory management for the sessions' caches")?;
-        let mut layout = Layout::default();
+impl LaneParts {
+    fn plan(shared: &Shared) -> Result<SequenceLanes<Self>, String> {
+        SequenceLanes::plan(
+            &shared.cuda,
+            shared.context,
+            READ_PAST,
+            sparkflash_model::active_profile().runtime.lane_memory_mb,
+            |layout| Self::lay_out(shared, layout),
+        )
+    }
+
+    fn lay_out(shared: &Shared, layout: &mut sparkflash_kernels::lane_memory::Layout) -> Self {
         let plan = &shared.plan;
         let row = shared.kv_width() * 2;
         let mut kv = Vec::with_capacity(plan.layers().len());
@@ -4058,30 +4059,13 @@ impl LaneMemory {
             }
             _ => Vec::new(),
         };
-        let shape = layout.finish(granularity, LANE_QUANTUM);
-        let budget = LanePool::budget(
-            &shape,
-            shared.context + READ_PAST,
-            sparkflash_model::active_profile().runtime.lane_memory_mb,
-        );
-        Ok(Self {
-            lanes: LanePool::new(shape, budget),
-            kv,
-            tables,
-            draft,
-        })
+        Self { kv, tables, draft }
     }
-}
-
-/// One session's span of the [LaneMemory].
-struct Lane {
-    memory: Arc<LaneMemory>,
-    span: LaneSpan,
 }
 
 /// One session's device state.
 struct State {
-    lane: Lane,
+    lane: SequenceLane<LaneParts>,
     keys: Vec<Deviceptr>,
     values: Vec<Deviceptr>,
     /// Each full layer's [KeyTables] when a split or fast walk reads them; `None` on a sliding
@@ -4103,18 +4087,16 @@ impl State {
         let hidden = shared.hidden();
         let mut total = 0usize;
         let memory = shared.lane_memory()?;
-        let base = cuda.vmm_reserve(memory.lanes.shape().stride)?;
-        let lane = Lane {
-            span: LaneSpan::new(base.0, memory.lanes.shape()),
-            memory: Arc::clone(&memory),
-        };
+        let lane = SequenceLane::reserve(cuda, &memory)?;
+        let base = lane.base();
+        let parts = memory.parts();
         let kv_bytes = |rows: usize, width: usize| rows.max(1) * width * 2;
         let mut keys = Vec::with_capacity(plan.layers().len());
         let mut values = Vec::with_capacity(plan.layers().len());
         let mut tables = Vec::with_capacity(plan.layers().len());
         for (index, layer) in plan.layers().iter().enumerate() {
             // A full layer's rows are the lane's, zeroed as they are backed.
-            if let Some((key, value)) = memory.kv[index] {
+            if let Some((key, value)) = parts.kv[index] {
                 keys.push(base.offset(key));
                 values.push(base.offset(value));
             } else {
@@ -4128,7 +4110,7 @@ impl State {
             }
             // A slot's entries are written when its key is stored and read only after, so the
             // tables need no clearing.
-            tables.push(memory.tables[index].map(|(gains, scales)| KeyTables {
+            tables.push(parts.tables[index].map(|(gains, scales)| KeyTables {
                 gains: base.offset(gains),
                 scales: base.offset(scales),
                 stride: layer.kv_rows.max(1),
@@ -4177,7 +4159,7 @@ impl State {
 
     fn reset(&mut self, shared: &Shared) -> Result<(), String> {
         for (index, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
-            if self.lane.memory.kv[index].is_some() {
+            if self.lane.lanes().parts().kv[index].is_some() {
                 continue;
             }
             let bytes = shared.plan.layers()[index].kv_rows.max(1) * shared.kv_width() * 2;
@@ -4204,37 +4186,28 @@ impl State {
     /// # Errors
     /// A pool with too few chunks left, or a driver failure.
     fn grow(&mut self, shared: &Shared, rows: usize) -> Result<(), String> {
-        let lane = &mut self.lane;
-        lane.memory
-            .lanes
-            .grow(&*shared.cuda, &mut lane.span, rows + READ_PAST)
+        self.lane
+            .back(&shared.cuda, rows)
+            .map_err(|error| error.to_string())
     }
 
     /// Whether the pool can back `rows` positions here now, counting the chunks a reset gives
     /// back first when `reset`.
     fn room(&self, rows: usize, reset: bool) -> bool {
-        self.lane
-            .memory
-            .lanes
-            .room(&self.lane.span, rows + READ_PAST, reset)
+        self.lane.room(rows, reset)
     }
 
     /// Gives every chunk the lane holds back to the pool, once the device is done with them.
     fn release(&mut self, shared: &Shared) -> Result<(), String> {
-        if self.lane.span.mapped() == 0 {
-            return Ok(());
-        }
-        shared.cuda.synchronize()?;
-        let lane = &mut self.lane;
-        lane.memory.lanes.release(&*shared.cuda, &mut lane.span)
+        self.lane.release(&shared.cuda)
     }
 
     /// The allocations this state owns outside its lane.
     fn buffers(&self) -> Vec<Deviceptr> {
-        let memory = &self.lane.memory;
+        let parts = self.lane.lanes().parts();
         let mut pointers: Vec<Deviceptr> = Vec::new();
         for (index, (key, value)) in self.keys.iter().zip(&self.values).enumerate() {
-            if memory.kv[index].is_none() {
+            if parts.kv[index].is_none() {
                 pointers.extend([*key, *value]);
             }
         }
@@ -4248,18 +4221,15 @@ impl State {
 
     /// Gives the lane back: its chunks to the pool and its span to the device.
     fn free_lane(&mut self, shared: &Shared) {
-        let _ = self.release(shared);
-        shared.cuda.vmm_free(
-            Deviceptr(self.lane.span.base()),
-            self.lane.memory.lanes.shape().stride,
-        );
+        self.lane.free(&shared.cuda);
     }
 
     /// The drafter's whole-context rings in this lane, by drafter layer.
     fn draft_rings(&self) -> Vec<Option<(Deviceptr, Deviceptr)>> {
-        let base = Deviceptr(self.lane.span.base());
+        let base = self.lane.base();
         self.lane
-            .memory
+            .lanes()
+            .parts()
             .draft
             .iter()
             .map(|ring| ring.map(|(keys, values)| (base.offset(keys), base.offset(values))))

@@ -204,13 +204,13 @@ fn copy(
 mod tests {
     use super::*;
 
-    fn log() -> (
-        std::cell::RefCell<Vec<(u64, u64, usize)>>,
-        impl Fn(&std::cell::RefCell<Vec<(u64, u64, usize)>>, &Deviceptr, &Deviceptr, usize),
-    ) {
+    /// Each copy a test saw: destination, source, bytes.
+    type Copies = std::cell::RefCell<Vec<(u64, u64, usize)>>;
+
+    fn log() -> (Copies, impl Fn(&Copies, &Deviceptr, &Deviceptr, usize)) {
         (
             std::cell::RefCell::new(Vec::new()),
-            |copies: &std::cell::RefCell<Vec<(u64, u64, usize)>>, dst: &Deviceptr, src, bytes| {
+            |copies: &Copies, dst: &Deviceptr, src, bytes| {
                 copies.borrow_mut().push((dst.0, src.0, bytes));
             },
         )

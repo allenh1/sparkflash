@@ -62,6 +62,7 @@ use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
+use sparkflash_kernels::lane_memory::{BackError, LanePlans, Layout, SequenceLane, SequenceLanes};
 
 // The shared context handle: one definition in `sparkflash_ops`, so both arms carry the same
 // `Send`/`Sync` wrapper around the driver context.
@@ -2806,6 +2807,7 @@ impl Qwen4ExpDeviceBackend {
             dflash,
             prefill,
             pooled: std::sync::Mutex::new(None),
+            lanes: LanePlans::default(),
             verify_rows,
             rewind,
             tp,
@@ -3114,14 +3116,17 @@ struct DeviceSequence {
     prompting: Option<Prompting>,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
-    /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements; the MTP
-    /// layer, when present, is one extra slot after the stack.
+    /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements in the
+    /// sequence's lane; the MTP layer, when present, is one extra slot after the stack.
     keys: Vec<Option<Deviceptr>>,
     /// Each sparse layer's BF16 value cache, the same shape as [Self::keys].
     values: Vec<Option<Deviceptr>>,
-    /// Each sparse layer's BF16 indexer-key cache, `context_limit * indexer_head_dim` elements;
-    /// the MTP layer, when present, is one extra slot after the stack.
+    /// Each sparse layer's BF16 indexer-key cache, `context_limit * indexer_head_dim` elements
+    /// in the sequence's lane; the MTP layer, when present, is one extra slot after the stack.
     index_keys: Vec<Option<Deviceptr>>,
+    /// The span [Self::keys], [Self::values] and [Self::index_keys] lie in, backed as the
+    /// sequence grows ([Self::back]); `None` only while the sequence is dropped.
+    lane: Option<SequenceLane<LaneParts>>,
     gdn_conv: Vec<Option<Deviceptr>>,
     gdn_recurrent: Vec<Option<Deviceptr>>,
     /// The other buffer of each GDN layer's recurrent pair: a verify leaves the live state as it
@@ -3307,7 +3312,63 @@ fn point_sizes(
     sizes
 }
 
+/// Rows past a forward's last position a sequence's lane backs too: a verify's drafts and the
+/// MTP layer write past it, and an attention tile reads past it (and masks the rows).
+const LANE_READ_PAST: usize = 1024;
+
+/// Where each sparse layer's caches (keys, values and indexer keys), and the MTP layer's, lie in
+/// a sequence's lane ([SequenceLanes], the lane memory GLM's and Inkling's sequences use too).
+/// A sequence reserves a span as long as its whole context's caches and physical memory backs
+/// it only as far as the sequence has reached ([DeviceSequence::back]), from one pool the
+/// backend's sequences share, so several conversations hold together what one whole context
+/// would.
+///
+/// The GDN and PLE state, the drafter's rings and the scratch stay plain allocations: they do
+/// not grow with the context.
+#[derive(Debug)]
+struct LaneParts {
+    /// Each layer's keys, values and indexer keys, then the MTP layer's; `None` for a GDN layer.
+    caches: Vec<Option<[usize; 3]>>,
+}
+
+impl LaneParts {
+    fn plan(layout: &mut Layout, config: &Qwen4ExpConfig, capacity: usize) -> Self {
+        let kv = config.kv_proj_width() * 2;
+        let index = config.indexer_head_dim * 2;
+        let sparse = |layout: &mut Layout| {
+            Some([
+                layout.part(capacity * kv, kv, 0),
+                layout.part(capacity * kv, kv, 0),
+                layout.part(capacity * index, index, 0),
+            ])
+        };
+        let mut caches: Vec<_> = config
+            .layer_types
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Sparse => sparse(layout),
+                LayerKind::Linear => None,
+            })
+            .collect();
+        if config.serves_mtp() {
+            caches.push(sparse(layout));
+        }
+        Self { caches }
+    }
+
+    /// Every cache's place in the lane at `base`.
+    fn caches(&self, base: Deviceptr) -> Vec<Option<[Deviceptr; 3]>> {
+        self.caches
+            .iter()
+            .map(|cache| cache.map(|parts| parts.map(|offset| base.offset(offset))))
+            .collect()
+    }
+}
+
 struct ReusableBuffers {
+    /// The attention caches' lane, its chunks given back to the pool; [Self::keys],
+    /// [Self::values] and [Self::index_keys] lie in it.
+    lane: SequenceLane<LaneParts>,
     keys: Vec<Option<Deviceptr>>,
     values: Vec<Option<Deviceptr>>,
     index_keys: Vec<Option<Deviceptr>>,
@@ -3325,7 +3386,7 @@ struct ReusableBuffers {
 }
 
 impl ReusableBuffers {
-    fn free(&self, cuda: &Cuda) {
+    fn free(mut self, cuda: &Cuda) {
         let _ = cuda.make_current();
         let mut ptrs: Vec<&Deviceptr> = self.scratch.iter().collect();
         ptrs.extend(self.prefill.pointers());
@@ -3333,11 +3394,8 @@ impl ReusableBuffers {
             ptrs.extend(draft.pointers());
         }
         ptrs.extend(
-            self.keys
+            self.gdn_conv
                 .iter()
-                .chain(&self.values)
-                .chain(&self.index_keys)
-                .chain(&self.gdn_conv)
                 .chain(&self.gdn_recurrent)
                 .chain(&self.gdn_spare)
                 .chain(&self.ple_conv)
@@ -3347,6 +3405,7 @@ impl ReusableBuffers {
         cuda.free_buffers(&ptrs);
         cuda.free_host_mapped(&self.ple_host_staging);
         cuda.free_host_mapped(&self.token_staging);
+        self.lane.free(cuda);
     }
 }
 
@@ -3359,7 +3418,13 @@ impl Drop for DeviceSequence {
         if let Some(overlap) = self.overlap.take() {
             overlap.release(&self.backend.cuda);
         }
+        let Some(mut lane) = self.lane.take() else {
+            return;
+        };
+        // A pooled sequence holds no chunks: another lane may grow into them.
+        let _ = lane.release(&self.backend.cuda);
         let reusable = ReusableBuffers {
+            lane,
             keys: std::mem::take(&mut self.keys),
             values: std::mem::take(&mut self.values),
             index_keys: std::mem::take(&mut self.index_keys),
@@ -3482,12 +3547,14 @@ struct SequenceShared {
     /// The freed-session buffer pool. The mutex covers only allocation bookkeeping; it is not a
     /// run lock, and a session's forward never holds it.
     pooled: std::sync::Mutex<Option<ReusableBuffers>>,
+    /// The sequences' attention caches' lanes, one plan a context limit ([LaneParts]).
+    lanes: LanePlans<usize, LaneParts>,
     /// The most rows a speculative verify forward takes: the token being decoded and the drafts
     /// after it. Every row but the last has a snapshot region to roll back to.
     verify_rows: usize,
     /// Whether a sequence keeps a rewind point at the end of each prompt
-    /// ([sparkflash_runtime::REWIND_ENV], on by default); never under the DFlash 2 drafter, whose
-    /// rings hold the positions past one.
+    /// ([sparkflash_runtime::REWIND_ENV], on by default). The point covers the DFlash 2
+    /// drafter's rings too, so a drafting sequence goes back with them.
     rewind: bool,
     /// The world this rank's partials are summed over, when the arm is one rank of several; its
     /// `config` is then the rank's share ([tp::rank_config]).
@@ -3498,6 +3565,32 @@ struct SequenceShared {
 }
 
 impl SequenceShared {
+    /// The lanes of sequences of `capacity` positions, planned on first use.
+    fn sequence_lanes(
+        &self,
+        capacity: usize,
+    ) -> Result<Arc<SequenceLanes<LaneParts>>, BackendError> {
+        let plan = || {
+            SequenceLanes::plan(
+                &self.cuda,
+                capacity,
+                LANE_READ_PAST,
+                sparkflash_model::active_profile().runtime.lane_memory_mb,
+                |layout| LaneParts::plan(layout, &self.config, capacity),
+            )
+            .map_err(|error| BackendError::new("qwen4_device", error))
+        };
+        self.lanes.get(capacity, plan, |lanes| {
+            if self.tp.as_ref().is_none_or(|tp| tp.runtime.rank() == 0) {
+                eprintln!(
+                    "[qwen] rank 0: sequences of {capacity} positions back their caches as they \
+                     grow: {}",
+                    lanes.describe()
+                );
+            }
+        })
+    }
+
     /// The drafter a sequence speculates with, by name: the DFlash 2 drafter when one is loaded,
     /// else the checkpoint's MTP stage when the arm serves it; `None` when the profile turns
     /// speculation off or the checkpoint has neither.
@@ -3524,6 +3617,8 @@ impl Drop for SequenceShared {
         {
             reusable.free(&self.cuda);
         }
+        // A sequence still alive gives its chunks back when it goes.
+        self.lanes.drain(&self.cuda);
         if let Some(tp) = &self.tp {
             self.cuda.free_buffers(&[&tp.slots]);
         }
@@ -4410,6 +4505,7 @@ impl DeviceSequence {
         position: usize,
         logits: bool,
     ) -> Result<Option<Vec<f32>>, BackendError> {
+        self.back(position + tokens.len())?;
         let config = Arc::clone(&self.backend.config);
         let kernels = &*self.backend.kernels;
         let weights = &self.backend.weights;
@@ -4738,6 +4834,29 @@ impl DeviceSequence {
         }
     }
 
+    /// Backs the sequence's lane for `rows` positions and the rows past them a forward reads or
+    /// writes ([LANE_READ_PAST]).
+    ///
+    /// # Errors
+    /// The pool's refusal (a `context` error) when it has too few chunks left, or a driver
+    /// failure.
+    pub(super) fn back(&mut self, rows: usize) -> Result<(), BackendError> {
+        let Some(lane) = self.lane.as_mut() else {
+            return Ok(());
+        };
+        lane.back(&self.backend.cuda, rows)
+            .map_err(|error| match error {
+                BackError::Refused(error) => BackendError::new("context", error),
+                BackError::Device(error) => BackendError::new("qwen4_device", error),
+            })
+    }
+
+    /// Whether the backend's pool can back this sequence for `rows` positions now, counting the
+    /// chunks a reset gives back first when `reset`: the answer [Self::back] would give.
+    pub(super) fn room(&self, rows: usize, reset: bool) -> bool {
+        self.lane.as_ref().is_none_or(|lane| lane.room(rows, reset))
+    }
+
     fn forward_batch(
         &mut self,
         tokens: &[u32],
@@ -4745,6 +4864,7 @@ impl DeviceSequence {
         snapshot_rows: usize,
     ) -> Result<Option<Vec<f32>>, BackendError> {
         let batch = tokens.len();
+        self.back(self.position + batch)?;
         self.probe_rows = batch;
         debug_assert!((1..=self.backend.prefill.chunk).contains(&batch));
         debug_assert!(logit_rows <= self.backend.verify_rows && logit_rows <= batch);
@@ -5221,6 +5341,14 @@ impl DeviceSequence {
         let replay_stride =
             shared.verify_rows * (config.linear_conv_width() + 2 * config.linear_num_value_heads);
         let reused = shared.pooled.lock().ok().and_then(|mut guard| guard.take());
+        // A pooled sequence's lane holds caches of its own context limit.
+        let reused = match reused {
+            Some(buf) if buf.lane.lanes().capacity() != context_limit => {
+                buf.free(cuda);
+                None
+            }
+            reused => reused,
+        };
         let buffers = if let Some(buf) = reused {
             buf
         } else {
@@ -5235,12 +5363,9 @@ impl DeviceSequence {
                         .map_err(|error| BackendError::new("qwen4_device", error))
                 };
             }
-            macro_rules! alloc_bf16 {
-                ($elements:expr) => {
-                    cuda.alloc((($elements) * 2).max(4), &mut total)
-                        .map_err(|error| BackendError::new("qwen4_device", error))
-                };
-            }
+            let lane = SequenceLane::reserve(cuda, &shared.sequence_lanes(context_limit)?)
+                .map_err(|error| BackendError::new("qwen4_device", error))?;
+            let caches = lane.lanes().parts().caches(lane.base());
             let mut keys = Vec::with_capacity(config.num_hidden_layers);
             let mut values = Vec::with_capacity(config.num_hidden_layers);
             let mut index_keys = Vec::with_capacity(config.num_hidden_layers);
@@ -5251,11 +5376,9 @@ impl DeviceSequence {
             for (index, kind) in config.layer_types.iter().enumerate() {
                 match kind {
                     LayerKind::Sparse => {
-                        keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                        values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                        index_keys.push(Some(alloc_bf16!(
-                            (context_limit * config.indexer_head_dim).max(1)
-                        )?));
+                        keys.push(caches[index].map(|cache| cache[0]));
+                        values.push(caches[index].map(|cache| cache[1]));
+                        index_keys.push(caches[index].map(|cache| cache[2]));
                         gdn_conv.push(None);
                         gdn_recurrent.push(None);
                         gdn_spare.push(None);
@@ -5290,9 +5413,10 @@ impl DeviceSequence {
             if config.serves_mtp() {
                 // The drafted layer has its own attention, so its keys, values and indexer keys
                 // are one more entry in the same lists the per-layer caches live in.
-                keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                index_keys.push(Some(alloc_bf16!(context_limit * config.indexer_head_dim)?));
+                let mtp = caches.get(config.layer_types.len()).copied().flatten();
+                keys.push(mtp.map(|cache| cache[0]));
+                values.push(mtp.map(|cache| cache[1]));
+                index_keys.push(mtp.map(|cache| cache[2]));
                 gdn_conv.push(None);
                 gdn_recurrent.push(None);
                 gdn_spare.push(None);
@@ -5379,6 +5503,7 @@ impl DeviceSequence {
                 .transpose()
                 .map_err(|error| BackendError::new("qwen4_dflash2", error))?;
             ReusableBuffers {
+                lane,
                 keys,
                 values,
                 index_keys,
@@ -5464,6 +5589,7 @@ impl DeviceSequence {
             keys: buffers.keys,
             values: buffers.values,
             index_keys: buffers.index_keys,
+            lane: Some(buffers.lane),
             gdn_conv: buffers.gdn_conv,
             gdn_recurrent: buffers.gdn_recurrent,
             gdn_spare: buffers.gdn_spare,

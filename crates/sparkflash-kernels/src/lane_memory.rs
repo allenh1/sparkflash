@@ -656,6 +656,277 @@ impl LanePool {
     }
 }
 
+/// The rows a sequence's lane backs at a time ([LaneShape::quantum]), so a decode step rarely maps
+/// anything.
+pub const LANE_QUANTUM: usize = 2048;
+
+/// Why a lane could not be backed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackError {
+    /// The pool has too few chunks left ([LanePool::short]), or the driver would not map one:
+    /// the request's refusal.
+    Refused(String),
+    /// A device failure around the backing (making the context current, waiting for the zeroes).
+    Device(String),
+}
+
+impl std::fmt::Display for BackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(error) | Self::Device(error) => f.write_str(error),
+        }
+    }
+}
+
+/// Every sequence of one kind on a device: the [LanePool] behind their lanes, the arm's parts
+/// (where each cache lies in a span, as offsets from its base) and the rows a sequence backs past
+/// its last position.
+///
+/// This is what an arm's sequences that keep position-addressed caches need of lane memory. The
+/// arm lays its caches out once ([SequenceLanes::plan]), each sequence reserves a span
+/// ([SequenceLane::reserve]) and points its caches at `base + offset`, and before a forward
+/// writes rows the sequence backs them ([SequenceLane::back]). The chunks come from one pool the
+/// sequences share, so several hold together what one whole context would: the budget is one
+/// full sequence's worth unless `runtime.lane_memory_mb` (SPARKFLASH_LANE_MEMORY_MB) says
+/// otherwise. It is a number, the same on every rank, so every rank of a group refuses the same
+/// growth, and the serving engine asks [SequenceLane::room] before it hands a slot a job.
+#[derive(Debug)]
+pub struct SequenceLanes<P> {
+    pool: LanePool,
+    capacity: usize,
+    read_past: usize,
+    parts: P,
+}
+
+impl<P> SequenceLanes<P> {
+    /// Lanes for sequences of `capacity` positions: `parts` lays every cache out over
+    /// `capacity` rows in the [Layout] it is handed and returns where each one lies, and a
+    /// sequence backs `read_past` rows past its last position too (the rows a kernel's tile
+    /// reads past it, or a drafter's drafts write). The pool holds `configured_mb` MiB when that
+    /// is set, else one whole sequence's worth ([LanePool::budget]).
+    ///
+    /// # Errors
+    /// A device without virtual memory management.
+    pub fn plan(
+        cuda: &Cuda,
+        capacity: usize,
+        read_past: usize,
+        configured_mb: Option<usize>,
+        parts: impl FnOnce(&mut Layout) -> P,
+    ) -> Result<Self, String> {
+        let granularity = cuda.vmm_granularity().ok_or_else(|| {
+            "the device has no virtual memory management for the sequences' caches".to_owned()
+        })?;
+        let mut layout = Layout::default();
+        let parts = parts(&mut layout);
+        let shape = layout.finish(granularity, LANE_QUANTUM);
+        let budget = LanePool::budget(&shape, capacity + read_past, configured_mb);
+        Ok(Self {
+            pool: LanePool::new(shape, budget),
+            capacity,
+            read_past,
+            parts,
+        })
+    }
+
+    /// Where each cache lies in a lane.
+    #[must_use]
+    pub fn parts(&self) -> &P {
+        &self.parts
+    }
+
+    /// The pool behind the lanes.
+    #[must_use]
+    pub fn pool(&self) -> &LanePool {
+        &self.pool
+    }
+
+    /// The positions a sequence holds at most.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The rows a lane backs for a sequence of `rows` positions.
+    fn rows(&self, rows: usize) -> usize {
+        rows.min(self.capacity) + self.read_past
+    }
+
+    /// [LanePool::describe], for the boot log.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        self.pool.describe()
+    }
+
+    /// Gives the pool's chunks back to the device. Every lane has released its own by now: each
+    /// holds these lanes.
+    pub fn drain(&self, cuda: &Cuda) {
+        let _ = cuda.make_current();
+        self.pool.pool().drain(cuda);
+    }
+}
+
+/// One sequence's span of its [SequenceLanes].
+///
+/// The arm frees it ([SequenceLane::free]) when the sequence goes, on the device that reserved
+/// it; a span dropped without that keeps its chunks out of the pool for good.
+#[derive(Debug)]
+pub struct SequenceLane<P> {
+    lanes: std::sync::Arc<SequenceLanes<P>>,
+    span: LaneSpan,
+    freed: bool,
+}
+
+impl<P> SequenceLane<P> {
+    /// Reserves a span for one sequence of `lanes`; nothing backs it yet.
+    ///
+    /// # Errors
+    /// The driver's refusal of the reservation.
+    pub fn reserve(cuda: &Cuda, lanes: &std::sync::Arc<SequenceLanes<P>>) -> Result<Self, String> {
+        let shape = lanes.pool.shape();
+        let base = cuda.vmm_reserve(shape.stride)?;
+        Ok(Self {
+            span: LaneSpan::new(base.0, shape),
+            lanes: std::sync::Arc::clone(lanes),
+            freed: false,
+        })
+    }
+
+    /// The span's first byte: a cache at offset `o` of the parts lies at `base().offset(o)`.
+    #[must_use]
+    pub fn base(&self) -> Deviceptr {
+        Deviceptr(self.span.base())
+    }
+
+    /// The lanes this span is one of.
+    #[must_use]
+    pub fn lanes(&self) -> &std::sync::Arc<SequenceLanes<P>> {
+        &self.lanes
+    }
+
+    /// The span.
+    #[must_use]
+    pub fn span(&self) -> &LaneSpan {
+        &self.span
+    }
+
+    /// Backs the lane for a sequence of `rows` positions and the rows past them the kernels
+    /// read or write. The new chunks are zeroed on the default stream, so this waits for the
+    /// device before it returns when it mapped any: a run stream does not wait for the default
+    /// one.
+    ///
+    /// # Errors
+    /// [BackError::Refused] when the pool has too few chunks left, [BackError::Device] for a
+    /// device failure.
+    pub fn back(&mut self, cuda: &Cuda, rows: usize) -> Result<(), BackError> {
+        let rows = self.lanes.rows(rows);
+        if rows <= self.span.backed() {
+            return Ok(());
+        }
+        // Zeroing the new chunks needs the context on the calling thread, which an engine
+        // thread may not have made current before a prompt.
+        cuda.make_current().map_err(BackError::Device)?;
+        self.lanes
+            .pool
+            .grow(cuda, &mut self.span, rows)
+            .map_err(BackError::Refused)?;
+        cuda.synchronize().map_err(BackError::Device)
+    }
+
+    /// Whether the pool can back this lane for `rows` positions now, counting the chunks a
+    /// reset gives back first when `reset`: the answer [SequenceLane::back] would give.
+    #[must_use]
+    pub fn room(&self, rows: usize, reset: bool) -> bool {
+        self.lanes
+            .pool
+            .room(&self.span, self.lanes.rows(rows), reset)
+    }
+
+    /// Gives every chunk back to the pool, once the device is done with them; the rows come
+    /// back zeroed as the sequence grows again.
+    ///
+    /// # Errors
+    /// A driver failure.
+    pub fn release(&mut self, cuda: &Cuda) -> Result<(), String> {
+        if self.span.mapped() == 0 {
+            return Ok(());
+        }
+        cuda.synchronize()?;
+        self.lanes.pool.release(cuda, &mut self.span)
+    }
+
+    /// Gives the lane back: its chunks to the pool and its span to the device. A second call
+    /// does nothing.
+    pub fn free(&mut self, cuda: &Cuda) {
+        if self.freed {
+            return;
+        }
+        self.freed = true;
+        // A sequence can go from a thread that has not touched the device yet.
+        let _ = cuda.make_current();
+        let _ = self.release(cuda);
+        cuda.vmm_free(self.base(), self.lanes.pool.shape().stride);
+        // The last lane of lanes whose arm has gone ([LanePlans::drain] drained the rest)
+        // gives the chunks back to the device.
+        if std::sync::Arc::strong_count(&self.lanes) == 1 {
+            self.lanes.drain(cuda);
+        }
+    }
+}
+
+/// An arm's [SequenceLanes], one for each kind of sequence (`K`: a capacity, whether it drafts),
+/// planned on first use.
+#[derive(Debug)]
+pub struct LanePlans<K, P> {
+    planned: std::sync::Mutex<Vec<(K, std::sync::Arc<SequenceLanes<P>>)>>,
+}
+
+impl<K, P> Default for LanePlans<K, P> {
+    fn default() -> Self {
+        Self {
+            planned: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl<K: PartialEq, P> LanePlans<K, P> {
+    /// The lanes of sequences of `key`, planned by `plan` the first time; `planned` is told of
+    /// a new plan (for the boot log).
+    ///
+    /// # Errors
+    /// `plan`'s.
+    pub fn get<E>(
+        &self,
+        key: K,
+        plan: impl FnOnce() -> Result<SequenceLanes<P>, E>,
+        planned: impl FnOnce(&SequenceLanes<P>),
+    ) -> Result<std::sync::Arc<SequenceLanes<P>>, E> {
+        let mut plans = self
+            .planned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, lanes)) = plans.iter().find(|(planned, _)| *planned == key) {
+            return Ok(std::sync::Arc::clone(lanes));
+        }
+        let lanes = std::sync::Arc::new(plan()?);
+        planned(&lanes);
+        plans.push((key, std::sync::Arc::clone(&lanes)));
+        Ok(lanes)
+    }
+
+    /// Gives every plan's spare chunks back to the device, as the arm goes. A sequence that
+    /// outlives the arm gives its own back when it is freed.
+    pub fn drain(&self, cuda: &Cuda) {
+        let plans = self
+            .planned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, lanes) in plans.iter() {
+            lanes.drain(cuda);
+        }
+    }
+}
+
 /// Rounds `value` up to a multiple of `to`.
 #[must_use]
 pub fn round_up(value: usize, to: usize) -> usize {

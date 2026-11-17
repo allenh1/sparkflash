@@ -203,6 +203,15 @@ impl FusedArm for QwenFusion {
         Ok(())
     }
 
+    /// The sequences' attention caches share one pool ([super::LaneParts]): a prompt that does
+    /// not continue the slot's history starts over, so it counts the chunks the reset gives back.
+    fn room(&self, slot: &DeviceSequence, prompt: Option<&[u32]>) -> bool {
+        match prompt {
+            Some(tokens) => slot.room(tokens.len(), !self.continues(slot, tokens)),
+            None => slot.room(slot.position + self.shared.verify_rows, false),
+        }
+    }
+
     fn set_sampling(&self, slot: &mut DeviceSequence, sampling: Sampling) {
         slot.set_sampling(sampling);
     }
