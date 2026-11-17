@@ -71,6 +71,30 @@ pub fn verdict(chunk: &[u32], picks: &[u32]) -> usize {
     kept
 }
 
+/// How many of [verdict]'s `kept` rows a sequence keeps in its caches: none past the first row
+/// that picked an end-of-turn token. The reply ends at that row, so a later row never answers
+/// the caller, and caches holding it would run past the history the caller saw. An arm that
+/// cannot rewind could not continue that history in the next turn. The verdict itself still
+/// measures the drafter, so the speculation counters and the depth take `kept`.
+///
+/// # Example
+///
+/// ```
+/// use sparkflash_model::spec::kept_to_end;
+/// // The second draft was the end of the turn, and the model chose it.
+/// assert_eq!(kept_to_end(4, &[11, 2, 17, 19], &[2]), 2);
+/// // No row picked an end of turn.
+/// assert_eq!(kept_to_end(4, &[11, 13, 17, 19], &[2]), 4);
+/// ```
+#[must_use]
+pub fn kept_to_end(kept: usize, picks: &[u32], eos: &[u32]) -> usize {
+    picks
+        .iter()
+        .take(kept)
+        .position(|pick| eos.contains(pick))
+        .map_or(kept, |row| row + 1)
+}
+
 /// Drafts up to `depth` tokens by prompt lookup: the tokens that followed the most recent earlier
 /// occurrence of `history`'s last `n` tokens, for the longest `n` in `min_ngram..=max_ngram` that
 /// has one.

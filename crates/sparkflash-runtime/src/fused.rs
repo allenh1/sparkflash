@@ -85,6 +85,14 @@ pub fn prompt_parts() -> Result<bool, String> {
     }
 }
 
+/// Whether `prompt` extends `held` by at least one token: what a sequence whose prefill only
+/// forwards past its history can take as it stands ([FusedArm::continues]), and the rule an arm's
+/// [FusedArm::room] uses to tell a continued prompt from one that starts over.
+#[must_use]
+pub fn extends(held: &[u32], prompt: &[u32]) -> bool {
+    held.len() < prompt.len() && prompt.starts_with(held)
+}
+
 /// What one part of a prompt left ([FusedArm::begin_prompt]).
 #[derive(Debug, Clone)]
 pub enum Part {
@@ -203,6 +211,16 @@ pub trait FusedArm: Send + Sync + 'static {
     fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
         let _ = slot;
         None
+    }
+
+    /// Whether the slot can take `prompt` as it stands, continuing what [FusedArm::history]
+    /// holds. The engine renews a slot that holds a request and cannot, before the prompt runs.
+    ///
+    /// The default is when the prompt [extends] the history, so an arm that names its history
+    /// needs a prefill that forwards only past it and nothing more. An arm whose prompt also
+    /// rewinds into the history or starts over by itself answers whenever it keeps one.
+    fn continues(&self, slot: &Self::Slot, prompt: &[u32]) -> bool {
+        self.history(slot).is_some_and(|held| extends(held, prompt))
     }
 
     /// A shorter prefix of [FusedArm::history] the slot can go back to, as
@@ -987,9 +1005,9 @@ impl<A: FusedArm> Room<'_, A> {
         } else {
             prompt.begun = true;
             (|| {
-                // A slot whose arm keeps its history goes to the prompt as it stands: the arm
-                // continues what the prompt shares with it, or starts over.
-                if arm.holds_request(&state) && arm.history(&state).is_none() {
+                // A slot the prompt continues goes to it as it stands ([FusedArm::continues]);
+                // any other that holds a request starts over.
+                if arm.holds_request(&state) && !arm.continues(&state, &prompt.tokens) {
                     arm.renew(&mut state)?;
                 }
                 arm.set_sampling(&mut state, prompt.sampling);
@@ -1316,6 +1334,11 @@ mod tests {
             Some(&slot.ids)
         }
 
+        /// The keeper's prefill starts over by itself, as Inkling's does.
+        fn continues(&self, _slot: &Self::Slot, _prompt: &[u32]) -> bool {
+            true
+        }
+
         fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
             slot.ids.get(..1)
         }
@@ -1347,6 +1370,98 @@ mod tests {
         first.prefill(&[9]).expect("another conversation");
         assert_eq!(first.cached_tokens(), 0);
         assert_eq!(first.reusable_prefix(), Some(&[9][..]));
+    }
+
+    /// A keeper whose prefill only forwards past its history, as the GLM and Qwen sequences do:
+    /// a prompt that does not extend it is refused, so the engine must renew the slot first.
+    struct Extender {
+        renewed: AtomicUsize,
+    }
+
+    impl FusedArm for Extender {
+        type Slot = Held;
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            Ok(Held::default())
+        }
+
+        fn holds_request(&self, slot: &Self::Slot) -> bool {
+            !slot.ids.is_empty()
+        }
+
+        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            self.renewed.fetch_add(1, Ordering::SeqCst);
+            *slot = Held::default();
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            if !extends(&slot.ids, tokens) {
+                return Err(BackendError::new(
+                    "toy",
+                    "the prompt does not extend the slot",
+                ));
+            }
+            slot.cached = slot.ids.len();
+            slot.ids = tokens.to_vec();
+            Ok(StepOutput::default())
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    slot.ids.push(*token);
+                    StepOutput::default()
+                })
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+
+        fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            Some(&slot.ids)
+        }
+
+        fn cached_tokens(&self, slot: &Self::Slot) -> usize {
+            slot.cached
+        }
+    }
+
+    /// The default [FusedArm::continues]: an arm that names its history and nothing more gets
+    /// its slot renewed before any prompt that does not extend it.
+    #[test]
+    fn a_slot_the_prompt_does_not_extend_is_renewed_before_it() {
+        let arm = Arc::new(Extender {
+            renewed: AtomicUsize::new(0),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 1).expect("the engine starts");
+        let mut session = engine.open().expect("a slot");
+        session.prefill(&[1, 2, 3]).expect("the prefill");
+        session.decode(4).expect("the decode");
+        session
+            .prefill(&[1, 2, 3, 4, 5])
+            .expect("the next turn continues");
+        assert_eq!(session.cached_tokens(), 4);
+        assert_eq!(arm.renewed.load(Ordering::SeqCst), 0);
+        // The same prompt again extends nothing, and neither does another conversation: both
+        // start over on a renewed slot rather than reach a prefill that refuses them.
+        session
+            .prefill(&[1, 2, 3, 4, 5])
+            .expect("a repeated prompt");
+        assert_eq!(session.cached_tokens(), 0);
+        session.prefill(&[9]).expect("another conversation");
+        assert_eq!(session.cached_tokens(), 0);
+        assert_eq!(arm.renewed.load(Ordering::SeqCst), 2);
+        assert_eq!(session.reusable_prefix(), Some(&[9][..]));
     }
 
     /// A [Keeper] whose slots share a budget of `limit` ids, counted by what each slot holds.

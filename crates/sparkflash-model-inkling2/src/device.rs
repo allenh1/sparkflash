@@ -3465,6 +3465,12 @@ impl FusedArm for InklingLanes {
         slot.session.reusable_prefix()
     }
 
+    /// A lane's prompt continues its history, rewinds into it or starts over by itself
+    /// ([InklingDeviceSession::begin_prompt]), so the engine never renews a lane for a prompt.
+    fn continues(&self, slot: &InklingLane, _prompt: &[u32]) -> bool {
+        self.history(slot).is_some()
+    }
+
     fn rewind_prefix<'s>(&self, slot: &'s InklingLane) -> Option<&'s [u32]> {
         slot.session.rewind_prefix()
     }

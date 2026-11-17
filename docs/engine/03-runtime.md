@@ -110,6 +110,35 @@ its own driver for now; it donates logic, and porting it onto the contract is op
 unique to a model stays with it: Inkling's convolutions and relative attention, Engram, Dory's
 loop pipeline (which uses only the policy pieces).
 
+### Then: every strategy on every arm
+
+Steps 1-7 gave the strategies one home; the ledger shows which arms still run without one. The
+next steps close those gaps, most served benefit first. The bar for each is the next model: a
+step is done when a new arm gets the strategy by writing only the hook
+[adding-a-model.md](../adding-a-model.md) names for it (a runtime default or a shared helper does
+the rest), and when the served check that proves it runs on any model
+(`scripts/served-gate.py`: `lanes`, `interleave`, `turns`). A strategy two arms implement alike
+belongs in the default instead.
+
+8. Prefix reuse on every lane: GLM's and Qwen's fused lanes keep their sequences between
+   requests, as Inkling's do, so a chat turn forwards only what it added. The engine renews a
+   slot whose prompt does not extend its history (`FusedArm::continues`, by default), so an arm
+   names its history and nothing more. An arm that commits a verify at once keeps no row past
+   the reply's end (`sparkflash_model::kept_to_end`). Otherwise a drafted end of turn leaves its
+   sequence one token past the history, and an arm that cannot rewind loses the conversation.
+9. A rewind point on every recurrent arm: GLM and Qwen keep their recurrent state at the end of
+   each prompt, as Inkling does, so a turn whose client re-renders the reply (reasoning dropped)
+   goes back to the prompt instead of starting cold.
+10. Lane memory for Qwen: its lanes allocate their caches for the whole context at open; on the
+    shared `LanePool`, as GLM's and Inkling's are, kept conversations share one budget.
+11. Dory on the fused engine: its recurrence group keeps its own lanes, so it has no prompt
+    parts, ledger or kept conversations of the runtime's.
+12. More typed plans executed (step 6): attention, MoE, the indexer and the residual mixers.
+13. The dispatcher's remaining rules (step 5): Qwen's split-K tile and the FP8 projections.
+14. DeepSeek on the contract, optional: its kernels (tensor-core decode, Engram reads, the RDMA
+    exchange) stay its own, its outputs must not change, and the contract would give it the
+    ledger and the shared prompt parts.
+
 ## Status
 
 | step | state |
@@ -121,6 +150,7 @@ loop pipeline (which uses only the policy pieces).
 | 5. projection dispatcher | first cut: BF16 projections (GLM, Dory, Inkling) choose and launch the wide tile through `sparkflash_ops::projection`; Qwen's split-K tile and the FP8 projections keep their own rules |
 | 6. typed plans executed | first cut: Qwen's prompt GDN scan and GLM's bulk KDA scan launch the kernel and grid of the rank plan's `ScanPlan`; attention, MoE, the indexer and the residual mixers still launch from the arms' own load-time geometry |
 | 7. ledger | done: every fused engine prints `ledger <arm>: ...` at start; Inkling, GLM and Qwen state their strategies |
+| 8. prefix reuse on every lane | done: GLM's and Qwen's lanes name their history; the engine renews a slot whose prompt does not extend it (`FusedArm::continues`); a verify keeps no row past the end of turn (`kept_to_end`); the thinking-off close is the codec's (`PromptCodec::close_thinking`). Served `turns`: Qwen 10 of 10 continued turns cached past their first prompt, GLM 28 of 30 over three runs (was 1 of 10); the miss the host's log caught is a reply whose split multi-byte character came back with a stray U+FFFD, so its re-encoding differs. Lanes greedy and sampled equal the last gates on both, Inkling's equal jr4's |
 
 ### Step 1: what it measured
 

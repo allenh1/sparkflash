@@ -508,6 +508,23 @@ impl PromptCodec for GlmCodec {
     fn token_str(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id)
     }
+
+    /// The template writes a turn without reasoning as `<think></think>`, so a turn that must
+    /// not reason closes the block the generation prompt opened: the next turn's rendering of
+    /// this one then extends the prompt, and a kept lane continues it.
+    fn close_thinking(&self, ids: &mut Vec<u32>) -> bool {
+        let (Some(open), Some(close)) = (
+            self.tokenizer.token_to_id(THINK_OPEN),
+            self.tokenizer.token_to_id(THINK_CLOSE),
+        ) else {
+            return false;
+        };
+        if ids.last() != Some(&open) {
+            return false;
+        }
+        ids.push(close);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -662,6 +679,35 @@ mod tests {
             !text.contains("\"strict\""),
             "strict is not part of the signature"
         );
+    }
+
+    /// A turn that must not reason closes the block the generation prompt opened, and the next
+    /// turn's rendering of the reply extends that prompt, so a kept lane continues it.
+    #[test]
+    fn a_closed_thinking_turn_is_the_prefix_of_the_next_turn() {
+        let codec = codec();
+        let first = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let mut prompt = codec.encode_chat(&first).expect("the template renders");
+        assert!(codec.close_thinking(&mut prompt));
+        let reply = codec
+            .encode_text("hi", false)
+            .expect("the tokenizer spells it");
+        let mut held = prompt.clone();
+        held.extend_from_slice(&reply);
+        let next = json!({"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "there"},
+        ]});
+        let next = codec.encode_chat(&next).expect("the template renders");
+        assert!(
+            next.starts_with(&held),
+            "{held:?} is not a prefix of {next:?}"
+        );
+        // A prompt the generation prompt did not end on an open block is left alone.
+        let mut closed = prompt.clone();
+        assert!(!codec.close_thinking(&mut closed));
+        assert_eq!(closed, prompt);
     }
 
     #[test]

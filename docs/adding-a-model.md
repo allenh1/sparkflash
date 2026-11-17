@@ -174,6 +174,26 @@ tensor-parallel group adds only its wire (`GroupWire`: admission, sampler and im
 `GroupLanes` runs rank 0's decisions on every rank. The engine (`FusedEngine`) owns slots, the
 engine thread, admission, the prompt scheduler and reclaim.
 
+**What a new arm inherits.** Each strategy below is built once; the arm supplies the hook in the
+middle column and gets the rest. The default is what an arm that writes nothing gets, and the
+gate is the served check (`scripts/served-gate.py`, any model by port) that proves it on the arm.
+
+| strategy | the arm supplies | default without it | served gate |
+| --- | --- | --- | --- |
+| fused lanes | `step` over several slots, each row computed as alone | (required) | `lanes`, `lanes --sampled` |
+| prompt parts | `begin_prompt` / `next_part` over the chunks its prefill already runs | whole prompts | `interleave` |
+| drafting, joint rounds | `RoundArm` (open, verify) and a `StepWall` | no drafts | `lanes` |
+| multi-token runs | `ready`, `give_back` | one step a reply | `lanes` |
+| prefix reuse | `history` and `cached_tokens`, and a prefill that forwards only past the history; an arm that commits a verify at once keeps no row past the end of turn (`sparkflash_model::kept_to_end`), or its sequence runs past the reply | renewed every request | `turns` |
+| a thinking-off turn that the next turn continues | `PromptCodec::close_thinking`, only when the template writes an empty reasoning block other than DeepSeek's `</think>` (GLM appends `</think>` to the open `<think>`) | the trailing `<think>` becomes `</think>` | `turns` (plain) |
+| renewal for a prompt that does not continue | nothing: `continues` defaults to "the prompt extends the history" | | `turns` (the cold rerun is cached 0) |
+| rewind to the last prompt | `rewind_prefix`, and `continues` true | no rewind | `turns` (think mode, where a template drops the reasoning) |
+| shared lane memory | `room` and `release` over `sparkflash_kernels::lane_memory::LanePool` | each slot owns its whole context | |
+| a tensor-parallel group | a `GroupWire` | one rank | every gate, on the group |
+
+A hook an arm skips shows in its ledger line as off, with the reason, so the gap is visible at
+boot rather than found later.
+
 **The ledger** is how an arm says what it does with that schedule. `FusedArm::ledger` returns a
 `sparkflash_runtime::Ledger` stating each strategy it runs natively, looped or off, with the
 reason; the engine adds what it decides and prints the line at boot. A strategy the arm leaves
@@ -359,6 +379,8 @@ and an arm without a fused batch or a KV budget says so at TP=1. A directory of 
 - [ ] the arm serves through `FusedArm` (and `RoundArm` to draft), and its ledger states every
       strategy it runs, so the boot line shows none as `the arm does not state it`;
 - [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`;
+- [ ] `scripts/served-gate.py all PORT --long FILE` passes on the served arm, and its `lanes` and
+      `interleave` digests are kept (`--out`) as the baseline the next build must equal;
 - [ ] the parity harness passes layer by layer against the host reference;
 - [ ] new environment aliases are in `ENV_OVERRIDES` and documented here;
 - [ ] the arm is registered in the model registry and has a descriptor;

@@ -44,7 +44,7 @@ use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
 use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
-    PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
+    PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, kept_to_end, verdict,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
@@ -256,12 +256,7 @@ impl FusedArm for GlmFusion {
     fn room(&self, slot: &Glm5NextSession, prompt: Option<&[u32]>) -> bool {
         let sequence = &slot.sequence;
         match prompt {
-            Some(tokens) => {
-                let keeps = slot
-                    .reusable_prefix()
-                    .is_some_and(|held| held.len() < tokens.len() && tokens.starts_with(held));
-                sequence.room(tokens.len(), !keeps)
-            }
+            Some(tokens) => sequence.room(tokens.len(), !self.continues(slot, tokens)),
             None => {
                 let drafts = self.spec().map_or(0, |spec| spec.drafts);
                 sequence.room(sequence.position() + 1 + drafts, false)
@@ -356,12 +351,22 @@ impl FusedArm for GlmFusion {
 
     /// A kept draft's answer is held. The caches have consumed it already and a GLM sequence
     /// cannot rewind, so an unused run is not given back: the engine renews the slot (the default
-    /// [FusedArm::give_back] refuses), which its next prompt would do anyway, since the arm keeps
-    /// no history.
+    /// [FusedArm::give_back] refuses), and its next prompt starts over.
     fn ready(&self, slot: &Glm5NextSession, token: u32) -> bool {
         slot.pending
             .front()
             .is_some_and(|front| front.token == token)
+    }
+
+    /// A slot keeps its sequence between requests as a session alone does: the next prompt that
+    /// extends it forwards only the rest ([Glm5NextSession::begin_prompt]). A sequence with a
+    /// draft still queued is ahead of its history and names none.
+    fn history<'s>(&self, slot: &'s Glm5NextSession) -> Option<&'s [u32]> {
+        slot.reusable_prefix()
+    }
+
+    fn cached_tokens(&self, slot: &Glm5NextSession) -> usize {
+        slot.cached_tokens()
     }
 
     fn max_batch(&self) -> usize {
@@ -381,7 +386,10 @@ impl FusedArm for GlmFusion {
             format!("MTP, up to {} drafts, {depth}", spec.drafts)
         });
         ledger.drafting(drafter, self.joint_rounds, true);
-        ledger.set(Strategy::PrefixReuse, Mode::off("the arm keeps no history"));
+        ledger.set(
+            Strategy::PrefixReuse,
+            Mode::native("a prompt that extends a lane's sequence; no rewind"),
+        );
         ledger
     }
 }
@@ -1043,15 +1051,18 @@ impl Glm5NextSession {
             self.sampler
                 .choose_verify(rows.iter().map(Vec::as_slice), &chunk[1..], &self.sampling);
         let kept = verdict(chunk, &picks);
+        let eos = &self.shared.eos;
+        // No row past the reply's end stays in the caches, so a reply that ends inside the round
+        // leaves its sequence at the history its caller saw, which the next turn extends.
+        let held = kept_to_end(kept, &picks, eos);
         if chunk.len() > 1 {
-            // Give back the rows the model did not keep, before this rank's next step.
-            rank.commit(&mut self.sequence, kept)?;
+            // Give back the rows the sequence does not keep, before this rank's next step.
+            rank.commit(&mut self.sequence, held)?;
         }
         if let Some(spec) = self.spec.as_mut() {
             spec.observe(confidence, chunk.len() - 1, kept);
         }
-        let eos = &self.shared.eos;
-        self.pending.extend_round(chunk, &picks, &rows, kept, eos);
+        self.pending.extend_round(chunk, &picks, &rows, held, eos);
         let next_token = picks.first().copied().filter(|token| !eos.contains(token));
         Ok(StepOutput {
             logits: rows.first().cloned().unwrap_or_default(),

@@ -40,7 +40,7 @@ pub mod share;
 
 pub use fused::{
     FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
-    PROMPT_PARTS_ENV, Part, prompt_parts,
+    PROMPT_PARTS_ENV, Part, extends, prompt_parts,
 };
 pub use group::{
     GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,

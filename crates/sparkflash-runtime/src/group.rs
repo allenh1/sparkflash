@@ -694,6 +694,13 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
         self.arm.history(slot.slot.as_ref()?)
     }
 
+    /// Rank 0's answer: a slot it renews is renewed on every worker by the next `LaneRequest`.
+    fn continues(&self, slot: &Self::Slot, prompt: &[u32]) -> bool {
+        slot.slot
+            .as_ref()
+            .is_some_and(|inner| self.arm.continues(inner, prompt))
+    }
+
     fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
         slot.slot
             .as_ref()

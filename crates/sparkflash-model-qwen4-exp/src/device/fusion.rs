@@ -269,6 +269,16 @@ impl FusedArm for QwenFusion {
         slot.speculation()
     }
 
+    /// A slot keeps its sequence between requests as a session alone does: the next prompt that
+    /// extends it forwards only the rest ([DeviceSequence::begin_prompt]).
+    fn history<'s>(&self, slot: &'s DeviceSequence) -> Option<&'s [u32]> {
+        slot.reusable_prefix()
+    }
+
+    fn cached_tokens(&self, slot: &DeviceSequence) -> usize {
+        slot.cached_tokens()
+    }
+
     fn max_batch(&self) -> usize {
         self.rows
     }
@@ -295,7 +305,10 @@ impl FusedArm for QwenFusion {
                 )),
             );
         }
-        ledger.set(Strategy::PrefixReuse, Mode::off("the arm keeps no history"));
+        ledger.set(
+            Strategy::PrefixReuse,
+            Mode::native("a prompt that extends a lane's sequence"),
+        );
         ledger
     }
 }

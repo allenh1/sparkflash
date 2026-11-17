@@ -79,7 +79,7 @@ pub use profile::{
     active as active_profile, install_active,
 };
 pub use prompt::{PromptCodec, PromptError};
-pub use spec::{Pending, Queue, Speculator, lookup_draft, verdict};
+pub use spec::{Pending, Queue, Speculator, kept_to_end, lookup_draft, verdict};
 pub use speculation::{DepthPolicy, StepCost};
 pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};
 pub use vision::{
