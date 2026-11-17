@@ -34,6 +34,7 @@ use sparkflash_weights::rng::is_prime;
 use sparkflash_weights::{DType, TensorPlan, TensorSpec};
 
 use crate::engine_plan::PlanError;
+use crate::naming::{AttentionNames, ExpertNames, FfnNames, NamingDialect, TensorNames};
 
 /// The prefix every language-model tensor carries in the released checkpoints.
 pub const LM_PREFIX: &str = "model.language_model";
@@ -212,12 +213,37 @@ impl ArchitectureTensorPlan {
         match architecture.family.as_str() {
             "qwen4_exp" | "qwen3_5_moe" => builder.qwen(architecture, mtp)?,
             "glm5_next" => builder.glm(architecture, mtp)?,
-            other => {
-                return Err(PlanError::Invalid(format!(
-                    "the shared tensor plan does not name the {other:?} family"
-                )));
+            _ => {
+                // A family no pack transcribes is planned in the canonical spelling; a caller
+                // holding the checkpoint plans its own spelling through [Self::named].
+                let names = NamingDialect::canonical(architecture)
+                    .names(architecture)
+                    .map_err(PlanError::Invalid)?;
+                builder.generic(architecture, &names)?;
             }
         }
+        Ok(builder.finish())
+    }
+
+    /// Plan a family no pack transcribes, in the names `names` spells: what
+    /// [crate::naming::resolve] read from a checkpoint, or [NamingDialect::canonical]'s for a
+    /// document alone. The backbone only (embedding, decoder layers, final norm and head); a
+    /// tied head is the embedding and is not planned twice. The order is the forward's, as
+    /// [TensorNames::walk] lists it, with an FP8 weight's tile scale after it.
+    ///
+    /// # Errors
+    /// A layer whose attention or FFN is not the one `names` spells for it, a family the
+    /// convention does not name (see [NamingDialect::names]), or a world a sharded axis does not
+    /// divide.
+    pub fn named(
+        architecture: &Architecture,
+        tp: TpPlan,
+        names: &TensorNames,
+    ) -> Result<Self, PlanError> {
+        let mut builder = Builder::new(tp, false, false, false);
+        builder.dense_format = architecture.quantization.dense_format;
+        builder.expert_format = architecture.quantization.expert_format;
+        builder.generic(architecture, names)?;
         Ok(builder.finish())
     }
 
@@ -723,6 +749,258 @@ impl Builder {
             },
         }
         Ok(())
+    }
+
+    /// A family no pack transcribes: the backbone in the names `names` spells, the dense
+    /// projections in the dense format and the routed experts in the expert format, split as the
+    /// released families split the same projections.
+    fn generic(&mut self, arch: &Architecture, names: &TensorNames) -> Result<(), PlanError> {
+        let hidden = arch.hidden_size;
+        if names.layers.len() != arch.layers.len() {
+            return Err(PlanError::Invalid(format!(
+                "the names spell {} layers for an architecture of {}",
+                names.layers.len(),
+                arch.layers.len()
+            )));
+        }
+        let dense = self.dense_format;
+        let experts = ExpertFormat::of(self.expert_format);
+        self.whole(
+            names.embed.clone(),
+            DType::BF16,
+            vec![arch.vocab_size, hidden],
+            Role::Embedding,
+        );
+        for (layer, named) in arch.layers.iter().zip(&names.layers) {
+            self.whole(
+                named.input_norm.clone(),
+                DType::BF16,
+                vec![hidden],
+                Role::Norm,
+            );
+            match (&layer.attention.kind, &named.attention) {
+                (
+                    AttentionKind::Gqa {
+                        kv_heads,
+                        output_gate,
+                    },
+                    AttentionNames::Gqa {
+                        q,
+                        k,
+                        v,
+                        o,
+                        q_norm,
+                        k_norm,
+                    },
+                ) => {
+                    let head_dim = layer.attention.head_dim;
+                    let width = layer.attention.heads * head_dim;
+                    let kv_width = kv_heads * head_dim;
+                    let query = if *output_gate { 2 * width } else { width };
+                    let attention = Role::Attention;
+                    self.dense_linear(
+                        stem(q)?,
+                        query,
+                        hidden,
+                        dense,
+                        attention,
+                        LinearSplit::Rows,
+                    )?;
+                    for name in [k, v] {
+                        self.dense_linear(
+                            stem(name)?,
+                            kv_width,
+                            hidden,
+                            dense,
+                            attention,
+                            LinearSplit::KvRows,
+                        )?;
+                    }
+                    self.dense_linear(
+                        stem(o)?,
+                        hidden,
+                        width,
+                        dense,
+                        attention,
+                        LinearSplit::Columns,
+                    )?;
+                    for norm in [q_norm, k_norm].into_iter().flatten() {
+                        self.whole(norm.clone(), DType::BF16, vec![head_dim], attention);
+                    }
+                }
+                (AttentionKind::Gdn(gdn), AttentionNames::Gdn(named)) => {
+                    let key_width = gdn.key_heads * gdn.key_dim;
+                    let value_width = gdn.value_heads * gdn.value_dim;
+                    let conv_width = 2 * key_width + value_width;
+                    let attention = Role::Attention;
+                    self.dense_linear(
+                        stem(&named.qkv)?,
+                        conv_width,
+                        hidden,
+                        dense,
+                        attention,
+                        LinearSplit::Rows,
+                    )?;
+                    self.dense_linear(
+                        stem(&named.z)?,
+                        value_width,
+                        hidden,
+                        dense,
+                        attention,
+                        LinearSplit::Rows,
+                    )?;
+                    for name in [&named.b, &named.a] {
+                        self.rows(
+                            name.clone(),
+                            DType::BF16,
+                            [gdn.value_heads, hidden],
+                            attention,
+                        )?;
+                    }
+                    self.dense_linear(
+                        stem(&named.out)?,
+                        hidden,
+                        value_width,
+                        dense,
+                        attention,
+                        LinearSplit::Columns,
+                    )?;
+                    self.conv_rows(
+                        named.conv.clone(),
+                        DType::BF16,
+                        conv_width,
+                        gdn.conv_kernel,
+                        attention,
+                    )?;
+                    for name in [&named.a_log, &named.dt_bias] {
+                        self.row_vector(name.clone(), DType::BF16, gdn.value_heads, attention)?;
+                    }
+                    self.whole(
+                        named.norm.clone(),
+                        DType::BF16,
+                        vec![gdn.value_dim],
+                        attention,
+                    );
+                }
+                (kind, _) => {
+                    return Err(PlanError::Invalid(format!(
+                        "layer {} runs {kind:?}, which its names do not spell",
+                        layer.index
+                    )));
+                }
+            }
+            self.whole(
+                named.post_norm.clone(),
+                DType::BF16,
+                vec![hidden],
+                Role::Norm,
+            );
+            match (&layer.ffn, &named.ffn) {
+                (Ffn::Dense(mlp), FfnNames::Dense(names)) => {
+                    self.swiglu(names, mlp.intermediate, hidden, dense, Role::DenseMlp)?;
+                }
+                (
+                    Ffn::Moe(moe),
+                    FfnNames::Moe {
+                        router,
+                        experts: bodies,
+                        shared,
+                        shared_gate,
+                    },
+                ) => {
+                    if bodies.len() != moe.routed_experts {
+                        return Err(PlanError::Invalid(format!(
+                            "layer {} names {} experts of {}",
+                            layer.index,
+                            bodies.len(),
+                            moe.routed_experts
+                        )));
+                    }
+                    self.whole(
+                        router.clone(),
+                        DType::BF16,
+                        vec![moe.routed_experts, hidden],
+                        Role::Router,
+                    );
+                    for body in bodies {
+                        for (name, rows) in
+                            [(&body.gate, true), (&body.up, true), (&body.down, false)]
+                        {
+                            self.expert(
+                                stem(name)?,
+                                moe.intermediate,
+                                hidden,
+                                experts,
+                                rows,
+                                Role::Experts,
+                            )?;
+                        }
+                    }
+                    if let Some(shared) = shared {
+                        self.swiglu(
+                            shared,
+                            moe.shared_intermediate,
+                            hidden,
+                            dense,
+                            Role::SharedExpert,
+                        )?;
+                    }
+                    if let Some(gate) = shared_gate {
+                        self.whole(
+                            gate.clone(),
+                            DType::BF16,
+                            vec![1, hidden],
+                            Role::SharedExpert,
+                        );
+                    }
+                }
+                (ffn, _) => {
+                    return Err(PlanError::Invalid(format!(
+                        "layer {} runs {ffn:?}, which its names do not spell",
+                        layer.index
+                    )));
+                }
+            }
+        }
+        self.whole(names.norm.clone(), DType::BF16, vec![hidden], Role::Norm);
+        if !names.head_tied() {
+            self.whole(
+                names.head.clone(),
+                DType::BF16,
+                vec![arch.vocab_size, hidden],
+                Role::LmHead,
+            );
+        }
+        Ok(())
+    }
+
+    /// A SwiGLU's gate and up rows and its down columns.
+    fn swiglu(
+        &mut self,
+        names: &ExpertNames,
+        intermediate: usize,
+        hidden: usize,
+        format: WeightFormat,
+        role: Role,
+    ) -> Result<(), PlanError> {
+        for name in [&names.gate, &names.up] {
+            self.dense_linear(
+                stem(name)?,
+                intermediate,
+                hidden,
+                format,
+                role,
+                LinearSplit::Rows,
+            )?;
+        }
+        self.dense_linear(
+            stem(&names.down)?,
+            hidden,
+            intermediate,
+            format,
+            role,
+            LinearSplit::Columns,
+        )
     }
 
     fn qwen(&mut self, arch: &Architecture, include_mtp: bool) -> Result<(), PlanError> {
@@ -1998,6 +2276,12 @@ impl Builder {
 }
 
 /// A layer's hyper-connection, or `None` for a plain residual stream.
+/// A weight's name without its `.weight`, the prefix the linear helpers spell scales under.
+fn stem(name: &str) -> Result<&str, PlanError> {
+    name.strip_suffix(".weight")
+        .ok_or_else(|| PlanError::Invalid(format!("{name} is not a weight the plan can scale")))
+}
+
 fn hyper_or_plain(layer: &Layer) -> Option<&sparkflash_model::architecture::HyperConnection> {
     match &layer.residual {
         Residual::Hyper(hyper) => Some(hyper),

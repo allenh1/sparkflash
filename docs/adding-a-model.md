@@ -424,17 +424,22 @@ overrides for a novel one. `MODELS` remains the canonical preset list, not a clo
 checkpoint goes to its pack converter, DeepSeek goes to the B12x converter, and any other
 resolved architecture goes to the generic dynamic writer.
 
-**Phase-4 status.** `EngineBuilder`, `ArchitectureTensorPlan` and `SlotPack` are merged,
-but their reach is deliberately narrow: the released Qwen and GLM arms implement `EngineBuilder`
-(`PartsDeviceBackend`), `ArchitectureTensorPlan` names only the `qwen4_exp` and `glm5_next`
-families, and `SlotPack` is plan-order TP1. A novel family has neither a plan builder nor a
-device arm, so:
+**Phase-4 status.** `EngineBuilder`, `ArchitectureTensorPlan` and `SlotPack` are merged. The
+released Qwen and GLM arms implement `EngineBuilder` (`PartsDeviceBackend`), and `SlotPack` is
+plan-order TP1. `ArchitectureTensorPlan` names every family: a released one in its pack's
+spelling, any other in the one shared convention of `sparkflash_ops::naming` (runtime step 15).
+`NamingDialect::probe` reads a checkpoint's choices inside the canonical Hugging Face spelling
+(its layer root, its post-attention norm, per-head norms, the router's and GDN projections'
+names, a shared expert's gate, a tied head) from its headers, `NamingDialect::names` spells every
+tensor from the `Architecture`, and `ArchitectureTensorPlan::named` plans them (shapes, rank
+splits, roles, FP8 tile scales) in forward order. The converter, the host reference and the
+web's fit read that one plan; a novel family has no device arm yet, so:
 
 - a novel family is served by the CPU reference backend in
   `sparkflash-cli/src/serve/dynamic_host.rs`, which executes the parts in
   `sparkflash-cli/src/dynamic.rs::DYNAMIC_PARTS` (embedding, RMSNorm, GQA, Gated DeltaNet,
-  dense SwiGLU, routed/shared MoE, LM head, plain residual) with canonical Hugging Face tensor
-  names and f32 arithmetic. That list is
+  dense SwiGLU, routed/shared MoE, LM head, plain residual) with the shared names and f32
+  arithmetic. That list is
   `sparkflash_ops::parts::HOST_REFERENCE_PARTS`, and it is the capability gate for both the CLI
   and the web control plane: the CUDA catalogue answers a different question. The GQA arithmetic
   follows Hugging Face: `rotate_half` RoPE pairs dimension `i` with `i + head_dim/2`, an
@@ -443,7 +448,7 @@ device arm, so:
   `default`/`linear` and refused by name for any other rule. It is a bring-up path, not a
   throughput claim, and it plans at TP1;
 - a novel family's rank file is the same `SlotPlan`/`SlotFileWriter` container holding the raw
-  checkpoint tensors in architecture-walk order (`DynamicRecords` in `convert.rs`), not a device
+  checkpoint tensors in the shared plan's order (`DynamicRecords` in `convert.rs`), not a device
   layout. The generic writer is TP1: a world above one is refused rather than writing several
   whole copies labelled as shards. `convert --inspect` recognises the `dynamic` rank file and
   verifies it, and a conversion with no `--output-dir` writes beside the working directory,
@@ -464,9 +469,8 @@ device arm, so:
   scales, NVFP4, or an E4M3 tensor without its `_scale_inv` grid) is refused at boot with the
   format and tensor name;
 
-Replacing the remaining novel-family host walk with a shared device `EngineBuilder` and adding a
-generic `ArchitectureTensorPlan` naming path is the next step; it is a new plan builder, not a
-rebase change.
+Replacing the remaining novel-family host walk with a shared device `EngineBuilder` is runtime
+steps 18-20 ([engine/03-runtime.md](engine/03-runtime.md)).
 
 The web control plane evaluates a released family with the same `EnginePlan` +
 `KernelResolver` at every width its device arm runs (`crates/sparkflash-web/src/fit.rs`), and

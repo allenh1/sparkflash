@@ -428,10 +428,8 @@ fn default_convert_world(family: &str) -> usize {
     }
 }
 
-/// What a dynamic rank file records beside its slots. It stores raw checkpoint tensors in
-/// architecture-walk order, so there are no pack-specific scalars to record yet. A family the
-/// shared [sparkflash_ops::tensor_plan::ArchitectureTensorPlan] names uses that plan's
-/// [sparkflash_ops::slot_pack::SlotPack] instead; a novel family does not, yet.
+/// What a dynamic rank file records beside its slots. It stores raw checkpoint tensors in the
+/// shared tensor plan's order, so there are no pack-specific scalars to record yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct DynamicRecords {}
 
@@ -452,15 +450,14 @@ impl ShownRecords for DynamicRecords {
     }
 }
 
-/// Converts one rank of a novel architecture by writing every tensor the dynamic host path reads,
-/// in the shared architecture's forward order.
+/// Converts one rank of a novel architecture by writing every tensor the shared tensor plan names
+/// for it, in the plan's (the forward's) order.
 ///
-/// Phase 4 is merged, but [ArchitectureTensorPlan](sparkflash_ops::tensor_plan::ArchitectureTensorPlan)
-/// names only the released Qwen and GLM families, and [SlotPack](sparkflash_ops::slot_pack::SlotPack)
-/// is plan-order TP1. This writer therefore records raw checkpoint bytes in walk order through
-/// [SlotPlan]/[SlotFileWriter]: [crate::dynamic::resolve] decides the names and the shared
-/// [Architecture] decides the order. A world above one writes the same complete tensor set for
-/// each rank; the dynamic serving path is TP=1, the shape the zero-code acceptance test uses.
+/// [crate::dynamic::resolve] reads the checkpoint's spelling and
+/// [ArchitectureTensorPlan::named](sparkflash_ops::tensor_plan::ArchitectureTensorPlan::named)
+/// plans it, so an FP8 weight's tile scale follows it and a tied head is the embedding, written
+/// once. The file records raw checkpoint bytes through [SlotPlan]/[SlotFileWriter]; the dynamic
+/// serving path is TP=1, the shape the zero-code acceptance test uses.
 fn convert_dynamic_rank(
     source: &dyn sparkflash_weights::WeightSource,
     architecture: &Architecture,
@@ -470,13 +467,16 @@ fn convert_dynamic_rank(
     label: &str,
 ) -> Result<WrittenRank, String> {
     let names = crate::dynamic::resolve(architecture, source)?;
-    let tensors = crate::dynamic::walk(&names);
+    let tp = sparkflash_model::TpPlan::new(1, 0).map_err(|error| error.to_string())?;
+    let tensors =
+        sparkflash_ops::tensor_plan::ArchitectureTensorPlan::named(architecture, tp, &names)
+            .map_err(|error| error.to_string())?;
     let mut plan = SlotPlan::default();
     let mut payloads = Vec::with_capacity(tensors.len());
-    for name in tensors {
-        let bytes = source.read(&name).map_err(|error| error.to_string())?;
-        plan.place(&name, bytes.len());
-        payloads.push((name, bytes));
+    for name in tensors.names() {
+        let bytes = source.read(name).map_err(|error| error.to_string())?;
+        plan.place(name, bytes.len());
+        payloads.push((name.to_owned(), bytes));
     }
     let index = plan.into_index(layout, label, DynamicRecords {});
     let mut writer = SlotFileWriter::create(output_dir, index)?;

@@ -94,6 +94,7 @@ pub mod error;
 pub mod gemm;
 pub mod images;
 pub mod launchers;
+pub mod naming;
 pub mod parity;
 pub mod parts;
 pub mod parts_backend;

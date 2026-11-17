@@ -148,6 +148,36 @@ belongs in the default instead.
     strategies on the runtime's `Ledger` at start; its scheduler, kernels and arithmetic are
     unchanged.
 
+### Then: the next model starts from the shared parts
+
+Steps 8-14 gave every arm the strategies. Two things still make a new family write its own crate:
+its tensor names exist only as probes in the command line's host reference (`cli/src/dynamic.rs`),
+which the plan, the converter and the web cannot see, and the launch geometry of routed experts,
+the indexer and the residual mixers is still each arm's own. The next steps close both, sharing
+first what two arms already do alike; choosing a different body (token vs grouped experts) changes
+bits and stays each arm's until a gate says otherwise.
+
+15. Generic tensor naming: `ArchitectureTensorPlan` names any family `Architecture` describes
+    (HF-canonical names, shapes, rank splits and roles, in the naming dialect the checkpoint
+    uses), so the host reference, the converter and the web read one plan. No device code.
+16. The indexer's launch: Qwen and GLM run the same three bodies (pool, score, pick) with the same
+    budget rule, and `SparseIndexerLauncher` already reproduces both arms' grids. Both launch
+    from it; one `MAX_SELECTED_TOKENS`. A grid move, no arithmetic.
+17. The routed experts' shared geometry: the grouped-MMA tile and item count (Qwen's and
+    Inkling's are the same constants), the `moe_plan` launch (GLM, Qwen, Inkling) and the
+    combine grid (GLM, Qwen) come from `sparkflash_ops`. Which body runs stays the arm's.
+18. Typed token-kernel calls: the epilogue plans (`NormPlan`, `RopePlan`, `ActivationPlan`), the
+    embed, residual add and KV append get `call`s with the argument layouts Qwen and the block
+    drafter (`dflash`) spell today, and both launch through them.
+19. A shared device arm for new families: dense BF16 grouped-query attention, one rank, on the
+    shared plan, uploader and calls, served through `EngineBuilder` when the resolver finds every
+    kernel, with the per-layer parity report against the host reference as its gate.
+20. That arm on the serving contract (`FusedArm`, lane memory, a rewind point, the ledger),
+    gated by `scripts/served-gate.py`.
+
+Left after these: GDN and routed experts on the shared arm, its TP above one, the residual mixers
+(one arm per rule) and MLA (GLM's alone).
+
 ## Status
 
 | step | state |

@@ -40,7 +40,9 @@ use sparkflash_weights::linear_attention::{
 };
 use sparkflash_weights::weights::WeightSource;
 
-use crate::dynamic::{ResolvedAttention, ResolvedFfn, ResolvedNames};
+use sparkflash_ops::naming::{
+    AttentionNames, ExpertNames, FfnNames, GdnNames, LayerNames, TensorNames,
+};
 
 /// The largest per-tensor element count this host path materialises.
 const ELEMENT_LIMIT: usize = 1 << 30;
@@ -49,7 +51,7 @@ const ELEMENT_LIMIT: usize = 1 << 30;
 pub(crate) struct DynamicHostBackend {
     descriptor: ModelDescriptor,
     architecture: Arc<Architecture>,
-    names: Arc<ResolvedNames>,
+    names: Arc<TensorNames>,
     source: Arc<dyn WeightSource>,
     context: usize,
 }
@@ -171,7 +173,7 @@ fn decode_host_tensor(
 /// `EXIT_REFUSED`) rather than discovered inside a request.
 fn validate_shapes(
     architecture: &Architecture,
-    names: &ResolvedNames,
+    names: &TensorNames,
     source: &dyn WeightSource,
 ) -> Result<(), String> {
     let hidden = architecture.hidden_size;
@@ -194,7 +196,7 @@ fn validate_shapes(
                     kv_heads,
                     output_gate,
                 },
-                ResolvedAttention::Gqa {
+                AttentionNames::Gqa {
                     q,
                     k,
                     v,
@@ -227,7 +229,7 @@ fn validate_shapes(
             }
             (
                 AttentionKind::Gdn(gdn),
-                ResolvedAttention::Gdn {
+                AttentionNames::Gdn(GdnNames {
                     qkv,
                     z,
                     b,
@@ -237,7 +239,7 @@ fn validate_shapes(
                     a_log,
                     dt_bias,
                     norm,
-                },
+                }),
             ) => {
                 if gdn.key_heads == 0
                     || gdn.value_heads == 0
@@ -284,14 +286,14 @@ fn validate_shapes(
             }
         }
         match (&layer.ffn, &names.ffn) {
-            (Ffn::Dense(dense), ResolvedFfn::Dense { gate, up, down }) => {
+            (Ffn::Dense(dense), FfnNames::Dense(ExpertNames { gate, up, down })) => {
                 check(gate, &[dense.intermediate, hidden])?;
                 check(up, &[dense.intermediate, hidden])?;
                 check(down, &[hidden, dense.intermediate])?;
             }
             (
                 Ffn::Moe(moe),
-                ResolvedFfn::Moe {
+                FfnNames::Moe {
                     router,
                     experts,
                     shared,
@@ -382,7 +384,7 @@ impl ModelBackend for DynamicHostBackend {
 
 struct SessionShared {
     architecture: Arc<Architecture>,
-    names: Arc<ResolvedNames>,
+    names: Arc<TensorNames>,
     source: Arc<dyn WeightSource>,
     context: usize,
 }
@@ -669,7 +671,7 @@ fn erf(value: f32) -> f32 {
 #[allow(clippy::too_many_arguments)]
 fn gqa_attention(
     source: &dyn WeightSource,
-    names: &crate::dynamic::ResolvedLayer,
+    names: &LayerNames,
     attention: &sparkflash_model::architecture::Attention,
     kv_heads: usize,
     output_gate: bool,
@@ -679,7 +681,7 @@ fn gqa_attention(
     epsilon: f32,
     zero_centered: bool,
 ) -> Result<Vec<f32>, String> {
-    let ResolvedAttention::Gqa {
+    let AttentionNames::Gqa {
         q,
         k,
         v,
@@ -867,14 +869,14 @@ fn apply_rope(
 #[allow(clippy::too_many_lines)]
 fn gdn_attention(
     source: &dyn WeightSource,
-    names: &crate::dynamic::ResolvedLayer,
+    names: &LayerNames,
     _attention: &sparkflash_model::architecture::Attention,
     gdn: &sparkflash_model::architecture::Gdn,
     input: &[f32],
     state: &mut GdnState,
     epsilon: f32,
 ) -> Result<Vec<f32>, String> {
-    let ResolvedAttention::Gdn {
+    let AttentionNames::Gdn(GdnNames {
         qkv,
         z,
         b,
@@ -884,7 +886,7 @@ fn gdn_attention(
         a_log,
         dt_bias,
         norm,
-    } = &names.attention
+    }) = &names.attention
     else {
         return Err("a GDN layer carries another attention's tensors".to_owned());
     };
@@ -1050,13 +1052,13 @@ fn matrix_or_vector(
 
 fn dense_ffn(
     source: &dyn WeightSource,
-    names: &crate::dynamic::ResolvedLayer,
+    names: &LayerNames,
     activation: Activation,
     input: &[f32],
     hidden: usize,
     intermediate: usize,
 ) -> Result<Vec<f32>, String> {
-    let ResolvedFfn::Dense { gate, up, down } = &names.ffn else {
+    let FfnNames::Dense(ExpertNames { gate, up, down }) = &names.ffn else {
         return Err("a dense layer carries another FFN's tensors".to_owned());
     };
     let (_, _, gate_values) = matrix(source, gate, input)?;
@@ -1078,12 +1080,12 @@ fn dense_ffn(
 
 fn moe_ffn(
     source: &dyn WeightSource,
-    names: &crate::dynamic::ResolvedLayer,
+    names: &LayerNames,
     input: &[f32],
     hidden: usize,
     moe: &sparkflash_model::architecture::Moe,
 ) -> Result<Vec<f32>, String> {
-    let ResolvedFfn::Moe {
+    let FfnNames::Moe {
         router,
         experts,
         shared,
@@ -1463,9 +1465,9 @@ mod tests {
             compression: None,
             indexer: None,
         };
-        let layer = crate::dynamic::ResolvedLayer {
+        let layer = LayerNames {
             input_norm: "input_norm".to_owned(),
-            attention: crate::dynamic::ResolvedAttention::Gqa {
+            attention: AttentionNames::Gqa {
                 q: "q".to_owned(),
                 k: "k".to_owned(),
                 v: "v".to_owned(),
@@ -1474,11 +1476,11 @@ mod tests {
                 k_norm: Some("k_norm".to_owned()),
             },
             post_norm: "post_norm".to_owned(),
-            ffn: crate::dynamic::ResolvedFfn::Dense {
+            ffn: FfnNames::Dense(ExpertNames {
                 gate: "gate".to_owned(),
                 up: "up".to_owned(),
                 down: "down".to_owned(),
-            },
+            }),
         };
         let inputs: Vec<Vec<f32>> = (0..2)
             .map(|step| {
