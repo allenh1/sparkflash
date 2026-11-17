@@ -95,6 +95,7 @@ pub mod gemm;
 pub mod images;
 pub mod indexer;
 pub mod launchers;
+pub mod moe;
 pub mod naming;
 pub mod parity;
 pub mod parts;

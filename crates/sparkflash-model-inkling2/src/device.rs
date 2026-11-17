@@ -4451,7 +4451,10 @@ impl Scratch {
         // The two-halves band plans each half on its own: two counts, and up to one more short
         // item and one more item an expert than the whole chunk's plan.
         let owned = shared.plan.expert_range().1;
-        let items = take((chunk::moe_items(rows * top_k, owned) + owned + 1) * 4, 4);
+        let items = take(
+            (sparkflash_ops::moe::grouped::items(rows * top_k, owned) + owned + 1) * 4,
+            4,
+        );
         let item_count = take(2, 4);
         let taus = take(rows, 4);
         let attention_pass = attention_pass_slots(rows, heads, split);

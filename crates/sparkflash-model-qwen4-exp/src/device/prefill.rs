@@ -50,6 +50,8 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
 use sparkflash_ops::OpPlan;
+// The routed experts' plan, grouped tile and item count are the shared rule.
+use sparkflash_ops::moe::{MAX_EXPERTS as MOE_MAX_EXPERTS, MoePlanCall, grouped};
 use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
 
 use super::{
@@ -112,21 +114,6 @@ pub const MIN_PREFILL_CHUNK: usize = 16;
 /// scores are a context's worth of floats, so their scratch is sized for this many rows only.
 pub const ATTENTION_CHUNK: usize = 128;
 
-/// Routed (token, slot) rows per expert item (Q4P_MOE_ROWS).
-const MOE_ROWS: usize = 32;
-/// The plan's shared histogram (Q4P_MAX_EXPERTS).
-const MOE_MAX_EXPERTS: usize = 512;
-/// Intermediate columns a gate_up CTA covers: 64 gate rows and the matching 64 up rows.
-const MOE_GATE_UP_COLUMNS: usize = 64;
-/// Output columns a down CTA covers (Q4P_BN).
-const MOE_DOWN_COLUMNS: usize = 128;
-/// K per pipeline stage (Q4P_BK): four 16-column E4M3 scale groups.
-const MOE_K_STAGE: usize = 64;
-/// q4p_moe_rows' intermediate (gate_up) and output (down) columns a CTA: four warps of 8 and 16.
-const MOE_ROWS_GATE_UP_COLUMNS: usize = 32;
-const MOE_ROWS_DOWN_COLUMNS: usize = 64;
-/// The K a q4p_moe_rows lane reads at once: two stages, 16 bytes of a packed row.
-const MOE_ROWS_K: usize = 2 * MOE_K_STAGE;
 // The scan geometry lives in the shared op library so the Qwen and GLM arms cannot drift.
 pub use sparkflash_ops::gdn::{
     CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, gdn_scan_shape, gdn_scan_shape_for,
@@ -444,7 +431,7 @@ impl PrefillScratch {
         total: &mut usize,
     ) -> Result<Self, String> {
         let slots = chunk * config.num_experts_per_tok;
-        let items = slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots);
+        let items = grouped::items(slots, config.num_experts);
         Ok(Self {
             expert_input: cuda.alloc((chunk * config.hidden_size * 4).max(4), total)?,
             items: cuda.alloc(items.max(1) * 16, total)?,
@@ -459,12 +446,7 @@ impl PrefillScratch {
             // The most items the plan can write is ceil(slots / 32) + experts; each is padded
             // to the 32-row item and holds gate and up.
             moe_gate_up: cuda.alloc(
-                ((slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots))
-                    * MOE_ROWS
-                    * 2
-                    * config.moe_intermediate_size
-                    * 4)
-                .max(4),
+                (items * grouped::ITEM_ROWS * 2 * config.moe_intermediate_size * 4).max(4),
                 total,
             )?,
         })
@@ -969,11 +951,12 @@ impl DeviceSequence {
         let hidden = config.hidden_size;
         let intermediate = config.moe_intermediate_size;
         if !part("experts")
-            || !hidden.is_multiple_of(MOE_DOWN_COLUMNS)
-            || !hidden.is_multiple_of(MOE_K_STAGE)
-            || !intermediate.is_multiple_of(MOE_GATE_UP_COLUMNS)
-            || !intermediate.is_multiple_of(MOE_K_STAGE)
-            || config.num_experts > MOE_MAX_EXPERTS
+            || !grouped::fits(
+                hidden,
+                intermediate,
+                (hidden, intermediate),
+                config.num_experts,
+            )
         {
             return Ok(false);
         }
@@ -990,62 +973,33 @@ impl DeviceSequence {
         )?;
         // The most items the plan can write, and the grid's bound: past the count it wrote, a
         // CTA returns before touching anything.
-        let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
-        self.launch(
-            kernels.moe_plan,
-            (1, 1, 1),
-            (
-                sparkflash_model::active_profile().plan.block_threads(),
-                1,
-                1,
-            ),
-            &[
-                self.expert_indices.0,
-                self.expert_perm.0,
-                scratch.items.0,
-                scratch.item_count.0,
-                0,
-                slots as u64,
-                config.num_experts as u64,
-                topk as u64,
-                MOE_ROWS as u64,
-                items as u64,
-                0,
-                // A slot routed to no expert is left out of the items, and its partial row
-                // is zeroed so the combine still sums one row per slot.
-                2,
-                0,
-                0,
-                0,
-                0,
-                self.expert_accumulator.0,
-                hidden as u64,
-            ],
-        )?;
-        let rows = batch < GEMM_MIN_BATCH
-            && hidden.is_multiple_of(MOE_ROWS_K)
-            && intermediate.is_multiple_of(MOE_ROWS_K);
-        let (gate_up, gate_up_columns, down, down_columns, block) = if rows {
-            (
-                kernels.moe_rows_gate_up,
-                MOE_ROWS_GATE_UP_COLUMNS,
-                kernels.moe_rows_down,
-                MOE_ROWS_DOWN_COLUMNS,
-                (128, 1, 1),
-            )
+        let items = grouped::items(slots, config.num_experts);
+        // A slot routed to no expert is left out of the items, and its partial row
+        // is zeroed so the combine still sums one row per slot.
+        let plan = MoePlanCall::items(
+            self.expert_indices.0,
+            self.expert_perm.0,
+            (scratch.items.0, scratch.item_count.0),
+            (slots, config.num_experts, topk),
+            grouped::ITEM_ROWS,
+            items,
+        )
+        .zeroing(self.expert_accumulator.0, hidden);
+        let (grid, block) = MoePlanCall::launch();
+        self.launch(kernels.moe_plan, grid, block, &plan.args())?;
+        let items = items as u32;
+        let rows = batch < GEMM_MIN_BATCH && grouped::rows_fit(hidden, intermediate);
+        let (gate_up, down) = if rows {
+            (kernels.moe_rows_gate_up, kernels.moe_rows_down)
         } else {
-            (
-                kernels.moe_gate_up,
-                MOE_GATE_UP_COLUMNS,
-                kernels.moe_down,
-                MOE_DOWN_COLUMNS,
-                (256, 1, 1),
-            )
+            (kernels.moe_gate_up, kernels.moe_down)
         };
+        let ((gate_up_grid, gate_up_block), (down_grid, down_block)) =
+            grouped::grids(intermediate, hidden, items, rows);
         self.launch(
             gate_up,
-            ((intermediate / gate_up_columns) as u32, items, 1),
-            block,
+            gate_up_grid,
+            gate_up_block,
             &[
                 table.0,
                 scales.0,
@@ -1063,8 +1017,8 @@ impl DeviceSequence {
         )?;
         self.launch(
             down,
-            ((hidden / down_columns) as u32, items, 1),
-            block,
+            down_grid,
+            down_block,
             &[
                 table.0,
                 scales.0,
@@ -1123,36 +1077,19 @@ impl DeviceSequence {
         let scratch = &self.prefill;
         let topk = config.num_experts_per_tok;
         let slots = batch * topk;
-        let items = (slots.div_ceil(MOE_ROWS) + config.num_experts.min(slots)) as u32;
-        self.launch(
-            kernels.moe_plan,
-            (1, 1, 1),
-            (
-                sparkflash_model::active_profile().plan.block_threads(),
-                1,
-                1,
-            ),
-            &[
-                self.expert_indices.0,
-                self.expert_perm.0,
-                scratch.items.0,
-                scratch.item_count.0,
-                0,
-                slots as u64,
-                config.num_experts as u64,
-                topk as u64,
-                MOE_ROWS as u64,
-                items as u64,
-                0,
-                2,
-                0,
-                0,
-                0,
-                0,
-                self.expert_accumulator.0,
-                hidden as u64,
-            ],
-        )?;
+        let items = grouped::items(slots, config.num_experts);
+        let plan = MoePlanCall::items(
+            self.expert_indices.0,
+            self.expert_perm.0,
+            (scratch.items.0, scratch.item_count.0),
+            (slots, config.num_experts, topk),
+            grouped::ITEM_ROWS,
+            items,
+        )
+        .zeroing(self.expert_accumulator.0, hidden);
+        let (grid, block) = MoePlanCall::launch();
+        self.launch(kernels.moe_plan, grid, block, &plan.args())?;
+        let items = items as u32;
         // Gate and up share the one gate_up buffer: gate in the first `intermediate` columns,
         // up in the second.
         for (matrix, at) in [(0u64, 0usize), (2u64, intermediate)] {

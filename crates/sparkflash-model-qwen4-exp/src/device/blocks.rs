@@ -32,6 +32,7 @@ use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::indexer::IndexerPass;
+use sparkflash_ops::moe::{MoePlanCall, combine_grid};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
@@ -779,14 +780,11 @@ impl DeviceSequence {
         // One rank's combination is its share of the sum: it is summed over the world before it
         // is injected, so the combine only writes it ([Self::inject_branch]).
         let sharded = self.backend.tp.is_some();
+        let (grid, block) = combine_grid(config.hidden_size, batch);
         self.launch(
             kernels.moe_combine,
-            (
-                config.hidden_size.div_ceil(256).max(1) as u32,
-                batch as u32,
-                1,
-            ),
-            (256, 1, 1),
+            grid,
+            block,
             &[
                 self.branch.0,
                 self.expert_accumulator.0,
@@ -839,37 +837,14 @@ impl DeviceSequence {
         // The plan writes both outputs this path reads: `sorted` (the run order, which its
         // expert kernels take as `perm`) and the run bounds. Qwen passes no item list and no
         // segments, so its slice of the shared kernel is the token path's.
-        {
-            self.launch(
-                kernels.moe_plan,
-                (1, 1, 1),
-                (
-                    sparkflash_model::active_profile().plan.block_threads(),
-                    1,
-                    1,
-                ),
-                &[
-                    indices.0,
-                    self.expert_perm.0,
-                    0,
-                    0,
-                    self.expert_run.0,
-                    (count * topk) as u64,
-                    config.num_experts as u64,
-                    topk as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )?;
-        }
+        let plan = MoePlanCall::runs(
+            indices.0,
+            self.expert_perm.0,
+            self.expert_run.0,
+            (count * topk, config.num_experts, topk),
+        );
+        let (grid, block) = MoePlanCall::launch();
+        self.launch(kernels.moe_plan, grid, block, &plan.args())?;
         let gate_up_grid = (
             intermediate.div_ceil(WARPS * ROWS) as u32,
             topk as u32,

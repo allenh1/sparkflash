@@ -38,6 +38,7 @@
 //! row-at-a-time one pick the same token" a test rather than a hope.
 
 use sparkflash_model::backend::BackendError;
+use sparkflash_ops::moe::{MoePlanCall, grouped};
 use sparkflash_ops::projection::{Route, WidePolicy, route_bf16};
 
 use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step, TauRule};
@@ -434,37 +435,18 @@ pub(super) fn run_steered_band(
                 ],
             )
             .map_err(device_error)?;
+        // One item an expert, whatever its slot count.
+        let plan = MoePlanCall::items(
+            scratch.local.0,
+            scratch.plan.0,
+            (scratch.items.0, scratch.item_count.0),
+            (slots, owned, top_k),
+            0,
+            max_items,
+        );
+        let (grid, block) = MoePlanCall::launch();
         shared
-            .launch(
-                shared.kernels.moe_plan,
-                (1, 1, 1),
-                (
-                    sparkflash_model::active_profile().plan.block_threads(),
-                    1,
-                    1,
-                ),
-                &[
-                    scratch.local.0,
-                    scratch.plan.0,
-                    scratch.items.0,
-                    scratch.item_count.0,
-                    0,
-                    slots as u64,
-                    owned as u64,
-                    top_k as u64,
-                    // One item an expert, whatever its slot count.
-                    0,
-                    max_items as u64,
-                    0,
-                    MOE_PLAN_DROP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                ],
-            )
+            .launch(shared.kernels.moe_plan, grid, block, &plan.args())
             .map_err(device_error)?;
     }
     // `row_slots` is the slots that read one input row: a token's top-k for the gate/up
@@ -2172,26 +2154,7 @@ const PAIR_RUN: usize = 16;
 /// The most rows a launch grid's second dimension holds.
 const GRID_ROWS: usize = 65_535;
 
-/// The (token, slot) rows one item of the grouped MMA holds (Q4P_MOE_ROWS).
-const MOE_ROWS: usize = 32;
-/// The K a stage of the grouped MMA reads (Q4P_BK), the intermediate columns a gate_up CTA writes
-/// and the output columns a down CTA writes.
-const MOE_K_STAGE: usize = 64;
-const MOE_GATE_UP_COLUMNS: usize = 64;
-const MOE_DOWN_COLUMNS: usize = 128;
-/// The threads of a grouped-MMA CTA and of the activation split.
-const MOE_THREADS: u32 = 256;
-/// The most experts the plan and the MMA tables index (MOE_PLAN_MAX_EXPERTS, Q4P_MAX_EXPERTS).
-const MOE_MAX_EXPERTS: usize = 512;
-/// moe_plan's mode for an id outside [0, experts): left out of the items (MOE_PLAN_DROP).
-const MOE_PLAN_DROP: u64 = 2;
-
-/// The most items the shared plan can cut from `slots` slots over `owned` experts: a run per
-/// expert and every MOE_ROWS rows of one. The grouped MMA's grid is this tall; past the count
-/// the plan wrote, a CTA returns before touching anything.
-pub(super) fn moe_items(slots: usize, owned: usize) -> usize {
-    slots.div_ceil(MOE_ROWS) + owned.min(slots)
-}
+// The grouped MMA's tile, item count and plan are the shared rule (sparkflash_ops::moe).
 
 /// The routed band over a chunk on the tensor cores, for an NVFP4 layer under the `tensor` walk
 /// and an MXFP8 one under [Mxfp8Walk::Mma].
@@ -2235,13 +2198,7 @@ fn run_band_mma(
     } else {
         shared.kernels.moe_gate_up
     };
-    if !down.rows.is_multiple_of(MOE_DOWN_COLUMNS)
-        || !hidden.is_multiple_of(MOE_K_STAGE)
-        || !intermediate.is_multiple_of(MOE_GATE_UP_COLUMNS)
-        || !intermediate.is_multiple_of(MOE_K_STAGE)
-        || !down.columns.is_multiple_of(MOE_K_STAGE)
-        || owned > MOE_MAX_EXPERTS
-    {
+    if !grouped::fits(hidden, intermediate, (down.rows, down.columns), owned) {
         return Err(device_error(format!(
             "layer {}: the grouped MMA's tiles do not cover hidden {hidden}, intermediate \
              {intermediate}, a down projection of {} by {} and {owned} experts a rank; \
@@ -2251,7 +2208,7 @@ fn run_band_mma(
     }
     let slots = rows * top_k;
     let elements = rows * hidden;
-    let items = moe_items(slots, owned);
+    let items = grouped::items(slots, owned);
     shared
         .launch(
             shared.kernels.band_shares,
@@ -2278,11 +2235,13 @@ fn run_band_mma(
         .launch(
             shared.kernels.split_bf16,
             (
-                (elements / 2).div_ceil(MOE_THREADS as usize).clamp(1, 4096) as u32,
+                (elements / 2)
+                    .div_ceil(grouped::THREADS as usize)
+                    .clamp(1, 4096) as u32,
                 1,
                 1,
             ),
-            (MOE_THREADS, 1, 1),
+            (grouped::THREADS, 1, 1),
             &[scratch.q_in.0, scratch.band.0, elements as u64],
         )
         .map_err(device_error)?;
@@ -2306,37 +2265,18 @@ fn run_band_mma(
         run_band_halves(shared, scratch, &band, &overlap, rows)?;
         return Ok(true);
     }
+    // Another rank's slot is left out; its share is zero, so the mix skips its row.
+    let plan = MoePlanCall::items(
+        scratch.local.0,
+        scratch.plan.0,
+        (scratch.items.0, scratch.item_count.0),
+        (slots, owned, top_k),
+        grouped::ITEM_ROWS,
+        items,
+    );
+    let (grid, block) = MoePlanCall::launch();
     shared
-        .launch(
-            shared.kernels.moe_plan,
-            (1, 1, 1),
-            (
-                sparkflash_model::active_profile().plan.block_threads(),
-                1,
-                1,
-            ),
-            &[
-                scratch.local.0,
-                scratch.plan.0,
-                scratch.items.0,
-                scratch.item_count.0,
-                0,
-                slots as u64,
-                owned as u64,
-                top_k as u64,
-                MOE_ROWS as u64,
-                items as u64,
-                0,
-                // Another rank's slot is left out; its share is zero, so the mix skips its row.
-                MOE_PLAN_DROP,
-                0,
-                0,
-                0,
-                0,
-                0,
-                hidden as u64,
-            ],
-        )
+        .launch(shared.kernels.moe_plan, grid, block, &plan.args())
         .map_err(device_error)?;
     let grid_items = u32::try_from(items).map_err(device_error)?;
     // The SwiGLU rows' two bf16 planes fill the activation buffer's f32 rows exactly. Under the
@@ -2353,8 +2293,12 @@ fn run_band_mma(
     shared
         .launch(
             gate_up_kernel,
-            ((intermediate / MOE_GATE_UP_COLUMNS) as u32, grid_items, 1),
-            (MOE_THREADS, 1, 1),
+            (
+                (intermediate / grouped::GATE_UP_COLUMNS) as u32,
+                grid_items,
+                1,
+            ),
+            (grouped::THREADS, 1, 1),
             &[
                 meta.table.0,
                 meta.scales.0,
@@ -2376,7 +2320,7 @@ fn run_band_mma(
     // Under the row split the down pass reads the gathered runs where they land (rank r's run of
     // both planes at r * run, a slot's row `intermediate` wide): the stages copy the elements a
     // joined row holds at their columns, so no join copies the activation first.
-    let grid = ((down.rows / MOE_DOWN_COLUMNS) as u32, grid_items, 1);
+    let grid = ((down.rows / grouped::DOWN_COLUMNS) as u32, grid_items, 1);
     let head = [
         meta.table.0,
         meta.scales.0,
@@ -2410,7 +2354,7 @@ fn run_band_mma(
         let runs = [intermediate as u64, (planes * slots * intermediate) as u64];
         let args: Vec<u64> = [&head[..], &source, &tail, &runs].concat();
         shared
-            .launch(kernel, grid, (MOE_THREADS, 1, 1), &args)
+            .launch(kernel, grid, (grouped::THREADS, 1, 1), &args)
             .map_err(device_error)?;
     } else {
         let kernel = if mx8 {
@@ -2421,7 +2365,7 @@ fn run_band_mma(
         let source = [scratch.activation.0, (slots * down.columns) as u64];
         let args: Vec<u64> = [&head[..], &source, &tail].concat();
         shared
-            .launch(kernel, grid, (MOE_THREADS, 1, 1), &args)
+            .launch(kernel, grid, (grouped::THREADS, 1, 1), &args)
             .map_err(device_error)?;
     }
     // The mix is local; the exchange that follows it completes the sum over the ranks.
@@ -2605,7 +2549,7 @@ fn run_band_halves(
         .enumerate()
     {
         let slots = half_rows * top_k;
-        let items = moe_items(slots, owned);
+        let items = grouped::items(slots, owned);
         places.push(HalfPlace {
             half,
             first_row,
@@ -2630,47 +2574,28 @@ fn run_band_halves(
     };
     let gate_up = |place: &HalfPlace| -> Result<(), BackendError> {
         let (plan, items, count) = plan_of(place);
+        let call = MoePlanCall::items(
+            scratch.local.offset(place.first_slot * int).0,
+            plan.0,
+            (items.0, count.0),
+            (place.slots, owned, top_k),
+            grouped::ITEM_ROWS,
+            place.items,
+        );
+        let (grid, block) = MoePlanCall::launch();
         shared
-            .launch(
-                shared.kernels.moe_plan,
-                (1, 1, 1),
-                (
-                    sparkflash_model::active_profile().plan.block_threads(),
-                    1,
-                    1,
-                ),
-                &[
-                    scratch.local.offset(place.first_slot * int).0,
-                    plan.0,
-                    items.0,
-                    count.0,
-                    0,
-                    place.slots as u64,
-                    owned as u64,
-                    top_k as u64,
-                    MOE_ROWS as u64,
-                    place.items as u64,
-                    0,
-                    MOE_PLAN_DROP,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    hidden as u64,
-                ],
-            )
+            .launch(shared.kernels.moe_plan, grid, block, &call.args())
             .map_err(device_error)?;
         let run = place.slots * intermediate * element;
         shared
             .launch(
                 band.gate_up,
                 (
-                    (intermediate / MOE_GATE_UP_COLUMNS) as u32,
+                    (intermediate / grouped::GATE_UP_COLUMNS) as u32,
                     u32::try_from(place.items).map_err(device_error)?,
                     1,
                 ),
-                (MOE_THREADS, 1, 1),
+                (grouped::THREADS, 1, 1),
                 &[
                     band.meta.table.0,
                     band.meta.scales.0,
@@ -2704,11 +2629,11 @@ fn run_band_halves(
             .launch(
                 band.down,
                 (
-                    (down.rows / MOE_DOWN_COLUMNS) as u32,
+                    (down.rows / grouped::DOWN_COLUMNS) as u32,
                     u32::try_from(place.items).map_err(device_error)?,
                     1,
                 ),
-                (MOE_THREADS, 1, 1),
+                (grouped::THREADS, 1, 1),
                 &[
                     band.meta.table.0,
                     band.meta.scales.0,

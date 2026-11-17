@@ -106,6 +106,7 @@ use sparkflash_ops::gemv::{
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
 use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
+use sparkflash_ops::moe::{MoePlanCall, combine_grid};
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
@@ -4934,35 +4935,21 @@ impl DeviceRank {
         let slots = rows * topk;
         let items = moe_items(slots, config.n_routed_experts);
         let moe_rows = items * MOE_ITEM_ROWS;
-        self.launch(
-            self.kernels.prefill_moe_plan,
-            (1, 1, 1),
-            sparkflash_model::active_profile().plan.block_threads(),
-            &[
-                s.expert_indices.0,
-                s.moe_sorted.0,
-                s.moe_items.0,
-                s.moe_item_count.0,
-                0,
-                slots as u64,
-                config.n_routed_experts as u64,
-                topk as u64,
-                MOE_ITEM_ROWS as u64,
-                items as u64,
-                0,
-                // A slot no expert owns is left out of the plan rather than counted as expert 0.
-                // This arm's combine sums every slot's row, so a dropped slot's row is zeroed
-                // here: the down projection writes only the item rows, and would otherwise leave
-                // whatever the previous chunk left in that slot.
-                2,
-                0,
-                0,
-                0,
-                0,
-                s.expert_out.0,
-                hidden as u64,
-            ],
-        )?;
+        // A slot no expert owns is left out of the plan rather than counted as expert 0. This
+        // arm's combine sums every slot's row, so a dropped slot's row is zeroed here: the down
+        // projection writes only the item rows, and would otherwise leave whatever the previous
+        // chunk left in that slot.
+        let plan = MoePlanCall::items(
+            s.expert_indices.0,
+            s.moe_sorted.0,
+            (s.moe_items.0, s.moe_item_count.0),
+            (slots, config.n_routed_experts, topk),
+            MOE_ITEM_ROWS,
+            items,
+        )
+        .zeroing(s.expert_out.0, hidden);
+        let (grid, block) = MoePlanCall::launch();
+        self.launch(self.kernels.prefill_moe_plan, grid, block.0, &plan.args())?;
         if self.prefill_activation == PrefillActivation::Fp8
             && width.is_multiple_of(FP8_BLOCK)
             && hidden.is_multiple_of(FP8_BLOCK)
@@ -5093,10 +5080,11 @@ impl DeviceRank {
     fn combine_experts(&self, rows: usize) -> Result<(), BackendError> {
         let s = &self.scratch;
         let config = &self.config;
+        let (grid, block) = combine_grid(config.hidden_size, rows);
         self.launch(
             self.kernels.combine,
-            (blocks(config.hidden_size), rows as u32, 1),
-            BLOCK,
+            grid,
+            block.0,
             &[
                 s.partial.0,
                 s.expert_out.0,
