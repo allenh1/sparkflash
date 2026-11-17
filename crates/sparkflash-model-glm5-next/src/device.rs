@@ -106,6 +106,7 @@ use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
+use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile};
 use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
 fn cubin_available() -> bool {
@@ -300,11 +301,6 @@ const FP8_BLOCK: usize = 128;
 /// The dynamic shared memory of the bulk E4M3 x E4M3 GEMMs in the prefill and MoE images
 /// (GLM_Q8_SHARED): their cp.async stages and a column tile's weight scales.
 const Q8_SHARED: u32 = 68_608;
-/// The dynamic shared memory of the bulk BF16 GEMM's wide tile (GLM_WIDE_SHARED): three cp.async
-/// stages of a 128-row f32 activation tile and a 256-row BF16 weight tile, 32 K each.
-const WIDE_SHARED: u32 = 98_304;
-/// The output columns of that tile (GLM_WIDE_BN).
-const WIDE_COLUMNS: usize = 256;
 /// The widest inner those GEMMs take (GLM_Q8_BLOCKS 128-column blocks): the kernel holds a column
 /// tile's weight scales in shared memory and does nothing for a wider one.
 const Q8_MAX_INNER: usize = 128 * FP8_BLOCK;
@@ -3219,33 +3215,58 @@ impl DeviceRank {
                 )
             });
             let out = output.offset(rows * first * 4);
+            // A BF16 part takes what the dispatcher gives GLM's bulk walk: the wide tile where it
+            // covers the part, else the skinny kernel (at most 32 outputs over whole 256-column
+            // steps), else the tiled GEMV.
+            let Some(scales) = scales else {
+                match WidePolicy::GLM.bulk(part_rows, columns, rows) {
+                    Route::Wide => {
+                        let bf16 = if self.prefill_activation == PrefillActivation::Bf16 {
+                            self.kernels.prefill_dense_bf16_bf16a
+                        } else {
+                            self.kernels.prefill_dense_bf16
+                        };
+                        let tile =
+                            WideTile::call(weight.0, input.0, out.0, part_rows, columns, rows)
+                                .map_err(refusal)?;
+                        self.launch(bf16, tile.grid, tile.block.0, &tile.args)?;
+                    }
+                    Route::Skinny => self.launch(
+                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
+                        (rows.div_ceil(16) as u32, 1, 1),
+                        BLOCK,
+                        &[
+                            weight.0,
+                            input.0,
+                            out.0,
+                            part_rows as u64,
+                            columns as u64,
+                            rows as u64,
+                        ],
+                    )?,
+                    _ => {
+                        let row = DeviceLinear {
+                            weight,
+                            scales: None,
+                            rows: part_rows,
+                            columns,
+                            parts: [part_rows; 3],
+                        };
+                        self.gemv_grouped(&row, input, out, rows)?;
+                    }
+                }
+                continue;
+            };
             // The block-scaled kernel indexes its scales a 128-column K block at a time, so a
-            // scaled part also needs the K run to be whole blocks, not just whole 32-column
-            // stages; the skinny kernel reads eight floats a lane a 256-column step.
+            // scaled part needs the K run to be whole blocks, not just whole 32-column stages.
             let tiled = part_rows % 32 == 0
                 && columns.is_multiple_of(32)
-                && scales.is_none_or(|_| columns.is_multiple_of(FP8_BLOCK))
-                && scales.is_none_or(|_| first.is_multiple_of(FP8_BLOCK));
-            if !tiled && scales.is_none() && part_rows <= 32 && columns.is_multiple_of(256) {
-                self.launch(
-                    self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
-                    (rows.div_ceil(16) as u32, 1, 1),
-                    BLOCK,
-                    &[
-                        weight.0,
-                        input.0,
-                        out.0,
-                        part_rows as u64,
-                        columns as u64,
-                        rows as u64,
-                    ],
-                )?;
-                continue;
-            }
+                && columns.is_multiple_of(FP8_BLOCK)
+                && first.is_multiple_of(FP8_BLOCK);
             if !tiled {
                 let row = DeviceLinear {
                     weight,
-                    scales,
+                    scales: Some(scales),
                     rows: part_rows,
                     columns,
                     parts: [part_rows; 3],
@@ -3254,45 +3275,37 @@ impl DeviceRank {
                 continue;
             }
             let grid = (part_rows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1);
-            let (fp8, bf16) = if self.prefill_activation == PrefillActivation::Bf16 {
-                (
-                    self.kernels.prefill_dense_fp8_bf16a,
-                    self.kernels.prefill_dense_bf16_bf16a,
-                )
+            let fp8 = if self.prefill_activation == PrefillActivation::Bf16 {
+                self.kernels.prefill_dense_fp8_bf16a
             } else {
-                (
-                    self.kernels.prefill_dense_fp8,
-                    self.kernels.prefill_dense_bf16,
-                )
+                self.kernels.prefill_dense_fp8
             };
-            match scales {
-                Some(scales)
-                    if self.prefill_activation == PrefillActivation::Fp8
-                        && columns.is_multiple_of(FP8_BLOCK) =>
-                {
-                    q8_inner(columns)?;
-                    if !quantised {
-                        self.quantise(input, rows, columns)?;
-                        quantised = true;
-                    }
-                    let s = &self.scratch;
-                    self.launch(
-                        self.kernels.prefill_dense_q8,
-                        grid,
-                        BLOCK,
-                        &[
-                            weight.0,
-                            scales.0,
-                            s.q8_codes.0,
-                            s.q8_scales.0,
-                            out.0,
-                            part_rows as u64,
-                            columns as u64,
-                            rows as u64,
-                        ],
-                    )?
+            if self.prefill_activation == PrefillActivation::Fp8
+                && columns.is_multiple_of(FP8_BLOCK)
+            {
+                q8_inner(columns)?;
+                if !quantised {
+                    self.quantise(input, rows, columns)?;
+                    quantised = true;
                 }
-                Some(scales) => self.launch(
+                let s = &self.scratch;
+                self.launch(
+                    self.kernels.prefill_dense_q8,
+                    grid,
+                    BLOCK,
+                    &[
+                        weight.0,
+                        scales.0,
+                        s.q8_codes.0,
+                        s.q8_scales.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?;
+            } else {
+                self.launch(
                     fp8,
                     grid,
                     BLOCK,
@@ -3305,20 +3318,7 @@ impl DeviceRank {
                         columns as u64,
                         rows as u64,
                     ],
-                )?,
-                None => self.launch(
-                    bf16,
-                    (part_rows.div_ceil(WIDE_COLUMNS) as u32, grid.1, 1),
-                    BLOCK,
-                    &[
-                        weight.0,
-                        input.0,
-                        out.0,
-                        part_rows as u64,
-                        columns as u64,
-                        rows as u64,
-                    ],
-                )?,
+                )?;
             }
         }
         Ok(())
@@ -5184,8 +5184,7 @@ impl DeviceRank {
             // The chunk's last row is its stash's last ([Self::fill]).
             drafter.last = Some(part.len().min(MAX_ROWS) - 1);
         }
-        if let (Some(drafter), Some((scratch, _)), Some(captured)) =
-            (&self.block, &block, captured)
+        if let (Some(drafter), Some((scratch, _)), Some(captured)) = (&self.block, &block, captured)
         {
             for (row, rows, position) in commits {
                 drafter
@@ -6247,7 +6246,9 @@ impl DeviceRank {
         let mut word = [0u8; 4];
         (1..=count)
             .map(|iteration| {
-                probs.read_at(at(iteration, row), &mut word).map_err(cuda_error)?;
+                probs
+                    .read_at(at(iteration, row), &mut word)
+                    .map_err(cuda_error)?;
                 Ok(f32::from_le_bytes(word))
             })
             .collect()
@@ -6532,7 +6533,6 @@ impl Drop for DeviceRank {
         self.cuda.destroy_run_stream(&self.stream);
     }
 }
-
 
 /// The softmax probability of `values[pick]`, as q4e_argmax_prob_slices takes it: 1 over the sum
 /// of e^(value - best), NaN values left out, and 0 when the best is not finite.

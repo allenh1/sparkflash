@@ -39,6 +39,11 @@ use sparkflash_kernels::images::{dory_cubin, qwen4_exp_cubin};
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
 use sparkflash_ops::gemv::CudaHandle;
+// dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
+// takes it are the dispatcher's.
+use sparkflash_ops::projection::{
+    Route, WIDE_COLUMNS, WIDE_SHARED, WidePolicy, WideTile, route_bf16,
+};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_weights::safetensors::open_checkpoint;
 use sparkflash_weights::{DType, WeightSource};
@@ -802,12 +807,6 @@ const SPLIT_MAX: usize = 256;
 const SPLIT_HEAD_MAX: usize = 256;
 /// The query heads a dory_attn_split block serves from one kv head's rows.
 const SPLIT_GQA_MAX: usize = 4;
-
-/// dory_mma_wide's output columns a block (GLM_WIDE_BN) and its dynamic shared memory
-/// (GLM_WIDE_SHARED): three cp.async stages of a 128-row f32 activation tile and a 256-row BF16
-/// weight tile, 32 K each.
-const WIDE_COLUMNS: usize = 256;
-const WIDE_SHARED: u32 = 98_304;
 
 /// The head widths dory_attn_mma is instantiated for.
 const PREFILL_HEAD_DIMS: [usize; 4] = [16, 64, 128, 256];
@@ -2201,42 +2200,38 @@ fn gemv_batch(
     output: Deviceptr,
     batch: usize,
 ) -> Result<(), BackendError> {
-    if batch > TOKEN_ROWS && matrix.rows.is_multiple_of(32) && matrix.columns.is_multiple_of(32) {
+    match route_bf16(Some(WidePolicy::DORY), matrix.rows, matrix.columns, batch) {
         // One 128-token x 256-column tensor-core block per grid point: the whole prompt chunk
         // is one launch, and the row-major checkpoint weights are loaded a tile at a time.
         // The eight-token path keeps q4e_gemv_bf16, whose per-token dot is the token kernel's
         // bits.
-        return launch(
-            cuda,
-            kernels.mma_wide,
-            (
-                matrix.rows.div_ceil(WIDE_COLUMNS) as u32,
-                batch.div_ceil(128) as u32,
-                1,
-            ),
-            (256, 1, 1),
-            &[
+        Route::Wide => {
+            let tile = WideTile::call(
                 matrix.pointer.0,
                 input.0,
                 output.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
-                batch as u64,
-            ],
-        );
-    }
-    if batch > TOKEN_ROWS {
+                matrix.rows,
+                matrix.columns,
+                batch,
+            )
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+            return launch(cuda, kernels.mma_wide, tile.grid, tile.block, &tile.args);
+        }
         // The load-time shape check refuses this, but keep the launch honest if another caller
         // reaches it: the token GEMV's bits differ from the tensor-core chunk's, so silently
         // switching arithmetic here would make a prompt's logits depend on its width.
-        return Err(BackendError::new(
-            DEVICE,
-            format!(
-                "a {batch}-row projection of a {}x{} matrix needs both dimensions in 32-column \
-                 steps for the wide kernel; the token GEMV would change the chunk's arithmetic",
-                matrix.rows, matrix.columns
-            ),
-        ));
+        Route::Refuse | Route::Skinny | Route::BatchedGemv => {
+            return Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "a {batch}-row projection of a {}x{} matrix needs both dimensions in \
+                     32-column steps for the wide kernel; the token GEMV would change the \
+                     chunk's arithmetic",
+                    matrix.rows, matrix.columns
+                ),
+            ));
+        }
+        Route::RowGemv => {}
     }
     // The kernel covers two rows a warp for a batch (16 rows a block at 256 threads) and one row
     // a warp for a single row; the grid must match that mapping or half the blocks exit unused.
@@ -2278,7 +2273,9 @@ fn gemv_group(
     if projections.len() > 4
         || projections.iter().any(|(matrix, _)| {
             Some(matrix.columns) != columns
-                || (wide && !(matrix.rows.is_multiple_of(32) && matrix.columns.is_multiple_of(32)))
+                || (wide
+                    && route_bf16(Some(WidePolicy::DORY), matrix.rows, matrix.columns, batch)
+                        != Route::Wide)
         })
     {
         for (matrix, output) in projections {

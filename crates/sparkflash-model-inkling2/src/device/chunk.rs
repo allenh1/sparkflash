@@ -38,6 +38,7 @@
 //! row-at-a-time one pick the same token" a test rather than a hope.
 
 use sparkflash_model::backend::BackendError;
+use sparkflash_ops::projection::{Route, WidePolicy, route_bf16};
 
 use crate::device_plan::{BandOp, Collective, ConvSlot, ExpertBody, LayerSchedule, Step, TauRule};
 
@@ -671,7 +672,11 @@ pub(super) fn project(
             .gemm(weight, input, out, width, inner, rows)
             .map_err(device_error);
     }
-    if Shared::wide_fits(walk, width, inner) {
+    // The tensor walk takes the wide tile on every shape it covers, at any rows; the walk is the
+    // caller's and not this rank's prompt walk, because a step of fused lanes walks exactly
+    // whatever a prompt walks.
+    let policy = (walk == PrefillWalk::Tensor).then_some(WidePolicy::INKLING_TENSOR);
+    if route_bf16(policy, width, inner, rows) == Route::Wide {
         return shared
             .wide(weight, input, out, width, inner, rows)
             .map_err(device_error);

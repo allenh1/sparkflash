@@ -69,9 +69,11 @@ runtime only asks an arm's sequence whether it has room (`FusedArm::room`). An a
 what grows with a sequence once (`Layout`), and one `LanePool` a rank backs, refuses and releases
 every sequence's span from a fixed budget: Inkling's and GLM's sequences both use it.
 
-Below the runtime, `sparkflash-ops` gets one projection entry point that picks row GEMV, batched
-GEMV, packed or the wide tile from shape, rows and precision, so tensor-core prefill is a
-property of the stack, not of an arm.
+Below the runtime, `sparkflash_ops::projection` picks a BF16 projection's kernel (row GEMV,
+batched GEMV, the skinny kernel or the wide tensor-core tile) from its shape, its rows and the
+arm's `WidePolicy`, and gives the wide tile's launch (`WideTile`), so tensor-core prefill is a
+property of the stack, not of an arm. GLM, Dory and Inkling route through it (step 5 below says
+what is not routed yet).
 
 ## Multi-token runs
 
@@ -115,7 +117,7 @@ loop pipeline (which uses only the policy pieces).
 | 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's and Qwen's `--tp4-rank` groups serve through it |
 | 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's and Qwen's groups step four lanes by default, GLM's on Inkling's lane memory |
 | 4. prefill scheduler | done: the engine runs a prompt past 256 tokens a chunk at a time, two decode steps between chunks (`SPARKFLASH_PROMPT_PARTS=off` opts out); Inkling, GLM and Qwen split their prompts into parts |
-| 5. projection dispatcher | planned |
+| 5. projection dispatcher | first cut: BF16 projections (GLM, Dory, Inkling) choose and launch the wide tile through `sparkflash_ops::projection`; Qwen's split-K tile and the FP8 projections keep their own rules |
 | 6. typed plans executed | planned |
 
 ### Step 1: what it measured
@@ -347,3 +349,31 @@ the last gate's.
 
 The decoders keep streaming while the prompt fills; the prompt's own first token pays for the
 decode steps between its chunks.
+
+### Step 5: one rule for the wide tile
+
+GLM's bulk prefill, Dory's prompt walk and Inkling's tensor walk each carried their own copy of
+the wide BF16 tile's geometry (128 rows by 256 columns, 256 threads, 96 KiB of shared memory,
+whole 32-wide tiles) and their own test for when to take it. They launched the same kernel body
+on the same grid, so the copies became one: `WideTile::call` gives the grid, block and arguments,
+and `route_bf16` (or `WidePolicy::bulk`, for a walk the arm has already sent down the bulk path)
+gives the kernel. What still differs between the arms is data, in `WidePolicy`, because each
+arm's digests were recorded under its own rule:
+
+| arm | takes the tile at | a shape the tile does not cover |
+| --- | --- | --- |
+| GLM | more than `GEMV_MAX_BATCH` rows | the skinny kernel (up to 32 columns over whole 256-wide steps), else the row GEMV |
+| Dory | more than `GEMV_MAX_BATCH` rows | refused: the token GEMV would change the chunk's arithmetic |
+| Inkling, tensor walk | any row count | the row GEMV |
+
+Each arm still launches the kernel symbol from its own image; only the decision and the launch
+shape are shared.
+
+Not routed yet, on purpose: Qwen's BF16 tensor-core path (a 128 x 128 tile whose split of K
+decides the sums), the FP8 projections (block, tile and MX scales differ by arm) and DeepSeek's
+`mxfp8_gemv_launch` family. Folding them in changes which kernel some shapes take, so each needs a
+gate showing the shared rule gives the same bits first.
+
+The gate is bit-neutral: Inkling's batch digests and every lanes-gate answer equal jr4's; GLM's
+lanes-gate and interleave answers equal step 4's; Dory's single-process server gives the step-4
+build's text and logprobs at prompts of 12, 700 and 3,000 words.

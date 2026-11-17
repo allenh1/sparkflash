@@ -53,9 +53,8 @@ use sparkflash_model::{
     Capabilities, DepthPolicy, ModelDescriptor, Speculator, StepCost, TpPlan, lookup_draft,
 };
 use sparkflash_ops::gemv::CudaHandle;
-use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round,
-};
+use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
+use sparkflash_runtime::{ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
@@ -600,16 +599,6 @@ fn attention_pass_slots(rows: usize, heads: usize, split: bool) -> usize {
     };
     ((budget / (rows * heads.max(1))) / unit * unit).max(unit)
 }
-
-/// The shared wide tile's geometry (kernels/shared_prefill_mma_sm121.cuh): GLM_WIDE_BN output
-/// columns by GLM_BM token rows a block of OM_THREADS threads, through GLM_WIDE_SHARED bytes of
-/// dynamic shared memory, over a matrix whose columns and inner width are multiples of
-/// WIDE_MULTIPLE (a projection that is not takes the row GEMV).
-const WIDE_COLUMNS: usize = 256;
-const WIDE_ROWS: usize = 128;
-const WIDE_THREADS: u32 = 256;
-const WIDE_SHARED: u32 = 98_304;
-const WIDE_MULTIPLE: usize = 32;
 
 /// The tokens one group of a batched projection launch carries (the row kernel's
 /// `Q4E_MAX_BATCH`).
@@ -1380,18 +1369,9 @@ impl Shared {
         )
     }
 
-    /// Whether `walk` takes the wide tile for a `width` x `inner` projection: the tensor walk
-    /// does when its columns and its inner width are whole 32-column tiles, as the tile reads
-    /// them. The walk is the caller's and not this rank's prompt walk, because a step of fused
-    /// lanes walks exactly whatever a prompt walks.
-    fn wide_fits(walk: PrefillWalk, width: usize, inner: usize) -> bool {
-        walk == PrefillWalk::Tensor
-            && width.is_multiple_of(WIDE_MULTIPLE)
-            && inner.is_multiple_of(WIDE_MULTIPLE)
-    }
-
-    /// One dense BF16 projection of `rows` token rows on the wide tile: out[rows][width] =
-    /// input[rows][inner] times the row-major weight's transpose.
+    /// One dense BF16 projection of `rows` token rows on the wide tile
+    /// ([sparkflash_ops::projection::WideTile]): out[rows][width] = input[rows][inner] times the
+    /// row-major weight's transpose.
     fn wide(
         &self,
         weight: Deviceptr,
@@ -1401,30 +1381,9 @@ impl Shared {
         inner: usize,
         rows: usize,
     ) -> Result<(), String> {
-        if !width.is_multiple_of(WIDE_MULTIPLE) || !inner.is_multiple_of(WIDE_MULTIPLE) {
-            return Err(format!(
-                "the wide tile reads whole {WIDE_MULTIPLE}-column tiles, not a {width} x {inner} \
-                 projection"
-            ));
-        }
         let weight = self.bf16_rows(weight, width, inner)?;
-        self.launch(
-            self.kernels.wide,
-            (
-                grid_blocks(width, WIDE_COLUMNS),
-                grid_blocks(rows, WIDE_ROWS),
-                1,
-            ),
-            (WIDE_THREADS, 1, 1),
-            &[
-                weight.0,
-                input.0,
-                out.0,
-                width as u64,
-                inner as u64,
-                rows as u64,
-            ],
-        )
+        let tile = WideTile::call(weight.0, input.0, out.0, width, inner, rows)?;
+        self.launch(self.kernels.wide, tile.grid, tile.block, &tile.args)
     }
 
     /// One RMSNorm of one row.
@@ -5106,7 +5065,11 @@ impl Drop for InklingDeviceSession {
         if let Some(boundary) = &self.boundary {
             pointers.push(boundary.arena);
         }
-        if let Some(buffer) = self.prompting.as_ref().and_then(|prompting| prompting.buffer) {
+        if let Some(buffer) = self
+            .prompting
+            .as_ref()
+            .and_then(|prompting| prompting.buffer)
+        {
             pointers.push(buffer);
         }
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
