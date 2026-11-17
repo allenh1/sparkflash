@@ -186,6 +186,7 @@ gate is the served check (`scripts/served-gate.py`, any model by port) that prov
 | multi-token runs | `ready`, `give_back` | one step a reply | `lanes` |
 | prefix reuse | `history` and `cached_tokens`, and a prefill that forwards only past the history; an arm that commits a verify at once keeps no row past the end of turn (`sparkflash_model::kept_to_end`), or its sequence runs past the reply | renewed every request | `turns` |
 | a thinking-off turn that the next turn continues | `PromptCodec::close_thinking`, only when the template writes an empty reasoning block other than DeepSeek's `</think>` (GLM appends `</think>` to the open `<think>`) | the trailing `<think>` becomes `</think>` | `turns` (plain) |
+| a reply whose text re-encodes to its ids | nothing: the host's decode holds a character a token left unfinished until the next completes it, and releases it at the end | | `turns` |
 | renewal for a prompt that does not continue | nothing: `continues` defaults to "the prompt extends the history" | | `turns` (the cold rerun is cached 0) |
 | rewind to the last prompt | `rewind_prefix`, and `continues` true | no rewind | `turns` (think mode, where a template drops the reasoning) |
 | shared lane memory | `room` and `release` over `sparkflash_kernels::lane_memory::LanePool` | each slot owns its whole context | |

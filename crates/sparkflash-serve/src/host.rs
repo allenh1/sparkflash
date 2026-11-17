@@ -1133,7 +1133,16 @@ fn serve_request(
         };
         next = step.next_token;
     }
-    let tail = stop_buffer.finish();
+    // A reply that ends on a replacement glyph (a character its last token left unfinished, or
+    // one the model chose) gets it now: nothing follows to complete it.
+    let mut tail = String::new();
+    if !stop_buffer.matched()
+        && let Some(full) = codec.decode(&generated)
+    {
+        let rest = settled_delta(&mut decoded, &full, true);
+        tail = stop_buffer.push(Some(&rest));
+    }
+    tail.push_str(&stop_buffer.finish());
     if !tail.is_empty()
         && let Err(ending) = send(Reply::Delta(tail))
     {
@@ -1167,21 +1176,34 @@ fn serve_request(
     (ending, Some(step))
 }
 
-/// Decodes the whole generated prefix and returns the part that is new.
-///
-/// A prompt codec's decode is a pure function of the ids. When a new token completes a multibyte
-/// character the decoder may revise a trailing replacement glyph; the common-prefix rule emits the
-/// corrected suffix at the cost of a possible duplicate, which is why the contract exposes a
-/// one-shot decode rather than a stateful stream today.
+/// Decodes the whole generated prefix and returns the part that is new ([settled_delta]).
 fn decode_new(codec: &dyn PromptCodec, previous: &mut String, ids: &[u32]) -> Option<String> {
     let full = codec.decode(ids)?;
-    let mut common = common_prefix_bytes(previous, &full);
-    while common > 0 && !full.is_char_boundary(common) {
+    Some(settled_delta(previous, &full, false))
+}
+
+/// The text `full` adds over the `emitted` decode, which then becomes `full`.
+///
+/// A byte-level token can end inside a multibyte character, and a one-shot decode spells the
+/// unfinished bytes as a replacement glyph. Until the `last` decode, a trailing run of them is
+/// held back, as tokenizers' `DecodeStream` holds it, because the next token may complete the
+/// character: emitting the glyph would put text in the reply that is not the decode of its ids,
+/// and the next turn's prompt, re-encoding that reply, would no longer extend the ids the
+/// server holds. A decode that revises text already emitted (a decoder that is not
+/// prefix-monotonic) emits from the first difference, at the cost of a possible duplicate.
+fn settled_delta(emitted: &mut String, full: &str, last: bool) -> String {
+    let settled = if last {
+        full
+    } else {
+        full.trim_end_matches('\u{FFFD}')
+    };
+    let mut common = common_prefix_bytes(emitted, settled);
+    while common > 0 && !settled.is_char_boundary(common) {
         common -= 1;
     }
-    let delta = full[common..].to_owned();
-    *previous = full;
-    Some(delta)
+    let delta = settled[common..].to_owned();
+    settled.clone_into(emitted);
+    delta
 }
 
 /// The bytes two decodes share, the common prefix a token's text delta is measured against.
@@ -1473,6 +1495,33 @@ mod tests {
         let mut buffer = StopBuffer::new(&["END".to_owned()]);
         assert_eq!(buffer.push(Some("hello EN")), "hello ");
         assert_eq!(buffer.finish(), "EN");
+    }
+
+    /// A token that ends inside a multibyte character emits nothing until the next completes it,
+    /// so the reply is the decode of its ids; the last decode releases a glyph still held.
+    #[test]
+    fn an_unfinished_character_is_held_until_a_token_completes_it() {
+        let mut emitted = String::new();
+        assert_eq!(settled_delta(&mut emitted, "I", false), "I");
+        // The token " \xE2\x88" settles its space; its partial character waits.
+        assert_eq!(settled_delta(&mut emitted, "I \u{FFFD}", false), " ");
+        assert_eq!(settled_delta(&mut emitted, "I \u{221D}", false), "\u{221D}");
+        assert_eq!(
+            settled_delta(&mut emitted, "I \u{221D} 1/\u{FFFD}", false),
+            " 1/"
+        );
+        assert_eq!(
+            settled_delta(&mut emitted, "I \u{221D} 1/\u{FFFD}", true),
+            "\u{FFFD}"
+        );
+        assert_eq!(emitted, "I \u{221D} 1/\u{FFFD}");
+        // A glyph the model chose mid-reply is emitted once a token follows it.
+        let mut emitted = String::new();
+        assert_eq!(settled_delta(&mut emitted, "a\u{FFFD}", false), "a");
+        assert_eq!(
+            settled_delta(&mut emitted, "a\u{FFFD}b", false),
+            "\u{FFFD}b"
+        );
     }
 
     #[test]

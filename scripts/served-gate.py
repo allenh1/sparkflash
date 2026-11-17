@@ -302,6 +302,13 @@ def turns(server, args):
                     i, "HIT" if hit else "MISS", a2["cached"], a2["prompt"], a1["prompt"],
                     ", cut" if a1["cut"] else "", c2["cached"],
                     "equal to cold" if equal else "differs from cold"))
+                if not hit:
+                    # The first reply's edges, where a re-rendering most often parts from the
+                    # ids the server holds (stripped whitespace, an unfinished character).
+                    reasoning, content = a1["said"]
+                    print("MISS %s c%d: reasoning tail %r, content head %r, tail %r" % (
+                        label, i, (reasoning or "")[-40:], content[:40], content[-40:]),
+                        flush=True)
             print("CHECK %s: %s => %s" % (label, "; ".join(notes), "PASS" if passed else "FAIL"),
                   flush=True)
             ok &= passed
