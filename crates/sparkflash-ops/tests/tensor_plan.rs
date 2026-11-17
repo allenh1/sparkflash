@@ -208,6 +208,12 @@ fn a_hybrid_architecture_plans_every_part_it_names() {
         })
         .expect("the KDA layer has a scan launcher");
     assert_eq!((scan.key_heads, scan.heads), (128, 128));
+    // The scan body itself, not the image's first KDA symbol (its prep pass).
+    assert_eq!(scan.kernel.symbol, "q4p_kda_scan");
+    assert_eq!(
+        (scan.launch.grid, scan.launch.block.0),
+        sparkflash_ops::gdn::gdn_scan_shape(128)
+    );
     let mut scans = 0;
     let mut attentions = 0;
     let mut dense = 0;

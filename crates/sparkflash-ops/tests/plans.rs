@@ -26,6 +26,7 @@ use sparkflash_ops::epilogue::{
     ActivationKind, ActivationPlan, GatherPlan, NormKind, NormPlan, QuantizePlan, RopePlan,
 };
 use sparkflash_ops::error::OpError;
+use sparkflash_ops::gdn::gdn_scan_shape_for;
 use sparkflash_ops::gemm::{DenseGemmPlan, ExpertCombinePlan, GroupedMoeGemmPlan, MoeRoutingPlan};
 use sparkflash_ops::images::Image;
 use sparkflash_ops::parity::{LayerPlan, ParityReport, Tolerance};
@@ -979,6 +980,38 @@ fn an_nvfp4_attention_is_unsupported_not_unresolved() {
     )
     .expect_err("attention has no NVFP4 body");
     assert!(matches!(error, OpError::Unsupported { .. }), "{error}");
+}
+
+#[test]
+fn the_scheduled_scan_is_what_the_arms_launch_at_every_world() {
+    for world in [1usize, 2, 4] {
+        // Qwen's GDN: one block row a value head, the released 128/128 body.
+        let plan = arm(QWEN, world);
+        let scan = ScanPlan::for_rank(CTX, &plan, ScanKind::Gdn, 4096)
+            .expect("the scan plans")
+            .expect("the released Qwen has GDN layers");
+        let qwen = requirement(&plan, Part::GdnScan);
+        assert_eq!(scan.heads, qwen.geometry.kv_heads, "TP{world} value heads");
+        assert_eq!(scan.kernel().symbol, "q4p_gdn_scan", "TP{world}");
+        let (grid, block) = gdn_scan_shape_for(scan.heads, scan.value_dim);
+        assert_eq!(scan.launch().grid, grid, "TP{world}");
+        assert_eq!(scan.launch().block, (block, 1, 1), "TP{world}");
+        // GLM's KDA: a head is both, at 128 x 128.
+        let plan = arm(GLM, world);
+        let scan = ScanPlan::for_rank(CTX, &plan, ScanKind::Kda, 4096)
+            .expect("the scan plans")
+            .expect("the released GLM has KDA layers");
+        assert_eq!(scan.kernel().symbol, "q4p_kda_scan", "TP{world}");
+        let (grid, block) = gdn_scan_shape_for(scan.heads, 128);
+        assert_eq!(scan.launch().grid, grid, "TP{world}");
+        assert_eq!(scan.launch().block, (block, 1, 1), "TP{world}");
+        // A plan without the other recurrence has no scan of it.
+        assert!(
+            ScanPlan::for_rank(CTX, &plan, ScanKind::Gdn, 4096)
+                .expect("no GDN layer is not an error")
+                .is_none()
+        );
+    }
 }
 
 #[test]

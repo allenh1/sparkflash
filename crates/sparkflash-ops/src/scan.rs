@@ -14,14 +14,15 @@
 
 //! Linear-attention scans: Gated DeltaNet and Kimi Delta Attention.
 
-use sparkflash_model::Part;
+use sparkflash_model::{Architecture, Part, Target};
 
-use crate::engine_plan::PartRequirement;
+use crate::engine_plan::{EnginePlan, PartRequirement};
 use crate::error::OpError;
+use crate::gdn::{GDN_VALUE, gdn_scan_shape_for};
 use crate::plan::{
     KernelId, KernelPhase, Launch, OpKind, OpPlan, PartGeometry, Precision, StreamId,
 };
-use crate::resolver::PlanContext;
+use crate::resolver::{Availability, PlanContext};
 
 /// The GDN scan symbols for one key/value head template, most specific first.
 ///
@@ -167,6 +168,101 @@ impl ScanPlan {
         };
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// The scan a schedule launches for `requirement` over `rows` rows: the heads, head widths
+    /// and convolution window are the requirement's (GDN's value heads in `kv_heads`, a KDA
+    /// head in `heads`), and the column split is [gdn_scan_shape_for]'s, the one rule every arm
+    /// and the boot launcher use.
+    ///
+    /// # Errors
+    /// A requirement that is not a linear-attention scan, or as [Self::new].
+    pub fn scheduled(
+        context: PlanContext,
+        requirement: &PartRequirement,
+        rows: usize,
+    ) -> Result<Self, OpError> {
+        let geometry = requirement.geometry;
+        let (kind, heads) = match requirement.part {
+            Part::GdnScan => (ScanKind::Gdn, geometry.kv_heads),
+            Part::KdaScan => (ScanKind::Kda, geometry.heads),
+            other => {
+                return Err(OpError::Binding(format!(
+                    "a {other} requirement is not a linear-attention scan"
+                )));
+            }
+        };
+        let value_dim = if geometry.v_head == 0 {
+            GDN_VALUE
+        } else {
+            geometry.v_head
+        };
+        let ((_, splits, _), _) = gdn_scan_shape_for(heads.max(1), value_dim);
+        Self::new(
+            context,
+            requirement,
+            kind,
+            rows,
+            heads,
+            geometry.head_dim,
+            value_dim,
+            splits as usize,
+            StreamId(0),
+        )
+    }
+
+    /// The scan every `kind` layer of a rank's `plan` runs over `rows` rows ([Self::scheduled]):
+    /// what an arm executes, built from the same plan the boot check resolved. `None` for a plan
+    /// with no such layer.
+    ///
+    /// # Errors
+    /// Two layers whose scans differ in geometry or precision (one launch cannot serve both), or
+    /// as [Self::scheduled].
+    pub fn for_rank(
+        context: PlanContext,
+        plan: &EnginePlan,
+        kind: ScanKind,
+        rows: usize,
+    ) -> Result<Option<Self>, OpError> {
+        let mut scans = plan
+            .requirements()
+            .filter(|requirement| requirement.part == kind.part());
+        let Some(first) = scans.next() else {
+            return Ok(None);
+        };
+        if let Some(other) = scans.find(|requirement| {
+            requirement.geometry != first.geometry || requirement.precision != first.precision
+        }) {
+            return Err(OpError::Binding(format!(
+                "the plan's {kind:?} layers differ ({:?} {:?} vs {:?} {:?}); one scan launch \
+                 serves them all",
+                first.geometry, first.precision, other.geometry, other.precision
+            )));
+        }
+        Self::scheduled(context, first, rows).map(Some)
+    }
+
+    /// [Self::for_rank] at rank `rank` of `world` of a parsed architecture, on sm121 against the
+    /// images this binary embeds: the form an arm builds at load, from the architecture its pack
+    /// planned.
+    ///
+    /// # Errors
+    /// A world the architecture does not divide, or as [Self::for_rank].
+    pub fn for_architecture(
+        architecture: &Architecture,
+        world: usize,
+        rank: usize,
+        kind: ScanKind,
+        rows: usize,
+    ) -> Result<Option<Self>, OpError> {
+        let plan = EnginePlan::for_architecture(architecture.clone(), Target::Sm121, world, rank)
+            .map_err(|error| OpError::Binding(format!("the rank's plan: {error}")))?;
+        Self::for_rank(
+            PlanContext::new(Target::Sm121, Availability::Embedded),
+            &plan,
+            kind,
+            rows,
+        )
     }
 
     /// The scan grid and block width for the head count, as the kernels choose it.

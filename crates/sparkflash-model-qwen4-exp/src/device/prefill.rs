@@ -49,6 +49,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
+use sparkflash_ops::OpPlan;
 
 use super::{
     DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
@@ -352,6 +353,16 @@ pub(super) struct PrefillKernels {
 }
 
 impl PrefillKernels {
+    /// The GDN scan body a plan names ([sparkflash_ops::scan::ScanPlan]).
+    fn gdn_scan_named(&self, symbol: &str) -> Result<Kernel, String> {
+        match symbol {
+            "q4p_gdn_scan" => Ok(self.gdn_scan),
+            "q4p_gdn_scan_64_64" => Ok(self.gdn_scan_64_64),
+            "q4p_gdn_scan_128_256" => Ok(self.gdn_scan_128_256),
+            other => Err(format!("the prefill image loads no GDN scan named {other}")),
+        }
+    }
+
     pub(super) fn load(cuda: &Cuda) -> Result<Self, String> {
         if embedded_prefill_cubin().is_empty() {
             return Err(
@@ -1367,18 +1378,27 @@ impl DeviceSequence {
             ],
         )?;
         let value_dim = config.linear_value_head_dim;
-        let scan = match (config.linear_key_head_dim, value_dim) {
-            (64, 64) => kernels.gdn_scan_64_64,
-            (128, 256) => kernels.gdn_scan_128_256,
-            _ => kernels.gdn_scan,
+        // The plan's scan: its kernel for the head widths and its grid ([ScanPlan]).
+        let plan = match &self.backend.gdn_scan {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                return Err(BackendError::new(
+                    "qwen4_prefill",
+                    "the rank's plan has no GDN scan",
+                ));
+            }
+            Err(refusal) => return Err(BackendError::new("qwen4_prefill", refusal.clone())),
         };
-        let (scan_grid, scan_threads) = gdn_scan_shape_for(heads, value_dim);
+        let launch = plan.launch();
+        let scan = kernels
+            .gdn_scan_named(launch.kernel.symbol)
+            .map_err(|error| BackendError::new("qwen4_prefill", error))?;
         // The verify's windows are the conv's snapshot; the recurrent state is replayed rather
         // than saved a row at a time, so the scan writes no snapshot of its own.
         self.launch(
             scan,
-            scan_grid,
-            (scan_threads, 1, 1),
+            launch.grid,
+            launch.block,
             &[
                 scratch.gdn_qk.0,
                 scratch.gdn_decay_beta.0,

@@ -97,16 +97,17 @@ use sparkflash_kernels::cuda_driver::{
 use sparkflash_kernels::images;
 use sparkflash_kernels::lane_memory::{LanePool, LaneSpan, Layout};
 use sparkflash_model::{BackendError, Part, StepCost};
+use sparkflash_ops::OpPlan;
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::gdn::{
     CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS,
-    gdn_scan_shape,
 };
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
 use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile};
+use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
 fn cubin_available() -> bool {
@@ -2163,6 +2164,9 @@ pub struct DeviceRank {
     kernels: Kernels,
     config: Glm5NextConfig,
     layout: TpLayout,
+    /// The bulk KDA scan the rank's plan resolves ([Self::kda_scan_plan]); `None` where runs
+    /// take the token kernels.
+    kda_scan: Option<ScanPlan>,
     geometry: HcGeometry,
     embed: Deviceptr,
     norm: Deviceptr,
@@ -2411,12 +2415,14 @@ impl DeviceRank {
         let scratch = Self::scratch(config, layout, MAX_ROWS, &stream, &mut memory, false)?;
         let prefetch = Prefetch::new(&cuda)?;
         let tokens_staged = TokenFence(cuda.stream_event().map_err(cuda_error)?);
+        let kda_scan = Self::kda_scan_plan(config, layout)?;
         let mut rank = Self {
             cuda,
             stream,
             kernels,
             config: config.clone(),
             layout,
+            kda_scan,
             geometry: HcGeometry::from(config),
             embed,
             norm,
@@ -4022,12 +4028,47 @@ impl DeviceRank {
     /// than a step's tile, never a verify (whose windows and memory a commit restores), at the
     /// head and history widths the prefill image is compiled for.
     fn bulk(&self, run: &Run<'_>) -> bool {
-        let config = &self.config;
-        !run.verify
-            && run.len > MAX_ROWS
-            && config.linear_head_dim == GDN_KEY
+        !run.verify && run.len > MAX_ROWS && self.kda_scan.is_some()
+    }
+
+    /// The bulk KDA scan this rank's plan resolves ([ScanPlan::for_architecture]), at the head
+    /// and history widths the prefill image is compiled for; `None` elsewhere, where every run
+    /// takes the token kernels.
+    ///
+    /// # Errors
+    /// A plan the rank cannot build, or one whose scan is not this rank's share.
+    fn kda_scan_plan(
+        config: &Glm5NextConfig,
+        layout: TpLayout,
+    ) -> Result<Option<ScanPlan>, BackendError> {
+        if !(config.linear_head_dim == GDN_KEY
             && config.linear_head_dim == GDN_VALUE
-            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim)
+            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim))
+        {
+            return Ok(None);
+        }
+        let plan = ScanPlan::for_architecture(
+            &config.architecture,
+            layout.world_size,
+            layout.rank,
+            ScanKind::Kda,
+            MAX_ROWS + 1,
+        )
+        .map_err(|error| BackendError::new("glm5_device", error.to_string()))?;
+        let heads = config.linear_num_heads / layout.world_size.max(1);
+        if let Some(scan) = &plan
+            && (scan.heads, scan.key_dim, scan.value_dim)
+                != (heads, config.linear_head_dim, GDN_VALUE)
+        {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the plan's KDA scan is {} heads of {} x {}, this rank's {heads} of {} x {}",
+                    scan.heads, scan.key_dim, scan.value_dim, config.linear_head_dim, GDN_VALUE
+                ),
+            ));
+        }
+        Ok(plan)
     }
 
     /// A bulk chunk's KDA recurrence over `len` rows of one sequence, Qwen's prefill scan with
@@ -4065,11 +4106,25 @@ impl DeviceRank {
                 groups,
             ],
         )?;
-        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
+        // The plan's scan: its kernel and its grid ([ScanPlan]).
+        let launch = self
+            .kda_scan
+            .as_ref()
+            .ok_or_else(|| BackendError::new("glm5_device", "the rank's plan has no KDA scan"))?
+            .launch();
+        if launch.kernel.symbol != "q4p_kda_scan" {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the prefill image loads no KDA scan named {}",
+                    launch.kernel.symbol
+                ),
+            ));
+        }
         self.launch(
             self.kernels.kda_scan,
-            scan_grid,
-            scan_threads,
+            launch.grid,
+            launch.block.0,
             &[
                 s.kda_qk.0,
                 s.kda_beta.0,

@@ -247,6 +247,21 @@ impl Glm5NextConfig {
             .filter(|layer| matches!(layer.attention.kind, AttentionKind::Mla { .. }))
             .count();
         same("layer_types (sparse layers)", self.sparse_layers(), mla)?;
+        // The bulk KDA scan launches the plan this geometry builds, so it must be the arm's.
+        for layer in &architecture.layers {
+            if let AttentionKind::Kda(kda) = &layer.attention.kind {
+                same(
+                    "linear_num_heads (KDA heads)",
+                    self.linear_num_heads,
+                    kda.heads,
+                )?;
+                same(
+                    "linear_head_dim (KDA head width)",
+                    self.linear_head_dim,
+                    kda.head_dim,
+                )?;
+            }
+        }
 
         let dense = architecture
             .layers
@@ -296,6 +311,15 @@ fn same(field: &str, configured: usize, canonical: usize) -> Result<(), ConfigEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fixtures_agree_with_their_architectures() {
+        for config in [Glm5NextConfig::tiny(), Glm5NextConfig::small()] {
+            config
+                .cross_check(&config.architecture)
+                .expect("a fixture's two views agree");
+        }
+    }
     use sparkflash_model::parts::{Part, Target};
 
     #[test]

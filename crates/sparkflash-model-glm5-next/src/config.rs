@@ -525,9 +525,13 @@ impl Glm5NextConfig {
     /// and every width a TP=4 rank slices is a multiple of 128: one KDA head, one MLA head and a
     /// 128-wide slice of each MLP a rank. The k-pool budget is four 4-token pools, so a 24-token
     /// run keeps the best four of six and the tail.
+    ///
+    /// Its shared architecture carries the same width, vocabulary and KDA heads, so
+    /// [Glm5NextConfig::cross_check] holds and a plan built from it (the bulk KDA scan's) has
+    /// the fixture's shapes.
     #[must_use]
     pub fn small() -> Self {
-        Self {
+        let mut config = Self {
             hidden_size: 256,
             vocab_size: 256,
             linear_head_dim: 128,
@@ -543,7 +547,27 @@ impl Glm5NextConfig {
             moe_intermediate_size: 512,
             fp8_block: Some(128),
             ..Self::tiny()
+        };
+        let (hidden, vocab, heads, head_dim) = (
+            config.hidden_size,
+            config.vocab_size,
+            config.linear_num_heads,
+            config.linear_head_dim,
+        );
+        let architecture = &mut config.architecture;
+        architecture.hidden_size = hidden;
+        architecture.vocab_size = vocab;
+        for layer in &mut architecture.layers {
+            if let sparkflash_model::architecture::AttentionKind::Kda(kda) =
+                &mut layer.attention.kind
+            {
+                kda.heads = heads;
+                kda.head_dim = head_dim;
+                layer.attention.heads = heads;
+                layer.attention.head_dim = head_dim;
+            }
         }
+        config
     }
 
     /// The decoder layers as the shared layer walk, in forward order.

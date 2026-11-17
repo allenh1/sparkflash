@@ -285,6 +285,7 @@ const GEMM_TILE_TOKENS: usize = 128;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::gemv::tiled_operands;
 pub use sparkflash_ops::gemv::{GEMV_MAX_BATCH, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS};
+use sparkflash_ops::scan::{ScanKind, ScanPlan};
 
 /// Below this many tokens the GEMM's fixed 128-token tile wastes more work than the extra weight
 /// passes it saves: the GEMV is then run once per eight tokens instead. At the tile size the
@@ -2755,6 +2756,45 @@ impl Qwen4ExpDeviceBackend {
                 tp.runtime.label()
             );
         }
+        // The prefill scan this rank's plan resolves: the arm launches the plan's kernel on the
+        // plan's grid, so the boot check and the launch are one decision.
+        let (world, rank) = tp
+            .as_ref()
+            .map_or((1, 0), |tp| (tp.runtime.world(), tp.runtime.rank()));
+        // A head pair no prompt scan body takes (a fixture's narrow heads) keeps the refusal: the
+        // token path still serves, and a prompt walk that reaches the scan refuses with it.
+        let gdn_scan = match ScanPlan::for_architecture(
+            &config.architecture,
+            world,
+            rank,
+            ScanKind::Gdn,
+            prefill.chunk.max(2),
+        ) {
+            Ok(plan) => Ok(plan),
+            Err(error @ sparkflash_ops::OpError::Resolve(_)) => Err(error.to_string()),
+            Err(error) => return Err(BackendError::new("qwen4_device", error.to_string())),
+        };
+        if let Ok(Some(scan)) = &gdn_scan
+            && (scan.heads, scan.key_dim, scan.value_dim)
+                != (
+                    local.linear_num_value_heads,
+                    local.linear_key_head_dim,
+                    local.linear_value_head_dim,
+                )
+        {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "the plan's GDN scan is {} value heads of {} x {}, this rank's {} of {} x {}",
+                    scan.heads,
+                    scan.key_dim,
+                    scan.value_dim,
+                    local.linear_num_value_heads,
+                    local.linear_key_head_dim,
+                    local.linear_value_head_dim
+                ),
+            ));
+        }
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
@@ -2765,6 +2805,7 @@ impl Qwen4ExpDeviceBackend {
             pooled: std::sync::Mutex::new(None),
             verify_rows,
             tp,
+            gdn_scan,
         });
         let _ = DeviceSequence::allocate(Arc::clone(&shared), context_limit)?;
         Ok(Self {
@@ -3405,6 +3446,9 @@ struct SequenceShared {
     /// The world this rank's partials are summed over, when the arm is one rank of several; its
     /// `config` is then the rank's share ([tp::rank_config]).
     tp: Option<tp::TensorParallel>,
+    /// The prefill GDN scan the rank's plan resolves ([ScanPlan::for_architecture]); `None` for
+    /// a checkpoint without GDN layers, the refusal for heads no prompt scan body takes.
+    gdn_scan: Result<Option<ScanPlan>, String>,
 }
 
 impl Drop for SequenceShared {
