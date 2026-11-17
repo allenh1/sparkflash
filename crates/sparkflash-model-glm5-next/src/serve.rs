@@ -40,17 +40,15 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler};
-use sparkflash_model::vision::VisionImage;
+use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
-use sparkflash_runtime::group::{frame_sampling, sampler_frame};
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, GroupWire, Opened, RoundArm, StepWall,
+    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Opened, RoundArm, StepWall, TextWire,
     mirror_until_the_group_ends, run_round, watched_hub,
 };
 use sparkflash_weights::WeightSource;
@@ -128,56 +126,7 @@ enum Fused {
     /// This rank alone.
     Local(Arc<FusedEngine<GlmFusion>>),
     /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs.
-    Group(Arc<FusedEngine<GroupLanes<GlmFusion, GlmWire>>>),
-}
-
-/// What GLM's group refuses and carries ([GroupWire]): rank 0 refuses a prompt over the context
-/// or with images (the vision tower is not loaded) before it broadcasts, and a request's whole
-/// sampler crosses ([sampler_frame]) because every rank's picks decide what its verify keeps.
-pub struct GlmWire {
-    context: usize,
-}
-
-impl GroupWire for GlmWire {
-    fn name(&self) -> &'static str {
-        "glm"
-    }
-
-    fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
-        if !images.is_empty() {
-            return Err(BackendError::new(
-                "request",
-                "the GLM arm serves text: its vision tower is not loaded",
-            ));
-        }
-        if tokens.len() > self.context {
-            return Err(BackendError::new(
-                "context",
-                format!(
-                    "the prompt needs {} positions, {} remain",
-                    tokens.len(),
-                    self.context
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    fn sampler(&self, sampling: &Sampling) -> Option<Tp4FrameSampler> {
-        sampler_frame(sampling)
-    }
-
-    fn sampling(&self, sampler: Option<Tp4FrameSampler>) -> Sampling {
-        frame_sampling(sampler)
-    }
-
-    fn images(&self, frames: Vec<Tp4DeviceImage>) -> Result<Vec<VisionImage>, String> {
-        if frames.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Err("the GLM arm serves text: a frame named image spans".to_owned())
-        }
-    }
+    Group(Arc<FusedEngine<GroupLanes<GlmFusion, TextWire>>>),
 }
 
 impl GlmFusion {
@@ -665,9 +614,7 @@ impl Glm5NextDeviceBackend {
         capacity: usize,
         hub: Tp4ControlHub,
     ) -> Result<(), BackendError> {
-        let wire = GlmWire {
-            context: self.context_limit,
-        };
+        let wire = TextWire::new("glm", "GLM", self.context_limit);
         let arm = Arc::new(GroupLanes::new(self.lanes()?, watched_hub(hub)?, wire));
         self.fused = Some(Fused::Group(FusedEngine::start(arm, capacity)?));
         Ok(())
@@ -686,9 +633,7 @@ impl Glm5NextDeviceBackend {
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
         let lanes = self.lanes().map_err(|error| error.to_string())?;
-        let wire = GlmWire {
-            context: self.context_limit,
-        };
+        let wire = TextWire::new("glm", "GLM", self.context_limit);
         mirror_until_the_group_ends(control, &lanes, &wire, capacity)
     }
 

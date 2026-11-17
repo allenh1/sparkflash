@@ -112,8 +112,8 @@ loop pipeline (which uses only the policy pieces).
 | step | state |
 | --- | --- |
 | 1. parallel drafts, Inkling | done: joint rounds, on by default (`SPARKFLASH_JOINT_ROUNDS=off` opts out) |
-| 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's `--tp4-rank` group serve through it |
-| 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's group steps four lanes by default, on Inkling's lane memory |
+| 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's and Qwen's `--tp4-rank` groups serve through it |
+| 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's and Qwen's groups step four lanes by default, GLM's on Inkling's lane memory |
 | 4. prefill scheduler | planned |
 | 5. projection dispatcher | planned |
 | 6. typed plans executed | planned |
@@ -151,8 +151,8 @@ while a sequence is on its way back (`HeldPool` in `sparkflash-serve`), and
 
 The mirror was generic, but only Inkling served through it: Qwen's fused lanes refuse a
 tensor-parallel group (`enable_fusion`), and the pack-path groups served through DeepSeek's
-`Tp4Driver` one request at a time. Step 3 moved GLM's group onto `GroupLanes`. Qwen's group still
-serves one request at a time; its arm sets no `PackArm::OPEN_LANES` yet.
+`Tp4Driver` one request at a time. Step 3 moved GLM's group onto `GroupLanes`, and then Qwen's
+(below, "Qwen's group").
 
 ### Step 3: Qwen and GLM on the contract
 
@@ -182,7 +182,7 @@ shapes therefore serve the same tokens.
 
 The workers' sampler must pick what rank 0 picks, because the picks decide how many drafts a
 verify keeps, so the frame now carries the whole sampler (`sampler_frame`, penalties included).
-GLM's arm serves text, so `GlmWire` refuses images.
+GLM's arm serves text, so its wire refuses images (`TextWire`, which Qwen's group shares).
 
 Fused lanes are the GLM group's default: `--tp4-rank` with no `--concurrency` steps
 four lanes (`pack::GROUP_LANES`). An explicit `--concurrency 1` is the opt-out. It serves one
@@ -296,3 +296,25 @@ Two fixes came out of the gate:
   (`a_modelopt_export_beside_the_config_keeps_the_configs_formats`).
 - **The three penalty fields made `Tp4ControlError` too large.** `UnexpectedFrame` now boxes the
   frame it reports.
+
+#### Qwen's group
+
+Qwen's `--tp4-rank` group now steps fused lanes as GLM's does. The batched walk was already
+tensor-parallel: its MLP sums its branch over the group (`inject_branch`) at any row count, so
+the change is wiring only. Rank 0 opens its backend as `N` lanes over the control hub
+(`Qwen4ExpDeviceBackend::enable_group_fusion`), and each worker replays rank 0's frames over its
+own lanes (`mirror_group`). Both arms take the same text wire (`TextWire`). `--tp4-rank` with no
+flags steps four lanes (`pack::GROUP_LANES`), and `--concurrency 1` is the opt-out to the
+one-request `Tp4Driver`. The vision tower is not loaded at TP, so the lanes serve text.
+
+Qwen3.8 NVFP4 at TP=4, DFlash 2 drafting, the served lanes gate on the cluster:
+
+| | alone, greedy | alone, sampled | four at once, greedy | four at once, sampled |
+| --- | --- | --- | --- | --- |
+| `--concurrency 1` | 65.5 tok/s | 25.4 tok/s | one request at a time | one request at a time |
+| default, four lanes | 62.6 tok/s | 40.0 tok/s | 91.9-97.3 tok/s | 54.0-55.2 tok/s |
+
+Every lane's answer, greedy and sampled, equals the one-request server's, and four at once equals
+alone. A lone streamed request runs at the same rate either way: 57.5 / 62.2 / 84.3 tok/s for
+prose, code and a 4.7k-token prompt on the lanes, against 58.3 / 62.8 / 84.8 one at a time.
+Killing rank 2 left no rank running a second later.

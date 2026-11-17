@@ -42,11 +42,10 @@ fn a_group_refuses_the_host_drivers_knobs() {
         ] {
             let mut args = vec!["--model", model];
             args.extend_from_slice(extra);
-            // GLM's group steps --fuse-batch lanes (PackArm::OPEN_LANES); Qwen's serves one
-            // request at a time.
-            if model == sparkflash_model_glm5_next::MODEL_ID && extra.contains(&"--fuse-batch") {
+            // Both groups step --fuse-batch lanes (PackArm::OPEN_LANES).
+            if extra.contains(&"--fuse-batch") {
                 let options =
-                    ServeOptions::parse(tp4_args(&args)).expect("the GLM group steps fused lanes");
+                    ServeOptions::parse(tp4_args(&args)).expect("the group steps fused lanes");
                 assert!(options.fuse_batch && options.concurrency == 2);
                 continue;
             }
@@ -61,26 +60,27 @@ fn a_group_refuses_the_host_drivers_knobs() {
 }
 
 #[test]
-fn the_glm_group_steps_fused_lanes_unless_told_one_at_a_time() {
-    let glm = sparkflash_model_glm5_next::MODEL_ID;
-    // No flags: the group's arm opens lanes, so it steps four of them.
-    let options = ServeOptions::parse(tp4_args(&["--model", glm])).expect("parses");
-    assert!(options.fuse_batch, "the GLM group fuses by default");
-    assert_eq!(options.concurrency, pack::GROUP_LANES);
-    // --fuse-batch alone takes the same default lane count.
-    let options = ServeOptions::parse(tp4_args(&["--model", glm, "--fuse-batch"])).expect("parses");
-    assert!(options.fuse_batch && options.concurrency == pack::GROUP_LANES);
-    // --concurrency 1 is the opt-out: one request at a time through the group driver.
-    let options =
-        ServeOptions::parse(tp4_args(&["--model", glm, "--concurrency", "1"])).expect("parses");
-    assert!(!options.fuse_batch && options.concurrency == 1);
-    // A group whose arm opens no lanes keeps one request at a time.
-    let options = ServeOptions::parse(tp4_args(&["--model", sparkflash_model_qwen4_exp::MODEL_ID]))
-        .expect("parses");
-    assert!(!options.fuse_batch && options.concurrency == 1);
-    // One node keeps the host driver's default.
-    let options = ServeOptions::parse(["--model".to_owned(), glm.to_owned()]).expect("parses");
-    assert!(!options.fuse_batch && options.concurrency == 1);
+fn a_group_steps_fused_lanes_unless_told_one_at_a_time() {
+    for model in [
+        sparkflash_model_glm5_next::MODEL_ID,
+        sparkflash_model_qwen4_exp::MODEL_ID,
+    ] {
+        // No flags: the group's arm opens lanes, so it steps four of them.
+        let options = ServeOptions::parse(tp4_args(&["--model", model])).expect("parses");
+        assert!(options.fuse_batch, "{model}: the group fuses by default");
+        assert_eq!(options.concurrency, pack::GROUP_LANES);
+        // --fuse-batch alone takes the same default lane count.
+        let options =
+            ServeOptions::parse(tp4_args(&["--model", model, "--fuse-batch"])).expect("parses");
+        assert!(options.fuse_batch && options.concurrency == pack::GROUP_LANES);
+        // --concurrency 1 is the opt-out: one request at a time through the group driver.
+        let options = ServeOptions::parse(tp4_args(&["--model", model, "--concurrency", "1"]))
+            .expect("parses");
+        assert!(!options.fuse_batch && options.concurrency == 1);
+        // One node keeps the host driver's default.
+        let options = ServeOptions::parse(["--model".to_owned(), model.to_owned()]).expect("parses");
+        assert!(!options.fuse_batch && options.concurrency == 1);
+    }
 }
 
 #[test]

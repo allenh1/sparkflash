@@ -2617,6 +2617,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sparkflash-api",
+ "sparkflash-comm",
  "sparkflash-engram",
  "sparkflash-kernels",
  "sparkflash-model",

@@ -142,6 +142,76 @@ pub fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
     }
 }
 
+/// The [GroupWire] of an arm whose group serves text: rank 0 refuses a prompt over the context or
+/// with images (no rank loads a vision tower) before it broadcasts, and a request's whole sampler
+/// crosses ([sampler_frame]) because every rank's picks decide what its verify keeps. GLM's and
+/// Qwen's `--tp4-rank` groups use it.
+pub struct TextWire {
+    /// The arm's name in trace lines.
+    name: &'static str,
+    /// The arm as the refusals name it.
+    arm: &'static str,
+    /// The positions a lane holds.
+    context: usize,
+}
+
+impl TextWire {
+    /// The wire of the arm `name` (trace lines) and `arm` (refusals) over lanes of `context`
+    /// positions.
+    #[must_use]
+    pub fn new(name: &'static str, arm: &'static str, context: usize) -> Self {
+        Self { name, arm, context }
+    }
+}
+
+impl GroupWire for TextWire {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
+        if !images.is_empty() {
+            return Err(BackendError::new(
+                "request",
+                format!(
+                    "the {} arm serves text: its vision tower is not loaded",
+                    self.arm
+                ),
+            ));
+        }
+        if tokens.len() > self.context {
+            return Err(BackendError::new(
+                "context",
+                format!(
+                    "the prompt needs {} positions, {} remain",
+                    tokens.len(),
+                    self.context
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sampler(&self, sampling: &Sampling) -> Option<Tp4FrameSampler> {
+        sampler_frame(sampling)
+    }
+
+    fn sampling(&self, sampler: Option<Tp4FrameSampler>) -> Sampling {
+        frame_sampling(sampler)
+    }
+
+    fn images(&self, frames: Vec<Tp4DeviceImage>) -> Result<Vec<VisionImage>, String> {
+        if frames.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(format!(
+                "the {} arm serves text: a frame named image spans",
+                self.arm
+            ))
+        }
+    }
+}
+
 /// The refusal of a prompt of `rows` positions (or a step) the lanes' memory cannot hold beside
 /// the sequences being served: the engine has already given up every idle one.
 #[must_use]

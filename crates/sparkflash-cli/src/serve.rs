@@ -5046,6 +5046,33 @@ impl Tp4RankApi for QwenTp4Rank {
 /// tokenizer and host-paged PLE source.
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let (backend, cuda, load_ms) = load_qwen_tp4_rank(config)?;
+    Ok(Box::new(QwenTp4Rank {
+        backend,
+        session: None,
+        _cuda: cuda,
+        load_ms,
+        steps: 0,
+        last_step_ms: 0,
+    }))
+}
+
+/// Loads one Qwen3.8-Flash-Next rank of the serve-owned group: its share of the weights (from the
+/// converted rank file when one is configured) over the group's collective. Both of the group's
+/// serving shapes open their rank here: one request at a time ([open_qwen_tp4_rank]) and fused
+/// lanes ([open_qwen_lanes]). Answers the backend, the handle the collective was opened in, and
+/// the load's milliseconds.
+#[cfg(feature = "tp4-serve")]
+fn load_qwen_tp4_rank(
+    config: &Tp4RankConfig,
+) -> Result<
+    (
+        sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend,
+        CudaHandle,
+        u64,
+    ),
+    String,
+> {
     let started = Instant::now();
     let directory = pack::checkpoint_directory(&config.checkpoint);
     let qwen_config = pack::read_config::<pack::QwenArm>(&directory)?;
@@ -5094,14 +5121,39 @@ fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Str
             path.display()
         )),
     );
-    Ok(Box::new(QwenTp4Rank {
-        backend,
-        session: None,
-        _cuda: cuda,
-        load_ms,
-        steps: 0,
-        last_step_ms: 0,
-    }))
+    Ok((backend, cuda, load_ms))
+}
+
+/// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::OPEN_LANES]):
+/// rank 0 answers its backend, whose sessions are handles on the group's lanes
+/// ([Qwen4ExpDeviceBackend::enable_group_fusion]); a worker replays rank 0's lanes until the group
+/// ends ([Qwen4ExpDeviceBackend::mirror_group]). Drafting is the profile's, as it is alone.
+///
+/// [PackArm::OPEN_LANES]: pack::PackArm::OPEN_LANES
+/// [Qwen4ExpDeviceBackend::enable_group_fusion]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::enable_group_fusion
+/// [Qwen4ExpDeviceBackend::mirror_group]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::mirror_group
+#[cfg(feature = "tp4-serve")]
+fn open_qwen_lanes(
+    config: &Tp4RankConfig,
+    lanes: usize,
+) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    // The backend's own CUDA handle holds the primary context the collective was opened in
+    // (releases are refcounted), so this one may go once the rank is loaded.
+    let (mut backend, _cuda, _) = load_qwen_tp4_rank(config)?;
+    if config.rank == 0 {
+        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
+            .map_err(|error| format!("rank 0 control channel: {error}"))?;
+        backend
+            .enable_group_fusion(lanes, hub)
+            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
+        eprintln!(
+            "sparkflash serve: Qwen rank 0 steps {lanes} fused lanes over {} ranks",
+            config.world_size
+        );
+        return Ok(Some(Box::new(backend)));
+    }
+    let mut control = tp4_control_worker(config)?;
+    match backend.mirror_group(&mut control, lanes)? {}
 }
 
 /// What the TP=4 driver serves and how it opens its rank.

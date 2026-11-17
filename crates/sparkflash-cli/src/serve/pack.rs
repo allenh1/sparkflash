@@ -47,7 +47,7 @@ use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam}
 use super::{
     ClusterStatsSnapshot, DSparkStepStats, RequestTimingStats, RoceTransportStats,
     TP4_CONTROL_TIMEOUT, Tp4Driver, Tp4EngineSpec, Tp4RankApi, Tp4RankConfig, Tp4ServeOptions,
-    default_engram_layers, empty_kv_snapshot, open_glm_lanes, open_glm_tp4_rank,
+    default_engram_layers, empty_kv_snapshot, open_glm_lanes, open_glm_tp4_rank, open_qwen_lanes,
     open_qwen_tp4_rank, pack_tp4_worker, tp4_rank_config,
 };
 
@@ -192,6 +192,8 @@ impl PackArm for QwenArm {
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_qwen_tp4_rank;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = Some(open_qwen_lanes);
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny();
@@ -322,6 +324,8 @@ impl PackArm for QwenFp8Arm {
     const KV_BUDGET: bool = QwenArm::KV_BUDGET;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         <QwenArm as PackArm>::write_fixture(directory)
@@ -398,6 +402,8 @@ impl PackArm for Qwen36Arm {
     const KV_BUDGET: bool = QwenArm::KV_BUDGET;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny_qwen35_moe(

@@ -298,9 +298,11 @@ is a `KvPlan` derived from its own geometry, and its speculative path is `spec`'
 one verify decides what survives, and the queue hands the rest back one token at a time. The shared driver then finds the checkpoint
 (`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
 the same configuration, and refuses at parse time any option the arm does not apply
-(`Pack::unapplied`): a group serves one request at a time, so `--concurrency`, `--fuse-batch` and
-`--kv-budget-gib` are refused there, and an arm without a fused batch or a KV budget says so at
-TP=1. A directory of rank files named by an environment variable resolves through
+(`Pack::unapplied`). A group whose arm opens lanes (`PackArm::OPEN_LANES`: GLM's and Qwen's)
+steps four fused lanes by default (`--fuse-batch --concurrency N` for another count,
+`--concurrency 1` for one request at a time); a group whose arm opens none serves one request at a
+time and refuses `--concurrency` and `--fuse-batch`. `--kv-budget-gib` is refused in any group,
+and an arm without a fused batch or a KV budget says so at TP=1. A directory of rank files named by an environment variable resolves through
 `converted_rank_file`, which refuses a directory that holds no file for the rank.
 
 ## 6. Checklist

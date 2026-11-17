@@ -21,6 +21,7 @@ authors.workspace = true
 description = "Qwen3.8-Flash-Next (Qwen4-Exp) pack: NVFP4 checkpoint, n-gram PLE and the TP=1 device arm"
 
 [dependencies]
+sparkflash-comm = { workspace = true }
 sparkflash-model = { workspace = true }
 sparkflash-runtime = { workspace = true }
 sparkflash-weights = { workspace = true }

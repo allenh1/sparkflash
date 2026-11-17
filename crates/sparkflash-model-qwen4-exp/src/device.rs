@@ -2136,7 +2136,22 @@ pub struct Qwen4ExpDeviceBackend {
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
     /// session runs its own forward on its own stream, the one-row-a-session path.
-    fused: Option<Arc<sparkflash_runtime::FusedEngine<fusion::QwenFusion>>>,
+    fused: Option<Fused>,
+}
+
+/// The engine a fused backend's sessions are handles on.
+enum Fused {
+    /// This rank alone ([Qwen4ExpDeviceBackend::enable_fusion]).
+    Local(Arc<sparkflash_runtime::FusedEngine<fusion::QwenFusion>>),
+    /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs
+    /// ([Qwen4ExpDeviceBackend::enable_group_fusion]).
+    Group(
+        Arc<
+            sparkflash_runtime::FusedEngine<
+                sparkflash_runtime::GroupLanes<fusion::QwenFusion, sparkflash_runtime::TextWire>,
+            >,
+        >,
+    ),
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -2369,8 +2384,9 @@ impl Qwen4ExpDeviceBackend {
     /// over `tp` before they are injected, so every rank holds the same residual streams. The
     /// drafter runs whole on every rank; the MTP layer is not loaded.
     ///
-    /// The rank serves one sequence at a time - every forward is a collective the whole group
-    /// steps through together - so it refuses [Self::enable_fusion].
+    /// Every forward is a collective the whole group steps through together, so the rank refuses
+    /// [Self::enable_fusion]: its sessions step as fused lanes only as a group, rank 0 under
+    /// [Self::enable_group_fusion] and the workers under [Self::mirror_group].
     ///
     /// # Errors
     /// A world the model's heads or widths do not split over, then everything [Self::open]
@@ -2781,19 +2797,83 @@ impl Qwen4ExpDeviceBackend {
             return Err(BackendError::new(
                 "qwen4_tp",
                 format!(
-                    "rank {} of {} serves one sequence at a time: every forward is a collective \
-                     its group steps through together",
+                    "rank {} of {} steps fused lanes only as a group: every forward is a \
+                     collective its group steps through together, so rank 0 broadcasts each \
+                     step (enable_group_fusion) and the workers replay it (mirror_group)",
                     tp.runtime.rank(),
                     tp.runtime.world()
                 ),
             ));
         }
-        let arm = Arc::new(fusion::QwenFusion::new(
-            Arc::clone(&self.shared),
-            self.context_limit,
-            capacity,
-        )?);
-        self.fused = Some(sparkflash_runtime::FusedEngine::start(arm, capacity)?);
+        let arm = Arc::new(self.lanes(capacity)?);
+        self.fused = Some(Fused::Local(sparkflash_runtime::FusedEngine::start(
+            arm, capacity,
+        )?));
+        Ok(())
+    }
+
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every lane's prompt, step,
+    /// give-back and release is broadcast through `hub` before it runs here, and each worker
+    /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
+    /// sequence on every rank and the collectives inside a step line up. A worker whose socket
+    /// closes ends this process, and so does a failure here after a frame went out
+    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
+    /// cannot start.
+    pub fn enable_group_fusion(
+        &mut self,
+        capacity: usize,
+        hub: sparkflash_comm::control::Tp4ControlHub,
+    ) -> Result<(), BackendError> {
+        self.group_rank()?;
+        let arm = Arc::new(sparkflash_runtime::GroupLanes::new(
+            self.lanes(capacity)?,
+            sparkflash_runtime::watched_hub(hub)?,
+            self.wire(),
+        ));
+        self.fused = Some(Fused::Group(sparkflash_runtime::FusedEngine::start(
+            arm, capacity,
+        )?));
+        Ok(())
+    }
+
+    /// A worker of an [Self::open_rank] group: replays rank 0's lane frames over `capacity`
+    /// lanes of this rank's own until the group can no longer serve, then ends the process
+    /// ([sparkflash_runtime::mirror_until_the_group_ends]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, or the arm's configuration, before any frame.
+    pub fn mirror_group(
+        &self,
+        control: &mut sparkflash_comm::control::Tp4ControlWorker,
+        capacity: usize,
+    ) -> Result<std::convert::Infallible, String> {
+        self.group_rank().map_err(|error| error.to_string())?;
+        let lanes = self.lanes(capacity).map_err(|error| error.to_string())?;
+        sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
+    }
+
+    /// The fused arm over this backend's sequences, with room for `capacity` in one pass.
+    fn lanes(&self, capacity: usize) -> Result<fusion::QwenFusion, BackendError> {
+        fusion::QwenFusion::new(Arc::clone(&self.shared), self.context_limit, capacity)
+    }
+
+    /// What the group's frames carry and rank 0 refuses: the arm serves text.
+    fn wire(&self) -> sparkflash_runtime::TextWire {
+        sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)
+    }
+
+    /// Refuses a backend that is no group's rank: its lanes have no peers to step with.
+    fn group_rank(&self) -> Result<(), BackendError> {
+        if self.shared.tp.is_none() {
+            return Err(BackendError::new(
+                "qwen4_tp",
+                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
+                 its sessions with enable_fusion",
+            ));
+        }
         Ok(())
     }
 
@@ -5825,10 +5905,18 @@ impl ModelBackend for Qwen4ExpDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        if let Some(fused) = &self.fused {
-            return fused
-                .open()
-                .map(|session| Box::new(session) as Box<dyn ModelSession>);
+        match &self.fused {
+            Some(Fused::Local(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            Some(Fused::Group(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            None => {}
         }
         DeviceSequence::allocate(Arc::clone(&self.shared), self.context_limit)
             .map(|session| Box::new(session) as Box<dyn ModelSession>)
