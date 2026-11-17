@@ -339,6 +339,15 @@ pub struct Indexer {
     pub candidate_pool: Option<CandidatePool>,
 }
 
+impl Indexer {
+    /// The most tokens one query attends: the budget's complete pools and the incomplete pool at
+    /// the end (Qwen3.8's 2,051 from a 2,048 budget over pools of four).
+    #[must_use]
+    pub const fn max_selected(&self) -> usize {
+        (self.topk / self.pool) * self.pool + self.pool.saturating_sub(1)
+    }
+}
+
 /// The HSI candidate pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidatePool {

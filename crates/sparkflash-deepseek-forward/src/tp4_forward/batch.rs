@@ -567,6 +567,94 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         )
     }
 
+    /// What this scheduler does with each run-time strategy, as every arm states it at boot
+    /// ([sparkflash_runtime::Ledger]). DeepSeek keeps its own scheduler and kernels; the line
+    /// reads the values the scheduler runs with and changes none of them.
+    pub(super) fn ledger(&self) -> sparkflash_runtime::Ledger {
+        use sparkflash_runtime::{Ledger, Mode, Strategy};
+        let (_, budget) = self.device.lane_memory();
+        let mut ledger = Ledger::new("DeepSeek");
+        ledger.set(
+            Strategy::Lanes,
+            if self.exchange.is_some() {
+                Mode::native(format!(
+                    "{} lanes, {} MiB lane memory, a queue of {QUEUE}",
+                    self.lanes.len(),
+                    budget >> 20
+                ))
+            } else {
+                Mode::off(
+                    "one sequence at a time: the group gathers no rows on the device \
+                     (SPARKFLASH_DEVICE_GATHER=0, or more than eight ranks)",
+                )
+            },
+        );
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::native(if self.exact_prefill {
+                format!(
+                    "exact steps, {} of {R_MAX} rows a tick while other lanes decode",
+                    self.busy_exact_steps
+                )
+            } else {
+                format!(
+                    "bulk chunks, {} rows a tick while other lanes decode, the decoders' share up \
+                     to {:.2}",
+                    self.busy_chunk, self.share.most
+                )
+            }),
+        );
+        let depth = super::spec::depth_policy(self.k);
+        ledger.drafting(
+            Some(format!(
+                "DSpark, up to {} drafts, {} depth",
+                self.k,
+                if depth.is_adaptive() {
+                    "adaptive"
+                } else {
+                    "fixed"
+                }
+            )),
+            true,
+            true,
+        );
+        ledger.set(
+            Strategy::JointRounds,
+            match (self.exchange, self.spec_floor) {
+                (Some(_), Some(floor)) => Mode::native(format!(
+                    "up to {} lanes share one verify, draft floor {floor}",
+                    R_MAX / 2
+                )),
+                (None, _) => Mode::off("one sequence at a time"),
+                (Some(_), None) => Mode::off(
+                    "SPARKFLASH_BATCH_SPEC=0: lanes decoding together take the plain step",
+                ),
+            },
+        );
+        ledger.set(
+            Strategy::PrefixReuse,
+            if self.reuse {
+                Mode::native(format!(
+                    "a lane keeps its sequence and a prompt resumes from the longest shared prefix \
+                     (cut to the compress ratios); lanes holding more than {} rows keep them from \
+                     shorter matches",
+                    self.prefix_reuse_min_rows
+                ))
+            } else {
+                Mode::off("SPARKFLASH_PREFIX_CACHE=0")
+            },
+        );
+        ledger.set(
+            Strategy::Group,
+            Mode::native(format!(
+                "a {}-rank tensor-parallel group: rank 0 decides each tick and broadcasts, the \
+                 workers replay",
+                self.inputs.world
+            )),
+        );
+        ledger
+    }
+
     /// Queues a request as sequence `id`. A request the device cannot serve is refused (the group
     /// carries on).
     ///

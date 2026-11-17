@@ -134,12 +134,19 @@ belongs in the default instead.
 10. Lane memory for Qwen: its lanes allocate their caches for the whole context at open; on the
     shared `LanePool`, as GLM's and Inkling's are, kept conversations share one budget.
 11. Dory on the fused engine: its recurrence group keeps its own lanes, so it has no prompt
-    parts, ledger or kept conversations of the runtime's.
+    parts, ledger or kept conversations of the runtime's. Done as Dory on the session contract
+    with its own ring scheduling: the ring keeps a batch on every rank at once, which one fused
+    walk a step cannot, so the arm keeps its scheduler and takes the contract's kept
+    conversations, `resume` and ledger.
 12. More typed plans executed (step 6): attention, MoE, the indexer and the residual mixers.
+    Done for grouped-query attention (`GqaBody`); the rest need descriptor fields first.
 13. The dispatcher's remaining rules (step 5): Qwen's split-K tile and the FP8 projections.
+    Done: `split_k_slices`/`SplitTile` and `fp8_tile_fits`/`Fp8Tile`.
 14. DeepSeek on the contract, optional: its kernels (tensor-core decode, Engram reads, the RDMA
     exchange) stay its own, its outputs must not change, and the contract would give it the
-    ledger and the shared prompt parts.
+    ledger and the shared prompt parts. Done as the ledger: its batch scheduler states its
+    strategies on the runtime's `Ledger` at start; its scheduler, kernels and arithmetic are
+    unchanged.
 
 ## Status
 
@@ -149,12 +156,16 @@ belongs in the default instead.
 | 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's and Qwen's `--tp4-rank` groups serve through it |
 | 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's and Qwen's groups step four lanes by default, GLM's on Inkling's lane memory |
 | 4. prefill scheduler | done: the engine runs a prompt past 256 tokens a chunk at a time, two decode steps between chunks (`SPARKFLASH_PROMPT_PARTS=off` opts out); Inkling, GLM and Qwen split their prompts into parts |
-| 5. projection dispatcher | first cut: BF16 projections (GLM, Dory, Inkling) choose and launch the wide tile through `sparkflash_ops::projection`; Qwen's split-K tile and the FP8 projections keep their own rules |
-| 6. typed plans executed | first cut: Qwen's prompt GDN scan and GLM's bulk KDA scan launch the kernel and grid of the rank plan's `ScanPlan`; attention, MoE, the indexer and the residual mixers still launch from the arms' own load-time geometry |
+| 5. projection dispatcher | done: BF16 projections (GLM, Dory, Inkling) choose and launch the wide tile through `sparkflash_ops::projection`; since step 13 Qwen's split-K tile and the FP8 tile (Qwen, GLM) too; DeepSeek's MX family stays its own |
+| 6. typed plans executed | in part: Qwen's prompt GDN scan and GLM's bulk KDA scan launch the kernel and grid of the rank plan's `ScanPlan`; since step 12 grouped-query attention its `GqaBody`; MLA, MoE, the indexer and the residual mixers still launch from the arms' own load-time geometry |
 | 7. ledger | done: every fused engine prints `ledger <arm>: ...` at start; Inkling, GLM and Qwen state their strategies |
 | 8. prefix reuse on every lane | done: GLM's and Qwen's lanes name their history; the engine renews a slot whose prompt does not extend it (`FusedArm::continues`); a verify keeps no row past the end of turn (`kept_to_end`); the thinking-off close is the codec's (`PromptCodec::close_thinking`). The host's reply text holds a character a token left unfinished until the next completes it, as tokenizers' `DecodeStream` does, so a reply re-encodes to its ids (a stray U+FFFD had broken a continued turn). Served `turns`: Qwen 10 of 10 continued turns cached past their first prompt; GLM 38 of 40 over four runs (was 1 of 10): one first turn cut at the token limit, whose drafted rows GLM cannot rewind (item 9), and one the host's log did not cover. Lanes greedy and sampled equal the last gates on both, Inkling's equal jr4's |
 | 9. a rewind point on every recurrent arm | done (deployed as p14, 2026-11-17): one shared `Checkpoint` (`sparkflash_kernels::checkpoint`) copies an arm's listed regions at each prompt's end and back at a rewind; `sparkflash_runtime::resume` picks extend or rewind; `continues` and the host's claim take the point even when the slot names no history, and the host respells a next turn that merges the point's last id (Qwen's `<think>\n\n` after a held `<think>`, `\n`). Inkling's boundary moved onto it; GLM keeps its KDA layers' convolution and recurrent memory and the MTP layer's hidden rows, Qwen its GDN and PLE state, the MTP stash and the n-gram windows; under a block drafter (Qwen's served DFlash 2, GLM's) the point also keeps the drafter's context rings whole (84 MB a lane for Qwen's), since a ring slot is a position modulo the ring and a reply longer than a block overwrites the window before the point. GLM's `give_back` cuts the history rather than failing, so a cut reply rewinds instead of renewing. One switch for every arm, `SPARKFLASH_REWIND` (`SPARKFLASH_INKLING_REWIND` is refused with the new name). Served gate `turns` (think-dropped every turn): Inkling and GLM (MTP and DFlash 2) REWOUND and equal to cold, GLM's cut first turn REWOUND; Qwen REWOUND+ (cached one short of the first prompt), its answers differ from cold because the model reads its own held ids for the merged newline; lanes gates equal their baselines |
 | 10. lane memory for Qwen | done: one helper, `sparkflash_kernels::lane_memory::SequenceLanes` (plan, reserve, back, room, release), lays out and backs every arm's lane caches; GLM's and Inkling's moved onto it, and Qwen's attention caches now back as a sequence grows instead of whole at open. Every arm takes the one budget rule (`LanePool::budget`): one whole sequence's chunks, at least `FLOOR_LANES` lanes' first step, or `SPARKFLASH_LANE_MEMORY_MB`. For Qwen at a 64K context that is a 1152 MiB pool where four lanes held 4 x 960 MiB before, so long prompts on several lanes at once share one context's worth and a growth past the pool is refused with the request's error; set `SPARKFLASH_LANE_MEMORY_MB` for more. Served gate 18: Inkling, GLM and Qwen lanes greedy and sampled equal their baselines (Inkling's equal jr4's), `turns` PASS on all three |
+| 11. Dory on the session contract | done: the recurrence group keeps its own ring scheduler (a batch on every rank at once, which one fused walk a step cannot) and takes the contract's parts: kept conversations (a parked lane holds its rows between requests), `sparkflash_runtime::resume` and the ledger (`ledger Dory: ...` at start). Every row is addressed by its position, so a lane goes back anywhere at no cost; its point sits one id before the prompt's end, because Dory's template opens a thinking reply with `<think>\n` and writes a past reply back as `<think></think>...` (and drops earlier turns' reasoning), so the next turn parts from the prompt at its last id. A repeated prompt therefore rewinds onto its own lane too; `scripts/served-gate.py turns` evicts the kept lanes before its cold reference. Served gates 20-21 on p17: lanes greedy and sampled equal p15's; `turns` PASS on every shape, plain turns HIT, thinking and think-dropped turns REWOUND+, every continued answer equal to cold |
+| 12. more typed plans executed | in part: grouped-query attention runs the plan's rule. `sparkflash_ops::attention::GqaBody::choose` picks the grouped body (four or six query heads a block, or the per-head `q4e_attn`), its grid and its shared memory from the query groups and the most tokens a query attends (`Indexer::max_selected`, now in the plan's geometry); the boot plan and Qwen's walk take it, the walk adding only which bodies the device granted. Bit-neutral by construction (every body computes each head as `q4e_attn`); Qwen lanes greedy and sampled equal p15's and its kernel test passes on the device. MLA, MoE, the indexer and the residual mixers need descriptor fields first |
+| 13. the dispatcher's remaining rules | done: Qwen's BF16 split-K tile (`split_k_slices`, `SplitTile`) and the FP8 tile (`fp8_tile_fits`, `Fp8Tile`, which Qwen's dense FP8 projections and GLM's FP8 parts launch) live in `sparkflash_ops::projection`, each the arm's old rule verbatim (a unit test pins the split against Qwen's old function). GLM and Qwen lanes greedy and sampled equal p15's. Qwen3.8 NVFP4 does not take the dense FP8 tile, so that arm's FP8 path is checked by the shared conditions and unit tests, not served; DeepSeek's MX family stays its own |
+| 14. DeepSeek on the contract (optional) | done as the ledger: the batch scheduler prints `ledger DeepSeek: ...` at start (lanes and lane memory, prompt parts, DSpark depth policy, joint rounds and their floor, prefix reuse, the group); its scheduler, kernels and arithmetic are unchanged (a boot line only; the forward crate builds and passes clippy on the device). Its prompt parts stay its own: its scheduler already splits prompts (busy and bulk chunks, a decode share) on the tick rank 0 broadcasts, and moving them onto the engine's would change that tick |
 
 ### Step 1: what it measured
 
@@ -405,10 +416,18 @@ arm's digests were recorded under its own rule:
 Each arm still launches the kernel symbol from its own image; only the decision and the launch
 shape are shared.
 
-Not routed yet, on purpose: Qwen's BF16 tensor-core path (a 128 x 128 tile whose split of K
-decides the sums), the FP8 projections (block, tile and MX scales differ by arm) and DeepSeek's
-`mxfp8_gemv_launch` family. Folding them in changes which kernel some shapes take, so each needs a
-gate showing the shared rule gives the same bits first.
+Step 13 moved two more rules into `sparkflash_ops::projection`, each the arm's old rule
+verbatim (a unit test pins the shared split against Qwen's old function shape for shape):
+
+- `split_k_slices` and `SplitTile`: Qwen's BF16 tensor-core path, a 128 x 128 tile whose split of
+  K decides the sums. The split aims at 96 blocks, keeps at least eight 32-wide stages a slice and
+  fits the partial buffer; the arm's walk takes the slices from it and launches through
+  `SplitTile::call`. A new arm with the same kernel takes the same split, so its sums match.
+- `fp8_tile_fits` and `Fp8Tile`: the 128 x 128 FP8 tile over whole E4M3 scale blocks, which
+  Qwen's dense FP8 projections and GLM's FP8 parts both launch.
+
+Still the arms' own, on purpose: DeepSeek's `mxfp8_gemv_launch` family (MX scales, its own
+kernels, outputs that must not move) and the arms' skinny and row GEMVs below the tile.
 
 The gate is bit-neutral: Inkling's batch digests and every lanes-gate answer equal jr4's; GLM's
 lanes-gate and interleave answers equal step 4's; Dory's single-process server gives the step-4
@@ -430,10 +449,18 @@ than launch a body built for other widths. The boot launcher
 (`LinearScanLauncher`) builds the same plan, so the resolver, the boot path and the serving walk
 name one kernel.
 
-This is the first cut. The scan was the one part whose plan already held everything its launch
-needs. Attention (MLA, sparse MLA, GQA), the routed experts, the indexer and the residual mixers
-each launch with values the plan does not carry yet (cache layouts, work lists, top-k widths,
-split-KV cuts), so executing them needs new descriptor fields first, each with a gate.
+The scan was the one part whose plan already held everything its launch needs. Step 12 added
+grouped-query attention: the plan now carries the most tokens a query attends
+(`Indexer::max_selected`, 2,051 for Qwen3.8's 2,048 budget over pools of four), and
+`GqaBody::choose` is the one rule for which grouped body runs (four or six query heads a block,
+or the per-head `q4e_attn`) and with what grid and shared memory. The boot plan and Qwen's walk
+both take it; the walk adds only whether the device granted the body's shared memory at load.
+Every body computes each head as the per-head kernel does, so the choice moves no bits.
+
+Still launched from the arms' own geometry, because the plan lacks what they need: MLA and
+sparse MLA (cache layouts, split-KV cuts), the routed experts (work lists; the grouped threshold
+is FP8-only and profile overrides are not read by the plan), the indexer and the residual mixers.
+Each needs new descriptor fields first, each with a gate.
 
 ### The ledger
 

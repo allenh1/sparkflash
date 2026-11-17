@@ -96,6 +96,7 @@ pub use prefill::{
     embedded_scan_cubin, gdn_scan_shape, gdn_scan_shape_for,
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
+use sparkflash_ops::attention::{GQA_GROUP_KERNELS, gqa_group_shared_bytes};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
@@ -227,9 +228,6 @@ pub(super) fn fill_plain_injection(
     cuda.copy_htod(&pointer, &ones)
 }
 
-/// The query heads q4e_attn_group computes together (Q4E_ATTN_GROUP).
-pub const ATTN_GROUP_HEADS: usize = 4;
-
 /// Keys a q4e_attn_full CTA takes a pass (Q4E_FULL_TILE).
 pub const FULL_ATTENTION_TILE: usize = 256;
 
@@ -243,26 +241,6 @@ pub fn full_attention_splits(visible: usize) -> usize {
         .div_ceil(FULL_ATTENTION_TILE)
         .clamp(1, FULL_ATTENTION_SPLITS)
 }
-
-/// The selected tokens q4e_attn_group stages in shared memory (Q4E_ATTN_GROUP_SELECTED); a
-/// configuration that selects more attends through q4e_attn.
-pub const ATTN_GROUP_SELECTED: usize = 2052;
-
-/// The grouped attention kernels by the query heads each computes together, in the order a
-/// configuration takes them: the first whose count divides its query groups. Six is a four-rank
-/// group's share of the released twelve.
-pub const ATTN_GROUP_KERNELS: [(usize, &str); 2] =
-    [(ATTN_GROUP_HEADS, "q4e_attn_group"), (6, "q4e_attn_group6")];
-
-/// A grouped attention kernel's dynamic shared memory over `heads` heads: a row of logits and a
-/// block of reduction floats for each head, then the token's selection.
-#[must_use]
-pub const fn attn_group_shared_bytes(heads: usize) -> u32 {
-    ((heads * (ATTN_GROUP_SELECTED + 256) + ATTN_GROUP_SELECTED) * 4) as u32
-}
-
-/// q4e_attn_group's dynamic shared memory (45,136 bytes).
-pub const ATTN_GROUP_SHARED_BYTES: u32 = attn_group_shared_bytes(ATTN_GROUP_HEADS);
 
 /// The rows an MTP verify forward takes at most: the token being decoded and two chained drafts.
 const MTP_VERIFY_ROWS: usize = 3;
@@ -596,8 +574,10 @@ struct Kernels {
     qsa_pick: Kernel,
     attn: Kernel,
     /// q4e_attn for several query heads of a KV head at once, bit-identical per head: the
-    /// [ATTN_GROUP_KERNELS] the device grants their shared memory, with their head counts.
-    attn_group: [Option<(usize, Kernel)>; ATTN_GROUP_KERNELS.len()],
+    /// [GQA_GROUP_KERNELS] the device grants their shared memory, by their head counts. Which one
+    /// a configuration launches is ops' rule
+    /// ([sparkflash_ops::attention::GqaBody::choose]), the one its boot plan names.
+    attn_group: [Option<(usize, Kernel)>; GQA_GROUP_KERNELS.len()],
     /// Every causal position, split over the context, and the splits' fold: the attention of a
     /// configuration with no sparse indexer ([Qwen4ExpConfig::full_attention]).
     attn_full: Kernel,
@@ -727,8 +707,8 @@ impl Kernels {
             qsa_pick: attn(cuda, "q4e_qsa_pick")?,
             attn: attn(cuda, "q4e_attn")?,
             // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
-            attn_group: ATTN_GROUP_KERNELS.map(|(heads, name)| {
-                let bytes = attn_group_shared_bytes(heads);
+            attn_group: GQA_GROUP_KERNELS.map(|(heads, name)| {
+                let bytes = gqa_group_shared_bytes(heads);
                 cuda.load_named_shared(embedded_attn_cubin(), name, bytes)
                     .map_err(|error| {
                         eprintln!(

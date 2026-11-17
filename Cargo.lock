@@ -2556,6 +2556,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-weights",
  "tempfile",
 ]

@@ -107,7 +107,9 @@ use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
-use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile};
+use sparkflash_ops::projection::{
+    Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
+};
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
@@ -3356,10 +3358,7 @@ impl DeviceRank {
             };
             // The block-scaled kernel indexes its scales a 128-column K block at a time, so a
             // scaled part needs the K run to be whole blocks, not just whole 32-column stages.
-            let tiled = part_rows % 32 == 0
-                && columns.is_multiple_of(32)
-                && columns.is_multiple_of(FP8_BLOCK)
-                && first.is_multiple_of(FP8_BLOCK);
+            let tiled = fp8_tile_fits(part_rows, columns) && first.is_multiple_of(FP8_BLOCK);
             if !tiled {
                 let row = DeviceLinear {
                     weight,
@@ -3371,7 +3370,7 @@ impl DeviceRank {
                 self.gemv_grouped(&row, input, out, rows)?;
                 continue;
             }
-            let grid = (part_rows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1);
+            let grid = Fp8Tile::grid(part_rows, rows);
             let fp8 = if self.prefill_activation == PrefillActivation::Bf16 {
                 self.kernels.prefill_dense_fp8_bf16a
             } else {

@@ -597,9 +597,32 @@ fn an_attention_launcher_describes_the_resolved_symbol() {
         resolved.id(),
         "the descriptor's grid/block describe the kernel the rank resolved, not a second lookup"
     );
-    // Four rows over a 4:1 query/KV group is 16 row-heads, four blocks of four.
-    assert_eq!(launcher.launch.grid, (4, 1, 1));
+    // A dense layer over 4,096 positions selects more than a grouped body stages, so the
+    // per-head body runs, as Qwen's walk launches it: a block a query head and a row.
+    assert_eq!(launcher.launch.grid, (8, 4, 1));
     assert_eq!(launcher.launch.block, (256, 1, 1));
+    assert_eq!(launcher.launch.shared_bytes, 0);
+
+    // An indexer that selects Qwen3.8's 2,051 tokens a query lets the four-head body take the
+    // 4:1 group: a block two head groups and a row, with the body's shared memory.
+    let selected = PartRequirement {
+        geometry: PartGeometry {
+            top_k: 2051,
+            ..requirement.geometry
+        },
+        ..requirement
+    };
+    let resolved = PlanContext::SM121_CATALOGUE
+        .resolver()
+        .resolve(&selected)
+        .expect("the grouped GQA body resolves");
+    let launcher = AttentionLauncher::new(&selected, &resolved, 4, 4096, StreamId(0))
+        .expect("the attention launcher binds");
+    assert_eq!(launcher.launch.grid, (2, 4, 1));
+    assert_eq!(
+        launcher.launch.shared_bytes,
+        sparkflash_ops::attention::gqa_group_shared_bytes(4)
+    );
 }
 
 /// The carried Qwen3.6-35B-A3B-FP8 document. The BF16 release is the same document without its

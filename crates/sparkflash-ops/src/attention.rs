@@ -23,12 +23,80 @@ use crate::plan::{
 };
 use crate::resolver::PlanContext;
 
-/// The dynamic shared memory q4e_attn_group reserves: logits and a reduction block for each
-/// of its four query heads, then the token's selection.
-const GQA_GROUP_SHARED_BYTES: u32 = 45_136;
+/// The selected tokens a grouped attention body stages in shared memory
+/// (`Q4E_ATTN_GROUP_SELECTED`, kernels/qwen4_attn_sm121.cu); a configuration that selects more
+/// attends through `q4e_attn`.
+pub const GQA_GROUP_SELECTED: usize = 2052;
 
-/// The dynamic shared memory q4e_attn_group6 reserves: the same layout over six query heads.
-const GQA_GROUP6_SHARED_BYTES: u32 = 63_600;
+/// The grouped attention bodies by the query heads one block computes, in the order a
+/// configuration takes them: the first whose head count divides its query groups. Six is a
+/// four-rank group's share of Qwen3.8's twelve.
+pub const GQA_GROUP_KERNELS: [(usize, &str); 2] = [(4, "q4e_attn_group"), (6, "q4e_attn_group6")];
+
+/// A grouped attention body's dynamic shared memory over `heads` heads: a row of logits and a
+/// block of reduction floats for each head, then the token's selection (45,136 bytes at four
+/// heads, 63,600 at six).
+#[must_use]
+pub const fn gqa_group_shared_bytes(heads: usize) -> u32 {
+    ((heads * (GQA_GROUP_SELECTED + 256) + GQA_GROUP_SELECTED) * 4) as u32
+}
+
+/// The body one grouped-query attention launch runs: how many query heads a block computes
+/// together, its symbol and its dynamic shared memory. One head is `q4e_attn`, which reserves
+/// none. Every body computes each head as `q4e_attn` would, so the choice moves no bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GqaBody {
+    /// The query heads a block computes.
+    pub heads: usize,
+    /// The image symbol.
+    pub symbol: &'static str,
+    /// The dynamic shared memory a launch reserves.
+    pub shared_bytes: u32,
+}
+
+impl GqaBody {
+    /// The per-head body, which takes any configuration.
+    pub const PER_HEAD: Self = Self {
+        heads: 1,
+        symbol: "q4e_attn",
+        shared_bytes: 0,
+    };
+
+    /// The body for `query_groups` query heads a key/value head, attending over at most
+    /// `selected` tokens a query: the first of [GQA_GROUP_KERNELS] whose head count divides the
+    /// groups, whose selection fits its shared memory and that `granted` (the device granted its
+    /// reservation when the image loaded), else [Self::PER_HEAD]. The one rule the boot plan and
+    /// every arm that launches these bodies take.
+    #[must_use]
+    pub fn choose(query_groups: usize, selected: usize, granted: impl Fn(usize) -> bool) -> Self {
+        GQA_GROUP_KERNELS
+            .iter()
+            .find(|&&(heads, _)| {
+                query_groups.is_multiple_of(heads)
+                    && selected <= GQA_GROUP_SELECTED
+                    && granted(heads)
+            })
+            .map_or(Self::PER_HEAD, |&(heads, symbol)| Self {
+                heads,
+                symbol,
+                shared_bytes: gqa_group_shared_bytes(heads),
+            })
+    }
+
+    /// The launch grid over `query_heads` heads and `rows` query rows: a block a head group and
+    /// a row, 256 threads a block.
+    #[must_use]
+    pub const fn grid(
+        &self,
+        query_heads: usize,
+        rows: usize,
+    ) -> ((u32, u32, u32), (u32, u32, u32)) {
+        (
+            ((query_heads / self.heads) as u32, rows as u32, 1),
+            (256, 1, 1),
+        )
+    }
+}
 
 /// The attention arithmetic a plan runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +184,14 @@ impl AttentionPlan {
             AttentionKind::Gqa {
                 query_heads,
                 kv_heads,
-            } => gqa_symbols(query_heads / kv_heads),
+            } => match GqaBody::choose(
+                query_heads / kv_heads,
+                gqa_selected(&requirement.geometry, context_len),
+                |_| true,
+            ) {
+                body if body == GqaBody::PER_HEAD => &["q4e_attn"][..],
+                body => &[body.symbol, "q4e_attn"][..],
+            },
             _ => symbols_for(kind, requirement.precision),
         };
         let phase = KernelPhase::for_rows(rows);
@@ -220,6 +295,20 @@ impl AttentionPlan {
     fn finish(plan: Self) -> Result<Self, OpError> {
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// The grouped body a GQA plan launches ([GqaBody::choose] over its query groups and the
+    /// tokens a query reads), or [GqaBody::PER_HEAD] for the other kinds.
+    #[must_use]
+    pub fn gqa_body(&self) -> GqaBody {
+        match self.kind {
+            AttentionKind::Gqa { .. } => GqaBody::choose(
+                self.group_size(),
+                gqa_selected(&self.geometry, self.context),
+                |_| true,
+            ),
+            _ => GqaBody::PER_HEAD,
+        }
     }
 
     /// The group size for grouped-query attention, or 1 for the other kinds.
@@ -344,21 +433,22 @@ impl OpPlan for AttentionPlan {
     }
 
     fn launch(&self) -> Launch {
-        let blocks = match self.kind {
-            AttentionKind::Gqa {
-                query_heads,
-                kv_heads,
-            } => self.rows * (query_heads / kv_heads).max(1),
-            _ => self.rows,
-        };
+        if let AttentionKind::Gqa { query_heads, .. } = self.kind {
+            let body = self.gqa_body();
+            let (grid, block) = body.grid(query_heads, self.rows);
+            return Launch {
+                kernel: self.kernel(),
+                grid,
+                block,
+                shared_bytes: body.shared_bytes,
+                stream: self.stream,
+            };
+        }
         Launch {
             kernel: self.kernel(),
-            grid: (blocks.div_ceil(4) as u32, 1, 1),
+            grid: (self.rows.div_ceil(4) as u32, 1, 1),
             block: (256, 1, 1),
-            shared_bytes: match self.kind {
-                AttentionKind::Gqa { .. } => gqa_kernel(self.group_size()).1,
-                _ => 0,
-            },
+            shared_bytes: 0,
             stream: self.stream,
         }
     }
@@ -384,25 +474,13 @@ impl OpPlan for AttentionPlan {
     }
 }
 
-/// The image symbol and dynamic shared memory a GQA head group runs.
-///
-/// The six-head and four-head grouped kernels are the only specialised variants; every other
-/// group (including the 12-head group a TP=1 Qwen arm holds) runs the per-head q4e_attn body,
-/// which needs no dynamic shared reservation.
-fn gqa_kernel(group: usize) -> (&'static str, u32) {
-    match group {
-        6 => ("q4e_attn_group6", GQA_GROUP6_SHARED_BYTES),
-        4 => ("q4e_attn_group", GQA_GROUP_SHARED_BYTES),
-        _ => ("q4e_attn", 0),
-    }
-}
-
-/// The symbol list for a GQA group, most specialised first.
-fn gqa_symbols(group: usize) -> &'static [&'static str] {
-    match group {
-        6 => &["q4e_attn_group6", "q4e_attn"],
-        4 => &["q4e_attn_group", "q4e_attn"],
-        _ => &["q4e_attn"],
+/// The tokens a GQA query reads: its indexer's selection when the layer has one, else the
+/// context.
+const fn gqa_selected(geometry: &PartGeometry, context: usize) -> usize {
+    if geometry.top_k > 0 {
+        geometry.top_k
+    } else {
+        context
     }
 }
 

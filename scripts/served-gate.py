@@ -26,7 +26,9 @@ new model is gated by these checks as they stand, not by a copy written for it:
                                answer equals its answer alone.
   turns PORT [--strict]        conversations alone and four at once, thinking off and on: each
                                continued turn is served from its kept lane (cached past its first
-                               prompt) and a rerun of it runs cold (cached 0). Whether the
+                               prompt) and a rerun of it runs cold (cached 0; an arm that rewinds
+                               a repeated prompt, as Dory's does, has its kept lanes evicted by
+                               unrelated prompts first). Whether the
                                continued answer equals the cold one is reported; --strict fails
                                on a difference (a continued turn forwards its suffix in other
                                chunks than a cold prompt, which may move greedy bits). A first
@@ -38,7 +40,11 @@ new model is gated by these checks as they stand, not by a copy written for it:
                                next turn merges the first prompt's last id with what follows
                                (Qwen's <think>\n\n after a held <think>, \n) rewinds by text
                                (REWOUND+, cached one short of the first prompt); its answer reads
-                               the held ids and may differ from cold.
+                               the held ids and may differ from cold. A thinking turn whose
+                               template writes the reply back without its reasoning (Dory's)
+                               is judged as think-dropped. Dory's lanes keep their point one id
+                               before the prompt's end (its reply opener's last id is not written
+                               back), so they rewind as REWOUND+.
   all PORT --long FILE         lanes, lanes --sampled, interleave and turns.
 
 --out FILE writes a check's digests as JSON; --baseline FILE fails the check unless they equal a
@@ -297,6 +303,22 @@ def turns(server, args):
                 continued = list(pool.map(second, [(f, None) for f in firsts]))
             with cf.ThreadPoolExecutor(count) as pool:
                 cold = list(pool.map(second, [(f, None) for f in firsts]))
+            # A rerun is cold only if no kept lane serves it. An arm whose point sits short of
+            # its prompt's end (Dory's) rewinds a repeated prompt onto its own lane, so evict the
+            # kept lanes with unrelated prompts (the pool renews its oldest) and ask again.
+            evicted = 0
+            for flood in (2 * len(TURN_TOPICS), 4 * len(TURN_TOPICS), 8 * len(TURN_TOPICS)):
+                warm = [i for i, c2 in enumerate(cold) if c2.get("cached", 0) > 0]
+                if not warm:
+                    break
+                for _ in range(flood):
+                    server.ask([{"role": "user", "content": "Evict %s." % uuid.uuid4().hex}], 1,
+                               extra)
+                evicted += flood
+                with cf.ThreadPoolExecutor(len(warm)) as pool:
+                    again = list(pool.map(second, [(firsts[i], None) for i in warm]))
+                for i, c2 in zip(warm, again):
+                    cold[i] = c2
             notes, passed = [], True
             for i, ((_, a1), a2, c2) in enumerate(zip(firsts, continued, cold)):
                 for turn, answer in (("t1", a1), ("t2", a2), ("t2 cold", c2)):
@@ -313,7 +335,11 @@ def turns(server, args):
                 exact = a1["prompt"] > 0 and a2["cached"] == a1["prompt"]
                 merged = a1["prompt"] > 1 and a2["cached"] == a1["prompt"] - 1
                 rewound = exact or merged
-                hit = extended or (rewound and (dropped or a1["cut"]))
+                # A template that writes a past reply back without its reasoning (Dory's
+                # truncate_history_thinking) makes a thinking turn a think-dropped one: the next
+                # prompt is shorter than the first prompt and the reply it would hold whole.
+                trimmed = bool(a1["said"][0]) and a2["prompt"] < a1["prompt"] + a1["tokens"]
+                hit = extended or (rewound and (dropped or trimmed or a1["cut"]))
                 equal = a2["said"] == c2["said"]
                 passed &= hit and c2["cached"] == 0 and (equal or not args.strict)
                 verdict = (
@@ -321,7 +347,9 @@ def turns(server, args):
                 )
                 notes.append("c%d %s cached %d of %d (t1 %d%s), cold cached %d, %s" % (
                     i, verdict if hit else verdict + " (MISS)", a2["cached"], a2["prompt"],
-                    a1["prompt"], ", cut" if a1["cut"] else "", c2["cached"],
+                    a1["prompt"],
+                    ", cut" if a1["cut"] else ", reasoning dropped by the template"
+                    if trimmed and not dropped else "", c2["cached"],
                     "equal to cold" if equal else "differs from cold"))
                 if not hit:
                     # The first reply's edges, where a re-rendering most often parts from the
@@ -330,6 +358,8 @@ def turns(server, args):
                     print("MISS %s c%d: reasoning tail %r, content head %r, tail %r" % (
                         label, i, (reasoning or "")[-40:], content[:40], content[-40:]),
                         flush=True)
+            if evicted:
+                notes.append("cold after %d evicting prompts" % evicted)
             print("CHECK %s: %s => %s" % (label, "; ".join(notes), "PASS" if passed else "FAIL"),
                   flush=True)
             ok &= passed

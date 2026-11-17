@@ -570,6 +570,12 @@ fn geometry_for(
                 geometry.kv_head_offset = kv.offset;
                 geometry.head_dim = attention.head_dim;
                 geometry.window = attention.window.unwrap_or(0);
+                // A layer whose indexer selects its keys attends at most that many a query, which
+                // decides the grouped body ([crate::attention::GqaBody::choose]).
+                geometry.top_k = attention
+                    .indexer
+                    .as_ref()
+                    .map_or(0, |indexer| indexer.max_selected());
             }
             _ => {
                 return Err(PlanError::Invalid(

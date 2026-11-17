@@ -50,6 +50,7 @@
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
 use sparkflash_ops::OpPlan;
+use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
 
 use super::{
     DeviceSequence, GEMM_MIN_BATCH, GEMM_PARTIAL_FLOATS, GEMM_SPLIT_TICKETS, GpuMat,
@@ -136,16 +137,10 @@ pub use sparkflash_ops::gdn::{
 pub fn gdn_qk_row(key_dim: usize) -> usize {
     2 * (key_dim + key_dim / 8)
 }
-/// The dense MMA's token and column tile (OM_BM, OM_BN).
-const DENSE_TILE: usize = 128;
 /// q4p_dense_rows' rows (one m16 tile) and columns (four warps of 8) a CTA, for launches of fewer
 /// than GEMM_MIN_BATCH rows.
 const DENSE_ROWS_TILE: usize = 16;
 const DENSE_ROWS_COLUMNS: usize = 32;
-/// CTAs a split dense MMA aims for: two per SM on GB10's forty-eight.
-const DENSE_TARGET_CTAS: usize = 96;
-/// The thinnest K slice a split takes, in 32-column blocks.
-const DENSE_MIN_SLICE_BLOCKS: usize = 8;
 
 /// One matrix of a q4p_dense_rows launch: `matrix` into `output`, split `segments` ways.
 type DenseRows<'a> = (&'a GpuMat, Deviceptr, usize);
@@ -502,22 +497,6 @@ fn aligned(pointer: Deviceptr) -> bool {
     pointer.0.is_multiple_of(16)
 }
 
-/// The K split of a dense MMA over `tokens` rows of a `rows` x `k_blocks` 32-column matrix: enough
-/// slices to bring the grid near DENSE_TARGET_CTAS, as many as the partials hold, none thinner
-/// than DENSE_MIN_SLICE_BLOCKS, and all the same width, so a divisor of the K blocks.
-fn dense_segments(rows: usize, k_blocks: usize, tokens: usize) -> usize {
-    let tiles = rows.div_ceil(DENSE_TILE) * tokens.div_ceil(DENSE_TILE);
-    let ceiling = DENSE_TARGET_CTAS
-        .div_ceil(tiles)
-        .min(GEMM_PARTIAL_FLOATS / (tokens * rows).max(1))
-        .min(k_blocks / DENSE_MIN_SLICE_BLOCKS)
-        .max(1);
-    (1..=ceiling)
-        .rev()
-        .find(|segments| k_blocks.is_multiple_of(*segments))
-        .unwrap_or(1)
-}
-
 impl DeviceSequence {
     /// Whether a forward of `batch` rows takes this path: every forward with the decode steps on
     /// it ([PrefillPlan::decode]), otherwise a chunk of GEMM_MIN_BATCH rows or more.
@@ -592,32 +571,28 @@ impl DeviceSequence {
         output: Deviceptr,
         batch: usize,
     ) -> Result<bool, BackendError> {
-        const TILE: usize = sparkflash_ops::gemv::E4M3_TILE;
         if !self.backend.prefill.tensor_cores
             || !part("dense")
-            || !matrix.rows.is_multiple_of(32)
-            || !matrix.columns.is_multiple_of(TILE)
+            || !fp8_tile_fits(matrix.rows, matrix.columns)
             || ![matrix.weight, input, output].into_iter().all(aligned)
         {
             return Ok(false);
         }
+        let tile = Fp8Tile::call(
+            matrix.weight.0,
+            matrix.scales.0,
+            input.0,
+            output.0,
+            matrix.rows,
+            matrix.columns,
+            batch,
+        )
+        .map_err(|error| BackendError::new("qwen4_device", error))?;
         self.launch(
             self.backend.kernels.prefill.dense_fp8,
-            (
-                matrix.rows.div_ceil(TILE) as u32,
-                batch.div_ceil(TILE) as u32,
-                1,
-            ),
-            (256, 1, 1),
-            &[
-                matrix.weight.0,
-                matrix.scales.0,
-                input.0,
-                output.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
-                batch as u64,
-            ],
+            tile.grid,
+            tile.block,
+            &tile.args,
         )?;
         Ok(true)
     }
@@ -644,7 +619,12 @@ impl DeviceSequence {
         } else {
             piece
         };
-        dense_segments(matrix.rows, matrix.columns / 32, reference)
+        split_k_slices(
+            matrix.rows,
+            matrix.columns / SPLIT_STAGE,
+            reference,
+            GEMM_PARTIAL_FLOATS,
+        )
     }
 
     /// Projections of one `input` over `batch` rows, each into its own output.
@@ -926,24 +906,16 @@ impl DeviceSequence {
                 &[],
             );
         }
-        self.launch(
-            kernels.prefill.dense_mma,
-            (
-                matrix.rows.div_ceil(DENSE_TILE) as u32,
-                batch.div_ceil(DENSE_TILE) as u32,
-                segments as u32,
-            ),
-            (256, 1, 1),
-            &[
-                matrix.pointer.0,
-                input.0,
-                target.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
-                batch as u64,
-                segments as u64,
-            ],
-        )?;
+        let tile = SplitTile::call(
+            matrix.pointer.0,
+            input.0,
+            target.0,
+            matrix.rows,
+            matrix.columns,
+            batch,
+            segments,
+        );
+        self.launch(kernels.prefill.dense_mma, tile.grid, tile.block, &tile.args)?;
         if segments > 1 {
             self.launch(
                 kernels.gemm_reduce,

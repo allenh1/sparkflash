@@ -196,6 +196,15 @@ gate is the served check (`scripts/served-gate.py`, any model by port) that prov
 A hook an arm skips shows in its ledger line as off, with the reason, so the gap is visible at
 boot rather than found later.
 
+**An arm that schedules its own lanes** (Dory's recurrence ring keeps a batch on every rank at
+once, which one fused walk a step cannot) still serves through the session contract, and keeps
+conversations as the fused arms do: `reusable_prefix` names the ids its lane was fed while the
+lane holds them, `rewind_prefix` the last prompt's end, `cached_tokens` the hit, and its prefill
+takes the prompt as `sparkflash_runtime::resume` says; `park` lets go of whatever runs ahead of
+the history (Dory's guessed rows) and takes the lane out of the counts that schedule running
+lanes. The host's kept pool does the rest. Such an arm builds its own `Ledger` and prints it at
+open, so its line reads as every other arm's.
+
 **The ledger** is how an arm says what it does with that schedule. `FusedArm::ledger` returns a
 `sparkflash_runtime::Ledger` stating each strategy it runs natively, looped or off, with the
 reason; the engine adds what it decides and prints the line at boot. A strategy the arm leaves
@@ -205,17 +214,25 @@ unstated prints as off, so an arm cannot appear to support what it does not.
 `route_bf16` with the arm's `WidePolicy` chooses the row GEMV, the wide tensor-core tile, the
 skinny kernel or a refusal, and `WideTile::call` gives the wide tile's grid, block and arguments.
 A new arm picks a policy (or adds one, with a gate) rather than writing its own row-count test.
-The decode GEMV's splits are `sparkflash_ops::gemv`'s.
+The decode GEMV's splits are `sparkflash_ops::gemv`'s. Two more tiles have their rules there: the
+split-K BF16 tile (`split_k_slices` cuts the inner dimension, the cut that decides a row's sums,
+and `SplitTile::call` gives the launch) and the block-scaled FP8 tile (`fp8_tile_fits`,
+`Fp8Tile::call`, or `Fp8Tile::grid` for a body with its own arguments), which Qwen's and GLM's FP8
+projections both launch. An arm adds only what its own operands need (alignment, a slice start).
 
 **Executed plans.** Where a typed plan carries everything its launch needs, the arm launches the
 plan instead of its own copy of the geometry: a linear-attention scan is
 `ScanPlan::for_architecture(&architecture, world, rank, kind, rows)`, the same plan the boot
 resolver checked, and the arm launches its kernel on its grid and block after checking it against
-the loaded weights' shapes. Today only the scan is executed this way; attention, the routed
-experts, the indexer and the residual mixers still launch from the arm's load-time geometry,
-because their plans do not yet carry the cache layouts, work lists and split cuts those launches
-take. A new arm should launch the scan from the plan and the rest through the shared helpers in
-section 5, and should not add a new parallel launch rule for a part another arm already runs.
+the loaded weights' shapes. Grouped-query attention is the second: `GqaBody::choose(query_groups,
+selected, granted)` names the body (four or six heads a block, or the per-head kernel), its shared
+memory and its grid (`GqaBody::grid`), the same rule the rank's `AttentionPlan` names at boot, so
+an arm loads the bodies in `GQA_GROUP_KERNELS` and launches what `choose` says over the ones the
+device granted. MLA attention, the routed experts, the indexer and the residual mixers still
+launch from the arm's load-time geometry, because their plans do not yet carry the cache layouts,
+work lists and split cuts those launches take. A new arm should launch the scan and GQA attention
+from the plan and the rest through the shared helpers in section 5, and should not add a new
+parallel launch rule for a part another arm already runs.
 
 **What stays in the arm**: its weights' layout and loader, the kernels unique to the model
 (Inkling's convolutions and relative attention, Engram, Dory's loop pipeline), its sampler wire,
@@ -380,7 +397,8 @@ and an arm without a fused batch or a KV budget says so at TP=1. A directory of 
       plan's `ScanPlan` (section 2b);
 - [ ] the arm serves through `FusedArm` (and `RoundArm` to draft), and its ledger states every
       strategy it runs, so the boot line shows none as `the arm does not state it`;
-- [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`;
+- [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`; a split-K or
+      FP8 tile launches through `SplitTile` / `Fp8Tile`, and GQA attention through `GqaBody`;
 - [ ] `scripts/served-gate.py all PORT --long FILE` passes on the served arm, and its `lanes` and
       `interleave` digests are kept (`--out`) as the baseline the next build must equal;
 - [ ] the parity harness passes layer by layer against the host reference;
