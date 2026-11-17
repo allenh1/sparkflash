@@ -25,11 +25,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{BackendError, ModelSession as _, Sampling, Speculation, StepOutput};
 
 use super::batch::BatchBuffers;
 use super::{DeviceSequence, SequenceShared};
-use sparkflash_runtime::{ExpertUnionWall, FusedArm, Opened, RoundArm, StepWall, run_round};
+use sparkflash_runtime::{
+    ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round,
+};
 
 /// The arm the engine steps.
 pub(super) struct QwenFusion {
@@ -210,6 +213,24 @@ impl FusedArm for QwenFusion {
         tokens: &[u32],
     ) -> Result<StepOutput, BackendError> {
         slot.prefill(tokens)
+    }
+
+    /// A prompt's chunks run one a part ([DeviceSequence::begin_prompt]); the arm serves text, so
+    /// a prompt with images is refused as [FusedArm::prefill_images] refuses it.
+    fn begin_prompt(
+        &self,
+        slot: &mut DeviceSequence,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        if !images.is_empty() {
+            return self.prefill_images(slot, tokens, images).map(Part::Done);
+        }
+        slot.begin_prompt(tokens)
+    }
+
+    fn next_part(&self, slot: &mut DeviceSequence) -> Result<Part, BackendError> {
+        slot.prompt_part()
     }
 
     /// With joint rounds, several members verify their rounds in one batch ([run_round]) and a

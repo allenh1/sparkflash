@@ -258,6 +258,21 @@ pub const MIN_PREFILL_ROWS: usize = 16;
 /// The widest chunk the scratch is sized for at the default context.
 pub const MAX_PREFILL_ROWS: usize = 4096;
 
+/// How a prompt runs ([DeviceRank::begin_prefill]).
+#[derive(Debug)]
+pub enum Prefill {
+    /// The token path ran it whole: its last row's logits.
+    Whole(Vec<f32>),
+    /// It takes bulk chunks of `width` tokens, the last one shorter, ending at position `end`
+    /// ([DeviceRank::prefill_chunk]).
+    Chunks {
+        /// The position past the prompt's last token.
+        end: usize,
+        /// The tokens a chunk takes.
+        width: usize,
+    },
+}
+
 /// The modelled wall of a block-drafted round at TP=4 on four GB10-class nodes that verifies
 /// `depth` drafts (ms), for [DepthPolicy](sparkflash_model::DepthPolicy): the drafter's block and
 /// the one-token step at 41.7 ms, and 5.9 ms a verified draft (mostly the experts its row adds).
@@ -5034,7 +5049,8 @@ impl DeviceRank {
     fn chunk_ready(&self, sequence: &DeviceSequence) -> bool {
         self.prefill.is_some() && (sequence.block.is_none() || self.drafting_prefill)
     }
-    /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits. A chunk
+    /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits
+    /// ([Self::begin_prefill], then each [Self::prefill_chunk] in turn). A chunk
     /// carries up to [DeviceRank::prefill_rows] rows through the tensor-core GEMMs and the padded
     /// routed-expert path; a prompt shorter than [MIN_PREFILL_ROWS], a rank opened with
     /// SPARKFLASH_GLM_PREFILL=0, or a sequence [Self::chunk_ready] refuses runs the token path
@@ -5050,16 +5066,45 @@ impl DeviceRank {
         sequence: &mut DeviceSequence,
         tokens: &[u32],
     ) -> Result<Vec<f32>, BackendError> {
+        let (end, width) = match self.begin_prefill(tp, gather, sequence, tokens)? {
+            Prefill::Whole(logits) => return Ok(logits),
+            Prefill::Chunks { end, width } => (end, width),
+        };
+        let mut last = Vec::new();
+        for part in tokens.chunks(width) {
+            last = self.prefill_chunk(tp, gather, sequence, part, end)?;
+        }
+        Ok(last)
+    }
+
+    /// Starts [Self::forward_prefill]'s prompt: a prompt the token path takes runs whole here;
+    /// one that takes the bulk chunks has its rows backed, and [Self::prefill_chunk] then runs its
+    /// chunks of the width answered, in order. Between two chunks the sequence holds everything
+    /// the next reads: the chunk scratch is the rank's, but each chunk fills it from the start
+    /// and commits the drafter's window rows before it ends, so a step or chunk of another
+    /// sequence between two of them carries nothing into this one.
+    ///
+    /// # Errors
+    /// As [Self::forward_prefill].
+    pub fn begin_prefill(
+        &mut self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        tokens: &[u32],
+    ) -> Result<Prefill, BackendError> {
         if tokens.is_empty() {
             return Err(refusal("an empty prompt has no logits"));
         }
         if self.prefill.is_none() || tokens.len() < MIN_PREFILL_ROWS || !self.chunk_ready(sequence)
         {
             let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
-            return Ok(logits
-                .pop()
-                .and_then(|mut rows| rows.pop())
-                .unwrap_or_default());
+            return Ok(Prefill::Whole(
+                logits
+                    .pop()
+                    .and_then(|mut rows| rows.pop())
+                    .unwrap_or_default(),
+            ));
         }
         self.check_sequence(sequence, tokens)?;
         if sequence.pending.is_some() {
@@ -5068,13 +5113,32 @@ impl DeviceRank {
             ));
         }
         self.back(sequence, sequence.position + tokens.len())?;
+        self.collective(tp, gather)?;
+        Ok(Prefill::Chunks {
+            end: sequence.position + tokens.len(),
+            width: self.prefill_rows,
+        })
+    }
+
+    /// One bulk chunk of the prompt [Self::begin_prefill] started, which ends at position `end`:
+    /// `part` is its next [Prefill::Chunks] width of tokens or the rest. Answers the chunk's last
+    /// row's full-vocabulary logits.
+    ///
+    /// # Errors
+    /// As [Self::forward_prefill].
+    pub fn prefill_chunk(
+        &mut self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        part: &[u32],
+        end: usize,
+    ) -> Result<Vec<f32>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
-        let chunk = self.prefill_rows;
         // A block drafter's first block reads the prompt's last `window_left` positions: a chunk
         // captures its rows from the first of those on into the drafter's prompt rows, a scratch
         // that is otherwise the sequence's, and commits them to its context a step's rows at a
         // time, as the token path's steps would ([Dflash2Config::window_commits]).
-        let end = sequence.position + tokens.len();
         let block = match (&self.block, &sequence.block) {
             (Some(block), Some(scratch)) => {
                 let prompt = block.prompt.ok_or_else(|| {
@@ -5084,53 +5148,49 @@ impl DeviceRank {
             }
             _ => None,
         };
-        let mut last = Vec::new();
-        for part in tokens.chunks(chunk) {
-            let start = sequence.position;
-            let commits: Vec<(usize, usize, usize)> =
-                block.as_ref().map_or_else(Vec::new, |(_, config)| {
-                    config
-                        .window_commits((start, part.len()), end, MAX_ROWS)
-                        .collect()
-                });
-            let captured = commits.first().map(|&(row, _, _)| row);
-            let run = Run {
-                layers: &sequence.layers,
-                position: start,
-                first: 0,
-                len: part.len(),
-                verify: false,
-                drafter: sequence.drafter.as_ref(),
-                block: block
-                    .as_ref()
-                    .zip(captured)
-                    .map(|((scratch, _), row)| (scratch, row)),
-            };
-            self.steps = self.steps.wrapping_add(1);
-            let prefill = self
-                .prefill
-                .take()
-                .ok_or_else(|| refusal("the prefill scratch is missing"))?;
-            let decode = std::mem::replace(&mut self.scratch, prefill);
-            let result =
-                self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
-            self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
-            let rows = result?;
-            last = rows.into_iter().next().unwrap_or_default();
-            sequence.position += part.len();
-            sequence.logits_at = None;
-            if let Some(drafter) = &mut sequence.drafter {
-                // The chunk's last row is its stash's last ([Self::fill]).
-                drafter.last = Some(part.len().min(MAX_ROWS) - 1);
-            }
-            if let (Some(drafter), Some((scratch, _)), Some(captured)) =
-                (&self.block, &block, captured)
-            {
-                for (row, rows, position) in commits {
-                    drafter
-                        .draft
-                        .commit(&*self, scratch, row - captured, rows, position)?;
-                }
+        let start = sequence.position;
+        let commits: Vec<(usize, usize, usize)> =
+            block.as_ref().map_or_else(Vec::new, |(_, config)| {
+                config
+                    .window_commits((start, part.len()), end, MAX_ROWS)
+                    .collect()
+            });
+        let captured = commits.first().map(|&(row, _, _)| row);
+        let run = Run {
+            layers: &sequence.layers,
+            position: start,
+            first: 0,
+            len: part.len(),
+            verify: false,
+            drafter: sequence.drafter.as_ref(),
+            block: block
+                .as_ref()
+                .zip(captured)
+                .map(|((scratch, _), row)| (scratch, row)),
+        };
+        self.steps = self.steps.wrapping_add(1);
+        let prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| refusal("the prefill scratch is missing"))?;
+        let decode = std::mem::replace(&mut self.scratch, prefill);
+        let result = self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
+        self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
+        let rows = result?;
+        let last = rows.into_iter().next().unwrap_or_default();
+        sequence.position += part.len();
+        sequence.logits_at = None;
+        if let Some(drafter) = &mut sequence.drafter {
+            // The chunk's last row is its stash's last ([Self::fill]).
+            drafter.last = Some(part.len().min(MAX_ROWS) - 1);
+        }
+        if let (Some(drafter), Some((scratch, _)), Some(captured)) =
+            (&self.block, &block, captured)
+        {
+            for (row, rows, position) in commits {
+                drafter
+                    .draft
+                    .commit(&*self, scratch, row - captured, rows, position)?;
             }
         }
         Ok(last)

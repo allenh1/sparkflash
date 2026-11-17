@@ -26,8 +26,14 @@
 //! are the ones it would see alone: [FusedArm::step] is one row a member, so a member's
 //! arithmetic does not depend on its neighbours.
 //!
-//! A prefill takes the engine: the prompt chunks of two requests are not batched, so a prompt runs
-//! to its first token while the other members' decodes wait.
+//! A prompt runs a part at a time between the members' steps ([FusedArm::begin_prompt]), the
+//! schedule DeepSeek's specification sets (spec 5.6.2): [PREFILL_DECODE_INTERVAL] steps of the
+//! decoding members between two parts, so a long prompt holds them up for one of its chunks at a
+//! time instead of for the whole prompt; a prompt of at most [PREFILL_BYPASS_MAX_TOKENS] runs
+//! whole as it arrives, between two parts of a longer one; and longer prompts take their turns one
+//! after another, each to its first token. A part is one of the arm's own chunks, so a prompt
+//! computes the chunks it would alone. The prompt chunks of two requests are not batched.
+//! [PROMPT_PARTS_ENV] off runs every prompt whole as it arrives.
 //!
 //! A fused session reports a reusable prefix when its arm keeps one ([FusedArm::history]): the
 //! engine then hands the slot's next prompt to the arm as it stands, the arm continues what the
@@ -41,6 +47,7 @@
 //! a batch, a reply a job. The arm supplies the arithmetic through [FusedArm]; nothing here knows
 //! which model it drives.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -48,6 +55,42 @@ use std::time::{Duration, Instant};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
+
+/// Steps of the decoding members between two parts of a prompt (`--prefill-decode-interval 2`,
+/// spec 5.6.2). DeepSeek's scheduler reads it from here.
+pub const PREFILL_DECODE_INTERVAL: usize = 2;
+
+/// A prompt of at most this many tokens runs whole as it arrives, between two parts of a longer
+/// one (`DSV41_PREFILL_BYPASS = 256`, spec 5.6.2). DeepSeek's scheduler reads it from here.
+pub const PREFILL_BYPASS_MAX_TOKENS: usize = 256;
+
+/// Whether the engine runs a long prompt a part at a time between the members' steps: `on` (the
+/// default) or `off`, which runs every prompt whole as it arrives while the members wait.
+pub const PROMPT_PARTS_ENV: &str = "SPARKFLASH_PROMPT_PARTS";
+
+/// [PROMPT_PARTS_ENV] as set.
+///
+/// # Errors
+/// A value other than `on` or `off`.
+pub fn prompt_parts() -> Result<bool, String> {
+    match std::env::var(PROMPT_PARTS_ENV) {
+        Err(_) => Ok(true),
+        Ok(value) => match value.trim() {
+            "" | "on" => Ok(true),
+            "off" => Ok(false),
+            other => Err(format!("{PROMPT_PARTS_ENV}={other} is neither on nor off")),
+        },
+    }
+}
+
+/// What one part of a prompt left ([FusedArm::begin_prompt]).
+#[derive(Debug, Clone)]
+pub enum Part {
+    /// The prompt is consumed: this is its first step.
+    Done(StepOutput),
+    /// The prompt has parts left; [FusedArm::next_part] runs the next.
+    More,
+}
 
 /// What a model exposes for its sessions to be fused.
 ///
@@ -101,6 +144,37 @@ pub trait FusedArm: Send + Sync + 'static {
                 "this arm has no vision path for the request's {} images",
                 images.len()
             ),
+        ))
+    }
+
+    /// Starts a prompt the engine may run a part at a time, as [FusedArm::prefill_images] takes
+    /// it, and runs its first part.
+    ///
+    /// Between two parts the engine steps the other members, so a part must be one of the chunks
+    /// the arm's own prefill runs, in the same order, with everything a later part reads kept in
+    /// the slot: nothing another slot's step writes may carry over from one part to the next. The
+    /// default runs the whole prompt as one part.
+    ///
+    /// # Errors
+    /// As [FusedArm::prefill_images]; a prompt that fails leaves no parts.
+    fn begin_prompt(
+        &self,
+        slot: &mut Self::Slot,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        self.prefill_images(slot, tokens, images).map(Part::Done)
+    }
+
+    /// Runs the next part of the prompt [FusedArm::begin_prompt] left.
+    ///
+    /// # Errors
+    /// A backend failure, or a slot with no prompt in parts; a prompt that fails leaves no parts.
+    fn next_part(&self, slot: &mut Self::Slot) -> Result<Part, BackendError> {
+        let _ = slot;
+        Err(BackendError::new(
+            "fused",
+            "this arm runs its prompts whole and has no part left to run",
         ))
     }
 
@@ -329,7 +403,8 @@ impl<A: FusedArm> FusedEngine<A> {
     /// allocates a slot it cannot use.
     ///
     /// # Errors
-    /// A slot the arm refuses to open, or a thread that cannot be started.
+    /// A slot the arm refuses to open, a [PROMPT_PARTS_ENV] that is neither on nor off, or a
+    /// thread that cannot be started.
     pub fn start(arm: Arc<A>, capacity: usize) -> Result<Arc<Self>, BackendError> {
         if capacity == 0 {
             return Err(BackendError::new(
@@ -337,6 +412,7 @@ impl<A: FusedArm> FusedEngine<A> {
                 "a fused engine needs at least one slot",
             ));
         }
+        let parts = prompt_parts().map_err(|error| BackendError::new("fused", error))?;
         let mut pool: Vec<Option<A::Slot>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             pool.push(Some(arm.open_slot()?));
@@ -349,7 +425,7 @@ impl<A: FusedArm> FusedEngine<A> {
         let engine_arm = Arc::clone(&arm);
         let thread = std::thread::Builder::new()
             .name("sparkflash-batch".to_owned())
-            .spawn(move || run(engine_arm, inbox, pool, capacity, thread_stats))
+            .spawn(move || run(engine_arm, inbox, pool, capacity, thread_stats, parts))
             .map_err(|error| BackendError::new("fused", error.to_string()))?;
         Ok(Arc::new(Self {
             arm,
@@ -610,26 +686,43 @@ fn first(steps: Vec<StepOutput>) -> Result<StepOutput, BackendError> {
         .ok_or_else(|| BackendError::new("fused", "the engine answered no step"))
 }
 
-/// The engine thread: collect the waiting jobs, run the prompts, step the rest together.
+/// The engine thread: collect the waiting jobs, step the decodes together, and run the prompts a
+/// part at a time between the steps (`parts`, [PROMPT_PARTS_ENV]) or whole as they arrive.
 fn run<A: FusedArm>(
     arm: Arc<A>,
     inbox: std::sync::mpsc::Receiver<Job>,
     mut pool: Vec<Option<A::Slot>>,
     capacity: usize,
     stats: Records,
+    parts: bool,
 ) {
     let mut idle = Idle::new(capacity);
+    // The long prompts, in arrival order: the first is the one running a part at a time.
+    let mut prompts: VecDeque<Prompt> = VecDeque::new();
+    // The members' steps since the running prompt's last part.
+    let mut since_part = 0usize;
     loop {
-        let Ok(first) = inbox.recv() else {
-            return;
+        // With a prompt running, the engine does not wait for a job: the prompt's next part is
+        // its work when no member posts.
+        let first = if prompts.is_empty() {
+            match inbox.recv() {
+                Ok(job) => Some(job),
+                Err(_) => return,
+            }
+        } else {
+            match inbox.recv_timeout(FILL_WINDOW) {
+                Ok(job) => Some(job),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         };
         let limit = capacity.min(arm.max_batch()).max(1);
-        let mut jobs = vec![first];
+        let mut jobs: Vec<Job> = first.into_iter().collect();
         // Everything already queued is one batch, and the batch waits a moment for a member that
         // is about to post: a decode that arrived while the thread was up would otherwise wait a
         // whole step for nothing.
         let deadline = Instant::now() + FILL_WINDOW;
-        while jobs.len() < limit {
+        while !jobs.is_empty() && jobs.len() < limit {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -648,20 +741,29 @@ fn run<A: FusedArm>(
                     images,
                     sampling,
                 } => {
-                    let prompt = Prompt {
-                        tokens: &tokens,
-                        images: &images,
-                        sampling,
-                    };
                     idle.busy(job.slot);
-                    let mut room = Room {
-                        arm: &*arm,
-                        pool: &mut pool,
-                        stats: &stats,
-                        idle: &mut idle,
+                    let prompt = Prompt {
+                        slot: job.slot,
+                        tokens,
+                        images,
+                        sampling,
+                        reply: job.reply,
+                        begun: false,
                     };
-                    room.make(job.slot, Some(&tokens));
-                    prefill(&*arm, &mut pool, &stats, job.slot, prompt, job.reply);
+                    if parts && prompt.tokens.len() > PREFILL_BYPASS_MAX_TOKENS {
+                        prompts.push_back(prompt);
+                    } else {
+                        let mut room = Room {
+                            arm: &*arm,
+                            pool: &mut pool,
+                            stats: &stats,
+                            idle: &mut idle,
+                        };
+                        let mut prompt = Some(prompt);
+                        while let Some(running) = prompt.take() {
+                            prompt = room.part(running);
+                        }
+                    }
                 }
                 Work::Decode { token } => {
                     idle.busy(job.slot);
@@ -676,6 +778,7 @@ fn run<A: FusedArm>(
                 }
             }
         }
+        let mut stepped = false;
         if !decodes.is_empty() {
             let mut room = Room {
                 arm: &*arm,
@@ -686,6 +789,24 @@ fn run<A: FusedArm>(
             let decodes = room.steps(decodes);
             if !decodes.is_empty() {
                 step(&*arm, &mut pool, &stats, decodes);
+                stepped = true;
+                since_part += 1;
+            }
+        }
+        // The running prompt's next part, once the members have had their steps since its last,
+        // or at once when no member is stepping.
+        if (!stepped || since_part >= PREFILL_DECODE_INTERVAL)
+            && let Some(running) = prompts.pop_front()
+        {
+            since_part = 0;
+            let mut room = Room {
+                arm: &*arm,
+                pool: &mut pool,
+                stats: &stats,
+                idle: &mut idle,
+            };
+            if let Some(more) = room.part(running) {
+                prompts.push_front(more);
             }
         }
     }
@@ -787,41 +908,65 @@ impl<A: FusedArm> Room<'_, A> {
     }
 }
 
-/// One prompt job's request: its tokens, its images and its sampler.
-struct Prompt<'a> {
-    tokens: &'a [u32],
-    images: &'a [VisionImage],
+/// One prompt job: its slot, its tokens, its images, its sampler and its caller, and whether its
+/// first part has run.
+struct Prompt {
+    slot: usize,
+    tokens: Vec<u32>,
+    images: Vec<VisionImage>,
     sampling: Sampling,
+    reply: Reply,
+    begun: bool,
 }
 
-/// Runs one prompt on its slot, between the slot's decodes.
-fn prefill<A: FusedArm>(
-    arm: &A,
-    pool: &mut [Option<A::Slot>],
-    stats: &[Arc<Mutex<Record>>],
-    slot: usize,
-    prompt: Prompt<'_>,
-    reply: Reply,
-) {
-    let Some(mut state) = pool[slot].take() else {
-        let _ = reply.send(Err(BackendError::new(
-            "fused",
-            "the slot is already running a job",
-        )));
-        return;
-    };
-    let answer = (|| {
-        // A slot whose arm keeps its history goes to the prompt as it stands: the arm continues
-        // what the prompt shares with it, or starts over.
-        if arm.holds_request(&state) && arm.history(&state).is_none() {
-            arm.renew(&mut state)?;
+impl<A: FusedArm> Room<'_, A> {
+    /// Runs the next part of `prompt` on its slot, between the members' steps, and gives the
+    /// prompt back while it has parts left. Its first part makes room for it and starts it; the
+    /// part that ends it, or fails, answers its caller.
+    fn part(&mut self, mut prompt: Prompt) -> Option<Prompt> {
+        let slot = prompt.slot;
+        if !prompt.begun {
+            self.make(slot, Some(&prompt.tokens));
         }
-        arm.set_sampling(&mut state, prompt.sampling);
-        arm.prefill_images(&mut state, prompt.tokens, prompt.images)
-    })();
-    record(arm, &state, &stats[slot], true);
-    pool[slot] = Some(state);
-    let _ = reply.send(answer.map(|step| vec![step]));
+        let Some(mut state) = self.pool[slot].take() else {
+            let _ = prompt.reply.send(Err(BackendError::new(
+                "fused",
+                "the slot is already running a job",
+            )));
+            return None;
+        };
+        let arm = self.arm;
+        let answer = if prompt.begun {
+            arm.next_part(&mut state)
+        } else {
+            prompt.begun = true;
+            (|| {
+                // A slot whose arm keeps its history goes to the prompt as it stands: the arm
+                // continues what the prompt shares with it, or starts over.
+                if arm.holds_request(&state) && arm.history(&state).is_none() {
+                    arm.renew(&mut state)?;
+                }
+                arm.set_sampling(&mut state, prompt.sampling);
+                arm.begin_prompt(&mut state, &prompt.tokens, &prompt.images)
+            })()
+        };
+        let more = matches!(answer, Ok(Part::More));
+        if !more {
+            record(arm, &state, &self.stats[slot], true);
+        }
+        self.pool[slot] = Some(state);
+        match answer {
+            Ok(Part::More) => Some(prompt),
+            Ok(Part::Done(step)) => {
+                let _ = prompt.reply.send(Ok(vec![step]));
+                None
+            }
+            Err(error) => {
+                let _ = prompt.reply.send(Err(error));
+                None
+            }
+        }
+    }
 }
 
 /// Rolls back the answers a handle's run left unused ([FusedArm::give_back]). A slot that cannot
@@ -1477,5 +1622,165 @@ mod tests {
         let mut slot = 0;
         assert!(arm.give_back(&mut slot, 0).is_ok());
         assert!(arm.give_back(&mut slot, 1).is_err());
+    }
+
+    /// An arm whose prompts run [Parted::WIDTH] tokens a part, logging every part and step in the
+    /// order the engine ran them. A prompt's answer is the sum of its tokens, whichever way it ran.
+    struct Parted {
+        log: Mutex<Vec<&'static str>>,
+    }
+
+    /// A [Parted] slot: the sum so far, and the prompt still running with how far it has gone.
+    #[derive(Default)]
+    struct Summing {
+        sum: u32,
+        prompt: Option<(Vec<u32>, usize)>,
+    }
+
+    impl Parted {
+        const WIDTH: usize = 100;
+
+        fn note(&self, event: &'static str) {
+            self.log.lock().expect("the log").push(event);
+        }
+
+        fn answer(sum: u32) -> StepOutput {
+            StepOutput {
+                logits: vec![0.0; 2],
+                next_token: Some(sum),
+                draft: Vec::new(),
+            }
+        }
+    }
+
+    impl FusedArm for Parted {
+        type Slot = Summing;
+
+        fn open_slot(&self) -> Result<Summing, BackendError> {
+            Ok(Summing::default())
+        }
+
+        fn holds_request(&self, slot: &Summing) -> bool {
+            slot.sum > 0
+        }
+
+        fn renew(&self, slot: &mut Summing) -> Result<(), BackendError> {
+            *slot = Summing::default();
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Summing, _sampling: Sampling) {}
+
+        fn prefill(&self, slot: &mut Summing, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+            let mut part = self.begin_prompt(slot, tokens, &[])?;
+            loop {
+                match part {
+                    Part::Done(step) => return Ok(step),
+                    Part::More => part = self.next_part(slot)?,
+                }
+            }
+        }
+
+        fn begin_prompt(
+            &self,
+            slot: &mut Summing,
+            tokens: &[u32],
+            _images: &[VisionImage],
+        ) -> Result<Part, BackendError> {
+            slot.prompt = Some((tokens.to_vec(), 0));
+            self.next_part(slot)
+        }
+
+        fn next_part(&self, slot: &mut Summing) -> Result<Part, BackendError> {
+            let (tokens, at) = slot
+                .prompt
+                .take()
+                .ok_or_else(|| BackendError::new("parted", "no prompt is running"))?;
+            let end = (at + Self::WIDTH).min(tokens.len());
+            slot.sum += tokens[at..end].iter().sum::<u32>();
+            self.note("part");
+            std::thread::sleep(Duration::from_millis(5));
+            if end == tokens.len() {
+                return Ok(Part::Done(Self::answer(slot.sum)));
+            }
+            slot.prompt = Some((tokens, end));
+            Ok(Part::More)
+        }
+
+        fn step(&self, members: &mut [(Summing, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            self.note("step");
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    slot.sum += *token;
+                    Self::answer(slot.sum)
+                })
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Summing) -> Speculation {
+            Speculation::default()
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_runs_a_part_at_a_time_between_the_members_steps() {
+        let arm = Arc::new(Parted {
+            log: Mutex::new(Vec::new()),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 2).expect("the engine starts");
+        let mut member = engine.open().expect("a slot");
+        let mut long = engine.open().expect("a slot");
+        member.prefill(&[1]).expect("a short prompt");
+        arm.log.lock().expect("the log").clear();
+        let prompt: Vec<u32> = (1..=350).collect();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let first = std::thread::scope(|scope| {
+            let decoding = scope.spawn(|| {
+                let mut steps = 0usize;
+                while !done.load(Ordering::SeqCst) {
+                    member.decode(1).expect("a step");
+                    steps += 1;
+                }
+                steps
+            });
+            // The member is decoding before the long prompt arrives.
+            while arm.log.lock().expect("the log").last() != Some(&"step") {
+                std::thread::yield_now();
+            }
+            let first = long.prefill(&prompt).expect("the long prompt");
+            done.store(true, Ordering::SeqCst);
+            assert!(decoding.join().expect("the member") > 0);
+            first
+        });
+        assert_eq!(
+            first.next_token,
+            Some(prompt.iter().sum()),
+            "the prompt's answer is the one it computes whole"
+        );
+        let log = arm.log.lock().expect("the log").clone();
+        let parts: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| (*event == "part").then_some(index))
+            .collect();
+        assert_eq!(parts.len(), 4, "350 tokens are 4 parts of 100: {log:?}");
+        assert!(
+            log[parts[0]..parts[3]].contains(&"step"),
+            "the member stepped while the prompt ran: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_at_the_bypass_runs_whole_as_it_arrives() {
+        let arm = Arc::new(Parted {
+            log: Mutex::new(Vec::new()),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 1).expect("the engine starts");
+        let mut session = engine.open().expect("a slot");
+        let prompt: Vec<u32> = (1..=PREFILL_BYPASS_MAX_TOKENS as u32).collect();
+        let first = session.prefill(&prompt).expect("the prompt");
+        assert_eq!(first.next_token, Some(prompt.iter().sum()));
+        assert_eq!(arm.log.lock().expect("the log").len(), 3, "three parts in a row");
     }
 }

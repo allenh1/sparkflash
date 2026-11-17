@@ -2663,6 +2663,7 @@ dependencies = [
  "sparkflash-comm",
  "sparkflash-engram",
  "sparkflash-kv",
+ "sparkflash-runtime",
  "sparkflash-trace",
  "thiserror 2.0.21",
 ]

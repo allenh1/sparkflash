@@ -48,13 +48,11 @@ pub const NAIVE_SCORE_BYTES: usize = 16;
 /// Largest sequence the engine is configured for (`SPARK_MAX_SEQ_LEN`, decision D5).
 pub const MAX_CONTEXT_TOKENS: usize = 1_048_576;
 
-/// Short-request prefill bypass threshold in prompt tokens
-/// (`DSV41_PREFILL_BYPASS = 256`, spec 5.6.2).
-pub const PREFILL_BYPASS_MAX_TOKENS: usize = 256;
-
-/// Decode steps that run between two prefill chunks (`--prefill-decode-interval 2`,
-/// spec 5.6.2).
-pub const PREFILL_DECODE_INTERVAL: usize = 2;
+/// Short-request prefill bypass threshold in prompt tokens (`DSV41_PREFILL_BYPASS = 256`,
+/// spec 5.6.2) and the decode steps that run between two prefill chunks
+/// (`--prefill-decode-interval 2`, spec 5.6.2). The runtime's fused engine schedules every arm's
+/// prompts by them, so they live there and this crate names the same values.
+pub use sparkflash_runtime::{PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL};
 
 /// DSpark draft block size k (spec 5.6.3).
 pub const DSPARK_BLOCK_SIZE: usize = 5;

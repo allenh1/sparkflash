@@ -45,18 +45,19 @@ use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
 };
+use sparkflash_model::vision::VisionImage;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Opened, RoundArm, StepWall, TextWire,
-    mirror_until_the_group_ends, run_round, watched_hub,
+    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Opened, Part, RoundArm, StepWall,
+    TextWire, mirror_until_the_group_ends, run_round, watched_hub,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
 use crate::config::Glm5NextConfig;
-use crate::device::{CudaHandle, DeviceRank, DeviceSequence, LatentCache};
+use crate::device::{CudaHandle, DeviceRank, DeviceSequence, LatentCache, Prefill};
 
 /// How a session drafts, once the backend has been told to.
 #[derive(Debug, Clone)]
@@ -154,6 +155,7 @@ impl GlmFusion {
             opening: None,
             consumed: Vec::new(),
             prefill_cached: 0,
+            prompting: None,
         })
     }
 
@@ -277,6 +279,24 @@ impl FusedArm for GlmFusion {
         tokens: &[u32],
     ) -> Result<StepOutput, BackendError> {
         slot.prefill(tokens)
+    }
+
+    /// A prompt's bulk chunks run one a part ([DeviceRank::begin_prefill]); the arm serves text,
+    /// so a prompt with images is refused as [FusedArm::prefill_images] refuses it.
+    fn begin_prompt(
+        &self,
+        slot: &mut Glm5NextSession,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        if !images.is_empty() {
+            return self.prefill_images(slot, tokens, images).map(Part::Done);
+        }
+        slot.begin_prompt(tokens)
+    }
+
+    fn next_part(&self, slot: &mut Glm5NextSession) -> Result<Part, BackendError> {
+        slot.prompt_part()
     }
 
     /// Drafting members verify their rounds in one walk ([run_round]); a lone member, or every
@@ -846,6 +866,7 @@ impl ModelBackend for Glm5NextDeviceBackend {
             opening: None,
             consumed: Vec::new(),
             prefill_cached: 0,
+            prompting: None,
         }))
     }
 }
@@ -877,6 +898,20 @@ pub struct Glm5NextSession {
     consumed: Vec<u32>,
     /// How many of the last prefill's tokens its caches already held, for the request's usage.
     prefill_cached: usize,
+    /// The prompt running a bulk chunk at a time, between its first chunk and its last.
+    prompting: Option<Prompting>,
+}
+
+/// A prompt running a bulk chunk at a time ([Glm5NextSession::begin_prompt]).
+struct Prompting {
+    /// The tokens it forwards: the prompt past what the caches held.
+    tokens: Vec<u32>,
+    /// Tokens forwarded so far.
+    at: usize,
+    /// The position past its last token.
+    end: usize,
+    /// The tokens a chunk takes.
+    width: usize,
 }
 
 impl std::fmt::Debug for Glm5NextSession {
@@ -1096,6 +1131,35 @@ impl ModelSession for Glm5NextSession {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        let mut part = self.begin_prompt(tokens)?;
+        loop {
+            match part {
+                Part::Done(step) => return Ok(step),
+                Part::More => part = self.prompt_part()?,
+            }
+        }
+    }
+
+    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        if let Some(step) = self.feed(token)? {
+            return Ok(step);
+        }
+        self.round(token)
+    }
+
+    fn speculation(&self) -> Speculation {
+        self.spec
+            .as_ref()
+            .map_or_else(Speculation::default, Speculator::stats)
+    }
+}
+
+impl Glm5NextSession {
+    /// Starts a prompt ([ModelSession::prefill]) and forwards its first bulk chunk, or all of it
+    /// on the token path; [Self::prompt_part] forwards each next chunk
+    /// ([DeviceRank::begin_prefill]).
+    fn begin_prompt(&mut self, tokens: &[u32]) -> Result<Part, BackendError> {
+        self.prompting = None;
         if tokens.is_empty() {
             return Err(BackendError::new(
                 "glm5_device",
@@ -1143,36 +1207,72 @@ impl ModelSession for Glm5NextSession {
             .rank
             .lock()
             .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let logits = rank.forward_prefill(
+        let fresh = &tokens[reused..];
+        let begun = rank.begin_prefill(
             &self.shared.tp,
             &self.shared.gather,
             &mut self.sequence,
-            &tokens[reused..],
+            fresh,
+        );
+        drop(rank);
+        match begun? {
+            Prefill::Whole(logits) => Ok(Part::Done(self.first_step(logits))),
+            Prefill::Chunks { end, width } => {
+                self.prompting = Some(Prompting {
+                    tokens: fresh.to_vec(),
+                    at: 0,
+                    end,
+                    width,
+                });
+                self.prompt_part()
+            }
+        }
+    }
+
+    /// Forwards the running prompt's next bulk chunk ([Self::begin_prompt]); the last one ends
+    /// the prompt and answers its first step.
+    fn prompt_part(&mut self) -> Result<Part, BackendError> {
+        let mut prompting = self.prompting.take().ok_or_else(|| {
+            BackendError::new(
+                "glm5_device",
+                "this sequence has no prompt running a chunk at a time",
+            )
+        })?;
+        let mut rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let to = (prompting.at + prompting.width).min(prompting.tokens.len());
+        let logits = rank.prefill_chunk(
+            &self.shared.tp,
+            &self.shared.gather,
+            &mut self.sequence,
+            &prompting.tokens[prompting.at..to],
+            prompting.end,
         )?;
+        drop(rank);
+        prompting.at = to;
+        if to < prompting.tokens.len() {
+            self.prompting = Some(prompting);
+            return Ok(Part::More);
+        }
+        Ok(Part::Done(self.first_step(logits)))
+    }
+
+    /// The prompt's first step: the token its last row's logits choose.
+    fn first_step(&mut self, logits: Vec<f32>) -> StepOutput {
         let token = self.sampler.choose(&logits, &self.sampling);
         let next_token = if self.shared.eos.contains(&token) {
             None
         } else {
             Some(token)
         };
-        Ok(StepOutput {
+        StepOutput {
             logits,
             next_token,
             draft: Vec::new(),
-        })
-    }
-
-    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        if let Some(step) = self.feed(token)? {
-            return Ok(step);
         }
-        self.round(token)
-    }
-
-    fn speculation(&self) -> Speculation {
-        self.spec
-            .as_ref()
-            .map_or_else(Speculation::default, Speculator::stats)
     }
 }
 

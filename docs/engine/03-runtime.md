@@ -60,7 +60,7 @@ and the arms:
 | `fused` | slots, the engine thread, prefix claim, park and least-recently-used reclaim, multi-token runs | `sparkflash_model::fused` |
 | `share` | the step wall models and the row share: each verify row to the draft likeliest accepted while it pays | DeepSeek's `share_rows`, `multi_step_ms`, `batch_step_ms` |
 | `rounds` | one speculative round for several sequences: draft every chain, share rows, one walk, each sequence accepts | DeepSeek's `spec_multi_step`, generalized |
-| `prefill` (next) | chunk sizing, interleaving chunks with running decodes | DeepSeek's scheduler |
+| `fused` (prompts) | a long prompt a chunk at a time between the running decoders' steps (`FusedArm::begin_prompt`, `FusedArm::next_part`, `Part`); the arm keeps its own chunk sizing | DeepSeek's scheduler (`PREFILL_DECODE_INTERVAL`, `PREFILL_BYPASS_MAX_TOKENS`) |
 | `group` | rank 0 decides and broadcasts, workers replay: lanes, runs, give-backs, releases; an arm supplies only its wire (`GroupWire`: admission, sampler and image frames) | Inkling's `GroupLanes` |
 | `ledger` (next) | per arm, which strategies run natively, looped or off; printed at boot | new |
 
@@ -114,7 +114,7 @@ loop pipeline (which uses only the policy pieces).
 | 1. parallel drafts, Inkling | done: joint rounds, on by default (`SPARKFLASH_JOINT_ROUNDS=off` opts out) |
 | 2. generic group mirror | done: `GroupLanes`, `mirror_lanes`, `GroupWire`; Inkling's device group and GLM's and Qwen's `--tp4-rank` groups serve through it |
 | 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's and Qwen's groups step four lanes by default, GLM's on Inkling's lane memory |
-| 4. prefill scheduler | planned |
+| 4. prefill scheduler | done: the engine runs a prompt past 256 tokens a chunk at a time, two decode steps between chunks (`SPARKFLASH_PROMPT_PARTS=off` opts out); Inkling, GLM and Qwen split their prompts into parts |
 | 5. projection dispatcher | planned |
 | 6. typed plans executed | planned |
 
@@ -318,3 +318,32 @@ Every lane's answer, greedy and sampled, equals the one-request server's, and fo
 alone. A lone streamed request runs at the same rate either way: 57.5 / 62.2 / 84.3 tok/s for
 prose, code and a 4.7k-token prompt on the lanes, against 58.3 / 62.8 / 84.8 one at a time.
 Killing rank 2 left no rank running a second later.
+
+### Step 4: a prompt no longer stalls every decoder
+
+The engine queues a prompt longer than `PREFILL_BYPASS_MAX_TOKENS` (256) and runs it a part at a
+time: after the members have taken `PREFILL_DECODE_INTERVAL` (2) steps, or when no member steps,
+the front prompt runs its next part. A shorter prompt runs whole as it arrives. Both values are
+DeepSeek's (spec 5.6.2); `sparkflash-scheduler` now names the runtime's. A part is one of the
+arm's own prefill chunks, so the chunk boundaries and every bit stay as they were; what a chunk
+leaves for the next one (caches, the drafter's state, the MTP's stash) is the sequence's own, and
+the shared prefill scratch carries nothing between chunks. A group broadcasts each later part
+(`LanePart`) so every rank runs it between the same steps. `SPARKFLASH_PROMPT_PARTS=off` runs every
+prompt whole; any other value is refused at start.
+
+An arm that does not split its prompts keeps the default `begin_prompt`, which runs the whole
+prompt as one part.
+
+The gate: three requests decode (greedy, streamed) when a long prompt arrives, at TP=4, on 4,096-row
+chunks. Each decoder's answer equals its answer alone, and every answer is the same with parts on
+and off. Inkling's batch digests and every lanes-gate answer equal jr4's, and GLM's and Qwen's equal
+the last gate's.
+
+| | long prompt | decoders' longest pause, off | with parts | long prompt's first token, off | with parts |
+| --- | --- | --- | --- | --- | --- |
+| Inkling (deployed config) | 120k characters | 26.2 s | 6.1 s | 26.6 s | 30.2 s |
+| GLM-5.3-Flash | 60k characters | 10.2 s | 2.8 s | 10.1 s | 10.5 s |
+| Qwen3.8 NVFP4 | 60k characters | 10.3 s | 2.7 s | 10.1 s | 10.3 s |
+
+The decoders keep streaming while the prompt fills; the prompt's own first token pays for the
+decode steps between its chunks.

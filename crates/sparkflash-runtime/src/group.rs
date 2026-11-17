@@ -16,8 +16,9 @@
 //!
 //! Every rank holds its share of the weights and runs the same walks, because the collectives
 //! inside a walk block until every rank joins. Rank 0 alone runs the [crate::FusedEngine]: it picks
-//! which lanes step together, and [GroupLanes] broadcasts each decision (a lane's prompt, a step's
-//! members in their row order, a give-back, a release) *before* running it on its own rank. A
+//! which lanes step together, and [GroupLanes] broadcasts each decision (a lane's prompt and each
+//! later part of it, a step's members in their row order, a give-back, a release) *before* running
+//! it on its own rank. A
 //! worker runs [mirror_lanes] over its own lane arm and replays the frames in the order they came,
 //! so lane `n` is the same sequence on every rank and the collectives line up.
 //!
@@ -43,7 +44,7 @@ use sparkflash_comm::control::{
 use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
-use crate::fused::FusedArm;
+use crate::fused::{FusedArm, Part};
 
 /// What an arm decides about its group's frames.
 pub trait GroupWire: Send + Sync + 'static {
@@ -345,8 +346,19 @@ pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
                 if wire.trace() {
                     eprintln!("[{name}] serve worker lane {lane} prefill {prompt_ids:?}");
                 }
-                arm.prefill_images(slot, &prompt_ids, &images)
+                arm.begin_prompt(slot, &prompt_ids, &images)
                     .map_err(|error| format!("lane {lane}: prefill: {error}"))?;
+            }
+            Tp4ControlFrame::LanePart { lane } => {
+                let slot = pool
+                    .get_mut(lane as usize)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| out_of_step(lane))?;
+                if wire.trace() {
+                    eprintln!("[{name}] serve worker lane {lane} next part");
+                }
+                arm.next_part(slot)
+                    .map_err(|error| format!("lane {lane}: prefill part: {error}"))?;
             }
             Tp4ControlFrame::LaneRelease { lane } => {
                 let slot = pool
@@ -393,8 +405,8 @@ pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
             }
             other => {
                 return Err(format!(
-                    "the fused worker expected LaneRequest, LaneRelease, LaneStep, LaneGiveBack or \
-                     Error, not {}",
+                    "the fused worker expected LaneRequest, LanePart, LaneRelease, LaneStep, \
+                     LaneGiveBack or Error, not {}",
                     other.kind()
                 ));
             }
@@ -518,12 +530,30 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
         self.prefill_images(slot, tokens, &[])
     }
 
+    /// Every part through the frames, as the engine would run them back to back: a worker's
+    /// `LaneRequest` runs only the first part.
     fn prefill_images(
         &self,
         slot: &mut Self::Slot,
         tokens: &[u32],
         images: &[VisionImage],
     ) -> Result<StepOutput, BackendError> {
+        let mut part = self.begin_prompt(slot, tokens, images)?;
+        loop {
+            match part {
+                Part::Done(step) => return Ok(step),
+                Part::More => part = self.next_part(slot)?,
+            }
+        }
+    }
+
+    /// Broadcast: every rank begins the same lane's prompt and runs its first part.
+    fn begin_prompt(
+        &self,
+        slot: &mut Self::Slot,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
         // Refuse before the broadcast, as the serial session does.
         self.wire.admit(tokens, images)?;
         if !self.arm.room(Self::slot(slot)?, Some(tokens)) {
@@ -548,7 +578,24 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
                 keep,
                 sampler,
             })
-            .and_then(|()| self.arm.prefill_images(inner, tokens, images)),
+            .and_then(|()| self.arm.begin_prompt(inner, tokens, images)),
+        )
+    }
+
+    /// Broadcast: every rank runs the same lane's next part, between the same steps.
+    fn next_part(&self, slot: &mut Self::Slot) -> Result<Part, BackendError> {
+        if self.wire.trace() {
+            eprintln!(
+                "[{}] serve rank 0 lane {} next part",
+                self.wire.name(),
+                slot.lane
+            );
+        }
+        let lane = slot.lane;
+        let inner = Self::slot(slot)?;
+        self.in_step(
+            self.send(&Tp4ControlFrame::LanePart { lane })
+                .and_then(|()| self.arm.next_part(inner)),
         )
     }
 

@@ -56,7 +56,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_runtime::Opened;
+use sparkflash_runtime::{Opened, Part as PromptPart};
 
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
@@ -3064,6 +3064,9 @@ struct DeviceSequence {
     consumed: Vec<u32>,
     /// How many of the last prefill's tokens its caches already held, for the request's usage.
     prefill_cached: usize,
+    /// The prompt running a chunk at a time, between its first chunk and its last
+    /// ([DeviceSequence::begin_prompt]).
+    prompting: Option<Prompting>,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
     /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements; the MTP
@@ -5321,6 +5324,7 @@ impl DeviceSequence {
             position: 0,
             consumed: Vec::new(),
             prefill_cached: 0,
+            prompting: None,
             score_stride,
             keys: buffers.keys,
             values: buffers.values,
@@ -5953,6 +5957,47 @@ impl ModelSession for DeviceSequence {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        let mut part = self.begin_prompt(tokens)?;
+        loop {
+            match part {
+                PromptPart::Done(step) => return Ok(step),
+                PromptPart::More => part = self.prompt_part()?,
+            }
+        }
+    }
+    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = self.feed(token)? {
+            return Ok(step);
+        }
+        // Offer the drafts as the chain's later tokens. A step the policy gave no drafts is the
+        // same call with one row - the verify path agrees with nothing and gives nothing back -
+        // so a batch can step every one of its members through this one path.
+        let position = self.position;
+        let drafts = std::mem::take(&mut self.spec_drafts);
+        let confidence = std::mem::take(&mut self.spec_confidence);
+        let mut rows = Vec::with_capacity(drafts.len() + 1);
+        rows.push(token);
+        rows.extend_from_slice(&drafts);
+        let hashers = std::sync::Arc::new(self.ple_hashers.clone());
+        let logits = self
+            .forward_batch(&rows, rows.len(), rows.len() - 1)?
+            .ok_or_else(|| BackendError::new("qwen4_device", "a step has no logits"))?;
+        self.resolve_verify(&rows, &logits, position, &drafts, &confidence, &hashers)
+    }
+}
+
+impl DeviceSequence {
+    /// Starts a prompt ([ModelSession::prefill]) and forwards its first chunk;
+    /// [Self::prompt_part] forwards each next one. The chunks are the prefill plan's
+    /// ([PrefillPlan::forwards]), so running them a part at a time between other sequences' steps
+    /// changes no bits: everything a chunk leaves for the next (the caches, the MTP's stash, the
+    /// drafter's rings) is this sequence's own.
+    pub(super) fn begin_prompt(&mut self, tokens: &[u32]) -> Result<PromptPart, BackendError> {
+        self.prompting = None;
         if tokens.is_empty() {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -5990,46 +6035,67 @@ impl ModelSession for DeviceSequence {
         self.spec_drafts.clear();
         self.spec_confidence.clear();
         self.spec_served.clear();
-        let tokens = &tokens[reused..];
+        let tokens = tokens[reused..].to_vec();
         // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
         // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
         // keeps, so the chunks would find most of them evicted again.
         let forwards = self.backend.prefill.forwards(tokens.len());
-        let last_idx = forwards.len() - 1;
         // The first draft block sits just past the prompt and reaches `window_left` positions
         // back; nothing before that is ever read from the rings ([Dflash2Config::window_commits]).
         let end = self.position + tokens.len();
-        let mut logits = Vec::new();
-        for (idx, rows) in forwards.into_iter().enumerate() {
-            let chunk = &tokens[rows];
-            let is_last = idx == last_idx;
-            if let Some(last_logits) = self.forward_batch(chunk, usize::from(is_last), 0)? {
-                logits = last_logits;
+        self.prompting = Some(Prompting {
+            tokens,
+            forwards,
+            at: 0,
+            end,
+        });
+        self.prompt_part()
+    }
+
+    /// Forwards the running prompt's next chunk ([Self::begin_prompt]); the last one ends the
+    /// prompt and answers its first step.
+    pub(super) fn prompt_part(&mut self) -> Result<PromptPart, BackendError> {
+        let mut prompting = self.prompting.take().ok_or_else(|| {
+            BackendError::new(
+                "qwen4_device",
+                "this sequence has no prompt running a chunk at a time",
+            )
+        })?;
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let is_last = prompting.at + 1 == prompting.forwards.len();
+        let rows = prompting.forwards[prompting.at].clone();
+        let chunk = &prompting.tokens[rows];
+        let logits = self.forward_batch(chunk, usize::from(is_last), 0)?;
+        let start = self.position - chunk.len();
+        if self.drafting() {
+            // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
+            // projections split when that was the chunk.
+            let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
+                draft
+                    .config
+                    .window_commits((start, chunk.len()), prompting.end, DENSE_ROWS)
+                    .collect()
+            });
+            for (row, rows, position) in commits {
+                self.dflash_commit(row, rows, position)?;
             }
-            let start = self.position - chunk.len();
-            if self.drafting() {
-                // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
-                // projections split when that was the chunk.
-                let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
-                    draft
-                        .config
-                        .window_commits((start, chunk.len()), end, DENSE_ROWS)
-                        .collect()
-                });
-                for (row, rows, position) in commits {
-                    self.dflash_commit(row, rows, position)?;
-                }
-                continue;
-            }
+        } else if self.spec_enabled {
             // The MTP reads the prompt one row behind the model, so each chunk feeds it the rows
             // assembled from the previous chunk's last state and this one's. Its own key and value
             // caches have to cover the prompt too, or its first draft would attend to nothing.
-            if self.spec_enabled {
-                self.assemble_mtp_rows(chunk.len())?;
-                self.mtp_pass(chunk, start, false)?;
-                self.stash_last_hyper(chunk.len())?;
-            }
+            self.assemble_mtp_rows(chunk.len())?;
+            self.mtp_pass(chunk, start, false)?;
+            self.stash_last_hyper(chunk.len())?;
         }
+        prompting.at += 1;
+        if !is_last {
+            self.prompting = Some(prompting);
+            return Ok(PromptPart::More);
+        }
+        let logits = logits.unwrap_or_default();
         let next_token = self.next(&logits);
         if let Some(token) = next_token {
             let position = self.position;
@@ -6040,35 +6106,24 @@ impl ModelSession for DeviceSequence {
                 self.draft_chain(token, position)?;
             }
         }
-        Ok(StepOutput {
+        Ok(PromptPart::Done(StepOutput {
             next_token,
             logits,
             draft: Vec::new(),
-        })
+        }))
     }
-    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        self.backend
-            .cuda
-            .make_current()
-            .map_err(|error| BackendError::new("qwen4_device", error))?;
-        if let Some(step) = self.feed(token)? {
-            return Ok(step);
-        }
-        // Offer the drafts as the chain's later tokens. A step the policy gave no drafts is the
-        // same call with one row - the verify path agrees with nothing and gives nothing back -
-        // so a batch can step every one of its members through this one path.
-        let position = self.position;
-        let drafts = std::mem::take(&mut self.spec_drafts);
-        let confidence = std::mem::take(&mut self.spec_confidence);
-        let mut rows = Vec::with_capacity(drafts.len() + 1);
-        rows.push(token);
-        rows.extend_from_slice(&drafts);
-        let hashers = std::sync::Arc::new(self.ple_hashers.clone());
-        let logits = self
-            .forward_batch(&rows, rows.len(), rows.len() - 1)?
-            .ok_or_else(|| BackendError::new("qwen4_device", "a step has no logits"))?;
-        self.resolve_verify(&rows, &logits, position, &drafts, &confidence, &hashers)
-    }
+}
+
+/// A prompt running a chunk at a time ([DeviceSequence::begin_prompt]).
+struct Prompting {
+    /// The tokens it forwards: the prompt past what the caches held.
+    tokens: Vec<u32>,
+    /// Its chunks, as the prefill plan splits it.
+    forwards: Vec<std::ops::Range<usize>>,
+    /// The chunks forwarded so far.
+    at: usize,
+    /// The position past its last token.
+    end: usize,
 }
 
 /// Load the cubin and exercise two kernels on synthetic buffers.

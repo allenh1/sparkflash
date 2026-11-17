@@ -35,7 +35,10 @@ pub mod group;
 pub mod rounds;
 pub mod share;
 
-pub use fused::{FusedArm, FusedEngine, FusedSession};
+pub use fused::{
+    FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
+    PROMPT_PARTS_ENV, Part, prompt_parts,
+};
 pub use group::{
     GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
     mirror_until_the_group_ends, watched_hub,

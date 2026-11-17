@@ -53,7 +53,9 @@ use sparkflash_model::{
     Capabilities, DepthPolicy, ModelDescriptor, Speculator, StepCost, TpPlan, lookup_draft,
 };
 use sparkflash_ops::gemv::CudaHandle;
-use sparkflash_runtime::{ExpertUnionWall, FusedArm, Opened, RoundArm, StepWall, run_round};
+use sparkflash_runtime::{
+    ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round,
+};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
@@ -3321,6 +3323,21 @@ impl InklingLanes {
             .lock()
             .map_err(|_| BackendError::new(DEVICE, "the lanes' row buffer lock is poisoned"))
     }
+
+    /// Runs `work` on a lane's session with the lanes' chunk buffer lent to it, and takes the
+    /// buffer back after, however `work` ends.
+    fn lend<T>(
+        &self,
+        slot: &mut InklingLane,
+        work: impl FnOnce(&mut InklingDeviceSession) -> Result<T, BackendError>,
+    ) -> Result<T, BackendError> {
+        self.bind()?;
+        let mut buffer = self.buffer()?;
+        slot.session.chunk = buffer.take();
+        let answer = work(&mut slot.session);
+        *buffer = slot.session.chunk.take();
+        answer
+    }
 }
 
 impl FusedArm for InklingLanes {
@@ -3355,12 +3372,22 @@ impl FusedArm for InklingLanes {
         tokens: &[u32],
         images: &[VisionImage],
     ) -> Result<StepOutput, BackendError> {
-        self.bind()?;
-        let mut buffer = self.buffer()?;
-        slot.session.chunk = buffer.take();
-        let answer = slot.session.prompt(tokens, images);
-        *buffer = slot.session.chunk.take();
-        answer
+        self.lend(slot, |session| session.prompt(tokens, images))
+    }
+
+    /// A prompt's chunks take the lanes' one chunk buffer a chunk at a time, so the other lanes
+    /// step on it between two of them.
+    fn begin_prompt(
+        &self,
+        slot: &mut InklingLane,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        self.lend(slot, |session| session.begin_prompt(tokens, images))
+    }
+
+    fn next_part(&self, slot: &mut InklingLane) -> Result<Part, BackendError> {
+        self.lend(slot, InklingDeviceSession::prompt_part)
     }
 
     /// With the drafter on, the lanes' rounds verify in one walk ([run_round]): each lane opens
@@ -4595,6 +4622,8 @@ struct InklingDeviceSession {
     drafter: Option<DraftState>,
     /// The last prompt's end, kept to rewind to ([REWIND_ENV]); `None` when the switch is off.
     boundary: Option<Boundary>,
+    /// The prompt running a chunk at a time, between its first chunk and its last.
+    prompting: Option<Prompting>,
 }
 
 /// The prompt-boundary checkpoint ([REWIND_ENV]): what a sequence held at the end of its last
@@ -5077,6 +5106,9 @@ impl Drop for InklingDeviceSession {
         if let Some(boundary) = &self.boundary {
             pointers.push(boundary.arena);
         }
+        if let Some(buffer) = self.prompting.as_ref().and_then(|prompting| prompting.buffer) {
+            pointers.push(buffer);
+        }
         let refs: Vec<&Deviceptr> = pointers.iter().collect();
         self.shared.cuda.free_buffers(&refs);
     }
@@ -5195,19 +5227,56 @@ struct ImageRun {
     source: Deviceptr,
 }
 
+/// A prompt running a chunk at a time ([FusedArm::begin_prompt]): what its later chunks read and
+/// what its end keeps.
+struct Prompting {
+    tokens: Vec<u32>,
+    /// The prompt's image spans, which the history holds once the prompt ends.
+    spans: Vec<ImageSpan>,
+    /// The first position forwarded; the ones before it were reused.
+    start: usize,
+    /// Positions forwarded past `start`.
+    forwarded: usize,
+    runs: Vec<ImageRun>,
+    /// The fresh images' rows, given back when the prompt ends.
+    buffer: Option<Deviceptr>,
+    /// The last chunk's last position's logits.
+    logits: Vec<f32>,
+}
+
 impl InklingDeviceSession {
-    /// Consumes a prompt whose image spans take `images`' rows ([ModelSession::prefill_images]).
-    ///
-    /// The held history is reused when the prompt extends it and carries the images it holds at
-    /// the spans it holds them; otherwise the sequence starts over. The images after the reused
-    /// prefix are encoded on rank 0 into a zeroed row buffer every rank holds, the group's sum
-    /// makes every rank's buffer rank 0's, and each chunk writes its image rows over the
-    /// placeholders' after the embedding norm ([Injection]).
+    /// Consumes a prompt whose image spans take `images`' rows ([ModelSession::prefill_images]),
+    /// its chunks back to back ([Self::begin_prompt]).
     fn prompt(
         &mut self,
         tokens: &[u32],
         images: &[VisionImage],
     ) -> Result<StepOutput, BackendError> {
+        let mut part = self.begin_prompt(tokens, images)?;
+        loop {
+            match part {
+                Part::Done(step) => return Ok(step),
+                Part::More => part = self.prompt_part()?,
+            }
+        }
+    }
+
+    /// Starts a prompt and forwards its first chunk; [Self::prompt_part] forwards each next one.
+    ///
+    /// The held history is reused when the prompt extends it and carries the images it holds at
+    /// the spans it holds them; otherwise the sequence starts over. The images after the reused
+    /// prefix are encoded on rank 0 into a zeroed row buffer every rank holds, the group's sum
+    /// makes every rank's buffer rank 0's, and each chunk writes its image rows over the
+    /// placeholders' after the embedding norm ([Injection]). Between two chunks the prompt keeps
+    /// its rows in the sequence's state and the image buffer: a chunk copies the stacks and
+    /// histories in at its start and back at its end, so another sequence's walk on the shared
+    /// chunk buffer between them carries nothing into this one.
+    fn begin_prompt(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        self.end_parts()?;
         if tokens.is_empty() {
             return Err(BackendError::new("request", "the prompt is empty"));
         }
@@ -5278,7 +5347,7 @@ impl InklingDeviceSession {
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
         if remaining == 0 && !self.last_logits.is_empty() {
-            return Ok(self.output(self.last_logits.clone()));
+            return Ok(Part::Done(self.output(self.last_logits.clone())));
         }
         if remaining == 0 {
             return Err(BackendError::new(
@@ -5315,93 +5384,126 @@ impl InklingDeviceSession {
         if let Some(boundary) = self.boundary.as_mut() {
             boundary.position = None;
         }
-        let answer = self.forward(tokens, start, &runs);
-        if let Some(buffer) = buffer {
-            // The chunks' copies out of the buffer are queued; they finish before it goes.
-            let drained = self.shared.cuda.synchronize();
-            self.shared.cuda.free_buffers(&[&buffer]);
-            drained.map_err(Self::fail)?;
+        self.prompting = Some(Prompting {
+            tokens: tokens.to_vec(),
+            spans: images.iter().map(|image| image.span).collect(),
+            start,
+            forwarded: 0,
+            runs,
+            buffer,
+            logits: Vec::new(),
+        });
+        self.prompt_part()
+    }
+
+    /// Forwards the running prompt's next chunk ([Self::begin_prompt]); the last one ends the
+    /// prompt and answers its first step.
+    fn prompt_part(&mut self) -> Result<Part, BackendError> {
+        let mut prompting = self
+            .prompting
+            .take()
+            .ok_or_else(|| Self::fail("this sequence has no prompt running a chunk at a time"))?;
+        let forwarded = self.forward_chunk(&mut prompting);
+        if forwarded.is_ok() && prompting.start + prompting.forwarded < prompting.tokens.len() {
+            self.prompting = Some(prompting);
+            return Ok(Part::More);
         }
-        let logits = answer?;
-        self.held_images = images.iter().map(|image| image.span).collect();
+        self.free_prompt_rows(prompting.buffer)?;
+        forwarded?;
+        let logits = prompting.logits;
+        self.held_images = prompting.spans;
         self.last_logits = logits.clone();
         if let Some(boundary) = self.boundary.as_mut() {
             boundary
                 .copy(&self.shared, &self.state, self.drafter.as_ref(), false)
                 .map_err(Self::fail)?;
-            boundary.position = Some(tokens.len());
+            boundary.position = Some(prompting.tokens.len());
             boundary.images.clone_from(&self.held_images);
         }
-        Ok(self.output(logits))
+        Ok(Part::Done(self.output(logits)))
     }
 
-    /// Forwards `tokens[start..]` a chunk at a time, writing `runs`' image rows over their
-    /// positions, and answers the last position's logits.
-    fn forward(
-        &mut self,
-        tokens: &[u32],
-        start: usize,
-        runs: &[ImageRun],
-    ) -> Result<Vec<f32>, BackendError> {
-        let remaining = tokens.len() - start;
+    /// Gives back a prompt left running (its caller never ran its last chunk): the sequence then
+    /// holds the chunks it forwarded, and a next prompt reuses or replaces them as it would any.
+    fn end_parts(&mut self) -> Result<(), BackendError> {
+        match self.prompting.take() {
+            Some(prompting) => self.free_prompt_rows(prompting.buffer),
+            None => Ok(()),
+        }
+    }
+
+    /// Gives back a prompt's image rows, once the chunks' queued copies out of them finish.
+    fn free_prompt_rows(&self, buffer: Option<Deviceptr>) -> Result<(), BackendError> {
+        let Some(buffer) = buffer else {
+            return Ok(());
+        };
+        let drained = self.shared.cuda.synchronize();
+        self.shared.cuda.free_buffers(&[&buffer]);
+        drained.map_err(Self::fail)
+    }
+
+    /// Forwards the running prompt's next chunk, writing its image rows over their positions, and
+    /// keeps the chunk's last position's logits.
+    fn forward_chunk(&mut self, prompting: &mut Prompting) -> Result<(), BackendError> {
+        let remaining = prompting.tokens.len() - prompting.start;
         let row_bytes = self.shared.hidden() * std::mem::size_of::<f32>();
         // A prompt's positions are forwarded a chunk at a time. Under the chunk walk a tail of
         // one position takes the decode step, which computes the same numbers at a narrower
         // launch; under the tensor walk it stays a chunk, because a decode step's projections are
         // the GEMV's sums and a prompt's last row would then depend on where the chunks fell. An
-        // image row is always a chunk's: the decode step has no rows to write it over.
+        // image row is always a chunk's: the decode step has no rows to write it over. A chunk's
+        // width depends only on the positions left, so the chunks fall where they would back to
+        // back.
         let walk = self.shared.prefill_walk;
-        let mut logits = Vec::new();
-        let mut forwarded = 0usize;
-        while forwarded < remaining {
-            let take = if walk.chunked() {
-                self.shared.chunk_widths.next(remaining - forwarded)
-            } else {
-                1
-            };
-            let first = start + forwarded;
-            let slice = &tokens[first..first + take];
-            let images: Vec<Injection> = runs
-                .iter()
-                .filter_map(|run| {
-                    let from = run.position.max(first);
-                    let to = (run.position + run.count).min(first + take);
-                    (from < to).then(|| Injection {
-                        row: from - first,
-                        source: run.source.offset((from - run.position) * row_bytes),
-                        count: to - from,
-                    })
+        let forwarded = prompting.forwarded;
+        let take = if walk.chunked() {
+            self.shared.chunk_widths.next(remaining - forwarded)
+        } else {
+            1
+        };
+        let first = prompting.start + forwarded;
+        let slice = &prompting.tokens[first..first + take];
+        let images: Vec<Injection> = prompting
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let from = run.position.max(first);
+                let to = (run.position + run.count).min(first + take);
+                (from < to).then(|| Injection {
+                    row: from - first,
+                    source: run.source.offset((from - run.position) * row_bytes),
+                    count: to - from,
                 })
-                .collect();
-            logits = if take == 1 && walk != PrefillWalk::Tensor && images.is_empty() {
-                self.step(slice[0])?
+            })
+            .collect();
+        prompting.logits = if take == 1 && walk != PrefillWalk::Tensor && images.is_empty() {
+            self.step(slice[0])?
+        } else {
+            let taps = self.drafter.as_ref().map(DraftState::sink);
+            // The rows walk forwards an image row as a one-row chunk of the exact walk.
+            let walk = if walk.chunked() {
+                walk
             } else {
-                let taps = self.drafter.as_ref().map(DraftState::sink);
-                // The rows walk forwards an image row as a one-row chunk of the exact walk.
-                let walk = if walk.chunked() {
-                    walk
-                } else {
-                    PrefillWalk::Chunk
-                };
-                self.open_chunk(take)?;
-                let chunk = self.chunk.as_mut().expect("a chunk buffer was just opened");
-                walk_rows(
-                    &self.shared,
-                    Rows::Chunk(&mut self.state),
-                    chunk,
-                    slice,
-                    walk,
-                    &images,
-                    taps,
-                )?
-                .pop()
-                .ok_or_else(|| Self::fail("a chunk answered no row"))?
+                PrefillWalk::Chunk
             };
-            self.inject(take, first)?;
-            self.history.extend_from_slice(slice);
-            forwarded += take;
-        }
-        Ok(logits)
+            self.open_chunk(take)?;
+            let chunk = self.chunk.as_mut().expect("a chunk buffer was just opened");
+            walk_rows(
+                &self.shared,
+                Rows::Chunk(&mut self.state),
+                chunk,
+                slice,
+                walk,
+                &images,
+                taps,
+            )?
+            .pop()
+            .ok_or_else(|| Self::fail("a chunk answered no row"))?
+        };
+        self.inject(take, first)?;
+        self.history.extend_from_slice(slice);
+        prompting.forwarded += take;
+        Ok(())
     }
 
     /// The image rows of `images` (`rows` of them in all), on every rank: a zeroed f32 buffer that
@@ -5498,6 +5600,7 @@ impl InklingDeviceSession {
         let mut session = Self {
             drafter,
             boundary: None,
+            prompting: None,
             shared: Arc::clone(shared),
             state,
             chunk: None,
@@ -5567,6 +5670,7 @@ impl InklingDeviceSession {
 
     /// Forget the sequence, keeping its allocations: the next prompt starts at position zero.
     fn forget(&mut self) -> Result<(), BackendError> {
+        self.end_parts()?;
         self.state
             .reset(&self.shared)
             .map_err(|error| BackendError::new(DEVICE, error))?;

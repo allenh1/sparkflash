@@ -169,6 +169,12 @@ pub enum Tp4ControlFrame {
         /// The answers to roll back.
         count: u32,
     },
+    /// Rank 0 -> every worker of a fused group: lane `lane` runs the next part of the prompt its
+    /// `LaneRequest` began, between the steps the frames around it name.
+    LanePart {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -194,6 +200,7 @@ impl Tp4ControlFrame {
             Self::LaneRelease { .. } => "LaneRelease",
             Self::LaneStep { .. } => "LaneStep",
             Self::LaneGiveBack { .. } => "LaneGiveBack",
+            Self::LanePart { .. } => "LanePart",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
