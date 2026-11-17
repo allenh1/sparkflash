@@ -912,7 +912,11 @@ impl GlmDrafting {
         format!(
             "up to {} draft(s) a step, {} depth",
             self.drafts,
-            if self.policy.is_adaptive() { "adaptive" } else { "fixed" }
+            if self.policy.is_adaptive() {
+                "adaptive"
+            } else {
+                "fixed"
+            }
         )
     }
 }

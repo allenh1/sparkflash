@@ -65,7 +65,9 @@ use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampli
 use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
 use sparkflash_model::{ModelDescriptor, TpPlan};
 use sparkflash_runtime::group::{broadcast, image_frames};
-use sparkflash_runtime::{FusedEngine, GroupLanes, GroupWire, mirror_until_the_group_ends, watched_hub};
+use sparkflash_runtime::{
+    FusedEngine, GroupLanes, GroupWire, mirror_until_the_group_ends, watched_hub,
+};
 use sparkflash_weights::tp::TpLayout;
 
 use crate::collective::connect_rank;
@@ -250,7 +252,8 @@ pub fn open_master(
     // Lanes run ahead of rank 0's answers, so a rank that dies or fails mid-job ends the whole
     // group rather than leave the rest in a collective (sparkflash_runtime::group).
     let hub = if group.lanes > 1 {
-        watched_hub(hub).map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?
+        watched_hub(hub)
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?
     } else {
         Arc::new(Mutex::new(hub))
     };

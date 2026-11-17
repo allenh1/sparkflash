@@ -4392,7 +4392,14 @@ impl GlmTp4Rank {
         // and shortens the chain by those against a row's cost, as the fused lanes do.
         let (drafted, confidence) = self
             .rank
-            .draft_chain(&self.tp, &self.gather, &mut self.sequence, token, &self.spec, room)
+            .draft_chain(
+                &self.tp,
+                &self.gather,
+                &mut self.sequence,
+                token,
+                &self.spec,
+                room,
+            )
             .map_err(|error| format!("the GLM rank's draft failed: {error}"))?;
         // What the drafter offered, then what the policy thought the rows were worth.
         let proposed = confidence.len();
@@ -4671,7 +4678,9 @@ impl GlmLoadedRank {
 
     /// The shared speculator's depth rule for this rank's drafts.
     fn depth_policy(&self) -> Option<sparkflash_model::DepthPolicy> {
-        self.drafting.as_ref().map(|drafting| drafting.policy.clone())
+        self.drafting
+            .as_ref()
+            .map(|drafting| drafting.policy.clone())
     }
 
     /// Announces the load and answers how long it took.

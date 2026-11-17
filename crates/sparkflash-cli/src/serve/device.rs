@@ -66,9 +66,9 @@ use super::{
     bind_and_serve, control_frame_bytes, control_pixels_bytes, default_tokenizer, epoch_millis,
     finished_event_with_fabric, load_tokenizer, refused, tp4_cluster_snapshot,
 };
-use sparkflash_comm::control::{exit_now, watch_workers};
 use crate::device_link::{DeviceFinish, DeviceJob, DeviceLink, DeviceOutcome, DeviceTick};
 use sparkflash_api::VisionImage;
+use sparkflash_comm::control::{exit_now, watch_workers};
 use sparkflash_model::vision::{ImageGrid as Grid, ImageSpan};
 use sparkflash_vision::{Geometry, IMAGE_TOKEN_ID};
 
@@ -1520,8 +1520,8 @@ fn start_leader(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpStream;
     use sparkflash_model_deepseek_v41::encoding::{load_hf_tokenizer, reference_tokenizer_path};
+    use std::net::TcpStream;
 
     #[test]
     fn a_control_frame_the_sockets_cannot_hold_does_not_wait_for_the_worker() {

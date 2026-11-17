@@ -2163,7 +2163,9 @@ mod tests {
     #[test]
     fn an_inkling_plan_launches_its_lane_group_with_its_knobs() {
         let mut config = inkling_plan();
-        config.validate().expect("the Inkling four-Spark plan validates");
+        config
+            .validate()
+            .expect("the Inkling four-Spark plan validates");
         assert!(config.is_inkling() && config.is_lane_group());
         assert_eq!(config.world_size(), WORLD_SIZE);
         assert!(config.requires_conversion());
