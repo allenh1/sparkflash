@@ -29,7 +29,16 @@ new model is gated by these checks as they stand, not by a copy written for it:
                                prompt) and a rerun of it runs cold (cached 0). Whether the
                                continued answer equals the cold one is reported; --strict fails
                                on a difference (a continued turn forwards its suffix in other
-                               chunks than a cold prompt, which may move greedy bits).
+                               chunks than a cold prompt, which may move greedy bits). A first
+                               turn cut at the token limit may instead go back to the end of its
+                               prompt (REWOUND, cached exactly its first prompt), and so must
+                               every turn of the think-dropped conversations, whose client sends
+                               the reply back without its reasoning: the lane rewinds to the end
+                               of the first prompt rather than starting cold. A template whose
+                               next turn merges the first prompt's last id with what follows
+                               (Qwen's <think>\n\n after a held <think>, \n) rewinds by text
+                               (REWOUND+, cached one short of the first prompt); its answer reads
+                               the held ids and may differ from cold.
   all PORT --long FILE         lanes, lanes --sampled, interleave and turns.
 
 --out FILE writes a check's digests as JSON; --baseline FILE fails the check unless they equal a
@@ -259,7 +268,8 @@ def interleave(server, args):
 
 def turns(server, args):
     ok = True
-    for thinking, mode in ((False, "plain"), (True, "think")):
+    for thinking, mode in ((False, "plain"), (True, "think"), (True, "think-dropped")):
+        dropped = mode == "think-dropped"
         extra = {"chat_template_kwargs": {"thinking": thinking, "enable_thinking": thinking}}
         for shape, count in (("alone", 1), ("four", len(TURN_TOPICS))):
             label = "turns %s %s" % (mode, shape)
@@ -272,7 +282,7 @@ def turns(server, args):
             def second(pair):
                 (opening, answer), suffix = pair
                 reply = {"role": "assistant", "content": answer["said"][1]}
-                if answer["said"][0]:
+                if answer["said"][0] and not dropped:
                     reply["reasoning_content"] = answer["said"][0]
                 return server.ask([opening, reply, {"role": "user", "content": FOLLOW}], 1024,
                                   extra)
@@ -295,12 +305,23 @@ def turns(server, args):
                     passed = False
                     notes.append("c%d ERROR" % i)
                     continue
-                hit = a2["cached"] > a1["prompt"]
+                # Past the first prompt: the lane held the reply too. Exactly the first prompt: it
+                # went back to that prompt's end, which a re-rendered reply asks for. One short:
+                # it went back there and the next turn's rendering merged the prompt's last id
+                # with the text after it, which the host forwards as its own ids (by text).
+                extended = a2["cached"] > a1["prompt"]
+                exact = a1["prompt"] > 0 and a2["cached"] == a1["prompt"]
+                merged = a1["prompt"] > 1 and a2["cached"] == a1["prompt"] - 1
+                rewound = exact or merged
+                hit = extended or (rewound and (dropped or a1["cut"]))
                 equal = a2["said"] == c2["said"]
                 passed &= hit and c2["cached"] == 0 and (equal or not args.strict)
+                verdict = (
+                    "HIT" if extended else "REWOUND" if exact else "REWOUND+" if merged else "MISS"
+                )
                 notes.append("c%d %s cached %d of %d (t1 %d%s), cold cached %d, %s" % (
-                    i, "HIT" if hit else "MISS", a2["cached"], a2["prompt"], a1["prompt"],
-                    ", cut" if a1["cut"] else "", c2["cached"],
+                    i, verdict if hit else verdict + " (MISS)", a2["cached"], a2["prompt"],
+                    a1["prompt"], ", cut" if a1["cut"] else "", c2["cached"],
                     "equal to cold" if equal else "differs from cold"))
                 if not hit:
                     # The first reply's edges, where a re-rendering most often parts from the

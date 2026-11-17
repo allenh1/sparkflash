@@ -90,6 +90,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, HostMapped, Kernel,
     RunStream, SideStream, StreamEvent,
@@ -1820,6 +1821,14 @@ pub struct DeviceSequence {
     memory: Allocations,
     /// The sparse layers' caches, backed as the sequence grows.
     lane: SequenceLane,
+    /// The rewind point: each KDA layer's convolution history and recurrent memory, and the MTP
+    /// layer's hidden rows, as they were at the end of the last prompt ([DeviceRank::keep_point]),
+    /// when the rank keeps one ([sparkflash_runtime::REWIND_ENV]). The sparse caches need no copy:
+    /// a position's rows stay until a later write at that position, and an index pool is
+    /// rewritten from the cached keys when a row completes it.
+    point: Option<Checkpoint>,
+    /// The MTP layer's [SequenceDrafter::last] at the point.
+    point_last: Option<usize>,
 }
 
 /// Rows past a step's last position a sequence's lane backs too: the MTP layer's drafts write
@@ -2130,6 +2139,37 @@ impl DeviceSequence {
         self.lane.memory.lanes.room(&self.lane.span, rows, reset)
     }
 
+    /// The position the sequence can go back to ([DeviceRank::rewind]): the end of its last
+    /// prompt, while the copies hold it.
+    #[must_use]
+    pub fn rewind_point(&self) -> Option<usize> {
+        self.point.as_ref().and_then(Checkpoint::point)
+    }
+
+    /// The copies no longer hold a point: a prompt began to forward past it and will keep its own
+    /// end.
+    pub fn forget_point(&mut self) {
+        if let Some(point) = self.point.as_mut() {
+            point.forget();
+        }
+    }
+
+    /// The live regions the rewind point copies, in its order.
+    fn point_regions(&self) -> Vec<Deviceptr> {
+        let mut live = Vec::new();
+        for layer in &self.layers {
+            if let SequenceLayer::Linear {
+                conv, recurrent, ..
+            } = layer
+            {
+                live.extend([*conv, *recurrent]);
+            }
+        }
+        live.extend(self.drafter.as_ref().map(|drafter| drafter.hidden));
+        live.extend(self.block.as_ref().map(DraftScratch::rings));
+        live
+    }
+
     /// The drafter's confidence in each of the sequence's last drafts: the block drafter's
     /// selector's probability for its pick among the row's candidates, in `(0, 1]`, or the MTP
     /// layer's softmax probability of its argmax (0 for a row whose logits have no finite best).
@@ -2211,6 +2251,9 @@ pub struct DeviceRank {
     prefetch: Option<Prefetch>,
     /// Recorded after each embedding launch that reads a token slab ([Self::embed_rows]).
     tokens_staged: TokenFence,
+    /// Whether a sequence keeps a rewind point at the end of each prompt
+    /// ([sparkflash_runtime::REWIND_ENV], on by default).
+    rewind: bool,
     memory: Allocations,
 }
 
@@ -2460,6 +2503,7 @@ impl DeviceRank {
                 Self::profile_enabled()?
             )),
             tokens_staged,
+            rewind: sparkflash_runtime::rewind().map_err(refusal)?,
             memory,
         };
         if rank.mtp.is_some() && rank.lm_head.scales.is_none() {
@@ -2808,7 +2852,7 @@ impl DeviceRank {
     /// # Errors
     /// When `capacity` is past the context window or the device refuses an allocation.
     pub fn new_sequence(&self, capacity: usize) -> Result<DeviceSequence, BackendError> {
-        self.sequence(capacity, false)
+        self.sequence(capacity, false, false)
     }
 
     /// Whether this rank loaded a DFlash 2 block drafter ([Self::load_block_drafter]).
@@ -2903,6 +2947,75 @@ impl DeviceRank {
         if let Some(drafter) = sequence.drafter.as_mut() {
             drafter.last = None;
         }
+        sequence.forget_point();
+        Ok(())
+    }
+
+    /// Whether this rank's sequences keep a rewind point ([Self::keep_point]): unless
+    /// [sparkflash_runtime::REWIND_ENV] is off.
+    #[must_use]
+    pub fn rewinds(&self) -> bool {
+        self.rewind
+    }
+
+    /// Keeps `sequence`'s state at its position as its rewind point ([DeviceSequence::rewind_point]):
+    /// copies, on the rank's stream, of each KDA layer's convolution history and recurrent memory
+    /// and of the MTP layer's hidden rows or the block drafter's rings. A sequence with no point (the rank keeps none) is left
+    /// as it is.
+    ///
+    /// # Errors
+    /// A sequence with a verify waiting for its commit, or a copy the device refuses (the sequence
+    /// then holds no point).
+    pub fn keep_point(&self, sequence: &mut DeviceSequence) -> Result<(), BackendError> {
+        if sequence.point.is_none() {
+            return Ok(());
+        }
+        if sequence.pending.is_some() {
+            return Err(refusal(
+                "a sequence keeps its rewind point only once its verify is committed",
+            ));
+        }
+        self.make_current()?;
+        let live = sequence.point_regions();
+        let position = sequence.position;
+        let point = sequence
+            .point
+            .as_mut()
+            .ok_or_else(|| refusal("no rewind point"))?;
+        point
+            .save(&self.cuda, Some(&self.stream), &live, position)
+            .map_err(cuda_error)?;
+        sequence.point_last = sequence.drafter.as_ref().and_then(|drafter| drafter.last);
+        Ok(())
+    }
+
+    /// Takes `sequence` back to its rewind point `point` ([Self::keep_point]): the copies back
+    /// into its KDA layers and the MTP layer's hidden rows, on the rank's stream, and its position
+    /// to the point. A verify still waiting for its commit is dropped with the rows past the point.
+    ///
+    /// # Errors
+    /// A point the sequence does not hold, or a copy the device refuses.
+    pub fn rewind(&self, sequence: &mut DeviceSequence, point: usize) -> Result<(), BackendError> {
+        if sequence.rewind_point() != Some(point) {
+            return Err(refusal(format!(
+                "the sequence holds no rewind point at position {point}"
+            )));
+        }
+        self.make_current()?;
+        let live = sequence.point_regions();
+        let kept = sequence
+            .point
+            .as_ref()
+            .ok_or_else(|| refusal("no rewind point"))?;
+        kept.restore(&self.cuda, Some(&self.stream), &live, point)
+            .map_err(cuda_error)?;
+        sequence.position = point;
+        sequence.pending = None;
+        sequence.logits_at = None;
+        sequence.confidence.clear();
+        if let Some(drafter) = sequence.drafter.as_mut() {
+            drafter.last = sequence.point_last;
+        }
         Ok(())
     }
 
@@ -2915,7 +3028,7 @@ impl DeviceRank {
         if self.mtp.is_none() {
             return Err(refusal("this rank has no MTP layer to draft with"));
         }
-        self.sequence(capacity, true)
+        self.sequence(capacity, true, false)
     }
 
     /// Load the DFlash 2 block drafter in `directory`, for [Self::new_block_drafting_sequence]:
@@ -2993,22 +3106,22 @@ impl DeviceRank {
         &self,
         capacity: usize,
     ) -> Result<DeviceSequence, BackendError> {
-        let Some(block) = &self.block else {
+        if self.block.is_none() {
             return Err(refusal(
                 "this rank has no block drafter; load_block_drafter loads one",
             ));
-        };
-        let mut sequence = self.sequence(capacity, false)?;
-        let memory = &mut sequence.memory;
-        let scratch = DraftScratch::allocate(&block.draft, MAX_ROWS, |floats| {
-            memory.floats(floats).map_err(|error| error.to_string())
-        })
-        .map_err(cuda_error)?;
-        sequence.block = Some(scratch);
-        Ok(sequence)
+        }
+        self.sequence(capacity, false, true)
     }
 
-    fn sequence(&self, capacity: usize, drafting: bool) -> Result<DeviceSequence, BackendError> {
+    /// A fresh sequence of up to `capacity` positions; `drafting` gives it the MTP layer's state
+    /// (when the rank has the layer), `block` the block drafter's (when the rank has one).
+    fn sequence(
+        &self,
+        capacity: usize,
+        drafting: bool,
+        block: bool,
+    ) -> Result<DeviceSequence, BackendError> {
         self.make_current()?;
         let config = &self.config;
         if capacity > config.max_position_embeddings {
@@ -3056,6 +3169,15 @@ impl DeviceRank {
             }),
             None => None,
         };
+        let block = match (&self.block, block) {
+            (Some(drafter), true) => Some(
+                DraftScratch::allocate(&drafter.draft, MAX_ROWS, |floats| {
+                    memory.floats(floats).map_err(|error| error.to_string())
+                })
+                .map_err(cuda_error)?,
+            ),
+            _ => None,
+        };
         let mut sequence = DeviceSequence {
             position: 0,
             capacity,
@@ -3063,11 +3185,32 @@ impl DeviceRank {
             logits_at: None,
             layers,
             drafter,
-            block: None,
+            block,
             confidence: Vec::new(),
             memory,
             lane,
+            point: None,
+            point_last: None,
         };
+        if self.rewind {
+            let mut sizes = Vec::new();
+            for layer in &self.layers {
+                if let DeviceBranch::Linear(kda) = &layer.branch {
+                    sizes.extend([history * 3 * kda.width * 4, kda.heads * head * head * 4]);
+                }
+            }
+            if sequence.drafter.is_some() {
+                sizes.push(MAX_ROWS * config.hidden_size * 4);
+            }
+            // The block drafter's rings hold its context by position modulo the ring, so a reply
+            // longer than a block overwrites the window before the point: the point keeps them
+            // whole.
+            if let (Some(drafter), Some(scratch)) = (&self.block, &sequence.block) {
+                sizes.push(scratch.rings_region(drafter.draft.config()).1 * 4);
+            }
+            let arena = sequence.memory.bytes(Checkpoint::arena_bytes(&sizes))?;
+            sequence.point = Some(Checkpoint::new(arena, sizes));
+        }
         self.clear(&mut sequence)?;
         Ok(sequence)
     }

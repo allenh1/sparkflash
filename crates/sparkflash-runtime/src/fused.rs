@@ -93,6 +93,82 @@ pub fn extends(held: &[u32], prompt: &[u32]) -> bool {
     held.len() < prompt.len() && prompt.starts_with(held)
 }
 
+/// Whether a sequence keeps a rewind point at the end of each prompt ([FusedArm::rewind_prefix]):
+/// unset, empty or `on` (the default) keeps one, `off` keeps none, so a prompt that parts from the
+/// reply after the last prompt starts over. Anything else is refused. Every arm that keeps a rewind
+/// point reads it.
+pub const REWIND_ENV: &str = "SPARKFLASH_REWIND";
+
+/// [REWIND_ENV] as set.
+///
+/// # Errors
+/// A value other than `on` or `off`.
+pub fn rewind() -> Result<bool, String> {
+    rewind_request(std::env::var(REWIND_ENV).ok().as_deref())
+}
+
+/// What a [REWIND_ENV] of `value` asks for: `true` keeps a rewind point.
+///
+/// ```
+/// use sparkflash_runtime::fused::rewind_request;
+/// assert_eq!(rewind_request(None), Ok(true));
+/// assert_eq!(rewind_request(Some("off")), Ok(false));
+/// assert!(rewind_request(Some("0")).is_err());
+/// ```
+///
+/// # Errors
+/// A value other than `on` or `off`.
+pub fn rewind_request(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("" | "on") => Ok(true),
+        Some("off") => Ok(false),
+        Some(other) => Err(format!(
+            "{REWIND_ENV}={other} is not a switch: use on (the default: keep the end of each \
+             prompt to go back to) or off (start over)"
+        )),
+    }
+}
+
+/// Where a prompt takes up a kept sequence ([resume]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// The sequence's state ends at its history and the prompt extends it: forward the prompt
+    /// past these many tokens.
+    Extend(usize),
+    /// The prompt keeps the rewind point and goes past it: put the state back to the point, then
+    /// forward the prompt past these many tokens.
+    Rewind(usize),
+}
+
+/// How `prompt` takes up a sequence that holds `history`, when it can: past the whole history
+/// while the state ends there (`current`), or else past the first `point` tokens the sequence can
+/// go back to. A sequence a verify left ahead of its history (answers its caller gave back) is not
+/// current, so only its point serves. `None` says the prompt starts over.
+///
+/// ```
+/// use sparkflash_runtime::fused::{Resume, resume};
+/// let history = [1, 2, 3, 4, 5];
+/// assert_eq!(resume(&history, true, Some(3), &[1, 2, 3, 4, 5, 6]), Some(Resume::Extend(5)));
+/// assert_eq!(resume(&history, true, Some(3), &[1, 2, 3, 9]), Some(Resume::Rewind(3)));
+/// assert_eq!(resume(&history, false, Some(3), &[1, 2, 3, 4, 5, 6]), Some(Resume::Rewind(3)));
+/// assert_eq!(resume(&history, true, Some(3), &[1, 2, 3]), None);
+/// assert_eq!(resume(&history, true, None, &[1, 2, 3, 9]), None);
+/// assert_eq!(resume(&[], true, None, &[7]), Some(Resume::Extend(0)));
+/// ```
+#[must_use]
+pub fn resume(
+    history: &[u32],
+    current: bool,
+    point: Option<usize>,
+    prompt: &[u32],
+) -> Option<Resume> {
+    if current && extends(history, prompt) {
+        return Some(Resume::Extend(history.len()));
+    }
+    let point = point.filter(|&point| point <= history.len())?;
+    extends(&history[..point], prompt).then_some(Resume::Rewind(point))
+}
+
 /// What one part of a prompt left ([FusedArm::begin_prompt]).
 #[derive(Debug, Clone)]
 pub enum Part {
@@ -216,15 +292,22 @@ pub trait FusedArm: Send + Sync + 'static {
     /// Whether the slot can take `prompt` as it stands, continuing what [FusedArm::history]
     /// holds. The engine renews a slot that holds a request and cannot, before the prompt runs.
     ///
-    /// The default is when the prompt [extends] the history, so an arm that names its history
-    /// needs a prefill that forwards only past it and nothing more. An arm whose prompt also
-    /// rewinds into the history or starts over by itself answers whenever it keeps one.
+    /// The default is when the prompt [extends] the history or the rewind point
+    /// ([FusedArm::rewind_prefix]), so an arm that names them needs a prefill that forwards past
+    /// one of them ([resume]) and nothing more. An arm whose prompt starts over by itself answers
+    /// whenever it keeps a history.
     fn continues(&self, slot: &Self::Slot, prompt: &[u32]) -> bool {
         self.history(slot).is_some_and(|held| extends(held, prompt))
+            || self
+                .rewind_prefix(slot)
+                .is_some_and(|point| extends(point, prompt))
     }
 
-    /// A shorter prefix of [FusedArm::history] the slot can go back to, as
-    /// [ModelSession::rewind_prefix] names it.
+    /// A prefix of the slot's last prompt and reply it can go back to, as
+    /// [ModelSession::rewind_prefix] names it: the end of the last prompt, where the arm keeps
+    /// what its caches do not hold (`sparkflash_kernels::checkpoint::Checkpoint`). It may name one
+    /// while [FusedArm::history] names none: a slot left ahead of its history by answers the
+    /// caller gave back goes back to the point.
     fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
         let _ = slot;
         None
@@ -280,8 +363,11 @@ pub trait FusedArm: Send + Sync + 'static {
     /// The caller never used the last `count` steps the slot answered (its run ended early: a stop
     /// string, the token limit, a forced token): roll them back, so the slot's history ends where
     /// the caller's does. They are always answers [FusedArm::ready] said were held, so they lie in
-    /// the round that produced them. The default refuses any count but zero, as an arm that holds
-    /// no answers never runs more than one step a reply.
+    /// the round that produced them. An arm whose caches cannot take them back may cut its history
+    /// there instead and name none while its state is ahead of it ([FusedArm::history]): its
+    /// rewind point still serves the next prompt. The default refuses any count but zero, as an
+    /// arm that holds no answers never runs more than one step a reply; the engine then renews
+    /// the slot.
     ///
     /// # Errors
     /// An arm that cannot give back what it was asked to.
@@ -1462,6 +1548,105 @@ mod tests {
         assert_eq!(session.cached_tokens(), 0);
         assert_eq!(arm.renewed.load(Ordering::SeqCst), 2);
         assert_eq!(session.reusable_prefix(), Some(&[9][..]));
+    }
+
+    /// A keeper with a rewind point at the end of each prompt, as GLM's and Qwen's sequences keep
+    /// one: its prefill takes a prompt as [resume] says and refuses any other.
+    struct Rewinder {
+        renewed: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct Pointed {
+        ids: Vec<u32>,
+        point: Option<usize>,
+        cached: usize,
+    }
+
+    impl FusedArm for Rewinder {
+        type Slot = Pointed;
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            Ok(Pointed::default())
+        }
+
+        fn holds_request(&self, slot: &Self::Slot) -> bool {
+            !slot.ids.is_empty()
+        }
+
+        fn renew(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
+            self.renewed.fetch_add(1, Ordering::SeqCst);
+            *slot = Pointed::default();
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            slot: &mut Self::Slot,
+            tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            slot.cached = match resume(&slot.ids, true, slot.point, tokens) {
+                Some(Resume::Extend(held) | Resume::Rewind(held)) => held,
+                None => return Err(BackendError::new("toy", "the prompt takes up nothing")),
+            };
+            slot.ids = tokens.to_vec();
+            slot.point = Some(tokens.len());
+            Ok(StepOutput::default())
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(slot, token)| {
+                    slot.ids.push(*token);
+                    StepOutput::default()
+                })
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+
+        fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            Some(&slot.ids)
+        }
+
+        fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
+            slot.point
+                .filter(|&point| point < slot.ids.len())
+                .map(|point| &slot.ids[..point])
+        }
+
+        fn cached_tokens(&self, slot: &Self::Slot) -> usize {
+            slot.cached
+        }
+    }
+
+    /// The default [FusedArm::continues] takes a prompt past the rewind point too: an arm that
+    /// names its point gets a turn that parts from the reply without renewing its slot.
+    #[test]
+    fn a_prompt_past_the_rewind_point_continues_the_slot() {
+        let arm = Arc::new(Rewinder {
+            renewed: AtomicUsize::new(0),
+        });
+        let engine = FusedEngine::start(Arc::clone(&arm), 1).expect("the engine starts");
+        let mut session = engine.open().expect("a slot");
+        session.prefill(&[1, 2, 3]).expect("the prefill");
+        session.decode(4).expect("the decode");
+        session.decode(5).expect("the decode");
+        assert_eq!(session.rewind_prefix(), Some(&[1, 2, 3][..]));
+        // The client renders the reply again with other ids: back to the prompt's end.
+        session.prefill(&[1, 2, 3, 6, 7]).expect("the rewound turn");
+        assert_eq!(session.cached_tokens(), 3);
+        assert_eq!(arm.renewed.load(Ordering::SeqCst), 0);
+        // A prompt that keeps neither the history nor the point starts over on a renewed slot.
+        session.decode(8).expect("the decode");
+        session.prefill(&[1, 2, 9]).expect("another conversation");
+        assert_eq!(session.cached_tokens(), 0);
+        assert_eq!(arm.renewed.load(Ordering::SeqCst), 1);
     }
 
     /// A [Keeper] whose slots share a budget of `limit` ids, counted by what each slot holds.

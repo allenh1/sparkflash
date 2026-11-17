@@ -56,8 +56,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_runtime::{Opened, Part as PromptPart};
+use sparkflash_runtime::{Opened, Part as PromptPart, Resume};
 
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
@@ -2795,6 +2796,8 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
+        let rewind = sparkflash_runtime::rewind()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
@@ -2804,6 +2807,7 @@ impl Qwen4ExpDeviceBackend {
             prefill,
             pooled: std::sync::Mutex::new(None),
             verify_rows,
+            rewind,
             tp,
             gdn_scan,
         });
@@ -3215,6 +3219,13 @@ struct DeviceSequence {
     draft: Option<DraftScratch>,
     /// The positions the caches hold; a verify that would run past it is never drafted.
     context_limit: usize,
+    /// The rewind point: each GDN layer's convolution history and recurrent memory, each PLE
+    /// layer's frames and the MTP's stash, as they were at the end of the last prompt
+    /// ([Self::keep_point]), when the backend keeps one ([sparkflash_runtime::REWIND_ENV]). The
+    /// attention caches need no copy: a position's rows stay until a later write at that position.
+    point: Option<Checkpoint>,
+    /// The n-gram windows at the point, which live on the host.
+    point_hashers: Vec<Option<crate::ngram::PleHasher>>,
     /// Verified answers whose tokens the engine has not consumed yet, oldest first.
     spec_queue: Vec<SpecPending>,
     /// The verified answers the engine consumed since the last forward, oldest first: what a run
@@ -3269,6 +3280,33 @@ struct SpecPending {
     replay: Vec<u32>,
 }
 
+/// The bytes of each region a rewind point copies, in [DeviceSequence::point_regions]'s order:
+/// each GDN layer's convolution history and recurrent memory, each PLE layer's frames, then the
+/// MTP's stash.
+fn point_sizes(
+    config: &Qwen4ExpConfig,
+    width: usize,
+    gdn_conv: &[Option<Deviceptr>],
+    ple_conv: &[Option<Deviceptr>],
+    rings: usize,
+) -> Vec<usize> {
+    let history = config.linear_conv_kernel_dim.saturating_sub(1).max(1);
+    let conv = history * config.linear_conv_width() * 4;
+    let recurrent = config.linear_num_value_heads
+        * config.linear_key_head_dim
+        * config.linear_value_head_dim
+        * 4;
+    let ple = config.ple_conv_kernel_size.saturating_sub(1).max(1) * config.ngram_size * width * 4;
+    let mut sizes = Vec::new();
+    for _ in gdn_conv.iter().flatten() {
+        sizes.extend([conv, recurrent]);
+    }
+    sizes.extend(ple_conv.iter().flatten().map(|_| ple));
+    sizes.push(width * 4);
+    sizes.push(rings);
+    sizes
+}
+
 struct ReusableBuffers {
     keys: Vec<Option<Deviceptr>>,
     values: Vec<Option<Deviceptr>>,
@@ -3277,6 +3315,8 @@ struct ReusableBuffers {
     gdn_recurrent: Vec<Option<Deviceptr>>,
     gdn_spare: Vec<Option<Deviceptr>>,
     ple_conv: Vec<Option<Deviceptr>>,
+    /// The rewind point's arena, when the backend keeps one.
+    point: Option<Deviceptr>,
     scratch: [Deviceptr; 52],
     prefill: PrefillScratch,
     draft: Option<DraftScratch>,
@@ -3301,6 +3341,7 @@ impl ReusableBuffers {
                 .chain(&self.gdn_recurrent)
                 .chain(&self.gdn_spare)
                 .chain(&self.ple_conv)
+                .chain(std::iter::once(&self.point))
                 .flatten(),
         );
         cuda.free_buffers(&ptrs);
@@ -3326,6 +3367,7 @@ impl Drop for DeviceSequence {
             gdn_recurrent: std::mem::take(&mut self.gdn_recurrent),
             gdn_spare: std::mem::take(&mut self.gdn_spare),
             ple_conv: std::mem::take(&mut self.ple_conv),
+            point: self.point.as_ref().map(Checkpoint::arena),
             scratch: [
                 self.hyper,
                 self.normed,
@@ -3443,6 +3485,10 @@ struct SequenceShared {
     /// The most rows a speculative verify forward takes: the token being decoded and the drafts
     /// after it. Every row but the last has a snapshot region to roll back to.
     verify_rows: usize,
+    /// Whether a sequence keeps a rewind point at the end of each prompt
+    /// ([sparkflash_runtime::REWIND_ENV], on by default); never under the DFlash 2 drafter, whose
+    /// rings hold the positions past one.
+    rewind: bool,
     /// The world this rank's partials are summed over, when the arm is one rank of several; its
     /// `config` is then the rank's share ([tp::rank_config]).
     tp: Option<tp::TensorParallel>,
@@ -5340,6 +5386,7 @@ impl DeviceSequence {
                 gdn_recurrent,
                 gdn_spare,
                 ple_conv,
+                point: None,
                 scratch,
                 prefill,
                 draft,
@@ -5347,6 +5394,30 @@ impl DeviceSequence {
                 token_staging,
             }
         };
+        let mut buffers = buffers;
+        // A DFlash 2 drafter's rings hold its context's keys and values by position modulo the
+        // ring, so a reply longer than a block overwrites the window before the point: the point
+        // keeps the whole ring.
+        let rings = shared
+            .dflash
+            .as_ref()
+            .zip(buffers.draft.as_ref())
+            .map_or(0, |(draft, scratch)| {
+                scratch.rings_region(&draft.config).1 * 4
+            });
+        let point_sizes = point_sizes(&config, width, &buffers.gdn_conv, &buffers.ple_conv, rings);
+        if !shared.rewind
+            && let Some(arena) = buffers.point.take()
+        {
+            cuda.free_buffers(&[&arena]);
+        }
+        if shared.rewind && buffers.point.is_none() {
+            let mut total = 0usize;
+            buffers.point = Some(
+                cuda.alloc(Checkpoint::arena_bytes(&point_sizes), &mut total)
+                    .map_err(|error| BackendError::new("qwen4_device", error))?,
+            );
+        }
         let history = config.linear_conv_kernel_dim.saturating_sub(1).max(1);
         let conv_elems = history * config.linear_conv_width();
         let rec_elems = config.linear_num_value_heads
@@ -5454,6 +5525,10 @@ impl DeviceSequence {
             prefill: buffers.prefill,
             draft: buffers.draft,
             context_limit,
+            point: buffers
+                .point
+                .map(|arena| Checkpoint::new(arena, point_sizes)),
+            point_hashers: Vec::new(),
             spec_queue: Vec::new(),
             spec_served: Vec::new(),
             spec_drafts: Vec::new(),
@@ -5954,6 +6029,85 @@ impl DeviceSequence {
         self.sampler.record(token);
         self.consumed.push(token);
     }
+
+    /// The position the sequence can go back to ([Self::rewind]): the end of its last prompt,
+    /// while the copies hold it.
+    fn rewind_point(&self) -> Option<usize> {
+        self.point.as_ref().and_then(Checkpoint::point)
+    }
+
+    /// The live regions the rewind point copies, in [point_sizes]'s order.
+    fn point_regions(&self) -> Vec<Deviceptr> {
+        let mut live = Vec::new();
+        for (conv, recurrent) in self.gdn_conv.iter().zip(&self.gdn_recurrent) {
+            if let (Some(conv), Some(recurrent)) = (conv, recurrent) {
+                live.extend([*conv, *recurrent]);
+            }
+        }
+        live.extend(self.ple_conv.iter().flatten().copied());
+        live.push(self.mtp_stash);
+        // The DFlash 2 drafter's rings, whole; no region when there is no drafter.
+        live.push(
+            self.backend
+                .dflash
+                .as_ref()
+                .zip(self.draft.as_ref())
+                .map_or(Deviceptr(0), |(draft, scratch)| {
+                    scratch.rings_region(&draft.config).0
+                }),
+        );
+        live
+    }
+
+    /// Keeps the sequence's state at its position as its rewind point, on its stream: the copies
+    /// of [Self::point_regions] and the n-gram windows. A sequence with no point is left as it is.
+    ///
+    /// # Errors
+    /// A copy the device refuses (the sequence then holds no point).
+    fn keep_point(&mut self) -> Result<(), BackendError> {
+        let live = self.point_regions();
+        let position = self.position;
+        let cuda = &self.backend.cuda;
+        let stream = self.batch_stream.as_ref().unwrap_or(&self.stream);
+        let Some(point) = self.point.as_mut() else {
+            return Ok(());
+        };
+        point
+            .save(cuda, Some(stream), &live, position)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.point_hashers.clone_from(&self.ple_hashers);
+        Ok(())
+    }
+
+    /// Takes the sequence back to its rewind point `point` ([Self::keep_point]): the copies back
+    /// into its live regions on its stream, the n-gram windows, and its position and history to
+    /// the point, with every verified answer and draft past it dropped.
+    ///
+    /// # Errors
+    /// A point the sequence does not hold, or a copy the device refuses.
+    fn rewind(&mut self, point: usize) -> Result<(), BackendError> {
+        if self.rewind_point() != Some(point) || point > self.consumed.len() {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("the sequence holds no rewind point at position {point}"),
+            ));
+        }
+        let live = self.point_regions();
+        let kept = self
+            .point
+            .as_ref()
+            .ok_or_else(|| BackendError::new("qwen4_device", "no rewind point"))?;
+        kept.restore(&self.backend.cuda, Some(self.clock()), &live, point)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.ple_hashers.clone_from(&self.point_hashers);
+        self.position = point;
+        self.consumed.truncate(point);
+        self.spec_queue.clear();
+        self.spec_served.clear();
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        Ok(())
+    }
 }
 
 impl ModelBackend for Qwen4ExpDeviceBackend {
@@ -6000,6 +6154,13 @@ impl ModelSession for DeviceSequence {
     fn reusable_prefix(&self) -> Option<&[u32]> {
         (self.spec_queue.is_empty() && self.position == self.consumed.len())
             .then_some(self.consumed.as_slice())
+    }
+
+    /// The end of the last prompt, while the sequence can go back to it ([Self::rewind]) and
+    /// something past it was forwarded.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        let point = self.rewind_point()?;
+        (point < self.position && point <= self.consumed.len()).then(|| &self.consumed[..point])
     }
 
     fn cached_tokens(&self) -> usize {
@@ -6071,21 +6232,34 @@ impl DeviceSequence {
         // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
         // case only the tokens past it are forwarded. Its sampler history is the whole prompt
         // either way: the penalties count every token the request reads.
-        let reused = self
-            .consumed
-            .iter()
-            .zip(tokens)
-            .take_while(|(held, given)| held == given)
-            .count();
-        if reused != self.consumed.len() || reused >= tokens.len() {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "a prefill must extend the {} token(s) this sequence holds by at least one; \
-                     this one does not",
-                    self.consumed.len()
-                ),
-            ));
+        // One that parts from the history, or that the sequence ran ahead of, may still keep the
+        // last prompt and go past it: the sequence goes back to that prompt's end first.
+        let current = self.spec_queue.is_empty() && self.position == self.consumed.len();
+        let reused = match sparkflash_runtime::resume(
+            &self.consumed,
+            current,
+            self.rewind_point(),
+            tokens,
+        ) {
+            Some(Resume::Extend(held)) => held,
+            Some(Resume::Rewind(point)) => {
+                self.rewind(point)?;
+                point
+            }
+            None => {
+                return Err(BackendError::new(
+                    "qwen4_device",
+                    format!(
+                        "a prefill must extend the {} token(s) this sequence holds by at least \
+                         one, or go past its rewind point; this one does neither",
+                        self.consumed.len()
+                    ),
+                ));
+            }
+        };
+        // The prompt forwards past the point: its own end is the next one.
+        if let Some(point) = self.point.as_mut() {
+            point.forget();
         }
         self.prefill_cached = reused;
         self.sampler.record_prompt(tokens);
@@ -6155,6 +6329,9 @@ impl DeviceSequence {
             self.prompting = Some(prompting);
             return Ok(PromptPart::More);
         }
+        // The prompt's end, before any draft past it: the state a next prompt that keeps this one
+        // goes back to.
+        self.keep_point()?;
         let logits = logits.unwrap_or_default();
         let next_token = self.next(&logits);
         if let Some(token) = next_token {

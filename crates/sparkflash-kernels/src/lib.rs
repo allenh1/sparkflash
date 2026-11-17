@@ -44,6 +44,7 @@ pub mod bf16a_mxfp8w_wo_a_launch;
 pub mod c_decl;
 pub mod cache_plan;
 pub mod cert_lm_head_launch;
+pub mod checkpoint;
 pub mod compressed_append_launch;
 pub mod compressed_cache_ref;
 pub mod compressor_staging;

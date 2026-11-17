@@ -2036,7 +2036,7 @@ text, prints `prefix reuse by rewind`, and reports the boundary as the hit; the 
 one point to every rank, so they rewind together. A reply longer than a widest chunk past the
 boundary makes the session offer no rewind, and the prompt runs as it would have.
 
-`SPARKFLASH_INKLING_REWIND=off` keeps no checkpoint and opens the drafter's rings at their window,
+`SPARKFLASH_REWIND=off` (named `SPARKFLASH_INKLING_REWIND` when this was measured) keeps no checkpoint and opens the drafter's rings at their window,
 and the prompt then runs cold. Any value other than on or off is refused.
 
 Four ranks, row split, batch arm (`--rewind 512`: a prompt, 24 greedy ids, then the prompt and

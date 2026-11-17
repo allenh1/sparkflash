@@ -37,6 +37,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, Kernel, Module,
     SideStream, StreamEvent,
@@ -358,18 +359,32 @@ fn overlap_request(value: Option<&str>) -> Result<Option<bool>, String> {
     }
 }
 
-/// The switch for the prompt-boundary checkpoint. Unset, empty or `on` keeps a copy, at the end of
-/// every prompt, of the state a sequence's cache rows do not hold: each layer's convolution
-/// histories, and the drafter's Markov feature. A next prompt that keeps that prompt but parts from
-/// the reply after it then rewinds to the prompt's end rather than starting over, as a chat client
-/// that renders the reply again with other ids makes it. `off` keeps no copy. Anything else is
-/// refused.
+/// The switch for the prompt-boundary checkpoint, which every arm reads. Unset, empty or `on`
+/// keeps a copy, at the end of every prompt, of the state a sequence's cache rows do not hold: each
+/// layer's convolution histories, and the drafter's Markov feature. A next prompt that keeps that
+/// prompt but parts from the reply after it then rewinds to the prompt's end rather than starting
+/// over, as a chat client that renders the reply again with other ids makes it. `off` keeps no
+/// copy. Anything else is refused.
 ///
 /// A rewind reads the rows its cache holds before the boundary, so the reply and the drafts after
 /// it must not have written over them: a sliding ring holds its window and a widest chunk, and the
 /// drafter's local rings are opened as wide under `on` (window + widest chunk - 1 rows of each
 /// local layer's keys and values, 32 KiB a row on Inkling-2's drafter).
-pub const REWIND_ENV: &str = "SPARKFLASH_INKLING_REWIND";
+pub use sparkflash_runtime::REWIND_ENV;
+
+/// The name Inkling's switch had before every arm read [REWIND_ENV]; set, it is refused with the
+/// name to use, so a launch script that still sets it does not silently lose its value.
+const OLD_REWIND_ENV: &str = "SPARKFLASH_INKLING_REWIND";
+
+/// What [REWIND_ENV] asks for, refusing [OLD_REWIND_ENV] when `old` is set.
+fn rewind_request(value: Option<&str>, old: Option<&str>) -> Result<bool, String> {
+    if let Some(old) = old {
+        return Err(format!(
+            "{OLD_REWIND_ENV}={old} is now {REWIND_ENV}, which every model reads: set that instead"
+        ));
+    }
+    sparkflash_runtime::rewind_request(value)
+}
 
 /// A switch that is on unless it is named off: unset, empty or `on` is `true`, `off` is `false`,
 /// and anything else is refused with what each of the two does.
@@ -381,16 +396,6 @@ fn default_on(name: &str, value: Option<&str>, on: &str, off: &str) -> Result<bo
             "{name}={other} is not a switch: use on (the default: {on}) or off ({off})"
         )),
     }
-}
-
-/// What [REWIND_ENV] asks for: `true` keeps the checkpoint.
-fn rewind_request(value: Option<&str>) -> Result<bool, String> {
-    default_on(
-        REWIND_ENV,
-        value,
-        "a prompt that keeps the last prompt and parts from its reply rewinds to the prompt's end",
-        "it starts over",
-    )
 }
 
 /// The switch for the chunk walk's block residuals (`inkling_block_residual_chain_*`). Unset, empty
@@ -2785,7 +2790,10 @@ impl InklingDeviceBackend {
             }
         }
         let depth_policy = depth_policy_from_env(draft, |name| std::env::var(name).ok())?;
-        let rewind = rewind_request(std::env::var(REWIND_ENV).ok().as_deref())?;
+        let rewind = rewind_request(
+            std::env::var(REWIND_ENV).ok().as_deref(),
+            std::env::var(OLD_REWIND_ENV).ok().as_deref(),
+        )?;
         // A stack grows one row a block boundary (layer % block == 0).
         let summaries = config
             .num_hidden_layers
@@ -4622,65 +4630,70 @@ struct InklingDeviceSession {
 /// histories and the drafter's Markov feature are the state after the last row and nothing else:
 /// these are copied out at the prompt's end and back in at a rewind.
 struct Boundary {
-    /// One allocation: every layer's four histories in slot order, then the drafter's feature.
-    arena: Deviceptr,
-    /// Where the feature's copy starts in the arena, when the sequence drafts with DSpark.
-    feature: Option<usize>,
-    /// The prompt's length while the copies hold its end; `None` before a prompt ends, and from
-    /// the moment a prompt starts forwarding until it ends.
-    position: Option<usize>,
+    /// Every layer's four histories in slot order, then the drafter's feature when the sequence
+    /// drafts with DSpark; its point is the prompt's length while the copies hold its end, and
+    /// `None` from the moment a prompt starts forwarding until it ends.
+    checkpoint: Checkpoint,
     /// The image spans the prompt held.
     images: Vec<ImageSpan>,
 }
 
 impl Boundary {
     fn allocate(shared: &Shared, drafter: Option<&DraftState>) -> Result<Self, String> {
-        let conv = shared.plan.layers().len() * shared.conv_slot_bytes().iter().sum::<usize>();
-        let feature = drafter
-            .zip(shared.dspark.as_ref())
-            .map(|(drafter, model)| drafter.feature(model).1);
-        let at = conv.next_multiple_of(256);
+        let mut sizes = Vec::new();
+        for _ in shared.plan.layers() {
+            sizes.extend(shared.conv_slot_bytes());
+        }
+        if let Some((drafter, model)) = drafter.zip(shared.dspark.as_ref()) {
+            sizes.push(drafter.feature(model).1);
+        }
         let mut total = 0usize;
-        let arena = shared.cuda.alloc(at + feature.unwrap_or(0), &mut total)?;
+        let arena = shared
+            .cuda
+            .alloc(Checkpoint::arena_bytes(&sizes), &mut total)?;
         Ok(Self {
-            arena,
-            feature: feature.map(|_| at),
-            position: None,
+            checkpoint: Checkpoint::new(arena, sizes),
             images: Vec::new(),
         })
     }
 
-    /// Copies `state`'s histories and `drafter`'s feature into the checkpoint (`back` false) or
-    /// out of it into them (`back` true), on the run's stream.
-    fn copy(
+    /// The point the copies hold, when they hold one.
+    fn position(&self) -> Option<usize> {
+        self.checkpoint.point()
+    }
+
+    /// The live regions, in the checkpoint's order: `state`'s histories, then `drafter`'s feature.
+    fn live(shared: &Shared, state: &State, drafter: Option<&DraftState>) -> Vec<Deviceptr> {
+        let mut live: Vec<Deviceptr> = state.conv.iter().flatten().copied().collect();
+        if let Some((drafter, model)) = drafter.zip(shared.dspark.as_ref()) {
+            live.push(drafter.feature(model).0);
+        }
+        live
+    }
+
+    /// Copies `state`'s histories and `drafter`'s feature into the checkpoint as the state at
+    /// `point`, on the run's stream.
+    fn save(
+        &mut self,
+        shared: &Shared,
+        state: &State,
+        drafter: Option<&DraftState>,
+        point: usize,
+    ) -> Result<(), String> {
+        let live = Self::live(shared, state, drafter);
+        self.checkpoint.save(&shared.cuda, None, &live, point)
+    }
+
+    /// Copies the checkpoint at `point` back into `state`'s histories and `drafter`'s feature.
+    fn restore(
         &self,
         shared: &Shared,
         state: &State,
         drafter: Option<&DraftState>,
-        back: bool,
+        point: usize,
     ) -> Result<(), String> {
-        let cuda = &shared.cuda;
-        let copy = |live: Deviceptr, kept: Deviceptr, bytes: usize| {
-            if back {
-                cuda.copy_dtod_async(&live, &kept, bytes)
-            } else {
-                cuda.copy_dtod_async(&kept, &live, bytes)
-            }
-        };
-        let mut at = 0usize;
-        for slots in &state.conv {
-            for (slot, bytes) in slots.iter().zip(shared.conv_slot_bytes()) {
-                copy(*slot, self.arena.offset(at), bytes)?;
-                at += bytes;
-            }
-        }
-        if let (Some(offset), Some(drafter), Some(model)) =
-            (self.feature, drafter, shared.dspark.as_ref())
-        {
-            let (feature, bytes) = drafter.feature(model);
-            copy(feature, self.arena.offset(offset), bytes)?;
-        }
-        Ok(())
+        let live = Self::live(shared, state, drafter);
+        self.checkpoint.restore(&shared.cuda, None, &live, point)
     }
 }
 
@@ -5092,7 +5105,7 @@ impl Drop for InklingDeviceSession {
             pointers.extend(drafter.buffers());
         }
         if let Some(boundary) = &self.boundary {
-            pointers.push(boundary.arena);
+            pointers.push(boundary.checkpoint.arena());
         }
         if let Some(buffer) = self
             .prompting
@@ -5195,7 +5208,7 @@ impl ModelSession for InklingDeviceSession {
     /// token - number at most a widest chunk; the drafter's local rings are opened as wide under
     /// [REWIND_ENV]. The next prompt gives a verify's unfed drafts back before it rewinds.
     fn rewind_prefix(&self) -> Option<&[u32]> {
-        let point = self.boundary.as_ref()?.position?;
+        let point = self.boundary.as_ref()?.position()?;
         let past = self.history.len().checked_sub(point)?;
         let drafts = self.shared.draft.map_or(0, |(_, depth)| depth);
         (past > 0 && past + drafts <= self.shared.prefill_chunk).then(|| &self.history[..point])
@@ -5314,7 +5327,7 @@ impl InklingDeviceSession {
                 drafter.reset();
             }
             if let Some(boundary) = self.boundary.as_mut() {
-                boundary.position = None;
+                boundary.checkpoint.forget();
             }
             self.history.clear();
             self.held_images.clear();
@@ -5374,7 +5387,7 @@ impl InklingDeviceSession {
         // From the first forwarded row the checkpoint no longer holds a prompt's end; it is
         // taken again once this prompt's last row is in.
         if let Some(boundary) = self.boundary.as_mut() {
-            boundary.position = None;
+            boundary.checkpoint.forget();
         }
         self.prompting = Some(Prompting {
             tokens: tokens.to_vec(),
@@ -5407,9 +5420,13 @@ impl InklingDeviceSession {
         self.last_logits = logits.clone();
         if let Some(boundary) = self.boundary.as_mut() {
             boundary
-                .copy(&self.shared, &self.state, self.drafter.as_ref(), false)
+                .save(
+                    &self.shared,
+                    &self.state,
+                    self.drafter.as_ref(),
+                    prompting.tokens.len(),
+                )
                 .map_err(Self::fail)?;
-            boundary.position = Some(prompting.tokens.len());
             boundary.images.clone_from(&self.held_images);
         }
         Ok(Part::Done(self.output(logits)))
@@ -5645,10 +5662,9 @@ impl InklingDeviceSession {
         let boundary = self
             .boundary
             .as_ref()
-            .filter(|boundary| boundary.position == Some(point))
             .ok_or_else(|| Self::fail(format!("no checkpoint at position {point}")))?;
         boundary
-            .copy(&self.shared, &self.state, self.drafter.as_ref(), true)
+            .restore(&self.shared, &self.state, self.drafter.as_ref(), point)
             .map_err(Self::fail)?;
         if let Some(drafter) = self.drafter.as_mut() {
             drafter.rewind(point).map_err(Self::fail)?;
@@ -5667,7 +5683,7 @@ impl InklingDeviceSession {
             .reset(&self.shared)
             .map_err(|error| BackendError::new(DEVICE, error))?;
         if let Some(boundary) = self.boundary.as_mut() {
-            boundary.position = None;
+            boundary.checkpoint.forget();
         }
         self.round = None;
         self.opening = None;
@@ -6885,8 +6901,8 @@ mod tests {
     use super::{
         ActivationPlanes, AttentionWalk, ChunkWidths, DEFAULT_PREFILL_CHUNK, DRAFT_MIN_DEPTH_ENV,
         DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter, LONG_PREFILL_CHUNK,
-        LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, depth_policy_from_env, mma_attention_shared,
-        overlap_request, residual_chain_request, rewind_request,
+        LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, REWIND_ENV, depth_policy_from_env,
+        mma_attention_shared, overlap_request, residual_chain_request, rewind_request,
     };
     use crate::config::Inkling2Config;
 
@@ -6957,7 +6973,12 @@ mod tests {
         fn chain(value: Option<&str>) -> Result<bool, String> {
             residual_chain_request(value, 8)
         }
-        for request in [rewind_request, chain] {
+        fn rewind(value: Option<&str>) -> Result<bool, String> {
+            rewind_request(value, None)
+        }
+        let old = rewind_request(None, Some("on")).unwrap_err();
+        assert!(old.contains(REWIND_ENV), "{old}");
+        for request in [rewind, chain] {
             for value in [None, Some(""), Some("on")] {
                 assert_eq!(request(value), Ok(true), "{value:?}");
             }

@@ -96,6 +96,46 @@ impl PromptCodec for Spelling {
     }
 }
 
+/// A codec whose generation prompt ends on `<t>` and `\n` (ids `40`, `41`) while the next turn's
+/// rendering of an empty reasoning block writes `<t>\n\n</t>`, which it merges as `40`, `42`
+/// (`\n\n`), `43`: a template's next turn parting from the held prompt inside its last id.
+struct Merging;
+
+impl PromptCodec for Merging {
+    fn encode_chat(
+        &self,
+        _request: &serde_json::Value,
+    ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+        Ok(vec![1])
+    }
+
+    fn encode_text(
+        &self,
+        text: &str,
+        _add_special_tokens: bool,
+    ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+        Ok(match text {
+            "\n" => vec![41],
+            "\n\n" => vec![42],
+            _ => vec![1],
+        })
+    }
+
+    fn decode(&self, ids: &[u32]) -> Option<String> {
+        ids.iter().map(|id| self.token_str(*id)).collect()
+    }
+
+    fn token_str(&self, id: u32) -> Option<String> {
+        Some(match id {
+            40 => "<t>".to_owned(),
+            41 => "\n".to_owned(),
+            42 => "\n\n".to_owned(),
+            43 => "</t>".to_owned(),
+            other => format!("<{other}>"),
+        })
+    }
+}
+
 fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL.to_owned(),
@@ -125,6 +165,9 @@ struct Recorder {
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     /// Sessions keep the end of their last prompt and rewind to it, as the Inkling arm does.
     rewinds: bool,
+    /// Once a reply runs past the rewind point, sessions name no history (their state is ahead of
+    /// the tokens they kept, as a GLM lane's is after it gives back drafted rows).
+    ahead: bool,
     /// How long a park takes, as a fused session's does while the engine finishes a step.
     park: Duration,
 }
@@ -236,7 +279,7 @@ impl ModelSession for PrefixSession {
             .zip(tokens)
             .take_while(|(held, given)| held == given)
             .count();
-        if reused != self.consumed.len()
+        if (reused != self.consumed.len() || self.reusable_prefix().is_none())
             && let Some(point) = self.rewind_prefix().map(<[u32]>::len)
             && reused >= point
             && point < tokens.len()
@@ -296,7 +339,8 @@ impl ModelSession for PrefixSession {
     }
 
     fn reusable_prefix(&self) -> Option<&[u32]> {
-        Some(self.consumed.as_slice())
+        let ahead = self.recorder.ahead && self.rewind_prefix().is_some();
+        (!ahead).then_some(self.consumed.as_slice())
     }
 
     fn rewind_prefix(&self) -> Option<&[u32]> {
@@ -578,6 +622,74 @@ async fn a_prompt_that_keeps_the_held_prompt_and_parts_from_its_reply_rewinds() 
         recorder.prefills(),
         vec![vec![5, 6, 7], vec![30, 31, 9]],
         "only the prompt past the rewind point was forwarded"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    let cold = host_driver(Arc::new(Recorder::default()));
+    let own = answer(&cold, request("cold", next, 2)).await;
+    assert_eq!(second.text, own.text);
+}
+
+/// The next turn writes the dropped reasoning as `<t>\n\n</t>`, whose `\n\n` spells the held
+/// prompt's last `\n` and one more: the sequence still goes back to its point, and the `\n` past
+/// it is forwarded as its own id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_that_merges_the_held_prompts_last_id_still_rewinds() {
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ..Recorder::default()
+    });
+    let driver = host_driver_with(Arc::clone(&recorder), Arc::new(Merging), true);
+    let mut first = request("a", vec![5, 40, 41], 2);
+    first.forced_tokens = vec![10, 11];
+    answer(&driver, first).await;
+
+    let next = vec![5u32, 40, 42, 43, 9];
+    let second = answer(&driver, request("b", next.clone(), 2)).await;
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 40, 41], vec![41, 43, 9]],
+        "the sequence went back to the held prompt and forwarded the newline past it"
+    );
+    assert_eq!(
+        second.cached, 2,
+        "the held prompt's ids before the merged one"
+    );
+    assert_eq!(recorder.most_alive(), 1);
+
+    // Off, the same prompt starts over.
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ..Recorder::default()
+    });
+    let off = host_driver_with(Arc::clone(&recorder), Arc::new(Merging), false);
+    let mut first = request("a", vec![5, 40, 41], 2);
+    first.forced_tokens = vec![10, 11];
+    answer(&off, first).await;
+    let cold = answer(&off, request("b", next.clone(), 2)).await;
+    assert_eq!(cold.cached, 0);
+    assert_eq!(recorder.prefills(), vec![vec![5, 40, 41], next]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_names_no_history_still_rewinds_to_its_point() {
+    let recorder = Arc::new(Recorder {
+        rewinds: true,
+        ahead: true,
+        ..Recorder::default()
+    });
+    let driver = host_driver(Arc::clone(&recorder));
+    answer(&driver, first_turn()).await;
+
+    // The next turn keeps the reply as it was, but the session cannot say it holds it: it is kept
+    // anyway and goes back to the end of the first prompt.
+    let next = vec![5u32, 6, 7, 10, 11, 9];
+    let second = answer(&driver, request("b", next.clone(), 2)).await;
+    assert_eq!(second.cached, 3, "the held prompt");
+    assert_eq!(
+        recorder.prefills(),
+        vec![vec![5, 6, 7], vec![10, 11, 9]],
+        "the reply and the new turn were forwarded from the rewind point"
     );
     assert_eq!(recorder.most_alive(), 1);
 

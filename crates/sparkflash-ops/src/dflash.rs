@@ -785,6 +785,12 @@ impl DraftScratch {
         (self.rings, config.num_hidden_layers * 2 * floats)
     }
 
+    /// The start of the drafter's context rings ([Self::rings_region]).
+    #[must_use]
+    pub fn rings(&self) -> Deviceptr {
+        self.rings
+    }
+
     /// The captured target rows of the last forward.
     #[must_use]
     pub fn features(&self) -> Deviceptr {

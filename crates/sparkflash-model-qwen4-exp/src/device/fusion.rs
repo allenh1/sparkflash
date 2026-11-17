@@ -275,6 +275,12 @@ impl FusedArm for QwenFusion {
         slot.reusable_prefix()
     }
 
+    /// The end of the last prompt, which a prompt that parts from the reply goes back to
+    /// ([DeviceSequence::begin_prompt]).
+    fn rewind_prefix<'s>(&self, slot: &'s DeviceSequence) -> Option<&'s [u32]> {
+        slot.rewind_prefix()
+    }
+
     fn cached_tokens(&self, slot: &DeviceSequence) -> usize {
         slot.cached_tokens()
     }
@@ -305,10 +311,12 @@ impl FusedArm for QwenFusion {
                 )),
             );
         }
-        ledger.set(
-            Strategy::PrefixReuse,
-            Mode::native("a prompt that extends a lane's sequence"),
-        );
+        let reuse = if self.shared.rewind {
+            "a prompt that extends a lane's sequence, or goes back to the last prompt's end"
+        } else {
+            "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
+        };
+        ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
         ledger
     }
 }

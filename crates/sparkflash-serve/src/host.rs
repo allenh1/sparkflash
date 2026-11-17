@@ -781,16 +781,21 @@ impl Continuation {
 ///
 /// A prompt that does neither may still go past the session's rewind point
 /// ([ModelSession::rewind_prefix]) with the point's images before it: the session goes back there.
+/// So may one for a session that names no history, its state left ahead of the tokens its caller
+/// kept (answers it gave back).
 fn continuation(
     kept: &Held,
     job: &Job,
     codec: &dyn PromptCodec,
     by_text: bool,
 ) -> Option<Continuation> {
-    let history = kept
+    let Some(history) = kept
         .session
         .reusable_prefix()
-        .filter(|history| !history.is_empty())?;
+        .filter(|history| !history.is_empty())
+    else {
+        return rewound(kept, job, codec, by_text);
+    };
     let held_images = kept.session.held_images();
     let prompt = job.prompt_tokens.as_slice();
     let respelling = || {
@@ -803,7 +808,7 @@ fn continuation(
     } else if let Some((ids, covered)) = respelling() {
         (Some(ids), covered)
     } else {
-        return rewound(kept, job);
+        return rewound(kept, job, codec, by_text);
     };
     if !same_images_before(held_images, &job.images, covered) {
         return None;
@@ -826,23 +831,31 @@ fn continuation(
 }
 
 /// How `job` continues `kept` from the session's rewind point, when its prompt keeps the point's
-/// tokens, goes past them, and carries the point's images before their end and no other.
-fn rewound(kept: &Held, job: &Job) -> Option<Continuation> {
+/// tokens (or, with `by_text`, spells their bytes: [respelled_prompt]), goes past them, and carries
+/// the point's images before their end and no other.
+fn rewound(kept: &Held, job: &Job, codec: &dyn PromptCodec, by_text: bool) -> Option<Continuation> {
     let point = kept
         .session
         .rewind_prefix()
         .filter(|point| !point.is_empty())?;
+    let held_images = kept.session.held_images();
     let prompt = job.prompt_tokens.as_slice();
-    if prompt.len() <= point.len()
-        || !prompt.starts_with(point)
-        || !same_images_before(kept.session.held_images(), &job.images, point.len())
-    {
+    let (respelled, covered) = if prompt.starts_with(point) {
+        (None, point.len())
+    } else if by_text && job.images.is_empty() && held_images.is_empty() {
+        let (ids, covered) = respelled_prompt(codec, point, prompt)?;
+        (Some(ids), covered)
+    } else {
+        return None;
+    };
+    let handed = respelled.as_ref().map_or(prompt.len(), Vec::len);
+    if handed <= point.len() || !same_images_before(held_images, &job.images, covered) {
         return None;
     }
     Some(Continuation {
-        respelled: None,
+        respelled,
         held: point.len(),
-        covered: point.len(),
+        covered,
         resume: false,
         rewound: true,
     })
@@ -870,9 +883,11 @@ fn sampling_for(mut sampling: Sampling, handed: usize) -> Sampling {
 /// `prompt`'s ids the held ones stand for.
 ///
 /// The two agree id for id up to where they part. From there `prompt` must spell the rest of
-/// `history` byte for byte in vocabulary spellings, special tokens included, ending on one of its
-/// own id boundaries. The codec's decode of the result must then equal its decode of `prompt`, so
-/// the conversation reads the same to it as well.
+/// `history` byte for byte in vocabulary spellings, special tokens included. When one of its ids
+/// spells past the end of `history` (a template whose next turn writes `<think>\n\n` where the
+/// held prompt ended on `<think>` and `\n`, which the tokenizer merges), the text past the end is
+/// encoded on its own after the held ids. The codec's decode of the result must then equal its
+/// decode of `prompt`, so the conversation reads the same to it as well.
 fn respelled_prompt(
     codec: &dyn PromptCodec,
     history: &[u32],
@@ -891,18 +906,37 @@ fn respelled_prompt(
         held.extend_from_slice(codec.token_str(id)?.as_bytes());
     }
     let (mut spelled, mut covered) = (0usize, shared);
+    let mut overhang = Vec::new();
     while spelled < held.len() {
         let piece = codec.token_str(*prompt.get(covered)?)?;
         let piece = piece.as_bytes();
-        if held.get(spelled..spelled + piece.len()) != Some(piece) {
+        let rest = &held[spelled..];
+        if piece.len() > rest.len() {
+            // This id spells the end of the held bytes and goes past it: the held ids stand for
+            // the prompt's before it, and its text past theirs is encoded on its own.
+            if !piece.starts_with(rest) {
+                return None;
+            }
+            let held_text = codec.decode(&history[shared..])?;
+            let given_text = codec.decode(&prompt[shared..=covered])?;
+            let past = given_text.strip_prefix(held_text.as_str())?;
+            overhang = codec.encode_text(past, false).ok()?;
+            if overhang.is_empty() {
+                return None;
+            }
+            break;
+        }
+        if &rest[..piece.len()] != piece {
             return None;
         }
         spelled += piece.len();
         covered += 1;
     }
-    let mut ids = Vec::with_capacity(history.len() + prompt.len() - covered);
+    let after = covered + usize::from(!overhang.is_empty());
+    let mut ids = Vec::with_capacity(history.len() + overhang.len() + prompt.len() - after);
     ids.extend_from_slice(history);
-    ids.extend_from_slice(&prompt[covered..]);
+    ids.extend_from_slice(&overhang);
+    ids.extend_from_slice(&prompt[after..]);
     (codec.decode(&ids)? == codec.decode(prompt)?).then_some((ids, covered))
 }
 
@@ -981,7 +1015,10 @@ fn run_request(
         eprintln!(
             "sparkflash serve: prefix reuse by rewind: the prompt keeps the held prompt of {} ids and parts from the reply after it; {} to forward",
             plan.held,
-            job.prompt_tokens.len() - plan.held,
+            plan.respelled
+                .as_ref()
+                .map_or(job.prompt_tokens.len(), Vec::len)
+                .saturating_sub(plan.held),
         );
     }
     if plan.resume {
@@ -1000,11 +1037,11 @@ fn run_request(
         started,
     );
     // Keep the sequence unless the backend failed in it. One the request moved keeps the step
-    // after its last token; one it never touched keeps the step it had.
+    // after its last token; one it never touched keeps the step it had. One that names no history
+    // (its state ran ahead of the tokens it kept) is kept for its rewind point.
+    let nonempty = |prefix: Option<&[u32]>| prefix.is_some_and(|prefix| !prefix.is_empty());
     if !matches!(ending, Err(Ending::Failed(_)))
-        && session
-            .reusable_prefix()
-            .is_some_and(|prefix| !prefix.is_empty())
+        && (nonempty(session.reusable_prefix()) || nonempty(session.rewind_prefix()))
     {
         let handed = plan
             .respelled

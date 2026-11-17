@@ -49,8 +49,8 @@ use sparkflash_model::{
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Opened, Part, RoundArm,
-    StepWall, Strategy, TextWire, mirror_until_the_group_ends, run_round, watched_hub,
+    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Opened, Part, Resume,
+    RoundArm, StepWall, Strategy, TextWire, mirror_until_the_group_ends, run_round, watched_hub,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -349,13 +349,21 @@ impl FusedArm for GlmFusion {
         slot.speculation()
     }
 
-    /// A kept draft's answer is held. The caches have consumed it already and a GLM sequence
-    /// cannot rewind, so an unused run is not given back: the engine renews the slot (the default
-    /// [FusedArm::give_back] refuses), and its next prompt starts over.
+    /// A kept draft's answer is held. The caches have consumed it already, so an unused run is
+    /// given back by cutting the history ([FusedArm::give_back]): the sequence is then ahead of
+    /// it, and its next prompt goes back to the last prompt's end ([FusedArm::rewind_prefix]).
     fn ready(&self, slot: &Glm5NextSession, token: u32) -> bool {
         slot.pending
             .front()
             .is_some_and(|front| front.token == token)
+    }
+
+    fn give_back(&self, slot: &mut Glm5NextSession, count: usize) -> Result<(), BackendError> {
+        slot.give_back(count)
+    }
+
+    fn rewind_prefix<'s>(&self, slot: &'s Glm5NextSession) -> Option<&'s [u32]> {
+        slot.rewind_prefix()
     }
 
     /// A slot keeps its sequence between requests as a session alone does: the next prompt that
@@ -377,19 +385,28 @@ impl FusedArm for GlmFusion {
     fn ledger(&self) -> Ledger {
         let mut ledger = Ledger::new("GLM");
         ledger.set(Strategy::PromptParts, Mode::native("bulk prefill chunks"));
+        let block = self
+            .shared
+            .rank
+            .lock()
+            .is_ok_and(|rank| rank.has_block_drafter());
         let drafter = self.spec().map(|spec| {
             let depth = if spec.policy.is_some() {
                 "adaptive depth"
             } else {
                 "fixed depth"
             };
-            format!("MTP, up to {} drafts, {depth}", spec.drafts)
+            let kind = if block { "DFlash 2" } else { "MTP" };
+            format!("{kind}, up to {} drafts, {depth}", spec.drafts)
         });
         ledger.drafting(drafter, self.joint_rounds, true);
-        ledger.set(
-            Strategy::PrefixReuse,
-            Mode::native("a prompt that extends a lane's sequence; no rewind"),
-        );
+        let rewinds = self.shared.rank.lock().is_ok_and(|rank| rank.rewinds());
+        let reuse = if rewinds {
+            "a prompt that extends a lane's sequence, or goes back to the last prompt's end"
+        } else {
+            "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
+        };
+        ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
         ledger
     }
 }
@@ -1153,6 +1170,14 @@ impl ModelSession for Glm5NextSession {
             .then_some(self.consumed.as_slice())
     }
 
+    /// The end of the last prompt, while the sequence can go back to it
+    /// ([DeviceRank::rewind]) and something past it was forwarded.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        let point = self.sequence.rewind_point()?;
+        (point < self.sequence.position() && point <= self.consumed.len())
+            .then(|| &self.consumed[..point])
+    }
+
     fn cached_tokens(&self) -> usize {
         self.prefill_cached
     }
@@ -1196,32 +1221,40 @@ impl Glm5NextSession {
         // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
         // case only the tokens past it are forwarded. Its sampler history is the whole prompt
         // either way: the penalties count every token the request reads.
-        let reused = self
-            .consumed
-            .iter()
-            .zip(tokens)
-            .take_while(|(held, given)| held == given)
-            .count();
-        if reused != self.consumed.len() || reused >= tokens.len() {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "a prefill must extend the {} token(s) this sequence holds by at least one; \
-                     this one does not",
-                    self.consumed.len()
-                ),
-            ));
-        }
-        if self.sequence.position() != self.consumed.len() {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "the caches hold {} position(s) but the history has {} token(s)",
-                    self.sequence.position(),
-                    self.consumed.len()
-                ),
-            ));
-        }
+        // One that parts from the history, or that the sequence ran ahead of, may still keep the
+        // last prompt and go past it: the sequence goes back to that prompt's end first.
+        let current = self.pending.is_empty() && self.sequence.position() == self.consumed.len();
+        let resume = sparkflash_runtime::resume(
+            &self.consumed,
+            current,
+            self.sequence.rewind_point(),
+            tokens,
+        );
+        let mut rank = self
+            .shared
+            .rank
+            .lock()
+            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
+        let reused = match resume {
+            Some(Resume::Extend(held)) => held,
+            Some(Resume::Rewind(point)) => {
+                rank.rewind(&mut self.sequence, point)?;
+                self.consumed.truncate(point);
+                point
+            }
+            None => {
+                return Err(BackendError::new(
+                    "glm5_device",
+                    format!(
+                        "a prefill must extend the {} token(s) this sequence holds by at least \
+                         one, or go past its rewind point; this one does neither",
+                        self.consumed.len()
+                    ),
+                ));
+            }
+        };
+        // The prompt forwards past the point: its own end is the next one.
+        self.sequence.forget_point();
         self.prefill_cached = reused;
         // A new prompt's tokens replace any chain the last one left queued.
         self.pending.clear();
@@ -1229,11 +1262,6 @@ impl Glm5NextSession {
         self.consumed.extend_from_slice(&tokens[reused..]);
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
         let fresh = &tokens[reused..];
         let begun = rank.begin_prefill(
             &self.shared.tp,
@@ -1241,6 +1269,9 @@ impl Glm5NextSession {
             &mut self.sequence,
             fresh,
         );
+        if matches!(begun, Ok(Prefill::Whole(_))) {
+            rank.keep_point(&mut self.sequence)?;
+        }
         drop(rank);
         match begun? {
             Prefill::Whole(logits) => Ok(Part::Done(self.first_step(logits))),
@@ -1278,13 +1309,37 @@ impl Glm5NextSession {
             &prompting.tokens[prompting.at..to],
             prompting.end,
         )?;
-        drop(rank);
         prompting.at = to;
         if to < prompting.tokens.len() {
             self.prompting = Some(prompting);
             return Ok(Part::More);
         }
+        rank.keep_point(&mut self.sequence)?;
+        drop(rank);
         Ok(Part::Done(self.first_step(logits)))
+    }
+
+    /// The caller never used the last `count` answers the sequence fed ([FusedArm::give_back]).
+    /// The caches consumed them and cannot give them back, so the history is cut there and the
+    /// queued answers dropped: the sequence is ahead of its history and names none
+    /// ([ModelSession::reusable_prefix]), and its next prompt goes back to its rewind point.
+    fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        if count > self.consumed.len() {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "{count} answers to give back, and the history holds {}",
+                    self.consumed.len()
+                ),
+            ));
+        }
+        self.consumed.truncate(self.consumed.len() - count);
+        self.pending.clear();
+        self.confidence.clear();
+        Ok(())
     }
 
     /// The prompt's first step: the token its last row's logits choose.
