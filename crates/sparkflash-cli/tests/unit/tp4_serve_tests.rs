@@ -77,8 +77,14 @@ fn a_group_steps_fused_lanes_unless_told_one_at_a_time() {
         let options = ServeOptions::parse(tp4_args(&["--model", model, "--concurrency", "1"]))
             .expect("parses");
         assert!(!options.fuse_batch && options.concurrency == 1);
-        // One node keeps the host driver's default.
-        let options = ServeOptions::parse(["--model".to_owned(), model.to_owned()]).expect("parses");
+        // One node keeps the host driver's default. It still names its weights: a run with none
+        // is refused at parse, so the tiny synthetic plan stands in for a checkpoint here.
+        let options = ServeOptions::parse([
+            "--model".to_owned(),
+            model.to_owned(),
+            "--synthetic".to_owned(),
+        ])
+        .expect("parses");
         assert!(!options.fuse_batch && options.concurrency == 1);
     }
 }
@@ -1202,7 +1208,9 @@ fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() 
     };
     // The carried profile: the MTP layer's chain of three, adaptive as DeepSeek's is, and a block
     // drafter's whole block.
-    let carried = GlmArm::profile_from(|_| None).expect("the carried profile").speculation;
+    let carried = GlmArm::profile_from(|_| None)
+        .expect("the carried profile")
+        .speculation;
     assert_eq!(drafts(&carried, false, 15), Ok(Some((3, true))));
     assert_eq!(drafts(&carried, true, 7), Ok(Some((7, true))));
     // The environment picks the chain and the rule.
@@ -1225,10 +1233,11 @@ fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() 
     assert_eq!(drafts(&spec(Some(false), None), true, 7), Ok(None));
     assert_eq!(drafts(&spec(Some(false), Some(0)), true, 7), Ok(None));
     assert_eq!(drafts(&spec(None, Some(0)), false, 15), Ok(None));
-    assert!(drafts(&spec(Some(false), Some(2)), true, 7)
-        .is_err_and(|error| error.contains("speculation.enabled=false")));
-    assert!(drafts(&spec(None, Some(8)), true, 7)
-        .is_err_and(|error| error.contains("past the 7")));
+    assert!(
+        drafts(&spec(Some(false), Some(2)), true, 7)
+            .is_err_and(|error| error.contains("speculation.enabled=false"))
+    );
+    assert!(drafts(&spec(None, Some(8)), true, 7).is_err_and(|error| error.contains("past the 7")));
 }
 
 #[test]
