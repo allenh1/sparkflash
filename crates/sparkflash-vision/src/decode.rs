@@ -44,6 +44,11 @@ pub enum AlphaPolicy {
     Blend,
     /// Ignore alpha and keep the colour samples, as Pillow's `convert("RGB")` does.
     Drop,
+    /// Alpha-composite onto an 8-pixel checkerboard of 204 and 153, the square at the image's
+    /// top-left corner light. This is Inkling-2's released processor (`convert_to_rgb` in
+    /// `image_processing_inkling2.py`), which shows the model a transparent region as the
+    /// checkerboard an image editor draws rather than as a flat colour.
+    Checkerboard,
 }
 
 /// Size limits checked before decoding.
@@ -184,8 +189,22 @@ fn from16(v: u16) -> u8 {
 }
 
 fn blend(c: u8, a: u8) -> u8 {
+    blend_onto(c, a, BACKGROUND)
+}
+
+/// `c` at opacity `a` over `background`, rounded to nearest: `(c a + b (255 - a) + 127) / 255`.
+fn blend_onto(c: u8, a: u8, background: u8) -> u8 {
     let (c, a) = (u32::from(c), u32::from(a));
-    ((c * a + u32::from(BACKGROUND) * (255 - a) + 127) / 255) as u8
+    ((c * a + u32::from(background) * (255 - a) + 127) / 255) as u8
+}
+
+/// The [`AlphaPolicy::Checkerboard`] sample under pixel (`x`, `y`).
+fn checkerboard(x: usize, y: usize) -> u8 {
+    if (y / 8 + x / 8).is_multiple_of(2) {
+        204
+    } else {
+        153
+    }
 }
 
 /// Grey, grey + alpha, RGB or RGBA 8-bit samples to RGB.
@@ -197,17 +216,29 @@ fn to_rgb(
     alpha: AlphaPolicy,
 ) -> RgbImage {
     let mut data = Vec::with_capacity(width * height * 3);
-    for px in samples.chunks_exact(channels).take(width * height) {
+    for (index, px) in samples
+        .chunks_exact(channels)
+        .take(width * height)
+        .enumerate()
+    {
+        let under = || checkerboard(index % width.max(1), index / width.max(1));
         match channels {
             1 => data.extend_from_slice(&[px[0]; 3]),
             2 => match alpha {
                 AlphaPolicy::Blend => data.extend_from_slice(&[blend(px[0], px[1]); 3]),
                 AlphaPolicy::Drop => data.extend_from_slice(&[px[0]; 3]),
+                AlphaPolicy::Checkerboard => {
+                    data.extend_from_slice(&[blend_onto(px[0], px[1], under()); 3]);
+                }
             },
             3 => data.extend_from_slice(px),
             _ => match alpha {
                 AlphaPolicy::Blend => data.extend(px[..3].iter().map(|&c| blend(c, px[3]))),
                 AlphaPolicy::Drop => data.extend_from_slice(&px[..3]),
+                AlphaPolicy::Checkerboard => {
+                    let background = under();
+                    data.extend(px[..3].iter().map(|&c| blend_onto(c, px[3], background)));
+                }
             },
         }
     }
@@ -374,6 +405,29 @@ mod tests {
             assert_eq!(blend(c, 0), BACKGROUND);
         }
         assert_eq!(blend(0, 128), 126);
+    }
+
+    #[test]
+    fn checkerboard_alternates_eight_pixel_squares_from_a_light_corner() {
+        // Two pixels a row, transparent then half-covered black, over 9 x 9: (0, 0) is light,
+        // (8, 0) and (0, 8) are dark, (8, 8) is light again.
+        let (width, height) = (9, 9);
+        let mut samples = Vec::new();
+        for _ in 0..width * height {
+            samples.extend_from_slice(&[10, 20, 30, 0]);
+        }
+        samples[(8 * width + 8) * 4 + 3] = 128;
+        let rgb = to_rgb(width, height, 4, &samples, AlphaPolicy::Checkerboard);
+        let at = |x: usize, y: usize| rgb.data[(y * width + x) * 3];
+        assert_eq!(at(0, 0), 204);
+        assert_eq!(at(7, 7), 204);
+        assert_eq!(at(8, 0), 153);
+        assert_eq!(at(0, 8), 153);
+        // (10 * 128 + 204 * 127 + 127) / 255
+        assert_eq!(at(8, 8), ((10 * 128 + 204 * 127 + 127) / 255) as u8);
+        // Opaque pixels are unchanged whatever is under them.
+        let opaque = to_rgb(1, 1, 4, &[7, 8, 9, 255], AlphaPolicy::Checkerboard);
+        assert_eq!(opaque.data, vec![7, 8, 9]);
     }
 
     #[test]

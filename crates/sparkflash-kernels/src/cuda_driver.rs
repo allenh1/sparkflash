@@ -107,10 +107,10 @@ fn pdl_enabled() -> bool {
 }
 
 /// Whether a kernel launches with programmatic stream serialization: the opt kernels, the
-/// Qwen4-Exp pack's q4e (token) and q4p (tensor-core) kernels and Dory's dory kernels. Every one
-/// opens with griddepcontrol.launch_dependents + griddepcontrol.wait (OPT_PDL_ENTRY), or issues
-/// only constant weight loads between the two, so it reads and writes nothing before the previous
-/// grid has completed and stream order holds.
+/// Qwen4-Exp pack's q4e (token) and q4p (tensor-core) kernels, Dory's dory kernels and
+/// Inkling-2's inkling kernels. Every one opens with griddepcontrol.launch_dependents +
+/// griddepcontrol.wait (OPT_PDL_ENTRY), or issues only constant weight loads between the two, so
+/// it reads and writes nothing before the previous grid has completed and stream order holds.
 fn programmatic(kernel: &Kernel) -> bool {
     PROGRAMMATIC_PREFIXES
         .iter()
@@ -120,7 +120,7 @@ fn programmatic(kernel: &Kernel) -> bool {
 
 /// The kernel name prefixes [programmatic] launches with programmatic stream serialization;
 /// tests/pdl_entry.rs holds every such kernel in kernels/ to the dependency wait.
-pub const PROGRAMMATIC_PREFIXES: [&str; 4] = ["opt_", "q4e_", "q4p_", "dory_"];
+pub const PROGRAMMATIC_PREFIXES: [&str; 5] = ["opt_", "q4e_", "q4p_", "dory_", "inkling_"];
 
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
 fn name(code: CuResult) -> String {
@@ -4311,6 +4311,32 @@ impl Cuda {
     ) -> Result<(), String> {
         self.launch_kernel(stream.stream, kernel, grid, block, args)
             .map_err(|r| format!("cuLaunchKernel on the run stream failed: {r}"))
+    }
+
+    /// Queues one device-to-device copy on a session's stream and returns without draining: it
+    /// runs after the launches queued there before it and before those queued after, as
+    /// [Cuda::copy_dtod_async] does on the default stream for the launches there.
+    ///
+    /// # Errors
+    /// The driver's cuMemcpyDtoDAsync failure code.
+    pub fn copy_dtod_on(
+        &self,
+        stream: &RunStream,
+        dst: &Deviceptr,
+        src: &Deviceptr,
+        bytes: usize,
+    ) -> Result<(), String> {
+        let copy: libloading::Symbol<
+            unsafe extern "C" fn(CuDeviceptr, CuDeviceptr, usize, CuStream) -> CuResult,
+        > = self.sym(b"cuMemcpyDtoDAsync_v2")?;
+        // SAFETY: the symbol comes from this context's library, both pointers are device addresses
+        // this process owns, and the stream belongs to this context.
+        let r = unsafe { copy(dst.0, src.0, bytes, stream.stream) };
+        if r != 0 {
+            return Err(format!("cuMemcpyDtoDAsync on the run stream failed: {r}"));
+        }
+        self.issued.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Copies host bytes to a device allocation on a session's stream and waits for the copy.

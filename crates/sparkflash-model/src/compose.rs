@@ -74,7 +74,7 @@ impl LayerStep {
     fn from_layer(layer: &Layer) -> Self {
         let attention = match &layer.attention.kind {
             AttentionKind::Mla { .. } => Part::MlaAttention,
-            AttentionKind::Gqa { .. } => Part::GqaAttention,
+            AttentionKind::Gqa { .. } | AttentionKind::Inkling { .. } => Part::GqaAttention,
             AttentionKind::Gdn(_) => Part::GdnScan,
             AttentionKind::Kda(_) => Part::KdaScan,
         };
@@ -95,6 +95,7 @@ impl LayerStep {
         };
         let residual = match &layer.residual {
             Residual::Plain => None,
+            Residual::BlockAttention => Some(Part::BlockAttentionResidual),
             Residual::Hyper(hyper) => Some(if hyper.manifold {
                 Part::ManifoldHyperConnection
             } else {

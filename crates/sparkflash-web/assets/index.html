@@ -210,7 +210,7 @@ limitations under the License.
       <div class="page-head">
         <div>
           <h1 id="setup-title">Setup</h1>
-          <p class="page-sub" id="setup-sub">Seven steps from four Sparks to a running server. Every step checks itself, so you can close this page and come back.</p>
+          <p class="page-sub" id="setup-sub">Seven steps from your Sparks to a running server. Every step checks itself, so you can close this page and come back.</p>
         </div>
         <div class="actions">
           <button id="setup-check" class="btn" type="button"><svg><use href="#i-refresh"/></svg><span>Check again</span></button>
@@ -258,7 +258,7 @@ limitations under the License.
             <label class="field">
               <span>Engine</span>
               <select id="engine-kind" disabled></select>
-              <small>Set from the selected model: V4.1 and GLM-5.3 are TP=4, Qwen3.8 is TP=1.</small>
+              <small>Set from the selected model, with the number of Sparks it runs on.</small>
             </label>
             <label class="field">
               <span>Max context <em>tokens</em></span>
@@ -273,8 +273,34 @@ limitations under the License.
             <label class="field">
               <span>Max concurrency <em>sequences</em></span>
               <input id="max-concurrency" type="number" min="1" max="32" step="1" required>
-              <small>Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
+              <small id="concurrency-hint">Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.</small>
             </label>
+            <div id="lane-knobs" class="hidden">
+              <label class="field">
+                <span>Drafting</span>
+                <select id="drafting">
+                  <option value="default">Model default</option>
+                  <option value="on">Draft with the model's drafter</option>
+                  <option value="off">Off</option>
+                </select>
+                <small id="drafting-hint">Speculative drafting is lossless: an answer is the same with it on or off.</small>
+              </label>
+              <label class="field">
+                <span>Lane memory <em>MiB per Spark</em></span>
+                <input id="lane-memory" type="number" min="1" step="1" placeholder="one full context's worth">
+                <small>The memory the lanes' caches share (<code>SPARKFLASH_LANE_MEMORY_MB</code>). A lane that needs more takes it from the conversation that has idled longest.</small>
+              </label>
+              <label class="field field-check">
+                <input id="joint-rounds" type="checkbox" checked>
+                <span>Verify drafting lanes together</span>
+                <small>One shared walk for every drafting lane's round (<code>SPARKFLASH_JOINT_ROUNDS</code>); off runs them one after another.</small>
+              </label>
+              <label class="field" id="prefill-chunk-field">
+                <span>Prefill chunk <em>rows</em></span>
+                <input id="prefill-chunk" type="number" min="1" max="65535" step="1" placeholder="4,096, widening to 8,192 on long prompts">
+                <small>Inkling's prompt chunk (<code>SPARKFLASH_INKLING_PREFILL_CHUNK</code>). At a 1M window, 4,096 leaves the memory 8,192 does not.</small>
+              </label>
+            </div>
           </div>
         </fieldset>
         <div class="savebar" id="model-savebar" aria-live="polite">
@@ -356,7 +382,7 @@ limitations under the License.
             <span class="guide-num" aria-hidden="true">7</span>
             <div class="guide-title">
               <h2>Start the server</h2>
-              <p class="guide-summary" id="g-launch-summary">Load the model on all four Sparks and answer requests.</p>
+              <p class="guide-summary" id="g-launch-summary">Load the model and answer requests.</p>
             </div>
             <span class="tag" id="g-launch-tag"></span>
           </div>

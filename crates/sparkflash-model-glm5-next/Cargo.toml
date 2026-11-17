@@ -22,8 +22,10 @@ description = "GLM-5.3-Flash (Glm5Next) pack: FP8 checkpoint plan and its TP=4 s
 
 [dependencies]
 bytemuck = { workspace = true }
+sparkflash-comm = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-model = { workspace = true }
+sparkflash-runtime = { workspace = true }
 sparkflash-ops = { workspace = true }
 sparkflash-weights = { workspace = true }
 serde = { workspace = true }

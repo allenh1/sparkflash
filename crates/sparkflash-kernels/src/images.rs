@@ -51,6 +51,8 @@ pub enum Image {
     GlmDecode,
     /// The routed-expert plan every arm shares.
     MoePlan,
+    /// The Inkling-2 relative attention, short convolution and softcapped epilogues.
+    Inkling,
     /// The Dory1.0-4B nGPT token kernels.
     Dory,
     /// The DeepSeek kernels loaded from the shared PTX set.
@@ -113,6 +115,11 @@ const GLM_DECODE: &[u8] = &[];
 const MOE_PLAN: &[u8] = include_bytes!(env!("SPARKFLASH_MOE_PLAN_CUBIN"));
 #[cfg(not(sparkflash_model_cubin))]
 const MOE_PLAN: &[u8] = &[];
+
+#[cfg(sparkflash_model_cubin)]
+const INKLING: &[u8] = include_bytes!(env!("SPARKFLASH_INKLING_CUBIN"));
+#[cfg(not(sparkflash_model_cubin))]
+const INKLING: &[u8] = &[];
 
 #[cfg(sparkflash_model_cubin)]
 const DORY: &[u8] = include_bytes!(env!("SPARKFLASH_DORY_CUBIN"));
@@ -185,6 +192,13 @@ pub fn moe_plan_cubin() -> &'static [u8] {
     MOE_PLAN
 }
 
+/// The Inkling-2 relative-attention, short-convolution and epilogue image, empty on a CPU-only
+/// build.
+#[must_use]
+pub fn inkling_cubin() -> &'static [u8] {
+    INKLING
+}
+
 /// The Dory1.0-4B token image, empty on a CPU-only build.
 #[must_use]
 pub fn dory_cubin() -> &'static [u8] {
@@ -202,6 +216,7 @@ impl Image {
         match self {
             Self::Qwen4Exp => &[
                 "q4e_add",
+                "q4e_argmax_prob_slices",
                 "q4e_argmax_slices",
                 "q4e_copy_flat",
                 "q4e_decode_f8e4m3",
@@ -214,7 +229,9 @@ impl Image {
                 "q4e_gemm_bf16",
                 "q4e_gemm_reduce",
                 "q4e_gemv4_bf16",
+                "q4e_gemv4_packed",
                 "q4e_gemv_bf16",
+                "q4e_gemv_packed",
                 "q4e_gemv_tiled_bf16",
                 "q4e_gemv_tiled_e4m3",
                 "q4e_gemv_tiled_e4m3_tile",
@@ -226,6 +243,7 @@ impl Image {
                 "q4e_hyper_up_tiled",
                 "q4e_inject",
                 "q4e_kda_decay",
+                "q4e_pack_bf16",
                 "q4e_ple_conv",
                 "q4e_ple_gate",
                 "q4e_quantize_e4m3_rows",
@@ -235,6 +253,7 @@ impl Image {
                 "q4e_shared_gate_up",
                 "q4e_sum_slots",
                 "q4e_swiglu",
+                "q4e_unpack_bf16",
                 "q4e_widen_streams",
                 "q4e_zero",
             ],
@@ -267,7 +286,18 @@ impl Image {
                 "q4p_hyper_up_rows",
                 "q4p_moe_down",
                 "q4p_moe_down_fp8",
+                "q4p_moe_down_head",
+                "q4p_moe_down_mx8",
+                "q4p_moe_down_mx8_head",
+                "q4p_moe_down_runs",
+                "q4p_moe_down_runs_head",
+                "q4p_moe_down_runs_mx8",
+                "q4p_moe_down_runs_mx8_head",
                 "q4p_moe_gate_up",
+                "q4p_moe_gate_up_capped",
+                "q4p_moe_gate_up_capped_head",
+                "q4p_moe_gate_up_capped_mx8",
+                "q4p_moe_gate_up_capped_mx8_head",
                 "q4p_moe_gate_up_fp8",
                 "q4p_moe_rows_down",
                 "q4p_moe_rows_gate_up",
@@ -289,6 +319,8 @@ impl Image {
             ],
             Self::Dflash2 => &[
                 "q4d_attn",
+                "q4d_attn_span_chunk",
+                "q4d_attn_span_merge",
                 "q4d_block_embed",
                 "q4d_capture",
                 "q4d_conv",
@@ -343,6 +375,60 @@ impl Image {
                 "q4e_swiglu_limited",
             ],
             Self::MoePlan => &["moe_plan"],
+            Self::Inkling => &[
+                "inkling_attn_decode",
+                "inkling_attn_prefill",
+                "inkling_block_residual",
+                "inkling_block_residual_chain_q1_n0",
+                "inkling_block_residual_chain_q1_n1",
+                "inkling_block_residual_chain_q1_n3",
+                "inkling_block_residual_chain_q3_n0",
+                "inkling_block_residual_chain_q3_n1",
+                "inkling_block_residual_chain_q3_n3",
+                "inkling_block_residual_mix",
+                "inkling_block_residual_stats",
+                "inkling_expert_mix",
+                "inkling_kv_store",
+                "inkling_logit_softcap",
+                "inkling_nvfp4_quantize_4_6",
+                "inkling_residual_add",
+                "inkling_short_conv",
+                "inkling_short_conv_decode",
+                "inkling_short_conv_dynamic",
+                "inkling_short_conv_dynamic_decode",
+                "inkling_mxfp8_expert_matvec",
+                "inkling_nvfp4_expert_matvec",
+                "inkling_router_topk",
+                "inkling_softcapped_swiglu",
+                "inkling_widen_f32",
+                // kernels/inkling_vision_sm121.cu: the vision tower's own stages.
+                "inkling_vision_layernorm",
+                "inkling_vision_patchify",
+                "inkling_vision_rope",
+                "inkling_vision_scale_add",
+                // kernels/inkling_draft_sm121.cu: the DSpark drafter's own stages.
+                "inkling_draft_add_round",
+                "inkling_draft_capture",
+                "inkling_draft_context",
+                "inkling_draft_markov_gates",
+                "inkling_draft_markov_input",
+                "inkling_draft_markov_last",
+                "inkling_draft_markov_local",
+                "inkling_draft_markov_logits",
+                "inkling_draft_masks",
+                "inkling_draft_mix_norm",
+                "inkling_draft_norm",
+                "inkling_draft_rope",
+                "inkling_draft_round",
+                "inkling_draft_swiglu",
+                // kernels/opt_exchange_sm121.cuh: the direct-RDMA exchange's device side.
+                "opt_exchange_collect",
+                "opt_exchange_stage_bf16",
+                // kernels/opt_vision_sm121.cu, which the vision stages bring: DeepSeek's vision
+                // GEMM and attention, reused unchanged by the Inkling tower.
+                "opt_vision_attn",
+                "opt_vision_gemm",
+            ],
             Self::Dory => &[
                 "dory_attn_combine",
                 "dory_attn_mma128",
@@ -620,6 +706,7 @@ impl Image {
             Self::GlmMoe => glm_moe_cubin(),
             Self::GlmDecode => glm_decode_cubin(),
             Self::MoePlan => moe_plan_cubin(),
+            Self::Inkling => inkling_cubin(),
             Self::Dory => dory_cubin(),
             // DeepSeek loads its kernels through the shared driver from the PTX set, and the
             // RoCEnante path compiles its own image at run time.
@@ -648,6 +735,7 @@ impl Image {
             Self::GlmMoe => "glm_moe_sm121",
             Self::GlmDecode => "glm_decode_sm121",
             Self::MoePlan => "moe_plan_sm121",
+            Self::Inkling => "inkling_sm121",
             Self::Dory => "dory_sm121",
             Self::Deepseek => "deepseek_ptx",
             Self::Rocenante => "rocenante_oneshot_sm121",
@@ -674,6 +762,7 @@ mod tests {
             Image::GlmDecode,
             Image::Deepseek,
             Image::Dory,
+            Image::Inkling,
             Image::Rocenante,
         ] {
             assert!(!image.name().is_empty());

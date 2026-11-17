@@ -1350,25 +1350,6 @@ struct RequestBuilder {
     constraint: Option<serde_json::Value>,
 }
 
-/// Turns the prompt's trailing opening think tag into the closing one, so a turn that must not
-/// reason still starts from the conversation's own rendered prefix: a template re-rendered with
-/// thinking off drops the prior turns' reasoning and shifts every token from position 2, which
-/// costs the whole prefix cache. Returns whether the swap happened.
-fn close_thinking_turn(seam: &dyn PromptCodec, ids: &mut [u32]) -> bool {
-    let single = |text: &str| match seam.encode_text(text, false) {
-        Ok(tokens) if tokens.len() == 1 => tokens.first().copied(),
-        _ => None,
-    };
-    let (Some(start), Some(end)) = (single("<think>"), single("</think>")) else {
-        return false;
-    };
-    let Some(last) = ids.last_mut().filter(|last| **last == start) else {
-        return false;
-    };
-    *last = end;
-    true
-}
-
 /// V4.1 thinking-mode sampling policy, adopted from deepseek-recipe 0.2.
 ///
 /// This is a deliberately labelled API-surface/sampling change (task-63), not a
@@ -2323,7 +2304,7 @@ async fn chat_completions(
     let (mut summary, prompt_token_ids) = match (seam.as_ref(), raw_for_seam.as_ref()) {
         (Some(seam), Some(raw)) => {
             let mut ids = seam.encode_chat(raw).map_err(prompt_codec_error)?;
-            let closed = !spec.thinking && close_thinking_turn(seam.as_ref(), &mut ids);
+            let closed = !spec.thinking && seam.close_thinking(&mut ids);
             if suppress_thinking && !closed {
                 // The rendered prompt did not end on the opening think tag, so closing it in
                 // place is not possible: re-render with the template's own thinking switch,
@@ -4411,11 +4392,7 @@ fn responses_message_item(object: &Map<String, Value>) -> Result<Value, ApiError
     // The released V4.1 encoder drops a developer message in thinking mode (the default) and
     // refuses it in chat mode. Fold it onto the system role, which the renderer supports at any
     // position, so the instruction reaches the model instead of disappearing.
-    let role = if role == "developer" {
-        "system".to_owned()
-    } else {
-        role
-    };
+    let role = sparkflash_model::prompt::template_role(&role).to_owned();
     let content = match object.get("content") {
         None => Value::Null,
         Some(content) => responses_content_to_chat(content)?,

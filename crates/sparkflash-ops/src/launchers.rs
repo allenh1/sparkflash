@@ -34,10 +34,12 @@ use sparkflash_kernels::cuda_driver::{Cuda, Kernel, RunStream};
 
 use crate::attention::{AttentionKind, AttentionPlan};
 use crate::engine_plan::{PartRequirement, PlanError};
-use crate::gdn::{GDN_VALUE, gdn_scan_shape_for};
 use crate::plan::{Launch, OpPlan, StreamId};
-use crate::resolver::ResolvedKernel;
-use crate::scan::ScanKind;
+use crate::resolver::{PlanContext, ResolvedKernel};
+use crate::scan::{ScanKind, ScanPlan};
+
+/// The rows the boot launchers describe a scan at: a prompt's (the grid does not depend on them).
+const SCHEDULED_ROWS: usize = 2;
 
 /// One fixed launch geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,55 +121,34 @@ pub struct LinearScanLauncher {
 }
 
 impl LinearScanLauncher {
-    /// Bind one scan requirement to its resolved kernel.
+    /// Bind one scan requirement to the scan plan an arm executes ([ScanPlan::scheduled]): the
+    /// kernel is the scan body the plan resolves for its head widths, not the image's first
+    /// symbol, and the grid is the plan's.
+    ///
+    /// `None` when no prompt scan body takes the requirement's head widths (a fixture's narrow
+    /// heads): such a rank runs its recurrence on the token kernel, and an arm whose prompt walk
+    /// reaches the scan refuses there ([ScanPlan::for_architecture]).
     ///
     /// # Errors
-    /// A requirement of the other recurrence.
+    /// A requirement of another part, or a scan the plan refuses for another reason.
     pub fn new(
         requirement: &PartRequirement,
-        resolved: &ResolvedKernel,
-    ) -> Result<Self, PlanError> {
-        let kind = match requirement.part {
-            sparkflash_model::Part::GdnScan => ScanKind::Gdn,
-            sparkflash_model::Part::KdaScan => ScanKind::Kda,
-            other => {
-                return Err(PlanError::Invalid(format!(
-                    "a {other} requirement is not a linear-attention scan"
-                )));
-            }
+        context: PlanContext,
+    ) -> Result<Option<Self>, PlanError> {
+        let plan = match ScanPlan::scheduled(context, requirement, SCHEDULED_ROWS) {
+            Ok(plan) => plan,
+            Err(crate::OpError::Resolve(_)) => return Ok(None),
+            Err(error) => return Err(PlanError::Invalid(error.to_string())),
         };
-        // GDN stores key heads in `heads` and value heads in `kv_heads`; its recurrence runs
-        // one grid row a value head. KDA's head is both, and its grid uses `heads`.
-        let (key_heads, heads) = match kind {
-            ScanKind::Gdn => (
-                requirement.geometry.heads.max(1),
-                requirement.geometry.kv_heads.max(1),
-            ),
-            ScanKind::Kda => (
-                requirement.geometry.heads.max(1),
-                requirement.geometry.heads.max(1),
-            ),
-        };
-        let value_dim = if requirement.geometry.v_head == 0 {
-            GDN_VALUE
-        } else {
-            requirement.geometry.v_head
-        };
-        let (grid, block) = gdn_scan_shape_for(heads, value_dim);
-        Ok(Self {
-            kind,
-            kernel: resolved.id(),
-            key_heads,
-            heads,
-            value_dim,
-            launch: KernelLaunch {
-                kernel: resolved.id(),
-                grid,
-                block: (block, 1, 1),
-                shared_bytes: 0,
-                stream: StreamId(0),
-            },
-        })
+        let launch = plan.launch();
+        Ok(Some(Self {
+            kind: plan.kind,
+            kernel: plan.kernel(),
+            key_heads: requirement.geometry.heads.max(1),
+            heads: plan.heads,
+            value_dim: plan.value_dim,
+            launch: KernelLaunch::from(launch),
+        }))
     }
 
     /// The grid and block the scan runs with.

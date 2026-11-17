@@ -26,6 +26,7 @@
 
 use crate::capabilities::Capabilities;
 use crate::descriptor::ModelDescriptor;
+use crate::vision::{ImageSpan, VisionImage};
 
 /// A backend failure.
 ///
@@ -151,6 +152,31 @@ pub trait ModelSession: Send {
     /// A backend failure, such as a shape mismatch or an exhausted context.
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError>;
 
+    /// Consumes a prompt whose image spans take `images`' features, and returns the first step.
+    ///
+    /// The images are in prompt order and their spans lie inside `tokens`. Without images this is
+    /// [`Self::prefill`]. The default refuses any image: a session that cannot encode one must
+    /// say so rather than read the placeholders as text.
+    ///
+    /// # Errors
+    /// As [`Self::prefill`], and a session without a vision path refuses images.
+    fn prefill_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
+        if images.is_empty() {
+            return self.prefill(tokens);
+        }
+        Err(BackendError::new(
+            "vision",
+            format!(
+                "this session has no vision path for the request's {} images",
+                images.len()
+            ),
+        ))
+    }
+
     /// Consumes one generated token and returns the next step.
     ///
     /// # Errors
@@ -176,6 +202,29 @@ pub trait ModelSession: Send {
         None
     }
 
+    /// A shorter prefix of [`Self::reusable_prefix`] the sequence can go back to, when it can.
+    ///
+    /// A session that kept its state at an earlier point (the end of its last prompt, say) may
+    /// take a prompt that starts with these tokens and parts from the rest of its history: it
+    /// rewinds to them and forwards the rest, and reports them as the hit. An adapter offers it
+    /// such a prompt only when the prompt goes past them. `None` - the default - says the session
+    /// has no such point.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        None
+    }
+
+    /// The images [`Self::reusable_prefix`] holds: their spans as they were fed, content keys
+    /// included.
+    ///
+    /// A history is ids, and an image's placeholders are the same ids whatever the image, so an
+    /// adapter continues a history that holds images only with a prompt that carries these same
+    /// images at these same spans. The ones that start before [`Self::rewind_prefix`]'s end are
+    /// the rewind point's. The default - none - suits a session that keeps no image with its
+    /// history: a prompt with an image inside the held tokens then starts a fresh sequence.
+    fn held_images(&self) -> &[ImageSpan] {
+        &[]
+    }
+
     /// How many of the last [`Self::prefill`]'s tokens the sequence already held.
     ///
     /// This is what the request reports as its cache hit. The default is zero, for a session
@@ -183,6 +232,12 @@ pub trait ModelSession: Send {
     fn cached_tokens(&self) -> usize {
         0
     }
+
+    /// Says the request is over and the adapter keeps the session for a later one: whatever the
+    /// sequence holds may be given up for another sequence that needs the memory, after which
+    /// [`Self::reusable_prefix`] no longer names it. The default does nothing, for a session that
+    /// holds its memory until it is dropped.
+    fn park(&mut self) {}
 }
 
 /// How a model runs on one host.
@@ -204,6 +259,15 @@ pub trait ModelBackend: Send + Sync {
     /// tower narrows the answer rather than advertising a channel it cannot run.
     fn capabilities(&self) -> Capabilities {
         self.descriptor().capabilities
+    }
+
+    /// The interconnect this backend's ranks exchange over, when it serves a group.
+    ///
+    /// A single-process backend leaves this `None`, and the serving layer reports that there is no
+    /// cluster behind it. A backend that is one rank of a group names the transport honestly, so
+    /// the model card and the cluster stats do not claim "no cluster" for a four-host server.
+    fn fabric_mode(&self) -> Option<&'static str> {
+        None
     }
 
     /// Opens a fresh sequence.

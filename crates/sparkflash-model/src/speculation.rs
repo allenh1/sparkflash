@@ -133,7 +133,17 @@ impl DepthPolicy {
     /// The policy the installed profile names, over chains of up to `k` drafts.
     #[must_use]
     pub fn from_profile(k: usize, cost: StepCost) -> Self {
-        let speculation = &crate::active_profile().speculation;
+        Self::from_speculation(&crate::active_profile().speculation, k, cost)
+    }
+
+    /// The policy `speculation` names, over chains of up to `k` drafts: for an arm that resolves
+    /// its own switches, and refuses a malformed one, rather than read the installed profile.
+    #[must_use]
+    pub fn from_speculation(
+        speculation: &crate::profile::SpeculationProfile,
+        k: usize,
+        cost: StepCost,
+    ) -> Self {
         let policy = match speculation.depth_policy {
             Some(crate::profile::DepthMode::Fixed) => Self::fixed(k, cost),
             Some(crate::profile::DepthMode::Adaptive) | None => Self::adaptive(k, cost),

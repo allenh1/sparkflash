@@ -35,7 +35,7 @@
 //!    * the kernel itself is compiled standalone, so it must be a self-contained translation
 //!      unit;
 //!    * every probed kernel is compiled on its own, so a failure names the file, and then
-//!      all forty-three are compiled together with the trace macros enabled, which is the only
+//!      all forty-nine are compiled together with the trace macros enabled, which is the only
 //!      check that can catch a collision BETWEEN kernel files.
 //!
 //!    None of that needs a GPU, only a CUDA frontend. When nvcc is absent but clang is present,
@@ -159,7 +159,7 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 }
 "#;
 
-/// The forty-three device kernel sources the crate probes and pins, with the stem used for their PTX
+/// The forty-nine device kernel sources the crate probes and pins, with the stem used for their PTX
 /// output.
 ///
 /// Six of them are the Milestone 4 kernels of specification 6.2, the set m4_abi's frozen KERNELS
@@ -189,10 +189,10 @@ __global__ void sparkflash_roce_abi_probe(RoceOneShotSlot *slot, uint64_t *sink)
 /// M=1 and multi-row decode path, the bulk-prefill MMA and the D59 vision tower, loaded by name
 /// from their own cubins, one pin each). They are
 /// device sources this crate ships, the clang/nvcc probes compile them like the others, and
-/// baseline/kernel_baseline.txt records their cubins. Every one of the forty-three is probed on every
+/// baseline/kernel_baseline.txt records their cubins. Every one of the forty-nine is probed on every
 /// build: a kernel that is only ever compiled by hand on a GPU host is a kernel nobody has
 /// type-checked, and the CI cuda-tests job runs exactly this probe.
-const PROBED_KERNELS: [(&str, &str); 43] = [
+const PROBED_KERNELS: [(&str, &str); 49] = [
     ("mega_mhc_sm121.cu", "mega_mhc_sm121"),
     ("b12x_mxfp8_dense_sm121.cu", "b12x_mxfp8_dense_sm121"),
     ("b12x_mxfp8_dense_m1_sm121.cu", "b12x_mxfp8_dense_m1_sm121"),
@@ -254,6 +254,14 @@ const PROBED_KERNELS: [(&str, &str); 43] = [
     // image; probing it here is what type-checks it on every build rather than only where nvcc
     // happens to compile the images.
     ("moe_plan_sm121.cu", "moe_plan_sm121"),
+    // Inkling-2-Small's sources. They are also composed into the Inkling image by
+    // kernels/inkling_sm121.cu; probing them on their own is what type-checks each body.
+    ("inkling_attn_sm121.cu", "inkling_attn_sm121"),
+    ("inkling_conv_sm121.cu", "inkling_conv_sm121"),
+    ("inkling_epilogue_sm121.cu", "inkling_epilogue_sm121"),
+    ("inkling_moe_sm121.cu", "inkling_moe_sm121"),
+    ("inkling_vision_sm121.cu", "inkling_vision_sm121"),
+    ("inkling_draft_sm121.cu", "inkling_draft_sm121"),
 ];
 
 /// The shared header every one of those kernels includes for its model constants, the MX codecs
@@ -326,9 +334,14 @@ const MODEL_IMAGES: &[(&str, &str, &str)] = &[
         "SPARKFLASH_MOE_PLAN_CUBIN",
     ),
     ("dory_sm121.cu", "dory_sm121.cubin", "SPARKFLASH_DORY_CUBIN"),
+    (
+        "inkling_sm121.cu",
+        "inkling_sm121.cubin",
+        "SPARKFLASH_INKLING_CUBIN",
+    ),
 ];
 
-/// The combined probe: all forty-three kernel sources in one translation unit with the trace macros
+/// The combined probe: all forty-nine kernel sources in one translation unit with the trace macros
 /// ENABLED. This is the only check in the build that can catch a collision BETWEEN kernels (two
 /// files defining the same macro to different values, or two identical non-inline symbols), and it
 /// is also the only one that compiles the enabled branch of every trace scope.
@@ -455,7 +468,7 @@ fn main() {
     );
 
     // The probed kernel set. Every kernel is probed individually so that a failure names the file,
-    // and then all forty-three are probed together with the trace macros enabled.
+    // and then all forty-nine are probed together with the trace macros enabled.
     if !kernels.join(M4_COMMON_HEADER).is_file() {
         println!(
             "cargo:warning=sparkflash-kernels: {} is missing; skipping every probed-kernel probe",
@@ -484,7 +497,7 @@ fn main() {
     report(
         &nvcc,
         &arch,
-        "the combined probe (all forty-three kernels, trace macros enabled)",
+        "the combined probe (all forty-nine kernels, trace macros enabled)",
         check_m4_probe(&nvcc, &arch, kernels),
     );
 }
@@ -696,7 +709,7 @@ fn report_clang_probe(clang: &Path, arch: &str) {
                 println!(
                     "cargo:warning=sparkflash-kernels: nvcc not found; clang's CUDA frontend parsed \
                  kernels/rocenante_oneshot_sm121.cu, the RoCEnante ABI probe (trace macros \
-                 enabled, signature redeclared, slot static_asserts), {checked} of the forty-three \
+                 enabled, signature redeclared, slot static_asserts), {checked} of the forty-nine \
                  probed kernels (the six Milestone 4 ABI kernels, the M7 SwiGLU quantiser \
                  epilogue and its weighted routed variant, the task-37 device router, the \
                  task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified head's \
@@ -729,7 +742,7 @@ fn report_clang_probe(clang: &Path, arch: &str) {
     }
 }
 
-/// Parses the forty-three probed kernels and the combined probe with clang. Returns how many kernels were
+/// Parses the forty-nine probed kernels and the combined probe with clang. Returns how many kernels were
 /// found and how many were missing, so the warning can say which evidence was gathered.
 fn check_probed_kernels_syntax(clang: &Path, arch: &str) -> Result<(usize, usize), ProbeFailure> {
     let kernels = Path::new("../../kernels");

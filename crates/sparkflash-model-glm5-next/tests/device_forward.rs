@@ -1094,12 +1094,11 @@ fn speculative_greedy(
                     "world {world} rank {rank} stream {stream} token {at}: a speculative draft is \
                      not the one-token draft"
                 );
-                // The block drafter's confidence in each draft, a probability; the MTP layer
-                // keeps none.
-                let block = matches!(drafting, Drafting::Block(_));
+                // The drafter's confidence in each draft, a probability: the block drafter's, and
+                // the MTP head's pick probability, which its adaptive depth reads.
                 assert_eq!(
                     confidence.len(),
-                    if block { drafts.len() } else { 0 },
+                    drafts.len(),
                     "world {world} rank {rank} stream {stream} token {at}"
                 );
                 assert!(

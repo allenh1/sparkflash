@@ -71,6 +71,69 @@ pub fn verdict(chunk: &[u32], picks: &[u32]) -> usize {
     kept
 }
 
+/// How many of [verdict]'s `kept` rows a sequence keeps in its caches: none past the first row
+/// that picked an end-of-turn token. The reply ends at that row, so a later row never answers
+/// the caller, and caches holding it would run past the history the caller saw. An arm that
+/// cannot rewind could not continue that history in the next turn. The verdict itself still
+/// measures the drafter, so the speculation counters and the depth take `kept`.
+///
+/// # Example
+///
+/// ```
+/// use sparkflash_model::spec::kept_to_end;
+/// // The second draft was the end of the turn, and the model chose it.
+/// assert_eq!(kept_to_end(4, &[11, 2, 17, 19], &[2]), 2);
+/// // No row picked an end of turn.
+/// assert_eq!(kept_to_end(4, &[11, 13, 17, 19], &[2]), 4);
+/// ```
+#[must_use]
+pub fn kept_to_end(kept: usize, picks: &[u32], eos: &[u32]) -> usize {
+    picks
+        .iter()
+        .take(kept)
+        .position(|pick| eos.contains(pick))
+        .map_or(kept, |row| row + 1)
+}
+
+/// Drafts up to `depth` tokens by prompt lookup: the tokens that followed the most recent earlier
+/// occurrence of `history`'s last `n` tokens, for the longest `n` in `min_ngram..=max_ngram` that
+/// has one.
+///
+/// This is the n-gram ("prompt lookup") drafter. It needs no model, so it drafts where a reply
+/// repeats its context (code edits, quotes, structured output) and proposes nothing elsewhere.
+/// [verdict] keeps only what the model chose, so a poor draft costs a verify row and never a
+/// token.
+///
+/// # Example
+///
+/// ```
+/// use sparkflash_model::spec::lookup_draft;
+/// // "3 4" occurred before, followed by 5 6 7.
+/// assert_eq!(lookup_draft(&[1, 3, 4, 5, 6, 7, 2, 3, 4], 2, 3, 2), vec![5, 6]);
+/// // No earlier "9 4", and a single token is below the shortest n-gram.
+/// assert!(lookup_draft(&[1, 4, 2, 9, 4], 2, 3, 4).is_empty());
+/// ```
+#[must_use]
+pub fn lookup_draft(history: &[u32], min_ngram: usize, max_ngram: usize, depth: usize) -> Vec<u32> {
+    let len = history.len();
+    if depth == 0 || len < 2 {
+        return Vec::new();
+    }
+    for n in (min_ngram.max(1)..=max_ngram.min(len - 1)).rev() {
+        let suffix = &history[len - n..];
+        // The most recent earlier occurrence, which always has a token after it: it starts
+        // before the suffix does.
+        if let Some(start) = (0..len - n)
+            .rev()
+            .find(|&start| &history[start..start + n] == suffix)
+        {
+            let from = start + n;
+            return history[from..(from + depth).min(len)].to_vec();
+        }
+    }
+    Vec::new()
+}
+
 /// A token a verify produced that the serving adapter has not been handed yet.
 ///
 /// The adapter's `decode` is called once per token the request emits. A round emitted several,
@@ -197,6 +260,13 @@ impl Speculator {
         self.max_depth
     }
 
+    /// Whether the depth follows the drafts' confidences, so a drafter that proposes one draft a
+    /// pass may stop once the policy wants no more.
+    #[must_use]
+    pub fn is_adaptive(&self) -> bool {
+        self.policy.as_ref().is_some_and(DepthPolicy::is_adaptive)
+    }
+
     /// What this sequence's drafts have been worth so far.
     ///
     /// A request reports its own counts, so a serving adapter resets the speculator when it
@@ -225,6 +295,24 @@ impl Speculator {
             None => self.max_depth,
         };
         want.min(room).min(self.max_depth)
+    }
+
+    /// The chance that drafts `0..=j` are all accepted, for each draft of `confidence` the caller
+    /// has `room` for: the policy's calibrated chain, or certainty up to [Self::max_depth] without
+    /// a policy (an MTP layer offers no probabilities, so its whole chain is wanted). A row share
+    /// across sequences weighs these (`sparkflash_runtime::share`); the caller cuts the chain to
+    /// the drafts it holds.
+    #[must_use]
+    pub fn chain(&self, confidence: &[f32], room: usize) -> Vec<f64> {
+        let limit = room.min(self.max_depth);
+        match self.policy.as_ref() {
+            Some(policy) => {
+                let mut chain = policy.chain(confidence);
+                chain.truncate(limit);
+                chain
+            }
+            None => vec![1.0; limit],
+        }
     }
 
     /// Records one round: `offered` drafts verified, `kept - 1` of them accepted.
@@ -314,6 +402,21 @@ mod tests {
         assert_eq!(stats.drafts_accepted, 2);
         speculator.reset();
         assert_eq!(speculator.stats(), Speculation::default());
+    }
+
+    #[test]
+    fn a_lookup_draft_takes_the_longest_and_latest_match() {
+        // "7 8" last occurred at 4..6 (followed by 2), earlier at 0..2 (followed by 9); the
+        // latest wins.
+        let history = [7, 8, 9, 1, 7, 8, 2, 5, 7, 8];
+        assert_eq!(lookup_draft(&history, 1, 3, 3), vec![2, 5, 7]);
+        // "1 2 3" beats the shorter "2 3" whose later occurrence follows something else.
+        let history = [1, 2, 3, 4, 0, 2, 3, 6, 1, 2, 3];
+        assert_eq!(lookup_draft(&history, 1, 3, 2), vec![4, 0]);
+        // The draft stops at the history's end.
+        assert_eq!(lookup_draft(&[5, 6, 5], 1, 2, 4), vec![6, 5]);
+        assert!(lookup_draft(&[5, 6, 5], 1, 2, 0).is_empty());
+        assert!(lookup_draft(&[5], 1, 2, 4).is_empty());
     }
 
     fn row(value: f32) -> Vec<f32> {

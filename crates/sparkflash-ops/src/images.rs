@@ -16,7 +16,8 @@
 
 pub use sparkflash_kernels::images::{
     Image, dflash2_cubin, glm_attention_cubin, glm_decode_cubin, glm_moe_cubin, glm_prefill_cubin,
-    qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin, qwen4_prefill_cubin, qwen4_scan_cubin,
+    inkling_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin, qwen4_prefill_cubin,
+    qwen4_scan_cubin,
 };
 
 /// Whether this build carries the Qwen3.8 attention image.
@@ -77,4 +78,10 @@ pub fn glm_moe_available() -> bool {
 #[must_use]
 pub fn glm_decode_available() -> bool {
     Image::GlmDecode.available()
+}
+
+/// Whether this build carries the Inkling-2 attention, convolution and epilogue image.
+#[must_use]
+pub fn inkling_available() -> bool {
+    Image::Inkling.available()
 }

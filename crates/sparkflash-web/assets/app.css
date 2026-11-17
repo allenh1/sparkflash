@@ -506,6 +506,10 @@ main {
 .field > span { color: var(--text-2); font-size: 12.5px; font-weight: 500; }
 .field > span em { color: var(--muted); font-style: normal; font-weight: 400; margin-left: 4px; }
 .field small { color: var(--muted); font-size: 12px; }
+/* The lane groups' knobs sit in the fields grid as if they were its own children. */
+#lane-knobs { display: contents; }
+.field-check { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 8px; row-gap: 5px; }
+.field-check > small { grid-column: 1 / -1; }
 .input-row { display: flex; gap: 6px; }
 .input-row > select, .input-row > input { flex: 1; min-width: 0; }
 .btn-icon { width: 34px; flex: none; padding: 0; }

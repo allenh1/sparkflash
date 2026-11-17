@@ -115,8 +115,8 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
         .collect();
     assert_eq!(
         listed.len(),
-        43,
-        "the list must name every baseline kernel - the forty-three entries: the six Milestone 4 \
+        49,
+        "the list must name every baseline kernel - the forty-nine entries: the six Milestone 4 \
          kernels, the M7 SwiGLU quantiser epilogue and its weighted routed variant, the task-37 \
          device router, the task-8 routed gate/up GEMM, the serving tail's RMSNorm, the certified \
          head's device reduce, the CSA2 sequence attention entry, D49's ring-capacity CSA2 entry, \
@@ -126,8 +126,9 @@ fn the_baseline_list_matches_the_manifest_and_the_kernels_on_disk() {
          (Engram gate/write, the two-direction stream conversion cubin, the routed-MoE \
          staging/combine pair), the S1 ratio>0 compressor pooling (the by-name \
          pool_group_f32 symbol), the nine opt decode cubins, \
-         the opt bulk-prefill MMA cubin, the opt vision tower cubin and the shared \
-         routed-expert plan: {listed:?}"
+         the opt bulk-prefill MMA cubin, the opt vision tower cubin, the shared \
+         routed-expert plan and Inkling-2's six sources (attention, convolution, epilogue, MoE, \
+         vision tower, drafter): {listed:?}"
     );
 
     let manifest = std::fs::read_to_string(crate_dir.join("baseline/kernel_baseline.txt"))
@@ -487,6 +488,7 @@ fn the_loader_resolves_every_name_the_pinned_baseline_uses() {
             || name == "moe_routed_device_sm121"
             || name == "moe_plan_sm121"
             || name == "pool_group_sm121"
+            || name.starts_with("inkling_")
             || name.starts_with("opt_")
         {
             continue;

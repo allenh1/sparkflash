@@ -14,11 +14,20 @@
 
 //! The generic host driver.
 //!
-//! The driver owns one backend and one sequence per worker. A worker keeps its sequence between
-//! requests when the backend says the sequence can continue from the prefix the next prompt shares
+//! The driver owns one backend and the sequences its workers keep between requests ([HeldPool]).
+//! A sequence is kept when the backend says it can continue from the prefix a later prompt shares
 //! with it ([ModelSession::reusable_prefix]), so a chat turn prefills only the text it added
-//! instead of the whole conversation. A prompt that does not extend the held tokens gets a fresh
-//! session; the two are equivalent, and only the work differs. Requests arrive through a bounded
+//! instead of the whole conversation. A request takes the kept sequence its prompt continues
+//! furthest, whichever worker served it last; a prompt that continues none gets a fresh session;
+//! the two are equivalent, and only the work differs.
+//!
+//! Two cases continue a held sequence although the ids differ. A client that sends the model's
+//! reply back as text has it re-encoded, and the tokenizer may spell a word with other ids than the
+//! model chose (`ĠRibb`+`on` against `Ġ`+`Ribbon`): when the prompt spells the held tokens' exact
+//! bytes, the sequence continues from its own ids and forwards the rest
+//! ([HostOptions::reuse_by_text]). And a request whose client left after its prefill finished keeps
+//! the sequence and the step it computed, so a retry of the same prompt answers from that step
+//! instead of prefilling it again. Requests arrive through a bounded
 //! channel and their events leave through a bounded reply channel, so a client that stops reading
 //! applies backpressure to the engine rather than growing an unbounded buffer.
 //!
@@ -28,9 +37,10 @@
 //! which preserves the serial one-job-at-a-time behavior. A value above 1 is for backends whose
 //! sessions are independent; a backend whose sessions share mutable engine state must serialize
 //! that state itself (the Qwen device arm gives each session its own stream, so their kernels can
-//! overlap). A backend that only supports one live session must stay at 1. With more than one
-//! worker a request is served by whichever worker takes it, so a prefix is reused only when the
-//! same worker sees the next request.
+//! overlap). A backend that only supports one live session must stay at 1. The kept sequences are
+//! the workers' in common, at most `concurrency` of them with the ones being served: an agent's
+//! next turn finds its conversation whichever worker takes it, and a new conversation takes the
+//! room of the least recently used kept one.
 //!
 //! This adapter is intentionally smaller than the V4.1 reference driver. It supports text
 //! requests, stop strings, sample logprobs and the standard usage/timing envelope. Prompt
@@ -38,8 +48,8 @@
 //! that asks for them receives a typed engine error rather than an invented payload.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -56,8 +66,9 @@ use sparkflash_api::telemetry_types::{
     PromptTokensDetails, RequestTimingStats, RoceTransportStats, finite_or_zero,
 };
 use sparkflash_model::telemetry::PrefixMatchPlan;
+use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{
-    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation,
+    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation, StepOutput,
 };
 use tokio::sync::mpsc;
 
@@ -79,6 +90,27 @@ pub const ENGINE_GONE_CODE: &str = "engine_gone";
 /// The error code for a request refused before any backend work.
 pub const REFUSED_CODE: &str = "refused";
 
+/// The environment switch for [HostOptions::reuse_by_text]: `0` (or `off`) turns it off.
+pub const REUSE_BY_TEXT_ENV: &str = "SPARKFLASH_REUSE_BY_TEXT";
+
+/// Reads [REUSE_BY_TEXT_ENV]: unset is on, `1`/`on`/`true`/`yes` is on, `0`/`off`/`false`/`no` is
+/// off. Any other value is refused rather than read as either.
+fn reuse_by_text_from_env() -> Result<bool, String> {
+    match std::env::var(REUSE_BY_TEXT_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{REUSE_BY_TEXT_ENV} is not valid UTF-8"))
+        }
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "on" | "true" | "yes" => Ok(true),
+            "0" | "off" | "false" | "no" => Ok(false),
+            _ => Err(format!(
+                "{REUSE_BY_TEXT_ENV}={value:?} is neither on (1) nor off (0)"
+            )),
+        },
+    }
+}
+
 /// How the generic host driver is sized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostOptions {
@@ -94,6 +126,10 @@ pub struct HostOptions {
     /// batch: it opens that many independent sessions and lets the operating system interleave
     /// their steps. A backend whose sessions share mutable state must keep this at 1.
     pub concurrency: usize,
+    /// Whether a held sequence continues a prompt that spells its tokens' exact bytes with other
+    /// ids, from its own ids. The model then reads the ids it chose for that span, not the ones a
+    /// cold prefill of the prompt would read. On by default; [REUSE_BY_TEXT_ENV] turns it off.
+    pub reuse_by_text: bool,
 }
 
 impl Default for HostOptions {
@@ -103,7 +139,21 @@ impl Default for HostOptions {
             queue_capacity: DEFAULT_QUEUE,
             reply_buffer: DEFAULT_REPLY_BUFFER,
             concurrency: 1,
+            reuse_by_text: true,
         }
+    }
+}
+
+impl HostOptions {
+    /// These options with the switches the environment sets ([REUSE_BY_TEXT_ENV]).
+    ///
+    /// # Errors
+    /// A switch whose value is neither on nor off.
+    pub fn with_env(self) -> Result<Self, String> {
+        Ok(Self {
+            reuse_by_text: reuse_by_text_from_env()?,
+            ..self
+        })
     }
 }
 
@@ -142,6 +192,10 @@ impl HostDriver {
             return Err("the host engine needs at least one worker".to_owned());
         }
         let descriptor = Arc::new(backend.descriptor().clone());
+        let fabric = backend
+            .fabric_mode()
+            .unwrap_or("none (host backend)")
+            .to_owned();
         // The model says what it can render; the driver adds what its own loop implements.
         // run_request feeds a forced token in place of the backend's choice, through the same
         // session.decode every request takes, so teacher forcing is this driver's to declare.
@@ -153,17 +207,28 @@ impl HostDriver {
         let (ready, reported) = std::sync::mpsc::channel();
         let metrics = Arc::new(Metrics::new());
         let backend: Arc<dyn ModelBackend> = Arc::from(backend);
+        let pool = Arc::new(HeldPool::new(options.concurrency));
         let mut handles = Vec::with_capacity(options.concurrency);
         for worker in 0..options.concurrency {
             let backend = Arc::clone(&backend);
             let codec = Arc::clone(&codec);
+            let pool = Arc::clone(&pool);
             let queued = queued.clone();
             let ready = ready.clone();
             let thread_metrics = Arc::clone(&metrics);
+            let by_text = options.reuse_by_text;
             let handle = std::thread::Builder::new()
                 .name(format!("sparkflash-host-engine-{worker}"))
                 .spawn(move || {
-                    host_thread(backend, codec, queued, ready, thread_metrics);
+                    host_thread(
+                        backend,
+                        codec,
+                        queued,
+                        ready,
+                        thread_metrics,
+                        &pool,
+                        by_text,
+                    );
                 })
                 .map_err(|error| format!("cannot start host engine worker {worker}: {error}"))?;
             handles.push(handle);
@@ -205,7 +270,7 @@ impl HostDriver {
             })
             .map_err(|error| format!("cannot start the host engine monitor: {error}"))?;
         drop(queued);
-        let cluster = cluster_snapshot(&descriptor);
+        let cluster = cluster_snapshot(&descriptor, &fabric);
         Ok(Self {
             model: descriptor.id.clone(),
             descriptor,
@@ -248,15 +313,13 @@ impl InferenceEngine for HostDriver {
             let missing = MissingCapability::vision();
             return refused(&missing.to_string(), missing.code());
         }
-        // The API prepares images into `vision` only for an engine that advertises vision. The
-        // generic host driver has no way to write those rows over the placeholder embeddings yet,
-        // and prefill would otherwise read the placeholders as ordinary text. Refuse rather than
-        // answer from a prompt whose images were silently dropped.
-        if !request.vision.is_empty() {
-            return refused(
-                "the generic host driver cannot prefill prepared images yet; use the V4.1 device arm or a text-only request",
-                REFUSED_CODE,
-            );
+        // The API prepares images into `vision` only for an engine that advertises vision, and the
+        // session writes their rows over the placeholders ([ModelSession::prefill_images]). A
+        // backend that does not advertise it would read the placeholders as ordinary text, so
+        // refuse rather than answer from a prompt whose images were silently dropped.
+        if !request.vision.is_empty() && !self.capabilities.vision {
+            let missing = MissingCapability::vision();
+            return refused(&missing.to_string(), missing.code());
         }
         if request.prompt_tokens.is_empty() {
             return refused(
@@ -281,6 +344,7 @@ impl InferenceEngine for HostDriver {
         let (replies, answers) = mpsc::channel(self.reply_buffer);
         let job = Job {
             prompt_tokens: request.prompt_tokens,
+            images: request.vision,
             forced_tokens: request.forced_tokens,
             max_tokens,
             sampling: Sampling {
@@ -317,11 +381,15 @@ impl InferenceEngine for HostDriver {
         }
         // The worker sends `Started` once it has decided which session serves the request, so the
         // event can carry the prefix the engine already holds. It is still the first event.
+        // The finish event's transport block names the fabric this driver's backend declared, so
+        // a four-rank device server does not report "no cluster" on the response it served.
+        let fabric = self.cluster.fabric_mode.clone();
         let answers = stream::unfold(
             AnswerState {
                 answers,
                 prompt_tokens,
                 done: false,
+                fabric,
             },
             move |mut state| async move {
                 if state.done {
@@ -341,7 +409,11 @@ impl InferenceEngine for HostDriver {
                     }
                     Some(Reply::Done(summary)) => {
                         state.done = true;
-                        Some((finished_event(state.prompt_tokens, *summary), state))
+                        let fabric = state.fabric.clone();
+                        Some((
+                            finished_event(state.prompt_tokens, *summary, &fabric),
+                            state,
+                        ))
                     }
                     Some(Reply::Failed(message)) => {
                         state.done = true;
@@ -388,11 +460,15 @@ struct AnswerState {
     answers: mpsc::Receiver<Reply>,
     prompt_tokens: usize,
     done: bool,
+    /// The fabric this driver's backend declared, carried to the finish event's transport block.
+    fabric: String,
 }
 
 /// One queued generation request.
 struct Job {
     prompt_tokens: Vec<u32>,
+    /// The prepared images whose spans lie in `prompt_tokens`, in prompt order.
+    images: Vec<VisionImage>,
     /// Teacher forcing: the tokens fed in place of the backend's choice; empty for a generation.
     forced_tokens: Vec<u32>,
     max_tokens: usize,
@@ -465,6 +541,8 @@ fn host_thread(
     jobs: Receiver<Job>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
     metrics: Arc<Metrics>,
+    pool: &HeldPool,
+    by_text: bool,
 ) {
     if ready.send(Ok(())).is_err() {
         return;
@@ -473,14 +551,18 @@ fn host_thread(
     // report per worker, and a clone held by a worker that later hangs would keep the channel
     // open after the reports it needs have already arrived.
     drop(ready);
-    // The sequence this worker last served, kept for the next request when the backend says it
-    // can continue from the prefix that request shares with it.
-    let mut held: Option<Box<dyn ModelSession>> = None;
     while let Ok(job) = jobs.recv() {
         metrics.request_admitted();
         let replies = job.replies.clone();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            run_request(backend.as_ref(), codec.as_ref(), job, &metrics, &mut held)
+            run_request(
+                backend.as_ref(),
+                codec.as_ref(),
+                job,
+                &metrics,
+                pool,
+                by_text,
+            )
         }));
         let failure = match outcome {
             Ok(Ok(())) => None,
@@ -507,15 +589,383 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// How many of `prompt` the held session already holds, when it may serve this request.
+/// A sequence a worker keeps between requests.
+struct Held {
+    session: Box<dyn ModelSession>,
+    /// The step after the last token the session holds, and the sampler that drew it.
+    ///
+    /// A request whose prompt is exactly the held history has nothing left to forward, so only
+    /// this step can answer it: the retry of a request whose client left once its prefill was done.
+    pending: Option<(Sampling, StepOutput)>,
+}
+
+/// The sequences kept between requests, every worker's in common.
 ///
-/// The session must have a reusable history, the prompt must extend it (strictly: a session with
-/// nothing left to forward has no logits for the last token), and the histories must agree token
-/// for token.
-fn reusable_prefix_len(session: &dyn ModelSession, prompt: &[u32]) -> Option<usize> {
-    let history = session.reusable_prefix()?;
-    (!history.is_empty() && prompt.len() > history.len() && prompt.starts_with(history))
-        .then_some(history.len())
+/// A request takes the kept sequence its prompt continues furthest ([continuation]), so an
+/// agent's next turn finds its conversation whichever worker serves it. A sequence no request
+/// continues stays for one that does, until a fresh sequence needs its room: the pool counts the
+/// sequences kept and the ones the workers are serving, at most `capacity` in all, and the least
+/// recently used kept one goes first. At one worker that is the serial driver's rule: a held
+/// sequence the request cannot continue is dropped before the next one opens.
+///
+/// A sequence on its way back ([Lease::keep]) is in neither list while its session parks, and a
+/// park may wait for the engine's current step. A request claims only once none is on its way:
+/// otherwise the next turn of a conversation that just answered would find the pool full and no
+/// continuation, and take another conversation's kept sequence.
+struct HeldPool {
+    capacity: usize,
+    state: Mutex<PoolState>,
+    /// Signalled when a sequence on its way back is kept.
+    returned: Condvar,
+}
+
+struct PoolState {
+    /// The kept sequences, each with the tick it was last kept at.
+    kept: Vec<(u64, Held)>,
+    /// The sequences the workers are serving.
+    serving: usize,
+    /// The served sequences whose sessions are parking on their way back to `kept`.
+    parking: usize,
+    clock: u64,
+}
+
+/// What a request starts from: a kept sequence and how the request continues it, or a fresh
+/// sequence and the kept one whose room it takes (dropped before the fresh one opens).
+enum Claim {
+    Continue(Held, Continuation),
+    Fresh(Option<Held>),
+}
+
+/// A worker's share of the pool while it serves a request: the request's sequence goes back with
+/// [Lease::keep], and a lease dropped without it gives its count back.
+struct Lease<'p> {
+    pool: &'p HeldPool,
+    kept: bool,
+}
+
+impl HeldPool {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(PoolState {
+                kept: Vec::new(),
+                serving: 0,
+                parking: 0,
+                clock: 0,
+            }),
+            returned: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        // The pool holds no invariant a panicking worker could break halfway: take it as it is.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The sequence `job` starts from, and the lease the worker serves it under.
+    fn claim(&self, job: &Job, codec: &dyn PromptCodec, by_text: bool) -> (Lease<'_>, Claim) {
+        let mut state = self.state();
+        // A sequence on its way back may be the one this request continues.
+        while state.parking > 0 {
+            state = self
+                .returned
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // The furthest continuation wins, the most recently kept among equals.
+        let best = state
+            .kept
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (used, held))| {
+                continuation(held, job, codec, by_text).map(|plan| (index, *used, plan))
+            })
+            .max_by_key(|(_, used, plan)| (plan.covered, *used));
+        let claim = match best {
+            Some((index, _, plan)) => Claim::Continue(state.kept.swap_remove(index).1, plan),
+            None if state.kept.len() + state.serving >= self.capacity => {
+                let oldest = state
+                    .kept
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (used, _))| *used)
+                    .map(|(index, _)| index);
+                Claim::Fresh(oldest.map(|index| state.kept.swap_remove(index).1))
+            }
+            None => Claim::Fresh(None),
+        };
+        state.serving += 1;
+        (
+            Lease {
+                pool: self,
+                kept: false,
+            },
+            claim,
+        )
+    }
+}
+
+impl Lease<'_> {
+    /// Keeps the request's sequence for the next request that continues it.
+    /// Keeps `held` for a later request. The request is over, so the session may give its
+    /// memory up for another that needs it ([ModelSession::park]).
+    ///
+    /// Claims wait while it parks ([HeldPool]).
+    fn keep(mut self, mut held: Held) {
+        self.pool.state().parking += 1;
+        // A panicking park must not leave every later claim waiting.
+        let parked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| held.session.park()));
+        self.kept = parked.is_ok();
+        let mut state = self.pool.state();
+        state.parking = state.parking.saturating_sub(1);
+        if parked.is_ok() {
+            state.serving = state.serving.saturating_sub(1);
+            state.clock += 1;
+            let tick = state.clock;
+            state.kept.push((tick, held));
+        }
+        drop(state);
+        self.pool.returned.notify_all();
+        if let Err(panic) = parked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            let mut state = self.pool.state();
+            state.serving = state.serving.saturating_sub(1);
+        }
+    }
+}
+
+/// How a request continues the held sequence.
+struct Continuation {
+    /// The ids the session is handed when they are not the request's own: its prompt with the
+    /// held ids where it spells their bytes with others.
+    respelled: Option<Vec<u32>>,
+    /// How many of the ids the session is handed it already holds.
+    held: usize,
+    /// How many of the request's own prompt ids those stand for.
+    covered: usize,
+    /// The session has nothing left to forward and answers from its pending step.
+    resume: bool,
+    /// The session goes back to its rewind point ([ModelSession::rewind_prefix]) and forwards
+    /// the prompt past it.
+    rewound: bool,
+}
+
+impl Continuation {
+    /// A fresh sequence: nothing held.
+    const COLD: Self = Self {
+        respelled: None,
+        held: 0,
+        covered: 0,
+        resume: false,
+        rewound: false,
+    };
+}
+
+/// How `job` may continue `kept`, when it may.
+///
+/// The prompt must extend the held tokens, or, with `by_text`, spell their exact bytes and then
+/// extend them. Extend means strictly unless the held step answers the request: a session with
+/// nothing left to forward has no other logits for the last token. The images inside the held
+/// tokens must be the ones the session holds there ([same_images_before]): a held history is ids,
+/// and an image's placeholders are the same ids whatever the image. A re-spelled prompt carries
+/// none and continues no history that holds one, because the re-spelling would move their spans.
+///
+/// A prompt that does neither may still go past the session's rewind point
+/// ([ModelSession::rewind_prefix]) with the point's images before it: the session goes back there.
+/// So may one for a session that names no history, its state left ahead of the tokens its caller
+/// kept (answers it gave back).
+fn continuation(
+    kept: &Held,
+    job: &Job,
+    codec: &dyn PromptCodec,
+    by_text: bool,
+) -> Option<Continuation> {
+    let Some(history) = kept
+        .session
+        .reusable_prefix()
+        .filter(|history| !history.is_empty())
+    else {
+        return rewound(kept, job, codec, by_text);
+    };
+    let held_images = kept.session.held_images();
+    let prompt = job.prompt_tokens.as_slice();
+    let respelling = || {
+        (by_text && job.images.is_empty() && held_images.is_empty())
+            .then(|| respelled_prompt(codec, history, prompt))
+            .flatten()
+    };
+    let (respelled, covered) = if prompt.starts_with(history) {
+        (None, history.len())
+    } else if let Some((ids, covered)) = respelling() {
+        (Some(ids), covered)
+    } else {
+        return rewound(kept, job, codec, by_text);
+    };
+    if !same_images_before(held_images, &job.images, covered) {
+        return None;
+    }
+    let handed = respelled.as_ref().map_or(prompt.len(), Vec::len);
+    let resume = handed == history.len();
+    if resume {
+        let (sampling, _) = kept.pending.as_ref()?;
+        if *sampling != sampling_for(job.sampling, handed) {
+            return None;
+        }
+    }
+    Some(Continuation {
+        respelled,
+        held: history.len(),
+        covered,
+        resume,
+        rewound: false,
+    })
+}
+
+/// How `job` continues `kept` from the session's rewind point, when its prompt keeps the point's
+/// tokens (or, with `by_text`, spells their bytes: [respelled_prompt]), goes past them, and carries
+/// the point's images before their end and no other.
+fn rewound(kept: &Held, job: &Job, codec: &dyn PromptCodec, by_text: bool) -> Option<Continuation> {
+    let point = kept
+        .session
+        .rewind_prefix()
+        .filter(|point| !point.is_empty())?;
+    let held_images = kept.session.held_images();
+    let prompt = job.prompt_tokens.as_slice();
+    let (respelled, covered) = if prompt.starts_with(point) {
+        (None, point.len())
+    } else if by_text && job.images.is_empty() && held_images.is_empty() {
+        let (ids, covered) = respelled_prompt(codec, point, prompt)?;
+        (Some(ids), covered)
+    } else {
+        return None;
+    };
+    let handed = respelled.as_ref().map_or(prompt.len(), Vec::len);
+    if handed <= point.len() || !same_images_before(held_images, &job.images, covered) {
+        return None;
+    }
+    Some(Continuation {
+        respelled,
+        held: point.len(),
+        covered,
+        resume: false,
+        rewound: true,
+    })
+}
+
+/// Whether `images` carry exactly the `held` images among those that start before `end`: every
+/// held span there comes back, content key and all, and no other image starts there.
+fn same_images_before(held: &[ImageSpan], images: &[VisionImage], end: usize) -> bool {
+    held.iter()
+        .filter(|span| span.start < end)
+        .all(|span| images.iter().any(|image| image.span == *span))
+        && images
+            .iter()
+            .filter(|image| image.span.start < end)
+            .all(|image| held.contains(&image.span))
+}
+
+/// `sampling` for a session handed `handed` prompt ids.
+fn sampling_for(mut sampling: Sampling, handed: usize) -> Sampling {
+    sampling.prompt_len = handed;
+    sampling
+}
+
+/// `prompt` with the held ids in place of the ids that spell the same bytes, and how many of
+/// `prompt`'s ids the held ones stand for.
+///
+/// The two agree id for id up to where they part. From there `prompt` must spell the rest of
+/// `history` byte for byte in vocabulary spellings, special tokens included. When one of its ids
+/// spells past the end of `history` (a template whose next turn writes `<think>\n\n` where the
+/// held prompt ended on `<think>` and `\n`, which the tokenizer merges), the text past the end is
+/// encoded on its own after the held ids. The codec's decode of the result must then equal its
+/// decode of `prompt`, so the conversation reads the same to it as well.
+fn respelled_prompt(
+    codec: &dyn PromptCodec,
+    history: &[u32],
+    prompt: &[u32],
+) -> Option<(Vec<u32>, usize)> {
+    let shared = history
+        .iter()
+        .zip(prompt)
+        .take_while(|(held, given)| held == given)
+        .count();
+    if shared == history.len() || shared == prompt.len() {
+        return None;
+    }
+    let mut held = Vec::new();
+    for &id in &history[shared..] {
+        held.extend_from_slice(codec.token_str(id)?.as_bytes());
+    }
+    let (mut spelled, mut covered) = (0usize, shared);
+    let mut overhang = Vec::new();
+    while spelled < held.len() {
+        let piece = codec.token_str(*prompt.get(covered)?)?;
+        let piece = piece.as_bytes();
+        let rest = &held[spelled..];
+        if piece.len() > rest.len() {
+            // This id spells the end of the held bytes and goes past it: the held ids stand for
+            // the prompt's before it, and its text past theirs is encoded on its own.
+            if !piece.starts_with(rest) {
+                return None;
+            }
+            let held_text = codec.decode(&history[shared..])?;
+            let given_text = codec.decode(&prompt[shared..=covered])?;
+            let past = given_text.strip_prefix(held_text.as_str())?;
+            overhang = codec.encode_text(past, false).ok()?;
+            if overhang.is_empty() {
+                return None;
+            }
+            break;
+        }
+        if &rest[..piece.len()] != piece {
+            return None;
+        }
+        spelled += piece.len();
+        covered += 1;
+    }
+    let after = covered + usize::from(!overhang.is_empty());
+    let mut ids = Vec::with_capacity(history.len() + overhang.len() + prompt.len() - after);
+    ids.extend_from_slice(history);
+    ids.extend_from_slice(&overhang);
+    ids.extend_from_slice(&prompt[after..]);
+    (codec.decode(&ids)? == codec.decode(prompt)?).then_some((ids, covered))
+}
+
+/// The prompt ids a request's hit stands for, from the ids the session reports it reused.
+fn client_cached(session_cached: usize, plan: &Continuation) -> usize {
+    if session_cached >= plan.held {
+        session_cached - plan.held + plan.covered
+    } else {
+        session_cached.min(plan.covered)
+    }
+}
+
+/// Why a request stopped before it finished.
+enum Ending {
+    /// The client stopped reading. The sequence is intact and may serve a retry.
+    ClientGone,
+    /// The request could not be answered, and the sequence is intact.
+    Refused(String),
+    /// The backend failed, and the sequence's state is unknown.
+    Failed(String),
+}
+
+impl Ending {
+    fn message(self) -> String {
+        match self {
+            Self::ClientGone => "the client stopped reading this response".to_owned(),
+            Self::Refused(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 fn run_request(
@@ -523,48 +973,147 @@ fn run_request(
     codec: &dyn PromptCodec,
     job: Job,
     metrics: &Metrics,
-    held: &mut Option<Box<dyn ModelSession>>,
+    pool: &HeldPool,
+    by_text: bool,
 ) -> Result<(), String> {
-    let started = Instant::now();
-    let (mut session, cached) = match held.take() {
-        Some(session) => match reusable_prefix_len(session.as_ref(), &job.prompt_tokens) {
-            Some(cached) => (session, cached),
-            None => (
-                backend
-                    .open_session()
-                    .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
-                0,
-            ),
-        },
-        None => (
-            backend
-                .open_session()
-                .map_err(|error| format!("the backend could not open a sequence: {error}"))?,
-            0,
-        ),
-    };
-    session.set_sampling(job.sampling);
+    // A request whose client is already gone, such as a retry queued behind the request it
+    // replaced, must not cost the held sequence the next request may continue.
+    if job.replies.is_closed() {
+        return Err(Ending::ClientGone.message());
+    }
     if job.logprobs.wants_prompt() {
         return Err(
             "the generic host backend does not expose per-position prompt logits yet".to_owned(),
         );
     }
+    let started = Instant::now();
+    let (lease, claim) = pool.claim(&job, codec, by_text);
+    // A kept sequence whose room a fresh one takes is dropped before the fresh one opens, never
+    // after: a session owns its whole cache, and at a long context two of them do not fit (an
+    // Inkling rank at the 1M window holds 8 GiB a session beside a chunk scratch, and opening the
+    // second ran the lead out of memory).
+    let (mut session, pending, plan) = match claim {
+        Claim::Continue(kept, plan) => (kept.session, kept.pending, plan),
+        Claim::Fresh(evicted) => {
+            drop(evicted);
+            let session = backend
+                .open_session()
+                .map_err(|error| format!("the backend could not open a sequence: {error}"))?;
+            (session, None, Continuation::COLD)
+        }
+    };
+    if let Some(ids) = &plan.respelled {
+        eprintln!(
+            "sparkflash serve: prefix reuse by text: the prompt spells the held reply with other ids; {} held ids stand for {} of its {}, {} to forward",
+            plan.held,
+            plan.covered,
+            job.prompt_tokens.len(),
+            ids.len() - plan.held,
+        );
+    }
+    if plan.rewound {
+        eprintln!(
+            "sparkflash serve: prefix reuse by rewind: the prompt keeps the held prompt of {} ids and parts from the reply after it; {} to forward",
+            plan.held,
+            plan.respelled
+                .as_ref()
+                .map_or(job.prompt_tokens.len(), Vec::len)
+                .saturating_sub(plan.held),
+        );
+    }
+    if plan.resume {
+        eprintln!(
+            "sparkflash serve: prefix reuse: the prompt is the held sequence of {} ids; answering from its held step",
+            plan.held,
+        );
+    }
+    let (ending, last) = serve_request(
+        session.as_mut(),
+        codec,
+        &job,
+        metrics,
+        &plan,
+        pending.as_ref().map(|(_, step)| step),
+        started,
+    );
+    // Keep the sequence unless the backend failed in it. One the request moved keeps the step
+    // after its last token; one it never touched keeps the step it had. One that names no history
+    // (its state ran ahead of the tokens it kept) is kept for its rewind point.
+    let nonempty = |prefix: Option<&[u32]>| prefix.is_some_and(|prefix| !prefix.is_empty());
+    if !matches!(ending, Err(Ending::Failed(_)))
+        && (nonempty(session.reusable_prefix()) || nonempty(session.rewind_prefix()))
+    {
+        let handed = plan
+            .respelled
+            .as_ref()
+            .map_or(job.prompt_tokens.len(), Vec::len);
+        let pending = match last {
+            Some(step) => Some((sampling_for(job.sampling, handed), step)),
+            None => pending,
+        };
+        lease.keep(Held { session, pending });
+    }
+    ending.map_err(Ending::message)
+}
+
+/// Runs `job` on `session` as `plan` says, and returns how it ended with the step after the last
+/// token the session holds, when the request moved the session.
+fn serve_request(
+    session: &mut dyn ModelSession,
+    codec: &dyn PromptCodec,
+    job: &Job,
+    metrics: &Metrics,
+    plan: &Continuation,
+    pending: Option<&StepOutput>,
+    started: Instant,
+) -> (Result<(), Ending>, Option<StepOutput>) {
+    let send = |reply: Reply| {
+        job.replies
+            .blocking_send(reply)
+            .map_err(|_| Ending::ClientGone)
+    };
     // The worker owns the decision, so the client learns the hit before the prefill runs and the
     // event stays first in the stream.
-    job.replies
-        .blocking_send(Reply::Started {
-            cached_tokens: cached,
-        })
-        .map_err(|_| "the client stopped reading this response".to_owned())?;
+    if let Err(ending) = send(Reply::Started {
+        cached_tokens: plan.covered,
+    }) {
+        return (Err(ending), None);
+    }
+    let prompt = plan.respelled.as_deref().unwrap_or(&job.prompt_tokens);
     let prefill_started = Instant::now();
-    let mut step = session.prefill(&job.prompt_tokens).map_err(|error| {
-        format!(
-            "prefill failed after {} prompt token(s): {error}",
-            job.prompt_tokens.len()
-        )
-    })?;
+    let (mut step, cached) = if plan.resume {
+        // The held step was drawn under this request's sampler (see `continuation`); setting it
+        // again could restart the random source that step already drew from.
+        let Some(step) = pending else {
+            return (
+                Err(Ending::Failed(
+                    "the held sequence was to resume from a step it does not have".to_owned(),
+                )),
+                None,
+            );
+        };
+        (step.clone(), job.prompt_tokens.len())
+    } else {
+        session.set_sampling(sampling_for(job.sampling, prompt.len()));
+        match session.prefill_images(prompt, &job.images) {
+            Ok(step) => (step, client_cached(session.cached_tokens(), plan)),
+            Err(error) => {
+                return (
+                    Err(Ending::Failed(format!(
+                        "prefill failed after {} prompt token(s): {error}",
+                        job.prompt_tokens.len()
+                    ))),
+                    None,
+                );
+            }
+        }
+    };
     let prefill_elapsed = prefill_started.elapsed();
-    let cached = session.cached_tokens();
+    // A client that left during the prefill is caught before the first decode, so the sequence
+    // holds exactly the prompt and the retry answers from this step.
+    if job.replies.is_closed() {
+        return (Err(Ending::ClientGone), Some(step));
+    }
     let mut generated = Vec::new();
     let mut decoded = String::new();
     let mut stop_buffer = StopBuffer::new(&job.stop);
@@ -586,35 +1135,55 @@ fn run_request(
         let piece = decode_new(codec, &mut decoded, &generated);
         let emit = stop_buffer.push(piece.as_deref());
         if want_sample {
-            let entry = token_logprob(&step.logits, token, &job.logprobs, codec)?;
-            if !emit.is_empty() {
-                job.replies
-                    .blocking_send(Reply::Delta(emit))
-                    .map_err(|_| "the client stopped reading this response".to_owned())?;
+            let entry = match token_logprob(&step.logits, token, &job.logprobs, codec) {
+                Ok(entry) => entry,
+                Err(message) => return (Err(Ending::Refused(message)), Some(step)),
+            };
+            if !emit.is_empty()
+                && let Err(ending) = send(Reply::Delta(emit))
+            {
+                return (Err(ending), Some(step));
             }
-            job.replies
-                .blocking_send(Reply::TokenLogprobs(Box::new(entry)))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
-        } else if !emit.is_empty() {
-            job.replies
-                .blocking_send(Reply::Delta(emit))
-                .map_err(|_| "the client stopped reading this response".to_owned())?;
+            if let Err(ending) = send(Reply::TokenLogprobs(Box::new(entry))) {
+                return (Err(ending), Some(step));
+            }
+        } else if !emit.is_empty()
+            && let Err(ending) = send(Reply::Delta(emit))
+        {
+            return (Err(ending), Some(step));
         }
         completion_tokens += 1;
         metrics.record_generation_tokens(1);
         if stop_buffer.matched() {
             break;
         }
-        step = session.decode(token).map_err(|error| {
-            format!("decode failed after {completion_tokens} token(s): {error}")
-        })?;
+        step = match session.decode(token) {
+            Ok(step) => step,
+            Err(error) => {
+                return (
+                    Err(Ending::Failed(format!(
+                        "decode failed after {completion_tokens} token(s): {error}"
+                    ))),
+                    None,
+                );
+            }
+        };
         next = step.next_token;
     }
-    let tail = stop_buffer.finish();
-    if !tail.is_empty() {
-        job.replies
-            .blocking_send(Reply::Delta(tail))
-            .map_err(|_| "the client stopped reading this response".to_owned())?;
+    // A reply that ends on a replacement glyph (a character its last token left unfinished, or
+    // one the model chose) gets it now: nothing follows to complete it.
+    let mut tail = String::new();
+    if !stop_buffer.matched()
+        && let Some(full) = codec.decode(&generated)
+    {
+        let rest = settled_delta(&mut decoded, &full, true);
+        tail = stop_buffer.push(Some(&rest));
+    }
+    tail.push_str(&stop_buffer.finish());
+    if !tail.is_empty()
+        && let Err(ending) = send(Reply::Delta(tail))
+    {
+        return (Err(ending), Some(step));
     }
     let elapsed = started.elapsed();
     // The prefill rate is the work the engine did, not the prompt it was given: the tokens the
@@ -634,41 +1203,44 @@ fn run_request(
         FinishReason::Stop
     };
     let speculation = session.speculation();
-    job.replies
-        .blocking_send(Reply::Done(Box::new(HostSummary {
-            completion_tokens,
-            finish_reason,
-            timing,
-            speculation,
-            cached_tokens: cached,
-        })))
-        .map_err(|_| "the client stopped reading this response".to_owned())?;
-    // Hold the sequence for the next request when it can continue from a prefix. The client has
-    // its whole answer by now, so a failure to store costs nothing.
-    if session
-        .reusable_prefix()
-        .is_some_and(|prefix| !prefix.is_empty())
-    {
-        *held = Some(session);
-    }
-    Ok(())
+    let ending = send(Reply::Done(Box::new(HostSummary {
+        completion_tokens,
+        finish_reason,
+        timing,
+        speculation,
+        cached_tokens: cached,
+    })));
+    (ending, Some(step))
 }
 
-/// Decodes the whole generated prefix and returns the part that is new.
-///
-/// A prompt codec's decode is a pure function of the ids. When a new token completes a multibyte
-/// character the decoder may revise a trailing replacement glyph; the common-prefix rule emits the
-/// corrected suffix at the cost of a possible duplicate, which is why the contract exposes a
-/// one-shot decode rather than a stateful stream today.
+/// Decodes the whole generated prefix and returns the part that is new ([settled_delta]).
 fn decode_new(codec: &dyn PromptCodec, previous: &mut String, ids: &[u32]) -> Option<String> {
     let full = codec.decode(ids)?;
-    let mut common = common_prefix_bytes(previous, &full);
-    while common > 0 && !full.is_char_boundary(common) {
+    Some(settled_delta(previous, &full, false))
+}
+
+/// The text `full` adds over the `emitted` decode, which then becomes `full`.
+///
+/// A byte-level token can end inside a multibyte character, and a one-shot decode spells the
+/// unfinished bytes as a replacement glyph. Until the `last` decode, a trailing run of them is
+/// held back, as tokenizers' `DecodeStream` holds it, because the next token may complete the
+/// character: emitting the glyph would put text in the reply that is not the decode of its ids,
+/// and the next turn's prompt, re-encoding that reply, would no longer extend the ids the
+/// server holds. A decode that revises text already emitted (a decoder that is not
+/// prefix-monotonic) emits from the first difference, at the cost of a possible duplicate.
+fn settled_delta(emitted: &mut String, full: &str, last: bool) -> String {
+    let settled = if last {
+        full
+    } else {
+        full.trim_end_matches('\u{FFFD}')
+    };
+    let mut common = common_prefix_bytes(emitted, settled);
+    while common > 0 && !settled.is_char_boundary(common) {
         common -= 1;
     }
-    let delta = full[common..].to_owned();
-    *previous = full;
-    Some(delta)
+    let delta = settled[common..].to_owned();
+    settled.clone_into(emitted);
+    delta
 }
 
 /// The bytes two decodes share, the common prefix a token's text delta is measured against.
@@ -852,7 +1424,7 @@ fn top_k(logprobs: &[f32], count: usize) -> Vec<usize> {
     order
 }
 
-fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
+fn finished_event(prompt_tokens: usize, summary: HostSummary, fabric: &str) -> EngineEvent {
     let completion_tokens = summary.completion_tokens;
     let speculation = summary.speculation;
     let cached = summary.cached_tokens.min(prompt_tokens);
@@ -881,7 +1453,7 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
             speculation.drafts_accepted,
         ),
         transport: RoceTransportStats {
-            fabric_mode: "none (host backend)".to_owned(),
+            fabric_mode: fabric.to_owned(),
             ..RoceTransportStats::default()
         },
         timing: RequestTimingStats {
@@ -915,15 +1487,15 @@ fn finished_event(prompt_tokens: usize, summary: HostSummary) -> EngineEvent {
     }
 }
 
-fn cluster_snapshot(descriptor: &ModelDescriptor) -> ClusterStatsSnapshot {
+fn cluster_snapshot(descriptor: &ModelDescriptor, fabric: &str) -> ClusterStatsSnapshot {
     ClusterStatsSnapshot {
         model: descriptor.id.clone(),
-        fabric_mode: "none (host backend)".to_owned(),
+        fabric_mode: fabric.to_owned(),
         nodes: Vec::new(),
         kv: empty_kv_snapshot(),
         engram: Vec::new(),
         transport: RoceTransportStats {
-            fabric_mode: "none (host backend)".to_owned(),
+            fabric_mode: fabric.to_owned(),
             ..RoceTransportStats::default()
         },
         dspark: DSparkStepStats::default(),
@@ -960,6 +1532,33 @@ mod tests {
         let mut buffer = StopBuffer::new(&["END".to_owned()]);
         assert_eq!(buffer.push(Some("hello EN")), "hello ");
         assert_eq!(buffer.finish(), "EN");
+    }
+
+    /// A token that ends inside a multibyte character emits nothing until the next completes it,
+    /// so the reply is the decode of its ids; the last decode releases a glyph still held.
+    #[test]
+    fn an_unfinished_character_is_held_until_a_token_completes_it() {
+        let mut emitted = String::new();
+        assert_eq!(settled_delta(&mut emitted, "I", false), "I");
+        // The token " \xE2\x88" settles its space; its partial character waits.
+        assert_eq!(settled_delta(&mut emitted, "I \u{FFFD}", false), " ");
+        assert_eq!(settled_delta(&mut emitted, "I \u{221D}", false), "\u{221D}");
+        assert_eq!(
+            settled_delta(&mut emitted, "I \u{221D} 1/\u{FFFD}", false),
+            " 1/"
+        );
+        assert_eq!(
+            settled_delta(&mut emitted, "I \u{221D} 1/\u{FFFD}", true),
+            "\u{FFFD}"
+        );
+        assert_eq!(emitted, "I \u{221D} 1/\u{FFFD}");
+        // A glyph the model chose mid-reply is emitted once a token follows it.
+        let mut emitted = String::new();
+        assert_eq!(settled_delta(&mut emitted, "a\u{FFFD}", false), "a");
+        assert_eq!(
+            settled_delta(&mut emitted, "a\u{FFFD}b", false),
+            "\u{FFFD}b"
+        );
     }
 
     #[test]

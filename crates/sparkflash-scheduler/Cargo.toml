@@ -26,5 +26,6 @@ sparkflash-comm = { workspace = true }
 sparkflash-trace = { workspace = true }
 sparkflash-kv = { workspace = true }
 sparkflash-engram = { workspace = true }
+sparkflash-runtime = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }

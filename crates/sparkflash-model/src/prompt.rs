@@ -96,6 +96,31 @@ impl fmt::Display for PromptError {
 
 impl std::error::Error for PromptError {}
 
+/// The role a chat message is rendered under: `developer` folded onto `system`, every other role
+/// unchanged.
+///
+/// OpenAI's newer clients send their instructions as `developer`. A released template with no
+/// such role either drops the message (DeepSeek V4.1's encoder in thinking mode) or refuses it
+/// (its chat mode, and Inkling's template), so a client loses its instructions or gets a 400.
+/// Folding it here keeps that rule in one place for every renderer that has only `system`; a
+/// renderer whose template names `developer` itself has no reason to call this.
+#[must_use]
+pub fn template_role(role: &str) -> &str {
+    if role == "developer" { "system" } else { role }
+}
+
+/// A chat message's role after [template_role], or None when the message has no string role.
+///
+/// Renderers read every role through this, including the neighbour and system-prompt checks, so
+/// a `developer` message is a `system` message everywhere a template looks at it.
+#[must_use]
+pub fn message_role(message: &Value) -> Option<&str> {
+    message
+        .get("role")
+        .and_then(Value::as_str)
+        .map(template_role)
+}
+
 /// What the HTTP surface needs from a model's prompt handling.
 pub trait PromptCodec: Send + Sync {
     /// Render a chat-completion request body and tokenize it.
@@ -119,6 +144,32 @@ pub trait PromptCodec: Send + Sync {
 
     /// The string spelling of one vocabulary id, or None when it is outside the vocabulary.
     fn token_str(&self, id: u32) -> Option<String>;
+
+    /// Closes the generation prompt's thinking block in place, for a turn that must not reason,
+    /// and says whether it could. The prompt keeps the conversation's own rendered prefix, so a
+    /// prefix the server holds still covers it: re-rendering with a template's thinking switch
+    /// may change the prior turns and cost the whole prefix cache. The next turn's rendering
+    /// writes this turn's empty reasoning, so the close must spell it the same way, or the next
+    /// prompt does not extend what the server holds.
+    ///
+    /// The default turns a trailing `<think>` into `</think>`, DeepSeek V4.1's non-thinking turn
+    /// (`<｜Assistant｜></think>`). A model whose template writes an empty reasoning block
+    /// differently overrides this. A prompt that does not end on a single-token `<think>` is
+    /// left alone, and the server re-renders it with the template's own switch.
+    fn close_thinking(&self, ids: &mut Vec<u32>) -> bool {
+        let single = |text: &str| match self.encode_text(text, false) {
+            Ok(tokens) if tokens.len() == 1 => tokens.first().copied(),
+            _ => None,
+        };
+        let (Some(start), Some(end)) = (single("<think>"), single("</think>")) else {
+            return false;
+        };
+        let Some(last) = ids.last_mut().filter(|last| **last == start) else {
+            return false;
+        };
+        *last = end;
+        true
+    }
 
     /// The model's image front end, when it has vision.
     ///

@@ -56,9 +56,13 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
+use sparkflash_runtime::{Opened, Part as PromptPart, Resume};
+
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, Deviceptr, HostMapped, Kernel, RunStream, StreamEvent,
 };
+use sparkflash_kernels::lane_memory::{BackError, LanePlans, Layout, SequenceLane, SequenceLanes};
 
 // The shared context handle: one definition in `sparkflash_ops`, so both arms carry the same
 // `Send`/`Sync` wrapper around the driver context.
@@ -92,6 +96,7 @@ pub use prefill::{
     embedded_scan_cubin, gdn_scan_shape, gdn_scan_shape_for,
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
+use sparkflash_ops::attention::{GQA_GROUP_KERNELS, gqa_group_shared_bytes};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
@@ -223,9 +228,6 @@ pub(super) fn fill_plain_injection(
     cuda.copy_htod(&pointer, &ones)
 }
 
-/// The query heads q4e_attn_group computes together (Q4E_ATTN_GROUP).
-pub const ATTN_GROUP_HEADS: usize = 4;
-
 /// Keys a q4e_attn_full CTA takes a pass (Q4E_FULL_TILE).
 pub const FULL_ATTENTION_TILE: usize = 256;
 
@@ -239,26 +241,6 @@ pub fn full_attention_splits(visible: usize) -> usize {
         .div_ceil(FULL_ATTENTION_TILE)
         .clamp(1, FULL_ATTENTION_SPLITS)
 }
-
-/// The selected tokens q4e_attn_group stages in shared memory (Q4E_ATTN_GROUP_SELECTED); a
-/// configuration that selects more attends through q4e_attn.
-pub const ATTN_GROUP_SELECTED: usize = 2052;
-
-/// The grouped attention kernels by the query heads each computes together, in the order a
-/// configuration takes them: the first whose count divides its query groups. Six is a four-rank
-/// group's share of the released twelve.
-pub const ATTN_GROUP_KERNELS: [(usize, &str); 2] =
-    [(ATTN_GROUP_HEADS, "q4e_attn_group"), (6, "q4e_attn_group6")];
-
-/// A grouped attention kernel's dynamic shared memory over `heads` heads: a row of logits and a
-/// block of reduction floats for each head, then the token's selection.
-#[must_use]
-pub const fn attn_group_shared_bytes(heads: usize) -> u32 {
-    ((heads * (ATTN_GROUP_SELECTED + 256) + ATTN_GROUP_SELECTED) * 4) as u32
-}
-
-/// q4e_attn_group's dynamic shared memory (45,136 bytes).
-pub const ATTN_GROUP_SHARED_BYTES: u32 = attn_group_shared_bytes(ATTN_GROUP_HEADS);
 
 /// The rows an MTP verify forward takes at most: the token being decoded and two chained drafts.
 const MTP_VERIFY_ROWS: usize = 3;
@@ -283,6 +265,7 @@ const GEMM_TILE_TOKENS: usize = 128;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::gemv::tiled_operands;
 pub use sparkflash_ops::gemv::{GEMV_MAX_BATCH, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS};
+use sparkflash_ops::scan::{ScanKind, ScanPlan};
 
 /// Below this many tokens the GEMM's fixed 128-token tile wastes more work than the extra weight
 /// passes it saves: the GEMV is then run once per eight tokens instead. At the tile size the
@@ -591,8 +574,10 @@ struct Kernels {
     qsa_pick: Kernel,
     attn: Kernel,
     /// q4e_attn for several query heads of a KV head at once, bit-identical per head: the
-    /// [ATTN_GROUP_KERNELS] the device grants their shared memory, with their head counts.
-    attn_group: [Option<(usize, Kernel)>; ATTN_GROUP_KERNELS.len()],
+    /// [GQA_GROUP_KERNELS] the device grants their shared memory, by their head counts. Which one
+    /// a configuration launches is ops' rule
+    /// ([sparkflash_ops::attention::GqaBody::choose]), the one its boot plan names.
+    attn_group: [Option<(usize, Kernel)>; GQA_GROUP_KERNELS.len()],
     /// Every causal position, split over the context, and the splits' fold: the attention of a
     /// configuration with no sparse indexer ([Qwen4ExpConfig::full_attention]).
     attn_full: Kernel,
@@ -722,8 +707,8 @@ impl Kernels {
             qsa_pick: attn(cuda, "q4e_qsa_pick")?,
             attn: attn(cuda, "q4e_attn")?,
             // Their buffers live only in the dynamic reservation, so a refusal means q4e_attn.
-            attn_group: ATTN_GROUP_KERNELS.map(|(heads, name)| {
-                let bytes = attn_group_shared_bytes(heads);
+            attn_group: GQA_GROUP_KERNELS.map(|(heads, name)| {
+                let bytes = gqa_group_shared_bytes(heads);
                 cuda.load_named_shared(embedded_attn_cubin(), name, bytes)
                     .map_err(|error| {
                         eprintln!(
@@ -2134,7 +2119,22 @@ pub struct Qwen4ExpDeviceBackend {
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
     /// session runs its own forward on its own stream, the one-row-a-session path.
-    fused: Option<Arc<sparkflash_model::FusedEngine<fusion::QwenFusion>>>,
+    fused: Option<Fused>,
+}
+
+/// The engine a fused backend's sessions are handles on.
+enum Fused {
+    /// This rank alone ([Qwen4ExpDeviceBackend::enable_fusion]).
+    Local(Arc<sparkflash_runtime::FusedEngine<fusion::QwenFusion>>),
+    /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs
+    /// ([Qwen4ExpDeviceBackend::enable_group_fusion]).
+    Group(
+        Arc<
+            sparkflash_runtime::FusedEngine<
+                sparkflash_runtime::GroupLanes<fusion::QwenFusion, sparkflash_runtime::TextWire>,
+            >,
+        >,
+    ),
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -2367,8 +2367,9 @@ impl Qwen4ExpDeviceBackend {
     /// over `tp` before they are injected, so every rank holds the same residual streams. The
     /// drafter runs whole on every rank; the MTP layer is not loaded.
     ///
-    /// The rank serves one sequence at a time - every forward is a collective the whole group
-    /// steps through together - so it refuses [Self::enable_fusion].
+    /// Every forward is a collective the whole group steps through together, so the rank refuses
+    /// [Self::enable_fusion]: its sessions step as fused lanes only as a group, rank 0 under
+    /// [Self::enable_group_fusion] and the workers under [Self::mirror_group].
     ///
     /// # Errors
     /// A world the model's heads or widths do not split over, then everything [Self::open]
@@ -2737,6 +2738,47 @@ impl Qwen4ExpDeviceBackend {
                 tp.runtime.label()
             );
         }
+        // The prefill scan this rank's plan resolves: the arm launches the plan's kernel on the
+        // plan's grid, so the boot check and the launch are one decision.
+        let (world, rank) = tp
+            .as_ref()
+            .map_or((1, 0), |tp| (tp.runtime.world(), tp.runtime.rank()));
+        // A head pair no prompt scan body takes (a fixture's narrow heads) keeps the refusal: the
+        // token path still serves, and a prompt walk that reaches the scan refuses with it.
+        let gdn_scan = match ScanPlan::for_architecture(
+            &config.architecture,
+            world,
+            rank,
+            ScanKind::Gdn,
+            prefill.chunk.max(2),
+        ) {
+            Ok(plan) => Ok(plan),
+            Err(error @ sparkflash_ops::OpError::Resolve(_)) => Err(error.to_string()),
+            Err(error) => return Err(BackendError::new("qwen4_device", error.to_string())),
+        };
+        if let Ok(Some(scan)) = &gdn_scan
+            && (scan.heads, scan.key_dim, scan.value_dim)
+                != (
+                    local.linear_num_value_heads,
+                    local.linear_key_head_dim,
+                    local.linear_value_head_dim,
+                )
+        {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!(
+                    "the plan's GDN scan is {} value heads of {} x {}, this rank's {} of {} x {}",
+                    scan.heads,
+                    scan.key_dim,
+                    scan.value_dim,
+                    local.linear_num_value_heads,
+                    local.linear_key_head_dim,
+                    local.linear_value_head_dim
+                ),
+            ));
+        }
+        let rewind = sparkflash_runtime::rewind()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
@@ -2745,8 +2787,11 @@ impl Qwen4ExpDeviceBackend {
             dflash,
             prefill,
             pooled: std::sync::Mutex::new(None),
+            lanes: LanePlans::default(),
             verify_rows,
+            rewind,
             tp,
+            gdn_scan,
         });
         let _ = DeviceSequence::allocate(Arc::clone(&shared), context_limit)?;
         Ok(Self {
@@ -2779,19 +2824,83 @@ impl Qwen4ExpDeviceBackend {
             return Err(BackendError::new(
                 "qwen4_tp",
                 format!(
-                    "rank {} of {} serves one sequence at a time: every forward is a collective \
-                     its group steps through together",
+                    "rank {} of {} steps fused lanes only as a group: every forward is a \
+                     collective its group steps through together, so rank 0 broadcasts each \
+                     step (enable_group_fusion) and the workers replay it (mirror_group)",
                     tp.runtime.rank(),
                     tp.runtime.world()
                 ),
             ));
         }
-        let arm = Arc::new(fusion::QwenFusion::new(
-            Arc::clone(&self.shared),
-            self.context_limit,
-            capacity,
+        let arm = Arc::new(self.lanes(capacity)?);
+        self.fused = Some(Fused::Local(sparkflash_runtime::FusedEngine::start(
+            arm, capacity,
+        )?));
+        Ok(())
+    }
+
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every lane's prompt, step,
+    /// give-back and release is broadcast through `hub` before it runs here, and each worker
+    /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
+    /// sequence on every rank and the collectives inside a step line up. A worker whose socket
+    /// closes ends this process, and so does a failure here after a frame went out
+    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
+    /// cannot start.
+    pub fn enable_group_fusion(
+        &mut self,
+        capacity: usize,
+        hub: sparkflash_comm::control::Tp4ControlHub,
+    ) -> Result<(), BackendError> {
+        self.group_rank()?;
+        let arm = Arc::new(sparkflash_runtime::GroupLanes::new(
+            self.lanes(capacity)?,
+            sparkflash_runtime::watched_hub(hub)?,
+            self.wire(),
         ));
-        self.fused = Some(sparkflash_model::FusedEngine::start(arm, capacity)?);
+        self.fused = Some(Fused::Group(sparkflash_runtime::FusedEngine::start(
+            arm, capacity,
+        )?));
+        Ok(())
+    }
+
+    /// A worker of an [Self::open_rank] group: replays rank 0's lane frames over `capacity`
+    /// lanes of this rank's own until the group can no longer serve, then ends the process
+    /// ([sparkflash_runtime::mirror_until_the_group_ends]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, or the arm's configuration, before any frame.
+    pub fn mirror_group(
+        &self,
+        control: &mut sparkflash_comm::control::Tp4ControlWorker,
+        capacity: usize,
+    ) -> Result<std::convert::Infallible, String> {
+        self.group_rank().map_err(|error| error.to_string())?;
+        let lanes = self.lanes(capacity).map_err(|error| error.to_string())?;
+        sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
+    }
+
+    /// The fused arm over this backend's sequences, with room for `capacity` in one pass.
+    fn lanes(&self, capacity: usize) -> Result<fusion::QwenFusion, BackendError> {
+        fusion::QwenFusion::new(Arc::clone(&self.shared), self.context_limit, capacity)
+    }
+
+    /// What the group's frames carry and rank 0 refuses: the arm serves text.
+    fn wire(&self) -> sparkflash_runtime::TextWire {
+        sparkflash_runtime::TextWire::new("qwen", "Qwen", self.context_limit)
+    }
+
+    /// Refuses a backend that is no group's rank: its lanes have no peers to step with.
+    fn group_rank(&self) -> Result<(), BackendError> {
+        if self.shared.tp.is_none() {
+            return Err(BackendError::new(
+                "qwen4_tp",
+                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
+                 its sessions with enable_fusion",
+            ));
+        }
         Ok(())
     }
 
@@ -2982,16 +3091,22 @@ struct DeviceSequence {
     consumed: Vec<u32>,
     /// How many of the last prefill's tokens its caches already held, for the request's usage.
     prefill_cached: usize,
+    /// The prompt running a chunk at a time, between its first chunk and its last
+    /// ([DeviceSequence::begin_prompt]).
+    prompting: Option<Prompting>,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
-    /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements; the MTP
-    /// layer, when present, is one extra slot after the stack.
+    /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements in the
+    /// sequence's lane; the MTP layer, when present, is one extra slot after the stack.
     keys: Vec<Option<Deviceptr>>,
     /// Each sparse layer's BF16 value cache, the same shape as [Self::keys].
     values: Vec<Option<Deviceptr>>,
-    /// Each sparse layer's BF16 indexer-key cache, `context_limit * indexer_head_dim` elements;
-    /// the MTP layer, when present, is one extra slot after the stack.
+    /// Each sparse layer's BF16 indexer-key cache, `context_limit * indexer_head_dim` elements
+    /// in the sequence's lane; the MTP layer, when present, is one extra slot after the stack.
     index_keys: Vec<Option<Deviceptr>>,
+    /// The span [Self::keys], [Self::values] and [Self::index_keys] lie in, backed as the
+    /// sequence grows ([Self::back]); `None` only while the sequence is dropped.
+    lane: Option<SequenceLane<LaneParts>>,
     gdn_conv: Vec<Option<Deviceptr>>,
     gdn_recurrent: Vec<Option<Deviceptr>>,
     /// The other buffer of each GDN layer's recurrent pair: a verify leaves the live state as it
@@ -3089,8 +3204,18 @@ struct DeviceSequence {
     draft: Option<DraftScratch>,
     /// The positions the caches hold; a verify that would run past it is never drafted.
     context_limit: usize,
+    /// The rewind point: each GDN layer's convolution history and recurrent memory, each PLE
+    /// layer's frames and the MTP's stash, as they were at the end of the last prompt
+    /// ([Self::keep_point]), when the backend keeps one ([sparkflash_runtime::REWIND_ENV]). The
+    /// attention caches need no copy: a position's rows stay until a later write at that position.
+    point: Option<Checkpoint>,
+    /// The n-gram windows at the point, which live on the host.
+    point_hashers: Vec<Option<crate::ngram::PleHasher>>,
     /// Verified answers whose tokens the engine has not consumed yet, oldest first.
     spec_queue: Vec<SpecPending>,
+    /// The verified answers the engine consumed since the last forward, oldest first: what a run
+    /// its caller ended early gives back ([Self::give_back]).
+    spec_served: Vec<SpecPending>,
     /// The MTP module's proposals for the positions after the last step, oldest first.
     spec_drafts: Vec<u32>,
     /// The DFlash 2 drafter's confidence in each of `spec_drafts`.
@@ -3140,7 +3265,90 @@ struct SpecPending {
     replay: Vec<u32>,
 }
 
+/// The bytes of each region a rewind point copies, in [DeviceSequence::point_regions]'s order:
+/// each GDN layer's convolution history and recurrent memory, each PLE layer's frames, then the
+/// MTP's stash.
+fn point_sizes(
+    config: &Qwen4ExpConfig,
+    width: usize,
+    gdn_conv: &[Option<Deviceptr>],
+    ple_conv: &[Option<Deviceptr>],
+    rings: usize,
+) -> Vec<usize> {
+    let history = config.linear_conv_kernel_dim.saturating_sub(1).max(1);
+    let conv = history * config.linear_conv_width() * 4;
+    let recurrent = config.linear_num_value_heads
+        * config.linear_key_head_dim
+        * config.linear_value_head_dim
+        * 4;
+    let ple = config.ple_conv_kernel_size.saturating_sub(1).max(1) * config.ngram_size * width * 4;
+    let mut sizes = Vec::new();
+    for _ in gdn_conv.iter().flatten() {
+        sizes.extend([conv, recurrent]);
+    }
+    sizes.extend(ple_conv.iter().flatten().map(|_| ple));
+    sizes.push(width * 4);
+    sizes.push(rings);
+    sizes
+}
+
+/// Rows past a forward's last position a sequence's lane backs too: a verify's drafts and the
+/// MTP layer write past it, and an attention tile reads past it (and masks the rows).
+const LANE_READ_PAST: usize = 1024;
+
+/// Where each sparse layer's caches (keys, values and indexer keys), and the MTP layer's, lie in
+/// a sequence's lane ([SequenceLanes], the lane memory GLM's and Inkling's sequences use too).
+/// A sequence reserves a span as long as its whole context's caches and physical memory backs
+/// it only as far as the sequence has reached ([DeviceSequence::back]), from one pool the
+/// backend's sequences share, so several conversations hold together what one whole context
+/// would.
+///
+/// The GDN and PLE state, the drafter's rings and the scratch stay plain allocations: they do
+/// not grow with the context.
+#[derive(Debug)]
+struct LaneParts {
+    /// Each layer's keys, values and indexer keys, then the MTP layer's; `None` for a GDN layer.
+    caches: Vec<Option<[usize; 3]>>,
+}
+
+impl LaneParts {
+    fn plan(layout: &mut Layout, config: &Qwen4ExpConfig, capacity: usize) -> Self {
+        let kv = config.kv_proj_width() * 2;
+        let index = config.indexer_head_dim * 2;
+        let sparse = |layout: &mut Layout| {
+            Some([
+                layout.part(capacity * kv, kv, 0),
+                layout.part(capacity * kv, kv, 0),
+                layout.part(capacity * index, index, 0),
+            ])
+        };
+        let mut caches: Vec<_> = config
+            .layer_types
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Sparse => sparse(layout),
+                LayerKind::Linear => None,
+            })
+            .collect();
+        if config.serves_mtp() {
+            caches.push(sparse(layout));
+        }
+        Self { caches }
+    }
+
+    /// Every cache's place in the lane at `base`.
+    fn caches(&self, base: Deviceptr) -> Vec<Option<[Deviceptr; 3]>> {
+        self.caches
+            .iter()
+            .map(|cache| cache.map(|parts| parts.map(|offset| base.offset(offset))))
+            .collect()
+    }
+}
+
 struct ReusableBuffers {
+    /// The attention caches' lane, its chunks given back to the pool; [Self::keys],
+    /// [Self::values] and [Self::index_keys] lie in it.
+    lane: SequenceLane<LaneParts>,
     keys: Vec<Option<Deviceptr>>,
     values: Vec<Option<Deviceptr>>,
     index_keys: Vec<Option<Deviceptr>>,
@@ -3148,6 +3356,8 @@ struct ReusableBuffers {
     gdn_recurrent: Vec<Option<Deviceptr>>,
     gdn_spare: Vec<Option<Deviceptr>>,
     ple_conv: Vec<Option<Deviceptr>>,
+    /// The rewind point's arena, when the backend keeps one.
+    point: Option<Deviceptr>,
     scratch: [Deviceptr; 52],
     prefill: PrefillScratch,
     draft: Option<DraftScratch>,
@@ -3156,7 +3366,7 @@ struct ReusableBuffers {
 }
 
 impl ReusableBuffers {
-    fn free(&self, cuda: &Cuda) {
+    fn free(mut self, cuda: &Cuda) {
         let _ = cuda.make_current();
         let mut ptrs: Vec<&Deviceptr> = self.scratch.iter().collect();
         ptrs.extend(self.prefill.pointers());
@@ -3164,19 +3374,18 @@ impl ReusableBuffers {
             ptrs.extend(draft.pointers());
         }
         ptrs.extend(
-            self.keys
+            self.gdn_conv
                 .iter()
-                .chain(&self.values)
-                .chain(&self.index_keys)
-                .chain(&self.gdn_conv)
                 .chain(&self.gdn_recurrent)
                 .chain(&self.gdn_spare)
                 .chain(&self.ple_conv)
+                .chain(std::iter::once(&self.point))
                 .flatten(),
         );
         cuda.free_buffers(&ptrs);
         cuda.free_host_mapped(&self.ple_host_staging);
         cuda.free_host_mapped(&self.token_staging);
+        self.lane.free(cuda);
     }
 }
 
@@ -3189,7 +3398,13 @@ impl Drop for DeviceSequence {
         if let Some(overlap) = self.overlap.take() {
             overlap.release(&self.backend.cuda);
         }
+        let Some(mut lane) = self.lane.take() else {
+            return;
+        };
+        // A pooled sequence holds no chunks: another lane may grow into them.
+        let _ = lane.release(&self.backend.cuda);
         let reusable = ReusableBuffers {
+            lane,
             keys: std::mem::take(&mut self.keys),
             values: std::mem::take(&mut self.values),
             index_keys: std::mem::take(&mut self.index_keys),
@@ -3197,6 +3412,7 @@ impl Drop for DeviceSequence {
             gdn_recurrent: std::mem::take(&mut self.gdn_recurrent),
             gdn_spare: std::mem::take(&mut self.gdn_spare),
             ple_conv: std::mem::take(&mut self.ple_conv),
+            point: self.point.as_ref().map(Checkpoint::arena),
             scratch: [
                 self.hyper,
                 self.normed,
@@ -3311,12 +3527,67 @@ struct SequenceShared {
     /// The freed-session buffer pool. The mutex covers only allocation bookkeeping; it is not a
     /// run lock, and a session's forward never holds it.
     pooled: std::sync::Mutex<Option<ReusableBuffers>>,
+    /// The sequences' attention caches' lanes, one plan a context limit ([LaneParts]).
+    lanes: LanePlans<usize, LaneParts>,
     /// The most rows a speculative verify forward takes: the token being decoded and the drafts
     /// after it. Every row but the last has a snapshot region to roll back to.
     verify_rows: usize,
+    /// Whether a sequence keeps a rewind point at the end of each prompt
+    /// ([sparkflash_runtime::REWIND_ENV], on by default). The point covers the DFlash 2
+    /// drafter's rings too, so a drafting sequence goes back with them.
+    rewind: bool,
     /// The world this rank's partials are summed over, when the arm is one rank of several; its
     /// `config` is then the rank's share ([tp::rank_config]).
     tp: Option<tp::TensorParallel>,
+    /// The prefill GDN scan the rank's plan resolves ([ScanPlan::for_architecture]); `None` for
+    /// a checkpoint without GDN layers, the refusal for heads no prompt scan body takes.
+    gdn_scan: Result<Option<ScanPlan>, String>,
+}
+
+impl SequenceShared {
+    /// The lanes of sequences of `capacity` positions, planned on first use.
+    fn sequence_lanes(
+        &self,
+        capacity: usize,
+    ) -> Result<Arc<SequenceLanes<LaneParts>>, BackendError> {
+        let plan = || {
+            SequenceLanes::plan(
+                &self.cuda,
+                capacity,
+                LANE_READ_PAST,
+                sparkflash_model::active_profile().runtime.lane_memory_mb,
+                |layout| LaneParts::plan(layout, &self.config, capacity),
+            )
+            .map_err(|error| BackendError::new("qwen4_device", error))
+        };
+        self.lanes.get(capacity, plan, |lanes| {
+            if self.tp.as_ref().is_none_or(|tp| tp.runtime.rank() == 0) {
+                eprintln!(
+                    "[qwen] rank 0: sequences of {capacity} positions back their caches as they \
+                     grow: {}",
+                    lanes.describe()
+                );
+            }
+        })
+    }
+
+    /// The drafter a sequence speculates with, by name: the DFlash 2 drafter when one is loaded,
+    /// else the checkpoint's MTP stage when the arm serves it; `None` when the profile turns
+    /// speculation off or the checkpoint has neither.
+    fn drafter(&self) -> Option<&'static str> {
+        let drafter = if self.dflash.is_some() {
+            "DFlash 2"
+        } else if self.config.serves_mtp() {
+            "MTP"
+        } else {
+            return None;
+        };
+        sparkflash_model::active_profile()
+            .speculation
+            .enabled
+            .unwrap_or(true)
+            .then_some(drafter)
+    }
 }
 
 impl Drop for SequenceShared {
@@ -3326,6 +3597,8 @@ impl Drop for SequenceShared {
         {
             reusable.free(&self.cuda);
         }
+        // A sequence still alive gives its chunks back when it goes.
+        self.lanes.drain(&self.cuda);
         if let Some(tp) = &self.tp {
             self.cuda.free_buffers(&[&tp.slots]);
         }
@@ -4212,6 +4485,7 @@ impl DeviceSequence {
         position: usize,
         logits: bool,
     ) -> Result<Option<Vec<f32>>, BackendError> {
+        self.back(position + tokens.len())?;
         let config = Arc::clone(&self.backend.config);
         let kernels = &*self.backend.kernels;
         let weights = &self.backend.weights;
@@ -4540,6 +4814,29 @@ impl DeviceSequence {
         }
     }
 
+    /// Backs the sequence's lane for `rows` positions and the rows past them a forward reads or
+    /// writes ([LANE_READ_PAST]).
+    ///
+    /// # Errors
+    /// The pool's refusal (a `context` error) when it has too few chunks left, or a driver
+    /// failure.
+    pub(super) fn back(&mut self, rows: usize) -> Result<(), BackendError> {
+        let Some(lane) = self.lane.as_mut() else {
+            return Ok(());
+        };
+        lane.back(&self.backend.cuda, rows)
+            .map_err(|error| match error {
+                BackError::Refused(error) => BackendError::new("context", error),
+                BackError::Device(error) => BackendError::new("qwen4_device", error),
+            })
+    }
+
+    /// Whether the backend's pool can back this sequence for `rows` positions now, counting the
+    /// chunks a reset gives back first when `reset`: the answer [Self::back] would give.
+    pub(super) fn room(&self, rows: usize, reset: bool) -> bool {
+        self.lane.as_ref().is_none_or(|lane| lane.room(rows, reset))
+    }
+
     fn forward_batch(
         &mut self,
         tokens: &[u32],
@@ -4547,6 +4844,7 @@ impl DeviceSequence {
         snapshot_rows: usize,
     ) -> Result<Option<Vec<f32>>, BackendError> {
         let batch = tokens.len();
+        self.back(self.position + batch)?;
         self.probe_rows = batch;
         debug_assert!((1..=self.backend.prefill.chunk).contains(&batch));
         debug_assert!(logit_rows <= self.backend.verify_rows && logit_rows <= batch);
@@ -5023,6 +5321,14 @@ impl DeviceSequence {
         let replay_stride =
             shared.verify_rows * (config.linear_conv_width() + 2 * config.linear_num_value_heads);
         let reused = shared.pooled.lock().ok().and_then(|mut guard| guard.take());
+        // A pooled sequence's lane holds caches of its own context limit.
+        let reused = match reused {
+            Some(buf) if buf.lane.lanes().capacity() != context_limit => {
+                buf.free(cuda);
+                None
+            }
+            reused => reused,
+        };
         let buffers = if let Some(buf) = reused {
             buf
         } else {
@@ -5037,12 +5343,9 @@ impl DeviceSequence {
                         .map_err(|error| BackendError::new("qwen4_device", error))
                 };
             }
-            macro_rules! alloc_bf16 {
-                ($elements:expr) => {
-                    cuda.alloc((($elements) * 2).max(4), &mut total)
-                        .map_err(|error| BackendError::new("qwen4_device", error))
-                };
-            }
+            let lane = SequenceLane::reserve(cuda, &shared.sequence_lanes(context_limit)?)
+                .map_err(|error| BackendError::new("qwen4_device", error))?;
+            let caches = lane.lanes().parts().caches(lane.base());
             let mut keys = Vec::with_capacity(config.num_hidden_layers);
             let mut values = Vec::with_capacity(config.num_hidden_layers);
             let mut index_keys = Vec::with_capacity(config.num_hidden_layers);
@@ -5053,11 +5356,9 @@ impl DeviceSequence {
             for (index, kind) in config.layer_types.iter().enumerate() {
                 match kind {
                     LayerKind::Sparse => {
-                        keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                        values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                        index_keys.push(Some(alloc_bf16!(
-                            (context_limit * config.indexer_head_dim).max(1)
-                        )?));
+                        keys.push(caches[index].map(|cache| cache[0]));
+                        values.push(caches[index].map(|cache| cache[1]));
+                        index_keys.push(caches[index].map(|cache| cache[2]));
                         gdn_conv.push(None);
                         gdn_recurrent.push(None);
                         gdn_spare.push(None);
@@ -5092,9 +5393,10 @@ impl DeviceSequence {
             if config.serves_mtp() {
                 // The drafted layer has its own attention, so its keys, values and indexer keys
                 // are one more entry in the same lists the per-layer caches live in.
-                keys.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                values.push(Some(alloc_bf16!(context_limit * config.kv_proj_width())?));
-                index_keys.push(Some(alloc_bf16!(context_limit * config.indexer_head_dim)?));
+                let mtp = caches.get(config.layer_types.len()).copied().flatten();
+                keys.push(mtp.map(|cache| cache[0]));
+                values.push(mtp.map(|cache| cache[1]));
+                index_keys.push(mtp.map(|cache| cache[2]));
                 gdn_conv.push(None);
                 gdn_recurrent.push(None);
                 gdn_spare.push(None);
@@ -5181,6 +5483,7 @@ impl DeviceSequence {
                 .transpose()
                 .map_err(|error| BackendError::new("qwen4_dflash2", error))?;
             ReusableBuffers {
+                lane,
                 keys,
                 values,
                 index_keys,
@@ -5188,6 +5491,7 @@ impl DeviceSequence {
                 gdn_recurrent,
                 gdn_spare,
                 ple_conv,
+                point: None,
                 scratch,
                 prefill,
                 draft,
@@ -5195,6 +5499,30 @@ impl DeviceSequence {
                 token_staging,
             }
         };
+        let mut buffers = buffers;
+        // A DFlash 2 drafter's rings hold its context's keys and values by position modulo the
+        // ring, so a reply longer than a block overwrites the window before the point: the point
+        // keeps the whole ring.
+        let rings = shared
+            .dflash
+            .as_ref()
+            .zip(buffers.draft.as_ref())
+            .map_or(0, |(draft, scratch)| {
+                scratch.rings_region(&draft.config).1 * 4
+            });
+        let point_sizes = point_sizes(&config, width, &buffers.gdn_conv, &buffers.ple_conv, rings);
+        if !shared.rewind
+            && let Some(arena) = buffers.point.take()
+        {
+            cuda.free_buffers(&[&arena]);
+        }
+        if shared.rewind && buffers.point.is_none() {
+            let mut total = 0usize;
+            buffers.point = Some(
+                cuda.alloc(Checkpoint::arena_bytes(&point_sizes), &mut total)
+                    .map_err(|error| BackendError::new("qwen4_device", error))?,
+            );
+        }
         let history = config.linear_conv_kernel_dim.saturating_sub(1).max(1);
         let conv_elems = history * config.linear_conv_width();
         let rec_elems = config.linear_num_value_heads
@@ -5236,10 +5564,12 @@ impl DeviceSequence {
             position: 0,
             consumed: Vec::new(),
             prefill_cached: 0,
+            prompting: None,
             score_stride,
             keys: buffers.keys,
             values: buffers.values,
             index_keys: buffers.index_keys,
+            lane: Some(buffers.lane),
             gdn_conv: buffers.gdn_conv,
             gdn_recurrent: buffers.gdn_recurrent,
             gdn_spare: buffers.gdn_spare,
@@ -5301,7 +5631,12 @@ impl DeviceSequence {
             prefill: buffers.prefill,
             draft: buffers.draft,
             context_limit,
+            point: buffers
+                .point
+                .map(|arena| Checkpoint::new(arena, point_sizes)),
+            point_hashers: Vec::new(),
             spec_queue: Vec::new(),
+            spec_served: Vec::new(),
             spec_drafts: Vec::new(),
             spec_confidence: Vec::new(),
             // The chain is as wide as the drafter that fills it: the MTP pair is two rows by
@@ -5325,11 +5660,7 @@ impl DeviceSequence {
                     DepthPolicy::from_profile(draft.config.block_size - 1, DFLASH2_STEP_COST)
                 }),
             ),
-            spec_enabled: (config.serves_mtp() || shared.dflash.is_some())
-                && sparkflash_model::active_profile()
-                    .speculation
-                    .enabled
-                    .unwrap_or(true),
+            spec_enabled: shared.drafter().is_some(),
             // A mean over the hyper-connection streams unless the profile names a scale; `sum`
             // is the spelling `SPARKFLASH_QWEN4_MTP_FOLD` has always documented for one, and it
             // arrives here as the number one (crates/sparkflash-model/src/profile.rs).
@@ -5567,6 +5898,8 @@ impl DeviceSequence {
         hashers: &std::sync::Arc<Vec<Option<crate::ngram::PleHasher>>>,
     ) -> Result<StepOutput, BackendError> {
         let vocab = self.backend.config.vocab_size;
+        // The answers served from the last verify are behind this forward now.
+        self.spec_served.clear();
         // The model's choice at each row, in order, up to the first that disagrees with the draft
         // after it: every later row's prefix holds a token the model did not choose. An agreed
         // draft is in the sampler's history before the row after it is chosen, and no row past
@@ -5674,6 +6007,215 @@ impl DeviceSequence {
     }
 }
 
+impl DeviceSequence {
+    /// The caller fed `token`: it joins the history, and the step its last verify already holds
+    /// for it is answered with no device work. A verify holding a different token gives its chain
+    /// back, and `None` says the token still needs a forward.
+    ///
+    /// # Errors
+    /// A driver failure while the chain's state is given back.
+    fn feed(&mut self, token: u32) -> Result<Option<StepOutput>, BackendError> {
+        self.sampler.record(token);
+        self.consumed.push(token);
+        // A verified chain already fed the model this token, and its logits here are the ones the
+        // last step read back; only the choice of the following token is left to make.
+        if let Some(front) = self.spec_queue.first() {
+            if front.token == token {
+                let mut pending = self.spec_queue.remove(0);
+                let step = StepOutput {
+                    next_token: pending.next_token,
+                    logits: std::mem::take(&mut pending.logits),
+                    draft: Vec::new(),
+                };
+                self.spec_served.push(pending);
+                return Ok(Some(step));
+            }
+            // The caller fed something else, so every position past this one is a token the model
+            // never chose: hand them all back and resume from where this one belongs.
+            let pending = self
+                .spec_queue
+                .drain(..)
+                .next()
+                .expect("the queue was not empty");
+            self.spec_served.clear();
+            self.unwind(&pending)?;
+        }
+        Ok(None)
+    }
+
+    /// Puts the sequence back where `pending`'s token belongs, as if it had never been fed: the
+    /// convolution windows and recurrent state after the verify's rows before it, the n-gram
+    /// windows replayed past them, and no drafts.
+    ///
+    /// # Errors
+    /// A driver failure.
+    fn unwind(&mut self, pending: &SpecPending) -> Result<(), BackendError> {
+        self.restore_states(pending.region)?;
+        self.rollback_recurrent(pending.region + 1)?;
+        self.ple_hashers = (*pending.hashers).clone();
+        for row in &pending.replay {
+            self.push_hashers(*row)?;
+        }
+        self.position = pending.position;
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        Ok(())
+    }
+
+    /// Whether the last verify already holds the step fed `token`.
+    pub(super) fn holds(&self, token: u32) -> bool {
+        self.spec_queue
+            .first()
+            .is_some_and(|pending| pending.token == token)
+    }
+
+    /// The caller never used the last `count` steps this sequence answered from its verify: the
+    /// tokens fed for them leave the history and the sampler, and the state goes back to where
+    /// the first of them belongs ([Self::unwind]).
+    ///
+    /// # Errors
+    /// More answers than the last verify served, or a driver failure.
+    pub(super) fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let served = self.spec_served.len();
+        if count > served {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("{count} answers to give back, and the last verify served {served}"),
+            ));
+        }
+        let pending = self
+            .spec_served
+            .drain(served - count..)
+            .next()
+            .expect("the served answers were just counted");
+        self.spec_queue.clear();
+        self.unwind(&pending)?;
+        self.consumed.truncate(self.consumed.len() - count);
+        let history = self.sampler.history().len();
+        self.sampler.truncate(history - count);
+        Ok(())
+    }
+
+    /// Opens this sequence's round on `token` for a shared walk ([sparkflash_runtime::RoundArm]):
+    /// the step its last verify holds, or the chance each leading run of its drafts is accepted.
+    /// The drafts stay here until the walk takes its share of them ([Self::take_drafts]).
+    ///
+    /// # Errors
+    /// A driver failure while a chain is given back.
+    pub(super) fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = self.feed(token)? {
+            return Ok(Opened::Held(step));
+        }
+        let mut chain = self
+            .spec
+            .chain(&self.spec_confidence, self.spec_drafts.len());
+        chain.truncate(self.spec_drafts.len());
+        Ok(Opened::Round(chain))
+    }
+
+    /// The first `depth` drafts of the opened round and the drafter's confidence in each, for the
+    /// walk that verifies them; the rest are dropped.
+    pub(super) fn take_drafts(&mut self, depth: usize) -> (Vec<u32>, Vec<f32>) {
+        let mut drafts = std::mem::take(&mut self.spec_drafts);
+        let mut confidence = std::mem::take(&mut self.spec_confidence);
+        drafts.truncate(depth);
+        confidence.truncate(depth);
+        (drafts, confidence)
+    }
+
+    /// Records `token` as fed, for a walk that runs it without drafts.
+    pub(super) fn feed_plain(&mut self, token: u32) {
+        self.sampler.record(token);
+        self.consumed.push(token);
+    }
+
+    /// The position the sequence can go back to ([Self::rewind]): the end of its last prompt,
+    /// while the copies hold it.
+    fn rewind_point(&self) -> Option<usize> {
+        self.point.as_ref().and_then(Checkpoint::point)
+    }
+
+    /// The live regions the rewind point copies, in [point_sizes]'s order.
+    fn point_regions(&self) -> Vec<Deviceptr> {
+        let mut live = Vec::new();
+        for (conv, recurrent) in self.gdn_conv.iter().zip(&self.gdn_recurrent) {
+            if let (Some(conv), Some(recurrent)) = (conv, recurrent) {
+                live.extend([*conv, *recurrent]);
+            }
+        }
+        live.extend(self.ple_conv.iter().flatten().copied());
+        live.push(self.mtp_stash);
+        // The DFlash 2 drafter's rings, whole; no region when there is no drafter.
+        live.push(
+            self.backend
+                .dflash
+                .as_ref()
+                .zip(self.draft.as_ref())
+                .map_or(Deviceptr(0), |(draft, scratch)| {
+                    scratch.rings_region(&draft.config).0
+                }),
+        );
+        live
+    }
+
+    /// Keeps the sequence's state at its position as its rewind point, on its stream: the copies
+    /// of [Self::point_regions] and the n-gram windows. A sequence with no point is left as it is.
+    ///
+    /// # Errors
+    /// A copy the device refuses (the sequence then holds no point).
+    fn keep_point(&mut self) -> Result<(), BackendError> {
+        let live = self.point_regions();
+        let position = self.position;
+        let cuda = &self.backend.cuda;
+        let stream = self.batch_stream.as_ref().unwrap_or(&self.stream);
+        let Some(point) = self.point.as_mut() else {
+            return Ok(());
+        };
+        point
+            .save(cuda, Some(stream), &live, position)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.point_hashers.clone_from(&self.ple_hashers);
+        Ok(())
+    }
+
+    /// Takes the sequence back to its rewind point `point` ([Self::keep_point]): the copies back
+    /// into its live regions on its stream, the n-gram windows, and its position and history to
+    /// the point, with every verified answer and draft past it dropped.
+    ///
+    /// # Errors
+    /// A point the sequence does not hold, or a copy the device refuses.
+    fn rewind(&mut self, point: usize) -> Result<(), BackendError> {
+        if self.rewind_point() != Some(point) || point > self.consumed.len() {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("the sequence holds no rewind point at position {point}"),
+            ));
+        }
+        let live = self.point_regions();
+        let kept = self
+            .point
+            .as_ref()
+            .ok_or_else(|| BackendError::new("qwen4_device", "no rewind point"))?;
+        kept.restore(&self.backend.cuda, Some(self.clock()), &live, point)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        self.ple_hashers.clone_from(&self.point_hashers);
+        self.position = point;
+        self.consumed.truncate(point);
+        self.spec_queue.clear();
+        self.spec_served.clear();
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        Ok(())
+    }
+}
+
 impl ModelBackend for Qwen4ExpDeviceBackend {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -5687,10 +6229,18 @@ impl ModelBackend for Qwen4ExpDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        if let Some(fused) = &self.fused {
-            return fused
-                .open()
-                .map(|session| Box::new(session) as Box<dyn ModelSession>);
+        match &self.fused {
+            Some(Fused::Local(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            Some(Fused::Group(engine)) => {
+                return engine
+                    .open()
+                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
+            }
+            None => {}
         }
         DeviceSequence::allocate(Arc::clone(&self.shared), self.context_limit)
             .map(|session| Box::new(session) as Box<dyn ModelSession>)
@@ -5712,6 +6262,13 @@ impl ModelSession for DeviceSequence {
             .then_some(self.consumed.as_slice())
     }
 
+    /// The end of the last prompt, while the sequence can go back to it ([Self::rewind]) and
+    /// something past it was forwarded.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        let point = self.rewind_point()?;
+        (point < self.position && point <= self.consumed.len()).then(|| &self.consumed[..point])
+    }
+
     fn cached_tokens(&self) -> usize {
         self.prefill_cached
     }
@@ -5727,132 +6284,21 @@ impl ModelSession for DeviceSequence {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        if tokens.is_empty() {
-            return Err(BackendError::new(
-                "qwen4_device",
-                "an empty prompt has no logits",
-            ));
-        }
-        self.backend
-            .cuda
-            .make_current()
-            .map_err(|error| BackendError::new("qwen4_device", error))?;
-        // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
-        // case only the tokens past it are forwarded. Its sampler history is the whole prompt
-        // either way: the penalties count every token the request reads.
-        let reused = self
-            .consumed
-            .iter()
-            .zip(tokens)
-            .take_while(|(held, given)| held == given)
-            .count();
-        if reused != self.consumed.len() || reused >= tokens.len() {
-            return Err(BackendError::new(
-                "qwen4_device",
-                format!(
-                    "a prefill must extend the {} token(s) this sequence holds by at least one; \
-                     this one does not",
-                    self.consumed.len()
-                ),
-            ));
-        }
-        self.prefill_cached = reused;
-        self.sampler.record_prompt(tokens);
-        self.consumed.extend_from_slice(&tokens[reused..]);
-        // A proposal drafted past the previous end anchors on a token the new suffix replaces; it
-        // is re-drafted from the new end below, like a fresh prompt's.
-        self.spec_drafts.clear();
-        self.spec_confidence.clear();
-        let tokens = &tokens[reused..];
-        // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
-        // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
-        // keeps, so the chunks would find most of them evicted again.
-        let forwards = self.backend.prefill.forwards(tokens.len());
-        let last_idx = forwards.len() - 1;
-        // The first draft block sits just past the prompt and reaches `window_left` positions
-        // back; nothing before that is ever read from the rings ([Dflash2Config::window_commits]).
-        let end = self.position + tokens.len();
-        let mut logits = Vec::new();
-        for (idx, rows) in forwards.into_iter().enumerate() {
-            let chunk = &tokens[rows];
-            let is_last = idx == last_idx;
-            if let Some(last_logits) = self.forward_batch(chunk, usize::from(is_last), 0)? {
-                logits = last_logits;
-            }
-            let start = self.position - chunk.len();
-            if self.drafting() {
-                // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
-                // projections split when that was the chunk.
-                let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
-                    draft
-                        .config
-                        .window_commits((start, chunk.len()), end, DENSE_ROWS)
-                        .collect()
-                });
-                for (row, rows, position) in commits {
-                    self.dflash_commit(row, rows, position)?;
-                }
-                continue;
-            }
-            // The MTP reads the prompt one row behind the model, so each chunk feeds it the rows
-            // assembled from the previous chunk's last state and this one's. Its own key and value
-            // caches have to cover the prompt too, or its first draft would attend to nothing.
-            if self.spec_enabled {
-                self.assemble_mtp_rows(chunk.len())?;
-                self.mtp_pass(chunk, start, false)?;
-                self.stash_last_hyper(chunk.len())?;
+        let mut part = self.begin_prompt(tokens)?;
+        loop {
+            match part {
+                PromptPart::Done(step) => return Ok(step),
+                PromptPart::More => part = self.prompt_part()?,
             }
         }
-        let next_token = self.next(&logits);
-        if let Some(token) = next_token {
-            let position = self.position;
-            if self.drafting() {
-                self.dflash_propose(token, position)?;
-            } else if self.spec_enabled {
-                // The first generated token's own embedding is the last row the MTP has not seen.
-                self.draft_chain(token, position)?;
-            }
-        }
-        Ok(StepOutput {
-            next_token,
-            logits,
-            draft: Vec::new(),
-        })
     }
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
         self.backend
             .cuda
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        self.sampler.record(token);
-        self.consumed.push(token);
-        // A verified chain already fed the model this token, and its logits here are the ones the
-        // last step read back; only the choice of the following token is left to make.
-        if let Some(front) = self.spec_queue.first() {
-            if front.token == token {
-                let pending = self.spec_queue.remove(0);
-                return Ok(StepOutput {
-                    next_token: pending.next_token,
-                    logits: pending.logits,
-                    draft: Vec::new(),
-                });
-            }
-            // The caller fed something else, so every position past this one is a token the model
-            // never chose: hand them all back and resume from where this one belongs.
-            let pending = self
-                .spec_queue
-                .drain(..)
-                .next()
-                .expect("the queue was not empty");
-            self.restore_states(pending.region)?;
-            self.rollback_recurrent(pending.region + 1)?;
-            self.ple_hashers = (*pending.hashers).clone();
-            for row in &pending.replay {
-                self.push_hashers(*row)?;
-            }
-            self.position = pending.position;
-            self.spec_drafts.clear();
-            self.spec_confidence.clear();
+        if let Some(step) = self.feed(token)? {
+            return Ok(step);
         }
         // Offer the drafts as the chain's later tokens. A step the policy gave no drafts is the
         // same call with one row - the verify path agrees with nothing and gives nothing back -
@@ -5869,6 +6315,158 @@ impl ModelSession for DeviceSequence {
             .ok_or_else(|| BackendError::new("qwen4_device", "a step has no logits"))?;
         self.resolve_verify(&rows, &logits, position, &drafts, &confidence, &hashers)
     }
+}
+
+impl DeviceSequence {
+    /// Starts a prompt ([ModelSession::prefill]) and forwards its first chunk;
+    /// [Self::prompt_part] forwards each next one. The chunks are the prefill plan's
+    /// ([PrefillPlan::forwards]), so running them a part at a time between other sequences' steps
+    /// changes no bits: everything a chunk leaves for the next (the caches, the MTP's stash, the
+    /// drafter's rings) is this sequence's own.
+    pub(super) fn begin_prompt(&mut self, tokens: &[u32]) -> Result<PromptPart, BackendError> {
+        self.prompting = None;
+        if tokens.is_empty() {
+            return Err(BackendError::new(
+                "qwen4_device",
+                "an empty prompt has no logits",
+            ));
+        }
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
+        // case only the tokens past it are forwarded. Its sampler history is the whole prompt
+        // either way: the penalties count every token the request reads.
+        // One that parts from the history, or that the sequence ran ahead of, may still keep the
+        // last prompt and go past it: the sequence goes back to that prompt's end first.
+        let current = self.spec_queue.is_empty() && self.position == self.consumed.len();
+        let reused = match sparkflash_runtime::resume(
+            &self.consumed,
+            current,
+            self.rewind_point(),
+            tokens,
+        ) {
+            Some(Resume::Extend(held)) => held,
+            Some(Resume::Rewind(point)) => {
+                self.rewind(point)?;
+                point
+            }
+            None => {
+                return Err(BackendError::new(
+                    "qwen4_device",
+                    format!(
+                        "a prefill must extend the {} token(s) this sequence holds by at least \
+                         one, or go past its rewind point; this one does neither",
+                        self.consumed.len()
+                    ),
+                ));
+            }
+        };
+        // The prompt forwards past the point: its own end is the next one.
+        if let Some(point) = self.point.as_mut() {
+            point.forget();
+        }
+        self.prefill_cached = reused;
+        self.sampler.record_prompt(tokens);
+        self.consumed.extend_from_slice(&tokens[reused..]);
+        // A proposal drafted past the previous end anchors on a token the new suffix replaces; it
+        // is re-drafted from the new end below, like a fresh prompt's.
+        self.spec_drafts.clear();
+        self.spec_confidence.clear();
+        self.spec_served.clear();
+        let tokens = tokens[reused..].to_vec();
+        // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
+        // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
+        // keeps, so the chunks would find most of them evicted again.
+        let forwards = self.backend.prefill.forwards(tokens.len());
+        // The first draft block sits just past the prompt and reaches `window_left` positions
+        // back; nothing before that is ever read from the rings ([Dflash2Config::window_commits]).
+        let end = self.position + tokens.len();
+        self.prompting = Some(Prompting {
+            tokens,
+            forwards,
+            at: 0,
+            end,
+        });
+        self.prompt_part()
+    }
+
+    /// Forwards the running prompt's next chunk ([Self::begin_prompt]); the last one ends the
+    /// prompt and answers its first step.
+    pub(super) fn prompt_part(&mut self) -> Result<PromptPart, BackendError> {
+        let mut prompting = self.prompting.take().ok_or_else(|| {
+            BackendError::new(
+                "qwen4_device",
+                "this sequence has no prompt running a chunk at a time",
+            )
+        })?;
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let is_last = prompting.at + 1 == prompting.forwards.len();
+        let rows = prompting.forwards[prompting.at].clone();
+        let chunk = &prompting.tokens[rows];
+        let logits = self.forward_batch(chunk, usize::from(is_last), 0)?;
+        let start = self.position - chunk.len();
+        if self.drafting() {
+            // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
+            // projections split when that was the chunk.
+            let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
+                draft
+                    .config
+                    .window_commits((start, chunk.len()), prompting.end, DENSE_ROWS)
+                    .collect()
+            });
+            for (row, rows, position) in commits {
+                self.dflash_commit(row, rows, position)?;
+            }
+        } else if self.spec_enabled {
+            // The MTP reads the prompt one row behind the model, so each chunk feeds it the rows
+            // assembled from the previous chunk's last state and this one's. Its own key and value
+            // caches have to cover the prompt too, or its first draft would attend to nothing.
+            self.assemble_mtp_rows(chunk.len())?;
+            self.mtp_pass(chunk, start, false)?;
+            self.stash_last_hyper(chunk.len())?;
+        }
+        prompting.at += 1;
+        if !is_last {
+            self.prompting = Some(prompting);
+            return Ok(PromptPart::More);
+        }
+        // The prompt's end, before any draft past it: the state a next prompt that keeps this one
+        // goes back to.
+        self.keep_point()?;
+        let logits = logits.unwrap_or_default();
+        let next_token = self.next(&logits);
+        if let Some(token) = next_token {
+            let position = self.position;
+            if self.drafting() {
+                self.dflash_propose(token, position)?;
+            } else if self.spec_enabled {
+                // The first generated token's own embedding is the last row the MTP has not seen.
+                self.draft_chain(token, position)?;
+            }
+        }
+        Ok(PromptPart::Done(StepOutput {
+            next_token,
+            logits,
+            draft: Vec::new(),
+        }))
+    }
+}
+
+/// A prompt running a chunk at a time ([DeviceSequence::begin_prompt]).
+struct Prompting {
+    /// The tokens it forwards: the prompt past what the caches held.
+    tokens: Vec<u32>,
+    /// Its chunks, as the prefill plan splits it.
+    forwards: Vec<std::ops::Range<usize>>,
+    /// The chunks forwarded so far.
+    at: usize,
+    /// The position past its last token.
+    end: usize,
 }
 
 /// Load the cubin and exercise two kernels on synthetic buffers.

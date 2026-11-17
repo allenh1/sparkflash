@@ -461,12 +461,9 @@ fn normalize_message(
     // refuses it in chat mode (its typed UnknownRole), so a client that sends its instructions as
     // developer loses them in one mode and gets a 400 in the other. `/v1/responses` already folds
     // it for the same reason (`responses_message_item`); every other route reaches the seam
-    // directly, so the fold belongs here.
-    let role = if role == "developer" {
-        "system".to_owned()
-    } else {
-        role
-    };
+    // directly, so the fold belongs here. The rule itself is shared with the other renderers
+    // ([sparkflash_model::prompt::template_role]).
+    let role = sparkflash_model::prompt::template_role(&role).to_owned();
 
     let content = match object.get("content") {
         None | Some(Value::Null) => None,

@@ -28,13 +28,12 @@
 //! images and 64 MiB a request, 32 MiB and 8192 pixels a side an image (4096 from the fifteenth
 //! image on), and a long side of 512 at `detail: "low"`.
 
-use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sparkflash_model::vision::{ImageSpan, PreparedImage, VisionCodec, VisionOptions};
+use sparkflash_model::vision::{PreparedImage, VisionCodec, VisionOptions};
 
 use crate::error::ApiError;
 use crate::multimodal::{ImagePart, parse_image_url};
@@ -59,23 +58,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REDIRECTS: u32 = 5;
 
-/// One image as the engine receives it: where its span sits in the prompt and its canvas.
-#[derive(Clone, PartialEq, Eq)]
-pub struct VisionImage {
-    /// The span's position, grid and content key.
-    pub span: ImageSpan,
-    /// The canvas: best_height * best_width * 3 bytes of RGB.
-    pub pixels: Arc<[u8]>,
-}
-
-impl fmt::Debug for VisionImage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VisionImage")
-            .field("span", &self.span)
-            .field("pixels", &self.pixels.len())
-            .finish()
-    }
-}
+/// One image as the engine receives it; the model crate owns the type so a session can take it.
+pub use sparkflash_model::vision::VisionImage;
 
 /// Sum of the span lengths: the usage block's image_tokens.
 #[must_use]

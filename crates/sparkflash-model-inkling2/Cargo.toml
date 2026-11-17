@@ -1,0 +1,30 @@
+[package]
+name = "sparkflash-model-inkling2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sparkflash-model = { workspace = true }
+sparkflash-runtime = { workspace = true }
+sparkflash-weights = { workspace = true }
+sparkflash-comm = { workspace = true }
+sparkflash-kernels = { workspace = true }
+sparkflash-ops = { workspace = true }
+sparkflash-vision = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
+tokenizers = { workspace = true }
+sha2 = { workspace = true }
+libm = "0.2"
+
+[features]
+default = []
+# The direct-RDMA exchange (the GB10 doorbell) in front of the NCCL device leg: the DeepSeek arm's
+# shared exchange in sparkflash_kernels::write_exchange, over sparkflash-comm's verbs backend.
+rdma = ["sparkflash-kernels/rdma"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

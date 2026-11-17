@@ -19,13 +19,16 @@
 //! pinned by value; set membership is not enough to catch a plan that swapped images.
 
 use sparkflash_model::{Part, Target};
-use sparkflash_ops::attention::{AttentionKind, AttentionPlan, SplitKvDecodePlan};
+use sparkflash_ops::attention::{
+    AttentionKind, AttentionPlan, GQA_GROUP_SELECTED, SplitKvDecodePlan, gqa_group_shared_bytes,
+};
 use sparkflash_ops::collective::{CollectiveKind, CollectivePlan};
 use sparkflash_ops::engine_plan::{EnginePlan, PartRequirement};
 use sparkflash_ops::epilogue::{
     ActivationKind, ActivationPlan, GatherPlan, NormKind, NormPlan, QuantizePlan, RopePlan,
 };
 use sparkflash_ops::error::OpError;
+use sparkflash_ops::gdn::gdn_scan_shape_for;
 use sparkflash_ops::gemm::{DenseGemmPlan, ExpertCombinePlan, GroupedMoeGemmPlan, MoeRoutingPlan};
 use sparkflash_ops::images::Image;
 use sparkflash_ops::parity::{LayerPlan, ParityReport, Tolerance};
@@ -455,12 +458,41 @@ fn grouped_attention_selects_the_kernel_for_its_head_group() {
         StreamId(0),
     )
     .expect("valid");
+    // Twelve groups take the four-head body, as Qwen's arm launches it at one rank.
     assert_eq!(twelve.group_size(), 12);
     assert_eq!(
         twelve.kernel(),
+        expected(Target::Sm121, Image::Qwen4Attn, "q4e_attn_group")
+    );
+    assert_eq!(twelve.launch().shared_bytes, 45_136);
+    assert_eq!(twelve.launch().grid, (6, 8, 1));
+    assert_eq!(six.launch().grid, (4, 8, 1));
+
+    // A selection past what a grouped body stages runs the per-head body.
+    let mut wide = requirement;
+    wide.geometry.top_k = GQA_GROUP_SELECTED + 1;
+    let per_head = AttentionPlan::new(
+        CTX,
+        &wide,
+        AttentionKind::Gqa {
+            query_heads: 24,
+            kv_heads: 4,
+        },
+        8,
+        context,
+        head_dim,
+        StreamId(0),
+    )
+    .expect("valid");
+    assert_eq!(
+        per_head.kernel(),
         expected(Target::Sm121, Image::Qwen4Attn, "q4e_attn")
     );
-    assert_eq!(twelve.launch().shared_bytes, 0);
+    assert_eq!(per_head.launch().shared_bytes, 0);
+    assert_eq!(per_head.launch().grid, (24, 8, 1));
+    // The released Qwen3.8 layer selects 2,051 tokens a query, which a grouped body holds.
+    assert_eq!(requirement.geometry.top_k, 2051);
+    assert_eq!(gqa_group_shared_bytes(6), 63_600);
 }
 
 #[test]
@@ -979,6 +1011,38 @@ fn an_nvfp4_attention_is_unsupported_not_unresolved() {
     )
     .expect_err("attention has no NVFP4 body");
     assert!(matches!(error, OpError::Unsupported { .. }), "{error}");
+}
+
+#[test]
+fn the_scheduled_scan_is_what_the_arms_launch_at_every_world() {
+    for world in [1usize, 2, 4] {
+        // Qwen's GDN: one block row a value head, the released 128/128 body.
+        let plan = arm(QWEN, world);
+        let scan = ScanPlan::for_rank(CTX, &plan, ScanKind::Gdn, 4096)
+            .expect("the scan plans")
+            .expect("the released Qwen has GDN layers");
+        let qwen = requirement(&plan, Part::GdnScan);
+        assert_eq!(scan.heads, qwen.geometry.kv_heads, "TP{world} value heads");
+        assert_eq!(scan.kernel().symbol, "q4p_gdn_scan", "TP{world}");
+        let (grid, block) = gdn_scan_shape_for(scan.heads, scan.value_dim);
+        assert_eq!(scan.launch().grid, grid, "TP{world}");
+        assert_eq!(scan.launch().block, (block, 1, 1), "TP{world}");
+        // GLM's KDA: a head is both, at 128 x 128.
+        let plan = arm(GLM, world);
+        let scan = ScanPlan::for_rank(CTX, &plan, ScanKind::Kda, 4096)
+            .expect("the scan plans")
+            .expect("the released GLM has KDA layers");
+        assert_eq!(scan.kernel().symbol, "q4p_kda_scan", "TP{world}");
+        let (grid, block) = gdn_scan_shape_for(scan.heads, 128);
+        assert_eq!(scan.launch().grid, grid, "TP{world}");
+        assert_eq!(scan.launch().block, (block, 1, 1), "TP{world}");
+        // A plan without the other recurrence has no scan of it.
+        assert!(
+            ScanPlan::for_rank(CTX, &plan, ScanKind::Gdn, 4096)
+                .expect("no GDN layer is not an error")
+                .is_none()
+        );
+    }
 }
 
 #[test]

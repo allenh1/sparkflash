@@ -58,6 +58,8 @@
 //   holds the scores (the rows router's). One warp per listed row, grid ceil(count / 8), 256
 //   threads.
 
+#pragma once  // kernels/inkling_vision_sm121.cu includes this file for Inkling's tower
+
 #include "opt_pdl_sm121.cuh"
 #include "opt_common_sm121.cuh"
 #include "opt_mma_bf16_sm121.cuh"

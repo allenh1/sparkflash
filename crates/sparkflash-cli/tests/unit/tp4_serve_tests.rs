@@ -42,6 +42,13 @@ fn a_group_refuses_the_host_drivers_knobs() {
         ] {
             let mut args = vec!["--model", model];
             args.extend_from_slice(extra);
+            // Both groups step --fuse-batch lanes (PackArm::OPEN_LANES).
+            if extra.contains(&"--fuse-batch") {
+                let options =
+                    ServeOptions::parse(tp4_args(&args)).expect("the group steps fused lanes");
+                assert!(options.fuse_batch && options.concurrency == 2);
+                continue;
+            }
             let error = ServeOptions::parse(tp4_args(&args))
                 .expect_err("a group serves one request at a time");
             for flag in flags {
@@ -49,6 +56,36 @@ fn a_group_refuses_the_host_drivers_knobs() {
             }
             assert!(error.contains("tensor-parallel group"), "{error}");
         }
+    }
+}
+
+#[test]
+fn a_group_steps_fused_lanes_unless_told_one_at_a_time() {
+    for model in [
+        sparkflash_model_glm5_next::MODEL_ID,
+        sparkflash_model_qwen4_exp::MODEL_ID,
+    ] {
+        // No flags: the group's arm opens lanes, so it steps four of them.
+        let options = ServeOptions::parse(tp4_args(&["--model", model])).expect("parses");
+        assert!(options.fuse_batch, "{model}: the group fuses by default");
+        assert_eq!(options.concurrency, pack::GROUP_LANES);
+        // --fuse-batch alone takes the same default lane count.
+        let options =
+            ServeOptions::parse(tp4_args(&["--model", model, "--fuse-batch"])).expect("parses");
+        assert!(options.fuse_batch && options.concurrency == pack::GROUP_LANES);
+        // --concurrency 1 is the opt-out: one request at a time through the group driver.
+        let options = ServeOptions::parse(tp4_args(&["--model", model, "--concurrency", "1"]))
+            .expect("parses");
+        assert!(!options.fuse_batch && options.concurrency == 1);
+        // One node keeps the host driver's default. It still names its weights: a run with none
+        // is refused at parse, so the tiny synthetic plan stands in for a checkpoint here.
+        let options = ServeOptions::parse([
+            "--model".to_owned(),
+            model.to_owned(),
+            "--synthetic".to_owned(),
+        ])
+        .expect("parses");
+        assert!(!options.fuse_batch && options.concurrency == 1);
     }
 }
 
@@ -316,6 +353,8 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             prompt_logprobs: None,
             speculative: true,
             cached_tokens: 0,
+            images: Vec::new(),
+            sampler: None,
         },
         Tp4ControlFrame::Request {
             prompt_ids: vec![9, 8],
@@ -323,6 +362,39 @@ fn control_frames_round_trip_on_a_loopback_socket() {
             prompt_logprobs: Some(3),
             speculative: false,
             cached_tokens: 0,
+            images: Vec::new(),
+            sampler: None,
+        },
+        // A fused group's prompt with an image span: the spans travel, the canvas does not.
+        Tp4ControlFrame::LaneRequest {
+            lane: 2,
+            prompt_ids: vec![5, 200_054, 200_054, 6],
+            images: vec![sparkflash_comm::control::Tp4DeviceImage {
+                start: 0,
+                n_llm_h: 1,
+                n_llm_w: 2,
+                best_height: 40,
+                best_width: 80,
+                key: sparkflash_comm::control::Tp4DeviceImage::hex_key(&[0xab; 32]),
+            }],
+            keep: false,
+            sampler: None,
+        },
+        // A kept lane's next turn, with its sampler.
+        Tp4ControlFrame::LaneRequest {
+            lane: 1,
+            prompt_ids: vec![5, 6, 7],
+            images: Vec::new(),
+            keep: true,
+            sampler: Some(sparkflash_comm::control::Tp4FrameSampler {
+                temperature_bits: 0.7f32.to_bits(),
+                top_p_bits: 0.9f32.to_bits(),
+                top_k: 20,
+                seed: 11,
+                repetition_penalty_bits: 1.1f32.to_bits(),
+                presence_penalty_bits: 0.5f32.to_bits(),
+                frequency_penalty_bits: 0.0f32.to_bits(),
+            }),
         },
         Tp4ControlFrame::Token { token_id: 7 },
         Tp4ControlFrame::End,
@@ -1123,4 +1195,93 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
     let error = check_checkpoint_plan(dir.path(), 4, Availability::Catalogue)
         .expect_err("a 16-patch tower is refused");
     assert!(error.contains("vision patch 16"), "{error}");
+}
+
+#[test]
+fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() {
+    use pack::{GlmArm, PackArm, glm_drafting};
+    use sparkflash_model::profile::{DepthMode, SpeculationProfile};
+    let drafts = |spec: &SpeculationProfile, block, most| {
+        glm_drafting(spec, block, most).map(|drafting| {
+            drafting.map(|drafting| (drafting.drafts, drafting.policy.is_adaptive()))
+        })
+    };
+    // The carried profile: the MTP layer's chain of three, adaptive as DeepSeek's is, and a block
+    // drafter's whole block.
+    let carried = GlmArm::profile_from(|_| None)
+        .expect("the carried profile")
+        .speculation;
+    assert_eq!(drafts(&carried, false, 15), Ok(Some((3, true))));
+    assert_eq!(drafts(&carried, true, 7), Ok(Some((7, true))));
+    // The environment picks the chain and the rule.
+    let env = GlmArm::profile_from(|name| match name {
+        "SPARKFLASH_GLM_DRAFTS" => Some("2".to_owned()),
+        "SPARKFLASH_GLM_DRAFT_POLICY" => Some("fixed".to_owned()),
+        _ => None,
+    })
+    .expect("the profile under the environment")
+    .speculation;
+    assert_eq!(env.depth_policy, Some(DepthMode::Fixed));
+    assert_eq!(drafts(&env, false, 15), Ok(Some((2, false))));
+    let spec = |enabled, drafts| SpeculationProfile {
+        enabled,
+        drafts,
+        ..SpeculationProfile::default()
+    };
+    assert_eq!(drafts(&spec(None, None), false, 15), Ok(Some((2, true))));
+    // SPARKFLASH_GLM_SPEC=off decodes a token a step, as drafts=0 does.
+    assert_eq!(drafts(&spec(Some(false), None), true, 7), Ok(None));
+    assert_eq!(drafts(&spec(Some(false), Some(0)), true, 7), Ok(None));
+    assert_eq!(drafts(&spec(None, Some(0)), false, 15), Ok(None));
+    assert!(
+        drafts(&spec(Some(false), Some(2)), true, 7)
+            .is_err_and(|error| error.contains("speculation.enabled=false"))
+    );
+    assert!(drafts(&spec(None, Some(8)), true, 7).is_err_and(|error| error.contains("past the 7")));
+}
+
+#[test]
+fn a_one_request_rank_gets_the_whole_sampler_and_a_penalized_request_does_not_draft() {
+    let (replies, _answers) = tokio::sync::mpsc::channel(REPLY_BUFFER);
+    let job = |temperature: f32, repetition_penalty: f32, replies| Job {
+        prompt_tokens: vec![100, 200],
+        forced_tokens: Vec::new(),
+        max_tokens: 6,
+        temperature,
+        top_p: 0.9,
+        top_k: 40,
+        repetition_penalty,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.25,
+        skip_special_tokens: true,
+        seed: 7,
+        logprobs: LogprobsRequest {
+            sample: None,
+            prompt: None,
+            token_ids: Vec::new(),
+        },
+        stop: Vec::new(),
+        enqueued_at: Instant::now(),
+        replies,
+    };
+    let sampled = tp4_sampling(&job(0.7, 1.1, replies.clone()));
+    assert_eq!(
+        sampled.sampling,
+        sparkflash_model::Sampling {
+            temperature: 0.7,
+            top_p: 0.9,
+            top_k: 40,
+            repetition_penalty: 1.1,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.25,
+            seed: 7,
+            prompt_len: 2,
+        }
+    );
+    assert!(!sampled.speculative);
+    // Greedy, but a penalty moves the argmax the device verify would take.
+    assert!(!tp4_sampling(&job(0.0, 1.0, replies.clone())).speculative);
+    let mut plain = job(0.0, 1.0, replies);
+    plain.frequency_penalty = 0.0;
+    assert!(tp4_sampling(&plain).speculative);
 }

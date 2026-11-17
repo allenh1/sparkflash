@@ -220,10 +220,10 @@ async fn two_concurrent_requests_are_fused_into_one_pass() {
             .enable_fusion(2)
             .map_err(|error| error.to_string())?;
         assert!(backend.fused(), "the backend reports its fused batch");
-        // A fused batch and a drafter are two trades on the same step: this arm runs one.
+        // The fused slots are open, so a drafter configured now would reach none of them.
         let refused = backend
             .enable_speculation(2, None)
-            .expect_err("fusion excludes speculation");
+            .expect_err("speculation comes before fusion");
         assert_eq!(refused.code(), "glm5_device");
         Ok(())
     }) else {
@@ -251,6 +251,94 @@ async fn two_concurrent_requests_are_fused_into_one_pass() {
             "a fused member generated nothing: {response}"
         );
     }
+}
+
+/// Drafting members of one fused engine verify their rounds together and emit what a plain
+/// session emits for each prompt.
+///
+/// Each member drafts its chain, the walk's rows are shared among the chains, and one verify runs
+/// every member's token and drafts. A member's tokens are still its own greedy decode, so each
+/// must equal a plain session's on the same prompt, and the members must have drafted: a build
+/// that silently stopped drafting would pass the first check alone.
+#[test]
+fn drafting_members_verified_together_emit_the_plain_tokens() {
+    let prompts: [&[u32]; 2] = [&[3, 7, 11, 13, 17], &[5, 2, 9, 4]];
+    let Some((plain, fused)) = drafting_and_plain_backends() else {
+        return;
+    };
+    let decode = |session: &mut dyn sparkflash_model::ModelSession, prompt: &[u32]| {
+        let mut next = session.prefill(prompt).expect("the prefill").next_token;
+        let mut tokens = Vec::new();
+        for _ in 0..10 {
+            let Some(token) = next else {
+                break;
+            };
+            tokens.push(token);
+            next = session.decode(token).expect("the decode").next_token;
+        }
+        tokens
+    };
+    let alone: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|prompt| {
+            let mut session = plain.open_session().expect("a plain session");
+            decode(&mut *session, prompt)
+        })
+        .collect();
+    let mut first = fused.open_session().expect("the first member");
+    let mut second = fused.open_session().expect("the second member");
+    let (left, right) = std::thread::scope(|scope| {
+        let left = scope.spawn(|| {
+            let tokens = decode(&mut *first, prompts[0]);
+            (tokens, first.speculation())
+        });
+        let right = scope.spawn(|| {
+            let tokens = decode(&mut *second, prompts[1]);
+            (tokens, second.speculation())
+        });
+        (
+            left.join().expect("the first member's thread"),
+            right.join().expect("the second member's thread"),
+        )
+    });
+    assert_eq!(left.0, alone[0], "the first member's tokens moved");
+    assert_eq!(right.0, alone[1], "the second member's tokens moved");
+    for (member, speculation) in [("first", left.1), ("second", right.1)] {
+        assert!(
+            speculation.verify_steps > 0,
+            "the {member} member never drafted: {speculation:?}"
+        );
+    }
+}
+
+/// A plain backend and a drafting fused one over the same tiny fixture, or None without a device.
+fn drafting_and_plain_backends() -> Option<(Glm5NextDeviceBackend, Glm5NextDeviceBackend)> {
+    if !cubin_available() {
+        eprintln!("skipping the joint-round comparison: this build has no cubin");
+        return None;
+    }
+    let temp = tempfile::tempdir().expect("a temporary directory");
+    let config = Glm5NextConfig::small();
+    write_synthetic_checkpoint(temp.path(), &config, 7, 2).expect("the fixture writes");
+    let directory = temp.path().to_path_buf();
+    std::mem::forget(temp);
+    let open = || {
+        let cuda = sparkflash_kernels::cuda_driver::Cuda::load().ok()?;
+        Glm5NextDeviceBackend::open_single_rank(
+            Arc::new(CudaHandle::new(cuda)),
+            config.clone(),
+            &directory,
+            CONTEXT,
+        )
+        .ok()
+    };
+    let plain = open()?;
+    let mut fused = open()?;
+    fused
+        .enable_speculation(2, None)
+        .expect("the fixture drafts with its MTP layer");
+    fused.enable_fusion(2).expect("drafting members fuse");
+    Some((plain, fused))
 }
 
 /// A sequence reports the tokens it holds, and a prompt that extends them is forwarded in part.

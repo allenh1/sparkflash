@@ -1,0 +1,361 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// kernels/inkling_epilogue_sm121.cu
+//
+// The two Inkling-2-Small epilogues the shared stack does not have, and the NVFP4
+// four-over-six activation quantiser that sits beside the shared MX quantisers.
+//
+// The routed experts' gate/up pair is the shared grouped MMA; only the activation differs.
+// The released model caps the gate at tanh(g / 4) and the up projection at tanh(u / 25),
+// so the epilogue is
+//
+//     out = tanh(gate / gate_cap) * sigmoid(gate) * tanh(up / up_cap)
+//
+// with gate_cap = 4 and up_cap = 25. Unlike a plain SwiGLU the gate's first factor is the
+// softcap itself, not silu's g * sigmoid(g); the sigmoid is the same. A non-positive or
+// non-finite cap disables the corresponding tanh, which is how the arm passes a layer that
+// declares no cap.
+//
+// The final head reduces as usual; this image only applies the logit softcap
+// tanh(logit / 30) * 30 and copies the real 200,058 entries out of the padded 201,024-row
+// vocabulary, in BF16, so the sampler never sees a padded row.
+//
+// The four-over-six quantiser is the released activation rule for the layers whose experts
+// are stored NVFP4: one E4M3 block scale a 16-element block, chosen between the candidate
+// scales amax / 4 and amax / 6 by the smaller mean absolute error after the E2M1 round trip.
+// It is a thin addition beside the shared quantisers: it emits the same packed E2M1 codes
+// and one E4M3 scale code a block, and the caller's per-expert outer scale is applied after
+// this kernel (this image does not pretend to know the checkpoint's amax denominator).
+//
+// ABI:
+//
+//   inkling_softcapped_swiglu(gate_up, out, width, gate_cap, up_cap)
+//     gate_up  [rows][2 * width] f32 in the checkpoint's w13 order: gate and up interleaved,
+//              element 2c the gate of column c and 2c + 1 its up
+//     out      [rows][width] f32
+//
+//   inkling_logit_softcap(logits, out, rows, padded_vocab, unpadded_vocab, cap)
+//     grid     (any number of column blocks, rows), block INKLING_EPI_BLOCK
+//     logits   [rows][padded_vocab] f32
+//     out      [rows][unpadded_vocab] BF16
+//
+//   inkling_nvfp4_quantize_4_6(x, packed, scales, rows, columns)
+//     x        [rows][columns] f32, columns a multiple of 16
+//     packed   [rows][columns / 2] uint8, two E2M1 codes a byte, low nibble first
+//     scales   [rows][columns / 16] uint8, E4M3 block scales
+//
+// The two seam kernels the arm's schedule needs and no shared image has. Both are exact: a
+// round-to-nearest-wide conversion and an addition, so their parity is a bit comparison rather
+// than a tolerance.
+//
+//   inkling_kv_store(key, value, key_cache, value_cache, rows, position, width)
+//     key, value        [rows][width] f32, the projected rows
+//     key_cache, value_cache  [positions][width] BF16, written at position + row
+//     The attention body reads BF16 cache rows because that is what the released model stores;
+//     the projection that feeds it is f32, so the narrowing is its own launch and not a silent
+//     argument to the attention kernel.
+//
+//   inkling_residual_add(residual, delta, out, rows, width)
+//     residual, delta, out  [rows][width] f32; out may alias either input
+//     The two residual topologies the block-attention stream needs: the additive residual and,
+//     at a block boundary, the same expression with the summary stack as the first term.
+//
+//   inkling_widen_f32(src, dst, count)
+//     src  BF16, dst f32; the widening is a bit insertion, so it rounds nothing
+//     The attention body writes BF16 (the released cache and output precision) and the output
+//     projection that follows reads f32, so this is the one conversion between them. It is the
+//     inverse of what inkling_kv_store does on the key/value path.
+//
+//   inkling_expert_mix(out, partials, scales, rows, slots, width, indices, owner_experts, owners)
+//     partials  [rows][slots][width] f32, one selected expert's projection a slot
+//     scales    [rows][slots] f32, the expert's share of the mix
+//     out       [rows][width] f32
+//     The three expert formats differ only in where their per-expert factor comes from, so the
+//     mix is one body: the arm hands it the router weight times whatever scale the format stores
+//     on the expert, and the sum is the layer's MLP output. It is a plain sum of scaled rows, in
+//     slot order, so the host's sequential f32 sum and this kernel agree to the last bit. A slot
+//     with a zero share (another rank's expert) is skipped rather than multiplied by zero.
+//     With owners > 0 (the row expert split, where one rank holds every slot's rows), each of the
+//     `owners` expert-parallel ranks' mixes - the slots whose expert indices[row][slot] /
+//     owner_experts names it - is that sum, and they are folded in ascending rank order from 0.0:
+//     an expert-parallel rank's local mix and its exchange's sum, term for term.
+//
+//   inkling_join_pieces(dst, src, rows, piece, world)
+//     src  [world][rows][piece] 16-byte words, dst [rows][world * piece]
+//     The ranks' gathered runs of a row side by side, so a row each rank computed a run of
+//     reads as one row. A copy: it rounds nothing.
+
+#include <cstdint>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include "opt_pdl_sm121.cuh"
+
+#include "m4_common_sm121.cuh"
+// inkling_tanh, inkling_sigmoid and the softcapped SwiGLU expression, shared with the grouped
+// MMA's gate_up epilogue (q4p_moe_gate_up_capped).
+#include "inkling_softcap_sm121.cuh"
+
+#define INKLING_EPI_BLOCK 256
+
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_softcapped_swiglu(
+    const float* __restrict__ gate_up,
+    float* __restrict__ out,
+    int width,
+    float gate_cap,
+    float up_cap) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    const int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x;
+    if (column >= width) {
+        return;
+    }
+    const float* source = gate_up + (uint64_t)row * 2 * width;
+    out[(uint64_t)row * width + column] =
+        inkling_softcapped_swiglu_value(source[2 * column], source[2 * column + 1], gate_cap, up_cap);
+}
+
+// The final softcap and the unpadded slice in one pass: grid (column blocks, rows), a block
+// striding over its row's entries gridDim.x blocks apart. Each entry is its own value, so the
+// grid changes only which thread writes it.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_logit_softcap(
+    const float* __restrict__ logits,
+    __nv_bfloat16* __restrict__ out,
+    int rows,
+    int padded_vocab,
+    int unpadded_vocab,
+    float cap) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (row >= rows || unpadded_vocab > padded_vocab) {
+        return;
+    }
+    const float* source = logits + (uint64_t)row * padded_vocab;
+    __nv_bfloat16* target = out + (uint64_t)row * unpadded_vocab;
+    for (int entry = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; entry < unpadded_vocab;
+         entry += gridDim.x * INKLING_EPI_BLOCK) {
+        const float value = source[entry];
+        target[entry] = __float2bfloat16_rn(cap > 0.0f ? cap * inkling_tanh(value / cap) : value);
+    }
+}
+
+// The mean absolute error of one E2M1 round trip at a candidate scale.
+__device__ __forceinline__ float inkling_four_over_six_error(float value, float scale,
+                                                             unsigned int lane) {
+    if (lane >= 16u) {
+        return 0.0f;
+    }
+    const float decoded = spark_fp4_e2m1_decode(spark_fp4_e2m1_encode(value / scale)) * scale;
+    return fabsf(__fadd_rn(value, -decoded));
+}
+
+// The f32 projections become the BF16 cache rows the attention body reads.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_kv_store(
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    __nv_bfloat16* __restrict__ key_cache,
+    __nv_bfloat16* __restrict__ value_cache,
+    int rows,
+    int position,
+    int width,
+    int cache_rows) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (row >= rows || width <= 0) {
+        return;
+    }
+    // A sliding layer's cache is a ring, so a chunk that crosses the wrap writes its rows at the
+    // wrapped slot rather than past the end. A full layer passes 0 and addresses absolutely.
+    const int slot = cache_rows > 0 ? (position + row) % cache_rows : position + row;
+    const uint64_t destination = (uint64_t)slot * width;
+    const uint64_t source = (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        key_cache[destination + column] = __float2bfloat16_rn(key[source + column]);
+        value_cache[destination + column] = __float2bfloat16_rn(value[source + column]);
+    }
+}
+
+// out = residual + delta, elementwise. out may alias residual (the stream is updated in place).
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_residual_add(
+    const float* __restrict__ residual,
+    const float* __restrict__ delta,
+    float* __restrict__ out,
+    int rows,
+    int width) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (row >= rows || width <= 0) {
+        return;
+    }
+    const uint64_t offset = (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        out[offset + column] =
+            __fadd_rn(residual[offset + column], delta[offset + column]);
+    }
+}
+
+// Append every row's stream to that row's block-summary stack: a chunk's rows each own a stack,
+// and the boundary layer's pre-attention stream is the new entry of it.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_summary_push(
+    const float* __restrict__ x,
+    float* __restrict__ summaries,
+    int hidden,
+    int blocks,
+    int block_stride) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (hidden <= 0) {
+        return;
+    }
+    float* target = summaries + (uint64_t)row * block_stride + (uint64_t)blocks * hidden;
+    const float* source = x + (uint64_t)row * hidden;
+    for (int index = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; index < hidden;
+         index += gridDim.x * INKLING_EPI_BLOCK) {
+        target[index] = source[index];
+    }
+}
+
+// BF16 -> f32: exact, a bit insertion.
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_widen_f32(
+    const __nv_bfloat16* __restrict__ src,
+    float* __restrict__ dst,
+    int count) {
+    OPT_PDL_ENTRY();
+    for (int index = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; index < count;
+         index += gridDim.x * INKLING_EPI_BLOCK) {
+        dst[index] = __bfloat162float(src[index]);
+    }
+}
+
+// The routed experts' mix: out = sum over the selected slots of scales[slot] * partials[slot].
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_expert_mix(
+    float* __restrict__ out,
+    const float* __restrict__ partials,
+    const float* __restrict__ scales,
+    int rows,
+    int slots,
+    int width,
+    const int* __restrict__ indices,
+    int owner_experts,
+    int owners) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.y;
+    if (row >= rows || slots <= 0 || width <= 0) {
+        return;
+    }
+    const float* band = partials + (uint64_t)row * slots * width;
+    const float* shares = scales + (uint64_t)row * slots;
+    const int* picks = indices != nullptr ? indices + (uint64_t)row * slots : nullptr;
+    const bool grouped = owners > 0 && owner_experts > 0 && picks != nullptr;
+    float* target = out + (uint64_t)row * width;
+    for (int column = blockIdx.x * INKLING_EPI_BLOCK + threadIdx.x; column < width;
+         column += gridDim.x * INKLING_EPI_BLOCK) {
+        float total = 0.0f;
+        for (int owner = 0; owner < (grouped ? owners : 1); ++owner) {
+            float value = 0.0f;
+            for (int slot = 0; slot < slots; ++slot) {
+                // A zero share is a slot another rank computed, whose partial here is whatever
+                // the buffer last held: skipping it is the sum with that term's +-0 for any
+                // finite stale value, and keeps a stale non-finite one out of the row.
+                const float share = shares[slot];
+                if (share != 0.0f && (!grouped || picks[slot] / owner_experts == owner)) {
+                    value =
+                        __fadd_rn(value, __fmul_rn(share, band[(uint64_t)slot * width + column]));
+                }
+            }
+            // Ungrouped, the one mix is the row; grouped, the ranks' mixes fold from 0.0.
+            total = grouped ? __fadd_rn(total, value) : value;
+        }
+        target[column] = total;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(INKLING_EPI_BLOCK) inkling_join_pieces(
+    uint4* __restrict__ dst,
+    const uint4* __restrict__ src,
+    long long rows,
+    int piece,
+    int world) {
+    OPT_PDL_ENTRY();
+    const long long wide = (long long)world * piece;
+    const long long total = rows * wide;
+    for (long long at = (long long)blockIdx.x * blockDim.x + threadIdx.x; at < total;
+         at += (long long)gridDim.x * blockDim.x) {
+        const long long row = at / wide;
+        const int within = (int)(at - row * wide);
+        const int rank = within / piece;
+        dst[at] = src[((long long)rank * rows + row) * piece + (within - rank * piece)];
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) inkling_nvfp4_quantize_4_6(
+    const float* __restrict__ x,
+    uint8_t* __restrict__ packed,
+    uint8_t* __restrict__ scales,
+    int rows,
+    int columns) {
+    OPT_PDL_ENTRY();
+    const int row = blockIdx.x;
+    if (row >= rows || (columns & 15) != 0) {
+        return;
+    }
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int warp = threadIdx.x >> 5;
+    const unsigned int warps = blockDim.x >> 5;
+    const int blocks = columns >> 4;
+    const float* source = x + (uint64_t)row * columns;
+    uint8_t* codes = packed + (uint64_t)row * (columns >> 1);
+    uint8_t* block_scales = scales + (uint64_t)row * blocks;
+    for (int block = (int)warp; block < blocks; block += (int)warps) {
+        const float value = lane < 16u ? source[block * 16 + lane] : 0.0f;
+        float amax = fabsf(value);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+        }
+        const float base = amax > 0.0f ? amax : 1.0f;
+        const uint8_t code4 = spark_fp8_e4m3_encode(base / 4.0f);
+        const uint8_t code6 = spark_fp8_e4m3_encode(base / 6.0f);
+        const float scale4 = spark_fp8_e4m3_decode(code4);
+        const float scale6 = spark_fp8_e4m3_decode(code6);
+        float error4 = inkling_four_over_six_error(value, scale4, lane);
+        float error6 = inkling_four_over_six_error(value, scale6, lane);
+#pragma unroll
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            error4 += __shfl_xor_sync(0xffffffffu, error4, offset);
+            error6 += __shfl_xor_sync(0xffffffffu, error6, offset);
+        }
+        const bool take_six = error6 < error4;
+        uint8_t chosen = take_six ? code6 : code4;
+        float scale = take_six ? scale6 : scale4;
+        // A block whose amax is below E4M3's smallest subnormal would otherwise divide by a
+        // zero scale; such a block quantises to all-zero codes under the unscaled identity.
+        if (!(scale > 0.0f)) {
+            chosen = spark_fp8_e4m3_encode(1.0f);
+            scale = 1.0f;
+        }
+        const unsigned int code = spark_fp4_e2m1_encode(value / scale);
+        const unsigned int neighbour = __shfl_down_sync(0xffffffffu, code, 1u);
+        if (lane < 16u && (lane & 1u) == 0u) {
+            codes[(block * 16 + (int)lane) >> 1] = (uint8_t)(code | (neighbour << 4));
+        }
+        if (lane == 0u) {
+            block_scales[block] = chosen;
+        }
+    }
+}

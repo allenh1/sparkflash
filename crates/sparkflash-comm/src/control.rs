@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The serve-owned TP=4 control channel: Hello/Ready/Request/Token/End/Error frames.
+//! A serve-owned control channel: Hello/Ready/Request/Token/End/Error frames.
 //!
-//! This is one message stream a request, separate from the engine's data collective, so rank 0
-//! can admit, broadcast and cancel without changing the transport the forward uses. The module is
-//! included only under `--features tp4-serve`.
+//! One message stream per request, separate from a model's data collective, so rank 0 can admit,
+//! broadcast and cancel without changing the transport the forward uses. It is a transport
+//! concern, so it lives here rather than in the CLI: the DeepSeek host group and the Inkling
+//! device group share the frames, the hub and the worker.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -24,7 +25,14 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::{TP4_CONTROL_CONNECT_RETRY, TP4_CONTROL_READ_TIMEOUT};
+/// How long a rank's control socket may block on one frame.
+///
+/// The timeout is a liveness guard for a dead peer, not a performance budget: a step between
+/// tokens can be tens of seconds on a device arm. It is deliberately much larger than one token.
+pub const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long a worker pauses between control-connect attempts while rank 0's hub is still binding.
+pub const CONTROL_CONNECT_RETRY: Duration = Duration::from_millis(100);
 
 // ---------------------------------------------------------------------------------------
 // TP=4 serve control channel
@@ -41,15 +49,15 @@ use super::{TP4_CONTROL_CONNECT_RETRY, TP4_CONTROL_READ_TIMEOUT};
 /// The largest control frame accepted: a device tick's prompt id lists (rank 0 stops admitting at
 /// [`TP4_TICK_PROMPT_IDS`] ids) and a small error message fit below this. A frame larger than this
 /// is a protocol error, not an allocation request.
-pub(super) const TP4_CONTROL_MAX_FRAME: usize = 8 << 20;
+pub const TP4_CONTROL_MAX_FRAME: usize = 8 << 20;
 
 /// The largest canvas a [`Tp4ControlFrame::DevicePixels`] frame carries: the largest span
 /// (`vision_max_n_token` tokens) is about 1024 cells of 42 x 42 RGB pixels, 5.4 MB.
-pub(super) const TP4_CONTROL_MAX_PIXELS: usize = 16 << 20;
+pub const TP4_CONTROL_MAX_PIXELS: usize = 16 << 20;
 
 /// The prompt ids one device tick's admissions carry at most (about 7 bytes each in JSON): a
 /// request past this joins at the next tick.
-pub(crate) const TP4_TICK_PROMPT_IDS: usize = 768 << 10;
+pub const TP4_TICK_PROMPT_IDS: usize = 768 << 10;
 
 /// One message on the serve-owned control channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +91,16 @@ pub enum Tp4ControlFrame {
         /// different prefix would run different collectives in the same step.
         #[serde(default)]
         cached_tokens: u32,
+        /// The prompt's image spans, in prompt order: every rank writes the images' rows over
+        /// these positions, so every rank must know them. The canvases do not travel; the rank
+        /// that encodes holds them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Tp4DeviceImage>,
+        /// A sampled request's sampler: every rank's drafter perturbs its picks with the noise
+        /// rank 0's sample takes, so every rank drafts the same ids. `None` (and a frame from a
+        /// rank 0 that predates the field) is greedy.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sampler: Option<Tp4FrameSampler>,
     },
     /// Rank 0 -> every worker: the sampled token for the next lockstep decode.
     Token {
@@ -111,6 +129,52 @@ pub enum Tp4ControlFrame {
         /// The canvas bytes after the frame.
         bytes: u64,
     },
+    /// Rank 0 -> every worker of a fused group: lane `lane` takes a request's prompt. A lane that
+    /// still holds an earlier request forgets it first, on every rank alike, unless `keep` says
+    /// rank 0's lane kept it to continue.
+    LaneRequest {
+        /// The lane, `0..lanes`, in the order rank 0's pool opened them.
+        lane: u32,
+        /// The tokens rank 0 rendered (the chat template is already applied).
+        prompt_ids: Vec<u32>,
+        /// The prompt's image spans, as [Tp4ControlFrame::Request] carries them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Tp4DeviceImage>,
+        /// Whether the lane keeps what it holds: the prompt then continues it, or the lane
+        /// rewinds or starts over itself, as rank 0's lane does with the same history.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
+        /// The request's sampler, as [Tp4ControlFrame::Request] carries it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sampler: Option<Tp4FrameSampler>,
+    },
+    /// Rank 0 -> every worker of a fused group: lane `lane` is idle and gives up what it holds,
+    /// so another lane can grow; its next request starts over.
+    LaneRelease {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+    },
+    /// Rank 0 -> every worker of a fused group: one step of these lanes, each consuming the token
+    /// rank 0 sampled for it, in this order - the order is the step's row order on every rank.
+    LaneStep {
+        /// `(lane, token)` a member.
+        members: Vec<(u32, u32)>,
+    },
+    /// Rank 0 -> every worker of a fused group: lane `lane`'s caller never used the last `count`
+    /// answers of its run, so the lane rolls them back within its round (the shared engine's
+    /// give-back), before the frame that follows.
+    LaneGiveBack {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+        /// The answers to roll back.
+        count: u32,
+    },
+    /// Rank 0 -> every worker of a fused group: lane `lane` runs the next part of the prompt its
+    /// `LaneRequest` began, between the steps the frames around it name.
+    LanePart {
+        /// The lane, as [Tp4ControlFrame::LaneRequest] names it.
+        lane: u32,
+    },
     /// The request ended normally; every worker leaves the request loop.
     End,
     /// The request or the group failed; every worker leaves the process.
@@ -124,7 +188,7 @@ pub enum Tp4ControlFrame {
 
 impl Tp4ControlFrame {
     /// A short name for an unexpected-frame message.
-    pub(super) fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Hello { .. } => "Hello",
             Self::Ready => "Ready",
@@ -132,9 +196,46 @@ impl Tp4ControlFrame {
             Self::Token { .. } => "Token",
             Self::DeviceTick { .. } => "DeviceTick",
             Self::DevicePixels { .. } => "DevicePixels",
+            Self::LaneRequest { .. } => "LaneRequest",
+            Self::LaneRelease { .. } => "LaneRelease",
+            Self::LaneStep { .. } => "LaneStep",
+            Self::LaneGiveBack { .. } => "LaneGiveBack",
+            Self::LanePart { .. } => "LanePart",
             Self::End => "End",
             Self::Error { .. } => "Error",
         }
+    }
+}
+
+/// A request's sampler as [Tp4ControlFrame::Request] carries it, in [Tp4DeviceAdmit]'s fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tp4FrameSampler {
+    /// The temperature's f32 bits (0 is greedy); bits keep the frame `Eq`.
+    pub temperature_bits: u32,
+    /// The nucleus threshold's f32 bits.
+    pub top_p_bits: u32,
+    /// The candidate count (0 keeps every token).
+    pub top_k: u32,
+    /// The sampler seed every rank draws its noise from.
+    pub seed: u64,
+    /// The repetition penalty's f32 bits: 1.0, and a frame without the field, is none. A group
+    /// whose workers pick what rank 0 picks (their picks decide what a verify keeps) needs the
+    /// penalties as much as the draw.
+    #[serde(default = "Tp4FrameSampler::no_repetition_penalty")]
+    pub repetition_penalty_bits: u32,
+    /// The presence penalty's f32 bits (0.0 is none).
+    #[serde(default)]
+    pub presence_penalty_bits: u32,
+    /// The frequency penalty's f32 bits (0.0 is none).
+    #[serde(default)]
+    pub frequency_penalty_bits: u32,
+}
+
+impl Tp4FrameSampler {
+    /// The bits of a repetition penalty that changes nothing.
+    #[must_use]
+    pub fn no_repetition_penalty() -> u32 {
+        1.0f32.to_bits()
     }
 }
 
@@ -184,6 +285,31 @@ pub struct Tp4DeviceImage {
     pub key: String,
 }
 
+impl Tp4DeviceImage {
+    /// A content key as the frame's 64 lowercase hex digits.
+    #[must_use]
+    pub fn hex_key(key: &[u8; 32]) -> String {
+        key.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The content key the frame's hex digits spell.
+    ///
+    /// # Errors
+    /// A key that is not 64 hex digits.
+    pub fn key_bytes(&self) -> Result<[u8; 32], String> {
+        let hex = self.key.as_bytes();
+        if hex.len() != 64 {
+            return Err(format!("a key of {} digits, not 64", hex.len()));
+        }
+        let mut key = [0u8; 32];
+        for (byte, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
+            let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| "the key is not hex".to_owned())?;
+        }
+        Ok(key)
+    }
+}
+
 /// A typed control-channel refusal or transport failure.
 #[derive(Debug)]
 pub enum Tp4ControlError {
@@ -225,8 +351,8 @@ pub enum Tp4ControlError {
     UnexpectedFrame {
         /// What the receiver expected.
         expected: &'static str,
-        /// What it got.
-        got: Tp4ControlFrame,
+        /// What it got, boxed so the error stays small beside the frames it reports.
+        got: Box<Tp4ControlFrame>,
     },
     /// A Hello named a rank outside the group or a rank that already joined.
     BadRank {
@@ -291,7 +417,7 @@ impl From<serde_json::Error> for Tp4ControlError {
 }
 
 /// One length-prefixed JSON control frame, as it goes on the wire.
-pub(super) fn control_frame_bytes(frame: &Tp4ControlFrame) -> Result<Vec<u8>, Tp4ControlError> {
+pub fn control_frame_bytes(frame: &Tp4ControlFrame) -> Result<Vec<u8>, Tp4ControlError> {
     let payload = serde_json::to_vec(frame)?;
     let length = u32::try_from(payload.len()).map_err(|_| Tp4ControlError::FrameTooLarge {
         bytes: payload.len(),
@@ -303,7 +429,7 @@ pub(super) fn control_frame_bytes(frame: &Tp4ControlFrame) -> Result<Vec<u8>, Tp
 }
 
 /// Writes one length-prefixed JSON control frame.
-pub(super) fn write_control_frame(
+pub fn write_control_frame(
     stream: &mut TcpStream,
     frame: &Tp4ControlFrame,
 ) -> Result<(), Tp4ControlError> {
@@ -315,7 +441,7 @@ pub(super) fn write_control_frame(
 }
 
 /// A [`Tp4ControlFrame::DevicePixels`] frame and its canvas bytes, as they go on the wire.
-pub(super) fn control_pixels_bytes(
+pub fn control_pixels_bytes(
     seq: u64,
     image: u32,
     pixels: &[u8],
@@ -336,10 +462,7 @@ pub(super) fn control_pixels_bytes(
 }
 
 /// Reads the `bytes` canvas bytes that follow a [`Tp4ControlFrame::DevicePixels`] frame.
-pub(super) fn read_control_pixels(
-    stream: &mut TcpStream,
-    bytes: u64,
-) -> Result<Vec<u8>, Tp4ControlError> {
+pub fn read_control_pixels(stream: &mut TcpStream, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
     let length = usize::try_from(bytes).unwrap_or(usize::MAX);
     if length > TP4_CONTROL_MAX_PIXELS {
         return Err(Tp4ControlError::FrameTooLarge { bytes: length });
@@ -355,7 +478,7 @@ pub(super) fn read_control_pixels(
 /// The socket's read timeout is a liveness guard for a stalled step; between requests it fires on
 /// a healthy server that has simply received nothing. Only the timeout kinds mean "try again":
 /// a reset or a broken pipe is still a failure.
-pub(super) fn control_read_is_idle(error: &Tp4ControlError) -> bool {
+pub fn control_read_is_idle(error: &Tp4ControlError) -> bool {
     matches!(
         error,
         Tp4ControlError::Io(error)
@@ -367,9 +490,7 @@ pub(super) fn control_read_is_idle(error: &Tp4ControlError) -> bool {
 }
 
 /// Reads one length-prefixed JSON control frame.
-pub(super) fn read_control_frame(
-    stream: &mut TcpStream,
-) -> Result<Tp4ControlFrame, Tp4ControlError> {
+pub fn read_control_frame(stream: &mut TcpStream) -> Result<Tp4ControlFrame, Tp4ControlError> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header)?;
     let length = usize::try_from(u32::from_be_bytes(header)).unwrap_or(usize::MAX);
@@ -383,13 +504,13 @@ pub(super) fn read_control_frame(
 
 /// Rank 0's end of the control channel: one stream per worker, readiness, and broadcast.
 #[derive(Debug)]
-pub(super) struct Tp4ControlHub {
+pub struct Tp4ControlHub {
     /// Index by worker rank; rank 0 is always None (it is the hub itself).
-    pub(super) streams: Vec<Option<TcpStream>>,
+    pub streams: Vec<Option<TcpStream>>,
     /// The number of ranks in the group.
-    pub(super) world: usize,
+    pub world: usize,
     /// Whether every worker has declared Hello and Ready was sent.
-    pub(super) ready: bool,
+    pub ready: bool,
 }
 
 impl Tp4ControlHub {
@@ -399,7 +520,7 @@ impl Tp4ControlHub {
     /// typed error with the count that joined, not an indefinite accept. Ready is sent only after
     /// every rank has connected: that is what makes a Request-before-Ready a protocol violation
     /// rather than a race.
-    pub(super) fn start(
+    pub fn start(
         address: SocketAddr,
         world: usize,
         timeout: Duration,
@@ -407,7 +528,21 @@ impl Tp4ControlHub {
         if world == 0 {
             return Err(Tp4ControlError::BadRank { rank: 0, world });
         }
-        let listener = TcpListener::bind(address)?;
+        Self::start_with_listener(TcpListener::bind(address)?, world, timeout)
+    }
+
+    /// Accepts on an already-bound listener; [Self::start] is this with the bind in front.
+    ///
+    /// A caller that needs the address before rank 0 starts - a test on an ephemeral port, or a
+    /// launcher that reports the port it will use - binds the socket itself and hands it here.
+    pub fn start_with_listener(
+        listener: TcpListener,
+        world: usize,
+        timeout: Duration,
+    ) -> Result<Self, Tp4ControlError> {
+        if world == 0 {
+            return Err(Tp4ControlError::BadRank { rank: 0, world });
+        }
         listener.set_nonblocking(true)?;
         let deadline = Instant::now() + timeout;
         let mut streams: Vec<Option<TcpStream>> = (0..world).map(|_| None).collect();
@@ -424,13 +559,13 @@ impl Tp4ControlHub {
                 Ok((mut stream, _peer)) => {
                     stream.set_nonblocking(false)?;
                     stream.set_nodelay(true)?;
-                    stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-                    stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+                    stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
+                    stream.set_write_timeout(Some(CONTROL_READ_TIMEOUT))?;
                     let frame = read_control_frame(&mut stream)?;
                     let Tp4ControlFrame::Hello { rank } = frame else {
                         return Err(Tp4ControlError::UnexpectedFrame {
                             expected: "Hello",
-                            got: frame,
+                            got: Box::new(frame),
                         });
                     };
                     let rank = usize::try_from(rank).unwrap_or(usize::MAX);
@@ -462,7 +597,7 @@ impl Tp4ControlHub {
     }
 
     /// Broadcasts one frame to every worker.
-    pub(super) fn broadcast(&mut self, frame: &Tp4ControlFrame) -> Result<(), Tp4ControlError> {
+    pub fn broadcast(&mut self, frame: &Tp4ControlFrame) -> Result<(), Tp4ControlError> {
         debug_assert_eq!(self.streams.len(), self.world);
         if !self.ready {
             return Err(Tp4ControlError::NotReady {
@@ -477,14 +612,15 @@ impl Tp4ControlHub {
 }
 
 /// One worker's end of the control channel.
-pub(super) struct Tp4ControlWorker {
-    pub(super) stream: TcpStream,
+pub struct Tp4ControlWorker {
+    /// The socket to rank 0's hub.
+    pub stream: TcpStream,
     /// This worker's rank.
-    pub(super) rank: u32,
+    pub rank: u32,
     /// The world size, for validation and messages.
-    pub(super) world: usize,
+    pub world: usize,
     /// Whether rank 0's Ready has been received.
-    pub(super) ready: bool,
+    pub ready: bool,
 }
 
 impl Tp4ControlWorker {
@@ -495,7 +631,7 @@ impl Tp4ControlWorker {
     /// first arrives before the listener exists and must wait for it rather than fail. Any other
     /// connect error, and the budget running out, still ends the start with a typed error; running
     /// out names the peer address and the budget in `Tp4ControlError::ConnectTimeout`.
-    pub(super) fn connect(
+    pub fn connect(
         address: SocketAddr,
         rank: u32,
         world: usize,
@@ -516,7 +652,7 @@ impl Tp4ControlWorker {
             match TcpStream::connect_timeout(&address, remaining) {
                 Ok(stream) => break stream,
                 Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    std::thread::sleep(TP4_CONTROL_CONNECT_RETRY.min(remaining));
+                    std::thread::sleep(CONTROL_CONNECT_RETRY.min(remaining));
                 }
                 Err(error) => {
                     if Instant::now() >= deadline {
@@ -530,8 +666,8 @@ impl Tp4ControlWorker {
             }
         };
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
-        stream.set_write_timeout(Some(TP4_CONTROL_READ_TIMEOUT))?;
+        stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(CONTROL_READ_TIMEOUT))?;
         Ok(Self {
             stream,
             rank,
@@ -541,7 +677,7 @@ impl Tp4ControlWorker {
     }
 
     /// Sends Hello and waits for rank 0's Ready.
-    pub(super) fn handshake(&mut self) -> Result<(), Tp4ControlError> {
+    pub fn handshake(&mut self) -> Result<(), Tp4ControlError> {
         debug_assert!(usize::try_from(self.rank).unwrap_or(usize::MAX) < self.world);
         write_control_frame(
             &mut self.stream,
@@ -555,13 +691,13 @@ impl Tp4ControlWorker {
             }
             other => Err(Tp4ControlError::UnexpectedFrame {
                 expected: "Ready",
-                got: other,
+                got: Box::new(other),
             }),
         }
     }
 
     /// Reads the next request-scoped frame. A frame before Ready is a typed refusal.
-    pub(super) fn next_frame(&mut self) -> Result<Tp4ControlFrame, Tp4ControlError> {
+    pub fn next_frame(&mut self) -> Result<Tp4ControlFrame, Tp4ControlError> {
         if !self.ready {
             return Err(Tp4ControlError::NotReady {
                 expected: "next frame",
@@ -571,7 +707,102 @@ impl Tp4ControlWorker {
     }
 
     /// Reads the canvas bytes after a [`Tp4ControlFrame::DevicePixels`] frame.
-    pub(super) fn next_pixels(&mut self, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
+    pub fn next_pixels(&mut self, bytes: u64) -> Result<Vec<u8>, Tp4ControlError> {
         read_control_pixels(&mut self.stream, bytes)
     }
+}
+
+/// Ends the process now, without the C exit handlers. CUDA's handlers tear the context down,
+/// which waits for the kernels in flight, and a collective whose peer has gone never finishes:
+/// a rank whose group failed would stay up, holding its memory and its port. Rust runs no
+/// destructors on exit either, so only the standard streams need flushing.
+pub fn exit_now(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: _exit takes no pointers and does not return.
+    unsafe { libc::_exit(code) }
+}
+
+/// Exits rank 0 when a worker's control socket closes. A dead rank must fail the server, not
+/// leave its requests waiting in a collective.
+///
+/// # Errors
+/// A stream that cannot be cloned for the watch, or a thread that cannot start.
+pub fn watch_workers(hub: &Tp4ControlHub) -> Result<(), String> {
+    for (rank, stream) in hub.streams.iter().enumerate() {
+        let Some(stream) = stream else { continue };
+        let mut probe = stream
+            .try_clone()
+            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+        std::thread::Builder::new()
+            .name(format!("sparkflash-watch-r{rank}"))
+            .spawn(move || {
+                // Workers send nothing after Hello: any read that is not a timeout is the end.
+                let mut byte = [0u8; 1];
+                loop {
+                    match probe.read(&mut byte) {
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Ok(0) | Err(_) => {
+                            eprintln!(
+                                "sparkflash serve: rank {rank} closed its control channel; the group cannot serve, exiting"
+                            );
+                            exit_now(1);
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            })
+            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Exits a worker when rank 0's control socket closes, even while the worker waits in a
+/// collective. A close after `ended` is set (rank 0 said End) is the group's clean end, and the
+/// watch stops; `last_words` runs just before an exit.
+///
+/// # Errors
+/// A stream that cannot be cloned for the watch, or a thread that cannot start.
+pub fn watch_leader(
+    stream: &TcpStream,
+    rank: usize,
+    ended: &'static std::sync::atomic::AtomicBool,
+    last_words: fn(),
+) -> Result<(), String> {
+    let probe = stream
+        .try_clone()
+        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    std::thread::Builder::new()
+        .name("sparkflash-watch-r0".to_owned())
+        .spawn(move || {
+            let mut byte = [0u8; 1];
+            loop {
+                match probe.peek(&mut byte) {
+                    // Frames are waiting for the rank's own thread: look again once it has read
+                    // them.
+                    Ok(n) if n > 0 => std::thread::sleep(Duration::from_millis(200)),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    _ => {
+                        if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        eprintln!(
+                            "sparkflash serve: rank {rank}: rank 0 closed the control channel, exiting"
+                        );
+                        last_words();
+                        exit_now(1);
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
+    Ok(())
 }

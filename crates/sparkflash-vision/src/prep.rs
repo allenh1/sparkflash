@@ -99,8 +99,11 @@ pub fn prepare(bytes: &[u8], options: &PrepOptions) -> Result<PreparedImage, Vis
 }
 
 /// The recipe's `limit_image_mat` size: the long side scaled to `limit`, both sides rounded half
-/// away from zero and at least 1.
-fn shrink_long_side(image: &RgbImage, limit: usize) -> RgbImage {
+/// away from zero and at least 1. An image already within the limit is returned as it is.
+///
+/// This is also every model's "detail: low" shrink, so they all mean the same image by it.
+#[must_use]
+pub fn shrink_long_side(image: &RgbImage, limit: usize) -> RgbImage {
     let long = image.width.max(image.height);
     if long <= limit {
         return image.clone();

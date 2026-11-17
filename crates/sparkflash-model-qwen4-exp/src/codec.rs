@@ -27,6 +27,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
+use sparkflash_model::prompt::message_role;
 use sparkflash_model::{PromptCodec, PromptError};
 
 #[cfg(test)]
@@ -289,10 +290,7 @@ impl QwenCodec {
 
         let mut text = String::new();
         let mut first = 0usize;
-        let first_is_system = matches!(
-            messages[0].get("role").and_then(Value::as_str),
-            Some("system" | "developer")
-        );
+        let first_is_system = message_role(&messages[0]) == Some("system");
         if let Some(tools) = tools {
             // With tools, the template always opens a system turn: the tool catalogue lives
             // there, and a leading system message becomes the tail of that same turn.
@@ -346,7 +344,7 @@ impl QwenCodec {
         }
 
         for (index, message) in messages.iter().enumerate().skip(first) {
-            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+            let role = message_role(message).ok_or_else(|| {
                 PromptError::invalid(
                     "every message needs a role",
                     Some("messages"),
@@ -354,7 +352,7 @@ impl QwenCodec {
                 )
             })?;
             match role {
-                "system" | "developer" => {
+                "system" => {
                     if index != 0 {
                         return Err(PromptError::invalid(
                             "a system message must be the first turn",
@@ -431,13 +429,10 @@ impl QwenCodec {
                     text.push('\n');
                 }
                 "tool" => {
-                    let merged_before = index > 0
-                        && messages[index - 1].get("role").and_then(Value::as_str) == Some("tool");
-                    let merged_after = messages
-                        .get(index + 1)
-                        .and_then(|next| next.get("role"))
-                        .and_then(Value::as_str)
-                        == Some("tool");
+                    let merged_before =
+                        index > 0 && message_role(&messages[index - 1]) == Some("tool");
+                    let merged_after =
+                        messages.get(index + 1).and_then(message_role) == Some("tool");
                     if !merged_before {
                         text.push_str(IM_START);
                         text.push_str("user");
@@ -538,7 +533,7 @@ fn last_query_index(messages: &[Value]) -> Result<usize, PromptError> {
     let mut last_query_index = messages.len().saturating_sub(1);
     let mut multi_step_tool = true;
     for (index, message) in messages.iter().enumerate().rev() {
-        if !multi_step_tool || message.get("role").and_then(Value::as_str) != Some("user") {
+        if !multi_step_tool || message_role(message) != Some("user") {
             continue;
         }
         let content = content_text(message, Some(IMAGE_PAD))?;

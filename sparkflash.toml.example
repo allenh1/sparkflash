@@ -59,8 +59,15 @@ device = true
 [runtime]
 # SPARK_MAX_SEQ_LEN. 1,048,576 is the model maximum.
 max_context_tokens = 1048576
-# SPARKFLASH_LANES. 32 is the engine design point.
+# SPARKFLASH_LANES. 32 is the engine design point. For the GLM and Inkling groups this is the
+# fused lanes every rank steps (--concurrency): 4 is their default, 1 serves one request at a time.
 max_concurrency = 32
+# The GLM and Inkling groups only (validation refuses them for another model):
+# drafting = "default"     # "on" drafts with the model's drafter, "off" never drafts
+# lane_memory_mb = 18000   # the memory a rank's lanes share; unset is one whole context's worth
+# joint_rounds = true      # false verifies drafting lanes one after another
+# Inkling-2-Small only: the prefill chunk rows; unset is 4,096 widening to 8,192 on long prompts.
+# prefill_chunk = 4096
 
 [cluster]
 # Rank 0's public HTTP bind (SPARKFLASH_HTTP_BIND).

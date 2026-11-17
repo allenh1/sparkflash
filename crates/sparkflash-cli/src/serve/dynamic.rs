@@ -60,6 +60,12 @@ pub(crate) struct DynamicCheckpoint {
     pub plan: EnginePlan,
 }
 
+/// The context a device-arm group admits when the operator does not name one.
+///
+/// The Inkling release's window is 1M tokens; 256K is the arm's documented serving default, and
+/// the difference is 6 GiB of KV a rank.
+const INKLING_GROUP_DEFAULT_CONTEXT: usize = 262_144;
+
 /// The prompt dialect a checkpoint's tokenizer declares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Dialect {
@@ -69,6 +75,8 @@ pub(crate) enum Dialect {
     Qwen,
     /// DeepSeek's own renderer, which its reference path normally serves.
     Deepseek,
+    /// Inkling-2's typed messages: `<|message_model|><|content_thinking|>...<|end_message|>`.
+    Inkling,
 }
 
 /// Resolves `options` into a checkpoint and its plan.
@@ -97,6 +105,9 @@ pub(crate) fn resolve(options: &ServeOptions) -> Result<DynamicCheckpoint, Strin
 /// The world a dynamic run plans at: one node for the host path, and the group's world only when
 /// the checkpoint belongs to a preset arm that has a group.
 fn serving_world(options: &ServeOptions) -> Result<usize, String> {
+    if let Some(group) = options.group.as_ref() {
+        return Ok(group.world);
+    }
     #[cfg(feature = "tp4-serve")]
     if let Some(tp4) = options.tp4.as_ref() {
         return Ok(tp4.world_size);
@@ -292,6 +303,25 @@ fn codec(
         )?;
         return Ok((Arc::new(codec), Dialect::Glm));
     }
+    if architecture.family == "inkling2" {
+        let codec = sparkflash_model_inkling2::InklingCodec::from_path(
+            &tokenizer,
+            architecture.tokens.bos_token_id,
+            architecture.tokens.eos_token_ids.clone(),
+        )
+        .map_err(|error| format!("{}: {error}", tokenizer.display()))?;
+        // The tower's geometry plans the image spans; a checkpoint without one serves text.
+        let config =
+            sparkflash_model_inkling2::config::Inkling2Config::from_checkpoint_dir(directory)
+                .map_err(|error| format!("{}: {error}", directory.display()))?;
+        let codec = match config.vision {
+            Some(vision) => codec
+                .with_vision(vision)
+                .map_err(|error| format!("{}: {error}", tokenizer.display()))?,
+            None => codec,
+        };
+        return Ok((Arc::new(codec), Dialect::Inkling));
+    }
     if text.contains(sparkflash_model_qwen4_exp::codec::IM_START)
         && text.contains(sparkflash_model_qwen4_exp::codec::IM_END)
     {
@@ -370,7 +400,11 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     }
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
-    let unresolved = if on_device {
+    let unresolved = if checkpoint.architecture.family == "inkling2" {
+        // Its host backend runs the new relative/short-conv/block arithmetic itself; the CUDA
+        // catalogue is a device-arm gate, not this path's capability list.
+        Vec::new()
+    } else if on_device {
         // The catalogue resolver sorts canonical entries first, so a Dory plan can resolve
         // through a Qwen image. Check the Dory image's own symbol list before advertising it.
         if checkpoint.architecture.family == "dory" {
@@ -414,6 +448,13 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     let context = options
         .context
         .unwrap_or(if window == 0 { 4096 } else { window });
+    // Every rank of the device group allocates its KV at the admitted context, and the released
+    // 1M window is not what a first server wants: the arm's documented default is 256K. An
+    // explicit --context still reaches the whole window, and validation below still bounds it.
+    let context = match (options.group.is_some(), options.context) {
+        (true, None) => context.min(INKLING_GROUP_DEFAULT_CONTEXT),
+        _ => context,
+    };
     if context == 0 || (window != 0 && context > window) {
         return Err(format!(
             "context limit {context} is outside 1..={window} for {}",
@@ -475,6 +516,17 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             super::pack::GlmArm::respond,
         ),
+        "inkling2" if options.group.is_some() => {
+            serve_inkling_group(options, checkpoint, descriptor, seam, dialect, context)
+        }
+        "inkling2" => serve_inkling_host(
+            checkpoint,
+            descriptor,
+            seam,
+            dialect,
+            context,
+            options,
+        ),
         "dory" => match options.recurrence.as_ref() {
             #[cfg(feature = "cuda")]
             Some(group) => super::recurrence::serve(
@@ -488,6 +540,95 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             None => serve_dory_host(checkpoint, descriptor, seam, dialect, context, options),
         },
         _ => serve_host(checkpoint, descriptor, seam, dialect, context, options),
+    }
+}
+
+/// Serves an Inkling checkpoint through its pack's f32 host reference.
+fn serve_inkling_host(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    let config =
+        sparkflash_model_inkling2::Inkling2Config::from_checkpoint_dir(&checkpoint.directory)
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    // A staged converted rank file is served as it is: the same plan, the same arithmetic, and a
+    // load that is a walk over one file instead of a sharded safetensors seek per tensor.
+    let layout = sparkflash_engine::parallel_tp::TpLayout {
+        rank: 0,
+        world_size: 1,
+    };
+    let converted = crate::serve::pack::converted_rank_file(
+        crate::serve::pack::INKLING_CONVERTED_DIR_ENV,
+        layout.rank,
+        layout.world_size,
+    )?;
+    let (source, where_from): (Arc<dyn sparkflash_weights::WeightSource>, String) = match &converted
+    {
+        Some(path) => (
+            Arc::new(
+                sparkflash_model_inkling2::RankFileSource::open(path, &config, layout)
+                    .map_err(|error| format!("{}: {error}", path.display()))?,
+            ),
+            format!("converted {}", path.display()),
+        ),
+        None => (
+            Arc::new(
+                sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+                    .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?,
+            ),
+            checkpoint.directory.display().to_string(),
+        ),
+    };
+    let backend = sparkflash_model_inkling2::Inkling2HostBackend::open(
+        descriptor.clone(),
+        config,
+        source,
+        context,
+    )
+    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let banner = format!(
+        "{} ({}) at TP=1 on {where_from}, context {context}, Inkling f32 host reference",
+        descriptor.id, descriptor.weights_id
+    );
+    serve_backend(
+        Box::new(backend),
+        descriptor,
+        seam,
+        dialect,
+        options,
+        &banner,
+    )
+}
+
+/// Serves an Inkling checkpoint through its four-rank device arm.
+///
+/// Rank 0 owns HTTP, the tokenizer and the control channel; every rank holds its own device state
+/// and mirrors the token ids rank 0 admits. The dispatch is here rather than in the pack because
+/// the device arm's group needs the resolved checkpoint, its tokenizer seam and the served
+/// descriptor, all of which this module built.
+fn serve_inkling_group(
+    options: &ServeOptions,
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+) -> Result<ExitCode, String> {
+    #[cfg(feature = "tp4-serve")]
+    {
+        super::inkling_group::serve(options, checkpoint, descriptor, seam, dialect, context)
+    }
+    #[cfg(not(feature = "tp4-serve"))]
+    {
+        let _ = (options, checkpoint, descriptor, seam, dialect, context);
+        Err(
+            "--rank is the Inkling device arm's four-rank group: this build carries no tp4-serve feature, so rebuild with --features tp4-serve"
+                .to_owned(),
+        )
     }
 }
 
@@ -534,6 +675,23 @@ pub(crate) fn serve_backend(
     options: &ServeOptions,
     banner: &str,
 ) -> Result<ExitCode, String> {
+    serve_backend_world(backend, descriptor, seam, dialect, options, banner, 1)
+}
+
+/// Serves `backend` behind HTTP in a group of `world` ranks, under that group's numerics key.
+///
+/// The single-process path is [serve_backend] with `world = 1`; a four-rank device arm names its
+/// own world so the boot line's numerics identity is the configuration that actually answered.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn serve_backend_world(
+    backend: Box<dyn ModelBackend>,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    options: &ServeOptions,
+    banner: &str,
+    world: usize,
+) -> Result<ExitCode, String> {
     let driver = sparkflash_serve::HostDriver::start(
         backend,
         Arc::clone(&seam),
@@ -541,16 +699,18 @@ pub(crate) fn serve_backend(
             max_tokens: options.max_tokens,
             concurrency: options.concurrency,
             ..sparkflash_serve::HostOptions::default()
-        },
+        }
+        .with_env()?,
     )?;
     let metrics = driver.metrics();
     let engine: Arc<dyn ApiInferenceEngine> = match dialect {
         Dialect::Glm => sparkflash_api::glm::GlmResponseEngine::layer(Arc::new(driver)),
         Dialect::Qwen => sparkflash_api::qwen::QwenResponseEngine::layer(Arc::new(driver)),
         Dialect::Deepseek => Arc::new(driver),
+        Dialect::Inkling => sparkflash_api::inkling::InklingResponseEngine::layer(Arc::new(driver)),
     };
     println!("sparkflash serve: {banner}");
-    let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
+    let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))

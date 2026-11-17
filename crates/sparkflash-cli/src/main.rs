@@ -31,7 +31,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use sparkflash_cli::{convert, device_chain, doctor, models, serve};
+use sparkflash_cli::{convert, device_chain, doctor, inkling_tp4, models, serve};
 use sparkflash_engram::packer::{CliArgs, run_cli};
 
 /// `pack-engram` options, shared verbatim with the standalone binary.
@@ -62,12 +62,13 @@ fn main() -> ExitCode {
         Some("models") => models::run(),
         Some("serve") => serve::run(args),
         Some("device-chain") => device_chain::run(args),
+        Some("inkling-tp4") => inkling_tp4::run(args),
         // `sparkflash --web` is the requested spelling; `sparkflash web` is the same entry point
         // with a conventional subcommand. Both hand the remaining arguments to the web crate.
         Some("--web") | Some("web") => sparkflash_web::run(args),
         _ => {
             println!(
-                "sparkflash: usage: sparkflash <models|--web|doctor|trace|pack-engram|convert|serve|device-chain>"
+                "sparkflash: usage: sparkflash <models|--web|doctor|trace|pack-engram|convert|serve|device-chain|inkling-tp4>"
             );
             ExitCode::SUCCESS
         }

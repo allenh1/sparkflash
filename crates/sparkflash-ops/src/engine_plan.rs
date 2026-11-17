@@ -561,7 +561,7 @@ fn geometry_for(
             }
         },
         Part::GqaAttention => match &attention.kind {
-            AttentionKind::Gqa { kv_heads, .. } => {
+            AttentionKind::Gqa { kv_heads, .. } | AttentionKind::Inkling { kv_heads } => {
                 let heads = split(tp, attention.heads, TpAxis::Heads, 1)?;
                 let kv = split(tp, *kv_heads, TpAxis::KvHeads, 1)?;
                 geometry.heads = heads.padded;
@@ -570,6 +570,12 @@ fn geometry_for(
                 geometry.kv_head_offset = kv.offset;
                 geometry.head_dim = attention.head_dim;
                 geometry.window = attention.window.unwrap_or(0);
+                // A layer whose indexer selects its keys attends at most that many a query, which
+                // decides the grouped body ([crate::attention::GqaBody::choose]).
+                geometry.top_k = attention
+                    .indexer
+                    .as_ref()
+                    .map_or(0, |indexer| indexer.max_selected());
             }
             _ => {
                 return Err(PlanError::Invalid(
@@ -612,6 +618,33 @@ fn geometry_for(
                 ));
             }
         },
+        Part::RelativeAttention => {
+            let inkling = architecture.inkling.as_ref().ok_or_else(|| {
+                PlanError::Invalid("a relative-attention part on a non-Inkling layer".to_owned())
+            })?;
+            geometry.heads = attention.heads;
+            geometry.head_dim = inkling.d_rel;
+            geometry.window = inkling.rel_extent;
+        }
+        Part::ShortConv => {
+            let inkling = architecture.inkling.as_ref().ok_or_else(|| {
+                PlanError::Invalid("a short-convolution part on a non-Inkling layer".to_owned())
+            })?;
+            geometry.window = inkling.short_conv;
+        }
+        Part::BlockAttentionResidual => {
+            let block = architecture
+                .inkling
+                .as_ref()
+                .and_then(|inkling| inkling.block_residual)
+                .ok_or_else(|| {
+                    PlanError::Invalid(
+                        "a block-attention residual part on a plain residual".to_owned(),
+                    )
+                })?;
+            geometry.streams = block.layers_per_block;
+        }
+        Part::SoftcappedActivation => {}
         Part::Csa2Compression => {
             geometry.ratio = attention
                 .compression
@@ -674,7 +707,7 @@ fn geometry_for(
                 geometry.streams = hyper.streams;
                 geometry.intermediate = hyper.lowrank.unwrap_or(0);
             }
-            Residual::Plain => {
+            Residual::Plain | Residual::BlockAttention => {
                 return Err(PlanError::Invalid(
                     "a hyper-connection part on a plain residual".to_owned(),
                 ));

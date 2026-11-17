@@ -175,6 +175,7 @@ use sparkflash_engine::parallel_tp::{BitGatherHandle, TpLayout, TpRuntime, Wire}
 use sparkflash_model_glm5_next::device::CudaHandle;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence};
+use sparkflash_model_inkling2::GroupOptions;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_qwen4_exp::sampling::Sampler;
 
@@ -184,11 +185,11 @@ use crate::run_header::{COMM_REDUCE_ENV, ReducePath};
 #[cfg(feature = "tp4-serve")]
 mod device;
 #[cfg(feature = "tp4-serve")]
-mod tp4_control;
+mod inkling_group;
 #[cfg(feature = "tp4-serve")]
 pub use device::DeviceServeOptions;
 #[cfg(feature = "tp4-serve")]
-use tp4_control::*;
+use sparkflash_comm::control::*;
 pub(crate) mod dynamic;
 mod dynamic_host;
 mod pack;
@@ -390,23 +391,6 @@ const TP4_JOB_QUEUE: usize = 1;
 #[cfg(feature = "tp4-serve")]
 const TP4_CONTROL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// How long a rank's control socket may block on one frame.
-///
-/// The timeout is a liveness guard for a dead peer, not a performance budget: a step between
-/// tokens can be tens of seconds on the reference forward. It is deliberately much larger than one
-/// token.
-#[cfg(feature = "tp4-serve")]
-const TP4_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// How long a worker pauses between control-connect attempts while rank 0's hub is still binding.
-///
-/// Rank 0 binds its control hub only after its own checkpoint load, but a worker connects as soon
-/// as its load finishes, so a worker can legitimately arrive before the listener exists. Retrying
-/// on connection-refused turns that startup race into a short wait instead of a failed start; the
-/// retries stay inside the same startup budget rank 0's hub waits with.
-#[cfg(feature = "tp4-serve")]
-const TP4_CONTROL_CONNECT_RETRY: Duration = Duration::from_millis(100);
-
 /// The Phase-1 TP=4 flags, parsed only when `--tp4-rank` is present.
 ///
 /// The four ranks are four processes with the same binary. Rank 0 owns the HTTP listener, the
@@ -560,6 +544,98 @@ pub(crate) fn announce_numerics(key: ConfigKey) -> Result<NumericsIdentity, Stri
     Ok(identity)
 }
 
+/// The default control port of the device-arm group: rank 0 binds it at its own peer address,
+/// and every worker dials it. It sits above the 29600 + rank collective ports the converted run
+/// uses, so one process can hold both.
+pub const GROUP_DEFAULT_CONTROL_PORT: u16 = 29700;
+
+/// Parses the device-arm group's flags into the arm's [GroupOptions].
+///
+/// # Errors
+/// A flag without `--rank`, a world that is not the peer list's length, a rank outside the world,
+/// a peer that is not an address, or a group without a converted directory.
+fn group_from_cli(
+    rank: Option<usize>,
+    world: Option<usize>,
+    peers: Option<&str>,
+    control_port: Option<u16>,
+    converted: Option<PathBuf>,
+) -> Result<Option<GroupOptions>, String> {
+    if rank.is_none()
+        && world.is_none()
+        && peers.is_none()
+        && control_port.is_none()
+        && converted.is_none()
+    {
+        return Ok(None);
+    }
+    let rank = rank.ok_or_else(|| {
+        "--rank is required when any group flag is given: one process serves one rank of the device arm"
+            .to_owned()
+    })?;
+    let raw = peers.ok_or_else(|| {
+        "--peer is required with --rank: every rank's collective address in rank order, comma separated"
+            .to_owned()
+    })?;
+    let peers = parse_group_peers(raw)?;
+    let world = world.unwrap_or(peers.len());
+    if world == 0 {
+        return Err("--world needs at least one rank".to_owned());
+    }
+    if peers.len() != world {
+        return Err(format!(
+            "--peer lists {} address(es) but --world is {world}",
+            peers.len()
+        ));
+    }
+    if rank >= world {
+        return Err(format!("--rank {rank} is outside a world of {world}"));
+    }
+    let control = SocketAddr::new(
+        peers[0].ip(),
+        control_port.unwrap_or(GROUP_DEFAULT_CONTROL_PORT),
+    );
+    let converted = match converted {
+        Some(directory) => directory,
+        None => match std::env::var_os(pack::INKLING_CONVERTED_DIR_ENV) {
+            Some(value) if !value.is_empty() => PathBuf::from(value),
+            _ => {
+                return Err(format!(
+                    "--converted DIR is required with --rank: it holds the four rank files the group loads (or set {})",
+                    pack::INKLING_CONVERTED_DIR_ENV
+                ));
+            }
+        },
+    };
+    Ok(Some(GroupOptions {
+        rank,
+        world,
+        peers,
+        control,
+        converted,
+        lanes: 1,
+    }))
+}
+
+/// Parses the comma-separated address list a group flag names, in rank order.
+///
+/// Unlike [parse_peers], each entry carries its port: a device arm's ranks bind the addresses the
+/// group was given, so the port is part of the identity rather than derived from a base.
+fn parse_group_peers(raw: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut peers = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err("--peer contains an empty address".to_owned());
+        }
+        let address = item
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("--peer: {item}: {error}"))?;
+        peers.push(address);
+    }
+    Ok(peers)
+}
+
 /// Parses the comma-separated peer list a group flag (`flag`) names, in rank order.
 fn parse_peers(flag: &str, raw: &str) -> Result<Vec<IpAddr>, String> {
     let mut peers = Vec::new();
@@ -682,6 +758,13 @@ pub struct ServeOptions {
     /// control channel. See [ServeEngine].
     #[cfg(feature = "tp4-serve")]
     pub tp4: Option<Tp4ServeOptions>,
+    /// The device-arm group this process is one rank of, when `--rank` was given.
+    ///
+    /// `None` is a single-process run. `Some` means this process is one rank of the Inkling-2-Small
+    /// device arm: rank 0 owns HTTP, the tokenizer and the control channel, and every rank holds
+    /// its own device state and mirrors the token ids rank 0 admits. The device arm's rank file
+    /// comes from [GroupOptions::converted].
+    pub group: Option<GroupOptions>,
     /// Dory's latent-recurrence group, when `--recurrence-rank` was given.
     ///
     /// `None` is one process serving the whole model. `Some` means this process runs its share
@@ -780,7 +863,26 @@ impl ServeOptions {
         // A registry model name selects a pack; the default DeepSeek arm is a pack identity but
         // not a PackArm, so the packed-model flag checks below are keyed on `is_arm`.
         let pack = cli.model.as_deref().and_then(pack::Pack::named);
+        // A `--tp4-rank` group whose arm opens its ranks as lanes steps [pack::GROUP_LANES] fused
+        // lanes unless the operator gives --concurrency (1 serves one request at a time).
+        #[cfg(feature = "tp4-serve")]
+        let group_lanes = cli.tp4_rank.is_some() && pack.is_some_and(pack::Pack::opens_group_lanes);
+        #[cfg(not(feature = "tp4-serve"))]
+        let group_lanes = false;
+        let fuse_batch = cli.fuse_batch || (group_lanes && cli.concurrency.is_none());
+        let concurrency = cli.concurrency.unwrap_or(if group_lanes && fuse_batch {
+            pack::GROUP_LANES
+        } else {
+            1
+        });
         let packed = pack.is_some_and(pack::Pack::is_arm);
+        let group = group_from_cli(
+            cli.rank,
+            cli.world,
+            cli.peer.as_deref(),
+            cli.control_port,
+            cli.converted.clone(),
+        )?;
         let tokenizer = cli.tokenizer;
         let mut checkpoint = cli.checkpoint;
         // A model id names its snapshot through the hub cache. Resolve it before the
@@ -809,6 +911,55 @@ impl ServeOptions {
                         });
                     }
                 }
+            }
+        }
+        if let Some(group) = group.as_ref() {
+            if cli.synthetic {
+                return Err(
+                    "--rank cannot be combined with --synthetic: the device arm serves the converted ranks of a released checkpoint, and the synthetic tiny plan is a single-process path"
+                        .to_owned(),
+                );
+            }
+            if checkpoint.is_none() {
+                return Err(
+                    "--rank requires --checkpoint DIR: every rank reads the released checkpoint's configuration"
+                        .to_owned(),
+                );
+            }
+            if pack != Some(pack::Pack::Inkling) {
+                return Err(format!(
+                    "--rank serves the Inkling-2-Small device arm; {} names another model. Its four-rank group reads converted rank files with --converted and its collective with --peer",
+                    cli.model.as_deref().unwrap_or("this checkpoint")
+                ));
+            }
+            if cli.recurrence_rank.is_some() {
+                return Err(
+                    "--rank and --recurrence-rank are different groups: choose one".to_owned(),
+                );
+            }
+            #[cfg(feature = "tp4-serve")]
+            if cli.tp4_rank.is_some() {
+                return Err(
+                    "--rank (the device arm's group) and --tp4-rank (the DeepSeek host group) are different groups: choose one"
+                        .to_owned(),
+                );
+            }
+            if cli.continuous_batching {
+                return Err(
+                    "--continuous-batching cannot be combined with --rank: the group runs one request at a time so every rank sees the same token sequence, and batching a different request into the group would desync it"
+                        .to_owned(),
+                );
+            }
+            // Fused lanes are the one way a group serves several requests: rank 0 sends each lane's
+            // prompt and every step's members, so the ranks step the same rows in the same order.
+            if concurrency != 1 && !fuse_batch {
+                return Err(
+                    "--concurrency cannot be combined with --rank unless --fuse-batch steps the requests as lanes: the group runs one sequence across every rank, so a second worker would interleave two different token sequences"
+                        .to_owned(),
+                );
+            }
+            if group.control.port() == 0 {
+                return Err("--control-port needs a non-zero port".to_owned());
             }
         }
         // An empty key would authenticate only an empty bearer token; refuse it at parse time
@@ -899,20 +1050,23 @@ impl ServeOptions {
         // The generic host driver's concurrency is a packed-model knob: each worker opens its own
         // session, which the V4.1 reference engine does not do (it has the continuous batching
         // scheduler above). Refusing the combination is better than silently running serial.
-        if cli.concurrency == 0 {
+        if concurrency == 0 {
             return Err("--concurrency must be at least 1".to_owned());
         }
-        if cli.concurrency > sparkflash_serve::host::DEFAULT_QUEUE {
+        if concurrency > sparkflash_serve::host::DEFAULT_QUEUE {
             return Err(format!(
                 "--concurrency {} exceeds the {}-request host queue",
-                cli.concurrency,
+                concurrency,
                 sparkflash_serve::host::DEFAULT_QUEUE
             ));
         }
-        if cli.fuse_batch && !packed {
+        // The Inkling device group fuses its own lanes: rank 0's engine steps every waiting
+        // request's row in one walk and broadcasts each step, so the group takes both knobs.
+        let fused_group = fuse_batch && group.is_some();
+        if fuse_batch && !packed && !fused_group {
             return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
         }
-        if cli.fuse_batch && cli.concurrency < 2 {
+        if fuse_batch && concurrency < 2 {
             return Err("--fuse-batch needs --concurrency of at least 2".to_owned());
         }
         if cli.kv_budget_gib.is_some() && !packed {
@@ -926,7 +1080,7 @@ impl ServeOptions {
         }
         // Dory's latent-recurrence group holds one sequence lane a concurrent request on every
         // rank; one Dory process stays serial.
-        if !packed && cli.concurrency != 1 && cli.recurrence_rank.is_none() {
+        if !packed && concurrency != 1 && cli.recurrence_rank.is_none() && !fused_group {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -1045,10 +1199,11 @@ impl ServeOptions {
             // refused by name when it is served, and the group flags stay off its surface.
             let pack = pack::Pack::named(model);
             #[cfg(feature = "tp4-serve")]
-            let group = cli.tp4_rank.is_some();
+            let in_group = cli.tp4_rank.is_some() || group.is_some();
             #[cfg(not(feature = "tp4-serve"))]
-            let group = false;
-            if group && pack.is_none() {
+            let in_group = group.is_some();
+            #[cfg(feature = "tp4-serve")]
+            if cli.tp4_rank.is_some() && pack.is_none() {
                 unsupported.push("--tp4-rank");
             }
             if !unsupported.is_empty() {
@@ -1060,16 +1215,19 @@ impl ServeOptions {
             // The pack-model knobs its arm would not apply on this path are refused too.
             if let Some(pack) = pack {
                 let unapplied = pack.unapplied(
-                    group,
-                    cli.concurrency,
-                    cli.fuse_batch,
+                    in_group,
+                    group.is_some(),
+                    concurrency,
+                    fuse_batch,
                     cli.kv_budget_gib.is_some(),
                 );
                 if !unapplied.is_empty() {
                     return Err(format!(
                         "--model {model} {} does not apply {}; it is refused rather than ignored",
-                        if group {
-                            "in a tensor-parallel group, which serves one request at a time,"
+                        if in_group {
+                            "in a tensor-parallel group, which serves one request at a time \
+                             unless it is the Inkling device group or the GLM group stepping \
+                             --fuse-batch lanes,"
                         } else {
                             "at TP=1"
                         },
@@ -1078,6 +1236,13 @@ impl ServeOptions {
                 }
             }
         }
+        // A fused group opens one lane a concurrent request on every rank.
+        let group = group.map(|mut group| {
+            if fuse_batch {
+                group.lanes = concurrency;
+            }
+            group
+        });
         match (cli.synthetic, checkpoint) {
             (true, Some(_)) => Err(
                 "--synthetic and --checkpoint cannot both be given: --synthetic serves the tiny synthetic plan and --checkpoint serves a real sharded checkpoint, so choose one"
@@ -1096,8 +1261,8 @@ impl ServeOptions {
                 numerics: cli.numerics,
                 continuous_batching: cli.continuous_batching,
                 max_batch,
-                concurrency: cli.concurrency,
-                fuse_batch: cli.fuse_batch,
+                concurrency,
+                fuse_batch,
                 kv_budget_gib: cli.kv_budget_gib,
                 element_limit,
                 engine: cli.engine,
@@ -1105,6 +1270,7 @@ impl ServeOptions {
                 engram_dir: cli.engram_dir,
                 #[cfg(feature = "tp4-serve")]
                 tp4,
+                group,
                 recurrence,
                 api_key: cli.api_key,
                 cors,
@@ -1306,16 +1472,20 @@ struct ServeArgs {
     /// How many packed-model requests the generic host driver runs at once.
     ///
     /// Each worker owns one session, so this is concurrent execution, not a fused batch. The
-    /// default is 1 (one request at a time); the flag is refused without --model because the
-    /// V4.1 engine's concurrency knob is --continuous-batching/--max-batch.
-    #[arg(long, value_name = "N", default_value_t = 1)]
-    concurrency: usize,
+    /// default is 1 (one request at a time), except in a --tp4-rank group whose arm steps fused
+    /// lanes (GLM), which serves four at once unless this says otherwise (1: one at a time). The
+    /// flag is refused without --model because the V4.1 engine's concurrency knob is
+    /// --continuous-batching/--max-batch.
+    #[arg(long, value_name = "N")]
+    concurrency: Option<usize>,
     /// Step the packed model's concurrent sessions as one batch over the weights (--model only).
     ///
     /// Each decode step reads the model's weights once for every session; a fused batch reads
     /// them once for all of them, which is the only way concurrent requests add throughput on a
-    /// step bound by weight traffic. Requires --concurrency above 1. A member keeps its drafter -
-    /// its verify's rows join the same pass - and a prefill still runs alone.
+    /// step bound by weight traffic. Requires --concurrency above 1, which a --tp4-rank group whose
+    /// arm steps lanes (GLM) defaults to four, and that group fuses unless --concurrency is given.
+    /// A member keeps its drafter - its verify's rows join the same pass - and a prefill still
+    /// runs alone.
     #[arg(long)]
     fuse_batch: bool,
     /// How much KV memory the packed model's session caches may claim, in GiB.
@@ -1407,6 +1577,25 @@ struct ServeArgs {
     #[cfg(feature = "tp4-serve")]
     #[arg(long, value_name = "DIR", requires = "tp4_device")]
     tp4_evidence_dir: Option<PathBuf>,
+    /// This process's rank in a device-arm group (the Inkling-2-Small four-rank server).
+    ///
+    /// One process serves one rank: rank 0 binds HTTP and the control channel, ranks 1-3 mirror
+    /// its prefill and decode on their own resident device state. --peer lists every rank's
+    /// collective address in rank order; --converted names the directory of converted rank files.
+    #[arg(long, value_name = "N")]
+    rank: Option<usize>,
+    /// The number of ranks in the group; default the --peer list's length.
+    #[arg(long, value_name = "N")]
+    world: Option<usize>,
+    /// Every rank's collective address, in rank order, comma separated (host:port each).
+    #[arg(long, value_name = "ADDR,ADDR")]
+    peer: Option<String>,
+    /// The control port rank 0 binds at its own peer address; default 29700.
+    #[arg(long, value_name = "PORT")]
+    control_port: Option<u16>,
+    /// The directory holding the converted rank files (rank-R-of-W.bin).
+    #[arg(long, value_name = "DIR")]
+    converted: Option<PathBuf>,
     /// This process's rank in Dory's latent-recurrence group (Dory checkpoints only).
     ///
     /// Each rank runs an even share of the recurrent loops on the whole hidden width and keeps
@@ -3808,33 +3997,20 @@ pub struct Tp4Step {
 /// begin_request instead. Sampling changes only which token rank 0 chooses; it does not change the
 /// forward arithmetic, and workers keep the greedy default because they ignore next_token.
 #[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Tp4Sampling {
-    /// The request temperature.
-    pub temperature: f32,
-    /// The request seed.
-    pub seed: u64,
+    /// The request's whole sampler: temperature, top-p, top-k, the three penalties and the seed.
+    /// A rank honours all of it or refuses the request.
+    pub sampling: sparkflash_model::Sampling,
     /// Whether each step's logits row is read (a request for logprobs). Without it a rank whose
     /// pick is the row's argmax may take it on the device and leave the row there; the token is
     /// the same.
     pub logits: bool,
     /// Whether the rank may decode the request speculatively: rank 0 sets it for a request whose
     /// tokens are each its row's argmax and whose rows are never read (no temperature, no
-    /// logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
+    /// penalty, no logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
     /// decodes a token a step.
     pub speculative: bool,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Default for Tp4Sampling {
-    fn default() -> Self {
-        Self {
-            temperature: 0.0,
-            seed: 0,
-            logits: false,
-            speculative: false,
-        }
-    }
 }
 
 /// The evidence counters the rank's extraction exposes.
@@ -3989,10 +4165,22 @@ struct HostTp4Rank {
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for HostTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        // The host rank decodes greedily (it refuses a temperature), so top-p and top-k change
+        // nothing; a penalty would move its argmax, and it has none to apply.
+        let request = &sampling.sampling;
+        if request.repetition_penalty != 1.0
+            || request.presence_penalty != 0.0
+            || request.frequency_penalty != 0.0
+        {
+            return Err(
+                "repetition, presence and frequency penalties are not served on the TP=4 host                  path"
+                    .to_owned(),
+            );
+        }
         self.rank
             .begin_request(crate::tp4_host::Tp4Sampling {
-                temperature: sampling.temperature,
-                seed: sampling.seed,
+                temperature: request.temperature,
+                seed: request.seed,
             })
             .map_err(|error| error.to_string())
     }
@@ -4200,26 +4388,22 @@ impl GlmTp4Rank {
             .sequence
             .capacity()
             .saturating_sub(self.sequence.position() + 1);
-        let count = self.spec.max_depth().min(room);
-        let mut drafted = if count == 0 {
-            Vec::new()
-        } else {
-            let mut batch = [(&mut self.sequence, token)];
-            self.rank
-                .draft(&self.tp, &self.gather, &mut batch, count)
-                .map_err(|error| format!("the GLM rank's draft failed: {error}"))?
-                .pop()
-                .unwrap_or_default()
-        };
-        // A block drafter proposes its whole block and says how sure it is of each draft; the
-        // policy weighs those against a row's cost and shortens the chain (the MTP layer has no
-        // confidences, so this leaves its drafts alone).
-        let confidence = self.sequence.draft_confidence().to_vec();
+        // The drafter says how sure it is of each draft; an adaptive policy stops the MTP layer
+        // and shortens the chain by those against a row's cost, as the fused lanes do.
+        let (drafted, confidence) = self
+            .rank
+            .draft_chain(
+                &self.tp,
+                &self.gather,
+                &mut self.sequence,
+                token,
+                &self.spec,
+                room,
+            )
+            .map_err(|error| format!("the GLM rank's draft failed: {error}"))?;
         // What the drafter offered, then what the policy thought the rows were worth.
-        let proposed = drafted.len();
-        let depth = self.spec.depth(&confidence, count);
-        drafted.truncate(depth);
-        let gated = proposed - drafted.len();
+        let proposed = confidence.len();
+        let gated = proposed.saturating_sub(drafted.len());
         let chunk: Vec<u32> = std::iter::once(token).chain(drafted).collect();
         let mut batch = [(&mut self.sequence, chunk.as_slice())];
         let picks = self
@@ -4283,11 +4467,7 @@ impl Tp4RankApi for GlmTp4Rank {
         // depends on its prompt, which this call does not see, and a chat turn's prompt begins with
         // everything the previous one left in the window.
         self.sampler.reset();
-        self.sampling = sparkflash_model::Sampling {
-            temperature: sampling.temperature,
-            seed: sampling.seed,
-            ..sparkflash_model::Sampling::default()
-        };
+        self.sampling = sampling.sampling;
         self.logits = sampling.logits;
         self.speculative = sampling.speculative && self.spec.max_depth() > 0;
         if self.speculative && (self.logits || !self.sampler.takes_argmax(&self.sampling)) {
@@ -4470,13 +4650,61 @@ fn open_pack_collective(
     Ok((tp, BitGatherHandle::new(gather)))
 }
 
-/// Opens one GLM-5.3-Flash rank of the serve-owned TP=4 group.
+/// One GLM-5.3-Flash rank of a group as it comes off the disk: its weights, drafter and
+/// collective, and the drafting the profile asks of it. Both of the group's serving shapes open
+/// their rank here: one request at a time ([open_glm_tp4_rank]) and fused lanes
+/// ([open_glm_lanes]).
+#[cfg(feature = "tp4-serve")]
+struct GlmLoadedRank {
+    rank: DeviceRank,
+    tp: TpRuntime,
+    gather: BitGatherHandle,
+    config: sparkflash_model_glm5_next::Glm5NextConfig,
+    /// How many drafts a drafting request verifies after each token at most, and the depth rule;
+    /// `None` decodes a token a step ([pack::glm_drafting]).
+    drafting: Option<pack::GlmDrafting>,
+    /// Whether a DFlash 2 block drafter is loaded.
+    block: bool,
+    origin: String,
+    started: Instant,
+}
+
+#[cfg(feature = "tp4-serve")]
+impl GlmLoadedRank {
+    /// The most drafts a step verifies; 0 decodes a token a step.
+    fn drafts(&self) -> usize {
+        self.drafting.as_ref().map_or(0, |drafting| drafting.drafts)
+    }
+
+    /// The shared speculator's depth rule for this rank's drafts.
+    fn depth_policy(&self) -> Option<sparkflash_model::DepthPolicy> {
+        self.drafting
+            .as_ref()
+            .map(|drafting| drafting.policy.clone())
+    }
+
+    /// Announces the load and answers how long it took.
+    fn announce(&self, rank: &Tp4RankConfig) -> u64 {
+        let load_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        eprintln!(
+            "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {}; {} collective",
+            rank.rank,
+            rank.world_size,
+            load_ms as f64 / 1000.0,
+            self.origin,
+            self.tp.label()
+        );
+        load_ms
+    }
+}
+
+/// Loads one GLM-5.3-Flash rank of the serve-owned group.
 ///
 /// The weights come from the checkpoint directory (or its index's parent), the configuration from
 /// its `config.json` or the carried release, and the collective from the same TCP seams the
 /// `glm-tp4` harness uses ([open_pack_collective]).
 #[cfg(feature = "tp4-serve")]
-fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
     let started = Instant::now();
     let directory = pack::checkpoint_directory(&config.checkpoint);
     let glm_config = pack::read_config::<pack::GlmArm>(&directory)?;
@@ -4563,10 +4791,8 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
     // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
     // token, which is what takes this arm past the MTP layer's two drafts. Its depth is the
     // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
-    let mut profile = sparkflash_model::ModelProfile::default();
-    profile
-        .apply_process_env()
-        .map_err(|error| error.to_string())?;
+    // The carried profile under the environment, as the single-GPU arm reads it.
+    let profile = <pack::GlmArm as pack::PackArm>::profile()?;
     if let Some(drafter) = profile.speculation.drafter.as_deref() {
         rank.load_block_drafter(std::path::Path::new(drafter))
             .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
@@ -4579,31 +4805,40 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
     // block reads, unless the profile keeps it on the token path (`prefill.drafting_prompt`).
     rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(true));
     let block = rank.has_block_drafter();
-    let most = rank.max_drafts();
-    // How many drafts a greedy request verifies after each token: the whole block when a block
-    // drafter is loaded, else the MTP layer's 2 (the harness's best at one stream); 0 decodes a
-    // token a step.
-    let drafts = match profile.speculation.drafts {
-        None if block => most,
-        None => 2.min(most),
-        Some(drafts) if drafts <= most => drafts,
-        Some(drafts) => {
-            return Err(format!(
-                "speculation.drafts={drafts} is not a draft count from 0 to {most}"
-            ));
-        }
-    };
-    // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
-    // token, which is what takes this arm past the MTP layer's two drafts. The depth is the
-    // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
+    let drafting = pack::glm_drafting(&profile.speculation, block, rank.max_drafts())?;
+    if config.rank == 0 {
+        eprintln!(
+            "sparkflash serve: GLM group drafting: {}",
+            drafting
+                .as_ref()
+                .map_or_else(|| "off".to_owned(), pack::GlmDrafting::label)
+        );
+    }
+    Ok(GlmLoadedRank {
+        rank,
+        tp,
+        gather,
+        config: glm_config,
+        drafting,
+        block,
+        origin,
+        started,
+    })
+}
+
+/// Opens one GLM-5.3-Flash rank of the serve-owned group serving one request at a time.
+#[cfg(feature = "tp4-serve")]
+fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let loaded = load_glm_tp4_rank(config)?;
+    let rank = &loaded.rank;
     // The window every request resets and reuses. Allocating it per request cost every rank about a
     // second of a short prompt's first token at the 1M default; here a window that does not fit
     // beside the weights is refused at startup, not at the first request. A drafting window also
     // keeps the MTP layer's caches, and a block-drafting one the drafter's own.
-    let sequence = if block {
+    let sequence = if loaded.block {
         rank.new_block_drafting_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
-    } else if drafts > 0 {
+    } else if loaded.drafts() > 0 {
         rank.new_drafting_sequence(config.context)
             .map_err(|error| {
                 format!("the GLM request window: {error} (speculation.drafts=0 drafts nothing)")
@@ -4612,23 +4847,15 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         rank.new_sequence(config.context)
             .map_err(|error| format!("the GLM request window: {error}"))?
     };
-    let spec = sparkflash_model::Speculator::new(
-        drafts,
-        block.then(|| {
-            sparkflash_model::DepthPolicy::adaptive(
-                drafts,
-                sparkflash_model_glm5_next::DFLASH2_STEP_COST,
-            )
-        }),
-    );
-    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    eprintln!(
-        "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {origin}; {} collective",
-        config.rank,
-        config.world_size,
-        load_ms as f64 / 1000.0,
-        tp.label()
-    );
+    let spec = sparkflash_model::Speculator::new(loaded.drafts(), loaded.depth_policy());
+    let load_ms = loaded.announce(config);
+    let GlmLoadedRank {
+        rank,
+        tp,
+        gather,
+        config: glm_config,
+        ..
+    } = loaded;
     Ok(Box::new(GlmTp4Rank {
         eos: glm_config.eos_token_ids.clone(),
         rank,
@@ -4645,6 +4872,51 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         steps: 0,
         last_step_ms: 0,
     }))
+}
+
+/// Opens one GLM-5.3-Flash rank of the serve-owned group stepping `lanes` fused lanes
+/// ([Glm5NextDeviceBackend::enable_group_fusion]).
+///
+/// The rank drafts as [open_glm_tp4_rank]'s does, so the two shapes serve the same tokens. Rank 0
+/// answers its backend, which broadcasts every lane's frames through the control hub before it
+/// runs them; a worker mirrors those frames over its own `lanes` lanes and answers `None` only if
+/// the channel's end is clean, which it never is: rank 0's exit ends it with an error.
+///
+/// [Glm5NextDeviceBackend::enable_group_fusion]: sparkflash_model_glm5_next::Glm5NextDeviceBackend::enable_group_fusion
+#[cfg(feature = "tp4-serve")]
+fn open_glm_lanes(
+    config: &Tp4RankConfig,
+    lanes: usize,
+) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    let loaded = load_glm_tp4_rank(config)?;
+    let policy = loaded.depth_policy();
+    let drafts = loaded.drafts();
+    loaded.announce(config);
+    let mut backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend::from_rank(
+        loaded.config,
+        loaded.rank,
+        loaded.tp,
+        loaded.gather,
+        config.context,
+    )
+    .map_err(|error| error.to_string())?;
+    backend
+        .enable_speculation(drafts, policy)
+        .map_err(|error| error.to_string())?;
+    if config.rank == 0 {
+        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
+            .map_err(|error| format!("rank 0 control channel: {error}"))?;
+        backend
+            .enable_group_fusion(lanes, hub)
+            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
+        eprintln!(
+            "sparkflash serve: GLM rank 0 steps {lanes} fused lanes over {} ranks, {drafts} draft(s)",
+            config.world_size
+        );
+        return Ok(Some(Box::new(backend)));
+    }
+    let mut control = tp4_control_worker(config)?;
+    match backend.mirror_group(&mut control, lanes)? {}
 }
 
 /// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
@@ -4717,11 +4989,7 @@ impl QwenTp4Rank {
 #[cfg(feature = "tp4-serve")]
 impl Tp4RankApi for QwenTp4Rank {
     fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-        let request = sparkflash_model::Sampling {
-            temperature: sampling.temperature,
-            seed: sampling.seed,
-            ..sparkflash_model::Sampling::default()
-        };
+        let request = sampling.sampling;
         if sampling.speculative && (sampling.logits || !Sampler::new().takes_argmax(&request)) {
             return Err(
                 "a speculative request must take each row's argmax and read no row; this one \
@@ -4787,6 +5055,33 @@ impl Tp4RankApi for QwenTp4Rank {
 /// tokenizer and host-paged PLE source.
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
+    let (backend, cuda, load_ms) = load_qwen_tp4_rank(config)?;
+    Ok(Box::new(QwenTp4Rank {
+        backend,
+        session: None,
+        _cuda: cuda,
+        load_ms,
+        steps: 0,
+        last_step_ms: 0,
+    }))
+}
+
+/// Loads one Qwen3.8-Flash-Next rank of the serve-owned group: its share of the weights (from the
+/// converted rank file when one is configured) over the group's collective. Both of the group's
+/// serving shapes open their rank here: one request at a time ([open_qwen_tp4_rank]) and fused
+/// lanes ([open_qwen_lanes]). Answers the backend, the handle the collective was opened in, and
+/// the load's milliseconds.
+#[cfg(feature = "tp4-serve")]
+fn load_qwen_tp4_rank(
+    config: &Tp4RankConfig,
+) -> Result<
+    (
+        sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend,
+        CudaHandle,
+        u64,
+    ),
+    String,
+> {
     let started = Instant::now();
     let directory = pack::checkpoint_directory(&config.checkpoint);
     let qwen_config = pack::read_config::<pack::QwenArm>(&directory)?;
@@ -4835,14 +5130,39 @@ fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Str
             path.display()
         )),
     );
-    Ok(Box::new(QwenTp4Rank {
-        backend,
-        session: None,
-        _cuda: cuda,
-        load_ms,
-        steps: 0,
-        last_step_ms: 0,
-    }))
+    Ok((backend, cuda, load_ms))
+}
+
+/// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::OPEN_LANES]):
+/// rank 0 answers its backend, whose sessions are handles on the group's lanes
+/// ([Qwen4ExpDeviceBackend::enable_group_fusion]); a worker replays rank 0's lanes until the group
+/// ends ([Qwen4ExpDeviceBackend::mirror_group]). Drafting is the profile's, as it is alone.
+///
+/// [PackArm::OPEN_LANES]: pack::PackArm::OPEN_LANES
+/// [Qwen4ExpDeviceBackend::enable_group_fusion]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::enable_group_fusion
+/// [Qwen4ExpDeviceBackend::mirror_group]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::mirror_group
+#[cfg(feature = "tp4-serve")]
+fn open_qwen_lanes(
+    config: &Tp4RankConfig,
+    lanes: usize,
+) -> Result<Option<Box<dyn sparkflash_model::ModelBackend>>, String> {
+    // The backend's own CUDA handle holds the primary context the collective was opened in
+    // (releases are refcounted), so this one may go once the rank is loaded.
+    let (mut backend, _cuda, _) = load_qwen_tp4_rank(config)?;
+    if config.rank == 0 {
+        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
+            .map_err(|error| format!("rank 0 control channel: {error}"))?;
+        backend
+            .enable_group_fusion(lanes, hub)
+            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
+        eprintln!(
+            "sparkflash serve: Qwen rank 0 steps {lanes} fused lanes over {} ranks",
+            config.world_size
+        );
+        return Ok(Some(Box::new(backend)));
+    }
+    let mut control = tp4_control_worker(config)?;
+    match backend.mirror_group(&mut control, lanes)? {}
 }
 
 /// What the TP=4 driver serves and how it opens its rank.
@@ -5237,6 +5557,35 @@ fn classify_tp4_request_error(message: String) -> Tp4RequestError {
     }
 }
 
+/// The sampler a one-request group's rank 0 runs `job` with: the request's whole sampler, and
+/// whether its tokens may be drafted and verified on the device.
+#[cfg(feature = "tp4-serve")]
+fn tp4_sampling(job: &Job) -> Tp4Sampling {
+    let logits = job.logprobs.wants_sample();
+    Tp4Sampling {
+        sampling: sparkflash_model::Sampling {
+            temperature: job.temperature,
+            top_p: job.top_p,
+            top_k: job.top_k,
+            repetition_penalty: job.repetition_penalty,
+            presence_penalty: job.presence_penalty,
+            frequency_penalty: job.frequency_penalty,
+            seed: job.seed,
+            prompt_len: job.prompt_tokens.len(),
+        },
+        logits,
+        // The sampler's greedy rule: zero, below it or NaN draws nothing. A penalty moves the
+        // argmax a verify takes on the device. A forced request never speculates: a kept draft
+        // would be emitted in place of the forced token.
+        speculative: (job.temperature.is_nan() || job.temperature <= 0.0)
+            && job.repetition_penalty == 1.0
+            && job.presence_penalty == 0.0
+            && job.frequency_penalty == 0.0
+            && !logits
+            && job.forced_tokens.is_empty(),
+    }
+}
+
 /// Runs one request on rank 0 while every worker runs the same ids.
 #[cfg(feature = "tp4-serve")]
 fn run_tp4_request(
@@ -5259,17 +5608,7 @@ fn run_tp4_request(
             )));
         }
     };
-    let logits = job.logprobs.wants_sample();
-    let sampling = Tp4Sampling {
-        temperature: job.temperature,
-        seed: job.seed,
-        logits,
-        // The sampler's greedy rule: zero, below it or NaN draws nothing. A forced request never
-        // speculates: a kept draft would be emitted in place of the forced token.
-        speculative: (job.temperature.is_nan() || job.temperature <= 0.0)
-            && !logits
-            && job.forced_tokens.is_empty(),
-    };
+    let sampling = tp4_sampling(&job);
     rank.begin_request(sampling)?;
     let max_tokens = u32::try_from(job.max_tokens).unwrap_or(u32::MAX);
     // One rank decides what every rank may keep, and the frame carries the decision: two ranks
@@ -5281,6 +5620,8 @@ fn run_tp4_request(
         prompt_logprobs: prompt_logprobs_frame,
         speculative: sampling.speculative,
         cached_tokens: cached,
+        images: Vec::new(),
+        sampler: None,
     })
     .map_err(|error| format!("control Request: {error}"))?;
     let request_started = Instant::now();
@@ -5639,7 +5980,19 @@ fn tp4_worker_loop(
                 prompt_logprobs,
                 speculative,
                 cached_tokens,
+                images,
+                sampler: _,
             }) => {
+                // This group's images travel in DeviceTick admissions; a serial Request that names
+                // spans has no path here, and reading its placeholders as text would answer from a
+                // prompt whose images were dropped.
+                if !images.is_empty() {
+                    return Err(format!(
+                        "a serial Request carried {} image spans; this group admits images only \
+                         through the device scheduler",
+                        images.len()
+                    ));
+                }
                 // Workers do not sample; reset their state with the greedy default. The engine's
                 // forward arithmetic is unchanged by the sampler, and their next_token is ignored.
                 // Whether the request speculates is rank 0's decision, so every rank runs the
@@ -6407,6 +6760,8 @@ struct ScriptedEngineSpec {
     pieces: Vec<String>,
     finish_reason: FinishReason,
     delay_ms: Option<u64>,
+    stall_on_drop_ms: Option<u64>,
+    stall_at_exit_ms: Option<u64>,
 }
 
 /// Reads the debug-build wire seed, when it is set.
@@ -6418,9 +6773,12 @@ fn scripted_engine_spec() -> Option<Result<ScriptedEngineSpec, String>> {
 
 /// Parses the debug-build wire seed.
 ///
-/// Shape: {"pieces": ["first content piece", ...], "finish_reason": "stop", "delay_ms": 0}.
-/// The pieces are handed to the mock engine as its content deltas, so the wire test controls
-/// the exact token boundaries the streaming parser sees.
+/// Shape: {"pieces": ["first content piece", ...], "finish_reason": "stop", "delay_ms": 0,
+/// "stall_on_drop_ms": 0, "stall_at_exit_ms": 0}. The pieces are handed to the mock engine as its
+/// content deltas, so the wire test controls the exact token boundaries the streaming parser sees;
+/// `stall_on_drop_ms` makes the engine's last owner block that long as it drops, like a rank whose
+/// peers are gone, and `stall_at_exit_ms` makes the C exit handlers block that long, like the CUDA
+/// driver's and NCCL's teardown waiting on that rank's stuck threads.
 #[cfg(debug_assertions)]
 fn parse_scripted_engine(path: &Path) -> Result<ScriptedEngineSpec, String> {
     let text = std::fs::read_to_string(path).map_err(|error| {
@@ -6460,11 +6818,35 @@ fn parse_scripted_engine(path: &Path) -> Result<ScriptedEngineSpec, String> {
         }
     };
     let delay_ms = value.get("delay_ms").and_then(serde_json::Value::as_u64);
+    let stall_on_drop_ms = value
+        .get("stall_on_drop_ms")
+        .and_then(serde_json::Value::as_u64);
+    let stall_at_exit_ms = value
+        .get("stall_at_exit_ms")
+        .and_then(serde_json::Value::as_u64);
     Ok(ScriptedEngineSpec {
         pieces,
         finish_reason,
         delay_ms,
+        stall_on_drop_ms,
+        stall_at_exit_ms,
     })
+}
+
+/// Registers a C exit handler that blocks `stall_ms` (debug-build wire seed).
+#[cfg(debug_assertions)]
+fn stall_at_exit(stall_ms: u64) -> Result<(), String> {
+    static STALL_MS: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn stall() {
+        std::thread::sleep(Duration::from_millis(STALL_MS.load(Ordering::Relaxed)));
+    }
+    STALL_MS.store(stall_ms, Ordering::Relaxed);
+    // SAFETY: the handler captures nothing and only sleeps.
+    if unsafe { libc::atexit(stall) } == 0 {
+        Ok(())
+    } else {
+        Err("atexit refused the scripted exit stall".to_owned())
+    }
 }
 
 /// The debug-build keep-alive override, in milliseconds.
@@ -6491,6 +6873,15 @@ fn run_scripted(
         .with_finish_reason(scripted.finish_reason);
     if let Some(delay_ms) = scripted.delay_ms {
         engine = engine.with_delay(Duration::from_millis(delay_ms));
+    }
+    if let Some(stall_ms) = scripted.stall_on_drop_ms {
+        engine = engine.with_stall_on_drop(Duration::from_millis(stall_ms));
+    }
+    if let Some(stall_ms) = scripted.stall_at_exit_ms
+        && let Err(error) = stall_at_exit(stall_ms)
+    {
+        eprintln!("sparkflash serve: {error}");
+        return ExitCode::FAILURE;
     }
     eprintln!(
         "sparkflash serve: debug scripted engine (no checkpoint): {} content piece(s), keep-alive {:?} ms",
@@ -6600,7 +6991,19 @@ async fn bind_and_serve(router: axum::Router, state: AppState, requested: Socket
             print_stage_timing_ledger();
             print_exchange_stats();
             print_plan_stats();
-            ExitCode::FAILURE
+            // Forced means the process ends here. Returning would drop the runtime and the
+            // backend, and both wait for the request the drain gave up on; on a rank whose peers
+            // are gone that is a collective that never completes, and the process outlived its
+            // own timeout until it was killed. `std::process::exit` is not enough either: it
+            // still runs the C exit handlers and library destructors (the CUDA driver's, NCCL's),
+            // and those wait on the same stuck threads, so rank 0 sat in a futex inside `exit`.
+            // `_exit` skips them; the kernel releases the GPU context and the RDMA resources the
+            // way it does for a kill.
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            // SAFETY: `_exit` takes no pointers and does not return; everything this process
+            // must say is flushed above.
+            unsafe { libc::_exit(1) }
         }
     }
 }
@@ -11015,6 +11418,10 @@ mod engram_packed_store {
         assert!(error.contains(MANIFEST_NAME), "{error}");
     }
 }
+
+#[cfg(all(test, feature = "tp4-serve"))]
+#[path = "../tests/unit/inkling_group_tests.rs"]
+mod inkling_group_tests;
 
 #[cfg(all(test, feature = "tp4-serve"))]
 #[path = "../tests/unit/tp4_serve_tests.rs"]

@@ -31,6 +31,7 @@ pub use sparkflash_deepseek_forward::device_link;
 pub use sparkflash_deepseek_forward::doctor;
 pub use sparkflash_deepseek_forward::engram_device_state;
 pub mod glm_tp4;
+pub mod inkling_tp4;
 pub use sparkflash_deepseek_forward::layer_attention_stages;
 pub use sparkflash_deepseek_forward::layer_device;
 pub use sparkflash_deepseek_forward::logits_dump;

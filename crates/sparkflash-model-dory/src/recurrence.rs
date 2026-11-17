@@ -51,8 +51,10 @@
 //!   uses has made its first transfer. A transport may connect a pair on its first transfer (NCCL
 //!   does), and a connect made once requests are in flight can wait on the ring's queued work,
 //!   which waits on the connect.
-//! - `Begin`: a new sequence on the lane. Every rank restarts the lane at position 0; the prompt
-//!   ids follow, for the last rank's sampler, with the request's sampling in the frame.
+//! - `Begin`: a new prompt on the lane. Every rank takes the lane back to the frame's position:
+//!   0 starts it over, and a later one keeps the rows before it, which the session already holds
+//!   for the prompt's first ids (a kept conversation's next turn). The whole prompt's ids follow,
+//!   for the last rank's sampler, with the request's sampling in the frame.
 //! - `Rows`: a chunk of a prompt's rows at a position; `state` then `input_h` follow, f32 rows of
 //!   the hidden width. A chunk that wants output makes the last rank answer.
 //! - `Step`: one decode row for each of up to [LANE_BATCH] lanes, with each lane's position and
@@ -95,6 +97,7 @@ use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
 use sparkflash_ops::sampler::{Sampler, SamplerMark, argmax};
+use sparkflash_runtime::{Ledger, Mode, Resume, Strategy, resume};
 
 use crate::config::{DoryConfig, KvCacheMode};
 use crate::device::{DeviceShared, DoryStage, LANE_BATCH, PREFILL_BATCH, StageCore, prompt_chunks};
@@ -319,6 +322,9 @@ enum Frame {
     Begin {
         lane: usize,
         prompt: usize,
+        /// The position the lane goes back to: 0 starts it over, a later one keeps the rows
+        /// before it, which the sequence on the lane already holds for this prompt's ids.
+        from: usize,
         sampling: Sampling,
     },
     Rows {
@@ -361,10 +367,12 @@ impl Frame {
             Self::Begin {
                 lane,
                 prompt,
+                from,
                 sampling,
             } => {
                 words[1] = BEGIN;
                 words[2] = word(prompt, "a prompt of")?;
+                words[12] = word(from, "a prompt resuming at")?;
                 words[3] = sampling.temperature.to_bits();
                 words[4] = sampling.top_p.to_bits();
                 words[5] = sampling.top_k as u32;
@@ -435,6 +443,7 @@ impl Frame {
             BEGIN => Self::Begin {
                 lane,
                 prompt: words[2] as usize,
+                from: words[12] as usize,
                 sampling: Sampling {
                     temperature: f32::from_bits(words[3]),
                     top_p: f32::from_bits(words[4]),
@@ -809,6 +818,9 @@ struct Group {
     world: usize,
     /// A lane drafts while at most this many lanes are held; 0 in a group that never drafts.
     draft_lanes: usize,
+    /// A kept session can go back to its last prompt, all but the last id
+    /// ([sparkflash_runtime::REWIND_ENV]).
+    rewind: bool,
     /// The ring and the lanes: held while a step's work is queued, never while it is awaited.
     head: Mutex<Head>,
     /// The answer messages on their way and the entries read: the reader thread fills it, the
@@ -980,6 +992,9 @@ struct HeadLane {
     buffers: LaneBuffers,
     /// The session that holds the lane.
     owner: Option<u64>,
+    /// The session is kept between requests ([ModelSession::park]): the lane holds its rows but
+    /// runs none, so it does not count against drafting or the ring's batches.
+    parked: bool,
     /// The rows the lane started on the drafting rank's guesses.
     draft: LaneDraft,
 }
@@ -1118,6 +1133,7 @@ impl DoryRecurrenceBackend {
         links: impl FnOnce(&Cuda, LinkStreams) -> Result<RecurrenceLinks, String>,
     ) -> Result<Self, String> {
         let drafting = draft_lanes > 0;
+        let rewind = sparkflash_runtime::rewind()?;
         let shared = open_stage(directory, context, 0, world, lanes, drafting)?;
         // The narrowest chunk cuts any prompt of the context into the most chunks.
         let slots = 1 + prompt_chunks(KvCacheMode::PerLoop, context, RECURRENCE_CHUNK_SHORT).len();
@@ -1127,6 +1143,7 @@ impl DoryRecurrenceBackend {
                 core,
                 buffers: LaneBuffers::allocate(&shared, slots)?,
                 owner: None,
+                parked: false,
                 draft: LaneDraft::default(),
             });
         }
@@ -1188,6 +1205,7 @@ impl DoryRecurrenceBackend {
         let group = Arc::new(Group {
             world,
             draft_lanes,
+            rewind,
             head: Mutex::new(Head {
                 ring,
                 lanes: entries,
@@ -1261,6 +1279,68 @@ impl DoryRecurrenceBackend {
     pub fn lanes(&self) -> usize {
         self.group.head.lock().map_or(0, |head| head.lanes.len())
     }
+
+    /// The runtime strategies the group runs, and how ([sparkflash_runtime::Ledger]).
+    ///
+    /// The ring schedules its own lanes: the fused engine's one walk a step cannot keep a batch
+    /// on every rank at once, so the group states its own lanes, prompt schedule and drafting,
+    /// and takes the session contract's kept conversations as every arm does.
+    #[must_use]
+    pub fn ledger(&self) -> Ledger {
+        let lanes = self.lanes();
+        let drafting = self.group.draft_lanes > 0;
+        let mut ledger = Ledger::new("Dory");
+        ledger
+            .set(
+                Strategy::Lanes,
+                Mode::native(format!(
+                    "{lanes} lanes, up to {LANE_BATCH} rows a pass, a batch on every rank"
+                )),
+            )
+            .set(
+                Strategy::PromptParts,
+                Mode::native(format!(
+                    "chunks of up to {RECURRENCE_CHUNK} rows between the other lanes' steps"
+                )),
+            )
+            .drafting(
+                drafting.then(|| {
+                    format!(
+                        "loop-1 exit on rank {DRAFTER}, while at most {} lanes run",
+                        self.group.draft_lanes
+                    )
+                }),
+                true,
+                false,
+            )
+            .set(
+                Strategy::PrefixReuse,
+                Mode::native(if self.group.rewind {
+                    "a prompt that extends a lane's sequence, or goes back to the last prompt, all but \
+                     its last id"
+                        .to_owned()
+                } else {
+                    format!(
+                        "a prompt that extends a lane's sequence; {}=off keeps no rewind point",
+                        sparkflash_runtime::REWIND_ENV
+                    )
+                }),
+            )
+            .set(
+                Strategy::Group,
+                Mode::native(format!(
+                    "a {}-rank ring: each rank runs its loops, rank 0 schedules",
+                    self.group.world
+                )),
+            );
+        if !drafting {
+            ledger.set(
+                Strategy::Drafting,
+                Mode::off("--recurrence-draft-lanes 0, or a group too small to draft"),
+            );
+        }
+        ledger
+    }
 }
 
 impl Drop for DoryRecurrenceBackend {
@@ -1300,6 +1380,9 @@ impl ModelBackend for DoryRecurrenceBackend {
             fences: [fence()?, fence()?],
             position: 0,
             speculation: Speculation::default(),
+            history: Vec::new(),
+            point: None,
+            cached: 0,
         }))
     }
 }
@@ -2148,11 +2231,11 @@ impl Head {
             })
     }
 
-    /// The lanes a session holds.
+    /// The lanes a running session holds: a kept one's parked lane runs nothing.
     fn held(&self) -> usize {
         self.lanes
             .iter()
-            .filter(|lane| lane.owner.is_some())
+            .filter(|lane| lane.owner.is_some() && !lane.parked)
             .count()
     }
 
@@ -2360,6 +2443,16 @@ struct DoryRecurrenceSession {
     position: usize,
     /// The guesses this sequence's rows were started on, and how many the model agreed with.
     speculation: Speculation,
+    /// The ids the lane's rows were fed, its last prompt and the decoded ids after it: always
+    /// `position` long. Empty once a step failed, so a sequence that may not hold them is not
+    /// continued.
+    history: Vec<u32>,
+    /// One id before the last prompt's end, where a later prompt that parts from the reply after
+    /// it goes back to: the rows before a position are the same whatever came after, and the
+    /// template's reply opener ends in an id a past reply is not written back with.
+    point: Option<usize>,
+    /// How many of the last prompt's ids the lane already held.
+    cached: usize,
 }
 
 impl Drop for DoryRecurrenceSession {
@@ -2375,6 +2468,7 @@ impl Drop for DoryRecurrenceSession {
             let _ = self.group.roll_back(entry, self.position);
             entry.draft.epoch = entry.draft.epoch.wrapping_add(1);
             entry.owner = None;
+            entry.parked = false;
         }
         self.group.forget_return(lane);
     }
@@ -2440,12 +2534,19 @@ impl ModelSession for DoryRecurrenceSession {
             ));
         }
         group.validate(tokens)?;
-        let chunks = prompt_chunks(
-            KvCacheMode::PerLoop,
-            tokens.len(),
-            recurrence_chunk(tokens.len()),
-        );
-        let lane = {
+        // The prompt's ids the lane already holds, as the history and the rewind point say: the
+        // rows before a position are the same whatever was fed after it, so the lane goes back
+        // there and forwards the rest.
+        let point = self.point.filter(|_| group.rewind);
+        let kept = match resume(&self.history, true, point, tokens) {
+            Some(Resume::Extend(kept) | Resume::Rewind(kept)) => kept,
+            None => 0,
+        };
+        // The history stands again only once the whole prompt is in.
+        self.history.clear();
+        self.point = None;
+        self.cached = 0;
+        let (lane, held, chunks) = {
             let mut head = group.lock_head()?;
             if head.closed {
                 return Err(BackendError::new(
@@ -2454,7 +2555,16 @@ impl ModelSession for DoryRecurrenceSession {
                 ));
             }
             let lane = head.claim(self.id, self.lane)?;
+            // A lane the session did not hold before holds none of its rows.
+            let held = if self.lane == Some(lane) { kept } else { 0 };
             self.lane = Some(lane);
+            head.lanes[lane].parked = false;
+            let rest = tokens.len() - held;
+            let chunks: Vec<std::ops::Range<usize>> =
+                prompt_chunks(KvCacheMode::PerLoop, rest, recurrence_chunk(rest))
+                    .into_iter()
+                    .map(|chunk| chunk.start + held..chunk.end + held)
+                    .collect();
             let slots = head.lanes[lane].buffers.slots;
             if 1 + chunks.len() > slots {
                 return Err(BackendError::new(
@@ -2469,6 +2579,7 @@ impl ModelSession for DoryRecurrenceSession {
             frames.push(Frame::Begin {
                 lane,
                 prompt: tokens.len(),
+                from: held,
                 sampling: self.sampling,
             });
             for (index, chunk) in chunks.iter().enumerate() {
@@ -2480,13 +2591,19 @@ impl ModelSession for DoryRecurrenceSession {
                 });
             }
             // A sequence the session ran before on this lane may have rows started on guesses
-            // still in flight: they are no one's, and every rank restarts the lane at Begin.
+            // still in flight: they are no one's, and every rank takes the lane back to the
+            // Begin frame's position.
             let entry = &mut head.lanes[lane];
             let stale: Vec<Ticket> = entry.draft.path.drain(..).map(|row| row.ticket).collect();
             group.discard(stale)?;
             entry.draft.epoch = entry.draft.epoch.wrapping_add(1);
             entry.draft.rewind = false;
             entry.draft.awaiting = None;
+            if held == 0 {
+                entry.core.restart();
+            } else {
+                entry.core.rewind(held)?;
+            }
             group.guarded(|| {
                 let Head { ring, lanes, .. } = &mut *head;
                 let entry = &mut lanes[lane];
@@ -2495,13 +2612,12 @@ impl ModelSession for DoryRecurrenceSession {
                     .stage_frames(cuda, &frames)
                     .map_err(link_error)?;
                 let bytes = entry.buffers.stage_ids(cuda, tokens).map_err(link_error)?;
-                entry.core.restart();
                 ring.send(cuda, 1, entry.buffers.slot(0), FRAME_BYTES)
                     .map_err(link_error)?;
                 ring.send(cuda, 1, entry.buffers.ids, bytes)
                     .map_err(link_error)
             })?;
-            lane
+            (lane, held, chunks)
         };
         self.position = tokens.len();
         self.speculation = Speculation::default();
@@ -2526,10 +2642,73 @@ impl ModelSession for DoryRecurrenceSession {
         }
         let ticket =
             ticket.ok_or_else(|| BackendError::new(RECURRENCE, "a prompt of no chunks"))?;
-        group.answer(ticket, lane)
+        let output = group.answer(ticket, lane)?;
+        self.history = tokens.to_vec();
+        // Every row is addressed by its position, so the lane can go back anywhere at no cost;
+        // the point sits one id before the prompt's end. Dory's template opens a thinking reply
+        // with `<think>\n` and writes a past reply back as `<think></think>...`, so the next
+        // turn keeps the prompt only up to its last id.
+        self.point = Some(tokens.len() - 1);
+        self.cached = held;
+        Ok(output)
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        let output = self.decode_row(token);
+        if output.is_err() {
+            // The lane may hold rows past the history, or lack some of it.
+            self.history.clear();
+            self.point = None;
+        }
+        output
+    }
+
+    fn speculation(&self) -> Speculation {
+        self.speculation
+    }
+
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        (self.lane.is_some() && !self.history.is_empty() && self.history.len() == self.position)
+            .then_some(&self.history[..])
+    }
+
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        self.reusable_prefix()?;
+        self.point
+            .filter(|&point| self.group.rewind && point < self.history.len())
+            .map(|point| &self.history[..point])
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.cached
+    }
+
+    fn park(&mut self) {
+        let Some(lane) = self.lane else {
+            return;
+        };
+        if let Ok(mut head) = self.group.head.lock()
+            && head.lanes[lane].owner == Some(self.id)
+        {
+            let entry = &mut head.lanes[lane];
+            // The rows started on guesses are no one's while the session waits for its next
+            // prompt, and a guess on its way is stale: nothing of the lane's is in flight.
+            if self.group.roll_back(entry, self.position).is_err() {
+                self.history.clear();
+                self.point = None;
+            }
+            entry.draft.epoch = entry.draft.epoch.wrapping_add(1);
+            entry.draft.awaiting = None;
+            entry.parked = true;
+        }
+        self.group.forget_return(lane);
+    }
+}
+
+impl DoryRecurrenceSession {
+    /// One decode row of [ModelSession::decode]: the history follows the lane only while the
+    /// two agree.
+    fn decode_row(&mut self, token: u32) -> Result<StepOutput, BackendError> {
         let group = Arc::clone(&self.group);
         let cuda = group.shared.cuda();
         cuda.make_current().map_err(link_error)?;
@@ -2586,17 +2765,12 @@ impl ModelSession for DoryRecurrenceSession {
             Start::Queue => group.submit(self.id, lane, token)?,
         };
         let output = group.answer(ticket, lane)?;
+        if self.history.len() == self.position {
+            self.history.push(token);
+        }
         self.position += 1;
         self.verify(&output)?;
         Ok(output)
-    }
-
-    fn speculation(&self) -> Speculation {
-        self.speculation
-    }
-
-    fn reusable_prefix(&self) -> Option<&[u32]> {
-        None
     }
 }
 
@@ -2815,8 +2989,9 @@ impl DoryRecurrenceStage {
                 Frame::Begin {
                     lane,
                     prompt,
+                    from,
                     sampling,
-                } => self.begin(lane, prompt, sampling)?,
+                } => self.begin(lane, prompt, from, sampling)?,
                 Frame::Rows {
                     lane,
                     rows,
@@ -2855,11 +3030,18 @@ impl DoryRecurrenceStage {
         }
     }
 
-    fn begin(&mut self, lane: usize, prompt: usize, sampling: Sampling) -> Result<(), String> {
+    fn begin(
+        &mut self,
+        lane: usize,
+        prompt: usize,
+        from: usize,
+        sampling: Sampling,
+    ) -> Result<(), String> {
         let context = self.shared.context();
-        if prompt == 0 || prompt > context {
+        if prompt == 0 || prompt > context || from >= prompt {
             return Err(format!(
-                "a Begin frame for {prompt} prompt tokens is outside 1..={context}"
+                "a Begin frame for {prompt} prompt tokens from position {from} is outside \
+                 1..={context}"
             ));
         }
         self.check_lane(lane)?;
@@ -2867,9 +3049,17 @@ impl DoryRecurrenceStage {
         let cuda = self.shared.cuda();
         let ids = self.buffers.ids;
         self.ring.recv(cuda, self.rank - 1, ids, prompt * 4)?;
+        let rank = self.rank;
         let entry = &mut self.lanes[lane];
-        entry.core.restart();
         entry.faulted = false;
+        if from == 0 {
+            entry.core.restart();
+        } else if let Err(error) = entry.core.rewind(from) {
+            // The lane does not hold the rows rank 0 keeps: the prompt's chunks are refused here
+            // and reach rank 0 as a fault, so the sequence fails rather than read rows it lacks.
+            eprintln!("dory recurrence rank {rank}: lane {lane}: {error}");
+            entry.faulted = true;
+        }
         entry.marks.clear();
         if last {
             let mut bytes = vec![0u8; prompt * 4];
@@ -3208,6 +3398,13 @@ mod tests {
             Frame::Begin {
                 lane: 3,
                 prompt: 4200,
+                from: 0,
+                sampling,
+            },
+            Frame::Begin {
+                lane: 1,
+                prompt: 4200,
+                from: 3100,
                 sampling,
             },
             Frame::Rows {

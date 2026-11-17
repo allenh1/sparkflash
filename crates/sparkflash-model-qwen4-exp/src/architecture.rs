@@ -135,6 +135,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
         vocab_size: 64,
         max_position_embeddings: 64,
         norm_epsilon: 1e-6,
+        inkling: None,
         embedding_tied_to_head: false,
         attention_bias: false,
         looped: None,
@@ -325,7 +326,7 @@ impl Qwen4ExpConfig {
         // differs from the shared walk would build the other model's blocks.
         for layer in &architecture.layers {
             let streams = match &layer.residual {
-                Residual::Plain => 1,
+                Residual::Plain | Residual::BlockAttention => 1,
                 Residual::Hyper(hyper) => hyper.streams,
             };
             check("residual streams", self.hc_count, streams)?;

@@ -652,6 +652,14 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
         "SPARKFLASH_QWEN4_DFLASH2_MIN_DEPTH",
         "speculation.min_depth",
     ),
+    (
+        "SPARKFLASH_INKLING_DRAFT_POLICY",
+        "speculation.depth_policy",
+    ),
+    (
+        "SPARKFLASH_INKLING_DRAFT_MIN_DEPTH",
+        "speculation.min_depth",
+    ),
     ("SPARKFLASH_DSPARK_STEPS", "speculation.dspark_steps"),
     ("SPARKFLASH_BATCH_SPEC", "speculation.batch_spec"),
     (
@@ -663,6 +671,8 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_GLM_SPEC", "speculation.enabled"),
     ("SPARKFLASH_GLM_SPEC_DEPTH", "speculation.depth"),
     ("SPARKFLASH_GLM_DRAFTS", "speculation.drafts"),
+    ("SPARKFLASH_GLM_DRAFT_POLICY", "speculation.depth_policy"),
+    ("SPARKFLASH_GLM_DRAFT_MIN_DEPTH", "speculation.min_depth"),
     ("SPARKFLASH_GLM_DFLASH2", "speculation.drafter"),
     ("SPARKFLASH_GLM_PROF", "diagnostics.profile"),
     ("SPARKFLASH_SEQUENCE_PARALLEL", "sequence.parallel"),

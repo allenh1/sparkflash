@@ -587,10 +587,6 @@ extern "C" __global__ void __launch_bounds__(256) opt_mma_router_topk(
 #define OMM_A_ROW (OMM_KB * 32u)      // E4M3 bytes per row per stage
 #define OMM_W_ROW (OMM_KB * 16u)      // packed FP4 bytes per column per stage
 
-__device__ __forceinline__ void om_cp4(uint32_t dst, const void *src, bool valid) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(dst), "l"(src), "r"(valid ? 4 : 0));
-}
-
 __device__ __forceinline__ void om_mma_e4m3_e2m1(float d[4], const uint32_t a[4], uint32_t b0, uint32_t b1,
                                                  uint32_t sfa, uint32_t sfb) {
     asm volatile(

@@ -99,10 +99,8 @@
 //! The returned RunReduce is owned by the run, used for BOTH per-layer collectives, and closed once
 //! at teardown (dropping it; close(handle) must not be called on the value returned here).
 
-use sparkflash_comm::device_reduce::{
-    BootstrapConfig, RunReduce, exchange_unique_id, setup_barrier,
-};
-use sparkflash_comm::nccl::{NcclApi, NcclError};
+use sparkflash_comm::device_reduce::{BootstrapConfig, RunReduce, open_run_reduce_over};
+use sparkflash_comm::nccl::NcclError;
 use sparkflash_comm::tcp::TcpTransport;
 use sparkflash_engine::linalg::EngineError;
 use sparkflash_engine::parallel_tp::{TpCollective, TpLayout, Wire};
@@ -130,39 +128,23 @@ pub fn open_run_reduce(
     config: BootstrapConfig,
 ) -> Result<RunReduce, NcclError> {
     validate_open_request(world, rank, payload, scratch)?;
-    // Load on EVERY rank before the gather, and carry the status: a rank that lacks libnccl then
-    // refuses all four ranks here, before any of them is inside NCCL, instead of failing locally
-    // while its peers wait in ncclCommInitRank.
-    let library = NcclApi::load();
-    let local = if rank == 0 {
-        match &library {
-            Ok(api) => Some(api.unique_id()?),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
-    let unique = exchange_unique_id(transport, world, rank, local, library.is_ok(), config)?;
-    let handle = RunReduce::open(world, rank, unique)?;
-    // Turn the run-owned opaque handle back into the owned value. open hands back
-    // Box::into_raw(Box::new(RunReduce)); rebuilding the Box and moving the value out is the exact
-    // inverse, so this RunReduce is the box's only owner and the raw handle is never used again -
-    // in particular close(handle) must NOT be called on it, Drop destroys the communicator. The
-    // port stores THIS value (as a reference) for both per-layer collectives.
-    // SAFETY: the pointer came from RunReduce::open in this function, it is not null (open is
-    // fallible and returned Ok), and Box::from_raw is paired with that into_raw exactly once.
-    let mut reduce: RunReduce = unsafe { *Box::from_raw(handle.cast::<RunReduce>()) };
+    // The sequence (library on every rank before the gather, open, warm-up, the one sync, the
+    // bounded barrier) is the comm crate's, shared with every arm that opens over its own exchange.
     // SAFETY: the caller contract above - scratch is a writable device address of at least payload
     // bf16 values on the current device, stream is valid there, and every rank passes the same
-    // payload - is exactly warm_up's documented requirement.
+    // payload - is exactly open_run_reduce_over's documented requirement.
     unsafe {
-        reduce.warm_up(stream, scratch, payload)?;
+        open_run_reduce_over(
+            transport,
+            world,
+            rank,
+            stream,
+            scratch,
+            payload,
+            config,
+            &synchronize_setup,
+        )
     }
-    synchronize_setup()?;
-    // Bounded setup barrier: every rank that completed open + warm-up + sync meets here, so a rank
-    // that failed one of them cannot leave its peers to enter the timed region alone.
-    setup_barrier(transport, world, rank)?;
-    Ok(reduce)
 }
 
 /// [`open_run_reduce`] for a [`DeviceExchange`] of `hidden`-wide f32 rows, on `cuda`'s context.

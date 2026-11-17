@@ -13051,34 +13051,17 @@ impl<'a> DeviceLayer<'a> {
         what: &str,
     ) -> Result<bool, String> {
         let mine = slots + (rank * bytes) as u64;
-        self.exchange_round(mine, bytes, rank, world, what, |round, collect| {
-            // The sixteen-byte copy when both buffers and the slot are aligned for it.
-            let unit = if (round.set | slots | bytes as u64) & 15 == 0 {
-                16usize
-            } else {
-                1
-            };
-            let blocks = (world * bytes / unit).div_ceil(256) as u32;
-            self.cuda.launch(
-                collect,
-                (blocks, 1, 1),
-                (256, 1, 1),
-                &[
-                    round.set,
-                    slots,
-                    bytes as u64,
-                    rank as u64,
-                    world as u64,
-                    unit as u64,
-                ],
-            )
+        self.exchange_round(mine, bytes, rank, world, what, |round, state| {
+            state.collect_slots(self.cuda, round, slots, bytes, rank, world)
         })
     }
 
     /// One round of the direct-RDMA exchange: submits it, launches the exchange kernel over the
     /// `row_bytes` at `row`, and then `after`, which launches whatever reads the round's row set
-    /// (it is handed the round and the collect kernel). Both launches happen under the exchange's
-    /// lock, so rounds reach the stream in the order they were submitted.
+    /// (it is handed the round and the exchange, whose collect kernel a slot exchange launches).
+    /// Both launches happen under the exchange's lock, so rounds reach the stream in the order
+    /// they were submitted. The launches are sparkflash_kernels::write_exchange's, which the
+    /// Inkling arm runs too.
     ///
     /// Returns `Ok(false)` without submitting anything when the run did not select the exchange
     /// or the row is larger than a round carries.
@@ -13092,7 +13075,7 @@ impl<'a> DeviceLayer<'a> {
         stage: &str,
         after: impl FnOnce(
             &crate::rdma_exchange::Round,
-            sparkflash_kernels::cuda_driver::Kernel,
+            &crate::rdma_exchange::ExchangeState,
         ) -> Result<(), String>,
     ) -> Result<bool, String> {
         let Some(shared) =
@@ -13108,36 +13091,17 @@ impl<'a> DeviceLayer<'a> {
         if row_bytes == 0 || row_bytes > state.row_cap() {
             return Ok(false);
         }
-        let round = state.submit(row_bytes).map_err(|error| {
-            format!("layer device stage {stage}: direct-RDMA exchange: {error}")
-        })?;
-        // A launch that fails here leaves the round reserved and its doorbell un-rung. Telling the
-        // exchange is not optional: without it the pump posts the skipped round from whatever
-        // bytes are in the row, and the peers fold them.
-        if let Err(error) = self.cuda.launch(
-            state.kernel(),
-            (1, 1, 1),
-            (1024, 1, 1),
-            &[
+        let round = state
+            .stage(
+                self.cuda,
                 row,
-                round.row,
-                row_bytes as u64,
-                round.control,
-                rank as u64,
-                world as u64,
-                round.seq,
-                round.rails,
-                round.lengths,
-                round.length_ring,
-            ],
-        ) {
-            state.fail(&format!(
-                "layer device stage {stage}: the exchange kernel for round {} did not launch: {error}",
-                round.seq
-            ));
-            return Err(error.to_string());
-        }
-        after(&round, state.collect())?;
+                row_bytes,
+                rank,
+                world,
+                &format_args!("layer device stage {stage}"),
+            )
+            .map_err(|error| format!("layer device stage {stage}: {error}"))?;
+        after(&round, &state)?;
         self.collectives_in_flight
             .set(self.collectives_in_flight.get().saturating_add(1));
         Ok(true)

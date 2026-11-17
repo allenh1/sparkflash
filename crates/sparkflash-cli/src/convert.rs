@@ -52,6 +52,10 @@ use sparkflash_model::{Architecture, Target};
 use sparkflash_model_glm5_next::Glm5NextConfig;
 use sparkflash_model_glm5_next::config::MODEL_TYPE as GLM_MODEL_TYPE;
 use sparkflash_model_glm5_next::convert::{WalkSpecs, convert_rank as glm_convert_rank};
+use sparkflash_model_inkling2::config::Inkling2Config;
+use sparkflash_model_inkling2::convert::{
+    InklingRecords, convert_rank as inkling_convert_rank, verify_rank as inkling_verify_rank,
+};
 use sparkflash_model_qwen4_exp::Qwen4ExpConfig;
 use sparkflash_model_qwen4_exp::convert::{Nvfp4Scalars, convert_rank as qwen_convert_rank};
 use sparkflash_ops::engine_plan::EnginePlan;
@@ -69,7 +73,7 @@ fn emit_progress(done: u64, total: u64, detail: &str) {
 }
 
 /// Usage string for `sparkflash convert`.
-pub const USAGE: &str = "sparkflash convert (--checkpoint DIR | --model ORG/REPO) [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
+pub const USAGE: &str = "sparkflash convert (--checkpoint DIR | --model ORG/REPO) [--output-dir DIR] [--tp-world-size W] [--tp-rank R | --ranks 0,1,2,3] [--no-pad-moe-640] [--expert-split experts|intermediate|rows] [--no-verify] | sparkflash convert --inspect FILE [--verify-weights]";
 
 /// Entry point called by `main.rs`.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -99,6 +103,8 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     let mut world_size: Option<usize> = None;
     let mut ranks: Vec<usize> = Vec::new();
     let mut pad_moe_640 = true;
+    // Inkling-2 only: how its rank files divide the routed experts (None is the default split).
+    let mut expert_split: Option<sparkflash_model_inkling2::ExpertSplit> = None;
     let mut verify = true;
     let mut inspect: Option<PathBuf> = None;
     let mut verify_weights = false;
@@ -146,6 +152,13 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 }
             }
             "--no-pad-moe-640" => pad_moe_640 = false,
+            "--expert-split" => {
+                let raw = take("--expert-split")?;
+                expert_split = Some(
+                    sparkflash_model_inkling2::ExpertSplit::parse(&raw)
+                        .map_err(|error| format!("--expert-split: {error}"))?,
+                );
+            }
             "--no-verify" => verify = false,
             "--verify-weights" | "--verify" => {
                 verify = true;
@@ -159,6 +172,12 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
     }
 
     if let Some(path) = inspect {
+        if expert_split.is_some() {
+            return Err(
+                "--expert-split names a conversion's layout; --inspect reads it from the file"
+                    .to_owned(),
+            );
+        }
         return inspect_file(&path, verify_weights);
     }
 
@@ -181,9 +200,15 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
         let architecture = Architecture::from_checkpoint_dir(&checkpoint_dir)
             .map_err(|error| unparsed(error.to_string()))?;
         let world = world_size.unwrap_or_else(|| default_convert_world(&architecture.family));
+        if expert_split.is_some() && architecture.family != "inkling2" {
+            return Err(format!(
+                "--expert-split is Inkling-2's rank-file layout, and this checkpoint is {:?}",
+                architecture.family
+            ));
+        }
         let released = matches!(
             architecture.family.as_str(),
-            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41"
+            "qwen4_exp" | "qwen4_exp_text" | GLM_MODEL_TYPE | "deepseek_v41" | "inkling2"
         );
         if !released && world != 1 {
             return Err(format!(
@@ -225,6 +250,38 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 glm_convert_rank(source, &config, layout, &out_dir, label)
                     .map_err(|error| error.to_string())
             });
+        }
+        if architecture.family == "inkling2" {
+            // Inkling-2's plan already names every rank's bytes, so its converter is a walk over
+            // that plan through the shared rank-file container; the pack below only selects the
+            // ranks and prints. Verifying also compares every slot against the checkpoint, which
+            // SlotPack's own read only checks against the header.
+            let mut config = Inkling2Config::from_checkpoint_dir(&checkpoint_dir)
+                .map_err(|error| unparsed(error.to_string()))?;
+            if let Some(split) = expert_split.take() {
+                config.expert_split = split;
+            }
+            let slot_pack = SlotPack {
+                name: "Inkling-2-Small",
+                world_size: world,
+                ranks: &ranks,
+                pad_moe_640,
+                // The closure below verifies the file against the checkpoint, slot digest
+                // included, so the pack's own payload re-read would be a third pass over 97.5 GB
+                // per rank for a weaker check (the header against itself).
+                verify: false,
+                allows_no_pad: true,
+            };
+            return slot_pack.convert::<InklingRecords>(
+                &checkpoint_dir,
+                |source, layout, label| {
+                    let converted = inkling_convert_rank(source, &config, layout, &out_dir, label)?;
+                    if verify {
+                        inkling_verify_rank(&converted.path, source, &config, layout)?;
+                    }
+                    Ok(converted)
+                },
+            );
         }
         if architecture.family != "deepseek_v41" {
             // A novel architecture composed of supported parts: convert it through the shared
@@ -272,6 +329,12 @@ pub fn run_lines(args: &[&str]) -> Result<Vec<String>, String> {
                 },
             );
         }
+    }
+    if expert_split.is_some() {
+        return Err(format!(
+            "--expert-split is Inkling-2's rank-file layout, and {} has no config.json naming one",
+            checkpoint_dir.display()
+        ));
     }
     let world_size = world_size.unwrap_or(4);
     let options = ConvertOptions {
@@ -374,6 +437,13 @@ struct DynamicRecords {}
 
 impl SlotRecords for DynamicRecords {
     const MODEL: &'static str = "dynamic";
+}
+
+impl ShownRecords for InklingRecords {
+    fn shown(&self) -> String {
+        // The plan names every slot from the configuration and this split.
+        format!(", experts split by {}", self.experts.name())
+    }
 }
 
 impl ShownRecords for DynamicRecords {
@@ -564,6 +634,9 @@ fn inspect_file(path: &Path, verify_weights: bool) -> Result<Vec<String>, String
     }
     if model == Some(DynamicRecords::MODEL) {
         return inspect_slot_file::<DynamicRecords>(path, preamble, verify_weights);
+    }
+    if model == Some(InklingRecords::MODEL) {
+        return inspect_slot_file::<InklingRecords>(path, preamble, verify_weights);
     }
     let (preamble, header) = inspect_converted_rank(path)?;
     if verify_weights {

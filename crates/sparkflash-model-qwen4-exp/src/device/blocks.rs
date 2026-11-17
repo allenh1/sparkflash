@@ -30,11 +30,12 @@
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
+use sparkflash_ops::attention::GqaBody;
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
-    ATTN_GROUP_SELECTED, Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch,
-    GpuExperts, GpuMoe, MAX_SELECTED_TOKENS, full_attention_splits,
+    Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts, GpuMoe,
+    MAX_SELECTED_TOKENS, full_attention_splits,
 };
 
 /// The indexer blocks one q4e_qsa_scores CTA scores for a row (Q4E_QSA_TILE).
@@ -352,22 +353,28 @@ impl DeviceSequence {
             self.probe_selected(slot, base, rows)?;
             self.prof_mark("sparse_pick")?;
             // A grouped kernel reads a token's selection once for several heads and computes
-            // each as q4e_attn would; it takes any configuration whose groups and selection it
-            // holds.
-            let (heads, attn) = kernels
+            // each as q4e_attn would. Which body runs is ops' rule over the kernels the device
+            // granted (GqaBody::choose), the same rule the rank's boot plan names.
+            let granted = |heads: usize| {
+                kernels
+                    .attn_group
+                    .iter()
+                    .flatten()
+                    .any(|&(h, _)| h == heads)
+            };
+            let body =
+                GqaBody::choose(config.query_groups(), config.max_selected_tokens(), granted);
+            let attn = kernels
                 .attn_group
                 .iter()
                 .flatten()
-                .copied()
-                .find(|&(heads, _)| {
-                    config.query_groups().is_multiple_of(heads)
-                        && config.max_selected_tokens() <= ATTN_GROUP_SELECTED
-                })
-                .unwrap_or((1, kernels.attn));
+                .find(|&&(heads, _)| heads == body.heads)
+                .map_or(kernels.attn, |&(_, kernel)| kernel);
+            let (grid, block) = body.grid(config.num_attention_heads, rows);
             self.launch(
                 attn,
-                ((config.num_attention_heads / heads) as u32, rows as u32, 1),
-                (256, 1, 1),
+                grid,
+                block,
                 &[
                     self.query.offset(base * attn_width * 4).0,
                     self.gate.offset(base * attn_width * 4).0,

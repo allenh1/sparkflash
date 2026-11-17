@@ -36,7 +36,7 @@ pub mod config;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
-pub mod fused;
+pub mod gumbel;
 pub mod numerics;
 pub mod parts;
 pub mod prof;
@@ -61,7 +61,9 @@ pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_ID, DORY1_0_4B_BF16_WEIGHTS_ID,
-    DORY1_0_4B_CONTEXT_TOKENS, DORY1_0_4B_MAX_OUTPUT_TOKENS, DORY1_0_4B_VOCAB_SIZE, MODELS,
+    DORY1_0_4B_CONTEXT_TOKENS, DORY1_0_4B_MAX_OUTPUT_TOKENS, DORY1_0_4B_VOCAB_SIZE,
+    INKLING2_CONTEXT_TOKENS, INKLING2_MAX_OUTPUT_TOKENS, INKLING2_SMALL_ID,
+    INKLING2_SMALL_WEIGHTS_ID, INKLING2_UNPADDED_VOCAB_SIZE, INKLING2_VOCAB_SIZE, MODELS,
     ModelDescriptor, QWEN36_CONTEXT_TOKENS, QWEN36_FLASH_35B_A3B_FP8_ID,
     QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID, QWEN36_MAX_OUTPUT_TOKENS, QWEN36_VOCAB_SIZE,
     V41_CONTEXT_TOKENS, V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, canonical_model_type,
@@ -69,7 +71,6 @@ pub use descriptor::{
     model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};
-pub use fused::{FusedArm, FusedEngine, FusedSession};
 pub use numerics::{ConfigKey, NumericsIdentity, NumericsProfile, NumericsStatus};
 pub use parts::{Part, PartSet, Target, built, is_built};
 pub use prof::StageProfiler;
@@ -78,7 +79,7 @@ pub use profile::{
     active as active_profile, install_active,
 };
 pub use prompt::{PromptCodec, PromptError};
-pub use spec::{Pending, Queue, Speculator, verdict};
+pub use spec::{Pending, Queue, Speculator, kept_to_end, lookup_draft, verdict};
 pub use speculation::{DepthPolicy, StepCost};
 pub use tp_plan::{Split, TpAxis, TpPlan, TpPlanError};
 pub use vision::{

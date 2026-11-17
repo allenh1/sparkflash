@@ -25,6 +25,7 @@ sparkflash-model = { workspace = true }
 sparkflash-weights = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-ops = { workspace = true }
+sparkflash-runtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
 

@@ -208,7 +208,7 @@ async fn the_default_is_one_session_at_a_time() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_prepared_image_is_refused_not_silently_dropped() {
+async fn a_prepared_image_is_refused_by_a_backend_without_vision() {
     let driver = HostDriver::start(
         Box::new(BlockingBackend {
             descriptor: descriptor(),
@@ -219,7 +219,7 @@ async fn a_prepared_image_is_refused_not_silently_dropped() {
     )
     .expect("the driver starts");
     let mut request = request("image");
-    request.vision.push(sparkflash_api::vision::VisionImage {
+    request.vision.push(sparkflash_model::vision::VisionImage {
         span: ImageSpan {
             start: 1,
             grid: ImageGrid {
@@ -237,7 +237,8 @@ async fn a_prepared_image_is_refused_not_silently_dropped() {
     assert!(
         matches!(
             events.first(),
-            Some(EngineEvent::Error { code, .. }) if code == sparkflash_serve::host::REFUSED_CODE
+            Some(EngineEvent::Error { code, .. })
+                if code == sparkflash_api::engine::MissingCapability::vision().code()
         ),
         "a prepared image must be refused, got {events:?}"
     );

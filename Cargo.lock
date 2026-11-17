@@ -2375,6 +2375,7 @@ dependencies = [
  "sparkflash-model-deepseek-v41",
  "sparkflash-model-dory",
  "sparkflash-model-glm5-next",
+ "sparkflash-model-inkling2",
  "sparkflash-model-qwen4-exp",
  "sparkflash-ops",
  "sparkflash-scheduler",
@@ -2423,6 +2424,7 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-model",
  "sparkflash-model-deepseek-v41",
+ "sparkflash-runtime",
  "sparkflash-vision",
  "tempfile",
 ]
@@ -2493,6 +2495,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sparkflash-comm",
  "sparkflash-engine",
  "sparkflash-kv",
  "sparkflash-trace",
@@ -2553,6 +2556,7 @@ dependencies = [
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-weights",
  "tempfile",
 ]
@@ -2567,15 +2571,36 @@ dependencies = [
  "serde",
  "serde_json",
  "sparkflash-api",
+ "sparkflash-comm",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-serve",
  "sparkflash-weights",
  "tempfile",
  "tokenizers",
  "tokio",
  "tower",
+]
+
+[[package]]
+name = "sparkflash-model-inkling2"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sparkflash-comm",
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-ops",
+ "sparkflash-runtime",
+ "sparkflash-vision",
+ "sparkflash-weights",
+ "tempfile",
+ "tokenizers",
 ]
 
 [[package]]
@@ -2593,10 +2618,12 @@ dependencies = [
  "serde_json",
  "sha2",
  "sparkflash-api",
+ "sparkflash-comm",
  "sparkflash-engram",
  "sparkflash-kernels",
  "sparkflash-model",
  "sparkflash-ops",
+ "sparkflash-runtime",
  "sparkflash-serve",
  "sparkflash-vision",
  "sparkflash-weights",
@@ -2621,6 +2648,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sparkflash-runtime"
+version = "0.1.0"
+dependencies = [
+ "sparkflash-comm",
+ "sparkflash-model",
+]
+
+[[package]]
 name = "sparkflash-scheduler"
 version = "0.1.0"
 dependencies = [
@@ -2629,6 +2664,7 @@ dependencies = [
  "sparkflash-comm",
  "sparkflash-engram",
  "sparkflash-kv",
+ "sparkflash-runtime",
  "sparkflash-trace",
  "thiserror 2.0.21",
 ]

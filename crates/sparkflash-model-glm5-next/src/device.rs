@@ -90,21 +90,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
     Cuda, DEFAULT_DIRECT_CHUNK_BYTES, DEFAULT_DIRECT_CONCURRENCY, Deviceptr, HostMapped, Kernel,
     RunStream, SideStream, StreamEvent,
 };
 use sparkflash_kernels::images;
+use sparkflash_kernels::lane_memory::{self, BackError, LanePlans, Layout, SequenceLanes};
 use sparkflash_model::{BackendError, Part, StepCost};
+use sparkflash_ops::OpPlan;
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::gdn::{
     CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS,
-    gdn_scan_shape,
 };
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
 };
+use sparkflash_ops::projection::{
+    Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
+};
+use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
 
 fn cubin_available() -> bool {
@@ -193,7 +199,7 @@ impl LatentCache {
 /// Returns `(latent elements, f32 scale floats)`: the E4M3 latent is one code a element and one
 /// f32 scale a whole [FP8_BLOCK]-wide tile, while the f32 latent is four bytes a element and no
 /// scales. The representation is resolved exactly as [LatentCache::quantises] does it; this is
-/// the allocation [DeviceRank::sparse_state] makes from the same pair.
+/// the caches [SparseParts::plan] lays out from the same pair.
 fn latent_row(config: &Glm5NextConfig, quantise: bool) -> (usize, usize) {
     let width = config.kv_lora_rank;
     (
@@ -257,6 +263,21 @@ pub const MIN_PREFILL_ROWS: usize = 16;
 /// The widest chunk the scratch is sized for at the default context.
 pub const MAX_PREFILL_ROWS: usize = 4096;
 
+/// How a prompt runs ([DeviceRank::begin_prefill]).
+#[derive(Debug)]
+pub enum Prefill {
+    /// The token path ran it whole: its last row's logits.
+    Whole(Vec<f32>),
+    /// It takes bulk chunks of `width` tokens, the last one shorter, ending at position `end`
+    /// ([DeviceRank::prefill_chunk]).
+    Chunks {
+        /// The position past the prompt's last token.
+        end: usize,
+        /// The tokens a chunk takes.
+        width: usize,
+    },
+}
+
 /// The modelled wall of a block-drafted round at TP=4 on four GB10-class nodes that verifies
 /// `depth` drafts (ms), for [DepthPolicy](sparkflash_model::DepthPolicy): the drafter's block and
 /// the one-token step at 41.7 ms, and 5.9 ms a verified draft (mostly the experts its row adds).
@@ -268,16 +289,22 @@ pub const DFLASH2_STEP_COST: StepCost = StepCost {
     prior_tokens_per_ms: 0.046,
 };
 
+/// The modelled wall of an MTP round that drafts and verifies `depth` drafts (ms), for
+/// [DepthPolicy](sparkflash_model::DepthPolicy): the one-token step at 34.0 ms and 9.0 ms a draft,
+/// its MTP pass and its verify row together, since the MTP layer drafts one token a pass. Fit to
+/// one stream's 34.0, 43.5, 52 and 61 ms rounds at 0 to 3 drafts over the NCCL leg
+/// (docs/models/glm53-flash.md); the first round assumes the 45 tok/s it made at 2.
+pub const MTP_STEP_COST: StepCost = StepCost {
+    step_ms: 34.0,
+    row_ms: 9.0,
+    prior_tokens_per_ms: 0.045,
+};
+
 /// The side of a block-scaled FP8 tile the kernels read (Q4E_FP8_BLOCK).
 const FP8_BLOCK: usize = 128;
 /// The dynamic shared memory of the bulk E4M3 x E4M3 GEMMs in the prefill and MoE images
 /// (GLM_Q8_SHARED): their cp.async stages and a column tile's weight scales.
 const Q8_SHARED: u32 = 68_608;
-/// The dynamic shared memory of the bulk BF16 GEMM's wide tile (GLM_WIDE_SHARED): three cp.async
-/// stages of a 128-row f32 activation tile and a 256-row BF16 weight tile, 32 K each.
-const WIDE_SHARED: u32 = 98_304;
-/// The output columns of that tile (GLM_WIDE_BN).
-const WIDE_COLUMNS: usize = 256;
 /// The widest inner those GEMMs take (GLM_Q8_BLOCKS 128-column blocks): the kernel holds a column
 /// tile's weight scales in shared memory and does nothing for a wider one.
 const Q8_MAX_INNER: usize = 128 * FP8_BLOCK;
@@ -453,6 +480,8 @@ fn append(into: &mut Vec<u8>, bytes: Vec<u8>) {
 struct Kernels {
     embed: Kernel,
     argmax: Kernel,
+    /// [Self::argmax] that also reports the pick's softmax probability: an MTP draft's confidence.
+    argmax_prob: Kernel,
     gemv_bf16: Kernel,
     gemv_fp8: Kernel,
     /// The E4M3 copy of the LM head drafts score with ([DeviceRank::draft_head]): its quantizer
@@ -620,6 +649,7 @@ impl Kernels {
         Ok(Self {
             embed: named("q4e_embed")?,
             argmax: named("q4e_argmax_slices")?,
+            argmax_prob: named("q4e_argmax_prob_slices")?,
             gemv_bf16: decode("q4e_gemv_tiled_bf16_parts")?,
             gemv_fp8: decode("q4e_gemv_tiled_e4m3_block")?,
             quantize_e4m3: named("q4e_quantize_e4m3_rows")?,
@@ -1726,6 +1756,9 @@ struct Scratch {
     /// drafts follow, iteration `i + 1` the argmax of iteration `i`'s logits, which the device
     /// writes and the next iteration's embedding reads with no host round trip.
     drafted: HostMapped,
+    /// `[MAX_ROWS][MAX_ROWS]` f32 beside [Self::drafted]: entry `[i + 1][row]` the probability
+    /// the MTP layer gave its draft `i + 1`, which the depth policy reads as its confidence.
+    draft_probs: HostMapped,
     /// A step's token ids, a u32 a row, which its one embedding launch reads in place
     /// ([DeviceRank::embed_rows]).
     step_tokens: HostMapped,
@@ -1788,6 +1821,120 @@ pub struct DeviceSequence {
     /// The block drafter's confidence in each of the sequence's last drafts.
     confidence: Vec<f32>,
     memory: Allocations,
+    /// The sparse layers' caches, backed as the sequence grows.
+    lane: SequenceLane,
+    /// The rewind point: each KDA layer's convolution history and recurrent memory, and the MTP
+    /// layer's hidden rows, as they were at the end of the last prompt ([DeviceRank::keep_point]),
+    /// when the rank keeps one ([sparkflash_runtime::REWIND_ENV]). The sparse caches need no copy:
+    /// a position's rows stay until a later write at that position, and an index pool is
+    /// rewritten from the cached keys when a row completes it.
+    point: Option<Checkpoint>,
+    /// The MTP layer's [SequenceDrafter::last] at the point.
+    point_last: Option<usize>,
+}
+
+/// Rows past a step's last position a sequence's lane backs too: the MTP layer's drafts write
+/// up to a step's rows past it, and a kernel that reads a whole tile past the position never
+/// reaches memory nothing backs.
+const LANE_READ_PAST: usize = 1024;
+
+/// Where each of a sequence's caches that grow with its context lies in its lane
+/// ([SequenceLanes], the lane memory Inkling's and Qwen's sequences use too): every DSA layer's
+/// latent, scales and indexer rows, and the MTP layer's in a drafting sequence. A sequence
+/// reserves a span as long as its whole capacity's caches and physical memory backs it only as
+/// far as the sequence has reached ([DeviceRank::back]), from one pool the rank's sequences share.
+///
+/// The KDA layers' state and the drafters' scratch stay plain allocations: they do not grow.
+struct LaneParts {
+    /// Each layer's caches, `None` for a KDA layer.
+    layers: Vec<Option<SparseParts>>,
+    /// The MTP layer's, in a drafting sequence.
+    mtp: Option<SparseParts>,
+}
+
+/// Which sequences share one [SequenceLanes]: those that draft with the MTP layer or not, of one
+/// capacity.
+type LaneKey = (bool, usize);
+
+/// One DSA layer's caches in a lane, as offsets from the span's base.
+#[derive(Debug, Clone, Copy)]
+struct SparseParts {
+    latent: usize,
+    latent_scales: Option<usize>,
+    /// The indexer's keys, gates and pooled keys, for a layer with an indexer.
+    index: Option<[usize; 3]>,
+}
+
+impl SparseParts {
+    /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
+    fn plan(
+        layout: &mut Layout,
+        config: &Glm5NextConfig,
+        dsa: &DeviceDsa,
+        capacity: usize,
+    ) -> Self {
+        // The latent is the release's E4M3 activation when the projections quantise theirs, and
+        // f32 for a BF16 release.
+        let (elements, scale_floats) = latent_row(config, dsa.quantise);
+        let latent_row = if dsa.quantise { elements } else { elements * 4 };
+        let latent = layout.part(capacity * latent_row, latent_row, 0);
+        let latent_scales = dsa
+            .quantise
+            .then(|| layout.part(capacity * scale_floats * 4, scale_floats * 4, 0));
+        let index = dsa.indexer.is_some().then(|| {
+            let row = config.index_head_dim * 4;
+            let kpool = config.index_kpool.max(1);
+            [
+                layout.part(capacity * row, row, 0),
+                layout.part(capacity * row, row, 0),
+                // A pooled row covers `kpool` positions; a position adds its share, rounded up.
+                layout.part(capacity / kpool * row, row.div_ceil(kpool), 0),
+            ]
+        });
+        Self {
+            latent,
+            latent_scales,
+            index,
+        }
+    }
+
+    /// The layer's state in the lane at `base`.
+    fn layer(self, base: Deviceptr) -> SequenceLayer {
+        let index = |part: usize| {
+            self.index
+                .map_or(Deviceptr(0), |index| base.offset(index[part]))
+        };
+        SequenceLayer::Sparse {
+            latent: base.offset(self.latent),
+            latent_scales: self
+                .latent_scales
+                .map_or(Deviceptr(0), |offset| base.offset(offset)),
+            index_keys: index(0),
+            index_gates: index(1),
+            pooled: index(2),
+        }
+    }
+}
+
+/// One sequence's span of its [SequenceLanes], freed with the sequence.
+struct SequenceLane {
+    cuda: Arc<CudaHandle>,
+    lane: lane_memory::SequenceLane<LaneParts>,
+}
+
+impl SequenceLane {
+    /// Gives every chunk back to the pool, once the device is done with them.
+    fn release(&mut self) -> Result<(), BackendError> {
+        self.lane.release(&self.cuda).map_err(cuda_error)
+    }
+}
+
+impl Drop for SequenceLane {
+    fn drop(&mut self) {
+        // A sequence can be returned to its pool from a worker thread that has not touched the
+        // device yet, as [Allocations] does: free makes the context current.
+        self.lane.free(&self.cuda);
+    }
 }
 
 /// What a drafting sequence keeps for the MTP layer: its caches, whose position `q` pairs the
@@ -1955,9 +2102,47 @@ impl DeviceSequence {
         self.capacity
     }
 
-    /// The block drafter's confidence in each of the sequence's last drafts, in `(0, 1]`: the
-    /// selector's probability for its pick among the row's candidates. Empty after an MTP draft,
-    /// which keeps none.
+    /// Whether the rank's pool can back this sequence for `rows` positions now, counting the
+    /// chunks a reset gives back first when `reset`: the answer [DeviceRank::back] would give.
+    #[must_use]
+    pub fn room(&self, rows: usize, reset: bool) -> bool {
+        self.lane.lane.room(rows, reset)
+    }
+
+    /// The position the sequence can go back to ([DeviceRank::rewind]): the end of its last
+    /// prompt, while the copies hold it.
+    #[must_use]
+    pub fn rewind_point(&self) -> Option<usize> {
+        self.point.as_ref().and_then(Checkpoint::point)
+    }
+
+    /// The copies no longer hold a point: a prompt began to forward past it and will keep its own
+    /// end.
+    pub fn forget_point(&mut self) {
+        if let Some(point) = self.point.as_mut() {
+            point.forget();
+        }
+    }
+
+    /// The live regions the rewind point copies, in its order.
+    fn point_regions(&self) -> Vec<Deviceptr> {
+        let mut live = Vec::new();
+        for layer in &self.layers {
+            if let SequenceLayer::Linear {
+                conv, recurrent, ..
+            } = layer
+            {
+                live.extend([*conv, *recurrent]);
+            }
+        }
+        live.extend(self.drafter.as_ref().map(|drafter| drafter.hidden));
+        live.extend(self.block.as_ref().map(DraftScratch::rings));
+        live
+    }
+
+    /// The drafter's confidence in each of the sequence's last drafts: the block drafter's
+    /// selector's probability for its pick among the row's candidates, in `(0, 1]`, or the MTP
+    /// layer's softmax probability of its argmax (0 for a row whose logits have no finite best).
     #[must_use]
     pub fn draft_confidence(&self) -> &[f32] {
         &self.confidence
@@ -1989,6 +2174,9 @@ pub struct DeviceRank {
     kernels: Kernels,
     config: Glm5NextConfig,
     layout: TpLayout,
+    /// The bulk KDA scan the rank's plan resolves ([Self::kda_scan_plan]); `None` where runs
+    /// take the token kernels.
+    kda_scan: Option<ScanPlan>,
     geometry: HcGeometry,
     embed: Deviceptr,
     norm: Deviceptr,
@@ -2001,6 +2189,8 @@ pub struct DeviceRank {
     mtp: Option<DeviceMtp>,
     /// The DFlash 2 block drafter, once [DeviceRank::load_block_drafter] loads one.
     block: Option<BlockDrafter>,
+    /// The sequences' [SequenceLanes], one a kind, each planned on first use.
+    lanes: LanePlans<LaneKey, LaneParts>,
     scratch: Scratch,
     /// Whether a block-drafting sequence's prompt runs through the bulk chunk
     /// (`prefill.drafting_prompt`, on by default) rather than the token path.
@@ -2031,6 +2221,9 @@ pub struct DeviceRank {
     prefetch: Option<Prefetch>,
     /// Recorded after each embedding launch that reads a token slab ([Self::embed_rows]).
     tokens_staged: TokenFence,
+    /// Whether a sequence keeps a rewind point at the end of each prompt
+    /// ([sparkflash_runtime::REWIND_ENV], on by default).
+    rewind: bool,
     memory: Allocations,
 }
 
@@ -2085,6 +2278,10 @@ impl Prefetch {
         }))
     }
 }
+
+/// Asked after each MTP pass with the probability of every row's newest draft: true drafts
+/// another pass. [DeviceRank::draft_while] takes it.
+pub type KeepDrafting<'a> = &'a mut dyn FnMut(&[f32]) -> bool;
 
 impl DeviceRank {
     /// Upload rank `layout.rank`'s slice of the text model.
@@ -2231,12 +2428,14 @@ impl DeviceRank {
         let scratch = Self::scratch(config, layout, MAX_ROWS, &stream, &mut memory, false)?;
         let prefetch = Prefetch::new(&cuda)?;
         let tokens_staged = TokenFence(cuda.stream_event().map_err(cuda_error)?);
+        let kda_scan = Self::kda_scan_plan(config, layout)?;
         let mut rank = Self {
             cuda,
             stream,
             kernels,
             config: config.clone(),
             layout,
+            kda_scan,
             geometry: HcGeometry::from(config),
             embed,
             norm,
@@ -2245,6 +2444,7 @@ impl DeviceRank {
             layers,
             mtp,
             block: None,
+            lanes: LanePlans::default(),
             scratch,
             prefill,
             drafting_prefill: true,
@@ -2273,6 +2473,7 @@ impl DeviceRank {
                 Self::profile_enabled()?
             )),
             tokens_staged,
+            rewind: sparkflash_runtime::rewind().map_err(refusal)?,
             memory,
         };
         if rank.mtp.is_some() && rank.lm_head.scales.is_none() {
@@ -2588,6 +2789,7 @@ impl DeviceRank {
             logits: memory.floats(world * rows * (config.vocab_size / world))?,
             logits_host: memory.mapped(world * rows * (config.vocab_size / world) * 4)?,
             drafted: memory.mapped(rows * rows * 4)?,
+            draft_probs: memory.mapped(rows * rows * 4)?,
             step_tokens: memory.mapped(rows * 4)?,
             mtp_tokens: memory.mapped(rows * 4)?,
             picks: memory.mapped(rows * 4)?,
@@ -2620,7 +2822,7 @@ impl DeviceRank {
     /// # Errors
     /// When `capacity` is past the context window or the device refuses an allocation.
     pub fn new_sequence(&self, capacity: usize) -> Result<DeviceSequence, BackendError> {
-        self.sequence(capacity, false)
+        self.sequence(capacity, false, false)
     }
 
     /// Whether this rank loaded a DFlash 2 block drafter ([Self::load_block_drafter]).
@@ -2659,10 +2861,10 @@ impl DeviceRank {
     }
 
     /// Puts `sequence` back at position 0 with no history, the state [Self::new_sequence] opens
-    /// one in, keeping its window: a server that holds one window between requests skips the
-    /// allocation, 18.2 GiB a rank at the 1M default. As in a fresh window, only the convolution
-    /// history and the recurrent memory are cleared; the caches are read below the position only,
-    /// and a block drafter's rings are zeroed.
+    /// one in, keeping its span and its plain allocations. The lane's chunks go back to the pool
+    /// (up to 18.2 GiB a rank at the 1M default) for any sequence to grow into. As in a fresh
+    /// window, the convolution history and the recurrent memory are cleared, and the caches come
+    /// back zeroed as the next prompt grows; a block drafter's rings are zeroed.
     ///
     /// # Errors
     /// When the device refuses a copy.
@@ -2697,6 +2899,8 @@ impl DeviceRank {
                     .map_err(cuda_error)?;
             }
         }
+        // The lane's rows go back to the pool, and come back zeroed as the next prompt grows.
+        sequence.lane.release()?;
         sequence.position = 0;
         sequence.pending = None;
         sequence.logits_at = None;
@@ -2713,6 +2917,75 @@ impl DeviceRank {
         if let Some(drafter) = sequence.drafter.as_mut() {
             drafter.last = None;
         }
+        sequence.forget_point();
+        Ok(())
+    }
+
+    /// Whether this rank's sequences keep a rewind point ([Self::keep_point]): unless
+    /// [sparkflash_runtime::REWIND_ENV] is off.
+    #[must_use]
+    pub fn rewinds(&self) -> bool {
+        self.rewind
+    }
+
+    /// Keeps `sequence`'s state at its position as its rewind point ([DeviceSequence::rewind_point]):
+    /// copies, on the rank's stream, of each KDA layer's convolution history and recurrent memory
+    /// and of the MTP layer's hidden rows or the block drafter's rings. A sequence with no point (the rank keeps none) is left
+    /// as it is.
+    ///
+    /// # Errors
+    /// A sequence with a verify waiting for its commit, or a copy the device refuses (the sequence
+    /// then holds no point).
+    pub fn keep_point(&self, sequence: &mut DeviceSequence) -> Result<(), BackendError> {
+        if sequence.point.is_none() {
+            return Ok(());
+        }
+        if sequence.pending.is_some() {
+            return Err(refusal(
+                "a sequence keeps its rewind point only once its verify is committed",
+            ));
+        }
+        self.make_current()?;
+        let live = sequence.point_regions();
+        let position = sequence.position;
+        let point = sequence
+            .point
+            .as_mut()
+            .ok_or_else(|| refusal("no rewind point"))?;
+        point
+            .save(&self.cuda, Some(&self.stream), &live, position)
+            .map_err(cuda_error)?;
+        sequence.point_last = sequence.drafter.as_ref().and_then(|drafter| drafter.last);
+        Ok(())
+    }
+
+    /// Takes `sequence` back to its rewind point `point` ([Self::keep_point]): the copies back
+    /// into its KDA layers and the MTP layer's hidden rows, on the rank's stream, and its position
+    /// to the point. A verify still waiting for its commit is dropped with the rows past the point.
+    ///
+    /// # Errors
+    /// A point the sequence does not hold, or a copy the device refuses.
+    pub fn rewind(&self, sequence: &mut DeviceSequence, point: usize) -> Result<(), BackendError> {
+        if sequence.rewind_point() != Some(point) {
+            return Err(refusal(format!(
+                "the sequence holds no rewind point at position {point}"
+            )));
+        }
+        self.make_current()?;
+        let live = sequence.point_regions();
+        let kept = sequence
+            .point
+            .as_ref()
+            .ok_or_else(|| refusal("no rewind point"))?;
+        kept.restore(&self.cuda, Some(&self.stream), &live, point)
+            .map_err(cuda_error)?;
+        sequence.position = point;
+        sequence.pending = None;
+        sequence.logits_at = None;
+        sequence.confidence.clear();
+        if let Some(drafter) = sequence.drafter.as_mut() {
+            drafter.last = sequence.point_last;
+        }
         Ok(())
     }
 
@@ -2725,7 +2998,7 @@ impl DeviceRank {
         if self.mtp.is_none() {
             return Err(refusal("this rank has no MTP layer to draft with"));
         }
-        self.sequence(capacity, true)
+        self.sequence(capacity, true, false)
     }
 
     /// Load the DFlash 2 block drafter in `directory`, for [Self::new_block_drafting_sequence]:
@@ -2803,22 +3076,22 @@ impl DeviceRank {
         &self,
         capacity: usize,
     ) -> Result<DeviceSequence, BackendError> {
-        let Some(block) = &self.block else {
+        if self.block.is_none() {
             return Err(refusal(
                 "this rank has no block drafter; load_block_drafter loads one",
             ));
-        };
-        let mut sequence = self.sequence(capacity, false)?;
-        let memory = &mut sequence.memory;
-        let scratch = DraftScratch::allocate(&block.draft, MAX_ROWS, |floats| {
-            memory.floats(floats).map_err(|error| error.to_string())
-        })
-        .map_err(cuda_error)?;
-        sequence.block = Some(scratch);
-        Ok(sequence)
+        }
+        self.sequence(capacity, false, true)
     }
 
-    fn sequence(&self, capacity: usize, drafting: bool) -> Result<DeviceSequence, BackendError> {
+    /// A fresh sequence of up to `capacity` positions; `drafting` gives it the MTP layer's state
+    /// (when the rank has the layer), `block` the block drafter's (when the rank has one).
+    fn sequence(
+        &self,
+        capacity: usize,
+        drafting: bool,
+        block: bool,
+    ) -> Result<DeviceSequence, BackendError> {
         self.make_current()?;
         let config = &self.config;
         if capacity > config.max_position_embeddings {
@@ -2827,29 +3100,50 @@ impl DeviceRank {
                 config.max_position_embeddings
             )));
         }
+        let drafting = drafting && self.mtp.is_some();
+        let lanes = self.sequence_lanes(capacity, drafting)?;
+        let lane = SequenceLane {
+            lane: lane_memory::SequenceLane::reserve(&self.cuda, &lanes).map_err(cuda_error)?,
+            cuda: Arc::clone(&self.cuda),
+        };
+        let base = lane.lane.base();
+        let parts = lanes.parts();
         let mut memory = Allocations::new(Arc::clone(&self.cuda));
         let head = config.linear_head_dim;
         let history = config.linear_conv_kernel_dim.saturating_sub(1);
         let layers = self
             .layers
             .iter()
-            .map(|layer| {
-                Ok(match &layer.branch {
-                    DeviceBranch::Linear(kda) => SequenceLayer::Linear {
+            .zip(&parts.layers)
+            .map(|(layer, parts)| {
+                Ok(match (&layer.branch, parts) {
+                    (DeviceBranch::Linear(kda), _) => SequenceLayer::Linear {
                         conv: memory.bytes(history * 3 * kda.width * 4)?,
                         recurrent: memory.bytes(kda.heads * head * head * 4)?,
                         spare: memory.floats(kda.heads * head * head)?,
                     },
-                    DeviceBranch::Sparse(dsa) => self.sparse_state(&mut memory, dsa, capacity)?,
+                    (DeviceBranch::Sparse(_), Some(parts)) => parts.layer(base),
+                    (DeviceBranch::Sparse(_), None) => {
+                        return Err(refusal("a sparse layer the lane has no caches for"));
+                    }
                 })
             })
             .collect::<Result<Vec<_>, BackendError>>()?;
-        let drafter = match &self.mtp {
-            Some(mtp) if drafting => Some(SequenceDrafter {
-                layer: self.sparse_state(&mut memory, &mtp.dsa, capacity)?,
+        let drafter = match parts.mtp {
+            Some(parts) => Some(SequenceDrafter {
+                layer: parts.layer(base),
                 hidden: memory.floats(MAX_ROWS * config.hidden_size)?,
                 last: None,
             }),
+            None => None,
+        };
+        let block = match (&self.block, block) {
+            (Some(drafter), true) => Some(
+                DraftScratch::allocate(&drafter.draft, MAX_ROWS, |floats| {
+                    memory.floats(floats).map_err(|error| error.to_string())
+                })
+                .map_err(cuda_error)?,
+            ),
             _ => None,
         };
         let mut sequence = DeviceSequence {
@@ -2859,48 +3153,97 @@ impl DeviceRank {
             logits_at: None,
             layers,
             drafter,
-            block: None,
+            block,
             confidence: Vec::new(),
             memory,
+            lane,
+            point: None,
+            point_last: None,
         };
+        if self.rewind {
+            let mut sizes = Vec::new();
+            for layer in &self.layers {
+                if let DeviceBranch::Linear(kda) = &layer.branch {
+                    sizes.extend([history * 3 * kda.width * 4, kda.heads * head * head * 4]);
+                }
+            }
+            if sequence.drafter.is_some() {
+                sizes.push(MAX_ROWS * config.hidden_size * 4);
+            }
+            // The block drafter's rings hold its context by position modulo the ring, so a reply
+            // longer than a block overwrites the window before the point: the point keeps them
+            // whole.
+            if let (Some(drafter), Some(scratch)) = (&self.block, &sequence.block) {
+                sizes.push(scratch.rings_region(drafter.draft.config()).1 * 4);
+            }
+            let arena = sequence.memory.bytes(Checkpoint::arena_bytes(&sizes))?;
+            sequence.point = Some(Checkpoint::new(arena, sizes));
+        }
         self.clear(&mut sequence)?;
         Ok(sequence)
     }
 
-    /// A DSA layer's caches for `capacity` positions, the indexer's only for a layer with one.
-    fn sparse_state(
+    /// The [SequenceLanes] of sequences of `capacity` positions that draft with the MTP layer or
+    /// not, planned on first use.
+    fn sequence_lanes(
         &self,
-        memory: &mut Allocations,
-        dsa: &DeviceDsa,
         capacity: usize,
-    ) -> Result<SequenceLayer, BackendError> {
-        let config = &self.config;
-        let index_dim = config.index_head_dim;
-        // The latent is the release's E4M3 activation when the projections quantise theirs, and
-        // f32 for a BF16 release.
-        let (latent_elements, latent_scale_floats) = latent_row(config, dsa.quantise);
-        let (latent, latent_scales) = if dsa.quantise {
-            (
-                memory.bytes(capacity * latent_elements)?,
-                memory.floats(capacity * latent_scale_floats)?,
+        drafting: bool,
+    ) -> Result<Arc<SequenceLanes<LaneParts>>, BackendError> {
+        let plan = || {
+            SequenceLanes::plan(
+                &self.cuda,
+                capacity,
+                LANE_READ_PAST,
+                sparkflash_model::active_profile().runtime.lane_memory_mb,
+                |layout| {
+                    let layers = self
+                        .layers
+                        .iter()
+                        .map(|layer| match &layer.branch {
+                            DeviceBranch::Linear(_) => None,
+                            DeviceBranch::Sparse(dsa) => {
+                                Some(SparseParts::plan(layout, &self.config, dsa, capacity))
+                            }
+                        })
+                        .collect();
+                    let mtp = self
+                        .mtp
+                        .as_ref()
+                        .filter(|_| drafting)
+                        .map(|mtp| SparseParts::plan(layout, &self.config, &mtp.dsa, capacity));
+                    LaneParts { layers, mtp }
+                },
             )
-        } else {
-            (memory.floats(capacity * latent_elements)?, Deviceptr(0))
+            .map_err(refusal)
         };
-        let mut index = |floats: usize| {
-            if dsa.indexer.is_some() {
-                memory.floats(floats)
-            } else {
-                Ok(Deviceptr(0))
+        self.lanes.get((drafting, capacity), plan, |lanes| {
+            if self.layout.rank == 0 {
+                eprintln!(
+                    "[glm5] rank 0: {}sequences of {capacity} positions back their caches as they \
+                     grow: {}",
+                    if drafting { "drafting " } else { "" },
+                    lanes.describe()
+                );
             }
-        };
-        Ok(SequenceLayer::Sparse {
-            index_keys: index(capacity * index_dim)?,
-            index_gates: index(capacity * index_dim)?,
-            pooled: index(capacity / config.index_kpool * index_dim)?,
-            latent,
-            latent_scales,
         })
+    }
+
+    /// Backs `sequence`'s lane for `rows` positions and the rows past them a step reads or a
+    /// draft writes ([LANE_READ_PAST]).
+    ///
+    /// # Errors
+    /// The pool's refusal when it has too few chunks left, or a driver
+    /// failure.
+    fn back(&self, sequence: &mut DeviceSequence, rows: usize) -> Result<(), BackendError> {
+        sequence
+            .lane
+            .lane
+            .back(&self.cuda, rows)
+            .map_err(|error| match error {
+                BackError::Refused(error) => refusal(error),
+                BackError::Device(error) => cuda_error(error),
+            })
     }
 
     fn launch(
@@ -2971,33 +3314,55 @@ impl DeviceRank {
                 )
             });
             let out = output.offset(rows * first * 4);
-            // The block-scaled kernel indexes its scales a 128-column K block at a time, so a
-            // scaled part also needs the K run to be whole blocks, not just whole 32-column
-            // stages; the skinny kernel reads eight floats a lane a 256-column step.
-            let tiled = part_rows % 32 == 0
-                && columns.is_multiple_of(32)
-                && scales.is_none_or(|_| columns.is_multiple_of(FP8_BLOCK))
-                && scales.is_none_or(|_| first.is_multiple_of(FP8_BLOCK));
-            if !tiled && scales.is_none() && part_rows <= 32 && columns.is_multiple_of(256) {
-                self.launch(
-                    self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
-                    (rows.div_ceil(16) as u32, 1, 1),
-                    BLOCK,
-                    &[
-                        weight.0,
-                        input.0,
-                        out.0,
-                        part_rows as u64,
-                        columns as u64,
-                        rows as u64,
-                    ],
-                )?;
+            // A BF16 part takes what the dispatcher gives GLM's bulk walk: the wide tile where it
+            // covers the part, else the skinny kernel (at most 32 outputs over whole 256-column
+            // steps), else the tiled GEMV.
+            let Some(scales) = scales else {
+                match WidePolicy::GLM.bulk(part_rows, columns, rows) {
+                    Route::Wide => {
+                        let bf16 = if self.prefill_activation == PrefillActivation::Bf16 {
+                            self.kernels.prefill_dense_bf16_bf16a
+                        } else {
+                            self.kernels.prefill_dense_bf16
+                        };
+                        let tile =
+                            WideTile::call(weight.0, input.0, out.0, part_rows, columns, rows)
+                                .map_err(refusal)?;
+                        self.launch(bf16, tile.grid, tile.block.0, &tile.args)?;
+                    }
+                    Route::Skinny => self.launch(
+                        self.kernels.prefill_skinny[part_rows.div_ceil(8) - 1],
+                        (rows.div_ceil(16) as u32, 1, 1),
+                        BLOCK,
+                        &[
+                            weight.0,
+                            input.0,
+                            out.0,
+                            part_rows as u64,
+                            columns as u64,
+                            rows as u64,
+                        ],
+                    )?,
+                    _ => {
+                        let row = DeviceLinear {
+                            weight,
+                            scales: None,
+                            rows: part_rows,
+                            columns,
+                            parts: [part_rows; 3],
+                        };
+                        self.gemv_grouped(&row, input, out, rows)?;
+                    }
+                }
                 continue;
-            }
+            };
+            // The block-scaled kernel indexes its scales a 128-column K block at a time, so a
+            // scaled part needs the K run to be whole blocks, not just whole 32-column stages.
+            let tiled = fp8_tile_fits(part_rows, columns) && first.is_multiple_of(FP8_BLOCK);
             if !tiled {
                 let row = DeviceLinear {
                     weight,
-                    scales,
+                    scales: Some(scales),
                     rows: part_rows,
                     columns,
                     parts: [part_rows; 3],
@@ -3005,46 +3370,38 @@ impl DeviceRank {
                 self.gemv_grouped(&row, input, out, rows)?;
                 continue;
             }
-            let grid = (part_rows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1);
-            let (fp8, bf16) = if self.prefill_activation == PrefillActivation::Bf16 {
-                (
-                    self.kernels.prefill_dense_fp8_bf16a,
-                    self.kernels.prefill_dense_bf16_bf16a,
-                )
+            let grid = Fp8Tile::grid(part_rows, rows);
+            let fp8 = if self.prefill_activation == PrefillActivation::Bf16 {
+                self.kernels.prefill_dense_fp8_bf16a
             } else {
-                (
-                    self.kernels.prefill_dense_fp8,
-                    self.kernels.prefill_dense_bf16,
-                )
+                self.kernels.prefill_dense_fp8
             };
-            match scales {
-                Some(scales)
-                    if self.prefill_activation == PrefillActivation::Fp8
-                        && columns.is_multiple_of(FP8_BLOCK) =>
-                {
-                    q8_inner(columns)?;
-                    if !quantised {
-                        self.quantise(input, rows, columns)?;
-                        quantised = true;
-                    }
-                    let s = &self.scratch;
-                    self.launch(
-                        self.kernels.prefill_dense_q8,
-                        grid,
-                        BLOCK,
-                        &[
-                            weight.0,
-                            scales.0,
-                            s.q8_codes.0,
-                            s.q8_scales.0,
-                            out.0,
-                            part_rows as u64,
-                            columns as u64,
-                            rows as u64,
-                        ],
-                    )?
+            if self.prefill_activation == PrefillActivation::Fp8
+                && columns.is_multiple_of(FP8_BLOCK)
+            {
+                q8_inner(columns)?;
+                if !quantised {
+                    self.quantise(input, rows, columns)?;
+                    quantised = true;
                 }
-                Some(scales) => self.launch(
+                let s = &self.scratch;
+                self.launch(
+                    self.kernels.prefill_dense_q8,
+                    grid,
+                    BLOCK,
+                    &[
+                        weight.0,
+                        scales.0,
+                        s.q8_codes.0,
+                        s.q8_scales.0,
+                        out.0,
+                        part_rows as u64,
+                        columns as u64,
+                        rows as u64,
+                    ],
+                )?;
+            } else {
+                self.launch(
                     fp8,
                     grid,
                     BLOCK,
@@ -3057,20 +3414,7 @@ impl DeviceRank {
                         columns as u64,
                         rows as u64,
                     ],
-                )?,
-                None => self.launch(
-                    bf16,
-                    (part_rows.div_ceil(WIDE_COLUMNS) as u32, grid.1, 1),
-                    BLOCK,
-                    &[
-                        weight.0,
-                        input.0,
-                        out.0,
-                        part_rows as u64,
-                        columns as u64,
-                        rows as u64,
-                    ],
-                )?,
+                )?;
             }
         }
         Ok(())
@@ -3774,12 +4118,47 @@ impl DeviceRank {
     /// than a step's tile, never a verify (whose windows and memory a commit restores), at the
     /// head and history widths the prefill image is compiled for.
     fn bulk(&self, run: &Run<'_>) -> bool {
-        let config = &self.config;
-        !run.verify
-            && run.len > MAX_ROWS
-            && config.linear_head_dim == GDN_KEY
+        !run.verify && run.len > MAX_ROWS && self.kda_scan.is_some()
+    }
+
+    /// The bulk KDA scan this rank's plan resolves ([ScanPlan::for_architecture]), at the head
+    /// and history widths the prefill image is compiled for; `None` elsewhere, where every run
+    /// takes the token kernels.
+    ///
+    /// # Errors
+    /// A plan the rank cannot build, or one whose scan is not this rank's share.
+    fn kda_scan_plan(
+        config: &Glm5NextConfig,
+        layout: TpLayout,
+    ) -> Result<Option<ScanPlan>, BackendError> {
+        if !(config.linear_head_dim == GDN_KEY
             && config.linear_head_dim == GDN_VALUE
-            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim)
+            && (2..=CONV_HISTORY + 1).contains(&config.linear_conv_kernel_dim))
+        {
+            return Ok(None);
+        }
+        let plan = ScanPlan::for_architecture(
+            &config.architecture,
+            layout.world_size,
+            layout.rank,
+            ScanKind::Kda,
+            MAX_ROWS + 1,
+        )
+        .map_err(|error| BackendError::new("glm5_device", error.to_string()))?;
+        let heads = config.linear_num_heads / layout.world_size.max(1);
+        if let Some(scan) = &plan
+            && (scan.heads, scan.key_dim, scan.value_dim)
+                != (heads, config.linear_head_dim, GDN_VALUE)
+        {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the plan's KDA scan is {} heads of {} x {}, this rank's {heads} of {} x {}",
+                    scan.heads, scan.key_dim, scan.value_dim, config.linear_head_dim, GDN_VALUE
+                ),
+            ));
+        }
+        Ok(plan)
     }
 
     /// A bulk chunk's KDA recurrence over `len` rows of one sequence, Qwen's prefill scan with
@@ -3817,11 +4196,25 @@ impl DeviceRank {
                 groups,
             ],
         )?;
-        let (scan_grid, scan_threads) = gdn_scan_shape(heads);
+        // The plan's scan: its kernel and its grid ([ScanPlan]).
+        let launch = self
+            .kda_scan
+            .as_ref()
+            .ok_or_else(|| BackendError::new("glm5_device", "the rank's plan has no KDA scan"))?
+            .launch();
+        if launch.kernel.symbol != "q4p_kda_scan" {
+            return Err(BackendError::new(
+                "glm5_device",
+                format!(
+                    "the prefill image loads no KDA scan named {}",
+                    launch.kernel.symbol
+                ),
+            ));
+        }
         self.launch(
             self.kernels.kda_scan,
-            scan_grid,
-            scan_threads,
+            launch.grid,
+            launch.block.0,
             &[
                 s.kda_qk.0,
                 s.kda_beta.0,
@@ -4801,7 +5194,8 @@ impl DeviceRank {
     fn chunk_ready(&self, sequence: &DeviceSequence) -> bool {
         self.prefill.is_some() && (sequence.block.is_none() || self.drafting_prefill)
     }
-    /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits. A chunk
+    /// Prefill `tokens` in bulk chunks and return the last row's full-vocabulary logits
+    /// ([Self::begin_prefill], then each [Self::prefill_chunk] in turn). A chunk
     /// carries up to [DeviceRank::prefill_rows] rows through the tensor-core GEMMs and the padded
     /// routed-expert path; a prompt shorter than [MIN_PREFILL_ROWS], a rank opened with
     /// SPARKFLASH_GLM_PREFILL=0, or a sequence [Self::chunk_ready] refuses runs the token path
@@ -4817,16 +5211,45 @@ impl DeviceRank {
         sequence: &mut DeviceSequence,
         tokens: &[u32],
     ) -> Result<Vec<f32>, BackendError> {
+        let (end, width) = match self.begin_prefill(tp, gather, sequence, tokens)? {
+            Prefill::Whole(logits) => return Ok(logits),
+            Prefill::Chunks { end, width } => (end, width),
+        };
+        let mut last = Vec::new();
+        for part in tokens.chunks(width) {
+            last = self.prefill_chunk(tp, gather, sequence, part, end)?;
+        }
+        Ok(last)
+    }
+
+    /// Starts [Self::forward_prefill]'s prompt: a prompt the token path takes runs whole here;
+    /// one that takes the bulk chunks has its rows backed, and [Self::prefill_chunk] then runs its
+    /// chunks of the width answered, in order. Between two chunks the sequence holds everything
+    /// the next reads: the chunk scratch is the rank's, but each chunk fills it from the start
+    /// and commits the drafter's window rows before it ends, so a step or chunk of another
+    /// sequence between two of them carries nothing into this one.
+    ///
+    /// # Errors
+    /// As [Self::forward_prefill].
+    pub fn begin_prefill(
+        &mut self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        tokens: &[u32],
+    ) -> Result<Prefill, BackendError> {
         if tokens.is_empty() {
             return Err(refusal("an empty prompt has no logits"));
         }
         if self.prefill.is_none() || tokens.len() < MIN_PREFILL_ROWS || !self.chunk_ready(sequence)
         {
             let mut logits = self.forward_batch(tp, gather, &mut [(sequence, tokens)])?;
-            return Ok(logits
-                .pop()
-                .and_then(|mut rows| rows.pop())
-                .unwrap_or_default());
+            return Ok(Prefill::Whole(
+                logits
+                    .pop()
+                    .and_then(|mut rows| rows.pop())
+                    .unwrap_or_default(),
+            ));
         }
         self.check_sequence(sequence, tokens)?;
         if sequence.pending.is_some() {
@@ -4834,13 +5257,33 @@ impl DeviceRank {
                 "the sequence's verify is not committed; commit it before its next step",
             ));
         }
+        self.back(sequence, sequence.position + tokens.len())?;
+        self.collective(tp, gather)?;
+        Ok(Prefill::Chunks {
+            end: sequence.position + tokens.len(),
+            width: self.prefill_rows,
+        })
+    }
+
+    /// One bulk chunk of the prompt [Self::begin_prefill] started, which ends at position `end`:
+    /// `part` is its next [Prefill::Chunks] width of tokens or the rest. Answers the chunk's last
+    /// row's full-vocabulary logits.
+    ///
+    /// # Errors
+    /// As [Self::forward_prefill].
+    pub fn prefill_chunk(
+        &mut self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        part: &[u32],
+        end: usize,
+    ) -> Result<Vec<f32>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
-        let chunk = self.prefill_rows;
         // A block drafter's first block reads the prompt's last `window_left` positions: a chunk
         // captures its rows from the first of those on into the drafter's prompt rows, a scratch
         // that is otherwise the sequence's, and commits them to its context a step's rows at a
         // time, as the token path's steps would ([Dflash2Config::window_commits]).
-        let end = sequence.position + tokens.len();
         let block = match (&self.block, &sequence.block) {
             (Some(block), Some(scratch)) => {
                 let prompt = block.prompt.ok_or_else(|| {
@@ -4850,53 +5293,48 @@ impl DeviceRank {
             }
             _ => None,
         };
-        let mut last = Vec::new();
-        for part in tokens.chunks(chunk) {
-            let start = sequence.position;
-            let commits: Vec<(usize, usize, usize)> =
-                block.as_ref().map_or_else(Vec::new, |(_, config)| {
-                    config
-                        .window_commits((start, part.len()), end, MAX_ROWS)
-                        .collect()
-                });
-            let captured = commits.first().map(|&(row, _, _)| row);
-            let run = Run {
-                layers: &sequence.layers,
-                position: start,
-                first: 0,
-                len: part.len(),
-                verify: false,
-                drafter: sequence.drafter.as_ref(),
-                block: block
-                    .as_ref()
-                    .zip(captured)
-                    .map(|((scratch, _), row)| (scratch, row)),
-            };
-            self.steps = self.steps.wrapping_add(1);
-            let prefill = self
-                .prefill
-                .take()
-                .ok_or_else(|| refusal("the prefill scratch is missing"))?;
-            let decode = std::mem::replace(&mut self.scratch, prefill);
-            let result =
-                self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
-            self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
-            let rows = result?;
-            last = rows.into_iter().next().unwrap_or_default();
-            sequence.position += part.len();
-            sequence.logits_at = None;
-            if let Some(drafter) = &mut sequence.drafter {
-                // The chunk's last row is its stash's last ([Self::fill]).
-                drafter.last = Some(part.len().min(MAX_ROWS) - 1);
-            }
-            if let (Some(drafter), Some((scratch, _)), Some(captured)) =
-                (&self.block, &block, captured)
-            {
-                for (row, rows, position) in commits {
-                    drafter
-                        .draft
-                        .commit(&*self, scratch, row - captured, rows, position)?;
-                }
+        let start = sequence.position;
+        let commits: Vec<(usize, usize, usize)> =
+            block.as_ref().map_or_else(Vec::new, |(_, config)| {
+                config
+                    .window_commits((start, part.len()), end, MAX_ROWS)
+                    .collect()
+            });
+        let captured = commits.first().map(|&(row, _, _)| row);
+        let run = Run {
+            layers: &sequence.layers,
+            position: start,
+            first: 0,
+            len: part.len(),
+            verify: false,
+            drafter: sequence.drafter.as_ref(),
+            block: block
+                .as_ref()
+                .zip(captured)
+                .map(|((scratch, _), row)| (scratch, row)),
+        };
+        self.steps = self.steps.wrapping_add(1);
+        let prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| refusal("the prefill scratch is missing"))?;
+        let decode = std::mem::replace(&mut self.scratch, prefill);
+        let result = self.step::<Vec<f32>>(tp, gather, &[run], part, device_leg, HeadRows::Last);
+        self.prefill = Some(std::mem::replace(&mut self.scratch, decode));
+        let rows = result?;
+        let last = rows.into_iter().next().unwrap_or_default();
+        sequence.position += part.len();
+        sequence.logits_at = None;
+        if let Some(drafter) = &mut sequence.drafter {
+            // The chunk's last row is its stash's last ([Self::fill]).
+            drafter.last = Some(part.len().min(MAX_ROWS) - 1);
+        }
+        if let (Some(drafter), Some((scratch, _)), Some(captured)) = (&self.block, &block, captured)
+        {
+            for (row, rows, position) in commits {
+                drafter
+                    .draft
+                    .commit(&*self, scratch, row - captured, rows, position)?;
             }
         }
         Ok(last)
@@ -5159,6 +5597,10 @@ impl DeviceRank {
                     "the sequence's verify is not committed; commit it before its next step",
                 ));
             }
+        }
+        for (sequence, tokens) in batch.iter_mut() {
+            let end = sequence.position + tokens.len();
+            self.back(sequence, end)?;
         }
         let mut logits: Vec<Vec<R>> = batch
             .iter()
@@ -5503,6 +5945,28 @@ impl DeviceRank {
             .collect())
     }
 
+    /// [Self::argmax_rows], and each pick's softmax probability into `probs`, an f32 a row.
+    fn argmax_prob_rows(
+        &self,
+        rows: usize,
+        tokens: Deviceptr,
+        probs: Deviceptr,
+    ) -> Result<(), BackendError> {
+        self.launch(
+            self.kernels.argmax_prob,
+            (rows as u32, 1, 1),
+            ARGMAX_BLOCK,
+            &[
+                self.scratch.logits.0,
+                tokens.0,
+                probs.0,
+                self.layout.world_size as u64,
+                rows as u64,
+                self.lm_head.rows as u64,
+            ],
+        )
+    }
+
     /// The argmax of each of `rows` rows of the gathered logits into `tokens`, a u32 a row.
     fn argmax_rows(&self, rows: usize, tokens: Deviceptr) -> Result<(), BackendError> {
         self.launch(
@@ -5736,6 +6200,26 @@ impl DeviceRank {
         batch: &mut [(&mut DeviceSequence, u32)],
         count: usize,
     ) -> Result<Vec<Vec<u32>>, BackendError> {
+        self.draft_while(tp, gather, batch, count, None)
+    }
+
+    /// [Self::draft] of at most `count` drafts, where the MTP layer stops early: after each draft
+    /// short of `count`, `more` sees each row's probabilities so far and the layer drafts another
+    /// only while it asks for one for some row. Each pass is the same whatever `more` answers, so
+    /// a draft it lets run is the token [Self::draft] would have drafted; every rank sees the same
+    /// probabilities and stops at the same pass. Reading them waits for the stream once a pass. A
+    /// block drafter proposes its whole block in one pass and ignores `more`.
+    ///
+    /// # Errors
+    /// As [Self::draft].
+    pub fn draft_while(
+        &self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        batch: &mut [(&mut DeviceSequence, u32)],
+        count: usize,
+        mut more: Option<KeepDrafting<'_>>,
+    ) -> Result<Vec<Vec<u32>>, BackendError> {
         let device_leg = self.collective(tp, gather)?;
         if batch.iter().any(|(sequence, _)| sequence.block.is_some()) {
             return self.draft_blocks((tp, gather, device_leg), batch, count);
@@ -5792,6 +6276,8 @@ impl DeviceRank {
                 .write_at(at(0, row), &next.to_le_bytes())
                 .map_err(cuda_error)?;
         }
+        let probs_at = |iteration: usize, row: usize| (iteration * MAX_ROWS + row) * 4;
+        let mut drafted_count = count;
         for iteration in 0..count {
             self.embed_drafted(iteration, rows)?;
             if iteration == 0 {
@@ -5835,7 +6321,11 @@ impl DeviceRank {
             self.norm_rows((s.mtp_x, hidden), mtp.head_norm, (s.mtp_out, hidden), rows)?;
             if device_leg {
                 self.lm_head(tp, s.mtp_out, rows, (true, true))?;
-                self.argmax_rows(rows, s.drafted.device().offset(at(iteration + 1, 0)))?;
+                self.argmax_prob_rows(
+                    rows,
+                    s.drafted.device().offset(at(iteration + 1, 0)),
+                    s.draft_probs.device().offset(probs_at(iteration + 1, 0)),
+                )?;
             } else {
                 let logits = self.logits(tp, gather, s.mtp_out, rows, (false, true))?;
                 for (row, values) in logits.iter().enumerate() {
@@ -5844,12 +6334,37 @@ impl DeviceRank {
                     s.drafted
                         .write_at(at(iteration + 1, row), &(token as u32).to_le_bytes())
                         .map_err(cuda_error)?;
+                    s.draft_probs
+                        .write_at(
+                            probs_at(iteration + 1, row),
+                            &pick_probability(values, token).to_le_bytes(),
+                        )
+                        .map_err(cuda_error)?;
                 }
+            }
+            let Some(more) = more.as_deref_mut() else {
+                continue;
+            };
+            if iteration + 1 == count {
+                break;
+            }
+            self.cuda
+                .synchronize_stream(&self.stream)
+                .map_err(cuda_error)?;
+            let mut wanted = false;
+            for row in 0..rows {
+                let probs = Self::read_probs(&s.draft_probs, row, iteration + 1, probs_at)?;
+                wanted |= more(&probs);
+            }
+            if !wanted {
+                drafted_count = iteration + 1;
+                break;
             }
         }
         self.cuda
             .synchronize_stream(&self.stream)
             .map_err(cuda_error)?;
+        let count = drafted_count;
         let mut drafts: Vec<Vec<u32>> = vec![Vec::with_capacity(count); rows];
         let mut picked = [0u8; 4];
         for iteration in 1..=count {
@@ -5860,10 +6375,70 @@ impl DeviceRank {
                 drafted.push(u32::from_le_bytes(picked));
             }
         }
-        for (sequence, _) in batch.iter_mut() {
-            sequence.confidence.clear();
+        for (row, (sequence, _)) in batch.iter_mut().enumerate() {
+            sequence.confidence = Self::read_probs(&s.draft_probs, row, count, probs_at)?;
         }
         Ok(drafts)
+    }
+
+    /// Row `row`'s probabilities of its first `count` MTP drafts, `[1..=count][row]` of `probs`.
+    fn read_probs(
+        probs: &HostMapped,
+        row: usize,
+        count: usize,
+        at: impl Fn(usize, usize) -> usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let mut word = [0u8; 4];
+        (1..=count)
+            .map(|iteration| {
+                probs
+                    .read_at(at(iteration, row), &mut word)
+                    .map_err(cuda_error)?;
+                Ok(f32::from_le_bytes(word))
+            })
+            .collect()
+    }
+
+    /// [Self::draft_while] under `spec`'s depth rule, after `anchor`, for one sequence: the drafts
+    /// it would verify and the drafter's confidence in each draft it proposed (as many as
+    /// [DeviceSequence::draft_confidence] holds, which may be more than the drafts kept).
+    ///
+    /// The drafter proposes up to the speculator's depth within `room`; an adaptive policy stops
+    /// the MTP layer once the drafts so far are all it would verify, and cuts the chain to the
+    /// depth it picks from the proposed drafts' own confidences. Every serving shape of the arm
+    /// drafts here, so they all verify the same chains.
+    ///
+    /// # Errors
+    /// As [Self::draft].
+    pub fn draft_chain(
+        &self,
+        tp: &TpRuntime,
+        gather: &BitGatherHandle,
+        sequence: &mut DeviceSequence,
+        anchor: u32,
+        spec: &sparkflash_model::Speculator,
+        room: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
+        let count = spec.max_depth().min(room);
+        if count == 0 {
+            sequence.confidence.clear();
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut more = |probs: &[f32]| spec.depth(probs, count) >= probs.len();
+        let more: Option<KeepDrafting<'_>> = if spec.is_adaptive() {
+            Some(&mut more)
+        } else {
+            None
+        };
+        let mut drafted = {
+            let mut batch = [(&mut *sequence, anchor)];
+            self.draft_while(tp, gather, &mut batch, count, more)?
+                .pop()
+                .unwrap_or_default()
+        };
+        let confidence = sequence.draft_confidence().to_vec();
+        drafted.truncate(spec.depth(&confidence, count));
+        Ok((drafted, confidence))
     }
 
     /// [Self::draft] for block-drafting sequences: each sequence's block after its `next` runs
@@ -6100,16 +6675,32 @@ impl Drop for DeviceRank {
         if let Some(block) = &self.block {
             block.draft.free(&self.cuda);
         }
+        // A sequence still alive gives its chunks back when it goes.
+        self.lanes.drain(&self.cuda);
         self.cuda.destroy_run_stream(&self.stream);
     }
 }
 
+/// The softmax probability of `values[pick]`, as q4e_argmax_prob_slices takes it: 1 over the sum
+/// of e^(value - best), NaN values left out, and 0 when the best is not finite.
+fn pick_probability(values: &[f32], pick: usize) -> f32 {
+    let best = values.get(pick).copied().unwrap_or(f32::NAN);
+    if !best.is_finite() {
+        return 0.0;
+    }
+    let total: f32 = values
+        .iter()
+        .filter(|value| !value.is_nan())
+        .map(|value| (value - best).exp())
+        .sum();
+    if total > 0.0 { 1.0 / total } else { 0.0 }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use sparkflash_model::architecture::AttentionKind;
 
-    /// The per-position sparse caches [DeviceRank::sparse_state] allocates for `config`: every
+    /// The per-position sparse caches [SparseParts::plan] lays out for `config`: every
     /// backbone MLA layer, each layer that owns an indexer, and the MTP stage (which the device
     /// always builds with its own indexer).
     fn allocated_sparse_per_token(config: &Glm5NextConfig, quantise: bool) -> u64 {
@@ -6169,7 +6760,7 @@ mod tests {
         assert_eq!(
             crate::single_rank_kv_plan(&config).per_token(),
             allocated_sparse_per_token(&config, auto),
-            "the admitted plan and `sparse_state` agree on the tiny fixture"
+            "the admitted plan and `SparseParts::plan` agree on the tiny fixture"
         );
 
         // With a whole-tile latent the per-tensor choice changes the allocation, and the plan

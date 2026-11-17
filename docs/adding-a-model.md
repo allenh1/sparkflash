@@ -160,6 +160,84 @@ per-frame and per-batch worklists), and refuses a checkpoint whose shapes the wi
 run. A new arm composes the typed plans and implements `GemvDevice` as this guide
 describes.
 
+## 2b. The contract: a schedule plus its unique kernels
+
+An arm does not write a serving loop. It supplies a schedule (how its walk steps rows) and the
+kernels only it has; everything else is shared and named here.
+
+**The schedule** is `sparkflash_runtime::FusedArm` ([engine/03-runtime.md](engine/03-runtime.md)):
+open a slot, step a set of slots one row each, run a prompt (`begin_prompt`, `next_part` for a
+prompt split into chunks), hand back a multi-token run (`ready`, `give_back`), and say what a slot
+holds for prefix reuse (`history`). A drafting arm adds `RoundArm` (draft every chain, one verify
+walk, accept per sequence) and the runtime decides the rows each round gets (`share_rows`). A
+tensor-parallel group adds only its wire (`GroupWire`: admission, sampler and image frames);
+`GroupLanes` runs rank 0's decisions on every rank. The engine (`FusedEngine`) owns slots, the
+engine thread, admission, the prompt scheduler and reclaim.
+
+**What a new arm inherits.** Each strategy below is built once; the arm supplies the hook in the
+middle column and gets the rest. The default is what an arm that writes nothing gets, and the
+gate is the served check (`scripts/served-gate.py`, any model by port) that proves it on the arm.
+
+| strategy | the arm supplies | default without it | served gate |
+| --- | --- | --- | --- |
+| fused lanes | `step` over several slots, each row computed as alone | (required) | `lanes`, `lanes --sampled` |
+| prompt parts | `begin_prompt` / `next_part` over the chunks its prefill already runs | whole prompts | `interleave` |
+| drafting, joint rounds | `RoundArm` (open, verify) and a `StepWall` | no drafts | `lanes` |
+| multi-token runs | `ready`, `give_back` | one step a reply | `lanes` |
+| prefix reuse | `history` and `cached_tokens`, and a prefill that forwards only past the history; an arm that commits a verify at once keeps no row past the end of turn (`sparkflash_model::kept_to_end`), or its sequence runs past the reply | renewed every request | `turns` |
+| a thinking-off turn that the next turn continues | `PromptCodec::close_thinking`, only when the template writes an empty reasoning block other than DeepSeek's `</think>` (GLM appends `</think>` to the open `<think>`) | the trailing `<think>` becomes `</think>` | `turns` (plain) |
+| a reply whose text re-encodes to its ids | nothing: the host's decode holds a character a token left unfinished until the next completes it, and releases it at the end | | `turns` |
+| renewal for a prompt that does not continue | nothing: `continues` defaults to "the prompt extends the history" | | `turns` (the cold rerun is cached 0) |
+| rewind to the last prompt | `rewind_prefix` over a `sparkflash_kernels::checkpoint::Checkpoint` of the regions its caches do not hold (recurrent memory, convolution histories, a drafter's last rows, a block drafter's context rings whole, since a reply longer than a block overwrites the window before the point), saved at each prompt's end and restored when `sparkflash_runtime::resume` says `Rewind`; `continues` and the host's claim take the point by default, even while `history` names none, and the host respells a next turn that merges the point's last id (`<think>\n\n` after a held `<think>`, `\n`); `SPARKFLASH_REWIND=off` keeps none | a re-rendered reply starts cold | `turns` (think-dropped; a cut first turn) |
+| a run its caller ended early, on an arm that commits a verify at once | `give_back` that cuts the history and names none while the state is ahead: the rewind point serves the next prompt | the slot is renewed | `turns` (a cut first turn: REWOUND) |
+| shared lane memory | where each cache that grows with a sequence lies (`sparkflash_kernels::lane_memory::SequenceLanes::plan` over a `Layout`), a `SequenceLane` a sequence reserves, `back` before a forward writes rows and `room` from `SequenceLane::room`; the pool, its budget (one whole sequence, `SPARKFLASH_LANE_MEMORY_MB`), zeroing, refusals and release are the helper's | each slot owns its whole context | `lanes` |
+| a tensor-parallel group | a `GroupWire` | one rank | every gate, on the group |
+
+A hook an arm skips shows in its ledger line as off, with the reason, so the gap is visible at
+boot rather than found later.
+
+**An arm that schedules its own lanes** (Dory's recurrence ring keeps a batch on every rank at
+once, which one fused walk a step cannot) still serves through the session contract, and keeps
+conversations as the fused arms do: `reusable_prefix` names the ids its lane was fed while the
+lane holds them, `rewind_prefix` the last prompt's end, `cached_tokens` the hit, and its prefill
+takes the prompt as `sparkflash_runtime::resume` says; `park` lets go of whatever runs ahead of
+the history (Dory's guessed rows) and takes the lane out of the counts that schedule running
+lanes. The host's kept pool does the rest. Such an arm builds its own `Ledger` and prints it at
+open, so its line reads as every other arm's.
+
+**The ledger** is how an arm says what it does with that schedule. `FusedArm::ledger` returns a
+`sparkflash_runtime::Ledger` stating each strategy it runs natively, looped or off, with the
+reason; the engine adds what it decides and prints the line at boot. A strategy the arm leaves
+unstated prints as off, so an arm cannot appear to support what it does not.
+
+**Shared launch rules.** A BF16 projection's kernel comes from `sparkflash_ops::projection`:
+`route_bf16` with the arm's `WidePolicy` chooses the row GEMV, the wide tensor-core tile, the
+skinny kernel or a refusal, and `WideTile::call` gives the wide tile's grid, block and arguments.
+A new arm picks a policy (or adds one, with a gate) rather than writing its own row-count test.
+The decode GEMV's splits are `sparkflash_ops::gemv`'s. Two more tiles have their rules there: the
+split-K BF16 tile (`split_k_slices` cuts the inner dimension, the cut that decides a row's sums,
+and `SplitTile::call` gives the launch) and the block-scaled FP8 tile (`fp8_tile_fits`,
+`Fp8Tile::call`, or `Fp8Tile::grid` for a body with its own arguments), which Qwen's and GLM's FP8
+projections both launch. An arm adds only what its own operands need (alignment, a slice start).
+
+**Executed plans.** Where a typed plan carries everything its launch needs, the arm launches the
+plan instead of its own copy of the geometry: a linear-attention scan is
+`ScanPlan::for_architecture(&architecture, world, rank, kind, rows)`, the same plan the boot
+resolver checked, and the arm launches its kernel on its grid and block after checking it against
+the loaded weights' shapes. Grouped-query attention is the second: `GqaBody::choose(query_groups,
+selected, granted)` names the body (four or six heads a block, or the per-head kernel), its shared
+memory and its grid (`GqaBody::grid`), the same rule the rank's `AttentionPlan` names at boot, so
+an arm loads the bodies in `GQA_GROUP_KERNELS` and launches what `choose` says over the ones the
+device granted. MLA attention, the routed experts, the indexer and the residual mixers still
+launch from the arm's load-time geometry, because their plans do not yet carry the cache layouts,
+work lists and split cuts those launches take. A new arm should launch the scan and GQA attention
+from the plan and the rest through the shared helpers in section 5, and should not add a new
+parallel launch rule for a part another arm already runs.
+
+**What stays in the arm**: its weights' layout and loader, the kernels unique to the model
+(Inkling's convolutions and relative attention, Engram, Dory's loop pipeline), its sampler wire,
+and the order of its layer walk.
+
 ## 3. Configuration
 
 Every arm has one typed TOML profile:
@@ -170,6 +248,7 @@ Every arm has one typed TOML profile:
 | GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/config/glm53_flash.toml` |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml` |
 | NVIDIA Nemotron Labs Dory1.0-4B (BF16) | `crates/sparkflash-model-dory/config/dory1_0_4b_bf16.toml` |
+| thinkingmachines/Inkling-2-Small (NVFP4) | `crates/sparkflash-model-inkling2/config/inkling2_small.toml` |
 
 The FP8 release shares that profile: the switches select arithmetic, and the one difference
 between the two Qwen checkpoints is the routed experts' storage (`ExpertQuant`), which the
@@ -276,6 +355,7 @@ the mechanism there; never copy it into the arm.
 | a routed-expert plan (count by expert, order the slots, cut items) | `kernels/moe_plan_sm121.cu`, `Image::MoePlan`; every arm launches it rather than carrying its own counting pass |
 | model id to checkpoint (the Hugging Face cache) | `sparkflash_weights::hub` |
 | `--synthetic` prompts without a tokenizer | `sparkflash_ops::codec::ByteCodec` |
+| a chat message's role, with OpenAI's `developer` folded onto `system` | `sparkflash_model::prompt::{message_role, template_role}`; a renderer reads every role through it |
 | `config.json` errors and a field that is one value or a list | `sparkflash_model::config::{ConfigError, OneOrMany}` |
 | an arm that renders every text channel (tools, thinking, reasoning effort) | `Capabilities::ALL`; forced decoding is the driver's, which the host and TP drivers add |
 | a tensor's byte length against its slot | `sparkflash_weights::weights::check_length` |
@@ -285,7 +365,8 @@ the mechanism there; never copy it into the arm.
 | the descriptor a pack reports (window and vocabulary from the checkpoint) | `sparkflash_model::arm::PackIdentity` |
 | a session's KV claim and the `--concurrency`/`--kv-budget-gib` admission | `sparkflash_model::arm::KvPlan`, printed and refused by `pack::admit` |
 | which drafts a verify keeps, the tokens it queues, the depth, the counters | `sparkflash_model::spec::{verdict, Queue, Speculator}` |
-| sessions stepped together as one pass over the weights (`--fuse-batch`) | `sparkflash_model::fused::{FusedArm, FusedEngine}` |
+| sessions stepped together as one pass over the weights (`--fuse-batch`), lanes and multi-token runs | `sparkflash_runtime::{FusedArm, FusedEngine}` ([engine/03-runtime.md](engine/03-runtime.md)) |
+| several sequences' drafts verified in one walk, and the rows each is given | `sparkflash_runtime::{RoundArm, run_round, share_rows, StepWall}` |
 | splitting a streamed answer into text and `<tool_call>` bodies | `sparkflash_api::tool_block::BlockSplitter` (the family parses the body) |
 | deterministic fixture weights and hash-table sizes | `sparkflash_weights::rng::{splitmix64, is_prime}` |
 
@@ -295,9 +376,11 @@ is a `KvPlan` derived from its own geometry, and its speculative path is `spec`'
 one verify decides what survives, and the queue hands the rest back one token at a time. The shared driver then finds the checkpoint
 (`--checkpoint`, the hub cache or the fixture), derives the context on every rank of a group from
 the same configuration, and refuses at parse time any option the arm does not apply
-(`Pack::unapplied`): a group serves one request at a time, so `--concurrency`, `--fuse-batch` and
-`--kv-budget-gib` are refused there, and an arm without a fused batch or a KV budget says so at
-TP=1. A directory of rank files named by an environment variable resolves through
+(`Pack::unapplied`). A group whose arm opens lanes (`PackArm::OPEN_LANES`: GLM's and Qwen's)
+steps four fused lanes by default (`--fuse-batch --concurrency N` for another count,
+`--concurrency 1` for one request at a time); a group whose arm opens none serves one request at a
+time and refuses `--concurrency` and `--fuse-batch`. `--kv-budget-gib` is refused in any group,
+and an arm without a fused batch or a KV budget says so at TP=1. A directory of rank files named by an environment variable resolves through
 `converted_rank_file`, which refuses a directory that holds no file for the rank.
 
 ## 6. Checklist
@@ -310,7 +393,14 @@ TP=1. A directory of rank files named by an environment variable resolves throug
 - [ ] nothing in section 5 is reimplemented in the arm;
 - [ ] no `.cu`/`.cuh` and no kernel build script in the model crate;
 - [ ] no dependency on another model crate;
-- [ ] every op is a plan, validated before its first launch;
+- [ ] every op is a plan, validated before its first launch, and the scan launches the rank
+      plan's `ScanPlan` (section 2b);
+- [ ] the arm serves through `FusedArm` (and `RoundArm` to draft), and its ledger states every
+      strategy it runs, so the boot line shows none as `the arm does not state it`;
+- [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`; a split-K or
+      FP8 tile launches through `SplitTile` / `Fp8Tile`, and GQA attention through `GqaBody`;
+- [ ] `scripts/served-gate.py all PORT --long FILE` passes on the served arm, and its `lanes` and
+      `interleave` digests are kept (`--out`) as the baseline the next build must equal;
 - [ ] the parity harness passes layer by layer against the host reference;
 - [ ] new environment aliases are in `ENV_OVERRIDES` and documented here;
 - [ ] the arm is registered in the model registry and has a descriptor;

@@ -319,6 +319,11 @@ impl DeviceSequence {
         debug_assert_eq!(count, rest.len() + 1);
         debug_assert_eq!(rows.iter().sum::<usize>(), tokens.len());
         let total = tokens.len();
+        // Every member's lane backs the rows its slice writes, before anything is queued.
+        self.back(self.position + rows[0])?;
+        for (member, width) in rest.iter_mut().zip(&rows[1..]) {
+            member.back(member.position + width)?;
+        }
         // Where each member's rows start, in the combined scratch and in the token list.
         let mut offsets = Vec::with_capacity(count);
         let mut running = 0usize;

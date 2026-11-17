@@ -22,9 +22,9 @@
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model_qwen4_exp::device::{
-    ATTN_GROUP_KERNELS, ATTN_GROUP_SELECTED, MAX_SELECTED_TOKENS, attn_group_shared_bytes,
-    cubin_available, embedded_attn_cubin,
+    MAX_SELECTED_TOKENS, cubin_available, embedded_attn_cubin,
 };
+use sparkflash_ops::attention::{GQA_GROUP_KERNELS, GQA_GROUP_SELECTED, gqa_group_shared_bytes};
 
 fn open() -> Option<Cuda> {
     if !cubin_available() {
@@ -186,17 +186,17 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
         "q4e_attn left an output unwritten"
     );
     let mut checked = 0;
-    for (group, name) in ATTN_GROUP_KERNELS {
+    for (group, name) in GQA_GROUP_KERNELS {
         if !groups.is_multiple_of(group) {
             continue;
         }
         checked += 1;
         let (_, kernel) = cuda
-            .load_named_shared(embedded_attn_cubin(), name, attn_group_shared_bytes(group))
+            .load_named_shared(embedded_attn_cubin(), name, gqa_group_shared_bytes(group))
             .unwrap_or_else(|error| panic!("the cubin carries {name}: {error}"));
         let grouped = run(kernel, group);
         for (token, &selected) in counts.iter().enumerate() {
-            if selected > ATTN_GROUP_SELECTED {
+            if selected > GQA_GROUP_SELECTED {
                 continue;
             }
             for head in 0..heads {
@@ -238,7 +238,7 @@ fn the_grouped_attention_matches_the_per_head_kernel_at_the_released_shape() {
             700,
             2047,
             2051,
-            ATTN_GROUP_SELECTED,
+            GQA_GROUP_SELECTED,
             MAX_SELECTED_TOKENS,
         ],
     );
@@ -254,7 +254,7 @@ fn the_grouped_attention_matches_the_per_head_kernel_at_a_four_rank_share() {
             head_dim: 256,
             context: 9000,
         },
-        &[0, 1, 700, 2051, ATTN_GROUP_SELECTED, MAX_SELECTED_TOKENS],
+        &[0, 1, 700, 2051, GQA_GROUP_SELECTED, MAX_SELECTED_TOKENS],
     );
 }
 
@@ -332,9 +332,9 @@ fn bench_the_attention_kernels() {
         let counts = upload_i32(&cuda, &vec![count as i32; rows]);
         let out = upload_f32(&cuda, &vec![0.0; rows * width]);
         let mut line = format!("rows {rows:>3} selected {count}:");
-        let grouped = ATTN_GROUP_KERNELS
+        let grouped = GQA_GROUP_KERNELS
             .iter()
-            .map(|&(group, name)| (group, name, attn_group_shared_bytes(group)));
+            .map(|&(group, name)| (group, name, gqa_group_shared_bytes(group)));
         for (group, name, shared) in std::iter::once((1, "q4e_attn", 0)).chain(grouped) {
             let (_, kernel) = cuda
                 .load_named_shared(embedded_attn_cubin(), name, shared)

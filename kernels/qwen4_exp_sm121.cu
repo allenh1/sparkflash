@@ -372,11 +372,62 @@ extern "C" __global__ void q4e_argmax_slices(const float* __restrict__ logits,
     }
 }
 
+// q4e_argmax_slices, and the pick's softmax probability into probs[blockIdx.x]: 1 / sum_j
+// e^(logit_j - best), NaN logits left out. The token is the one q4e_argmax_slices writes, so a
+// draft that reports how sure it is drafts the same tokens. A row whose best is not finite (all
+// NaN, or an infinity) reports 0, which a depth policy reads as no confidence.
+extern "C" __global__ void q4e_argmax_prob_slices(const float* __restrict__ logits,
+                                                  int* __restrict__ tokens,
+                                                  float* __restrict__ probs, int world, int rows,
+                                                  int local) {
+    OPT_PDL_ENTRY();
+    __shared__ float shared_value[32];
+    __shared__ int shared_index[32];
+    __shared__ float scratch[1024];
+    const int row = blockIdx.x;
+    float value = -INFINITY;
+    int index = 0x7FFFFFFF;
+    for (int rank = 0; rank < world; ++rank) {
+        const float* slice = logits + ((unsigned long long)rank * rows + row) * local;
+#pragma unroll 4
+        for (int j = threadIdx.x; j < local; j += blockDim.x) {
+            q4e_take_better(slice[j], rank * local + j, &value, &index);
+        }
+    }
+    q4e_block_best(&value, &index, shared_value, shared_index);
+    float total = 0.0f;
+    if (isfinite(value)) {
+        for (int rank = 0; rank < world; ++rank) {
+            const float* slice = logits + ((unsigned long long)rank * rows + row) * local;
+#pragma unroll 4
+            for (int j = threadIdx.x; j < local; j += blockDim.x) {
+                const float logit = slice[j];
+                total += isnan(logit) ? 0.0f : __expf(logit - value);
+            }
+        }
+    }
+    total = q4e_block_sum(total, scratch);
+    if (threadIdx.x == 0) {
+        tokens[row] = isnan(logits[(unsigned long long)row * local]) ? 0 : index;
+        probs[row] = (isfinite(value) && total > 0.0f) ? 1.0f / total : 0.0f;
+    }
+}
+
 // y = W x, with W in BF16 [rows, columns] and x/y in f32 ([batch, columns] -> [batch, rows]).
+//
+// The grid's y dimension carries independent groups of `batch` tokens: group blockIdx.y reads
+// the activations at token blockIdx.y * batch and writes the outputs there, and nothing else
+// about the walk changes, so every (row, token) sum is the one a launch of that group alone
+// computes. A one-group launch (gridDim.y = 1, every caller before this) is unchanged. It is how
+// a chunk of thousands of tokens runs a projection too narrow for the tensor-core tile (a dozen
+// output rows) as one launch instead of a launch per eight tokens on one or two blocks.
 extern "C" __global__ void q4e_gemv_bf16(const __nv_bfloat16* __restrict__ w,
                                          const float* __restrict__ x, float* __restrict__ y,
                                          int rows, int columns, int batch) {
     OPT_PDL_ENTRY();
+    const unsigned long long group = (unsigned long long)blockIdx.y * (batch > 1 ? batch : 1);
+    x += group * columns;
+    y += group * rows;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
@@ -514,6 +565,327 @@ extern "C" __global__ void q4e_gemv4_bf16(
                     }
                 }
             }
+        }
+    }
+}
+
+// The packed BF16 form (kernels/bf16_packed_sm121.cuh): its walks repeat q4e_dot_chunk's sums
+// above, so it is included after them.
+#include "bf16_packed_sm121.cuh"
+
+// One half of a batch's tokens: the first ceil(batch / 2), or the rest. A batched packed walk
+// takes a pair of rows against one half, so it holds Q4E_HALF_BATCH sums a row.
+#define Q4E_HALF_BATCH ((Q4E_MAX_BATCH + 1) / 2)
+struct Q4eBatchHalf {
+    int first;
+    int count;
+};
+__device__ __forceinline__ Q4eBatchHalf q4e_batch_half(int batch, int which) {
+    const int lower = (batch + 1) / 2;
+    return which == 0 ? Q4eBatchHalf{0, lower} : Q4eBatchHalf{lower, batch - lower};
+}
+
+// q4e_gemv_bf16 over a packed matrix: the same rows a warp, the same groups along the grid's y,
+// the same sums over the same words, from the packed bytes. Columns are a multiple of 256 and x
+// is 16-byte aligned (the host refuses anything else: there is no column walk to fall back on).
+extern "C" __global__ void q4e_gemv_packed(const unsigned char* __restrict__ w,
+                                           const unsigned int* __restrict__ offsets,
+                                           const unsigned int* __restrict__ entries,
+                                           const float* __restrict__ x, float* __restrict__ y,
+                                           int rows, int columns, int batch,
+                                           unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const unsigned long long group = (unsigned long long)blockIdx.y * (batch > 1 ? batch : 1);
+    x += group * columns;
+    y += group * rows;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int stride = gridDim.x * warps;
+    if (batch <= 1) {
+        for (int row = blockIdx.x * warps + warp; row < rows; row += stride) {
+            const Q4ePackedRow packed = q4e_packed_row(w, offsets, entries, row, columns, row_bytes);
+            float total = q4e_packed_row_dot(packed, x, columns, lane);
+            total = q4e_warp_sum(total);
+            if (lane == 0) {
+                y[row] = total;
+            }
+        }
+        return;
+    }
+    if (batch > Q4E_MAX_BATCH) {
+        return;
+    }
+    // A work item is a pair of rows and one half of the tokens, so the grid's one warp a row
+    // all work, each with half the sums in flight. The weights' second read is the first's
+    // block's, from L1; a (row, token) sum is the same walk either way.
+    for (int item = blockIdx.x * warps + warp; item < ((rows + 1) / 2) * 2; item += stride) {
+        const int row = (item >> 1) * 2;
+        const Q4eBatchHalf half = q4e_batch_half(batch, item & 1);
+        const bool second = row + 1 < rows;
+        const Q4ePackedRow pair[2] = {
+            q4e_packed_row(w, offsets, entries, row, columns, row_bytes),
+            q4e_packed_row(w, offsets, entries, second ? row + 1 : row, columns, row_bytes)};
+        float totals[2][Q4E_HALF_BATCH];
+        const float* __restrict__ xh = x + (unsigned long long)half.first * columns;
+        q4e_packed_rows_dot_batch<2, Q4E_HALF_BATCH>(pair, xh, columns, lane, half.count, totals);
+#pragma unroll
+        for (int t = 0; t < Q4E_HALF_BATCH; ++t) {
+            if (t < half.count) {
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
+                const unsigned long long token = (unsigned long long)(half.first + t);
+                if (lane == 0) {
+                    y[token * rows + row] = first_sum;
+                    if (second) {
+                        y[token * rows + row + 1] = second_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Where q4e_gemv4_packed's row `global_row` of the four matrices stacked lands, as
+// q4e_gemv4_locate places it: its packed row, its output, its row there and that output's rows.
+__device__ __forceinline__ void q4e_gemv4_packed_locate(
+    int global_row, const unsigned char* const (&w)[4], const unsigned int* const (&offsets)[4],
+    const unsigned int* const (&entries)[4], float* const (&y)[4], const int (&r)[4], int columns,
+    unsigned long long row_bytes, Q4ePackedRow* row, float** out, int* local_row,
+    int* out_rows) {
+    // Constant indices in every branch, so the four-pointer arrays stay in registers.
+    const int r01 = r[0] + r[1];
+    const int r012 = r01 + r[2];
+    if (global_row < r[0]) {
+        *local_row = global_row;
+        *out_rows = r[0];
+        *out = y[0];
+        *row = q4e_packed_row(w[0], offsets[0], entries[0], *local_row, columns, row_bytes);
+    } else if (global_row < r01) {
+        *local_row = global_row - r[0];
+        *out_rows = r[1];
+        *out = y[1];
+        *row = q4e_packed_row(w[1], offsets[1], entries[1], *local_row, columns, row_bytes);
+    } else if (global_row < r012) {
+        *local_row = global_row - r01;
+        *out_rows = r[2];
+        *out = y[2];
+        *row = q4e_packed_row(w[2], offsets[2], entries[2], *local_row, columns, row_bytes);
+    } else {
+        *local_row = global_row - r012;
+        *out_rows = r[3];
+        *out = y[3];
+        *row = q4e_packed_row(w[3], offsets[3], entries[3], *local_row, columns, row_bytes);
+    }
+}
+
+// q4e_gemv4_bf16 over four packed matrices that read the same x: each row's sum is the one
+// q4e_gemv_packed (and so q4e_gemv_bf16) gives it.
+extern "C" __global__ void q4e_gemv4_packed(
+    const unsigned char* __restrict__ w0, const unsigned char* __restrict__ w1,
+    const unsigned char* __restrict__ w2, const unsigned char* __restrict__ w3,
+    const unsigned int* __restrict__ o0, const unsigned int* __restrict__ o1,
+    const unsigned int* __restrict__ o2, const unsigned int* __restrict__ o3,
+    const unsigned int* __restrict__ e0, const unsigned int* __restrict__ e1,
+    const unsigned int* __restrict__ e2, const unsigned int* __restrict__ e3,
+    const float* __restrict__ x, float* __restrict__ y0, float* __restrict__ y1,
+    float* __restrict__ y2, float* __restrict__ y3, int r0, int r1, int r2, int r3, int columns,
+    int batch, unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const unsigned char* const w[4] = {w0, w1, w2, w3};
+    const unsigned int* const offsets[4] = {o0, o1, o2, o3};
+    const unsigned int* const entries[4] = {e0, e1, e2, e3};
+    float* const y[4] = {y0, y1, y2, y3};
+    const int r[4] = {r0, r1, r2, r3};
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int stride = gridDim.x * warps;
+    const int total_rows = r0 + r1 + r2 + r3;
+    if (batch <= 1) {
+        for (int global_row = blockIdx.x * warps + warp; global_row < total_rows;
+             global_row += stride) {
+            Q4ePackedRow row;
+            float* out;
+            int local_row;
+            int out_rows;
+            q4e_gemv4_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                    &row, &out, &local_row, &out_rows);
+            float total = q4e_packed_row_dot(row, x, columns, lane);
+            total = q4e_warp_sum(total);
+            if (lane == 0) {
+                out[local_row] = total;
+            }
+        }
+        return;
+    }
+    if (batch > Q4E_MAX_BATCH) {
+        return;
+    }
+    // Work items as in q4e_gemv_packed: a pair of rows and one half of the tokens.
+    for (int item = blockIdx.x * warps + warp; item < ((total_rows + 1) / 2) * 2;
+         item += stride) {
+        const int global_row = (item >> 1) * 2;
+        const Q4eBatchHalf half = q4e_batch_half(batch, item & 1);
+        const bool second = global_row + 1 < total_rows;
+        Q4ePackedRow pair[2];
+        float* out[2];
+        int local_row[2];
+        int out_rows[2];
+        q4e_gemv4_packed_locate(global_row, w, offsets, entries, y, r, columns, row_bytes,
+                                &pair[0], &out[0], &local_row[0], &out_rows[0]);
+        q4e_gemv4_packed_locate(second ? global_row + 1 : global_row, w, offsets, entries, y, r,
+                                columns, row_bytes, &pair[1], &out[1], &local_row[1],
+                                &out_rows[1]);
+        float totals[2][Q4E_HALF_BATCH];
+        const float* __restrict__ xh = x + (unsigned long long)half.first * columns;
+        q4e_packed_rows_dot_batch<2, Q4E_HALF_BATCH>(pair, xh, columns, lane, half.count, totals);
+#pragma unroll
+        for (int t = 0; t < Q4E_HALF_BATCH; ++t) {
+            if (t < half.count) {
+                const float first_sum = q4e_warp_sum(totals[0][t]);
+                const float second_sum = q4e_warp_sum(totals[1][t]);
+                const unsigned long long token = (unsigned long long)(half.first + t);
+                if (lane == 0) {
+                    out[0][token * out_rows[0] + local_row[0]] = first_sum;
+                    if (second) {
+                        out[1][token * out_rows[1] + local_row[1]] = second_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Packs `rows` BF16 rows (columns a multiple of 256) a warp a row. With `packed` null it only
+// counts: counts[row] = the row's escapes. Otherwise it writes the packed rows `row_bytes` apart
+// and each row's escapes from entries[offsets[row]] on, in walk order. Offsets and counts are the
+// caller's for these rows (it offsets the pointers to a group's first row).
+extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ source,
+                                         unsigned char* __restrict__ packed,
+                                         const unsigned int* __restrict__ offsets,
+                                         unsigned int* __restrict__ entries,
+                                         unsigned int* __restrict__ counts, int rows, int columns,
+                                         unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int chunks = columns >> 3;
+    for (int row = blockIdx.x * warps + warp; row < rows; row += gridDim.x * warps) {
+        const unsigned short* src = source + (unsigned long long)row * columns;
+        unsigned char* a = packed != nullptr ? packed + (unsigned long long)row * row_bytes : nullptr;
+        unsigned char* b = a != nullptr ? a + columns : nullptr;
+        unsigned char* c = b != nullptr ? b + columns / 2 : nullptr;
+        unsigned int written = packed != nullptr ? offsets[row] : 0u;
+        unsigned int escapes = 0;
+        int chunk = lane;
+        int step = 0;
+        unsigned long long a_off = 0;
+        while (chunk < chunks) {
+            const int n = chunk + 96 < chunks ? 4 : (chunk + 32 < chunks ? 2 : 1);
+            unsigned short words[32];
+            unsigned int top = 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (j < n) {
+                    const uint4 value =
+                        *reinterpret_cast<const uint4*>(src + (chunk + 32 * j) * 8);
+                    const unsigned int parts[4] = {value.x, value.y, value.z, value.w};
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const unsigned short word =
+                            (unsigned short)((k & 1) ? parts[k >> 1] >> 16 : parts[k >> 1] & 0xFFFFu);
+                        words[j * 8 + k] = word;
+                        top = max(top, (unsigned int)(word >> 7) & 0xFFu);
+                    }
+                }
+            }
+            unsigned int mine = 0;
+#pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < n * 8 && top - ((words[i] >> 7) & 0xFFu) >= Q4E_PACKED_ESCAPE) {
+                    ++mine;
+                }
+            }
+            // Each lane's escapes go after the lower lanes' at this step, so the list is in walk
+            // order whatever the warp's timing.
+            unsigned int before = mine;
+#pragma unroll
+            for (int delta = 1; delta < 32; delta <<= 1) {
+                const unsigned int up = __shfl_up_sync(0xFFFFFFFFu, before, delta);
+                if (lane >= delta) {
+                    before += up;
+                }
+            }
+            const unsigned int step_total = __shfl_sync(0xFFFFFFFFu, before, 31);
+            before -= mine;
+            if (a != nullptr) {
+                unsigned int at = written + before;
+                unsigned char* a_lane = a + a_off + (unsigned long long)lane * n * 8;
+                unsigned char* b_lane = b + a_off / 2 + (unsigned long long)lane * n * 4;
+                for (int j = 0; j < n; ++j) {
+                    unsigned int nib = 0;
+                    for (int k = 0; k < 8; ++k) {
+                        const unsigned short word = words[j * 8 + k];
+                        unsigned int off = top - ((word >> 7) & 0xFFu);
+                        if (off >= Q4E_PACKED_ESCAPE) {
+                            off = Q4E_PACKED_ESCAPE;
+                            const unsigned int column = (unsigned int)((chunk + 32 * j) * 8 + k);
+                            entries[at++] = (column << 16) | word;
+                        }
+                        a_lane[j * 8 + k] = (unsigned char)(((word >> 8) & 0x80u) | (word & 0x7Fu));
+                        nib |= off << ((k & 3) * 8 + (k >> 2) * 4);
+                    }
+                    *reinterpret_cast<unsigned int*>(b_lane + j * 4) = nib;
+                }
+                c[step * 32 + lane] = (unsigned char)top;
+            }
+            written += step_total;
+            escapes += step_total;
+            a_off += 32ull * n * 8;
+            chunk += 32 * n;
+            ++step;
+        }
+        if (a != nullptr) {
+            const int used = columns + columns / 2 + 32 * step;
+            for (int p = used + lane; p < (int)row_bytes; p += 32) {
+                a[p] = 0;
+            }
+        } else if (lane == 0) {
+            counts[row] = escapes;
+        }
+    }
+}
+
+// Rebuilds `rows` packed rows a warp a row: into `out` as BF16 when it is not null, and against
+// `expected` when that is not null, adding the differing words to *differ. Offsets are the
+// caller's for these rows.
+extern "C" __global__ void q4e_unpack_bf16(const unsigned char* __restrict__ packed,
+                                           const unsigned int* __restrict__ offsets,
+                                           const unsigned int* __restrict__ entries,
+                                           unsigned short* __restrict__ out,
+                                           const unsigned short* __restrict__ expected,
+                                           unsigned int* __restrict__ differ, int rows,
+                                           int columns, unsigned long long row_bytes) {
+    OPT_PDL_ENTRY();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (int row = blockIdx.x * warps + warp; row < rows; row += gridDim.x * warps) {
+        const Q4ePackedRow rows_of[1] = {
+            q4e_packed_row(packed, offsets, entries, row, columns, row_bytes)};
+        Q4ePackedWords words{
+            out != nullptr
+                ? reinterpret_cast<uint4*>(out + (unsigned long long)row * columns)
+                : nullptr,
+            expected != nullptr
+                ? reinterpret_cast<const uint4*>(expected + (unsigned long long)row * columns)
+                : nullptr,
+            0u};
+        q4e_packed_walk<1>(rows_of, columns, lane, words);
+        if (words.differ != 0) {
+            atomicAdd(differ, words.differ);
         }
     }
 }
@@ -1051,58 +1423,116 @@ extern "C" __global__ void q4e_shared_gate_up(
     }
 }
 
+// The values one thread of q4e_rmsnorm holds between its two passes: offsets t, t + blockDim.x,
+// ... of its group. A group wider than this many a thread takes the unheld walk.
+#define Q4E_NORM_HELD 32
+// The narrowest group q4e_rmsnorm_rows holds. Below it the held walk's fixed Q4E_NORM_HELD steps
+// cost more than the dependent loads they save (a 128-wide head's norm measured 4 us unheld, 10
+// held), so per-head and indexer-width groups keep the unheld walk; hidden-width rows (Inkling's
+// 4608, Qwen's 5120, GLM's 7168) measured as fast or faster held. Both walks give the same bits.
+#define Q4E_NORM_ROWS_HELD_MIN 2048
+
+// One group's RMSNorm: dst[i] = src[i] * rsqrt(mean(src^2) + eps) * (zero_centred ? 1 + w : w)
+// for i < group, the gain w = weight[weight_per_group ? i : (weight_start + i) % width]. The
+// caller has run OPT_PDL_LAUNCH; this waits on the previous grid once it has what it can read
+// before it.
+//
+// A thread loads its gains (constant weights) before the previous grid has finished, then holds
+// its values from the sum to the scaling, so a decode norm pays one cold weight load overlapped
+// with the kernel before it instead of a dependent one an element. The arithmetic is the unheld
+// walk's: the same sum in the same order, the same block tree, the same products. `hold` false,
+// or a group wider than Q4E_NORM_HELD a thread, takes the unheld walk. src and dst may be the same
+// row.
+__device__ __forceinline__ void q4e_rmsnorm_group(const float* src,
+                                                  const __nv_bfloat16* __restrict__ weight,
+                                                  float* dst, int weight_start, int width,
+                                                  int group, float eps, int zero_centred,
+                                                  int weight_per_group, bool hold, float* scratch) {
+    if (!hold || group > Q4E_NORM_HELD * (int)blockDim.x) {
+        OPT_PDL_WAIT();
+        float sum = 0.0f;
+        for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
+            float value = src[offset];
+            sum += value * value;
+        }
+        float mean = q4e_block_sum(sum, scratch) / group;
+        float scale = rsqrtf(mean + eps);
+        for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
+            float gain =
+                __bfloat162float(weight[weight_per_group ? offset : ((weight_start + offset) % width)]);
+            dst[offset] = src[offset] * scale * (zero_centred ? (1.0f + gain) : gain);
+        }
+        return;
+    }
+    float gains[Q4E_NORM_HELD];
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            const float gain =
+                __bfloat162float(weight[weight_per_group ? offset : ((weight_start + offset) % width)]);
+            gains[k] = zero_centred ? (1.0f + gain) : gain;
+        }
+    }
+    OPT_PDL_WAIT();
+    float held[Q4E_NORM_HELD];
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            held[k] = src[offset];
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            sum += held[k] * held[k];
+        }
+    }
+    float mean = q4e_block_sum(sum, scratch) / group;
+    float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int k = 0; k < Q4E_NORM_HELD; ++k) {
+        const int offset = threadIdx.x + k * blockDim.x;
+        if (offset < group) {
+            dst[offset] = held[k] * scale * gains[k];
+        }
+    }
+}
+
 // out = x * rsqrt(mean(x^2) per group + eps) * (zero_centred ? 1 + w : w).
 // weight_per_group == 0 reads a width-element weight per token; otherwise the weight repeats every
-// group.
+// group. See q4e_rmsnorm_group.
 extern "C" __global__ void q4e_rmsnorm(const float* x, const __nv_bfloat16* __restrict__ weight,
                                        float* out, int width, int group, float eps,
                                        int zero_centred, int weight_per_group) {
+    // The row it normalises was written by the previous grid: wait for it before the loads.
     OPT_PDL_ENTRY();
-    int start = blockIdx.x * group;
-    float sum = 0.0f;
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        float value = x[start + offset];
-        sum += value * value;
-    }
+    const int start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
-    float mean = q4e_block_sum(sum, scratch) / group;
-    float scale = rsqrtf(mean + eps);
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        int index = start + offset;
-        float gain = __bfloat162float(weight[weight_per_group ? offset : (index % width)]);
-        out[index] = x[index] * scale * (zero_centred ? (1.0f + gain) : gain);
-    }
+    q4e_rmsnorm_group(x + start, weight, out + start, start, width, group, eps, zero_centred,
+                      weight_per_group, true, scratch);
 }
 
 // RMSNorm over a row-strided buffer: blockIdx.x is the group inside the row, blockIdx.y the row.
 // The dense q4e_rmsnorm numbers its groups consecutively over one flat buffer; this one keeps a
 // source and a destination stride, which is what the indexer needs (its query occupies the first
-// index_heads * index_dim floats of a wider per-token row).
+// index_heads * index_dim floats of a wider per-token row). A row's group is q4e_rmsnorm's walk
+// and bits for that group (q4e_rmsnorm_group), its gains read from the group's place in the row.
 extern "C" __global__ void q4e_rmsnorm_rows(const float* x, const __nv_bfloat16* __restrict__ weight,
                                             float* out, int width, int group, float eps,
                                             int zero_centred, int weight_per_group,
                                             int src_stride, int dst_stride) {
+    // The rows it normalises were written by the previous grid: wait for them before the loads.
     OPT_PDL_ENTRY();
     const int row = blockIdx.y;
-    const int dst_row = row * dst_stride;
-    const int src_row = row * src_stride;
-    const int group_index = blockIdx.x;
-    const int src_start = src_row + group_index * group;
-    const int dst_start = dst_row + group_index * group;
-    float sum = 0.0f;
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        float value = x[src_start + offset];
-        sum += value * value;
-    }
+    const int group_start = blockIdx.x * group;
     __shared__ float scratch[Q4E_BLOCK];
-    float mean = q4e_block_sum(sum, scratch) / group;
-    float scale = rsqrtf(mean + eps);
-    for (int offset = threadIdx.x; offset < group; offset += blockDim.x) {
-        int index = dst_start + offset;
-        int weight_index = weight_per_group ? offset : (group_index * group + offset) % width;
-        float gain = __bfloat162float(weight[weight_index]);
-        out[index] = x[src_start + offset] * scale * (zero_centred ? (1.0f + gain) : gain);
-    }
+    q4e_rmsnorm_group(x + row * src_stride + group_start, weight,
+                      out + row * dst_stride + group_start, group_start, width, group, eps,
+                      zero_centred, weight_per_group, group >= Q4E_NORM_ROWS_HELD_MIN, scratch);
 }
 
 

@@ -6,7 +6,7 @@ model once and copies it over, and converts the weights. Then it starts, stops a
 cluster. Everything it does is a command run on the lead, or over SSH on the others, and
 `sparkflash.toml` holds the result.
 
-It runs either of the TP=4 packs, V4.1-Flash and GLM-5.3-Flash, on the four Sparks. It also runs
+It runs the TP=4 packs, V4.1-Flash, GLM-5.3-Flash and Inkling-2-Small, on the four Sparks. It also runs
 a **single Spark** for the TP=1 Qwen3.8-Flash-Next pack. That path needs no other Spark, no SSH
 and no fast network: step 1 offers **Run on this Spark only**, and the console downloads the
 checkpoint and starts one local server.
@@ -111,8 +111,8 @@ and over SSH on the others, and reports:
 - every RoCE device: port state and rate, GID table, netdev, IPv4 address, prefix and MTU;
 - `arp_ignore` / `arp_announce`, addresses and routes;
 - size, time and SHA-256 of the binary, cubins and NCCL library;
-- file count and size of the checkpoint, and this rank's converted file and manifest (GLM writes
-  the rank file only, so that file is its completion marker);
+- file count and size of the checkpoint, and this rank's converted file and manifest (GLM and
+  Inkling write the rank file only, so that file is their completion marker);
 - free space where the model goes.
 
 The report compares each node with the lead (`ready`, `missing`, `outdated`, `partial`) and lists
@@ -183,7 +183,7 @@ atomically (a sibling temp file, then rename). See
 | :-- | :-- |
 | `[model]` | Architecture (`weights`), Hugging Face model `id`, checkpoint (empty: looked up in the hub cache), hub cache, tokenizer, converted weights, cubins |
 | `[engine]` | How the weights run (`kind`, `device`) |
-| `[runtime]` | `SPARK_MAX_SEQ_LEN` and `SPARKFLASH_LANES` |
+| `[runtime]` | `SPARK_MAX_SEQ_LEN` and the concurrency: `SPARKFLASH_LANES` for V4.1, `--concurrency` fused lanes for the GLM and Inkling groups (four by default, 1 for one request at a time). The lane groups also take `drafting` (`default`, `on`, `off`), `lane_memory_mb` (`SPARKFLASH_LANE_MEMORY_MB`) and `joint_rounds` (`SPARKFLASH_JOINT_ROUNDS`); Inkling takes `prefill_chunk` (`SPARKFLASH_INKLING_PREFILL_CHUNK`; the form starts Inkling at 4,096, because a 1M window leaves no room for the 8,192-row widening). Validation refuses one of these for a model that would not read it |
 | `[cluster]` | Rank 0 HTTP bind, collective base port, SSH user/options, and the rank list: exactly four nodes for V4.1, exactly one local node for Qwen |
 | `[paths]` | Checkout, binary, launcher, NCCL library, log root on every node |
 | `[network]` | `NCCL_IB_HCA`, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, extra rank environment |
@@ -192,7 +192,7 @@ atomically (a sibling temp file, then rename). See
 
 Validation refuses an unknown weight/engine selection, a mismatched weight/engine pair, a context
 outside the selected model's window (1..=1,048,576 for V4.1 and GLM-5.3, 1..=262,144 for Qwen), a
-concurrency outside 1..=32, duplicate SSH names or peers, a non-IP peer, a malformed socket
+concurrency outside 1..=32, a lane-group or Inkling knob for another model, duplicate SSH names or peers, a non-IP peer, a malformed socket
 address/URL, and the wrong rank count: four nodes for V4.1 and GLM-5.3, one local node for Qwen. It
 also refuses SSH names and
 users that SSH would read as options (a leading `-`, whitespace, `@` in the user), extra
@@ -369,7 +369,7 @@ cannot remove. `scripts/setup.sh` runs it for the Sparks picked in the terminal.
 | **Download** | `python3 -I scripts/hf-download.py --repo <model.id> --cache <hub cache>` on the lead |
 | **Deploy** / **Copy** | `python3 -I scripts/sync-nodes.py --host <address>,<ssh name> … --path …` on the lead (software: binary, cubins, NCCL; model: the model's cache folder without `*.incomplete` files). Deploy runs automatically when the node check finds a missing or older copy |
 | **Prepare the weights** / per-rank **Convert** | One job per rank: rank 0 locally when `local = true`, the others over SSH. Each runs `sparkflash convert --checkpoint … --output-dir … --tp-world-size <world_size> --tp-rank R --no-verify`, plus `--no-pad-moe-640` for V4.1; the TP=1 Qwen pack converts rank 0 of 1 |
-| **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES`, paths, and every `NCCL_*` value from the TOML. Each rank is started detached, so the job ends once all four are running |
+| **Launch cluster** | `scripts/serve-four-node.sh launch` with `SPARK_NODES`, `SPARK_PEERS`, `SPARK_LOCAL_RANKS` (the `local = true` ranks, started on the lead without SSH), `SPARK_MAX_SEQ_LEN`, `SPARKFLASH_LANES` (or `SPARKFLASH_CONCURRENCY` and the lane knobs for a lane group), paths, and every `NCCL_*` value from the TOML. GLM's ranks take `--tp4-rank`; Inkling's take its own group flags (`--rank`, `--peer`, `--world`, `--converted`), which the launcher picks from the model (`SPARKFLASH_GROUP_FORM`). Each rank is started detached, so the job ends once all four are running |
 | **Start server** (local) | `scripts/serve-single-node.sh launch` with the binary, checkpoint, tokenizer, context, HTTP bind and `SPARKFLASH_QWEN_CONVERTED_DIR` (the one rank file the pack boots from). The one TP=1 process is started detached; its log and pid file are under `paths.log_root` |
 | **Stop** | `scripts/serve-four-node.sh stop`, or `scripts/serve-single-node.sh stop` (SIGTERM; rank 0 drains first) |
 | **Rank status** | `scripts/serve-four-node.sh status`, or `scripts/serve-single-node.sh status` |

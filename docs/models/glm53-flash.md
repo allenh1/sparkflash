@@ -91,9 +91,12 @@ Rank 0 owns HTTP, the tokenizer and the control hub; ranks 1-3 load the same GLM
 same token ids, and rank 0 samples once a step, so every rank commits the same token. A greedy
 request without logprobs whose penalties change nothing takes the step's argmax as the device
 picked it, and the logits row stays on the device; any other request reads the row and samples it
-on the host. Such a greedy request also decodes speculatively: the MTP layer drafts
-`SPARKFLASH_GLM_DRAFTS` tokens after each token (2 by default; 0 drafts none), one verify step runs
-the token and its drafts, and the drafts greedy would have picked are kept with the token after
+on the host. Such a greedy request also decodes speculatively: the MTP layer drafts up to
+`SPARKFLASH_GLM_DRAFTS` tokens after each token (the profile's `speculation.depth`, three, by
+default; 0 drafts none). The chain is adaptive by default: it stops drafting once the shared
+`DepthPolicy` judges the drafts' probabilities not worth another pass
+(`SPARKFLASH_GLM_DRAFT_POLICY=fixed` drafts the whole chain; `SPARKFLASH_GLM_DRAFT_MIN_DEPTH` sets
+the floor). One verify step runs the token and its drafts, and the drafts greedy would have picked are kept with the token after
 them, so the tokens are the one-token steps' (`DeviceRank::verify_batch_greedy`, held to plain
 greedy by `tests/device_forward.rs`). Rank 0 decides, and the Request frame carries the decision,
 so every rank runs the same drafts and verifies. A count past 7 refuses at startup, as does a rank

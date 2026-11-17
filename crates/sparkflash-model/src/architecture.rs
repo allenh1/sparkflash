@@ -61,6 +61,74 @@ pub struct Architecture {
     pub mtp: Option<Mtp>,
     /// The checkpoint's special-token ids, as `config.json` and the tokenizer declare them.
     pub tokens: Tokens,
+    /// Inkling-2's relative-attention and block-residual geometry, when the release is one.
+    pub inkling: Option<Inkling>,
+}
+
+/// The Inkling-2 text stack geometry that has no equivalent in the other releases.
+///
+/// Inkling keeps a learned relative-position bias instead of RoPE, a block-attention residual
+/// stream instead of a plain additive one, four short convolutions a layer, and a softcapped
+/// SwiGLU. All of these are model-wide shapes; the per-layer schedule stays in [Layer].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inkling {
+    /// The learned relative-bias width.
+    pub d_rel: usize,
+    /// The furthest backward distance the relative bank scores (rel_extent).
+    pub rel_extent: usize,
+    /// The per-head query/key L2 clip.
+    pub qk_l2_clip: f64,
+    /// The per-head relative-state L2 clip.
+    pub rel_l2_clip: f64,
+    /// Query and relative-state log scaling on full-attention layers.
+    pub log_scaling: Option<LogScaling>,
+    /// The softcaps on the SwiGLU gate and up projections.
+    pub softcaps: Softcaps,
+    /// The depthwise short-convolution width.
+    pub short_conv: usize,
+    /// Whether the value projection is followed by an unweighted RMSNorm.
+    pub value_norm: bool,
+    /// The block-attention residual schedule.
+    pub block_residual: Option<BlockAttentionResidual>,
+    /// The final logit softcap, applied before the unpadded vocabulary slice.
+    pub final_logit_softcap: Option<f64>,
+    /// The number of logits the model scores after the softcap.
+    pub unpadded_vocab_size: usize,
+    /// One stored expert format per decoder layer.
+    pub layer_expert_formats: Vec<WeightFormat>,
+}
+
+/// The log scaling full-attention layers apply to queries and relative states.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogScaling {
+    /// The position floor below which the scale is one.
+    pub n_floor: usize,
+    /// The log coefficient.
+    pub alpha: f64,
+}
+
+/// The SwiGLU softcaps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Softcaps {
+    /// The softcap on the gate projection.
+    pub gate: f64,
+    /// The softcap on the up projection.
+    pub up: f64,
+}
+
+/// The block-attention residual of Inkling-2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockAttentionResidual {
+    /// Decoder layers per summary block.
+    pub layers_per_block: usize,
+    /// Learned queries an attention input uses on a sliding layer.
+    pub sliding_queries: usize,
+    /// Learned queries an attention input uses on a full layer.
+    pub full_queries: usize,
+    /// Learned queries the MLP input and final output use.
+    pub mlp_queries: usize,
+    /// Whether the summary stack is normalized before the query attention.
+    pub normalize: bool,
 }
 
 /// The special-token ids a checkpoint names.
@@ -156,6 +224,11 @@ pub enum AttentionKind {
         kv_heads: usize,
         /// Whether the output is multiplied by a learned gate.
         output_gate: bool,
+    },
+    /// Inkling-2 attention: GQA with a learned relative bias, no RoPE, a sink and a gate.
+    Inkling {
+        /// Key/value heads.
+        kv_heads: usize,
     },
     /// Gated DeltaNet.
     Gdn(Gdn),
@@ -266,6 +339,15 @@ pub struct Indexer {
     pub candidate_pool: Option<CandidatePool>,
 }
 
+impl Indexer {
+    /// The most tokens one query attends: the budget's complete pools and the incomplete pool at
+    /// the end (Qwen3.8's 2,051 from a 2,048 budget over pools of four).
+    #[must_use]
+    pub const fn max_selected(&self) -> usize {
+        (self.topk / self.pool) * self.pool + self.pool.saturating_sub(1)
+    }
+}
+
 /// The HSI candidate pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidatePool {
@@ -359,6 +441,8 @@ pub enum Residual {
     Plain,
     /// A widened residual stream with a data-dependent mix.
     Hyper(HyperConnection),
+    /// Inkling-2's block-attention residual: a stack of block summaries plus a partial state.
+    BlockAttention,
 }
 
 /// Hyper-connection geometry.
@@ -658,7 +742,11 @@ impl Architecture {
         let architectures = string_list(root.get("architectures"))?;
         let hidden_size = required_usize(text, "hidden_size", "text_config")?;
         let vocab_size = required_usize(text, "vocab_size", "text_config")?;
-        let max_position_embeddings = optional_usize(text, "max_position_embeddings")?.unwrap_or(0);
+        // Transformers writes the window as max_position_embeddings; some releases (Inkling
+        // among them) write the tokenizer-side spelling model_max_length.
+        let max_position_embeddings = optional_usize(text, "max_position_embeddings")?
+            .or(optional_usize(text, "model_max_length")?)
+            .unwrap_or(0);
         let norm_epsilon = optional_f64(text, "rms_norm_eps")?.unwrap_or(1e-6);
         let embedding_tied_to_head = optional_bool(text, "tie_word_embeddings")?.unwrap_or(false);
         let attention_bias = optional_bool(text, "attention_bias")?.unwrap_or(false);
@@ -667,8 +755,9 @@ impl Architecture {
         let looped = loop_schedule(text, &family)?;
         let quantization = quantization(root)?;
         let vision = vision(root, hidden_size)?;
-        let mtp = mtp(text, hidden_size)?;
+        let mtp = mtp(root, text, hidden_size)?;
         let tokens = tokens(root, text)?;
+        let inkling = inkling(text, root, vocab_size)?;
 
         Ok(Self {
             family,
@@ -685,6 +774,7 @@ impl Architecture {
             vision,
             mtp,
             tokens,
+            inkling,
         })
     }
 
@@ -813,6 +903,25 @@ impl Architecture {
     /// A read error, a malformed document, or a shape [Self::from_json] refuses.
     pub fn from_checkpoint_dir(dir: &std::path::Path) -> Result<Self, ConfigError> {
         let mut architecture = Self::from_path(&dir.join("config.json"))?;
+        let quant = dir.join("hf_quant_config.json");
+        if quant.is_file() {
+            let text = std::fs::read_to_string(&quant)
+                .map_err(|error| ConfigError::Json(format!("{}: {error}", quant.display())))?;
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|error| ConfigError::Json(error.to_string()))?;
+            // Two documents share the name. Inkling's lists parameter groups, the only place its
+            // per-layer split is written, so it is applied. ModelOpt's export (Qwen3.8's NVFP4
+            // release) restates the quantization_config that config.json carries and this parse
+            // has already read, so that reading stands. Any other document is refused.
+            let model = object(&value, "model").unwrap_or(&value);
+            let export = object(&value, "quantization")
+                .is_some_and(|quantization| quantization.get("quant_algo").is_some());
+            let read = architecture.quantization.dense_format != WeightFormat::Bf16
+                || architecture.quantization.expert_format != WeightFormat::Bf16;
+            if model.get("parameter_groups").is_some() || !(export && read) {
+                architecture.apply_quant_config(&value)?;
+            }
+        }
         let generation = dir.join("generation_config.json");
         if generation.is_file() {
             let text = std::fs::read_to_string(&generation)
@@ -839,6 +948,98 @@ impl Architecture {
             }
         }
         Ok(architecture)
+    }
+
+    /// Apply a released `hf_quant_config.json` to the parsed architecture.
+    ///
+    /// The document names parameter groups, not a flat format: Inkling stores layers 0-39
+    /// NVFP4 and layers 40-47 MXFP8 in one checkpoint. The group's tensor names are the only
+    /// place that per-layer split is written, so the parser records one format per layer
+    /// instead of collapsing the mixed precision to the first declaration.
+    ///
+    /// # Errors
+    /// A malformed document, or a group whose arithmetic has no [WeightFormat].
+    pub fn apply_quant_config(&mut self, root: &Value) -> Result<(), ConfigError> {
+        let model = object(root, "model").unwrap_or(root);
+        let Some(groups) = model.get("parameter_groups").and_then(Value::as_array) else {
+            return Err(invalid(
+                "hf_quant_config.json has no model.parameter_groups",
+            ));
+        };
+        let mut formats = vec![self.quantization.expert_format; self.layers.len()];
+        let mut dense = self.quantization.dense_format;
+        let mut saw_expert = false;
+        for group in groups {
+            let compute = optional_string(group, "compute_dtype")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let output = optional_string(group, "output_dtype")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let block = usize_list(group.get("weight_block_shape"))?
+                .last()
+                .copied()
+                .or_else(|| {
+                    object(group, "required_activation_quantization").and_then(|activation| {
+                        optional_usize(activation, "block_size").ok().flatten()
+                    })
+                });
+            let format = match (compute.as_str(), output.as_str()) {
+                ("nvfp4", _) => WeightFormat::NvFp4 {
+                    group_size: block.unwrap_or(16),
+                },
+                ("mxfp8", _) => WeightFormat::MxFp8 {
+                    block: block.unwrap_or(32),
+                },
+                (_, "uint8") if group.get("weight_scale_format").is_some() => WeightFormat::NvFp4 {
+                    group_size: block.unwrap_or(16),
+                },
+                (_, "float8_e4m3fn")
+                    if group.get("weight_transform").is_some_and(|value| {
+                        value.as_str().is_some_and(|name| name.contains("mxfp8"))
+                    }) =>
+                {
+                    WeightFormat::MxFp8 {
+                        block: block.unwrap_or(32),
+                    }
+                }
+                _ => WeightFormat::Bf16,
+            };
+            let tensors = string_list(group.get("tensors"))?;
+            for name in tensors {
+                if let Some(layer) = name
+                    .strip_prefix("model.llm.layers.")
+                    .and_then(|rest| rest.split('.').next())
+                    .and_then(|index| index.parse::<usize>().ok())
+                {
+                    if let Some(slot) = formats.get_mut(layer) {
+                        *slot = format;
+                    }
+                    if format != WeightFormat::Bf16 {
+                        saw_expert = true;
+                    }
+                } else if format != WeightFormat::Bf16 && name.contains("experts") {
+                    saw_expert = true;
+                } else if format != WeightFormat::Bf16 && name.contains("weight") {
+                    dense = format;
+                }
+            }
+        }
+        if saw_expert {
+            self.quantization.expert_format = formats
+                .iter()
+                .copied()
+                .find(|format| *format != WeightFormat::Bf16)
+                .unwrap_or(self.quantization.expert_format);
+        }
+        self.quantization.dense_format = dense;
+        self.quantization
+            .method
+            .get_or_insert_with(|| "mixed".to_owned());
+        if let Some(inkling) = &mut self.inkling {
+            inkling.layer_expert_formats = formats;
+        }
+        Ok(())
     }
 
     /// The cache claim this architecture makes at `world` ranks.
@@ -896,13 +1097,21 @@ impl Architecture {
         let mut fixed = 0u64;
         for layer in &self.layers {
             match &layer.attention.kind {
-                AttentionKind::Gqa { kv_heads, .. } => {
+                AttentionKind::Gqa { kv_heads, .. } | AttentionKind::Inkling { kv_heads } => {
                     let heads = ((*kv_heads as u64).div_ceil(world)).max(1);
                     let kv = 2u64
                         .saturating_mul(heads)
                         .saturating_mul(layer.attention.head_dim as u64)
                         .saturating_mul(2);
-                    per_token = per_token.saturating_add(kv);
+                    // An Inkling sliding layer has a fixed window, so its cache is a constant
+                    // per session rather than a per-token charge. This is the difference that
+                    // makes a 1M-token session fit: 40 sliding layers x 1023 positions.
+                    if let Some(window) = layer.attention.window {
+                        fixed = fixed
+                            .saturating_add(kv.saturating_mul(window.saturating_sub(1) as u64));
+                    } else {
+                        per_token = per_token.saturating_add(kv);
+                    }
                     if let Some(indexer) = &layer.attention.indexer
                         && indexer.owns_keys
                     {
@@ -977,6 +1186,7 @@ impl Architecture {
                             .saturating_add(latent_bytes(width, latent_fp8).saturating_mul(extra));
                     }
                     AttentionKind::Gdn(_) | AttentionKind::Kda(_) => {}
+                    AttentionKind::Inkling { .. } => {}
                 }
             }
         }
@@ -1008,7 +1218,7 @@ impl Architecture {
             .iter()
             .find_map(|layer| layer.attention.indexer.as_ref());
         match &last.attention.kind {
-            AttentionKind::Gqa { kv_heads, .. } => {
+            AttentionKind::Gqa { kv_heads, .. } | AttentionKind::Inkling { kv_heads } => {
                 let heads = ((*kv_heads as u64).div_ceil(world)).max(1);
                 let indexer = last
                     .attention
@@ -1070,6 +1280,11 @@ impl Architecture {
         if self.vision.is_some() {
             parts.insert(Part::Vision);
         }
+        if self.inkling.as_ref().is_some_and(|inkling| {
+            inkling.softcaps.gate.is_finite() || inkling.softcaps.up.is_finite()
+        }) {
+            parts.insert(Part::SoftcappedActivation);
+        }
         for layer in &self.layers {
             match &layer.attention.kind {
                 AttentionKind::Mla { .. } => {
@@ -1077,6 +1292,11 @@ impl Architecture {
                 }
                 AttentionKind::Gqa { .. } => {
                     parts.insert(Part::GqaAttention);
+                }
+                AttentionKind::Inkling { .. } => {
+                    parts.insert(Part::GqaAttention);
+                    parts.insert(Part::RelativeAttention);
+                    parts.insert(Part::ShortConv);
                 }
                 AttentionKind::Gdn(_) => {
                     parts.insert(Part::GdnScan);
@@ -1098,6 +1318,9 @@ impl Architecture {
                 Ffn::Moe(_) => {
                     parts.insert(Part::Moe);
                 }
+            }
+            if matches!(layer.residual, Residual::BlockAttention) {
+                parts.insert(Part::BlockAttentionResidual);
             }
             if let Residual::Hyper(hyper) = &layer.residual {
                 parts.insert(if hyper.manifold {
@@ -1148,9 +1371,22 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
     }
     let count = required_usize(text, "num_hidden_layers", "text_config")?;
     let mut layer_types = string_list(text.get("layer_types"))?;
+    let local_layers = usize_list(text.get("local_layer_ids"))?;
     let ratios = usize_list(text.get("compress_ratios"))?;
     let indexer_types = string_list(text.get("indexer_types"))?;
-    if layer_types.is_empty() && ratios.is_empty() {
+    if layer_types.is_empty() && !local_layers.is_empty() {
+        // Inkling names the sliding-layer set rather than a full_attention_interval. Every
+        // unlisted layer is full attention; the local set is the sliding window.
+        layer_types = (0..count)
+            .map(|index| {
+                if local_layers.contains(&index) {
+                    "hybrid_sliding".to_owned()
+                } else {
+                    "full_attention".to_owned()
+                }
+            })
+            .collect();
+    } else if layer_types.is_empty() && ratios.is_empty() {
         // A release that names only `full_attention_interval` uses the reference rule: every
         // Nth layer is full/sparse attention and the rest are linear. A Qwen-shaped release
         // that names linear-attention geometry but omits the interval gets the same default
@@ -1241,6 +1477,35 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
             residual,
             sides,
         });
+    }
+    if text.get("d_rel").is_some() {
+        // Inkling's attention is GQA shaped but has no rotary embedding: it carries a learned
+        // relative bias instead. Name the variant here, after the shared GQA geometry has been
+        // read, so the family-specific arithmetic is not threaded through the generic parser.
+        let window = optional_usize(text, "sliding_window_size")?
+            .or(optional_usize(text, "sliding_window")?)
+            .unwrap_or(0);
+        let block = text.get("n_layers_per_attn_res_block").is_some();
+        for layer in &mut layers {
+            let local = local_layers.contains(&layer.index);
+            if let AttentionKind::Gqa { kv_heads, .. } = layer.attention.kind {
+                layer.attention.kind = AttentionKind::Inkling { kv_heads };
+                layer.attention.rope.rotated_dims = 0;
+            }
+            layer.attention.window = (local && window > 0).then_some(window);
+            if block {
+                layer.residual = Residual::BlockAttention;
+            }
+            if let Ffn::Moe(moe) = &mut layer.ffn {
+                // Inkling's router is a per-expert sigmoid with a learned correction bias and
+                // a route scale; the released document spells the multiplier route_scale.
+                moe.score = Score::Sigmoid;
+                moe.norm_topk = true;
+                moe.selection_bias = true;
+                moe.routed_scaling =
+                    optional_f64(text, "route_scale")?.unwrap_or(moe.routed_scaling);
+            }
+        }
     }
     Ok(layers)
 }
@@ -1442,6 +1707,7 @@ fn attention(
     let is_linear = layer_type.contains("linear");
     let is_sparse = layer_type.contains("sparse")
         || layer_type.contains("attention")
+        || layer_type.contains("sliding")
         || layer_type == "compressed_attention";
     let is_mla = optional_usize(text, "kv_lora_rank")?.is_some()
         || optional_usize(text, "qk_nope_head_dim")?.is_some()
@@ -1655,13 +1921,17 @@ fn ffn(
                 .is_some(),
         )
     });
-    let shared_intermediate = optional_usize(text, "shared_expert_intermediate_size")?
-        .or(optional_usize(text, "moe_intermediate_size")?)
+    // Transformers checkpoints in the Inkling and Mixtral shape spell the expert width
+    // intermediate_size; the releases this parser grew up on spell it moe_intermediate_size.
+    let expert_intermediate = optional_usize(text, "moe_intermediate_size")?
+        .or(optional_usize(text, "intermediate_size")?)
         .ok_or_else(|| invalid(format!("layer {index} has no MoE intermediate width")))?;
+    let shared_intermediate =
+        optional_usize(text, "shared_expert_intermediate_size")?.unwrap_or(expert_intermediate);
     Ok(Ffn::Moe(Moe {
         routed_experts,
         active_experts: required_usize(text, "num_experts_per_tok", "text_config")?,
-        intermediate: required_usize(text, "moe_intermediate_size", "text_config")?,
+        intermediate: expert_intermediate,
         shared_experts,
         shared_intermediate,
         // A release that gates its shared expert names no count; it names the expert by width.
@@ -1809,10 +2079,75 @@ fn ple_geometry(text: &Value) -> Result<PleGeometry, ConfigError> {
     })
 }
 
-fn mtp(text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
+/// The Inkling-2 geometry, when the document describes one.
+fn inkling(text: &Value, root: &Value, vocab_size: usize) -> Result<Option<Inkling>, ConfigError> {
+    let family = string(root, "model_type")
+        .or_else(|| string(text, "model_type"))
+        .unwrap_or_default();
+    let Some(d_rel) = optional_usize(text, "d_rel")? else {
+        return Ok(None);
+    };
+    if family != "inkling2" {
+        return Err(invalid(format!(
+            "d_rel is declared by {family:?}, not an inkling2 document"
+        )));
+    }
+    let layers = required_usize(text, "num_hidden_layers", "text_config")?;
+    let local = usize_list(text.get("local_layer_ids"))?;
+    if local.iter().any(|index| *index >= layers) {
+        return Err(invalid(
+            "local_layer_ids names a layer outside num_hidden_layers",
+        ));
+    }
+    let block_layers = optional_usize(text, "n_layers_per_attn_res_block")?.unwrap_or(0);
+    let block_residual = (block_layers > 0).then_some(BlockAttentionResidual {
+        layers_per_block: block_layers,
+        sliding_queries: 1,
+        full_queries: 3,
+        mlp_queries: 1,
+        normalize: optional_bool(text, "attn_res_normalize_values")?.unwrap_or(true),
+    });
+    let softcaps = Softcaps {
+        gate: optional_f64(text, "mlp_gate_softcap")?.unwrap_or(f64::INFINITY),
+        up: optional_f64(text, "mlp_up_softcap")?.unwrap_or(f64::INFINITY),
+    };
+    let log_scaling = match optional_usize(text, "log_scaling_n_floor")? {
+        Some(n_floor) => Some(LogScaling {
+            n_floor,
+            alpha: optional_f64(text, "log_scaling_alpha")?.unwrap_or(0.0),
+        }),
+        None => None,
+    };
+    let quantization = quantization(root)?;
+    Ok(Some(Inkling {
+        d_rel,
+        rel_extent: optional_usize(text, "rel_extent")?.unwrap_or(0),
+        qk_l2_clip: optional_f64(text, "qk_l2_clip_threshold")?.unwrap_or(f64::INFINITY),
+        rel_l2_clip: optional_f64(text, "rel_l2_clip_threshold")?.unwrap_or(f64::INFINITY),
+        log_scaling,
+        softcaps,
+        short_conv: optional_usize(text, "sconv_kernel_size")?.unwrap_or(4),
+        value_norm: optional_bool(text, "use_value_norm_no_gamma")?.unwrap_or(false),
+        block_residual,
+        final_logit_softcap: optional_f64(text, "final_logit_softcapping")?,
+        unpadded_vocab_size: optional_usize(text, "unpadded_vocab_size")?.unwrap_or(vocab_size),
+        layer_expert_formats: vec![quantization.expert_format; layers],
+    }))
+}
+
+fn mtp(root: &Value, text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
+    // Three releases spell the stage block three ways: flat MTP fields, a nested `mtp`, or
+    // Inkling's `mtp_config` whose stage depth is an ordinary `num_hidden_layers`.
+    let nested_mtp = object(text, "mtp_config")
+        .or_else(|| object(root, "mtp_config"))
+        .or_else(|| object(text, "mtp"));
     let stages = optional_usize(text, "num_nextn_predict_layers")?
         .or(optional_usize(text, "mtp_num_hidden_layers")?)
         .or(optional_usize(text, "n_mtp_layers")?)
+        .or(match nested_mtp {
+            Some(nested) => optional_usize(nested, "num_hidden_layers")?,
+            None => None,
+        })
         .unwrap_or(0);
     if stages == 0 {
         return Ok(None);
@@ -1823,7 +2158,7 @@ fn mtp(text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
     // is not enough - a GLM-style nested stage block can say `hybrid` while still owning its
     // cache on every rank - so the Qwen marker (or an explicit `mtp.replicated`) decides, and
     // the default stays replicated.
-    let replicated = match object(text, "mtp") {
+    let replicated = match nested_mtp {
         Some(nested) => {
             if let Some(replicated) = optional_bool(nested, "replicated")? {
                 replicated
@@ -1834,10 +2169,20 @@ fn mtp(text: &Value, _hidden: usize) -> Result<Option<Mtp>, ConfigError> {
         }
         None => true,
     };
+    let nested_value = |name: &str| -> Result<Option<usize>, ConfigError> {
+        match nested_mtp {
+            Some(nested) => optional_usize(nested, name),
+            None => Ok(None),
+        }
+    };
+    let target_layers = match nested_mtp {
+        Some(nested) => usize_list(nested.get("target_layer_ids"))?,
+        None => usize_list(text.get("dspark_target_layer_ids"))?,
+    };
     Ok(Some(Mtp {
         stages,
-        block_size: optional_usize(text, "dspark_block_size")?,
-        target_layers: usize_list(text.get("dspark_target_layer_ids"))?,
+        block_size: optional_usize(text, "dspark_block_size")?.or(nested_value("block_size")?),
+        target_layers,
         routed_experts: optional_usize(text, "dspark_n_routed_experts")?,
         active_experts: optional_usize(text, "dspark_num_experts_per_tok")?,
         replicated,
@@ -2831,6 +3176,42 @@ mod tests {
         let architecture =
             Architecture::from_json(&document.to_string()).expect("the released Qwen config");
         assert_eq!(architecture.quantization.expert, None);
+    }
+
+    #[test]
+    fn a_modelopt_export_beside_the_config_keeps_the_configs_formats() {
+        // Qwen3.8's NVFP4 release ships ModelOpt's hf_quant_config.json beside a config.json
+        // that already carries the same quantization_config: the directory opens with the
+        // config's formats. A document that is neither that export nor Inkling's parameter
+        // groups is still refused.
+        let directory = std::env::temp_dir().join(format!(
+            "sparkflash-architecture-quant-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).expect("a temp directory");
+        std::fs::write(directory.join("config.json"), QWEN).expect("config.json");
+        std::fs::write(
+            directory.join("hf_quant_config.json"),
+            r#"{"producer": {"name": "modelopt"}, "quantization": {"quant_algo": "MIXED_PRECISION", "group_size": 16}}"#,
+        )
+        .expect("hf_quant_config.json");
+        let architecture =
+            Architecture::from_checkpoint_dir(&directory).expect("the released Qwen directory");
+        let alone = Architecture::from_json(QWEN).expect("the released Qwen config");
+        assert_eq!(
+            architecture.quantization.expert_format,
+            alone.quantization.expert_format
+        );
+        assert_eq!(
+            architecture.quantization.dense_format,
+            alone.quantization.dense_format
+        );
+        std::fs::write(directory.join("hf_quant_config.json"), r#"{"model": {}}"#)
+            .expect("hf_quant_config.json");
+        Architecture::from_checkpoint_dir(&directory)
+            .expect_err("a document with neither form is refused");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

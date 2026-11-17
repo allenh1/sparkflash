@@ -181,6 +181,8 @@ __device__ __forceinline__ __half2 __hmul2(__half2 a, __half2 b) {
 
 // CUDA's launch-bounds annotation is an attribute on the kernel; the syntax probe does not need it.
 #define __launch_bounds__(...)
+// Nor the thread-block-cluster shape (inkling_attn_window).
+#define __cluster_dims__(...)
 
 // vector_functions.h: make_uint4 is a device function, not a type, so the probe needs it declared
 // too (kernels/rmsnorm_sm121.cu packs four bf16 pairs into one 128-bit store through it).
@@ -450,6 +452,20 @@ __device__ __forceinline__ int __ffs(int value) {
     return __builtin_ffs(value);
 }
 
+// Byte i of the result is byte (selector >> 4i) & 7 of the pair (x the low four bytes, y the
+// high), as the device's prmt; the sign-replicating mode (selector bit 3 a nibble) is not
+// modelled.
+__device__ __forceinline__ unsigned int __byte_perm(unsigned int x, unsigned int y,
+                                                    unsigned int selector) {
+    const unsigned long long pair = ((unsigned long long)y << 32) | x;
+    unsigned int result = 0;
+    for (int i = 0; i < 4; ++i) {
+        const unsigned int pick = (selector >> (4 * i)) & 7u;
+        result |= (unsigned int)((pair >> (8 * pick)) & 0xFFu) << (8 * i);
+    }
+    return result;
+}
+
 __device__ __forceinline__ unsigned int atomicOr(unsigned int *address, unsigned int value) {
     const unsigned int old = *address;
     *address |= value;
@@ -536,6 +552,19 @@ __device__ __forceinline__ float cosf(float value) {
 }
 
 __device__ __forceinline__ float sinf(float value) {
+    (void)value;
+    return 0.0f;
+}
+
+// The drafter's accurate rotary and its tanh gates (kernels/inkling_draft_sm121.cu); like the
+// rest of this stub they only let the probe type-check, and nvcc uses its own definitions.
+__device__ __forceinline__ void sincosf(float value, float *sine, float *cosine) {
+    (void)value;
+    *sine = 0.0f;
+    *cosine = 1.0f;
+}
+
+__device__ __forceinline__ float tanhf(float value) {
     (void)value;
     return 0.0f;
 }

@@ -46,6 +46,7 @@ pub const SUPPORTED_ENGINES: &[&str] = &[
     DEFAULT_ENGINE_ID,
     QWEN_ENGINE_ID,
     GLM_ENGINE_ID,
+    INKLING_ENGINE_ID,
     DYNAMIC_ENGINE_ID,
 ];
 
@@ -80,6 +81,12 @@ pub const QWEN36_WEIGHTS_ID: &str =
 
 /// The control-plane weight selector for Dory1.0-4B (BF16).
 pub const DORY_WEIGHTS_ID: &str = sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID;
+
+/// The control-plane weight selector for Inkling-2-Small (NVFP4).
+pub const INKLING_WEIGHTS_ID: &str = sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID;
+
+/// The control-plane engine selector for the TP=4 Inkling-2-Small pack.
+pub const INKLING_ENGINE_ID: &str = "inkling2";
 
 /// The canonical Hugging Face id of the Qwen3.6-35B-A3B checkpoint.
 pub const QWEN36_MODEL_ID: &str = sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_ID;
@@ -117,6 +124,15 @@ pub const SOLO_WORLD_SIZE: usize = 1;
 /// The largest concurrency the current engine is designed for.
 pub const MAX_CONCURRENCY: usize = 32;
 
+/// The fused lanes a lane group (GLM-5.3-Flash's and Inkling-2-Small's four-rank groups) steps
+/// unless the plan says otherwise: the CLI's own default for a GLM `--tp4-rank` group
+/// (`pack::GROUP_LANES`) and the Inkling site launcher's.
+pub const GROUP_LANES: usize = 4;
+
+/// The widest prefill chunk Inkling's arm takes (`SPARKFLASH_INKLING_PREFILL_CHUNK`): a chunk's
+/// rows are a launch's grid rows.
+pub const MAX_PREFILL_CHUNK: usize = 65_535;
+
 /// The default config path, relative to the lead node's working directory.
 pub const DEFAULT_CONFIG_PATH: &str = "sparkflash.toml";
 
@@ -152,6 +168,9 @@ pub struct ModelProfile {
     pub requires_conversion: bool,
     /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
     pub requires_cubins: bool,
+    /// Whether the family's four-rank group steps concurrent requests as fused lanes on every
+    /// rank, with the drafting and lane-memory knobs of [RuntimeConfig].
+    pub lane_group: bool,
 }
 
 /// The deployment fields a model profile needs that the model registry does not own.
@@ -170,6 +189,8 @@ struct Deployment {
     requires_conversion: bool,
     /// Whether launch loads the external cubin directory built by scripts/build-cubins.sh.
     requires_cubins: bool,
+    /// Whether the four-rank group steps concurrent requests as fused lanes.
+    lane_group: bool,
 }
 
 /// The deployment fields for the weights selector, or a panic naming the unregistered family.
@@ -184,6 +205,7 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "deepseek-ai",
             requires_conversion: true,
             requires_cubins: true,
+            lane_group: false,
         },
         QWEN_WEIGHTS_ID | QWEN_FP8_WEIGHTS_ID => Deployment {
             engine: QWEN_ENGINE_ID,
@@ -194,6 +216,7 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "Qwen",
             requires_conversion: true,
             requires_cubins: false,
+            lane_group: false,
         },
         QWEN36_WEIGHTS_ID => Deployment {
             // The dynamic engine launches Qwen3.5-MoE from the checkpoint: the FP8 release on
@@ -206,6 +229,7 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "Qwen",
             requires_conversion: false,
             requires_cubins: false,
+            lane_group: false,
         },
         GLM_WEIGHTS_ID => Deployment {
             engine: GLM_ENGINE_ID,
@@ -217,6 +241,7 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "zai-org",
             requires_conversion: true,
             requires_cubins: false,
+            lane_group: true,
         },
         DORY_WEIGHTS_ID => Deployment {
             // The dynamic route opens Dory's device arm when its cubins are present, and its
@@ -229,6 +254,20 @@ fn deployment_for(weights: &str) -> Deployment {
             org: "nvidia",
             requires_conversion: false,
             requires_cubins: false,
+            lane_group: false,
+        },
+        INKLING_WEIGHTS_ID => Deployment {
+            engine: INKLING_ENGINE_ID,
+            search: "Inkling-2",
+            world_size: WORLD_SIZE,
+            // The 393.5 GB checkpoint fits four Sparks; it does not fit one or two.
+            worlds: &[WORLD_SIZE],
+            org: "thinkingmachines",
+            requires_conversion: true,
+            // The arm's kernels are built into the binary (SPARKFLASH_INKLING_CUBIN at build
+            // time); its group takes no cubin directory.
+            requires_cubins: false,
+            lane_group: true,
         },
         other => panic!("no web deployment profile for the registry weights {other}"),
     }
@@ -257,6 +296,7 @@ pub static MODEL_PROFILES: LazyLock<Vec<ModelProfile>> = LazyLock::new(|| {
                 context_tokens: model.context_tokens,
                 requires_conversion: deployment.requires_conversion,
                 requires_cubins: deployment.requires_cubins,
+                lane_group: deployment.lane_group,
             }
         })
         .collect()
@@ -402,14 +442,57 @@ impl Default for EngineConfig {
     }
 }
 
-/// The two runtime knobs the model exposes to the operator.
+/// Whether a lane group's requests draft: GLM-5.3-Flash's MTP layer, Inkling-2-Small's DSpark
+/// block drafter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Drafting {
+    /// The arm's own default: GLM drafts, Inkling does not.
+    #[default]
+    Default,
+    /// Draft with the model's drafter (`SPARKFLASH_INKLING_DRAFT=dspark` for Inkling).
+    On,
+    /// Never draft (`SPARKFLASH_GLM_SPEC=off`, `SPARKFLASH_INKLING_DRAFT=off`).
+    Off,
+}
+
+impl Drafting {
+    /// Whether this is the arm's own default.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::Default
+    }
+}
+
+/// The runtime knobs the model exposes to the operator.
+///
+/// The first two apply to every model. The rest are the lane groups' ([ModelProfile::lane_group])
+/// and Inkling's, and a plan that sets one for a model that would not read it is refused by
+/// [SparkConfig::validate] rather than launched without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// The sequence window advertised and served (`SPARK_MAX_SEQ_LEN`).
     pub max_context_tokens: usize,
-    /// The number of sequences the scheduler may run at once (`SPARKFLASH_LANES`).
+    /// The number of sequences the engine may run at once: the V4.1 scheduler's lanes
+    /// (`SPARKFLASH_LANES`), or a lane group's fused lanes (`--concurrency`, 1 serving one
+    /// request at a time).
     pub max_concurrency: usize,
+    /// Whether a lane group's requests draft.
+    #[serde(skip_serializing_if = "Drafting::is_default")]
+    pub drafting: Drafting,
+    /// The memory a lane group's rank shares among its lanes' caches, in MiB
+    /// (`SPARKFLASH_LANE_MEMORY_MB`); unset is one whole context's worth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane_memory_mb: Option<usize>,
+    /// Whether a lane group's drafting lanes verify in one shared walk (`SPARKFLASH_JOINT_ROUNDS`);
+    /// false runs their rounds one after another.
+    pub joint_rounds: bool,
+    /// Inkling's prefill chunk rows (`SPARKFLASH_INKLING_PREFILL_CHUNK`); unset is 4,096 rows
+    /// widening to 8,192 while a long prompt has two wide chunks left. A 1M window leaves room
+    /// for 4,096-row chunks only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_chunk: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -417,6 +500,10 @@ impl Default for RuntimeConfig {
         Self {
             max_context_tokens: MODEL_CONTEXT_TOKENS,
             max_concurrency: MAX_CONCURRENCY,
+            drafting: Drafting::Default,
+            lane_memory_mb: None,
+            joint_rounds: true,
+            prefill_chunk: None,
         }
     }
 }
@@ -716,6 +803,7 @@ impl SparkConfig {
                 self.runtime.max_concurrency
             )));
         }
+        self.validate_lane_knobs()?;
         let solo = self.is_qwen() || self.is_dynamic();
         let expected_nodes = if solo { SOLO_WORLD_SIZE } else { WORLD_SIZE };
         if self.cluster.nodes.len() != expected_nodes {
@@ -856,6 +944,47 @@ impl SparkConfig {
     /// that runs it. An explicit checkpoint is checked the same way when it carries a
     /// `config.json`. A model that is neither cached nor an explicit directory must be one of
     /// the canonical releases, so the download step cannot be pointed at an arbitrary repository.
+    /// Refuses a lane-group or Inkling knob the selected model would not read, so a plan is never
+    /// launched with a setting silently dropped.
+    fn validate_lane_knobs(&self) -> Result<(), ConfigError> {
+        let runtime = &self.runtime;
+        if !self.is_lane_group() {
+            let set = [
+                (!runtime.drafting.is_default(), "runtime.drafting"),
+                (runtime.lane_memory_mb.is_some(), "runtime.lane_memory_mb"),
+                (!runtime.joint_rounds, "runtime.joint_rounds"),
+            ];
+            if let Some((_, name)) = set.iter().find(|(set, _)| *set) {
+                return Err(ConfigError::new(format!(
+                    "{name} is a lane group's knob (GLM-5.3-Flash, Inkling-2-Small); {:?} does \
+                     not read it",
+                    self.model.weights
+                )));
+            }
+        }
+        if runtime.lane_memory_mb == Some(0) {
+            return Err(ConfigError::new(
+                "runtime.lane_memory_mb must be a positive MiB count; leave it unset for one \
+                 whole context's worth",
+            ));
+        }
+        if let Some(chunk) = runtime.prefill_chunk {
+            if !self.is_inkling() {
+                return Err(ConfigError::new(format!(
+                    "runtime.prefill_chunk is Inkling-2-Small's prefill width; {:?} does not \
+                     read it",
+                    self.model.weights
+                )));
+            }
+            if !(1..=MAX_PREFILL_CHUNK).contains(&chunk) {
+                return Err(ConfigError::new(format!(
+                    "runtime.prefill_chunk must be in 1..={MAX_PREFILL_CHUNK}, got {chunk}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_model_family(&self) -> Result<(), ConfigError> {
         if self.is_dynamic() {
             return self.validate_dynamic_family();
@@ -1213,6 +1342,21 @@ impl SparkConfig {
         self.model.weights == GLM_WEIGHTS_ID
     }
 
+    /// Whether the selected weights are the TP=4 Inkling-2-Small pack, whose device group takes
+    /// `--rank/--peer/--world` and boots from `--converted` rank files.
+    #[must_use]
+    pub fn is_inkling(&self) -> bool {
+        self.model.weights == INKLING_WEIGHTS_ID
+    }
+
+    /// Whether the selected family's four-rank group steps concurrent requests as fused lanes
+    /// ([ModelProfile::lane_group]).
+    #[must_use]
+    pub fn is_lane_group(&self) -> bool {
+        !self.is_dynamic()
+            && profile_for_weights(&self.model.weights).is_some_and(|profile| profile.lane_group)
+    }
+
     /// The model selector a packed four-rank launcher passes as its --model argument.
     ///
     /// The V4.1 engine is the launcher's default and takes no --model; a packed model names its
@@ -1334,11 +1478,11 @@ impl SparkConfig {
 
     /// Whether the node check should require a conversion manifest beside this rank's file.
     ///
-    /// The GLM and Qwen converters write one rank file and no manifest; that file is the
-    /// completion marker. V4.1 writes a manifest after each rank file.
+    /// The GLM, Qwen and Inkling converters write one rank file and no manifest; that file is
+    /// the completion marker. V4.1 writes a manifest after each rank file.
     #[must_use]
     pub fn requires_conversion_manifest(&self) -> bool {
-        !(self.is_glm() || self.is_qwen() || self.is_dynamic())
+        !(self.is_glm() || self.is_qwen() || self.is_inkling() || self.is_dynamic())
     }
 
     /// The single-node launcher script, next to the four-node one.
@@ -1549,10 +1693,19 @@ impl SparkConfig {
             "SPARK_MAX_SEQ_LEN".to_owned(),
             self.runtime.max_context_tokens.to_string(),
         );
-        env.insert(
-            "SPARKFLASH_LANES".to_owned(),
-            self.runtime.max_concurrency.to_string(),
-        );
+        // A lane group steps its fused lanes from --concurrency; SPARKFLASH_LANES is the V4.1
+        // scheduler's, and the packs do not read it.
+        if self.is_lane_group() {
+            env.insert(
+                "SPARKFLASH_CONCURRENCY".to_owned(),
+                self.runtime.max_concurrency.to_string(),
+            );
+        } else {
+            env.insert(
+                "SPARKFLASH_LANES".to_owned(),
+                self.runtime.max_concurrency.to_string(),
+            );
+        }
         // A packed four-rank model is selected by --model and sizes its window with --context;
         // the V4.1 engine is the launcher's default and reads SPARK_MAX_SEQ_LEN instead.
         if let Some(model) = self.packed_model() {
@@ -1562,6 +1715,7 @@ impl SparkConfig {
                 self.runtime.max_context_tokens.to_string(),
             );
         }
+        self.insert_lane_env(&mut env);
         if !self.cluster.ssh_user.trim().is_empty() {
             env.insert("SSH_USER".to_owned(), self.cluster.ssh_user.clone());
         }
@@ -1607,6 +1761,33 @@ impl SparkConfig {
             env.insert(key.clone(), value.clone());
         }
         env
+    }
+
+    /// The lane-group and Inkling knobs, as the switches every rank reads.
+    fn insert_lane_env(&self, env: &mut BTreeMap<String, String>) {
+        let runtime = &self.runtime;
+        let drafting = match (runtime.drafting, self.is_inkling()) {
+            (Drafting::Default, _) => None,
+            (Drafting::On, true) => Some(("SPARKFLASH_INKLING_DRAFT", "dspark")),
+            (Drafting::Off, true) => Some(("SPARKFLASH_INKLING_DRAFT", "off")),
+            (Drafting::On, false) => Some(("SPARKFLASH_GLM_SPEC", "on")),
+            (Drafting::Off, false) => Some(("SPARKFLASH_GLM_SPEC", "off")),
+        };
+        if let Some((key, value)) = drafting {
+            env.insert(key.to_owned(), value.to_owned());
+        }
+        if let Some(mib) = runtime.lane_memory_mb {
+            env.insert("SPARKFLASH_LANE_MEMORY_MB".to_owned(), mib.to_string());
+        }
+        if !runtime.joint_rounds {
+            env.insert("SPARKFLASH_JOINT_ROUNDS".to_owned(), "off".to_owned());
+        }
+        if let Some(chunk) = runtime.prefill_chunk {
+            env.insert(
+                "SPARKFLASH_INKLING_PREFILL_CHUNK".to_owned(),
+                chunk.to_string(),
+            );
+        }
     }
 
     /// The environment the single-node launcher receives.
@@ -1965,6 +2146,88 @@ mod tests {
         assert_eq!(env["SPARKFLASH_CONTEXT"], GLM_CONTEXT_TOKENS.to_string());
         assert_eq!(env["SPARK_MAX_SEQ_LEN"], GLM_CONTEXT_TOKENS.to_string());
         assert!(!env.contains_key("SPARKFLASH_CUBINS"));
+    }
+
+    fn inkling_plan() -> SparkConfig {
+        let mut config = SparkConfig::default();
+        config.model.weights = INKLING_WEIGHTS_ID.to_owned();
+        config.model.id = sparkflash_model::descriptor::INKLING2_SMALL_ID.to_owned();
+        config.model.checkpoint = "/data/Inkling-2-Small".to_owned();
+        config.model.cubins.clear();
+        config.engine.kind = INKLING_ENGINE_ID.to_owned();
+        config.runtime.max_context_tokens = sparkflash_model::descriptor::INKLING2_CONTEXT_TOKENS;
+        config.runtime.max_concurrency = GROUP_LANES;
+        config
+    }
+
+    #[test]
+    fn an_inkling_plan_launches_its_lane_group_with_its_knobs() {
+        let mut config = inkling_plan();
+        config
+            .validate()
+            .expect("the Inkling four-Spark plan validates");
+        assert!(config.is_inkling() && config.is_lane_group());
+        assert_eq!(config.world_size(), WORLD_SIZE);
+        assert!(config.requires_conversion());
+        // Its kernels are built into the binary, and its converter writes no manifest.
+        assert!(!config.requires_cubins());
+        assert!(!config.requires_conversion_manifest());
+        let env = config.launch_env();
+        assert_eq!(env["SPARKFLASH_MODEL"], INKLING_WEIGHTS_ID);
+        assert_eq!(env["SPARKFLASH_CONCURRENCY"], GROUP_LANES.to_string());
+        assert!(!env.contains_key("SPARKFLASH_LANES"));
+        assert!(!env.contains_key("SPARKFLASH_CUBINS"));
+        assert!(!env.contains_key("SPARKFLASH_INKLING_DRAFT"));
+
+        config.runtime.drafting = Drafting::On;
+        config.runtime.lane_memory_mb = Some(9000);
+        config.runtime.joint_rounds = false;
+        config.runtime.prefill_chunk = Some(4096);
+        config.validate().expect("every knob is Inkling's");
+        let env = config.launch_env();
+        assert_eq!(env["SPARKFLASH_INKLING_DRAFT"], "dspark");
+        assert_eq!(env["SPARKFLASH_LANE_MEMORY_MB"], "9000");
+        assert_eq!(env["SPARKFLASH_JOINT_ROUNDS"], "off");
+        assert_eq!(env["SPARKFLASH_INKLING_PREFILL_CHUNK"], "4096");
+        let text = config.to_toml().expect("encodes");
+        let loaded = SparkConfig::from_toml(&text).expect("decodes");
+        assert_eq!(loaded.runtime, config.runtime);
+
+        config.runtime.prefill_chunk = Some(MAX_PREFILL_CHUNK + 1);
+        assert!(config.validate().is_err());
+        config.runtime.prefill_chunk = None;
+        config.runtime.lane_memory_mb = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn lane_knobs_are_refused_for_a_model_that_would_not_read_them() {
+        let mut glm = SparkConfig::default();
+        glm.model.weights = GLM_WEIGHTS_ID.to_owned();
+        glm.model.id = GLM_MODEL_ID.to_owned();
+        glm.model.checkpoint = "/data/GLM-5.3-Flash".to_owned();
+        glm.engine.kind = GLM_ENGINE_ID.to_owned();
+        glm.runtime.max_context_tokens = GLM_CONTEXT_TOKENS;
+        glm.runtime.drafting = Drafting::Off;
+        glm.validate().expect("GLM drafts");
+        assert_eq!(glm.launch_env()["SPARKFLASH_GLM_SPEC"], "off");
+        glm.runtime.prefill_chunk = Some(4096);
+        let error = glm.validate().expect_err("GLM has no prefill chunk knob");
+        assert!(error.message.contains("runtime.prefill_chunk"), "{error}");
+
+        let mut deepseek = SparkConfig::default();
+        deepseek.validate().expect("the default plan validates");
+        assert!(!deepseek.is_lane_group());
+        assert_eq!(
+            deepseek.launch_env()["SPARKFLASH_LANES"],
+            MAX_CONCURRENCY.to_string()
+        );
+        deepseek.runtime.lane_memory_mb = Some(9000);
+        let error = deepseek.validate().expect_err("V4.1 has no lane pool");
+        assert!(error.message.contains("runtime.lane_memory_mb"), "{error}");
+        deepseek.runtime.lane_memory_mb = None;
+        deepseek.runtime.joint_rounds = false;
+        assert!(deepseek.validate().is_err());
     }
 
     #[test]

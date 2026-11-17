@@ -47,12 +47,14 @@ use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam}
 use super::{
     ClusterStatsSnapshot, DSparkStepStats, RequestTimingStats, RoceTransportStats,
     TP4_CONTROL_TIMEOUT, Tp4Driver, Tp4EngineSpec, Tp4RankApi, Tp4RankConfig, Tp4ServeOptions,
-    default_engram_layers, empty_kv_snapshot, open_glm_tp4_rank, open_qwen_tp4_rank,
-    pack_tp4_worker, tp4_rank_config,
+    default_engram_layers, empty_kv_snapshot, open_glm_lanes, open_glm_tp4_rank, open_qwen_lanes,
+    open_qwen_tp4_rank, pack_tp4_worker, tp4_rank_config,
 };
 
 /// The variable naming a directory of Qwen3.8-Flash-Next rank files (`sparkflash convert`).
 pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
+/// Where an Inkling run reads its converted rank file, when one is staged.
+pub(super) const INKLING_CONVERTED_DIR_ENV: &str = "SPARKFLASH_INKLING_CONVERTED_DIR";
 
 /// The default DeepSeek arm's carried profile. The arm has no [PackArm] (the reference path
 /// serves it), but its boot still reads the same typed profile as the packed arms.
@@ -75,9 +77,15 @@ pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
         "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Qwen36Arm::PROFILE_TOML),
         "glm5_next" => Some(GlmArm::PROFILE_TOML),
         "dory" => Some(DORY_PROFILE_TOML),
+        "inkling2" => Some(sparkflash_model_inkling2::PROFILE_TOML),
         _ => None,
     }
 }
+
+/// Opens one rank of a pack's group stepping `lanes` fused lanes ([`PackArm::OPEN_LANES`]).
+#[cfg(feature = "tp4-serve")]
+pub(super) type GroupLanesOpen =
+    fn(&Tp4RankConfig, usize) -> Result<Option<Box<dyn ModelBackend>>, String>;
 
 /// What one pack's serving arm supplies; [`serve_host`] and [`serve_group`] are the rest.
 pub(super) trait PackArm {
@@ -105,6 +113,12 @@ pub(super) trait PackArm {
     /// Opens this process's rank of a tensor-parallel group.
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String>;
+    /// The group's fused lanes under `--fuse-batch` (sparkflash_runtime::GroupLanes): opens
+    /// this process's rank stepping that many lanes, and answers rank 0's backend, or `None` once
+    /// a worker's mirror of rank 0's lanes ends. `None` here: the group serves one request at a
+    /// time, and `--fuse-batch` is refused.
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = None;
 
     /// Writes the tiny fixture `--synthetic` serves into `directory`.
     fn write_fixture(directory: &Path) -> Result<Self::Config, String>;
@@ -178,6 +192,8 @@ impl PackArm for QwenArm {
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_qwen_tp4_rank;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = Some(open_qwen_lanes);
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny();
@@ -308,6 +324,8 @@ impl PackArm for QwenFp8Arm {
     const KV_BUDGET: bool = QwenArm::KV_BUDGET;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         <QwenArm as PackArm>::write_fixture(directory)
@@ -384,6 +402,8 @@ impl PackArm for Qwen36Arm {
     const KV_BUDGET: bool = QwenArm::KV_BUDGET;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = QwenArm::OPEN_RANK;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = QwenArm::OPEN_LANES;
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Qwen4ExpConfig::tiny_qwen35_moe(
@@ -462,6 +482,8 @@ impl PackArm for GlmArm {
     const KV_BUDGET: bool = true;
     #[cfg(feature = "tp4-serve")]
     const OPEN_RANK: fn(&Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> = open_glm_tp4_rank;
+    #[cfg(feature = "tp4-serve")]
+    const OPEN_LANES: Option<GroupLanesOpen> = Some(open_glm_lanes);
 
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Glm5NextConfig::tiny();
@@ -605,6 +627,10 @@ pub(super) fn qwen35_on_device(directory: &Path) -> bool {
         .is_some_and(|config| sparkflash_model_qwen4_exp::device::identity_for(&config).is_ok())
 }
 
+/// The lanes a `--tp4-rank` group whose arm opens lanes ([Pack::opens_group_lanes]) steps when
+/// neither `--concurrency` nor `--fuse-batch` is given: four, as the Inkling group serves.
+pub(super) const GROUP_LANES: usize = 4;
+
 /// The packs the model registry knows, including the default DeepSeek arm.
 ///
 /// The variants are the registry's families; every id, weights selector, model type, label,
@@ -621,6 +647,8 @@ pub(super) enum Pack {
     Glm,
     /// Dory1.0-4B, served by the dynamic path's device arm or host reference.
     Dory,
+    /// Inkling-2-Small, served by its pack's host/device arm.
+    Inkling,
 }
 
 impl Pack {
@@ -636,6 +664,7 @@ impl Pack {
             Self::Qwen36 => sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
             Self::Glm => sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID,
             Self::Dory => sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID,
+            Self::Inkling => sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID,
         };
         sparkflash_model::find_model_by_weights(weights)
             .expect("the model registry carries every pack's weight selector")
@@ -650,6 +679,7 @@ impl Pack {
             sparkflash_model::descriptor::QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID => Some(Self::Qwen36),
             sparkflash_model::descriptor::GLM53_FLASH_WEIGHTS_ID => Some(Self::Glm),
             sparkflash_model::descriptor::DORY1_0_4B_BF16_WEIGHTS_ID => Some(Self::Dory),
+            sparkflash_model::descriptor::INKLING2_SMALL_WEIGHTS_ID => Some(Self::Inkling),
             _ => None,
         }
     }
@@ -698,6 +728,9 @@ impl Pack {
             Some(Self::Dory) if !sparkflash_model_dory::DoryDeviceBackend::available() => {
                 return Vec::new();
             }
+            // The Inkling pack's host reference is the initial serving path; its device arm is
+            // gated by the same catalogue once it lands.
+            Some(Self::Inkling) => return Vec::new(),
             Some(Self::Dory) | Some(Self::Deepseek) | None => {
                 sparkflash_ops::parts::serving(sparkflash_model::Target::Sm121)
             }
@@ -713,7 +746,7 @@ impl Pack {
 
     /// Whether this variant has a [PackArm] (the DeepSeek arm is the default serving path).
     pub(super) const fn is_arm(self) -> bool {
-        !matches!(self, Self::Deepseek | Self::Dory)
+        !matches!(self, Self::Deepseek | Self::Dory | Self::Inkling)
     }
 
     /// The served id of this pack.
@@ -727,12 +760,37 @@ impl Pack {
         Self::from_descriptor(descriptor)
     }
 
+    /// Whether this pack's `--tp4-rank` group opens its ranks as fused lanes
+    /// ([PackArm::OPEN_LANES]); such a group steps [GROUP_LANES] of them unless the operator says
+    /// otherwise, and `--concurrency 1` serves one request at a time.
+    pub(super) fn opens_group_lanes(self) -> bool {
+        #[cfg(feature = "tp4-serve")]
+        return match self {
+            Self::Qwen => QwenArm::OPEN_LANES.is_some(),
+            Self::QwenFp8 => QwenFp8Arm::OPEN_LANES.is_some(),
+            Self::Qwen36 => Qwen36Arm::OPEN_LANES.is_some(),
+            Self::Glm => GlmArm::OPEN_LANES.is_some(),
+            Self::Deepseek | Self::Dory | Self::Inkling => false,
+        };
+        #[cfg(not(feature = "tp4-serve"))]
+        {
+            let _ = self;
+            false
+        }
+    }
+
     /// The flags among those given that this pack's arm would not apply: on one node, the
     /// knobs its host arm lacks; in a group, which serves one request at a time over a window
     /// every rank allocates, `--concurrency` above 1, `--fuse-batch` and `--kv-budget-gib`.
+    ///
+    /// `device_group` is the `--rank` group of the Inkling device arm, which steps concurrent
+    /// requests as fused lanes on every rank, as GLM's `--tp4-rank` group does: they take
+    /// `--concurrency` with `--fuse-batch`, and still refuse `--concurrency` alone, which would
+    /// interleave sequences in their lockstep.
     pub(super) fn unapplied(
         self,
         group: bool,
+        device_group: bool,
         concurrency: usize,
         fuse_batch: bool,
         kv_budget: bool,
@@ -740,13 +798,17 @@ impl Pack {
         let (fuses, budgets) = match self {
             Self::Qwen | Self::QwenFp8 | Self::Qwen36 => (QwenArm::FUSED_BATCH, QwenArm::KV_BUDGET),
             Self::Glm => (GlmArm::FUSED_BATCH, GlmArm::KV_BUDGET),
-            Self::Deepseek | Self::Dory => (false, false),
+            Self::Deepseek | Self::Dory | Self::Inkling => (false, false),
         };
+        // The groups that step concurrent requests as fused lanes: the Inkling device group, and a
+        // `--tp4-rank` group whose arm opens its ranks as lanes ([PackArm::OPEN_LANES]).
+        let tp4_lanes = !device_group && self.opens_group_lanes();
+        let lanes = tp4_lanes || (device_group && matches!(self, Self::Inkling));
         let mut unapplied = Vec::new();
-        if group && concurrency != 1 {
+        if group && concurrency != 1 && !(lanes && fuse_batch) {
             unapplied.push("--concurrency");
         }
-        if fuse_batch && (group || !fuses) {
+        if fuse_batch && if group { !lanes } else { !fuses } {
             unapplied.push("--fuse-batch");
         }
         if kv_budget && (group || !budgets) {
@@ -765,7 +827,7 @@ impl Pack {
             Self::QwenFp8 => serve_arm::<QwenFp8Arm>(options),
             Self::Qwen36 => serve_arm::<Qwen36Arm>(options),
             Self::Glm => serve_arm::<GlmArm>(options),
-            Self::Dory => {
+            Self::Dory | Self::Inkling => {
                 return super::dynamic::serve(options).unwrap_or_else(|message| {
                     eprintln!("sparkflash serve: {message}");
                     ExitCode::from(EXIT_REFUSED)
@@ -810,9 +872,8 @@ pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, Str
 ///
 /// The fields are the typed ones ([sparkflash_model::profile::SpeculationProfile]) and the
 /// environment names that set them are declared in [sparkflash_model::profile::ENV_OVERRIDES], so
-/// a switch here is a documented field rather than a new variable read at the point of use: a
-/// block drafter's depth is adaptive (it reports a confidence a draft), the MTP layer's is fixed
-/// (it reports none).
+/// a switch here is a documented field rather than a new variable read at the point of use. The
+/// drafts and their depth rule are [glm_drafting]'s, which the four-rank group reads too.
 fn apply_speculation(
     backend: &mut sparkflash_model_glm5_next::Glm5NextDeviceBackend,
     profile: &ModelProfile,
@@ -824,30 +885,89 @@ fn apply_speculation(
             .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
         eprintln!("sparkflash serve: GLM drafting with the DFlash 2 drafter {drafter}");
     }
-    if spec.enabled != Some(true) {
-        return Ok(());
-    }
-    // Two drafts is what the former harness default was and what the MTP layer pays for; a block
-    // drafter's block is longer, so a fixed depth is an operator's choice either way.
-    let drafts = spec.depth.unwrap_or(2);
-    let policy = spec.drafter.as_ref().map(|_| {
-        sparkflash_model::DepthPolicy::adaptive(
-            drafts,
-            sparkflash_model_glm5_next::DFLASH2_STEP_COST,
-        )
-    });
-    backend
-        .enable_speculation(drafts, policy)
+    let (block, most) = backend
+        .drafting_limits()
         .map_err(|error| error.to_string())?;
-    eprintln!(
-        "sparkflash serve: GLM speculating {drafts} draft(s) a step, {}",
-        if spec.drafter.is_some() {
-            "adaptive depth"
-        } else {
-            "fixed depth"
+    let Some(drafting) = glm_drafting(spec, block, most)? else {
+        return Ok(());
+    };
+    eprintln!("sparkflash serve: GLM speculating {}", drafting.label());
+    backend
+        .enable_speculation(drafting.drafts, Some(drafting.policy))
+        .map_err(|error| error.to_string())
+}
+
+/// How a GLM rank drafts: the most drafts a step verifies and the shared depth rule over them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GlmDrafting {
+    /// The most drafts a step proposes and verifies after its token.
+    pub(crate) drafts: usize,
+    /// [sparkflash_model::DepthPolicy::from_speculation] over [Self::drafts].
+    pub(crate) policy: sparkflash_model::DepthPolicy,
+}
+
+impl GlmDrafting {
+    /// For the serve log: the chain and its rule.
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "up to {} draft(s) a step, {} depth",
+            self.drafts,
+            if self.policy.is_adaptive() {
+                "adaptive"
+            } else {
+                "fixed"
+            }
+        )
+    }
+}
+
+/// The GLM arm's drafting from the profile's speculation section, for a rank with a block drafter
+/// (`block`) or the MTP layer, drafting at most `most`. `None` drafts nothing.
+///
+/// Either drafter says how sure it is of each draft (the block drafter's selector, the MTP
+/// layer's softmax), so the depth is DeepSeek's: adaptive unless `speculation.depth_policy` says
+/// fixed (`SPARKFLASH_GLM_DRAFT_POLICY`), at least `speculation.min_depth`, against the drafter's
+/// own step cost. The chain is `speculation.drafts` (`SPARKFLASH_GLM_DRAFTS`), else the whole
+/// block for a block drafter, else `speculation.depth` (`SPARKFLASH_GLM_SPEC_DEPTH`; the carried
+/// profile says 3), else 2. `speculation.enabled=false` (`SPARKFLASH_GLM_SPEC=off`) drafts
+/// nothing.
+///
+/// # Errors
+/// A chain past what the rank drafts, or a draft count asked for with speculation off.
+pub(crate) fn glm_drafting(
+    spec: &sparkflash_model::profile::SpeculationProfile,
+    block: bool,
+    most: usize,
+) -> Result<Option<GlmDrafting>, String> {
+    let drafts = match (spec.enabled, spec.drafts) {
+        (Some(false), None | Some(0)) => return Ok(None),
+        (Some(false), Some(drafts)) => {
+            return Err(format!(
+                "speculation.enabled=false with speculation.drafts={drafts}: say one or the other"
+            ));
         }
-    );
-    Ok(())
+        (_, Some(drafts)) => drafts,
+        (_, None) if block => most,
+        (_, None) => spec.depth.unwrap_or(2),
+    };
+    if drafts == 0 {
+        return Ok(None);
+    }
+    if drafts > most {
+        return Err(format!(
+            "{drafts} drafts a step (speculation.drafts or speculation.depth) is past the {most}              this rank's {} drafts",
+            if block { "block drafter" } else { "MTP layer" }
+        ));
+    }
+    let cost = if block {
+        sparkflash_model_glm5_next::DFLASH2_STEP_COST
+    } else {
+        sparkflash_model_glm5_next::MTP_STEP_COST
+    };
+    Ok(Some(GlmDrafting {
+        drafts,
+        policy: sparkflash_model::DepthPolicy::from_speculation(spec, drafts, cost),
+    }))
 }
 
 /// The one KV admission rule every single-node arm runs before it uploads a weight.
@@ -1095,17 +1215,7 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     let descriptor = backend.descriptor().clone();
     let seam = released_seam
         .unwrap_or_else(|| Arc::new(sparkflash_ops::codec::ByteCodec::new(descriptor.vocab_size)));
-    let driver = sparkflash_serve::HostDriver::start(
-        Box::new(backend),
-        Arc::clone(&seam),
-        sparkflash_serve::HostOptions {
-            max_tokens: options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
-            concurrency: options.concurrency,
-            ..sparkflash_serve::HostOptions::default()
-        },
-    )?;
-    let metrics = driver.metrics();
-    println!(
+    let banner = format!(
         "sparkflash serve: {} ({}) at TP=1 on {}, context {context}",
         descriptor.id,
         descriptor.weights_id,
@@ -1113,12 +1223,53 @@ fn serve_host<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
     );
     // The byte codec's output is arbitrary text, not the released template's channels, so the
     // fixture stays on the raw driver.
-    let engine: Arc<dyn ApiInferenceEngine> = if options.synthetic {
-        Arc::new(driver)
-    } else {
-        A::respond(Arc::new(driver))
+    let respond = (!options.synthetic).then_some(A::respond as Respond);
+    serve_backend(
+        options,
+        Box::new(backend),
+        seam,
+        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        1,
+        respond,
+        &banner,
+    )
+}
+
+/// An arm's response dialect over the raw driver ([`PackArm::respond`]).
+type Respond = fn(Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
+
+/// Serves `backend` behind the generic host driver ([`sparkflash_serve::HostDriver`]): one
+/// session a concurrent request, `respond`'s dialect over it when given, and the numerics key of
+/// a group of `world` ranks. Every arm that serves a [`ModelBackend`] serves it here, on one
+/// node or as rank 0 of a group's fused lanes; `banner` announces what is served.
+fn serve_backend(
+    options: &ServeOptions,
+    backend: Box<dyn ModelBackend>,
+    seam: Arc<dyn PromptCodec>,
+    max_tokens: usize,
+    world: usize,
+    respond: Option<Respond>,
+    banner: &str,
+) -> Result<ExitCode, String> {
+    let descriptor = backend.descriptor().clone();
+    let driver = sparkflash_serve::HostDriver::start(
+        backend,
+        Arc::clone(&seam),
+        sparkflash_serve::HostOptions {
+            max_tokens,
+            concurrency: options.concurrency,
+            ..sparkflash_serve::HostOptions::default()
+        }
+        .with_env()?,
+    )?;
+    let metrics = driver.metrics();
+    println!("{banner}");
+    let driver: Arc<dyn ApiInferenceEngine> = Arc::new(driver);
+    let engine = match respond {
+        Some(respond) => respond(driver),
+        None => driver,
     };
-    let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
+    let numerics = ConfigKey::tp(descriptor.id.clone(), world, options.numerics, CUDA_ARCH);
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))
@@ -1187,31 +1338,25 @@ pub(super) fn serve_arm_identity<A: PackArm>(
         A::fuse(&mut backend, options.concurrency)
             .map_err(|error| format!("cannot fuse the batch: {error}"))?;
     }
-    let backend = DescriptorBackend {
-        inner: backend,
-        descriptor: descriptor.clone(),
-    };
-    let driver = sparkflash_serve::HostDriver::start(
-        Box::new(backend),
-        Arc::clone(&seam),
-        sparkflash_serve::HostOptions {
-            max_tokens: options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
-            concurrency: options.concurrency,
-            ..sparkflash_serve::HostOptions::default()
-        },
-    )?;
-    let metrics = driver.metrics();
-    println!(
+    let banner = format!(
         "sparkflash serve: {} ({}) at TP=1 on {}, context {context}",
         descriptor.id,
         descriptor.weights_id,
         directory.display()
     );
-    let engine = respond(Arc::new(driver));
-    let numerics = ConfigKey::tp(descriptor.id.clone(), 1, options.numerics, CUDA_ARCH);
-    Ok(serve_with_seam(
-        engine, metrics, seam, None, options, descriptor, numerics,
-    ))
+    let backend = DescriptorBackend {
+        inner: backend,
+        descriptor,
+    };
+    serve_backend(
+        options,
+        Box::new(backend),
+        seam,
+        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        1,
+        Some(respond),
+        &banner,
+    )
 }
 
 /// The cluster telemetry a pack's group can state: its fabric mode, not a node list or a rail.
@@ -1281,6 +1426,16 @@ fn serve_group<A: PackArm>(
             profile.weights.as_deref().unwrap_or("-")
         );
     }
+    if options.fuse_batch {
+        let open = A::OPEN_LANES.ok_or_else(|| {
+            format!(
+                "{} TP={} serves one request at a time: --fuse-batch has no lanes to fuse",
+                A::NAME,
+                tp4.world_size
+            )
+        })?;
+        return serve_group_lanes::<A>(options, tp4, &directory, &config, context, open);
+    }
     if tp4.rank != 0 {
         pack_tp4_worker(options, tp4, context, A::OPEN_RANK)
             .map_err(|message| format!("rank {}: {message}", tp4.rank))?;
@@ -1323,6 +1478,49 @@ fn serve_group<A: PackArm>(
     Ok(serve_with_seam(
         engine, metrics, seam, None, options, descriptor, numerics,
     ))
+}
+
+/// A pack's group under `--fuse-batch`: every rank opens `--concurrency` lanes
+/// ([`PackArm::OPEN_LANES`]), rank 0 serves its backend through the host driver as one node
+/// does, and each worker mirrors rank 0's lanes until the group ends.
+#[cfg(feature = "tp4-serve")]
+fn serve_group_lanes<A: PackArm>(
+    options: &ServeOptions,
+    tp4: &Tp4ServeOptions,
+    directory: &Path,
+    config: &A::Config,
+    context: usize,
+    open: GroupLanesOpen,
+) -> Result<ExitCode, String> {
+    let mut rank_config = tp4_rank_config(options, tp4, TP4_CONTROL_TIMEOUT)?;
+    rank_config.context = context;
+    if tp4.rank != 0 {
+        open(&rank_config, options.concurrency)
+            .map_err(|message| format!("rank {}: {message}", tp4.rank))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    // The tokenizer before the rank upload, as the one-request group loads it.
+    let (_, seam) = pack_seam::<A>(options, directory, config)?;
+    let backend = open(&rank_config, options.concurrency)?
+        .ok_or_else(|| format!("{} rank 0 opened no lanes", A::NAME))?;
+    let banner = format!(
+        "sparkflash serve: {} TP={} rank 0 on {}; control {}; {} fused lanes; workers never \
+         detokenize",
+        A::MODEL_ID,
+        tp4.world_size,
+        tp4.peers[0],
+        tp4.control_port,
+        options.concurrency
+    );
+    serve_backend(
+        options,
+        backend,
+        seam,
+        options.max_tokens.min(A::MAX_OUTPUT_TOKENS),
+        tp4.world_size,
+        Some(A::respond),
+        &banner,
+    )
 }
 
 #[cfg(test)]
@@ -1436,6 +1634,24 @@ mod tests {
             .expect("the Dory config is written");
         assert_eq!(Pack::detect(directory.path()), Some(Pack::Dory));
         assert!(!Pack::Dory.is_arm());
+        assert!(Pack::missing_parts(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn an_inkling_checkpoint_detects_as_the_inkling_pack() {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        std::fs::write(
+            directory.path().join(CHECKPOINT_CONFIG_NAME),
+            sparkflash_model_inkling2::carried_config(),
+        )
+        .expect("the released config is written");
+        std::fs::write(
+            directory.path().join("hf_quant_config.json"),
+            sparkflash_model_inkling2::carried_quant(),
+        )
+        .expect("the quant groups are written");
+        assert_eq!(Pack::detect(directory.path()), Some(Pack::Inkling));
+        assert!(!Pack::Inkling.is_arm());
         assert!(Pack::missing_parts(directory.path()).is_empty());
     }
 

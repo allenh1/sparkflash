@@ -420,6 +420,10 @@ function paintConfig(config, report, force = false) {
 
   setValue("max-context", config.runtime.max_context_tokens);
   setValue("max-concurrency", config.runtime.max_concurrency);
+  setValue("drafting", config.runtime.drafting || "default");
+  setValue("lane-memory", config.runtime.lane_memory_mb);
+  $("joint-rounds").checked = config.runtime.joint_rounds !== false;
+  setValue("prefill-chunk", config.runtime.prefill_chunk);
   setValue("checkpoint", config.model.checkpoint);
   setValue("hub-cache", config.model.hub_cache);
   const checkpoint = S.state?.checkpoint;
@@ -737,7 +741,10 @@ function chooseBrowsedModel(model) {
     select.appendChild(option);
   }
   select.value = model.id;
-  if (model.weights) $("model-weights").value = model.weights;
+  if (model.weights && $("model-weights").value !== model.weights) {
+    $("model-weights").value = model.weights;
+    resetRuntimeFor(model.weights);
+  }
   if (model.engine) $("engine-kind").value = model.engine;
   if (model.context_tokens) {
     $("max-context").max = model.context_tokens;
@@ -816,6 +823,43 @@ function paintModels(selected) {
   paintModelSource();
 }
 
+// The build's family entry for a weights selector: whether its group steps fused lanes, and
+// which lane knobs it reads.
+function familyFor(weights) {
+  return (S.state?.supported?.models || []).find((model) => model.weights === weights) || null;
+}
+
+// Moving to another family resets the knobs only the old one read, and starts the new one at its
+// own lane count: four fused lanes for a lane group, the scheduler's 32 for V4.1. Inkling starts
+// at 4,096-row prefill chunks, which a 1M window leaves room for.
+function resetRuntimeFor(weights) {
+  const family = familyFor(weights);
+  const limits = S.state?.limits || {};
+  $("max-concurrency").value = family?.lane_group ? (limits.group_lanes || 4) : (limits.max_concurrency || 32);
+  $("drafting").value = "default";
+  $("lane-memory").value = "";
+  $("joint-rounds").checked = true;
+  $("prefill-chunk").value = family?.prefill_chunk ? 4096 : "";
+}
+
+// The lane knobs, the concurrency hint and the context presets follow the selected family.
+function paintRuntimeKnobs() {
+  const family = familyFor($("model-weights").value);
+  const lanes = Boolean(family?.lane_group);
+  $("lane-knobs").classList.toggle("hidden", !lanes);
+  $("prefill-chunk-field").classList.toggle("hidden", !family?.prefill_chunk);
+  const lanesDefault = S.state?.limits?.group_lanes || 4;
+  $("concurrency-hint").innerHTML = lanes
+    ? "Requests every Spark steps together as fused lanes (<code>--concurrency</code>); " + lanesDefault +
+      " is the default, and 1 serves one request at a time."
+    : "Sets <code>SPARKFLASH_LANES</code>; 32 is the engine's design point.";
+  $("drafting").options[0].textContent = family?.drafts_by_default ? "Model default (drafts)" : "Model default (no drafting)";
+  const ceiling = Number($("max-context").max) || Infinity;
+  for (const chip of document.querySelectorAll("[data-context]")) {
+    chip.classList.toggle("hidden", Number(chip.dataset.context) > ceiling);
+  }
+}
+
 // Choosing a model fixes the architecture and engine; they are one choice, not two.
 function applyModelProfile(id = $("model-id").value, dirty = true) {
   const profile = modelProfile(id);
@@ -823,6 +867,7 @@ function applyModelProfile(id = $("model-id").value, dirty = true) {
   let changed = false;
   if (profile.weights && $("model-weights").value !== profile.weights) {
     $("model-weights").value = profile.weights;
+    if (dirty) resetRuntimeFor(profile.weights);
     changed = true;
   }
   if (profile.engine && $("engine-kind").value !== profile.engine) {
@@ -836,6 +881,7 @@ function applyModelProfile(id = $("model-id").value, dirty = true) {
       changed = true;
     }
   }
+  paintRuntimeKnobs();
   if (dirty && changed) markDirty();
   return true;
 }
@@ -1075,6 +1121,10 @@ function collectConfig() {
   config.runtime = {
     max_context_tokens: numberValue("max-context", config.runtime.max_context_tokens),
     max_concurrency: numberValue("max-concurrency", config.runtime.max_concurrency),
+    drafting: $("drafting").value,
+    lane_memory_mb: numberValue("lane-memory", null),
+    joint_rounds: $("joint-rounds").checked,
+    prefill_chunk: numberValue("prefill-chunk", null),
   };
   config.paths = {
     repo_root: $("repo-root").value.trim(),
@@ -1858,10 +1908,10 @@ function launchBody(state, model) {
     launchJob.finished_ms && Date.now() - launchJob.finished_ms < 10 * 60 * 1000;
   if (running || model.online || loading) {
     parts.push(progressBar(running, loading
-      ? "The server is loading its weights. A debug build can take a few minutes."
+      ? "The server is loading its weights. A large model, or a debug build, takes several minutes."
       : model.solo
         ? "Starting this Spark's server and loading the model."
-        : "Starting the four Sparks and loading the model (~25 seconds)."));
+        : "Starting the four Sparks and loading the model."));
     if (loading) {
       parts.push('<p class="guide-note">The ranks are running; this step completes when rank 0 answers <code>/readyz</code>. ' +
         "A release build boots much faster than this debug binary.</p>");
@@ -2800,6 +2850,8 @@ function bindEvents() {
   });
   $("max-context").addEventListener("input", markDirty);
   $("max-concurrency").addEventListener("input", markDirty);
+  for (const id of ["lane-memory", "prefill-chunk"]) $(id).addEventListener("input", markDirty);
+  for (const id of ["drafting", "joint-rounds"]) $(id).addEventListener("change", markDirty);
   $("save-model").addEventListener("click", saveConfig);
   $("discard-model").addEventListener("click", discardConfig);
   $("checkpoint").addEventListener("input", paintModelSource);

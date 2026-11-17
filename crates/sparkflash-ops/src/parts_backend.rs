@@ -134,7 +134,9 @@ impl PartsDeviceRank {
             let mut launchers = Vec::with_capacity(layer.requirements.len());
             for requirement in &layer.requirements {
                 match slots.get(cursor).and_then(Option::as_ref) {
-                    Some(resolved) => launchers.push(launcher_for(requirement, resolved)?),
+                    Some(resolved) => {
+                        launchers.push(launcher_for(requirement, resolved, context)?);
+                    }
                     None => launchers.push(LayerLauncher::Unresolved(requirement.part)),
                 }
                 cursor += 1;
@@ -230,11 +232,14 @@ impl PartsDeviceRank {
 fn launcher_for(
     requirement: &crate::engine_plan::PartRequirement,
     resolved: &ResolvedKernel,
+    context: PlanContext,
 ) -> Result<LayerLauncher, PlanError> {
     Ok(match requirement.part {
-        Part::GdnScan | Part::KdaScan => {
-            LayerLauncher::LinearScan(LinearScanLauncher::new(requirement, resolved)?)
-        }
+        // Without a prompt scan body for its heads, the requirement keeps the resolver's kernel.
+        Part::GdnScan | Part::KdaScan => LinearScanLauncher::new(requirement, context)?.map_or(
+            LayerLauncher::Other(resolved.id()),
+            LayerLauncher::LinearScan,
+        ),
         Part::GqaAttention | Part::MlaAttention => {
             LayerLauncher::Attention(AttentionLauncher::new(
                 requirement,

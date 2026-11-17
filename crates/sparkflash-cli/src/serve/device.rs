@@ -39,7 +39,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +68,7 @@ use super::{
 };
 use crate::device_link::{DeviceFinish, DeviceJob, DeviceLink, DeviceOutcome, DeviceTick};
 use sparkflash_api::VisionImage;
+use sparkflash_comm::control::{exit_now, watch_workers};
 use sparkflash_model::vision::{ImageGrid as Grid, ImageSpan};
 use sparkflash_vision::{Geometry, IMAGE_TOKEN_ID};
 
@@ -177,18 +178,6 @@ impl DeviceHealth {
             None => Ok(()),
         }
     }
-}
-
-/// Ends the process now, without the C exit handlers: CUDA's tears the context down, which waits
-/// for the kernels in flight, and a collective whose peer has gone never finishes, so a rank whose
-/// group failed would stay up, holding its memory and its port. Rust runs no destructors on exit
-/// either, so only the standard streams need flushing.
-fn exit_now(code: i32) -> ! {
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    // SAFETY: _exit takes no pointers and does not return.
-    unsafe { libc::_exit(code) }
 }
 
 /// The device path's flags, parsed only with `--tp4-device`.
@@ -794,7 +783,7 @@ fn admit_frame(seq: u64, job: &DeviceJob) -> Tp4DeviceAdmit {
                     n_llm_w: narrow(span.grid.n_llm_w),
                     best_height: narrow(span.grid.best_height),
                     best_width: narrow(span.grid.best_width),
-                    key: span.key.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    key: Tp4DeviceImage::hex_key(&span.key),
                 }
             })
             .collect(),
@@ -814,19 +803,9 @@ fn admitted_job(
     let seq = admit.seq;
     let mut images = Vec::with_capacity(admit.images.len());
     for (index, image) in admit.images.into_iter().enumerate() {
-        let mut key = [0u8; 32];
-        let hex = image.key.as_bytes();
-        if hex.len() != 64 {
-            return Err(format!(
-                "sequence {seq} image {index}: a key of {} digits",
-                hex.len()
-            ));
-        }
-        for (byte, pair) in key.iter_mut().zip(hex.as_chunks::<2>().0) {
-            let pair = std::str::from_utf8(pair).map_err(|error| error.to_string())?;
-            *byte = u8::from_str_radix(pair, 16)
-                .map_err(|_| format!("sequence {seq} image {index}: the key is not hex"))?;
-        }
+        let key = image
+            .key_bytes()
+            .map_err(|error| format!("sequence {seq} image {index}: {error}"))?;
         let index = u32::try_from(index).unwrap_or(u32::MAX);
         images.push(VisionImage {
             span: ImageSpan {
@@ -1212,76 +1191,6 @@ impl DeviceLink for WorkerLink {
     }
 }
 
-/// Exits rank 0 when a worker's control socket closes: a dead rank must fail the server, not
-/// leave its requests waiting in a collective.
-fn watch_workers(hub: &Tp4ControlHub) -> Result<(), String> {
-    for (rank, stream) in hub.streams.iter().enumerate() {
-        let Some(stream) = stream else { continue };
-        let mut probe = stream
-            .try_clone()
-            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
-        std::thread::Builder::new()
-            .name(format!("sparkflash-watch-r{rank}"))
-            .spawn(move || {
-                // Workers send nothing after Hello: any read that is not a timeout is the end.
-                let mut byte = [0u8; 1];
-                loop {
-                    match std::io::Read::read(&mut probe, &mut byte) {
-                        Err(error)
-                            if matches!(
-                                error.kind(),
-                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                            ) => {}
-                        Ok(0) | Err(_) => {
-                            eprintln!(
-                                "sparkflash serve: rank {rank} closed its control channel; the group cannot serve, exiting"
-                            );
-                            exit_now(1);
-                        }
-                        Ok(_) => {}
-                    }
-                }
-            })
-            .map_err(|error| format!("rank {rank} control watch: {error}"))?;
-    }
-    Ok(())
-}
-
-/// Exits a worker when rank 0's control socket closes, even while it waits in a collective.
-fn watch_leader(stream: &TcpStream, rank: usize) -> Result<(), String> {
-    let probe = stream
-        .try_clone()
-        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
-    std::thread::Builder::new()
-        .name("sparkflash-watch-r0".to_owned())
-        .spawn(move || {
-            let mut byte = [0u8; 1];
-            loop {
-                match probe.peek(&mut byte) {
-                    // Frames are waiting for the device thread: look again once it has read them.
-                    Ok(n) if n > 0 => std::thread::sleep(Duration::from_millis(200)),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    _ => {
-                        if LEADER_ENDED.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        eprintln!(
-                            "sparkflash serve: rank {rank}: rank 0 closed the control channel, exiting"
-                        );
-                        super::print_exchange_stats();
-                        exit_now(1);
-                    }
-                }
-            }
-        })
-        .map_err(|error| format!("rank {rank} control watch: {error}"))?;
-    Ok(())
-}
-
 /// Logs when rank 0's loop stalls and when it moves again, so a stall leaves its time in the log
 /// whether or not anything polled `/health`.
 fn watch_loop(health: Arc<DeviceHealth>) -> Result<(), String> {
@@ -1426,7 +1335,12 @@ pub(super) fn run(
                 .stream
                 .set_read_timeout(None)
                 .map_err(|error| format!("control: {error}"))?;
-            watch_leader(&worker.stream, tp4.rank)?;
+            sparkflash_comm::control::watch_leader(
+                &worker.stream,
+                tp4.rank,
+                &LEADER_ENDED,
+                super::print_exchange_stats,
+            )?;
             crate::device_link::install(Box::new(WorkerLink {
                 control: worker,
                 pixels: std::collections::HashMap::new(),
@@ -1607,6 +1521,7 @@ fn start_leader(
 mod tests {
     use super::*;
     use sparkflash_model_deepseek_v41::encoding::{load_hf_tokenizer, reference_tokenizer_path};
+    use std::net::TcpStream;
 
     #[test]
     fn a_control_frame_the_sockets_cannot_hold_does_not_wait_for_the_worker() {

@@ -159,7 +159,7 @@ const DOORBELL_POLLS: usize = 32;
 const IDLE_SPIN: Duration = Duration::from_millis(10);
 
 /// The device's "peer published another length" tag in the abort word, matching
-/// `OPT_EXCHANGE_ABORT_LENGTH` in kernels/opt_misc_sm121.cu. Bits 16-23 name the peer.
+/// `OPT_EXCHANGE_ABORT_LENGTH` in kernels/opt_exchange_sm121.cuh. Bits 16-23 name the peer.
 const ABORT_TAG_LENGTH: u64 = 0x4c45;
 
 /// Where the abort word puts the peer that disagreed.
@@ -1976,7 +1976,7 @@ mod tests {
         // them with constants. A test that builds the word from the Rust constants and decodes it
         // with the same constants proves only that Rust agrees with itself, which is how the peer
         // at bit 8 survived a review. Read the kernel's own text and compare instead.
-        let source = include_str!("../../../../kernels/opt_misc_sm121.cu");
+        let source = include_str!("../../../../kernels/opt_exchange_sm121.cuh");
         let value = |name: &str| -> u64 {
             let line = source
                 .lines()

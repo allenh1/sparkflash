@@ -36,6 +36,7 @@
 use std::path::Path;
 
 use serde_json::Value;
+use sparkflash_model::prompt::message_role;
 use sparkflash_model::{PromptCodec, PromptError};
 
 /// The serialized special tokens the released template writes.
@@ -237,11 +238,11 @@ impl GlmCodec {
         }
         let last_user = messages
             .iter()
-            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+            .rposition(|message| message_role(message) == Some("user"));
         let mut index = 0;
         while index < messages.len() {
             let message = &messages[index];
-            let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+            let role = message_role(message).ok_or_else(|| {
                 PromptError::invalid("a message has no role", Some("messages"), None)
             })?;
             match role {
@@ -291,9 +292,7 @@ impl GlmCodec {
                 "tool" => {
                     // The template opens one observation turn for the whole run of tool
                     // messages, so the first of a run writes it and the rest only their response.
-                    if index == 0
-                        || messages[index - 1].get("role").and_then(Value::as_str) != Some("tool")
-                    {
+                    if index == 0 || message_role(&messages[index - 1]) != Some("tool") {
                         text.push_str(OBSERVATION);
                     }
                     let content = self.visible_text(message.get("content"))?;
@@ -509,6 +508,23 @@ impl PromptCodec for GlmCodec {
     fn token_str(&self, id: u32) -> Option<String> {
         self.tokenizer.id_to_token(id)
     }
+
+    /// The template writes a turn without reasoning as `<think></think>`, so a turn that must
+    /// not reason closes the block the generation prompt opened: the next turn's rendering of
+    /// this one then extends the prompt, and a kept lane continues it.
+    fn close_thinking(&self, ids: &mut Vec<u32>) -> bool {
+        let (Some(open), Some(close)) = (
+            self.tokenizer.token_to_id(THINK_OPEN),
+            self.tokenizer.token_to_id(THINK_CLOSE),
+        ) else {
+            return false;
+        };
+        if ids.last() != Some(&open) {
+            return false;
+        }
+        ids.push(close);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +634,27 @@ mod tests {
     }
 
     #[test]
+    fn a_developer_message_is_a_system_turn() {
+        let codec = codec();
+        let render = |role: &str| {
+            codec
+                .render(&json!({"messages": [
+                    {"role": role, "content": "hello"},
+                    {"role": "user", "content": "hi"}
+                ]}))
+                .expect("the template renders")
+        };
+        assert_eq!(render("developer"), render("system"));
+        assert_eq!(
+            render("developer"),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>hello<|user|>hi<|assistant|><think>"
+        );
+        codec
+            .render(&json!({"messages": [{"role": "narrator", "content": "x"}]}))
+            .expect_err("a role the template has no turn for is still refused");
+    }
+
+    #[test]
     fn a_tool_catalogue_and_a_reasoning_effort_are_rendered_before_the_turns() {
         let codec = codec();
         let request = json!({
@@ -642,6 +679,35 @@ mod tests {
             !text.contains("\"strict\""),
             "strict is not part of the signature"
         );
+    }
+
+    /// A turn that must not reason closes the block the generation prompt opened, and the next
+    /// turn's rendering of the reply extends that prompt, so a kept lane continues it.
+    #[test]
+    fn a_closed_thinking_turn_is_the_prefix_of_the_next_turn() {
+        let codec = codec();
+        let first = json!({"messages": [{"role": "user", "content": "hello"}]});
+        let mut prompt = codec.encode_chat(&first).expect("the template renders");
+        assert!(codec.close_thinking(&mut prompt));
+        let reply = codec
+            .encode_text("hi", false)
+            .expect("the tokenizer spells it");
+        let mut held = prompt.clone();
+        held.extend_from_slice(&reply);
+        let next = json!({"messages": [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "there"},
+        ]});
+        let next = codec.encode_chat(&next).expect("the template renders");
+        assert!(
+            next.starts_with(&held),
+            "{held:?} is not a prefix of {next:?}"
+        );
+        // A prompt the generation prompt did not end on an open block is left alone.
+        let mut closed = prompt.clone();
+        assert!(!codec.close_thinking(&mut closed));
+        assert_eq!(closed, prompt);
     }
 
     #[test]

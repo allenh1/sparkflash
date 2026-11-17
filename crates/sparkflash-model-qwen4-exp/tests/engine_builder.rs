@@ -179,6 +179,14 @@ fn the_gdn_scan_launcher_uses_value_heads_at_every_world() {
         assert_eq!(scan.key_heads, 16 / world, "TP{world} key heads");
         assert_eq!(scan.heads, 48 / world, "TP{world} value heads");
         assert_eq!(scan.launch.grid.0, scan.heads as u32, "TP{world} scan grid");
+        // The launcher names the scan body the arm launches, on the arm's grid.
+        assert_eq!(scan.kernel.symbol, "q4p_gdn_scan", "TP{world} scan symbol");
+        let (grid, block) = sparkflash_ops::gdn::gdn_scan_shape_for(scan.heads, scan.value_dim);
+        assert_eq!(
+            (scan.launch.grid, scan.launch.block.0),
+            (grid, block),
+            "TP{world}"
+        );
     }
 }
 
