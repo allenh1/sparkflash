@@ -28,6 +28,7 @@
 //! [`TOPC`] tokens are guaranteed); a nucleus wider than that is cut at the list, which only a
 //! near-flat distribution reaches.
 
+#[allow(unused_imports)] // every user of the re-export is behind the device feature
 pub use sparkflash_model::gumbel::GumbelSampler as Sampler;
 #[allow(unused_imports)]
 pub(super) use sparkflash_model::gumbel::{TOPC, TOPC_WORDS};

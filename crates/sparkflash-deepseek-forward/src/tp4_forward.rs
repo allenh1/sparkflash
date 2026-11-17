@@ -13101,7 +13101,7 @@ impl<'a> DeviceLayer<'a> {
                 &format_args!("layer device stage {stage}"),
             )
             .map_err(|error| format!("layer device stage {stage}: {error}"))?;
-        after(&round, &*state)?;
+        after(&round, &state)?;
         self.collectives_in_flight
             .set(self.collectives_in_flight.get().saturating_add(1));
         Ok(true)

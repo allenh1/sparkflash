@@ -423,7 +423,9 @@ impl GpuDflash2 {
 /// drafter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Part {
+    /// Rows `first..first + count` of the matrix.
     Rows(usize, usize),
+    /// Columns `first..first + count` of the matrix.
     Columns(usize, usize),
 }
 
@@ -466,6 +468,7 @@ pub struct DraftUploader<'a> {
 }
 
 impl<'a> DraftUploader<'a> {
+    /// An uploader over one device and the drafter's single-shot weight source.
     #[must_use]
     pub fn new(cuda: &'a Cuda, source: &'a dyn WeightSource) -> Self {
         Self { cuda, source }

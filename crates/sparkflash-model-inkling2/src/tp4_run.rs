@@ -84,6 +84,7 @@ pub struct RewindCheck {
     pub extended_cached: usize,
     /// The kept session's prefill wall time, and the fresh one's.
     pub rewound_ms: u128,
+    /// The fresh session's prefill wall time.
     pub cold_ms: u128,
     /// The largest difference between the rewound and the cold prefill's logits; zero when they
     /// are the same bits.
@@ -97,10 +98,15 @@ pub struct RewindCheck {
     pub extended_equal: bool,
     /// Each session's ids and decode digest from the second prompt on.
     pub rewound_ids: Vec<u32>,
+    /// The extended session's ids from the second prompt on.
     pub extended_ids: Vec<u32>,
+    /// The cold session's ids from the second prompt on.
     pub cold_ids: Vec<u32>,
+    /// The rewound session's decode digest.
     pub rewound_digest: u64,
+    /// The extended session's decode digest.
     pub extended_digest: u64,
+    /// The cold session's decode digest.
     pub cold_digest: u64,
 }
 

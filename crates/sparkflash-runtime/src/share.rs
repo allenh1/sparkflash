@@ -36,11 +36,17 @@ pub trait StepWall {
 /// past them, plus `seq_ms` for each sequence past the first (DeepSeek's fitted step model).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BandWall {
+    /// The first band's intercept, in modelled milliseconds.
     pub a0: f64,
+    /// The first band's slope a row, in modelled milliseconds.
     pub a1: f64,
+    /// The second band's intercept.
     pub b0: f64,
+    /// The second band's slope a row.
     pub b1: f64,
+    /// The wall each sequence past the first adds.
     pub seq_ms: f64,
+    /// The last row count the first band covers; past it the second band's pair applies.
     pub band_rows: usize,
 }
 
@@ -72,11 +78,17 @@ impl StepWall for BandWall {
 /// ones fewer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExpertUnionWall {
+    /// What one row reads whatever its picks: the dense weights, the head, the collectives.
     pub fixed_ms: f64,
+    /// The wall each distinct expert any row picked adds.
     pub expert_ms: f64,
+    /// The wall a row adds.
     pub row_ms: f64,
+    /// The wall each sequence past the first adds: its own attention walk and draft pass.
     pub seq_ms: f64,
+    /// How many experts the layer routes over.
     pub experts: usize,
+    /// How many experts a row picks.
     pub top_k: usize,
 }
 

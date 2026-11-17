@@ -76,6 +76,7 @@ pub struct GumbelSampler {
     pub top_p: f32,
     /// 0 keeps every token.
     pub top_k: u32,
+    /// The Gumbel stream's seed: two requests with the same seed draw the same noise.
     pub seed: u64,
 }
 
@@ -96,6 +97,7 @@ impl GumbelSampler {
         seed: 0,
     };
 
+    /// True when the request is the plain argmax (a temperature of zero or below).
     pub fn is_greedy(&self) -> bool {
         self.temperature <= 0.0
     }

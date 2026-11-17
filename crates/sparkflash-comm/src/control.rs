@@ -613,6 +613,7 @@ impl Tp4ControlHub {
 
 /// One worker's end of the control channel.
 pub struct Tp4ControlWorker {
+    /// The socket to rank 0's hub.
     pub stream: TcpStream,
     /// This worker's rank.
     pub rank: u32,

@@ -22,6 +22,7 @@ use sparkflash_model::architecture::WeightFormat;
 
 use crate::config::Inkling2Config;
 
+/// The synthetic weight source the host and device parity tests build a whole arm from.
 pub struct TinySource {
     specs: HashMap<String, TensorSpec>,
     data: HashMap<String, Vec<u8>>,
@@ -100,6 +101,8 @@ impl WeightSource for TinySource {
     }
 }
 
+/// One deterministic value for `name`, element `index`, scaled by `scale`: the fixtures are
+/// seeded by tensor name so a test can rebuild any weight it needs.
 pub fn seeded(name: &str, index: usize, scale: f32) -> f32 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in name.bytes().chain(index.to_le_bytes()) {
@@ -110,6 +113,7 @@ pub fn seeded(name: &str, index: usize, scale: f32) -> f32 {
     unit * scale
 }
 
+/// Adds the seeded `[rows, columns]` BF16 matrix `name` to `source`.
 pub fn matrix(source: &mut TinySource, name: &str, rows: usize, columns: usize, scale: f32) {
     let values: Vec<f32> = (0..rows * columns)
         .map(|index| seeded(name, index, scale))
@@ -328,10 +332,12 @@ pub fn tiny_source(config: &Inkling2Config) -> TinySource {
     source
 }
 
+/// A seeded vector of `len` values, for a test that needs an arbitrary input.
 pub fn random_vec(name: &str, len: usize, scale: f32) -> Vec<f32> {
     (0..len).map(|index| seeded(name, index, scale)).collect()
 }
 
+/// Writes one layer's routed experts in the format that layer's config names.
 pub fn write_experts(source: &mut TinySource, config: &Inkling2Config, layer: usize) {
     let prefix = format!("model.llm.layers.{layer}.mlp.experts");
     let experts = config.n_routed_experts;
