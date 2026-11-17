@@ -62,7 +62,7 @@ and the arms:
 | `rounds` | one speculative round for several sequences: draft every chain, share rows, one walk, each sequence accepts | DeepSeek's `spec_multi_step`, generalized |
 | `fused` (prompts) | a long prompt a chunk at a time between the running decoders' steps (`FusedArm::begin_prompt`, `FusedArm::next_part`, `Part`); the arm keeps its own chunk sizing | DeepSeek's scheduler (`PREFILL_DECODE_INTERVAL`, `PREFILL_BYPASS_MAX_TOKENS`) |
 | `group` | rank 0 decides and broadcasts, workers replay: lanes, runs, give-backs, releases; an arm supplies only its wire (`GroupWire`: admission, sampler and image frames) | Inkling's `GroupLanes` |
-| `ledger` (next) | per arm, which strategies run natively, looped or off; printed at boot | new |
+| `ledger` | per arm, which strategies run natively, looped or off (`Ledger`, `Strategy`, `Mode`); the engine states lanes, prompt parts and group, the arm the rest (`FusedArm::ledger`); printed at boot | new |
 
 Device memory for lanes stays in `sparkflash_kernels::lane_memory` (it needs the driver); the
 runtime only asks an arm's sequence whether it has room (`FusedArm::room`). An arm lays out
@@ -103,6 +103,7 @@ step, and one walk serves them all.
 5. The projection dispatcher in `sparkflash-ops`.
 6. Execute the typed plans directly, so a new arm starts as a schedule plus its unique kernels.
    `docs/adding-a-model.md` then describes the contract instead of a forward.
+7. The ledger: per arm, which strategies run natively, looped or off, printed at boot.
 
 Steps 1-4 move scheduling, not arithmetic: the existing digests are their gate. DeepSeek keeps
 its own driver for now; it donates logic, and porting it onto the contract is optional. What is
@@ -118,7 +119,8 @@ loop pipeline (which uses only the policy pieces).
 | 3. Qwen and GLM on the contract | done: both arms' fused lanes draft and verify through `RoundArm`; GLM's and Qwen's groups step four lanes by default, GLM's on Inkling's lane memory |
 | 4. prefill scheduler | done: the engine runs a prompt past 256 tokens a chunk at a time, two decode steps between chunks (`SPARKFLASH_PROMPT_PARTS=off` opts out); Inkling, GLM and Qwen split their prompts into parts |
 | 5. projection dispatcher | first cut: BF16 projections (GLM, Dory, Inkling) choose and launch the wide tile through `sparkflash_ops::projection`; Qwen's split-K tile and the FP8 projections keep their own rules |
-| 6. typed plans executed | planned |
+| 6. typed plans executed | first cut: Qwen's prompt GDN scan and GLM's bulk KDA scan launch the kernel and grid of the rank plan's `ScanPlan`; attention, MoE, the indexer and the residual mixers still launch from the arms' own load-time geometry |
+| 7. ledger | done: every fused engine prints `ledger <arm>: ...` at start; Inkling, GLM and Qwen state their strategies |
 
 ### Step 1: what it measured
 
@@ -377,3 +379,42 @@ gate showing the shared rule gives the same bits first.
 The gate is bit-neutral: Inkling's batch digests and every lanes-gate answer equal jr4's; GLM's
 lanes-gate and interleave answers equal step 4's; Dory's single-process server gives the step-4
 build's text and logprobs at prompts of 12, 700 and 3,000 words.
+
+### Step 6: the scan runs the plan
+
+The boot check already builds an `EnginePlan` per rank and resolves every part's kernel; until
+now the arms then launched their scans from a second copy of the same facts. `ScanPlan::scheduled`
+turns a scan requirement into the launch the arms run (heads, head widths, the column split of
+`gdn_scan_shape_for`, the resolved kernel), and `ScanPlan::for_architecture` builds it for a
+rank from the architecture its pack planned, refusing a plan whose scan layers differ. Qwen's
+prompt walk launches its GDN scan from that plan (the plan's symbol, grid and block) and GLM's
+bulk prefill its KDA scan; each arm checks the plan against its own loaded shapes and refuses a
+mismatch at load, so the plan and the weights cannot drift apart silently. Heads no prompt scan
+body takes (a test fixture's narrow ones) keep the token kernel: the boot launcher names the
+resolver's kernel, and a prompt walk that reaches the scan refuses with the plan's reason rather
+than launch a body built for other widths. The boot launcher
+(`LinearScanLauncher`) builds the same plan, so the resolver, the boot path and the serving walk
+name one kernel.
+
+This is the first cut. The scan was the one part whose plan already held everything its launch
+needs. Attention (MLA, sparse MLA, GQA), the routed experts, the indexer and the residual mixers
+each launch with values the plan does not carry yet (cache layouts, work lists, top-k widths,
+split-KV cuts), so executing them needs new descriptor fields first, each with a gate.
+
+### The ledger
+
+`sparkflash_runtime::Ledger` says, for one arm, how each runtime strategy runs: lanes, prompt
+parts, drafting, joint rounds, multi-token runs, prefix reuse and the group. Each is `native`
+(the arm's walk takes the strategy's shape), `looped` (the runtime loops a smaller shape) or
+`off`, with a reason. The engine fills what it decides (the lane count; prompt parts off under
+`SPARKFLASH_PROMPT_PARTS=off`; the group), the arm the rest through `FusedArm::ledger`; a
+strategy nobody states prints as `off (the arm does not state it)`, so a missing statement shows
+rather than reads as support. The line is printed once when the engine starts:
+
+```text
+sparkflash serve: ledger Inkling: lanes native (4 slots); prompt parts native (chunks of up to
+4096 tokens); drafting native (DSpark, up to 7 drafts); joint rounds native; multi-token runs
+native; prefix reuse native; group native (inkling: rank 0 decides and broadcasts, the workers
+replay)
+```
+

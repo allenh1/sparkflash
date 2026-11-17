@@ -31,7 +31,7 @@ use sparkflash_model::{BackendError, ModelSession as _, Sampling, Speculation, S
 use super::batch::BatchBuffers;
 use super::{DeviceSequence, SequenceShared};
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round,
+    ExpertUnionWall, FusedArm, Ledger, Mode, Opened, Part, RoundArm, StepWall, Strategy, run_round,
 };
 
 /// The arm the engine steps.
@@ -271,5 +271,31 @@ impl FusedArm for QwenFusion {
 
     fn max_batch(&self) -> usize {
         self.rows
+    }
+
+    fn ledger(&self) -> Ledger {
+        let mut ledger = Ledger::new("Qwen");
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::native("the prefill plan's chunks"),
+        );
+        let drafter = self
+            .shared
+            .drafter()
+            .map(|drafter| format!("{drafter}, up to {} drafts", self.depth()));
+        let drafts = drafter.is_some();
+        ledger.drafting(drafter, self.joint_rounds, true);
+        if drafts && !self.joint_rounds {
+            // Without joint rounds a fused step is one plain row a member; a lone member drafts.
+            ledger.set(
+                Strategy::JointRounds,
+                Mode::off(format!(
+                    "{}=off: fused lanes step one plain row each, a lone request drafts",
+                    sparkflash_runtime::JOINT_ROUNDS_ENV
+                )),
+            );
+        }
+        ledger.set(Strategy::PrefixReuse, Mode::off("the arm keeps no history"));
+        ledger
     }
 }

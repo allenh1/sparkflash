@@ -160,6 +160,45 @@ per-frame and per-batch worklists), and refuses a checkpoint whose shapes the wi
 run. A new arm composes the typed plans and implements `GemvDevice` as this guide
 describes.
 
+## 2b. The contract: a schedule plus its unique kernels
+
+An arm does not write a serving loop. It supplies a schedule (how its walk steps rows) and the
+kernels only it has; everything else is shared and named here.
+
+**The schedule** is `sparkflash_runtime::FusedArm` ([engine/03-runtime.md](engine/03-runtime.md)):
+open a slot, step a set of slots one row each, run a prompt (`begin_prompt`, `next_part` for a
+prompt split into chunks), hand back a multi-token run (`ready`, `give_back`), and say what a slot
+holds for prefix reuse (`history`). A drafting arm adds `RoundArm` (draft every chain, one verify
+walk, accept per sequence) and the runtime decides the rows each round gets (`share_rows`). A
+tensor-parallel group adds only its wire (`GroupWire`: admission, sampler and image frames);
+`GroupLanes` runs rank 0's decisions on every rank. The engine (`FusedEngine`) owns slots, the
+engine thread, admission, the prompt scheduler and reclaim.
+
+**The ledger** is how an arm says what it does with that schedule. `FusedArm::ledger` returns a
+`sparkflash_runtime::Ledger` stating each strategy it runs natively, looped or off, with the
+reason; the engine adds what it decides and prints the line at boot. A strategy the arm leaves
+unstated prints as off, so an arm cannot appear to support what it does not.
+
+**Shared launch rules.** A BF16 projection's kernel comes from `sparkflash_ops::projection`:
+`route_bf16` with the arm's `WidePolicy` chooses the row GEMV, the wide tensor-core tile, the
+skinny kernel or a refusal, and `WideTile::call` gives the wide tile's grid, block and arguments.
+A new arm picks a policy (or adds one, with a gate) rather than writing its own row-count test.
+The decode GEMV's splits are `sparkflash_ops::gemv`'s.
+
+**Executed plans.** Where a typed plan carries everything its launch needs, the arm launches the
+plan instead of its own copy of the geometry: a linear-attention scan is
+`ScanPlan::for_architecture(&architecture, world, rank, kind, rows)`, the same plan the boot
+resolver checked, and the arm launches its kernel on its grid and block after checking it against
+the loaded weights' shapes. Today only the scan is executed this way; attention, the routed
+experts, the indexer and the residual mixers still launch from the arm's load-time geometry,
+because their plans do not yet carry the cache layouts, work lists and split cuts those launches
+take. A new arm should launch the scan from the plan and the rest through the shared helpers in
+section 5, and should not add a new parallel launch rule for a part another arm already runs.
+
+**What stays in the arm**: its weights' layout and loader, the kernels unique to the model
+(Inkling's convolutions and relative attention, Engram, Dory's loop pipeline), its sampler wire,
+and the order of its layer walk.
+
 ## 3. Configuration
 
 Every arm has one typed TOML profile:
@@ -315,7 +354,11 @@ and an arm without a fused batch or a KV budget says so at TP=1. A directory of 
 - [ ] nothing in section 5 is reimplemented in the arm;
 - [ ] no `.cu`/`.cuh` and no kernel build script in the model crate;
 - [ ] no dependency on another model crate;
-- [ ] every op is a plan, validated before its first launch;
+- [ ] every op is a plan, validated before its first launch, and the scan launches the rank
+      plan's `ScanPlan` (section 2b);
+- [ ] the arm serves through `FusedArm` (and `RoundArm` to draft), and its ledger states every
+      strategy it runs, so the boot line shows none as `the arm does not state it`;
+- [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`;
 - [ ] the parity harness passes layer by layer against the host reference;
 - [ ] new environment aliases are in `ENV_OVERRIDES` and documented here;
 - [ ] the arm is registered in the model registry and has a descriptor;

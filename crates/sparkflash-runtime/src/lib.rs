@@ -25,13 +25,16 @@
 //! * [rounds]: one speculative round over several sequences - every chain drafted, rows shared,
 //!   one walk, each sequence accepting its own;
 //! * [group]: fused lanes across a tensor-parallel group - rank 0 decides and broadcasts, every
-//!   other rank replays.
+//!   other rank replays;
+//! * [ledger]: which of these an arm runs natively, looped or not at all, printed when its engine
+//!   starts.
 //!
 //! The plan, and what is still to move here, is
 //! [docs/engine/03-runtime.md](../../../docs/engine/03-runtime.md).
 
 pub mod fused;
 pub mod group;
+pub mod ledger;
 pub mod rounds;
 pub mod share;
 
@@ -43,5 +46,6 @@ pub use group::{
     GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
     mirror_until_the_group_ends, watched_hub,
 };
+pub use ledger::{Ledger, Mode, Strategy};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};

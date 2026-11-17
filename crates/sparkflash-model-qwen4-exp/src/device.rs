@@ -3451,6 +3451,26 @@ struct SequenceShared {
     gdn_scan: Result<Option<ScanPlan>, String>,
 }
 
+impl SequenceShared {
+    /// The drafter a sequence speculates with, by name: the DFlash 2 drafter when one is loaded,
+    /// else the checkpoint's MTP stage when the arm serves it; `None` when the profile turns
+    /// speculation off or the checkpoint has neither.
+    fn drafter(&self) -> Option<&'static str> {
+        let drafter = if self.dflash.is_some() {
+            "DFlash 2"
+        } else if self.config.serves_mtp() {
+            "MTP"
+        } else {
+            return None;
+        };
+        sparkflash_model::active_profile()
+            .speculation
+            .enabled
+            .unwrap_or(true)
+            .then_some(drafter)
+    }
+}
+
 impl Drop for SequenceShared {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.pooled.lock()
@@ -5459,11 +5479,7 @@ impl DeviceSequence {
                     DepthPolicy::from_profile(draft.config.block_size - 1, DFLASH2_STEP_COST)
                 }),
             ),
-            spec_enabled: (config.serves_mtp() || shared.dflash.is_some())
-                && sparkflash_model::active_profile()
-                    .speculation
-                    .enabled
-                    .unwrap_or(true),
+            spec_enabled: shared.drafter().is_some(),
             // A mean over the hyper-connection streams unless the profile names a scale; `sum`
             // is the spelling `SPARKFLASH_QWEN4_MTP_FOLD` has always documented for one, and it
             // arrives here as the number one (crates/sparkflash-model/src/profile.rs).

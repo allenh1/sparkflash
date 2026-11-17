@@ -54,7 +54,9 @@ use sparkflash_model::{
 };
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
-use sparkflash_runtime::{ExpertUnionWall, FusedArm, Opened, Part, RoundArm, StepWall, run_round};
+use sparkflash_runtime::{
+    ExpertUnionWall, FusedArm, Ledger, Mode, Opened, Part, RoundArm, StepWall, Strategy, run_round,
+};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::quant::bf16_to_f32;
 
@@ -3473,6 +3475,27 @@ impl FusedArm for InklingLanes {
 
     fn cached_tokens(&self, slot: &InklingLane) -> usize {
         slot.session.cached_tokens()
+    }
+
+    fn ledger(&self) -> Ledger {
+        let mut ledger = Ledger::new("Inkling");
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::native(format!(
+                "chunks of up to {} tokens",
+                self.shared.prefill_chunk
+            )),
+        );
+        let drafter = self.shared.draft.as_ref().map(|(drafter, depth)| {
+            let name = match drafter {
+                Drafter::Lookup => "prompt lookup",
+                Drafter::Dspark => "DSpark",
+            };
+            format!("{name}, up to {depth} drafts")
+        });
+        ledger.drafting(drafter, self.joint_rounds, true);
+        ledger.set(Strategy::PrefixReuse, Mode::native(""));
+        ledger
     }
 
     fn max_batch(&self) -> usize {

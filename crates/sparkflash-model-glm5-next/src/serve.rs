@@ -41,16 +41,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
+use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
     PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, verdict,
 };
-use sparkflash_model::vision::VisionImage;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Opened, Part, RoundArm, StepWall,
-    TextWire, mirror_until_the_group_ends, run_round, watched_hub,
+    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Opened, Part, RoundArm,
+    StepWall, Strategy, TextWire, mirror_until_the_group_ends, run_round, watched_hub,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -367,6 +367,22 @@ impl FusedArm for GlmFusion {
     fn max_batch(&self) -> usize {
         // A step is one row a member and the rank's batch is `MAX_ROWS` rows wide.
         crate::device::MAX_ROWS
+    }
+
+    fn ledger(&self) -> Ledger {
+        let mut ledger = Ledger::new("GLM");
+        ledger.set(Strategy::PromptParts, Mode::native("bulk prefill chunks"));
+        let drafter = self.spec().map(|spec| {
+            let depth = if spec.policy.is_some() {
+                "adaptive depth"
+            } else {
+                "fixed depth"
+            };
+            format!("MTP, up to {} drafts, {depth}", spec.drafts)
+        });
+        ledger.drafting(drafter, self.joint_rounds, true);
+        ledger.set(Strategy::PrefixReuse, Mode::off("the arm keeps no history"));
+        ledger
     }
 }
 

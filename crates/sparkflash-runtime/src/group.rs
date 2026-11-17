@@ -45,6 +45,7 @@ use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput}
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::fused::{FusedArm, Part};
+use crate::ledger::{Ledger, Mode, Strategy};
 
 /// What an arm decides about its group's frames.
 pub trait GroupWire: Send + Sync + 'static {
@@ -233,7 +234,9 @@ pub type Split = fn(&str) -> !;
 /// Ends rank 0's process when its group is out of step ([Split]). Rank 0's exit closes every
 /// control socket, which ends each worker's process in turn, collective or not.
 pub fn end_group(why: &str) -> ! {
-    eprintln!("sparkflash serve: rank 0: the group is out of step and cannot serve, exiting: {why}");
+    eprintln!(
+        "sparkflash serve: rank 0: the group is out of step and cannot serve, exiting: {why}"
+    );
     exit_now(1)
 }
 
@@ -732,6 +735,16 @@ impl<A: FusedArm, W: GroupWire> FusedArm for GroupLanes<A, W> {
             .map_or(0, |inner| self.arm.cached_tokens(inner))
     }
 
+    fn ledger(&self) -> Ledger {
+        self.arm.ledger().with(
+            Strategy::Group,
+            Mode::native(format!(
+                "{}: rank 0 decides and broadcasts, the workers replay",
+                self.wire.name()
+            )),
+        )
+    }
+
     fn max_batch(&self) -> usize {
         self.arm.max_batch()
     }
@@ -1057,7 +1070,8 @@ mod tests {
             fails: true,
             ..ToyLanes::default()
         };
-        let lanes = GroupLanes::new(failing, Arc::clone(&hub), Wire { context: 64 }).with_split(splits);
+        let lanes =
+            GroupLanes::new(failing, Arc::clone(&hub), Wire { context: 64 }).with_split(splits);
         let mut lane = lanes.open_slot().expect("lane 0");
         lanes.prefill(&mut lane, &[1, 2]).expect("the prompt");
         let mut members = vec![(lane, 3u32)];
@@ -1066,9 +1080,7 @@ mod tests {
             let _ = lanes.step(&mut members);
         }))
         .expect_err("the failed step splits the group");
-        let why = split
-            .downcast_ref::<String>()
-            .expect("the split's message");
+        let why = split.downcast_ref::<String>().expect("the split's message");
         assert!(why.contains("the device failed"), "{why}");
         let error = worker
             .join()

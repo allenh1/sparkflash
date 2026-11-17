@@ -56,6 +56,8 @@ use std::time::{Duration, Instant};
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
+use crate::ledger::{Ledger, Mode, Strategy};
+
 /// Steps of the decoding members between two parts of a prompt (`--prefill-decode-interval 2`,
 /// spec 5.6.2). DeepSeek's scheduler reads it from here.
 pub const PREFILL_DECODE_INTERVAL: usize = 2;
@@ -284,6 +286,46 @@ pub trait FusedArm: Send + Sync + 'static {
     fn max_batch(&self) -> usize {
         usize::MAX
     }
+
+    /// What the arm states of the runtime's strategies ([crate::ledger]): whether it splits its
+    /// prompts, drafts, verifies its lanes' rounds in one walk, hands back runs and keeps
+    /// prefixes. The engine adds its lanes and whether prompts run in parts at all, and prints the
+    /// ledger when it starts. The default states nothing, which prints every strategy as unstated.
+    fn ledger(&self) -> Ledger {
+        Ledger::new(std::any::type_name::<Self>())
+    }
+}
+
+/// The ledger the engine prints: the arm's, with the engine's own lanes and prompt schedule.
+fn engine_ledger<A: FusedArm>(arm: &A, capacity: usize, parts: bool) -> Ledger {
+    let mut ledger = arm.ledger();
+    let rows = capacity.min(arm.max_batch());
+    ledger.set(
+        Strategy::Lanes,
+        match (capacity, rows) {
+            (1, _) => Mode::off("one slot"),
+            (_, 1) => Mode::looped(format!("{capacity} slots, one row a step")),
+            (_, rows) if rows < capacity => {
+                Mode::native(format!("{capacity} slots, {rows} a step"))
+            }
+            _ => Mode::native(format!("{capacity} slots")),
+        },
+    );
+    if !parts {
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::off(format!("{PROMPT_PARTS_ENV}=off")),
+        );
+    } else if !ledger.states(Strategy::PromptParts) {
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::off("the arm runs its prompts whole"),
+        );
+    }
+    if !ledger.states(Strategy::Group) {
+        ledger.set(Strategy::Group, Mode::off("one rank"));
+    }
+    ledger
 }
 
 /// How long a step waits for the batch to fill before it runs with what it has.
@@ -413,6 +455,10 @@ impl<A: FusedArm> FusedEngine<A> {
             ));
         }
         let parts = prompt_parts().map_err(|error| BackendError::new("fused", error))?;
+        eprintln!(
+            "sparkflash serve: {}",
+            engine_ledger(&*arm, capacity, parts)
+        );
         let mut pool: Vec<Option<A::Slot>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             pool.push(Some(arm.open_slot()?));
@@ -1781,6 +1827,37 @@ mod tests {
         let prompt: Vec<u32> = (1..=PREFILL_BYPASS_MAX_TOKENS as u32).collect();
         let first = session.prefill(&prompt).expect("the prompt");
         assert_eq!(first.next_token, Some(prompt.iter().sum()));
-        assert_eq!(arm.log.lock().expect("the log").len(), 3, "three parts in a row");
+        assert_eq!(
+            arm.log.lock().expect("the log").len(),
+            3,
+            "three parts in a row"
+        );
+    }
+
+    #[test]
+    fn the_engine_states_its_lanes_and_prompt_schedule_beside_the_arm() {
+        let toy = Toy {
+            steps: AtomicUsize::new(0),
+            rows: AtomicUsize::new(0),
+        };
+        let ledger = engine_ledger(&toy, 4, true);
+        assert_eq!(ledger.mode(Strategy::Lanes), Mode::native("4 slots"));
+        assert_eq!(
+            ledger.mode(Strategy::PromptParts),
+            Mode::off("the arm runs its prompts whole")
+        );
+        assert_eq!(ledger.mode(Strategy::Group), Mode::off("one rank"));
+        assert_eq!(
+            engine_ledger(&toy, 1, true).mode(Strategy::Lanes),
+            Mode::off("one slot")
+        );
+        let parted = Parted {
+            log: Mutex::new(Vec::new()),
+        };
+        let ledger = engine_ledger(&parted, 2, false);
+        assert_eq!(
+            ledger.mode(Strategy::PromptParts),
+            Mode::off(format!("{PROMPT_PARTS_ENV}=off"))
+        );
     }
 }
