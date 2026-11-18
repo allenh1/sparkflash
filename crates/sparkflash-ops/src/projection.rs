@@ -550,6 +550,9 @@ mod tests {
         assert_eq!(route_fp8(None, 4096, 2048, 256), Route::BatchedGemv);
         // A width the tile does not take: the BF16 tile's 32-wide inner is not a scale block.
         assert_eq!(route_fp8(dense, 4096, 2048 + 32, 256), Route::BatchedGemv);
-        assert_eq!(route_fp8(Some(WidePolicy::DORY), 4100, 2048, 256), Route::Refuse);
+        assert_eq!(
+            route_fp8(Some(WidePolicy::DORY), 4100, 2048, 256),
+            Route::Refuse
+        );
     }
 }
