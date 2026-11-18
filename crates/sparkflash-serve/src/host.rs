@@ -38,9 +38,11 @@
 //! sessions are independent; a backend whose sessions share mutable engine state must serialize
 //! that state itself (the Qwen device arm gives each session its own stream, so their kernels can
 //! overlap). A backend that only supports one live session must stay at 1. The kept sequences are
-//! the workers' in common, at most `concurrency` of them with the ones being served: an agent's
-//! next turn finds its conversation whichever worker takes it, and a new conversation takes the
-//! room of the least recently used kept one.
+//! the workers' in common, at most the worker count of them with the ones being served: an
+//! agent's next turn finds its conversation whichever worker takes it, and a new conversation
+//! takes the room of the least recently used kept one. A backend that sizes its sessions for
+//! their requests ([ModelBackend::sizes_sessions]) keeps one more, so a client interleaving an
+//! unrelated request (a title call) does not evict the conversation its next turn continues.
 //!
 //! This adapter is intentionally smaller than the V4.1 reference driver. It supports text
 //! requests, stop strings, sample logprobs and the standard usage/timing envelope. Prompt
@@ -68,7 +70,8 @@ use sparkflash_api::telemetry_types::{
 use sparkflash_model::telemetry::PrefixMatchPlan;
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{
-    ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation, StepOutput,
+    BackendError, ModelBackend, ModelDescriptor, ModelSession, PromptCodec, Sampling, Speculation,
+    StepOutput,
 };
 use tokio::sync::mpsc;
 
@@ -208,14 +211,16 @@ impl HostDriver {
         let metrics = Arc::new(Metrics::new());
         let backend: Arc<dyn ModelBackend> = Arc::from(backend);
         // How many sequences are kept for a following request. One a worker is serving is not
-        // in `kept`, so the worker count is the floor; a client that interleaves an unrelated
-        // request (a title call) would otherwise take the only slot and evict the conversation
-        // that the next turn continues. The knob exists because a kept sequence holds its
-        // whole KV cache: at a long context two of them do not fit on one card.
+        // in `kept`, so the worker count is the floor. A backend whose sessions are sized for
+        // their request gets one more: a client that interleaves an unrelated request (a title
+        // call) would otherwise take the only spare slot and evict the conversation the next
+        // turn continues, and a request-sized sequence is cheap enough to sit beside another.
+        // A backend whose sessions reserve the whole served context keeps the worker count,
+        // because at a long context two of them do not fit on one card.
         let kept_sequences = std::env::var("SPARKFLASH_HELD_SEQUENCES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(options.concurrency)
+            .unwrap_or_else(|| options.concurrency + usize::from(backend.sizes_sessions()))
             .max(options.concurrency);
         let pool = Arc::new(HeldPool::new(kept_sequences));
         let mut handles = Vec::with_capacity(options.concurrency);
@@ -684,27 +689,56 @@ impl HeldPool {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        // What the request must be able to hold: its prompt and the generation it asked for.
+        // A kept sequence's cache is fixed when it opens, so one that cannot hold this much is
+        // not a continuation, however far its history reaches: continuing it would run past its
+        // own capacity in the middle of the answer.
+        let needed = job.prompt_tokens.len().saturating_add(job.max_tokens);
         // The furthest continuation wins, the most recently kept among equals.
         let best = state
             .kept
             .iter()
             .enumerate()
+            .filter(|(_, (_, held))| held.session.capacity_tokens() >= needed)
             .filter_map(|(index, (used, held))| {
                 continuation(held, job, codec, by_text).map(|plan| (index, *used, plan))
             })
             .max_by_key(|(_, used, plan)| (plan.covered, *used));
         let claim = match best {
             Some((index, _, plan)) => Claim::Continue(state.kept.swap_remove(index).1, plan),
-            None if state.kept.len() + state.serving >= self.capacity => {
-                let oldest = state
+            None => {
+                // The sequence this request would have continued had it been big enough goes
+                // first, whether or not the pool is full: it is exactly the one the fresh session
+                // replaces, and keeping it beside the fresh one would reserve the same
+                // conversation twice. Failing that, a full pool gives up the least recently used
+                // kept sequence.
+                let too_small = state
                     .kept
                     .iter()
                     .enumerate()
+                    .filter(|(_, (_, held))| {
+                        held.session.capacity_tokens() < needed
+                            && continuation(held, job, codec, by_text).is_some()
+                    })
                     .min_by_key(|(_, (used, _))| *used)
                     .map(|(index, _)| index);
-                Claim::Fresh(oldest.map(|index| state.kept.swap_remove(index).1))
+                let full = state.kept.len() + state.serving >= self.capacity;
+                let oldest = || {
+                    if !full {
+                        return None;
+                    }
+                    state
+                        .kept
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, (used, _))| *used)
+                        .map(|(index, _)| index)
+                };
+                let evicted = too_small
+                    .or_else(oldest)
+                    .map(|index| state.kept.swap_remove(index).1);
+                Claim::Fresh(evicted)
             }
-            None => Claim::Fresh(None),
         };
         state.serving += 1;
         (
@@ -714,6 +748,21 @@ impl HeldPool {
             },
             claim,
         )
+    }
+
+    /// Gives up the least recently used kept sequence, if there is one.
+    ///
+    /// A fresh session that did not fit beside the ones kept gets one retry after this. Only a
+    /// sequence no worker is serving can go: the ones being served belong to requests in flight.
+    fn release_one(&self) -> Option<Held> {
+        let mut state = self.state();
+        let oldest = state
+            .kept
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (used, _))| *used)
+            .map(|(index, _)| index)?;
+        Some(state.kept.swap_remove(oldest).1)
     }
 }
 
@@ -1006,9 +1055,8 @@ fn run_request(
         Claim::Continue(kept, plan) => (kept.session, kept.pending, plan),
         Claim::Fresh(evicted) => {
             drop(evicted);
-            let session = backend
-                .open_session()
-                .map_err(|error| format!("the backend could not open a sequence: {error}"))?;
+            let reach = job.prompt_tokens.len().saturating_add(job.max_tokens);
+            let session = open_sized(backend, pool, reach)?;
             (session, None, Continuation::COLD)
         }
     };
@@ -1064,6 +1112,39 @@ fn run_request(
         lease.keep(Held { session, pending });
     }
     ending.map_err(Ending::message)
+}
+
+/// Opens a sequence sized for a request that can reach `reach` tokens.
+///
+/// A sequence that did not fit is retried once after giving back the least recently used kept
+/// one: two conversations can each be sized for their own request and still exceed the card, and
+/// the alternative is refusing a request that would fit on its own. A second failure is the
+/// honest answer.
+fn open_sized(
+    backend: &dyn ModelBackend,
+    pool: &HeldPool,
+    reach: usize,
+) -> Result<Box<dyn ModelSession>, String> {
+    match backend.open_session_for(reach) {
+        Ok(session) => Ok(session),
+        Err(error) if error.is_out_of_memory() => {
+            let Some(evicted) = pool.release_one() else {
+                return Err(open_failed(&error));
+            };
+            // The kept sequence's memory is freed before the next open: a session owns its
+            // whole cache, and the open needs the room the kept one held.
+            drop(evicted);
+            backend
+                .open_session_for(reach)
+                .map_err(|error| open_failed(&error))
+        }
+        Err(error) => Err(open_failed(&error)),
+    }
+}
+
+/// The operator-facing message for an open that failed.
+fn open_failed(error: &BackendError) -> String {
+    format!("the backend could not open a sequence: {error}")
 }
 
 /// Runs `job` on `session` as `plan` says, and returns how it ended with the step after the last
@@ -1584,5 +1665,130 @@ mod tests {
         assert_eq!(row[0], f32::NEG_INFINITY);
         assert!((row[1] - 0.0).abs() < 1e-6);
         assert_eq!(row[2], f32::NEG_INFINITY);
+    }
+
+    /// A session that holds a prefix and reports a fixed capacity, so the pool's fit rule can be
+    /// exercised without a backend or a card.
+    struct SizedSession {
+        held: Vec<u32>,
+        capacity: usize,
+    }
+
+    impl ModelSession for SizedSession {
+        fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+            self.held.extend_from_slice(tokens);
+            Ok(StepOutput::default())
+        }
+
+        fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+            self.held.push(token);
+            Ok(StepOutput::default())
+        }
+
+        fn reusable_prefix(&self) -> Option<&[u32]> {
+            Some(self.held.as_slice())
+        }
+
+        fn capacity_tokens(&self) -> usize {
+            self.capacity
+        }
+    }
+
+    /// A codec that spells nothing: the pool only asks one to respell a held history its prompt
+    /// does not extend, and these tests continue their history exactly.
+    struct NoSpelling;
+
+    impl PromptCodec for NoSpelling {
+        fn encode_chat(
+            &self,
+            _request: &serde_json::Value,
+        ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+            Ok(vec![1])
+        }
+
+        fn encode_text(
+            &self,
+            _text: &str,
+            _add_special_tokens: bool,
+        ) -> Result<Vec<u32>, sparkflash_model::PromptError> {
+            Ok(vec![1])
+        }
+
+        fn decode(&self, _ids: &[u32]) -> Option<String> {
+            None
+        }
+
+        fn token_str(&self, _id: u32) -> Option<String> {
+            None
+        }
+    }
+
+    /// A request for `prompt` that generates at most `max_tokens` tokens.
+    fn sized_job(prompt: Vec<u32>, max_tokens: usize) -> Job {
+        let (replies, _receiver) = tokio::sync::mpsc::channel(1);
+        Job {
+            prompt_tokens: prompt,
+            images: Vec::new(),
+            forced_tokens: Vec::new(),
+            max_tokens,
+            sampling: Sampling::default(),
+            logprobs: LogprobsRequest::default(),
+            stop: Vec::new(),
+            enqueued_at: Instant::now(),
+            replies,
+        }
+    }
+
+    /// A pool that keeps `slots` sequences, one of them a three-token prefix that reserved
+    /// room for `capacity` tokens.
+    fn one_sized(slots: usize, capacity: usize) -> HeldPool {
+        let pool = HeldPool::new(slots);
+        pool.state().kept.push((
+            1,
+            Held {
+                session: Box::new(SizedSession {
+                    held: vec![1, 2, 3],
+                    capacity,
+                }),
+                pending: None,
+            },
+        ));
+        pool
+    }
+
+    #[test]
+    fn a_continuation_that_does_not_fit_is_not_claimed() {
+        // The prompt extends the kept sequence, but the request reaches six tokens (five in the
+        // prompt and one generated) and the sequence reserved four. Continuing it would run past
+        // its own capacity mid-answer, so it is dropped instead and the request opens fresh. The
+        // pool has a spare slot, and the too-small sequence goes anyway: it is the one the fresh
+        // session replaces, and keeping both would reserve the conversation twice.
+        let pool = one_sized(2, 4);
+        let (lease, claim) = pool.claim(&sized_job(vec![1, 2, 3, 4, 5], 1), &NoSpelling, false);
+        match claim {
+            Claim::Fresh(Some(evicted)) => {
+                assert_eq!(evicted.session.capacity_tokens(), 4);
+            }
+            Claim::Fresh(None) | Claim::Continue(..) => {
+                panic!("a sequence that cannot hold the request must not be claimed");
+            }
+        }
+        drop(lease);
+        assert!(
+            pool.state().kept.is_empty(),
+            "the too-small sequence kept its room"
+        );
+    }
+
+    #[test]
+    fn a_continuation_that_fits_exactly_is_claimed() {
+        // Six reserved tokens for a request that reaches six: the bound is inclusive.
+        let pool = one_sized(2, 6);
+        let (lease, claim) = pool.claim(&sized_job(vec![1, 2, 3, 4, 5], 1), &NoSpelling, false);
+        assert!(
+            matches!(claim, Claim::Continue(..)),
+            "a sequence with room for the whole request is continued"
+        );
+        drop(lease);
     }
 }

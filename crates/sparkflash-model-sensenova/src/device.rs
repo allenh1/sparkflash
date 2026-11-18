@@ -24,12 +24,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
+use sparkflash_kernels::cuda_driver::{
+    Cuda, Deviceptr, Kernel, OUT_OF_MEMORY as DRIVER_OUT_OF_MEMORY,
+};
 use sparkflash_kernels::images::{
     qwen4_attn_cubin, qwen4_exp_cubin, qwen4_prefill_cubin, qwen4_scan_cubin, sensenova_cubin,
 };
 use sparkflash_model::ModelDescriptor;
-use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::backend::{
+    BackendError, ModelBackend, ModelSession, OUT_OF_MEMORY as OUT_OF_MEMORY_CODE, Sampling,
+    StepOutput, request_capacity,
+};
 use sparkflash_model::profile::{KvCacheMode, active};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GpuMat, GpuMatE4m3Tile, TILED_GEMV_PARTIALS, gemv_e4m3_tile,
@@ -1301,11 +1306,57 @@ struct VisitState {
     recurrent: Option<Deviceptr>,
 }
 
+/// The buffers a session open has claimed, freed if the open stops before a session owns them.
+///
+/// An open that fails halfway - the serving pool frees a kept sequence and retries an open that
+/// did not fit on the card - would otherwise leave the regions claimed before the failure to
+/// nobody: the session that frees a session's buffers is the value being built. Every pointer is
+/// recorded and this guard is disarmed once the session is complete, so a failed open gives all
+/// its memory back and the retry can take the room the kept sequence released.
+struct Claimed<'a> {
+    cuda: &'a CudaHandle,
+    pointers: Vec<Deviceptr>,
+}
+
+impl<'a> Claimed<'a> {
+    fn new(cuda: &'a CudaHandle) -> Self {
+        Self {
+            cuda,
+            pointers: Vec::new(),
+        }
+    }
+
+    fn claim(&mut self, pointer: Deviceptr) {
+        self.pointers.push(pointer);
+    }
+
+    /// The session owns what was claimed, so the guard must not free it.
+    fn forget(mut self) {
+        self.pointers.clear();
+    }
+}
+
+impl Drop for Claimed<'_> {
+    fn drop(&mut self) {
+        if self.pointers.is_empty() {
+            return;
+        }
+        let references: Vec<&Deviceptr> = self.pointers.iter().collect();
+        self.cuda.free_buffers(&references);
+    }
+}
+
 struct DeviceSession {
     shared: Arc<DeviceShared>,
     scratch: Scratch,
     visits: Vec<VisitState>,
     position: usize,
+    /// The tokens every KV region of this session holds.
+    ///
+    /// A session reserves the cache its request can reach, not the whole served context
+    /// ([request_capacity]): a title call must not hold the memory a 128K conversation needs.
+    /// The session is never grown; a request past this capacity gets a fresh one instead.
+    capacity: usize,
     /// The captured 56-visit forward, when the arm built one.
     graph: Option<sparkflash_kernels::cuda_driver::GraphId>,
     sampler: Sampler,
@@ -1344,7 +1395,11 @@ impl Drop for DeviceSession {
 }
 
 impl DeviceSession {
-    fn open(shared: Arc<DeviceShared>) -> Result<Self, String> {
+    /// Opens a session whose every KV region holds `capacity` tokens.
+    ///
+    /// # Errors
+    /// A device allocation that does not fit, or a kernel or graph the arm cannot build.
+    fn open(shared: Arc<DeviceShared>, capacity: usize) -> Result<Self, String> {
         // The generic host driver opens sessions on a serving worker, not on the thread that
         // loaded the context. A CUDA context is per-thread, so bind it before any allocation.
         shared.cuda.make_current()?;
@@ -1355,6 +1410,7 @@ impl DeviceSession {
         let fused = config.linear_projection_width();
         let value = config.linear_value_width();
         let mut pointers = Vec::new();
+        let mut claimed = Claimed::new(&shared.cuda);
         let mut allocated = shared.allocated;
         // The rewind point copies each linear visit's convolution and recurrent state. The KV
         // caches need nothing: they are written at an index, so a shorter position reads only
@@ -1371,11 +1427,13 @@ impl DeviceSession {
         }
         let arena_bytes = sparkflash_kernels::checkpoint::Checkpoint::arena_bytes(&region_sizes);
         let arena = shared.cuda.alloc(arena_bytes, &mut allocated)?;
+        claimed.claim(arena);
         pointers.push(arena);
         let checkpoint =
             sparkflash_kernels::checkpoint::Checkpoint::new(arena, region_sizes);
         let mut alloc = |bytes: usize| -> Result<Deviceptr, String> {
             let pointer = shared.cuda.alloc(bytes, &mut allocated)?;
+            claimed.claim(pointer);
             pointers.push(pointer);
             Ok(pointer)
         };
@@ -1416,34 +1474,35 @@ impl DeviceSession {
             position: alloc(4)?,
             pointers,
         };
+        // The arena, the scratch and the visits are claimed as they are allocated, so an
+        // allocation that fails gives every earlier region back before the error leaves here.
+        let mut region = |bytes: usize| -> Result<Deviceptr, String> {
+            let pointer = shared.cuda.alloc(bytes, &mut allocated)?;
+            claimed.claim(pointer);
+            Ok(pointer)
+        };
         let mut visits = Vec::with_capacity(config.visits());
         for physical in config.execution_plan() {
             let state = match config.layer_types[physical] {
                 LayerType::Full => {
                     let row_bytes = if shared.kv_fp8 {
-                        shared.context * kv
+                        capacity * kv
                     } else {
-                        shared.context * kv * 2
+                        capacity * kv * 2
                     };
                     let k_scale = if shared.kv_fp8 {
-                        Some(shared.cuda.alloc(
-                            shared.context * config.num_key_value_heads * 4,
-                            &mut allocated,
-                        )?)
+                        Some(region(capacity * config.num_key_value_heads * 4)?)
                     } else {
                         None
                     };
                     let v_scale = if shared.kv_fp8 {
-                        Some(shared.cuda.alloc(
-                            shared.context * config.num_key_value_heads * 4,
-                            &mut allocated,
-                        )?)
+                        Some(region(capacity * config.num_key_value_heads * 4)?)
                     } else {
                         None
                     };
                     VisitState {
-                        keys: Some(shared.cuda.alloc(row_bytes, &mut allocated)?),
-                        values: Some(shared.cuda.alloc(row_bytes, &mut allocated)?),
+                        keys: Some(region(row_bytes)?),
+                        values: Some(region(row_bytes)?),
                         k_scales: k_scale,
                         v_scales: v_scale,
                         conv: None,
@@ -1455,16 +1514,14 @@ impl DeviceSession {
                     values: None,
                     k_scales: None,
                     v_scales: None,
-                    conv: Some(shared.cuda.alloc(
+                    conv: Some(region(
                         config.linear.conv_kernel.saturating_sub(1) * fused * 4,
-                        &mut allocated,
                     )?),
-                    recurrent: Some(shared.cuda.alloc(
+                    recurrent: Some(region(
                         config.linear.value_heads
                             * config.linear.key_dim
                             * config.linear.value_dim
                             * 4,
-                        &mut allocated,
                     )?),
                 },
             };
@@ -1511,11 +1568,15 @@ impl DeviceSession {
                 );
             }
         }
+        // Every fallible step is behind us: the session owns what was claimed from here, so its
+        // Drop frees it and the guard must not.
+        claimed.forget();
         let eos = shared.config.eos_token_ids.clone();
         let mut session = Self {
             shared,
             scratch,
             visits,
+            capacity,
             position: 0,
             graph: None,
             sampler: Sampler::new(),
@@ -1605,12 +1666,12 @@ impl DeviceSession {
                 format!("a forward takes 1..={PREFILL_ROWS} rows, not {rows}"),
             ));
         }
-        if self.position + rows > shared.context {
+        if self.position + rows > self.capacity {
             return Err(BackendError::new(
                 DEVICE,
                 format!(
-                    "{rows} rows from {} run past the served context {}",
-                    self.position, shared.context
+                    "{rows} rows from {} run past the sequence's capacity {}",
+                    self.position, self.capacity
                 ),
             ));
         }
@@ -2441,9 +2502,35 @@ impl ModelBackend for SenseNovaDeviceBackend {
         &self.descriptor
     }
 
+    /// Every session reserves its KV regions from the request ([Self::open_session_for]), so the
+    /// driver may keep one more sequence than it has workers at little cost.
+    fn sizes_sessions(&self) -> bool {
+        true
+    }
+
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        let session = DeviceSession::open(Arc::clone(&self.shared))
+        let session = DeviceSession::open(Arc::clone(&self.shared), self.shared.context)
             .map_err(|error| BackendError::new(DEVICE, error))?;
+        Ok(Box::new(session))
+    }
+
+    /// A session whose KV regions hold what `tokens` can reach, not the whole served context.
+    ///
+    /// The descriptor still advertises the configured context and still serves a request that
+    /// reaches it: [request_capacity] caps the reservation at that context.
+    fn open_session_for(&self, tokens: usize) -> Result<Box<dyn ModelSession>, BackendError> {
+        let capacity = request_capacity(self.shared.context, tokens);
+        let session = DeviceSession::open(Arc::clone(&self.shared), capacity).map_err(|error| {
+            // The pool reads this code to decide whether giving a kept sequence's memory back
+            // can let the open through. An allocation is the only failure that can: every other
+            // one is the arm's own and is reported as such.
+            let code = if error.contains(DRIVER_OUT_OF_MEMORY) {
+                OUT_OF_MEMORY_CODE
+            } else {
+                DEVICE
+            };
+            BackendError::new(code, error)
+        })?;
         Ok(Box::new(session))
     }
 }
@@ -2581,12 +2668,12 @@ impl ModelSession for DeviceSession {
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        if self.position >= self.shared.context {
+        if self.position >= self.capacity {
             return Err(BackendError::new(
                 DEVICE,
                 format!(
-                    "the sequence is past the served context {}",
-                    self.shared.context
+                    "the sequence is past its reserved capacity {}",
+                    self.capacity
                 ),
             ));
         }
@@ -2620,5 +2707,13 @@ impl ModelSession for DeviceSession {
     /// whole conversation: without it every request was a fresh sequence.
     fn reusable_prefix(&self) -> Option<&[u32]> {
         Some(self.held.as_slice())
+    }
+
+    /// The tokens this session's KV regions were allocated for.
+    ///
+    /// The pool hands this session only a request whose prompt and generation fit here; one that
+    /// does not gets a fresh session at its own size instead, because a region cannot grow.
+    fn capacity_tokens(&self) -> usize {
+        self.capacity
     }
 }

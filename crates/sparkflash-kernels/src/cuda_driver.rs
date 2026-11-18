@@ -122,12 +122,18 @@ fn programmatic(kernel: &Kernel) -> bool {
 /// tests/pdl_entry.rs holds every such kernel in kernels/ to the dependency wait.
 pub const PROGRAMMATIC_PREFIXES: [&str; 5] = ["opt_", "q4e_", "q4p_", "dory_", "inkling_"];
 
+/// The driver's name for CUDA_ERROR_OUT_OF_MEMORY, as [name] spells it.
+///
+/// A caller that has to tell an exhausted device from every other failure matches this in the
+/// error text rather than the bare number: the allocation's message carries both.
+pub const OUT_OF_MEMORY: &str = "OUT_OF_MEMORY";
+
 /// The driver's CUresult names, so a report says OUT_OF_MEMORY rather than 2.
 fn name(code: CuResult) -> String {
     let s = match code {
         0 => "SUCCESS",
         1 => "INVALID_VALUE",
-        2 => "OUT_OF_MEMORY",
+        2 => OUT_OF_MEMORY,
         3 => "NOT_INITIALIZED",
         4 => "DEINITIALIZED",
         100 => "NO_DEVICE",
@@ -2732,7 +2738,9 @@ impl Cuda {
             let mut p: CuDeviceptr = 0;
             let r = f(&mut p, bytes);
             if r != 0 {
-                return Err(format!("cuMemAlloc({bytes}) failed: {r}"));
+                // Name the code, not only its number: the serving driver reads OUT_OF_MEMORY to
+                // decide whether giving back a kept sequence's memory can let the open succeed.
+                return Err(format!("cuMemAlloc({bytes}) failed: {}", name(r)));
             }
             *total += bytes;
             note_alloc();

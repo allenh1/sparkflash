@@ -28,6 +28,44 @@ use crate::capabilities::Capabilities;
 use crate::descriptor::ModelDescriptor;
 use crate::vision::{ImageSpan, VisionImage};
 
+/// The error code for a session whose state did not fit on the device.
+///
+/// It is the one code the serving driver reads rather than reports ([BackendError::is_out_of_memory]):
+/// a fresh sequence can be given back and opened again after a kept one releases its memory, and
+/// a second failure is the honest answer.
+pub const OUT_OF_MEMORY: &str = "out_of_memory";
+
+/// The smallest cache a request-sized session reserves: 2K tokens.
+///
+/// A request-sized session does not reserve the served context, because a 59-token title call
+/// that reserved 128K tokens would hold the memory a whole conversation needs. The floor is what a
+/// small request can still pay: at 28 KiB a token it is a few tens of MB.
+pub const REQUEST_CAPACITY_FLOOR: usize = 2 * 1024;
+
+/// The headroom a request-sized session reserves past what the request itself reaches.
+///
+/// About one chat turn and the answer to it, so a conversation that keeps growing outgrows its
+/// allocation only every few turns. A session's cache is fixed when it opens, so the turn that
+/// does grow pays one re-prefill; the headroom is what keeps that rare.
+pub const REQUEST_CAPACITY_SLACK: usize = 1536;
+
+/// The capacity a request-sized session reserves when the request can reach `reach` tokens.
+///
+/// The reach is the prompt plus the request's generation cap: everything the sequence must hold
+/// before its answer is complete. It is rounded up to a power of two from
+/// [REQUEST_CAPACITY_FLOOR], so the cache a conversation holds is one of a few stable sizes
+/// rather than a request's exact length, and capped at the served context so no request reserves
+/// more than the model advertises.
+#[must_use]
+pub fn request_capacity(configured: usize, reach: usize) -> usize {
+    let wanted = reach.saturating_add(REQUEST_CAPACITY_SLACK);
+    let mut capacity = REQUEST_CAPACITY_FLOOR;
+    while capacity < wanted && capacity < configured {
+        capacity = capacity.saturating_mul(2);
+    }
+    capacity.min(configured)
+}
+
 /// A backend failure.
 ///
 /// The message is written for an operator; the code is the stable category a serving layer can
@@ -61,6 +99,15 @@ impl BackendError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    /// Whether the session could not allocate its state on the device.
+    ///
+    /// A serving driver may give back a kept sequence's memory and try the open again: two long
+    /// conversations can exceed the card even when each was sized for its own request.
+    #[must_use]
+    pub fn is_out_of_memory(&self) -> bool {
+        self.code == OUT_OF_MEMORY
     }
 }
 
@@ -238,6 +285,19 @@ pub trait ModelSession: Send {
     /// [`Self::reusable_prefix`] no longer names it. The default does nothing, for a session that
     /// holds its memory until it is dropped.
     fn park(&mut self) {}
+
+    /// How many tokens this sequence's state can hold, prompt and generation together.
+    ///
+    /// The serving driver continues a kept sequence only with a request that fits: a session's
+    /// cache is fixed when it opens, so one that cannot hold the prompt plus the generation cap
+    /// would run past its own context mid-answer. Such a sequence is dropped and a fresh one is
+    /// opened at the request's size ([ModelBackend::open_session_for]) instead of grown.
+    ///
+    /// `usize::MAX` - the default - says the session does not size its state against a request,
+    /// so every request fits.
+    fn capacity_tokens(&self) -> usize {
+        usize::MAX
+    }
 }
 
 /// How a model runs on one host.
@@ -275,6 +335,35 @@ pub trait ModelBackend: Send + Sync {
     /// # Errors
     /// A backend failure, such as unavailable weights or an unsupported configuration.
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError>;
+
+    /// Whether [`Self::open_session_for`] makes a session smaller than the served context.
+    ///
+    /// The serving driver keeps one sequence more than it has workers for such a backend: a
+    /// second request-sized sequence costs only what its request reaches, and the spare slot is
+    /// what lets a client interleave an unrelated request (a title call) without evicting the
+    /// conversation the next turn continues. A backend whose sessions reserve the whole served
+    /// context keeps the worker count instead, because two of those may not fit on one card.
+    fn sizes_sessions(&self) -> bool {
+        false
+    }
+
+    /// Opens a fresh sequence sized for a request that can reach `tokens` positions.
+    ///
+    /// `tokens` is the request's prompt plus its generation cap: what the sequence must hold
+    /// before the answer is complete. A backend that reserves its cache when the session opens
+    /// uses it to reserve only what the request can reach ([request_capacity]), instead of the
+    /// whole served context for a request that will never get there.
+    ///
+    /// The default ignores the size and opens the backend's configured session, which is right
+    /// for a backend whose state grows as it consumes tokens: it has nothing to reserve up front.
+    ///
+    /// # Errors
+    /// A backend failure, such as unavailable weights, or a device that cannot fit the state.
+    /// [BackendError::is_out_of_memory] distinguishes the second.
+    fn open_session_for(&self, tokens: usize) -> Result<Box<dyn ModelSession>, BackendError> {
+        let _ = tokens;
+        self.open_session()
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +376,33 @@ mod tests {
         assert_eq!(error.code(), "weights");
         assert_eq!(error.message(), "the shard is missing");
         assert_eq!(error.to_string(), "the shard is missing");
+    }
+
+    #[test]
+    fn a_request_capacity_rounds_up_to_a_power_of_two_and_stops_at_the_context() {
+        // A title call reaches 67 tokens: it reserves the 2K floor, not the served context.
+        assert_eq!(request_capacity(131_072, 59 + 8), REQUEST_CAPACITY_FLOOR);
+        // One token past the floor's reach moves the reservation to the next power of two.
+        assert_eq!(
+            request_capacity(131_072, REQUEST_CAPACITY_FLOOR - REQUEST_CAPACITY_SLACK + 1),
+            2 * REQUEST_CAPACITY_FLOOR
+        );
+        assert_eq!(
+            request_capacity(131_072, REQUEST_CAPACITY_FLOOR - REQUEST_CAPACITY_SLACK),
+            REQUEST_CAPACITY_FLOOR
+        );
+        // A 120K prompt at an 8-token cap reserves the whole 128K window it can reach.
+        assert_eq!(request_capacity(131_072, 120 * 1024 + 8), 131_072);
+        // The served context caps it: no request reserves more than the model advertises.
+        assert_eq!(request_capacity(32_768, 120 * 1024 + 8), 32_768);
+        // A context below the floor is reserved whole rather than rounded past.
+        assert_eq!(request_capacity(1024, 59), 1024);
+    }
+
+    #[test]
+    fn only_the_out_of_memory_code_reads_as_an_allocation_failure() {
+        assert!(BackendError::new(OUT_OF_MEMORY, "cuMemAlloc failed").is_out_of_memory());
+        assert!(!BackendError::new("weights", "cuMemAlloc failed").is_out_of_memory());
     }
 
     #[test]

@@ -1367,10 +1367,23 @@ impl<B: ModelBackend> ModelBackend for DescriptorBackend<B> {
         self.inner.capabilities()
     }
 
+    fn sizes_sessions(&self) -> bool {
+        self.inner.sizes_sessions()
+    }
+
     fn open_session(
         &self,
     ) -> Result<Box<dyn sparkflash_model::ModelSession>, sparkflash_model::BackendError> {
         self.inner.open_session()
+    }
+
+    fn open_session_for(
+        &self,
+        tokens: usize,
+    ) -> Result<Box<dyn sparkflash_model::ModelSession>, sparkflash_model::BackendError> {
+        // The identity is the only thing this wrapper replaces: a session that sizes its cache
+        // for the request must be sized by the arm, not opened at the served context.
+        self.inner.open_session_for(tokens)
     }
 }
 

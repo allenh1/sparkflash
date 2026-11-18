@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use sparkflash_model::ModelDescriptor;
-use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::backend::{
+    BackendError, ModelBackend, ModelSession, Sampling, StepOutput, request_capacity,
+};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_weights::WeightSource;
 
@@ -69,6 +71,23 @@ impl SenseNovaHostBackend {
     pub fn weights(&self) -> &SenseNovaWeights {
         &self.weights
     }
+
+    /// A session whose sequence may reach `capacity` tokens.
+    ///
+    /// The host reference grows its caches as it consumes tokens, so the bound is a refusal
+    /// point, not an allocation: sizing it to the request keeps the two paths' contracts the
+    /// same without paying the configured context's memory for a title call.
+    fn session(&self, capacity: usize) -> SenseNovaSession {
+        SenseNovaSession {
+            eos: self.weights.config.eos_token_ids.clone(),
+            weights: Arc::clone(&self.weights),
+            state: SenseNovaState::new(&self.weights.config),
+            context: capacity,
+            sampler: Sampler::new(),
+            sampling: Sampling::default(),
+            held: Vec::new(),
+        }
+    }
 }
 
 impl ModelBackend for SenseNovaHostBackend {
@@ -76,16 +95,22 @@ impl ModelBackend for SenseNovaHostBackend {
         &self.descriptor
     }
 
+    /// The bound a session opens with comes from the request ([Self::open_session_for]), so the
+    /// driver may keep one more sequence than it has workers at little cost.
+    fn sizes_sessions(&self) -> bool {
+        true
+    }
+
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        Ok(Box::new(SenseNovaSession {
-            eos: self.weights.config.eos_token_ids.clone(),
-            weights: Arc::clone(&self.weights),
-            state: SenseNovaState::new(&self.weights.config),
-            context: self.context,
-            sampler: Sampler::new(),
-            sampling: Sampling::default(),
-            held: Vec::new(),
-        }))
+        Ok(Box::new(self.session(self.context)))
+    }
+
+    /// A session bounded by what the request can reach (`request_capacity`), so the host path
+    /// sizes its sequence the same way the device arm's KV regions are sized.
+    fn open_session_for(&self, tokens: usize) -> Result<Box<dyn ModelSession>, BackendError> {
+        Ok(Box::new(
+            self.session(request_capacity(self.context, tokens)),
+        ))
     }
 }
 
@@ -120,7 +145,10 @@ impl SenseNovaSession {
         if self.state.position >= self.context {
             return Err(BackendError::new(
                 "sensenova_context",
-                format!("the sequence is past the served context {}", self.context),
+                format!(
+                    "the sequence is past its reserved capacity {}",
+                    self.context
+                ),
             ));
         }
         let position = self.state.position;
@@ -174,5 +202,10 @@ impl ModelSession for SenseNovaSession {
     /// suffix instead of walking the whole conversation again.
     fn reusable_prefix(&self) -> Option<&[u32]> {
         Some(self.held.as_slice())
+    }
+
+    /// The tokens this session was opened for.
+    fn capacity_tokens(&self) -> usize {
+        self.context
     }
 }
