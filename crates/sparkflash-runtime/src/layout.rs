@@ -225,6 +225,11 @@ pub trait LaneState {
     /// # Errors
     /// `to` past [Self::position], a missing checkpoint, or a device failure.
     fn rewind(&mut self, to: usize) -> Result<(), BackendError>;
+
+    /// Whether the sequence can grow to `positions`, or (when `reset`) start over and use the
+    /// chunks a lane of that many positions needs. It answers the physical memory question; the
+    /// runtime asks it before a job runs, so an idle sequence can be given up for a long one.
+    fn room(&self, positions: usize, reset: bool) -> bool;
 }
 
 #[cfg(test)]

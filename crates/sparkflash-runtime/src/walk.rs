@@ -29,7 +29,7 @@
 //! The trait carries no `Send` or `Sync` bound. DeepSeek's sequence is single-threaded; an
 //! engine that needs the bounds asks for them at its own implementation.
 
-use sparkflash_model::backend::{BackendError, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
@@ -506,6 +506,13 @@ pub trait Walk: 'static {
 
     /// The most rows one pass may hold, and the context.
     fn limits(&self) -> Limits;
+
+    /// Applies a request's sampler to one of the arm's sequences before its prompt runs.
+    ///
+    /// The runtime owns when a request's sampler is set; an arm whose [Walk::head] chooses a
+    /// token keeps the sampler with its sequence and applies it here. An arm that chooses
+    /// without a sampler leaves the sequence as it is.
+    fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling);
 
     /// Runs these rows of these sequences through the layers, in one pass.
     ///
