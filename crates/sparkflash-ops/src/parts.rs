@@ -470,6 +470,51 @@ const fn row_one(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::decode(name, precisions, ComputeClass::Row, RowBand::at_most(1))
 }
 
+/// The most rows DeepSeek's multi-row step carries.
+///
+/// `rows::R_MAX` is 64 (`crates/sparkflash-deepseek-forward/src/tp4_forward/rows.rs:44`): the
+/// row bodies below are launched over one to sixty-four rows in either pass, and anything wider
+/// is the bulk chunk path whose tensor-core bodies are [tc_bulk].
+const DEEPSEEK_ROWS_MAX: usize = 64;
+
+/// An elementwise body over DeepSeek's multi-row step, in both passes.
+const fn elem_rows(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(
+        name,
+        precisions,
+        ComputeClass::Elementwise,
+        RowBand::at_most(DEEPSEEK_ROWS_MAX),
+    )
+}
+
+/// A row body over DeepSeek's multi-row step, in both passes.
+const fn row_rows_deepseek(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(
+        name,
+        precisions,
+        ComputeClass::Row,
+        RowBand::at_most(DEEPSEEK_ROWS_MAX),
+    )
+}
+
+/// A tensor-core body on DeepSeek's bulk-chunk path, in the prompt pass.
+///
+/// The body's grid is over token rows, so its band is every row count; the phase is the bulk
+/// path's, which only runs above [DEEPSEEK_ROWS_MAX].
+const fn tc_bulk(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::prefill(name, precisions, ComputeClass::TensorCore, RowBand::ALL)
+}
+
+/// An elementwise body in DeepSeek's draft pass.
+const fn elem_dec(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
+}
+
+/// A row body in DeepSeek's draft pass.
+const fn row_dec_all(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(name, precisions, ComputeClass::Row, RowBand::ALL)
+}
+
 /// A catalogue entry on the one target the kernels are built for today.
 const fn sm121(
     part: Part,
@@ -545,7 +590,16 @@ pub const CATALOGUE: &[PartKernel] = &[
             row("cert_lm_head_batched_sm121", &[Precision::Bf16]),
             sym("lm_head_reduce_sm121", &[Precision::Bf16]),
             row("opt_lm_head", &[Precision::Bf16]),
-            row("opt_rows_lm_head", &[Precision::Bf16]),
+            // The multi-row head is the same body over the whole rows step, not the eight-row
+            // GEMV band: rows::R_MAX is 64.
+            row_rows_deepseek("opt_rows_lm_head", &[Precision::Bf16]),
+            // The head's screen and sampler side: the cross-rank argmax fold/pick, the
+            // stream-order store of a host-chosen id, and the truncated sampler's slice
+            // statistics. Elementwise over one to DEEPSEEK_ROWS_MAX rows.
+            elem_rows("opt_rows_argmax_fold", &[Precision::F32]),
+            elem_rows("opt_rows_argmax_pick", &[Precision::F32]),
+            elem_rows("opt_rows_store_u32", &[Precision::F32]),
+            elem_rows("opt_rows_topc", &[Precision::F32]),
         ],
         true,
     ),
@@ -570,6 +624,28 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym(
                 "opt_flash_mla_csa2_seq",
                 &[Precision::MxFp8, Precision::Bf16],
+            ),
+            // The kv path and the multi-row attention bodies: the append, the fused
+            // norm/rope/window (opt_rows_kv), and the split scores/softmax/values sequence.
+            // Elementwise bodies (the reference's serial dot products), over one to
+            // DEEPSEEK_ROWS_MAX rows.
+            sym("kv_append_bf16", &[Precision::Bf16]),
+            elem_rows("opt_rows_kv", &[Precision::Bf16]),
+            elem_rows(
+                "opt_rows_attn",
+                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            elem_rows(
+                "opt_rows_attn_scores",
+                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            elem_rows(
+                "opt_rows_attn_softmax",
+                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            elem_rows(
+                "opt_rows_attn_values",
+                &[Precision::MxFp8, Precision::Bf16, Precision::Fp8E4M3],
             ),
         ],
         true,
@@ -629,6 +705,31 @@ pub const CATALOGUE: &[PartKernel] = &[
                 &[Precision::MxFp8, Precision::Bf16],
             ),
             sym("pool_group_f32", &[Precision::F32]),
+            // The chunk and multi-row compressor: the pooled recurrence, the groups' FP4 key
+            // and store rows, and the host-weight wkv/wgate projections. The two projection
+            // families are shared with the sparse indexer below; the bulk form is the
+            // tensor-core tile, the row form is a per-row warp GEMV.
+            sym("opt_pool_rows", &[Precision::F32]),
+            sym(
+                "opt_rows_group_pool",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            sym("opt_rows_group_keys", &[Precision::Bf16, Precision::NvFp4]),
+            sym(
+                "opt_rows_group_append",
+                &[Precision::Bf16, Precision::NvFp4],
+            ),
+            tc_bulk("opt_mma_hostw_bf16w", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16w_f32o", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_f32w_f32o", &[Precision::F32]),
+            tc_bulk("opt_mma_hostw_bf16a_bf16w", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16a_bf16w_f32o", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16a_f32w_f32o", &[Precision::F32]),
+            row_rows_deepseek("opt_rows_hostw_bf16w", &[Precision::Bf16]),
+            row_rows_deepseek("opt_rows_hostw_bf16w_f32o", &[Precision::Bf16]),
+            row_rows_deepseek("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
+            row_rows_deepseek("opt_rows_hostw_bf16w_f32o_ring", &[Precision::Bf16]),
+            row_rows_deepseek("opt_rows_hostw_f32w_f32o_ring", &[Precision::F32]),
         ],
         true,
     ),
@@ -652,6 +753,39 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "flash_mla_csa2_seq_sm121",
                 &[Precision::MxFp8, Precision::Bf16],
             ),
+            // The indexer's select family: the reference's pre-pass and score routine, the
+            // multi-row score/select bodies, and the segmented score forms. Elementwise over
+            // one to DEEPSEEK_ROWS_MAX rows; the weights_proj and wk host-weight projections
+            // are the tensor-core bulk tile and the per-row warp GEMV the compressor also uses.
+            sym("opt_ref_select_pre", &[Precision::Bf16, Precision::Fp8E4M3]),
+            sym("opt_select_scores", &[Precision::Bf16, Precision::Fp8E4M3]),
+            sym(
+                "opt_select_scores_rows",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            sym(
+                "opt_select_scores_seg",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            sym(
+                "opt_select_scores_segs",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            sym("opt_select_rows", &[Precision::Bf16, Precision::Fp8E4M3]),
+            sym("opt_select_rows_bf16", &[Precision::Bf16]),
+            sym(
+                "opt_select_rows_tab",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            tc_bulk("opt_mma_hostw_bf16w", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16w_f32o", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_f32w_f32o", &[Precision::F32]),
+            tc_bulk("opt_mma_hostw_bf16a_bf16w", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16a_bf16w_f32o", &[Precision::Bf16]),
+            tc_bulk("opt_mma_hostw_bf16a_f32w_f32o", &[Precision::F32]),
+            row_rows_deepseek("opt_rows_hostw_bf16w", &[Precision::Bf16]),
+            row_rows_deepseek("opt_rows_hostw_bf16w_f32o", &[Precision::Bf16]),
+            row_rows_deepseek("opt_rows_hostw_f32w_f32o", &[Precision::F32]),
         ],
         true,
     ),
@@ -787,6 +921,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             tc("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
             tc("opt_mma_f32a_f32o", &[Precision::F32]),
             tc("opt_mma_fp8_bf16o", &[Precision::Fp8E4M3]),
+            // The shared expert's gate/up over a split chunk's gathered bf16 rows, f32 out.
+            tc("opt_mma_bf16a_f32o", &[Precision::Bf16]),
             sym("shared_swiglu_f32", &[Precision::F32]),
         ],
         true,
@@ -942,6 +1078,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Deepseek,
         &[
             sym("swiglu_mxfp8_quant_sm121", &[Precision::MxFp8]),
+            // The same epilogue with the routing weight multiplied in before the quantiser.
+            sym("swiglu_mxfp8_quant_weighted_sm121", &[Precision::MxFp8]),
             sym("shared_swiglu_f32", &[Precision::F32]),
             sym("opt_rows_shared_swiglu", &[Precision::F32]),
         ],
@@ -1059,6 +1197,10 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             sym("opt_bulk_fp4_pack", &[Precision::F32]),
             sym("mxfp8_quantize_activations_sm121", &[Precision::Bf16]),
+            // The layer's f32 and bf16 activation prologues and the kv window quantiser.
+            sym("w8a8_prologue_e4m3", &[Precision::F32]),
+            sym("opt_rows_prologue_bf16", &[Precision::Bf16]),
+            sym("window_quant_fp8_bf16", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1099,6 +1241,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             tc("opt_mma_moe_gate_up", &[Precision::NvFp4]),
             tc("opt_mma_moe_down", &[Precision::NvFp4]),
             sym("moe_expert_stage_sm121", &[Precision::Bf16]),
+            // The draft's top-3 routed experts and the layer device path's gate/up. The two
+            // dedup bodies are warp-dot rows (one weight read per distinct expert), not MMA
+            // tiles; routed_gate_up_sm121 is the same row arithmetic over the layer's slots.
+            row_dec_all("opt_moe_gate_up_dedup_k3_sm121", &[Precision::NvFp4]),
+            row_dec_all("opt_moe_down_dedup_sm121", &[Precision::NvFp4]),
+            row_all("routed_gate_up_sm121", &[Precision::NvFp4]),
         ],
         true,
     ),
@@ -1329,10 +1477,30 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[row_dec("q4e_expert_gemv_e4m3_block", &[Precision::Fp8E4M3])],
         false,
     ),
+    // The draft's own plan builder (opt_moe_plan_sm121) sits beside the shared one; DeepSeek's
+    // entry is canonical as it is for every part DeepSeek implements.
+    sm121(
+        Part::MoePlan,
+        Image::Deepseek,
+        &[sym("opt_moe_plan_sm121", &[Precision::Bf16])],
+        true,
+    ),
     sm121(
         Part::MoePlan,
         Image::MoePlan,
         &[sym("moe_plan", &[Precision::Bf16])],
+        false,
+    ),
+    // DeepSeek's own rank fold and the side-stream prefetch that runs during its all-reduce.
+    // The fold is the one-shot exchange's local sum (opt_sum_ranks_bf16); the prefetch is a
+    // hint that moves no arithmetic, kept here because it is queued against the collective.
+    sm121(
+        Part::Collective,
+        Image::Deepseek,
+        &[
+            sym("opt_sum_ranks_bf16", &[Precision::Bf16]),
+            sym("opt_rows_prefetch_l2", &[Precision::Bf16, Precision::F32]),
+        ],
         true,
     ),
     sm121(
@@ -1342,7 +1510,7 @@ pub const CATALOGUE: &[PartKernel] = &[
             "rocenante_oneshot_allreduce_bf16_tp4",
             &[Precision::Bf16],
         )],
-        true,
+        false,
     ),
     sm121(
         Part::Collective,
@@ -1388,6 +1556,18 @@ pub const CATALOGUE: &[PartKernel] = &[
             ),
             sym("mhc_entry_bf16", &[Precision::Bf16]),
             sym("mhc_ffn_seams", &[Precision::Bf16]),
+            // The layer seam's remaining bodies: the attention residual and FFN epilogue, the
+            // bulk seam derivation and the multi-row seam/post/tail/collapse forms.
+            sym("mhc_attn_residual", &[Precision::Bf16]),
+            sym("mhc_ffn_epilogue", &[Precision::Bf16]),
+            sym(
+                "opt_bulk_seam_derive",
+                &[Precision::Bf16, Precision::Fp8E4M3],
+            ),
+            elem_rows("opt_rows_mhc_post", &[Precision::Bf16]),
+            elem_rows("opt_rows_mhc_seam", &[Precision::Bf16]),
+            elem_rows("opt_rows_mhc_tail", &[Precision::Bf16]),
+            elem_rows("opt_rows_hc_pre_collapse", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1493,6 +1673,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("opt_rows_engram_post", &[Precision::Bf16]),
             sym("opt_rows_engram_wkv", &[Precision::Bf16]),
             sym("opt_rows_engram_wkv_s", &[Precision::Bf16]),
+            // The chunk wkv on the tensor cores and the split wkv's ranked row permute.
+            tc_bulk("opt_mma_fp8_rows_bf16o", &[Precision::MxFp8]),
+            elem_rows("opt_rows_rank_permute", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1539,6 +1722,28 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("opt_draft_head_fp8", &[Precision::Fp8E4M3]),
             sym("opt_draft_head_fp8t", &[Precision::Fp8E4M3]),
             sym("opt_draft_logits_fp8", &[Precision::Fp8E4M3]),
+            // The draft's tap capture, its normalise-and-quantise, and the three block-scaled
+            // MMA head-logit bodies (the tensor-core forms of opt_draft_logits).
+            elem_dec("opt_draft_taps", &[Precision::F32]),
+            elem_dec("opt_draft_norm_quant", &[Precision::Bf16, Precision::MxFp8]),
+            KernelSymbol::decode(
+                "opt_mma_bf16a_fp8row_f32o",
+                &[Precision::Fp8E4M3],
+                ComputeClass::TensorCore,
+                RowBand::ALL,
+            ),
+            KernelSymbol::decode(
+                "opt_mma_fp8_rowscale_f32o",
+                &[Precision::Fp8E4M3],
+                ComputeClass::TensorCore,
+                RowBand::ALL,
+            ),
+            KernelSymbol::decode(
+                "opt_mma_head_fp8t_f32o",
+                &[Precision::Fp8E4M3],
+                ComputeClass::TensorCore,
+                RowBand::ALL,
+            ),
         ],
         true,
     ),
