@@ -78,6 +78,7 @@ impl ModelBackend for SenseNovaHostBackend {
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
         Ok(Box::new(SenseNovaSession {
+            eos: self.weights.config.eos_token_ids.clone(),
             weights: Arc::clone(&self.weights),
             state: SenseNovaState::new(&self.weights.config),
             context: self.context,
@@ -93,9 +94,24 @@ struct SenseNovaSession {
     context: usize,
     sampler: Sampler,
     sampling: Sampling,
+    /// The ids that end the sequence, from the checkpoint's own configuration.
+    eos: Vec<u32>,
 }
 
 impl SenseNovaSession {
+    /// Chooses the next token, ending the sequence at an end-of-generation id.
+    ///
+    /// `None` is what the serving loop reads as "the model finished"; returning a stop id as a
+    /// token appends it to the completion and keeps generating past the end of the answer.
+    fn next(&mut self, logits: &[f32]) -> Option<u32> {
+        let token = self.sampler.choose(logits, &self.sampling);
+        if self.eos.contains(&token) {
+            None
+        } else {
+            Some(token)
+        }
+    }
+
     fn forward(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
         if self.state.position >= self.context {
             return Err(BackendError::new(
@@ -129,9 +145,9 @@ impl ModelSession for SenseNovaSession {
         }
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
+        let next_token = self.next(&logits);
         Ok(StepOutput {
-            next_token: Some(chosen as u32),
+            next_token,
             logits,
             draft: Vec::new(),
         })
@@ -140,9 +156,9 @@ impl ModelSession for SenseNovaSession {
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
         let logits = self.forward(token)?;
         self.sampler.record(token);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
+        let next_token = self.next(&logits);
         Ok(StepOutput {
-            next_token: Some(chosen as u32),
+            next_token,
             logits,
             draft: Vec::new(),
         })

@@ -277,6 +277,16 @@ Four correctness bugs found on the way, all of them silent:
   every visit's GDN output wrong. This one *is* what made the served text boilerplate.
 - **The chunked convolution's state fill** wrote the taps back to front, so any row block starting
   from history carried the wrong taps.
+- **The arm never ended a sequence.** Both sessions returned the sampled id unconditionally
+  (`next_token: Some(chosen)`), so `None` — the serving loop's "the model finished" — never
+  arrived. Every turn ran to `max_tokens`: the model answered, then opened fresh
+  `<|im_start|>assistant` turns and re-answered itself (`Hello!\n</think>\n\nHello!\n...`), and on a
+  tool turn a clean `tool_calls` block came back followed by a tail of stray `</tool_call>`
+  fragments in `content`. The checkpoint's own `eos_token_id` (248046 `<|im_end|>`, plus 248044
+  from `generation_config.json`) was parsed into the config and then read by nothing. Both
+  sessions now stop on it, and `the_sequence_ends_at_the_checkpoints_stop_id` in
+  `tests/real_parity.rs` renders a turn through the same codec the server uses and fails with
+  "a stop id was emitted as a token: 248046" if the check is removed.
 
 Text check, run against the f32 host reference (`SPARKFLASH_SENSENOVA_HOST=1`, which serves the
 same plan and weights through independent arithmetic): on the FP8 checkpoint the host answers

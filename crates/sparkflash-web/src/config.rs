@@ -106,6 +106,13 @@ pub const GLM_ENGINE_ID: &str = "glm5-next";
 /// The canonical Hugging Face id of the GLM-5.3-Flash checkpoint.
 pub const GLM_MODEL_ID: &str = sparkflash_model::descriptor::GLM53_FLASH_ID;
 
+/// The control-plane weight selector for the SenseNova-Loop-9B FP8 checkpoint.
+pub const SENSENOVA_WEIGHTS_ID: &str =
+    sparkflash_model::descriptor::SENSENOVA_LOOP_9B_WEIGHTS_ID;
+
+/// The canonical Hugging Face id of the SenseNova-Loop-9B checkpoint.
+pub const SENSENOVA_MODEL_ID: &str = sparkflash_model::descriptor::SENSENOVA_LOOP_9B_ID;
+
 /// The maximum context window of V4.1-Flash.
 pub const MODEL_CONTEXT_TOKENS: usize = sparkflash_model::V41_CONTEXT_TOKENS;
 
@@ -269,6 +276,21 @@ fn deployment_for(weights: &str) -> Deployment {
             requires_cubins: false,
             lane_group: true,
         },
+        SENSENOVA_WEIGHTS_ID => Deployment {
+            // The dynamic route opens SenseNova-Loop's device arm when its cubins are present;
+            // the arm is the only pack with its own loop/mHC kernels, so it has no other engine.
+            engine: DYNAMIC_ENGINE_ID,
+            search: "SenseNova-Loop",
+            world_size: SOLO_WORLD_SIZE,
+            // Two streams of one 9.4B decoder on one card; the pack has no tensor-parallel arm.
+            worlds: &[SOLO_WORLD_SIZE],
+            org: "sensenova",
+            // The FP8 mirror is served as it ships: the arm requantises on the device, at load.
+            requires_conversion: false,
+            // The arm's kernels are built into the binary, like Inkling-2's.
+            requires_cubins: false,
+            lane_group: false,
+        },
         other => panic!("no web deployment profile for the registry weights {other}"),
     }
 }
@@ -320,12 +342,24 @@ pub fn profile_for_weights(weights: &str) -> Option<&'static ModelProfile> {
         .find(|profile| profile.weights.eq_ignore_ascii_case(weights.trim()))
 }
 
-/// The profile for a canonical released Hugging Face id.
+/// Released ids that name a profile under a second spelling.
+///
+/// SenseNova-Loop-9B went to the Hub as `-Preview`, which is the id an operator sees when they
+/// pick it from the browser; the registry carries the release name. The console has to accept
+/// either, or the family it ships looks like one it cannot run.
+pub const ID_ALIASES: &[(&str, &str)] = &[("sensenova/SenseNova-Loop-9B-Preview", SENSENOVA_MODEL_ID)];
+
+/// The profile for a canonical released Hugging Face id, under either spelling.
 #[must_use]
 pub fn profile_for_id(id: &str) -> Option<&'static ModelProfile> {
+    let id = id.trim();
+    let canonical = ID_ALIASES
+        .iter()
+        .find(|(alias, _)| alias.eq_ignore_ascii_case(id))
+        .map_or(id, |(_, canonical)| *canonical);
     MODEL_PROFILES
         .iter()
-        .find(|profile| profile.id.eq_ignore_ascii_case(id.trim()))
+        .find(|profile| profile.id.eq_ignore_ascii_case(canonical))
 }
 
 /// A configuration that failed to parse or validate.
@@ -1132,6 +1166,15 @@ impl SparkConfig {
                     architecture.family
                 )));
             }
+            return Ok(());
+        }
+        // A family this build carries is runnable before anything is downloaded, exactly as
+        // `validate` treats the canonical ids above: the dynamic route is what opens its device
+        // arm, so asking the hub cache to vouch for it would make a shipped family look absent.
+        if let Some(profile) = profile_for_id(&self.model.id)
+            && profile.engine == DYNAMIC_ENGINE_ID
+            && self.model.weights == profile.weights
+        {
             return Ok(());
         }
         let cached = self

@@ -1243,6 +1243,8 @@ struct DeviceSession {
     graph: Option<sparkflash_kernels::cuda_driver::GraphId>,
     sampler: Sampler,
     sampling: Sampling,
+    /// The ids that end the sequence: `<|im_end|>` and `<|endoftext|>` from the checkpoint.
+    eos: Vec<u32>,
 }
 
 impl Drop for DeviceSession {
@@ -1413,6 +1415,7 @@ impl DeviceSession {
                 );
             }
         }
+        let eos = shared.config.eos_token_ids.clone();
         let mut session = Self {
             shared,
             scratch,
@@ -1421,6 +1424,7 @@ impl DeviceSession {
             graph: None,
             sampler: Sampler::new(),
             sampling: Sampling::default(),
+            eos,
         };
         session.graph = session.capture_graph();
         Ok(session)
@@ -2343,6 +2347,24 @@ impl ModelBackend for SenseNovaDeviceBackend {
     }
 }
 
+impl DeviceSession {
+    /// Chooses the next token, ending the sequence at an end-of-generation id.
+    ///
+    /// The released configuration names two stop ids (`<|endoftext|>` and `<|im_end|>`), and the
+    /// serving loop reads `None` as "the model finished". Returning a stop id as a token instead
+    /// appends it to the completion and then keeps generating past the end of the answer - which
+    /// is what the arm did: every turn ran to `max_tokens`, and the model, having answered, went
+    /// on to open fresh `<|im_start|>assistant` turns and re-answer itself.
+    fn next(&mut self, logits: &[f32]) -> Option<u32> {
+        let token = self.sampler.choose(logits, &self.sampling);
+        if self.eos.contains(&token) {
+            None
+        } else {
+            Some(token)
+        }
+    }
+}
+
 impl ModelSession for DeviceSession {
     fn set_sampling(&mut self, sampling: Sampling) {
         self.sampling = sampling;
@@ -2364,9 +2386,9 @@ impl ModelSession for DeviceSession {
         }
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
+        let next_token = self.next(&logits);
         Ok(StepOutput {
-            next_token: Some(chosen as u32),
+            next_token,
             logits,
             draft: Vec::new(),
         })
@@ -2384,9 +2406,9 @@ impl ModelSession for DeviceSession {
         }
         let logits = self.forward_rows(&[token])?;
         self.sampler.record(token);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
+        let next_token = self.next(&logits);
         Ok(StepOutput {
-            next_token: Some(chosen as u32),
+            next_token,
             logits,
             draft: Vec::new(),
         })
