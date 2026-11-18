@@ -24,7 +24,7 @@
 //! * plan is the vocabulary: dtypes, layouts, streams, OpPlan and Launch.
 //! * gemm, attention, scan, epilogue and collective are the typed plans.
 //! * images exposes the shared cubins, so no model crate compiles CUDA.
-//! * formats types a weight's stored format and its scales.
+//! * formats types a weight's stored format and its scales, and widen is the one conversion.
 //! * parts is the per-target catalogue: which image and symbols implement each model part.
 //! * parity is the bring-up harness an arm runs against its host reference.
 //! * gemv, gdn and tp are the shared launch helpers the Qwen, GLM and DeepSeek arms call.
@@ -118,6 +118,7 @@ pub mod gemv;
 pub mod packed;
 pub mod tower;
 pub mod tp;
+pub mod widen;
 
 pub use engine_plan::{
     EngineBuilder, EnginePlan, LayerExecution, PartRequirement, PlanError, PrecisionPolicy,
@@ -136,3 +137,7 @@ pub use plan::{
 pub use resolver::{Availability, KernelResolver, PlanContext, ResolveError, ResolvedKernel};
 pub use slot_pack::{PackSlot, SlotPack};
 pub use tensor_plan::{ArchitectureTensorPlan, Role as TensorRole};
+pub use widen::{
+    BytesPerToken, FormatLedger, LedgerRow, WidenError, WidenLog, WidenRecord,
+    bytes_per_token_floor, stored_bytes_floor, widen,
+};
