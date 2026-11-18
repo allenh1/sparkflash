@@ -495,10 +495,16 @@ impl PackArm for GlmArm {
     const OPEN_LANES: Option<GroupLanesOpen> = Some(open_glm_lanes);
 
     fn check_profile(profile: &ModelProfile) -> Result<(), String> {
+        // The ledger's tensor-core decode row, the serving walk's capability and this refusal
+        // are one constant ([sparkflash_model_glm5_next::TOKEN_DECODE]), so the switch cannot be
+        // refused for a reason the boot ledger does not state.
+        let sparkflash_model::ledger::State::Off(why) = sparkflash_model_glm5_next::TOKEN_DECODE
+        else {
+            return Ok(());
+        };
         if profile.decode.tensor_cores == Some(true) {
             return Err(format!(
-                "the GLM arm ({}) decodes on its row GEMV and never reads the tensor-core tile, \
-                 but decode.tensor_cores = true (SPARKFLASH_DECODE_MMA=on) is set. Set \
+                "the GLM arm ({}) cannot honour decode.tensor_cores = true: {why}. Set \
                  SPARKFLASH_DECODE_MMA=off, or unset it, to run the row GEMV GLM serves; its \
                  tensor-core decode is a later phase",
                 Self::MODEL_ID
