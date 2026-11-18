@@ -49,9 +49,13 @@ impl ChunkPolicy {
     /// The policy for `limits`, where one positional row occupies `bytes_per_row` and
     /// `free_bytes` are reported free. A zero `free_bytes` means "not measured": only the
     /// limits apply. A zero `bytes_per_row` also removes the memory term.
+    ///
+    /// The context does not lower the pass width: a prompt is at most its own length and the
+    /// runtime clamps a chunk to it, so a short context still runs a prompt that fits as one
+    /// whole pass (dense's 256 rows at a 128-position context, for example).
     #[must_use]
     pub fn new(limits: Limits, free_bytes: u64, bytes_per_row: usize) -> Self {
-        let by_limits = limits.rows.min(limits.context).max(1);
+        let by_limits = limits.rows.max(1);
         let by_memory = if free_bytes > 0 && bytes_per_row > 0 {
             usize::try_from(free_bytes / bytes_per_row as u64)
                 .unwrap_or(usize::MAX)
@@ -145,6 +149,12 @@ mod tests {
         );
         // Across a band it does.
         assert_eq!(ChunkPolicy::new(limits, 4_096, 1).rows(), 4_096);
+    }
+
+    #[test]
+    fn a_context_below_the_chunk_size_does_not_split_a_prompt() {
+        let dense = Limits::new(256, 128);
+        assert_eq!(ChunkPolicy::for_limits(dense).rows(), 256);
     }
 
     #[test]
