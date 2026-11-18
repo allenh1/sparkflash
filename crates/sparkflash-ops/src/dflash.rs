@@ -56,7 +56,8 @@ use sparkflash_weights::safetensors::{
 
 use crate::calls::{self, RmsNorm, Rope};
 use crate::gemv::{
-    GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, tiled_gemv_e4m3_splits, tiled_operands,
+    E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, GpuMatE4m3Tile,
+    tiled_gemv_e4m3_splits, tiled_operands,
 };
 use sparkflash_model::dflash2::{Dflash2Config, DraftTarget};
 use sparkflash_weights::{DType, TensorSpec, WeightSource};
@@ -517,6 +518,76 @@ impl<'a> DraftUploader<'a> {
         let bytes = self.read(name, rows * columns * 2)?;
         Ok(GpuMat {
             pointer: self.bytes(&bytes)?,
+            rows,
+            columns,
+        })
+    }
+
+    /// A block-scaled E4M3 matrix on the device: `name`'s `[rows][columns]` codes and the
+    /// `[ceil(rows / 128)][ceil(columns / 128)]` inverse scales of its `weight_scale_inv`, held as
+    /// the BF16 the tile kernels read. An F32 grid is taken when every scale is a BF16 value, so
+    /// the narrowing changes no scale; any other is refused.
+    ///
+    /// # Errors
+    /// A name that is not a `.weight`, codes or scales of another dtype or shape, an F32 scale
+    /// BF16 does not hold, and as [Self::read] and [Self::bytes].
+    pub fn mat_e4m3_tile(
+        &self,
+        name: &str,
+        rows: usize,
+        columns: usize,
+    ) -> Result<GpuMatE4m3Tile, String> {
+        let spec = |name: &str| self.source.spec(name).map_err(|error| error.to_string());
+        let weight = spec(name)?;
+        if weight.dtype != DType::F8E4M3 || weight.shape != [rows, columns] {
+            return Err(format!(
+                "{name} is {:?} {:?}, not E4M3 [{rows}, {columns}]",
+                weight.dtype, weight.shape
+            ));
+        }
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|prefix| format!("{prefix}.weight_scale_inv"))
+            .ok_or_else(|| format!("{name} is not a .weight, so it names no weight_scale_inv"))?;
+        let grid = [rows.div_ceil(E4M3_TILE), columns.div_ceil(E4M3_TILE)];
+        let scale = spec(&scale_name)?;
+        if scale.shape != grid {
+            return Err(format!(
+                "{scale_name} is {:?}, not the {grid:?} grid of 128 x 128 tiles",
+                scale.shape
+            ));
+        }
+        let scales = match scale.dtype {
+            DType::BF16 => self.read(&scale_name, grid[0] * grid[1] * 2)?,
+            DType::F32 => {
+                let words = self.read(&scale_name, grid[0] * grid[1] * 4)?;
+                let mut narrowed = Vec::with_capacity(words.len() / 2);
+                for word in words.as_chunks::<4>().0 {
+                    let bits = u32::from_le_bytes(*word);
+                    if bits & 0xffff != 0 {
+                        return Err(format!(
+                            "{scale_name} holds the F32 scale {}, which BF16 does not hold",
+                            f32::from_bits(bits)
+                        ));
+                    }
+                    narrowed.extend(((bits >> 16) as u16).to_le_bytes());
+                }
+                narrowed
+            }
+            dtype => {
+                return Err(format!(
+                    "{scale_name} is {dtype:?}; the tile kernels read BF16 inverse scales"
+                ));
+            }
+        };
+        let codes = self.read(name, rows * columns)?;
+        let weight = self.bytes(&codes)?;
+        let scales = self
+            .bytes(&scales)
+            .inspect_err(|_| self.cuda.free_buffers(&[&weight]))?;
+        Ok(GpuMatE4m3Tile {
+            weight,
+            scales,
             rows,
             columns,
         })

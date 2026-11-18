@@ -54,6 +54,7 @@ use sparkflash_kernels::images::Image;
 use sparkflash_model::Architecture;
 use sparkflash_model::architecture::WeightFormat;
 
+use crate::gemv::E4M3_TILE;
 use crate::plan::{KernelSymbol, Precision, ShapeConstraint};
 use sparkflash_model::Part;
 use sparkflash_model::Target;
@@ -1769,20 +1770,27 @@ pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
     "q4e_deinterleave",
     "q4e_embed",
     "q4e_gemv_bf16",
+    "q4e_gemv_tiled_e4m3_tile",
     "q4e_rmsnorm",
     "q4e_rope",
     "q4e_swiglu",
 ];
+
+/// The prefill-image kernel the shared dense arm's block-scaled FP8 prompt projections launch
+/// ([crate::projection::Fp8Tile]).
+pub const DENSE_FP8_TILE_SYMBOL: &str = "q4p_dense_fp8";
 
 /// The attention-image kernels the shared dense arm launches.
 pub const DENSE_ATTENTION_SYMBOLS: &[&str] =
     &["q4e_attn_full", "q4e_attn_full_combine", "q4e_cache_bf16"];
 
 /// The routed-expert kernels the shared dense arm launches for an MoE layer: the router, the
-/// token path's BF16 expert passes and the combine.
+/// token path's BF16 and block-scaled FP8 expert passes and the combine.
 pub const DENSE_MOE_SYMBOLS: &[&str] = &[
     "q4e_expert_down_bf16",
+    "q4e_expert_down_fp8",
     "q4e_expert_gate_up_bf16",
+    "q4e_expert_gate_up_fp8",
     "q4e_moe_combine",
     "q4e_route",
 ];
@@ -1810,6 +1818,7 @@ pub fn dense_device_images() -> Result<(), String> {
         (Image::Qwen4Exp, DENSE_TOKEN_SYMBOLS),
         (Image::Qwen4Attn, DENSE_ATTENTION_SYMBOLS),
         (Image::Dory, &[DENSE_WIDE_SYMBOL][..]),
+        (Image::Qwen4Prefill, &[DENSE_FP8_TILE_SYMBOL][..]),
         (Image::Qwen4Moe, DENSE_MOE_SYMBOLS),
         (Image::MoePlan, &["moe_plan"][..]),
     ] {
@@ -1837,10 +1846,11 @@ pub fn dense_device_images() -> Result<(), String> {
 ///
 /// The arm runs the host reference's arithmetic on the token image: a BF16 embedding, RMSNorm,
 /// grouped-query attention (with or without the per-head output gate and q/k norms, plain
-/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU or routed BF16 experts
-/// (a softmax, sigmoid or sqrt-softplus score, the top-k with or without renormalising, a routed
+/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU or routed experts (a
+/// softmax, sigmoid or sqrt-softplus score, the top-k with or without renormalising, a routed
 /// scale, a shared expert with or without its sigmoid gate), a plain residual and the head, on
-/// one rank. It is gated by a per-layer parity report against that reference, so it
+/// one rank. Its projections and experts are BF16 or E4M3 under one inverse scale a 128 x 128
+/// tile, over widths of whole tiles; the embedding, the head and the norms are BF16. It is gated by a per-layer parity report against that reference, so it
 /// takes nothing the reference does not execute, and nothing the reference does that its kernels
 /// do not (a linear rotary rule, another activation, a clamp). Everything else is refused by
 /// name, and the host reference stays that checkpoint's executor.
@@ -1850,10 +1860,19 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
     if let Some(refusal) = host_reference_structure_refusal(architecture) {
         return Some(refusal);
     }
-    if architecture.quantization.dense_format != WeightFormat::Bf16 {
+    let dense_format = architecture.quantization.dense_format;
+    if !dense_arm_reads(dense_format) {
         return Some(format!(
-            "its dense projections are {}, and the arm reads BF16",
-            architecture.quantization.dense_format.name()
+            "its dense projections are {}, and the arm reads BF16 or 128 x 128 block-scaled FP8",
+            dense_format.name()
+        ));
+    }
+    let tiled = dense_format != WeightFormat::Bf16;
+    if tiled && !architecture.hidden_size.is_multiple_of(E4M3_TILE) {
+        return Some(format!(
+            "its block-scaled FP8 projections read whole {E4M3_TILE}-column scale tiles, and the \
+             hidden width {} is not one",
+            architecture.hidden_size
         ));
     }
     if architecture.hidden_size == 0
@@ -1925,6 +1944,20 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
                 scaling.kind, scaling.factor
             ));
         }
+        let query_width = attention.heads * attention.head_dim;
+        let ffn_width = match &layer.ffn {
+            Ffn::Dense(dense) => dense.intermediate,
+            Ffn::Moe(moe) if moe.shared_experts > 0 => moe.shared_intermediate,
+            Ffn::Moe(_) => 0,
+        };
+        if tiled && !(query_width.is_multiple_of(E4M3_TILE) && ffn_width.is_multiple_of(E4M3_TILE))
+        {
+            return Some(format!(
+                "layer {index}'s block-scaled FP8 output and down projections read whole \
+                 {E4M3_TILE}-column scale tiles, and the attention width {query_width} or the MLP \
+                 width {ffn_width} is not one"
+            ));
+        }
         match &layer.ffn {
             Ffn::Dense(dense) if dense.activation == Activation::Silu && dense.clamp.is_none() => {}
             Ffn::Dense(dense) => {
@@ -1948,17 +1981,32 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
     None
 }
 
+/// Whether the shared dense arm reads weights stored as `format`: BF16, or E4M3 codes under one
+/// inverse scale a 128 x 128 tile (the host reference's one FP8 arithmetic, whatever the release
+/// declares of its activations: both keep them f32).
+fn dense_arm_reads(format: WeightFormat) -> bool {
+    matches!(
+        format,
+        WeightFormat::Bf16
+            | WeightFormat::Fp8Tile {
+                block_m: E4M3_TILE,
+                block_n: E4M3_TILE,
+                ..
+            }
+    )
+}
+
 /// Why the shared dense arm's routed experts cannot execute `moe`, if they cannot.
 fn dense_moe_refusal(
     architecture: &Architecture,
     moe: &sparkflash_model::architecture::Moe,
 ) -> Option<String> {
     use sparkflash_model::architecture::{Activation, Score};
-    let quantization = &architecture.quantization;
-    if quantization.expert_format != WeightFormat::Bf16 {
+    let format = architecture.quantization.expert_format;
+    if !dense_arm_reads(format) {
         return Some(format!(
-            "they are {}, and the arm reads BF16 experts",
-            quantization.expert_format.name()
+            "they are {}, and the arm reads BF16 or 128 x 128 block-scaled FP8 experts",
+            format.name()
         ));
     }
     if moe.activation != Activation::Silu || moe.clamp.is_some() {
@@ -1989,10 +2037,18 @@ fn dense_moe_refusal(
         ));
     }
     let hidden = architecture.hidden_size;
-    if !hidden.is_multiple_of(8) || moe.intermediate == 0 || !moe.intermediate.is_multiple_of(8) {
+    let (multiple, rows) = if format == WeightFormat::Bf16 {
+        (8, "BF16 rows eight columns at a time")
+    } else {
+        (E4M3_TILE, "block-scaled FP8 rows a 128-column scale tile at a time")
+    };
+    if !hidden.is_multiple_of(multiple)
+        || moe.intermediate == 0
+        || !moe.intermediate.is_multiple_of(multiple)
+    {
         return Some(format!(
-            "the expert passes read BF16 rows eight columns at a time, and the hidden width \
-             {hidden} or the expert width {} is not a positive multiple of eight",
+            "the expert passes read {rows}, and the hidden width {hidden} or the expert width {} \
+             is not a positive multiple of {multiple}",
             moe.intermediate
         ));
     }
@@ -2304,6 +2360,15 @@ mod tests {
     use super::*;
     use crate::plan::PrecisionMask;
     use std::collections::HashSet;
+
+    /// The block-scaled FP8 declaration the Qwen3 FP8 releases write.
+    fn fp8() -> serde_json::Value {
+        serde_json::json!({
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128]
+        })
+    }
 
     const DEEPSEEK: &str =
         include_str!("../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json");
@@ -2737,6 +2802,12 @@ mod tests {
         };
         let dense = parse(&|_| {});
         assert_eq!(dense_device_refusal(&dense), None);
+        let tiled = parse(&|document| document["quantization_config"] = fp8());
+        assert!(matches!(
+            tiled.quantization.dense_format,
+            WeightFormat::Fp8Tile { .. }
+        ));
+        assert_eq!(dense_device_refusal(&tiled), None, "FP8 projections");
         let arm = dynamic_device_arm(&dense);
         if dense_device_images().is_ok() {
             assert_eq!(arm, Ok(DENSE_DEVICE_ARM));
@@ -2775,6 +2846,20 @@ mod tests {
                 },
                 "heads of 1..=256",
             ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["quantization_config"] = fp8();
+                    document["intermediate_size"] = serde_json::json!(544);
+                },
+                "the MLP width 544",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["quantization_config"] =
+                        serde_json::json!({"quant_method": "fp8", "weight_block_size": [64, 64]});
+                },
+                "BF16 or 128 x 128 block-scaled FP8",
+            ),
         ] {
             let architecture = parse(edit);
             let refusal = dense_device_refusal(&architecture)
@@ -2811,6 +2896,12 @@ mod tests {
             Architecture::from_json(&document.to_string()).expect("the document parses")
         };
         assert_eq!(dense_device_refusal(&parse(&|_| {})), None);
+        let tiled = parse(&|document| document["quantization_config"] = fp8());
+        assert!(matches!(
+            tiled.quantization.expert_format,
+            WeightFormat::Fp8Tile { .. }
+        ));
+        assert_eq!(dense_device_refusal(&tiled), None, "FP8 experts");
         for score in ["sigmoid", "sqrtsoftplus"] {
             let independent = parse(&|document| {
                 document["scoring_func"] = serde_json::json!(score);
@@ -2842,7 +2933,20 @@ mod tests {
                 &|document: &mut serde_json::Value| {
                     document["moe_intermediate_size"] = serde_json::json!(132);
                 },
-                "multiple of eight",
+                "multiple of 8",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["quantization_config"] = fp8();
+                    document["moe_intermediate_size"] = serde_json::json!(192);
+                },
+                "positive multiple of 128",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["quantization_config"] = serde_json::json!({"quant_method": "nvfp4"});
+                },
+                "BF16 or 128 x 128 block-scaled FP8",
             ),
             (
                 &|document: &mut serde_json::Value| {

@@ -24,7 +24,9 @@
 //!
 //! Three routed checkpoints follow: a softmax router with a sigmoid-gated shared expert, a
 //! sigmoid router after a dense first layer (picks kept as scored and scaled, an ungated shared
-//! expert), and a sqrt-softplus router with no shared expert.
+//! expert), and a sqrt-softplus router with no shared expert. Two block-scaled FP8 checkpoints
+//! close it, as the Qwen3 FP8 releases store their projections and experts (E4M3 codes under one
+//! BF16 or F32 inverse scale a 128 x 128 tile): a dense gated one and the first routed one.
 //!
 //! The arm's serving contract is checked here too, on the same fixtures: fused lanes answer every
 //! step's logits to the bit as each conversation alone, and a kept lane continues its
@@ -53,35 +55,64 @@ const TOLERANCE: Tolerance = Tolerance::new(2e-2, 2e-2);
 
 struct Memory(BTreeMap<String, (TensorSpec, Vec<u8>)>);
 
+/// `elements` deterministic words salted by `name`.
+fn mixed(name: &str, elements: usize) -> impl Iterator<Item = u32> {
+    let salt = name.bytes().fold(0x811c_9dc5u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    (0..elements as u32).map(move |index| {
+        (index ^ salt)
+            .wrapping_mul(0x9e37_79b9)
+            .rotate_left(13)
+            .wrapping_mul(0x85eb_ca6b)
+    })
+}
+
 impl Memory {
+    fn insert(&mut self, name: &str, dtype: DType, shape: &[usize], bytes: Vec<u8>) {
+        let spec = TensorSpec {
+            name: name.to_owned(),
+            dtype,
+            shape: shape.to_vec(),
+        };
+        self.0.insert(name.to_owned(), (spec, bytes));
+    }
+
     /// A BF16 tensor of deterministic values in `[-scale, scale]` around `centre`.
     fn push(&mut self, name: &str, shape: &[usize], centre: f32, scale: f32) {
         let elements: usize = shape.iter().product();
-        let salt = name.bytes().fold(0x811c_9dc5u32, |hash, byte| {
-            (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
-        });
-        let bytes = (0..elements as u32)
-            .flat_map(|index| {
-                let mixed = (index ^ salt)
-                    .wrapping_mul(0x9e37_79b9)
-                    .rotate_left(13)
-                    .wrapping_mul(0x85eb_ca6b);
+        let bytes = mixed(name, elements)
+            .flat_map(|mixed| {
                 let unit = (mixed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
                 let value = centre + unit * scale;
                 ((value.to_bits() >> 16) as u16).to_le_bytes()
             })
             .collect();
-        self.0.insert(
-            name.to_owned(),
-            (
-                TensorSpec {
-                    name: name.to_owned(),
-                    dtype: DType::BF16,
-                    shape: shape.to_vec(),
-                },
-                bytes,
-            ),
-        );
+        self.insert(name, DType::BF16, shape, bytes);
+    }
+
+    /// A block-scaled E4M3 `[rows, columns]` weight as the FP8 releases store one: codes of
+    /// magnitude under two and a `weight_scale_inv` grid a 128 x 128 tile around `scale`, BF16 or
+    /// (`wide`) F32 words that hold BF16 values.
+    fn push_fp8(&mut self, name: &str, [rows, columns]: [usize; 2], scale: f32, wide: bool) {
+        // Exponent fields 0..=7 keep every code finite and under 1.875 in magnitude.
+        let codes = mixed(name, rows * columns)
+            .map(|mixed| ((mixed >> 24) & 0x80 | (mixed >> 8) & 0x3f) as u8)
+            .collect();
+        self.insert(name, DType::F8E4M3, &[rows, columns], codes);
+        let grid = [rows.div_ceil(128), columns.div_ceil(128)];
+        let scale_name = name.replace(".weight", ".weight_scale_inv");
+        let scales = mixed(&scale_name, grid[0] * grid[1]).map(|mixed| {
+            let unit = (mixed >> 8) as f32 / (1u32 << 24) as f32;
+            ((scale * (0.5 + unit)).to_bits() >> 16) as u16
+        });
+        if wide {
+            let words = scales.flat_map(|bits| (u32::from(bits) << 16).to_le_bytes());
+            self.insert(&scale_name, DType::F32, &grid, words.collect());
+        } else {
+            let words = scales.flat_map(u16::to_le_bytes);
+            self.insert(&scale_name, DType::BF16, &grid, words.collect());
+        }
     }
 }
 
@@ -114,6 +145,9 @@ struct Fixture {
     config: Value,
     gated: bool,
     tied: bool,
+    /// Its projections and experts are block-scaled E4M3 (`weight_block_size` 128 x 128), each
+    /// odd layer's scales F32; the embedding, head, norms and routers stay BF16.
+    fp8: bool,
 }
 
 impl Fixture {
@@ -138,34 +172,28 @@ impl Fixture {
         let query_rows = heads * head_dim * if self.gated { 2 } else { 1 };
         for layer in 0..self.value("num_hidden_layers") {
             let at = |name: &str| format!("model.layers.{layer}.{name}.weight");
+            let form = Form {
+                fp8: self.fp8,
+                wide: layer % 2 == 1,
+            };
             source.push(&at("input_layernorm"), &[hidden], 1.0, 0.2);
             source.push(&at("post_attention_layernorm"), &[hidden], 1.0, 0.2);
-            source.push(&at("self_attn.q_proj"), &[query_rows, hidden], 0.0, weight);
-            source.push(
-                &at("self_attn.k_proj"),
-                &[kv_heads * head_dim, hidden],
-                0.0,
-                weight,
-            );
-            source.push(
-                &at("self_attn.v_proj"),
-                &[kv_heads * head_dim, hidden],
-                0.0,
-                weight,
-            );
-            source.push(
-                &at("self_attn.o_proj"),
-                &[hidden, heads * head_dim],
-                0.0,
-                weight,
-            );
+            let kv = kv_heads * head_dim;
+            for (name, shape) in [
+                ("self_attn.q_proj", [query_rows, hidden]),
+                ("self_attn.k_proj", [kv, hidden]),
+                ("self_attn.v_proj", [kv, hidden]),
+                ("self_attn.o_proj", [hidden, heads * head_dim]),
+            ] {
+                form.push(&mut source, &at(name), shape);
+            }
             if self.gated {
                 source.push(&at("self_attn.q_norm"), &[head_dim], 1.0, 0.2);
                 source.push(&at("self_attn.k_norm"), &[head_dim], 1.0, 0.2);
             }
             let first_dense = self.config["first_k_dense_replace"].as_u64().unwrap_or(0) as usize;
             if self.config.get("num_experts").is_none() || layer < first_dense {
-                mlp(
+                form.mlp(
                     &mut source,
                     &format!("model.layers.{layer}.mlp"),
                     intermediate,
@@ -178,7 +206,7 @@ impl Fixture {
             source.push(&at("mlp.gate"), &[experts, hidden], 0.0, weight);
             for expert in 0..experts {
                 let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
-                mlp(&mut source, &prefix, width, hidden);
+                form.mlp(&mut source, &prefix, width, hidden);
             }
             let counted = self.config.get("n_shared_experts").is_some();
             let shared = match self.config["shared_expert_intermediate_size"].as_u64() {
@@ -187,7 +215,7 @@ impl Fixture {
             };
             if let Some(shared) = shared {
                 let prefix = format!("model.layers.{layer}.mlp.shared_expert");
-                mlp(&mut source, &prefix, shared, hidden);
+                form.mlp(&mut source, &prefix, shared, hidden);
                 if !counted {
                     source.push(&at("mlp.shared_expert_gate"), &[1, hidden], 0.0, weight);
                 }
@@ -197,27 +225,34 @@ impl Fixture {
     }
 }
 
-/// One SwiGLU MLP of `width` under `prefix`.
-fn mlp(source: &mut Memory, prefix: &str, width: usize, hidden: usize) {
-    let weight = (hidden as f32).sqrt().recip();
-    source.push(
-        &format!("{prefix}.gate_proj.weight"),
-        &[width, hidden],
-        0.0,
-        weight,
-    );
-    source.push(
-        &format!("{prefix}.up_proj.weight"),
-        &[width, hidden],
-        0.0,
-        weight,
-    );
-    source.push(
-        &format!("{prefix}.down_proj.weight"),
-        &[hidden, width],
-        0.0,
-        (width as f32).sqrt().recip(),
-    );
+/// How a layer stores its projections.
+#[derive(Clone, Copy)]
+struct Form {
+    /// Block-scaled E4M3 rather than BF16.
+    fp8: bool,
+    /// F32 scale grids rather than BF16.
+    wide: bool,
+}
+
+impl Form {
+    /// A projection whose values stay within about `1 / sqrt(columns)`.
+    fn push(self, source: &mut Memory, name: &str, [rows, columns]: [usize; 2]) {
+        let weight = (columns as f32).sqrt().recip();
+        if self.fp8 {
+            // The codes' root mean square is about a uniform unit value's, and the tile scales
+            // average one in `weight`.
+            source.push_fp8(name, [rows, columns], weight, self.wide);
+        } else {
+            source.push(name, &[rows, columns], 0.0, weight);
+        }
+    }
+
+    /// One SwiGLU MLP of `width` under `prefix`.
+    fn mlp(self, source: &mut Memory, prefix: &str, width: usize, hidden: usize) {
+        self.push(source, &format!("{prefix}.gate_proj.weight"), [width, hidden]);
+        self.push(source, &format!("{prefix}.up_proj.weight"), [width, hidden]);
+        self.push(source, &format!("{prefix}.down_proj.weight"), [hidden, width]);
+    }
 }
 
 fn plain() -> Fixture {
@@ -240,6 +275,7 @@ fn plain() -> Fixture {
         }),
         gated: false,
         tied: false,
+        fp8: false,
     }
 }
 
@@ -265,6 +301,7 @@ fn gated() -> Fixture {
         }),
         gated: true,
         tied: true,
+        fp8: false,
     }
 }
 
@@ -295,6 +332,7 @@ fn routed() -> Fixture {
         }),
         gated: false,
         tied: false,
+        fp8: false,
     }
 }
 
@@ -331,6 +369,7 @@ fn sigmoid_routed() -> Fixture {
         }),
         gated: true,
         tied: true,
+        fp8: false,
     }
 }
 
@@ -360,7 +399,56 @@ fn softplus_routed() -> Fixture {
         }),
         gated: false,
         tied: false,
+        fp8: false,
     }
+}
+
+/// The Qwen3 FP8 releases' form on a dense family: every projection E4M3 under a BF16 (odd
+/// layers: F32) inverse scale a 128 x 128 tile, gated normed attention whose 64-row key and value
+/// projections fill half a tile, and an MLP of three tiles.
+fn fp8_dense() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_dense_fp8",
+            "architectures": ["AcmeDenseFp8ForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 384,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "hidden_act": "silu",
+            "attn_output_gate": true,
+            "tie_word_embeddings": false,
+            "quantization_config": {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128]
+            }
+        }),
+        gated: true,
+        tied: false,
+        fp8: true,
+    }
+}
+
+/// [routed]'s checkpoint with block-scaled FP8 experts, shared expert and attention; the router
+/// and the shared expert's gate stay BF16, as the releases keep them.
+fn fp8_routed() -> Fixture {
+    let mut fixture = routed();
+    fixture.config["model_type"] = json!("acme_moe_fp8");
+    fixture.config["architectures"] = json!(["AcmeMoeFp8ForCausalLM"]);
+    fixture.config["quantization_config"] = json!({
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128]
+    });
+    fixture.fp8 = true;
+    fixture
 }
 
 fn argmax(values: &[f32]) -> u32 {
@@ -529,6 +617,29 @@ fn sqrt_softplus_routed_experts_without_a_shared_expert_match_the_host_reference
 #[test]
 fn routed_decode_rows_match_the_host_reference_layer_by_layer() {
     assert_passed(parity(&routed(), 6, 2));
+}
+
+#[test]
+fn block_scaled_fp8_projections_match_the_host_reference_layer_by_layer() {
+    // Two chunks: 256 rows on the FP8 tensor-core tile, then 44, and decode rows on the tiled
+    // E4M3 GEMV.
+    assert_passed(parity(&fp8_dense(), 300, 3));
+}
+
+#[test]
+fn block_scaled_fp8_decode_rows_match_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&fp8_dense(), 6, 2));
+}
+
+#[test]
+fn block_scaled_fp8_experts_match_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&fp8_routed(), 300, 3));
+}
+
+#[test]
+fn fused_fp8_lanes_answer_every_step_as_each_conversation_alone() {
+    // A decode row's E4M3 sums are its own at any batch: the tiled GEMV splits by the matrix.
+    lanes_answer_as_alone(&fp8_routed());
 }
 
 /// One conversation turn: each step's token and its logits' bits, the prompt's first.

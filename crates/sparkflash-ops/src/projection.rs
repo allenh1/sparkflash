@@ -336,6 +336,27 @@ pub fn fp8_tile_fits(columns: usize, inner: usize) -> bool {
     columns.is_multiple_of(SPLIT_STAGE) && inner.is_multiple_of(E4M3_TILE)
 }
 
+/// The kernel a block-scaled FP8 projection of `rows` rows over a `columns x inner` weight takes
+/// under `policy`, by [route_bf16]'s rule: [Route::Wide] is the FP8 tile ([Fp8Tile]) where
+/// [fp8_tile_fits] covers the shape, and the row GEMV (the block-scaled E4M3 GEMV) otherwise. An
+/// arm adds its operands' alignment.
+#[must_use]
+pub fn route_fp8(policy: Option<WidePolicy>, columns: usize, inner: usize, rows: usize) -> Route {
+    let Some(policy) = policy else {
+        return gemv(rows);
+    };
+    if rows < policy.min_rows {
+        return gemv(rows);
+    }
+    if fp8_tile_fits(columns, inner) {
+        return Route::Wide;
+    }
+    match policy.off_shape {
+        OffShape::Refuse => Route::Refuse,
+        OffShape::Gemv | OffShape::Skinny => gemv(rows),
+    }
+}
+
 /// One launch of the block-scaled FP8 tile: its grid and block, and the arguments the
 /// BF16-activation bodies take (weight, scales, input, output, columns, inner, rows). GLM's
 /// quantised-activation body runs on the same grid with its own arguments.
@@ -517,5 +538,18 @@ mod tests {
         assert_eq!(tile.block, (256, 1, 1));
         assert_eq!(tile.args, [1, 2, 3, 4, 4128, 2048, 129]);
         assert!(Fp8Tile::call(1, 2, 3, 4, 4096, 2080, 8).is_err());
+    }
+
+    #[test]
+    fn an_fp8_projection_routes_by_the_bf16_rule_over_its_own_tile() {
+        let dense = Some(WidePolicy::DENSE);
+        for rows in 1..=GEMV_MAX_BATCH {
+            assert_eq!(route_fp8(dense, 4096, 2048, rows), Route::RowGemv);
+        }
+        assert_eq!(route_fp8(dense, 4096, 2048, 256), Route::Wide);
+        assert_eq!(route_fp8(None, 4096, 2048, 256), Route::BatchedGemv);
+        // A width the tile does not take: the BF16 tile's 32-wide inner is not a scale block.
+        assert_eq!(route_fp8(dense, 4096, 2048 + 32, 256), Route::BatchedGemv);
+        assert_eq!(route_fp8(Some(WidePolicy::DORY), 4100, 2048, 256), Route::Refuse);
     }
 }

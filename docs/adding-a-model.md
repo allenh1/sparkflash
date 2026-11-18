@@ -435,19 +435,25 @@ tensor from the `Architecture`, and `ArchitectureTensorPlan::named` plans them (
 splits, roles, FP8 tile scales) in forward order. The converter, the host reference and the
 web's fit read that one plan, and:
 
-- a novel family that is a BF16 grouped-query decoder (embedding, RMSNorm, GQA with or without
+- a novel family that is a grouped-query decoder (embedding, RMSNorm, GQA with or without
   the per-head output gate and `q_norm`/`k_norm`, plain `rotate_half` RoPE over the leading
-  rotated dimensions, a dense unclamped SwiGLU or routed BF16 experts, a plain residual and the
-  head) is served
+  rotated dimensions, a dense unclamped SwiGLU or routed experts, a plain residual and the
+  head), BF16 or with its projections and experts in 128 x 128-tile FP8, is served
   on the device by the shared dense arm, `sparkflash-model-dense` (runtime step 19), with no code
   of its own: it reads the `Architecture`, the shared names, `DraftUploader` and the typed
   `sparkflash_ops::calls`, and its prompt projections take the shared wide tile
   (`WidePolicy::DENSE`). A routed layer (runtime step 21: a softmax, sigmoid or sqrt-softplus
   router, its top-k with or without renormalising, a routed scale, one shared expert with or
   without its sigmoid gate) runs the released arms' parts: `q4e_route`, `MoePlanCall::runs`, the
-  token path's expert passes in their BF16 form and `q4e_moe_combine`. `sparkflash_ops::parts::dense_device_refusal` is its gate, and it names
-  what it refuses (a window, a rope scaling, another activation, a bias, a non-BF16 projection or
-  expert, a selection bias, a widened residual...). It gates on its own launch list rather than the kernel
+  token path's expert passes in their BF16 form and `q4e_moe_combine`. A release that stores its
+  projections and experts as E4M3 codes under one inverse scale a 128 x 128 tile (runtime step
+  22, the Qwen3 FP8 form) runs Qwen's and GLM's FP8 kernels: the FP8 tile (`Fp8Tile`, by
+  `projection::route_fp8`) for a prompt chunk, the tiled E4M3 GEMV for decode rows, and the
+  expert passes' FP8 form; each tensor is uploaded as it is stored, through
+  `DraftUploader::mat_e4m3_tile`. `sparkflash_ops::parts::dense_device_refusal` is its gate, and
+  it names what it refuses (a window, a rope scaling, another activation, a bias, a projection or
+  expert format other than BF16 and the 128 x 128 FP8 tile, a width that splits a scale tile, a
+  selection bias, a widened residual...). It gates on its own launch list rather than the kernel
   catalogue, whose rows pin the released presets' shapes. Its check is a per-layer parity report
   against the host reference (`cli/src/serve/dense_parity.rs`), not a recorded digest: it keeps
   BF16 keys and values where the reference keeps f32. It serves at TP1 on the serving contract

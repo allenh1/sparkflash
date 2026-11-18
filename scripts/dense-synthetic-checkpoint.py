@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dense-synthetic-checkpoint.py: a random BF16 checkpoint of a family no pack names.
+"""dense-synthetic-checkpoint.py: a random checkpoint of a family no pack names.
 
 The shared dense device arm's served gate (scripts/served-gate.py) checks the serving contract:
 fused lanes equal alone, prompt parts, kept conversations and the rewind point. None of that
@@ -22,11 +22,13 @@ this writes one with random weights beside a ChatML tokenizer copied from TOKENI
 tokenizer.json, vocab.json, chat template and generation config):
 
   dense-synthetic-checkpoint.py TOKENIZER_DIR OUT_DIR [--layers 8] [--hidden 1024]
-      [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]]
+      [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]] [--fp8]
 
 With --experts every layer routes: a softmax router renormalising its top-k picks over that many
 BF16 experts, and a sigmoid-gated shared expert when --shared-intermediate names its width (the
-Qwen MoE spelling), so the served gate covers the arm's routed layers too.
+Qwen MoE spelling), so the served gate covers the arm's routed layers too. With --fp8 every
+projection and expert is stored as the Qwen3 FP8 releases store them: E4M3 codes under one BF16
+`weight_scale_inv` a 128 x 128 tile (the embedding, head, norms and router stay BF16).
 
 The head scores only plain word tokens (a space and three to eight lowercase letters), at a
 scale that outweighs every other token's zero, so greedy and sampled replies are words that
@@ -59,28 +61,47 @@ def bf16_constant(count, value):
     return word * count
 
 
+def e4m3_random(count):
+    """`count` E4M3 codes of random sign and mantissa, each in [1, 2)."""
+    # Sign bit, the exponent field pinned at the bias (7), and three mantissa bits.
+    table = bytes(((byte & 0x87) | 0x38) for byte in range(256))
+    return os.urandom(count).translate(table)
+
+
 def write(path, tensors):
-    """A safetensors file of `tensors`: (name, shape, bytes) in order."""
+    """A safetensors file of `tensors`: (name, shape, bytes[, dtype]) in order, BF16 unless named."""
     header, offset = {}, 0
-    for name, shape, data in tensors:
-        header[name] = {"dtype": "BF16", "shape": shape, "data_offsets": [offset, offset + len(data)]}
+    for name, shape, data, *dtype in tensors:
+        header[name] = {"dtype": dtype[0] if dtype else "BF16", "shape": shape,
+                        "data_offsets": [offset, offset + len(data)]}
         offset += len(data)
     blob = json.dumps(header, separators=(",", ":")).encode()
     blob += b" " * (-len(blob) % 8)
     with open(path, "wb") as out:
         out.write(struct.pack("<Q", len(blob)))
         out.write(blob)
-        for _, _, data in tensors:
+        for _, _, data, *_ in tensors:
             out.write(data)
 
 
-def mlp(prefix, width, hidden, inner):
-    """One SwiGLU MLP of `width` under `prefix`."""
+def projection(name, rows, columns, exponent, fp8):
+    """One `[rows, columns]` projection about 2**exponent: BF16, or with `fp8` E4M3 codes in
+    [1, 2) under a BF16 inverse scale of 2**exponent a 128 x 128 tile."""
+    if not fp8:
+        return [(name, [rows, columns], bf16_random(rows * columns, exponent))]
+    grid = [-(-rows // 128), -(-columns // 128)]
     return [
-        (prefix + "gate_proj.weight", [width, hidden], bf16_random(width * hidden, inner(hidden))),
-        (prefix + "up_proj.weight", [width, hidden], bf16_random(width * hidden, inner(hidden))),
-        (prefix + "down_proj.weight", [hidden, width], bf16_random(hidden * width, inner(width))),
+        (name, [rows, columns], e4m3_random(rows * columns), "F8_E4M3"),
+        (name.replace(".weight", ".weight_scale_inv"), grid,
+         bf16_constant(grid[0] * grid[1], 2.0 ** exponent)),
     ]
+
+
+def mlp(prefix, width, hidden, inner, fp8):
+    """One SwiGLU MLP of `width` under `prefix`."""
+    return (projection(prefix + "gate_proj.weight", width, hidden, inner(hidden), fp8)
+            + projection(prefix + "up_proj.weight", width, hidden, inner(hidden), fp8)
+            + projection(prefix + "down_proj.weight", hidden, width, inner(width), fp8))
 
 
 def main():
@@ -97,7 +118,9 @@ def main():
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--expert-intermediate", type=int, default=512)
     parser.add_argument("--shared-intermediate", type=int, default=0)
+    parser.add_argument("--fp8", action="store_true")
     args = parser.parse_args()
+    fp8 = args.fp8
     os.makedirs(args.out_dir, exist_ok=True)
     for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
                  "chat_template.jinja", "generation_config.json"):
@@ -148,6 +171,12 @@ def main():
         })
         if args.shared_intermediate:
             config["shared_expert_intermediate_size"] = args.shared_intermediate
+    if fp8:
+        config["quantization_config"] = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+        }
     with open(os.path.join(args.out_dir, "config.json"), "w") as out:
         json.dump(config, out, indent=2)
     # Each projection's magnitude about one over the root of its inner width.
@@ -167,26 +196,29 @@ def main():
         tensors += [
             (at + "input_layernorm.weight", [hidden], bf16_constant(hidden, 1.0)),
             (at + "post_attention_layernorm.weight", [hidden], bf16_constant(hidden, 1.0)),
-            (at + "self_attn.q_proj.weight", [q, hidden], bf16_random(q * hidden, inner(hidden))),
-            (at + "self_attn.k_proj.weight", [kv, hidden], bf16_random(kv * hidden, inner(hidden))),
-            (at + "self_attn.v_proj.weight", [kv, hidden], bf16_random(kv * hidden, inner(hidden))),
-            (at + "self_attn.o_proj.weight", [hidden, q], bf16_random(hidden * q, inner(q))),
         ]
+        attn = at + "self_attn."
+        tensors += projection(attn + "q_proj.weight", q, hidden, inner(hidden), fp8)
+        tensors += projection(attn + "k_proj.weight", kv, hidden, inner(hidden), fp8)
+        tensors += projection(attn + "v_proj.weight", kv, hidden, inner(hidden), fp8)
+        tensors += projection(attn + "o_proj.weight", hidden, q, inner(q), fp8)
         if not args.experts:
-            tensors += mlp(at + "mlp.", args.intermediate, hidden, inner)
+            tensors += mlp(at + "mlp.", args.intermediate, hidden, inner, fp8)
             continue
         tensors.append((at + "mlp.gate.weight", [args.experts, hidden],
                         bf16_random(args.experts * hidden, inner(hidden))))
         for expert in range(args.experts):
-            tensors += mlp(at + "mlp.experts.%d." % expert, args.expert_intermediate, hidden, inner)
+            tensors += mlp(at + "mlp.experts.%d." % expert, args.expert_intermediate, hidden,
+                           inner, fp8)
         if args.shared_intermediate:
-            tensors += mlp(at + "mlp.shared_expert.", args.shared_intermediate, hidden, inner)
+            tensors += mlp(at + "mlp.shared_expert.", args.shared_intermediate, hidden, inner, fp8)
             tensors.append((at + "mlp.shared_expert_gate.weight", [1, hidden],
                             bf16_random(hidden, inner(hidden))))
     write(os.path.join(args.out_dir, "model.safetensors"), tensors)
-    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s" % (
+    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s%s" % (
         args.out_dir, args.layers, hidden, size, len(words),
-        ", %d experts (top %d)" % (args.experts, args.top_k) if args.experts else ""))
+        ", %d experts (top %d)" % (args.experts, args.top_k) if args.experts else "",
+        ", FP8 projections" if fp8 else ""))
 
 
 if __name__ == "__main__":

@@ -14,13 +14,19 @@
 
 //! The shared dense device arm: a family no pack transcribes, served on the device.
 //!
-//! A BF16 grouped-query decoder (embedding, RMSNorm, grouped-query attention with or without the
+//! A grouped-query decoder (embedding, RMSNorm, grouped-query attention with or without the
 //! per-head output gate and q/k norms, plain rotate-half RoPE, a dense SwiGLU or routed experts,
 //! a plain residual and the head) needs no code of its own: this arm reads the shared
 //! [Architecture], resolves the checkpoint's own spelling through [sparkflash_ops::naming],
 //! uploads every tensor through [DraftUploader] and launches the shared token-image bodies through
 //! their typed [sparkflash_ops::calls]. Its prompt projections take the shared wide tile under
 //! [WidePolicy::DENSE]; decode rows keep the row GEMV.
+//!
+//! A projection or expert stored as E4M3 codes under one BF16 inverse scale a 128 x 128 tile (the
+//! Qwen3 FP8 releases' form, [Proj::Fp8]) runs the kernels Qwen's and GLM's FP8 weights run: the
+//! FP8 tensor-core tile ([Fp8Tile]) for a prompt chunk by [route_fp8], the tiled E4M3 GEMV for
+//! decode rows, and the token passes' FP8 form for the experts. Activations stay f32 in all of
+//! them, as in the host reference, which applies the same tile scales to the same codes.
 //!
 //! A routed layer runs the parts the released arms run: the one router body (`q4e_route`, any
 //! family's score, top-k, renormalisation and scale), the shared expert plan's run walk
@@ -44,9 +50,10 @@ use std::sync::{Arc, Mutex};
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{
     dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
+    qwen4_prefill_cubin,
 };
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
-use sparkflash_model::architecture::{AttentionKind, Ffn};
+use sparkflash_model::architecture::{AttentionKind, Ffn, WeightFormat};
 use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
@@ -55,10 +62,15 @@ use sparkflash_model::{Architecture, Capabilities, ModelDescriptor};
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::DraftUploader;
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
-use sparkflash_ops::gemv::{CudaHandle, GEMV_MAX_BATCH, GpuMat};
+use sparkflash_ops::gemv::{
+    CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
+    TILED_GEMV_PARTIALS, gemv_e4m3_tile,
+};
 use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
 use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, TensorNames};
-use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16};
+use sparkflash_ops::projection::{
+    Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
+};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{FusedArm, FusedEngine, Ledger, Mode, Part, Resume, Strategy, resume};
 use sparkflash_weights::{DType, WeightSource};
@@ -161,22 +173,48 @@ impl Shape {
 struct Layer {
     shape: Shape,
     input_norm: Deviceptr,
-    q: GpuMat,
-    k: GpuMat,
-    v: GpuMat,
-    o: GpuMat,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    o: Proj,
     q_norm: Option<Deviceptr>,
     k_norm: Option<Deviceptr>,
     post_norm: Deviceptr,
     ffn: LayerFfn,
 }
 
+/// One projection's weights on the device: BF16, or E4M3 codes under one BF16 inverse scale a
+/// 128 x 128 tile, as the checkpoint stores the tensor.
+#[derive(Debug, Clone, Copy)]
+enum Proj {
+    Bf16(GpuMat),
+    Fp8(GpuMatE4m3Tile),
+}
+
+impl Proj {
+    /// Output rows.
+    const fn rows(&self) -> usize {
+        match self {
+            Self::Bf16(mat) => mat.rows,
+            Self::Fp8(mat) => mat.rows,
+        }
+    }
+
+    /// The token passes' table entries: the weight and its scale grid (none for BF16).
+    const fn table(&self) -> [u64; 2] {
+        match self {
+            Self::Bf16(mat) => [mat.pointer.0, 0],
+            Self::Fp8(mat) => [mat.weight.0, mat.scales.0],
+        }
+    }
+}
+
 /// One SwiGLU MLP's projections: a dense layer's, or a routed layer's shared expert.
 #[derive(Debug, Clone, Copy)]
 struct Mlp {
-    gate: GpuMat,
-    up: GpuMat,
-    down: GpuMat,
+    gate: Proj,
+    up: Proj,
+    down: Proj,
 }
 
 /// A layer's MLP on the device.
@@ -185,13 +223,13 @@ enum LayerFfn {
     Dense(Mlp),
     Routed {
         /// The router, `[experts][hidden]`.
-        router: GpuMat,
-        /// Six addresses an expert, the token passes' table: gate, its (unread) scale, up, its
-        /// scale, down, its scale.
+        router: Proj,
+        /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
+        /// BF16), up, its grid, down, its grid.
         table: Deviceptr,
         shared: Option<Mlp>,
-        /// The shared expert's sigmoid gate, one `[hidden]` row.
-        shared_gate: Option<GpuMat>,
+        /// The shared expert's sigmoid gate, one BF16 `[hidden]` row.
+        shared_gate: Option<Proj>,
     },
 }
 
@@ -220,6 +258,15 @@ struct Kernels {
     cache: Kernel,
     wide: Kernel,
     moe: Option<MoeKernels>,
+    fp8: Option<Fp8Kernels>,
+}
+
+/// The block-scaled FP8 projections' kernels, loaded when the checkpoint declares FP8: the
+/// tiled E4M3 GEMV for decode rows and the FP8 tensor-core tile for prompt chunks.
+#[derive(Clone, Copy)]
+struct Fp8Kernels {
+    gemv: Kernel,
+    tile: Kernel,
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context
@@ -228,9 +275,10 @@ unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
 impl Kernels {
-    /// Loads every kernel, and the routed layers' when `stage` (the expert passes' staging
-    /// reservation, [token::stage_bytes]) names one.
-    fn load(cuda: &Cuda, stage: Option<u32>) -> Result<Self, String> {
+    /// Loads every kernel, the routed layers' when `stage` (the expert passes' staging
+    /// reservation, [token::stage_bytes]) names one, in the experts' `formats.experts`, and the
+    /// FP8 projections' when `formats.fp8` says the checkpoint declares FP8.
+    fn load(cuda: &Cuda, stage: Option<u32>, formats: Formats) -> Result<Self, String> {
         let named = |image: &'static [u8], name: &'static str| {
             cuda.load_named(image, name).map(|(_, kernel)| kernel)
         };
@@ -238,18 +286,32 @@ impl Kernels {
             cuda.load_named_shared(qwen4_moe_cubin(), name, bytes)
                 .map(|(_, kernel)| kernel)
         };
+        let (gate_up, down) = if formats.fp8_experts {
+            ("q4e_expert_gate_up_fp8", "q4e_expert_down_fp8")
+        } else {
+            ("q4e_expert_gate_up_bf16", "q4e_expert_down_bf16")
+        };
         let moe = match stage {
             Some(bytes) => Some(MoeKernels {
                 route: named(qwen4_moe_cubin(), "q4e_route")?,
                 plan: named(moe_plan_cubin(), "moe_plan")?,
-                gate_up: staged("q4e_expert_gate_up_bf16", bytes)?,
-                down: staged("q4e_expert_down_bf16", bytes)?,
+                gate_up: staged(gate_up, bytes)?,
+                down: staged(down, bytes)?,
                 combine: named(qwen4_moe_cubin(), "q4e_moe_combine")?,
             }),
             None => None,
         };
+        let fp8 = if formats.fp8 {
+            Some(Fp8Kernels {
+                gemv: named(qwen4_exp_cubin(), "q4e_gemv_tiled_e4m3_tile")?,
+                tile: named(qwen4_prefill_cubin(), "q4p_dense_fp8")?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             moe,
+            fp8,
             add: named(qwen4_exp_cubin(), "q4e_add")?,
             deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
             embed: named(qwen4_exp_cubin(), "q4e_embed")?,
@@ -264,6 +326,27 @@ impl Kernels {
                 .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
                 .map(|(_, kernel)| kernel)?,
         })
+    }
+}
+
+/// The weight formats a checkpoint declares, which pick the kernels the arm loads.
+#[derive(Debug, Clone, Copy)]
+struct Formats {
+    /// Any projection or expert is block-scaled FP8.
+    fp8: bool,
+    /// The routed experts are block-scaled FP8 (else BF16).
+    fp8_experts: bool,
+}
+
+impl Formats {
+    fn of(architecture: &Architecture) -> Self {
+        let tiled = |format: WeightFormat| matches!(format, WeightFormat::Fp8Tile { .. });
+        let quantization = &architecture.quantization;
+        let fp8_experts = tiled(quantization.expert_format);
+        Self {
+            fp8: fp8_experts || tiled(quantization.dense_format),
+            fp8_experts,
+        }
     }
 }
 
@@ -346,9 +429,10 @@ impl DenseDeviceBackend {
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
-        let kernels = Kernels::load(&cuda, expert_stage(architecture)?)?;
+        let formats = Formats::of(architecture);
+        let kernels = Kernels::load(&cuda, expert_stage(architecture)?, formats)?;
         let mut owned = Vec::new();
-        let uploaded = upload(&cuda, architecture, &names, source, &mut owned);
+        let uploaded = upload(&cuda, architecture, &names, source, formats, &mut owned);
         let (embed, head, norm, layers, weight_bytes) = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
@@ -538,11 +622,13 @@ fn expert_stage(architecture: &Architecture) -> Result<Option<u32>, String> {
 
 type Uploaded = (GpuMat, GpuMat, Deviceptr, Vec<Layer>, usize);
 
-/// One upload's tensors: each checked BF16 at its architecture shape, and every allocation in
-/// `owned` as it is made, so a failure part way frees what was uploaded.
+/// One upload's tensors: each checked at its architecture shape (BF16, or a projection's
+/// block-scaled E4M3), and every allocation in `owned` as it is made, so a failure part way frees
+/// what was uploaded.
 struct Uploads<'a> {
     uploader: DraftUploader<'a>,
     source: &'a dyn WeightSource,
+    formats: Formats,
     owned: &'a mut Vec<Deviceptr>,
     bytes: usize,
 }
@@ -567,11 +653,37 @@ impl Uploads<'_> {
         Ok(self.keep(pointer, width * 2))
     }
 
+    /// A projection as the checkpoint stores it: BF16, or E4M3 codes and their 128 x 128 tile
+    /// scales when the checkpoint declares block-scaled FP8.
+    fn proj(&mut self, name: &str, rows: usize, columns: usize) -> Result<Proj, String> {
+        let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+        if spec.dtype != DType::F8E4M3 {
+            return self.mat(name, rows, columns).map(Proj::Bf16);
+        }
+        if !self.formats.fp8 {
+            return Err(format!(
+                "{name} is E4M3, but the checkpoint declares no block-scaled FP8 weights, so the \
+                 shared dense device arm has no FP8 kernel for it"
+            ));
+        }
+        if !columns.is_multiple_of(E4M3_TILE) {
+            return Err(format!(
+                "{name} is E4M3 over {columns} columns; the tile kernels read whole \
+                 {E4M3_TILE}-column scale tiles"
+            ));
+        }
+        let mat = self.uploader.mat_e4m3_tile(name, rows, columns)?;
+        self.keep(mat.weight, rows * columns);
+        let grid = rows.div_ceil(E4M3_TILE) * columns.div_ceil(E4M3_TILE);
+        self.keep(mat.scales, grid * 2);
+        Ok(Proj::Fp8(mat))
+    }
+
     fn mlp(&mut self, names: &ExpertNames, width: usize, hidden: usize) -> Result<Mlp, String> {
         Ok(Mlp {
-            gate: self.mat(&names.gate, width, hidden)?,
-            up: self.mat(&names.up, width, hidden)?,
-            down: self.mat(&names.down, hidden, width)?,
+            gate: self.proj(&names.gate, width, hidden)?,
+            up: self.proj(&names.up, width, hidden)?,
+            down: self.proj(&names.down, hidden, width)?,
         })
     }
 
@@ -600,12 +712,23 @@ impl Uploads<'_> {
                 routed.experts
             ));
         }
-        let router = self.mat(router, routed.experts, hidden)?;
+        let router = self.proj(router, routed.experts, hidden)?;
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
-        for expert in experts {
+        let fp8 = self.formats.fp8_experts;
+        for (number, expert) in experts.iter().enumerate() {
             let Mlp { gate, up, down } = self.mlp(expert, routed.intermediate, hidden)?;
-            for address in [gate.pointer.0, 0, up.pointer.0, 0, down.pointer.0, 0] {
-                table.extend(address.to_le_bytes());
+            for (proj, name) in [(&gate, &expert.gate), (&up, &expert.up), (&down, &expert.down)] {
+                if matches!(proj, Proj::Fp8(_)) != fp8 {
+                    return Err(format!(
+                        "layer {index}'s expert {number} stores {name} as {}, and the checkpoint \
+                         declares {} experts, the one form the expert passes are loaded in",
+                        if fp8 { "BF16" } else { "E4M3" },
+                        if fp8 { "block-scaled FP8" } else { "BF16" }
+                    ));
+                }
+                for address in proj.table() {
+                    table.extend(address.to_le_bytes());
+                }
             }
         }
         let table = self.uploader.bytes(&table)?;
@@ -632,11 +755,11 @@ impl Uploads<'_> {
                     ));
                 }
                 let pointer = self.uploader.vector(name, hidden)?;
-                Some(GpuMat {
+                Some(Proj::Bf16(GpuMat {
                     pointer: self.keep(pointer, hidden * 2),
                     rows: 1,
                     columns: hidden,
-                })
+                }))
             }
             None => None,
         };
@@ -654,18 +777,21 @@ impl Uploads<'_> {
     }
 }
 
-/// Uploads every tensor `names` resolves, each checked BF16 at its architecture shape; every
-/// allocation lands in `owned` as it is made, so a failure part way frees what was uploaded.
+/// Uploads every tensor `names` resolves, each checked at its architecture shape (BF16, or a
+/// projection's block-scaled E4M3 under `formats`); every allocation lands in `owned` as it is
+/// made, so a failure part way frees what was uploaded.
 fn upload(
     cuda: &Cuda,
     architecture: &Architecture,
     names: &TensorNames,
     source: &dyn WeightSource,
+    formats: Formats,
     owned: &mut Vec<Deviceptr>,
 ) -> Result<Uploaded, String> {
     let mut up = Uploads {
         uploader: DraftUploader::new(cuda, source),
         source,
+        formats,
         owned,
         bytes: 0,
     };
@@ -703,10 +829,10 @@ fn upload(
         layers.push(Layer {
             shape,
             input_norm: up.vector(&layer_names.input_norm, hidden)?,
-            q: up.mat(q, shape.query_rows(), hidden)?,
-            k: up.mat(k, shape.kv_width(), hidden)?,
-            v: up.mat(v, shape.kv_width(), hidden)?,
-            o: up.mat(o, hidden, shape.query_width())?,
+            q: up.proj(q, shape.query_rows(), hidden)?,
+            k: up.proj(k, shape.kv_width(), hidden)?,
+            v: up.proj(v, shape.kv_width(), hidden)?,
+            o: up.proj(o, hidden, shape.query_width())?,
             q_norm: q_norm
                 .as_deref()
                 .map(|name| up.vector(name, shape.head_dim))
@@ -741,9 +867,102 @@ impl Shared {
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
     }
 
+    /// `output[rows][proj.rows] = input[rows][proj.columns] x projᵀ` in the projection's format,
+    /// on the kernel [route_bf16] or [route_fp8] picks under `policy` (`None` keeps the row GEMV);
+    /// an FP8 GEMV splits its sums in `b`'s tiled scratch.
+    fn project(
+        &self,
+        proj: &Proj,
+        b: &Buffers,
+        input: u64,
+        output: u64,
+        rows: usize,
+        policy: Option<WidePolicy>,
+    ) -> Result<(), BackendError> {
+        match proj {
+            Proj::Bf16(mat) => self.project_bf16(mat, input, output, rows, policy),
+            Proj::Fp8(mat) => self.project_fp8(mat, b, input, output, rows, policy),
+        }
+    }
+
+    /// A block-scaled FP8 projection: the FP8 tensor-core tile ([Fp8Tile]) where [route_fp8]
+    /// takes it and the operands are 16-byte aligned, else the tiled E4M3 GEMV a group of rows at
+    /// a time. Both keep the activations f32 and apply each tile's scale to its sums, the host
+    /// reference's arithmetic to a tolerance.
+    fn project_fp8(
+        &self,
+        mat: &GpuMatE4m3Tile,
+        b: &Buffers,
+        input: u64,
+        output: u64,
+        rows: usize,
+        policy: Option<WidePolicy>,
+    ) -> Result<(), BackendError> {
+        let Some(kernels) = self.kernels.fp8 else {
+            return Err(BackendError::new(
+                DEVICE,
+                "an FP8 projection runs without the FP8 kernels",
+            ));
+        };
+        let tiled = Tiled {
+            shared: self,
+            partials: b.tiled_partials,
+            counters: b.tiled_counters,
+        };
+        let gemv = |input: u64, output: u64, batch: usize| {
+            gemv_e4m3_tile(
+                &tiled,
+                kernels.gemv,
+                mat,
+                Deviceptr(input),
+                Deviceptr(output),
+                batch,
+            )
+        };
+        let batched = || {
+            for start in (0..rows).step_by(GEMV_MAX_BATCH) {
+                gemv(
+                    input + (start * mat.columns * 4) as u64,
+                    output + (start * mat.rows * 4) as u64,
+                    GEMV_MAX_BATCH.min(rows - start),
+                )?;
+            }
+            Ok(())
+        };
+        let aligned = [mat.weight.0, input, output]
+            .iter()
+            .all(|address| address.is_multiple_of(16));
+        match route_fp8(policy, mat.rows, mat.columns, rows) {
+            Route::RowGemv => gemv(input, output, rows),
+            Route::Wide if aligned => {
+                let tile = Fp8Tile::call(
+                    mat.weight.0,
+                    mat.scales.0,
+                    input,
+                    output,
+                    mat.rows,
+                    mat.columns,
+                    rows,
+                )
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+                self.cuda
+                    .launch_async(kernels.tile, tile.grid, tile.block, &tile.args)
+                    .map_err(|error| BackendError::new(DEVICE, format!("q4p_dense_fp8: {error}")))
+            }
+            Route::Wide | Route::BatchedGemv => batched(),
+            route @ (Route::Skinny | Route::Refuse) => Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "the dense policy routed an FP8 {} x {} projection to {route:?}",
+                    mat.rows, mat.columns
+                ),
+            )),
+        }
+    }
+
     /// `output[rows][mat.rows] = input[rows][mat.columns] x matᵀ` on the kernel
     /// [route_bf16] picks under `policy` (`None` keeps the row GEMV).
-    fn project(
+    fn project_bf16(
         &self,
         mat: &GpuMat,
         input: u64,
@@ -814,13 +1033,13 @@ impl Shared {
         rows: usize,
         policy: Option<WidePolicy>,
     ) -> Result<(), BackendError> {
-        self.project(&mlp.gate, b.normed.0, b.ffn_gate.0, rows, policy)?;
-        self.project(&mlp.up, b.normed.0, b.ffn_up.0, rows, policy)?;
+        self.project(&mlp.gate, b, b.normed.0, b.ffn_gate.0, rows, policy)?;
+        self.project(&mlp.up, b, b.normed.0, b.ffn_up.0, rows, policy)?;
         self.call(
             self.kernels.swiglu,
-            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, rows * mlp.gate.rows),
+            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, rows * mlp.gate.rows()),
         )?;
-        self.project(&mlp.down, b.ffn_up.0, output.0, rows, policy)
+        self.project(&mlp.down, b, b.ffn_up.0, output.0, rows, policy)
     }
 
     /// A routed layer's MLP over `rows` into `b.projected`: the router on the row GEMV (so a
@@ -851,7 +1070,7 @@ impl Shared {
         };
         let hidden = self.hidden;
         let (experts, top_k, intermediate) = (routed.experts, routed.top_k, routed.intermediate);
-        self.project(router, b.normed.0, b.router.0, rows, None)?;
+        self.project(router, b, b.normed.0, b.router.0, rows, None)?;
         self.launch(
             kernels.route,
             ((rows as u32, 1, 1), (256, 1, 1)),
@@ -914,7 +1133,7 @@ impl Shared {
                 .map_err(|error| BackendError::new(DEVICE, format!("the shared row: {error}")))?,
         }
         if let Some(gate) = shared_gate {
-            self.project(gate, b.normed.0, b.shared_logit.0, rows, None)?;
+            self.project(gate, b, b.normed.0, b.shared_logit.0, rows, None)?;
         }
         self.launch(
             kernels.combine,
@@ -935,6 +1154,41 @@ impl Shared {
                 0,
             ],
         )
+    }
+}
+
+/// The arm as the shared tiled GEMVs' device ([GemvDevice]): its stream and one walk's split
+/// sums and per-tile counters.
+struct Tiled<'a> {
+    shared: &'a Shared,
+    partials: Deviceptr,
+    counters: Deviceptr,
+}
+
+impl GemvDevice for Tiled<'_> {
+    fn launch(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        self.shared.launch(kernel, (grid, block), args)
+    }
+
+    fn gemv(
+        &self,
+        matrix: &GpuMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        self.shared
+            .project_bf16(matrix, input.0, output.0, rows, None)
+    }
+
+    fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
+        (self.partials, self.counters)
     }
 }
 
@@ -995,11 +1249,15 @@ struct Buffers {
     /// The shared expert's rows (zeros without one), and its gate's logit a row.
     shared_out: Deviceptr,
     shared_logit: Deviceptr,
+    /// The tiled E4M3 GEMV's split sums, and its per-tile counters (zero between launches: the
+    /// kernel resets each counter it uses).
+    tiled_partials: Deviceptr,
+    tiled_counters: Deviceptr,
     logit_rows: usize,
 }
 
 impl Buffers {
-    fn all(&self) -> [&Deviceptr; 23] {
+    fn all(&self) -> [&Deviceptr; 25] {
         [
             &self.tokens,
             &self.x,
@@ -1024,6 +1282,8 @@ impl Buffers {
             &self.expert_partials,
             &self.shared_out,
             &self.shared_logit,
+            &self.tiled_partials,
+            &self.tiled_counters,
         ]
     }
 }
@@ -1065,6 +1325,7 @@ impl Scratch {
         };
         let (experts, slots) = (routed(|r| r.experts), rows * routed(|r| r.top_k));
         let any_routed = slots > 0;
+        let fp8 = shared.kernels.fp8.is_some();
         let floats = [
             rows,
             rows * hidden,
@@ -1089,6 +1350,8 @@ impl Scratch {
             slots * hidden,
             if any_routed { rows * hidden } else { 0 },
             if any_routed { rows } else { 0 },
+            if fp8 { TILED_GEMV_PARTIALS } else { 0 },
+            if fp8 { TILED_GEMV_BLOCKS } else { 0 },
         ];
         let mut pointers = Vec::with_capacity(floats.len());
         let mut total = 0usize;
@@ -1127,8 +1390,19 @@ impl Scratch {
             expert_partials: p(20),
             shared_out: p(21),
             shared_logit: p(22),
+            tiled_partials: p(23),
+            tiled_counters: p(24),
             logit_rows,
         };
+        // The counters start at zero; every tiled launch leaves them so.
+        if fp8
+            && let Err(error) = shared
+                .cuda
+                .copy_htod(&buffers.tiled_counters, &[0u8; TILED_GEMV_BLOCKS * 4])
+        {
+            shared.cuda.free_buffers(&buffers.all());
+            return Err(error);
+        }
         Ok(Self { shared, buffers })
     }
 }
@@ -1335,9 +1609,9 @@ fn walk(
             rows,
         )?;
         let projected_query = if shape.gated { b.interleaved } else { b.query };
-        shared.project(&layer.q, b.normed.0, projected_query.0, rows, policy)?;
-        shared.project(&layer.k, b.normed.0, b.key.0, rows, policy)?;
-        shared.project(&layer.v, b.normed.0, b.value.0, rows, policy)?;
+        shared.project(&layer.q, b, b.normed.0, projected_query.0, rows, policy)?;
+        shared.project(&layer.k, b, b.normed.0, b.key.0, rows, policy)?;
+        shared.project(&layer.v, b, b.normed.0, b.value.0, rows, policy)?;
         if shape.gated {
             shared.call(
                 kernels.deinterleave,
@@ -1419,7 +1693,7 @@ fn walk(
             )?;
             first += count;
         }
-        shared.project(&layer.o, b.attended.0, b.projected.0, rows, policy)?;
+        shared.project(&layer.o, b, b.attended.0, b.projected.0, rows, policy)?;
         shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         shared.norm(
             RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
@@ -1470,7 +1744,7 @@ fn head(
         ),
         count,
     )?;
-    shared.project(&shared.head, b.normed.0, b.logits.0, count, None)?;
+    shared.project_bf16(&shared.head, b.normed.0, b.logits.0, count, None)?;
     let mut bytes = vec![0u8; count * shared.vocab * 4];
     shared
         .cuda
