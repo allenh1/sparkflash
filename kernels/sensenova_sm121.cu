@@ -26,18 +26,22 @@ __device__ __forceinline__ float sensenova_sigmoid(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
+// The position is a device word so the launch list does not change a token: a captured CUDA
+// graph replays the arguments it was captured with, and only the buffer's contents advance.
 extern "C" __global__ void sensenova_rope(float* __restrict__ values, int head_dim, int rotated,
-                                          int position, const float* __restrict__ inv_freq,
-                                          float scale, int row_stride, int batch) {
+                                          const int* __restrict__ position,
+                                          const float* __restrict__ inv_freq, float scale,
+                                          int row_stride, int batch) {
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     if (head >= (int)blockDim.x || row >= batch || rotated < 2 || (rotated & 1)) {
         return;
     }
+    const int at = *position + row;
     const int half = rotated >> 1;
     float* base = values + (unsigned long long)row * row_stride + head * head_dim;
     for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
-        const float angle = position * inv_freq[pair];
+        const float angle = at * inv_freq[pair];
         float sine, cosine;
         sincosf(angle, &sine, &cosine);
         const float sin_scaled = sine * scale;
@@ -216,7 +220,8 @@ __device__ __forceinline__ float sensenova_e4m3(unsigned char code) {
 
 extern "C" __global__ void sensenova_cache_q8(const float* __restrict__ source,
                                                unsigned char* __restrict__ codes,
-                                               float* __restrict__ scales, int base, int rows,
+                                               float* __restrict__ scales,
+                                               const int* __restrict__ position, int rows,
                                                int kv_heads, int head_dim) {
     const int head = blockIdx.x;
     const int row = blockIdx.y;
@@ -225,7 +230,8 @@ extern "C" __global__ void sensenova_cache_q8(const float* __restrict__ source,
     }
     const int width = kv_heads * head_dim;
     const float* src = source + (unsigned long long)row * width + head * head_dim;
-    unsigned char* dst = codes + (unsigned long long)(base + row) * width + head * head_dim;
+    unsigned char* dst =
+        codes + (unsigned long long)(*position + row) * width + head * head_dim;
     float largest = 0.0f;
     for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
         largest = fmaxf(largest, fabsf(src[dim]));
@@ -241,7 +247,7 @@ extern "C" __global__ void sensenova_cache_q8(const float* __restrict__ source,
     }
     const float scale = scratch[0] > 0.0f ? scratch[0] / 448.0f : 1.0f;
     if (threadIdx.x == 0) {
-        scales[(unsigned long long)(base + row) * kv_heads + head] = scale;
+        scales[(unsigned long long)(*position + row) * kv_heads + head] = scale;
     }
     for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
         dst[dim] = __nv_cvt_float_to_fp8(src[dim] / scale, __NV_SATFINITE, __NV_E4M3);
@@ -314,15 +320,15 @@ extern "C" __global__ void sensenova_attn_full_q8(const float* __restrict__ q,
                                                    const unsigned char* __restrict__ values,
                                                    const float* __restrict__ k_scales,
                                                    const float* __restrict__ v_scales,
-                                                   float* __restrict__ partials, int position,
-                                                   int heads, int kv_heads, int head_dim,
-                                                   int groups) {
+                                                   float* __restrict__ partials,
+                                                   const int* __restrict__ position, int heads,
+                                                   int kv_heads, int head_dim, int groups) {
     __shared__ float logits[SENSENOVA_FULL_TILE];
     __shared__ float reduce[256];
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     const int split = blockIdx.z;
-    const int visible = position + row + 1;
+    const int visible = *position + row + 1;
     const int splits = sensenova_full_splits(visible);
     if (split >= splits || head_dim <= 0 || head_dim > 256) {
         return;
@@ -392,5 +398,37 @@ extern "C" __global__ void sensenova_attn_full_q8(const float* __restrict__ q,
     }
     if (threadIdx.x < head_dim) {
         part[2 + threadIdx.x] = accumulator;
+    }
+}
+
+// q4e_attn_full_combine over a device position: the shared kernel takes the token's index as an
+// argument, which would make every replayed launch a different graph node argument.
+extern "C" __global__ void sensenova_attn_combine(const float* __restrict__ partials,
+                                                   const float* __restrict__ gate,
+                                                   float* __restrict__ out,
+                                                   const int* __restrict__ position,
+                                                   int heads, int head_dim) {
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int splits = sensenova_full_splits(*position + row + 1);
+    const int stride = head_dim + 2;
+    const float* part =
+        partials + ((unsigned long long)row * heads + head) * SENSENOVA_FULL_SPLITS * stride;
+    float maximum = -INFINITY;
+    for (int split = 0; split < splits; ++split) {
+        maximum = fmaxf(maximum, part[split * stride]);
+    }
+    float total = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        total += part[split * stride + 1] * __expf(part[split * stride] - maximum);
+    }
+    const unsigned long long at = ((unsigned long long)row * heads + head) * head_dim;
+    for (int dim = threadIdx.x; dim < head_dim; dim += blockDim.x) {
+        float accumulator = 0.0f;
+        for (int split = 0; split < splits; ++split) {
+            accumulator += part[split * stride + 2 + dim] * __expf(part[split * stride] - maximum);
+        }
+        const float value = accumulator / total;
+        out[at + dim] = gate != nullptr ? value / (1.0f + __expf(-gate[at + dim])) : value;
     }
 }

@@ -45,6 +45,15 @@ use crate::tensor::SenseNovaTensorPlan;
 const DEVICE: &str = "sensenova_device";
 const BLOCK: u32 = 256;
 
+/// The attention split grid: one block a 256-key tile, at most. The q8 kernel derives the splits
+/// a row actually takes from the device position, so a constant grid is correct at every index
+/// and is what lets the whole visit list be one replayed graph.
+const FULL_SPLITS: u32 = 16;
+
+/// Serialises graph capture: the driver's capture mode is process-wide, so two sessions must not
+/// build their graphs at once.
+static CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// One uploaded matrix, BF16 or E4M3 with its tile scales.
 #[derive(Debug, Clone, Copy)]
 struct DeviceMat {
@@ -97,6 +106,7 @@ struct Kernels {
     attn_full_combine: Kernel,
     cache_q8: Kernel,
     attn_q8: Kernel,
+    attn_combine: Kernel,
     mhc_pre: Kernel,
     mhc_post: Kernel,
     mhc_leave: Kernel,
@@ -749,6 +759,7 @@ impl Kernels {
             attn_full_combine: load(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
             cache_q8: load(sensenova_cubin(), "sensenova_cache_q8")?,
             attn_q8: load(sensenova_cubin(), "sensenova_attn_full_q8")?,
+            attn_combine: load(sensenova_cubin(), "sensenova_attn_combine")?,
             mhc_pre: load(sensenova_cubin(), "sensenova_mhc_pre")?,
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
@@ -778,6 +789,9 @@ struct Scratch {
     partials: Deviceptr,
     coeffs: Deviceptr,
     logits: Deviceptr,
+    /// The token index the kernels read. A device word, not an argument, so one captured graph
+    /// serves every position.
+    position: Deviceptr,
     pointers: Vec<Deviceptr>,
 }
 
@@ -796,6 +810,8 @@ struct DeviceSession {
     scratch: Scratch,
     visits: Vec<VisitState>,
     position: usize,
+    /// The captured 56-visit forward, when the arm built one.
+    graph: Option<sparkflash_kernels::cuda_driver::GraphId>,
     sampler: Sampler,
     sampling: Sampling,
 }
@@ -803,6 +819,10 @@ struct DeviceSession {
 impl Drop for DeviceSession {
     fn drop(&mut self) {
         let _ = self.shared.cuda.make_current();
+        // The graph reads these buffers, so it goes first.
+        if let Some(graph) = self.graph.take() {
+            self.shared.cuda.graph_destroy(graph);
+        }
         let mut references: Vec<&Deviceptr> = self.scratch.pointers.iter().collect();
         for visit in &self.visits {
             references.extend(visit.keys.as_ref());
@@ -856,6 +876,7 @@ impl DeviceSession {
             partials: alloc(config.num_attention_heads * 16 * (config.head_dim + 2) * 4)?,
             coeffs: alloc(8 * 4)?,
             logits: alloc(config.vocab_size * 4)?,
+            position: alloc(4)?,
             pointers,
         };
         let mut visits = Vec::with_capacity(config.visits());
@@ -929,14 +950,73 @@ impl DeviceSession {
                 )?;
             }
         }
-        Ok(Self {
+        let mut session = Self {
             shared,
             scratch,
             visits,
             position: 0,
+            graph: None,
             sampler: Sampler::new(),
             sampling: Sampling::default(),
-        })
+        };
+        session.graph = session.capture_graph();
+        Ok(session)
+    }
+
+    /// Captures the 56 visits and the LM head as one CUDA graph.
+    ///
+    /// The decode measured 22.5 ms a token for 14.1 GB of weights, and one 2 GB GEMV alone ran
+    /// at ~870 GB/s against the visit list's ~600: the difference is the ~600 dependent launches
+    /// a token and their tails, not the memory system. A replayed graph issues the same work with
+    /// one host call, so the gap is the launch path itself.
+    ///
+    /// The launches read the position from a device word, so the argument list - and therefore
+    /// the graph - is the same at every index. That is the one structural requirement: the split
+    /// grid is constant and the cache, rope and attention take a pointer.
+    ///
+    /// Capture happens once, when the session opens. A graph bakes in the buffers it was
+    /// captured with, so it is per-session; the serving pool opens a sequence only after the one
+    /// it replaces is dropped, and [CAPTURE] keeps two opens from overlapping anyway.
+    fn capture_graph(&mut self) -> Option<sparkflash_kernels::cuda_driver::GraphId> {
+        if std::env::var("SPARKFLASH_SENSENOVA_GRAPH").as_deref() == Ok("0") {
+            return None;
+        }
+        // The 8-bit path is the one whose launches are position-free; the BF16 fallback caches by
+        // a host-computed pointer offset, which a replay would freeze at capture time.
+        if !self.shared.kv_fp8 {
+            return None;
+        }
+        if std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok() {
+            return None;
+        }
+        // The per-visit timer synchronises between visits, which a capture cannot cross.
+        if std::env::var("SPARKFLASH_SENSENOVA_TIME").as_deref() == Ok("2") {
+            return None;
+        }
+        let shared = Arc::clone(&self.shared);
+        let _guard = CAPTURE.lock().unwrap_or_else(|error| error.into_inner());
+        if let Err(error) = shared.cuda.graph_capture_begin() {
+            eprintln!("sensenova graph: capture refused: {error}");
+            return None;
+        }
+        if let Err(error) = self.project(false, false) {
+            shared.cuda.graph_capture_abort();
+            eprintln!("sensenova graph: capture failed: {error}");
+            return None;
+        }
+        match shared.cuda.graph_capture_end() {
+            Ok((graph, records)) => {
+                eprintln!(
+                    "sensenova graph: captured {} launches, replaying one call a token",
+                    records.len()
+                );
+                Some(graph)
+            }
+            Err(error) => {
+                eprintln!("sensenova graph: capture ended badly: {error}");
+                None
+            }
+        }
     }
 
     fn forward(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
@@ -956,10 +1036,10 @@ impl DeviceSession {
                 ),
             ));
         }
-        let timed = std::env::var("SPARKFLASH_SENSENOVA_TIME").is_ok();
-        let per_visit = std::env::var("SPARKFLASH_SENSENOVA_TIME").as_deref() == Ok("2");
+        let clock = std::env::var("SPARKFLASH_SENSENOVA_TIME");
+        let timed = clock.is_ok();
+        let per_visit = clock.as_deref() == Ok("2");
         let started = std::time::Instant::now();
-        let mut visit_clock = started;
         let position = self.position;
         let row = token as usize * hidden * 2;
         let embed = &shared.weights.host_embed[row..row + hidden * 2];
@@ -978,6 +1058,58 @@ impl DeviceSession {
         if debug {
             self.report("embed", self.scratch.hidden, hidden)?;
         }
+        // The launches read the position from the device, so a replayed graph is valid at any
+        // index; the word is rewritten here, ahead of either path, on the same stream.
+        shared
+            .cuda
+            .copy_htod(&self.scratch.position, &u32::try_from(position).unwrap_or(0).to_le_bytes())
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        match self.graph {
+            Some(graph) => shared
+                .cuda
+                .graph_launch(graph)
+                .map_err(|error| BackendError::new(DEVICE, error))?,
+            None => self.project(debug, per_visit)?,
+        }
+        if timed {
+            shared
+                .cuda
+                .synchronize()
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+        }
+        let after_device = started.elapsed();
+        let mut logit_bytes = vec![0u8; config.vocab_size * 4];
+        shared
+            .cuda
+            .copy_dtoh(&mut logit_bytes, &self.scratch.logits)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        let logits: Vec<f32> = logit_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        if timed {
+            let total = started.elapsed();
+            eprintln!(
+                "sensenova time: embed {:.2} ms, device {:.2} ms, head {:.2} ms, total {:.2} ms",
+                after_embed.as_secs_f64() * 1e3,
+                (after_device - after_embed).as_secs_f64() * 1e3,
+                (total - after_device).as_secs_f64() * 1e3,
+                total.as_secs_f64() * 1e3
+            );
+        }
+        self.position += 1;
+        Ok(logits)
+    }
+
+    /// The token's 56 visits, the final norm and the LM head: the launches a graph captures.
+    fn project(&mut self, debug: bool, per_visit: bool) -> Result<(), BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let config = &shared.config;
+        let hidden = config.hidden_size;
+        let position = self.position;
+        let mut visit_clock = std::time::Instant::now();
         for (visit, physical) in config.execution_plan().into_iter().enumerate() {
             let layer = &shared.weights.layers[physical];
             let state = self.visits[visit];
@@ -1175,42 +1307,12 @@ impl DeviceSession {
         if debug {
             self.report("device final hidden", self.scratch.normed, hidden)?;
         }
-        if timed {
-            shared
-                .cuda
-                .synchronize()
-                .map_err(|error| BackendError::new(DEVICE, error))?;
-        }
-        let after_device = started.elapsed();
         shared.gemv(
             &shared.weights.head,
             self.scratch.normed,
             self.scratch.logits,
             1,
-        )?;
-        let mut logit_bytes = vec![0u8; config.vocab_size * 4];
-        shared
-            .cuda
-            .copy_dtoh(&mut logit_bytes, &self.scratch.logits)
-            .map_err(|error| BackendError::new(DEVICE, error))?;
-        let logits: Vec<f32> = logit_bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
-        if timed {
-            let total = started.elapsed();
-            eprintln!(
-                "sensenova time: embed {:.2} ms, device {:.2} ms, head {:.2} ms, total {:.2} ms",
-                after_embed.as_secs_f64() * 1e3,
-                (after_device - after_embed).as_secs_f64() * 1e3,
-                (total - after_device).as_secs_f64() * 1e3,
-                total.as_secs_f64() * 1e3
-            );
-        }
-        self.position += 1;
-        Ok(logits)
+        )
     }
 
     fn report(&self, label: &str, pointer: Deviceptr, width: usize) -> Result<(), BackendError> {
@@ -1326,7 +1428,7 @@ impl DeviceSession {
                 self.scratch.query.0,
                 head_dim as u64,
                 config.rope.dims as u64,
-                position as u64,
+                self.scratch.position.0,
                 shared.inv_freq.0,
                 u64::from(shared.rope_scale.to_bits()),
                 query as u64,
@@ -1341,7 +1443,7 @@ impl DeviceSession {
                 self.scratch.key.0,
                 head_dim as u64,
                 config.rope.dims as u64,
-                position as u64,
+                self.scratch.position.0,
                 shared.inv_freq.0,
                 u64::from(shared.rope_scale.to_bits()),
                 kv as u64,
@@ -1366,7 +1468,7 @@ impl DeviceSession {
                         source.0,
                         codes.0,
                         scales.0,
-                        position as u64,
+                        self.scratch.position.0,
                         1,
                         kv_heads as u64,
                         head_dim as u64,
@@ -1375,7 +1477,7 @@ impl DeviceSession {
             }
             shared.launch(
                 shared.kernels.attn_q8,
-                (heads as u32, 1, splits),
+                (heads as u32, 1, FULL_SPLITS),
                 (BLOCK, 1, 1),
                 &[
                     self.scratch.query.0,
@@ -1384,7 +1486,7 @@ impl DeviceSession {
                     k_scales.0,
                     v_scales.0,
                     self.scratch.partials.0,
-                    position as u64,
+                    self.scratch.position.0,
                     heads as u64,
                     kv_heads as u64,
                     head_dim as u64,
@@ -1430,19 +1532,35 @@ impl DeviceSession {
                 ],
             )?;
         }
-        shared.launch(
-            shared.kernels.attn_full_combine,
-            (heads as u32, 1, 1),
-            (BLOCK, 1, 1),
-            &[
-                self.scratch.partials.0,
-                self.scratch.gate.0,
-                self.scratch.attn_out.0,
-                position as u64,
-                heads as u64,
-                head_dim as u64,
-            ],
-        )?;
+        if shared.kv_fp8 {
+            shared.launch(
+                shared.kernels.attn_combine,
+                (heads as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    self.scratch.partials.0,
+                    self.scratch.gate.0,
+                    self.scratch.attn_out.0,
+                    self.scratch.position.0,
+                    heads as u64,
+                    head_dim as u64,
+                ],
+            )?;
+        } else {
+            shared.launch(
+                shared.kernels.attn_full_combine,
+                (heads as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    self.scratch.partials.0,
+                    self.scratch.gate.0,
+                    self.scratch.attn_out.0,
+                    position as u64,
+                    heads as u64,
+                    head_dim as u64,
+                ],
+            )?;
+        }
         shared.gemv(&o, self.scratch.attn_out, self.scratch.attention, 1)
     }
 

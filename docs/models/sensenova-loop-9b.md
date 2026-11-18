@@ -3,8 +3,9 @@
 Status: **host reference on every target, and a TP=1 device arm served on the RTX 5080.** The FP8
 mirror boots at its **160K** default with an **8-bit K/V cache**, keeps only the embedding on the
 host, matches the host reference's argmax on the first token (worst logit delta 0.063 from the
-E4M3 K/V round) and decodes at about **44 tok/s** (22.5 ms a token, 5.5x the first arm). The pack
-is `sparkflash-model-sensenova`; the served selector is `sensenova-loop-9b-fp8`.
+E4M3 K/V round) and decodes at about **45 tok/s** (22.4 ms a token, 5.5x the first arm). The
+token's 56 visits are one captured CUDA graph of 1028 launches. The pack is
+`sparkflash-model-sensenova`; the served selector is `sensenova-loop-9b-fp8`.
 
 SenseNova-Loop-9B is a 9.4B-parameter multimodal decoder released by SenseTime on 2026-11-17
 (Apache-2.0). It is a Qwen3.5 hybrid stack with two structural additions:
@@ -136,6 +137,14 @@ Every projection and every block body is a shared kernel:
 | mHC | `sensenova_mhc_pre` / `_post` / `_leave` |
 | LM head | `q4e_gemv_bf16` (2 GB BF16 on the device) |
 
+The token's launches are captured once, when the session opens, into a CUDA graph
+(`SPARKFLASH_SENSENOVA_GRAPH=0` disables it). A graph bakes in its buffers, so it is per session,
+and the position is a device word rather than an argument - the split grid is constant and the
+rope, cache and attention kernels read `*position` - which is what makes one graph valid at every
+index. The 1028 launches replay as one call; the copies that bracket them (one embedding row in,
+the logits out) stay outside. The gain is small (22.5 -> 22.4 ms) because the host launch path was
+not the bottleneck: the graph removes its cost, not the deviceside per-kernel overhead.
+
 The weights are uploaded once per **physical** layer; the two loop visits reuse them. All 56
 visit caches are allocated at open: 14 8-bit KV caches of `context * 1024` bytes plus one f32
 scale a token and KV head, and 42 GDN state pairs. The embedding row is the only host upload and
@@ -148,11 +157,14 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-1. **One graph for the 56 visits.** The body reads its 12.1 GB at ~600 GB/s while the single big
-   head GEMV reads its 2 GB at ~870 GB/s; the gap is the ten dependent launches a visit, not
-   bandwidth. Concatenating q/k/v, qkv/z and gate/up into single tiled GEMVs is worth ~5% by
-   itself; capturing the visits as a CUDA graph with the position as the only updated argument is
-   where the rest is.
+1. **Fewer and fatter kernels.** The token is one captured graph of 1028 launches, so the host
+   launch path is gone; the body still reads its 12.1 GB at ~630 GB/s against ~870 for the single
+   big head GEMV. What is left is per-kernel: seven GEMVs a visit each restart the DRAM stream and
+   the split-reduce adds a dependent tail, and about eleven small kernels (two routers, two norms,
+   rope, cache, qgate, conv, scan, swiglu) run on one to forty blocks. Folding the norm into the
+   GEMV prologue, the rope and qgate into its epilogue, and the two mHC passes into one kernel is
+   the next real step; it is worth ~8% and needs the visit body restructured rather than more
+   calls.
 2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
    `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
    chunked GDN scan, both of which the shared images already carry. This is the largest single

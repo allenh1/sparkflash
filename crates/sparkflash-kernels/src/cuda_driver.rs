@@ -2540,32 +2540,13 @@ impl Cuda {
                 if stream.is_null() {
                     return Err("graph capture is active without a capture stream".to_string());
                 }
-                let launch: libloading::Symbol<LaunchFn> = self.sym(b"cuLaunchKernel")?;
-                let (_storage, mut ptrs) = Cuda::kernel_params(args);
-                // SAFETY: the symbol comes from this context's library, every argument is a u64
-                // or a pointer to one that outlives the call, and the stream is the private
-                // capture stream; the driver records this call into the graph being built.
-                let r = unsafe {
-                    launch(
-                        kernel.function,
-                        grid.0,
-                        grid.1,
-                        grid.2,
-                        block.0,
-                        block.1,
-                        block.2,
-                        kernel.shared_bytes,
-                        stream,
-                        ptrs.as_mut_ptr(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                if r != 0 {
-                    return Err(format!(
-                        "cuLaunchKernel failed while capturing a graph: {}",
-                        name(r)
-                    ));
-                }
+                // Through the same entry the direct path uses, so a node carries the
+                // programmatic-stream-serialization attribute its kernel opens with. Capturing
+                // with a plain cuLaunchKernel drops it, and every node then waits for the previous
+                // kernel to fully drain: on the SenseNova arm that was the entire difference
+                // between the graph and the direct path.
+                self.launch_kernel(stream, kernel, grid, block, args)
+                    .map_err(|error| format!("{error} while capturing a graph"))?;
                 control.records.push(record);
                 Ok(())
             }
