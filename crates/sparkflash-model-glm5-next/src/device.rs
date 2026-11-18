@@ -101,7 +101,7 @@ use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, RmsNorm};
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
-use sparkflash_ops::gdn::{CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
+use sparkflash_ops::gdn::{self, CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS,
     TILED_GEMV_ROUND, gemv_e4m3, tiled_gemv_e4m3_splits, tiled_gemv_splits,
@@ -4010,35 +4010,12 @@ impl DeviceRank {
                 own.mixed.offset(floats(run.first * mixes)),
             );
             if self.bulk(run) {
-                self.launch(
-                    self.kernels.conv_rows,
-                    (blocks(mixes), run.len as u32, 1),
-                    BLOCK,
-                    &[
-                        raw.0,
-                        conv.0,
-                        kda.conv.0,
-                        mixed.0,
-                        mixes as u64,
-                        config.linear_conv_kernel_dim as u64,
-                    ],
-                )?;
-                self.launch(
-                    self.kernels.conv_history,
-                    (blocks(mixes), 1, 1),
-                    BLOCK,
-                    &[
-                        raw.0,
-                        conv.0,
-                        mixes as u64,
-                        config.linear_conv_kernel_dim as u64,
-                        run.len as u64,
-                        // A chunk never verifies, so it keeps no windows.
-                        0,
-                        0,
-                        0,
-                    ],
-                )?;
+                let width = (mixes, config.linear_conv_kernel_dim);
+                let call = gdn::conv_rows(raw.0, conv.0, kda.conv.0, mixed.0, width, run.len);
+                self.launch(self.kernels.conv_rows, call.grid, call.block.0, &call.args)?;
+                // A chunk never verifies, so it keeps no windows.
+                let call = gdn::conv_history(raw.0, conv.0, width, run.len, (0, 0, 0));
+                self.launch(self.kernels.conv_history, call.grid, call.block.0, &call.args)?;
                 continue;
             }
             // A verify keeps the windows after each of its rows but the last, for a commit that
@@ -4231,22 +4208,15 @@ impl DeviceRank {
                 0,
             ],
         )?;
-        self.launch(
-            self.kernels.kda_gate,
-            (heads as u32, len as u32, 1),
-            GDN_VALUE as u32,
-            &[
-                out.0,
-                gate.0,
-                kda.o_norm.0,
-                out.0,
-                heads as u64,
-                value,
-                float(config.rms_norm_eps as f32),
-                // The sigmoid output gate.
-                1,
-            ],
-        )
+        // The sigmoid output gate.
+        let call = gdn::gated_norm(
+            (out.0, gate.0, kda.o_norm.0, out.0),
+            (heads, GDN_VALUE),
+            config.rms_norm_eps as f32,
+            true,
+            len,
+        );
+        self.launch(self.kernels.kda_gate, call.grid, call.block.0, &call.args)
     }
 
     /// KDA's recurrence over `len` rows of one sequence: `inputs` are the convolved rows, the

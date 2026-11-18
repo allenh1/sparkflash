@@ -49,7 +49,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_model::BackendError;
-use sparkflash_ops::OpPlan;
+use sparkflash_ops::{OpPlan, gdn};
 // The routed experts' plan, grouped tile and item count are the shared rule.
 use sparkflash_ops::moe::{MAX_EXPERTS as MOE_MAX_EXPERTS, MoePlanCall, grouped};
 use sparkflash_ops::projection::{Fp8Tile, SPLIT_STAGE, SplitTile, fp8_tile_fits, split_k_slices};
@@ -116,14 +116,9 @@ pub const ATTENTION_CHUNK: usize = 128;
 
 // The scan geometry lives in the shared op library so the Qwen and GLM arms cannot drift.
 pub use sparkflash_ops::gdn::{
-    CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, gdn_scan_shape, gdn_scan_shape_for,
+    CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE, gdn_qk_row, gdn_scan_shape, gdn_scan_shape_for,
 };
 
-/// The floats q4p_gdn_prep stages for one (token, key head): q then k, each key_dim wide with
-/// four padding floats after every 32 (Q4P_GDN_ROW).
-pub fn gdn_qk_row(key_dim: usize) -> usize {
-    2 * (key_dim + key_dim / 8)
-}
 /// q4p_dense_rows' rows (one m16 tile) and columns (four warps of 8) a CTA, for launches of fewer
 /// than GEMM_MIN_BATCH rows.
 const DENSE_ROWS_TILE: usize = 16;
@@ -1183,40 +1178,27 @@ impl DeviceSequence {
             return Ok(false);
         }
         let config = &self.backend.config;
-        let taps = config.linear_conv_kernel_dim;
-        let heads = config.linear_num_value_heads;
-        let width = config.linear_conv_width();
+        let geometry = config.gdn_geometry();
+        let conv = (geometry.conv_width(), geometry.taps);
         let kernels = &self.backend.kernels.prefill;
         let [conv_out, ..] = inputs;
-        let columns = width.div_ceil(256).max(1) as u32;
-        self.launch(
-            kernels.gdn_conv,
-            (columns, batch as u32, 1),
-            (256, 1, 1),
-            &[
-                self.linear_qkv.0,
-                conv_state.0,
-                conv_weight.0,
-                conv_out.0,
-                width as u64,
-                taps as u64,
-            ],
-        )?;
-        self.launch(
-            kernels.gdn_conv_state,
-            (columns, 1, 1),
-            (256, 1, 1),
-            &[
-                self.linear_qkv.0,
-                conv_state.0,
-                width as u64,
-                taps as u64,
-                batch as u64,
-                snapshot,
-                snapshot_rows as u64,
-                region_stride,
-            ],
-        )?;
+        let call = gdn::conv_rows(
+            self.linear_qkv.0,
+            conv_state.0,
+            conv_weight.0,
+            conv_out.0,
+            conv,
+            batch,
+        );
+        self.launch(kernels.gdn_conv, call.grid, call.block, &call.args)?;
+        let call = gdn::conv_history(
+            self.linear_qkv.0,
+            conv_state.0,
+            conv,
+            batch,
+            (snapshot, snapshot_rows, region_stride),
+        );
+        self.launch(kernels.gdn_conv_state, call.grid, call.block, &call.args)?;
         self.prof_mark("gdn_conv")?;
         self.gdn_recurrence(
             a_log,
@@ -1225,21 +1207,14 @@ impl DeviceSequence {
             (recurrent_state, recurrent_out),
             batch,
         )?;
-        self.launch(
-            kernels.gdn_gate,
-            (heads as u32, batch as u32, 1),
-            (config.linear_value_head_dim as u32, 1, 1),
-            &[
-                self.linear_out.0,
-                self.linear_z.0,
-                norm.0,
-                self.linear_out.0,
-                heads as u64,
-                config.linear_value_head_dim as u64,
-                u64::from((config.rms_norm_eps as f32).to_bits()),
-                u64::from(config.output_gate_is_sigmoid()),
-            ],
-        )?;
+        let call = gdn::gated_norm(
+            (self.linear_out.0, self.linear_z.0, norm.0, self.linear_out.0),
+            (geometry.heads, geometry.value_dim),
+            config.rms_norm_eps as f32,
+            config.output_gate_is_sigmoid(),
+            batch,
+        );
+        self.launch(kernels.gdn_gate, call.grid, call.block, &call.args)?;
         self.prof_mark("gdn_recur")?;
         Ok(true)
     }
@@ -1260,33 +1235,20 @@ impl DeviceSequence {
         if !self.gdn_fits() {
             return Ok(false);
         }
-        let config = &self.backend.config;
-        let key_heads = config.linear_num_key_heads;
-        let heads = config.linear_num_value_heads;
-        let groups = config.value_groups();
-        let key_width = config.linear_key_width();
+        let geometry = self.backend.config.gdn_geometry();
         let kernels = &self.backend.kernels.prefill;
         let scratch = &self.prefill;
-        self.launch(
-            kernels.gdn_prep,
-            (key_heads as u32, rows as u32, 1),
-            (config.linear_key_head_dim as u32, 1, 1),
-            &[
-                conv.0,
-                a.0,
-                b.0,
-                a_log.0,
-                dt_bias.0,
-                scratch.gdn_qk.0,
-                scratch.gdn_decay_beta.0,
-                key_width as u64,
-                key_heads as u64,
-                heads as u64,
-                config.linear_value_head_dim as u64,
-                groups as u64,
-            ],
-        )?;
-        let value_dim = config.linear_value_head_dim;
+        let call = geometry.prep(
+            conv.0,
+            a.0,
+            b.0,
+            a_log.0,
+            dt_bias.0,
+            scratch.gdn_qk.0,
+            scratch.gdn_decay_beta.0,
+            rows,
+        );
+        self.launch(kernels.gdn_prep, call.grid, call.block, &call.args)?;
         // The plan's scan: its kernel for the head widths and its grid ([ScanPlan]).
         let plan = match &self.backend.gdn_scan {
             Ok(Some(plan)) => plan,
@@ -1304,28 +1266,13 @@ impl DeviceSequence {
             .map_err(|error| BackendError::new("qwen4_prefill", error))?;
         // The verify's windows are the conv's snapshot; the recurrent state is replayed rather
         // than saved a row at a time, so the scan writes no snapshot of its own.
-        self.launch(
-            scan,
-            launch.grid,
-            launch.block,
-            &[
-                scratch.gdn_qk.0,
-                scratch.gdn_decay_beta.0,
-                conv.0,
-                from.0,
-                to.0,
-                self.linear_out.0,
-                key_width as u64,
-                key_heads as u64,
-                heads as u64,
-                value_dim as u64,
-                groups as u64,
-                rows as u64,
-                0,
-                0,
-                0,
-            ],
-        )?;
+        let args = geometry.scan_args(
+            (scratch.gdn_qk.0, scratch.gdn_decay_beta.0, conv.0),
+            (from.0, to.0),
+            self.linear_out.0,
+            rows,
+        );
+        self.launch(scan, launch.grid, launch.block, &args)?;
         Ok(true)
     }
 }

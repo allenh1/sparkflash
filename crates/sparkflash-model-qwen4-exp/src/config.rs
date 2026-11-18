@@ -1032,6 +1032,18 @@ impl Qwen4ExpConfig {
         self.linear_num_value_heads / self.linear_num_key_heads
     }
 
+    /// The Gated DeltaNet geometry the shared chunk calls take ([sparkflash_ops::gdn]).
+    #[must_use]
+    pub fn gdn_geometry(&self) -> sparkflash_ops::gdn::GdnGeometry {
+        sparkflash_ops::gdn::GdnGeometry {
+            key_heads: self.linear_num_key_heads,
+            heads: self.linear_num_value_heads,
+            key_dim: self.linear_key_head_dim,
+            value_dim: self.linear_value_head_dim,
+            taps: self.linear_conv_kernel_dim,
+        }
+    }
+
     /// Hashed PLE heads per n-gram order (8).
     #[must_use]
     pub fn heads_per_order(&self) -> usize {

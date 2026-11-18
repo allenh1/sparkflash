@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Typed calls of the token image's shared kernels: norm, rotary, residual add, SwiGLU, copy,
-//! embedding, the BF16 cache append, the row GEMV, the head deinterleave and the split full
+//! zero, embedding, the BF16 cache append, the row GEMV, the head deinterleave and the split full
 //! attention.
 //!
 //! Every device arm launches these bodies from the Qwen token image (`kernels/qwen4_exp_sm121.cu`
@@ -74,6 +74,12 @@ pub const fn swiglu(gate: u64, up: u64, out: u64, count: usize) -> Call<4> {
 #[must_use]
 pub const fn copy(dst: u64, src: u64, count: usize) -> Call<3> {
     flat(count, [dst, src, count as u64])
+}
+
+/// `q4e_zero`: `count` floats of `dst` set to zero.
+#[must_use]
+pub const fn zero(dst: u64, count: usize) -> Call<2> {
+    flat(count, [dst, count as u64])
 }
 
 /// `q4e_cache_bf16`: `count` f32 values of `rows` narrowed to BF16 into `cache`, one contiguous

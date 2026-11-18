@@ -437,8 +437,9 @@ web's fit read that one plan, and:
 
 - a novel family that is a grouped-query decoder (embedding, RMSNorm, GQA with or without
   the per-head output gate and `q_norm`/`k_norm`, plain `rotate_half` RoPE over the leading
-  rotated dimensions, a dense unclamped SwiGLU or routed experts, a plain residual and the
-  head), BF16 or with its projections and experts in 128 x 128-tile FP8, is served
+  rotated dimensions, Gated DeltaNet layers between them or not, a dense unclamped SwiGLU or
+  routed experts, a plain residual and the head), BF16 or with its projections and experts in
+  128 x 128-tile FP8, is served
   on the device by the shared dense arm, `sparkflash-model-dense` (runtime step 19), with no code
   of its own: it reads the `Architecture`, the shared names, `DraftUploader` and the typed
   `sparkflash_ops::calls`, and its prompt projections take the shared wide tile
@@ -450,7 +451,16 @@ web's fit read that one plan, and:
   22, the Qwen3 FP8 form) runs Qwen's and GLM's FP8 kernels: the FP8 tile (`Fp8Tile`, by
   `projection::route_fp8`) for a prompt chunk, the tiled E4M3 GEMV for decode rows, and the
   expert passes' FP8 form; each tensor is uploaded as it is stored, through
-  `DraftUploader::mat_e4m3_tile`. `sparkflash_ops::parts::dense_device_refusal` is its gate, and
+  `DraftUploader::mat_e4m3_tile`. A Gated DeltaNet layer (runtime step 23, a hybrid family's
+  `linear_attn`) runs the scan image's chunk kernels Qwen's prompts run, through
+  `sparkflash_ops::gdn`'s typed calls (the conv over a segment's rows and its history advanced
+  past them, the prep, the scan its `ScanPlan` resolves for the head pair, the gated norm) at
+  every row count, decode rows included, so a row's state is the same bits alone, in a prompt or
+  in a fused step; each lane holds its conv history and delta-rule state, and the rewind point
+  copies them (`Checkpoint`) at each prompt's end. Every such layer shares one geometry, at a head
+  pair the scan is compiled for ((64, 64), (128, 128), (128, 256)), two to nine conv taps, value
+  heads a multiple of the key heads and a SiLU or sigmoid gate.
+  `sparkflash_ops::parts::dense_device_refusal` is its gate, and
   it names what it refuses (a window, a rope scaling, another activation, a bias, a projection or
   expert format other than BF16 and the 128 x 128 FP8 tile, a width that splits a scale tile, a
   selection bias, a widened residual...). It gates on its own launch list rather than the kernel

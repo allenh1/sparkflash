@@ -23,12 +23,16 @@ tokenizer.json, vocab.json, chat template and generation config):
 
   dense-synthetic-checkpoint.py TOKENIZER_DIR OUT_DIR [--layers 8] [--hidden 1024]
       [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]] [--fp8]
+      [--gdn]
 
 With --experts every layer routes: a softmax router renormalising its top-k picks over that many
 BF16 experts, and a sigmoid-gated shared expert when --shared-intermediate names its width (the
 Qwen MoE spelling), so the served gate covers the arm's routed layers too. With --fp8 every
 projection and expert is stored as the Qwen3 FP8 releases store them: E4M3 codes under one BF16
-`weight_scale_inv` a 128 x 128 tile (the embedding, head, norms and router stay BF16).
+`weight_scale_inv` a 128 x 128 tile (the embedding, head, norms and router stay BF16). With
+--gdn every even layer is a Gated DeltaNet (Qwen3.5's `linear_attn` spelling: four key heads and
+eight value heads of 128, four conv taps, a SiLU output gate) between attention layers, so the
+gate covers the recurrent state in the lanes and the rewind point's copy of it.
 
 The head scores only plain word tokens (a space and three to eight lowercase letters), at a
 scale that outweighs every other token's zero, so greedy and sampled replies are words that
@@ -104,6 +108,22 @@ def mlp(prefix, width, hidden, inner, fp8):
             + projection(prefix + "down_proj.weight", hidden, width, inner(width), fp8))
 
 
+def gdn(prefix, hidden, inner, fp8, key_heads=4, heads=8, dim=128, taps=4):
+    """One Gated DeltaNet layer under `prefix`: the fused q/k/v, output gate and out projections
+    (FP8 with `fp8`), the beta and decay projections, a `[width, 1, taps]` conv, decay rates of
+    exp(-0.5) and the gated norm, all BF16."""
+    width = 2 * key_heads * dim + heads * dim
+    return (projection(prefix + "in_proj_qkv.weight", width, hidden, inner(hidden), fp8)
+            + projection(prefix + "in_proj_z.weight", heads * dim, hidden, inner(hidden), fp8)
+            + projection(prefix + "in_proj_b.weight", heads, hidden, inner(hidden), False)
+            + projection(prefix + "in_proj_a.weight", heads, hidden, inner(hidden), False)
+            + [(prefix + "conv1d.weight", [width, 1, taps], bf16_random(width * taps, -2)),
+               (prefix + "A_log", [heads], bf16_constant(heads, -0.5)),
+               (prefix + "dt_bias", [heads], bf16_constant(heads, 0.0)),
+               (prefix + "norm.weight", [dim], bf16_constant(dim, 1.0))]
+            + projection(prefix + "out_proj.weight", hidden, heads * dim, inner(heads * dim), fp8))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("tokenizer_dir")
@@ -119,6 +139,7 @@ def main():
     parser.add_argument("--expert-intermediate", type=int, default=512)
     parser.add_argument("--shared-intermediate", type=int, default=0)
     parser.add_argument("--fp8", action="store_true")
+    parser.add_argument("--gdn", action="store_true")
     args = parser.parse_args()
     fp8 = args.fp8
     os.makedirs(args.out_dir, exist_ok=True)
@@ -171,6 +192,18 @@ def main():
         })
         if args.shared_intermediate:
             config["shared_expert_intermediate_size"] = args.shared_intermediate
+    linear = lambda layer: args.gdn and layer % 2 == 0
+    if args.gdn:
+        config.update({
+            "model_type": config["model_type"].replace("acme_", "acme_hybrid_"),
+            "layer_types": ["linear_attention" if linear(layer) else "full_attention"
+                            for layer in range(args.layers)],
+            "linear_conv_kernel_dim": 4,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+        })
     if fp8:
         config["quantization_config"] = {
             "quant_method": "fp8",
@@ -197,11 +230,14 @@ def main():
             (at + "input_layernorm.weight", [hidden], bf16_constant(hidden, 1.0)),
             (at + "post_attention_layernorm.weight", [hidden], bf16_constant(hidden, 1.0)),
         ]
-        attn = at + "self_attn."
-        tensors += projection(attn + "q_proj.weight", q, hidden, inner(hidden), fp8)
-        tensors += projection(attn + "k_proj.weight", kv, hidden, inner(hidden), fp8)
-        tensors += projection(attn + "v_proj.weight", kv, hidden, inner(hidden), fp8)
-        tensors += projection(attn + "o_proj.weight", hidden, q, inner(q), fp8)
+        if linear(layer):
+            tensors += gdn(at + "linear_attn.", hidden, inner, fp8)
+        else:
+            attn = at + "self_attn."
+            tensors += projection(attn + "q_proj.weight", q, hidden, inner(hidden), fp8)
+            tensors += projection(attn + "k_proj.weight", kv, hidden, inner(hidden), fp8)
+            tensors += projection(attn + "v_proj.weight", kv, hidden, inner(hidden), fp8)
+            tensors += projection(attn + "o_proj.weight", hidden, q, inner(q), fp8)
         if not args.experts:
             tensors += mlp(at + "mlp.", args.intermediate, hidden, inner, fp8)
             continue
@@ -215,10 +251,11 @@ def main():
             tensors.append((at + "mlp.shared_expert_gate.weight", [1, hidden],
                             bf16_random(hidden, inner(hidden))))
     write(os.path.join(args.out_dir, "model.safetensors"), tensors)
-    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s%s" % (
+    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s%s%s" % (
         args.out_dir, args.layers, hidden, size, len(words),
         ", %d experts (top %d)" % (args.experts, args.top_k) if args.experts else "",
-        ", FP8 projections" if fp8 else ""))
+        ", FP8 projections" if fp8 else "",
+        ", Gated DeltaNet on even layers" if args.gdn else ""))
 
 
 if __name__ == "__main__":

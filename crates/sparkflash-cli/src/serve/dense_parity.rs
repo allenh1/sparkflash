@@ -178,18 +178,22 @@ impl Fixture {
             };
             source.push(&at("input_layernorm"), &[hidden], 1.0, 0.2);
             source.push(&at("post_attention_layernorm"), &[hidden], 1.0, 0.2);
-            let kv = kv_heads * head_dim;
-            for (name, shape) in [
-                ("self_attn.q_proj", [query_rows, hidden]),
-                ("self_attn.k_proj", [kv, hidden]),
-                ("self_attn.v_proj", [kv, hidden]),
-                ("self_attn.o_proj", [hidden, heads * head_dim]),
-            ] {
-                form.push(&mut source, &at(name), shape);
-            }
-            if self.gated {
-                source.push(&at("self_attn.q_norm"), &[head_dim], 1.0, 0.2);
-                source.push(&at("self_attn.k_norm"), &[head_dim], 1.0, 0.2);
+            if self.config["layer_types"][layer] == "linear_attention" {
+                self.linear(&mut source, layer, form);
+            } else {
+                let kv = kv_heads * head_dim;
+                for (name, shape) in [
+                    ("self_attn.q_proj", [query_rows, hidden]),
+                    ("self_attn.k_proj", [kv, hidden]),
+                    ("self_attn.v_proj", [kv, hidden]),
+                    ("self_attn.o_proj", [hidden, heads * head_dim]),
+                ] {
+                    form.push(&mut source, &at(name), shape);
+                }
+                if self.gated {
+                    source.push(&at("self_attn.q_norm"), &[head_dim], 1.0, 0.2);
+                    source.push(&at("self_attn.k_norm"), &[head_dim], 1.0, 0.2);
+                }
             }
             let first_dense = self.config["first_k_dense_replace"].as_u64().unwrap_or(0) as usize;
             if self.config.get("num_experts").is_none() || layer < first_dense {
@@ -222,6 +226,39 @@ impl Fixture {
             }
         }
         source
+    }
+
+    /// A Gated DeltaNet layer's tensors: the fused q/k/v, output gate and out projections in the
+    /// layer's form, the beta and decay projections BF16, the conv as `[width][1][taps]`, decay
+    /// rates that keep a head's state within a few steps' memory, and the gated norm.
+    fn linear(&self, source: &mut Memory, layer: usize, form: Form) {
+        let hidden = self.value("hidden_size");
+        let (key_heads, heads) = (
+            self.value("linear_num_key_heads"),
+            self.value("linear_num_value_heads"),
+        );
+        let (key_dim, value_dim) = (
+            self.value("linear_key_head_dim"),
+            self.value("linear_value_head_dim"),
+        );
+        let taps = self.value("linear_conv_kernel_dim");
+        let (key_width, value_width) = (key_heads * key_dim, heads * value_dim);
+        let conv_width = 2 * key_width + value_width;
+        let at = |name: &str| format!("model.layers.{layer}.linear_attn.{name}");
+        for (name, shape) in [
+            ("in_proj_qkv.weight", [conv_width, hidden]),
+            ("in_proj_z.weight", [value_width, hidden]),
+            ("out_proj.weight", [hidden, value_width]),
+        ] {
+            form.push(source, &at(name), shape);
+        }
+        let weight = (hidden as f32).sqrt().recip();
+        source.push(&at("in_proj_b.weight"), &[heads, hidden], 0.0, weight);
+        source.push(&at("in_proj_a.weight"), &[heads, hidden], 0.0, weight);
+        source.push(&at("conv1d.weight"), &[conv_width, 1, taps], 0.0, 0.5);
+        source.push(&at("A_log"), &[heads], -0.5, 0.5);
+        source.push(&at("dt_bias"), &[heads], 0.0, 0.5);
+        source.push(&at("norm.weight"), &[value_dim], 1.0, 0.2);
     }
 }
 
@@ -451,6 +488,76 @@ fn fp8_routed() -> Fixture {
     fixture
 }
 
+/// A hybrid family no pack names: Gated DeltaNet layers (two key heads, four value heads of 128,
+/// a SiLU gate, four taps) between gated normed attention layers, the first two chunks apart.
+fn hybrid() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_hybrid",
+            "architectures": ["AcmeHybridForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "linear_attention", "full_attention", "linear_attention", "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "silu",
+            "attn_output_gate": true,
+            "tie_word_embeddings": false
+        }),
+        gated: true,
+        tied: false,
+        fp8: false,
+    }
+}
+
+/// [hybrid]'s family at the other end of the scan's pairs: 64-wide heads (four key heads, eight
+/// value heads), a sigmoid gate, three taps, three of eight routed experts with a gated shared
+/// expert, and block-scaled FP8 projections.
+fn hybrid_fp8_routed() -> Fixture {
+    let mut fixture = hybrid();
+    let config = &mut fixture.config;
+    config["model_type"] = json!("acme_hybrid_moe_fp8");
+    config["architectures"] = json!(["AcmeHybridMoeFp8ForCausalLM"]);
+    for (key, value) in [
+        ("linear_num_key_heads", 4),
+        ("linear_num_value_heads", 8),
+        ("linear_key_head_dim", 64),
+        ("linear_value_head_dim", 64),
+        ("linear_conv_kernel_dim", 3),
+        ("moe_intermediate_size", 128),
+        ("shared_expert_intermediate_size", 256),
+        ("num_experts", 8),
+        // Two picks put a prompt row's last-layer router at a near tie (the whole row takes
+        // another expert there, every layer before it within the tolerance); three do not.
+        ("num_experts_per_tok", 3),
+    ] {
+        config[key] = json!(value);
+    }
+    config["output_gate_type"] = json!("sigmoid");
+    config["norm_topk_prob"] = json!(true);
+    config["quantization_config"] = json!({
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128]
+    });
+    fixture.fp8 = true;
+    fixture
+}
+
 fn argmax(values: &[f32]) -> u32 {
     let mut best = 0;
     for (index, value) in values.iter().enumerate() {
@@ -637,6 +744,29 @@ fn block_scaled_fp8_experts_match_the_host_reference_layer_by_layer() {
 }
 
 #[test]
+fn gated_deltanet_layers_match_the_host_reference_layer_by_layer() {
+    // Two chunks: the second's conv reads the first's history, its scan the first's state.
+    assert_passed(parity(&hybrid(), 300, 3));
+}
+
+#[test]
+fn gated_deltanet_decode_rows_match_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&hybrid(), 6, 2));
+}
+
+#[test]
+fn narrow_sigmoid_gated_deltanet_layers_with_fp8_experts_match_the_host_reference() {
+    assert_passed(parity(&hybrid_fp8_routed(), 300, 3));
+}
+
+#[test]
+fn fused_gated_deltanet_lanes_answer_every_step_as_each_conversation_alone() {
+    // A row's conv and scan read only its own sequence's state, and the prep and the gated norm
+    // are row-wise, so a lane's recurrence is its own at any batch.
+    lanes_answer_as_alone(&hybrid());
+}
+
+#[test]
 fn fused_fp8_lanes_answer_every_step_as_each_conversation_alone() {
     // A decode row's E4M3 sums are its own at any batch: the tiled GEMV splits by the matrix.
     lanes_answer_as_alone(&fp8_routed());
@@ -729,7 +859,19 @@ fn lanes_answer_as_alone(fixture: &Fixture) {
 
 #[test]
 fn a_kept_lane_continues_its_conversation_and_goes_back_to_its_prompt() {
-    let Some((_, _, _, mut backend)) = open(&plain(), "kept lane") else {
+    kept_lane(&plain());
+}
+
+#[test]
+fn a_kept_gated_deltanet_lane_continues_and_goes_back_to_its_prompts_state() {
+    // The recurrent state past the prompt is not the prompt's: the rewind copies it back.
+    kept_lane(&hybrid());
+}
+
+/// A kept lane continues its conversation as a cold prompt would, and a prompt that parts from
+/// the reply goes back to the end of the last prompt, again as a cold prompt would.
+fn kept_lane(fixture: &Fixture) {
+    let Some((_, _, _, mut backend)) = open(fixture, "kept lane") else {
         return;
     };
     backend.enable_fusion(1).expect("the fused engine starts");
@@ -747,18 +889,21 @@ fn a_kept_lane_continues_its_conversation_and_goes_back_to_its_prompt() {
         held.len(),
         "the turn continues the lane"
     );
-    let mut cold = backend.session().expect("a cold session");
-    let expected = cold.forward(&next).expect("the cold prompt");
-    let worst = expected
-        .iter()
-        .zip(&continued.logits)
-        .map(|(cold, continued)| (cold - continued).abs())
-        .fold(0.0f32, f32::max);
-    eprintln!("a continued turn's logits against cold: largest difference {worst:e}");
-    assert!(
-        worst <= 4.0 * TOLERANCE.absolute,
-        "a continued turn's logits are {worst} from cold"
-    );
+    let against_cold = |tokens: &[u32], logits: &[f32], what: &str| {
+        let mut cold = backend.session().expect("a cold session");
+        let expected = cold.forward(tokens).expect("the cold prompt");
+        let worst = expected
+            .iter()
+            .zip(logits)
+            .map(|(cold, warm)| (cold - warm).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("{what}'s logits against cold: largest difference {worst:e}");
+        assert!(
+            worst <= 4.0 * TOLERANCE.absolute,
+            "{what}'s logits are {worst} from cold"
+        );
+    };
+    against_cold(&next, &continued.logits, "a continued turn");
     // Two steps past that turn, a prompt that parts from their reply goes back to the end of
     // the last prompt.
     let token = continued.next_token.expect("the arm picks every token");
@@ -768,7 +913,7 @@ fn a_kept_lane_continues_its_conversation_and_goes_back_to_its_prompt() {
         .expect("a decode step");
     let mut parted = next.clone();
     parted.push(if token == 77 { 78 } else { 77 });
-    session
+    let rewound = session
         .prefill(&parted)
         .expect("a turn from the prompt's end");
     assert_eq!(
@@ -776,4 +921,5 @@ fn a_kept_lane_continues_its_conversation_and_goes_back_to_its_prompt() {
         next.len(),
         "the turn goes back to the end of the last prompt"
     );
+    against_cold(&parted, &rewound.logits, "a turn from the rewind point");
 }

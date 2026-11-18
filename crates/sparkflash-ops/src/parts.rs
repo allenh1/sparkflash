@@ -1774,6 +1774,20 @@ pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
     "q4e_rmsnorm",
     "q4e_rope",
     "q4e_swiglu",
+    "q4e_zero",
+];
+
+/// The scan-image kernels the shared dense arm's Gated DeltaNet layers launch
+/// ([crate::gdn]): the conv and its history, the prep, the gated norm, and the scan at each head
+/// pair [crate::scan::ScanPlan] may resolve.
+pub const DENSE_GDN_SYMBOLS: &[&str] = &[
+    "q4p_gdn_conv",
+    "q4p_gdn_conv_state",
+    "q4p_gdn_gate",
+    "q4p_gdn_prep",
+    "q4p_gdn_scan",
+    "q4p_gdn_scan_128_256",
+    "q4p_gdn_scan_64_64",
 ];
 
 /// The prefill-image kernel the shared dense arm's block-scaled FP8 prompt projections launch
@@ -1820,6 +1834,7 @@ pub fn dense_device_images() -> Result<(), String> {
         (Image::Dory, &[DENSE_WIDE_SYMBOL][..]),
         (Image::Qwen4Prefill, &[DENSE_FP8_TILE_SYMBOL][..]),
         (Image::Qwen4Moe, DENSE_MOE_SYMBOLS),
+        (Image::Qwen4Scan, DENSE_GDN_SYMBOLS),
         (Image::MoePlan, &["moe_plan"][..]),
     ] {
         if !image.available() {
@@ -1846,14 +1861,16 @@ pub fn dense_device_images() -> Result<(), String> {
 ///
 /// The arm runs the host reference's arithmetic on the token image: a BF16 embedding, RMSNorm,
 /// grouped-query attention (with or without the per-head output gate and q/k norms, plain
-/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU or routed experts (a
+/// rotate-half RoPE over the leading rotated dimensions) or a Gated DeltaNet (the scan image's
+/// chunk kernels, every linear layer of one geometry), a dense SwiGLU or routed experts (a
 /// softmax, sigmoid or sqrt-softplus score, the top-k with or without renormalising, a routed
 /// scale, a shared expert with or without its sigmoid gate), a plain residual and the head, on
 /// one rank. Its projections and experts are BF16 or E4M3 under one inverse scale a 128 x 128
-/// tile, over widths of whole tiles; the embedding, the head and the norms are BF16. It is gated by a per-layer parity report against that reference, so it
-/// takes nothing the reference does not execute, and nothing the reference does that its kernels
-/// do not (a linear rotary rule, another activation, a clamp). Everything else is refused by
-/// name, and the host reference stays that checkpoint's executor.
+/// tile, over widths of whole tiles; the embedding, the head and the norms are BF16. It is gated
+/// by a per-layer parity report against that reference, so it takes nothing the reference does
+/// not execute, and nothing the reference does that its kernels do not (a linear rotary rule,
+/// another activation, a clamp). Everything else is refused by name, and the host reference stays
+/// that checkpoint's executor.
 #[must_use]
 pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
     use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, Residual};
@@ -1891,13 +1908,39 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
             "it declares {what}, which the arm does not execute"
         ));
     }
+    // Every linear-attention layer takes the one scan kernel the arm loads for the first.
+    let first_gdn = architecture
+        .layers
+        .iter()
+        .find_map(|layer| match &layer.attention.kind {
+            AttentionKind::Gdn(gdn) => Some((layer.index, gdn)),
+            _ => None,
+        });
     for layer in &architecture.layers {
         let index = layer.index;
         let attention = &layer.attention;
-        let AttentionKind::Gqa { kv_heads, .. } = attention.kind else {
-            return Some(format!(
-                "layer {index} is not grouped-query attention, the only attention the arm runs"
-            ));
+        let kv_heads = match &attention.kind {
+            AttentionKind::Gqa { kv_heads, .. } => Some(*kv_heads),
+            AttentionKind::Gdn(gdn) => {
+                if let Some((first, geometry)) = first_gdn
+                    && geometry != gdn
+                {
+                    return Some(format!(
+                        "layer {index}'s Gated DeltaNet is not layer {first}'s, and the arm runs \
+                         every linear-attention layer on one scan"
+                    ));
+                }
+                if let Some(refusal) = dense_gdn_refusal(gdn) {
+                    return Some(format!("layer {index}'s Gated DeltaNet: {refusal}"));
+                }
+                None
+            }
+            _ => {
+                return Some(format!(
+                    "layer {index} is neither grouped-query attention nor a Gated DeltaNet, the \
+                     attentions the arm runs"
+                ));
+            }
         };
         let declared = [
             (attention.window.is_some(), "a sliding window"),
@@ -1915,36 +1958,16 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
                 "layer {index} declares {what}, which the arm does not execute"
             ));
         }
-        if attention.heads == 0
-            || kv_heads == 0
-            || !attention.heads.is_multiple_of(kv_heads)
-            || attention.head_dim == 0
-            || attention.head_dim > DENSE_MAX_HEAD_DIM
+        if let Some(kv_heads) = kv_heads
+            && let Some(refusal) = dense_gqa_refusal(attention, kv_heads)
         {
-            return Some(format!(
-                "layer {index}'s attention ({} heads over {kv_heads} key/value heads of {}) is \
-                 not one the split attention takes (whole groups, heads of 1..={DENSE_MAX_HEAD_DIM})",
-                attention.heads, attention.head_dim
-            ));
+            return Some(format!("layer {index}{refusal}"));
         }
-        let rope = &attention.rope;
-        if !rope.rotated_dims.min(attention.head_dim).is_multiple_of(2) {
-            return Some(format!(
-                "layer {index} rotates {} dimensions a head, which is not even",
-                rope.rotated_dims
-            ));
-        }
-        if rope.rotated_dims >= 2
-            && let Some(scaling) = &rope.scaling
-            && !matches!(scaling.kind.to_ascii_lowercase().as_str(), "" | "default")
-        {
-            return Some(format!(
-                "layer {index} declares rope.scaling {:?} (factor {}); the arm's rotary is the \
-                 plain rule",
-                scaling.kind, scaling.factor
-            ));
-        }
-        let query_width = attention.heads * attention.head_dim;
+        // The output projection's columns: the attended heads, or the linear attention's values.
+        let query_width = match &attention.kind {
+            AttentionKind::Gdn(gdn) => gdn.value_heads * gdn.value_dim,
+            _ => attention.heads * attention.head_dim,
+        };
         let ffn_width = match &layer.ffn {
             Ffn::Dense(dense) => dense.intermediate,
             Ffn::Moe(moe) if moe.shared_experts > 0 => moe.shared_intermediate,
@@ -1977,6 +2000,81 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
                 }
             }
         }
+    }
+    None
+}
+
+/// Why the shared dense arm's split attention and rotary cannot execute a grouped-query layer's
+/// `attention` over `kv_heads`, if they cannot: the reason as it follows "layer N".
+fn dense_gqa_refusal(
+    attention: &sparkflash_model::architecture::Attention,
+    kv_heads: usize,
+) -> Option<String> {
+    if attention.heads == 0
+        || kv_heads == 0
+        || !attention.heads.is_multiple_of(kv_heads)
+        || attention.head_dim == 0
+        || attention.head_dim > DENSE_MAX_HEAD_DIM
+    {
+        return Some(format!(
+            "'s attention ({} heads over {kv_heads} key/value heads of {}) is not one the split \
+             attention takes (whole groups, heads of 1..={DENSE_MAX_HEAD_DIM})",
+            attention.heads, attention.head_dim
+        ));
+    }
+    let rope = &attention.rope;
+    if !rope.rotated_dims.min(attention.head_dim).is_multiple_of(2) {
+        return Some(format!(
+            " rotates {} dimensions a head, which is not even",
+            rope.rotated_dims
+        ));
+    }
+    if rope.rotated_dims >= 2
+        && let Some(scaling) = &rope.scaling
+        && !matches!(scaling.kind.to_ascii_lowercase().as_str(), "" | "default")
+    {
+        return Some(format!(
+            " declares rope.scaling {:?} (factor {}); the arm's rotary is the plain rule",
+            scaling.kind, scaling.factor
+        ));
+    }
+    None
+}
+
+/// Why the scan image's chunk kernels cannot execute `gdn`, if they cannot: a head pair the scan
+/// is not compiled for ([SCAN_HEAD_PAIRS]), a conv window past its history, key heads that do not
+/// divide the value heads, or an output gate other than SiLU or sigmoid.
+fn dense_gdn_refusal(gdn: &sparkflash_model::architecture::Gdn) -> Option<String> {
+    use sparkflash_model::architecture::Activation;
+    let heads = (gdn.key_dim, gdn.value_dim);
+    if !SCAN_HEAD_PAIRS.contains(&heads) {
+        return Some(format!(
+            "its (key, value) heads {heads:?} are not a pair the scan is compiled for \
+             {SCAN_HEAD_PAIRS:?}"
+        ));
+    }
+    let most = crate::gdn::CONV_HISTORY + 1;
+    if !(2..=most).contains(&gdn.conv_kernel) {
+        return Some(format!(
+            "its conv takes {} taps, and the scan carries 2..={most}",
+            gdn.conv_kernel
+        ));
+    }
+    if gdn.key_heads == 0
+        || gdn.value_heads == 0
+        || !gdn.value_heads.is_multiple_of(gdn.key_heads)
+        || gdn.value_heads / gdn.key_heads > gdn.key_dim
+    {
+        return Some(format!(
+            "its {} key heads do not divide its {} value heads into groups of at most {}",
+            gdn.key_heads, gdn.value_heads, gdn.key_dim
+        ));
+    }
+    if !matches!(gdn.output_gate, Activation::Silu | Activation::Sigmoid) {
+        return Some(format!(
+            "its output gate is {:?}, and the gated norm takes SiLU or sigmoid",
+            gdn.output_gate
+        ));
     }
     None
 }
@@ -2859,6 +2957,86 @@ mod tests {
                         serde_json::json!({"quant_method": "fp8", "weight_block_size": [64, 64]});
                 },
                 "BF16 or 128 x 128 block-scaled FP8",
+            ),
+        ] {
+            let architecture = parse(edit);
+            let refusal = dense_device_refusal(&architecture)
+                .or_else(|| host_reference_structure_refusal(&architecture))
+                .expect("the shape is refused");
+            assert!(refusal.contains(named), "{named}: {refusal}");
+        }
+    }
+
+    /// A hybrid family's Gated DeltaNet layers are the shared dense arm's at every head pair the
+    /// scan is compiled for, and what its chunk kernels do not execute is refused by name.
+    #[test]
+    fn gated_deltanet_layers_are_the_shared_dense_arms_and_the_rest_is_named() {
+        let document = serde_json::json!({
+            "model_type": "acme_hybrid",
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "linear_attention", "full_attention", "linear_attention", "full_attention"
+            ],
+            "linear_conv_kernel_dim": 4,
+            "linear_num_key_heads": 2,
+            "linear_num_value_heads": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu"
+        });
+        let parse = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut document = document.clone();
+            edit(&mut document);
+            Architecture::from_json(&document.to_string()).expect("the document parses")
+        };
+        let hybrid = parse(&|_| {});
+        assert!(matches!(
+            hybrid.layers[0].attention.kind,
+            sparkflash_model::architecture::AttentionKind::Gdn(_)
+        ));
+        assert_eq!(dense_device_refusal(&hybrid), None);
+        for (key, dim) in [(64, 64), (128, 256)] {
+            let pair = parse(&|document| {
+                document["linear_key_head_dim"] = serde_json::json!(key);
+                document["linear_value_head_dim"] = serde_json::json!(dim);
+                document["output_gate_type"] = serde_json::json!("sigmoid");
+            });
+            assert_eq!(dense_device_refusal(&pair), None, "({key}, {dim})");
+        }
+        let tiled = parse(&|document| document["quantization_config"] = fp8());
+        assert_eq!(dense_device_refusal(&tiled), None, "FP8 projections");
+        for (edit, named) in [
+            (
+                &(|document: &mut serde_json::Value| {
+                    document["linear_value_head_dim"] = serde_json::json!(96);
+                }) as &dyn Fn(&mut serde_json::Value),
+                "a pair the scan is compiled for",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["linear_conv_kernel_dim"] = serde_json::json!(10);
+                },
+                "2..=9",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["linear_num_value_heads"] = serde_json::json!(3);
+                },
+                "do not divide",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["output_gate_type"] = serde_json::json!("gelu");
+                },
+                "SiLU or sigmoid",
             ),
         ] {
             let architecture = parse(edit);
