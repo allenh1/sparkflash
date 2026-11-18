@@ -148,10 +148,11 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-1. **Fewer kernels a visit, or one graph.** The body now reads its 12.1 GB at ~600 GB/s while the
-   single big head GEMV reads its 2 GB at ~870 GB/s; the gap is the ten dependent launches a visit,
-   not bandwidth. Fusing q/k/v, z/b/a and gate/up into batched tiled GEMVs, or capturing the 56
-   visits as a CUDA graph with the position as the only updated argument, is the next ~25%.
+1. **One graph for the 56 visits.** The body reads its 12.1 GB at ~600 GB/s while the single big
+   head GEMV reads its 2 GB at ~870 GB/s; the gap is the ten dependent launches a visit, not
+   bandwidth. Concatenating q/k/v, qkv/z and gate/up into single tiled GEMVs is worth ~5% by
+   itself; capturing the visits as a CUDA graph with the position as the only updated argument is
+   where the rest is.
 2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
    `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
    chunked GDN scan, both of which the shared images already carry. This is the largest single
