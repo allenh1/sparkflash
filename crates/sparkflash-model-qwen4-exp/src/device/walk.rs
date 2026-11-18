@@ -24,6 +24,11 @@
 //! prompt's chunk boundaries and therefore its bits do not move. The token pass keeps the
 //! arm's speculative decode: a sequence whose last verify already holds the token answers from
 //! it, and one that does not batches its token and drafts through the same kernels as before.
+//!
+//! The walk is kept for when the shared runtime can drive a drafting arm; Qwen serves on its own
+//! fused arm ([super::fusion::QwenFusion]) until then, so much of this module is not constructed
+//! on the serving path yet.
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -31,28 +36,15 @@ use std::sync::{Arc, Mutex};
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
-    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Runtime, Segment,
-    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
+    Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout,
+    Walk, WalkCapabilities,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
 use super::{DENSE_ROWS, DeviceSequence, SequenceShared};
-
-/// A shared round's cost at TP=1 on a GB10-class node, from the block drafter's own step cost
-/// (the old Qwen fused arm's measurement): about 10 new experts a row at 0.8 ms each, the rest of
-/// a step fixed, and a few milliseconds a member past the first for its own attention,
-/// recurrence and draft. The expert counts are the checkpoint's, set in [QwenWalk::new].
-const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
-    fixed_ms: 50.4,
-    expert_ms: 0.81,
-    row_ms: 0.5,
-    seq_ms: 6.0,
-    experts: 0,
-    top_k: 0,
-};
 
 /// The Qwen arm, exposed to the shared runtime as a [Walk].
 pub(super) struct QwenWalk {
@@ -66,8 +58,6 @@ pub(super) struct QwenWalk {
     members: usize,
     /// The steps a token or verify pass already resolved, in segment order, for the head.
     pending: Mutex<VecDeque<StepOutput>>,
-    /// What a shared round of this arm costs, for the row share.
-    wall: ExpertUnionWall,
 }
 
 impl QwenWalk {
@@ -80,11 +70,6 @@ impl QwenWalk {
     ) -> Result<Self, BackendError> {
         let layout = layout_of(&shared.config);
         let limits = Limits::new(pass_rows(shared.prefill.chunk), context_limit);
-        let wall = ExpertUnionWall {
-            experts: shared.config.num_experts,
-            top_k: shared.config.num_experts_per_tok,
-            ..JOINT_WALL
-        };
         Ok(Self {
             shared,
             layout,
@@ -92,7 +77,6 @@ impl QwenWalk {
             batch: Mutex::new(None),
             members: capacity.clamp(1, MAX_BATCH),
             pending: Mutex::new(VecDeque::new()),
-            wall,
         })
     }
 
@@ -385,53 +369,6 @@ impl Walk for QwenWalk {
     /// prefill chunk.
     fn max_segments(&self) -> usize {
         self.members
-    }
-
-    /// Opens a member's round: the step its last verify holds, or the chain it drafts next.
-    fn open_round(&self, seq: &mut DeviceSequence, token: u32) -> Result<Opened, BackendError> {
-        seq.backend
-            .cuda
-            .make_current()
-            .map_err(|error| BackendError::new("qwen4_device", error))?;
-        if let Some(step) = seq.feed(token)? {
-            return Ok(Opened::Held(step));
-        }
-        let mut chain = seq.spec.chain(&seq.spec_confidence, seq.spec_drafts.len());
-        chain.truncate(seq.spec_drafts.len());
-        Ok(Opened::Round(chain))
-    }
-
-    /// One batch of every member's anchor and the first depth drafts it opened: the batch's
-    /// verify folds each member's rows back into its step and its next chain.
-    fn verify_round(
-        &self,
-        round: &mut [(&mut DeviceSequence, u32, usize)],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut drafts = Vec::with_capacity(round.len());
-        let mut confidence = Vec::with_capacity(round.len());
-        let mut tokens = Vec::with_capacity(round.len());
-        for (seq, token, depth) in round.iter_mut() {
-            let mut draft = std::mem::take(&mut seq.spec_drafts);
-            draft.truncate(*depth);
-            let mut sure = std::mem::take(&mut seq.spec_confidence);
-            sure.truncate(*depth);
-            drafts.push(draft);
-            confidence.push(sure);
-            tokens.push(*token);
-        }
-        let mut members: Vec<&mut DeviceSequence> = Vec::with_capacity(round.len());
-        for (seq, _, _) in round.iter_mut() {
-            members.push(&mut **seq);
-        }
-        self.batch(&mut members, &drafts, &confidence, &tokens)
-    }
-
-    fn round_wall(&self) -> &dyn StepWall {
-        &self.wall
-    }
-
-    fn round_budget(&self, seqs: usize) -> usize {
-        seqs * self.shared.verify_rows.saturating_sub(1)
     }
 
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
