@@ -28,10 +28,12 @@
 use std::sync::{Arc, Mutex};
 
 use sparkflash_model::backend::{BackendError, StepOutput};
+use sparkflash_model::ledger::State;
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
-    Absent, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision, Pass, PassKind,
-    Region, Segment, StateKind, StateLayout, Walk, WalkCapabilities,
+    Absent, ComputeDeclaration, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits,
+    NoVision, Pass, PassKind, PassMask, Region, Segment, Segments, StateKind, StateLayout, Walk,
+    WalkCapabilities,
 };
 
 use super::{
@@ -185,7 +187,19 @@ impl Walk for DenseWalk {
     type Drafter = Absent<&'static str>;
     type Vision = NoVision;
 
-    const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Both);
+    const CAPABILITIES: WalkCapabilities = WalkCapabilities {
+        passes: PassMask::ALL,
+        segments: Segments::Many,
+        state: StateKind::Both,
+        // The arm's own four rows, word for word the declaration in
+        // `sparkflash_model::ARM_LEDGERS`; a test below holds them equal.
+        compute: ComputeDeclaration {
+            prompt: State::Native("prompt projections on the shared wide tile"),
+            token: State::Off("row GEMV; decode.tensor_cores=true is refused"),
+            stored: State::Native("BF16, FP8 E4M3 and NVFP4 parts run in their stored formats"),
+            rewind: State::Native("a prompt that goes back to the last prompt's end"),
+        },
+    };
 
     fn layout(&self) -> &StateLayout {
         &self.layout
@@ -330,6 +344,29 @@ mod tests {
         ]);
         assert_eq!(both.kind(), StateKind::Both);
         assert!(both.needs_checkpoint());
+    }
+
+    /// The adapter's four declared rows are the arm's static declaration, so the two cannot
+    /// drift while phase 1 moves the arm onto the runtime.
+    #[test]
+    fn the_declared_compute_rows_are_the_arm_ledger_rows() {
+        use sparkflash_model::ledger::{Strategy, ledger_for_arm};
+        let declared = ledger_for_arm("dense").expect("dense's declaration");
+        let capabilities = <super::DenseWalk as Walk>::CAPABILITIES.compute;
+        for (strategy, stated) in [
+            (Strategy::TensorCorePrompt, capabilities.prompt),
+            (Strategy::TensorCoreDecode, capabilities.token),
+            (Strategy::StoredArithmetic, capabilities.stored),
+            (Strategy::Rewind, capabilities.rewind),
+        ] {
+            let from_table = declared
+                .rows
+                .iter()
+                .find(|(row, _)| *row == strategy)
+                .map(|(_, state)| *state)
+                .expect("the arm states every strategy");
+            assert_eq!(stated, from_table, "{} drifted", strategy.name());
+        }
     }
 
     sparkflash_runtime::conformance!(super::DenseWalk);

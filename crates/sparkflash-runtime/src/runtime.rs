@@ -332,6 +332,12 @@ fn runtime_ledger<W: Walk>(chunk: Option<usize>) -> Ledger {
         Strategy::Group,
         Mode::native("mirrored for any tensor-parallel group"),
     );
+    // The four rows the arm's own kernels decide. The runtime cannot see inside a walk, so the
+    // arm declares them on `WalkCapabilities`; a row left out is refused at boot.
+    ledger.set(Strategy::TensorCorePrompt, caps.compute.prompt.into());
+    ledger.set(Strategy::TensorCoreDecode, caps.compute.token.into());
+    ledger.set(Strategy::StoredArithmetic, caps.compute.stored.into());
+    ledger.set(Strategy::Rewind, caps.compute.rewind.into());
     ledger
 }
 

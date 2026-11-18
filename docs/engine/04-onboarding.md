@@ -1,7 +1,12 @@
 # 04 — Onboarding a model: the common patterns by construction
 
-This page is a plan. Nothing in it is built. It reads the tree at `101ccb9`. The decisions taken
+This page is a plan. Nothing in it is built. It reads the tree at `1e3cb3a9`. The decisions taken
 on 2026-11-18 are folded in and listed under [Decisions](#decisions).
+
+[04-onboarding-review.md](04-onboarding-review.md) reviews it and
+[04-onboarding-audit.md](04-onboarding-audit.md) measures it. Where a *(survey)* count below was
+re-measured, the measured value and the audit's citation are given; the phase-0 implementation is
+on `runtime-shared-plans`.
 
 [03-runtime.md](03-runtime.md) wrote each serving strategy once. This page is about the step after
 that: a new model must not be able to leave a strategy out, and nobody should have to ask for one.
@@ -41,12 +46,20 @@ the other rows.
 
 ## What onboarding costs today
 
-* A GLM-style family touches about 52 existing files and creates about 32 *(survey)*.
-* Only 9 `match` sites in 3 files stop compiling when one is forgotten *(survey)*. The other
-  registration sites fail silently or not at all.
-* There are 8 serving entry paths *(survey)*: DeepSeek's own, the pack host and group, dynamic ids
-  of pack families, two for Inkling, two for Dory, and the dynamic dense or CPU path.
-* `docs/adding-a-model.md` §6 is a 15-item checklist kept by hand.
+* A GLM-style family touches about 55 existing files (42 in the six-commit landing window) and
+  creates exactly 32. Only the second number reproduces from git; the first is the union of the
+  15 GLM-titled commits and includes 9 docs and `Cargo.lock` *(audit)*.
+* Only 8 `match` sites in 3 files stop compiling when one is forgotten: four in `pack.rs`, one in
+  `dynamic.rs`, three in `images.rs`. `Pack::is_arm` is a `!matches!` and does not. Another nine
+  wildcard matches (`profile_toml_for_family`, `from_descriptor`, `device_family`, the dynamic
+  family dispatch, `default_convert_world`, `shape_for`, the web's `fit`/`hf`) fail silently
+  *(audit)*.
+* There are 9 server-construction sites, or 8 categories if the pack host and group count as one:
+  DeepSeek's own, the pack host, the pack group, dynamic ids of pack families, two for Inkling,
+  two for Dory, and the dynamic dense or CPU path *(audit)*. Mechanism 5 derives the registry,
+  console, conversion, scripts, tests and CI from `ARMS`; it does not derive the serving
+  dispatch, so a new family still edits these sites.
+* `docs/adding-a-model.md` §6 is a 15-item checklist kept by hand (15 `- [ ]` lines, :386-410).
 * Each arm carries its own run loop:
 
 | Crate | Source lines |
@@ -118,7 +131,7 @@ Every arm also picks its own chunk size: Inkling 4096, 8192 or 65,535; GLM 4096;
 * The resolved plan is validated at boot and then dropped. Arms launch their own kernels by name.
 
 The arm a new family lands on is the dense arm, and it is the furthest behind. Its decode step
-passes no tile policy (`lib.rs:2785`), copies the full logits to the host every step (`:2749`),
+passes no tile policy (`lib.rs:2799`), copies the full logits to the host every step (`:2778`),
 and states no drafter (`:3043`).
 
 ### D. Format is a run-time value
@@ -157,9 +170,10 @@ The checks every arm should have exist once, in one arm: Qwen's `batch_exactness
 a scheduler no other model runs.
 
 * `sparkflash-deepseek-forward` does not depend on `sparkflash-ops` (its `Cargo.toml`). It has no
-  catalogue, no `Call<N>` and no shared dispatch; it resolves kernels by string *(survey: 19
-  `load_named` sites, about 205 distinct symbols, about 105 of them in the catalogue)*. The three
-  `opt_gemv_mma_*` tensor-core decode bodies are not in the catalogue.
+  catalogue, no `Call<N>` and no shared dispatch; it resolves kernels by string: 19 `load_named`
+  sites, 219 distinct symbols in its image, 127 of them named anywhere in the crate, 76 in the
+  catalogue, 143 exported but uncatalogued *(audit)*. The three `opt_gemv_mma_*` tensor-core
+  decode bodies are not in the catalogue.
 * Its scheduler (`Batch::tick`, `tp4_forward/batch.rs:886`) has strategies the shared engine
   lacks *(survey)*:
   * the prompt chunks of several requests in one tick (`prefill_together`, `:2035`); the shared
@@ -171,8 +185,9 @@ a scheduler no other model runs.
   `GroupLanes` broadcasts each decision.
 * Its serving path in the CLI is 14,545 lines of its own (`device_chain.rs`, `tp4_host.rs`,
   `tp4_chain.rs`, `tp4_device_runner.rs`, `serve/device.rs`). That is why the CLI is over its cap.
-* Of the forward crate's 66,757 lines, about half is layer arithmetic and kernel launches, about
-  4,500 is scheduling, and 11,154 is tests *(survey)*. The scheduler is the small part.
+* Of the forward crate's 66,757 source lines, 57-62% is layer arithmetic and kernel launches,
+  5,703-6,321 is scheduling (`batch.rs`, `spec.rs`, `lanes.rs`), and 7,713 lines with 371 tests
+  are inline — there is no `tests/` directory *(audit)*. The scheduler is the small part.
 
 Three of DeepSeek's behaviours would fail the generated checks of mechanism 6 today. Each is
 already written down:
@@ -181,12 +196,13 @@ already written down:
 * those bits move with the chunk boundary for an idle prompt over about 2.6K tokens
   (`docs/optimization-strategy.md:497`);
 * a request resumed from a reused lane can give different greedy text than the same request
-  prefilled whole (`docs/NUMERICS.md:281`).
+  prefilled whole (`docs/NUMERICS.md:284`).
 
 Two statements in the docs are stale and get fixed in phase 0. `03-runtime.md:266` says DeepSeek
 keeps its own `tp4_reduce::DeviceExchange`; that type's only users are the pack paths
 (`serve.rs:4658`, `glm_tp4.rs:394`), and DeepSeek already opens the shared RDMA exchange.
-`design.md:117` says eight sequences share a speculative step; the code allows 32.
+`design.md:118-119` says eight sequences share a speculative step; the code allows 32
+  (`R_MAX = 64`, `2 * many.len() <= R_MAX`, `batch.rs:2214`).
 
 ## The design
 

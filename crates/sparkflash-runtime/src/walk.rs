@@ -30,6 +30,7 @@
 //! engine that needs the bounds asks for them at its own implementation.
 
 use sparkflash_model::backend::{BackendError, StepOutput};
+use sparkflash_model::ledger::State;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::pool::LaneMemory;
@@ -327,16 +328,80 @@ pub struct WalkCapabilities {
     pub segments: Segments,
     /// The broad shape of the arm's state, for the ledger's reuse and rewind rows.
     pub state: StateKind,
+    /// What the arm declares about the strategies the runtime does not decide itself: the
+    /// tensor-core bodies, the stored-format arithmetic and the rewind. The runtime owns the
+    /// lanes, the prompt parts and the group, and derives those rows from the fields above.
+    pub compute: ComputeDeclaration,
+}
+
+/// What an arm declares about the four strategies its own kernels decide.
+///
+/// Each field is a [`State`], so the declaration is static and readable with no device. A row
+/// left out is refused at boot by [`crate::Ledger::require_complete`], which is why the fields
+/// have no default constructor beyond the explicit [`ComputeDeclaration::none`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeDeclaration {
+    /// Every GEMM-class prompt part on the tensor-core tile ([crate::Strategy::TensorCorePrompt]).
+    pub prompt: State,
+    /// The one-to-eight row step on the tensor-core tile ([crate::Strategy::TensorCoreDecode]).
+    pub token: State,
+    /// Every stored format kept in its own arithmetic ([crate::Strategy::StoredArithmetic]).
+    pub stored: State,
+    /// A changed turn going back to the last prompt's end ([crate::Strategy::Rewind]).
+    pub rewind: State,
+}
+
+impl ComputeDeclaration {
+    /// All four strategies off, each with the reason the walk gives.
+    #[must_use]
+    pub const fn none(
+        prompt: &'static str,
+        token: &'static str,
+        stored: &'static str,
+        rewind: &'static str,
+    ) -> Self {
+        Self {
+            prompt: State::Off(prompt),
+            token: State::Off(token),
+            stored: State::Off(stored),
+            rewind: State::Off(rewind),
+        }
+    }
+
+    /// All four strategies native, with the details the arm states.
+    #[must_use]
+    pub const fn all_native(
+        prompt: &'static str,
+        token: &'static str,
+        stored: &'static str,
+        rewind: &'static str,
+    ) -> Self {
+        Self {
+            prompt: State::Native(prompt),
+            token: State::Native(token),
+            stored: State::Native(stored),
+            rewind: State::Native(rewind),
+        }
+    }
 }
 
 impl WalkCapabilities {
     /// Capabilities that accept every pass and many segments, with `state`.
+    ///
+    /// The compute rows are all native: a walk that declares every pass is the toy shape the
+    /// runtime's tests use. An arm states its own, because only it knows which bodies it has.
     #[must_use]
     pub const fn all(state: StateKind) -> Self {
         Self {
             passes: PassMask::ALL,
             segments: Segments::Many,
             state,
+            compute: ComputeDeclaration::all_native(
+                "every prompt part on the tensor-core tile",
+                "the token rows on the tensor-core tile",
+                "stored formats kept in their own arithmetic",
+                "rewind from the positional or recurrent region",
+            ),
         }
     }
 
