@@ -121,3 +121,65 @@ fn the_device_tracks_the_host_over_a_prompt_and_a_few_steps() {
         argmax(&device_logits)
     );
 }
+
+/// A prefill chunk must be the single-row steps it stands in for, now on the real checkpoint.
+///
+/// The host comparison cannot separate a chunk bug from a precision difference: both arms carry the
+/// same quantised weights and the same 8-bit cache, so a chunk that runs the projection at two rows
+/// instead of one is the only thing that can move the result by more than the arithmetic. This test
+/// therefore asks the device only about itself.
+#[test]
+#[ignore = "loads the 11 GB release; run with SENSENOVA_FP8_DIR=<dir> --ignored --test-threads=1"]
+fn the_device_chunk_matches_its_single_rows_on_the_release() {
+    use sparkflash_model::backend::ModelBackend;
+    let directory = PathBuf::from(std::env::var("SENSENOVA_FP8_DIR").expect("SENSENOVA_FP8_DIR"));
+    let descriptor = ModelDescriptor::sensenova_loop_9b();
+    let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open(&directory, descriptor, 4096)
+        .expect("device backend");
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| value.is_finite())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    };
+    for rows in [2usize, 3, 8] {
+        let tokens: Vec<u32> = (1..=rows as u32).collect();
+        let mut chunked = backend.open_session().expect("chunk session");
+        let together = chunked.prefill(&tokens).expect("chunk prefill").logits;
+        let mut single = backend.open_session().expect("single session");
+        let mut apart = single.prefill(&tokens[..1]).expect("first row").logits;
+        for token in &tokens[1..] {
+            apart = single.decode(*token).expect("single row").logits;
+        }
+        let worst = together
+            .iter()
+            .zip(&apart)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "rows {rows}: chunk argmax {} single argmax {}, worst chunk-vs-single delta {worst}",
+            argmax(&together),
+            argmax(&apart)
+        );
+        // The same comparison with the row count as the only variable: both arms walk the chunk
+        // kernels, so a gap here is the rows>1 path itself rather than a chunk-vs-decode difference.
+        let mut split = backend.open_session().expect("split session");
+        let mut pieces = split.prefill(&tokens[..1]).expect("first chunk").logits;
+        for token in &tokens[1..] {
+            pieces = split.prefill(&[*token]).expect("one-row chunk").logits;
+        }
+        let alone = together
+            .iter()
+            .zip(&pieces)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!(
+            "rows {rows}: chunk argmax {} one-row-chunk argmax {}, worst {alone}",
+            argmax(&together),
+            argmax(&pieces)
+        );
+    }
+}

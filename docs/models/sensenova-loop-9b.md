@@ -219,7 +219,10 @@ The prefill engine is the NVFP4 block-scaled MMA (`mma.sync.aligned.kind::mxf4nv
 m16n8k64 instruction a four SM cycles runs at ~890 TFLOPS peak on this part; measured prefill has
 climbed 240 tok/s (the eight-row GEMV) → 917 (E4M3 MMA) → 2,017 (NVFP4) → 2,987 (parallel scan) →
 3,982 (fused z/b/a, chunked conv) → 5,077 (register-state scan) → 5,640 (persistent GEMM) → 6,244
-tok/s on a 569-token prompt with 1,024-row chunks. A 512-row chunk's stage budget, taken with
+tok/s on a 569-token prompt with 1,024-row chunks. The E4M3 fallback (`SPARKFLASH_SENSENOVA_FP8=1`,
+the path the bisect below uses) is far slower — measured 1,230 tok/s on 834 prompt tokens and 1,063
+tok/s on 3,624 through `serve` — which is why the row-length history above is all NVFP4. A 512-row
+chunk's stage budget, taken with
 `SPARKFLASH_SENSENOVA_TIME=2`, is 89.5 ms in total: dense 54 ms (MLP down 14.1, up 10.5, gate
 10.4, GDN qkv 5.4, z 3.5, out 3.5, head 2.3, full q 1.8, kv 1.4, o 1.2) and everything else 35.6 ms
 (full attention core 9.1, GDN scan 9.0, norm+mHC 9.6, swiglu 2.7, conv 2.5, merge 1.3). A 12,000
@@ -246,15 +249,51 @@ same plan and weights through independent arithmetic): on the FP8 checkpoint the
 "The capital of France is" → " Paris.\nParis is a major city in Europe" and "1, 2, 3, 4, 5, 6, 7," →
 " 8, 9, 10,". The device arm still does not: a one-token prompt tracks the host to within the FP4
 round (first-token argmax equal, worst logit 1.23), but a five-token prompt diverges at step 0
-(worst 16.5), so the remaining bug is in a rows>1 path — the chunked conv, the scan's slice loop,
-the mHC kernels or the cache write — and `the_device_tracks_the_host_over_a_prompt_and_a_few_steps`
-in `tests/real_parity.rs` is the harness that shows it.
+(worst 16.5), and `the_device_tracks_the_host_over_a_prompt_and_a_few_steps` in
+`tests/real_parity.rs` is the harness that shows it.
+
+### The rows>1 bug is in the NVFP4 prefill path
+
+The host comparison cannot tell a chunk bug from a precision difference, because the two arms fold
+their sums in different orders either way. Two measurements separate them, and both are cheap
+because a captured graph makes a four-step comparison two seconds.
+
+`the_device_chunk_matches_its_single_rows_on_the_release` asks the device only about itself: one
+session prefills `[1..n]` as a chunk, another walks the same tokens one at a time, and the last
+rows are compared. `SPARKFLASH_SENSENOVA_FP8=1` is the only variable.
+
+| rows | NVFP4 chunk vs one-row | E4M3 chunk vs one-row |
+| :-- | :-- | :-- |
+| 2 | 18.22, argmax 52028 against 220 | 4.82, argmax equal |
+| 3 | 16.60, argmax 105 against 5 | 5.52, argmax equal |
+| 8 | 19.40, argmax 2 against 271 | 6.01, argmax equal |
+
+So the chunk machinery the two arms share — the chunked convolution, the scan's slice loop, the mHC
+kernels, the cache write, the prefill attention — is sound; only the NVFP4 arm moves. The E4M3 arm's
+4.8–6.0 is the floor a chunk-versus-decode comparison has at all, because a chunk runs `attn_prefill`
+and `sensenova_gdn_conv`/`_scan` where a decode step runs `sensenova_attn_q8`/`_combine` and
+`q4e_gdn_conv`/`_recur`. A second arm of the same test, which runs `prefill` one row at a time so
+that both sides use the chunk kernels, returns the same numbers to the digit, so the row count really
+is the only variable left.
+
+The GEMM is not the fault. `/tmp/fp4shapes.cu` reproduces the arm's quantiser and GEMM at the served
+shapes against a sampled host decode; extended with two- and three-row cases on both the wide and the
+narrow form it is exact there too — `worst 0.000000` at `tokens` 1, 2, 3, 5, 8, 16 and 128, on
+`cols` 256/4096/8192/12288 against `inner` 4096/12288. What is left is the arm's side of the
+invocation, and the FP4 arm is the only one that also switches the `z`/`b`/`a` projections to a
+single combined 4,224-column matrix (`attach_fp4` builds it, so `SPARKFLASH_SENSENOVA_FP8=1` skips
+it), which is the next thing to bisect.
 
 ```bash
 SPARKFLASH_CUDA_ARCH=sm_120a cargo test --release -p sparkflash-model-sensenova --test device
 SPARKFLASH_CUDA_ARCH=sm_120a SENSENOVA_FP8_DIR=/home/allenh1/models/sensenova-fp8 \
-  cargo test --release -p sparkflash-model-sensenova --test real_parity -- --ignored --nocapture
+  cargo test --release -p sparkflash-model-sensenova --test real_parity -- --ignored --nocapture \
+  --test-threads=1
 ```
+
+The architecture flag belongs on the test run as well as on the build: `cargo test` re-runs the kernel
+build script, and without it the release cubin is rebuilt for the `sm_121a` default and the 5080
+refuses it with `cuModuleLoadData failed: 209`.
 
 The arm must be built with `SPARKFLASH_CUDA_ARCH=sm_120a`: the block-scaled MMA does not exist for
 plain `sm_120`, and an image without it silently falls back to the GEMV path.
