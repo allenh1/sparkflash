@@ -203,12 +203,16 @@ extern "C" __global__ void sensenova_mhc_post(float* __restrict__ streams,
 
 // Collapses the two streams at the last mHC layer.
 extern "C" __global__ void sensenova_mhc_leave(const float* __restrict__ streams,
-                                                 float* __restrict__ out, int hidden) {
-    const int column = blockIdx.x * blockDim.x + threadIdx.x;
-    if (column >= hidden) {
+                                                 float* __restrict__ out, int hidden, int rows) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
         return;
     }
-    out[column] = 0.5f * __fadd_rn(streams[column], streams[hidden + column]);
+    const float* pair = streams + (unsigned long long)row * 2 * hidden;
+    float* target = out + (unsigned long long)row * hidden;
+    for (int column = threadIdx.x; column < hidden; column += blockDim.x) {
+        target[column] = 0.5f * __fadd_rn(pair[column], pair[hidden + column]);
+    }
 }
 
 // The 8-bit K/V cache: one E4M3 code a value with one f32 inverse scale a (token, KV head).

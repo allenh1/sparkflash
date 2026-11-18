@@ -50,6 +50,10 @@ const BLOCK: u32 = 256;
 /// and is what lets the whole visit list be one replayed graph.
 const FULL_SPLITS: u32 = 16;
 
+/// The most rows one forward takes: a verify is the anchor plus drafts, and a prefill chunk is
+/// the same shape. The shared GEMV's register tile (`GEMV_MAX_BATCH`) is the bound.
+const ROWS: usize = 8;
+
 /// Serialises graph capture: the driver's capture mode is process-wide, so two sessions must not
 /// build their graphs at once.
 static CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -854,27 +858,30 @@ impl DeviceSession {
             pointers.push(pointer);
             Ok(pointer)
         };
+        // Every activation buffer holds ROWS tokens: a verify or a prefill chunk runs the same
+        // visit list over that many rows, which is what makes one weight pass serve them all.
+        let mut wide = |count: usize| -> Result<Deviceptr, String> { alloc(ROWS * count * 4) };
         let scratch = Scratch {
-            hidden: alloc(hidden * 4)?,
-            branch: alloc(hidden.max(config.intermediate_size) * 4)?,
-            normed: alloc(hidden * 4)?,
-            attention: alloc(hidden * 4)?,
-            ffn: alloc(hidden.max(config.intermediate_size) * 4)?,
-            streams: alloc(2 * hidden * 4)?,
-            qkv: alloc(fused * 4)?,
-            z: alloc(value * 4)?,
-            b: alloc(config.linear.value_heads * 4)?,
-            a: alloc(config.linear.value_heads * 4)?,
-            conv_out: alloc(fused * 4)?,
-            gdn_out: alloc(value * 4)?,
-            q_interleaved: alloc(2 * query * 4)?,
-            query: alloc(query * 4)?,
-            gate: alloc(query * 4)?,
-            key: alloc(kv * 4)?,
-            value: alloc(kv * 4)?,
-            attn_out: alloc(query * 4)?,
-            partials: alloc(config.num_attention_heads * 16 * (config.head_dim + 2) * 4)?,
-            coeffs: alloc(8 * 4)?,
+            hidden: wide(hidden)?,
+            branch: wide(hidden.max(config.intermediate_size))?,
+            normed: wide(hidden)?,
+            attention: wide(hidden)?,
+            ffn: wide(hidden.max(config.intermediate_size))?,
+            streams: wide(2 * hidden)?,
+            qkv: wide(fused)?,
+            z: wide(value)?,
+            b: wide(config.linear.value_heads)?,
+            a: wide(config.linear.value_heads)?,
+            conv_out: wide(fused)?,
+            gdn_out: wide(value)?,
+            q_interleaved: wide(2 * query)?,
+            query: wide(query)?,
+            gate: wide(query)?,
+            key: wide(kv)?,
+            value: wide(kv)?,
+            attn_out: wide(query)?,
+            partials: wide(config.num_attention_heads * 16 * (config.head_dim + 2))?,
+            coeffs: wide(8)?,
             logits: alloc(config.vocab_size * 4)?,
             position: alloc(4)?,
             pointers,
@@ -999,7 +1006,7 @@ impl DeviceSession {
             eprintln!("sensenova graph: capture refused: {error}");
             return None;
         }
-        if let Err(error) = self.project(false, false) {
+        if let Err(error) = self.project(1, false, false) {
             shared.cuda.graph_capture_abort();
             eprintln!("sensenova graph: capture failed: {error}");
             return None;
@@ -1019,7 +1026,12 @@ impl DeviceSession {
         }
     }
 
-    fn forward(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
+    /// One forward over `tokens`, from the current position, returning the last row's logits.
+    ///
+    /// A verify and a prefill chunk are the same call. Every projection reads its weights once
+    /// for all the rows, which is what makes a batch of eight cost little more than one token on
+    /// a body that is bound by the weight pass.
+    fn forward_rows(&mut self, tokens: &[u32]) -> Result<Vec<f32>, BackendError> {
         let shared = Arc::clone(&self.shared);
         shared
             .cuda
@@ -1027,27 +1039,56 @@ impl DeviceSession {
             .map_err(|error| BackendError::new(DEVICE, error))?;
         let config = &shared.config;
         let hidden = config.hidden_size;
-        if token as usize >= config.vocab_size {
+        let rows = tokens.len();
+        if rows == 0 || rows > ROWS {
+            return Err(BackendError::new(
+                DEVICE,
+                format!("a forward takes 1..={ROWS} rows, not {rows}"),
+            ));
+        }
+        if self.position + rows > shared.context {
             return Err(BackendError::new(
                 DEVICE,
                 format!(
-                    "token {token} is outside the vocabulary {}",
-                    config.vocab_size
+                    "{rows} rows from {} run past the served context {}",
+                    self.position, shared.context
                 ),
             ));
+        }
+        for token in tokens {
+            if *token as usize >= config.vocab_size {
+                return Err(BackendError::new(
+                    DEVICE,
+                    format!(
+                        "token {token} is outside the vocabulary {}",
+                        config.vocab_size
+                    ),
+                ));
+            }
+        }
+        // The BF16 cache path addresses a row by a host-computed pointer offset, which the chunk
+        // loop would have to know; the 8-bit path's kernels take the row index themselves.
+        if !shared.kv_fp8 && rows > 1 {
+            let mut logits = Vec::new();
+            for token in tokens {
+                logits = self.forward_rows(&[*token])?;
+            }
+            return Ok(logits);
         }
         let clock = std::env::var("SPARKFLASH_SENSENOVA_TIME");
         let timed = clock.is_ok();
         let per_visit = clock.as_deref() == Ok("2");
         let started = std::time::Instant::now();
         let position = self.position;
-        let row = token as usize * hidden * 2;
-        let embed = &shared.weights.host_embed[row..row + hidden * 2];
-        let mut widened = Vec::with_capacity(hidden * 4);
-        for pair in embed.as_chunks::<2>().0 {
-            let value =
-                sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
-            widened.extend_from_slice(&value.to_le_bytes());
+        let mut widened = Vec::with_capacity(rows * hidden * 4);
+        for token in tokens {
+            let row = *token as usize * hidden * 2;
+            let embed = &shared.weights.host_embed[row..row + hidden * 2];
+            for pair in embed.as_chunks::<2>().0 {
+                let value =
+                    sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+                widened.extend_from_slice(&value.to_le_bytes());
+            }
         }
         shared
             .cuda
@@ -1064,12 +1105,13 @@ impl DeviceSession {
             .cuda
             .copy_htod(&self.scratch.position, &u32::try_from(position).unwrap_or(0).to_le_bytes())
             .map_err(|error| BackendError::new(DEVICE, error))?;
-        match self.graph {
+        // A graph bakes in its grids, so only the one-row forward replays one.
+        match self.graph.filter(|_| rows == 1) {
             Some(graph) => shared
                 .cuda
                 .graph_launch(graph)
                 .map_err(|error| BackendError::new(DEVICE, error))?,
-            None => self.project(debug, per_visit)?,
+            None => self.project(rows, debug, per_visit)?,
         }
         if timed {
             shared
@@ -1099,12 +1141,17 @@ impl DeviceSession {
                 total.as_secs_f64() * 1e3
             );
         }
-        self.position += 1;
+        self.position += rows;
         Ok(logits)
     }
 
     /// The token's 56 visits, the final norm and the LM head: the launches a graph captures.
-    fn project(&mut self, debug: bool, per_visit: bool) -> Result<(), BackendError> {
+    fn project(
+        &mut self,
+        rows: usize,
+        debug: bool,
+        per_visit: bool,
+    ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let config = &shared.config;
         let hidden = config.hidden_size;
@@ -1116,27 +1163,25 @@ impl DeviceSession {
             let uses_mhc = layer.mhc_attn.is_some();
             if uses_mhc {
                 if physical == config.mhc.start {
-                    shared.launch(
-                        shared.kernels.copy_flat,
-                        (hidden.div_ceil(256) as u32, 1, 1),
-                        (BLOCK, 1, 1),
-                        &[self.scratch.streams.0, self.scratch.hidden.0, hidden as u64],
-                    )?;
-                    shared.launch(
-                        shared.kernels.copy_flat,
-                        (hidden.div_ceil(256) as u32, 1, 1),
-                        (BLOCK, 1, 1),
-                        &[
-                            self.scratch.streams.offset(hidden * 4).0,
-                            self.scratch.hidden.0,
-                            hidden as u64,
-                        ],
-                    )?;
+                    for row in 0..rows {
+                        for half in 0..2 {
+                            shared.launch(
+                                shared.kernels.copy_flat,
+                                (hidden.div_ceil(256) as u32, 1, 1),
+                                (BLOCK, 1, 1),
+                                &[
+                                    self.scratch.streams.offset((row * 2 + half) * hidden * 4).0,
+                                    self.scratch.hidden.offset(row * hidden * 4).0,
+                                    hidden as u64,
+                                ],
+                            )?;
+                        }
+                    }
                 }
                 let (weight, bias) = layer.mhc_attn.expect("router");
                 shared.launch(
                     shared.kernels.mhc_pre,
-                    (1, 1, 1),
+                    (rows as u32, 1, 1),
                     (BLOCK, 1, 1),
                     &[
                         self.scratch.streams.0,
@@ -1156,7 +1201,7 @@ impl DeviceSession {
                     self.scratch.normed,
                     hidden,
                     hidden,
-                    1,
+                    rows,
                 )?;
             } else {
                 shared.rmsnorm(
@@ -1165,12 +1210,12 @@ impl DeviceSession {
                     self.scratch.normed,
                     hidden,
                     hidden,
-                    1,
+                    rows,
                 )?;
             }
             match config.layer_types[physical] {
-                LayerType::Full => self.full_attention(layer, state, position)?,
-                LayerType::Linear => self.linear_attention(layer, state)?,
+                LayerType::Full => self.full_attention(layer, state, position, rows)?,
+                LayerType::Linear => self.linear_attention(layer, state, rows)?,
             };
             if debug {
                 self.report(
@@ -1182,7 +1227,7 @@ impl DeviceSession {
             if uses_mhc {
                 shared.launch(
                     shared.kernels.mhc_post,
-                    (1, hidden.div_ceil(256) as u32, 1),
+                    (rows as u32, hidden.div_ceil(256) as u32, 1),
                     (BLOCK, 1, 1),
                     &[
                         self.scratch.streams.0,
@@ -1194,7 +1239,7 @@ impl DeviceSession {
                 let (weight, bias) = layer.mhc_ffn.expect("router");
                 shared.launch(
                     shared.kernels.mhc_pre,
-                    (1, 1, 1),
+                    (rows as u32, 1, 1),
                     (BLOCK, 1, 1),
                     &[
                         self.scratch.streams.0,
@@ -1214,17 +1259,17 @@ impl DeviceSession {
                     self.scratch.normed,
                     hidden,
                     hidden,
-                    1,
+                    rows,
                 )?;
             } else {
                 shared.launch(
                     shared.kernels.add,
-                    (hidden.div_ceil(256) as u32, 1, 1),
+                    ((rows * hidden).div_ceil(256) as u32, 1, 1),
                     (BLOCK, 1, 1),
                     &[
                         self.scratch.hidden.0,
                         self.scratch.attention.0,
-                        hidden as u64,
+                        (rows * hidden) as u64,
                     ],
                 )?;
                 shared.rmsnorm(
@@ -1233,10 +1278,10 @@ impl DeviceSession {
                     self.scratch.normed,
                     hidden,
                     hidden,
-                    1,
+                    rows,
                 )?;
             }
-            self.mlp(layer)?;
+            self.mlp(layer, rows)?;
             if debug {
                 self.report(
                     &format!("device visit {visit} layer {physical} ffn"),
@@ -1247,7 +1292,7 @@ impl DeviceSession {
             if uses_mhc {
                 shared.launch(
                     shared.kernels.mhc_post,
-                    (1, hidden.div_ceil(256) as u32, 1),
+                    (rows as u32, hidden.div_ceil(256) as u32, 1),
                     (BLOCK, 1, 1),
                     &[
                         self.scratch.streams.0,
@@ -1259,17 +1304,26 @@ impl DeviceSession {
                 if physical == config.mhc.end - 1 {
                     shared.launch(
                         shared.kernels.mhc_leave,
-                        (hidden.div_ceil(256) as u32, 1, 1),
+                        (rows as u32, 1, 1),
                         (BLOCK, 1, 1),
-                        &[self.scratch.streams.0, self.scratch.hidden.0, hidden as u64],
+                        &[
+                            self.scratch.streams.0,
+                            self.scratch.hidden.0,
+                            hidden as u64,
+                            rows as u64,
+                        ],
                     )?;
                 }
             } else {
                 shared.launch(
                     shared.kernels.add,
-                    (hidden.div_ceil(256) as u32, 1, 1),
+                    ((rows * hidden).div_ceil(256) as u32, 1, 1),
                     (BLOCK, 1, 1),
-                    &[self.scratch.hidden.0, self.scratch.ffn.0, hidden as u64],
+                    &[
+                        self.scratch.hidden.0,
+                        self.scratch.ffn.0,
+                        (rows * hidden) as u64,
+                    ],
                 )?;
             }
             if debug {
@@ -1302,14 +1356,16 @@ impl DeviceSession {
             self.scratch.normed,
             hidden,
             hidden,
-            1,
+            rows,
         )?;
         if debug {
             self.report("device final hidden", self.scratch.normed, hidden)?;
         }
+        // Only the last row's logits are read: a verify's earlier rows are already in the
+        // chain's answer, and a prefill chunk's are not needed at all.
         shared.gemv(
             &shared.weights.head,
-            self.scratch.normed,
+            self.scratch.normed.offset((rows - 1) * hidden * 4),
             self.scratch.logits,
             1,
         )
@@ -1336,35 +1392,35 @@ impl DeviceSession {
         Ok(())
     }
 
-    fn mlp(&mut self, layer: &DeviceLayer) -> Result<(), BackendError> {
+    fn mlp(&mut self, layer: &DeviceLayer, rows: usize) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let intermediate = shared.config.intermediate_size;
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.gemv(&layer.gate, self.scratch.normed, self.scratch.branch, 1)?;
+        shared.gemv(&layer.gate, self.scratch.normed, self.scratch.branch, rows)?;
         if debug {
-            self.report("device mlp gate", self.scratch.branch, intermediate)?;
+            self.report("device mlp gate", self.scratch.branch, rows * intermediate)?;
         }
-        shared.gemv(&layer.up, self.scratch.normed, self.scratch.ffn, 1)?;
+        shared.gemv(&layer.up, self.scratch.normed, self.scratch.ffn, rows)?;
         if debug {
-            self.report("device mlp up", self.scratch.ffn, intermediate)?;
+            self.report("device mlp up", self.scratch.ffn, rows * intermediate)?;
         }
         shared.launch(
             shared.kernels.swiglu,
-            (intermediate.div_ceil(256) as u32, 1, 1),
+            ((rows * intermediate).div_ceil(256) as u32, 1, 1),
             (BLOCK, 1, 1),
             &[
                 self.scratch.branch.0,
                 self.scratch.ffn.0,
                 self.scratch.branch.0,
-                intermediate as u64,
+                (rows * intermediate) as u64,
             ],
         )?;
         if debug {
-            self.report("device mlp hidden", self.scratch.branch, intermediate)?;
+            self.report("device mlp hidden", self.scratch.branch, rows * intermediate)?;
         }
-        shared.gemv(&layer.down, self.scratch.branch, self.scratch.ffn, 1)?;
+        shared.gemv(&layer.down, self.scratch.branch, self.scratch.ffn, rows)?;
         if debug {
-            self.report("device mlp down", self.scratch.ffn, intermediate)?;
+            self.report("device mlp down", self.scratch.ffn, rows * intermediate)?;
         }
         Ok(())
     }
@@ -1374,6 +1430,7 @@ impl DeviceSession {
         layer: &DeviceLayer,
         state: VisitState,
         position: usize,
+        rows: usize,
     ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let config = &shared.config;
@@ -1388,10 +1445,10 @@ impl DeviceSession {
             layer.v.expect("v"),
             layer.o.expect("o"),
         );
-        shared.gemv(&q, self.scratch.normed, self.scratch.q_interleaved, 1)?;
+        shared.gemv(&q, self.scratch.normed, self.scratch.q_interleaved, rows)?;
         shared.launch(
             shared.kernels.qgate,
-            (heads as u32, 1, 1),
+            (heads as u32, rows as u32, 1),
             (256, 1, 1),
             &[
                 self.scratch.q_interleaved.0,
@@ -1399,18 +1456,18 @@ impl DeviceSession {
                 self.scratch.gate.0,
                 head_dim as u64,
                 heads as u64,
-                1,
+                rows as u64,
             ],
         )?;
-        shared.gemv(&k, self.scratch.normed, self.scratch.key, 1)?;
-        shared.gemv(&v, self.scratch.normed, self.scratch.value, 1)?;
+        shared.gemv(&k, self.scratch.normed, self.scratch.key, rows)?;
+        shared.gemv(&v, self.scratch.normed, self.scratch.value, rows)?;
         shared.rmsnorm(
             self.scratch.query,
             layer.q_norm.expect("q norm"),
             self.scratch.query,
             head_dim,
             head_dim,
-            heads,
+            rows * heads,
         )?;
         shared.rmsnorm(
             self.scratch.key,
@@ -1418,11 +1475,11 @@ impl DeviceSession {
             self.scratch.key,
             head_dim,
             head_dim,
-            kv_heads,
+            rows * kv_heads,
         )?;
         shared.launch(
             shared.kernels.rope,
-            (heads as u32, 1, 1),
+            (heads as u32, rows as u32, 1),
             (128, 1, 1),
             &[
                 self.scratch.query.0,
@@ -1432,12 +1489,12 @@ impl DeviceSession {
                 shared.inv_freq.0,
                 u64::from(shared.rope_scale.to_bits()),
                 query as u64,
-                1,
+                rows as u64,
             ],
         )?;
         shared.launch(
             shared.kernels.rope,
-            (kv_heads as u32, 1, 1),
+            (kv_heads as u32, rows as u32, 1),
             (128, 1, 1),
             &[
                 self.scratch.key.0,
@@ -1447,7 +1504,7 @@ impl DeviceSession {
                 shared.inv_freq.0,
                 u64::from(shared.rope_scale.to_bits()),
                 kv as u64,
-                1,
+                rows as u64,
             ],
         )?;
         let keys = state.keys.expect("keys");
@@ -1462,14 +1519,14 @@ impl DeviceSession {
             ] {
                 shared.launch(
                     shared.kernels.cache_q8,
-                    (kv_heads as u32, 1, 1),
+                    (kv_heads as u32, rows as u32, 1),
                     (BLOCK, 1, 1),
                     &[
                         source.0,
                         codes.0,
                         scales.0,
                         self.scratch.position.0,
-                        1,
+                        rows as u64,
                         kv_heads as u64,
                         head_dim as u64,
                     ],
@@ -1477,7 +1534,7 @@ impl DeviceSession {
             }
             shared.launch(
                 shared.kernels.attn_q8,
-                (heads as u32, 1, FULL_SPLITS),
+                (heads as u32, rows as u32, FULL_SPLITS),
                 (BLOCK, 1, 1),
                 &[
                     self.scratch.query.0,
@@ -1535,7 +1592,7 @@ impl DeviceSession {
         if shared.kv_fp8 {
             shared.launch(
                 shared.kernels.attn_combine,
-                (heads as u32, 1, 1),
+                (heads as u32, rows as u32, 1),
                 (BLOCK, 1, 1),
                 &[
                     self.scratch.partials.0,
@@ -1561,13 +1618,14 @@ impl DeviceSession {
                 ],
             )?;
         }
-        shared.gemv(&o, self.scratch.attn_out, self.scratch.attention, 1)
+        shared.gemv(&o, self.scratch.attn_out, self.scratch.attention, rows)
     }
 
     fn linear_attention(
         &mut self,
         layer: &DeviceLayer,
         state: VisitState,
+        rows: usize,
     ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let config = &shared.config;
@@ -1582,19 +1640,19 @@ impl DeviceSession {
             layer.out.expect("out"),
         );
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.gemv(&qkv, self.scratch.normed, self.scratch.qkv, 1)?;
+        shared.gemv(&qkv, self.scratch.normed, self.scratch.qkv, rows)?;
         if debug {
             self.report("gdn qkv", self.scratch.qkv, fused)?;
         }
-        shared.gemv(&z, self.scratch.normed, self.scratch.z, 1)?;
+        shared.gemv(&z, self.scratch.normed, self.scratch.z, rows)?;
         if debug {
             self.report("gdn z", self.scratch.z, value_width)?;
         }
-        shared.gemv(&b, self.scratch.normed, self.scratch.b, 1)?;
+        shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
         if debug {
             self.report("gdn b", self.scratch.b, config.linear.value_heads)?;
         }
-        shared.gemv(&a, self.scratch.normed, self.scratch.a, 1)?;
+        shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
         if debug {
             self.report("gdn a", self.scratch.a, config.linear.value_heads)?;
         }
@@ -1611,7 +1669,7 @@ impl DeviceSession {
                 self.scratch.conv_out.0,
                 fused as u64,
                 config.linear.conv_kernel as u64,
-                1,
+                rows as u64,
                 0,
                 0,
                 0,
@@ -1642,7 +1700,7 @@ impl DeviceSession {
                 (config.linear.value_heads / config.linear.key_heads.max(1)) as u64,
                 (config.rms_norm_eps as f32).to_bits() as u64,
                 0,
-                1,
+                rows as u64,
                 (config.linear.key_dim * config.linear.value_dim * 4) as u64,
                 0,
             ],
@@ -1650,7 +1708,7 @@ impl DeviceSession {
         if debug {
             self.report("gdn recur", self.scratch.gdn_out, value_width)?;
         }
-        shared.gemv(&out, self.scratch.gdn_out, self.scratch.attention, 1)?;
+        shared.gemv(&out, self.scratch.gdn_out, self.scratch.attention, rows)?;
         if debug {
             self.report("gdn out", self.scratch.attention, config.hidden_size)?;
         }
@@ -1680,9 +1738,12 @@ impl ModelSession for DeviceSession {
         if tokens.is_empty() {
             return Err(BackendError::new(DEVICE, "an empty prompt"));
         }
+        // A prompt runs in chunks of ROWS: every projection then reads its weights once for the
+        // whole chunk, and the causal attention the kernels implement makes the rows of one
+        // chunk exactly the rows of the one-token steps they stand in for.
         let mut logits = Vec::new();
-        for token in tokens {
-            logits = self.forward(*token)?;
+        for chunk in tokens.chunks(ROWS) {
+            logits = self.forward_rows(chunk)?;
         }
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
@@ -1704,7 +1765,7 @@ impl ModelSession for DeviceSession {
                 ),
             ));
         }
-        let logits = self.forward(token)?;
+        let logits = self.forward_rows(&[token])?;
         self.sampler.record(token);
         let chosen = self.sampler.choose(&logits, &self.sampling);
         Ok(StepOutput {

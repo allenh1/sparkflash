@@ -60,6 +60,11 @@ Per-token KV is **56 KiB in BF16, 28 KiB in 8-bit**: 14 full-attention visits x 
 layers inside the loop hold two independent caches each. The GDN side is 42 recurrent visits,
 ~84 MiB of f32 state plus ~4 MiB of convolution history per sequence, also per visit.
 
+A prompt runs in chunks of up to eight rows, which is the decode GEMV's register tile: the
+projections read their weights once for the chunk, so a 60-token prompt prefills in ~0.25 s
+(~240 tok/s) instead of 1.35 s, and the chunk is bit-identical to the single-token steps it
+stands in for (the fixture's chunk test holds all three of 2, 3 and 8 rows to a delta of 0).
+
 The arm defaults to **160K**. With FP8 weights, an 8-bit K/V cache, the BF16 LM head on the device
 and the embedding on the host, the device plan is 8.4 GiB of weights plus 4.6 GiB of cache at 160K
 (13.3 GiB); the server reported 10.8 GiB resident after a short request, because the caches are only
