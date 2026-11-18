@@ -53,6 +53,7 @@
 #include "q4e_common_sm121.cuh"
 #include "shared_swiglu_sm121.cuh"
 #include "q4e_gemv_sm121.cuh"
+#include "bf16_packed_sm121.cuh"
 
 #define Q4E_BLOCK 256
 #define Q4E_MAX_SELECTED 2304
@@ -1370,6 +1371,29 @@ extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 3)
     }
     q4e_tiled_gemv<Q4eTgBf16>(
         Q4eTgRows<__nv_bfloat16>{w, rows, columns},
+        Q4eTgPartStore{y, rows, batch, second, third, fourth, group.x, group.y}, x, columns,
+        group.y, partials, counters);
+}
+
+// q4e_gemv_tiled_bf16_parts over the packed form (bf16_packed_sm121.cuh): the same grid, splits,
+// stores and sums, each chunk's words rebuilt from the packed planes, so a row's outputs are the
+// BF16 kernel's bits from three quarters of the bytes.
+extern "C" __global__ void __launch_bounds__(Q4E_TG_THREADS, 2)
+    q4e_gemv_tiled_packed_parts(const unsigned char* __restrict__ w,
+                                const unsigned int* __restrict__ offsets,
+                                const unsigned int* __restrict__ entries,
+                                const float* __restrict__ x, float* __restrict__ y, int rows,
+                                int columns, int batch, float* __restrict__ partials,
+                                unsigned int* __restrict__ counters, int second, int third,
+                                int fourth, unsigned long long row_bytes) {
+    OPT_PDL_LAUNCH();
+    const int2 group = q4e_tg_group(x, partials, counters, columns, batch);
+    if (batch > Q4E_MAX_BATCH * (int)gridDim.z || group.y <= 0 || columns % 256 != 0) {
+        OPT_PDL_WAIT();
+        return;
+    }
+    q4e_tiled_gemv<Q4eTgPacked>(
+        Q4eTgPackedRows{w, offsets, entries, rows, columns, row_bytes},
         Q4eTgPartStore{y, rows, batch, second, third, fourth, group.x, group.y}, x, columns,
         group.y, partials, counters);
 }

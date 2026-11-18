@@ -108,6 +108,7 @@ use sparkflash_ops::gemv::{
 };
 use sparkflash_ops::indexer::{IndexerPass, MAX_BUDGET_BLOCKS, MAX_SELECTED_TOKENS};
 use sparkflash_ops::moe::{MoePlanCall, combine_grid};
+use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
@@ -467,6 +468,14 @@ fn append(into: &mut Vec<u8>, bytes: Vec<u8>) {
     }
 }
 
+/// The smallest BF16 projection GLM packs is one of more than 2^24 weights. The tiled packed GEMV
+/// reads three quarters of the bytes but rebuilds each chunk and runs two blocks an SM, so it
+/// gains on a matrix that streams long enough: streaming from DRAM on one Spark, 38,720 x 4,096
+/// (the head's slice) took 1,061 against 1,325 us at one row and 1,144 against 1,573 at eight;
+/// 6,160 x 4,096 191 against 216 us at one row, even at eight; 4,096 x 2,048 79 against 78 us at
+/// one row and 102 against 81 at eight; the 288 x 4,096 router lost at every batch.
+const PACK_MIN_WEIGHTS: usize = 1 << 24;
+
 /// The kernels a rank launches, by name from the pack's cubin.
 #[derive(Clone, Copy)]
 struct Kernels {
@@ -475,6 +484,8 @@ struct Kernels {
     /// [Self::argmax] that also reports the pick's softmax probability: an MTP draft's confidence.
     argmax_prob: Kernel,
     gemv_bf16: Kernel,
+    /// [Self::gemv_bf16] over a packed copy ([sparkflash_ops::packed]): the same sums.
+    gemv_packed: Kernel,
     gemv_fp8: Kernel,
     /// The E4M3 copy of the LM head drafts score with ([DeviceRank::draft_head]): its quantizer
     /// and its GEMV.
@@ -643,6 +654,7 @@ impl Kernels {
             argmax: named("q4e_argmax_slices")?,
             argmax_prob: named("q4e_argmax_prob_slices")?,
             gemv_bf16: decode("q4e_gemv_tiled_bf16_parts")?,
+            gemv_packed: decode("q4e_gemv_tiled_packed_parts")?,
             gemv_fp8: decode("q4e_gemv_tiled_e4m3_block")?,
             quantize_e4m3: named("q4e_quantize_e4m3_rows")?,
             gemv_e4m3: named("q4e_gemv_tiled_e4m3")?,
@@ -2216,6 +2228,9 @@ pub struct DeviceRank {
     /// Whether a sequence keeps a rewind point at the end of each prompt
     /// ([sparkflash_runtime::REWIND_ENV], on by default).
     rewind: bool,
+    /// Packed copies of the BF16 projections the tiled GEMV reads ([Self::pack_linears]), beside
+    /// the BF16 rows the bulk prefill and the drafts' E4M3 head still read.
+    packed: PackedSet,
     memory: Allocations,
 }
 
@@ -2466,12 +2481,67 @@ impl DeviceRank {
             )),
             tokens_staged,
             rewind: sparkflash_runtime::rewind().map_err(refusal)?,
+            packed: PackedSet::new(Form::from_env().map_err(refusal)?, Placement::Beside).tiled(),
             memory,
         };
         if rank.mtp.is_some() && rank.lm_head.scales.is_none() {
             rank.draft_head()?;
         }
+        rank.pack_linears()?;
         Ok(rank)
+    }
+
+    /// Packs the large BF16 projections every step reads through the tiled GEMV: of each KDA
+    /// layer's fused projection and output, the MLA and indexer projections stored as BF16, the
+    /// router and the LM head, those of more than [PACK_MIN_WEIGHTS] weights (on the released
+    /// model, the KDA fused projections and the head). A matrix only another kernel reads (the
+    /// mixers' projections, which q4e_mhc_post folds in; kv_b, which the attention absorbs) stays
+    /// BF16 alone. Every packed matrix is unpacked and compared with its BF16 rows here, and one
+    /// differing word refuses the load.
+    fn pack_linears(&mut self) -> Result<(), BackendError> {
+        let mut matrices = Vec::new();
+        let mut add = |linear: &DeviceLinear| {
+            if linear.scales.is_none() && linear.rows * linear.columns > PACK_MIN_WEIGHTS {
+                matrices.push((linear.weight, linear.rows, linear.columns));
+            }
+        };
+        for layer in &self.layers {
+            match &layer.branch {
+                DeviceBranch::Linear(kda) => [&kda.fused, &kda.o].into_iter().for_each(&mut add),
+                DeviceBranch::Sparse(dsa) => {
+                    [&dsa.fused, &dsa.q_b, &dsa.o]
+                        .into_iter()
+                        .for_each(&mut add);
+                    if let Some(indexer) = &dsa.indexer {
+                        [&indexer.fused, &indexer.wq_b]
+                            .into_iter()
+                            .for_each(&mut add);
+                    }
+                }
+            }
+            if let DeviceFfn::Moe(moe) = &layer.ffn {
+                add(&moe.router);
+            }
+        }
+        add(&self.lm_head);
+        if matrices.is_empty() || Form::from_env().map_err(refusal)? == Form::Checkpoint {
+            eprintln!("[glm] {}", self.packed.summary());
+            return Ok(());
+        }
+        let kernels = packed::Kernels::load(&self.cuda).map_err(refusal)?;
+        // The packing runs on the default stream, which this rank's uploads are not ordered
+        // against.
+        self.cuda
+            .synchronize_stream(&self.stream)
+            .map_err(cuda_error)?;
+        let (_, packed_bytes) = self
+            .packed
+            .pack(&self.cuda, &kernels, &matrices, 0)
+            .map_err(refusal)?;
+        self.memory.bytes += packed_bytes;
+        self.memory.buffers.extend(self.packed.allocations());
+        eprintln!("[glm] rank {}: {}", self.layout.rank, self.packed.summary());
+        Ok(())
     }
 
     /// The E4M3 copy of this rank's slice of the LM head that drafts score with, quantized on
@@ -3577,13 +3647,23 @@ impl DeviceRank {
         }
         let tiles = linear.rows.div_ceil(TILE_ROWS);
         let scratch = &self.scratch;
-        let (kernel, splits, mut args) = match linear.scales {
-            None => (
+        // A packed copy of these rows, when there is one: the same launch over the packed planes.
+        let packed = self
+            .packed
+            .get(linear.weight)
+            .filter(|packed| packed.admits(linear.rows, linear.columns, input).is_ok());
+        let (kernel, splits, mut args) = match (linear.scales, packed) {
+            (None, Some(packed)) => (
+                self.kernels.gemv_packed,
+                tiled_gemv_splits(tiles, linear.columns),
+                packed.planes().to_vec(),
+            ),
+            (None, None) => (
                 self.kernels.gemv_bf16,
                 tiled_gemv_splits(tiles, linear.columns),
                 vec![linear.weight.0],
             ),
-            Some(scales) => (
+            (Some(scales), _) => (
                 self.kernels.gemv_fp8,
                 tiled_gemv_e4m3_splits(tiles, linear.columns),
                 vec![linear.weight.0, scales.0],
@@ -3602,6 +3682,9 @@ impl DeviceRank {
             args.push(u64::from(self.config.dynamic_activations));
         }
         args.extend(linear.parts.map(|start| start as u64));
+        if let (None, Some(packed)) = (linear.scales, packed) {
+            args.push(packed.row_bytes() as u64);
+        }
         let groups = rows.div_ceil(MAX_ROWS) as u32;
         self.launch(kernel, (tiles as u32, splits as u32, groups), BLOCK, &args)
     }
@@ -3653,6 +3736,8 @@ impl DeviceRank {
         let spans: Vec<(u64, u64)> = reads
             .iter()
             .map(|&(at, bytes)| {
+                // A packed matrix's GEMV reads its packed rows, not the BF16 ones.
+                let (at, bytes) = self.packed.get(at).map_or((at, bytes), |p| p.span());
                 let bytes = bytes.min(left);
                 left -= bytes;
                 (at.0, bytes as u64)
@@ -4005,7 +4090,12 @@ impl DeviceRank {
                 self.launch(self.kernels.conv_rows, call.grid, call.block.0, &call.args)?;
                 // A chunk never verifies, so it keeps no windows.
                 let call = gdn::conv_history(raw.0, conv.0, width, run.len, (0, 0, 0));
-                self.launch(self.kernels.conv_history, call.grid, call.block.0, &call.args)?;
+                self.launch(
+                    self.kernels.conv_history,
+                    call.grid,
+                    call.block.0,
+                    &call.args,
+                )?;
                 continue;
             }
             // A verify keeps the windows after each of its rows but the last, for a commit that

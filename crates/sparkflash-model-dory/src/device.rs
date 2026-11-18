@@ -465,7 +465,7 @@ impl DeviceShared {
         Ok(shared)
     }
 
-    /// Packs every projection beside its BF16 rows (none under [Form::Bf16]): the decode GEMVs
+    /// Packs every projection beside its BF16 rows (none under [Form::Checkpoint]): the decode GEMVs
     /// read the packed rows, the wide tiles the BF16 ones. A matrix whose packed rows do not
     /// unpack to its BF16 rows refuses the open.
     fn pack(&mut self) -> Result<(), String> {

@@ -64,7 +64,7 @@ fn dense_slots(plans: &[&InklingDevicePlan]) -> (BTreeSet<usize>, Option<usize>)
     (dense.difference(&other).copied().collect(), head)
 }
 
-/// Packs every dense projection the form takes, in place, or none under [Form::Bf16].
+/// Packs every dense projection the form takes, in place, or none under [Form::Checkpoint].
 ///
 /// # Errors
 /// A driver failure, or a matrix whose packed rows do not unpack to its BF16 rows.
@@ -76,7 +76,7 @@ pub(super) fn pack_dense(
     form: Form,
 ) -> Result<PackedSet, String> {
     let mut dense = PackedSet::new(form, Placement::InPlace);
-    if form == Form::Bf16 || plans.is_empty() {
+    if form == Form::Checkpoint || plans.is_empty() {
         return Ok(dense);
     }
     let served = plans[0].served();

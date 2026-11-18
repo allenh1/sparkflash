@@ -1646,7 +1646,7 @@ of the widest matrix but the head. Before a group overwrites its BF16 rows, `q4e
 rebuilds the group and counts the words that differ from those rows. A single differing word
 refuses the rank. A prompt's tensor-core tiles read BF16, so `wide` and `gemm` unpack a
 projection into the scratch first; at an 8,192-row chunk that costs nothing measurable.
-`SPARKFLASH_BF16_FORM=bf16` keeps the checkpoint's rows, and any other value is refused (the switch is shared with every arm that packs, `sparkflash_ops::packed`; the old `SPARKFLASH_INKLING_DENSE` is refused with a pointer to it).
+`SPARKFLASH_DENSE_WEIGHTS=checkpoint` keeps the checkpoint's rows (`packed`, the default, packs), and any other value is refused (the switch is shared with every arm that packs, `sparkflash_ops::packed`; its old names `SPARKFLASH_INKLING_DENSE` and `SPARKFLASH_BF16_FORM` are refused with a pointer to it).
 
 | standalone, one rank's slice (BF16 -> packed, every output word equal) | batch 1 | batch 4 |
 |---|---|---|

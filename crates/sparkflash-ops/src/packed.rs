@@ -13,7 +13,9 @@
 // limitations under the License.
 
 //! Dense BF16 projections in the packed form (kernels/bf16_packed_sm121.cuh), for every arm whose
-//! decode GEMVs walk `q4e_gemv_bf16` / `q4e_gemv4_bf16`.
+//! decode GEMVs walk `q4e_gemv_bf16` / `q4e_gemv4_bf16` (Inkling, Dory, the dense arm), in the
+//! row walk's [Layout], or a tiled reader (GLM's `q4e_gemv_tiled_packed_parts`, Qwen's few-row
+//! tensor-core tile), in the tiled one: the same bytes and bits, ordered for the reader.
 //!
 //! A decode step's dense GEMVs run at the DRAM floor. The packed form holds the same BF16 words
 //! in about three quarters of the bytes: a sign and mantissa byte a weight, a 4-bit exponent
@@ -34,12 +36,13 @@ use sparkflash_kernels::images::qwen4_exp_cubin;
 
 use crate::calls::{BLOCK, Call};
 
-/// The switch between the packed form (`packed`, the default) and the checkpoint's BF16 rows
-/// (`bf16`), for every arm that packs. Anything else is refused.
-pub const FORM_ENV: &str = "SPARKFLASH_BF16_FORM";
-/// Inkling's switch before the form was shared; refused with a pointer to [FORM_ENV] rather than
-/// read, so an old script cannot think it chose a form.
-const RETIRED_ENV: &str = "SPARKFLASH_INKLING_DENSE";
+/// How every arm that packs stores its dense BF16 projections: `packed` (the default, the
+/// lossless packed form) or `checkpoint` (the checkpoint's BF16 rows as they are). Anything else
+/// is refused.
+pub const FORM_ENV: &str = "SPARKFLASH_DENSE_WEIGHTS";
+/// The switch's earlier names (Inkling's own, then the shared `=packed|bf16` one); refused with a
+/// pointer to [FORM_ENV] rather than read, so an old script cannot think it chose a form.
+const RETIRED_ENVS: [&str; 2] = ["SPARKFLASH_INKLING_DENSE", "SPARKFLASH_BF16_FORM"];
 
 /// How the dense projections are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,20 +50,22 @@ pub enum Form {
     /// Packed at load, every matrix whose shape the form takes.
     Packed,
     /// As the checkpoint stores them.
-    Bf16,
+    Checkpoint,
 }
 
 impl Form {
     /// The form [FORM_ENV] names.
     ///
     /// # Errors
-    /// An unknown form, or the retired Inkling switch set.
+    /// An unknown form, or a retired name of the switch set.
     pub fn from_env() -> Result<Self, String> {
-        if let Ok(value) = std::env::var(RETIRED_ENV) {
-            return Err(format!(
-                "{RETIRED_ENV}={value} is retired: the packed form is shared now, so set \
-                 {FORM_ENV}=packed or {FORM_ENV}=bf16 instead"
-            ));
+        for retired in RETIRED_ENVS {
+            if let Ok(value) = std::env::var(retired) {
+                return Err(format!(
+                    "{retired}={value} is retired: set {FORM_ENV}=packed or \
+                     {FORM_ENV}=checkpoint instead"
+                ));
+            }
         }
         Self::parse(std::env::var(FORM_ENV).ok().as_deref())
     }
@@ -68,11 +73,11 @@ impl Form {
     fn parse(value: Option<&str>) -> Result<Self, String> {
         match value {
             None | Some("" | "packed") => Ok(Self::Packed),
-            Some("bf16") => Ok(Self::Bf16),
+            Some("checkpoint") => Ok(Self::Checkpoint),
             Some(other) => Err(format!(
                 "{FORM_ENV}={other} is not a dense form: use packed (the default: the dense \
                  projections in a lossless 12.25-bit form, the BF16 bits from three quarters of \
-                 the bytes) or bf16 (the checkpoint's rows)"
+                 the bytes) or checkpoint (the checkpoint's BF16 rows as they are)"
             )),
         }
     }
@@ -86,6 +91,17 @@ pub enum Placement {
     InPlace,
     /// In an arena of their own, the BF16 rows kept for the walks that read them.
     Beside,
+}
+
+/// How a packed matrix orders a step's plane bytes (kernels/bf16_packed_sm121.cuh): for the row
+/// walk (`q4e_gemv_packed`, `q4e_gemv4_packed`) or for a tiled reader. The two hold the same bytes
+/// and bits; a matrix is in one, and a reader of the other kind refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// A lane's chunks of a step together, as q4e_row_dot_bf16 reads them.
+    Walk,
+    /// A step's chunks in order, 32 lanes' a round, as the tiled readers take them.
+    Tiled,
 }
 
 /// The form's four kernels, all in the Qwen4Exp image beside `q4e_gemv_bf16`.
@@ -178,13 +194,53 @@ pub struct Packed {
     rows: usize,
     columns: usize,
     row_bytes: usize,
+    layout: Layout,
 }
 
 impl Packed {
+    /// The order of the matrix's plane bytes, which its reader must take.
+    #[must_use]
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Refuses a reader of the other layout's kind.
+    fn read_as(&self, layout: Layout) -> Result<(), String> {
+        if self.layout == layout {
+            return Ok(());
+        }
+        Err(format!(
+            "a {:?}-layout reader over a packed {} x {} matrix in the {:?} layout",
+            layout, self.rows, self.columns, self.layout
+        ))
+    }
+
+    /// The pointers a packed walk takes for this matrix, in its argument order: the packed rows,
+    /// the row offsets into the escapes, and the escapes.
+    #[must_use]
+    pub fn planes(&self) -> [u64; 3] {
+        [self.pointer.0, self.offsets.0, self.entries.0]
+    }
+
+    /// The stride from one packed row to the next.
+    #[must_use]
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// The packed rows' bytes, which a pass over the matrix reads: a prefetch span.
+    #[must_use]
+    pub fn span(&self) -> (Deviceptr, usize) {
+        (self.pointer, self.rows * self.row_bytes)
+    }
+
     /// Refuses a launch the packed walk cannot take: other columns than the matrix's, more rows
     /// than it has, or activations that are not 16-byte loads (the BF16 walk falls back to a
     /// column walk there; the packed one has none).
-    fn admits(&self, rows: usize, columns: usize, input: Deviceptr) -> Result<(), String> {
+    ///
+    /// # Errors
+    /// The launch the matrix does not admit, named.
+    pub fn admits(&self, rows: usize, columns: usize, input: Deviceptr) -> Result<(), String> {
         if columns != self.columns || rows > self.rows {
             return Err(format!(
                 "a {rows} x {columns} projection over a packed {} x {} matrix",
@@ -194,7 +250,7 @@ impl Packed {
         if !(input.0 as usize).is_multiple_of(ALIGN) {
             return Err(format!(
                 "a packed projection reads its activations as 16-byte loads, and {:#x} is not \
-                 one ({FORM_ENV}=bf16 keeps the BF16 walk)",
+                 one ({FORM_ENV}=checkpoint keeps the BF16 walk)",
                 input.0
             ));
         }
@@ -215,6 +271,7 @@ pub fn gemv(
     batch: usize,
     groups: u32,
 ) -> Result<Call<9>, String> {
+    packed.read_as(Layout::Walk)?;
     packed.admits(rows, columns, input)?;
     Ok(Call {
         grid: (grid(rows), groups, 1),
@@ -253,6 +310,7 @@ pub fn gemv4(
     // (w0..w3, o0..o3, e0..e3, x, y0..y3, r0..r3, columns, batch, row_bytes)
     let mut args = [0u64; 5 * FUSED + 4];
     for (slot, (packed, output, rows)) in parts.iter().enumerate() {
+        packed.read_as(Layout::Walk)?;
         packed.admits(*rows, columns, input)?;
         args[slot] = packed.pointer.0;
         args[FUSED + slot] = packed.offsets.0;
@@ -279,7 +337,7 @@ fn unpack(
     output: Deviceptr,
     (source, differ): (Deviceptr, Deviceptr),
     rows: usize,
-) -> Call<9> {
+) -> Call<10> {
     Call {
         grid: (grid(rows), 1, 1),
         block: (BLOCK, 1, 1),
@@ -293,6 +351,7 @@ fn unpack(
             rows as u64,
             packed.columns as u64,
             packed.row_bytes as u64,
+            u64::from(packed.layout == Layout::Tiled),
         ],
     }
 }
@@ -303,6 +362,8 @@ pub struct PackedSet {
     /// The form [FORM_ENV] chose, which every later [Self::pack] keeps to.
     form: Form,
     placement: Placement,
+    /// The layout every matrix of the set is packed in.
+    layout: Layout,
     /// Each [Self::pack] call's offsets, escapes and (beside the rows) packed rows.
     arenas: Vec<Deviceptr>,
     /// In place only: a BF16 matrix's worth, for the walks that read BF16 rows, and what the
@@ -321,11 +382,24 @@ impl PackedSet {
             packed: HashMap::new(),
             form,
             placement,
+            layout: Layout::Walk,
             arenas: Vec::new(),
             scratch: None,
             bf16_bytes: 0,
             packed_bytes: 0,
         }
+    }
+
+    /// The set in the tiled layout, for an arm whose packed reader is tiled. Set before the first
+    /// [Self::pack].
+    #[must_use]
+    pub fn tiled(mut self) -> Self {
+        debug_assert!(
+            self.packed.is_empty(),
+            "a set changes layout before it packs"
+        );
+        self.layout = Layout::Tiled;
+        self
     }
 
     /// The packed matrix whose BF16 rows start at `weight`, if it is one.
@@ -343,7 +417,7 @@ impl PackedSet {
     }
 
     /// Packs `matrices`, (rows, row count, columns) BF16 slots, and adds them: the ones the form
-    /// takes, none under [Form::Bf16]. In place, the slots must be ones only the GEMV walks and
+    /// takes, none under [Form::Checkpoint]. In place, the slots must be ones only the GEMV walks and
     /// [Self::bf16_rows] read; the first call allocates the scratch at `scratch_bytes` (at least
     /// [MIN_SCRATCH]) and later ones pack through it. Beside the rows, `scratch_bytes` is unused.
     /// On an error this call's allocations are freed and the set is as it was.
@@ -360,7 +434,7 @@ impl PackedSet {
         matrices: &[(Deviceptr, usize, usize)],
         scratch_bytes: usize,
     ) -> Result<(usize, usize), String> {
-        if self.form == Form::Bf16 {
+        if self.form == Form::Checkpoint {
             return Ok((0, 0));
         }
         let mut candidates = Vec::new();
@@ -414,6 +488,7 @@ impl PackedSet {
         let packed = pack_matrices(
             cuda,
             kernels,
+            self.layout,
             &mut candidates,
             (counts, differ),
             scratch,
@@ -456,7 +531,7 @@ impl PackedSet {
         rows: usize,
         columns: usize,
         offset: usize,
-    ) -> Result<(Option<Call<9>>, Deviceptr), String> {
+    ) -> Result<(Option<Call<10>>, Deviceptr), String> {
         let Some(packed) = self
             .get(weight)
             .filter(|_| self.placement == Placement::InPlace)
@@ -473,7 +548,7 @@ impl PackedSet {
         {
             return Err(format!(
                 "a walk over {rows} x {columns} BF16 rows of a packed {} x {} matrix at byte \
-                 {offset} of a {bytes}-byte scratch ({FORM_ENV}=bf16 keeps the BF16 rows)",
+                 {offset} of a {bytes}-byte scratch ({FORM_ENV}=checkpoint keeps the BF16 rows)",
                 packed.rows, packed.columns
             ));
         }
@@ -488,7 +563,7 @@ impl PackedSet {
     #[must_use]
     pub fn summary(&self) -> String {
         if self.packed.is_empty() {
-            return format!("dense projections in BF16 ({FORM_ENV}=bf16 or none packable)");
+            return format!("dense projections in BF16 ({FORM_ENV}=checkpoint or none packable)");
         }
         let place = match self.placement {
             Placement::InPlace => "in place",
@@ -521,6 +596,7 @@ struct Candidate {
 fn pack_matrices(
     cuda: &Cuda,
     kernels: &Kernels,
+    layout: Layout,
     matrices: &mut [Candidate],
     (counts, differ): (Deviceptr, Deviceptr),
     scratch: Option<(Deviceptr, usize)>,
@@ -541,10 +617,11 @@ fn pack_matrices(
             rows as u64,
             packed.columns as u64,
             packed.row_bytes as u64,
+            u64::from(packed.layout == Layout::Tiled),
         ];
         launch(kernels.pack, (grid(rows), 1, 1), &args)
     };
-    let check = |call: Call<9>| launch(kernels.unpack, call.grid, &call.args);
+    let check = |call: Call<10>| launch(kernels.unpack, call.grid, &call.args);
     let mut arena_bytes = 0usize;
     for matrix in matrices.iter_mut() {
         let counting = Packed {
@@ -554,6 +631,7 @@ fn pack_matrices(
             rows: matrix.rows,
             columns: matrix.columns,
             row_bytes: row_bytes(matrix.columns),
+            layout,
         };
         pack(matrix.pointer, &counting, counts, matrix.rows)?;
         let mut bytes = vec![0u8; matrix.rows * 4];
@@ -601,6 +679,7 @@ fn pack_matrices(
             rows: matrix.rows,
             columns: matrix.columns,
             row_bytes,
+            layout,
         };
         match scratch {
             None => {
@@ -650,7 +729,7 @@ fn pack_matrices(
     if differ_words != 0 {
         return Err(format!(
             "the packed dense projections unpack to {differ_words} BF16 words other than the \
-             checkpoint's; the rank refuses to serve them ({FORM_ENV}=bf16 keeps the BF16 rows)"
+             checkpoint's; the rank refuses to serve them ({FORM_ENV}=checkpoint keeps the BF16 rows)"
         ));
     }
     Ok((packed, bf16_bytes, packed_bytes))
@@ -691,7 +770,9 @@ mod tests {
         assert_eq!(Form::parse(None), Ok(Form::Packed));
         assert_eq!(Form::parse(Some("")), Ok(Form::Packed));
         assert_eq!(Form::parse(Some("packed")), Ok(Form::Packed));
-        assert_eq!(Form::parse(Some("bf16")), Ok(Form::Bf16));
+        assert_eq!(Form::parse(Some("checkpoint")), Ok(Form::Checkpoint));
+        // The old value is not a quiet alias for either form.
+        assert!(Form::parse(Some("bf16")).is_err());
         let refused = Form::parse(Some("fp8")).unwrap_err();
         assert!(refused.contains(FORM_ENV), "{refused}");
     }
@@ -705,6 +786,7 @@ mod tests {
             rows: 64,
             columns: 512,
             row_bytes: row_bytes(512),
+            layout: Layout::Walk,
         };
         let call = gemv4(
             &[
@@ -737,5 +819,12 @@ mod tests {
             )
             .is_err()
         );
+        // A tiled matrix is refused by the row walks.
+        let tiled = Packed {
+            layout: Layout::Tiled,
+            ..matrix(0x1000)
+        };
+        assert!(gemv(tiled, Deviceptr(0x8000), Deviceptr(0), (64, 512), 1, 1).is_err());
+        assert!(gemv4(&[(tiled, Deviceptr(0x9000), 64)], Deviceptr(0x8000), 512, 1).is_err());
     }
 }

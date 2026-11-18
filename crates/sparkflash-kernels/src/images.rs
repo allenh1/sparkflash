@@ -366,6 +366,7 @@ impl Image {
                 "q4e_expert_gemv_e4m3_block",
                 "q4e_gemv_tiled_bf16_parts",
                 "q4e_gemv_tiled_e4m3_block",
+                "q4e_gemv_tiled_packed_parts",
                 "q4e_glm_index_scores",
                 "q4e_glm_mla_absorb",
                 "q4e_glm_mla_attend",

@@ -75,6 +75,8 @@
 #include "shared_prefill_mma_sm121.cuh"
 // Inkling-2-Small's softcapped SwiGLU, the activation q4p_moe_gate_up_capped applies.
 #include "inkling_softcap_sm121.cuh"
+// The packed BF16 form, which q4p_dense_rows reads where the launch names a packed copy.
+#include "bf16_packed_sm121.cuh"
 
 // The shared header's gate, under the name this image used.
 #define q4p_silu q4e_silu
@@ -351,9 +353,101 @@ __device__ __forceinline__ void q4p_rows_fetch(const __nv_bfloat16* row, unsigne
     }
 }
 
+// Where a tile's weight rows come from. A source fetches a round's loads into `next` and gives
+// back the 16 bytes of BF16 words each load stands for when the round is staged, so every source
+// stages the same words and the MMA chain after the stage is one chain, with one set of bits.
+//
+// Q4pRowsBf16: the BF16 rows themselves, one 16-byte streamed load a row a lane.
+struct Q4pRowsBf16 {
+    const __nv_bfloat16* row;
+    unsigned int inner;
+    __device__ __forceinline__ void fetch(unsigned int kb0, unsigned int k_blocks, bool live,
+                                          uint4 next[8]) const {
+        q4p_rows_fetch(row, inner, kb0, k_blocks, live, next);
+    }
+    __device__ __forceinline__ uint4 words(unsigned int, unsigned int, unsigned int, bool,
+                                           uint4 loaded) const {
+        return loaded;
+    }
+};
+
+// Q4pRowsPacked: a packed copy of the rows in the tiled layout (bf16_packed_sm121.cuh), whose
+// chunk a lane loads as Q4eTgPacked::load does - plane-A bytes, plane-B word, the step's top -
+// and rebuilds and patches as Q4eTgPacked::decode does when the round is staged: the same eight
+// words, from three quarters of the bytes. Lane l's chunk of a round is chunk k_at / 8 + 4 kb0 +
+// l of the full row; a round's 32 chunks are contiguous plane bytes when k_at / 8 is a whole
+// number of 32-chunk rounds.
+struct Q4pRowsPacked {
+    const unsigned char* base;  // the warp's first packed row
+    unsigned long long row_bytes;
+    const unsigned int* entries;
+    unsigned int begin[9];  // the warp's rows' runs of the escape list, offsets[n0..n0 + 8]
+    unsigned int columns;   // the full row's, which the layout follows
+    unsigned int chunk0;    // this lane's chunk of the slice's first round
+    __device__ __forceinline__ void fetch(unsigned int kb0, unsigned int k_blocks, bool live,
+                                          uint4 next[8]) const {
+        const unsigned int lane = threadIdx.x & 31u;
+        const bool here = live && kb0 + (lane >> 2) < k_blocks;
+        const int chunk = (int)(chunk0 + 4u * kb0);
+        const Q4ePackedAt at = q4e_packed_at(chunk, (int)(columns >> 3));
+        const unsigned int a_at = (unsigned int)q4e_packed_tiled_a(at, chunk & 31);
+        const unsigned int b_at = (unsigned int)q4e_packed_tiled_b(at, chunk & 31);
+        const unsigned int c_at = columns + columns / 2 + at.step * 32 + (chunk & 31);
+#pragma unroll
+        for (unsigned int i = 0; i < 8u; ++i) {
+            if (here) {
+                const unsigned char* a = base + (unsigned long long)i * row_bytes;
+                const uint2 mant = __ldg(reinterpret_cast<const uint2*>(a + a_at));
+                const unsigned int nib =
+                    __ldg(reinterpret_cast<const unsigned int*>(a + columns + b_at));
+                next[i] = make_uint4(mant.x, mant.y, nib, (unsigned int)__ldg(a + c_at));
+            } else {
+                next[i] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+    }
+    // Row i's words of round kb0's load `loaded`: zeros past the slice, as the BF16 fetch gives.
+    __device__ __forceinline__ uint4 words(unsigned int i, unsigned int kb0, unsigned int k_blocks,
+                                           bool live, uint4 loaded) const {
+        const unsigned int lane = threadIdx.x & 31u;
+        uint4 value[1] = {
+            q4e_packed_chunk(make_uint2(loaded.x, loaded.y), loaded.z, loaded.w * 0x01010101u)};
+        if (live && kb0 + (lane >> 2) < k_blocks && begin[i] != begin[i + 1]) {
+            Q4ePackedRow escapes;
+            escapes.entries = entries;
+            escapes.begin = begin[i];
+            escapes.end = begin[i + 1];
+            q4e_packed_patch<1>(value, (int)(chunk0 + 4u * kb0), escapes);
+        }
+        return value[0];
+    }
+};
+
+// A tile's packed source over rows n0 to n0 + 7 of a packed matrix of `columns` columns.
+__device__ __forceinline__ Q4pRowsPacked q4p_rows_packed(const unsigned char* packed,
+                                                         const unsigned int* offsets,
+                                                         const unsigned int* entries,
+                                                         unsigned long long row_bytes,
+                                                         unsigned int columns, unsigned int n0,
+                                                         bool live, unsigned long long k_at) {
+    Q4pRowsPacked source;
+    const unsigned int first = live ? n0 : 0u;
+    source.base = packed + (unsigned long long)first * row_bytes;
+    source.row_bytes = row_bytes;
+    source.entries = entries;
+#pragma unroll
+    for (unsigned int i = 0; i < 9u; ++i) {
+        source.begin[i] = live ? __ldg(offsets + first + i) : 0u;
+    }
+    source.columns = columns;
+    source.chunk0 = (unsigned int)(k_at >> 3) + (threadIdx.x & 31u);
+    return source;
+}
+
 // The tile's MMA chain from the first round in `next`, into the C fragment `acc` - rows g and
 // g + 8, columns 2q and 2q + 1. `tile` is the warp's own 8 x Q4P_ROWS_STRIDE shared stage.
-__device__ __forceinline__ void q4p_rows_tile(const __nv_bfloat16* row, const float* __restrict__ a,
+template <typename Source>
+__device__ __forceinline__ void q4p_rows_tile(const Source& source, const float* __restrict__ a,
                                               unsigned int inner, unsigned int tokens, bool live,
                                               unsigned int m0, unsigned long long k_at,
                                               unsigned int k_blocks, unsigned char* tile,
@@ -374,11 +468,12 @@ __device__ __forceinline__ void q4p_rows_tile(const __nv_bfloat16* row, const fl
         __syncwarp();
 #pragma unroll
         for (unsigned int i = 0; i < 8u; ++i) {
-            *reinterpret_cast<uint4*>(tile + i * Q4P_ROWS_STRIDE + 16u * lane) = next[i];
+            *reinterpret_cast<uint4*>(tile + i * Q4P_ROWS_STRIDE + 16u * lane) =
+                source.words(i, kb0, k_blocks, live, next[i]);
         }
         __syncwarp();
         if (kb0 + Q4P_ROWS_ROUND < k_blocks) {
-            q4p_rows_fetch(row, inner, kb0 + Q4P_ROWS_ROUND, k_blocks, live, next);
+            source.fetch(kb0 + Q4P_ROWS_ROUND, k_blocks, live, next);
         }
 #pragma unroll
         for (unsigned int u = 0; u < Q4P_ROWS_ROUND; ++u) {
@@ -457,7 +552,12 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
     unsigned int dense_x, unsigned int riders, const __nv_bfloat16* rw0, float* ry0, int rows0,
     int epilogue0, float scale0, int split0, float* partials0, unsigned int* tickets0,
     const __nv_bfloat16* rw1, float* ry1, int rows1, int epilogue1, float scale1, int split1,
-    float* partials1, unsigned int* tickets1) {
+    float* partials1, unsigned int* tickets1, const unsigned char* packed0,
+    const unsigned int* offsets0, const unsigned int* entries0, unsigned long long row_bytes0,
+    const unsigned char* packed1, const unsigned int* offsets1, const unsigned int* entries1,
+    unsigned long long row_bytes1, const unsigned char* packed2, const unsigned int* offsets2,
+    const unsigned int* entries2, unsigned long long row_bytes2, const unsigned char* packed3,
+    const unsigned int* offsets3, const unsigned int* entries3, unsigned long long row_bytes3) {
     __shared__ __align__(16) unsigned char stage[4][8u * Q4P_ROWS_STRIDE];
     static_assert(sizeof(stage) >= Q4P_GEMM_ROWS_STAGE * sizeof(__nv_bfloat16),
                   "a rider stages its weights in the dense tile's stage");
@@ -493,8 +593,14 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
     unsigned int first = 0;
     unsigned int counted = 0;
     unsigned int across = (cols0 + 31u) / 32u;
+    // The matrix's packed copy, when the launch names one (null: its BF16 rows).
+    const unsigned char* packed = packed0;
+    const unsigned int* offsets = offsets0;
+    const unsigned int* entries = entries0;
+    unsigned long long row_bytes = row_bytes0;
     const auto pick = [&](unsigned int m, const __nv_bfloat16* wm, float* om, float* ym,
-                          unsigned int cm, unsigned int sm) {
+                          unsigned int cm, unsigned int sm, const unsigned char* pm,
+                          const unsigned int* fm, const unsigned int* em, unsigned long long bm) {
         if (count > m && blockIdx.x >= first + across * segments) {
             first += across * segments;
             counted += segments > 1u ? across : 0u;
@@ -504,11 +610,15 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
             cols = cm;
             segments = sm;
             across = (cm + 31u) / 32u;
+            packed = pm;
+            offsets = fm;
+            entries = em;
+            row_bytes = bm;
         }
     };
-    pick(1u, w1, out1, y1, cols1, segments1);
-    pick(2u, w2, out2, y2, cols2, segments2);
-    pick(3u, w3, out3, y3, cols3, segments3);
+    pick(1u, w1, out1, y1, cols1, segments1, packed1, offsets1, entries1, row_bytes1);
+    pick(2u, w2, out2, y2, cols2, segments2, packed2, offsets2, entries2, row_bytes2);
+    pick(3u, w3, out3, y3, cols3, segments3, packed3, offsets3, entries3, row_bytes3);
     const unsigned int bx = (blockIdx.x - first) / segments;
     const unsigned int z = blockIdx.x - first - bx * segments;
     // The weights are constant: the first round streams while the previous kernel finishes.
@@ -523,12 +633,20 @@ extern "C" __global__ __launch_bounds__(128) void q4p_dense_rows(
     const unsigned int slice = inner / segments;
     const unsigned int k_blocks = slice >> 5;
     const unsigned long long k_at = (unsigned long long)z * slice;
-    const __nv_bfloat16* row = q4p_rows_row(w, inner, n0, live, k_at);
     uint4 next[8];
-    q4p_rows_fetch(row, inner, 0u, k_blocks, live, next);
-    OPT_PDL_WAIT();
     float acc[4];
-    q4p_rows_tile(row, a, inner, tokens, live, m0, k_at, k_blocks, stage[warp], next, acc);
+    if (packed != nullptr) {
+        const Q4pRowsPacked source =
+            q4p_rows_packed(packed, offsets, entries, row_bytes, inner, n0, live, k_at);
+        source.fetch(0u, k_blocks, live, next);
+        OPT_PDL_WAIT();
+        q4p_rows_tile(source, a, inner, tokens, live, m0, k_at, k_blocks, stage[warp], next, acc);
+    } else {
+        const Q4pRowsBf16 source{q4p_rows_row(w, inner, n0, live, k_at), inner};
+        source.fetch(0u, k_blocks, live, next);
+        OPT_PDL_WAIT();
+        q4p_rows_tile(source, a, inner, tokens, live, m0, k_at, k_blocks, stage[warp], next, acc);
+    }
     const unsigned long long plane = (unsigned long long)tokens * cols;
 #pragma unroll
     for (unsigned int half = 0; half < 2u; ++half) {
@@ -582,12 +700,13 @@ extern "C" __global__ __launch_bounds__(128) void q4p_hyper_up_rows(
     const unsigned int m0 = blockIdx.y * 16u;
     const bool live = warp < hc && column0 < hidden;
     const unsigned int k_blocks = lowrank >> 5;
-    const __nv_bfloat16* row = q4p_rows_row(up, lowrank, warp * hidden + column0, live, 0ull);
+    const Q4pRowsBf16 source{q4p_rows_row(up, lowrank, warp * hidden + column0, live, 0ull),
+                             lowrank};
     uint4 next[8];
-    q4p_rows_fetch(row, lowrank, 0u, k_blocks, live, next);
+    source.fetch(0u, k_blocks, live, next);
     OPT_PDL_WAIT();
     float acc[4];
-    q4p_rows_tile(row, low, lowrank, tokens, live, m0, 0ull, k_blocks, stage[warp], next, acc);
+    q4p_rows_tile(source, low, lowrank, tokens, live, m0, 0ull, k_blocks, stage[warp], next, acc);
     raw[warp][g][2u * q] = acc[0];
     raw[warp][g][2u * q + 1u] = acc[1];
     raw[warp][g + 8u][2u * q] = acc[2];

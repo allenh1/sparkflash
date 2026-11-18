@@ -95,25 +95,8 @@
 #define q4e_e2m1 spark_fp4_e2m1_decode
 
 
-__device__ __forceinline__ float q4e_dot_pair(unsigned int word, float x0, float x1) {
-    const float low = __bfloat162float(__ushort_as_bfloat16((unsigned short)(word & 0xFFFFu)));
-    const float high = __bfloat162float(__ushort_as_bfloat16((unsigned short)(word >> 16)));
-    return low * x0 + high * x1;
-}
-
-__device__ __forceinline__ float q4e_dot_word(unsigned int word, const float* __restrict__ x,
-                                              int base) {
-    return q4e_dot_pair(word, x[base], x[base + 1]);
-}
-
-// One 16-byte chunk of a BF16 row: eight weights against eight activations loaded as two float4s.
-__device__ __forceinline__ float q4e_dot_chunk(const uint4 value, const float* __restrict__ x,
-                                               int base) {
-    const float4 x0 = q4e_ldg(reinterpret_cast<const float4*>(x + base));
-    const float4 x1 = q4e_ldg(reinterpret_cast<const float4*>(x + base + 4));
-    return q4e_dot_pair(value.x, x0.x, x0.y) + q4e_dot_pair(value.y, x0.z, x0.w) +
-           q4e_dot_pair(value.z, x1.x, x1.y) + q4e_dot_pair(value.w, x1.z, x1.w);
-}
+// q4e_dot_pair, q4e_dot_word and q4e_dot_chunk are the shared header's (q4e_gemv_sm121.cuh), so
+// the packed walks there repeat them word for word.
 
 // One warp's partial dot product of a BF16 row against an f32 vector; reduce with q4e_warp_sum.
 __device__ __forceinline__ float q4e_row_dot_bf16(const __nv_bfloat16* __restrict__ row,
@@ -763,13 +746,14 @@ extern "C" __global__ void q4e_gemv4_packed(
 // Packs `rows` BF16 rows (columns a multiple of 256) a warp a row. With `packed` null it only
 // counts: counts[row] = the row's escapes. Otherwise it writes the packed rows `row_bytes` apart
 // and each row's escapes from entries[offsets[row]] on, in walk order. Offsets and counts are the
-// caller's for these rows (it offsets the pointers to a group's first row).
+// caller's for these rows (it offsets the pointers to a group's first row). `tiled` nonzero
+// writes the tiled layout (bf16_packed_sm121.cuh), else the row walk's.
 extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ source,
                                          unsigned char* __restrict__ packed,
                                          const unsigned int* __restrict__ offsets,
                                          unsigned int* __restrict__ entries,
                                          unsigned int* __restrict__ counts, int rows, int columns,
-                                         unsigned long long row_bytes) {
+                                         unsigned long long row_bytes, int tiled) {
     OPT_PDL_ENTRY();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -825,8 +809,13 @@ extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ sour
             before -= mine;
             if (a != nullptr) {
                 unsigned int at = written + before;
-                unsigned char* a_lane = a + a_off + (unsigned long long)lane * n * 8;
-                unsigned char* b_lane = b + a_off / 2 + (unsigned long long)lane * n * 4;
+                // Chunk j of the lane's: at 8 j + its lane's 8 n in the row walk's layout, at
+                // 256 j + 8 lane in the tiled one (plane B at half of each).
+                unsigned char* a_lane = a + a_off + (unsigned long long)lane * (tiled ? 8 : n * 8);
+                unsigned char* b_lane =
+                    b + a_off / 2 + (unsigned long long)lane * (tiled ? 4 : n * 4);
+                const int a_step = tiled ? 256 : 8;
+                const int b_step = tiled ? 128 : 4;
                 for (int j = 0; j < n; ++j) {
                     unsigned int nib = 0;
                     for (int k = 0; k < 8; ++k) {
@@ -837,10 +826,11 @@ extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ sour
                             const unsigned int column = (unsigned int)((chunk + 32 * j) * 8 + k);
                             entries[at++] = (column << 16) | word;
                         }
-                        a_lane[j * 8 + k] = (unsigned char)(((word >> 8) & 0x80u) | (word & 0x7Fu));
+                        a_lane[j * a_step + k] =
+                            (unsigned char)(((word >> 8) & 0x80u) | (word & 0x7Fu));
                         nib |= off << ((k & 3) * 8 + (k >> 2) * 4);
                     }
-                    *reinterpret_cast<unsigned int*>(b_lane + j * 4) = nib;
+                    *reinterpret_cast<unsigned int*>(b_lane + j * b_step) = nib;
                 }
                 c[step * 32 + lane] = (unsigned char)top;
             }
@@ -863,14 +853,14 @@ extern "C" __global__ void q4e_pack_bf16(const unsigned short* __restrict__ sour
 
 // Rebuilds `rows` packed rows a warp a row: into `out` as BF16 when it is not null, and against
 // `expected` when that is not null, adding the differing words to *differ. Offsets are the
-// caller's for these rows.
+// caller's for these rows; `tiled` names the layout, as q4e_pack_bf16's does.
 extern "C" __global__ void q4e_unpack_bf16(const unsigned char* __restrict__ packed,
                                            const unsigned int* __restrict__ offsets,
                                            const unsigned int* __restrict__ entries,
                                            unsigned short* __restrict__ out,
                                            const unsigned short* __restrict__ expected,
                                            unsigned int* __restrict__ differ, int rows,
-                                           int columns, unsigned long long row_bytes) {
+                                           int columns, unsigned long long row_bytes, int tiled) {
     OPT_PDL_ENTRY();
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -886,7 +876,11 @@ extern "C" __global__ void q4e_unpack_bf16(const unsigned char* __restrict__ pac
                 ? reinterpret_cast<const uint4*>(expected + (unsigned long long)row * columns)
                 : nullptr,
             0u};
-        q4e_packed_walk<1>(rows_of, columns, lane, words);
+        if (tiled) {
+            q4e_packed_walk<1, Q4ePackedWords, true>(rows_of, columns, lane, words);
+        } else {
+            q4e_packed_walk<1>(rows_of, columns, lane, words);
+        }
         if (words.differ != 0) {
             atomicAdd(differ, words.differ);
         }

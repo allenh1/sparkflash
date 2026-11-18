@@ -121,7 +121,7 @@ fn launch(cuda: &Cuda, name: &'static str, grid: (u32, u32, u32), threads: u32, 
         || name == "glm_prefill_index_scores"
     {
         sparkflash_kernels::images::glm_attention_cubin()
-    } else if name.starts_with("q4e_glm_") || name == "q4e_gemv_tiled_bf16_parts" {
+    } else if name.starts_with("q4e_glm_") || name.starts_with("q4e_gemv_tiled_") {
         sparkflash_kernels::images::glm_decode_cubin()
     } else {
         embedded_glm_prefill_cubin()
@@ -1154,5 +1154,98 @@ fn the_exact_projection_is_the_tiled_gemvs_bit_for_bit() {
                 "{outs} x {columns}: row {r} output {j} is not the tiled chain"
             );
         }
+    }
+}
+
+/// The packed form's tiled GEMV (q4e_gemv_tiled_packed_parts) gives the BF16 one's bits over
+/// every walk shape the layout holds - whole quads, a pair, single chunks, a pair then a single -
+/// with escapes (zeros and weights far under their neighbours), one split and many, four parts,
+/// and one to sixteen rows.
+#[test]
+fn the_packed_tiled_gemv_is_the_bf16_ones_bits() {
+    use sparkflash_ops::gemv::tiled_gemv_splits;
+    use sparkflash_ops::packed::{Form, Kernels, PackedSet, Placement};
+    let Some(cuda) = open() else { return };
+    let kernels = Kernels::load(&cuda).expect("packed kernels");
+    let bf16 = |value: f32| (value.to_bits() >> 16) as u16;
+    for (outs, columns) in [
+        (300, 4096),
+        (64, 2560),
+        (40, 1536),
+        (33, 256),
+        (50, 1792),
+        (96, 7424),
+    ] {
+        let mut lcg = Lcg((outs * 31 + columns) as u64);
+        let words: Vec<u16> = (0..outs * columns)
+            .map(|i| match (i % 97, i % 89) {
+                (0, _) => 0,
+                (_, 0) => bf16(lcg.next() * 1e-7),
+                _ => bf16(lcg.next()),
+            })
+            .collect();
+        let w = upload::<u16>(&cuda, &words);
+        let mut set = PackedSet::new(Form::Packed, Placement::Beside).tiled();
+        set.pack(&cuda, &kernels, &[(w, outs, columns)], 0)
+            .expect("the packed copy unpacks to the BF16 rows");
+        let packed = set.get(w).expect("packed");
+        let tiles = outs.div_ceil(32);
+        let rounds = columns / 256;
+        let parts = [outs / 4, outs / 2, outs - 3];
+        for rows in [1usize, 3, 8, 16] {
+            let input = upload::<f32>(&cuda, &Lcg(rows as u64).values(rows * columns));
+            for splits in [tiled_gemv_splits(tiles, columns), rounds] {
+                let groups = rows.div_ceil(8);
+                let mut total = 0;
+                let partials = cuda
+                    .alloc(groups * splits * 8 * tiles * 32 * 4, &mut total)
+                    .expect("alloc");
+                let counters = upload::<u8>(&cuda, &vec![0u8; groups * tiles * 4]);
+                let mut outputs = Vec::new();
+                for (name, mut args) in [
+                    ("q4e_gemv_tiled_bf16_parts", vec![w.0]),
+                    ("q4e_gemv_tiled_packed_parts", packed.planes().to_vec()),
+                ] {
+                    let y = upload::<f32>(&cuda, &vec![f32::NAN; rows * outs]);
+                    args.extend([
+                        input.0,
+                        y.0,
+                        outs as u64,
+                        columns as u64,
+                        rows as u64,
+                        partials.0,
+                        counters.0,
+                    ]);
+                    args.extend(parts.map(|start| start as u64));
+                    if name.contains("packed") {
+                        args.push(packed.row_bytes() as u64);
+                    }
+                    launch(
+                        &cuda,
+                        name,
+                        (tiles as u32, splits as u32, groups as u32),
+                        256,
+                        &args,
+                    );
+                    outputs.push(download::<u32>(&cuda, &y, rows * outs));
+                }
+                let differ = outputs[0]
+                    .iter()
+                    .zip(&outputs[1])
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    outputs[0]
+                        .iter()
+                        .all(|bits| f32::from_bits(*bits).is_finite()),
+                    "{outs} x {columns}, {rows} rows, {splits} splits: an output left unwritten"
+                );
+                assert_eq!(
+                    differ, 0,
+                    "{outs} x {columns}, {rows} rows, {splits} splits: {differ} sums differ"
+                );
+            }
+        }
+        eprintln!("{outs} x {columns}: packed tiled sums equal the BF16 ones");
     }
 }

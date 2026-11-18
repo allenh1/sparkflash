@@ -746,6 +746,11 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "q4e_gemv_tiled_bf16_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
+            // The same GEMV over the packed form's planes (sparkflash_ops::packed).
+            dec(
+                "q4e_gemv_tiled_packed_parts",
+                &[Precision::Bf16, Precision::F32],
+            ),
             dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
         ],
         false,
@@ -823,6 +828,11 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             dec(
                 "q4e_gemv_tiled_bf16_parts",
+                &[Precision::Bf16, Precision::F32],
+            ),
+            // The same GEMV over the packed form's planes (sparkflash_ops::packed).
+            dec(
+                "q4e_gemv_tiled_packed_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
             dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
@@ -2151,7 +2161,10 @@ fn dense_moe_refusal(
             moe.intermediate
         ));
     }
-    if moe.norm_topk && moe.active_experts == 1 && moe.score != Score::Softmax && !moe.selection_bias
+    if moe.norm_topk
+        && moe.active_experts == 1
+        && moe.score != Score::Softmax
+        && !moe.selection_bias
     {
         return Some(
             "one pick renormalised under an independent score: the router keeps its score (the \

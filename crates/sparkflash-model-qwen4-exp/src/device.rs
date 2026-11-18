@@ -72,8 +72,8 @@ use sparkflash_model::{
 };
 pub(crate) use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_weights::linalg::ScaleGrid;
-use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::rank_file::fnv1a;
+use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
 use sparkflash_weights::{WeightSource, check_length};
 
@@ -102,6 +102,7 @@ use sparkflash_ops::calls::{self, Call, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
+use sparkflash_ops::packed::{Form, PackedSet, Placement};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -2735,11 +2736,13 @@ impl Qwen4ExpDeviceBackend {
         }
         let rewind = sparkflash_runtime::rewind()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let packed = pack_dense(&cuda, &weights)?;
         let shared = Arc::new(SequenceShared {
             cuda: CudaHandle::new(cuda),
             kernels: KernelSet(kernels),
             config: Arc::new(local),
             weights,
+            packed,
             dflash,
             prefill,
             pooled: std::sync::Mutex::new(None),
@@ -3475,6 +3478,9 @@ struct SequenceShared {
     kernels: KernelSet,
     config: Arc<Qwen4ExpConfig>,
     weights: GpuWeights,
+    /// Packed copies of the layers' BF16 projections beside their rows ([pack_dense]), which the
+    /// few-row tensor-core tile reads for the same bits from three quarters of the bytes.
+    packed: PackedSet,
     /// The DFlash 2 drafter `SPARKFLASH_QWEN4_DFLASH2` names, which replaces the MTP head as the
     /// speculative drafter when it is loaded.
     dflash: Option<GpuDflash2>,
@@ -3557,7 +3563,82 @@ impl Drop for SequenceShared {
         if let Some(tp) = &mut self.tp {
             tp.sums.release(&self.cuda);
         }
+        let packed: Vec<Deviceptr> = self.packed.allocations().collect();
+        self.cuda.free_buffers(&packed.iter().collect::<Vec<_>>());
     }
+}
+
+/// The smallest BF16 projection the arm packs: one of at least 2^20 weights. A smaller one is
+/// a sliver of a step's bytes and not worth an arena entry.
+const PACK_MIN_WEIGHTS: usize = 1 << 20;
+
+/// Packs the layers' BF16 projections that the few-row tensor-core tile (q4p_dense_rows) reads,
+/// beside their rows: each layer's attention or GDN projections, its shared expert and its
+/// router, and the hyper-connection's bottleneck, the ones of at least [PACK_MIN_WEIGHTS] weights
+/// whose shape the tile and the form both take. The bulk prefill's MMA and every token kernel
+/// keep reading the BF16 rows, which stay. Every packed matrix is unpacked and compared with its
+/// BF16 rows here, and one differing word refuses the load. `SPARKFLASH_DENSE_WEIGHTS=checkpoint` packs
+/// nothing.
+fn pack_dense(cuda: &Cuda, weights: &GpuWeights) -> Result<PackedSet, BackendError> {
+    let refusal = |error: String| BackendError::new("qwen4_device", error);
+    let mut set = PackedSet::new(Form::from_env().map_err(refusal)?, Placement::Beside).tiled();
+    fn bf16(matrix: &Dense) -> Option<&GpuMat> {
+        match matrix {
+            Dense::Bf16(matrix) => Some(matrix),
+            Dense::Fp8(_) => None,
+        }
+    }
+    let mut candidates: Vec<&GpuMat> = Vec::new();
+    for layer in &weights.layers {
+        match &layer.branch {
+            GpuBranch::Linear {
+                in_qkv,
+                in_z,
+                out_proj,
+                ..
+            } => candidates.extend([in_qkv, in_z, out_proj].into_iter().filter_map(bf16)),
+            GpuBranch::Sparse {
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                ..
+            } => candidates.extend(
+                [q_proj, k_proj, v_proj, o_proj]
+                    .into_iter()
+                    .filter_map(bf16),
+            ),
+        }
+        let moe = &layer.moe;
+        candidates.extend(
+            [&moe.shared, &moe.shared_up, &moe.shared_down]
+                .into_iter()
+                .filter_map(bf16),
+        );
+        candidates.push(&moe.router);
+        candidates.extend(
+            [&layer.attn_hyper, &layer.mlp_hyper]
+                .into_iter()
+                .filter_map(|hyper| hyper.mix.as_ref().map(|mix| &mix.down)),
+        );
+    }
+    let matrices: Vec<(Deviceptr, usize, usize)> = candidates
+        .into_iter()
+        .filter(|matrix| {
+            matrix.rows.is_multiple_of(32)
+                && matrix.rows * matrix.columns >= PACK_MIN_WEIGHTS
+                && sparkflash_ops::packed::packable(matrix.rows, matrix.columns)
+        })
+        .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+        .collect();
+    if matrices.is_empty() || Form::from_env().map_err(refusal)? == Form::Checkpoint {
+        eprintln!("qwen4: {}", set.summary());
+        return Ok(set);
+    }
+    let kernels = sparkflash_ops::packed::Kernels::load(cuda).map_err(refusal)?;
+    set.pack(cuda, &kernels, &matrices, 0).map_err(refusal)?;
+    eprintln!("qwen4: {}", set.summary());
+    Ok(set)
 }
 
 impl DeviceSequence {

@@ -46,6 +46,28 @@
 // read once per chunk while every per-token accumulator stays in registers with no stack spill.
 #define Q4E_MAX_BATCH 8
 
+// q4e_row_dot_bf16's arithmetic: a BF16 word's two weights against two activations, and one
+// 16-byte chunk of a row (eight weights) against eight activations loaded as two float4s. The
+// packed walks (bf16_packed_sm121.cuh) call the same expressions on the words they rebuild.
+__device__ __forceinline__ float q4e_dot_pair(unsigned int word, float x0, float x1) {
+    const float low = __bfloat162float(__ushort_as_bfloat16((unsigned short)(word & 0xFFFFu)));
+    const float high = __bfloat162float(__ushort_as_bfloat16((unsigned short)(word >> 16)));
+    return low * x0 + high * x1;
+}
+
+__device__ __forceinline__ float q4e_dot_word(unsigned int word, const float* __restrict__ x,
+                                              int base) {
+    return q4e_dot_pair(word, x[base], x[base + 1]);
+}
+
+__device__ __forceinline__ float q4e_dot_chunk(const uint4 value, const float* __restrict__ x,
+                                               int base) {
+    const float4 x0 = q4e_ldg(reinterpret_cast<const float4*>(x + base));
+    const float4 x1 = q4e_ldg(reinterpret_cast<const float4*>(x + base + 4));
+    return q4e_dot_pair(value.x, x0.x, x0.y) + q4e_dot_pair(value.y, x0.z, x0.w) +
+           q4e_dot_pair(value.z, x1.x, x1.y) + q4e_dot_pair(value.w, x1.z, x1.w);
+}
+
 // ---------------------------------------------------------------------------------------------
 // One token MoE router: softmax, sigmoid or sqrt-softplus scores, an optional noaux_tc
 // selection bias, and norm_topk/routed_scaling. Qwen's q4e_router and GLM's q4e_noaux_router
@@ -280,9 +302,25 @@ __device__ __forceinline__ float2 q4e_e4m3x2(unsigned int pair) {
 
 // The weight formats the tiled body reads. A lane takes one 16-byte chunk of each of its rows a
 // round, `kColumns` weights, against `x`: the chunk's staged activations, four to a float4.
-// `kBlockScaled` formats stage their activations through q4e_tg_fp8_activation.
-struct Q4eTgBf16 {
-    using Weight = __nv_bfloat16;
+// `kBlockScaled` formats stage their activations through q4e_tg_fp8_activation. A row is what the
+// body's `row_of` returns: a pointer to the stored weights here, so `present` and `load` are the
+// pointer's and `decode` keeps the loaded words; the packed form (bf16_packed_sm121.cuh) has rows
+// of its own, loads its planes' bytes and rebuilds the chunk in `decode`, which the body calls
+// after the round's activations are staged so the loads stay in flight over the staging. `load`
+// and `decode` also see the body's `row_of`, which holds what every row shares.
+template <typename W>
+struct Q4eTgStored {
+    using Weight = W;
+    __device__ static bool present(const W* row) { return row != nullptr; }
+    template <typename RowOf>
+    __device__ static uint4 load(const RowOf&, const W* row, int column) {
+        return q4e_ldg(reinterpret_cast<const uint4*>(row + column));
+    }
+    template <typename RowOf>
+    __device__ static uint4 decode(const RowOf&, const W*, int, uint4 loaded) { return loaded; }
+};
+
+struct Q4eTgBf16 : Q4eTgStored<__nv_bfloat16> {
     static constexpr int kColumns = 8;
     static constexpr bool kBlockScaled = false;
     __device__ static float fma(const uint4 word4, const float4* x, float acc) {
@@ -290,8 +328,7 @@ struct Q4eTgBf16 {
     }
 };
 
-struct Q4eTgE4m3 {
-    using Weight = unsigned char;
+struct Q4eTgE4m3 : Q4eTgStored<unsigned char> {
     static constexpr int kColumns = 16;
     static constexpr bool kBlockScaled = false;
     __device__ static float fma(const uint4 word4, const float4* x, float acc) {
@@ -374,7 +411,8 @@ __device__ __forceinline__ void q4e_tiled_gemv(const RowOf& row_of, const Finish
     const int share = (rounds + splits - 1) / splits;
     const int begin = blockIdx.y * share;
     const int end = min(rounds, begin + share);
-    const typename Format::Weight* rows[Q4E_TG_ROWS];
+    using Row = decltype(row_of(0, 0, 0));
+    Row rows[Q4E_TG_ROWS];
 #pragma unroll
     for (int r = 0; r < Q4E_TG_ROWS; ++r) {
         rows[r] = row_of(tile, warp, r);
@@ -396,9 +434,8 @@ __device__ __forceinline__ void q4e_tiled_gemv(const RowOf& row_of, const Finish
         uint4 w[Q4E_TG_ROWS];
 #pragma unroll
         for (int r = 0; r < Q4E_TG_ROWS; ++r) {
-            if (in && rows[r] != nullptr) {
-                w[r] = q4e_ldg(
-                    reinterpret_cast<const uint4*>(rows[r] + base + lane * Format::kColumns));
+            if (in && Format::present(rows[r])) {
+                w[r] = Format::load(row_of, rows[r], base + lane * Format::kColumns);
             }
         }
         if (round == begin) {
@@ -425,6 +462,12 @@ __device__ __forceinline__ void q4e_tiled_gemv(const RowOf& row_of, const Finish
         __syncthreads();
         if (in) {
 #pragma unroll
+            for (int r = 0; r < Q4E_TG_ROWS; ++r) {
+                if (Format::present(rows[r])) {
+                    w[r] = Format::decode(row_of, rows[r], base + lane * Format::kColumns, w[r]);
+                }
+            }
+#pragma unroll
             for (int t = 0; t < Q4E_MAX_BATCH; ++t) {
                 if (t < batch) {
                     float4 quads[kQuads];
@@ -434,7 +477,7 @@ __device__ __forceinline__ void q4e_tiled_gemv(const RowOf& row_of, const Finish
                     }
 #pragma unroll
                     for (int r = 0; r < Q4E_TG_ROWS; ++r) {
-                        if (rows[r] != nullptr) {
+                        if (Format::present(rows[r])) {
                             acc[r][t] = Format::fma(w[r], quads, acc[r][t]);
                         }
                     }

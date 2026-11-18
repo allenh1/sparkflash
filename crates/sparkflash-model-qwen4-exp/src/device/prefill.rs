@@ -769,8 +769,24 @@ impl DeviceSequence {
     ) -> Result<(), BackendError> {
         let mut columns = 0usize;
         let mut matrices = [0u64; 20];
+        // Each matrix's packed copy (rows, offsets, escapes, row stride), zeros for its BF16 rows.
+        let mut packed = [0u64; 16];
         let (mut partials, mut tiles) = (0usize, 0usize);
         for (slot, &(matrix, output, segments)) in group.iter().enumerate() {
+            if let Some(copy) = self
+                .backend
+                .packed
+                .get(matrix.pointer)
+                .filter(|copy| copy.admits(matrix.rows, matrix.columns, input).is_ok())
+            {
+                let [rows, offsets, entries] = copy.planes();
+                packed[slot * 4..slot * 4 + 4].copy_from_slice(&[
+                    rows,
+                    offsets,
+                    entries,
+                    copy.row_bytes() as u64,
+                ]);
+            }
             let target = if segments > 1 {
                 self.gemm_partials.offset(partials * 4)
             } else {
@@ -839,6 +855,7 @@ impl DeviceSequence {
         args.extend_from_slice(&matrices);
         args.extend_from_slice(&[columns as u64, riders.len() as u64]);
         args.extend_from_slice(&riding);
+        args.extend_from_slice(&packed);
         self.launch(
             self.backend.kernels.prefill.dense_rows,
             (
@@ -1208,7 +1225,12 @@ impl DeviceSequence {
             batch,
         )?;
         let call = gdn::gated_norm(
-            (self.linear_out.0, self.linear_z.0, norm.0, self.linear_out.0),
+            (
+                self.linear_out.0,
+                self.linear_z.0,
+                norm.0,
+                self.linear_out.0,
+            ),
             (geometry.heads, geometry.value_dim),
             config.rms_norm_eps as f32,
             config.output_gate_is_sigmoid(),

@@ -51,6 +51,7 @@ use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::m4_quant::{bf16_bits, bf16_bits_to_f32};
 use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin, embedded_prefill_cubin};
+use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
 
 /// The worst |error| relative to the largest |reference| the forms may reach. The split carries
 /// about 2^-17 of each activation; dropping the remainder (one BF16 activation) lands near 6e-4.
@@ -162,6 +163,24 @@ fn launch_rows(
     tokens: usize,
     finish: Finish,
 ) {
+    launch_rows_packed(
+        cuda, kernel, matrices, &[None; 4], riders, a, inner, tokens, finish,
+    );
+}
+
+/// [launch_rows] with matrix m read from its packed copy `packed[m]` where there is one.
+#[allow(clippy::too_many_arguments)]
+fn launch_rows_packed(
+    cuda: &Cuda,
+    kernel: Kernel,
+    matrices: &[(Deviceptr, Deviceptr, Deviceptr, usize, usize)],
+    packed: &[Option<Packed>; 4],
+    riders: &[Rider],
+    a: Deviceptr,
+    inner: usize,
+    tokens: usize,
+    finish: Finish,
+) {
     let mut args = vec![
         a.0,
         inner as u64,
@@ -199,6 +218,15 @@ fn launch_rows(
                 ctas += (rider.rows * tokens).div_ceil(128) * rider.split;
             }
             None => args.extend_from_slice(&[0; 8]),
+        }
+    }
+    for copy in packed {
+        match copy {
+            Some(copy) => {
+                args.extend_from_slice(&copy.planes());
+                args.push(copy.row_bytes() as u64);
+            }
+            None => args.extend_from_slice(&[0; 4]),
         }
     }
     let planes = tokens.div_ceil(16);
@@ -301,6 +329,148 @@ fn finish_tile(
 fn poison(cuda: &Cuda, pointer: Deviceptr, elements: usize) {
     cuda.memset_d8_async(pointer, 0xff, elements * 4)
         .expect("memset");
+}
+
+/// A packed copy of a matrix (crates/sparkflash-ops/src/packed.rs) through q4p_dense_rows is
+/// the BF16 rows' launch, bit for bit: the tile stages the words its fetch rebuilds, so every
+/// output, split slices and finished sums alike, is the same. The weights hold zeros and values
+/// far under their step's largest, which the form keeps as escapes, so the patch is on the path;
+/// one launch holds a packed matrix beside a BF16 one, at different splits.
+#[test]
+fn a_packed_copy_gives_the_bf16_rows_bits() {
+    let Some(cuda) = open() else { return };
+    let (_rows_module, rows_kernel) = cuda
+        .load_named(embedded_prefill_cubin(), "q4p_dense_rows")
+        .expect("q4p_dense_rows");
+    let kernels = packed::Kernels::load(&cuda).expect("the packed form's kernels");
+    let scale = 1.3f32;
+    for (cols, inner, segments, epilogue) in [
+        (96usize, 2560usize, 5usize, 2u32),
+        (512, 2560, 2, 1),
+        (2560, 6144, 2, 0),
+        (4096, 2560, 1, 1),
+        (256, 1792, 1, 0),
+    ] {
+        let mut rng = Lcg((cols * 13 + inner * 5 + segments) as u64);
+        let weights: Vec<u16> = (0..cols * inner)
+            .map(|at| match at % 997 {
+                0 => 0,
+                1 => bf16_bits(rng.next() * 1e-9),
+                _ => bf16_bits(rng.next() * 0.05),
+            })
+            .collect();
+        let w = upload::<u8>(
+            &cuda,
+            &weights
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let mut set = PackedSet::new(Form::Packed, Placement::Beside).tiled();
+        set.pack(&cuda, &kernels, &[(w, cols, inner)], 0)
+            .expect("the pack");
+        let copy = set.get(w).expect("a packable shape");
+        const TOKENS: usize = 17;
+        let activations: Vec<f32> = (0..TOKENS * inner).map(|_| rng.next()).collect();
+        let a = upload::<u8>(
+            &cuda,
+            &activations
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        let plane = segments * TOKENS * cols;
+        let out = [
+            upload::<u8>(&cuda, &vec![0u8; plane * 4]),
+            upload::<u8>(&cuda, &vec![0u8; plane * 4]),
+        ];
+        let y = [
+            upload::<u8>(&cuda, &vec![0u8; TOKENS * cols * 4]),
+            upload::<u8>(&cuda, &vec![0u8; TOKENS * cols * 4]),
+        ];
+        let tiles = cols.div_ceil(32) * TOKENS.div_ceil(16);
+        let tickets = upload::<u8>(&cuda, &vec![0u8; 2 * tiles * 4]);
+        let shape = format!("{cols} x {inner} split {segments} epilogue {epilogue}");
+        for count in [1usize, 3, 8, 16, 17] {
+            let mut got = Vec::new();
+            for (form, copy) in [None, Some(copy)].into_iter().enumerate() {
+                poison(&cuda, out[form], segments * count * cols);
+                poison(&cuda, y[form], count * cols);
+                launch_rows_packed(
+                    &cuda,
+                    rows_kernel,
+                    &[(w, out[form], y[form], cols, segments)],
+                    &[copy, None, None, None],
+                    &[],
+                    a,
+                    inner,
+                    count,
+                    Finish {
+                        y: y[form],
+                        tickets,
+                        epilogue,
+                        scale,
+                    },
+                );
+                let finished = if segments > 1 { y[form] } else { out[form] };
+                got.push((
+                    download::<u32>(&cuda, &out[form], segments * count * cols),
+                    download::<u32>(&cuda, &finished, count * cols),
+                ));
+            }
+            assert!(
+                got[0].0 == got[1].0 && got[0].1 == got[1].1,
+                "{shape}: a {count}-row launch over the packed copy differs from the BF16 rows'"
+            );
+            assert!(
+                got[0]
+                    .1
+                    .iter()
+                    .all(|bits| f32::from_bits(*bits).is_finite()),
+                "{shape}: a {count}-row launch left an output unwritten"
+            );
+        }
+        // Both forms in one launch, the packed matrix second at its own split.
+        let count = 5;
+        let half = upload::<u8>(&cuda, &vec![0u8; TOKENS * cols * 4]);
+        poison(&cuda, y[0], count * cols);
+        poison(&cuda, y[1], count * cols);
+        launch_rows_packed(
+            &cuda,
+            rows_kernel,
+            &[(w, half, y[0], cols, 1), (w, out[1], y[1], cols, segments)],
+            &[None, Some(copy), None, None],
+            &[],
+            a,
+            inner,
+            count,
+            Finish {
+                y: y[1],
+                tickets,
+                epilogue,
+                scale,
+            },
+        );
+        let bf16 = download::<u32>(&cuda, &half, count * cols);
+        let packed = download::<u32>(
+            &cuda,
+            &if segments > 1 { y[1] } else { out[1] },
+            count * cols,
+        );
+        if segments == 1 {
+            assert!(
+                bf16 == packed,
+                "{shape}: a grouped launch's packed matrix differs"
+            );
+        } else {
+            assert!(
+                packed.iter().all(|bits| f32::from_bits(*bits).is_finite()),
+                "{shape}: a grouped launch left a packed output unwritten"
+            );
+        }
+        let held: Vec<Deviceptr> = set.allocations().collect();
+        cuda.free_buffers(&held.iter().collect::<Vec<_>>());
+    }
 }
 
 #[test]
