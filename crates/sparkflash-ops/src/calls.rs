@@ -82,6 +82,17 @@ pub const fn zero(dst: u64, count: usize) -> Call<2> {
     flat(count, [dst, count as u64])
 }
 
+/// `q4e_sum_slots`: this rank's `count` floats at `own` summed with every peer's at
+/// `slots + peer * count`, in ascending rank order from 0.0, into `own` (the rank's own slot is
+/// not read). `count` is a multiple of four: a thread sums a float4.
+#[must_use]
+pub const fn sum_slots(own: u64, slots: u64, count: usize, rank: usize, world: usize) -> Call<5> {
+    flat(
+        count / 4,
+        [own, slots, count as u64, rank as u64, world as u64],
+    )
+}
+
 /// `q4e_cache_bf16`: `count` f32 values of `rows` narrowed to BF16 into `cache`, one contiguous
 /// run (a chunk's keys or values, appended at once).
 #[must_use]

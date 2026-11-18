@@ -449,15 +449,65 @@ impl Part {
     }
 
     fn of(self, bytes: &[u8], (rows, columns): (usize, usize)) -> Vec<u8> {
+        Self::all_of(&[self], bytes, (rows, columns))
+    }
+
+    /// The shape of `parts` of a `[rows, columns]` matrix laid one after another: all of them
+    /// row runs (the rows stacked) or all column runs (each row's runs side by side).
+    fn shape_of(parts: &[Self], (rows, columns): (usize, usize)) -> Result<(usize, usize), String> {
+        let stacked = parts.iter().all(|part| matches!(part, Self::Rows(..)));
+        if parts.is_empty() {
+            return Err("no part of the matrix is named".to_owned());
+        }
+        if !stacked && !parts.iter().all(|part| matches!(part, Self::Columns(..))) {
+            return Err(format!("{parts:?} mix rows and columns"));
+        }
+        let mut total = 0;
+        for part in parts {
+            let (part_rows, part_columns) = part.shape((rows, columns))?;
+            total += if stacked { part_rows } else { part_columns };
+        }
+        Ok(if stacked {
+            (total, columns)
+        } else {
+            (rows, total)
+        })
+    }
+
+    /// The bytes of `parts`, as [Self::shape_of] lays them out, of the row-major `bytes` of a
+    /// `[rows, columns]` matrix.
+    fn all_of(parts: &[Self], bytes: &[u8], (rows, columns): (usize, usize)) -> Vec<u8> {
         let row = bytes.len() / rows;
         let element = row / columns;
-        match self {
-            Self::Rows(first, count) => bytes[first * row..(first + count) * row].to_vec(),
-            Self::Columns(first, count) => bytes
-                .chunks_exact(row)
-                .flat_map(|values| &values[first * element..(first + count) * element])
+        if parts.iter().all(|part| matches!(part, Self::Rows(..))) {
+            return parts
+                .iter()
+                .flat_map(|part| match *part {
+                    Self::Rows(first, count) | Self::Columns(first, count) => {
+                        &bytes[first * row..(first + count) * row]
+                    }
+                })
                 .copied()
-                .collect(),
+                .collect();
+        }
+        bytes
+            .chunks_exact(row)
+            .flat_map(|values| {
+                parts.iter().flat_map(move |part| match *part {
+                    Self::Rows(first, count) | Self::Columns(first, count) => {
+                        &values[first * element..(first + count) * element]
+                    }
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// The part in whole `tile`-wide units: the part of a tile grid the part of the matrix is.
+    const fn tiles(self, tile: usize) -> Self {
+        match self {
+            Self::Rows(first, count) => Self::Rows(first / tile, count.div_ceil(tile)),
+            Self::Columns(first, count) => Self::Columns(first / tile, count.div_ceil(tile)),
         }
     }
 }
@@ -537,6 +587,45 @@ impl<'a> DraftUploader<'a> {
         rows: usize,
         columns: usize,
     ) -> Result<GpuMatE4m3Tile, String> {
+        self.mat_e4m3_tile_parts(name, (rows, columns), &[Part::Rows(0, rows)])
+    }
+
+    /// [Self::mat_e4m3_tile]'s [Part]s, laid one after another as [Self::mat_parts] lays a BF16
+    /// matrix's: a rank's share of a block-scaled FP8 projection, its codes and the same parts of
+    /// the tile grid. A part starts on a tile edge and holds whole tiles; only the last part, and
+    /// only where it ends the axis, may end inside the axis's partial last tile (whose one scale
+    /// it then holds alone).
+    ///
+    /// # Errors
+    /// A part that splits a scale tile (a last part inside one tile takes that tile's scale),
+    /// and as [Self::mat_e4m3_tile].
+    pub fn mat_e4m3_tile_parts(
+        &self,
+        name: &str,
+        (rows, columns): (usize, usize),
+        parts: &[Part],
+    ) -> Result<GpuMatE4m3Tile, String> {
+        let (part_rows, part_columns) = Part::shape_of(parts, (rows, columns))?;
+        for (index, part) in parts.iter().enumerate() {
+            let (first, count, total) = match *part {
+                Part::Rows(first, count) => (first, count, rows),
+                Part::Columns(first, count) => (first, count, columns),
+            };
+            // A last part may end short of a tile at the axis's end, or lie inside one source
+            // tile (a 64-row key/value head share): its rows or columns then take that tile's
+            // scale, as they do whole. Every part before it is whole tiles, so it starts a tile.
+            let last = index + 1 == parts.len();
+            let ends = last && first + count == total;
+            let inside = last && count > 0 && first / E4M3_TILE == (first + count - 1) / E4M3_TILE;
+            if !inside
+                && (!first.is_multiple_of(E4M3_TILE) || (!count.is_multiple_of(E4M3_TILE) && !ends))
+            {
+                return Err(format!(
+                    "{part:?} of the E4M3 [{rows}, {columns}] {name} splits a \
+                     {E4M3_TILE} x {E4M3_TILE} scale tile"
+                ));
+            }
+        }
         let spec = |name: &str| self.source.spec(name).map_err(|error| error.to_string());
         let weight = spec(name)?;
         if weight.dtype != DType::F8E4M3 || weight.shape != [rows, columns] {
@@ -581,6 +670,9 @@ impl<'a> DraftUploader<'a> {
             }
         };
         let codes = self.read(name, rows * columns)?;
+        let codes = Part::all_of(parts, &codes, (rows, columns));
+        let tiles: Vec<Part> = parts.iter().map(|part| part.tiles(E4M3_TILE)).collect();
+        let scales = Part::all_of(&tiles, &scales, (grid[0], grid[1]));
         let weight = self.bytes(&codes)?;
         let scales = self
             .bytes(&scales)
@@ -588,8 +680,8 @@ impl<'a> DraftUploader<'a> {
         Ok(GpuMatE4m3Tile {
             weight,
             scales,
-            rows,
-            columns,
+            rows: part_rows,
+            columns: part_columns,
         })
     }
 
@@ -603,10 +695,25 @@ impl<'a> DraftUploader<'a> {
         (rows, columns): (usize, usize),
         part: Part,
     ) -> Result<GpuMat, String> {
-        let (part_rows, part_columns) = part.shape((rows, columns))?;
+        self.mat_parts(name, (rows, columns), &[part])
+    }
+
+    /// Several [Part]s of a row-major BF16 matrix on the device, one after another: row runs
+    /// stacked, or column runs side by side in each row. A rank's share of a fused projection
+    /// (a Gated DeltaNet's q, k and v rows) is three runs.
+    ///
+    /// # Errors
+    /// Parts outside the matrix or of both kinds, and as [Self::read] and [Self::bytes].
+    pub fn mat_parts(
+        &self,
+        name: &str,
+        (rows, columns): (usize, usize),
+        parts: &[Part],
+    ) -> Result<GpuMat, String> {
+        let (part_rows, part_columns) = Part::shape_of(parts, (rows, columns))?;
         let bytes = self.read(name, rows * columns * 2)?;
         Ok(GpuMat {
-            pointer: self.bytes(&part.of(&bytes, (rows, columns)))?,
+            pointer: self.bytes(&Part::all_of(parts, &bytes, (rows, columns)))?,
             rows: part_rows,
             columns: part_columns,
         })

@@ -26,4 +26,5 @@ sparkflash-weights = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-ops = { workspace = true }
 sparkflash-runtime = { workspace = true }
+sparkflash-comm = { workspace = true }
 

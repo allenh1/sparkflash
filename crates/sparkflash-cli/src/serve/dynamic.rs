@@ -395,13 +395,6 @@ fn profile(architecture: &Architecture) -> Result<ModelProfile, String> {
 /// The resolution or plan failed, the plan has unresolved parts (the exact list is returned),
 /// the tokenizer cannot be named, or the backend cannot open.
 pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
-    #[cfg(feature = "tp4-serve")]
-    if options.tp4.is_some() {
-        return Err(
-            "a dynamically resolved model serves at TP=1 on this base: the shared EngineBuilder and the shared dense device arm are TP1. Name a released preset with --model to use its group, or drop the --tp4-rank flags"
-                .to_owned(),
-        );
-    }
     let checkpoint = resolve(options)?;
     let on_device = device_family(&checkpoint.architecture.family, &checkpoint.directory);
     let unresolved = if checkpoint.architecture.family == "inkling2" {
@@ -435,8 +428,9 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     };
     if !unresolved.is_empty() {
         return Err(format!(
-            "--model {} resolves to a plan this build cannot execute at TP1 on sm121: {}",
+            "--model {} resolves to a plan this build cannot execute at TP{} on sm121: {}",
             checkpoint.model_id,
+            serving_world(options)?,
             unresolved.join("; ")
         ));
     }
@@ -500,6 +494,15 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         family,
         "qwen4_exp" | "qwen4_exp_text" | "glm5_next" | "inkling2" | "dory"
     ) && !(on_device && matches!(family, "qwen3_5_moe" | "qwen3_5_moe_text"));
+    #[cfg(feature = "tp4-serve")]
+    if options.tp4.is_some() && !novel {
+        return Err(format!(
+            "--model {} is a {family} checkpoint: a dynamically resolved model serves a --tp4-rank \
+             group only on the shared dense device arm. Name the released preset with --model to \
+             use its own group, or drop the --tp4-rank flags",
+            checkpoint.model_id
+        ));
+    }
     if !novel
         && (options.concurrency != 1 || options.fuse_batch)
         && options.group.is_none()
@@ -605,6 +608,19 @@ fn serve_novel(
     options: &ServeOptions,
 ) -> Result<ExitCode, String> {
     let wanted = dense_device(std::env::var(DENSE_DEVICE_ENV).ok().as_deref())?;
+    #[cfg(feature = "tp4-serve")]
+    if let Some(tp4) = options.tp4.as_ref() {
+        return serve_dense_group(
+            &checkpoint,
+            descriptor,
+            seam,
+            dialect,
+            context,
+            options,
+            tp4,
+            wanted,
+        );
+    }
     let reason = if wanted == DenseDevice::Off {
         format!("{DENSE_DEVICE_ENV}=0")
     } else {
@@ -679,6 +695,124 @@ fn serve_novel(
         checkpoint.model_id
     );
     serve_host(checkpoint, descriptor, seam, dialect, context, options)
+}
+
+/// Serves one rank of a `--tp4-rank` group on the shared dense device arm: each rank opens its
+/// share of the checkpoint over the pack collective ([super::open_pack_collective]: NCCL by
+/// default, the host seam with `SPARK_COMM_REDUCE=tcp`, both summing in rank order), rank 0 fuses
+/// the group's lanes behind HTTP and the workers mirror them until the group ends. The host
+/// reference runs alone, so a checkpoint the arm does not take is refused here rather than served
+/// at another world than the one asked for.
+#[cfg(feature = "tp4-serve")]
+#[allow(clippy::too_many_arguments)]
+fn serve_dense_group(
+    checkpoint: &DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+    tp4: &super::Tp4ServeOptions,
+    wanted: DenseDevice,
+) -> Result<ExitCode, String> {
+    let model = &checkpoint.model_id;
+    if wanted == DenseDevice::Off {
+        return Err(format!(
+            "--model {model}: {DENSE_DEVICE_ENV}=0 keeps the host reference, which runs on one \
+             rank; drop the --tp4-rank flags or unset it"
+        ));
+    }
+    if tp4.device.is_some() {
+        return Err(format!(
+            "--model {model}: --tp4-device configures DeepSeek's device harness; the shared dense \
+             device arm's group takes none of it"
+        ));
+    }
+    let arm =
+        sparkflash_ops::parts::dynamic_device_arm(&checkpoint.architecture).map_err(|reason| {
+            format!(
+                "--model {model}: a --tp4-rank group needs the shared dense device arm: {reason}"
+            )
+        })?;
+    if arm != sparkflash_ops::parts::DENSE_DEVICE_ARM {
+        return Err(format!(
+            "--model {model}: a --tp4-rank group needs the shared dense device arm, not {arm}"
+        ));
+    }
+    let lanes = dense_lanes(
+        options.concurrency_set.then_some(options.concurrency),
+        sparkflash_model::active_profile().runtime.concurrency,
+    )?;
+    let mut rank_options = options.clone();
+    rank_options.checkpoint = Some(checkpoint.directory.clone());
+    let mut config = super::tp4_rank_config(&rank_options, tp4, super::TP4_CONTROL_TIMEOUT)?;
+    config.context = context;
+    let started = std::time::Instant::now();
+    let cuda =
+        sparkflash_kernels::cuda_driver::Cuda::load().map_err(|error| format!("CUDA: {error}"))?;
+    let (tp, _gather) = super::open_pack_collective(
+        &config,
+        &cuda,
+        "shared dense",
+        checkpoint.architecture.hidden_size,
+        &format!(
+            "dense-serve;{model};{};{context}",
+            checkpoint.directory.display()
+        ),
+    )?;
+    let label = tp.label();
+    let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+    let mut backend = sparkflash_model_dense::DenseDeviceBackend::open_rank(
+        descriptor.clone(),
+        &checkpoint.architecture,
+        &source,
+        context,
+        tp,
+    )
+    .map_err(|error| format!("--model {model} rank {}: {error}", tp4.rank))?;
+    eprintln!(
+        "sparkflash serve: {model} rank {}/{} loaded in {:.1} s on the shared dense device arm \
+         ({:.2} GiB of weights); {label} collective",
+        tp4.rank,
+        tp4.world_size,
+        started.elapsed().as_secs_f64(),
+        backend.weight_bytes() as f64 / f64::from(1u32 << 30)
+    );
+    if tp4.rank != 0 {
+        let mut control = super::tp4_control_worker(&config)?;
+        match backend
+            .mirror_group(&mut control, lanes)
+            .map_err(|error| format!("rank {}: {error}", tp4.rank))? {}
+    }
+    let hub = sparkflash_comm::control::Tp4ControlHub::start(
+        config.control_address(),
+        config.world_size,
+        config.timeout,
+    )
+    .map_err(|error| format!("rank 0 control channel: {error}"))?;
+    backend
+        .enable_group_fusion(lanes, hub)
+        .map_err(|error| format!("--model {model}: cannot fuse the group's lanes: {error}"))?;
+    let banner = format!(
+        "{} ({}) at TP={} rank 0 on {}, context {context}, shared dense device arm ({lanes} \
+         lanes; workers never detokenize)",
+        descriptor.id,
+        descriptor.weights_id,
+        tp4.world_size,
+        checkpoint.directory.display(),
+    );
+    let mut options = options.clone();
+    options.concurrency = lanes;
+    serve_backend_world(
+        Box::new(backend),
+        descriptor,
+        seam,
+        dialect,
+        &options,
+        &banner,
+        tp4.world_size,
+    )
 }
 
 /// The lanes the shared dense device arm steps: `--concurrency` when given, else the profile's

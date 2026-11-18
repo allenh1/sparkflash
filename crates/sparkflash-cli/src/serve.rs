@@ -1208,17 +1208,14 @@ impl ServeOptions {
             if cli.device_token_live {
                 unsupported.push("--device-token-live");
             }
-            // Every pack with a serving arm brings a tensor-parallel arm too; any other id is
-            // refused by name when it is served, and the group flags stay off its surface.
+            // Every pack with a serving arm brings a tensor-parallel arm too. Any other id is a
+            // dynamically resolved checkpoint, whose route serves a --tp4-rank group on the
+            // shared dense device arm and refuses it by name for every other family.
             let pack = pack::Pack::named(model);
             #[cfg(feature = "tp4-serve")]
             let in_group = cli.tp4_rank.is_some() || group.is_some();
             #[cfg(not(feature = "tp4-serve"))]
             let in_group = group.is_some();
-            #[cfg(feature = "tp4-serve")]
-            if cli.tp4_rank.is_some() && pack.is_none() {
-                unsupported.push("--tp4-rank");
-            }
             if !unsupported.is_empty() {
                 return Err(format!(
                     "--model {model} serves its own pack: {} cannot be combined with it",

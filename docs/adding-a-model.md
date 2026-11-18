@@ -477,7 +477,15 @@ web's fit read that one plan, and:
   (`scripts/dense-synthetic-checkpoint.py` writes a random checkpoint of a family no pack names
   for that); `SPARKFLASH_DENSE_DEVICE=0` keeps such a checkpoint on the host reference and `=1` refuses to
   boot unless the arm opens. Unset, the boot line names which backend answers and, on the host,
-  why the arm did not;
+  why the arm did not. The same arm serves a `--tp4-rank` group (runtime step 24):
+  `DenseDeviceBackend::open_rank` holds the rank's share of every tensor as the shared `TpPlan`
+  splits it (query heads, key/value heads shared when the world exceeds them, both Gated DeltaNet
+  head counts, every MLP and expert width; FP8 shares on whole scale tiles), every branch's
+  partial rows are summed in rank order through `sparkflash_ops::tp::RowSums` (the host seam, or
+  NCCL's one-shot and two-shot device legs, which give the same bits), and rank 0's lanes run on
+  every rank through `GroupLanes` (`enable_group_fusion`, `mirror_group`). A worker never
+  detokenizes; the host reference runs alone, so a checkpoint the arm refuses is refused at a
+  world above one;
 - any other novel family is served by the CPU reference backend in
   `sparkflash-cli/src/serve/dynamic_host.rs`, which executes the parts in
   `sparkflash-cli/src/dynamic.rs::DYNAMIC_PARTS` (embedding, RMSNorm, GQA, Gated DeltaNet,

@@ -1761,6 +1761,10 @@ pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, S
     Ok("the Qwen3.5-MoE device arm")
 }
 
+/// The columns the shared dense arm's BF16 expert passes read at a time: an expert's width, and
+/// each rank's share of it, is whole runs of this many.
+pub const DENSE_BF16_EXPERT_RUN: usize = 8;
+
 /// The name [dynamic_device_arm] gives the shared dense arm.
 pub const DENSE_DEVICE_ARM: &str = "the shared dense device arm";
 
@@ -1773,6 +1777,7 @@ pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
     "q4e_gemv_tiled_e4m3_tile",
     "q4e_rmsnorm",
     "q4e_rope",
+    "q4e_sum_slots",
     "q4e_swiglu",
     "q4e_zero",
 ];
@@ -1865,7 +1870,8 @@ pub fn dense_device_images() -> Result<(), String> {
 /// chunk kernels, every linear layer of one geometry), a dense SwiGLU or routed experts (a
 /// softmax, sigmoid or sqrt-softplus score, the top-k with or without renormalising, a routed
 /// scale, a shared expert with or without its sigmoid gate), a plain residual and the head, on
-/// one rank. Its projections and experts are BF16 or E4M3 under one inverse scale a 128 x 128
+/// one rank or as a tensor-parallel group's rank (each sharded axis split as [sparkflash_model::TpPlan]
+/// splits it, every branch's partial rows summed in rank order). Its projections and experts are BF16 or E4M3 under one inverse scale a 128 x 128
 /// tile, over widths of whole tiles; the embedding, the head and the norms are BF16. It is gated
 /// by a per-layer parity report against that reference, so it takes nothing the reference does
 /// not execute, and nothing the reference does that its kernels do not (a linear rotary rule,
@@ -2136,9 +2142,12 @@ fn dense_moe_refusal(
     }
     let hidden = architecture.hidden_size;
     let (multiple, rows) = if format == WeightFormat::Bf16 {
-        (8, "BF16 rows eight columns at a time")
+        (DENSE_BF16_EXPERT_RUN, "BF16 rows eight columns at a time")
     } else {
-        (E4M3_TILE, "block-scaled FP8 rows a 128-column scale tile at a time")
+        (
+            E4M3_TILE,
+            "block-scaled FP8 rows a 128-column scale tile at a time",
+        )
     };
     if !hidden.is_multiple_of(multiple)
         || moe.intermediate == 0

@@ -20,10 +20,13 @@ fn the_glm_and_qwen_packs_may_take_the_group_flags() {
 }
 
 #[test]
-fn a_packed_model_without_a_group_arm_still_refuses_the_group_flags() {
-    let error = ServeOptions::parse(tp4_args(&["--model", "example/no-group-arm"]))
-        .expect_err("a pack without a tensor-parallel arm serves TP=1 only");
-    assert!(error.contains("--tp4-rank"), "{error}");
+fn a_model_without_a_pack_takes_the_group_flags_to_the_dynamic_route() {
+    // The dynamic route resolves the checkpoint first: it serves the group on the shared dense
+    // device arm and refuses --tp4-rank by name for every other family (dynamic::serve).
+    let options = ServeOptions::parse(tp4_args(&["--model", "example/no-group-arm"]))
+        .expect("the dynamic route decides the group");
+    assert_eq!(options.model.as_deref(), Some("example/no-group-arm"));
+    assert!(options.tp4.is_some());
 }
 
 #[test]

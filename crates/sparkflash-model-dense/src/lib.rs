@@ -51,7 +51,18 @@
 //! It serves on the shared runtime's contract ([DenseLanes], a [FusedArm]): fused lanes whose
 //! decode rows share one walk, prompts a chunk at a time between the lanes' steps, kept
 //! conversations and a rewind point to the end of each prompt, its caches on the shared lane
-//! memory ([SequenceLanes]), and the ledger. It runs on one rank.
+//! memory ([SequenceLanes]), and the ledger.
+//!
+//! It runs on one rank or on a tensor-parallel group ([DenseDeviceBackend::open_rank]): a rank
+//! holds its share of every attention layer's query heads (and of the key/value heads, which a
+//! world wider than them shares), of every Gated DeltaNet layer's key and value heads, and of
+//! every MLP's and expert's width (the gate and up rows, the down columns), as the shared
+//! [TpPlan] splits them, and holds the rest whole: the embedding, the norms, the routers and the
+//! head. Each branch therefore leaves a partial of its hidden rows, which the ranks sum in rank
+//! order ([RowSums]) before the residual takes it, so the residual is the same bits on every rank
+//! and so is every replicated decision (the router's picks, the token). Rank 0 serves the group's
+//! fused lanes and every other rank replays them ([DenseDeviceBackend::enable_group_fusion],
+//! [DenseDeviceBackend::mirror_group]).
 
 use std::sync::{Arc, Mutex};
 
@@ -67,10 +78,10 @@ use sparkflash_model::backend::{
     BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
 };
 use sparkflash_model::vision::VisionImage;
-use sparkflash_model::{Architecture, Capabilities, ModelDescriptor};
-use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
-use sparkflash_ops::dflash::DraftUploader;
+use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
+use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
+use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
 use sparkflash_ops::gdn::{self, GdnGeometry, gdn_qk_row};
 use sparkflash_ops::gemv::{
@@ -84,7 +95,11 @@ use sparkflash_ops::projection::{
 };
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
-use sparkflash_runtime::{FusedArm, FusedEngine, Ledger, Mode, Part, Resume, Strategy, resume};
+use sparkflash_ops::tp::RowSums;
+use sparkflash_runtime::{
+    FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Part, Resume, Strategy, TextWire, resume,
+};
+use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
 
 /// The host-facing name of a device refusal.
@@ -109,6 +124,53 @@ struct Shape {
     routed: Option<Routed>,
     /// A Gated DeltaNet layer's geometry.
     linear: Option<Linear>,
+    /// Where this rank's share of each sharded axis starts.
+    cut: Cut,
+}
+
+/// The first element of this rank's share of each sharded axis of a layer, in heads or in
+/// columns of width: all zero at one rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Cut {
+    heads: usize,
+    kv_heads: usize,
+    /// The dense MLP's (or the shared expert's) first column.
+    intermediate: usize,
+    /// Each routed expert's first column.
+    expert: usize,
+    key_heads: usize,
+    value_heads: usize,
+}
+
+/// Which share of each sharded axis this rank holds, as the shared [TpPlan] splits it.
+#[derive(Debug, Clone, Copy)]
+struct Shard(TpPlan);
+
+impl Shard {
+    /// One rank holding everything.
+    fn whole() -> Self {
+        Self(TpPlan::new(1, 0).expect("one rank is a world"))
+    }
+
+    /// `(first, count)` of `total` split evenly along `axis`, with nothing padded: the kernels
+    /// take the rank's share as its own width.
+    fn split(self, total: usize, axis: TpAxis, what: &str) -> Result<(usize, usize), String> {
+        let split = self
+            .0
+            .split(total, axis, 1)
+            .map_err(|error| format!("{what}: {error}"))?;
+        Ok((split.offset, split.per_rank))
+    }
+
+    /// `(first, count)` of `total` as whole `tile`-wide runs, the remainder to the first ranks:
+    /// a block-scaled FP8 expert's share, whose scales cover whole tiles.
+    fn tiles(self, total: usize, tile: usize, what: &str) -> Result<(usize, usize), String> {
+        let split = self
+            .0
+            .split_tiles(total, tile, TpAxis::Intermediate)
+            .map_err(|error| format!("{what}: {error}"))?;
+        Ok((split.offset, split.per_rank))
+    }
 }
 
 /// A Gated DeltaNet layer's geometry and its output gate.
@@ -133,59 +195,106 @@ struct Routed {
 }
 
 impl Shape {
-    fn of(architecture: &Architecture, index: usize) -> Result<Self, String> {
+    /// Layer `index`'s shape as `shard`'s rank holds it, every sharded count and width its
+    /// share, and where each share starts.
+    fn of(architecture: &Architecture, index: usize, shard: Shard) -> Result<Self, String> {
         let layer = &architecture.layers[index];
         let attention = &layer.attention;
+        let what = |axis: &str| format!("layer {index}'s {axis}");
+        let mut cut = Cut::default();
         let (heads, kv_heads, head_dim, gated, linear) = match &attention.kind {
             AttentionKind::Gqa {
                 kv_heads,
                 output_gate,
-            } => (
-                attention.heads,
-                *kv_heads,
-                attention.head_dim,
-                *output_gate,
-                None,
-            ),
-            AttentionKind::Gdn(gdn) => (
-                0,
-                0,
-                0,
-                false,
-                Some(Linear {
-                    geometry: GdnGeometry {
-                        key_heads: gdn.key_heads,
-                        heads: gdn.value_heads,
-                        key_dim: gdn.key_dim,
-                        value_dim: gdn.value_dim,
-                        taps: gdn.conv_kernel,
-                    },
-                    sigmoid: gdn.output_gate == Activation::Sigmoid,
-                }),
-            ),
+            } => {
+                let (first, heads) =
+                    shard.split(attention.heads, TpAxis::Heads, &what("query heads"))?;
+                let (kv_first, kv_heads) =
+                    shard.split(*kv_heads, TpAxis::KvHeads, &what("key/value heads"))?;
+                (cut.heads, cut.kv_heads) = (first, kv_first);
+                (heads, kv_heads, attention.head_dim, *output_gate, None)
+            }
+            AttentionKind::Gdn(gdn) => {
+                // Both head counts split evenly: a rank's value heads read its own key heads.
+                let (key_first, key_heads) = shard.split(
+                    gdn.key_heads,
+                    TpAxis::Heads,
+                    &what("Gated DeltaNet key heads"),
+                )?;
+                let (value_first, value_heads) = shard.split(
+                    gdn.value_heads,
+                    TpAxis::Heads,
+                    &what("Gated DeltaNet value heads"),
+                )?;
+                (cut.key_heads, cut.value_heads) = (key_first, value_first);
+                (
+                    0,
+                    0,
+                    0,
+                    false,
+                    Some(Linear {
+                        geometry: GdnGeometry {
+                            key_heads,
+                            heads: value_heads,
+                            key_dim: gdn.key_dim,
+                            value_dim: gdn.value_dim,
+                            taps: gdn.conv_kernel,
+                        },
+                        sigmoid: gdn.output_gate == Activation::Sigmoid,
+                    }),
+                )
+            }
             _ => {
                 return Err(format!(
                     "layer {index} is neither grouped-query attention nor a Gated DeltaNet"
                 ));
             }
         };
+        let fp8_experts = matches!(
+            architecture.quantization.expert_format,
+            WeightFormat::Fp8Tile { .. }
+        );
         let (intermediate, routed) = match &layer.ffn {
-            Ffn::Dense(dense) => (dense.intermediate, None),
-            Ffn::Moe(moe) => (
-                if moe.shared_experts > 0 {
-                    moe.shared_intermediate
+            Ffn::Dense(dense) => {
+                let (first, width) =
+                    shard.split(dense.intermediate, TpAxis::Intermediate, &what("MLP width"))?;
+                cut.intermediate = first;
+                (width, None)
+            }
+            Ffn::Moe(moe) => {
+                let shared = if moe.shared_experts > 0 {
+                    let (first, width) = shard.split(
+                        moe.shared_intermediate,
+                        TpAxis::Intermediate,
+                        &what("shared expert's width"),
+                    )?;
+                    cut.intermediate = first;
+                    width
                 } else {
                     0
-                },
-                Some(Routed {
-                    experts: moe.routed_experts,
-                    top_k: moe.active_experts,
-                    intermediate: moe.intermediate,
-                    score: router_score(moe.score),
-                    renormalise: moe.norm_topk,
-                    scaling: moe.routed_scaling as f32,
-                }),
-            ),
+                };
+                // A share is whole runs of what the expert passes read at a time (a scale tile
+                // of FP8, eight BF16 columns), the remainder to the first ranks: an even split
+                // of a 136-wide expert is two 68-wide shares the BF16 passes cannot read.
+                let run = if fp8_experts {
+                    E4M3_TILE
+                } else {
+                    sparkflash_ops::parts::DENSE_BF16_EXPERT_RUN
+                };
+                let (first, width) = shard.tiles(moe.intermediate, run, &what("expert width"))?;
+                cut.expert = first;
+                (
+                    shared,
+                    Some(Routed {
+                        experts: moe.routed_experts,
+                        top_k: moe.active_experts,
+                        intermediate: width,
+                        score: router_score(moe.score),
+                        renormalise: moe.norm_topk,
+                        scaling: moe.routed_scaling as f32,
+                    }),
+                )
+            }
         };
         Ok(Self {
             heads,
@@ -197,6 +306,7 @@ impl Shape {
             intermediate,
             routed,
             linear,
+            cut,
         })
     }
 
@@ -331,6 +441,8 @@ struct MoeKernels {
 #[derive(Clone, Copy)]
 struct Kernels {
     add: Kernel,
+    /// A group's row sum ([RowSums]) on the device legs.
+    sum_slots: Kernel,
     deinterleave: Kernel,
     embed: Kernel,
     gemv: Kernel,
@@ -434,6 +546,7 @@ impl Kernels {
             fp8,
             gdn,
             add: named(qwen4_exp_cubin(), "q4e_add")?,
+            sum_slots: named(qwen4_exp_cubin(), "q4e_sum_slots")?,
             deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
             embed: named(qwen4_exp_cubin(), "q4e_embed")?,
             gemv: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
@@ -496,12 +609,19 @@ struct Shared {
     /// Every weight allocation, freed once.
     owned: Vec<Deviceptr>,
     weight_bytes: usize,
+    /// The group's sums of each branch's partial rows, on a tensor-parallel rank.
+    sums: Option<RowSums>,
+    /// Which share of each sharded axis this rank holds.
+    shard: Shard,
 }
 
 impl Drop for Shared {
     fn drop(&mut self) {
         // Every sequence holds the shared state, so each has given its lane back by now.
         self.lanes.drain(&self.cuda);
+        if let Some(sums) = self.sums.as_mut() {
+            sums.release(&self.cuda);
+        }
         let references: Vec<&Deviceptr> = self.owned.iter().collect();
         self.cuda.free_buffers(&references);
     }
@@ -511,8 +631,15 @@ impl Drop for Shared {
 pub struct DenseDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
-    /// The fused engine its sessions open on once [Self::enable_fusion] has run.
-    fused: Option<Arc<FusedEngine<DenseLanes>>>,
+    /// The fused engine its sessions open on once [Self::enable_fusion] (or, on rank 0 of a
+    /// group, [Self::enable_group_fusion]) has run.
+    fused: Option<Fused>,
+}
+
+/// The fused engine a backend's sessions open on: its own lanes, or a group's on rank 0.
+enum Fused {
+    Local(Arc<FusedEngine<DenseLanes>>),
+    Group(Arc<FusedEngine<GroupLanes<DenseLanes, TextWire>>>),
 }
 
 impl DenseDeviceBackend {
@@ -532,10 +659,41 @@ impl DenseDeviceBackend {
     /// zero context or one past the checkpoint's window, a CUDA context that cannot open, or a
     /// device without the virtual memory management the lanes need.
     pub fn open(
+        descriptor: ModelDescriptor,
+        architecture: &Architecture,
+        source: &dyn WeightSource,
+        context: usize,
+    ) -> Result<Self, String> {
+        Self::open_at(descriptor, architecture, source, context, None)
+    }
+
+    /// [Self::open] for one rank of a tensor-parallel group over `tp`: the rank's share of each
+    /// sharded tensor (as the shared [TpPlan] splits it), every branch's partial rows summed
+    /// over the group before the residual takes them ([RowSums]). Every rank opens the same
+    /// checkpoint and steps the same walks, which [Self::enable_group_fusion] and
+    /// [Self::mirror_group] keep in step.
+    ///
+    /// # Errors
+    /// As [Self::open], a head count or width the world does not split (an attention layer's
+    /// key/value heads may be fewer than the ranks, which then share them), a block-scaled FP8
+    /// share that splits a scale tile, or a collective whose device leg does not sum on the f32
+    /// wire.
+    pub fn open_rank(
+        descriptor: ModelDescriptor,
+        architecture: &Architecture,
+        source: &dyn WeightSource,
+        context: usize,
+        tp: TpRuntime,
+    ) -> Result<Self, String> {
+        Self::open_at(descriptor, architecture, source, context, Some(tp))
+    }
+
+    fn open_at(
         mut descriptor: ModelDescriptor,
         architecture: &Architecture,
         source: &dyn WeightSource,
         context: usize,
+        tp: Option<TpRuntime>,
     ) -> Result<Self, String> {
         if let Some(refusal) = sparkflash_ops::parts::dense_device_refusal(architecture) {
             return Err(format!("the shared dense device arm refuses it: {refusal}"));
@@ -551,17 +709,34 @@ impl DenseDeviceBackend {
         let policy = profile_policy(profile)?;
         let rewind = sparkflash_runtime::rewind()?;
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
+        let shard = match &tp {
+            Some(tp) => {
+                Shard(TpPlan::new(tp.world(), tp.rank()).map_err(|error| error.to_string())?)
+            }
+            None => Shard::whole(),
+        };
+        let shapes = (0..architecture.layers.len())
+            .map(|index| Shape::of(architecture, index, shard))
+            .collect::<Result<Vec<_>, _>>()?;
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
         let formats = Formats::of(architecture);
         let kernels = Kernels::load(
             &cuda,
-            expert_stage(architecture)?,
+            expert_stage(architecture.hidden_size, &shapes)?,
             formats,
-            linear_scan(architecture)?.as_ref(),
+            linear_scan(architecture, shard)?.as_ref(),
         )?;
         let mut owned = Vec::new();
-        let uploaded = upload(&cuda, architecture, &names, source, formats, &mut owned);
+        let uploaded = upload(
+            &cuda,
+            architecture,
+            &names,
+            source,
+            formats,
+            &shapes,
+            &mut owned,
+        );
         let (embed, head, norm, layers, weight_bytes) = match uploaded {
             Ok(uploaded) => uploaded,
             Err(error) => {
@@ -583,6 +758,18 @@ impl DenseDeviceBackend {
                 let references: Vec<&Deviceptr> = owned.iter().collect();
                 cuda.free_buffers(&references);
                 return Err(error);
+            }
+        };
+        let sums = match tp
+            .map(|tp| RowSums::new(&cuda, tp, CHUNK_ROWS, architecture.hidden_size, DEVICE))
+            .transpose()
+        {
+            Ok(sums) => sums,
+            Err(error) => {
+                lanes.drain(&cuda);
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error.to_string());
             }
         };
         eprintln!(
@@ -612,6 +799,8 @@ impl DenseDeviceBackend {
                 linear_sizes,
                 owned,
                 weight_bytes,
+                sums,
+                shard,
             }),
         })
     }
@@ -638,9 +827,81 @@ impl DenseDeviceBackend {
     /// # Errors
     /// A zero capacity, a scratch or lane the device refuses, or a thread that cannot start.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
+        if self.shared.sums.is_some() {
+            return Err(BackendError::new(
+                DEVICE,
+                "a group's rank steps its lanes with its peers: fuse rank 0's with \
+                 enable_group_fusion and mirror them on the others with mirror_group",
+            ));
+        }
         let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(FusedEngine::start(Arc::new(arm), capacity)?);
+        self.fused = Some(Fused::Local(FusedEngine::start(Arc::new(arm), capacity)?));
         Ok(())
+    }
+
+    /// [Self::enable_fusion] on rank 0 of an [Self::open_rank] group: every lane's prompt, step,
+    /// give-back and release is broadcast through `hub` before it runs here, and each worker
+    /// replays them ([Self::mirror_group]) over its own `capacity` lanes, so lane `n` is the same
+    /// sequence on every rank and the sums inside a walk line up. A worker whose socket closes
+    /// ends this process, and so does a failure here after a frame went out
+    /// ([sparkflash_runtime::watched_hub], [sparkflash_runtime::end_group]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, then as [Self::enable_fusion], or a watch that
+    /// cannot start.
+    pub fn enable_group_fusion(
+        &mut self,
+        capacity: usize,
+        hub: sparkflash_comm::control::Tp4ControlHub,
+    ) -> Result<(), BackendError> {
+        self.group_rank()?;
+        let arm = GroupLanes::new(
+            DenseLanes::new(Arc::clone(&self.shared), capacity)?,
+            sparkflash_runtime::watched_hub(hub)?,
+            self.wire(),
+        );
+        self.fused = Some(Fused::Group(FusedEngine::start(Arc::new(arm), capacity)?));
+        Ok(())
+    }
+
+    /// A worker of an [Self::open_rank] group: replays rank 0's lane frames over `capacity`
+    /// lanes of this rank's own until the group can no longer serve, then ends the process
+    /// ([sparkflash_runtime::mirror_until_the_group_ends]).
+    ///
+    /// # Errors
+    /// A backend that is not a group's rank, or the lanes' scratch, before any frame.
+    pub fn mirror_group(
+        &self,
+        control: &mut sparkflash_comm::control::Tp4ControlWorker,
+        capacity: usize,
+    ) -> Result<std::convert::Infallible, String> {
+        self.group_rank().map_err(|error| error.to_string())?;
+        let lanes = DenseLanes::new(Arc::clone(&self.shared), capacity)
+            .map_err(|error| error.to_string())?;
+        sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
+    }
+
+    /// What the group's frames carry and rank 0 refuses: the arm serves text.
+    fn wire(&self) -> TextWire {
+        TextWire::new("dense", "shared dense device", self.shared.context)
+    }
+
+    /// Refuses a backend that is no group's rank: its lanes have no peers to step with.
+    fn group_rank(&self) -> Result<(), BackendError> {
+        if self.shared.sums.is_none() {
+            return Err(BackendError::new(
+                DEVICE,
+                "group lanes need a group's rank (open_rank); this backend runs alone, so fuse \
+                 its sessions with enable_fusion",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The rank and world this backend holds its share at: `(0, 1)` alone.
+    #[must_use]
+    pub fn rank(&self) -> (usize, usize) {
+        (self.shared.shard.0.rank(), self.shared.shard.0.world())
     }
 }
 
@@ -671,8 +932,10 @@ impl ModelBackend for DenseDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        if let Some(engine) = &self.fused {
-            return Ok(Box::new(engine.open()?));
+        match &self.fused {
+            Some(Fused::Local(engine)) => return Ok(Box::new(engine.open()?)),
+            Some(Fused::Group(engine)) => return Ok(Box::new(engine.open()?)),
+            None => {}
         }
         Ok(Box::new(
             self.session()
@@ -720,7 +983,7 @@ fn profile_policy(
         return refuse("has no drafter, but speculation.enabled = true");
     }
     if profile.sequence.parallel == Some(true) || profile.sequence.overlap == Some(true) {
-        return refuse("runs on one rank, without sequence parallelism or overlap");
+        return refuse("has no sequence parallelism or overlapped halves");
     }
     if matches!(
         profile.attention.latent_cache,
@@ -735,25 +998,21 @@ fn profile_policy(
     })
 }
 
-/// The expert passes' staging reservation for the widest routed layer, or `None` when no layer
-/// routes.
-fn expert_stage(architecture: &Architecture) -> Result<Option<u32>, String> {
-    let widest = architecture
-        .layers
+/// The expert passes' staging reservation for the widest routed layer as the rank holds it, or
+/// `None` when no layer routes.
+fn expert_stage(hidden: usize, shapes: &[Shape]) -> Result<Option<u32>, String> {
+    let widest = shapes
         .iter()
-        .filter_map(|layer| match &layer.ffn {
-            Ffn::Moe(moe) => Some(moe.intermediate),
-            Ffn::Dense(_) => None,
-        })
+        .filter_map(|shape| shape.routed.map(|routed| routed.intermediate))
         .max();
     widest
-        .map(|intermediate| token::stage_bytes(architecture.hidden_size, intermediate))
+        .map(|intermediate| token::stage_bytes(hidden, intermediate))
         .transpose()
 }
 
-/// The Gated DeltaNet layers' scan, as the rank's plan resolves it for their head pair, or `None`
-/// when no layer is one.
-fn linear_scan(architecture: &Architecture) -> Result<Option<ScanPlan>, String> {
+/// The Gated DeltaNet layers' scan, as the rank's plan resolves it for its share of their head
+/// pair, or `None` when no layer is one.
+fn linear_scan(architecture: &Architecture, shard: Shard) -> Result<Option<ScanPlan>, String> {
     let linear = architecture
         .layers
         .iter()
@@ -761,7 +1020,8 @@ fn linear_scan(architecture: &Architecture) -> Result<Option<ScanPlan>, String> 
     if !linear {
         return Ok(None);
     }
-    match ScanPlan::for_architecture(architecture, 1, 0, ScanKind::Gdn, CHUNK_ROWS) {
+    let (world, rank) = (shard.0.world(), shard.0.rank());
+    match ScanPlan::for_architecture(architecture, world, rank, ScanKind::Gdn, CHUNK_ROWS) {
         Ok(Some(plan)) => Ok(Some(plan)),
         Ok(None) => Err("the rank's plan has no scan for its Gated DeltaNet layers".to_owned()),
         Err(error) => Err(format!("the Gated DeltaNet scan: {error}")),
@@ -774,12 +1034,7 @@ fn linear_sizes(layers: &[Layer]) -> Vec<usize> {
     layers
         .iter()
         .filter_map(|layer| layer.shape.linear)
-        .flat_map(|linear| {
-            [
-                linear.geometry.conv_bytes(),
-                linear.geometry.state_bytes(),
-            ]
-        })
+        .flat_map(|linear| [linear.geometry.conv_bytes(), linear.geometry.state_bytes()])
         .collect()
 }
 
@@ -819,9 +1074,23 @@ impl Uploads<'_> {
     /// A projection as the checkpoint stores it: BF16, or E4M3 codes and their 128 x 128 tile
     /// scales when the checkpoint declares block-scaled FP8.
     fn proj(&mut self, name: &str, rows: usize, columns: usize) -> Result<Proj, String> {
+        self.proj_runs(name, (rows, columns), &[Run::Rows(0, rows)])
+    }
+
+    /// The `runs` of a `[rows, columns]` projection this rank holds, one after another
+    /// ([DraftUploader::mat_parts]), in the checkpoint's form.
+    fn proj_runs(
+        &mut self,
+        name: &str,
+        (rows, columns): (usize, usize),
+        runs: &[Run],
+    ) -> Result<Proj, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
         if spec.dtype != DType::F8E4M3 {
-            return self.mat(name, rows, columns).map(Proj::Bf16);
+            bf16(self.source, name, &[rows, columns])?;
+            let mat = self.uploader.mat_parts(name, (rows, columns), runs)?;
+            self.keep(mat.pointer, mat.rows * mat.columns * 2);
+            return Ok(Proj::Bf16(mat));
         }
         if !self.formats.fp8 {
             return Err(format!(
@@ -829,25 +1098,49 @@ impl Uploads<'_> {
                  shared dense device arm has no FP8 kernel for it"
             ));
         }
-        if !columns.is_multiple_of(E4M3_TILE) {
+        let mat = self
+            .uploader
+            .mat_e4m3_tile_parts(name, (rows, columns), runs)?;
+        self.keep(mat.weight, mat.rows * mat.columns);
+        let grid = mat.rows.div_ceil(E4M3_TILE) * mat.columns.div_ceil(E4M3_TILE);
+        self.keep(mat.scales, grid * 2);
+        if !mat.columns.is_multiple_of(E4M3_TILE) {
             return Err(format!(
-                "{name} is E4M3 over {columns} columns; the tile kernels read whole \
-                 {E4M3_TILE}-column scale tiles"
+                "{name} is E4M3 over {} columns a rank; the tile kernels read whole \
+                 {E4M3_TILE}-column scale tiles",
+                mat.columns
             ));
         }
-        let mat = self.uploader.mat_e4m3_tile(name, rows, columns)?;
-        self.keep(mat.weight, rows * columns);
-        let grid = rows.div_ceil(E4M3_TILE) * columns.div_ceil(E4M3_TILE);
-        self.keep(mat.scales, grid * 2);
         Ok(Proj::Fp8(mat))
     }
 
-    fn mlp(&mut self, names: &ExpertNames, width: usize, hidden: usize) -> Result<Mlp, String> {
+    /// A SwiGLU of `width` columns, of which this rank holds `count` from `first`: the gate and up
+    /// rows, the down columns.
+    fn mlp(
+        &mut self,
+        names: &ExpertNames,
+        width: usize,
+        (first, count): (usize, usize),
+        hidden: usize,
+    ) -> Result<Mlp, String> {
+        let rows = [Run::Rows(first, count)];
         Ok(Mlp {
-            gate: self.proj(&names.gate, width, hidden)?,
-            up: self.proj(&names.up, width, hidden)?,
-            down: self.proj(&names.down, hidden, width)?,
+            gate: self.proj_runs(&names.gate, (width, hidden), &rows)?,
+            up: self.proj_runs(&names.up, (width, hidden), &rows)?,
+            down: self.proj_runs(&names.down, (hidden, width), &[Run::Columns(first, count)])?,
         })
+    }
+
+    /// The rows of a BF16 `[rows][width]` tensor this rank holds, one after another: a
+    /// depthwise filter's channels or a per-head vector's heads.
+    fn vector_runs(
+        &mut self,
+        name: &str,
+        (rows, width): (usize, usize),
+        runs: &[Run],
+    ) -> Result<Deviceptr, String> {
+        let mat = self.uploader.mat_parts(name, (rows, width), runs)?;
+        Ok(self.keep(mat.pointer, mat.rows * width * 2))
     }
 
     /// A layer's token mixer and its output projection: grouped-query attention's projections and
@@ -856,9 +1149,10 @@ impl Uploads<'_> {
         &mut self,
         index: usize,
         names: &AttentionNames,
-        shape: &Shape,
+        (shape, whole): (&Shape, &Shape),
         hidden: usize,
     ) -> Result<(Mixer, Proj), String> {
+        let cut = shape.cut;
         match (names, shape.linear) {
             (
                 AttentionNames::Gqa {
@@ -872,10 +1166,18 @@ impl Uploads<'_> {
                 },
                 None,
             ) => {
+                // A query head's rows are its query and, when gated, its gate, interleaved.
+                let query_head = shape.query_rows() / shape.heads.max(1);
+                let head_dim = shape.head_dim;
+                let kv = [Run::Rows(cut.kv_heads * head_dim, shape.kv_width())];
                 let mixer = Mixer::Gqa {
-                    q: self.proj(q, shape.query_rows(), hidden)?,
-                    k: self.proj(k, shape.kv_width(), hidden)?,
-                    v: self.proj(v, shape.kv_width(), hidden)?,
+                    q: self.proj_runs(
+                        q,
+                        (whole.query_rows(), hidden),
+                        &[Run::Rows(cut.heads * query_head, shape.query_rows())],
+                    )?,
+                    k: self.proj_runs(k, (whole.kv_width(), hidden), &kv)?,
+                    v: self.proj_runs(v, (whole.kv_width(), hidden), &kv)?,
                     q_norm: q_norm
                         .as_deref()
                         .map(|name| self.vector(name, shape.head_dim))
@@ -885,7 +1187,12 @@ impl Uploads<'_> {
                         .map(|name| self.vector(name, shape.head_dim))
                         .transpose()?,
                 };
-                Ok((mixer, self.proj(o, hidden, shape.query_width())?))
+                let o = self.proj_runs(
+                    o,
+                    (hidden, whole.query_width()),
+                    &[Run::Columns(cut.heads * head_dim, shape.query_width())],
+                )?;
+                Ok((mixer, o))
             }
             (AttentionNames::Gdn(names), Some(linear)) => {
                 let geometry = linear.geometry;
@@ -900,26 +1207,64 @@ impl Uploads<'_> {
                     dt_bias,
                     norm,
                 } = names;
+                let Some(all) = whole.linear.map(|linear| linear.geometry) else {
+                    return Err(format!(
+                        "layer {index} is a Gated DeltaNet at one rank only"
+                    ));
+                };
                 let heads = geometry.heads;
+                let (key_dim, value_dim) = (geometry.key_dim, geometry.value_dim);
+                let key_width = all.key_heads * key_dim;
+                // The fused projection's rows (and the conv's channels) are every query, every
+                // key, then every value: a rank's share is a run of each.
+                let qkv_runs = [
+                    Run::Rows(cut.key_heads * key_dim, geometry.key_heads * key_dim),
+                    Run::Rows(
+                        key_width + cut.key_heads * key_dim,
+                        geometry.key_heads * key_dim,
+                    ),
+                    Run::Rows(
+                        2 * key_width + cut.value_heads * value_dim,
+                        geometry.value_width(),
+                    ),
+                ];
+                let values = [Run::Rows(
+                    cut.value_heads * value_dim,
+                    geometry.value_width(),
+                )];
+                let value_heads = [Run::Rows(cut.value_heads, heads)];
                 let mixer = Mixer::Gdn(GdnLayer {
-                    qkv: self.proj(qkv, geometry.conv_width(), hidden)?,
-                    z: self.proj(z, geometry.value_width(), hidden)?,
-                    b: self.proj(b, heads, hidden)?,
-                    a: self.proj(a, heads, hidden)?,
-                    conv: self.conv(conv, geometry.conv_width(), geometry.taps)?,
-                    a_log: self.vector(a_log, heads)?,
-                    dt_bias: self.vector(dt_bias, heads)?,
-                    norm: self.vector(norm, geometry.value_dim)?,
+                    qkv: self.proj_runs(qkv, (all.conv_width(), hidden), &qkv_runs)?,
+                    z: self.proj_runs(z, (all.value_width(), hidden), &values)?,
+                    b: self.proj_runs(b, (all.heads, hidden), &value_heads)?,
+                    a: self.proj_runs(a, (all.heads, hidden), &value_heads)?,
+                    conv: self.conv(conv, (all.conv_width(), geometry.taps), &qkv_runs)?,
+                    a_log: self.vector_runs(a_log, (all.heads, 1), &value_heads)?,
+                    dt_bias: self.vector_runs(dt_bias, (all.heads, 1), &value_heads)?,
+                    norm: self.vector(norm, value_dim)?,
                 });
-                Ok((mixer, self.proj(out, hidden, geometry.value_width())?))
+                let out = self.proj_runs(
+                    out,
+                    (hidden, all.value_width()),
+                    &[Run::Columns(
+                        cut.value_heads * value_dim,
+                        geometry.value_width(),
+                    )],
+                )?;
+                Ok((mixer, out))
             }
             _ => Err(format!("layer {index} names another token mixer's tensors")),
         }
     }
 
     /// A depthwise conv's BF16 `[width][taps]` filter, which a release stores as `[width][1][taps]`
-    /// or as `[width][taps]`.
-    fn conv(&mut self, name: &str, width: usize, taps: usize) -> Result<Deviceptr, String> {
+    /// or as `[width][taps]`: the `runs` of its channels this rank holds.
+    fn conv(
+        &mut self,
+        name: &str,
+        (width, taps): (usize, usize),
+        runs: &[Run],
+    ) -> Result<Deviceptr, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
         if spec.dtype != DType::BF16
             || (spec.shape != [width, 1, taps] && spec.shape != [width, taps])
@@ -930,8 +1275,7 @@ impl Uploads<'_> {
                 spec.dtype, spec.shape
             ));
         }
-        let pointer = self.uploader.vector(name, width * taps)?;
-        Ok(self.keep(pointer, width * taps * 2))
+        self.vector_runs(name, (width, taps), runs)
     }
 
     /// A routed layer's router, experts (and their table), shared expert and its gate.
@@ -939,10 +1283,13 @@ impl Uploads<'_> {
         &mut self,
         index: usize,
         names: &FfnNames,
-        shape: &Shape,
+        (shape, whole): (&Shape, &Shape),
         routed: &Routed,
         hidden: usize,
     ) -> Result<LayerFfn, String> {
+        let Some(all) = whole.routed else {
+            return Err(format!("layer {index} routes at one rank only"));
+        };
         let FfnNames::Moe {
             router,
             experts,
@@ -963,8 +1310,17 @@ impl Uploads<'_> {
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
         let fp8 = self.formats.fp8_experts;
         for (number, expert) in experts.iter().enumerate() {
-            let Mlp { gate, up, down } = self.mlp(expert, routed.intermediate, hidden)?;
-            for (proj, name) in [(&gate, &expert.gate), (&up, &expert.up), (&down, &expert.down)] {
+            let Mlp { gate, up, down } = self.mlp(
+                expert,
+                all.intermediate,
+                (shape.cut.expert, routed.intermediate),
+                hidden,
+            )?;
+            for (proj, name) in [
+                (&gate, &expert.gate),
+                (&up, &expert.up),
+                (&down, &expert.down),
+            ] {
                 if matches!(proj, Proj::Fp8(_)) != fp8 {
                     return Err(format!(
                         "layer {index}'s expert {number} stores {name} as {}, and the checkpoint \
@@ -981,7 +1337,12 @@ impl Uploads<'_> {
         let table = self.uploader.bytes(&table)?;
         let table = self.keep(table, routed.experts * 6 * 8);
         let shared = match (shared, shape.intermediate) {
-            (Some(names), width) if width > 0 => Some(self.mlp(names, width, hidden)?),
+            (Some(names), width) if width > 0 => Some(self.mlp(
+                names,
+                whole.intermediate,
+                (shape.cut.intermediate, width),
+                hidden,
+            )?),
             (None, 0) => None,
             _ => {
                 return Err(format!(
@@ -1027,12 +1388,14 @@ impl Uploads<'_> {
 /// Uploads every tensor `names` resolves, each checked at its architecture shape (BF16, or a
 /// projection's block-scaled E4M3 under `formats`); every allocation lands in `owned` as it is
 /// made, so a failure part way frees what was uploaded.
+#[allow(clippy::too_many_arguments)]
 fn upload(
     cuda: &Cuda,
     architecture: &Architecture,
     names: &TensorNames,
     source: &dyn WeightSource,
     formats: Formats,
+    shapes: &[Shape],
     owned: &mut Vec<Deviceptr>,
 ) -> Result<Uploaded, String> {
     let mut up = Uploads {
@@ -1052,18 +1415,29 @@ fn upload(
     };
     let norm = up.vector(&names.norm, hidden)?;
     let mut layers = Vec::with_capacity(architecture.layers.len());
-    for (index, layer_names) in names.layers.iter().enumerate() {
-        let shape = Shape::of(architecture, index)?;
-        let (mixer, o) = up.mixer(index, &layer_names.attention, &shape, hidden)?;
+    if names.layers.len() != shapes.len() {
+        return Err(format!(
+            "the checkpoint names {} layers, the architecture {}",
+            names.layers.len(),
+            shapes.len()
+        ));
+    }
+    for (index, (layer_names, shape)) in names.layers.iter().zip(shapes).enumerate() {
+        let whole = Shape::of(architecture, index, Shard::whole())?;
+        let pair = (shape, &whole);
+        let (mixer, o) = up.mixer(index, &layer_names.attention, pair, hidden)?;
         let ffn = match (&shape.routed, &layer_names.ffn) {
-            (None, FfnNames::Dense(names)) => {
-                LayerFfn::Dense(up.mlp(names, shape.intermediate, hidden)?)
-            }
+            (None, FfnNames::Dense(names)) => LayerFfn::Dense(up.mlp(
+                names,
+                whole.intermediate,
+                (shape.cut.intermediate, shape.intermediate),
+                hidden,
+            )?),
             (None, _) => return Err(format!("layer {index} names a routed MLP's tensors")),
-            (Some(routed), names) => up.routed(index, names, &shape, routed, hidden)?,
+            (Some(routed), names) => up.routed(index, names, pair, routed, hidden)?,
         };
         layers.push(Layer {
-            shape,
+            shape: *shape,
             input_norm: up.vector(&layer_names.input_norm, hidden)?,
             mixer,
             o,
@@ -1087,6 +1461,17 @@ fn bf16(source: &dyn WeightSource, name: &str, shape: &[usize]) -> Result<(), St
 }
 
 impl Shared {
+    /// A branch's `rows` partial rows at `partial` summed over the group, in place: nothing at one
+    /// rank.
+    fn sum(&self, partial: Deviceptr, rows: usize) -> Result<(), BackendError> {
+        match &self.sums {
+            None => Ok(()),
+            Some(sums) => sums.sum(&self.cuda, None, partial, rows, |call| {
+                self.call(self.kernels.sum_slots, call)
+            }),
+        }
+    }
+
     fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
         self.cuda
             .launch_async(kernel, call.grid, call.block, &call.args)
@@ -1136,10 +1521,8 @@ impl Shared {
                 ),
             )?;
         }
-        for (gains, values, width) in [
-            (*q_norm, b.query, query_width),
-            (*k_norm, b.key, kv_width),
-        ] {
+        for (gains, values, width) in [(*q_norm, b.query, query_width), (*k_norm, b.key, kv_width)]
+        {
             if let Some(gains) = gains {
                 self.norm(
                     RmsNorm::new(values.0, gains.0, values.0, width, self.eps)
@@ -1244,7 +1627,9 @@ impl Shared {
         let mut first = 0usize;
         for (sequence, tokens) in segments {
             let Cache::Linear { conv: history, .. } = sequence.caches[index] else {
-                return refuse(format!("layer {index}'s lane part holds no recurrent state"));
+                return refuse(format!(
+                    "layer {index}'s lane part holds no recurrent state"
+                ));
             };
             let count = tokens.len();
             let at = (first * width * 4) as u64;
@@ -1283,7 +1668,9 @@ impl Shared {
         let mut first = 0usize;
         for (sequence, tokens) in segments {
             let Cache::Linear { state, .. } = sequence.caches[index] else {
-                return refuse(format!("layer {index}'s lane part holds no recurrent state"));
+                return refuse(format!(
+                    "layer {index}'s lane part holds no recurrent state"
+                ));
             };
             let count = tokens.len();
             let args = geometry.scan_args(
@@ -2194,6 +2581,7 @@ fn walk(
             Mixer::Gdn(gdn) => shared.linear(index, layer, gdn, b, segments, rows, policy)?,
         }
         shared.project(&layer.o, b, b.attended.0, b.projected.0, rows, policy)?;
+        shared.sum(b.projected, rows)?;
         shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         shared.norm(
             RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
@@ -2203,6 +2591,7 @@ fn walk(
             LayerFfn::Dense(mlp) => shared.mlp(mlp, b, b.projected, rows, policy)?,
             LayerFfn::Routed { .. } => shared.routed(layer, b, rows, policy)?,
         }
+        shared.sum(b.projected, rows)?;
         shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         if let Some(trace) = trace.as_deref_mut() {
             let mut bytes = vec![0u8; rows * hidden * 4];
@@ -2548,7 +2937,9 @@ mod tests {
         assert!(refused(|profile| profile.prefill.exact = Some(true)).contains("exact"));
         assert!(refused(|profile| profile.decode.tensor_cores = Some(true)).contains("decode"));
         assert!(refused(|profile| profile.speculation.enabled = Some(true)).contains("drafter"));
-        assert!(refused(|profile| profile.sequence.parallel = Some(true)).contains("one rank"));
+        assert!(
+            refused(|profile| profile.sequence.parallel = Some(true)).contains("sequence parallel")
+        );
         let mut lanes = ModelProfile::default();
         lanes.runtime.concurrency = Some(4);
         assert!(

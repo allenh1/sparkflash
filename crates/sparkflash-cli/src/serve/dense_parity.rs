@@ -32,19 +32,29 @@
 //! step's logits to the bit as each conversation alone, and a kept lane continues its
 //! conversation or goes back to the end of its prompt.
 //!
+//! The arm's tensor-parallel ranks are gated the same way, as an in-process group of two on this
+//! one device: rank 0's layers and logits against the host reference, every other rank's to the
+//! bit as rank 0's (each rank sums the same partials in rank order, so the residuals agree), and
+//! the device legs' sums (one-shot and two-shot, met here through the host) to the bit as the
+//! host leg's.
+//!
 //! Without the kernels or a CUDA device the test says so and passes: the gate runs where the arm
 //! can.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 
 use serde_json::{Value, json};
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_model::{Architecture, Capabilities, ModelBackend, ModelDescriptor, ModelSession};
 use sparkflash_model_dense::DenseDeviceBackend;
+use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::parity::{ParityReport, Tolerance};
 use sparkflash_ops::plan::OpKind;
 use sparkflash_weights::dtype::DType;
+use sparkflash_weights::linalg::EngineError;
 use sparkflash_weights::spec::TensorSpec;
+use sparkflash_weights::tp::{LocalBus, LocalRank, TpCollective, TpLayout, TpRuntime, Wire};
 use sparkflash_weights::weights::{WeightError, WeightSource};
 
 use super::dynamic_host::DynamicHostBackend;
@@ -286,9 +296,17 @@ impl Form {
 
     /// One SwiGLU MLP of `width` under `prefix`.
     fn mlp(self, source: &mut Memory, prefix: &str, width: usize, hidden: usize) {
-        self.push(source, &format!("{prefix}.gate_proj.weight"), [width, hidden]);
+        self.push(
+            source,
+            &format!("{prefix}.gate_proj.weight"),
+            [width, hidden],
+        );
         self.push(source, &format!("{prefix}.up_proj.weight"), [width, hidden]);
-        self.push(source, &format!("{prefix}.down_proj.weight"), [hidden, width]);
+        self.push(
+            source,
+            &format!("{prefix}.down_proj.weight"),
+            [hidden, width],
+        );
     }
 }
 
@@ -578,6 +596,15 @@ fn open(
     Arc<Memory>,
     DenseDeviceBackend,
 )> {
+    let (architecture, descriptor, source) = prepare(fixture, what)?;
+    let context = descriptor.context_tokens;
+    let device = DenseDeviceBackend::open(descriptor.clone(), &architecture, &*source, context)
+        .expect("the dense arm opens");
+    Some((architecture, descriptor, source, device))
+}
+
+/// The fixture's architecture, descriptor and tensors, or `None` where the arm cannot run.
+fn prepare(fixture: &Fixture, what: &str) -> Option<(Architecture, ModelDescriptor, Arc<Memory>)> {
     let architecture =
         Architecture::from_json(&fixture.config.to_string()).expect("the fixture parses");
     let family = architecture.family.clone();
@@ -599,18 +626,244 @@ fn open(
         context,
         Capabilities::ALL,
     );
-    let source = Arc::new(fixture.source());
-    let device = DenseDeviceBackend::open(descriptor.clone(), &architecture, &*source, context)
-        .expect("the dense arm opens");
-    Some((architecture, descriptor, source, device))
+    Some((architecture, descriptor, Arc::new(fixture.source())))
+}
+
+/// An in-process group's rank whose collective has the device legs: the slots each leg fills
+/// ([TpCollective::exchange_on_device], [TpCollective::scatter_on_device]) are read back, gathered
+/// over the host bus and written into the peers' slots, so the arm sums them on the device as it
+/// does over NCCL. The f32 wire leaves every bit as it was sent.
+struct DeviceLegs {
+    local: LocalRank,
+    cuda: CudaHandle,
+}
+
+impl DeviceLegs {
+    /// Every rank's `bytes` at `send`, in rank order.
+    fn gather(&mut self, send: u64, bytes: usize) -> Result<Vec<u8>, EngineError> {
+        let device = |detail: String| EngineError::Shape {
+            what: "in-process device legs".to_owned(),
+            detail,
+        };
+        let mut mine = vec![0u8; bytes];
+        self.cuda
+            .copy_dtoh(&mut mine, &Deviceptr(send))
+            .map_err(device)?;
+        let mine: Vec<f32> = mine
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| f32::from_le_bytes(*word))
+            .collect();
+        let mut everyone = vec![0.0f32; mine.len() * self.local.world()];
+        self.local.all_gather_assign(&mine, &mut everyone)?;
+        Ok(everyone
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect())
+    }
+
+    fn write(&self, at: u64, bytes: &[u8]) -> Result<(), EngineError> {
+        self.cuda
+            .copy_htod(&Deviceptr(at), bytes)
+            .map_err(|detail| EngineError::Shape {
+                what: "in-process device legs".to_owned(),
+                detail,
+            })
+    }
+}
+
+impl TpCollective for DeviceLegs {
+    fn world(&self) -> usize {
+        self.local.world()
+    }
+    fn rank(&self) -> usize {
+        self.local.rank()
+    }
+    fn label(&self) -> &'static str {
+        "in-process device legs"
+    }
+    fn all_reduce_assign(&mut self, values: &mut [f32]) -> Result<(), EngineError> {
+        self.local.all_reduce_assign(values)
+    }
+    fn all_gather_assign(&mut self, local: &[f32], out: &mut [f32]) -> Result<(), EngineError> {
+        self.local.all_gather_assign(local, out)
+    }
+    fn device_wire(&self) -> Option<Wire> {
+        Some(Wire::F32)
+    }
+    fn exchange_on_device(
+        &mut self,
+        _stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        let everyone = self.gather(send, bytes)?;
+        for peer in (0..self.world()).filter(|peer| *peer != self.rank()) {
+            let at = slots + (peer * bytes) as u64;
+            self.write(at, &everyone[peer * bytes..][..bytes])?;
+        }
+        Ok(())
+    }
+    fn scatter_on_device(
+        &mut self,
+        _stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+    ) -> Result<(), EngineError> {
+        let chunk = bytes / self.world();
+        let everyone = self.gather(send, bytes)?;
+        for peer in (0..self.world()).filter(|peer| *peer != self.rank()) {
+            let at = slots + (peer * chunk) as u64;
+            self.write(at, &everyone[peer * bytes + self.rank() * chunk..][..chunk])?;
+        }
+        Ok(())
+    }
+}
+
+/// A group of `world` ranks on this one device, the arm's sums on the host leg or (with
+/// `device_legs`) the one-shot and two-shot device legs.
+#[derive(Clone, Copy)]
+struct Group {
+    world: usize,
+    device_legs: bool,
+}
+
+impl Group {
+    /// Rank `rank`'s collective over `bus`, opened on the calling thread.
+    fn runtime(self, bus: &Arc<LocalBus>, rank: usize) -> TpRuntime {
+        let local = LocalRank {
+            rank,
+            bus: Arc::clone(bus),
+        };
+        let collective: Box<dyn TpCollective> = if self.device_legs {
+            let cuda = CudaHandle::new(Cuda::load().expect("a CUDA device"));
+            Box::new(DeviceLegs { local, cuda })
+        } else {
+            Box::new(local)
+        };
+        let layout = TpLayout {
+            rank,
+            world_size: self.world,
+        };
+        TpRuntime::new(layout, collective).expect("the group's collective")
+    }
+}
+
+/// One step's every layer trace and logits, as a rank answered them.
+type Answer = (Vec<Vec<f32>>, Vec<f32>);
+
+/// A worker rank on its own thread: it steps each feed it is sent and answers what it computed.
+struct Peer {
+    feeds: mpsc::Sender<Vec<u32>>,
+    answers: mpsc::Receiver<Answer>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Peer {
+    fn start(
+        group: Group,
+        bus: &Arc<LocalBus>,
+        rank: usize,
+        (architecture, descriptor, source): (&Architecture, &ModelDescriptor, &Arc<Memory>),
+    ) -> Self {
+        let (feeds, fed) = mpsc::channel::<Vec<u32>>();
+        let (answer, answers) = mpsc::channel();
+        let (bus, architecture, descriptor, source) = (
+            Arc::clone(bus),
+            architecture.clone(),
+            descriptor.clone(),
+            Arc::clone(source),
+        );
+        let thread = std::thread::spawn(move || {
+            let context = descriptor.context_tokens;
+            let backend = DenseDeviceBackend::open_rank(
+                descriptor,
+                &architecture,
+                &*source,
+                context,
+                group.runtime(&bus, rank),
+            )
+            .unwrap_or_else(|error| panic!("rank {rank} opens: {error}"));
+            let mut session = backend.session().expect("a worker session");
+            session.trace(true);
+            // An empty answer says the rank opened, before rank 0 waits on it in a sum.
+            if answer.send((Vec::new(), Vec::new())).is_err() {
+                return;
+            }
+            for tokens in fed {
+                let logits = session.forward(&tokens).expect("a worker forward");
+                if answer.send((session.take_trace(), logits)).is_err() {
+                    return;
+                }
+            }
+        });
+        let peer = Self {
+            feeds,
+            answers,
+            thread,
+        };
+        peer.answers.recv().expect("the worker rank opens");
+        peer
+    }
+}
+
+/// `values` as their bits, for comparing to the bit.
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
 }
 
 /// Runs `fixture` through both backends and returns the report, or `None` where the arm cannot
 /// run.
 fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport> {
-    let (architecture, descriptor, source, device) = open(fixture, "parity report")?;
+    parity_over(fixture, prompt, steps, None).map(|(report, _)| report)
+}
+
+/// [parity] with the arm as rank 0 of `group`, every worker rank's layers and logits checked to
+/// the bit against rank 0's; answers the report and rank 0's every answer.
+fn group_parity(
+    fixture: &Fixture,
+    prompt: usize,
+    steps: usize,
+    group: Group,
+) -> Option<(ParityReport, Vec<Answer>)> {
+    parity_over(fixture, prompt, steps, Some(group))
+}
+
+fn parity_over(
+    fixture: &Fixture,
+    prompt: usize,
+    steps: usize,
+    group: Option<Group>,
+) -> Option<(ParityReport, Vec<Answer>)> {
+    let (architecture, descriptor, source) = prepare(fixture, "parity report")?;
     let family = architecture.family.clone();
     let context = descriptor.context_tokens;
+    let (device, peers) = match group {
+        None => (
+            DenseDeviceBackend::open(descriptor.clone(), &architecture, &*source, context)
+                .expect("the dense arm opens"),
+            Vec::new(),
+        ),
+        Some(group) => {
+            let bus = Arc::new(LocalBus::new(group.world).with_wire(Wire::F32));
+            let peers: Vec<Peer> = (1..group.world)
+                .map(|rank| Peer::start(group, &bus, rank, (&architecture, &descriptor, &source)))
+                .collect();
+            let device = DenseDeviceBackend::open_rank(
+                descriptor.clone(),
+                &architecture,
+                &*source,
+                context,
+                group.runtime(&bus, 0),
+            )
+            .expect("rank 0 opens");
+            assert_eq!(device.rank(), (0, group.world));
+            (device, peers)
+        }
+    };
     let host =
         DynamicHostBackend::open(descriptor, Arc::new(architecture.clone()), source, context)
             .expect("the host reference opens");
@@ -633,24 +886,42 @@ fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport
                 reference.len()
             );
         };
+    let mut answered = Vec::new();
     let mut step = |report: &mut ParityReport, label: &str, tokens: &[u32]| -> u32 {
         let mut expected = Vec::new();
         for token in tokens {
             expected = host.forward(*token).expect("the host forward");
         }
+        for peer in &peers {
+            peer.feeds
+                .send(tokens.to_vec())
+                .expect("a worker rank takes the feed");
+        }
         let actual = device.forward(tokens).expect("the device forward");
-        for (layer, (reference, actual)) in host
-            .take_trace()
-            .iter()
-            .zip(device.take_trace())
-            .enumerate()
-        {
+        let trace = device.take_trace();
+        for (index, peer) in peers.iter().enumerate() {
+            let (layers, logits) = peer.answers.recv().expect("a worker rank answers");
+            assert_eq!(layers.len(), trace.len());
+            for (layer, (mine, theirs)) in trace.iter().zip(&layers).enumerate() {
+                assert!(
+                    bits(mine) == bits(theirs),
+                    "{family} {label}: rank {} layer {layer} differs from rank 0's",
+                    index + 1
+                );
+            }
+            assert!(
+                bits(&actual) == bits(&logits),
+                "{family} {label}: rank {}'s logits differ from rank 0's",
+                index + 1
+            );
+        }
+        for (layer, (reference, actual)) in host.take_trace().iter().zip(&trace).enumerate() {
             record(
                 report,
                 &format!("{label} layer {layer}"),
                 OpKind::GqaAttention,
                 reference,
-                &actual,
+                actual,
             );
         }
         record(
@@ -675,13 +946,95 @@ fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport
         } else {
             eprintln!("{family} {label}: a near tie ({margin:e}), reference {want}, arm {got}");
         }
+        answered.push((trace, actual));
         want
     };
     let mut next = step(&mut report, "prompt", &tokens);
     for index in 0..steps {
         next = step(&mut report, &format!("decode {index}"), &[next]);
     }
-    Some(report)
+    for peer in peers {
+        drop(peer.feeds);
+        peer.thread.join().expect("a worker rank ends");
+    }
+    Some((report, answered))
+}
+
+/// `fixture` at TP=2 on the host leg and on the device legs: each passes [group_parity], and the
+/// two legs' answers agree to the bit.
+fn two_ranks(fixture: &Fixture, prompt: usize, steps: usize) {
+    let host = group_parity(
+        fixture,
+        prompt,
+        steps,
+        Group {
+            world: 2,
+            device_legs: false,
+        },
+    );
+    let Some((report, host)) = host else {
+        return;
+    };
+    assert_passed(Some(report));
+    let (report, device) = group_parity(
+        fixture,
+        prompt,
+        steps,
+        Group {
+            world: 2,
+            device_legs: true,
+        },
+    )
+    .expect("the device legs run where the host leg did");
+    assert_passed(Some(report));
+    assert_eq!(host.len(), device.len());
+    for (step, ((host_layers, host_logits), (device_layers, device_logits))) in
+        host.iter().zip(&device).enumerate()
+    {
+        for (layer, (host, device)) in host_layers.iter().zip(device_layers).enumerate() {
+            assert!(
+                bits(host) == bits(device),
+                "step {step} layer {layer}: the device legs' residual differs from the host leg's"
+            );
+        }
+        assert!(
+            bits(host_logits) == bits(device_logits),
+            "step {step}: the device legs' logits differ from the host leg's"
+        );
+    }
+}
+
+#[test]
+fn two_ranks_of_a_two_chunk_llama_shaped_prompt_match_the_host_reference() {
+    two_ranks(&plain(), 300, 3);
+}
+
+#[test]
+fn two_ranks_sharing_one_key_value_head_match_the_host_reference() {
+    // One key/value head for two ranks: both read it, each its own two query heads; the MLP
+    // width (520) splits into two 260-wide shares the row GEMV takes.
+    two_ranks(&gated(), 300, 3);
+}
+
+#[test]
+fn two_ranks_of_sigmoid_routed_experts_match_the_host_reference() {
+    // A 136-wide expert splits into 72 and 64 columns, whole runs of the eight the BF16 expert
+    // passes read at a time.
+    two_ranks(&sigmoid_routed(), 40, 3);
+}
+
+#[test]
+fn two_ranks_of_gated_deltanet_layers_match_the_host_reference() {
+    two_ranks(&hybrid(), 300, 3);
+}
+
+#[test]
+fn two_ranks_of_fp8_gated_deltanet_layers_and_experts_match_the_host_reference() {
+    // Each rank holds whole 128 x 128 tiles of every expert (two tiles split one apiece) and
+    // a 64-row key/value share inside one tile.
+    let mut fixture = hybrid_fp8_routed();
+    fixture.config["moe_intermediate_size"] = json!(256);
+    two_ranks(&fixture, 300, 3);
 }
 
 fn assert_passed(report: Option<ParityReport>) {
