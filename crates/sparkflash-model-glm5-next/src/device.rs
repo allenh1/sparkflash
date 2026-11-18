@@ -2655,6 +2655,43 @@ impl DeviceRank {
         &self.config
     }
 
+    /// The rows one bulk prefill chunk may hold: the active profile's `prefill.chunk`, or
+    /// [MAX_ROWS] when this rank takes the token path for every prompt.
+    ///
+    /// This is the rank's own scratch width ([Self::prefill_rows]), so a serving walk that sizes
+    /// its chunks from it cannot hand a chunk to scratch that was not allocated for one.
+    #[must_use]
+    pub fn prefill_rows(&self) -> usize {
+        self.prefill_rows
+    }
+
+    /// The cache plan this rank's sequences allocate: one positional row a position a sparse
+    /// layer (the release's E4M3 latent and its scales, or the f32 latent, plus the indexer's
+    /// own rows) and the linear-attention state a session.
+    ///
+    /// This is [Glm5NextConfig::architecture]'s plan at this rank's world size and the latent
+    /// representation the layers were built with, so a serving walk's [crate::walk::GlmWalk]
+    /// layout describes the caches the rank actually holds rather than a compiled-in guess.
+    #[must_use]
+    pub fn kv_plan(&self) -> sparkflash_model::KvPlan {
+        self.config
+            .architecture
+            .kv_plan(self.layout.world_size, self.latent_fp8())
+            .unwrap_or_else(|_| sparkflash_model::KvPlan::new(0, 0))
+    }
+
+    /// Whether this rank's sparse layers store their latent cache as E4M3 codes.
+    #[must_use]
+    pub fn latent_fp8(&self) -> bool {
+        self.layers
+            .iter()
+            .find_map(|layer| match &layer.branch {
+                DeviceBranch::Sparse(dsa) => Some(dsa.quantise),
+                DeviceBranch::Linear(_) => None,
+            })
+            .unwrap_or(false)
+    }
+
     /// Refuses a configuration a kernel's fixed bounds would truncate.
     fn check_bounds(config: &Glm5NextConfig) -> Result<(), BackendError> {
         let selected = config.index_pools() * config.index_kpool + config.index_kpool - 1;
@@ -3297,7 +3334,11 @@ impl DeviceRank {
     /// # Errors
     /// The pool's refusal when it has too few chunks left, or a driver
     /// failure.
-    fn back(&self, sequence: &mut DeviceSequence, rows: usize) -> Result<(), BackendError> {
+    pub(crate) fn back(
+        &self,
+        sequence: &mut DeviceSequence,
+        rows: usize,
+    ) -> Result<(), BackendError> {
         sequence
             .lane
             .lane

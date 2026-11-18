@@ -58,26 +58,7 @@ use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
 use crate::config::Glm5NextConfig;
 use crate::device::{CudaHandle, DeviceRank, DeviceSequence, LatentCache, Prefill};
-
-/// How a session drafts, once the backend has been told to.
-#[derive(Debug, Clone)]
-struct SpecConfig {
-    /// The most drafts a step verifies.
-    drafts: usize,
-    /// The depth policy, when the drafter says how sure it is of each draft (the block drafter).
-    policy: Option<DepthPolicy>,
-}
-
-/// The backend's rank and the collectives every session's step runs through.
-struct Shared {
-    rank: Mutex<DeviceRank>,
-    tp: TpRuntime,
-    gather: BitGatherHandle,
-    eos: Vec<u32>,
-    /// Set once, before the first session opens: a session's sequence is a drafting one or it is
-    /// not, so the choice cannot change under a live session.
-    spec: OnceLock<SpecConfig>,
-}
+use crate::walk::{Shared, SpecConfig};
 
 /// The arm that steps GLM slots together, behind [sparkflash_runtime::FusedEngine].
 ///

@@ -421,7 +421,11 @@ where
                 },
             ));
         }
-        let current = slot.prompt.is_none();
+        // The history may lag the arm's position: a walk that verified drafts keeps their rows
+        // in the sequence while the caller has only been given the anchor's token. A prompt may
+        // extend the history only when the state ends exactly where the history does; otherwise
+        // the rewind point is the resume, as an arm that owns the rule asks for.
+        let current = slot.prompt.is_none() && slot.seq.position() == slot.history.len();
         let answer = resume(&slot.history, current, slot.point, tokens);
         let start = match answer {
             Some(Resume::Extend(held)) => held,
@@ -464,8 +468,19 @@ where
         self.plain_step(members)
     }
 
+    fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
+        self.walk.ready(&slot.seq, token)
+    }
+
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
-        slot.speculation
+        // The counters are the drafter's, which only the arm can read; the slot's own field is
+        // the fallback for a walk that states nothing.
+        let measured = self.walk.speculation(&slot.seq);
+        if measured == Speculation::default() {
+            slot.speculation
+        } else {
+            measured
+        }
     }
 
     fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
@@ -530,7 +545,7 @@ where
                 ),
             )
         })?;
-        slot.seq.rewind(to)?;
+        self.walk.give_back(&mut slot.seq, to)?;
         slot.history.truncate(to);
         slot.point = slot.point.filter(|point| *point <= to);
         slot.cached = slot.cached.min(to);
@@ -606,6 +621,15 @@ mod tests {
         limits: Limits,
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
         sampling: Mutex<Option<Sampling>>,
+        /// Rows the walk keeps past the ones the caller was given tokens for, as a verify keeps
+        /// its drafts' rows. Zero is the plain walk.
+        kept_past: usize,
+        /// What the walk reports for a sequence's speculative counters.
+        counters: Speculation,
+        /// Tokens whose answer the walk says it already holds.
+        held: Mutex<Vec<u32>>,
+        /// The positions the runtime asked the walk to put its state back to.
+        gives: Mutex<Vec<usize>>,
     }
 
     impl ToyWalk {
@@ -618,7 +642,17 @@ mod tests {
                 limits: Limits::new(rows, context),
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
+                kept_past: 0,
+                counters: Speculation::default(),
+                held: Mutex::new(Vec::new()),
+                gives: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The same walk, keeping `kept_past` rows past what the caller was given.
+        fn keeping(mut self, kept_past: usize) -> Self {
+            self.kept_past = kept_past;
+            self
         }
     }
 
@@ -645,6 +679,20 @@ mod tests {
             *self.sampling.lock().expect("the toy sampler record") = Some(sampling);
         }
 
+        fn speculation(&self, _seq: &Self::Seq) -> Speculation {
+            self.counters
+        }
+
+        fn ready(&self, _seq: &Self::Seq, token: u32) -> bool {
+            self.held.lock().expect("the held list").contains(&token)
+        }
+
+        fn give_back(&self, _seq: &mut Self::Seq, to: usize) -> Result<(), BackendError> {
+            // This walk's state cannot go back; it records the ask and stays where it is.
+            self.gives.lock().expect("the give-back list").push(to);
+            Ok(())
+        }
+
         fn walk(
             &self,
             segments: &mut [Segment<'_, Self::Seq>],
@@ -663,6 +711,8 @@ mod tests {
             for segment in segments {
                 segment.seq.rows.extend_from_slice(segment.rows);
                 rows += segment.rows.len();
+                // A verify's rows stay in the state past the tokens the caller is given.
+                segment.seq.rows.extend(vec![u32::MAX; self.kept_past]);
             }
             Ok(Hidden::new(rows))
         }
@@ -743,6 +793,84 @@ mod tests {
             slot.seq().rows.len() - before,
             1,
             "the shared prefix was not forwarded again"
+        );
+    }
+
+    /// A state that ends past the history (a verify kept its drafts' rows) cannot extend the
+    /// history: the next prompt goes back to the rewind point instead of forwarding at a position
+    /// the caller's text does not reach.
+    #[test]
+    fn a_prompt_extends_the_history_only_where_the_state_ends() {
+        let runtime =
+            Runtime::new(ToyWalk::new(256, 4_096).keeping(2), 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime
+            .prefill(&mut slot, &[1, 2, 3])
+            .expect("the first prompt");
+        // The walk kept two rows the caller was never given a token for.
+        assert_eq!(slot.seq().rows, vec![1, 2, 3, u32::MAX, u32::MAX]);
+        assert_eq!(slot.history(), &[1, 2, 3]);
+        runtime
+            .prefill(&mut slot, &[1, 2, 3, 9])
+            .expect("the continuation");
+        assert_eq!(
+            slot.seq().rows,
+            vec![1, 2, 3, 9, u32::MAX, u32::MAX],
+            "the prompt went back to the point instead of forwarding from the kept rows"
+        );
+        assert_eq!(slot.history(), &[1, 2, 3, 9]);
+    }
+
+    /// The arm's counters reach the serving layer through the runtime: the runtime cannot see
+    /// inside a walk, so a drafter's report would otherwise read as zero.
+    #[test]
+    fn the_walk_reports_a_sequence_s_speculation() {
+        let mut walk = ToyWalk::new(256, 4_096);
+        walk.counters = Speculation {
+            verify_steps: 3,
+            drafts_proposed: 9,
+            drafts_accepted: 4,
+        };
+        let runtime = Runtime::new(walk, 0).expect("the runtime starts");
+        let slot = runtime.open_slot().expect("a slot");
+        assert_eq!(
+            runtime.speculation(&slot),
+            Speculation {
+                verify_steps: 3,
+                drafts_proposed: 9,
+                drafts_accepted: 4,
+            }
+        );
+    }
+
+    /// The runtime asks the walk what a slot already holds and what a give-back does, so an
+    /// arm whose caches cannot go back (they consumed the unused answers) keeps its own rule.
+    #[test]
+    fn the_walk_answers_a_run_and_a_give_back() {
+        let runtime =
+            Runtime::new(ToyWalk::new(256, 4_096).keeping(2), 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime.prefill(&mut slot, &[1, 2, 3]).expect("the prompt");
+        runtime.walk().held.lock().expect("the held list").push(42);
+        assert!(runtime.ready(&slot, 42), "the walk holds this answer");
+        assert!(!runtime.ready(&slot, 41));
+        runtime
+            .give_back(&mut slot, 2)
+            .expect("the walk takes the give-back");
+        assert_eq!(slot.history(), &[1]);
+        assert_eq!(
+            runtime
+                .walk()
+                .gives
+                .lock()
+                .expect("the give-back list")
+                .as_slice(),
+            &[1]
+        );
+        assert_eq!(
+            slot.seq().rows.len(),
+            5,
+            "the walk kept its state where it was; its position says the history lags it"
         );
     }
 

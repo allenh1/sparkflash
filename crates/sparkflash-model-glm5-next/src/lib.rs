@@ -39,6 +39,8 @@
 //!   device rank behind `ModelBackend`/`ModelSession` so the generic host driver can serve it: a
 //!   session reuses a kept prefix, and one that has been told to draft verifies the MTP layer's or
 //!   the DFlash 2 drafter's chain with the shared rule (`sparkflash_model::spec`).
+//! * [walk] is the arm as `sparkflash_runtime::Walk`: the same device calls the serving loop ran,
+//!   with the runtime owning the prompt parts, reuse, rewind, the lanes and the ledger.
 //!
 //! # Attribution
 //!
@@ -87,6 +89,16 @@ pub const DEFAULT_DEVICE_CONTEXT: usize = sparkflash_model::descriptor::GLM53_CO
 /// The output ceiling the serving arm advertises for one request.
 pub const MAX_OUTPUT_TOKENS: usize = sparkflash_model::descriptor::GLM53_MAX_OUTPUT_TOKENS;
 
+/// What the arm states of its token (one-to-eight row) step: the row GEMV.
+///
+/// The release decodes on the row GEMV, not on the tensor-core tile, so a profile that asks for
+/// `decode.tensor_cores = true` is refused. The refusal and the boot ledger's tensor-core
+/// decode row are the same constant ([crate::walk::GlmWalk]'s
+/// [sparkflash_runtime::WalkCapabilities] and the CLI's GLM profile check), so a GLM that ever
+/// decodes on the tile stops refusing the switch by the same edit.
+pub const TOKEN_DECODE: sparkflash_model::ledger::State =
+    sparkflash_model::ledger::State::Off("row GEMV; decode.tensor_cores=true is refused");
+
 pub mod architecture;
 pub mod checkpoint;
 pub mod codec;
@@ -96,6 +108,7 @@ pub mod device;
 pub mod forward;
 pub mod serve;
 pub mod tensor;
+pub mod walk;
 
 /// The KV cache a packed serve may spend before it must refuse more workers.
 ///
@@ -224,6 +237,7 @@ pub use device::{DFLASH2_STEP_COST, DeviceRank, DeviceSequence, MAX_ROWS, MTP_ST
 pub use forward::{Glm5NextWeights, ReferenceState};
 pub use serve::Glm5NextDeviceBackend;
 pub use tensor::{Glm5NextTensorPlan, Role, Split};
+pub use walk::{GlmSequence, GlmWalk};
 
 #[cfg(test)]
 mod tests {
