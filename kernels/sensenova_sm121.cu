@@ -501,6 +501,22 @@ __device__ __forceinline__ void sensenova_wait() {
     asm volatile("cp.async.wait_group %0;" ::"n"(N));
 }
 
+// The smallest positive E4M3 there is: a block whose amax/6 rounds below it would round to a zero
+// scale, and a zero scale quantises the whole block to zero. A block that small is carried at this
+// floor instead, so its largest value lands near the code range's top rather than nowhere.
+#define SENSENOVA_FP4_SCALE_FLOOR 0.001953125f
+
+__device__ __forceinline__ uint8_t sensenova_block_scale_byte(float largest) {
+    __nv_fp8_storage_t storage =
+        __nv_cvt_float_to_fp8(largest / 6.0f, __NV_SATFINITE, __NV_E4M3);
+    return sensenova_e4m3(storage) >= SENSENOVA_FP4_SCALE_FLOOR ? (uint8_t)storage : (uint8_t)0x01;
+}
+
+__device__ __forceinline__ float sensenova_block_scale(float largest) {
+    const uint8_t byte = sensenova_block_scale_byte(largest);
+    return byte == 0x01 ? SENSENOVA_FP4_SCALE_FLOOR : sensenova_e4m3(byte);
+}
+
 // The E2M1 magnitude of |v| / scale: the eight codes 0, 0.5, 1, 1.5, 2, 3, 4, 6, nearest first.
 __device__ __forceinline__ uint32_t sensenova_e2m1(float value) {
     const float magnitude = fabsf(value);
@@ -545,12 +561,9 @@ extern "C" __global__ void sensenova_quant_fp4(const float* __restrict__ x,
         values[i] = source[i];
         largest = fmaxf(largest, fabsf(values[i]));
     }
-    float scale = largest / 6.0f;
-    __nv_fp8_storage_t storage = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
-    float stored = sensenova_e4m3(storage);
-    if (stored == 0.0f) stored = 1.0f;
+    const float stored = sensenova_block_scale(largest);
     const float inverse = 1.0f / stored;
-    scales[at] = (uint8_t)storage;
+    scales[at] = sensenova_block_scale_byte(largest);
     uint64_t packed = 0;
 #pragma unroll
     for (unsigned int i = 0; i < 16u; ++i) {
@@ -583,12 +596,9 @@ extern "C" __global__ void sensenova_quant_weights_fp4(const uint8_t* __restrict
         values[i] = (float)(*reinterpret_cast<const __nv_fp8_e4m3*>(&storage)) * tile;
         largest = fmaxf(largest, fabsf(values[i]));
     }
-    float scale = largest / 6.0f;
-    __nv_fp8_storage_t storage = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
-    float stored = sensenova_e4m3(storage);
-    if (stored == 0.0f) stored = 1.0f;
+    const float stored = sensenova_block_scale(largest);
     const float inverse = 1.0f / stored;
-    scales[at] = (uint8_t)storage;
+    scales[at] = sensenova_block_scale_byte(largest);
     uint64_t packed = 0;
 #pragma unroll
     for (unsigned int i = 0; i < 16u; ++i) {

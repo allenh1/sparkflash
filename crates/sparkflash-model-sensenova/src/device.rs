@@ -1867,16 +1867,18 @@ impl DeviceSession {
         let quant = (self.scratch.fp4_codes, self.scratch.fp4_scales);
         let intermediate = shared.config.intermediate_size;
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
+        // The last row, which is the one a host report for the prompt's final token carries.
+        let last = rows.saturating_sub(1);
         let drain = || shared.cuda.synchronize().map_err(|error| BackendError::new(DEVICE, error));
         shared.project_matrix(&layer.gate, self.scratch.normed, self.scratch.branch, rows, quant)?;
         clock.mark("  mlp gate", drain)?;
         if debug {
-            self.report("device mlp gate", self.scratch.branch, rows * intermediate)?;
+            self.report("device mlp gate", self.scratch.branch.offset(last * intermediate * 4), intermediate)?;
         }
         shared.project_matrix(&layer.up, self.scratch.normed, self.scratch.ffn, rows, quant)?;
         clock.mark("  mlp up", drain)?;
         if debug {
-            self.report("device mlp up", self.scratch.ffn, rows * intermediate)?;
+            self.report("device mlp up", self.scratch.ffn.offset(last * intermediate * 4), intermediate)?;
         }
         shared.launch(
             shared.kernels.swiglu,
@@ -1891,12 +1893,12 @@ impl DeviceSession {
         )?;
         clock.mark("  mlp swiglu", drain)?;
         if debug {
-            self.report("device mlp hidden", self.scratch.branch, rows * intermediate)?;
+            self.report("device mlp hidden", self.scratch.branch.offset(last * intermediate * 4), intermediate)?;
         }
         shared.project_matrix(&layer.down, self.scratch.branch, self.scratch.ffn, rows, quant)?;
         clock.mark("  mlp down", drain)?;
         if debug {
-            self.report("device mlp down", self.scratch.ffn, rows * intermediate)?;
+            self.report("device mlp down", self.scratch.ffn.offset(last * intermediate * 4), intermediate)?;
         }
         Ok(())
     }
@@ -2158,10 +2160,12 @@ impl DeviceSession {
             layer.out.expect("out"),
         );
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
+        // The last row, which is the one a host report for the prompt's final token carries.
+        let last = rows.saturating_sub(1);
         shared.project_matrix(&qkv, self.scratch.normed, self.scratch.qkv, rows, quant)?;
         clock.mark("  gdn qkv", drain)?;
         if debug {
-            self.report("gdn qkv", self.scratch.qkv, fused)?;
+            self.report("gdn qkv", self.scratch.qkv.offset(last * fused * 4), fused)?;
         }
         // z, b and a are one 4,224-column projection of the same activation: the prefill issues
         // it as a single pass, and the b/a GEMVs it replaced (36 ms a chunk) are gone. Below the
@@ -2173,7 +2177,7 @@ impl DeviceSession {
         shared.project_matrix(&zb_matrix, self.scratch.normed, zb_out, rows, quant)?;
         clock.mark("  gdn z", drain)?;
         if debug {
-            self.report("gdn z", self.scratch.z, zb_stride)?;
+            self.report("gdn z", self.scratch.z.offset(last * zb_stride * 4), zb_stride)?;
         }
         // Where the three sit inside the combined output: z from 0, b after it, then a.
         let (b_base, a_base) = if layer.zcb.is_some() && rows <= PREFILL_ROWS {
@@ -2187,7 +2191,7 @@ impl DeviceSession {
         }
         clock.mark("  gdn ba", drain)?;
         if debug {
-            self.report("gdn b", b_base, config.linear.value_heads)?;
+            self.report("gdn b", b_base.offset(last * zb_stride * 4), config.linear.value_heads)?;
         }
         let conv = state.conv.expect("conv state");
         let recurrent = state.recurrent.expect("recurrent state");
@@ -2215,7 +2219,7 @@ impl DeviceSession {
         )?;
         clock.mark("  gdn conv", drain)?;
         if debug {
-            self.report("gdn conv", self.scratch.conv_out, fused)?;
+            self.report("gdn conv", self.scratch.conv_out.offset(last * fused * 4), fused)?;
         }
         // The scan's per-row scalars first - they never look at the state - then the recurrence,
         // whose blocks are a head's 32 value columns at a time, then the head's gated norm.
@@ -2277,6 +2281,10 @@ impl DeviceSession {
             ],
         )?;
         clock.mark("  gdn scan", drain)?;
+        if debug {
+            self.report("gdn v", self.scratch.conv_out.offset((last * fused + key_width * 2) * 4), value_width)?;
+            self.report("gdn core", self.scratch.gdn_out.offset(last * value_width * 4), value_width)?;
+        }
         shared.launch(
             shared.kernels.gdn_gate,
             (heads as u32, rows as u32, 1),
@@ -2294,12 +2302,12 @@ impl DeviceSession {
         )?;
         clock.mark("  gdn recur", drain)?;
         if debug {
-            self.report("gdn recur", self.scratch.gdn_out, value_width)?;
+            self.report("gdn recur", self.scratch.gdn_out.offset(last * value_width * 4), value_width)?;
         }
         shared.project_matrix(&out, self.scratch.gdn_out, self.scratch.attention, rows, quant)?;
         clock.mark("  gdn out", drain)?;
         if debug {
-            self.report("gdn out", self.scratch.attention, config.hidden_size)?;
+            self.report("gdn out", self.scratch.attention.offset(last * config.hidden_size * 4), config.hidden_size)?;
         }
         Ok(())
     }

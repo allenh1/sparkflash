@@ -77,7 +77,11 @@ fn the_device_tracks_the_host_over_a_prompt_and_a_few_steps() {
     .expect("host backend");
     let device = sparkflash_model_sensenova::SenseNovaDeviceBackend::open(&directory, descriptor, 4096)
         .expect("device backend");
-    let prompt = [1u32, 2, 3, 4, 5];
+    let length: u32 = std::env::var("SENSENOVA_PROMPT_LEN")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let prompt: Vec<u32> = (1..=length).collect();
     let mut host_session = host.open_session().expect("host session");
     let mut device_session = device.open_session().expect("device session");
     let argmax = |values: &[f32]| {
