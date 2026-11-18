@@ -26,6 +26,7 @@
 //! cargo test -p sparkflash-model-qwen4-exp --test expert_bench -- --ignored --nocapture
 //! ```
 
+use sparkflash_kernels::test_io;
 use std::time::Instant;
 
 use sparkflash_kernels::cuda_driver::Cuda;
@@ -51,17 +52,7 @@ const fn expert_bytes() -> usize {
 }
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 fn u64_bytes(values: &[u64]) -> Vec<u8> {

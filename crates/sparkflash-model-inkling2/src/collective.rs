@@ -731,7 +731,8 @@ impl NcclExchange {
         let config = BootstrapConfig {
             native_rounding: 0,
             env_toggles: 0,
-            plan_digest: fnv1a(run.as_bytes()),
+            // FNV-1a over the run description, the agreement digest the shared opener checks.
+            plan_digest: sparkflash_weights::rank_file::fnv1a(run.as_bytes()),
         };
         let sync = || {
             cuda.synchronize()
@@ -870,16 +871,6 @@ impl Exchange for NcclExchange {
         }
         Ok(())
     }
-}
-
-/// FNV-1a over the run description, the agreement digest the shared opener checks.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// The exchange one rank of a TP group runs: the TCP exchange over `config`, with the run's NCCL

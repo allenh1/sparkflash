@@ -112,7 +112,7 @@ use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, fp8_tile_fits,
 };
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
-use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
+use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 
 fn cubin_available() -> bool {
     !images::qwen4_exp_cubin().is_empty() && !images::glm_decode_cubin().is_empty()
@@ -3925,9 +3925,7 @@ impl DeviceRank {
     /// [Self::two_shot_rows] rows (0 for never) of whole float4 chunks a rank.
     fn two_shot(&self, rows: usize) -> bool {
         let world = self.layout.world_size;
-        self.two_shot_rows > 0
-            && rows >= self.two_shot_rows
-            && splits_two_shot(rows * self.geometry.dim, world)
+        takes_two_shots(self.two_shot_rows, rows, rows * self.geometry.dim, world)
     }
 
     /// [Self::mix_out] of the partials at `partial`, which the two-shot and host legs overwrite
@@ -3963,15 +3961,7 @@ impl DeviceRank {
                 .map_err(weights_error)?;
             world
         } else {
-            let mut bytes = vec![0u8; rows * hidden * 4];
-            self.cuda
-                .copy_dtoh_on(&self.stream, &mut bytes, &partial)
-                .map_err(cuda_error)?;
-            let mut values = to_f32(&bytes);
-            tp.all_reduce(&mut values).map_err(weights_error)?;
-            self.cuda
-                .copy_htod_on(&self.stream, &partial, &to_bytes(&values))
-                .map_err(cuda_error)?;
+            host_sum(&self.cuda, Some(&self.stream), tp, partial, rows * hidden)?;
             1
         };
         self.post((streams, partial, coeffs), hc, rows, world, next)

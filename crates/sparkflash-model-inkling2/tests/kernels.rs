@@ -25,6 +25,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_kernels::images::inkling_cubin;
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_inkling2::reference::{
     self, AttentionParams, cache_bf16, logit_softcap, residual_add, short_conv, short_conv_decode,
     short_conv_dynamic, short_conv_dynamic_decode, softcapped_swiglu,
@@ -55,17 +56,7 @@ fn f(value: f32) -> u64 {
 }
 
 fn open() -> Option<Cuda> {
-    if inkling_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Inkling cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((inkling_cubin().is_empty()).then_some("Inkling cubin"))
 }
 
 /// A deterministic generator, so a failure is reproducible.
@@ -89,23 +80,6 @@ impl Lcg {
     }
 }
 
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
 /// bf16 bits, as the kernels read the convolution taps and the key/value cache.
 fn upload_bf16(cuda: &Cuda, values: &[f32]) -> Deviceptr {
     let bits: Vec<u8> = values
@@ -115,23 +89,11 @@ fn upload_bf16(cuda: &Cuda, values: &[f32]) -> Deviceptr {
             rounded.to_le_bytes()
         })
         .collect();
-    upload(cuda, &bits)
+    upload::<u8>(cuda, &bits)
 }
 
 fn upload_zeros(cuda: &Cuda, elements: usize) -> Deviceptr {
-    upload_f32(cuda, &vec![0f32; elements])
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
+    upload::<f32>(cuda, &vec![0f32; elements])
 }
 
 fn download_bf16(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
@@ -198,7 +160,7 @@ fn the_static_short_convolution_matches_the_host() {
     let x = rng.values(rows * channels);
     let taps = rng.values(channels * kernel_width);
     let (_, kernel) = kernel(&cuda, "inkling_short_conv");
-    let x_device = upload_f32(&cuda, &x);
+    let x_device = upload::<f32>(&cuda, &x);
     let taps_device = upload_bf16(&cuda, &taps);
     let out = upload_zeros(&cuda, rows * channels);
     let blocks = channels.div_ceil(256) as u32;
@@ -216,7 +178,7 @@ fn the_static_short_convolution_matches_the_host() {
         ],
     )
     .expect("short_conv launch");
-    let device = download_f32(&cuda, &out, rows * channels);
+    let device = download::<f32>(&cuda, &out, rows * channels);
     // The taps are bf16 on the device, so the host reads the same rounded values.
     let rounded: Vec<f32> = taps
         .iter()
@@ -270,7 +232,7 @@ fn the_static_short_convolution_decode_matches_the_prefill() {
     let blocks = channels.div_ceil(256) as u32;
     let mut device = Vec::new();
     for token in &tokens {
-        let x = upload_f32(&cuda, token);
+        let x = upload::<f32>(&cuda, token);
         cuda.launch(
             kernel,
             (blocks, 1, 1),
@@ -285,7 +247,7 @@ fn the_static_short_convolution_decode_matches_the_prefill() {
             ],
         )
         .expect("short_conv_decode launch");
-        device.extend(download_f32(&cuda, &out, channels));
+        device.extend(download::<f32>(&cuda, &out, channels));
     }
     assert_close("short_conv_decode", &host, &device);
 }
@@ -321,9 +283,9 @@ fn the_dynamic_short_convolution_matches_the_host() {
     );
 
     let (_, kernel) = kernel(&cuda, "inkling_short_conv_dynamic");
-    let x_device = upload_f32(&cuda, &x);
+    let x_device = upload::<f32>(&cuda, &x);
     let static_device = upload_bf16(&cuda, &static_taps);
-    let dynamic_device = upload_f32(&cuda, &dynamic);
+    let dynamic_device = upload::<f32>(&cuda, &dynamic);
     let out = upload_zeros(&cuda, rows * channels);
     let blocks = channels.div_ceil(256) as u32;
     cuda.launch(
@@ -342,7 +304,7 @@ fn the_dynamic_short_convolution_matches_the_host() {
         ],
     )
     .expect("short_conv_dynamic launch");
-    let device = download_f32(&cuda, &out, rows * channels);
+    let device = download::<f32>(&cuda, &out, rows * channels);
     assert_close("short_conv_dynamic", &host, &device);
 }
 
@@ -390,8 +352,8 @@ fn the_dynamic_short_convolution_decode_matches_the_host() {
     let blocks = channels.div_ceil(256) as u32;
     let mut device = Vec::new();
     for (token, taps) in tokens.iter().zip(&dynamic) {
-        let x = upload_f32(&cuda, token);
-        let dynamic_device = upload_f32(&cuda, taps);
+        let x = upload::<f32>(&cuda, token);
+        let dynamic_device = upload::<f32>(&cuda, taps);
         cuda.launch(
             kernel,
             (blocks, 1, 1),
@@ -408,7 +370,7 @@ fn the_dynamic_short_convolution_decode_matches_the_host() {
             ],
         )
         .expect("short_conv_dynamic_decode launch");
-        device.extend(download_f32(&cuda, &out, channels));
+        device.extend(download::<f32>(&cuda, &out, channels));
     }
     assert_close("short_conv_dynamic_decode", &host, &device);
 }
@@ -434,7 +396,7 @@ fn the_softcapped_swiglu_matches_the_host() {
         ));
     }
     let (_, kernel) = kernel(&cuda, "inkling_softcapped_swiglu");
-    let source = upload_f32(&cuda, &gate_up);
+    let source = upload::<f32>(&cuda, &gate_up);
     let out = upload_zeros(&cuda, rows * width);
     let blocks = width.div_ceil(256) as u32;
     cuda.launch(
@@ -444,7 +406,7 @@ fn the_softcapped_swiglu_matches_the_host() {
         &[source.0, out.0, u(width), f(gate_cap), f(up_cap)],
     )
     .expect("softcapped_swiglu launch");
-    let device = download_f32(&cuda, &out, rows * width);
+    let device = download::<f32>(&cuda, &out, rows * width);
     assert_close("softcapped_swiglu", &host, &device);
 }
 
@@ -460,7 +422,7 @@ fn the_logit_softcap_matches_the_host() {
     let logits = rng.values(padded);
     let host = logit_softcap(&logits, 1, padded, unpadded, cap);
     let (_, kernel) = kernel(&cuda, "inkling_logit_softcap");
-    let source = upload_f32(&cuda, &logits);
+    let source = upload::<f32>(&cuda, &logits);
     let out = upload_bf16(&cuda, &vec![0f32; unpadded]);
     cuda.launch(
         kernel,
@@ -544,16 +506,16 @@ fn the_relative_attention_decode_matches_the_host() {
     .expect("the host attention");
 
     let (_, kernel) = kernel(&cuda, "inkling_attn_decode");
-    let q_device = upload_f32(&cuda, &q);
-    let gate_device = upload_f32(&cuda, &gate);
+    let q_device = upload::<f32>(&cuda, &q);
+    let gate_device = upload::<f32>(&cuda, &gate);
     let keys_device = upload_bf16(&cuda, &keys.concat());
     let values_device = upload_bf16(&cuda, &values.concat());
-    let rel_device = upload_f32(&cuda, &rel);
+    let rel_device = upload::<f32>(&cuda, &rel);
     let bank_device = upload_bf16(&cuda, &rel_bank_raw);
-    let sink_device = upload_f32(&cuda, &sink);
-    let q_scale_device = upload_f32(&cuda, &q_scale);
-    let k_scale_device = upload_f32(&cuda, &vec![1.0f32; kv_width]);
-    let rel_scale_device = upload_f32(&cuda, &rel_scale);
+    let sink_device = upload::<f32>(&cuda, &sink);
+    let q_scale_device = upload::<f32>(&cuda, &q_scale);
+    let k_scale_device = upload::<f32>(&cuda, &vec![1.0f32; kv_width]);
+    let rel_scale_device = upload::<f32>(&cuda, &rel_scale);
     let out = upload_bf16(&cuda, &vec![0f32; q_width]);
     cuda.launch(
         kernel,
@@ -627,9 +589,9 @@ fn the_nvfp4_expert_matvec_matches_the_host() {
         .expect("the host product");
 
     let (_, kernel) = kernel(&cuda, "inkling_nvfp4_expert_matvec");
-    let codes_device = upload(&cuda, &codes);
-    let scales_device = upload(&cuda, &scales);
-    let x_device = upload_f32(&cuda, &x);
+    let codes_device = upload::<u8>(&cuda, &codes);
+    let scales_device = upload::<u8>(&cuda, &scales);
+    let x_device = upload::<f32>(&cuda, &x);
     let out = upload_zeros(&cuda, rows);
     cuda.launch(
         kernel,
@@ -646,7 +608,7 @@ fn the_nvfp4_expert_matvec_matches_the_host() {
         ],
     )
     .expect("nvfp4_expert_matvec launch");
-    let device = download_f32(&cuda, &out, rows);
+    let device = download::<f32>(&cuda, &out, rows);
     assert_close("nvfp4_expert_matvec", &host, &device);
 }
 
@@ -673,9 +635,9 @@ fn the_mxfp8_expert_matvec_matches_the_host() {
         .expect("the host product");
 
     let (_, kernel) = kernel(&cuda, "inkling_mxfp8_expert_matvec");
-    let codes_device = upload(&cuda, &codes);
-    let scales_device = upload(&cuda, &scales);
-    let x_device = upload_f32(&cuda, &x);
+    let codes_device = upload::<u8>(&cuda, &codes);
+    let scales_device = upload::<u8>(&cuda, &scales);
+    let x_device = upload::<f32>(&cuda, &x);
     let out = upload_zeros(&cuda, rows);
     cuda.launch(
         kernel,
@@ -692,7 +654,7 @@ fn the_mxfp8_expert_matvec_matches_the_host() {
         ],
     )
     .expect("mxfp8_expert_matvec launch");
-    let device = download_f32(&cuda, &out, rows);
+    let device = download::<f32>(&cuda, &out, rows);
     assert_close("mxfp8_expert_matvec", &host, &device);
 }
 
@@ -711,9 +673,9 @@ fn the_sigmoid_router_matches_the_host() {
         reference::router_topk(&logits, &bias, experts, top_k, route_scale);
 
     let (_, kernel) = kernel(&cuda, "inkling_router_topk");
-    let logits_device = upload_f32(&cuda, &logits);
-    let bias_device = upload_f32(&cuda, &bias);
-    let indices_device = upload(&cuda, &vec![0u8; top_k * 4]);
+    let logits_device = upload::<f32>(&cuda, &logits);
+    let bias_device = upload::<f32>(&cuda, &bias);
+    let indices_device = upload::<u8>(&cuda, &vec![0u8; top_k * 4]);
     let weights_device = upload_zeros(&cuda, top_k);
     cuda.launch(
         kernel,
@@ -740,7 +702,7 @@ fn the_sigmoid_router_matches_the_host() {
         .iter()
         .map(|word| i32::from_le_bytes(*word) as usize)
         .collect();
-    let device_weights = download_f32(&cuda, &weights_device, top_k);
+    let device_weights = download::<f32>(&cuda, &weights_device, top_k);
     assert_eq!(
         device_indices, host_indices,
         "the router chose other experts"
@@ -761,10 +723,10 @@ fn the_residual_add_matches_the_host_exactly() {
     let host = residual_add(&residual, &delta, rows, columns);
 
     let (_, kernel) = kernel(&cuda, "inkling_residual_add");
-    let residual_device = upload_f32(&cuda, &residual);
-    let delta_device = upload_f32(&cuda, &delta);
+    let residual_device = upload::<f32>(&cuda, &residual);
+    let delta_device = upload::<f32>(&cuda, &delta);
     // In place: the stream is updated by writing over the residual.
-    let out = upload_f32(&cuda, &residual);
+    let out = upload::<f32>(&cuda, &residual);
     let blocks = columns.div_ceil(256) as u32;
     cuda.launch(
         kernel,
@@ -779,7 +741,7 @@ fn the_residual_add_matches_the_host_exactly() {
         ],
     )
     .expect("residual_add launch");
-    let device = download_f32(&cuda, &out, rows * columns);
+    let device = download::<f32>(&cuda, &out, rows * columns);
     // An addition of two f32 values in one rounding is the same operation on both sides, so the
     // comparison is exact: no tolerance would hide a kernel that added the wrong term.
     assert_eq!(host, device, "residual_add is not the host's add");
@@ -803,8 +765,8 @@ fn the_kv_store_matches_the_host_rounding() {
     let value_cache_seed = rng.values(capacity * width);
 
     let (_, kernel) = kernel(&cuda, "inkling_kv_store");
-    let key_device = upload_f32(&cuda, &key);
-    let value_device = upload_f32(&cuda, &value);
+    let key_device = upload::<f32>(&cuda, &key);
+    let value_device = upload::<f32>(&cuda, &value);
     let key_cache = upload_bf16(&cuda, &key_cache_seed);
     let value_cache = upload_bf16(&cuda, &value_cache_seed);
     let blocks = width.div_ceil(256) as u32;
@@ -873,13 +835,13 @@ fn a_ring_cache_reads_the_same_rows_as_a_linear_one() {
     let keys: Vec<Vec<f32>> = (0..positions).map(|_| rng.values(kv_width)).collect();
     let values: Vec<Vec<f32>> = (0..positions).map(|_| rng.values(kv_width)).collect();
     let (_, kernel) = kernel(&cuda, "inkling_attn_decode");
-    let q_device = upload_f32(&cuda, &q);
-    let gate_device = upload_f32(&cuda, &gate);
-    let rel_device = upload_f32(&cuda, &rel);
+    let q_device = upload::<f32>(&cuda, &q);
+    let gate_device = upload::<f32>(&cuda, &gate);
+    let rel_device = upload::<f32>(&cuda, &rel);
     let bank_device = upload_bf16(&cuda, &rel_bank);
-    let sink_device = upload_f32(&cuda, &sink);
-    let q_scale_device = upload_f32(&cuda, &q_scale);
-    let rel_scale_device = upload_f32(&cuda, &rel_scale);
+    let sink_device = upload::<f32>(&cuda, &sink);
+    let q_scale_device = upload::<f32>(&cuda, &q_scale);
+    let rel_scale_device = upload::<f32>(&cuda, &rel_scale);
     let out = upload_bf16(&cuda, &vec![0f32; q_width]);
 
     // The kernel rounds the cache to BF16 on read, so both runs start from the same rows.
@@ -953,8 +915,8 @@ fn the_expert_mix_matches_the_host_exactly() {
     let host = reference::expert_mix(&partials, &scales, slots, width);
 
     let (_, kernel) = kernel(&cuda, "inkling_expert_mix");
-    let partials_device = upload_f32(&cuda, &partials);
-    let scales_device = upload_f32(&cuda, &scales);
+    let partials_device = upload::<f32>(&cuda, &partials);
+    let scales_device = upload::<f32>(&cuda, &scales);
     let out = upload_zeros(&cuda, width);
     let blocks = width.div_ceil(256) as u32;
     cuda.launch(
@@ -975,7 +937,7 @@ fn the_expert_mix_matches_the_host_exactly() {
         ],
     )
     .expect("expert_mix launch");
-    let device = download_f32(&cuda, &out, width);
+    let device = download::<f32>(&cuda, &out, width);
     // A scaled sum of f32 rows in one order is the same operation on both sides.
     assert_eq!(host, device, "expert_mix is not the host's mix");
 }
@@ -1020,10 +982,10 @@ fn the_grouped_expert_mix_is_the_expert_parallel_mix_and_sum() {
     }
 
     let (_, kernel) = kernel(&cuda, "inkling_expert_mix");
-    let partials_device = upload_f32(&cuda, &partials);
-    let scales_device = upload_f32(&cuda, &scales);
+    let partials_device = upload::<f32>(&cuda, &partials);
+    let scales_device = upload::<f32>(&cuda, &scales);
     let picks_bytes: Vec<u8> = picks.iter().flat_map(|pick| pick.to_le_bytes()).collect();
-    let picks_device = upload(&cuda, &picks_bytes);
+    let picks_device = upload::<u8>(&cuda, &picks_bytes);
     let out = upload_zeros(&cuda, rows * width);
     cuda.launch(
         kernel,
@@ -1042,7 +1004,7 @@ fn the_grouped_expert_mix_is_the_expert_parallel_mix_and_sum() {
         ],
     )
     .expect("grouped expert_mix launch");
-    let device = download_f32(&cuda, &out, rows * width);
+    let device = download::<f32>(&cuda, &out, rows * width);
     let differ = host
         .iter()
         .zip(&device)
@@ -1064,7 +1026,7 @@ fn the_join_lays_the_ranks_runs_side_by_side() {
     // 16-byte words of four f32 each; every value names its rank, row and position.
     let source: Vec<f32> = (0..world * rows * words * 4).map(|at| at as f32).collect();
     let (_, kernel) = kernel(&cuda, "inkling_join_pieces");
-    let source_device = upload_f32(&cuda, &source);
+    let source_device = upload::<f32>(&cuda, &source);
     let out = upload_zeros(&cuda, source.len());
     cuda.launch(
         kernel,
@@ -1073,7 +1035,7 @@ fn the_join_lays_the_ranks_runs_side_by_side() {
         &[out.0, source_device.0, u(rows), u(words), u(world)],
     )
     .expect("join launch");
-    let device = download_f32(&cuda, &out, source.len());
+    let device = download::<f32>(&cuda, &out, source.len());
     let piece = words * 4;
     for row in 0..rows {
         for rank in 0..world {

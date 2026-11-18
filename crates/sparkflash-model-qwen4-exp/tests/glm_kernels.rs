@@ -32,6 +32,7 @@
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::glm_decode_cubin;
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{
     TILED_GEMV_PARTIALS, cubin_available, embedded_cubin, embedded_prefill_cubin,
     embedded_scan_cubin, tiled_gemv_e4m3_splits,
@@ -57,21 +58,12 @@ const EPS: f32 = 1e-5;
 const RELATIVE_TOLERANCE: f32 = 1e-5;
 
 fn open(prefill: bool) -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    if prefill && embedded_prefill_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp prefill cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    let missing = if !cubin_available() {
+        Some("Qwen4-Exp cubin")
+    } else {
+        (prefill && embedded_prefill_cubin().is_empty()).then_some("Qwen4-Exp prefill cubin")
+    };
+    test_io::cuda_or_skip(missing)
 }
 
 /// A small deterministic generator, so a failure reproduces.
@@ -89,35 +81,6 @@ impl Lcg {
     fn values(&mut self, count: usize) -> Vec<f32> {
         (0..count).map(|_| self.next()).collect()
     }
-}
-
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
 }
 
 fn assert_close(what: &str, host: &[f32], device: &[f32]) {
@@ -259,10 +222,10 @@ struct Uploaded {
 
 /// Uploads the fixture and runs q4e_kda_decay over it, checking its factors against the host's.
 fn upload_fixture(cuda: &Cuda, fixture: &Fixture) -> Uploaded {
-    let forget = upload_f32(cuda, &fixture.forget);
-    let a_log = upload_f32(cuda, &fixture.a_log);
-    let dt_bias = upload_f32(cuda, &fixture.dt_bias);
-    let decay = upload_f32(cuda, &vec![0.0; TOKENS * WIDTH]);
+    let forget = upload::<f32>(cuda, &fixture.forget);
+    let a_log = upload::<f32>(cuda, &fixture.a_log);
+    let dt_bias = upload::<f32>(cuda, &fixture.dt_bias);
+    let decay = upload::<f32>(cuda, &vec![0.0; TOKENS * WIDTH]);
     let (_decay_module, decay_kernel) = cuda
         .load_named(embedded_cubin(), "q4e_kda_decay")
         .expect("q4e_kda_decay");
@@ -285,13 +248,13 @@ fn upload_fixture(cuda: &Cuda, fixture: &Fixture) -> Uploaded {
     assert_close(
         "decay factors",
         &fixture.decay,
-        &download_f32(cuda, &decay, TOKENS * WIDTH),
+        &download::<f32>(cuda, &decay, TOKENS * WIDTH),
     );
     Uploaded {
-        mixed: upload_f32(cuda, &fixture.mixed),
-        gate: upload_f32(cuda, &fixture.gate),
-        write: upload_f32(cuda, &fixture.write),
-        norm: upload(
+        mixed: upload::<f32>(cuda, &fixture.mixed),
+        gate: upload::<f32>(cuda, &fixture.gate),
+        write: upload::<f32>(cuda, &fixture.write),
+        norm: upload::<u8>(
             cuda,
             &fixture
                 .norm
@@ -332,13 +295,13 @@ fn recurrence(
     rows: usize,
     gated: bool,
 ) -> (Vec<f32>, Vec<f32>) {
-    let from = upload_f32(cuda, &fixture.start);
+    let from = upload::<f32>(cuda, &fixture.start);
     let into = if gated {
         from
     } else {
-        upload_f32(cuda, &vec![0.0; HEADS * DIM * DIM])
+        upload::<f32>(cuda, &vec![0.0; HEADS * DIM * DIM])
     };
-    let out = upload_f32(cuda, &vec![0.0; rows * WIDTH]);
+    let out = upload::<f32>(cuda, &vec![0.0; rows * WIDTH]);
     let mut arguments = vec![
         device.mixed.0,
         device.gate.0,
@@ -368,11 +331,11 @@ fn recurrence(
     cuda.launch(kernel, (HEADS as u32, parts, 1), (128, 1, 1), &arguments)
         .expect("gdn_recur launch");
     let outputs = if gated {
-        download_f32(cuda, &out, rows * WIDTH)
+        download::<f32>(cuda, &out, rows * WIDTH)
     } else {
         Vec::new()
     };
-    (outputs, download_f32(cuda, &into, HEADS * DIM * DIM))
+    (outputs, download::<f32>(cuda, &into, HEADS * DIM * DIM))
 }
 
 #[test]
@@ -406,7 +369,7 @@ fn the_column_split_recurrence_keeps_the_whole_heads_bits() {
     };
     let fixture = Fixture::new();
     let device = upload_fixture(&cuda, &fixture);
-    let counters = upload(&cuda, &[0; HEADS * 4]);
+    let counters = upload::<u8>(&cuda, &[0; HEADS * 4]);
     let split = [counters.0];
     let load = |name: &'static str, staged: Option<usize>| {
         match staged {
@@ -442,7 +405,7 @@ fn the_column_split_recurrence_keeps_the_whole_heads_bits() {
         }
     }
     assert!(
-        download_f32(&cuda, &counters, HEADS)
+        download::<f32>(&cuda, &counters, HEADS)
             .iter()
             .all(|count| count.to_bits() == 0),
         "a head's counter left set"
@@ -470,9 +433,9 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
     let (_gate_module, gate) = cuda
         .load_named(scan_image, "q4p_gdn_gate")
         .expect("q4p_gdn_gate");
-    let qk = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * QK_ROW]);
-    let decay_beta = upload_f32(&cuda, &vec![0.0; TOKENS * HEADS * 2]);
-    let out = upload_f32(&cuda, &vec![0.0; TOKENS * WIDTH]);
+    let qk = upload::<f32>(&cuda, &vec![0.0; TOKENS * HEADS * QK_ROW]);
+    let decay_beta = upload::<f32>(&cuda, &vec![0.0; TOKENS * HEADS * 2]);
+    let out = upload::<f32>(&cuda, &vec![0.0; TOKENS * WIDTH]);
     cuda.launch(
         prep,
         (HEADS as u32, TOKENS as u32, 1),
@@ -493,8 +456,8 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
     .expect("kda_prep launch");
     // The scan from the fixture's start state with each head's value columns split `splits` ways.
     let run_scan = |splits: usize| {
-        let state = upload_f32(&cuda, &fixture.start);
-        let raw = upload_f32(&cuda, &vec![0.0; TOKENS * WIDTH]);
+        let state = upload::<f32>(&cuda, &fixture.start);
+        let raw = upload::<f32>(&cuda, &vec![0.0; TOKENS * WIDTH]);
         cuda.launch(
             scan,
             (HEADS as u32, splits as u32, 1),
@@ -524,8 +487,8 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
     let (raw, state) = run_scan(1);
     // A value column's recurrence reads no other column, so every split is the same bits.
     let whole = (
-        download_f32(&cuda, &raw, TOKENS * WIDTH),
-        download_f32(&cuda, &state, HEADS * DIM * DIM),
+        download::<f32>(&cuda, &raw, TOKENS * WIDTH),
+        download::<f32>(&cuda, &state, HEADS * DIM * DIM),
     );
     for splits in [2, 4, 8, 16] {
         let (split_raw, split_state) = run_scan(splits);
@@ -533,12 +496,12 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
             (
                 "outputs",
                 &whole.0,
-                download_f32(&cuda, &split_raw, TOKENS * WIDTH),
+                download::<f32>(&cuda, &split_raw, TOKENS * WIDTH),
             ),
             (
                 "state",
                 &whole.1,
-                download_f32(&cuda, &split_state, HEADS * DIM * DIM),
+                download::<f32>(&cuda, &split_state, HEADS * DIM * DIM),
             ),
         ] {
             assert!(
@@ -570,12 +533,12 @@ fn the_tensor_core_prefill_scan_matches_the_host_delta_rule_at_one_rank() {
     assert_close(
         "prefill outputs",
         &fixture.out,
-        &download_f32(&cuda, &out, TOKENS * WIDTH),
+        &download::<f32>(&cuda, &out, TOKENS * WIDTH),
     );
     assert_close(
         "prefill state",
         &fixture.state,
-        &download_f32(&cuda, &state, HEADS * DIM * DIM),
+        &download::<f32>(&cuda, &state, HEADS * DIM * DIM),
     );
 }
 
@@ -634,12 +597,12 @@ fn device_fp8_linear(
     let (_module, kernel) = cuda
         .load_named(glm_decode_cubin(), "q4e_gemv_tiled_e4m3_block")
         .expect("q4e_gemv_tiled_e4m3_block");
-    let w = upload(cuda, codes);
-    let scales = upload_f32(cuda, scales);
-    let x = upload_f32(cuda, x);
-    let y = upload_f32(cuda, &vec![f32::NAN; batch * rows]);
-    let partials = upload_f32(cuda, &vec![0.0; TILED_GEMV_PARTIALS]);
-    let counters = upload(cuda, &vec![0u8; tiles * 4]);
+    let w = upload::<u8>(cuda, codes);
+    let scales = upload::<f32>(cuda, scales);
+    let x = upload::<f32>(cuda, x);
+    let y = upload::<f32>(cuda, &vec![f32::NAN; batch * rows]);
+    let partials = upload::<f32>(cuda, &vec![0.0; TILED_GEMV_PARTIALS]);
+    let counters = upload::<u8>(cuda, &vec![0u8; tiles * 4]);
     cuda.launch(
         kernel,
         (tiles as u32, splits as u32, 1),
@@ -662,7 +625,7 @@ fn device_fp8_linear(
         ],
     )
     .expect("gemv_tiled_e4m3_block launch");
-    download_f32(cuda, &y, batch * rows)
+    download::<f32>(cuda, &y, batch * rows)
 }
 
 /// An E4M3 code drawn uniformly from the finite ones.
@@ -788,16 +751,6 @@ const MLA_LATENT: usize = 512;
 const MLA_STRIDE: usize = 2304;
 const MLA_POSITIONS: usize = 3000;
 
-fn upload_i32(cuda: &Cuda, values: &[i32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
 /// The split attention (q4e_glm_mla_scores, _softmax, _mix and _project) against the one kernel
 /// it replaces, bit for bit, over the E4M3 cache and the f32 one: a full selection, one that
 /// ends inside a tile, an empty one and a short one, in one run that starts past row 0.
@@ -822,7 +775,7 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
     let counts = [0, 2048, 1000, 0, 37, 2048];
     let rows = counts.len();
     let (base, run) = (1, rows - 1);
-    let q_abs = upload_f32(&cuda, &rng.values(rows * HEADS * MLA_LATENT));
+    let q_abs = upload::<f32>(&cuda, &rng.values(rows * HEADS * MLA_LATENT));
     let codes: Vec<u8> = (0..MLA_POSITIONS * MLA_LATENT)
         .map(|_| finite_code(&mut rng))
         .collect();
@@ -833,22 +786,22 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
         .map(|index| quant::f8e4m3_to_f32(codes[index]) * scales[index / FP8_BLOCK])
         .collect();
     let (codes, scales, latent) = (
-        upload(&cuda, &codes),
-        upload_f32(&cuda, &scales),
-        upload_f32(&cuda, &latent),
+        upload::<u8>(&cuda, &codes),
+        upload::<f32>(&cuda, &scales),
+        upload::<f32>(&cuda, &latent),
     );
-    let kv_b = upload_f32(
+    let kv_b = upload::<f32>(
         &cuda,
         &rng.values(HEADS * (MLA_NOPE + MLA_VALUE) * MLA_LATENT),
     );
     let selected: Vec<i32> = (0..rows * MLA_STRIDE)
         .map(|_| ((rng.next() + 1.0) * 0.5 * (MLA_POSITIONS - 1) as f32) as i32)
         .collect();
-    let selected = upload_i32(&cuda, &selected);
-    let count = upload_i32(&cuda, &counts);
+    let selected = upload::<i32>(&cuda, &selected);
+    let count = upload::<i32>(&cuda, &counts);
     let unset = vec![f32::from_bits(0x7FC0_1234); rows * HEADS * MLA_VALUE];
     for quantise in [1u64, 0] {
-        let expected = upload_f32(&cuda, &unset);
+        let expected = upload::<f32>(&cuda, &unset);
         cuda.launch(
             attend,
             (HEADS as u32, run as u32, 1),
@@ -871,10 +824,10 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
             ],
         )
         .expect("mla_attend launch");
-        let got = upload_f32(&cuda, &unset);
-        let logits = upload_f32(&cuda, &vec![0.0; rows * HEADS * MLA_STRIDE]);
-        let total = upload_f32(&cuda, &vec![0.0; rows * HEADS]);
-        let mixed = upload_f32(&cuda, &vec![0.0; rows * HEADS * MLA_LATENT]);
+        let got = upload::<f32>(&cuda, &unset);
+        let logits = upload::<f32>(&cuda, &vec![0.0; rows * HEADS * MLA_STRIDE]);
+        let total = upload::<f32>(&cuda, &vec![0.0; rows * HEADS]);
+        let mixed = upload::<f32>(&cuda, &vec![0.0; rows * HEADS * MLA_LATENT]);
         let launches: [Launch; 4] = [
             (
                 scores,
@@ -947,8 +900,8 @@ fn the_split_latent_attention_keeps_the_attend_kernels_bits() {
             cuda.launch(*kernel, *grid, (*threads, 1, 1), arguments)
                 .expect("split attention launch");
         }
-        let expected = download_f32(&cuda, &expected, rows * HEADS * MLA_VALUE);
-        let got = download_f32(&cuda, &got, rows * HEADS * MLA_VALUE);
+        let expected = download::<f32>(&cuda, &expected, rows * HEADS * MLA_VALUE);
+        let got = download::<f32>(&cuda, &got, rows * HEADS * MLA_VALUE);
         assert!(
             expected[HEADS * MLA_VALUE..2 * HEADS * MLA_VALUE]
                 .iter()

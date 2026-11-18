@@ -27,6 +27,7 @@
 //! It skips - loudly - without the prefill image or a CUDA driver.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_prefill_cubin};
 use sparkflash_weights::quant;
 
@@ -34,17 +35,9 @@ const HIDDEN: usize = 128;
 const INTERMEDIATE: usize = 128;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || embedded_prefill_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen prefill image");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!cubin_available() || embedded_prefill_cubin().is_empty()).then_some("Qwen prefill image"),
+    )
 }
 
 struct Lcg(u64);
@@ -63,35 +56,6 @@ impl Lcg {
         let code = ((self.next() + 1.0) * 128.0) as u8;
         if code & 0x7F == 0x7F { code - 1 } else { code }
     }
-}
-
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
 }
 
 /// The device silu, rounded as the kernel's `gate / (1 + e^-gate)`.
@@ -153,17 +117,20 @@ fn run_case(cuda: &Cuda, case: &Case<'_>) -> f32 {
             scale[expert * 3 + matrix] = value;
         }
     }
-    let pointers: Vec<Deviceptr> = weight.iter().map(|bytes| upload(cuda, bytes)).collect();
+    let pointers: Vec<Deviceptr> = weight
+        .iter()
+        .map(|bytes| upload::<u8>(cuda, bytes))
+        .collect();
     let table: Vec<u8> = pointers
         .iter()
         .flat_map(|pointer| pointer.0.to_le_bytes())
         .collect();
-    let table = upload(cuda, &table);
+    let table = upload::<u8>(cuda, &table);
 
     // The plan's stable order: by expert, ties by slot.
     let mut order: Vec<usize> = (0..slots).collect();
     order.sort_by_key(|&slot| (expert_of[slot], slot));
-    let sorted = upload(
+    let sorted = upload::<u8>(
         cuda,
         &order
             .iter()
@@ -177,20 +144,20 @@ fn run_case(cuda: &Cuda, case: &Case<'_>) -> f32 {
             item_bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
-    let items = upload(cuda, &item_bytes);
+    let items = upload::<u8>(cuda, &item_bytes);
 
     let mixed = rng.values(tokens * HIDDEN);
-    let input = upload_f32(cuda, &mixed);
-    let gate_up_buffer = upload_f32(cuda, &vec![0.0; slots * 2 * INTERMEDIATE]);
-    let activated = upload_f32(cuda, &vec![0.0; slots * INTERMEDIATE]);
-    let partials = upload_f32(cuda, &vec![0.0; slots * HIDDEN]);
+    let input = upload::<f32>(cuda, &mixed);
+    let gate_up_buffer = upload::<f32>(cuda, &vec![0.0; slots * 2 * INTERMEDIATE]);
+    let activated = upload::<f32>(cuda, &vec![0.0; slots * INTERMEDIATE]);
+    let partials = upload::<f32>(cuda, &vec![0.0; slots * HIDDEN]);
     // Qwen's routing probabilities: [batch][experts], the top-k weights in the first TOPK
     // columns of each token's row.
     let mut probabilities = vec![0.0f32; tokens * experts];
     for slot in 0..slots {
         probabilities[(slot / topk) * experts + slot % topk] = weight_of[slot];
     }
-    let route = upload_f32(cuda, &probabilities);
+    let route = upload::<f32>(cuda, &probabilities);
 
     let launch = |kernel, grid: (u32, u32, u32), args: &[u64]| {
         cuda.launch(kernel, grid, (256, 1, 1), args)
@@ -239,7 +206,7 @@ fn run_case(cuda: &Cuda, case: &Case<'_>) -> f32 {
             experts as u64,
         ],
     );
-    let got = download_f32(cuda, &partials, slots * HIDDEN);
+    let got = download::<f32>(cuda, &partials, slots * HIDDEN);
 
     // The scalar twin: slot -> (token, expert), its gate/up, SwiGLU, and down times the token's
     // routing weight for that slot.

@@ -22,20 +22,14 @@
 
 use half::bf16;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_dflash2_cubin};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || embedded_dflash2_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp DFlash 2 cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!cubin_available() || embedded_dflash2_cubin().is_empty())
+            .then_some("Qwen4-Exp DFlash 2 cubin"),
+    )
 }
 
 /// A small deterministic generator, so a failure reproduces.
@@ -51,66 +45,8 @@ impl Lcg {
     }
 }
 
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn upload_i32(cuda: &Cuda, values: &[i32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn upload_bf16(cuda: &Cuda, values: &[bf16]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn zeros(cuda: &Cuda, elements: usize) -> Deviceptr {
-    upload(cuda, &vec![0u8; elements * 4])
-}
-
-fn download(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<[u8; 4]> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes.as_chunks::<4>().0.to_vec()
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    download(cuda, pointer, elements)
-        .into_iter()
-        .map(f32::from_le_bytes)
-        .collect()
-}
-
-fn download_i32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<i32> {
-    download(cuda, pointer, elements)
-        .into_iter()
-        .map(i32::from_le_bytes)
-        .collect()
+    upload::<u8>(cuda, &vec![0u8; elements * 4])
 }
 
 fn kernel(cuda: &Cuda, name: &'static str) -> sparkflash_kernels::cuda_driver::Kernel {
@@ -218,12 +154,12 @@ fn the_top_k_matches_a_host_sort_at_the_released_vocabulary() {
     };
     let shape @ (vocab, rows, k) = (248_320_usize, 7_usize, 16_usize);
     let logits = tied_logits(vocab, rows);
-    let (values, ids) = device_top_k(&cuda, &upload_f32(&cuda, &logits), shape, 0);
+    let (values, ids) = device_top_k(&cuda, &upload::<f32>(&cuda, &logits), shape, 0);
     assert_host_top_k(
         &logits,
         shape,
-        &download_f32(&cuda, &values, rows * k),
-        &download_i32(&cuda, &ids, rows * k),
+        &download::<f32>(&cuda, &values, rows * k),
+        &download::<i32>(&cuda, &ids, rows * k),
     );
 }
 
@@ -248,15 +184,15 @@ fn the_ranks_slices_merge_to_the_whole_vocabularys_top_k() {
             .collect();
         let (values, ids) = device_top_k(
             &cuda,
-            &upload_f32(&cuda, &slice),
+            &upload::<f32>(&cuda, &slice),
             (local, rows, k),
             rank * local,
         );
-        gathered_values.extend(download_f32(&cuda, &values, rows * k));
-        gathered_ids.extend(download_i32(&cuda, &ids, rows * k));
+        gathered_values.extend(download::<f32>(&cuda, &values, rows * k));
+        gathered_ids.extend(download::<i32>(&cuda, &ids, rows * k));
     }
-    let part_values = upload_f32(&cuda, &gathered_values);
-    let part_ids = upload_i32(&cuda, &gathered_ids);
+    let part_values = upload::<f32>(&cuda, &gathered_values);
+    let part_ids = upload::<i32>(&cuda, &gathered_ids);
     let values = zeros(&cuda, rows * k);
     let ids = zeros(&cuda, rows * k);
     cuda.launch(
@@ -278,8 +214,8 @@ fn the_ranks_slices_merge_to_the_whole_vocabularys_top_k() {
     assert_host_top_k(
         &logits,
         shape,
-        &download_f32(&cuda, &values, rows * k),
-        &download_i32(&cuda, &ids, rows * k),
+        &download::<f32>(&cuda, &values, rows * k),
+        &download::<i32>(&cuda, &ids, rows * k),
     );
 }
 
@@ -309,11 +245,11 @@ fn the_selector_walks_the_best_scoring_chain() {
         (1, 1, 1),
         (256, 1, 1),
         &[
-            upload_i32(&cuda, &candidates).0,
-            upload_f32(&cuda, &unary).0,
-            upload_f32(&cuda, &projected).0,
-            upload_bf16(&cuda, &predecessor).0,
-            upload_bf16(&cuda, &successor).0,
+            upload::<i32>(&cuda, &candidates).0,
+            upload::<f32>(&cuda, &unary).0,
+            upload::<f32>(&cuda, &projected).0,
+            upload::<bf16>(&cuda, &predecessor).0,
+            upload::<bf16>(&cuda, &successor).0,
             drafts.0,
             confidences.0,
             anchor as u64,
@@ -323,8 +259,8 @@ fn the_selector_walks_the_best_scoring_chain() {
         ],
     )
     .expect("select launch");
-    let chosen = download_i32(&cuda, &drafts, edges);
-    let confidence = download_f32(&cuda, &confidences, edges);
+    let chosen = download::<i32>(&cuda, &drafts, edges);
+    let confidence = download::<f32>(&cuda, &confidences, edges);
     let mut previous = anchor as usize;
     for edge in 0..edges {
         let score = |c: usize| -> f64 {
@@ -375,9 +311,9 @@ fn the_block_convolution_matches_the_host_on_both_sides() {
     let base: Vec<bf16> = (0..2 * taps * hidden)
         .map(|_| bf16::from_f32(rng.next()))
         .collect();
-    let device_x = upload_f32(&cuda, &x);
-    let device_coefficients = upload_f32(&cuda, &coefficients);
-    let device_base = upload_bf16(&cuda, &base);
+    let device_x = upload::<f32>(&cuda, &x);
+    let device_coefficients = upload::<f32>(&cuda, &coefficients);
+    let device_base = upload::<bf16>(&cuda, &base);
     for side in 0..2_usize {
         let out = zeros(&cuda, rows * hidden);
         cuda.launch(
@@ -398,7 +334,7 @@ fn the_block_convolution_matches_the_host_on_both_sides() {
             ],
         )
         .expect("conv launch");
-        let got = download_f32(&cuda, &out, rows * hidden);
+        let got = download::<f32>(&cuda, &out, rows * hidden);
         for row in 0..rows {
             for column in 0..hidden {
                 let mut expected = 0.0_f32;
@@ -517,11 +453,11 @@ fn the_ring_attention_matches_the_host_across_a_wrapped_ring() {
             (heads as u32, rows as u32, 1),
             (256, 1, 1),
             &[
-                upload_f32(&cuda, &queries).0,
-                upload_f32(&cuda, &ring_keys).0,
-                upload_f32(&cuda, &ring_values).0,
-                upload_f32(&cuda, &block_keys).0,
-                upload_f32(&cuda, &block_values).0,
+                upload::<f32>(&cuda, &queries).0,
+                upload::<f32>(&cuda, &ring_keys).0,
+                upload::<f32>(&cuda, &ring_values).0,
+                upload::<f32>(&cuda, &block_keys).0,
+                upload::<f32>(&cuda, &block_values).0,
                 out.0,
                 heads as u64,
                 kv_heads as u64,
@@ -534,7 +470,7 @@ fn the_ring_attention_matches_the_host_across_a_wrapped_ring() {
             ],
         )
         .expect("attention launch");
-        let got = download_f32(&cuda, &out, rows * q_width);
+        let got = download::<f32>(&cuda, &out, rows * q_width);
         let expected = host_attention(
             &queries,
             &ring_keys,

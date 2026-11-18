@@ -108,6 +108,7 @@ pub mod router_launch;
 pub mod router_ref;
 pub mod sequence_chain;
 pub mod swiglu_ref;
+pub mod test_io;
 pub mod vision_tower;
 #[cfg(feature = "rdma")]
 pub mod write_exchange;

@@ -22,6 +22,7 @@
 //! cargo test -p sparkflash-model-qwen4-exp --test gemm_bench -- --ignored --nocapture
 //! ```
 
+use sparkflash_kernels::test_io;
 use std::time::Instant;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Kernel};
@@ -30,17 +31,7 @@ use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
 const ROUNDS: usize = 20;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 fn measure(

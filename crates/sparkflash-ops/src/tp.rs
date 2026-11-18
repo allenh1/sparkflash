@@ -111,6 +111,54 @@ impl RowSums {
         &self.runtime
     }
 
+    /// Whether the partials travel on the devices rather than over the host seam.
+    #[must_use]
+    pub const fn device_leg(&self) -> bool {
+        self.device_leg
+    }
+
+    /// The most rows one sum takes: the slots' rows.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Every peer's partial rows, `[world][rows][hidden]` floats, on a device leg.
+    #[must_use]
+    pub const fn slots(&self) -> Option<Deviceptr> {
+        self.slots
+    }
+
+    /// The one-shot leg's exchange alone: every peer's `bytes` at `partial` gathered into the
+    /// slots on the raw `stream`, for a caller that sums them in a kernel of its own (an inject
+    /// that folds the slots in rank order). The slots are returned.
+    ///
+    /// # Errors
+    /// No device leg, more bytes than one peer's slot holds, or a collective failure.
+    pub fn gather(
+        &self,
+        stream: u64,
+        partial: Deviceptr,
+        bytes: usize,
+    ) -> Result<Deviceptr, BackendError> {
+        let Some(slots) = self.slots else {
+            return Err(BackendError::new(
+                "tp",
+                "a device gather over a collective with no device leg",
+            ));
+        };
+        if bytes > self.rows * self.hidden * 4 {
+            return Err(BackendError::new(
+                "tp",
+                format!("{bytes} bytes do not fit the collective's slots"),
+            ));
+        }
+        self.runtime
+            .exchange_on_device(stream, partial.0, slots.0, bytes)
+            .map_err(collective_error)?;
+        Ok(slots)
+    }
+
     /// Gives the slots back.
     pub fn release(&mut self, cuda: &Cuda) {
         if let Some(slots) = self.slots.take() {
@@ -136,10 +184,12 @@ impl RowSums {
             ));
         }
         Ok(
-            if self.two_shot_rows > 0
-                && rows >= self.two_shot_rows
-                && splits_two_shot(rows * self.hidden, self.runtime.world())
-            {
+            if takes_two_shots(
+                self.two_shot_rows,
+                rows,
+                rows * self.hidden,
+                self.runtime.world(),
+            ) {
                 SumLeg::TwoShot
             } else {
                 SumLeg::OneShot
@@ -166,46 +216,64 @@ impl RowSums {
         let raw = stream.map_or(0, RunStream::raw);
         let device = |error: String| BackendError::new("tp", error);
         match (self.leg(rows)?, self.slots) {
-            (SumLeg::Host, _) => {
-                let mut bytes = vec![0u8; count * 4];
-                match stream {
-                    Some(stream) => cuda.copy_dtoh_on(stream, &mut bytes, &partial),
-                    None => cuda.copy_dtoh(&mut bytes, &partial),
-                }
-                .map_err(device)?;
-                let mut values: Vec<f32> = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|word| f32::from_le_bytes(*word))
-                    .collect();
-                self.runtime
-                    .all_reduce(&mut values)
-                    .map_err(collective_error)?;
-                let bytes: Vec<u8> = values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect();
-                match stream {
-                    Some(stream) => cuda.copy_htod_on(stream, &partial, &bytes),
-                    None => cuda.copy_htod(&partial, &bytes),
-                }
-                .map_err(device)
-            }
+            (SumLeg::Host, _) => host_sum(cuda, stream, &self.runtime, partial, count),
             (SumLeg::TwoShot, Some(slots)) => {
                 reduce_two_shot(&self.runtime, raw, partial, slots, count, |mine, chunk| {
                     launch(calls::sum_slots(mine.0, slots.0, chunk, rank, world))
                 })
             }
-            (SumLeg::OneShot, Some(slots)) => {
-                self.runtime
-                    .exchange_on_device(raw, partial.0, slots.0, count * 4)
-                    .map_err(collective_error)?;
+            (SumLeg::OneShot, Some(_)) => {
+                let slots = self.gather(raw, partial, count * 4)?;
                 launch(calls::sum_slots(partial.0, slots.0, count, rank, world))
             }
             (_, None) => Err(device("a device leg without its slots".to_owned())),
         }
     }
+}
+
+/// The host leg: `count` floats of partials at `partial` copied back on `stream` (`None`: the
+/// null stream), summed by the collective's host all-reduce and copied up in place.
+///
+/// # Errors
+/// A copy or collective failure.
+pub fn host_sum(
+    cuda: &Cuda,
+    stream: Option<&RunStream>,
+    runtime: &TpRuntime,
+    partial: Deviceptr,
+    count: usize,
+) -> Result<(), BackendError> {
+    let device = |error: String| BackendError::new("tp", error);
+    let mut bytes = vec![0u8; count * 4];
+    match stream {
+        Some(stream) => cuda.copy_dtoh_on(stream, &mut bytes, &partial),
+        None => cuda.copy_dtoh(&mut bytes, &partial),
+    }
+    .map_err(device)?;
+    let mut values: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    runtime.all_reduce(&mut values).map_err(collective_error)?;
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    match stream {
+        Some(stream) => cuda.copy_htod_on(stream, &partial, &bytes),
+        None => cuda.copy_htod(&partial, &bytes),
+    }
+    .map_err(device)
+}
+
+/// Whether a device-leg sum of `rows` rows (`count` floats over `world` ranks) takes two shots:
+/// at least `two_shot_rows` rows ([sparkflash_weights::tp::two_shot_rows], 0 for never) that
+/// split into whole float4 chunks a rank.
+#[must_use]
+pub fn takes_two_shots(two_shot_rows: usize, rows: usize, count: usize, world: usize) -> bool {
+    two_shot_rows > 0 && rows >= two_shot_rows && splits_two_shot(count, world)
 }
 
 /// Whether count floats split over world ranks into whole float4 chunks.
@@ -254,7 +322,12 @@ pub fn reduce_scatter(
     Ok(mine)
 }
 
-fn gather_in_place(
+/// Every rank's `bytes` at `mine`, which is its own slot of `base` (`base + rank * bytes`),
+/// exchanged into the peers' slots of `base` in rank order; the own slot is left as it is.
+///
+/// # Errors
+/// A collective failure.
+pub fn gather_in_place(
     tp: &TpRuntime,
     stream: u64,
     base: Deviceptr,

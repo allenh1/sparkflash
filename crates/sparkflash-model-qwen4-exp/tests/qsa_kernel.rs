@@ -21,21 +21,12 @@
 //! the order slipped. They skip - loudly - without an embedded cubin or a CUDA driver.
 
 use half::bf16;
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::cuda_driver::Cuda;
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_attn_cubin};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 /// A small deterministic generator, so a failure reproduces.
@@ -49,45 +40,6 @@ impl Lcg {
             .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
     }
-}
-
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn upload_bf16(cuda: &Cuda, values: &[bf16]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
 }
 
 /// q4e_block_sum at 128 threads.
@@ -129,17 +81,17 @@ fn the_block_scores_sum_in_the_block_trees_order() {
         .map(|_| bf16::from_f32(0.25 * rng.next()))
         .collect();
     let queries: Vec<f32> = (0..rows * HEADS * DIM).map(|_| rng.next()).collect();
-    let keys_on = upload_bf16(&cuda, &keys);
-    let weight_on = upload(
+    let keys_on = upload::<bf16>(&cuda, &keys);
+    let weight_on = upload::<u8>(
         &cuda,
         &weight
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect::<Vec<_>>(),
     );
-    let queries_on = upload_f32(&cuda, &queries);
-    let pooled_on = upload_f32(&cuda, &vec![f32::NAN; pooled_blocks * DIM]);
-    let scores_on = upload_f32(&cuda, &vec![f32::NAN; rows * stride]);
+    let queries_on = upload::<f32>(&cuda, &queries);
+    let pooled_on = upload::<f32>(&cuda, &vec![f32::NAN; pooled_blocks * DIM]);
+    let scores_on = upload::<f32>(&cuda, &vec![f32::NAN; rows * stride]);
     let (_, pool) = cuda
         .load_named(embedded_attn_cubin(), "q4e_qsa_pool")
         .expect("the cubin carries q4e_qsa_pool");
@@ -178,8 +130,8 @@ fn the_block_scores_sum_in_the_block_trees_order() {
         ],
     )
     .expect("score");
-    let pooled = download_f32(&cuda, &pooled_on, pooled_blocks * DIM);
-    let scores = download_f32(&cuda, &scores_on, rows * stride);
+    let pooled = download::<f32>(&cuda, &pooled_on, pooled_blocks * DIM);
+    let scores = download::<f32>(&cuda, &scores_on, rows * stride);
     assert!(
         pooled.iter().all(|value| value.is_finite()),
         "q4e_qsa_pool left a block unwritten"
@@ -248,18 +200,6 @@ fn the_block_scores_sum_in_the_block_trees_order() {
             );
         }
     }
-}
-
-fn download_i32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<i32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| i32::from_le_bytes(*word))
-        .collect()
 }
 
 /// The selection the pick kernel made before the radix select: a min-heap of the first budget
@@ -331,9 +271,9 @@ fn the_radix_pick_keeps_what_the_heap_kept() {
         let scores: Vec<f32> = (0..rows * stride)
             .map(|_| (rng.next().abs() * levels).floor() / levels)
             .collect();
-        let scores_on = upload_f32(&cuda, &scores);
-        let selected_on = upload(&cuda, &vec![0xFFu8; rows * SELECT_STRIDE * 4]);
-        let count_on = upload(&cuda, &vec![0xFFu8; rows * 4]);
+        let scores_on = upload::<f32>(&cuda, &scores);
+        let selected_on = upload::<u8>(&cuda, &vec![0xFFu8; rows * SELECT_STRIDE * 4]);
+        let count_on = upload::<u8>(&cuda, &vec![0xFFu8; rows * 4]);
         cuda.launch(
             pick,
             (rows as u32, 1, 1),
@@ -350,8 +290,8 @@ fn the_radix_pick_keeps_what_the_heap_kept() {
             ],
         )
         .expect("pick");
-        let selected = download_i32(&cuda, &selected_on, rows * SELECT_STRIDE);
-        let count = download_i32(&cuda, &count_on, rows);
+        let selected = download::<i32>(&cuda, &selected_on, rows * SELECT_STRIDE);
+        let count = download::<i32>(&cuda, &count_on, rows);
         for row in 0..rows {
             let want = heap_pick(
                 &scores[row * stride..(row + 1) * stride],

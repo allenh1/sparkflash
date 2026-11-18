@@ -44,6 +44,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
 use sparkflash_kernels::images::inkling_cubin;
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_inkling2::reference::{self, AttentionParams};
 
 const HEADS: usize = 12;
@@ -69,17 +70,7 @@ fn f(value: f32) -> u64 {
 }
 
 fn open() -> Option<Cuda> {
-    if inkling_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Inkling cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((inkling_cubin().is_empty()).then_some("Inkling cubin"))
 }
 
 struct Lcg(u64);
@@ -115,40 +106,12 @@ fn token_kernel(cuda: &Cuda, name: &'static str) -> sparkflash_kernels::cuda_dri
         .1
 }
 
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
 fn upload_bf16(cuda: &Cuda, values: &[f32]) -> Deviceptr {
     let bytes: Vec<u8> = values
         .iter()
         .flat_map(|value| sparkflash_weights::quant::f32_to_bf16_bits(*value).to_le_bytes())
         .collect();
-    upload(cuda, &bytes)
-}
-
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, count: usize) -> Vec<f32> {
-    let mut bytes = vec![0u8; count * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
+    upload::<u8>(cuda, &bytes)
 }
 
 fn download_bf16(cuda: &Cuda, pointer: &Deviceptr, count: usize) -> Vec<f32> {
@@ -249,16 +212,16 @@ fn the_prefill_attention_is_the_decode_attention_a_row_at_a_time() {
         })
         .collect();
 
-    let q_device = upload_f32(&cuda, &q);
-    let gate_device = upload_f32(&cuda, &gate);
-    let rel_device = upload_f32(&cuda, &rel);
-    let sink_device = upload_f32(&cuda, &sink);
+    let q_device = upload::<f32>(&cuda, &q);
+    let gate_device = upload::<f32>(&cuda, &gate);
+    let rel_device = upload::<f32>(&cuda, &rel);
+    let sink_device = upload::<f32>(&cuda, &sink);
     let keys_device = upload_bf16(&cuda, &keys);
     let values_device = upload_bf16(&cuda, &values);
     let bank_device = upload_bf16(&cuda, &rel_bank);
-    let q_scale_device = upload_f32(&cuda, &q_scale);
-    let k_scale_device = upload_f32(&cuda, &k_scale);
-    let rel_scale_device = upload_f32(&cuda, &rel_scale);
+    let q_scale_device = upload::<f32>(&cuda, &q_scale);
+    let k_scale_device = upload::<f32>(&cuda, &k_scale);
+    let rel_scale_device = upload::<f32>(&cuda, &rel_scale);
     let out = upload_bf16(&cuda, &vec![0f32; ROWS * q_width]);
     cuda.launch(
         kernel(&cuda, "inkling_attn_prefill"),
@@ -315,8 +278,8 @@ fn the_chunk_gemm_is_the_decode_gemv_a_row_at_a_time() {
     let weight_bf16 = round_bf16(&weight);
     let input: Vec<f32> = rng.values(columns);
     let weight_device = upload_bf16(&cuda, &weight);
-    let input_device = upload_f32(&cuda, &input);
-    let gemv_out = upload_f32(&cuda, &vec![0f32; rows]);
+    let input_device = upload::<f32>(&cuda, &input);
+    let gemv_out = upload::<f32>(&cuda, &vec![0f32; rows]);
     cuda.launch(
         token_kernel(&cuda, "q4e_gemv_bf16"),
         (24, 1, 1),
@@ -331,7 +294,7 @@ fn the_chunk_gemm_is_the_decode_gemv_a_row_at_a_time() {
         ],
     )
     .expect("gemv launch");
-    let gemm_out = upload_f32(&cuda, &vec![0f32; rows]);
+    let gemm_out = upload::<f32>(&cuda, &vec![0f32; rows]);
     cuda.launch(
         token_kernel(&cuda, "q4e_gemm_bf16"),
         (2, 1, 1),
@@ -350,8 +313,8 @@ fn the_chunk_gemm_is_the_decode_gemv_a_row_at_a_time() {
         ],
     )
     .expect("gemm launch");
-    let gemv = download_f32(&cuda, &gemv_out, rows);
-    let gemm = download_f32(&cuda, &gemm_out, rows);
+    let gemv = download::<f32>(&cuda, &gemv_out, rows);
+    let gemm = download::<f32>(&cuda, &gemm_out, rows);
     // The two sum in the same inner-dimension order, so the expectation is the bits - the
     // tolerance is only there so a failing row prints a number rather than an index.
     assert_close("gemm-vs-gemv", &gemv, &gemm);
@@ -405,8 +368,8 @@ fn a_chunk_convolution_is_the_decode_convolution_a_row_at_a_time() {
     // arithmetic in the walk gives the kernel.
     let mut buffer = lead.clone();
     buffer.extend_from_slice(&rows);
-    let buffer_device = upload_f32(&cuda, &buffer);
-    let out = upload_f32(&cuda, &vec![0f32; ROWS * CHANNELS]);
+    let buffer_device = upload::<f32>(&cuda, &buffer);
+    let out = upload::<f32>(&cuda, &vec![0f32; ROWS * CHANNELS]);
     cuda.launch(
         kernel(&cuda, "inkling_short_conv"),
         (3, ROWS as u32, 1),
@@ -422,12 +385,12 @@ fn a_chunk_convolution_is_the_decode_convolution_a_row_at_a_time() {
         ],
     )
     .expect("short_conv launch");
-    let device = download_f32(&cuda, &out, ROWS * CHANNELS);
+    let device = download::<f32>(&cuda, &out, ROWS * CHANNELS);
     assert_close("short_conv", &host, &device);
 
     // The same history through the copy kernel, and back, is the history it started as.
-    let state_device = upload_f32(&cuda, &state);
-    let pad_device = upload_f32(&cuda, &vec![0f32; history * CHANNELS]);
+    let state_device = upload::<f32>(&cuda, &state);
+    let pad_device = upload::<f32>(&cuda, &vec![0f32; history * CHANNELS]);
     let copy = kernel(&cuda, "inkling_conv_history_copy");
     cuda.launch(
         copy,
@@ -437,11 +400,11 @@ fn a_chunk_convolution_is_the_decode_convolution_a_row_at_a_time() {
     )
     .expect("history to the row layout");
     assert_eq!(
-        download_f32(&cuda, &pad_device, history * CHANNELS),
+        download::<f32>(&cuda, &pad_device, history * CHANNELS),
         lead,
         "the lead"
     );
-    let back = upload_f32(&cuda, &vec![0f32; CHANNELS * history]);
+    let back = upload::<f32>(&cuda, &vec![0f32; CHANNELS * history]);
     cuda.launch(
         copy,
         (2, 1, 1),
@@ -450,7 +413,7 @@ fn a_chunk_convolution_is_the_decode_convolution_a_row_at_a_time() {
     )
     .expect("history to the channel layout");
     assert_eq!(
-        download_f32(&cuda, &back, CHANNELS * history),
+        download::<f32>(&cuda, &back, CHANNELS * history),
         state,
         "the round trip"
     );
@@ -477,10 +440,10 @@ fn the_expert_matvec_with_a_plan_is_the_matvec_a_pair_at_a_time() {
     let x: Vec<f32> = rng.values(entries * columns);
     // A decode pair a launch, so the pairs are deliberately a row and a slot apart.
     let plan: [i32; 6] = [2, 1, 0, 2, 1, 3];
-    let codes_device = upload(&cuda, &codes);
-    let scales_device = upload(&cuda, &scales);
-    let x_device = upload_f32(&cuda, &x);
-    let plan_device = upload(
+    let codes_device = upload::<u8>(&cuda, &codes);
+    let scales_device = upload::<u8>(&cuda, &scales);
+    let x_device = upload::<f32>(&cuda, &x);
+    let plan_device = upload::<u8>(
         &cuda,
         &plan
             .iter()
@@ -490,7 +453,7 @@ fn the_expert_matvec_with_a_plan_is_the_matvec_a_pair_at_a_time() {
     let matvec = kernel(&cuda, "inkling_nvfp4_expert_matvec");
 
     // One launch for the whole plan.
-    let chunked = upload_f32(&cuda, &vec![0f32; 4 * width]);
+    let chunked = upload::<f32>(&cuda, &vec![0f32; 4 * width]);
     cuda.launch(
         matvec,
         (width as u32, entries as u32, 1),
@@ -507,14 +470,14 @@ fn the_expert_matvec_with_a_plan_is_the_matvec_a_pair_at_a_time() {
         ],
     )
     .expect("the plan's matvec");
-    let planned = download_f32(&cuda, &chunked, 4 * width);
+    let planned = download::<f32>(&cuda, &chunked, 4 * width);
 
     // The same pairs, one launch each, offset on the host.
     let mut expected = vec![0f32; 4 * width];
     for entry in 0..entries {
         let row = plan[2 * entry] as usize;
         let slot = plan[2 * entry + 1] as usize;
-        let out = upload_f32(&cuda, &vec![0f32; width]);
+        let out = upload::<f32>(&cuda, &vec![0f32; width]);
         cuda.launch(
             matvec,
             (width as u32, 1, 1),
@@ -532,7 +495,7 @@ fn the_expert_matvec_with_a_plan_is_the_matvec_a_pair_at_a_time() {
         )
         .expect("a pair's matvec");
         expected[slot * width..(slot + 1) * width]
-            .copy_from_slice(&download_f32(&cuda, &out, width));
+            .copy_from_slice(&download::<f32>(&cuda, &out, width));
     }
     assert_eq!(planned, expected, "the plan is the pair a launch");
 }
@@ -552,11 +515,11 @@ fn the_batched_projection_is_the_one_row_projection_a_row_at_a_time() {
     let weight: Vec<f32> = rng.values(rows * columns);
     let x: Vec<f32> = rng.values(batch * columns);
     let weight_device = upload_bf16(&cuda, &weight);
-    let x_device = upload_f32(&cuda, &x);
+    let x_device = upload::<f32>(&cuda, &x);
     let gemv = token_kernel(&cuda, "q4e_gemv_bf16");
     let grid = rows.div_ceil(8) as u32;
 
-    let batched = upload_f32(&cuda, &vec![0f32; batch * rows]);
+    let batched = upload::<f32>(&cuda, &vec![0f32; batch * rows]);
     cuda.launch(
         gemv,
         (grid, 1, 1),
@@ -571,11 +534,11 @@ fn the_batched_projection_is_the_one_row_projection_a_row_at_a_time() {
         ],
     )
     .expect("the batched projection");
-    let got = download_f32(&cuda, &batched, batch * rows);
+    let got = download::<f32>(&cuda, &batched, batch * rows);
 
     let mut expected = Vec::with_capacity(batch * rows);
     for token in 0..batch {
-        let single = upload_f32(&cuda, &vec![0f32; rows]);
+        let single = upload::<f32>(&cuda, &vec![0f32; rows]);
         cuda.launch(
             gemv,
             (grid, 1, 1),
@@ -590,7 +553,7 @@ fn the_batched_projection_is_the_one_row_projection_a_row_at_a_time() {
             ],
         )
         .expect("the one-row projection");
-        expected.extend(download_f32(&cuda, &single, rows));
+        expected.extend(download::<f32>(&cuda, &single, rows));
     }
     assert_eq!(got, expected, "a row of a batch is the row alone");
 }
@@ -613,11 +576,11 @@ fn a_grouped_projection_is_each_group_launched_alone() {
     let weight: Vec<f32> = rng.values(rows * columns);
     let x: Vec<f32> = rng.values(tokens * columns);
     let weight_device = upload_bf16(&cuda, &weight);
-    let x_device = upload_f32(&cuda, &x);
+    let x_device = upload::<f32>(&cuda, &x);
     let gemv = token_kernel(&cuda, "q4e_gemv_bf16");
     let grid = rows.div_ceil(8) as u32;
 
-    let grouped = upload_f32(&cuda, &vec![0f32; tokens * rows]);
+    let grouped = upload::<f32>(&cuda, &vec![0f32; tokens * rows]);
     cuda.launch(
         gemv,
         (grid, groups as u32, 1),
@@ -632,11 +595,11 @@ fn a_grouped_projection_is_each_group_launched_alone() {
         ],
     )
     .expect("the grouped projection");
-    let got = download_f32(&cuda, &grouped, tokens * rows);
+    let got = download::<f32>(&cuda, &grouped, tokens * rows);
 
     let mut expected = Vec::with_capacity(tokens * rows);
     for group in 0..groups {
-        let alone = upload_f32(&cuda, &vec![0f32; batch * rows]);
+        let alone = upload::<f32>(&cuda, &vec![0f32; batch * rows]);
         cuda.launch(
             gemv,
             (grid, 1, 1),
@@ -651,7 +614,7 @@ fn a_grouped_projection_is_each_group_launched_alone() {
             ],
         )
         .expect("one group alone");
-        expected.extend(download_f32(&cuda, &alone, batch * rows));
+        expected.extend(download::<f32>(&cuda, &alone, batch * rows));
     }
     assert_eq!(
         got, expected,
@@ -716,21 +679,21 @@ fn run_mma_case(cuda: &Cuda, case: &MmaCase, seed: u64) {
     let taus: Vec<f32> = rng.values(rows).iter().map(|v| 1.2 + 0.4 * v).collect();
     let tau = 1.1f32;
 
-    let q_device = upload_f32(cuda, &q);
-    let gate_device = upload_f32(cuda, &gate);
-    let rel_device = upload_f32(cuda, &rel);
+    let q_device = upload::<f32>(cuda, &q);
+    let gate_device = upload::<f32>(cuda, &gate);
+    let rel_device = upload::<f32>(cuda, &rel);
     let sink_device = if case.sinks {
-        upload_f32(cuda, &sink)
+        upload::<f32>(cuda, &sink)
     } else {
         Deviceptr(0)
     };
     let keys_device = upload_bf16(cuda, &keys);
     let values_device = upload_bf16(cuda, &values);
     let bank_device = upload_bf16(cuda, &bank);
-    let q_scale_device = upload_f32(cuda, &q_scale);
-    let rel_scale_device = upload_f32(cuda, &rel_scale);
+    let q_scale_device = upload::<f32>(cuda, &q_scale);
+    let rel_scale_device = upload::<f32>(cuda, &rel_scale);
     let taus_device = if case.tau_rows {
-        upload_f32(cuda, &taus)
+        upload::<f32>(cuda, &taus)
     } else {
         Deviceptr(0)
     };
@@ -775,8 +738,8 @@ fn run_mma_case(cuda: &Cuda, case: &MmaCase, seed: u64) {
     .expect("attn_prefill launch");
 
     // The tensor-core walk: the query side, every visible key's gain and scale, the MMA body.
-    let q_ready = upload_f32(cuda, &vec![0f32; rows * q_width]);
-    let rel_ready = upload_f32(cuda, &vec![0f32; rows * HEADS * 16]);
+    let q_ready = upload::<f32>(cuda, &vec![0f32; rows * q_width]);
+    let rel_ready = upload::<f32>(cuda, &vec![0f32; rows * HEADS * 16]);
     cuda.launch(
         kernel(cuda, "inkling_attn_prepare"),
         (HEADS as u32, rows as u32, 1),
@@ -807,8 +770,8 @@ fn run_mma_case(cuda: &Cuda, case: &MmaCase, seed: u64) {
     let span = last + 1 - scale_first;
     // A stride wider than the span, as the arm's context-wide tables are.
     let stride = span + 40;
-    let gains = upload_f32(cuda, &vec![0f32; KV_HEADS * stride]);
-    let scales = upload_f32(cuda, &vec![0f32; KV_HEADS * stride]);
+    let gains = upload::<f32>(cuda, &vec![0f32; KV_HEADS * stride]);
+    let scales = upload::<f32>(cuda, &vec![0f32; KV_HEADS * stride]);
     cuda.launch(
         kernel(cuda, "inkling_attn_key_scales"),
         (span.div_ceil(16) as u32, KV_HEADS as u32, 1),
@@ -1023,25 +986,25 @@ fn run_split_case(cuda: &Cuda, case: &SplitCase, seed: u64) {
     let rel_scale: Vec<f32> = rng.values(HEADS * d_rel);
     let tau = 1.1f32;
 
-    let q_device = upload_f32(cuda, &q);
-    let gate_device = upload_f32(cuda, &gate);
-    let rel_device = upload_f32(cuda, &rel);
+    let q_device = upload::<f32>(cuda, &q);
+    let gate_device = upload::<f32>(cuda, &gate);
+    let rel_device = upload::<f32>(cuda, &rel);
     let sink_device = if case.sinks {
-        upload_f32(cuda, &sink)
+        upload::<f32>(cuda, &sink)
     } else {
         Deviceptr(0)
     };
     let keys_device = upload_bf16(cuda, &keys);
     let values_device = upload_bf16(cuda, &values);
     let bank_device = upload_bf16(cuda, &bank);
-    let q_scale_device = upload_f32(cuda, &q_scale);
-    let rel_scale_device = upload_f32(cuda, &rel_scale);
+    let q_scale_device = upload::<f32>(cuda, &q_scale);
+    let rel_scale_device = upload::<f32>(cuda, &rel_scale);
     let scale_stride = case.pass_slots + 1;
-    let gains = upload_f32(cuda, &vec![0f32; KV_HEADS * scale_stride]);
-    let scales = upload_f32(cuda, &vec![0f32; KV_HEADS * scale_stride]);
-    let scores = upload_f32(cuda, &vec![0f32; HEADS * case.pass_slots]);
-    let state = upload_f32(cuda, &vec![0f32; HEADS * (2 + HEAD_DIM)]);
-    let parts = upload_f32(cuda, &vec![f32::NAN; HEADS * part_stride * (2 + HEAD_DIM)]);
+    let gains = upload::<f32>(cuda, &vec![0f32; KV_HEADS * scale_stride]);
+    let scales = upload::<f32>(cuda, &vec![0f32; KV_HEADS * scale_stride]);
+    let scores = upload::<f32>(cuda, &vec![0f32; HEADS * case.pass_slots]);
+    let state = upload::<f32>(cuda, &vec![0f32; HEADS * (2 + HEAD_DIM)]);
+    let parts = upload::<f32>(cuda, &vec![f32::NAN; HEADS * part_stride * (2 + HEAD_DIM)]);
     let exact_out = upload_bf16(cuda, &vec![0f32; q_width]);
     let fast_out = upload_bf16(cuda, &vec![0f32; q_width]);
     let (key_scales, scorer, mix, part, merge) = (

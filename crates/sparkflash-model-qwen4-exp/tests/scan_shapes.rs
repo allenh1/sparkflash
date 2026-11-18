@@ -17,6 +17,7 @@
 //! template axis and the split cap (V_DIM 64 allows at most eight splits) without a checkpoint.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::test_io;
 use sparkflash_model_qwen4_exp::device::{
     cubin_available, embedded_scan_cubin, gdn_scan_shape_for,
 };
@@ -69,17 +70,9 @@ const HALF: usize = KEY + KEY / 8;
 const ROW: usize = 2 * HALF;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || embedded_scan_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen scan image");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!cubin_available() || embedded_scan_cubin().is_empty()).then_some("Qwen scan image"),
+    )
 }
 
 struct Lcg(u64);

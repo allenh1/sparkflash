@@ -24,20 +24,13 @@
 
 use sparkflash_kernels::cuda_driver::Cuda;
 use sparkflash_kernels::images::moe_plan_cubin;
+use sparkflash_kernels::test_io;
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_moe_cubin};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || moe_plan_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp or plan cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!cubin_available() || moe_plan_cubin().is_empty()).then_some("Qwen4-Exp or plan cubin"),
+    )
 }
 
 fn as_i32(bytes: &[u8]) -> Vec<i32> {

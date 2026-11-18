@@ -30,7 +30,9 @@ use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel, RunStream, StreamEvent};
 use sparkflash_model::BackendError;
-use sparkflash_weights::tp::{TpLayout, TpRuntime, Wire};
+use sparkflash_ops::calls;
+use sparkflash_ops::tp::{RowSums, SumLeg, gather_in_place, reduce_scatter};
+use sparkflash_weights::tp::{TpLayout, TpRuntime};
 
 use super::{
     DENSE_ROWS, DeviceSequence, GEMM_PARTIAL_REGION, GpuHyper, GpuLayer, MAX_INTERMEDIATE,
@@ -197,40 +199,10 @@ pub(crate) fn rank_config(config: &Qwen4ExpConfig, shard: Shard) -> Result<Qwen4
     })
 }
 
-// The two-shot collective is the shared one ([sparkflash_ops::tp]); the arm keeps only its
-// device-leg switch and the error type its other collectives use.
-pub use sparkflash_ops::tp::{reduce_scatter, reduce_two_shot, splits_two_shot};
-
-/// Every rank's `bytes` at `mine`, which is its own slot of `base` (`base + rank * bytes`),
-/// exchanged into the peers' slots of `base` in rank order; the own slot is left as it is.
-fn gather_in_place(
-    tp: &TpRuntime,
-    stream: u64,
-    base: Deviceptr,
-    mine: Deviceptr,
-    bytes: usize,
-) -> Result<(), BackendError> {
-    debug_assert_eq!(mine, base.offset(tp.rank() * bytes));
-    tp.exchange_on_device(stream, mine.0, base.0, bytes)
-        .map_err(collective_error)
-}
-
-fn collective_error(error: impl std::fmt::Display) -> BackendError {
-    BackendError::new("qwen4_tp", error.to_string())
-}
-
-/// The collective a sharded arm sums its branch partials with.
+/// The collective a sharded arm sums its branch partials with: the shared row sums
+/// ([RowSums]) and the arm's sequence-parallel switches.
 pub(super) struct TensorParallel {
-    pub(super) runtime: TpRuntime,
-    /// Whether the partials are exchanged on the devices (NCCL) rather than over the host seam.
-    device_leg: bool,
-    /// The fewest rows a step sums with [reduce_two_shot] ([sparkflash_weights::tp::two_shot_rows]).
-    two_shot_rows: usize,
-    /// Every peer's partial rows of one forward, `[world][rows][hidden]` floats, for the device
-    /// leg to gather into.
-    pub(super) slots: Deviceptr,
-    /// The most rows one forward sums: the slots' `rows`.
-    rows: usize,
+    pub(super) sums: RowSums,
     /// Whether a wide prefill chunk splits its hyper-connections over the ranks
     /// ([DeviceSequence::sequence_parallel]).
     sequence_parallel: bool,
@@ -243,47 +215,32 @@ impl TensorParallel {
     /// The collective over `runtime`, with gather room for `rows` rows of `hidden`.
     ///
     /// # Errors
-    /// A device leg that does not sum on the f32 wire, or the slots allocation.
+    /// As [RowSums::new].
     pub(super) fn new(
-        cuda: &sparkflash_kernels::cuda_driver::Cuda,
+        cuda: &Cuda,
         runtime: TpRuntime,
         rows: usize,
         hidden: usize,
     ) -> Result<Self, BackendError> {
-        // The device leg moves raw bits and the inject sums them in Wire::F32's order; a leg that
-        // rounds another way is refused rather than summed as if it were.
-        let device_leg = match runtime.device_wire() {
-            None => false,
-            Some(Wire::F32) => true,
-            Some(wire) => {
-                return Err(BackendError::new(
-                    "qwen4_tp",
-                    format!(
-                        "the collective's device leg sums on the {wire:?} wire; this arm sums only \
-                         Wire::F32"
-                    ),
-                ));
-            }
-        };
-        let two_shot_rows = sparkflash_weights::tp::two_shot_rows().map_err(collective_error)?;
-        let slots = cuda
-            .alloc(runtime.world() * rows * hidden * 4, &mut 0)
-            .map_err(|error| BackendError::new("qwen4_tp", error))?;
+        let profile = sparkflash_model::active_profile();
         Ok(Self {
-            runtime,
-            device_leg,
-            two_shot_rows,
-            slots,
-            rows,
-            sequence_parallel: sparkflash_model::active_profile()
-                .sequence
-                .parallel
-                .unwrap_or(true),
-            overlap: sparkflash_model::active_profile()
-                .sequence
-                .overlap
-                .unwrap_or(true),
+            sums: RowSums::new(cuda, runtime, rows, hidden, "qwen4_tp")?,
+            sequence_parallel: profile.sequence.parallel.unwrap_or(true),
+            overlap: profile.sequence.overlap.unwrap_or(true),
         })
+    }
+
+    /// The collective.
+    pub(super) const fn runtime(&self) -> &TpRuntime {
+        self.sums.runtime()
+    }
+
+    /// The device leg's slots, which every sum that reaches them has ([Self::sequence_parallel]
+    /// and the one-shot inject need a device leg).
+    fn slots(&self) -> Result<Deviceptr, BackendError> {
+        self.sums
+            .slots()
+            .ok_or_else(|| BackendError::new("qwen4_tp", "a device sum without a device leg"))
     }
 }
 
@@ -339,7 +296,7 @@ impl DeviceSequence {
     /// ([Self::overlapped_layers]): each half must itself split into whole [DENSE_ROWS] pieces.
     pub(super) fn overlaps(&self, batch: usize) -> bool {
         self.backend.tp.as_ref().is_some_and(|tp| {
-            tp.overlap && batch.is_multiple_of(2 * tp.runtime.world() * DENSE_ROWS)
+            tp.overlap && batch.is_multiple_of(2 * tp.runtime().world() * DENSE_ROWS)
         })
     }
 
@@ -371,7 +328,7 @@ impl DeviceSequence {
             self.overlap = Some(Overlap::new(&backend.cuda, backend.kernels.zero)?);
         }
         let config = &backend.config;
-        let (rank, world) = (tp.runtime.rank(), tp.runtime.world());
+        let (rank, world) = (tp.runtime().rank(), tp.runtime().world());
         let half = batch / 2;
         let own = half / world;
         let share = |session: &mut Self, h: usize| {
@@ -533,20 +490,20 @@ impl DeviceSequence {
     /// verify), and the session must not need the widened rows afterwards (the MTP reads them).
     pub(super) fn sequence_parallel(&self, batch: usize, chunk: bool) -> Option<(usize, usize)> {
         let tp = self.backend.tp.as_ref()?;
-        let world = tp.runtime.world();
+        let world = tp.runtime().world();
         let mtp = self.spec_enabled && !self.drafting();
         if !tp.sequence_parallel
-            || !tp.device_leg
+            || !tp.sums.device_leg()
             || !chunk
             || mtp
             || world < 2
-            || batch > tp.rows
+            || batch > tp.sums.rows()
             || !batch.is_multiple_of(world * DENSE_ROWS)
         {
             return None;
         }
         let count = batch / world;
-        Some((tp.runtime.rank() * count, count))
+        Some((tp.runtime().rank() * count, count))
     }
 
     /// The folded rows a branch reads and the injection weights of `block`, over every row of a
@@ -580,7 +537,7 @@ impl DeviceSequence {
         let tp = self.backend.tp.as_ref().ok_or_else(|| {
             BackendError::new("qwen4_tp", "a row gather on an arm that is not sharded")
         })?;
-        gather_in_place(&tp.runtime, self.clock().raw(), base, mine, bytes)
+        gather_in_place(tp.runtime(), self.clock().raw(), base, mine, bytes)
     }
 
     /// The widened rows the language head folds: the last `rows` rows of the forward, which
@@ -591,23 +548,14 @@ impl DeviceSequence {
         let (Some(tp), Some(_)) = (self.backend.tp.as_ref(), self.own_rows) else {
             return Ok(last);
         };
-        let world = tp.runtime.world();
-        let bytes = rows * width * 4;
-        if bytes > tp.rows * self.backend.config.hidden_size * 4 {
-            return Err(BackendError::new(
-                "qwen4_tp",
-                format!("{rows} head rows do not fit the collective's slots"),
-            ));
-        }
+        let world = tp.runtime().world();
         // Each rank sends the rows at the end of the chunk, which only the last rank's share
         // holds; the exchange leaves a rank's own slot unwritten, so the last rank reads its own.
-        tp.runtime
-            .exchange_on_device(self.clock().raw(), last.0, tp.slots.0, bytes)
-            .map_err(collective_error)?;
-        if tp.runtime.rank() + 1 == world {
+        let slots = tp.sums.gather(self.clock().raw(), last, rows * width * 4)?;
+        if tp.runtime().rank() + 1 == world {
             Ok(last)
         } else {
-            Ok(tp.slots.offset((world - 1) * bytes))
+            Ok(slots.offset((world - 1) * rows * width * 4))
         }
     }
 
@@ -615,8 +563,8 @@ impl DeviceSequence {
     ///
     /// On a sharded arm the rows are this rank's partials and are summed over the world first:
     /// gathered into the slots for q4e_inject to fold in rank order (one shot), summed in place by
-    /// [reduce_two_shot] from [TensorParallel::two_shot_rows] rows on, or summed on the host seam
-    /// when the collective has no device leg. All three add the same bits. Under sequence
+    /// the two-shot all-reduce from [sparkflash_weights::tp::two_shot_rows] rows on, or summed on
+    /// the host seam when the collective has no device leg ([RowSums::leg]). All three add the same bits. Under sequence
     /// parallelism ([Self::own_rows]) only the reduce-scatter runs and only this rank's rows are
     /// injected; the partials reduce-scattered are the `rows` from [Self::window] on.
     pub(super) fn inject_branch(
@@ -632,40 +580,15 @@ impl DeviceSequence {
         let mut target = (hyper, self.branch, injection, rows);
         let (slots, rank, world) = match &backend.tp {
             None => (0, 0, 1),
-            Some(tp) if !tp.device_leg => {
-                let mut values = vec![0.0f32; count];
-                let cuda = &backend.cuda;
-                cuda.copy_dtoh_on(
-                    self.clock(),
-                    bytemuck::cast_slice_mut(&mut values),
-                    &self.branch,
-                )
-                .map_err(|error| BackendError::new("qwen4_tp", error))?;
-                tp.runtime
-                    .all_reduce(&mut values)
-                    .map_err(collective_error)?;
-                cuda.copy_htod_on(self.clock(), &self.branch, bytemuck::cast_slice(&values))
-                    .map_err(|error| BackendError::new("qwen4_tp", error))?;
-                (0, 0, 1)
-            }
-            Some(tp) if rows > tp.rows => {
-                return Err(BackendError::new(
-                    "qwen4_tp",
-                    format!(
-                        "a forward of {rows} rows is wider than the {} the collective's slots hold",
-                        tp.rows
-                    ),
-                ));
-            }
             Some(tp) => {
-                let world = tp.runtime.world();
-                let stream = self.clock().raw();
+                let sums = &tp.sums;
+                let leg = sums.leg(rows)?;
                 if let Some((first, own)) = self.own_rows {
                     let mine = reduce_scatter(
-                        &tp.runtime,
-                        stream,
+                        tp.runtime(),
+                        self.clock().raw(),
                         self.branch.offset(self.window * hidden * 4),
-                        tp.slots,
+                        tp.slots()?,
                         count,
                         |mine, chunk| self.sum_slots(tp, mine, chunk),
                     )?;
@@ -677,24 +600,30 @@ impl DeviceSequence {
                         own,
                     );
                     (0, 0, 1)
-                } else if tp.two_shot_rows > 0
-                    && rows >= tp.two_shot_rows
-                    && splits_two_shot(count, world)
-                {
-                    reduce_two_shot(
-                        &tp.runtime,
-                        stream,
+                } else if leg == SumLeg::OneShot {
+                    // The inject folds the gathered slots in rank order itself.
+                    let slots = sums.gather(self.clock().raw(), self.branch, count * 4)?;
+                    (
+                        slots.0,
+                        tp.runtime().rank() as u64,
+                        tp.runtime().world() as u64,
+                    )
+                } else {
+                    sums.sum(
+                        &backend.cuda,
+                        Some(self.clock()),
                         self.branch,
-                        tp.slots,
-                        count,
-                        |mine, chunk| self.sum_slots(tp, mine, chunk),
+                        rows,
+                        |call| {
+                            self.launch(
+                                backend.kernels.sum_slots,
+                                call.grid,
+                                call.block,
+                                &call.args,
+                            )
+                        },
                     )?;
                     (0, 0, 1)
-                } else {
-                    tp.runtime
-                        .exchange_on_device(stream, self.branch.0, tp.slots.0, count * 4)
-                        .map_err(collective_error)?;
-                    (tp.slots.0, tp.runtime.rank() as u64, world as u64)
                 }
             }
         };
@@ -724,17 +653,13 @@ impl DeviceSequence {
         mine: Deviceptr,
         chunk: usize,
     ) -> Result<(), BackendError> {
+        let (rank, world) = (tp.runtime().rank(), tp.runtime().world());
+        let call = calls::sum_slots(mine.0, tp.slots()?.0, chunk, rank, world);
         self.launch(
             self.backend.kernels.sum_slots,
-            ((chunk / 4).div_ceil(256).max(1) as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                mine.0,
-                tp.slots.0,
-                chunk as u64,
-                tp.runtime.rank() as u64,
-                tp.runtime.world() as u64,
-            ],
+            call.grid,
+            call.block,
+            &call.args,
         )
     }
 }

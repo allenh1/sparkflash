@@ -27,15 +27,7 @@ use std::collections::{HashMap, HashSet};
 
 use sparkflash_model::Sampling;
 use sparkflash_weights::linalg::finite_argmax;
-
-/// The 64-bit mixer the deterministic draw uses.
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut mixed = value;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^ (mixed >> 31)
-}
+use sparkflash_weights::rng::splitmix64;
 
 /// Token history and the draw state one sequence carries.
 ///

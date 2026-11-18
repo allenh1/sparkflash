@@ -22,22 +22,15 @@
 //!
 //! It skips - loudly - without an embedded cubin or a CUDA driver.
 
-use sparkflash_kernels::cuda_driver::Cuda;
+use sparkflash_kernels::test_io;
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin};
 use sparkflash_weights::quant::f8e4m3_to_f32;
 
 #[test]
 fn every_e4m3_code_decodes_the_way_the_host_decodes_it() {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
+    let Some(cuda) = test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
+    else {
         return;
-    }
-    let cuda = match Cuda::load() {
-        Ok(cuda) => cuda,
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            return;
-        }
     };
     let codes: Vec<u8> = (0u8..=255).collect();
     let mut total = 0_usize;

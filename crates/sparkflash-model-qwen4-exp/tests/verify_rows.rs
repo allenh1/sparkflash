@@ -30,6 +30,7 @@
 //! It skips - loudly - without an embedded cubin or a CUDA driver.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::test_io;
 use sparkflash_model_qwen4_exp::device::{
     TILED_GEMV_BLOCKS, TILED_GEMV_PARTIALS, cubin_available, embedded_cubin,
     tiled_gemv_e4m3_splits, tiled_gemv_splits,
@@ -135,17 +136,7 @@ fn tiled_scratch(cuda: &Cuda, total: &mut usize) -> (Deviceptr, Deviceptr) {
 }
 
 fn cuda_or_skip() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 #[test]

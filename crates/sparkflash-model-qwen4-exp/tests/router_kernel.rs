@@ -22,22 +22,13 @@
 //! The tests skip - loudly - without an embedded cubin or a CUDA driver, like the parity suite.
 
 use sparkflash_kernels::cuda_driver::Cuda;
+use sparkflash_kernels::test_io;
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_moe_cubin};
 
 const MAX_TOPK: usize = 64;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 /// A softmax the way the kernel computes it, for the expected selection.

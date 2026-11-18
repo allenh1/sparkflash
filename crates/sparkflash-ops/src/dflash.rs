@@ -1698,7 +1698,7 @@ pub fn write_synthetic_drafter(
         .map(|spec| {
             let elements = usize::try_from(spec.elements())
                 .map_err(|_| format!("{} is too large for this machine", spec.name))?;
-            let mut state = seed ^ fnv1a(spec.name.as_bytes());
+            let mut state = seed ^ sparkflash_weights::rank_file::fnv1a(spec.name.as_bytes());
             let mut bytes = Vec::with_capacity(elements * 2);
             let norm = spec.name.contains("norm") && spec.name.ends_with(".weight");
             for _ in 0..elements {
@@ -1720,17 +1720,8 @@ pub fn write_synthetic_drafter(
     Ok(config)
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
 fn next_unit(state: &mut u64) -> f32 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut mixed = *state;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    mixed ^= mixed >> 31;
+    let mixed = sparkflash_weights::rng::splitmix64(*state);
+    *state = state.wrapping_add(sparkflash_weights::rng::SPLITMIX_GAMMA);
     ((mixed >> 40) as f32) / ((1u64 << 24) as f32)
 }

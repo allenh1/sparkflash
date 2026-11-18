@@ -19,41 +19,12 @@
 //! without an embedded cubin or a CUDA driver.
 
 use half::bf16;
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::cuda_driver::Cuda;
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_attn_cubin};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    let mut total = 0;
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, &bytes).expect("upload");
-    pointer
-}
-
-fn download_u16(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<u16> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 2];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect()
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 #[test]
@@ -72,7 +43,7 @@ fn the_flat_cache_store_narrows_every_value_with_rne() {
         f32::INFINITY,
         f32::NEG_INFINITY,
     ];
-    let source = upload_f32(&cuda, &values);
+    let source = upload::<f32>(&cuda, &values);
     let mut total = 0;
     let destination = cuda
         .alloc(values.len() * 2, &mut total)
@@ -87,7 +58,7 @@ fn the_flat_cache_store_narrows_every_value_with_rne() {
         &[destination.0, source.0, values.len() as u64],
     )
     .expect("cache store");
-    let got = download_u16(&cuda, &destination, values.len());
+    let got = download::<u16>(&cuda, &destination, values.len());
     let want: Vec<u16> = values
         .iter()
         .map(|value| bf16::from_f32(*value).to_bits())
@@ -110,7 +81,7 @@ fn the_strided_cache_store_honours_the_destination_stride() {
             source.push((row * 10 + column) as f32 / 8.0);
         }
     }
-    let source_on = upload_f32(&cuda, &source);
+    let source_on = upload::<f32>(&cuda, &source);
     let mut total = 0;
     let destination = cuda
         .alloc(ROWS * DEST_STRIDE * 2, &mut total)
@@ -135,7 +106,7 @@ fn the_strided_cache_store_honours_the_destination_stride() {
         ],
     )
     .expect("strided cache store");
-    let got = download_u16(&cuda, &destination, ROWS * DEST_STRIDE);
+    let got = download::<u16>(&cuda, &destination, ROWS * DEST_STRIDE);
     let mut want = vec![0xFFFFu16; ROWS * DEST_STRIDE];
     for row in 0..ROWS {
         for column in 0..WIDTH {

@@ -31,6 +31,7 @@
 //! the argmax of the logits the plain step returns, and the row it leaves on the device the plain
 //! step's last kept row.
 
+use sparkflash_kernels::test_io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -67,17 +68,10 @@ fn stride_tokens(config: &Glm5NextConfig, count: usize, stride: usize, first: us
 
 /// A CUDA context, or why this run cannot have one.
 fn open() -> Option<Arc<CudaHandle>> {
-    if !qwen4_available() || !glm_decode_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp or GLM decode cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(Arc::new(CudaHandle::new(cuda))),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!qwen4_available() || !glm_decode_available()).then_some("Qwen4-Exp or GLM decode cubin"),
+    )
+    .map(|cuda| Arc::new(CudaHandle::new(cuda)))
 }
 
 fn source(directory: &Path) -> SafeTensorsSource {

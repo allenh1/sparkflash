@@ -20,26 +20,17 @@
 //! (kernels/glm_moe_sm121.cu); glm_quantise_rows stays in the prefill image.
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr};
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{
     cubin_available, embedded_glm_moe_cubin, embedded_glm_prefill_cubin,
 };
 use sparkflash_weights::quant;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available()
+    let missing = !cubin_available()
         || embedded_glm_prefill_cubin().is_empty()
-        || embedded_glm_moe_cubin().is_empty()
-    {
-        eprintln!("skipped: this build embeds no GLM prefill or routed-expert cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+        || embedded_glm_moe_cubin().is_empty();
+    test_io::cuda_or_skip(missing.then_some("GLM prefill or routed-expert cubin"))
 }
 
 struct Lcg(u64);
@@ -60,49 +51,6 @@ impl Lcg {
     }
 }
 
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-fn download(cuda: &Cuda, pointer: &Deviceptr, bytes: usize) -> Vec<u8> {
-    cuda.synchronize().expect("synchronize");
-    let mut out = vec![0u8; bytes];
-    cuda.copy_dtoh(&mut out, pointer).expect("download");
-    out
-}
-fn download_i32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<i32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| i32::from_le_bytes(*word))
-        .collect()
-}
-fn download_f32(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<f32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect()
-}
 fn assert_close(what: &str, host: &[f32], device: &[f32], tolerance: f32) {
     assert_eq!(host.len(), device.len(), "{what}: lengths");
     let scale = host
@@ -215,10 +163,10 @@ fn the_bulk_fp8_dense_gemm_matches_the_host_block_scaled_linear() {
             host[t * cols + c] = sum;
         }
     }
-    let w = upload(&cuda, &codes);
-    let ws = upload_f32(&cuda, &scales);
-    let a = upload_f32(&cuda, &x);
-    let out = upload_f32(&cuda, &vec![0.0; tokens * cols]);
+    let w = upload::<u8>(&cuda, &codes);
+    let ws = upload::<f32>(&cuda, &scales);
+    let a = upload::<f32>(&cuda, &x);
+    let out = upload::<f32>(&cuda, &vec![0.0; tokens * cols]);
     launch(
         &cuda,
         "glm_prefill_fp8b128_mma",
@@ -234,12 +182,12 @@ fn the_bulk_fp8_dense_gemm_matches_the_host_block_scaled_linear() {
             tokens as u64,
         ],
     );
-    let got = download_f32(&cuda, &out, tokens * cols);
+    let got = download::<f32>(&cuda, &out, tokens * cols);
     assert_close("bulk fp8 dense", &host, &got, 5e-3);
     // The bf16-activation form drops the split's low half: the same block-scaled sum to the
     // precision a bf16 activation carries, which is finer than the FP8 the model quantises its
     // activations with.
-    let out = upload_f32(&cuda, &vec![0.0; tokens * cols]);
+    let out = upload::<f32>(&cuda, &vec![0.0; tokens * cols]);
     launch(
         &cuda,
         "glm_prefill_fp8b128_mma_bf16a",
@@ -255,7 +203,7 @@ fn the_bulk_fp8_dense_gemm_matches_the_host_block_scaled_linear() {
             tokens as u64,
         ],
     );
-    let got = download_f32(&cuda, &out, tokens * cols);
+    let got = download::<f32>(&cuda, &out, tokens * cols);
     assert_close("bulk fp8 dense, bf16 activation", &host, &got, 5e-2);
 }
 
@@ -284,10 +232,10 @@ fn the_head_tiled_fp8_projection_strides_its_per_head_scales_as_elements() {
         .collect();
     // The absorbed query as [tokens][heads][latent]; the output as [tokens][heads][value].
     let x = rng.values(tokens * heads * latent);
-    let w = upload(&cuda, &codes);
-    let ws = upload_f32(&cuda, &scales);
-    let a = upload_f32(&cuda, &x);
-    let out = upload_f32(&cuda, &vec![0.0; tokens * heads * value]);
+    let w = upload::<u8>(&cuda, &codes);
+    let ws = upload::<f32>(&cuda, &scales);
+    let a = upload::<f32>(&cuda, &x);
+    let out = upload::<f32>(&cuda, &vec![0.0; tokens * heads * value]);
     launch(
         &cuda,
         "glm_prefill_heads_fp8b128_mma",
@@ -314,7 +262,7 @@ fn the_head_tiled_fp8_projection_strides_its_per_head_scales_as_elements() {
             ((per_head / 128) * blocks) as u64,
         ],
     );
-    let got = download_f32(&cuda, &out, tokens * heads * value);
+    let got = download::<f32>(&cuda, &out, tokens * heads * value);
     let mut host = vec![0.0f32; tokens * heads * value];
     for t in 0..tokens {
         for head in 0..heads {
@@ -348,9 +296,9 @@ fn the_bulk_q8_gemm_matches_the_host_dynamic_activation_linear() {
     // A zero block quantises to zero codes under a zero scale.
     x[..128].fill(0.0);
     let (x_codes, x_scales) = quantised(&x);
-    let input = upload_f32(&cuda, &x);
-    let q = upload(&cuda, &vec![0u8; tokens * inner]);
-    let qs = upload_f32(&cuda, &vec![1.0; tokens * inner / 128]);
+    let input = upload::<f32>(&cuda, &x);
+    let q = upload::<u8>(&cuda, &vec![0u8; tokens * inner]);
+    let qs = upload::<f32>(&cuda, &vec![1.0; tokens * inner / 128]);
     launch(
         &cuda,
         "glm_quantise_rows",
@@ -359,11 +307,11 @@ fn the_bulk_q8_gemm_matches_the_host_dynamic_activation_linear() {
         &[input.0, q.0, qs.0, tokens as u64, inner as u64],
     );
     assert_eq!(
-        download(&cuda, &q, tokens * inner),
+        download::<u8>(&cuda, &q, tokens * inner),
         x_codes,
         "the device's codes are the host's"
     );
-    let got_scales = download_f32(&cuda, &qs, tokens * inner / 128);
+    let got_scales = download::<f32>(&cuda, &qs, tokens * inner / 128);
     assert!(
         got_scales
             .iter()
@@ -384,9 +332,9 @@ fn the_bulk_q8_gemm_matches_the_host_dynamic_activation_linear() {
             host[t * cols + c] = sum as f32;
         }
     }
-    let w = upload(&cuda, &codes);
-    let ws = upload_f32(&cuda, &scales);
-    let out = upload_f32(&cuda, &vec![f32::NAN; tokens * cols]);
+    let w = upload::<u8>(&cuda, &codes);
+    let ws = upload::<f32>(&cuda, &scales);
+    let out = upload::<f32>(&cuda, &vec![f32::NAN; tokens * cols]);
     launch(
         &cuda,
         "glm_prefill_q8_mma",
@@ -403,7 +351,7 @@ fn the_bulk_q8_gemm_matches_the_host_dynamic_activation_linear() {
             tokens as u64,
         ],
     );
-    let got = download_f32(&cuda, &out, tokens * cols);
+    let got = download::<f32>(&cuda, &out, tokens * cols);
     assert_close("bulk q8 dense", &host, &got, 1e-5);
 }
 
@@ -415,7 +363,7 @@ fn the_skinny_bf16_projection_matches_the_host() {
     let (rows, columns) = (37usize, 1032usize);
     let mut rng = Lcg(0x676c_6d34);
     let x = rng.values(rows * columns);
-    let input = upload_f32(&cuda, &x);
+    let input = upload::<f32>(&cuda, &x);
     for outs in [24usize, 16, 5, 32] {
         let weights: Vec<u16> = (0..outs * columns)
             .map(|_| (rng.next().to_bits() >> 16) as u16)
@@ -430,14 +378,14 @@ fn the_skinny_bf16_projection_matches_the_host() {
                 host[r * outs + j] = sum as f32;
             }
         }
-        let w = upload(
+        let w = upload::<u8>(
             &cuda,
             &weights
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let out = upload_f32(&cuda, &vec![f32::NAN; rows * outs]);
+        let out = upload::<f32>(&cuda, &vec![f32::NAN; rows * outs]);
         let name = match outs.div_ceil(8) {
             1 => "glm_prefill_skinny_bf16_1",
             2 => "glm_prefill_skinny_bf16_2",
@@ -458,7 +406,7 @@ fn the_skinny_bf16_projection_matches_the_host() {
                 rows as u64,
             ],
         );
-        let got = download_f32(&cuda, &out, rows * outs);
+        let got = download::<f32>(&cuda, &out, rows * outs);
         assert_close(&format!("skinny bf16, {outs} outputs"), &host, &got, 1e-5);
         // And the kernel's own chain to the bit: lane l's fmaf over its eight columns of each
         // 256-column round in column order from 0.0, then the xor butterfly, output j from lane j.
@@ -581,20 +529,20 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
     let mut dn_tables = Vec::new();
     let mut keep = Vec::new();
     for e in 0..experts {
-        let gw = upload(
+        let gw = upload::<u8>(
             &cuda,
             &gate_up_codes[e * 2 * width * hidden..(e + 1) * 2 * width * hidden],
         );
-        let gs = upload_f32(
+        let gs = upload::<f32>(
             &cuda,
             &gate_up_scales[e * (2 * width / 128) * (hidden / 128)
                 ..(e + 1) * (2 * width / 128) * (hidden / 128)],
         );
-        let dw = upload(
+        let dw = upload::<u8>(
             &cuda,
             &down_codes[e * hidden * width..(e + 1) * hidden * width],
         );
-        let ds = upload_f32(
+        let ds = upload::<f32>(
             &cuda,
             &down_scales
                 [e * (hidden / 128) * (width / 128)..(e + 1) * (hidden / 128) * (width / 128)],
@@ -603,10 +551,10 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
         dn_tables.extend([dw.0.to_le_bytes(), ds.0.to_le_bytes()].concat());
         keep.extend([gw, gs, dw, ds]);
     }
-    let gu_table = upload(&cuda, &gu_tables);
-    let dn_table = upload(&cuda, &dn_tables);
+    let gu_table = upload::<u8>(&cuda, &gu_tables);
+    let dn_table = upload::<u8>(&cuda, &dn_tables);
     let indices: Vec<i32> = picks.iter().flatten().map(|v| *v as i32).collect();
-    let indices = upload(
+    let indices = upload::<u8>(
         &cuda,
         &indices
             .iter()
@@ -617,14 +565,14 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
     let item_rows = 128usize;
     let max_items = (rows * topk).div_ceil(item_rows) + experts.min(rows * topk) + 1;
     let moe_rows = max_items * item_rows;
-    let slot_of = upload_f32(&cuda, &vec![0.0; moe_rows]); // overwritten with ints by the plan
-    let items = upload(&cuda, &vec![0u8; max_items * 16]);
-    let item_count = upload(&cuda, &[0u8; 4]);
-    let input = upload_f32(&cuda, &x);
-    let gate_up = upload_f32(&cuda, &vec![0.0; moe_rows * 2 * width]);
-    let activated = upload_f32(&cuda, &vec![0.0; moe_rows * width]);
-    let route_dev = upload_f32(&cuda, &route);
-    let out = upload_f32(&cuda, &vec![0.0; rows * topk * hidden]);
+    let slot_of = upload::<f32>(&cuda, &vec![0.0; moe_rows]); // overwritten with ints by the plan
+    let items = upload::<u8>(&cuda, &vec![0u8; max_items * 16]);
+    let item_count = upload::<u8>(&cuda, &[0u8; 4]);
+    let input = upload::<f32>(&cuda, &x);
+    let gate_up = upload::<f32>(&cuda, &vec![0.0; moe_rows * 2 * width]);
+    let activated = upload::<f32>(&cuda, &vec![0.0; moe_rows * width]);
+    let route_dev = upload::<f32>(&cuda, &route);
+    let out = upload::<f32>(&cuda, &vec![0.0; rows * topk * hidden]);
     // The shared plan (kernels/moe_plan_sm121.cu) writes `sorted` and the item list; the MMA
     // bodies read an item's slots from `sorted` at the item's first rank.
     launch(
@@ -653,9 +601,9 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
             0,
         ],
     );
-    let plan_count = download_i32(&cuda, &item_count, 1)[0].max(0) as usize;
-    let plan_items = download_i32(&cuda, &items, max_items * 4);
-    let plan_slots = download_i32(&cuda, &slot_of, moe_rows);
+    let plan_count = download::<i32>(&cuda, &item_count, 1)[0].max(0) as usize;
+    let plan_items = download::<i32>(&cuda, &items, max_items * 4);
+    let plan_slots = download::<i32>(&cuda, &slot_of, moe_rows);
     let want_items: usize = (0..experts)
         .map(|e| {
             picks
@@ -692,10 +640,10 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
         );
     }
     if q8 {
-        let codes = upload(&cuda, &vec![0u8; rows * hidden]);
-        let scales = upload_f32(&cuda, &vec![0.0; rows * hidden / 128]);
-        let act_codes = upload(&cuda, &vec![0u8; moe_rows * width]);
-        let act_scales = upload_f32(&cuda, &vec![0.0; moe_rows * width / 128]);
+        let codes = upload::<u8>(&cuda, &vec![0u8; rows * hidden]);
+        let scales = upload::<f32>(&cuda, &vec![0.0; rows * hidden / 128]);
+        let act_codes = upload::<u8>(&cuda, &vec![0u8; moe_rows * width]);
+        let act_scales = upload::<f32>(&cuda, &vec![0.0; moe_rows * width / 128]);
         launch(
             &cuda,
             "glm_quantise_rows",
@@ -753,7 +701,7 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
                 route_dev.0,
             ],
         );
-        let got = download_f32(&cuda, &out, rows * topk * hidden);
+        let got = download::<f32>(&cuda, &out, rows * topk * hidden);
         // A device gate/up sum a rounding away from the host's can land its activation on the
         // neighbouring code, so the down projection's tolerance is the FP8 step's, not f32's.
         assert_close("bulk routed experts, q8", &expected, &got, 5e-3);
@@ -806,7 +754,7 @@ fn routed_experts(experts: usize, hidden: usize, width: usize, picks: &[[u32; 2]
             route_dev.0,
         ],
     );
-    let got = download_f32(&cuda, &out, rows * topk * hidden);
+    let got = download::<f32>(&cuda, &out, rows * topk * hidden);
     assert_close("bulk routed experts", &expected, &got, 5e-3);
 }
 
@@ -819,8 +767,8 @@ fn the_bulk_swiglu_reads_gate_and_up_halves() {
     let mut source = Vec::new();
     source.extend_from_slice(&gate);
     source.extend_from_slice(&up);
-    let input = upload_f32(&cuda, &source);
-    let out = upload_f32(&cuda, &vec![0.0; width]);
+    let input = upload::<f32>(&cuda, &source);
+    let out = upload::<f32>(&cuda, &vec![0.0; width]);
     launch(
         &cuda,
         "glm_moe_swiglu",
@@ -834,7 +782,7 @@ fn the_bulk_swiglu_reads_gate_and_up_halves() {
             out.0,
         ],
     );
-    let got = download_f32(&cuda, &out, width);
+    let got = download::<f32>(&cuda, &out, width);
     let want: Vec<f32> = gate
         .iter()
         .zip(&up)
@@ -905,12 +853,12 @@ fn the_bulk_index_scores_are_the_decode_kernels_bit_for_bit() {
         let score_stride = pools + 70;
         let sentinel = f32::from_bits(0x7FC0_1234);
         let (q, w, k) = (
-            upload_f32(&cuda, &query),
-            upload_f32(&cuda, &weights),
-            upload_f32(&cuda, &keys),
+            upload::<f32>(&cuda, &query),
+            upload::<f32>(&cuda, &weights),
+            upload::<f32>(&cuda, &keys),
         );
-        let decode = upload_f32(&cuda, &vec![sentinel; rows * score_stride]);
-        let bulk = upload_f32(&cuda, &vec![sentinel; rows * score_stride]);
+        let decode = upload::<f32>(&cuda, &vec![sentinel; rows * score_stride]);
+        let bulk = upload::<f32>(&cuda, &vec![sentinel; rows * score_stride]);
         launch(
             &cuda,
             "q4e_glm_index_scores",
@@ -952,8 +900,8 @@ fn the_bulk_index_scores_are_the_decode_kernels_bit_for_bit() {
                 rows as u64,
             ],
         );
-        let expected = download_f32(&cuda, &decode, rows * score_stride);
-        let got = download_f32(&cuda, &bulk, rows * score_stride);
+        let expected = download::<f32>(&cuda, &decode, rows * score_stride);
+        let got = download::<f32>(&cuda, &bulk, rows * score_stride);
         for row in 0..rows {
             let own = (position + row + 1) / pool;
             for p in 0..score_stride {
@@ -1015,22 +963,22 @@ fn the_wide_bf16_gemm_is_the_128_column_tiles_bit_for_bit() {
         let weights: Vec<u16> = (0..outs * columns)
             .map(|_| ((rng.next() * 0.05).to_bits() >> 16) as u16)
             .collect();
-        let w = upload(
+        let w = upload::<u8>(
             &cuda,
             &weights
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let input = upload_f32(&cuda, &x);
+        let input = upload::<f32>(&cuda, &x);
         let sentinel = f32::from_bits(0x7FC0_4321);
         for (narrow, wide) in [
             ("glm_prefill_bf16_mma", "glm_prefill_bf16_wide"),
             ("glm_prefill_bf16_mma_bf16a", "glm_prefill_bf16_wide_bf16a"),
         ] {
             // A row past the last, which neither kernel may write.
-            let expected = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
-            let got = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+            let expected = upload::<f32>(&cuda, &vec![sentinel; (rows + 1) * outs]);
+            let got = upload::<f32>(&cuda, &vec![sentinel; (rows + 1) * outs]);
             let args = |out: &Deviceptr| {
                 [
                     w.0,
@@ -1055,8 +1003,8 @@ fn the_wide_bf16_gemm_is_the_128_column_tiles_bit_for_bit() {
                 256,
                 &args(&got),
             );
-            let expected = download_f32(&cuda, &expected, (rows + 1) * outs);
-            let got = download_f32(&cuda, &got, (rows + 1) * outs);
+            let expected = download::<f32>(&cuda, &expected, (rows + 1) * outs);
+            let got = download::<f32>(&cuda, &got, (rows + 1) * outs);
             assert!(
                 expected[..rows * outs]
                     .iter()
@@ -1109,24 +1057,24 @@ fn the_exact_projection_is_the_tiled_gemvs_bit_for_bit() {
             *value = 0x8000;
         }
         let widened = |i: usize| f32::from_bits(u32::from(weights[i]) << 16);
-        let w = upload(
+        let w = upload::<u8>(
             &cuda,
             &weights
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let input = upload_f32(&cuda, &x);
+        let input = upload::<f32>(&cuda, &x);
         let sentinel = f32::from_bits(0x7FC0_1234);
         // A row past the last, which neither kernel may write.
-        let tiled = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
-        let exact = upload_f32(&cuda, &vec![sentinel; (rows + 1) * outs]);
+        let tiled = upload::<f32>(&cuda, &vec![sentinel; (rows + 1) * outs]);
+        let exact = upload::<f32>(&cuda, &vec![sentinel; (rows + 1) * outs]);
         let groups = 64usize;
         let mut total = 0;
         let partials = cuda
             .alloc(groups * rounds * 8 * tiles * 32 * 4, &mut total)
             .expect("alloc");
-        let counters = upload(&cuda, &vec![0u8; groups * tiles * 4]);
+        let counters = upload::<u8>(&cuda, &vec![0u8; groups * tiles * 4]);
         for done in (0..rows).step_by(512) {
             let count = 512.min(rows - done);
             launch(
@@ -1163,8 +1111,8 @@ fn the_exact_projection_is_the_tiled_gemvs_bit_for_bit() {
                 rows as u64,
             ],
         );
-        let expected = download_f32(&cuda, &tiled, (rows + 1) * outs);
-        let got = download_f32(&cuda, &exact, (rows + 1) * outs);
+        let expected = download::<f32>(&cuda, &tiled, (rows + 1) * outs);
+        let got = download::<f32>(&cuda, &exact, (rows + 1) * outs);
         for (at, (got, expected)) in got.iter().zip(&expected).enumerate() {
             assert_eq!(
                 got.to_bits(),

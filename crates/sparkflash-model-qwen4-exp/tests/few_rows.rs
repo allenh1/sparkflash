@@ -49,6 +49,7 @@
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::m4_quant::{bf16_bits, bf16_bits_to_f32};
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin, embedded_prefill_cubin};
 
 /// The worst |error| relative to the largest |reference| the forms may reach. The split carries
@@ -56,17 +57,9 @@ use sparkflash_model_qwen4_exp::device::{cubin_available, embedded_cubin, embedd
 const ACCURACY: f64 = 5e-5;
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() || embedded_prefill_cubin().is_empty() {
-        eprintln!("skipped: this build embeds no Qwen prefill image");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip(
+        (!cubin_available() || embedded_prefill_cubin().is_empty()).then_some("Qwen prefill image"),
+    )
 }
 
 struct Lcg(u64);
@@ -78,25 +71,6 @@ impl Lcg {
             .wrapping_add(1_442_695_040_888_963_407);
         ((self.0 >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
     }
-}
-
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn download_bits(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<u32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| u32::from_le_bytes(*word))
-        .collect()
 }
 
 /// Where a q4p_dense_rows launch finishes its outputs: `y`, from the slices on `tickets`, through
@@ -356,14 +330,14 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
             .map(|_| bf16_bits(rng.next() * 0.05))
             .collect();
         let activations: Vec<f32> = (0..TOKENS * inner).map(|_| rng.next()).collect();
-        let w = upload(
+        let w = upload::<u8>(
             &cuda,
             &weights
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let a = upload(
+        let a = upload::<u8>(
             &cuda,
             &activations
                 .iter()
@@ -371,15 +345,15 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
                 .collect::<Vec<_>>(),
         );
         let partials = segments * TOKENS * cols;
-        let tile_out = upload(&cuda, &vec![0u8; partials * 4]);
-        let tile_y = upload(&cuda, &vec![0u8; TOKENS * cols * 4]);
-        let rows_out = upload(&cuda, &vec![0u8; partials * 4]);
+        let tile_out = upload::<u8>(&cuda, &vec![0u8; partials * 4]);
+        let tile_y = upload::<u8>(&cuda, &vec![0u8; TOKENS * cols * 4]);
+        let rows_out = upload::<u8>(&cuda, &vec![0u8; partials * 4]);
         // One counter a 32-column, 16-row tile, shared by every launch below.
-        let tickets = upload(
+        let tickets = upload::<u8>(
             &cuda,
             &vec![0u8; cols.div_ceil(32) * TOKENS.div_ceil(16) * 4],
         );
-        let rows_y = upload(&cuda, &vec![0u8; TOKENS * cols * 4]);
+        let rows_y = upload::<u8>(&cuda, &vec![0u8; TOKENS * cols * 4]);
         let finish = Finish {
             y: rows_y,
             tickets,
@@ -389,7 +363,7 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
         launch(
             &cuda, k, false, w, a, tile_out, cols, inner, TOKENS, segments, finish,
         );
-        let tile = download_bits(&cuda, &tile_out, partials);
+        let tile = download::<u32>(&cuda, &tile_out, partials);
         finish_tile(
             &cuda,
             reduce,
@@ -401,7 +375,7 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
             epilogue,
             scale,
         );
-        let finished = download_bits(&cuda, &tile_y, TOKENS * cols);
+        let finished = download::<u32>(&cuda, &tile_y, TOKENS * cols);
         let shape = format!("{cols} x {inner} split {segments} epilogue {epilogue}");
 
         // 1. Every row of an M-row launch is the tile's row, its slices and its finished outputs.
@@ -410,7 +384,7 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
             launch(
                 &cuda, k, true, w, a, rows_out, cols, inner, count, segments, finish,
             );
-            let got = download_bits(&cuda, &rows_out, segments * count * cols);
+            let got = download::<u32>(&cuda, &rows_out, segments * count * cols);
             for segment in (0..segments).filter(|_| segments > 1) {
                 for token in 0..count {
                     let at = (segment * count + token) * cols;
@@ -428,7 +402,7 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
                 }
             }
             let got = if segments > 1 {
-                download_bits(&cuda, &rows_y, count * cols)
+                download::<u32>(&cuda, &rows_y, count * cols)
             } else {
                 got
             };
@@ -459,7 +433,7 @@ fn a_few_rows_are_the_bits_the_tile_computes_and_within_the_split_bound() {
                 segments,
                 finish,
             );
-            let got = download_bits(&cuda, if segments > 1 { &rows_y } else { &rows_out }, cols);
+            let got = download::<u32>(&cuda, if segments > 1 { &rows_y } else { &rows_out }, cols);
             assert_eq!(
                 got,
                 finished[token * cols..(token + 1) * cols],
@@ -531,7 +505,7 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
     // a wide pair, split as the release splits them and not.
     let shapes = [96usize, 512, 640, 2560];
     let mut rng = Lcg(0x9a0f);
-    let a = upload(
+    let a = upload::<u8>(
         &cuda,
         &(0..TOKENS * INNER)
             .flat_map(|_| rng.next().to_le_bytes())
@@ -540,7 +514,7 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
     let weights: Vec<Deviceptr> = shapes
         .iter()
         .map(|cols| {
-            upload(
+            upload::<u8>(
                 &cuda,
                 &(0..cols * INNER)
                     .flat_map(|_| bf16_bits(rng.next() * 0.05).to_le_bytes())
@@ -548,7 +522,7 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
             )
         })
         .collect();
-    let tickets = upload(&cuda, &vec![0u8; 256 * 4 * 4]);
+    let tickets = upload::<u8>(&cuda, &vec![0u8; 256 * 4 * 4]);
     for (segments, epilogue) in [(5usize, 1u32), (2, 0), (1, 2)] {
         let finish = Finish {
             y: Deviceptr(0),
@@ -561,8 +535,8 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
                 .iter()
                 .map(|cols| {
                     (
-                        upload(&cuda, &vec![0u8; segments * count * cols * 4]),
-                        upload(&cuda, &vec![0u8; count * cols * 4]),
+                        upload::<u8>(&cuda, &vec![0u8; segments * count * cols * 4]),
+                        upload::<u8>(&cuda, &vec![0u8; count * cols * 4]),
                     )
                 })
                 .collect()
@@ -590,8 +564,8 @@ fn a_launch_of_several_matrices_gives_each_the_bits_of_its_own() {
             for (i, cols) in shapes.iter().enumerate() {
                 // An unsplit launch finishes into `out`; a split one into `y`.
                 let pick = |(out, y): (Deviceptr, Deviceptr)| if segments > 1 { y } else { out };
-                let want = download_bits(&cuda, &pick(alone[i]), count * cols);
-                let got = download_bits(&cuda, &pick(together[i]), count * cols);
+                let want = download::<u32>(&cuda, &pick(alone[i]), count * cols);
+                let got = download::<u32>(&cuda, &pick(together[i]), count * cols);
                 assert_eq!(
                     got, want,
                     "matrix {i} ({cols} x {INNER}) of four, {count} rows split {segments}"
@@ -614,7 +588,7 @@ fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
     // unsplit beside the keys, values and indexer split five ways, and both orders of the two.
     let shapes = [(1024usize, 1usize), (512, 5), (512, 5), (640, 5)];
     let mut rng = Lcg(0x5917);
-    let a = upload(
+    let a = upload::<u8>(
         &cuda,
         &(0..TOKENS * INNER)
             .flat_map(|_| rng.next().to_le_bytes())
@@ -623,7 +597,7 @@ fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
     let weights: Vec<Deviceptr> = shapes
         .iter()
         .map(|(cols, _)| {
-            upload(
+            upload::<u8>(
                 &cuda,
                 &(0..cols * INNER)
                     .flat_map(|_| bf16_bits(rng.next() * 0.05).to_le_bytes())
@@ -631,7 +605,7 @@ fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
             )
         })
         .collect();
-    let tickets = upload(&cuda, &vec![0u8; 256 * 4 * 4]);
+    let tickets = upload::<u8>(&cuda, &vec![0u8; 256 * 4 * 4]);
     let finish = Finish {
         y: Deviceptr(0),
         tickets,
@@ -645,8 +619,8 @@ fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
                     .iter()
                     .map(|(cols, segments)| {
                         (
-                            upload(&cuda, &vec![0u8; segments * count * cols * 4]),
-                            upload(&cuda, &vec![0u8; count * cols * 4]),
+                            upload::<u8>(&cuda, &vec![0u8; segments * count * cols * 4]),
+                            upload::<u8>(&cuda, &vec![0u8; count * cols * 4]),
                         )
                     })
                     .collect()
@@ -676,15 +650,15 @@ fn a_launch_of_matrices_at_different_splits_gives_each_the_bits_of_its_own() {
             for (i, &(cols, segments)) in shapes.iter().enumerate() {
                 let pick = |(out, y): (Deviceptr, Deviceptr)| if segments > 1 { y } else { out };
                 assert_eq!(
-                    download_bits(&cuda, &pick(together[i]), count * cols),
-                    download_bits(&cuda, &pick(alone[i]), count * cols),
+                    download::<u32>(&cuda, &pick(together[i]), count * cols),
+                    download::<u32>(&cuda, &pick(alone[i]), count * cols),
                     "matrix {i} ({cols} x {INNER}, split {segments}) in order {order:?}, {count} \
                      rows"
                 );
             }
             // Every split tile's counter is back at zero for the next launch.
             assert!(
-                download_bits(&cuda, &tickets, 256 * 4)
+                download::<u32>(&cuda, &tickets, 256 * 4)
                     .iter()
                     .all(|c| *c == 0),
                 "a launch of mixed splits left its tickets set"
@@ -711,28 +685,28 @@ fn the_hyper_up_launch_is_the_bits_of_the_projection_and_the_mix() {
     for (hidden, hc, lowrank) in [(2560usize, 4usize, 320usize), (256, 3, 64), (64, 2, 32)] {
         let mut rng = Lcg((hidden * 7 + hc * 3 + lowrank) as u64);
         let rows = hc * hidden;
-        let up = upload(
+        let up = upload::<u8>(
             &cuda,
             &(0..rows * lowrank)
                 .flat_map(|_| bf16_bits(rng.next() * 0.1).to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let low = upload(
+        let low = upload::<u8>(
             &cuda,
             &(0..TOKENS * lowrank)
                 .flat_map(|_| rng.next().to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let normed = upload(
+        let normed = upload::<u8>(
             &cuda,
             &(0..TOKENS * rows)
                 .flat_map(|_| rng.next().to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let raw = upload(&cuda, &vec![0u8; TOKENS * rows * 4]);
+        let raw = upload::<u8>(&cuda, &vec![0u8; TOKENS * rows * 4]);
         let (want, got) = (
-            upload(&cuda, &vec![0u8; TOKENS * hidden * 4]),
-            upload(&cuda, &vec![0u8; TOKENS * hidden * 4]),
+            upload::<u8>(&cuda, &vec![0u8; TOKENS * hidden * 4]),
+            upload::<u8>(&cuda, &vec![0u8; TOKENS * hidden * 4]),
         );
         let finish = Finish {
             y: Deviceptr(0),
@@ -783,8 +757,8 @@ fn the_hyper_up_launch_is_the_bits_of_the_projection_and_the_mix() {
             )
             .expect("q4p_hyper_up_rows");
             assert_eq!(
-                download_bits(&cuda, &got, count * hidden),
-                download_bits(&cuda, &want, count * hidden),
+                download::<u32>(&cuda, &got, count * hidden),
+                download::<u32>(&cuda, &want, count * hidden),
                 "hidden {hidden}, {hc} streams, rank {lowrank}: {count} rows"
             );
         }
@@ -808,14 +782,14 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
     let dense = [512usize, 640];
     let off_tile = [(48usize, 48usize, 0u32), (4, 48, 2), (1, 7, 1), (48, 1, 2)];
     let mut rng = Lcg(0x51de);
-    let a = upload(
+    let a = upload::<u8>(
         &cuda,
         &(0..TOKENS * INNER)
             .flat_map(|_| rng.next().to_le_bytes())
             .collect::<Vec<_>>(),
     );
     let matrix = |rows: usize, rng: &mut Lcg| {
-        upload(
+        upload::<u8>(
             &cuda,
             &(0..rows * INNER)
                 .flat_map(|_| bf16_bits(rng.next() * 0.05).to_le_bytes())
@@ -827,18 +801,18 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
         .iter()
         .map(|&(rows, ..)| matrix(rows, &mut rng))
         .collect();
-    let tickets = upload(&cuda, &vec![0u8; 256 * 4 * 4]);
+    let tickets = upload::<u8>(&cuda, &vec![0u8; 256 * 4 * 4]);
     let rider = |slot: usize, count: usize| {
         let (rows, split, epilogue) = off_tile[slot];
         Rider {
             w: rider_weights[slot],
-            y: upload(&cuda, &vec![0u8; count * rows * 4]),
+            y: upload::<u8>(&cuda, &vec![0u8; count * rows * 4]),
             rows,
             epilogue,
             scale: 1.7,
             split,
-            partials: upload(&cuda, &vec![0u8; split * count * rows * 4]),
-            tickets: upload(&cuda, &vec![0u8; (rows * count).div_ceil(128) * 4]),
+            partials: upload::<u8>(&cuda, &vec![0u8; split * count * rows * 4]),
+            tickets: upload::<u8>(&cuda, &vec![0u8; (rows * count).div_ceil(128) * 4]),
         }
     };
     for segments in [5usize, 1] {
@@ -855,8 +829,8 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                         .iter()
                         .map(|cols| {
                             (
-                                upload(&cuda, &vec![0u8; segments * count * cols * 4]),
-                                upload(&cuda, &vec![0u8; count * cols * 4]),
+                                upload::<u8>(&cuda, &vec![0u8; segments * count * cols * 4]),
+                                upload::<u8>(&cuda, &vec![0u8; count * cols * 4]),
                             )
                         })
                         .collect()
@@ -902,8 +876,8 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                     let pick =
                         |(out, y): (Deviceptr, Deviceptr)| if segments > 1 { y } else { out };
                     assert_eq!(
-                        download_bits(&cuda, &pick(together[i]), count * cols),
-                        download_bits(&cuda, &pick(alone[i]), count * cols),
+                        download::<u32>(&cuda, &pick(together[i]), count * cols),
+                        download::<u32>(&cuda, &pick(alone[i]), count * cols),
                         "dense matrix {i} ({cols} x {INNER}) beside riders {pair:?}, {count} rows \
                          split {segments}"
                     );
@@ -911,8 +885,8 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                 for (alone, beside) in mine.iter().zip(&riding) {
                     let (rows, split, epilogue) = (alone.rows, alone.split, alone.epilogue);
                     assert_eq!(
-                        download_bits(&cuda, &beside.y, count * rows),
-                        download_bits(&cuda, &alone.y, count * rows),
+                        download::<u32>(&cuda, &beside.y, count * rows),
+                        download::<u32>(&cuda, &alone.y, count * rows),
                         "a {rows} x {INNER} rider split {split} epilogue {epilogue}, {count} rows, \
                          beside a launch split {segments}"
                     );
@@ -921,7 +895,7 @@ fn a_rider_is_the_bits_of_its_own_gemm_rows_launch() {
                 for rider in riding {
                     let counters = (rider.rows * count).div_ceil(128);
                     assert!(
-                        download_bits(&cuda, &rider.tickets, counters)
+                        download::<u32>(&cuda, &rider.tickets, counters)
                             .iter()
                             .all(|c| *c == 0),
                         "a rider left its tickets set"
@@ -960,14 +934,14 @@ fn a_few_rows_are_the_bits_the_token_gemm_computes() {
             .map(|_| bf16_bits(rng.next() * 0.05))
             .collect();
         let activations: Vec<f32> = (0..TOKENS * columns).map(|_| rng.next()).collect();
-        let w = upload(
+        let w = upload::<u8>(
             &cuda,
             &weights
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect::<Vec<_>>(),
         );
-        let a = upload(
+        let a = upload::<u8>(
             &cuda,
             &activations
                 .iter()
@@ -976,16 +950,16 @@ fn a_few_rows_are_the_bits_the_token_gemm_computes() {
         );
         let outputs = segments * TOKENS * rows;
         let (tile_y, tile_partials) = (
-            upload(&cuda, &vec![0u8; outputs * 4]),
-            upload(&cuda, &vec![0u8; outputs * 4]),
+            upload::<u8>(&cuda, &vec![0u8; outputs * 4]),
+            upload::<u8>(&cuda, &vec![0u8; outputs * 4]),
         );
         let (rows_y, rows_partials) = (
-            upload(&cuda, &vec![0u8; outputs * 4]),
-            upload(&cuda, &vec![0u8; outputs * 4]),
+            upload::<u8>(&cuda, &vec![0u8; outputs * 4]),
+            upload::<u8>(&cuda, &vec![0u8; outputs * 4]),
         );
         let scale = 1.7f32;
         // One counter a 128-output tile, shared by every launch below.
-        let tickets = upload(&cuda, &vec![0u8; (rows * TOKENS).div_ceil(128) * 4]);
+        let tickets = upload::<u8>(&cuda, &vec![0u8; (rows * TOKENS).div_ceil(128) * 4]);
         let run = |kernel,
                    grid: (usize, usize),
                    y: Deviceptr,
@@ -1037,8 +1011,8 @@ fn a_few_rows_are_the_bits_the_token_gemm_computes() {
             )
             .expect("q4e_gemm_reduce");
         }
-        let finished = download_bits(&cuda, &tile_y, TOKENS * rows);
-        let want = download_bits(&cuda, &tile_partials, outputs);
+        let finished = download::<u32>(&cuda, &tile_y, TOKENS * rows);
+        let want = download::<u32>(&cuda, &tile_partials, outputs);
         let shape = format!("{rows} x {columns} split {segments}");
         for count in 1..=TOKENS {
             poison(&cuda, rows_y, count * rows);
@@ -1050,7 +1024,7 @@ fn a_few_rows_are_the_bits_the_token_gemm_computes() {
                 count,
                 11,
             );
-            let got = download_bits(&cuda, &rows_y, count * rows);
+            let got = download::<u32>(&cuda, &rows_y, count * rows);
             if let Some(at) = (0..count * rows).find(|at| got[*at] != finished[*at]) {
                 panic!(
                     "{shape}: row {} of a {count}-row launch, output {}, finished: {:e} where the \
@@ -1064,7 +1038,7 @@ fn a_few_rows_are_the_bits_the_token_gemm_computes() {
             if segments == 1 {
                 continue;
             }
-            let got = download_bits(&cuda, &rows_partials, segments * count * rows);
+            let got = download::<u32>(&cuda, &rows_partials, segments * count * rows);
             for segment in 0..segments {
                 for token in 0..count {
                     let at = (segment * count + token) * rows;
@@ -1207,14 +1181,14 @@ impl Moe {
     fn run(&self, cuda: &Cuda, rows: bool, tokens: usize) -> (Vec<u16>, Vec<u32>) {
         self.launch(cuda, rows, tokens);
         let slots = tokens * MOE_TOPK;
-        let words = download_bits(cuda, &self.activated, slots * MOE_INTERMEDIATE);
+        let words = download::<u32>(cuda, &self.activated, slots * MOE_INTERMEDIATE);
         let halves = words
             .iter()
             .flat_map(|word| [*word as u16, (*word >> 16) as u16])
             .collect();
         (
             halves,
-            download_bits(cuda, &self.partials, slots * MOE_HIDDEN),
+            download::<u32>(cuda, &self.partials, slots * MOE_HIDDEN),
         )
     }
 }
@@ -1271,7 +1245,7 @@ fn a_few_rows_are_the_bits_the_expert_panel_computes_and_within_the_split_bound(
     let pointers: Vec<Deviceptr> = matrices
         .iter()
         .flatten()
-        .map(|m| upload(&cuda, m))
+        .map(|m| upload::<u8>(&cuda, m))
         .collect();
     let table: Vec<u8> = pointers.iter().flat_map(|p| p.0.to_le_bytes()).collect();
     let weight_scale_2: Vec<f32> = (0..MOE_EXPERTS * 3)
@@ -1298,23 +1272,23 @@ fn a_few_rows_are_the_bits_the_expert_panel_computes_and_within_the_split_bound(
         plan,
         panel: (kernel(1), kernel(2)),
         rows: (kernel(3), kernel(4)),
-        table: upload(&cuda, &table),
-        scales: upload(&cuda, &f32_bytes(&weight_scale_2)),
-        indices: upload(
+        table: upload::<u8>(&cuda, &table),
+        scales: upload::<u8>(&cuda, &f32_bytes(&weight_scale_2)),
+        indices: upload::<u8>(
             &cuda,
             &indices
                 .iter()
                 .flat_map(|i| i.to_le_bytes())
                 .collect::<Vec<_>>(),
         ),
-        mixed: upload(&cuda, &f32_bytes(&mixed)),
-        probabilities: upload(&cuda, &f32_bytes(&probabilities)),
-        x: upload(&cuda, &vec![0u8; 2 * TOKENS * hidden * 2]),
-        sorted: upload(&cuda, &vec![0u8; slots * 4]),
-        items: upload(&cuda, &vec![0u8; (slots.div_ceil(32) + MOE_EXPERTS) * 16]),
-        item_count: upload(&cuda, &[0u8; 4]),
-        activated: upload(&cuda, &vec![0u8; 2 * slots * intermediate * 2]),
-        partials: upload(&cuda, &vec![0u8; slots * hidden * 4]),
+        mixed: upload::<u8>(&cuda, &f32_bytes(&mixed)),
+        probabilities: upload::<u8>(&cuda, &f32_bytes(&probabilities)),
+        x: upload::<u8>(&cuda, &vec![0u8; 2 * TOKENS * hidden * 2]),
+        sorted: upload::<u8>(&cuda, &vec![0u8; slots * 4]),
+        items: upload::<u8>(&cuda, &vec![0u8; (slots.div_ceil(32) + MOE_EXPERTS) * 16]),
+        item_count: upload::<u8>(&cuda, &[0u8; 4]),
+        activated: upload::<u8>(&cuda, &vec![0u8; 2 * slots * intermediate * 2]),
+        partials: upload::<u8>(&cuda, &vec![0u8; slots * hidden * 4]),
     };
     let (panel_activated, panel_partials) = moe.run(&cuda, false, TOKENS);
     let plane = slots * intermediate;

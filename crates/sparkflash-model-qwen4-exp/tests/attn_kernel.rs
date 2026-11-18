@@ -20,24 +20,15 @@
 //! to the most it stages. They skip - loudly - without an embedded cubin or a CUDA driver.
 
 use half::bf16;
-use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
+use sparkflash_kernels::cuda_driver::{Cuda, Kernel};
+use sparkflash_kernels::test_io::{self, download, upload};
 use sparkflash_model_qwen4_exp::device::{
     MAX_SELECTED_TOKENS, cubin_available, embedded_attn_cubin,
 };
 use sparkflash_ops::attention::{GQA_GROUP_KERNELS, GQA_GROUP_SELECTED, gqa_group_shared_bytes};
 
 fn open() -> Option<Cuda> {
-    if !cubin_available() {
-        eprintln!("skipped: this build embeds no Qwen4-Exp cubin");
-        return None;
-    }
-    match Cuda::load() {
-        Ok(cuda) => Some(cuda),
-        Err(error) => {
-            eprintln!("skipped: no CUDA driver ({error})");
-            None
-        }
-    }
+    test_io::cuda_or_skip((!cubin_available()).then_some("Qwen4-Exp cubin"))
 }
 
 /// A small deterministic generator, so a failure reproduces.
@@ -55,55 +46,6 @@ impl Lcg {
     fn next(&mut self) -> f32 {
         ((self.next_u64() >> 7) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
     }
-}
-
-fn upload(cuda: &Cuda, bytes: &[u8]) -> Deviceptr {
-    let mut total = 0;
-    let pointer = cuda.alloc(bytes.len().max(4), &mut total).expect("alloc");
-    cuda.copy_htod(&pointer, bytes).expect("upload");
-    pointer
-}
-
-fn upload_f32(cuda: &Cuda, values: &[f32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn upload_bf16(cuda: &Cuda, values: &[bf16]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn upload_i32(cuda: &Cuda, values: &[i32]) -> Deviceptr {
-    upload(
-        cuda,
-        &values
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn download_bits(cuda: &Cuda, pointer: &Deviceptr, elements: usize) -> Vec<u32> {
-    cuda.synchronize().expect("synchronize");
-    let mut bytes = vec![0u8; elements * 4];
-    cuda.copy_dtoh(&mut bytes, pointer).expect("download");
-    bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| u32::from_le_bytes(*word))
-        .collect()
 }
 
 struct Shape {
@@ -146,15 +88,15 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
         }
     }
     let count: Vec<i32> = counts.iter().map(|&count| count as i32).collect();
-    let q = upload_f32(&cuda, &q);
-    let gate = upload_f32(&cuda, &gate);
-    let keys = upload_bf16(&cuda, &keys);
-    let values = upload_bf16(&cuda, &values);
-    let selected = upload_i32(&cuda, &selected);
-    let count = upload_i32(&cuda, &count);
+    let q = upload::<f32>(&cuda, &q);
+    let gate = upload::<f32>(&cuda, &gate);
+    let keys = upload::<bf16>(&cuda, &keys);
+    let values = upload::<bf16>(&cuda, &values);
+    let selected = upload::<i32>(&cuda, &selected);
+    let count = upload::<i32>(&cuda, &count);
     let run = |kernel: Kernel, group: usize| {
         // Filled with NaN, so a head the kernel never writes cannot match by accident.
-        let out = upload_f32(&cuda, &vec![f32::NAN; tokens * width]);
+        let out = upload::<f32>(&cuda, &vec![f32::NAN; tokens * width]);
         cuda.launch(
             kernel,
             ((heads / group) as u32, tokens as u32, 1),
@@ -175,7 +117,7 @@ fn grouped_matches_per_head(shape: &Shape, counts: &[usize]) {
             ],
         )
         .expect("launch");
-        download_bits(&cuda, &out, tokens * width)
+        download::<u32>(&cuda, &out, tokens * width)
     };
     let (_, per_head) = cuda
         .load_named(embedded_attn_cubin(), "q4e_attn")
@@ -282,13 +224,13 @@ fn bench_the_attention_kernels() {
     let (heads, kv_heads, head_dim, context) = (24usize, 2usize, 256usize, 8192usize);
     let groups = heads / kv_heads;
     let mut rng = Lcg(0xbe_7c4);
-    let keys = upload_bf16(
+    let keys = upload::<bf16>(
         &cuda,
         &(0..context * kv_heads * head_dim)
             .map(|_| bf16::from_f32(rng.next()))
             .collect::<Vec<_>>(),
     );
-    let values = upload_bf16(
+    let values = upload::<bf16>(
         &cuda,
         &(0..context * kv_heads * head_dim)
             .map(|_| bf16::from_f32(rng.next()))
@@ -303,11 +245,11 @@ fn bench_the_attention_kernels() {
         (128, 1024),
     ] {
         let width = heads * head_dim;
-        let q = upload_f32(
+        let q = upload::<f32>(
             &cuda,
             &(0..rows * width).map(|_| rng.next()).collect::<Vec<_>>(),
         );
-        let gate = upload_f32(
+        let gate = upload::<f32>(
             &cuda,
             &(0..rows * width).map(|_| rng.next()).collect::<Vec<_>>(),
         );
@@ -328,9 +270,9 @@ fn bench_the_attention_kernels() {
                 }
             }
         }
-        let selected = upload_i32(&cuda, &selected);
-        let counts = upload_i32(&cuda, &vec![count as i32; rows]);
-        let out = upload_f32(&cuda, &vec![0.0; rows * width]);
+        let selected = upload::<i32>(&cuda, &selected);
+        let counts = upload::<i32>(&cuda, &vec![count as i32; rows]);
+        let out = upload::<f32>(&cuda, &vec![0.0; rows * width]);
         let mut line = format!("rows {rows:>3} selected {count}:");
         let grouped = GQA_GROUP_KERNELS
             .iter()

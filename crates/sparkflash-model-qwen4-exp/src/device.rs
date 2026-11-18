@@ -73,6 +73,7 @@ use sparkflash_model::{
 pub(crate) use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_weights::linalg::ScaleGrid;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
+use sparkflash_weights::rank_file::fnv1a;
 use sparkflash_weights::tp::{TpLayout, TpRuntime};
 use sparkflash_weights::{WeightSource, check_length};
 
@@ -101,7 +102,6 @@ use sparkflash_ops::calls::{self, Call, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
-pub use tp::{reduce_two_shot, splits_two_shot};
 
 /// Whether `SPARKFLASH_QWEN4_PROBE=hash` asks every probe for a hash of its buffer's bytes
 /// instead of the finite check: two runs of one prompt then diff line by line, and the first line
@@ -109,13 +109,6 @@ pub use tp::{reduce_two_shot, splits_two_shot};
 fn probe_hashing() -> bool {
     sparkflash_model::active_profile().diagnostics.probe
         == Some(sparkflash_model::profile::ProbeMode::Hash)
-}
-
-/// 64-bit FNV-1a over a probed buffer's bytes.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// Per-stage device timing, enabled with `SPARKFLASH_QWEN4_PROF`.
@@ -540,7 +533,7 @@ struct Kernels {
     hyper_mix: Kernel,
     hyper_inject: Kernel,
     inject: Kernel,
-    /// The two-shot all-reduce's in-place sum of this rank's chunk ([tp::reduce_two_shot]).
+    /// The row sums' in-place sum of this rank's chunk ([sparkflash_ops::tp::RowSums]).
     sum_slots: Kernel,
     swiglu: Kernel,
     router: Kernel,
@@ -2693,19 +2686,19 @@ impl Qwen4ExpDeviceBackend {
         if let Some(tp) = &tp {
             eprintln!(
                 "qwen4: rank {} of {}: {} query heads, {} GDN value heads, experts {} wide; {} collective",
-                tp.runtime.rank(),
-                tp.runtime.world(),
+                tp.runtime().rank(),
+                tp.runtime().world(),
                 local.num_attention_heads,
                 local.linear_num_value_heads,
                 local.moe_intermediate_size,
-                tp.runtime.label()
+                tp.runtime().label()
             );
         }
         // The prefill scan this rank's plan resolves: the arm launches the plan's kernel on the
         // plan's grid, so the boot check and the launch are one decision.
         let (world, rank) = tp
             .as_ref()
-            .map_or((1, 0), |tp| (tp.runtime.world(), tp.runtime.rank()));
+            .map_or((1, 0), |tp| (tp.runtime().world(), tp.runtime().rank()));
         // A head pair no prompt scan body takes (a fixture's narrow heads) keeps the refusal: the
         // token path still serves, and a prompt walk that reaches the scan refuses with it.
         let gdn_scan = match ScanPlan::for_architecture(
@@ -2790,8 +2783,8 @@ impl Qwen4ExpDeviceBackend {
                     "rank {} of {} steps fused lanes only as a group: every forward is a \
                      collective its group steps through together, so rank 0 broadcasts each \
                      step (enable_group_fusion) and the workers replay it (mirror_group)",
-                    tp.runtime.rank(),
-                    tp.runtime.world()
+                    tp.runtime().rank(),
+                    tp.runtime().world()
                 ),
             ));
         }
@@ -3523,7 +3516,7 @@ impl SequenceShared {
             .map_err(|error| BackendError::new("qwen4_device", error))
         };
         self.lanes.get(capacity, plan, |lanes| {
-            if self.tp.as_ref().is_none_or(|tp| tp.runtime.rank() == 0) {
+            if self.tp.as_ref().is_none_or(|tp| tp.runtime().rank() == 0) {
                 eprintln!(
                     "[qwen] rank 0: sequences of {capacity} positions back their caches as they \
                      grow: {}",
@@ -3561,8 +3554,8 @@ impl Drop for SequenceShared {
         }
         // A sequence still alive gives its chunks back when it goes.
         self.lanes.drain(&self.cuda);
-        if let Some(tp) = &self.tp {
-            self.cuda.free_buffers(&[&tp.slots]);
+        if let Some(tp) = &mut self.tp {
+            tp.sums.release(&self.cuda);
         }
     }
 }
