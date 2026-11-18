@@ -952,7 +952,8 @@ impl DeviceSession {
             attn_out: wide(query)?,
             partials: wide(config.num_attention_heads * 16 * (config.head_dim + 2))?,
             coeffs: wide(8)?,
-            logits: alloc(config.vocab_size * 4)?,
+            // A verify reads every row's logits; a prefill chunk only the last row's.
+            logits: alloc(ROWS * config.vocab_size * 4)?,
             position: alloc(4)?,
             pointers,
         };
@@ -1190,7 +1191,9 @@ impl DeviceSession {
                 .map_err(|error| BackendError::new(DEVICE, error))?;
         }
         let after_device = started.elapsed();
-        let mut logit_bytes = vec![0u8; config.vocab_size * 4];
+        // A one-row step and a chunk above the tile read one row; a verify reads them all.
+        let head_rows = if rows <= ROWS { rows } else { 1 };
+        let mut logit_bytes = vec![0u8; head_rows * config.vocab_size * 4];
         shared
             .cuda
             .copy_dtoh(&mut logit_bytes, &self.scratch.logits)
@@ -1428,13 +1431,16 @@ impl DeviceSession {
         if debug {
             self.report("device final hidden", self.scratch.normed, hidden)?;
         }
-        // Only the last row's logits are read: a verify's earlier rows are already in the
-        // chain's answer, and a prefill chunk's are not needed at all.
+        // A verify needs every row's pick, so its head runs over all of them; a prefill chunk
+        // needs the row that predicts the next token, and a one-row step is one row.
+        let head_rows = if rows <= ROWS { rows } else { 1 };
         shared.gemv(
             &shared.weights.head,
-            self.scratch.normed.offset((rows - 1) * hidden * 4),
+            self.scratch
+                .normed
+                .offset((rows - head_rows) * hidden * 4),
             self.scratch.logits,
-            1,
+            head_rows,
         )
     }
 
@@ -1810,7 +1816,9 @@ impl ModelSession for DeviceSession {
         // chunk exactly the rows of the one-token steps they stand in for.
         let mut logits = Vec::new();
         for chunk in tokens.chunks(PREFILL_ROWS) {
-            logits = self.forward_rows(chunk)?;
+            let all = self.forward_rows(chunk)?;
+            // A chunk under the verify tile returns every row; only the last one predicts.
+            logits = all[all.len() - self.shared.config.vocab_size..].to_vec();
         }
         self.sampler.reset();
         self.sampler.record_prompt(tokens);
