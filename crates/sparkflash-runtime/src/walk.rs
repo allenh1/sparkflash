@@ -29,7 +29,7 @@
 //! The trait carries no `Send` or `Sync` bound. DeepSeek's sequence is single-threaded; an
 //! engine that needs the bounds asks for them at its own implementation.
 
-use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
@@ -543,5 +543,16 @@ pub trait Walk: 'static {
     #[must_use]
     fn capabilities(&self) -> WalkCapabilities {
         Self::CAPABILITIES
+    }
+
+    /// The speculative counters of `seq`'s request, as the arm's drafter kept them.
+    ///
+    /// The runtime owns the slot and cannot see inside a walk, so an arm that drafts reports its
+    /// own counters here; a walk that drafts nothing keeps the zero default, which the serving
+    /// layer reads as "no speculation". The counters are a request's, not a lifetime's: the arm
+    /// resets them when the request's sampler is set ([Walk::set_sampling]).
+    fn speculation(&self, seq: &Self::Seq) -> Speculation {
+        let _ = seq;
+        Speculation::default()
     }
 }

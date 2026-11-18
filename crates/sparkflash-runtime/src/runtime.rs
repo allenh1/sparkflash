@@ -469,7 +469,14 @@ where
     }
 
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
-        slot.speculation
+        // The counters are the drafter's, which only the arm can read; the slot's own field is
+        // the fallback for a walk that states nothing.
+        let measured = self.walk.speculation(&slot.seq);
+        if measured == Speculation::default() {
+            slot.speculation
+        } else {
+            measured
+        }
     }
 
     fn history<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
@@ -613,6 +620,8 @@ mod tests {
         /// Rows the walk keeps past the ones the caller was given tokens for, as a verify keeps
         /// its drafts' rows. Zero is the plain walk.
         kept_past: usize,
+        /// What the walk reports for a sequence's speculative counters.
+        counters: Speculation,
     }
 
     impl ToyWalk {
@@ -626,6 +635,7 @@ mod tests {
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
                 kept_past: 0,
+                counters: Speculation::default(),
             }
         }
 
@@ -657,6 +667,10 @@ mod tests {
 
         fn set_sampling(&self, _seq: &mut Self::Seq, sampling: Sampling) {
             *self.sampling.lock().expect("the toy sampler record") = Some(sampling);
+        }
+
+        fn speculation(&self, _seq: &Self::Seq) -> Speculation {
+            self.counters
         }
 
         fn walk(
@@ -785,6 +799,28 @@ mod tests {
             "the prompt went back to the point instead of forwarding from the kept rows"
         );
         assert_eq!(slot.history(), &[1, 2, 3, 9]);
+    }
+
+    /// The arm's counters reach the serving layer through the runtime: the runtime cannot see
+    /// inside a walk, so a drafter's report would otherwise read as zero.
+    #[test]
+    fn the_walk_reports_a_sequence_s_speculation() {
+        let mut walk = ToyWalk::new(256, 4_096);
+        walk.counters = Speculation {
+            verify_steps: 3,
+            drafts_proposed: 9,
+            drafts_accepted: 4,
+        };
+        let runtime = Runtime::new(walk, 0).expect("the runtime starts");
+        let slot = runtime.open_slot().expect("a slot");
+        assert_eq!(
+            runtime.speculation(&slot),
+            Speculation {
+                verify_steps: 3,
+                drafts_proposed: 9,
+                drafts_accepted: 4,
+            }
+        );
     }
 
     #[test]
