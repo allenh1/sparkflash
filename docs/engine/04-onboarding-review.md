@@ -159,6 +159,48 @@ registration are hardcoded outside `ARMS`; and `Walk`/`PartExec` cannot express 
 drafter taps, Engram state, per-sequence constraints, or request-level sampling. Those are
 recorded there, not silently folded into a phase.
 
+## Confirmed during implementation: the drafting gap
+
+Reviewing the shared runtime against the first arm that drafts (Qwen) found a defect the dense move
+could not expose, because dense has no drafter. It is recorded here because it changes phase 1's
+definition of done.
+
+* `Runtime::step` is `plain_step` (`runtime.rs:457`); nothing in the runtime calls `run_round`.
+* The loss is **all drafting**, not only joint rounds: a lone request that used to draft and verify
+  its own chain now gets one plain row (`fusion.rs:249-253` was the old path).
+* **Three ledger rows were untrue**: Drafting and JointRounds from `VERIFY && Many`, and Runs
+  hard-coded `true`; the joint-round row also ignored `SPARKFLASH_JOINT_ROUNDS`. Phase 8's
+  `sparkflash onboard` prints the same rows.
+* `Runtime::verify` is not yet a verify: it heads only the anchor row, never compares a draft with
+  the model's choice, and appends every draft to history (`runtime.rs:202-243`); its own test
+  asserts that shape. Wiring `step` to it as it stands would change output tokens.
+
+The decision, taken here: **a released drafting arm stays on its own fusion until the runtime
+drafts**, and `Runtime<W>` refuses a walk that has a `Drafter` but no round path, so the lie is
+impossible by construction. This follows the plan's regression clause (an arm that measures slower
+stays where it is) and keeps phase 1's guarantee honest while the drafting phase is still ahead.
+
+What the runtime must gain before GLM, Inkling or Qwen can leave their fusion — the next phase-1
+commit, shared by all three arms rather than designed from one:
+
+1. A real `Drafter` contract (today it has only `PRESENT` and `describe`), lifted from the shape
+   the three arms already share (`open_round`, `take_drafts`, `resolve_verify`, `holds`).
+2. Verify rows headed in order with a stop at the first mismatch; `HeadInput` has only `Prompt`
+   and `Token`, so it needs the verify form.
+3. `room` for a step must reserve `verify_rows`, not one row.
+4. `Limits.rows` conflates rows a pass and members a batch; a verify pass is
+   `members x (1 + depth)`. The two must be separate numbers.
+5. A home for the cost model (`JOINT_WALL`, depth) that the old arms had in their own fusion.
+6. A seventh conformance check: **drafted = plain**, including a case where the draft is
+   rejected. Its absence is why this got through.
+
+Two smaller findings from the same review: the extra LM-head work per prompt chunk (old shape
+`forward_batch(chunk, usize::from(is_last), 0)`, `device.rs:6389`) is restorable because `head`
+is a separate call, but in a TP group the head rows are a collective (`tp.rs:545-559`), so the
+per-chunk cost can be a collective and not only a GEMM; and `Pass::bulk(rows)` carries no prompt
+end, where the old code limited drafter commits to a window before the prompt's end
+(`device.rs:6394-6400`), which the drafting contract must carry.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

@@ -555,6 +555,25 @@ in anyone's memory.
 
 Each released arm's present chunk sizes become inputs to `ChunkPolicy`, so its bits hold.
 
+**Amendment, taken during the first implementation (see
+[04-onboarding-review.md](04-onboarding-review.md#confirmed-during-implementation-the-drafting-gap)).**
+Step 2 as written assumed a moved arm can draft through `Runtime<W>`. It cannot yet: the runtime's
+`step` is a plain row, nothing calls `run_round`, and `Runtime::verify` heads only the anchor and
+appends every draft. So the move is split:
+
+* The **drafting phase is pulled forward** into phase 1 before any drafting arm leaves its fusion.
+  `Drafter` gains its real methods (lifted from the shape GLM, Qwen and Inkling already share —
+  `open_round`, `take_drafts`, `resolve_verify`, `holds`), `HeadInput` gains the verify form,
+  heading stops at the first mismatch, `room` reserves the verify rows, `Limits` separates rows a
+  pass from members a batch, the cost model gets a home, and the golden check list gains
+  "drafted = plain" (including a rejected draft).
+* Until then, **`Runtime<W>` refuses a `Walk` whose `Drafter::PRESENT`**, and a released drafting
+  arm keeps its own fusion. Dense (no drafter) moves now; GLM, Qwen and Inkling move when the
+  runtime drafts. An arm that has already lost its fusion gets it back rather than serving slower.
+
+This keeps the phase's promise (a strategy cannot be left out) without changing a released model's
+tokens or speed, and follows the regression clause.
+
 Gate per stage: `conformance!` and `served-gate.py all` on the moved arm, bit-exact against the
 registry. Value: chunked prefill, lanes, group lanes, reuse and rewind can no longer be left out.
 Expected removal is a few thousand lines per arm *(estimate)*.
