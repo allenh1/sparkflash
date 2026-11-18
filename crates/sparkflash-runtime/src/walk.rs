@@ -34,6 +34,19 @@ use sparkflash_model::ledger::State;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::pool::LaneMemory;
+use crate::rounds::Opened;
+use crate::share::StepWall;
+
+/// A walk's round costs nothing: the default for an arm that does not draft.
+struct ZeroWall;
+
+impl StepWall for ZeroWall {
+    fn ms(&self, _seqs: usize, _rows: usize) -> f64 {
+        0.0
+    }
+}
+
+static ZERO_WALL: ZeroWall = ZeroWall;
 
 /// What a walk is for.
 ///
@@ -554,5 +567,66 @@ pub trait Walk: 'static {
     #[must_use]
     fn max_segments(&self) -> usize {
         self.limits().rows
+    }
+
+    /// Opens a sequence's speculative round on the token it was fed: the step its last verify
+    /// already holds, or the chance each leading run of the chain it drafts is accepted.
+    ///
+    /// The runtime calls this only for an arm that declares a drafter and takes verify passes
+    /// over many segments; the drafts it stashes with the sequence are then read by
+    /// [Walk::verify_round]. The default opens an empty chain, which is the right answer for a
+    /// walk that drafts nothing.
+    ///
+    /// # Errors
+    /// A backend failure or an exhausted context.
+    fn open_round(&self, seq: &mut Self::Seq, token: u32) -> Result<Opened, BackendError> {
+        let _ = (seq, token);
+        Ok(Opened::Round(Vec::new()))
+    }
+
+    /// Verifies the rounds [Walk::open_round] opened, one entry a member. The default walks each
+    /// member's anchor alone; an arm that drafts a chain overrides this to include the first
+    /// depth drafts it stashed.
+    ///
+    /// # Errors
+    /// A backend failure; every member of the walk fails with it.
+    fn verify_round(
+        &self,
+        round: &mut [(&mut Self::Seq, u32, usize)],
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        if round.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tokens: Vec<Vec<u32>> = round.iter().map(|(_, token, _)| vec![*token]).collect();
+        let mut segments: Vec<Segment<'_, Self::Seq>> = round
+            .iter_mut()
+            .zip(tokens.iter_mut())
+            .map(|((seq, _, _), rows)| Segment::new(&mut **seq, rows))
+            .collect();
+        let hidden = self.walk(&mut segments, Pass::token_rows())?;
+        let mut rows: Vec<HeadRow<'_, Self::Seq>> = round
+            .iter_mut()
+            .zip(tokens.iter())
+            .enumerate()
+            .map(|(row, ((seq, token, _), _))| HeadRow::token(&mut **seq, row, *token))
+            .collect();
+        self.head(&hidden, &mut rows)
+    }
+
+    /// What one shared round costs, for the row share. The default charges nothing, which gives
+    /// every drafted chain its budget.
+    fn round_wall(&self) -> &dyn StepWall {
+        &ZERO_WALL
+    }
+
+    /// The most drafts one shared round of seqs members may verify. The default is zero: a walk
+    /// that drafts states its own.
+    fn round_budget(&self, _seqs: usize) -> usize {
+        0
+    }
+
+    /// The least chance a draft must have to be given a row.
+    fn round_floor(&self) -> f64 {
+        0.0
     }
 }
