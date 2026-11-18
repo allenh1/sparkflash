@@ -605,6 +605,7 @@ mod tests {
         layout: StateLayout,
         limits: Limits,
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
+        sampling: Mutex<Option<Sampling>>,
     }
 
     impl ToyWalk {
@@ -616,6 +617,7 @@ mod tests {
                 }]),
                 limits: Limits::new(rows, context),
                 walks: Mutex::new(Vec::new()),
+                sampling: Mutex::new(None),
             }
         }
     }
@@ -639,7 +641,9 @@ mod tests {
             self.limits
         }
 
-        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+        fn set_sampling(&self, _seq: &mut Self::Seq, sampling: Sampling) {
+            *self.sampling.lock().expect("the toy sampler record") = Some(sampling);
+        }
 
         fn walk(
             &self,
@@ -759,6 +763,42 @@ mod tests {
             .expect("the cold prompt");
         assert_eq!(warm.seq().rows, cold.seq().rows);
         assert_eq!(warm.history(), cold.history());
+    }
+
+    #[test]
+    fn the_request_sampler_reaches_the_walk_on_a_fresh_and_a_renewed_slot() {
+        let runtime = runtime(256);
+        let sampling = Sampling {
+            temperature: 0.7,
+            repetition_penalty: 1.1,
+            seed: 9,
+            ..Sampling::default()
+        };
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime.set_sampling(&mut slot, sampling);
+        assert_eq!(
+            *runtime
+                .walk()
+                .sampling
+                .lock()
+                .expect("the toy sampler record"),
+            Some(sampling)
+        );
+        *runtime
+            .walk()
+            .sampling
+            .lock()
+            .expect("the toy sampler record") = None;
+        runtime.renew(&mut slot).expect("the renewal");
+        assert_eq!(
+            *runtime
+                .walk()
+                .sampling
+                .lock()
+                .expect("the toy sampler record"),
+            Some(sampling),
+            "a renewed slot keeps the request's sampler"
+        );
     }
 
     #[test]
