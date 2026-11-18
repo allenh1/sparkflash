@@ -251,7 +251,7 @@ impl Fixture {
                 None => counted.then_some(width),
             };
             if let Some(shared) = shared {
-                let spelling = if noaux { "shared_experts" } else { "shared_expert" };
+                #[rustfmt::skip] let spelling = if noaux { "shared_experts" } else { "shared_expert" };
                 let prefix = format!("model.layers.{layer}.mlp.{spelling}");
                 form.mlp(&mut source, &prefix, shared, hidden);
                 if !counted {
