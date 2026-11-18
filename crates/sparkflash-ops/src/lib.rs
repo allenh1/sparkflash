@@ -85,6 +85,7 @@
 //!     assert_eq!(generic.geometry.hidden, 2560);
 
 pub mod attention;
+pub mod calls;
 pub mod codec;
 pub mod collective;
 pub mod dflash;

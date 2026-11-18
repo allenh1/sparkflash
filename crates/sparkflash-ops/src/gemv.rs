@@ -188,6 +188,21 @@ pub trait GemvDevice {
         args: &[u64],
     ) -> Result<(), BackendError>;
 
+    /// Launch a typed call ([crate::calls::Call]) on the arm's stream.
+    ///
+    /// # Errors
+    /// When the device refuses the launch.
+    fn call<const N: usize>(
+        &self,
+        kernel: Kernel,
+        call: crate::calls::Call<N>,
+    ) -> Result<(), BackendError>
+    where
+        Self: Sized,
+    {
+        self.launch(kernel, call.grid, call.block, &call.args)
+    }
+
     /// output = matrix input for rows rows of matrix.columns values.
     ///
     /// # Errors

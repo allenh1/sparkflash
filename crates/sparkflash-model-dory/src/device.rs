@@ -2037,19 +2037,18 @@ fn embed_rows(
     }
     let hidden = config.hidden_size;
     for (offset, token) in tokens.iter().enumerate() {
+        let call = sparkflash_ops::calls::embed(
+            embed.pointer.0,
+            scratch.hidden.offset(offset * hidden * 4).0,
+            *token,
+            (hidden, hidden),
+        );
         launch(
             cuda,
             shared.kernels.embed,
-            (hidden.div_ceil(256) as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                embed.pointer.0,
-                scratch.hidden.offset(offset * hidden * 4).0,
-                *token as u64,
-                hidden as u64,
-                hidden as u64,
-                0,
-            ],
+            call.grid,
+            call.block,
+            &call.args,
         )?;
     }
     Ok(())

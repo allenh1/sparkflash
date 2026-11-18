@@ -54,6 +54,7 @@ use sparkflash_weights::safetensors::{
     CheckpointIndex, MAX_HEADER_BYTES, SafeTensorsHeader, SafeTensorsSource,
 };
 
+use crate::calls::{self, RmsNorm, Rope};
 use crate::gemv::{
     GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3, tiled_gemv_e4m3_splits, tiled_operands,
 };
@@ -1318,17 +1319,8 @@ impl GpuDflash2 {
         )?;
         self.gemv_e4m3(device, &layer.up_proj, scratch.convolved, scratch.up, block)?;
         let width = block * config.intermediate_size;
-        device.launch(
-            self.kernels.swiglu,
-            (width.div_ceil(256) as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                scratch.gate.0,
-                scratch.up.0,
-                scratch.activated.0,
-                width as u64,
-            ],
-        )?;
+        let call = calls::swiglu(scratch.gate.0, scratch.up.0, scratch.activated.0, width);
+        device.call(self.kernels.swiglu, call)?;
         self.gemv_e4m3(
             device,
             &layer.down_proj,
@@ -1410,22 +1402,17 @@ impl GpuDflash2 {
         groups: usize,
         group: usize,
     ) -> Result<(), BackendError> {
-        let eps = self.config.rms_norm_eps as f32;
-        device.launch(
-            self.kernels.rmsnorm,
-            (groups as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                input.0,
-                weight.0,
-                output.0,
-                group as u64,
-                group as u64,
-                u64::from(eps.to_bits()),
-                0,
-                1,
-            ],
+        // Every group takes the same gains: a per-head norm, or one row a group.
+        let call = RmsNorm::new(
+            input.0,
+            weight.0,
+            output.0,
+            group,
+            self.config.rms_norm_eps as f32,
         )
+        .groups(group, true)
+        .call(groups);
+        device.call(self.kernels.rmsnorm, call)
     }
 
     /// The drafter's full-width NeoX rotary over `tokens` rows of `heads` heads, `row_stride`
@@ -1439,20 +1426,18 @@ impl GpuDflash2 {
         tokens: usize,
     ) -> Result<(), BackendError> {
         let config = &self.config;
-        device.launch(
-            self.kernels.rope,
-            (heads as u32, tokens as u32, 1),
-            (128, 1, 1),
-            &[
-                rows.0,
-                config.head_dim as u64,
-                config.head_dim as u64,
-                position as u64,
-                u64::from((config.rope_theta as f32).to_bits()),
-                row_stride as u64,
-                tokens as u64,
-            ],
-        )
+        let call = Rope {
+            rows: rows.0,
+            heads,
+            head_dim: config.head_dim,
+            rotary: config.head_dim,
+            position,
+            theta: config.rope_theta as f32,
+            row_stride,
+            tokens,
+        }
+        .call();
+        device.call(self.kernels.rope, call)
     }
 }
 

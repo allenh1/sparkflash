@@ -53,6 +53,7 @@ use sparkflash_model::vision::{ImageSpan, VisionImage};
 use sparkflash_model::{
     Capabilities, DepthPolicy, ModelDescriptor, Speculator, StepCost, TpPlan, lookup_draft,
 };
+use sparkflash_ops::calls::{self, Call, RmsNorm};
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
 use sparkflash_runtime::{
@@ -1242,6 +1243,11 @@ impl Shared {
         self.config.sconv_kernel_size
     }
 
+    /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
+    fn call<const N: usize>(&self, entry: Entry, call: Call<N>) -> Result<(), String> {
+        self.launch(entry, call.grid, call.block, &call.args)
+    }
+
     fn launch(
         &self,
         entry: Entry,
@@ -1402,21 +1408,14 @@ impl Shared {
         rows: usize,
         width: usize,
     ) -> Result<(), String> {
-        self.launch(
-            self.kernels.rmsnorm,
-            (rows as u32, 1, 1),
-            (TOKEN_BLOCK, 1, 1),
-            &[
-                input.0,
-                weight.0,
-                out.0,
-                width as u64,
-                width as u64,
-                bits(self.config.architecture.norm_epsilon as f32),
-                0,
-                0,
-            ],
-        )
+        let norm = RmsNorm::new(
+            input.0,
+            weight.0,
+            out.0,
+            width,
+            self.config.architecture.norm_epsilon as f32,
+        );
+        self.call(self.kernels.rmsnorm, norm.call(rows))
     }
 
     /// The block-attention residual over the summary stack plus the current stream.
@@ -1604,22 +1603,16 @@ impl Shared {
         src_stride: usize,
         dst_stride: usize,
     ) -> Result<(), String> {
-        self.launch(
+        let norm = RmsNorm::new(
+            input.0,
+            weight.0,
+            out.0,
+            width,
+            self.config.architecture.norm_epsilon as f32,
+        );
+        self.call(
             self.kernels.rmsnorm_rows,
-            (1, rows as u32, 1),
-            (TOKEN_BLOCK, 1, 1),
-            &[
-                input.0,
-                weight.0,
-                out.0,
-                width as u64,
-                width as u64,
-                bits(self.config.architecture.norm_epsilon as f32),
-                0,
-                0,
-                src_stride as u64,
-                dst_stride as u64,
-            ],
+            norm.rows_call(rows, src_stride, dst_stride),
         )
     }
 
@@ -6029,18 +6022,14 @@ impl InklingDeviceSession {
                     let local = (token as usize).checked_sub(first);
                     let weight = self.weight(step.weights[0]);
                     match local {
-                        Some(row) if row < rank_vocab => run(shared.launch(
+                        Some(row) if row < rank_vocab => run(shared.call(
                             shared.kernels.embed,
-                            (flat(hidden), 1, 1),
-                            (TOKEN_BLOCK, 1, 1),
-                            &[
+                            calls::embed(
                                 weight.0,
                                 self.state.scratch.x.0,
-                                row as u64,
-                                hidden as u64,
-                                hidden as u64,
-                                0,
-                            ],
+                                row as u32,
+                                (hidden, hidden),
+                            ),
                         ))?,
                         _ => run(shared
                             .cuda

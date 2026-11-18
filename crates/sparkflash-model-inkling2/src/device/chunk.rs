@@ -1116,21 +1116,17 @@ pub(super) fn walk_rows(
                     else {
                         continue;
                     };
-                    run(shared.launch(
+                    run(shared.call(
                         shared.kernels.embed,
-                        (flat(hidden), 1, 1),
-                        (TOKEN_BLOCK, 1, 1),
-                        &[
+                        sparkflash_ops::calls::embed(
                             table.0,
                             scratch
                                 .x
                                 .offset(row * hidden * std::mem::size_of::<f32>())
                                 .0,
-                            local as u64,
-                            hidden as u64,
-                            hidden as u64,
-                            0,
-                        ],
+                            local as u32,
+                            (hidden, hidden),
+                        ),
                     ))?;
                 }
             }

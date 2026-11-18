@@ -345,20 +345,15 @@ impl DeviceSequence {
         if super::prof::enabled() {
             super::prof::begin();
         }
-        let embed_blocks = width.div_ceil(256).max(1) as u32;
         for (row, &token) in tokens.iter().enumerate() {
-            self.launch(
+            self.call(
                 kernels.embed,
-                (embed_blocks, 1, 1),
-                (256, 1, 1),
-                &[
+                sparkflash_ops::calls::embed(
                     weights.embed.pointer.0,
                     self.hyper.offset(row * width * 4).0,
-                    u64::from(token),
-                    config.hidden_size as u64,
-                    width as u64,
-                    0,
-                ],
+                    token,
+                    (config.hidden_size, width),
+                ),
             )?;
         }
         self.probe_finite(0, "embed", self.hyper, total * width)?;
@@ -515,18 +510,13 @@ impl DeviceSequence {
     ) -> Result<(), BackendError> {
         let kernels = &*self.backend.kernels;
         let elems = rows * self.backend.config.linear_num_value_heads;
-        let blocks = elems.div_ceil(256).max(1) as u32;
-        self.launch(
+        self.call(
             kernels.copy_flat,
-            (blocks, 1, 1),
-            (256, 1, 1),
-            &[b_out.0, self.linear_b.0, elems as u64],
+            sparkflash_ops::calls::copy(b_out.0, self.linear_b.0, elems),
         )?;
-        self.launch(
+        self.call(
             kernels.copy_flat,
-            (blocks, 1, 1),
-            (256, 1, 1),
-            &[a_out.0, self.linear_a.0, elems as u64],
+            sparkflash_ops::calls::copy(a_out.0, self.linear_a.0, elems),
         )?;
         Ok(())
     }

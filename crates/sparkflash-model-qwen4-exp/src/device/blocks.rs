@@ -31,6 +31,7 @@
 use sparkflash_kernels::cuda_driver::Deviceptr;
 use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
+use sparkflash_ops::calls::{self, Rope};
 use sparkflash_ops::indexer::IndexerPass;
 use sparkflash_ops::moe::{MoePlanCall, combine_grid};
 
@@ -171,58 +172,53 @@ impl DeviceSequence {
         let idx_q_width = config.indexer_n_heads * config.indexer_head_dim;
         let ratio = config.indexer_compress_ratio.max(1);
         let score_stride = self.score_stride;
-        self.launch(
+        self.call(
             kernels.rope,
-            (config.num_attention_heads as u32, batch as u32, 1),
-            (128, 1, 1),
-            &[
-                self.query.0,
-                config.head_dim as u64,
-                config.rotary_dim() as u64,
-                position as u64,
-                (config.rope_theta as f32).to_bits() as u64,
-                attn_width as u64,
-                batch as u64,
-            ],
+            Rope {
+                rows: self.query.0,
+                heads: config.num_attention_heads,
+                head_dim: config.head_dim,
+                rotary: config.rotary_dim(),
+                position,
+                theta: config.rope_theta as f32,
+                row_stride: attn_width,
+                tokens: batch,
+            }
+            .call(),
         )?;
-        self.launch(
+        self.call(
             kernels.rope,
-            (config.num_key_value_heads as u32, batch as u32, 1),
-            (128, 1, 1),
-            &[
-                self.kv_row.0,
-                config.head_dim as u64,
-                config.rotary_dim() as u64,
-                position as u64,
-                (config.rope_theta as f32).to_bits() as u64,
-                kv_width as u64,
-                batch as u64,
-            ],
+            Rope {
+                rows: self.kv_row.0,
+                heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                rotary: config.rotary_dim(),
+                position,
+                theta: config.rope_theta as f32,
+                row_stride: kv_width,
+                tokens: batch,
+            }
+            .call(),
         )?;
         // The chunk's keys and values land in the cache as one contiguous run, so the append
         // narrows batch * kv_width f32 projections to BF16 in one pass rather than one copy per
         // token. The cache holds the model dtype, not the kernels' working f32.
         let kv_elems = batch * kv_width;
-        let kv_blocks = kv_elems.div_ceil(256).max(1) as u32;
-        self.launch(
+        self.call(
             kernels.cache_bf16,
-            (kv_blocks, 1, 1),
-            (256, 1, 1),
-            &[
+            calls::cache_bf16(
                 keys.offset(position * kv_width * 2).0,
                 self.kv_row.0,
-                kv_elems as u64,
-            ],
+                kv_elems,
+            ),
         )?;
-        self.launch(
+        self.call(
             kernels.cache_bf16,
-            (kv_blocks, 1, 1),
-            (256, 1, 1),
-            &[
+            calls::cache_bf16(
                 values.offset(position * kv_width * 2).0,
                 self.value_row.0,
-                kv_elems as u64,
-            ],
+                kv_elems,
+            ),
         )?;
         if config.full_attention() {
             self.probe_finite(slot, "sparse_query", self.query, batch * attn_width)?;
@@ -253,35 +249,31 @@ impl DeviceSequence {
                 idx_q_width as u64,
             ],
         )?;
-        self.launch(
+        self.call(
             kernels.rope,
-            (config.indexer_n_heads as u32, batch as u32, 1),
-            (128, 1, 1),
-            &[
-                self.index_query.0,
-                config.indexer_head_dim as u64,
-                config.rotary_dim().min(config.indexer_head_dim) as u64,
-                position as u64,
-                (config.rope_theta as f32).to_bits() as u64,
-                idx_q_width as u64,
-                batch as u64,
-            ],
+            Rope {
+                rows: self.index_query.0,
+                heads: config.indexer_n_heads,
+                head_dim: config.indexer_head_dim,
+                rotary: config.rotary_dim().min(config.indexer_head_dim),
+                position,
+                theta: config.rope_theta as f32,
+                row_stride: idx_q_width,
+                tokens: batch,
+            }
+            .call(),
         )?;
-        self.launch(
+        self.call(
             kernels.cache_rows_bf16,
-            (
-                config.indexer_head_dim.div_ceil(256).max(1) as u32,
-                batch as u32,
-                1,
+            calls::cache_rows_bf16(
+                (
+                    index_keys.offset(position * config.indexer_head_dim * 2).0,
+                    config.indexer_head_dim,
+                ),
+                (self.index_row.offset(idx_q_width * 4).0, idx_row_width),
+                config.indexer_head_dim,
+                batch,
             ),
-            (256, 1, 1),
-            &[
-                index_keys.offset(position * config.indexer_head_dim * 2).0,
-                self.index_row.offset(idx_q_width * 4).0,
-                config.indexer_head_dim as u64,
-                config.indexer_head_dim as u64,
-                idx_row_width as u64,
-            ],
         )?;
         self.probe_finite(slot, "sparse_query", self.query, batch * attn_width)?;
         self.probe_finite(slot, "sparse_keys", self.kv_row, batch * kv_width)?;
@@ -957,16 +949,14 @@ impl DeviceSequence {
             // The same argument as the hyper passes: one weight pass per chunk instead of one per
             // group of eight tokens. A decode step on the chunk path comes here too, so its row
             // gets a chunk row's bits.
-            self.launch(
+            self.call(
                 kernels.swiglu,
-                ((batch * intermediate).div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
-                &[
+                calls::swiglu(
                     self.shared_hidden.0,
                     self.shared_up.0,
                     self.shared_up.0,
-                    (batch * intermediate) as u64,
-                ],
+                    batch * intermediate,
+                ),
             )?;
         } else {
             // Same register-accumulator bound as the hyper passes: one launch per group of

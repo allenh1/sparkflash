@@ -99,6 +99,7 @@ use sparkflash_kernels::images;
 use sparkflash_kernels::lane_memory::{self, BackError, LanePlans, Layout, SequenceLanes};
 use sparkflash_model::{BackendError, Part, StepCost};
 use sparkflash_ops::OpPlan;
+use sparkflash_ops::calls::{self, Call, RmsNorm};
 use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 use sparkflash_ops::gdn::{CONV_HISTORY, GDN_KEY, GDN_QK_ROW, GDN_VALUE};
 use sparkflash_ops::gemv::{
@@ -3237,6 +3238,11 @@ impl DeviceRank {
             })
     }
 
+    /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
+    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
+        self.launch(kernel, call.grid, call.block.0, &call.args)
+    }
+
     fn launch(
         &self,
         kernel: Kernel,
@@ -4315,7 +4321,7 @@ impl DeviceRank {
     ) -> Result<(), BackendError> {
         let s = &self.scratch;
         let config = &self.config;
-        let eps = float(config.rms_norm_eps as f32);
+        let eps = config.rms_norm_eps as f32;
         let (q_lora, kv_lora) = (config.q_lora_rank, config.kv_lora_rank);
         let floats = |count: usize| count * 4;
         self.gemv(&dsa.fused, s.collapsed, s.dsa_fused, rows)?;
@@ -4324,20 +4330,9 @@ impl DeviceRank {
             (s.dsa_fused, dsa.q_a_norm, q_lora),
             (latent, dsa.kv_a_norm, kv_lora),
         ] {
-            self.launch(
+            self.call(
                 self.kernels.rmsnorm,
-                (rows as u32, 1, 1),
-                BLOCK,
-                &[
-                    part.0,
-                    norm.0,
-                    part.0,
-                    width as u64,
-                    width as u64,
-                    eps,
-                    0,
-                    0,
-                ],
+                RmsNorm::new(part.0, norm.0, part.0, width, eps).call(rows),
             )?;
         }
         // The latent, not its expansion: attention reads it in latent space, and kv_b's rows are
@@ -5748,20 +5743,16 @@ impl DeviceRank {
             ],
         )?;
         let normed = row(s.head_normed, hidden);
-        self.launch(
+        self.call(
             self.kernels.rmsnorm,
-            (count as u32, 1, 1),
-            BLOCK,
-            &[
+            RmsNorm::new(
                 row(s.head, hidden).0,
                 self.norm.0,
                 normed.0,
-                hidden as u64,
-                hidden as u64,
-                float(config.rms_norm_eps as f32),
-                0,
-                0,
-            ],
+                hidden,
+                config.rms_norm_eps as f32,
+            )
+            .call(count),
         )?;
         // The LM head and the MTP layer's caches read every row's normed hidden.
         if let Some(share) = share {
@@ -5977,18 +5968,15 @@ impl DeviceRank {
             .map_err(cuda_error)?;
         slab.write_at(0, bytemuck::cast_slice(tokens))
             .map_err(cuda_error)?;
-        self.launch(
+        self.call(
             self.kernels.embed,
-            (blocks(copies * hidden), tokens.len() as u32, 1),
-            BLOCK,
-            &[
+            calls::embed_rows(
                 self.embed.0,
                 out.0,
-                0,
-                hidden as u64,
-                (copies * hidden) as u64,
                 slab.device().0,
-            ],
+                (hidden, copies * hidden),
+                tokens.len(),
+            ),
         )?;
         self.cuda
             .record_event_on(&self.stream, &self.tokens_staged.0)
@@ -6001,18 +5989,15 @@ impl DeviceRank {
         let s = &self.scratch;
         let hidden = self.config.hidden_size;
         let tokens = s.drafted.device().offset(iteration * MAX_ROWS * 4);
-        self.launch(
+        self.call(
             self.kernels.embed,
-            (blocks(hidden), rows as u32, 1),
-            BLOCK,
-            &[
+            calls::embed_rows(
                 self.embed.0,
                 s.mtp_embed.0,
-                0,
-                hidden as u64,
-                hidden as u64,
                 tokens.0,
-            ],
+                (hidden, hidden),
+                rows,
+            ),
         )
     }
 
@@ -6026,22 +6011,16 @@ impl DeviceRank {
         rows: usize,
     ) -> Result<(), BackendError> {
         let hidden = self.config.hidden_size;
-        self.launch(
+        let norm = RmsNorm::new(
+            x.0,
+            weight.0,
+            out.0,
+            hidden,
+            self.config.rms_norm_eps as f32,
+        );
+        self.call(
             self.kernels.rmsnorm_rows,
-            (1, rows as u32, 1),
-            BLOCK,
-            &[
-                x.0,
-                weight.0,
-                out.0,
-                hidden as u64,
-                hidden as u64,
-                float(self.config.rms_norm_eps as f32),
-                0,
-                0,
-                src_stride as u64,
-                dst_stride as u64,
-            ],
+            norm.rows_call(rows, src_stride, dst_stride),
         )
     }
 

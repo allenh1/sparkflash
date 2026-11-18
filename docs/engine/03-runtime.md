@@ -166,9 +166,10 @@ bits and stays each arm's until a gate says otherwise.
 17. The routed experts' shared geometry: the grouped-MMA tile and item count (Qwen's and
     Inkling's are the same constants), the `moe_plan` launch (GLM, Qwen, Inkling) and the
     combine grid (GLM, Qwen) come from `sparkflash_ops`. Which body runs stays the arm's.
-18. Typed token-kernel calls: the epilogue plans (`NormPlan`, `RopePlan`, `ActivationPlan`), the
-    embed, residual add and KV append get `call`s with the argument layouts Qwen and the block
-    drafter (`dflash`) spell today, and both launch through them.
+18. Typed token-kernel calls: the bodies the epilogue plans (`NormPlan`, `RopePlan`,
+    `ActivationPlan`) resolve to, the embed, residual add and KV append get `call`s with the
+    argument layouts Qwen and the block drafter (`dflash`) spell today, and both launch through
+    them.
 19. A shared device arm for new families: dense BF16 grouped-query attention, one rank, on the
     shared plan, uploader and calls, served through `EngineBuilder` when the resolver finds every
     kernel, with the per-layer parity report against the host reference as its gate.
@@ -199,6 +200,7 @@ Left after these: GDN and routed experts on the shared arm, its TP above one, th
 | 15. generic tensor naming | done: `sparkflash_ops::naming` holds the HF-canonical spelling (`TensorNames`, `NamingDialect`) and probes which of its choices a checkpoint makes (the layer root, the post-attention norm, per-head norms, the router, a gated shared expert, a tied head); `ArchitectureTensorPlan` plans any family `Architecture` describes from it (`named`, or `served` in the canonical dialect), and refuses a family it does not spell (MLA, residual mixers). The host reference (`cli/src/dynamic.rs`, now a thin resolve) and the dynamic converter read the one plan; no device code changed |
 | 16. the indexer's launch | done: `sparkflash_ops::indexer::IndexerPass` gives the pool, score, pick and GLM's run-score grids from one pass of rows; Qwen's and GLM's walks and `SparseIndexerLauncher` launch from it, with one `MAX_SELECTED_TOKENS` and `MAX_BUDGET_BLOCKS`. A unit test pins every grid to the arms' old rules; the arguments and bodies are unchanged |
 | 17. routed experts' shared geometry | done: `sparkflash_ops::moe` holds the shared plan's call (`MoePlanCall`: the item plan, the token path's run plan, zeroed rows), the grouped W4A16 tile (`grouped`: item rows, stage, columns, `items`, `fits`, `rows_fit`, `grids`) and the combine grid. Qwen's prefill and token path, Inkling's three plan sites and GLM's bulk plan and combine launch from it; GLM keeps its own 128-row items. A unit test pins the argument lists and grids to the arms' old ones; the one argument that moved is the stride beside a null zero-row pointer, which the kernel does not read |
+| 18. typed token-kernel calls | done: `sparkflash_ops::calls` builds one launch (`Call`: grid, block, arguments in the kernel's order) for the token image's shared bodies: `RmsNorm` (`q4e_rmsnorm`, and `q4e_rmsnorm_rows` with strides), `Rope`, `add`, `swiglu`, `copy`, `embed`/`embed_rows` and the BF16 cache appends. The block drafter launches through it (`GemvDevice::call`), as do Qwen's norm, rotary, cache appends, residual adds, SwiGLU, copies and embeddings, and GLM's, Inkling's and Dory's norms and embeddings. A unit test pins the lists to the arms' old ones; every argument and grid is the same (an elementwise grid that moved is the same size, and those bodies walk a grid stride) |
 
 ### Step 1: what it measured
 

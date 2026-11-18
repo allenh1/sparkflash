@@ -97,6 +97,7 @@ pub use prefill::{
 };
 use prefill::{PrefillKernels, PrefillScratch, Projection};
 use sparkflash_ops::attention::{GQA_GROUP_KERNELS, gqa_group_shared_bytes};
+use sparkflash_ops::calls::{self, Call, RmsNorm};
 pub use sparkflash_ops::dflash::{DraftDevice, DraftScratch, GpuDflash2};
 pub use sparkflash_ops::gemv::gemv_e4m3;
 use sparkflash_ops::gemv::gemv_e4m3_tile;
@@ -2956,22 +2957,23 @@ impl Qwen4ExpDeviceBackend {
             .cuda
             .copy_htod(&device_weight, &weight_bytes)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let norm = RmsNorm::new(
+            device_input.0,
+            device_weight.0,
+            device_output.0,
+            width,
+            1e-6,
+        )
+        .zero_centred(true)
+        .groups(width, true)
+        .call(1);
         self.shared
             .cuda
             .launch(
                 self.shared.kernels.rmsnorm,
-                (1, 1, 1),
-                (256, 1, 1),
-                &[
-                    device_input.0,
-                    device_weight.0,
-                    device_output.0,
-                    width as u64,
-                    width as u64,
-                    (1e-6f32).to_bits() as u64,
-                    1,
-                    1,
-                ],
+                norm.grid,
+                norm.block,
+                &norm.args,
             )
             .map_err(|error| BackendError::new("qwen4_device", error))?;
         let mut bytes = vec![0u8; width * 4];
@@ -3601,6 +3603,11 @@ impl Drop for SequenceShared {
 }
 
 impl DeviceSequence {
+    /// Launch a typed call of the shared token kernels ([sparkflash_ops::calls]).
+    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
+        self.launch(kernel, call.grid, call.block, &call.args)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &self,
@@ -4160,21 +4167,16 @@ impl DeviceSequence {
         weight_per_group: bool,
         batch: usize,
     ) -> Result<(), BackendError> {
-        self.launch(
-            self.backend.kernels.rmsnorm,
-            (((batch * width) / group) as u32, 1, 1),
-            (256, 1, 1),
-            &[
-                input.0,
-                weight.0,
-                output.0,
-                width as u64,
-                group as u64,
-                (self.backend.config.rms_norm_eps as f32).to_bits() as u64,
-                u64::from(zero_centred),
-                u64::from(weight_per_group),
-            ],
+        let norm = RmsNorm::new(
+            input.0,
+            weight.0,
+            output.0,
+            width,
+            self.backend.config.rms_norm_eps as f32,
         )
+        .zero_centred(zero_centred)
+        .groups(group, weight_per_group);
+        self.call(self.backend.kernels.rmsnorm, norm.call(batch))
     }
 
     fn hyper(
@@ -4424,15 +4426,9 @@ impl DeviceSequence {
             } else {
                 self.hyper.offset((row - 1) * width * 4)
             };
-            self.launch(
+            self.call(
                 self.backend.kernels.copy_flat,
-                (width.div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
-                &[
-                    self.mtp_rows.offset(row * width * 4).0,
-                    source.0,
-                    width as u64,
-                ],
+                calls::copy(self.mtp_rows.offset(row * width * 4).0, source.0, width),
             )?;
         }
         Ok(())
@@ -4441,26 +4437,22 @@ impl DeviceSequence {
     /// Carry the drafted layer's own widened row into the MTP's stash, for the chained proposal.
     fn stash_mtp_hyper(&self) -> Result<(), BackendError> {
         let width = self.backend.config.hyper_width();
-        self.launch(
+        self.call(
             self.backend.kernels.copy_flat,
-            (width.div_ceil(256).max(1) as u32, 1, 1),
-            (256, 1, 1),
-            &[self.mtp_stash.0, self.mtp_hyper.0, width as u64],
+            calls::copy(self.mtp_stash.0, self.mtp_hyper.0, width),
         )
     }
 
     /// Carry this forward's last widened row into the MTP's stash for the next batch.
     fn stash_last_hyper(&self, count: usize) -> Result<(), BackendError> {
         let width = self.backend.config.hyper_width();
-        self.launch(
+        self.call(
             self.backend.kernels.copy_flat,
-            (width.div_ceil(256).max(1) as u32, 1, 1),
-            (256, 1, 1),
-            &[
+            calls::copy(
                 self.mtp_stash.0,
                 self.hyper.offset((count - 1) * width * 4).0,
-                width as u64,
-            ],
+                width,
+            ),
         )
     }
 
@@ -4515,18 +4507,14 @@ impl DeviceSequence {
             ],
         )?;
         for (t, &token) in tokens.iter().enumerate() {
-            self.launch(
+            self.call(
                 kernels.embed,
-                (flat(hidden), 1, 1),
-                (256, 1, 1),
-                &[
+                calls::embed(
                     weights.embed.pointer.0,
                     self.mtp_embed.offset(t * hidden * 4).0,
-                    u64::from(token),
-                    hidden as u64,
-                    hidden as u64,
-                    0,
-                ],
+                    token,
+                    (hidden, hidden),
+                ),
             )?;
         }
         self.norm(
@@ -4541,11 +4529,9 @@ impl DeviceSequence {
         )?;
         self.gemv(&mtp.fc_embedding, self.mtp_embed, self.mixed, batch)?;
         self.gemv(&mtp.fc_hidden, self.mtp_folded, self.mtp_embed, batch)?;
-        self.launch(
+        self.call(
             kernels.add,
-            (flat(batch * hidden), 1, 1),
-            (256, 1, 1),
-            &[self.mixed.0, self.mtp_embed.0, (batch * hidden) as u64],
+            calls::add(self.mixed.0, self.mtp_embed.0, batch * hidden),
         )?;
         self.launch(
             kernels.widen_streams,
@@ -4742,22 +4728,13 @@ impl DeviceSequence {
             ],
         )?;
         self.probe_finite(index, "ple_conv_out", self.ple_conv_out, batch * width)?;
-        let add_blocks = (batch * width).div_ceil(256).max(1) as u32;
-        self.launch(
+        self.call(
             kernels.add,
-            (add_blocks, 1, 1),
-            (256, 1, 1),
-            &[
-                self.ple_gated.0,
-                self.ple_conv_out.0,
-                (batch * width) as u64,
-            ],
+            calls::add(self.ple_gated.0, self.ple_conv_out.0, batch * width),
         )?;
-        self.launch(
+        self.call(
             kernels.add,
-            (add_blocks, 1, 1),
-            (256, 1, 1),
-            &[self.hyper.0, self.ple_gated.0, (batch * width) as u64],
+            calls::add(self.hyper.0, self.ple_gated.0, batch * width),
         )?;
         self.probe_finite(index, "after_ple", self.hyper, batch * width)?;
         self.prof_mark("ple")?;
@@ -4885,18 +4862,15 @@ impl DeviceSequence {
         self.token_staging
             .write_at(0, bytemuck::cast_slice::<u32, u8>(tokens))
             .map_err(|error| BackendError::new("qwen4_device", error))?;
-        self.launch(
+        self.call(
             kernels.embed,
-            (width.div_ceil(256).max(1) as u32, batch as u32, 1),
-            (256, 1, 1),
-            &[
+            calls::embed_rows(
                 weights.embed.pointer.0,
                 self.hyper.0,
-                0,
-                config.hidden_size as u64,
-                width as u64,
                 self.token_staging.device().0,
-            ],
+                (config.hidden_size, width),
+                batch,
+            ),
         )?;
         cuda.record_event_on(self.clock(), &self.tokens_staged.0)
             .map_err(|error| BackendError::new("qwen4_device", error))?;
@@ -5170,11 +5144,9 @@ impl DeviceSequence {
         let mut at = 0usize;
         for conv in self.gdn_conv.iter().flatten() {
             let snapshot = region.offset(at * 4);
-            self.launch(
+            self.call(
                 kernels.copy_flat,
-                (conv_elems.div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
-                &[conv.0, snapshot.0, conv_elems as u64],
+                calls::copy(conv.0, snapshot.0, conv_elems),
             )?;
             at += conv_elems;
         }
@@ -5187,11 +5159,9 @@ impl DeviceSequence {
                 continue;
             };
             let snapshot = region.offset(at * 4);
-            self.launch(
+            self.call(
                 kernels.copy_flat,
-                (ple_elems.div_ceil(256).max(1) as u32, 1, 1),
-                (256, 1, 1),
-                &[state.0, snapshot.0, ple_elems as u64],
+                calls::copy(state.0, snapshot.0, ple_elems),
             )?;
             at += ple_elems;
         }
@@ -6504,22 +6474,18 @@ pub fn device_self_test() -> Result<(), BackendError> {
         .map_err(|error| BackendError::new("qwen4_device", error))?;
     cuda.copy_htod(&device_weight, &weight_bytes)
         .map_err(|error| BackendError::new("qwen4_device", error))?;
-    cuda.launch(
-        kernels.rmsnorm,
-        (1, 1, 1),
-        (256, 1, 1),
-        &[
-            device_input.0,
-            device_weight.0,
-            device_output.0,
-            width as u64,
-            width as u64,
-            (1e-6f32).to_bits() as u64,
-            1,
-            1,
-        ],
+    let norm = RmsNorm::new(
+        device_input.0,
+        device_weight.0,
+        device_output.0,
+        width,
+        1e-6,
     )
-    .map_err(|error| BackendError::new("qwen4_device", error))?;
+    .zero_centred(true)
+    .groups(width, true)
+    .call(1);
+    cuda.launch(kernels.rmsnorm, norm.grid, norm.block, &norm.args)
+        .map_err(|error| BackendError::new("qwen4_device", error))?;
     let mut bytes = vec![0u8; width * 4];
     cuda.copy_dtoh(&mut bytes, &device_output)
         .map_err(|error| BackendError::new("qwen4_device", error))?;
