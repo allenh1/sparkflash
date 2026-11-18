@@ -124,11 +124,13 @@ __device__ __forceinline__ void shared_moe_router_body(
             __syncthreads();
         }
         if (thread == 0) {
+            // Qwen's q4e_router renormalises at a scale of one, so its weights are the plain
+            // quotient: dividing by one and multiplying by one are exact.
             float normaliser = 0.0f;
             for (int slot = 0; slot < topk; ++slot) normaliser += chosen[slot];
-            if (normaliser <= 0.0f) normaliser = 1.0f;
+            if (normaliser <= 0.0f || !renormalise) normaliser = 1.0f;
             for (int slot = 0; slot < topk; ++slot) {
-                const float route = chosen[slot] / normaliser;
+                const float route = __fmul_rn(chosen[slot] / normaliser, scaling);
                 if constexpr (kWriteProbabilities) {
                     probs_b[slot] = route;
                 } else {

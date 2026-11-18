@@ -271,10 +271,13 @@ impl Image {
             ],
             Self::Qwen4Moe => &[
                 "q4e_expert_down",
+                "q4e_expert_down_bf16",
                 "q4e_expert_down_fp8",
                 "q4e_expert_gate_up",
+                "q4e_expert_gate_up_bf16",
                 "q4e_expert_gate_up_fp8",
                 "q4e_moe_combine",
+                "q4e_route",
                 "q4e_router",
             ],
             Self::Qwen4Prefill => &[

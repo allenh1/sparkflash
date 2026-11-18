@@ -22,6 +22,10 @@
 //! row GEMV a group at a time). The arm keeps its key/value cache in BF16 where the reference
 //! keeps f32, so the bound is a tolerance, and the next token must agree at every step.
 //!
+//! Three routed checkpoints follow: a softmax router with a sigmoid-gated shared expert, a
+//! sigmoid router after a dense first layer (picks kept as scored and scaled, an ungated shared
+//! expert), and a sqrt-softplus router with no shared expert.
+//!
 //! The arm's serving contract is checked here too, on the same fixtures: fused lanes answer every
 //! step's logits to the bit as each conversation alone, and a kept lane continues its
 //! conversation or goes back to the end of its prompt.
@@ -159,17 +163,61 @@ impl Fixture {
                 source.push(&at("self_attn.q_norm"), &[head_dim], 1.0, 0.2);
                 source.push(&at("self_attn.k_norm"), &[head_dim], 1.0, 0.2);
             }
-            source.push(&at("mlp.gate_proj"), &[intermediate, hidden], 0.0, weight);
-            source.push(&at("mlp.up_proj"), &[intermediate, hidden], 0.0, weight);
-            source.push(
-                &at("mlp.down_proj"),
-                &[hidden, intermediate],
-                0.0,
-                (intermediate as f32).sqrt().recip(),
-            );
+            let first_dense = self.config["first_k_dense_replace"].as_u64().unwrap_or(0) as usize;
+            if self.config.get("num_experts").is_none() || layer < first_dense {
+                mlp(
+                    &mut source,
+                    &format!("model.layers.{layer}.mlp"),
+                    intermediate,
+                    hidden,
+                );
+                continue;
+            }
+            let experts = self.value("num_experts");
+            let width = self.value("moe_intermediate_size");
+            source.push(&at("mlp.gate"), &[experts, hidden], 0.0, weight);
+            for expert in 0..experts {
+                let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
+                mlp(&mut source, &prefix, width, hidden);
+            }
+            let counted = self.config.get("n_shared_experts").is_some();
+            let shared = match self.config["shared_expert_intermediate_size"].as_u64() {
+                Some(shared) => Some(shared as usize),
+                None => counted.then_some(width),
+            };
+            if let Some(shared) = shared {
+                let prefix = format!("model.layers.{layer}.mlp.shared_expert");
+                mlp(&mut source, &prefix, shared, hidden);
+                if !counted {
+                    source.push(&at("mlp.shared_expert_gate"), &[1, hidden], 0.0, weight);
+                }
+            }
         }
         source
     }
+}
+
+/// One SwiGLU MLP of `width` under `prefix`.
+fn mlp(source: &mut Memory, prefix: &str, width: usize, hidden: usize) {
+    let weight = (hidden as f32).sqrt().recip();
+    source.push(
+        &format!("{prefix}.gate_proj.weight"),
+        &[width, hidden],
+        0.0,
+        weight,
+    );
+    source.push(
+        &format!("{prefix}.up_proj.weight"),
+        &[width, hidden],
+        0.0,
+        weight,
+    );
+    source.push(
+        &format!("{prefix}.down_proj.weight"),
+        &[hidden, width],
+        0.0,
+        (width as f32).sqrt().recip(),
+    );
 }
 
 fn plain() -> Fixture {
@@ -217,6 +265,101 @@ fn gated() -> Fixture {
         }),
         gated: true,
         tied: true,
+    }
+}
+
+/// Qwen's routed form on a family no pack names: a softmax over eight experts, two renormalised
+/// picks, and a sigmoid-gated shared expert twice an expert's width.
+fn routed() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_moe",
+            "architectures": ["AcmeMoeForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 256,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "norm_topk_prob": true,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false
+        }),
+        gated: false,
+        tied: false,
+    }
+}
+
+/// The independent scores: a dense first layer, then a sigmoid over sixteen experts, four picks
+/// kept as scored and scaled, an expert width the staging pads (136), and one ungated shared
+/// expert of an expert's width; gated attention and a tied head.
+fn sigmoid_routed() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_moe_sigmoid",
+            "architectures": ["AcmeMoeSigmoidForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 384,
+            "moe_intermediate_size": 136,
+            "n_shared_experts": 1,
+            "num_experts": 16,
+            "num_experts_per_tok": 4,
+            "first_k_dense_replace": 1,
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": false,
+            "routed_scaling_factor": 2.5,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "silu",
+            "attn_output_gate": true,
+            "tie_word_embeddings": true
+        }),
+        gated: true,
+        tied: true,
+    }
+}
+
+/// A sqrt-softplus score over twelve experts, three renormalised picks, and no shared expert.
+fn softplus_routed() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_moe_softplus",
+            "architectures": ["AcmeMoeSoftplusForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "moe_intermediate_size": 64,
+            "num_experts": 12,
+            "num_experts_per_tok": 3,
+            "scoring_func": "sqrtsoftplus",
+            "norm_topk_prob": true,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false
+        }),
+        gated: false,
+        tied: false,
     }
 }
 
@@ -368,6 +511,26 @@ fn a_prompt_of_decode_rows_matches_the_host_reference_layer_by_layer() {
     assert_passed(parity(&gated(), 6, 2));
 }
 
+#[test]
+fn a_routed_checkpoint_with_a_gated_shared_expert_matches_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&routed(), 300, 3));
+}
+
+#[test]
+fn sigmoid_routed_experts_after_a_dense_layer_match_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&sigmoid_routed(), 40, 3));
+}
+
+#[test]
+fn sqrt_softplus_routed_experts_without_a_shared_expert_match_the_host_reference() {
+    assert_passed(parity(&softplus_routed(), 40, 3));
+}
+
+#[test]
+fn routed_decode_rows_match_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&routed(), 6, 2));
+}
+
 /// One conversation turn: each step's token and its logits' bits, the prompt's first.
 type Turn = Vec<(u32, Vec<u32>)>;
 
@@ -396,7 +559,18 @@ fn prompt_of(length: usize, salt: usize) -> Vec<u32> {
 
 #[test]
 fn fused_lanes_answer_every_step_as_each_conversation_alone() {
-    let Some((_, _, _, mut backend)) = open(&gated(), "fused lanes") else {
+    lanes_answer_as_alone(&gated());
+}
+
+#[test]
+fn fused_routed_lanes_answer_every_step_as_each_conversation_alone() {
+    // The expert passes group a run's rows two at a time, and a row's dot is its own at any
+    // grouping, so a lane's experts sum as they would alone.
+    lanes_answer_as_alone(&sigmoid_routed());
+}
+
+fn lanes_answer_as_alone(fixture: &Fixture) {
+    let Some((_, _, _, mut backend)) = open(fixture, "fused lanes") else {
         return;
     };
     backend.enable_fusion(4).expect("the fused engine starts");

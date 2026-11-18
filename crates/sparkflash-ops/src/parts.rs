@@ -1778,6 +1778,22 @@ pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
 pub const DENSE_ATTENTION_SYMBOLS: &[&str] =
     &["q4e_attn_full", "q4e_attn_full_combine", "q4e_cache_bf16"];
 
+/// The routed-expert kernels the shared dense arm launches for an MoE layer: the router, the
+/// token path's BF16 expert passes and the combine.
+pub const DENSE_MOE_SYMBOLS: &[&str] = &[
+    "q4e_expert_down_bf16",
+    "q4e_expert_gate_up_bf16",
+    "q4e_moe_combine",
+    "q4e_route",
+];
+
+/// The most experts the shared arm's router and plan hold (`Q4E_MAX_EXPERTS`,
+/// `MOE_PLAN_MAX_EXPERTS`).
+pub const DENSE_MAX_EXPERTS: usize = crate::moe::MAX_EXPERTS;
+
+/// The most experts a token of the shared arm activates (`Q4E_MAX_TOPK`).
+pub const DENSE_MAX_TOP_K: usize = 64;
+
 /// The image entry of the shared wide tile the dense arm's prompt projections launch
 /// ([crate::projection::WideTile]); the Dory image carries it.
 pub const DENSE_WIDE_SYMBOL: &str = "dory_mma_wide";
@@ -1794,6 +1810,8 @@ pub fn dense_device_images() -> Result<(), String> {
         (Image::Qwen4Exp, DENSE_TOKEN_SYMBOLS),
         (Image::Qwen4Attn, DENSE_ATTENTION_SYMBOLS),
         (Image::Dory, &[DENSE_WIDE_SYMBOL][..]),
+        (Image::Qwen4Moe, DENSE_MOE_SYMBOLS),
+        (Image::MoePlan, &["moe_plan"][..]),
     ] {
         if !image.available() {
             return Err(format!(
@@ -1819,8 +1837,10 @@ pub fn dense_device_images() -> Result<(), String> {
 ///
 /// The arm runs the host reference's arithmetic on the token image: a BF16 embedding, RMSNorm,
 /// grouped-query attention (with or without the per-head output gate and q/k norms, plain
-/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU, a plain residual and
-/// the head, on one rank. It is gated by a per-layer parity report against that reference, so it
+/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU or routed BF16 experts
+/// (a softmax, sigmoid or sqrt-softplus score, the top-k with or without renormalising, a routed
+/// scale, a shared expert with or without its sigmoid gate), a plain residual and the head, on
+/// one rank. It is gated by a per-layer parity report against that reference, so it
 /// takes nothing the reference does not execute, and nothing the reference does that its kernels
 /// do not (a linear rotary rule, another activation, a clamp). Everything else is refused by
 /// name, and the host reference stays that checkpoint's executor.
@@ -1918,12 +1938,79 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
                     }
                 ));
             }
-            Ffn::Moe(_) => {
-                return Some(format!(
-                    "layer {index} routes experts, and the arm runs dense MLPs"
-                ));
+            Ffn::Moe(moe) => {
+                if let Some(refusal) = dense_moe_refusal(architecture, moe) {
+                    return Some(format!("layer {index}'s routed experts: {refusal}"));
+                }
             }
         }
+    }
+    None
+}
+
+/// Why the shared dense arm's routed experts cannot execute `moe`, if they cannot.
+fn dense_moe_refusal(
+    architecture: &Architecture,
+    moe: &sparkflash_model::architecture::Moe,
+) -> Option<String> {
+    use sparkflash_model::architecture::{Activation, Score};
+    let quantization = &architecture.quantization;
+    if quantization.expert_format != WeightFormat::Bf16 {
+        return Some(format!(
+            "they are {}, and the arm reads BF16 experts",
+            quantization.expert_format.name()
+        ));
+    }
+    if moe.activation != Activation::Silu || moe.clamp.is_some() {
+        return Some(format!(
+            "their MLP is {:?}{}, and the arm runs an unclamped SwiGLU",
+            moe.activation,
+            if moe.clamp.is_some() { " clamped" } else { "" }
+        ));
+    }
+    if moe.selection_bias {
+        return Some(
+            "selection adds a learned correction bias, which the arm's router does not".to_owned(),
+        );
+    }
+    if moe.routed_experts == 0 || moe.routed_experts > DENSE_MAX_EXPERTS {
+        return Some(format!(
+            "{} experts is outside the router's 1..={DENSE_MAX_EXPERTS}",
+            moe.routed_experts
+        ));
+    }
+    if moe.active_experts == 0
+        || moe.active_experts > DENSE_MAX_TOP_K
+        || moe.active_experts > moe.routed_experts
+    {
+        return Some(format!(
+            "a token activates {} of {} experts, outside the router's 1..={DENSE_MAX_TOP_K}",
+            moe.active_experts, moe.routed_experts
+        ));
+    }
+    let hidden = architecture.hidden_size;
+    if !hidden.is_multiple_of(8) || moe.intermediate == 0 || !moe.intermediate.is_multiple_of(8) {
+        return Some(format!(
+            "the expert passes read BF16 rows eight columns at a time, and the hidden width \
+             {hidden} or the expert width {} is not a positive multiple of eight",
+            moe.intermediate
+        ));
+    }
+    if moe.norm_topk && moe.active_experts == 1 && moe.score != Score::Softmax {
+        return Some(
+            "one pick renormalised under an independent score: the router keeps its score (the \
+             top-k-above-one rule) where the host reference divides it to one"
+                .to_owned(),
+        );
+    }
+    if moe.shared_experts > 1 {
+        return Some(format!(
+            "{} shared experts; the arm adds one",
+            moe.shared_experts
+        ));
+    }
+    if moe.shared_experts == 0 && moe.shared_gated {
+        return Some("a shared-expert gate with no shared expert".to_owned());
     }
     None
 }
@@ -2693,6 +2780,91 @@ mod tests {
             let refusal = dense_device_refusal(&architecture)
                 .or_else(|| host_reference_structure_refusal(&architecture))
                 .expect("the shape is refused");
+            assert!(refusal.contains(named), "{named}: {refusal}");
+        }
+    }
+
+    /// A routed family's BF16 experts are the shared dense arm's under any score, and what its
+    /// router and expert passes do not execute is refused by name.
+    #[test]
+    fn routed_bf16_experts_are_the_shared_dense_arms_and_the_rest_is_named() {
+        let document = serde_json::json!({
+            "model_type": "acme_moe",
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 256,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu"
+        });
+        let parse = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut document = document.clone();
+            edit(&mut document);
+            Architecture::from_json(&document.to_string()).expect("the document parses")
+        };
+        assert_eq!(dense_device_refusal(&parse(&|_| {})), None);
+        for score in ["sigmoid", "sqrtsoftplus"] {
+            let independent = parse(&|document| {
+                document["scoring_func"] = serde_json::json!(score);
+                document["norm_topk_prob"] = serde_json::json!(false);
+                document["routed_scaling_factor"] = serde_json::json!(2.5);
+            });
+            assert_eq!(dense_device_refusal(&independent), None, "{score}");
+        }
+        for (edit, named) in [
+            (
+                &(|document: &mut serde_json::Value| {
+                    document["topk_method"] = serde_json::json!("noaux_tc");
+                }) as &dyn Fn(&mut serde_json::Value),
+                "correction bias",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["num_experts"] = serde_json::json!(1024);
+                },
+                "outside the router's 1..=512",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["num_experts_per_tok"] = serde_json::json!(9);
+                },
+                "a token activates 9 of 8",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["moe_intermediate_size"] = serde_json::json!(132);
+                },
+                "multiple of eight",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["swiglu_limit"] = serde_json::json!(7.0);
+                },
+                "unclamped SwiGLU",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["scoring_func"] = serde_json::json!("sigmoid");
+                    document["num_experts_per_tok"] = serde_json::json!(1);
+                },
+                "one pick renormalised",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["n_shared_experts"] = serde_json::json!(2);
+                },
+                "2 shared experts",
+            ),
+        ] {
+            let refusal = dense_device_refusal(&parse(edit)).expect("the shape is refused");
             assert!(refusal.contains(named), "{named}: {refusal}");
         }
     }

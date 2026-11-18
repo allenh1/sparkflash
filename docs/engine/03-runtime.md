@@ -176,8 +176,29 @@ bits and stays each arm's until a gate says otherwise.
 20. That arm on the serving contract (`FusedArm`, lane memory, a rewind point, the ledger),
     gated by `scripts/served-gate.py`.
 
-Left after these: GDN and routed experts on the shared arm, its TP above one, the residual mixers
-(one arm per rule) and MLA (GLM's alone).
+### Then: the shared arm takes the parts the released arms run
+
+Steps 19-20 give a dense family the device and the serving strategies with no code of its own.
+Most new families route experts, ship an FP8 release beside the BF16 one, or mix linear-attention
+layers in, and each of those is already a kernel some arm runs. The next steps put those kernels
+behind the shared arm's plan, so the families that need them get them too; each is gated by the
+per-layer parity report against the host reference and then `scripts/served-gate.py`.
+
+21. Routed experts on the shared arm: an MoE layer (a softmax, sigmoid or sqrt-softplus score, the
+    top-k with or without renormalising, a routed scale, shared experts with or without their
+    sigmoid gate) runs the one router body (`q4e_route`), the shared plan's run walk
+    (`MoePlanCall::runs`), the token path's expert passes and the combine. The experts are BF16, a
+    third format of the one expert body beside NVFP4 and FP8, whose launch rule (`moe::token`) Qwen
+    now takes from the same place.
+22. FP8 on the shared arm: a release whose projections are 128x128-tile E4M3 takes the shared FP8
+    tile (`Fp8Tile`) for its prompt and the FP8 row GEMV for its tokens, and its experts take the
+    expert body's FP8 form.
+23. GDN layers on the shared arm: a Gated DeltaNet layer runs the shared scan plan (`ScanPlan`)
+    and the Qwen image's scan bodies, with its convolution and recurrent state on the lane and in
+    the rewind point.
+
+Left after these: the shared arm's TP above one, the residual mixers (one arm per rule) and MLA
+(GLM's alone).
 
 ## Status
 
@@ -203,6 +224,7 @@ Left after these: GDN and routed experts on the shared arm, its TP above one, th
 | 18. typed token-kernel calls | done: `sparkflash_ops::calls` builds one launch (`Call`: grid, block, arguments in the kernel's order) for the token image's shared bodies: `RmsNorm` (`q4e_rmsnorm`, and `q4e_rmsnorm_rows` with strides), `Rope`, `add`, `swiglu`, `copy`, `embed`/`embed_rows` and the BF16 cache appends. The block drafter launches through it (`GemvDevice::call`), as do Qwen's norm, rotary, cache appends, residual adds, SwiGLU, copies and embeddings, and GLM's, Inkling's and Dory's norms and embeddings. A unit test pins the lists to the arms' old ones; every argument and grid is the same (an elementwise grid that moved is the same size, and those bodies walk a grid stride) |
 | 19. a shared device arm for new families | done: `sparkflash-model-dense` serves a family no pack names when it is a dense BF16 grouped-query decoder (`sparkflash_ops::parts::dense_device_refusal` names everything else), from the `Architecture`, the shared names, `DraftUploader` and the typed calls (new: `gemv_bf16`, `deinterleave`, `FullAttention`, which Qwen and Dory now launch through too); its prompt projections take the wide tile under `WidePolicy::DENSE`. It implements `EngineBuilder` and `serve --model` picks it for such a family (`SPARKFLASH_DENSE_DEVICE`: unset prefers it and names why the host answers instead, `1` requires it, `0` keeps the host). One deviation from the step's text: it gates on its own launch list (`dense_device_images`), not the kernel catalogue, whose `DenseMlp` and GQA rows pin the released presets' hidden widths and query groups (a 2048-wide Llama does not resolve); a catalogue row per shape rule would be a new `Part` identity each. Gate: the per-layer parity report against the host reference (`cli/src/serve/dense_parity.rs`, every layer's residual and the logits, two fixtures: a two-chunk Llama-shaped prompt on the wide tile; a gated, q/k-normed, half-rotated, tied checkpoint whose MLP takes the batched row GEMV), passed on the RTX laptop (sm_121): every residual within 5.2e-3 of the reference (plain prompt 300 rows over both layers, decode within 7.6e-4), logits within 6.1e-4 untied and 4.3e-2 tied (the unit-scale tied head magnifies the BF16 cache rounding; within the 2e-2 + 2e-2·|ref| bound), and the next token agreed at every step, the plain prompt's one near tie (margin 8.0e-2) included |
 | 20. that arm on the serving contract | done: `DenseLanes` is a `FusedArm`, so `serve --model` on a dense family starts the shared `FusedEngine` with four lanes by default (`--concurrency`, or the profile's `runtime.concurrency`; a mismatch is refused, the host reference refuses both lane knobs). A fused step walks one row a member through the same launches with the row GEMV (policy `None`), so a member's bits are its lone row's; prompts run in 256-row parts; each lane's keys and values grow in `SequenceLanes` memory (one sequence's worth by default, `runtime.lane_memory_mb` for more); the KV is position-addressed, so the rewind point is the prompt's length and going back is moving the position (`SPARKFLASH_REWIND`); the ledger prints `ledger dense: ...`. Device tests (`dense_parity.rs`): fused lanes at 5 to 300-row prompts give every step's tokens and logit bits as each alone, a kept lane continues (within 7.4e-6 of a cold forward) and goes back to its prompt. Served gate on the RTX laptop on a random-weight checkpoint of a family no pack names (`scripts/dense-synthetic-checkpoint.py`: 8 layers, hidden 1024, GQA 16/4, the Qwen3.6 tokenizer): lanes greedy and sampled equal alone (267 tok/s alone, 161-187 a lane at four), interleave equal alone with a 0.40 s longest pause while a 60K-character prompt filled, `turns` PASS (plain and thinking turns REWOUND and equal to cold; think-dropped REWOUND+, as on Qwen, the model reading its held ids for the merged newline) |
+| 21. routed experts on the shared arm | done: an MoE layer of BF16 experts runs on `sparkflash-model-dense` from the parts the released arms run: `q4e_route` (one router kernel over the shared `shared_moe_router_body`, any score with or without renormalising and a routed scale; Qwen's `q4e_router` is the same body at a scale of one, its bits unchanged), `MoePlanCall::runs`, the token path's expert passes in a BF16 form of Qwen's one expert body (`q4e_expert_gate_up_bf16`/`_down_bf16`, rows of eight BF16 a lane; the NVFP4 and FP8 forms untouched) on the launch rule `sparkflash_ops::moe::token` that Qwen now takes from the same place, and `q4e_moe_combine`; the shared expert and its sigmoid gate run as a dense MLP. The router stays on the row GEMV at every row count, so a prompt row picks the experts its decode row would. `dense_device_refusal` names what it does not run (another expert format, a selection bias, a clamp, past 512 experts or 64 picks, widths not a multiple of eight, more than one shared expert, and one pick renormalised under an independent score, which the host reference divides to one where HF keeps it). Gate (`dense_parity.rs`, RTX laptop): three routed fixtures, a softmax router with a sigmoid-gated shared expert over a two-chunk prompt, a sigmoid router after a dense layer (scale 2.5, no renormalising, ungated shared expert, an expert width the staging pads), a sqrt-softplus router with no shared expert; no pick differed from the reference's: residuals within 6.1e-3, logits within 1.1e-2, the next token agreed at every step; fused routed lanes give each conversation's bits alone. Served (`served-gate.py all`, a synthetic checkpoint of 8 routed layers, 32 experts top-4 and a gated shared expert, from `dense-synthetic-checkpoint.py --experts`): four lanes together equal each alone, greedy and sampled; a decoding lane paused at most 0.42 s while a 60k-character prompt filled; every turn shape rewound and matched its cold run. |
 
 ### Step 1: what it measured
 

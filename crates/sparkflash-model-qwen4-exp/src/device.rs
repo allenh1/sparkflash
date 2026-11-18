@@ -722,22 +722,10 @@ impl Kernels {
 
 /// The routed-expert token kernels stage Q4E_MEMBER_GROUP rows of their activation in dynamic
 /// shared memory, one padded float a column group (kernels/qwen4_moe_sm121.cu).
-const MOE_SMEM_STRIDE: usize = 33;
-const MOE_MEMBER_GROUP: usize = 2;
-
-/// The dynamic shared memory a routed-expert token launch reserves: the deeper of its gate/up
-/// (hidden wide) and down (intermediate wide) staging, for the largest geometry the config
-/// serves. The kernel computes the same padded stride from the width it is launched with.
+/// The dynamic shared memory a routed-expert token launch reserves, for the largest geometry the
+/// config serves: the shared token rule ([sparkflash_ops::moe::token::stage_bytes]).
 fn moe_expert_stage_bytes(config: &Qwen4ExpConfig) -> Result<u32, String> {
-    let pad = |columns: usize| columns.div_ceil(32) * MOE_SMEM_STRIDE;
-    let rows = pad(config.hidden_size).max(pad(config.moe_intermediate_size));
-    let bytes = MOE_MEMBER_GROUP * rows * 4;
-    // A reservation past 4 GiB cannot be expressed in cuFuncSetAttribute's int; refusing is the
-    // only honest answer, because a 0 here would load the plain kernel and silently fall back to
-    // the global staging path.
-    u32::try_from(bytes).map_err(|_| {
-        format!("the routed-expert staging reservation of {bytes} bytes does not fit 32 bits")
-    })
+    sparkflash_ops::moe::token::stage_bytes(config.hidden_size, config.moe_intermediate_size)
 }
 
 fn bytes_f32(bytes: &[u8], name: &str) -> Result<f32, String> {

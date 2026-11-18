@@ -14,13 +14,19 @@
 
 //! The shared dense device arm: a family no pack transcribes, served on the device.
 //!
-//! A dense BF16 grouped-query decoder (embedding, RMSNorm, grouped-query attention with or
-//! without the per-head output gate and q/k norms, plain rotate-half RoPE, a dense SwiGLU, a
-//! plain residual and the head) needs no code of its own: this arm reads the shared
+//! A BF16 grouped-query decoder (embedding, RMSNorm, grouped-query attention with or without the
+//! per-head output gate and q/k norms, plain rotate-half RoPE, a dense SwiGLU or routed experts,
+//! a plain residual and the head) needs no code of its own: this arm reads the shared
 //! [Architecture], resolves the checkpoint's own spelling through [sparkflash_ops::naming],
 //! uploads every tensor through [DraftUploader] and launches the shared token-image bodies through
 //! their typed [sparkflash_ops::calls]. Its prompt projections take the shared wide tile under
 //! [WidePolicy::DENSE]; decode rows keep the row GEMV.
+//!
+//! A routed layer runs the parts the released arms run: the one router body (`q4e_route`, any
+//! family's score, top-k, renormalisation and scale), the shared expert plan's run walk
+//! ([MoePlanCall::runs]), the token path's expert passes in their BF16 form (one block a run of
+//! an expert's rows, Qwen's NVFP4 and FP8 body) and the combine, with the shared expert and its
+//! sigmoid gate on the same projections as a dense MLP.
 //!
 //! Which checkpoints it takes is [sparkflash_ops::parts::dense_device_refusal]: nothing the host
 //! reference does not execute, and nothing the reference does that these kernels do not. Its
@@ -36,7 +42,9 @@
 use std::sync::{Arc, Mutex};
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
-use sparkflash_kernels::images::{dory_cubin, qwen4_attn_cubin, qwen4_exp_cubin};
+use sparkflash_kernels::images::{
+    dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
+};
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
 use sparkflash_model::architecture::{AttentionKind, Ffn};
 use sparkflash_model::backend::{
@@ -48,7 +56,8 @@ use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::DraftUploader;
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
 use sparkflash_ops::gemv::{CudaHandle, GEMV_MAX_BATCH, GpuMat};
-use sparkflash_ops::naming::{AttentionNames, FfnNames, TensorNames};
+use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
+use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, TensorNames};
 use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{FusedArm, FusedEngine, Ledger, Mode, Part, Resume, Strategy, resume};
@@ -69,7 +78,23 @@ struct Shape {
     gated: bool,
     rotary: usize,
     theta: f32,
+    /// The dense MLP's width, or a routed layer's shared expert's (zero without one).
     intermediate: usize,
+    /// A routed layer's experts.
+    routed: Option<Routed>,
+}
+
+/// A routed layer's rule: what `q4e_route` and the expert passes take.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Routed {
+    experts: usize,
+    top_k: usize,
+    /// One expert's SwiGLU width.
+    intermediate: usize,
+    /// The router's score ([router_score]).
+    score: u64,
+    renormalise: bool,
+    scaling: f32,
 }
 
 impl Shape {
@@ -82,8 +107,23 @@ impl Shape {
         else {
             return Err(format!("layer {index} is not grouped-query attention"));
         };
-        let Ffn::Dense(dense) = &layer.ffn else {
-            return Err(format!("layer {index} routes experts"));
+        let (intermediate, routed) = match &layer.ffn {
+            Ffn::Dense(dense) => (dense.intermediate, None),
+            Ffn::Moe(moe) => (
+                if moe.shared_experts > 0 {
+                    moe.shared_intermediate
+                } else {
+                    0
+                },
+                Some(Routed {
+                    experts: moe.routed_experts,
+                    top_k: moe.active_experts,
+                    intermediate: moe.intermediate,
+                    score: router_score(moe.score),
+                    renormalise: moe.norm_topk,
+                    scaling: moe.routed_scaling as f32,
+                }),
+            ),
         };
         let head_dim = layer.attention.head_dim;
         Ok(Self {
@@ -93,7 +133,8 @@ impl Shape {
             gated: output_gate,
             rotary: layer.attention.rope.rotated_dims.min(head_dim),
             theta: layer.attention.rope.theta.max(1.0) as f32,
-            intermediate: dense.intermediate,
+            intermediate,
+            routed,
         })
     }
 
@@ -127,9 +168,41 @@ struct Layer {
     q_norm: Option<Deviceptr>,
     k_norm: Option<Deviceptr>,
     post_norm: Deviceptr,
+    ffn: LayerFfn,
+}
+
+/// One SwiGLU MLP's projections: a dense layer's, or a routed layer's shared expert.
+#[derive(Debug, Clone, Copy)]
+struct Mlp {
     gate: GpuMat,
     up: GpuMat,
     down: GpuMat,
+}
+
+/// A layer's MLP on the device.
+#[derive(Debug, Clone, Copy)]
+enum LayerFfn {
+    Dense(Mlp),
+    Routed {
+        /// The router, `[experts][hidden]`.
+        router: GpuMat,
+        /// Six addresses an expert, the token passes' table: gate, its (unread) scale, up, its
+        /// scale, down, its scale.
+        table: Deviceptr,
+        shared: Option<Mlp>,
+        /// The shared expert's sigmoid gate, one `[hidden]` row.
+        shared_gate: Option<GpuMat>,
+    },
+}
+
+/// The routed layers' kernels, loaded when a layer routes.
+#[derive(Clone, Copy)]
+struct MoeKernels {
+    route: Kernel,
+    plan: Kernel,
+    gate_up: Kernel,
+    down: Kernel,
+    combine: Kernel,
 }
 
 /// The kernels this arm launches, loaded once.
@@ -146,6 +219,7 @@ struct Kernels {
     combine: Kernel,
     cache: Kernel,
     wide: Kernel,
+    moe: Option<MoeKernels>,
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context
@@ -154,11 +228,28 @@ unsafe impl Send for Kernels {}
 unsafe impl Sync for Kernels {}
 
 impl Kernels {
-    fn load(cuda: &Cuda) -> Result<Self, String> {
+    /// Loads every kernel, and the routed layers' when `stage` (the expert passes' staging
+    /// reservation, [token::stage_bytes]) names one.
+    fn load(cuda: &Cuda, stage: Option<u32>) -> Result<Self, String> {
         let named = |image: &'static [u8], name: &'static str| {
             cuda.load_named(image, name).map(|(_, kernel)| kernel)
         };
+        let staged = |name: &'static str, bytes: u32| {
+            cuda.load_named_shared(qwen4_moe_cubin(), name, bytes)
+                .map(|(_, kernel)| kernel)
+        };
+        let moe = match stage {
+            Some(bytes) => Some(MoeKernels {
+                route: named(qwen4_moe_cubin(), "q4e_route")?,
+                plan: named(moe_plan_cubin(), "moe_plan")?,
+                gate_up: staged("q4e_expert_gate_up_bf16", bytes)?,
+                down: staged("q4e_expert_down_bf16", bytes)?,
+                combine: named(qwen4_moe_cubin(), "q4e_moe_combine")?,
+            }),
+            None => None,
+        };
         Ok(Self {
+            moe,
             add: named(qwen4_exp_cubin(), "q4e_add")?,
             deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
             embed: named(qwen4_exp_cubin(), "q4e_embed")?,
@@ -255,7 +346,7 @@ impl DenseDeviceBackend {
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
-        let kernels = Kernels::load(&cuda)?;
+        let kernels = Kernels::load(&cuda, expert_stage(architecture)?)?;
         let mut owned = Vec::new();
         let uploaded = upload(&cuda, architecture, &names, source, &mut owned);
         let (embed, head, norm, layers, weight_bytes) = match uploaded {
@@ -429,7 +520,139 @@ fn profile_policy(
     })
 }
 
+/// The expert passes' staging reservation for the widest routed layer, or `None` when no layer
+/// routes.
+fn expert_stage(architecture: &Architecture) -> Result<Option<u32>, String> {
+    let widest = architecture
+        .layers
+        .iter()
+        .filter_map(|layer| match &layer.ffn {
+            Ffn::Moe(moe) => Some(moe.intermediate),
+            Ffn::Dense(_) => None,
+        })
+        .max();
+    widest
+        .map(|intermediate| token::stage_bytes(architecture.hidden_size, intermediate))
+        .transpose()
+}
+
 type Uploaded = (GpuMat, GpuMat, Deviceptr, Vec<Layer>, usize);
+
+/// One upload's tensors: each checked BF16 at its architecture shape, and every allocation in
+/// `owned` as it is made, so a failure part way frees what was uploaded.
+struct Uploads<'a> {
+    uploader: DraftUploader<'a>,
+    source: &'a dyn WeightSource,
+    owned: &'a mut Vec<Deviceptr>,
+    bytes: usize,
+}
+
+impl Uploads<'_> {
+    fn keep(&mut self, pointer: Deviceptr, bytes: usize) -> Deviceptr {
+        self.owned.push(pointer);
+        self.bytes += bytes;
+        pointer
+    }
+
+    fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<GpuMat, String> {
+        bf16(self.source, name, &[rows, columns])?;
+        let mat = self.uploader.mat(name, rows, columns)?;
+        self.keep(mat.pointer, rows * columns * 2);
+        Ok(mat)
+    }
+
+    fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
+        bf16(self.source, name, &[width])?;
+        let pointer = self.uploader.vector(name, width)?;
+        Ok(self.keep(pointer, width * 2))
+    }
+
+    fn mlp(&mut self, names: &ExpertNames, width: usize, hidden: usize) -> Result<Mlp, String> {
+        Ok(Mlp {
+            gate: self.mat(&names.gate, width, hidden)?,
+            up: self.mat(&names.up, width, hidden)?,
+            down: self.mat(&names.down, hidden, width)?,
+        })
+    }
+
+    /// A routed layer's router, experts (and their table), shared expert and its gate.
+    fn routed(
+        &mut self,
+        index: usize,
+        names: &FfnNames,
+        shape: &Shape,
+        routed: &Routed,
+        hidden: usize,
+    ) -> Result<LayerFfn, String> {
+        let FfnNames::Moe {
+            router,
+            experts,
+            shared,
+            shared_gate,
+        } = names
+        else {
+            return Err(format!("layer {index} names a dense MLP's tensors"));
+        };
+        if experts.len() != routed.experts {
+            return Err(format!(
+                "layer {index} names {} experts, the architecture {}",
+                experts.len(),
+                routed.experts
+            ));
+        }
+        let router = self.mat(router, routed.experts, hidden)?;
+        let mut table = Vec::with_capacity(routed.experts * 6 * 8);
+        for expert in experts {
+            let Mlp { gate, up, down } = self.mlp(expert, routed.intermediate, hidden)?;
+            for address in [gate.pointer.0, 0, up.pointer.0, 0, down.pointer.0, 0] {
+                table.extend(address.to_le_bytes());
+            }
+        }
+        let table = self.uploader.bytes(&table)?;
+        let table = self.keep(table, routed.experts * 6 * 8);
+        let shared = match (shared, shape.intermediate) {
+            (Some(names), width) if width > 0 => Some(self.mlp(names, width, hidden)?),
+            (None, 0) => None,
+            _ => {
+                return Err(format!(
+                    "layer {index}'s shared expert and the architecture's width {} disagree",
+                    shape.intermediate
+                ));
+            }
+        };
+        let shared_gate = match shared_gate {
+            Some(name) => {
+                // A release stores the gate as `[1][hidden]` or as `[hidden]`.
+                let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+                if spec.dtype != DType::BF16 || spec.elements() != hidden as u128 {
+                    return Err(format!(
+                        "{name} is {:?} {:?}; the shared dense device arm reads it as a BF16 \
+                         {hidden}-wide gate",
+                        spec.dtype, spec.shape
+                    ));
+                }
+                let pointer = self.uploader.vector(name, hidden)?;
+                Some(GpuMat {
+                    pointer: self.keep(pointer, hidden * 2),
+                    rows: 1,
+                    columns: hidden,
+                })
+            }
+            None => None,
+        };
+        if shared_gate.is_some() && shared.is_none() {
+            return Err(format!(
+                "layer {index} names a shared-expert gate without a shared expert"
+            ));
+        }
+        Ok(LayerFfn::Routed {
+            router,
+            table,
+            shared,
+            shared_gate,
+        })
+    }
+}
 
 /// Uploads every tensor `names` resolves, each checked BF16 at its architecture shape; every
 /// allocation lands in `owned` as it is made, so a failure part way frees what was uploaded.
@@ -440,82 +663,63 @@ fn upload(
     source: &dyn WeightSource,
     owned: &mut Vec<Deviceptr>,
 ) -> Result<Uploaded, String> {
-    let uploader = DraftUploader::new(cuda, source);
+    let mut up = Uploads {
+        uploader: DraftUploader::new(cuda, source),
+        source,
+        owned,
+        bytes: 0,
+    };
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
-    let mut bytes = 0usize;
-    let mut mat = |name: &str, rows: usize, columns: usize| -> Result<GpuMat, String> {
-        bf16(source, name, &[rows, columns])?;
-        let mat = uploader.mat(name, rows, columns)?;
-        owned.push(mat.pointer);
-        bytes += rows * columns * 2;
-        Ok(mat)
-    };
-    let embed = mat(&names.embed, vocab, hidden)?;
+    let embed = up.mat(&names.embed, vocab, hidden)?;
     let head = if names.head_tied() {
         embed
     } else {
-        mat(&names.head, vocab, hidden)?
+        up.mat(&names.head, vocab, hidden)?
     };
-    let mut matrices = Vec::with_capacity(architecture.layers.len());
+    let norm = up.vector(&names.norm, hidden)?;
+    let mut layers = Vec::with_capacity(architecture.layers.len());
     for (index, layer_names) in names.layers.iter().enumerate() {
         let shape = Shape::of(architecture, index)?;
-        let AttentionNames::Gqa { q, k, v, o, .. } = &layer_names.attention else {
-            return Err(format!("layer {index} names another attention's tensors"));
-        };
-        let FfnNames::Dense(ffn) = &layer_names.ffn else {
-            return Err(format!("layer {index} names a routed MLP's tensors"));
-        };
-        matrices.push((
-            shape,
-            [
-                mat(q, shape.query_rows(), hidden)?,
-                mat(k, shape.kv_width(), hidden)?,
-                mat(v, shape.kv_width(), hidden)?,
-                mat(o, hidden, shape.query_width())?,
-                mat(&ffn.gate, shape.intermediate, hidden)?,
-                mat(&ffn.up, shape.intermediate, hidden)?,
-                mat(&ffn.down, hidden, shape.intermediate)?,
-            ],
-        ));
-    }
-    let mut vector = |name: &str, width: usize| -> Result<Deviceptr, String> {
-        bf16(source, name, &[width])?;
-        let pointer = uploader.vector(name, width)?;
-        owned.push(pointer);
-        bytes += width * 2;
-        Ok(pointer)
-    };
-    let norm = vector(&names.norm, hidden)?;
-    let mut layers = Vec::with_capacity(matrices.len());
-    for ((shape, [q, k, v, o, gate, up, down]), layer_names) in
-        matrices.into_iter().zip(&names.layers)
-    {
-        let AttentionNames::Gqa { q_norm, k_norm, .. } = &layer_names.attention else {
-            unreachable!("checked above");
-        };
-        layers.push(Layer {
-            shape,
-            input_norm: vector(&layer_names.input_norm, hidden)?,
+        let AttentionNames::Gqa {
             q,
             k,
             v,
             o,
+            q_norm,
+            k_norm,
+            ..
+        } = &layer_names.attention
+        else {
+            return Err(format!("layer {index} names another attention's tensors"));
+        };
+        let ffn = match (&shape.routed, &layer_names.ffn) {
+            (None, FfnNames::Dense(names)) => {
+                LayerFfn::Dense(up.mlp(names, shape.intermediate, hidden)?)
+            }
+            (None, _) => return Err(format!("layer {index} names a routed MLP's tensors")),
+            (Some(routed), names) => up.routed(index, names, &shape, routed, hidden)?,
+        };
+        layers.push(Layer {
+            shape,
+            input_norm: up.vector(&layer_names.input_norm, hidden)?,
+            q: up.mat(q, shape.query_rows(), hidden)?,
+            k: up.mat(k, shape.kv_width(), hidden)?,
+            v: up.mat(v, shape.kv_width(), hidden)?,
+            o: up.mat(o, hidden, shape.query_width())?,
             q_norm: q_norm
                 .as_deref()
-                .map(|name| vector(name, shape.head_dim))
+                .map(|name| up.vector(name, shape.head_dim))
                 .transpose()?,
             k_norm: k_norm
                 .as_deref()
-                .map(|name| vector(name, shape.head_dim))
+                .map(|name| up.vector(name, shape.head_dim))
                 .transpose()?,
-            post_norm: vector(&layer_names.post_norm, hidden)?,
-            gate,
-            up,
-            down,
+            post_norm: up.vector(&layer_names.post_norm, hidden)?,
+            ffn,
         });
     }
-    Ok((embed, head, norm, layers, bytes))
+    Ok((embed, head, norm, layers, up.bytes))
 }
 
 /// Refuses a tensor that is not BF16 at `shape`.
@@ -589,6 +793,149 @@ impl Shared {
             plan.zero_centred(self.zero_centred).call(rows),
         )
     }
+
+    fn launch(
+        &self,
+        kernel: Kernel,
+        (grid, block): Launch,
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        self.cuda
+            .launch_async(kernel, grid, block, args)
+            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
+    }
+
+    /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch.
+    fn mlp(
+        &self,
+        mlp: &Mlp,
+        b: &Buffers,
+        output: Deviceptr,
+        rows: usize,
+        policy: Option<WidePolicy>,
+    ) -> Result<(), BackendError> {
+        self.project(&mlp.gate, b.normed.0, b.ffn_gate.0, rows, policy)?;
+        self.project(&mlp.up, b.normed.0, b.ffn_up.0, rows, policy)?;
+        self.call(
+            self.kernels.swiglu,
+            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, rows * mlp.gate.rows),
+        )?;
+        self.project(&mlp.down, b.ffn_up.0, output.0, rows, policy)
+    }
+
+    /// A routed layer's MLP over `rows` into `b.projected`: the router on the row GEMV (so a
+    /// prompt row picks the experts its decode row would), `q4e_route`, the shared plan's runs,
+    /// the BF16 token passes, the shared expert and its gate, and the combine.
+    fn routed(
+        &self,
+        layer: &Layer,
+        b: &Buffers,
+        rows: usize,
+        policy: Option<WidePolicy>,
+    ) -> Result<(), BackendError> {
+        let (
+            Some(routed),
+            LayerFfn::Routed {
+                router,
+                table,
+                shared,
+                shared_gate,
+            },
+            Some(kernels),
+        ) = (&layer.shape.routed, &layer.ffn, self.kernels.moe)
+        else {
+            return Err(BackendError::new(
+                DEVICE,
+                "a routed layer runs without its experts or the routed kernels",
+            ));
+        };
+        let hidden = self.hidden;
+        let (experts, top_k, intermediate) = (routed.experts, routed.top_k, routed.intermediate);
+        self.project(router, b.normed.0, b.router.0, rows, None)?;
+        self.launch(
+            kernels.route,
+            ((rows as u32, 1, 1), (256, 1, 1)),
+            &[
+                b.router.0,
+                b.indices.0,
+                b.weights.0,
+                experts as u64,
+                top_k as u64,
+                routed.score,
+                u64::from(routed.renormalise),
+                u64::from(routed.scaling.to_bits()),
+            ],
+        )?;
+        let plan = MoePlanCall::runs(
+            b.indices.0,
+            b.sorted.0,
+            b.runs.0,
+            (rows * top_k, experts, top_k),
+        );
+        self.launch(kernels.plan, MoePlanCall::launch(), &plan.args())?;
+        self.launch(
+            kernels.gate_up,
+            token::gate_up_grid(intermediate, top_k, rows),
+            &[
+                table.0,
+                b.indices.0,
+                b.sorted.0,
+                b.runs.0,
+                b.normed.0,
+                b.activated.0,
+                top_k as u64,
+                hidden as u64,
+                intermediate as u64,
+            ],
+        )?;
+        self.launch(
+            kernels.down,
+            token::down_grid(hidden, top_k, rows),
+            &[
+                table.0,
+                b.indices.0,
+                b.sorted.0,
+                b.runs.0,
+                b.weights.0,
+                b.activated.0,
+                b.expert_partials.0,
+                top_k as u64,
+                hidden as u64,
+                intermediate as u64,
+                top_k as u64,
+            ],
+        )?;
+        match shared {
+            Some(mlp) => self.mlp(mlp, b, b.shared_out, rows, policy)?,
+            // The combine always adds a shared row; a layer without one adds zeros.
+            None => self
+                .cuda
+                .memset_d8_async(b.shared_out, 0, rows * hidden * 4)
+                .map_err(|error| BackendError::new(DEVICE, format!("the shared row: {error}")))?,
+        }
+        if let Some(gate) = shared_gate {
+            self.project(gate, b.normed.0, b.shared_logit.0, rows, None)?;
+        }
+        self.launch(
+            kernels.combine,
+            combine_grid(hidden, rows),
+            &[
+                b.projected.0,
+                b.expert_partials.0,
+                b.shared_out.0,
+                if shared_gate.is_some() {
+                    b.shared_logit.0
+                } else {
+                    0
+                },
+                0,
+                0,
+                top_k as u64,
+                hidden as u64,
+                0,
+            ],
+        )
+    }
 }
 
 /// Where each layer's key and value caches lie in a sequence's lane ([SequenceLanes], the lane
@@ -633,11 +980,26 @@ struct Buffers {
     ffn_gate: Deviceptr,
     ffn_up: Deviceptr,
     logits: Deviceptr,
+    /// A routed layer's router logits, `[rows][experts]`.
+    router: Deviceptr,
+    /// The picked experts (i32) and their weights, `[rows][top_k]` each.
+    indices: Deviceptr,
+    weights: Deviceptr,
+    /// The slots in expert order (i32), and each slot's run (two i32 a slot).
+    sorted: Deviceptr,
+    runs: Deviceptr,
+    /// Every slot's SwiGLU row, `[rows * top_k][intermediate]`.
+    activated: Deviceptr,
+    /// Every slot's weighted down row, `[rows * top_k][hidden]`.
+    expert_partials: Deviceptr,
+    /// The shared expert's rows (zeros without one), and its gate's logit a row.
+    shared_out: Deviceptr,
+    shared_logit: Deviceptr,
     logit_rows: usize,
 }
 
 impl Buffers {
-    fn all(&self) -> [&Deviceptr; 14] {
+    fn all(&self) -> [&Deviceptr; 23] {
         [
             &self.tokens,
             &self.x,
@@ -653,6 +1015,15 @@ impl Buffers {
             &self.ffn_gate,
             &self.ffn_up,
             &self.logits,
+            &self.router,
+            &self.indices,
+            &self.weights,
+            &self.sorted,
+            &self.runs,
+            &self.activated,
+            &self.expert_partials,
+            &self.shared_out,
+            &self.shared_logit,
         ]
     }
 }
@@ -683,6 +1054,17 @@ impl Scratch {
         let rows = CHUNK_ROWS;
         let hidden = shared.hidden;
         let logit_rows = logit_rows.clamp(1, CHUNK_ROWS);
+        let routed = |of: fn(&Routed) -> usize| {
+            shared
+                .layers
+                .iter()
+                .filter_map(|layer| layer.shape.routed.as_ref())
+                .map(of)
+                .max()
+                .unwrap_or(0)
+        };
+        let (experts, slots) = (routed(|r| r.experts), rows * routed(|r| r.top_k));
+        let any_routed = slots > 0;
         let floats = [
             rows,
             rows * hidden,
@@ -698,6 +1080,15 @@ impl Scratch {
             rows * widest(|shape| shape.intermediate),
             rows * widest(|shape| shape.intermediate),
             logit_rows * shared.vocab,
+            rows * experts,
+            slots,
+            slots,
+            slots,
+            2 * slots,
+            slots * routed(|r| r.intermediate),
+            slots * hidden,
+            if any_routed { rows * hidden } else { 0 },
+            if any_routed { rows } else { 0 },
         ];
         let mut pointers = Vec::with_capacity(floats.len());
         let mut total = 0usize;
@@ -727,6 +1118,15 @@ impl Scratch {
             ffn_gate: p(11),
             ffn_up: p(12),
             logits: p(13),
+            router: p(14),
+            indices: p(15),
+            weights: p(16),
+            sorted: p(17),
+            runs: p(18),
+            activated: p(19),
+            expert_partials: p(20),
+            shared_out: p(21),
+            shared_logit: p(22),
             logit_rows,
         };
         Ok(Self { shared, buffers })
@@ -1025,14 +1425,10 @@ fn walk(
             RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
             rows,
         )?;
-        shared.project(&layer.gate, b.normed.0, b.ffn_gate.0, rows, policy)?;
-        shared.project(&layer.up, b.normed.0, b.ffn_up.0, rows, policy)?;
-        let width = rows * shape.intermediate;
-        shared.call(
-            kernels.swiglu,
-            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, width),
-        )?;
-        shared.project(&layer.down, b.ffn_up.0, b.projected.0, rows, policy)?;
+        match &layer.ffn {
+            LayerFfn::Dense(mlp) => shared.mlp(mlp, b, b.projected, rows, policy)?,
+            LayerFfn::Routed { .. } => shared.routed(layer, b, rows, policy)?,
+        }
         shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
         if let Some(trace) = trace.as_deref_mut() {
             let mut bytes = vec![0u8; rows * hidden * 4];

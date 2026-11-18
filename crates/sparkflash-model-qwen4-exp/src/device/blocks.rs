@@ -33,7 +33,7 @@ use sparkflash_model::BackendError;
 use sparkflash_ops::attention::GqaBody;
 use sparkflash_ops::calls::{self, Rope};
 use sparkflash_ops::indexer::IndexerPass;
-use sparkflash_ops::moe::{MoePlanCall, combine_grid};
+use sparkflash_ops::moe::{MoePlanCall, combine_grid, token};
 
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
@@ -800,11 +800,7 @@ impl DeviceSequence {
         // The expert dot is latency-bound on its weight rows, so `expert_bench` reads best with
         // rows to spare in flight: two rows per warp and eight warps a block - one sixteen-row
         // panel - beat one row per warp at every sharing level, and beat wider blocks too. The
-        // row counts mirror `Q4E_ROWS_PER_WARP` and, for the NVFP4 down pass's shorter rows,
-        // `Q4E_DOWN_ROWS_PER_WARP` in the kernel.
-        const WARPS: usize = 8;
-        const ROWS: usize = 2;
-        const DOWN_ROWS: usize = 4;
+        // shared token rule ([token]) holds those counts beside the kernel's.
         let count = batch;
         let indices = self.expert_indices;
         let weights = self.probabilities;
@@ -821,19 +817,8 @@ impl DeviceSequence {
         );
         let (grid, block) = MoePlanCall::launch();
         self.launch(kernels.moe_plan, grid, block, &plan.args())?;
-        let gate_up_grid = (
-            intermediate.div_ceil(WARPS * ROWS) as u32,
-            topk as u32,
-            count as u32,
-        );
-        let down_grid = |rows: usize| {
-            (
-                hidden.div_ceil(WARPS * rows) as u32,
-                topk as u32,
-                count as u32,
-            )
-        };
-        let block = ((WARPS * 32) as u32, 1, 1);
+        let (gate_up_grid, block) = token::gate_up_grid(intermediate, topk, count);
+        let (down_grid, _) = token::down_grid(hidden, topk, count);
         match *experts {
             GpuExperts::Nvfp4 { table, scales } => {
                 self.launch(
@@ -855,7 +840,7 @@ impl DeviceSequence {
                 )?;
                 self.launch(
                     kernels.expert_down,
-                    down_grid(DOWN_ROWS),
+                    down_grid,
                     block,
                     &[
                         table.0,
@@ -895,7 +880,7 @@ impl DeviceSequence {
                     // The shared body tiles Q4E_DOWN_ROWS_PER_WARP rows a warp for both formats,
                     // so this grid is the NVFP4 one; it used to launch ROWS because the FP8 body
                     // was its own copy with the narrower tile.
-                    down_grid(DOWN_ROWS),
+                    down_grid,
                     block,
                     &[
                         table.0,

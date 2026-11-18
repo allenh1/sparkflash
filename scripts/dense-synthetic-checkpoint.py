@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""dense-synthetic-checkpoint.py: a random dense BF16 checkpoint of a family no pack names.
+"""dense-synthetic-checkpoint.py: a random BF16 checkpoint of a family no pack names.
 
 The shared dense device arm's served gate (scripts/served-gate.py) checks the serving contract:
 fused lanes equal alone, prompt parts, kept conversations and the rewind point. None of that
@@ -22,6 +22,11 @@ this writes one with random weights beside a ChatML tokenizer copied from TOKENI
 tokenizer.json, vocab.json, chat template and generation config):
 
   dense-synthetic-checkpoint.py TOKENIZER_DIR OUT_DIR [--layers 8] [--hidden 1024]
+      [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]]
+
+With --experts every layer routes: a softmax router renormalising its top-k picks over that many
+BF16 experts, and a sigmoid-gated shared expert when --shared-intermediate names its width (the
+Qwen MoE spelling), so the served gate covers the arm's routed layers too.
 
 The head scores only plain word tokens (a space and three to eight lowercase letters), at a
 scale that outweighs every other token's zero, so greedy and sampled replies are words that
@@ -69,6 +74,15 @@ def write(path, tensors):
             out.write(data)
 
 
+def mlp(prefix, width, hidden, inner):
+    """One SwiGLU MLP of `width` under `prefix`."""
+    return [
+        (prefix + "gate_proj.weight", [width, hidden], bf16_random(width * hidden, inner(hidden))),
+        (prefix + "up_proj.weight", [width, hidden], bf16_random(width * hidden, inner(hidden))),
+        (prefix + "down_proj.weight", [hidden, width], bf16_random(hidden * width, inner(width))),
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("tokenizer_dir")
@@ -79,6 +93,10 @@ def main():
     parser.add_argument("--kv-heads", type=int, default=4)
     parser.add_argument("--intermediate", type=int, default=2816)
     parser.add_argument("--context", type=int, default=32768)
+    parser.add_argument("--experts", type=int, default=0)
+    parser.add_argument("--top-k", type=int, default=4)
+    parser.add_argument("--expert-intermediate", type=int, default=512)
+    parser.add_argument("--shared-intermediate", type=int, default=0)
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
@@ -119,6 +137,17 @@ def main():
         "bos_token_id": generation.get("bos_token_id"),
         "eos_token_id": generation.get("eos_token_id"),
     }
+    if args.experts:
+        config.update({
+            "model_type": "acme_moe",
+            "architectures": ["AcmeMoeForCausalLM"],
+            "num_experts": args.experts,
+            "num_experts_per_tok": args.top_k,
+            "moe_intermediate_size": args.expert_intermediate,
+            "norm_topk_prob": True,
+        })
+        if args.shared_intermediate:
+            config["shared_expert_intermediate_size"] = args.shared_intermediate
     with open(os.path.join(args.out_dir, "config.json"), "w") as out:
         json.dump(config, out, indent=2)
     # Each projection's magnitude about one over the root of its inner width.
@@ -142,16 +171,22 @@ def main():
             (at + "self_attn.k_proj.weight", [kv, hidden], bf16_random(kv * hidden, inner(hidden))),
             (at + "self_attn.v_proj.weight", [kv, hidden], bf16_random(kv * hidden, inner(hidden))),
             (at + "self_attn.o_proj.weight", [hidden, q], bf16_random(hidden * q, inner(q))),
-            (at + "mlp.gate_proj.weight", [args.intermediate, hidden],
-             bf16_random(args.intermediate * hidden, inner(hidden))),
-            (at + "mlp.up_proj.weight", [args.intermediate, hidden],
-             bf16_random(args.intermediate * hidden, inner(hidden))),
-            (at + "mlp.down_proj.weight", [hidden, args.intermediate],
-             bf16_random(hidden * args.intermediate, inner(args.intermediate))),
         ]
+        if not args.experts:
+            tensors += mlp(at + "mlp.", args.intermediate, hidden, inner)
+            continue
+        tensors.append((at + "mlp.gate.weight", [args.experts, hidden],
+                        bf16_random(args.experts * hidden, inner(hidden))))
+        for expert in range(args.experts):
+            tensors += mlp(at + "mlp.experts.%d." % expert, args.expert_intermediate, hidden, inner)
+        if args.shared_intermediate:
+            tensors += mlp(at + "mlp.shared_expert.", args.shared_intermediate, hidden, inner)
+            tensors.append((at + "mlp.shared_expert_gate.weight", [1, hidden],
+                            bf16_random(hidden, inner(hidden))))
     write(os.path.join(args.out_dir, "model.safetensors"), tensors)
-    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head" % (
-        args.out_dir, args.layers, hidden, size, len(words)))
+    print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s" % (
+        args.out_dir, args.layers, hidden, size, len(words),
+        ", %d experts (top %d)" % (args.experts, args.top_k) if args.experts else ""))
 
 
 if __name__ == "__main__":

@@ -258,6 +258,78 @@ pub mod grouped {
     }
 }
 
+/// The token path's expert bodies (`q4e_expert_gate_up`/`q4e_expert_down` and their FP8 and BF16
+/// forms, which Qwen and the shared dense arm launch): one block a run of an expert's slots,
+/// eight warps of two gate/up rows or four down rows each, and the activation staging they
+/// reserve.
+pub mod token {
+    use super::Launch;
+
+    /// The warps a block runs.
+    pub const WARPS: usize = 8;
+    /// The gate/up rows a warp dots (`Q4E_ROWS_PER_WARP`).
+    pub const ROWS: usize = 2;
+    /// The down rows a warp dots (`Q4E_DOWN_ROWS_PER_WARP`), for every format.
+    pub const DOWN_ROWS: usize = 4;
+    /// The staged members a pass holds at once (`Q4E_MEMBER_GROUP`).
+    pub const MEMBER_GROUP: usize = 2;
+    /// The staging's padded stride, a float every 32 columns (`Q4E_SMEM_STRIDE`).
+    pub const STAGE_STRIDE: usize = 33;
+
+    /// The dynamic shared memory a launch reserves: the deeper of its gate/up (`hidden` wide)
+    /// and down (`intermediate` wide) staging. The kernel computes the same padded stride from
+    /// the width it is launched with.
+    ///
+    /// # Errors
+    /// A reservation past 32 bits, which `cuFuncSetAttribute` cannot take; a zero there would load
+    /// the plain kernel and fall back to the global staging silently.
+    pub fn stage_bytes(hidden: usize, intermediate: usize) -> Result<u32, String> {
+        let pad = |columns: usize| columns.div_ceil(32) * STAGE_STRIDE;
+        let bytes = MEMBER_GROUP * pad(hidden).max(pad(intermediate)) * 4;
+        u32::try_from(bytes).map_err(|_| {
+            format!("the routed-expert staging reservation of {bytes} bytes does not fit 32 bits")
+        })
+    }
+
+    /// The gate/up pass over `rows` tokens of `top_k` slots.
+    #[must_use]
+    pub const fn gate_up_grid(intermediate: usize, top_k: usize, rows: usize) -> Launch {
+        (
+            (
+                intermediate.div_ceil(WARPS * ROWS) as u32,
+                top_k as u32,
+                rows as u32,
+            ),
+            ((WARPS * 32) as u32, 1, 1),
+        )
+    }
+
+    /// The down pass over `rows` tokens of `top_k` slots.
+    #[must_use]
+    pub const fn down_grid(hidden: usize, top_k: usize, rows: usize) -> Launch {
+        (
+            (
+                hidden.div_ceil(WARPS * DOWN_ROWS) as u32,
+                top_k as u32,
+                rows as u32,
+            ),
+            ((WARPS * 32) as u32, 1, 1),
+        )
+    }
+}
+
+/// The score a router applies (`Q4E_ROUTER_SOFTMAX`, `_SIGMOID`, `_SQRT_SOFTPLUS`), as
+/// `q4e_route` takes it.
+#[must_use]
+pub const fn router_score(score: sparkflash_model::architecture::Score) -> u64 {
+    use sparkflash_model::architecture::Score;
+    match score {
+        Score::Softmax => 0,
+        Score::Sigmoid => 1,
+        Score::SqrtSoftPlus => 2,
+    }
+}
+
 /// The combine (`q4e_moe_combine`, which GLM and Qwen launch): a 256-thread block a 256-column
 /// slice of a row.
 #[must_use]
@@ -321,5 +393,26 @@ mod tests {
         );
         assert_eq!(combine_grid(4096, 3), ((16, 3, 1), (256, 1, 1)));
         assert_eq!(combine_grid(2560, 1), ((10, 1, 1), (256, 1, 1)));
+    }
+
+    #[test]
+    fn the_token_rules_are_qwens_old_rules() {
+        // Qwen's routed_experts (blocks.rs) and moe_expert_stage_bytes (device.rs), verbatim:
+        // eight warps of two rows (gate/up) or four (down), a padded 33-float staging stride.
+        let (hidden, intermediate, top_k, rows) = (2560usize, 1024usize, 10usize, 3usize);
+        assert_eq!(
+            token::gate_up_grid(intermediate, top_k, rows),
+            ((intermediate.div_ceil(16) as u32, 10, 3), (256, 1, 1))
+        );
+        assert_eq!(
+            token::down_grid(hidden, top_k, rows),
+            ((hidden.div_ceil(32) as u32, 10, 3), (256, 1, 1))
+        );
+        let pad = |columns: usize| columns.div_ceil(32) * 33;
+        assert_eq!(
+            token::stage_bytes(hidden, intermediate),
+            Ok((2 * pad(hidden).max(pad(intermediate)) * 4) as u32)
+        );
+        assert!(token::stage_bytes(1usize << 40, 1).is_err());
     }
 }
