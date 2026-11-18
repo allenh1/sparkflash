@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{
-    qwen4_attn_cubin, qwen4_exp_cubin, qwen4_scan_cubin, sensenova_cubin,
+    qwen4_attn_cubin, qwen4_exp_cubin, qwen4_prefill_cubin, qwen4_scan_cubin, sensenova_cubin,
 };
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
@@ -53,6 +53,15 @@ const FULL_SPLITS: u32 = 16;
 /// The most rows one forward takes: a verify is the anchor plus drafts, and a prefill chunk is
 /// the same shape. The shared GEMV's register tile (`GEMV_MAX_BATCH`) is the bound.
 const ROWS: usize = 8;
+
+/// The rows one prefill chunk takes. The tensor-core projection tiles 128 rows, so a chunk is
+/// one tile row; the decode GEMV's eight-row tile stays for the verify.
+const PREFILL_ROWS: usize = 512;
+
+/// The dynamic shared memory `q4p_dense_fp8` asks for: GLM_Q8_SHARED in
+/// shared_prefill_mma_sm121.cuh - four stages of a 128x32 activation tile, a 128x32 weight tile
+/// and the rows' activation scales, then the rows' activation rows and the column tile's scales.
+const DENSE_SHARED: u32 = 4 * (128 * 64 + 128 * 64 + 128 * 4) + 128 * 4 + 128 * 4;
 
 /// Serialises graph capture: the driver's capture mode is process-wide, so two sessions must not
 /// build their graphs at once.
@@ -114,6 +123,9 @@ struct Kernels {
     mhc_pre: Kernel,
     mhc_post: Kernel,
     mhc_leave: Kernel,
+    mhc_enter: Kernel,
+    /// The tensor-core dense projection, when the prefill image carries it.
+    dense_fp8: Option<Kernel>,
 }
 
 struct Weights {
@@ -665,6 +677,49 @@ impl DeviceShared {
         )
     }
 
+    /// Projects `rows` rows of `input` through `matrix` into `output`.
+    ///
+    /// Above the decode tile the whole chunk goes through the tensor-core kernel in one launch.
+    /// A shape that is not a 128-row multiple (the GDN gate and decay vectors are 32 rows) still
+    /// takes the decode GEMV, a tile at a time.
+    fn project_matrix(
+        &self,
+        matrix: &DeviceMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if rows > GEMV_MAX_BATCH && matrix.scales.is_some() && matrix.rows % 128 == 0
+            && matrix.columns % 128 == 0
+            && let Some(kernel) = self.kernels.dense_fp8
+        {
+            return self.launch(
+                kernel,
+                ((matrix.rows / 128) as u32, rows.div_ceil(128) as u32, 1),
+                (256, 1, 1),
+                &[
+                    matrix.pointer.0,
+                    matrix.scales.expect("scales").0,
+                    input.0,
+                    output.0,
+                    matrix.rows as u64,
+                    matrix.columns as u64,
+                    rows as u64,
+                ],
+            );
+        }
+        for base in (0..rows).step_by(GEMV_MAX_BATCH) {
+            let count = GEMV_MAX_BATCH.min(rows - base);
+            self.gemv(
+                matrix,
+                input.offset(base * matrix.columns * 4),
+                output.offset(base * matrix.rows * 4),
+                count,
+            )?;
+        }
+        Ok(())
+    }
+
     fn gemv(
         &self,
         matrix: &DeviceMat,
@@ -745,6 +800,19 @@ impl Kernels {
         let load = |image: &'static [u8], name: &'static str| {
             cuda.load_named(image, name).map(|(_, kernel)| kernel)
         };
+        // The bulk-prefill image holds the tensor-core dense projection and is optional: on a
+        // toolchain that cannot build it the arm prefills through the decode GEMV instead.
+        let dense = if qwen4_prefill_cubin().is_empty() {
+            None
+        } else {
+            match cuda.load_named_shared(qwen4_prefill_cubin(), "q4p_dense_fp8", DENSE_SHARED) {
+                Ok((_, kernel)) => Some(kernel),
+                Err(error) => {
+                    eprintln!("sensenova: no tensor-core dense projection: {error}");
+                    None
+                }
+            }
+        };
         Ok(Self {
             copy_flat: load(qwen4_exp_cubin(), "q4e_copy_flat")?,
             gemv_bf16: load(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
@@ -767,6 +835,8 @@ impl Kernels {
             mhc_pre: load(sensenova_cubin(), "sensenova_mhc_pre")?,
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
+            mhc_enter: load(sensenova_cubin(), "sensenova_mhc_enter")?,
+            dense_fp8: dense
         })
     }
 }
@@ -860,7 +930,7 @@ impl DeviceSession {
         };
         // Every activation buffer holds ROWS tokens: a verify or a prefill chunk runs the same
         // visit list over that many rows, which is what makes one weight pass serve them all.
-        let mut wide = |count: usize| -> Result<Deviceptr, String> { alloc(ROWS * count * 4) };
+        let mut wide = |count: usize| -> Result<Deviceptr, String> { alloc(PREFILL_ROWS * count * 4) };
         let scratch = Scratch {
             hidden: wide(hidden)?,
             branch: wide(hidden.max(config.intermediate_size))?,
@@ -1040,10 +1110,10 @@ impl DeviceSession {
         let config = &shared.config;
         let hidden = config.hidden_size;
         let rows = tokens.len();
-        if rows == 0 || rows > ROWS {
+        if rows == 0 || rows > PREFILL_ROWS {
             return Err(BackendError::new(
                 DEVICE,
-                format!("a forward takes 1..={ROWS} rows, not {rows}"),
+                format!("a forward takes 1..={PREFILL_ROWS} rows, not {rows}"),
             ));
         }
         if self.position + rows > shared.context {
@@ -1163,20 +1233,17 @@ impl DeviceSession {
             let uses_mhc = layer.mhc_attn.is_some();
             if uses_mhc {
                 if physical == config.mhc.start {
-                    for row in 0..rows {
-                        for half in 0..2 {
-                            shared.launch(
-                                shared.kernels.copy_flat,
-                                (hidden.div_ceil(256) as u32, 1, 1),
-                                (BLOCK, 1, 1),
-                                &[
-                                    self.scratch.streams.offset((row * 2 + half) * hidden * 4).0,
-                                    self.scratch.hidden.offset(row * hidden * 4).0,
-                                    hidden as u64,
-                                ],
-                            )?;
-                        }
-                    }
+                    shared.launch(
+                        shared.kernels.mhc_enter,
+                        (rows as u32, 1, 1),
+                        (BLOCK, 1, 1),
+                        &[
+                            self.scratch.hidden.0,
+                            self.scratch.streams.0,
+                            hidden as u64,
+                            rows as u64,
+                        ],
+                    )?;
                 }
                 let (weight, bias) = layer.mhc_attn.expect("router");
                 shared.launch(
@@ -1396,11 +1463,11 @@ impl DeviceSession {
         let shared = Arc::clone(&self.shared);
         let intermediate = shared.config.intermediate_size;
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.gemv(&layer.gate, self.scratch.normed, self.scratch.branch, rows)?;
+        shared.project_matrix(&layer.gate, self.scratch.normed, self.scratch.branch, rows)?;
         if debug {
             self.report("device mlp gate", self.scratch.branch, rows * intermediate)?;
         }
-        shared.gemv(&layer.up, self.scratch.normed, self.scratch.ffn, rows)?;
+        shared.project_matrix(&layer.up, self.scratch.normed, self.scratch.ffn, rows)?;
         if debug {
             self.report("device mlp up", self.scratch.ffn, rows * intermediate)?;
         }
@@ -1418,7 +1485,7 @@ impl DeviceSession {
         if debug {
             self.report("device mlp hidden", self.scratch.branch, rows * intermediate)?;
         }
-        shared.gemv(&layer.down, self.scratch.branch, self.scratch.ffn, rows)?;
+        shared.project_matrix(&layer.down, self.scratch.branch, self.scratch.ffn, rows)?;
         if debug {
             self.report("device mlp down", self.scratch.ffn, rows * intermediate)?;
         }
@@ -1445,7 +1512,7 @@ impl DeviceSession {
             layer.v.expect("v"),
             layer.o.expect("o"),
         );
-        shared.gemv(&q, self.scratch.normed, self.scratch.q_interleaved, rows)?;
+        shared.project_matrix(&q, self.scratch.normed, self.scratch.q_interleaved, rows)?;
         shared.launch(
             shared.kernels.qgate,
             (heads as u32, rows as u32, 1),
@@ -1459,8 +1526,8 @@ impl DeviceSession {
                 rows as u64,
             ],
         )?;
-        shared.gemv(&k, self.scratch.normed, self.scratch.key, rows)?;
-        shared.gemv(&v, self.scratch.normed, self.scratch.value, rows)?;
+        shared.project_matrix(&k, self.scratch.normed, self.scratch.key, rows)?;
+        shared.project_matrix(&v, self.scratch.normed, self.scratch.value, rows)?;
         shared.rmsnorm(
             self.scratch.query,
             layer.q_norm.expect("q norm"),
@@ -1618,7 +1685,7 @@ impl DeviceSession {
                 ],
             )?;
         }
-        shared.gemv(&o, self.scratch.attn_out, self.scratch.attention, rows)
+        shared.project_matrix(&o, self.scratch.attn_out, self.scratch.attention, rows)
     }
 
     fn linear_attention(
@@ -1640,11 +1707,11 @@ impl DeviceSession {
             layer.out.expect("out"),
         );
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.gemv(&qkv, self.scratch.normed, self.scratch.qkv, rows)?;
+        shared.project_matrix(&qkv, self.scratch.normed, self.scratch.qkv, rows)?;
         if debug {
             self.report("gdn qkv", self.scratch.qkv, fused)?;
         }
-        shared.gemv(&z, self.scratch.normed, self.scratch.z, rows)?;
+        shared.project_matrix(&z, self.scratch.normed, self.scratch.z, rows)?;
         if debug {
             self.report("gdn z", self.scratch.z, value_width)?;
         }
@@ -1708,7 +1775,7 @@ impl DeviceSession {
         if debug {
             self.report("gdn recur", self.scratch.gdn_out, value_width)?;
         }
-        shared.gemv(&out, self.scratch.gdn_out, self.scratch.attention, rows)?;
+        shared.project_matrix(&out, self.scratch.gdn_out, self.scratch.attention, rows)?;
         if debug {
             self.report("gdn out", self.scratch.attention, config.hidden_size)?;
         }
@@ -1742,7 +1809,7 @@ impl ModelSession for DeviceSession {
         // whole chunk, and the causal attention the kernels implement makes the rows of one
         // chunk exactly the rows of the one-token steps they stand in for.
         let mut logits = Vec::new();
-        for chunk in tokens.chunks(ROWS) {
+        for chunk in tokens.chunks(PREFILL_ROWS) {
             logits = self.forward_rows(chunk)?;
         }
         self.sampler.reset();

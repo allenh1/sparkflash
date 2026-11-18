@@ -201,6 +201,24 @@ extern "C" __global__ void sensenova_mhc_post(float* __restrict__ streams,
                                 __fmul_rn(c[3], branch_value));
 }
 
+// The enter side: a row's residual becomes both streams. One block a row, so a chunk is one
+// launch instead of two copies a row.
+extern "C" __global__ void sensenova_mhc_enter(const float* __restrict__ hidden,
+                                                float* __restrict__ streams, int width, int rows) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const float* source = hidden + (unsigned long long)row * width;
+    float* first = streams + (unsigned long long)row * 2 * width;
+    float* second = first + width;
+    for (int column = threadIdx.x; column < width; column += blockDim.x) {
+        const float value = source[column];
+        first[column] = value;
+        second[column] = value;
+    }
+}
+
 // Collapses the two streams at the last mHC layer.
 extern "C" __global__ void sensenova_mhc_leave(const float* __restrict__ streams,
                                                  float* __restrict__ out, int hidden, int rows) {

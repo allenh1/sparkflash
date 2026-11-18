@@ -60,7 +60,15 @@ Per-token KV is **56 KiB in BF16, 28 KiB in 8-bit**: 14 full-attention visits x 
 layers inside the loop hold two independent caches each. The GDN side is 42 recurrent visits,
 ~84 MiB of f32 state plus ~4 MiB of convolution history per sequence, also per visit.
 
-A prompt runs in chunks of up to eight rows, which is the decode GEMV's register tile: the
+A prompt runs in chunks of up to **512 rows** through `q4p_dense_fp8`, the tensor-core dense
+projection: a 492-token prompt prefills in 542 ms (~900 tok/s), against ~240 tok/s on the
+eight-row decode GEMV and 44 tok/s token at a time. The measurement is ~20 TFLOPS, so the tile is
+not yet at the card's MMA rate; the projection grid is one to four row tiles against 32 column
+tiles for a 4096-wide matrix, which is the occupancy to attack next. Shapes that are not 128-row
+multiples (the GDN gate and decay vectors are 32 rows) still take the decode GEMV a tile at a
+time, and a forward of eight rows or fewer does too.
+
+Under 512 rows the prefill runs in chunks of up to eight rows, the decode GEMV's register tile: the
 projections read their weights once for the chunk, so a 60-token prompt prefills in ~0.25 s
 (~240 tok/s) instead of 1.35 s, and the chunk is bit-identical to the single-token steps it
 stands in for (the fixture's chunk test holds all three of 2, 3 and 8 rows to a delta of 0).
