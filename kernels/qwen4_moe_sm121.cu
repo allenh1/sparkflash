@@ -523,12 +523,15 @@ __device__ __forceinline__ void q4e_bf16_row_dot_group(const unsigned char* row,
     }
 }
 
-template <int QUANT>
+// CLAMP limits the gate and up dots before the SwiGLU (silu(min(gate, limit)) *
+// clamp(up, -limit, limit), GLM's swiglu_limit form); the unclamped entries compile it out.
+template <int QUANT, bool CLAMP = false>
 __device__ __forceinline__ void q4e_expert_gate_up_body(
     const unsigned long long* __restrict__ table, const float* __restrict__ scales,
     const int* __restrict__ indices, const int* __restrict__ perm,
     const int* __restrict__ run_bounds, const float* __restrict__ x,
-    float* __restrict__ activated, int slots, int hidden, int intermediate) {
+    float* __restrict__ activated, int slots, int hidden, int intermediate,
+    float limit = 0.0f) {
     constexpr bool FP8 = QUANT == Q4E_QUANT_FP8;
     constexpr bool BF16 = QUANT == Q4E_QUANT_BF16;
     constexpr bool NVFP4 = QUANT == Q4E_QUANT_NVFP4;
@@ -673,8 +676,12 @@ __device__ __forceinline__ void q4e_expert_gate_up_body(
 #pragma unroll
                 for (int m = 0; m < Q4E_MEMBER_GROUP; ++m) {
                     if (m < count) {
-                        const float gate = q4e_warp_sum(g[m]);
-                        const float up = q4e_warp_sum(u[m]);
+                        float gate = q4e_warp_sum(g[m]);
+                        float up = q4e_warp_sum(u[m]);
+                        if constexpr (CLAMP) {
+                            gate = fminf(gate, limit);
+                            up = fminf(fmaxf(up, -limit), limit);
+                        }
                         if (lane == 0) {
                             const int total_slot = perm[begin + group + m];
                             activated[(unsigned long long)total_slot * intermediate + row] =
@@ -707,6 +714,17 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_fp8(
     OPT_PDL_ENTRY();
     q4e_expert_gate_up_body<Q4E_QUANT_FP8>(table, nullptr, indices, perm, run_bounds, x, activated,
                                            slots, hidden, intermediate);
+}
+
+// The FP8 pass under a release's swiglu_limit: the same arguments and a positive `limit`.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_fp8_clamped(
+    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
+    const int* __restrict__ perm, const int* __restrict__ run_bounds,
+    const float* __restrict__ x, float* __restrict__ activated, int slots, int hidden,
+    int intermediate, float limit) {
+    OPT_PDL_ENTRY();
+    q4e_expert_gate_up_body<Q4E_QUANT_FP8, true>(table, nullptr, indices, perm, run_bounds, x,
+                                                 activated, slots, hidden, intermediate, limit);
 }
 
 // Routed-experts pass two: down projection with conflict-free shared-memory staging
@@ -873,6 +891,17 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_bf16(
                                             activated, slots, hidden, intermediate);
 }
 
+// The BF16 pass under a release's swiglu_limit: the same arguments and a positive `limit`.
+extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_gate_up_bf16_clamped(
+    const unsigned long long* __restrict__ table, const int* __restrict__ indices,
+    const int* __restrict__ perm, const int* __restrict__ run_bounds,
+    const float* __restrict__ x, float* __restrict__ activated, int slots, int hidden,
+    int intermediate, float limit) {
+    OPT_PDL_ENTRY();
+    q4e_expert_gate_up_body<Q4E_QUANT_BF16, true>(table, nullptr, indices, perm, run_bounds, x,
+                                                  activated, slots, hidden, intermediate, limit);
+}
+
 extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down_bf16(
     const unsigned long long* __restrict__ table, const int* __restrict__ indices,
     const int* __restrict__ perm, const int* __restrict__ run_bounds,
@@ -888,21 +917,32 @@ extern "C" __global__ __launch_bounds__(256, 4) void q4e_expert_down_bf16(
 // _SQRT_SOFTPLUS, `renormalise` divides the picks by their sum, and `scaling` multiplies them.
 // The weights are written [batch][topk] in pick order, beside the picked ids. No selection bias:
 // the shared arm refuses one (it is GLM's q4e_noaux_router). grid (batch), Q4E_BLOCK threads.
-extern "C" __global__ void q4e_route(const float* __restrict__ logits, int* __restrict__ indices,
+extern "C" __global__ void q4e_route(const float* __restrict__ logits,
+                                     const float* __restrict__ bias, int* __restrict__ indices,
                                      float* __restrict__ weights, int experts, int topk,
                                      int score, int renormalise, float scaling) {
     OPT_PDL_ENTRY();
+    // A null bias is the plain rule; a bias (noaux_tc, GLM's q4e_noaux_router form in pick
+    // order) ranks independent scores only: the host refuses it over a softmax.
     if (score == Q4E_ROUTER_SOFTMAX) {
         shared_moe_router_body<Q4E_ROUTER_SOFTMAX, false, false, false, Q4E_MAX_EXPERTS,
                                Q4E_MAX_TOPK, Q4E_BLOCK>(logits, nullptr, nullptr, indices, weights,
                                                         experts, topk, renormalise, scaling);
-    } else if (score == Q4E_ROUTER_SIGMOID) {
+    } else if (score == Q4E_ROUTER_SIGMOID && bias == nullptr) {
         shared_moe_router_body<Q4E_ROUTER_SIGMOID, false, false, false, Q4E_MAX_EXPERTS,
                                Q4E_MAX_TOPK, Q4E_BLOCK>(logits, nullptr, nullptr, indices, weights,
                                                         experts, topk, renormalise, scaling);
-    } else if (score == Q4E_ROUTER_SQRT_SOFTPLUS) {
+    } else if (score == Q4E_ROUTER_SIGMOID) {
+        shared_moe_router_body<Q4E_ROUTER_SIGMOID, true, false, false, Q4E_MAX_EXPERTS,
+                               Q4E_MAX_TOPK, Q4E_BLOCK>(logits, bias, nullptr, indices, weights,
+                                                        experts, topk, renormalise, scaling);
+    } else if (score == Q4E_ROUTER_SQRT_SOFTPLUS && bias == nullptr) {
         shared_moe_router_body<Q4E_ROUTER_SQRT_SOFTPLUS, false, false, false, Q4E_MAX_EXPERTS,
                                Q4E_MAX_TOPK, Q4E_BLOCK>(logits, nullptr, nullptr, indices, weights,
+                                                        experts, topk, renormalise, scaling);
+    } else if (score == Q4E_ROUTER_SQRT_SOFTPLUS) {
+        shared_moe_router_body<Q4E_ROUTER_SQRT_SOFTPLUS, true, false, false, Q4E_MAX_EXPERTS,
+                               Q4E_MAX_TOPK, Q4E_BLOCK>(logits, bias, nullptr, indices, weights,
                                                         experts, topk, renormalise, scaling);
     }
 }

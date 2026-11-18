@@ -296,12 +296,16 @@ fn validate_shapes(
                 Ffn::Moe(moe),
                 FfnNames::Moe {
                     router,
+                    bias,
                     experts,
                     shared,
                     shared_gate,
                 },
             ) => {
                 check(router, &[moe.routed_experts, hidden])?;
+                if let Some(bias) = bias {
+                    check(bias, &[moe.routed_experts])?;
+                }
                 if experts.len() != moe.routed_experts {
                     return Err(format!(
                         "layer {layer_index} resolves {} expert bodies for {} experts",
@@ -510,7 +514,7 @@ impl HostSession {
                 Ffn::Dense(dense) => dense_ffn(
                     shared.source.as_ref(),
                     names,
-                    dense.activation,
+                    (dense.activation, dense.clamp),
                     &ffn_input,
                     hidden,
                     dense.intermediate,
@@ -1082,10 +1086,23 @@ fn matrix_or_vector(
     }
 }
 
+/// One SwiGLU value: the activated gate times up, both clamped first when the release limits
+/// them (`silu(min(gate, limit)) * clamp(up, -limit, limit)`, GLM's form; the boot refusal
+/// [sparkflash_ops::parts::host_reference_ffn_refusal] keeps a clamp to SwiGLU).
+fn gated((activation, clamp): (Activation, Option<f64>), gate: f32, up: f32) -> f32 {
+    match clamp {
+        Some(limit) => {
+            let limit = limit as f32;
+            activate(activation, gate.min(limit)) * up.clamp(-limit, limit)
+        }
+        None => activate(activation, gate) * up,
+    }
+}
+
 fn dense_ffn(
     source: &dyn WeightSource,
     names: &LayerNames,
-    activation: Activation,
+    activation: (Activation, Option<f64>),
     input: &[f32],
     hidden: usize,
     intermediate: usize,
@@ -1098,7 +1115,7 @@ fn dense_ffn(
     let activated: Vec<f32> = gate_values
         .iter()
         .zip(&up_values)
-        .map(|(gate, up)| activate(activation, *gate) * up)
+        .map(|(gate, up)| gated(activation, *gate, *up))
         .collect();
     let (_, columns, out) = matrix(source, down, &activated)?;
     if columns != intermediate || out.len() != hidden {
@@ -1119,6 +1136,7 @@ fn moe_ffn(
 ) -> Result<Vec<f32>, String> {
     let FfnNames::Moe {
         router,
+        bias,
         experts,
         shared,
         shared_gate,
@@ -1126,6 +1144,7 @@ fn moe_ffn(
     else {
         return Err("an MoE layer carries another FFN's tensors".to_owned());
     };
+    let activation = (moe.activation, moe.clamp);
     let (_, _, logits) = matrix(source, router, input)?;
     let probabilities = match moe.score {
         Score::Softmax => softmax(&logits),
@@ -1143,15 +1162,37 @@ fn moe_ffn(
         ));
     }
     let mut selected: Vec<(usize, f32)> = probabilities.iter().copied().enumerate().collect();
-    selected.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    selected.truncate(moe.active_experts);
-    if moe.norm_topk {
+    if let Some(bias) = bias {
+        // noaux_tc: rank by score plus the correction bias, weigh by the plain score, and
+        // renormalise only above one pick (HF's DeepSeek-V3 rule, GLM's reference). The routed
+        // scale is applied below with every other rule's.
+        let (_, _, bias) = matrix_or_vector(source, bias)?;
+        if bias.len() != probabilities.len() {
+            return Err(format!(
+                "the selection bias holds {} values for {} experts",
+                bias.len(),
+                probabilities.len()
+            ));
+        }
+        sparkflash_weights::topk::noaux_top_k(
+            &probabilities,
+            &bias,
+            moe.active_experts,
+            moe.norm_topk,
+            1.0,
+            &mut selected,
+        );
+    } else {
+        selected.sort_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        selected.truncate(moe.active_experts);
+    }
+    if moe.norm_topk && bias.is_none() {
         let total: f32 = selected.iter().map(|(_, weight)| weight).sum();
         if total > 0.0 {
             for (_, weight) in &mut selected {
@@ -1167,7 +1208,7 @@ fn moe_ffn(
         let activated: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(gate, up)| activate(moe.activation, *gate) * up)
+            .map(|(gate, up)| gated(activation, *gate, *up))
             .collect();
         let body = matrix(source, &names.down, &activated)?.2;
         for (slot, value) in out.iter_mut().zip(&body) {
@@ -1180,7 +1221,7 @@ fn moe_ffn(
         let activated: Vec<f32> = gate
             .iter()
             .zip(&up)
-            .map(|(gate, up)| activate(moe.activation, *gate) * up)
+            .map(|(gate, up)| gated(activation, *gate, *up))
             .collect();
         let body = matrix(source, &shared.down, &activated)?.2;
         let scalar = match shared_gate {

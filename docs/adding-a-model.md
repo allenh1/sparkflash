@@ -437,15 +437,16 @@ web's fit read that one plan, and:
 
 - a novel family that is a grouped-query decoder (embedding, RMSNorm, GQA with or without
   the per-head output gate and `q_norm`/`k_norm`, plain `rotate_half` RoPE over the leading
-  rotated dimensions, Gated DeltaNet layers between them or not, a dense unclamped SwiGLU or
-  routed experts, a plain residual and the head), BF16 or with its projections and experts in
+  rotated dimensions, Gated DeltaNet layers between them or not, a dense SwiGLU (clamped by a
+  `swiglu_limit` or not) or routed experts, a plain residual and the head), BF16 or with its projections and experts in
   128 x 128-tile FP8, is served
   on the device by the shared dense arm, `sparkflash-model-dense` (runtime step 19), with no code
   of its own: it reads the `Architecture`, the shared names, `DraftUploader` and the typed
   `sparkflash_ops::calls`, and its prompt projections take the shared wide tile
   (`WidePolicy::DENSE`). A routed layer (runtime step 21: a softmax, sigmoid or sqrt-softplus
-  router, its top-k with or without renormalising, a routed scale, one shared expert with or
-  without its sigmoid gate) runs the released arms' parts: `q4e_route`, `MoePlanCall::runs`, the
+  router, its top-k with or without renormalising, a sigmoid or sqrt-softplus top-k on score
+  plus a noaux_tc `e_score_correction_bias` (runtime step 25), a routed scale, one shared expert
+  with or without its sigmoid gate) runs the released arms' parts: `q4e_route`, `MoePlanCall::runs`, the
   token path's expert passes in their BF16 form and `q4e_moe_combine`. A release that stores its
   projections and experts as E4M3 codes under one inverse scale a 128 x 128 tile (runtime step
   22, the Qwen3 FP8 form) runs Qwen's and GLM's FP8 kernels: the FP8 tile (`Fp8Tile`, by

@@ -903,6 +903,7 @@ impl Builder {
                     Ffn::Moe(moe),
                     FfnNames::Moe {
                         router,
+                        bias,
                         experts: bodies,
                         shared,
                         shared_gate,
@@ -922,6 +923,16 @@ impl Builder {
                         vec![moe.routed_experts, hidden],
                         Role::Router,
                     );
+                    if let Some(bias) = bias {
+                        // The released documents store the correction bias in f32 (GLM's own
+                        // plan says the same of its gate).
+                        self.whole(
+                            bias.clone(),
+                            DType::F32,
+                            vec![moe.routed_experts],
+                            Role::Router,
+                        );
+                    }
                     for body in bodies {
                         for (name, rows) in
                             [(&body.gate, true), (&body.up, true), (&body.down, false)]

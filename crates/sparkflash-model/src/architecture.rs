@@ -402,10 +402,23 @@ pub struct Moe {
     pub norm_topk: bool,
     /// Whether selection adds a learned correction bias.
     pub selection_bias: bool,
+    /// The expert groups selection is limited to, when the release limits it.
+    pub group_limit: Option<GroupLimit>,
     /// The SwiGLU clamp, when the release declares one.
     pub clamp: Option<f64>,
     /// The activation.
     pub activation: Activation,
+}
+
+/// Group-limited selection (`n_group`, `topk_group`): the experts form `groups` equal groups, and
+/// a token picks its experts from the `kept` groups that score best. Recorded only when it limits
+/// anything (more than one group, fewer kept than there are).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupLimit {
+    /// The expert groups.
+    pub groups: usize,
+    /// The groups a token picks from.
+    pub kept: usize,
 }
 
 /// The routing score a MoE gate applies.
@@ -1941,9 +1954,17 @@ fn ffn(
         routed_scaling: optional_f64(text, "routed_scaling_factor")?.unwrap_or(1.0),
         norm_topk: optional_bool(text, "norm_topk_prob")?.unwrap_or(true),
         selection_bias: optional_string(text, "topk_method").as_deref() == Some("noaux_tc"),
+        group_limit: group_limit(text)?,
         clamp,
         activation,
     }))
+}
+
+/// The group limit `n_group` and `topk_group` declare, when it limits selection at all.
+fn group_limit(text: &Value) -> Result<Option<GroupLimit>, ConfigError> {
+    let groups = optional_usize(text, "n_group")?.unwrap_or(1);
+    let kept = optional_usize(text, "topk_group")?.unwrap_or(groups);
+    Ok((groups > 1 && kept < groups).then_some(GroupLimit { groups, kept }))
 }
 
 fn residual(text: &Value) -> Result<Residual, ConfigError> {

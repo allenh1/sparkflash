@@ -1779,6 +1779,7 @@ pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
     "q4e_rope",
     "q4e_sum_slots",
     "q4e_swiglu",
+    "q4e_swiglu_clamped",
     "q4e_zero",
 ];
 
@@ -1804,12 +1805,14 @@ pub const DENSE_ATTENTION_SYMBOLS: &[&str] =
     &["q4e_attn_full", "q4e_attn_full_combine", "q4e_cache_bf16"];
 
 /// The routed-expert kernels the shared dense arm launches for an MoE layer: the router, the
-/// token path's BF16 and block-scaled FP8 expert passes and the combine.
+/// token path's BF16 and block-scaled FP8 expert passes (and their clamped forms) and the combine.
 pub const DENSE_MOE_SYMBOLS: &[&str] = &[
     "q4e_expert_down_bf16",
     "q4e_expert_down_fp8",
     "q4e_expert_gate_up_bf16",
+    "q4e_expert_gate_up_bf16_clamped",
     "q4e_expert_gate_up_fp8",
+    "q4e_expert_gate_up_fp8_clamped",
     "q4e_moe_combine",
     "q4e_route",
 ];
@@ -1988,16 +1991,11 @@ pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
             ));
         }
         match &layer.ffn {
-            Ffn::Dense(dense) if dense.activation == Activation::Silu && dense.clamp.is_none() => {}
+            Ffn::Dense(dense) if dense.activation == Activation::Silu => {}
             Ffn::Dense(dense) => {
                 return Some(format!(
-                    "layer {index}'s MLP is {:?}{}, and the arm runs an unclamped SwiGLU",
-                    dense.activation,
-                    if dense.clamp.is_some() {
-                        " clamped"
-                    } else {
-                        ""
-                    }
+                    "layer {index}'s MLP is {:?}, and the arm runs a SwiGLU",
+                    dense.activation
                 ));
             }
             Ffn::Moe(moe) => {
@@ -2113,17 +2111,11 @@ fn dense_moe_refusal(
             format.name()
         ));
     }
-    if moe.activation != Activation::Silu || moe.clamp.is_some() {
+    if moe.activation != Activation::Silu {
         return Some(format!(
-            "their MLP is {:?}{}, and the arm runs an unclamped SwiGLU",
-            moe.activation,
-            if moe.clamp.is_some() { " clamped" } else { "" }
+            "their MLP is {:?}, and the arm runs a SwiGLU",
+            moe.activation
         ));
-    }
-    if moe.selection_bias {
-        return Some(
-            "selection adds a learned correction bias, which the arm's router does not".to_owned(),
-        );
     }
     if moe.routed_experts == 0 || moe.routed_experts > DENSE_MAX_EXPERTS {
         return Some(format!(
@@ -2159,7 +2151,8 @@ fn dense_moe_refusal(
             moe.intermediate
         ));
     }
-    if moe.norm_topk && moe.active_experts == 1 && moe.score != Score::Softmax {
+    if moe.norm_topk && moe.active_experts == 1 && moe.score != Score::Softmax && !moe.selection_bias
+    {
         return Some(
             "one pick renormalised under an independent score: the router keeps its score (the \
              top-k-above-one rule) where the host reference divides it to one"
@@ -2209,7 +2202,47 @@ pub fn host_reference_structure_refusal(architecture: &Architecture) -> Option<S
             names.join(", ")
         ));
     }
-    host_reference_rope_refusal(architecture)
+    host_reference_rope_refusal(architecture).or_else(|| host_reference_ffn_refusal(architecture))
+}
+
+/// The first layer whose MLP or routing rule the host reference does not apply.
+///
+/// The reference selects experts by score, or by score plus the `noaux_tc` correction bias
+/// ([sparkflash_weights::topk::noaux_top_k]), over every expert, and clamps a SwiGLU the release
+/// limits (`silu(min(gate, limit)) * clamp(up, -limit, limit)`, GLM's form). Group-limited
+/// selection (`n_group`, `topk_group`), a bias over a softmax score and a clamp on another
+/// activation would be computed as if undeclared, so they are refused at boot.
+#[must_use]
+pub fn host_reference_ffn_refusal(architecture: &Architecture) -> Option<String> {
+    use sparkflash_model::architecture::{Activation, Ffn, Score};
+    for layer in &architecture.layers {
+        let index = layer.index;
+        let (activation, clamp) = match &layer.ffn {
+            Ffn::Dense(dense) => (dense.activation, dense.clamp),
+            Ffn::Moe(moe) => {
+                if let Some(limit) = moe.group_limit {
+                    return Some(format!(
+                        "layer {index} picks its experts from the best {} of {} expert groups, \
+                         which the dynamic host path does not limit",
+                        limit.kept, limit.groups
+                    ));
+                }
+                if moe.selection_bias && moe.score == Score::Softmax {
+                    return Some(format!(
+                        "layer {index} adds a selection bias to a softmax score; the dynamic host \
+                         path adds it to independent (sigmoid or sqrt-softplus) scores"
+                    ));
+                }
+                (moe.activation, moe.clamp)
+            }
+        };
+        if clamp.is_some() && activation != Activation::Silu {
+            return Some(format!(
+                "layer {index} clamps a {activation:?} MLP; the dynamic host path clamps a SwiGLU"
+            ));
+        }
+    }
+    None
 }
 
 /// The first layer whose rotary scaling rule the host reference does not apply.
@@ -3097,12 +3130,46 @@ mod tests {
             });
             assert_eq!(dense_device_refusal(&independent), None, "{score}");
         }
+        // GLM's router and SwiGLU: the noaux_tc correction bias over a sigmoid score (one pick
+        // included: it keeps its score, the top-k-above-one rule), one group of every expert, and
+        // a clamp on every MLP.
+        for picks in [1, 2] {
+            let noaux = parse(&|document| {
+                document["scoring_func"] = serde_json::json!("sigmoid");
+                document["topk_method"] = serde_json::json!("noaux_tc");
+                document["n_group"] = serde_json::json!(1);
+                document["topk_group"] = serde_json::json!(1);
+                document["num_experts_per_tok"] = serde_json::json!(picks);
+                document["swiglu_limit"] = serde_json::json!(7.0);
+            });
+            let sparkflash_model::architecture::Ffn::Moe(moe) = &noaux.layers[0].ffn else {
+                panic!("a routed layer");
+            };
+            assert!(moe.selection_bias && moe.group_limit.is_none() && moe.clamp == Some(7.0));
+            assert_eq!(dense_device_refusal(&noaux), None, "noaux_tc at {picks}");
+        }
         for (edit, named) in [
             (
                 &(|document: &mut serde_json::Value| {
+                    document["scoring_func"] = serde_json::json!("sigmoid");
                     document["topk_method"] = serde_json::json!("noaux_tc");
+                    document["n_group"] = serde_json::json!(4);
+                    document["topk_group"] = serde_json::json!(2);
                 }) as &dyn Fn(&mut serde_json::Value),
-                "correction bias",
+                "best 2 of 4 expert groups",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["topk_method"] = serde_json::json!("noaux_tc");
+                },
+                "selection bias to a softmax score",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["hidden_act"] = serde_json::json!("gelu");
+                    document["swiglu_limit"] = serde_json::json!(7.0);
+                },
+                "clamps a",
             ),
             (
                 &|document: &mut serde_json::Value| {
@@ -3134,12 +3201,6 @@ mod tests {
                     document["quantization_config"] = serde_json::json!({"quant_method": "nvfp4"});
                 },
                 "BF16 or 128 x 128 block-scaled FP8",
-            ),
-            (
-                &|document: &mut serde_json::Value| {
-                    document["swiglu_limit"] = serde_json::json!(7.0);
-                },
-                "unclamped SwiGLU",
             ),
             (
                 &|document: &mut serde_json::Value| {

@@ -1784,6 +1784,18 @@ extern "C" __global__ void q4e_swiglu(const float* __restrict__ gate, const floa
     }
 }
 
+// out[i] = silu(min(gate[i], limit)) * clamp(up[i], -limit, limit): q4e_swiglu under a release's
+// swiglu_limit (GLM's clamp, the token image's division spelling of the silu).
+extern "C" __global__ void q4e_swiglu_clamped(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              float* __restrict__ out, int width, float limit) {
+    OPT_PDL_ENTRY();
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < width;
+         index += blockDim.x * gridDim.x) {
+        out[index] = shared_swiglu_value<true, false>(gate[index], up[index], limit);
+    }
+}
+
 
 // Test seam exposing E4M3 decode across all 256 codes.
 extern "C" __global__ void q4e_decode_f8e4m3(const unsigned char* codes, float* out, int count) {

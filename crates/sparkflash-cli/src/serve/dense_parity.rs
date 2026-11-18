@@ -27,6 +27,9 @@
 //! expert), and a sqrt-softplus router with no shared expert. Two block-scaled FP8 checkpoints
 //! close it, as the Qwen3 FP8 releases store their projections and experts (E4M3 codes under one
 //! BF16 or F32 inverse scale a 128 x 128 tile): a dense gated one and the first routed one.
+//! GLM's router and SwiGLU close the routed set: a `noaux_tc` sigmoid router (the top-k by score
+//! plus a correction bias, weighed by the plain score) under a `swiglu_limit` that clamps every
+//! MLP, with DeepSeek's `shared_experts` spelling, in BF16 and in FP8.
 //!
 //! The arm's serving contract is checked here too, on the same fixtures: fused lanes answer every
 //! step's logits to the bit as each conversation alone, and a kept lane continues its
@@ -99,6 +102,18 @@ impl Memory {
             })
             .collect();
         self.insert(name, DType::BF16, shape, bytes);
+    }
+
+    /// An F32 tensor of deterministic values in `[-scale, scale]` around `centre`.
+    fn push_f32(&mut self, name: &str, shape: &[usize], centre: f32, scale: f32) {
+        let elements: usize = shape.iter().product();
+        let bytes = mixed(name, elements)
+            .flat_map(|mixed| {
+                let unit = (mixed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0;
+                (centre + unit * scale).to_le_bytes()
+            })
+            .collect();
+        self.insert(name, DType::F32, shape, bytes);
     }
 
     /// A block-scaled E4M3 `[rows, columns]` weight as the FP8 releases store one: codes of
@@ -218,6 +233,14 @@ impl Fixture {
             let experts = self.value("num_experts");
             let width = self.value("moe_intermediate_size");
             source.push(&at("mlp.gate"), &[experts, hidden], 0.0, weight);
+            // A noaux_tc release (DeepSeek's form) stores its correction bias in f32 beside the
+            // router, of a spread that reorders close sigmoid scores, and spells its shared
+            // expert `shared_experts`.
+            let noaux = self.config["topk_method"] == "noaux_tc";
+            if noaux {
+                let name = format!("model.layers.{layer}.mlp.gate.e_score_correction_bias");
+                source.push_f32(&name, &[experts], 0.0, 0.1);
+            }
             for expert in 0..experts {
                 let prefix = format!("model.layers.{layer}.mlp.experts.{expert}");
                 form.mlp(&mut source, &prefix, width, hidden);
@@ -228,7 +251,8 @@ impl Fixture {
                 None => counted.then_some(width),
             };
             if let Some(shared) = shared {
-                let prefix = format!("model.layers.{layer}.mlp.shared_expert");
+                let spelling = if noaux { "shared_experts" } else { "shared_expert" };
+                let prefix = format!("model.layers.{layer}.mlp.{spelling}");
                 form.mlp(&mut source, &prefix, shared, hidden);
                 if !counted {
                     source.push(&at("mlp.shared_expert_gate"), &[1, hidden], 0.0, weight);
@@ -426,6 +450,64 @@ fn sigmoid_routed() -> Fixture {
         tied: true,
         fp8: false,
     }
+}
+
+/// GLM's router and SwiGLU on a family no pack names: a dense first layer, then a sigmoid over
+/// sixteen experts whose top three are taken on score plus an f32 correction bias (`noaux_tc`,
+/// one group of all of them) and renormalised, a routed scale, and one shared expert spelled
+/// `shared_experts`; a `swiglu_limit` that clamps a share of every MLP's gate and up values.
+fn noaux_routed() -> Fixture {
+    Fixture {
+        config: json!({
+            "model_type": "acme_moe_noaux",
+            "architectures": ["AcmeMoeNoauxForCausalLM"],
+            "hidden_size": 256,
+            "intermediate_size": 384,
+            "moe_intermediate_size": 128,
+            "n_shared_experts": 1,
+            "num_experts": 16,
+            // Four or five picks put a 300-row prompt's router at a near tie (a 2e-5 to 5e-5 gap
+            // between the last pick and the next, under the first layer's tolerance), so that
+            // row takes another expert there; three do not.
+            "num_experts_per_tok": 3,
+            "first_k_dense_replace": 1,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": true,
+            "routed_scaling_factor": 1.8,
+            "swiglu_limit": 0.75,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false
+        }),
+        gated: false,
+        tied: false,
+        fp8: false,
+    }
+}
+
+/// [noaux_routed]'s checkpoint with every projection and expert block-scaled FP8: the clamped
+/// FP8 expert pass and the clamped SwiGLU after FP8 projections.
+fn noaux_fp8_routed() -> Fixture {
+    let mut fixture = noaux_routed();
+    fixture.config["model_type"] = json!("acme_moe_noaux_fp8");
+    fixture.config["architectures"] = json!(["AcmeMoeNoauxFp8ForCausalLM"]);
+    fixture.config["quantization_config"] = json!({
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128]
+    });
+    fixture.fp8 = true;
+    fixture
 }
 
 /// A sqrt-softplus score over twelve experts, three renormalised picks, and no shared expert.
@@ -1024,6 +1106,13 @@ fn two_ranks_of_sigmoid_routed_experts_match_the_host_reference() {
 }
 
 #[test]
+fn two_ranks_of_a_noaux_router_under_a_swiglu_limit_match_the_host_reference() {
+    // The bias whole on every rank; the experts, the shared expert and the first dense MLP split
+    // 64 + 64 and 192 + 192, each share clamped before its partial rows are summed.
+    two_ranks(&noaux_routed(), 40, 3);
+}
+
+#[test]
 fn two_ranks_of_gated_deltanet_layers_match_the_host_reference() {
     two_ranks(&hybrid(), 300, 3);
 }
@@ -1067,6 +1156,16 @@ fn a_routed_checkpoint_with_a_gated_shared_expert_matches_the_host_reference_lay
 #[test]
 fn sigmoid_routed_experts_after_a_dense_layer_match_the_host_reference_layer_by_layer() {
     assert_passed(parity(&sigmoid_routed(), 40, 3));
+}
+
+#[test]
+fn a_noaux_router_under_a_swiglu_limit_matches_the_host_reference_layer_by_layer() {
+    assert_passed(parity(&noaux_routed(), 300, 3));
+}
+
+#[test]
+fn a_noaux_router_with_fp8_experts_under_a_swiglu_limit_matches_the_host_reference() {
+    assert_passed(parity(&noaux_fp8_routed(), 40, 3));
 }
 
 #[test]
@@ -1161,6 +1260,7 @@ fn fused_routed_lanes_answer_every_step_as_each_conversation_alone() {
     // The expert passes group a run's rows two at a time, and a row's dot is its own at any
     // grouping, so a lane's experts sum as they would alone.
     lanes_answer_as_alone(&sigmoid_routed());
+    lanes_answer_as_alone(&noaux_routed());
 }
 
 fn lanes_answer_as_alone(fixture: &Fixture) {

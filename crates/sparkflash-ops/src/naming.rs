@@ -80,11 +80,13 @@ impl TensorNames {
                 }
                 FfnNames::Moe {
                     router,
+                    bias,
                     experts,
                     shared,
                     shared_gate,
                 } => {
                     out.push(router.clone());
+                    out.extend(bias.iter().cloned());
                     for expert in experts.iter().chain(shared) {
                         out.extend([expert.gate.clone(), expert.up.clone(), expert.down.clone()]);
                     }
@@ -185,6 +187,8 @@ pub enum FfnNames {
     Moe {
         /// Router logits.
         router: String,
+        /// The selection's correction bias (`e_score_correction_bias`), when selection adds one.
+        bias: Option<String>,
         /// Per-expert SwiGLU tensors.
         experts: Vec<ExpertNames>,
         /// The shared expert's SwiGLU tensors, when the checkpoint stores one.
@@ -224,6 +228,9 @@ const POST_NORMS: [&str; 3] = ["post_attention_layernorm", "ffn_norm", "pre_ffn_
 /// The router's spellings.
 const ROUTERS: [&str; 2] = ["gate", "router"];
 
+/// The shared expert's spellings: one MLP either way.
+const SHARED_EXPERTS: [&str; 2] = ["shared_expert", "shared_experts"];
+
 const EMBEDDINGS: [&str; 7] = [
     "model.embed_tokens.weight",
     "model.language_model.embed_tokens.weight",
@@ -261,6 +268,8 @@ pub struct NamingDialect {
     /// Whether the GDN projections are spelled `in_qkv` rather than `in_proj_qkv`.
     gdn_short: bool,
     router: &'static str,
+    /// The shared expert's spelling: Qwen's `shared_expert` or DeepSeek's `shared_experts`.
+    shared: &'static str,
     /// Whether a shared expert carries its scalar gate, or `None` to take the document's word.
     shared_gate: Option<bool>,
 }
@@ -280,6 +289,7 @@ impl NamingDialect {
             qk_norm: false,
             gdn_short: false,
             router: ROUTERS[0],
+            shared: SHARED_EXPERTS[0],
             shared_gate: None,
         }
     }
@@ -379,6 +389,19 @@ impl NamingDialect {
             }
             None => ROUTERS[0],
         };
+        // The first layer that holds a shared expert says how it is spelled.
+        let shared = architecture
+            .layers
+            .iter()
+            .find(|layer| matches!(&layer.ffn, Ffn::Moe(moe) if moe.shared_experts > 0))
+            .map_or(Ok(SHARED_EXPERTS[0]), |layer| {
+                let found = pick(
+                    layer.index,
+                    &["mlp.shared_expert", "mlp.shared_experts"],
+                    ".gate_proj.weight",
+                )?;
+                Ok::<_, String>(found.trim_start_matches("mlp."))
+            })?;
         let shared_gate = Some(moe.is_some_and(|layer| {
             has(&at(
                 layer_root,
@@ -395,6 +418,7 @@ impl NamingDialect {
             qk_norm,
             gdn_short,
             router,
+            shared,
             shared_gate,
         })
     }
@@ -458,11 +482,14 @@ impl NamingDialect {
                 Ffn::Dense(_) => FfnNames::Dense(ExpertNames::under(&format!("{p}.mlp"))),
                 Ffn::Moe(moe) => FfnNames::Moe {
                     router: format!("{p}.mlp.{}.weight", self.router),
+                    bias: moe
+                        .selection_bias
+                        .then(|| format!("{p}.mlp.{}.e_score_correction_bias", self.router)),
                     experts: (0..moe.routed_experts)
                         .map(|expert| ExpertNames::under(&format!("{p}.mlp.experts.{expert}")))
                         .collect(),
                     shared: (moe.shared_experts > 0)
-                        .then(|| ExpertNames::under(&format!("{p}.mlp.shared_expert"))),
+                        .then(|| ExpertNames::under(&format!("{p}.mlp.{}", self.shared))),
                     shared_gate: (moe.shared_experts > 0
                         && self.shared_gate.unwrap_or(moe.shared_gated))
                     .then(|| format!("{p}.mlp.shared_expert_gate.weight")),

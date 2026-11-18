@@ -88,6 +88,7 @@ pub fn tiny_architecture() -> Architecture {
             routed_scaling: 2.5,
             norm_topk: true,
             selection_bias: true,
+            group_limit: None,
             clamp: Some(10.0),
             activation: Activation::Silu,
         })

@@ -115,6 +115,7 @@ pub(crate) fn tiny_architecture() -> Architecture {
             routed_scaling: 1.0,
             norm_topk: true,
             selection_bias: false,
+            group_limit: None,
             clamp: None,
             activation: Activation::Silu,
         })

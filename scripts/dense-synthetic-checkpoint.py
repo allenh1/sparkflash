@@ -22,12 +22,15 @@ this writes one with random weights beside a ChatML tokenizer copied from TOKENI
 tokenizer.json, vocab.json, chat template and generation config):
 
   dense-synthetic-checkpoint.py TOKENIZER_DIR OUT_DIR [--layers 8] [--hidden 1024]
-      [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]] [--fp8]
-      [--gdn]
+      [--experts 32 --top-k 4 --expert-intermediate 512 [--shared-intermediate 1024]
+       [--noaux]] [--fp8] [--gdn]
 
 With --experts every layer routes: a softmax router renormalising its top-k picks over that many
 BF16 experts, and a sigmoid-gated shared expert when --shared-intermediate names its width (the
-Qwen MoE spelling), so the served gate covers the arm's routed layers too. With --fp8 every
+Qwen MoE spelling), so the served gate covers the arm's routed layers too. --noaux routes as
+GLM and DeepSeek do instead: a sigmoid score whose top-k is taken on score plus an f32
+`e_score_correction_bias` (`topk_method` noaux_tc, one group), a routed scale, an ungated shared
+expert spelled `shared_experts`, and a `swiglu_limit` on every MLP. With --fp8 every
 projection and expert is stored as the Qwen3 FP8 releases store them: E4M3 codes under one BF16
 `weight_scale_inv` a 128 x 128 tile (the embedding, head, norms and router stay BF16). With
 --gdn every even layer is a Gated DeltaNet (Qwen3.5's `linear_attn` spelling: four key heads and
@@ -58,6 +61,12 @@ def bf16_random(count, exponent):
     table = bytes(((byte & 0x80) | top) for byte in range(256))
     raw[1::2] = bytes(raw[1::2]).translate(table)
     return bytes(raw)
+
+
+def f32_random(count, scale):
+    """`count` F32 values uniform in [-scale, scale]."""
+    words = struct.unpack("<%dI" % count, os.urandom(4 * count))
+    return struct.pack("<%df" % count, *((word / 2.0 ** 31 - 1.0) * scale for word in words))
 
 
 def bf16_constant(count, value):
@@ -138,6 +147,7 @@ def main():
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--expert-intermediate", type=int, default=512)
     parser.add_argument("--shared-intermediate", type=int, default=0)
+    parser.add_argument("--noaux", action="store_true")
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument("--gdn", action="store_true")
     args = parser.parse_args()
@@ -190,7 +200,24 @@ def main():
             "moe_intermediate_size": args.expert_intermediate,
             "norm_topk_prob": True,
         })
-        if args.shared_intermediate:
+        if args.noaux:
+            # DeepSeek's spelling: a counted shared expert of --shared-intermediate's width.
+            config.update({
+                "model_type": "acme_moe_noaux",
+                "architectures": ["AcmeMoeNoauxForCausalLM"],
+                "scoring_func": "sigmoid",
+                "topk_method": "noaux_tc",
+                "n_group": 1,
+                "topk_group": 1,
+                "routed_scaling_factor": 2.5,
+                "swiglu_limit": 7.0,
+            })
+            if args.shared_intermediate:
+                config["n_shared_experts"] = 1
+                config["moe_intermediate_size"] = args.expert_intermediate
+                if args.shared_intermediate != args.expert_intermediate:
+                    parser.error("--noaux spells one shared expert of an expert's width")
+        elif args.shared_intermediate:
             config["shared_expert_intermediate_size"] = args.shared_intermediate
     linear = lambda layer: args.gdn and layer % 2 == 0
     if args.gdn:
@@ -243,17 +270,23 @@ def main():
             continue
         tensors.append((at + "mlp.gate.weight", [args.experts, hidden],
                         bf16_random(args.experts * hidden, inner(hidden))))
+        if args.noaux:
+            tensors.append((at + "mlp.gate.e_score_correction_bias", [args.experts],
+                            f32_random(args.experts, 0.05), "F32"))
         for expert in range(args.experts):
             tensors += mlp(at + "mlp.experts.%d." % expert, args.expert_intermediate, hidden,
                            inner, fp8)
-        if args.shared_intermediate:
+        if args.shared_intermediate and args.noaux:
+            tensors += mlp(at + "mlp.shared_experts.", args.shared_intermediate, hidden, inner, fp8)
+        elif args.shared_intermediate:
             tensors += mlp(at + "mlp.shared_expert.", args.shared_intermediate, hidden, inner, fp8)
             tensors.append((at + "mlp.shared_expert_gate.weight", [1, hidden],
                             bf16_random(hidden, inner(hidden))))
     write(os.path.join(args.out_dir, "model.safetensors"), tensors)
     print("wrote %s: %d layers, hidden %d, vocab %d, %d word tokens in the head%s%s%s" % (
         args.out_dir, args.layers, hidden, size, len(words),
-        ", %d experts (top %d)" % (args.experts, args.top_k) if args.experts else "",
+        ", %d experts (top %d%s)" % (args.experts, args.top_k, ", noaux_tc" if args.noaux else "")
+        if args.experts else "",
         ", FP8 projections" if fp8 else "",
         ", Gated DeltaNet on even layers" if args.gdn else ""))
 

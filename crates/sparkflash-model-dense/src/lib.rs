@@ -120,6 +120,8 @@ struct Shape {
     theta: f32,
     /// The dense MLP's width, or a routed layer's shared expert's (zero without one).
     intermediate: usize,
+    /// The SwiGLU limit every MLP of the layer takes (`swiglu_limit`), when the release sets one.
+    clamp: Option<f32>,
     /// A routed layer's experts.
     routed: Option<Routed>,
     /// A Gated DeltaNet layer's geometry.
@@ -304,6 +306,11 @@ impl Shape {
             rotary: attention.rope.rotated_dims.min(head_dim),
             theta: attention.rope.theta.max(1.0) as f32,
             intermediate,
+            clamp: match &layer.ffn {
+                Ffn::Dense(dense) => dense.clamp,
+                Ffn::Moe(moe) => moe.clamp,
+            }
+            .map(|limit| limit as f32),
             routed,
             linear,
             cut,
@@ -418,6 +425,8 @@ enum LayerFfn {
     Routed {
         /// The router, `[experts][hidden]`.
         router: Proj,
+        /// The selection's correction bias, f32 an expert, when selection adds one.
+        bias: Option<Deviceptr>,
         /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
         /// BF16), up, its grid, down, its grid.
         table: Deviceptr,
@@ -433,6 +442,8 @@ struct MoeKernels {
     route: Kernel,
     plan: Kernel,
     gate_up: Kernel,
+    /// The gate/up pass under a `swiglu_limit`.
+    gate_up_clamped: Kernel,
     down: Kernel,
     combine: Kernel,
 }
@@ -449,6 +460,7 @@ struct Kernels {
     rmsnorm: Kernel,
     rope: Kernel,
     swiglu: Kernel,
+    swiglu_clamped: Kernel,
     attention: Kernel,
     combine: Kernel,
     cache: Kernel,
@@ -503,16 +515,25 @@ impl Kernels {
             cuda.load_named_shared(qwen4_moe_cubin(), name, bytes)
                 .map(|(_, kernel)| kernel)
         };
-        let (gate_up, down) = if formats.fp8_experts {
-            ("q4e_expert_gate_up_fp8", "q4e_expert_down_fp8")
+        let (gate_up, gate_up_clamped, down) = if formats.fp8_experts {
+            (
+                "q4e_expert_gate_up_fp8",
+                "q4e_expert_gate_up_fp8_clamped",
+                "q4e_expert_down_fp8",
+            )
         } else {
-            ("q4e_expert_gate_up_bf16", "q4e_expert_down_bf16")
+            (
+                "q4e_expert_gate_up_bf16",
+                "q4e_expert_gate_up_bf16_clamped",
+                "q4e_expert_down_bf16",
+            )
         };
         let moe = match stage {
             Some(bytes) => Some(MoeKernels {
                 route: named(qwen4_moe_cubin(), "q4e_route")?,
                 plan: named(moe_plan_cubin(), "moe_plan")?,
                 gate_up: staged(gate_up, bytes)?,
+                gate_up_clamped: staged(gate_up_clamped, bytes)?,
                 down: staged(down, bytes)?,
                 combine: named(qwen4_moe_cubin(), "q4e_moe_combine")?,
             }),
@@ -553,6 +574,7 @@ impl Kernels {
             rmsnorm: named(qwen4_exp_cubin(), "q4e_rmsnorm")?,
             rope: named(qwen4_exp_cubin(), "q4e_rope")?,
             swiglu: named(qwen4_exp_cubin(), "q4e_swiglu")?,
+            swiglu_clamped: named(qwen4_exp_cubin(), "q4e_swiglu_clamped")?,
             attention: named(qwen4_attn_cubin(), "q4e_attn_full")?,
             combine: named(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
             cache: named(qwen4_attn_cubin(), "q4e_cache_bf16")?,
@@ -1133,6 +1155,36 @@ impl Uploads<'_> {
 
     /// The rows of a BF16 `[rows][width]` tensor this rank holds, one after another: a
     /// depthwise filter's channels or a per-head vector's heads.
+    /// An f32 vector of `elements` on the device, from an F32 tensor or a BF16 one widened (a
+    /// router's correction bias, which every rank holds whole).
+    fn floats(&mut self, name: &str, elements: usize) -> Result<Deviceptr, String> {
+        let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+        if spec.elements() != elements as u128 {
+            return Err(format!(
+                "{name} is {:?}, expected {elements} values",
+                spec.shape
+            ));
+        }
+        let bytes = match spec.dtype {
+            DType::F32 => self.uploader.read(name, elements * 4)?,
+            DType::BF16 => self
+                .uploader
+                .read(name, elements * 2)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|word| f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes())
+                .collect(),
+            other => {
+                return Err(format!(
+                    "{name} is {other:?}; the shared dense device arm reads an F32 or BF16 vector"
+                ));
+            }
+        };
+        let pointer = self.uploader.bytes(&bytes)?;
+        Ok(self.keep(pointer, elements * 4))
+    }
+
     fn vector_runs(
         &mut self,
         name: &str,
@@ -1292,6 +1344,7 @@ impl Uploads<'_> {
         };
         let FfnNames::Moe {
             router,
+            bias,
             experts,
             shared,
             shared_gate,
@@ -1307,6 +1360,10 @@ impl Uploads<'_> {
             ));
         }
         let router = self.proj(router, routed.experts, hidden)?;
+        let bias = match bias {
+            Some(name) => Some(self.floats(name, routed.experts)?),
+            None => None,
+        };
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
         let fp8 = self.formats.fp8_experts;
         for (number, expert) in experts.iter().enumerate() {
@@ -1378,6 +1435,7 @@ impl Uploads<'_> {
         }
         Ok(LayerFfn::Routed {
             router,
+            bias,
             table,
             shared,
             shared_gate,
@@ -1859,10 +1917,12 @@ impl Shared {
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
     }
 
-    /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch.
+    /// `output = down(silu(gate(normed)) * up(normed))` over `rows`, in the MLP scratch, the gate
+    /// and up clamped first under the layer's `clamp`.
     fn mlp(
         &self,
         mlp: &Mlp,
+        clamp: Option<f32>,
         b: &Buffers,
         output: Deviceptr,
         rows: usize,
@@ -1870,10 +1930,17 @@ impl Shared {
     ) -> Result<(), BackendError> {
         self.project(&mlp.gate, b, b.normed.0, b.ffn_gate.0, rows, policy)?;
         self.project(&mlp.up, b, b.normed.0, b.ffn_up.0, rows, policy)?;
-        self.call(
-            self.kernels.swiglu,
-            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, rows * mlp.gate.rows()),
-        )?;
+        let count = rows * mlp.gate.rows();
+        match clamp {
+            None => self.call(
+                self.kernels.swiglu,
+                calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, count),
+            )?,
+            Some(limit) => self.call(
+                self.kernels.swiglu_clamped,
+                calls::swiglu_clamped(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, count, limit),
+            )?,
+        }
         self.project(&mlp.down, b, b.ffn_up.0, output.0, rows, policy)
     }
 
@@ -1891,6 +1958,7 @@ impl Shared {
             Some(routed),
             LayerFfn::Routed {
                 router,
+                bias,
                 table,
                 shared,
                 shared_gate,
@@ -1911,6 +1979,7 @@ impl Shared {
             ((rows as u32, 1, 1), (256, 1, 1)),
             &[
                 b.router.0,
+                bias.map_or(0, |bias| bias.0),
                 b.indices.0,
                 b.weights.0,
                 experts as u64,
@@ -1927,21 +1996,26 @@ impl Shared {
             (rows * top_k, experts, top_k),
         );
         self.launch(kernels.plan, MoePlanCall::launch(), &plan.args())?;
-        self.launch(
-            kernels.gate_up,
-            token::gate_up_grid(intermediate, top_k, rows),
-            &[
-                table.0,
-                b.indices.0,
-                b.sorted.0,
-                b.runs.0,
-                b.normed.0,
-                b.activated.0,
-                top_k as u64,
-                hidden as u64,
-                intermediate as u64,
-            ],
-        )?;
+        let gate_up = [
+            table.0,
+            b.indices.0,
+            b.sorted.0,
+            b.runs.0,
+            b.normed.0,
+            b.activated.0,
+            top_k as u64,
+            hidden as u64,
+            intermediate as u64,
+        ];
+        let grid = token::gate_up_grid(intermediate, top_k, rows);
+        match layer.shape.clamp {
+            None => self.launch(kernels.gate_up, grid, &gate_up)?,
+            Some(limit) => {
+                let mut clamped = gate_up.to_vec();
+                clamped.push(u64::from(limit.to_bits()));
+                self.launch(kernels.gate_up_clamped, grid, &clamped)?;
+            }
+        }
         self.launch(
             kernels.down,
             token::down_grid(hidden, top_k, rows),
@@ -1960,7 +2034,7 @@ impl Shared {
             ],
         )?;
         match shared {
-            Some(mlp) => self.mlp(mlp, b, b.shared_out, rows, policy)?,
+            Some(mlp) => self.mlp(mlp, layer.shape.clamp, b, b.shared_out, rows, policy)?,
             // The combine always adds a shared row; a layer without one adds zeros.
             None => self
                 .cuda
@@ -2588,7 +2662,9 @@ fn walk(
             rows,
         )?;
         match &layer.ffn {
-            LayerFfn::Dense(mlp) => shared.mlp(mlp, b, b.projected, rows, policy)?,
+            LayerFfn::Dense(mlp) => {
+                shared.mlp(mlp, layer.shape.clamp, b, b.projected, rows, policy)?;
+            }
             LayerFfn::Routed { .. } => shared.routed(layer, b, rows, policy)?,
         }
         shared.sum(b.projected, rows)?;

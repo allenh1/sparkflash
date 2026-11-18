@@ -70,6 +70,13 @@ pub const fn swiglu(gate: u64, up: u64, out: u64, count: usize) -> Call<4> {
     flat(count, [gate, up, out, count as u64])
 }
 
+/// `q4e_swiglu_clamped`: [swiglu] with the gate clamped to at most `limit` and up to
+/// `[-limit, limit]` first (a release's `swiglu_limit`).
+#[must_use]
+pub const fn swiglu_clamped(gate: u64, up: u64, out: u64, count: usize, limit: f32) -> Call<5> {
+    flat(count, [gate, up, out, count as u64, limit.to_bits() as u64])
+}
+
 /// `q4e_copy_flat`: `count` floats from `src` to `dst`.
 #[must_use]
 pub const fn copy(dst: u64, src: u64, count: usize) -> Call<3> {
