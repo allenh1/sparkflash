@@ -157,14 +157,15 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-1. **Fewer and fatter kernels.** The token is one captured graph of 1028 launches, so the host
-   launch path is gone; the body still reads its 12.1 GB at ~630 GB/s against ~870 for the single
-   big head GEMV. What is left is per-kernel: seven GEMVs a visit each restart the DRAM stream and
-   the split-reduce adds a dependent tail, and about eleven small kernels (two routers, two norms,
-   rope, cache, qgate, conv, scan, swiglu) run on one to forty blocks. Folding the norm into the
-   GEMV prologue, the rope and qgate into its epilogue, and the two mHC passes into one kernel is
-   the next real step; it is worth ~8% and needs the visit body restructured rather than more
-   calls.
+1. **Batch the verify, not the launches.** Fusing kernels was measured and does not pay. Two
+   variants were built and served at 160K: the norm folded into both mHC routers (plus an
+   `add_norm` for the plain-residual visits) ran 22.3 -> 23.2 ms, and `gate`/`up` concatenated
+   into one GEMV ran 22.3 -> 22.6 ms, both with fewer launches (1028 -> 924 and 972). The reason
+   is that the FP8 tiled GEMV is decode-issue-bound, not bandwidth-bound: it sustains 596 G
+   elements/s where the BF16 head GEMV sustains 435, i.e. 37% more elements at half the bytes.
+   Fewer, fatter FP8 GEMVs read the same elements and pay the same issue cost; PDL already
+   overlaps the small kernels' tails. What does help is doing more tokens per weight pass, which
+   is exactly the speculative verify: at 8 rows the 14.1 GB is read once for 8 positions.
 2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
    `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
    chunked GDN scan, both of which the shared images already carry. This is the largest single
