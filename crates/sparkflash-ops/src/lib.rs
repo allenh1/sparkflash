@@ -111,6 +111,7 @@ pub mod tensor_plan;
 
 pub mod gdn;
 pub mod gemv;
+pub mod packed;
 pub mod tower;
 pub mod tp;
 

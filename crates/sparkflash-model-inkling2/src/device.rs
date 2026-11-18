@@ -86,7 +86,8 @@ use chunk::{
 };
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
-use packed::{DenseForm, DenseWeights, pack_dense};
+use packed::pack_dense;
+use sparkflash_ops::packed::{Form as DenseForm, PackedSet};
 pub use tower::InklingVisionTower;
 
 /// The backend name the diagnostics use.
@@ -768,10 +769,7 @@ struct Kernels {
     /// A decode row's run of projections over one input, up to [GEMV_FUSED] in one launch.
     gemv4: Entry,
     /// The same two walks over packed matrices ([packed]), and the form's packer and unpacker.
-    gemv_packed: Entry,
-    gemv4_packed: Entry,
-    pack: Entry,
-    unpack: Entry,
+    packed: sparkflash_ops::packed::Kernels,
     block_residual: Entry,
     /// The residual's two-launch form: every stack row's statistics in a block of its own,
     /// then the softmax and the mix.
@@ -964,10 +962,7 @@ impl Kernels {
             rmsnorm: load(token, "q4e_rmsnorm")?,
             gemv: load(token, "q4e_gemv_bf16")?,
             gemv4: load(token, "q4e_gemv4_bf16")?,
-            gemv_packed: load(token, "q4e_gemv_packed")?,
-            gemv4_packed: load(token, "q4e_gemv4_packed")?,
-            pack: load(token, "q4e_pack_bf16")?,
-            unpack: load(token, "q4e_unpack_bf16")?,
+            packed: sparkflash_ops::packed::Kernels::load(cuda)?,
             block_residual: load(inkling, "inkling_block_residual")?,
             block_residual_stats: load(inkling, "inkling_block_residual_stats")?,
             block_residual_mix: load(inkling, "inkling_block_residual_mix")?,
@@ -1131,7 +1126,7 @@ struct Shared {
     kernels: Kernels,
     weights: Weights,
     /// The dense projections packed in place ([packed]), by their slots' pointers.
-    dense: DenseWeights,
+    dense: PackedSet,
     clip: Vec<ClipScales>,
     clip_arena: Deviceptr,
     experts: Vec<Option<ExpertScale>>,
@@ -3015,7 +3010,7 @@ impl InklingDeviceBackend {
             .unwrap_or(0);
         match shared.dense.pack(
             &shared.cuda,
-            &shared.kernels,
+            &shared.kernels.packed,
             model.dense_matrices(),
             widest,
         ) {

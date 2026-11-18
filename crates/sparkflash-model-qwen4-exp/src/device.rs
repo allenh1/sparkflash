@@ -2095,22 +2095,9 @@ pub struct Qwen4ExpDeviceBackend {
     context_limit: usize,
     /// The sessions-stepped-together engine, when the operator asked for one. Unset means every
     /// session runs its own forward on its own stream, the one-row-a-session path.
-    fused: Option<Fused>,
-}
-
-/// The engine a fused backend's sessions are handles on.
-enum Fused {
-    /// This rank alone ([Qwen4ExpDeviceBackend::enable_fusion]).
-    Local(Arc<sparkflash_runtime::FusedEngine<fusion::QwenFusion>>),
-    /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs
-    /// ([Qwen4ExpDeviceBackend::enable_group_fusion]).
-    Group(
-        Arc<
-            sparkflash_runtime::FusedEngine<
-                sparkflash_runtime::GroupLanes<fusion::QwenFusion, sparkflash_runtime::TextWire>,
-            >,
-        >,
-    ),
+    /// The engine sessions are handles on, once [Qwen4ExpDeviceBackend::enable_fusion] or
+    /// [Qwen4ExpDeviceBackend::enable_group_fusion] ran.
+    fused: Option<sparkflash_runtime::Fusion<fusion::QwenFusion>>,
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -2808,10 +2795,10 @@ impl Qwen4ExpDeviceBackend {
                 ),
             ));
         }
-        let arm = Arc::new(self.lanes(capacity)?);
-        self.fused = Some(Fused::Local(sparkflash_runtime::FusedEngine::start(
-            arm, capacity,
-        )?));
+        self.fused = Some(sparkflash_runtime::Fusion::local(
+            self.lanes(capacity)?,
+            capacity,
+        )?);
         Ok(())
     }
 
@@ -2831,14 +2818,12 @@ impl Qwen4ExpDeviceBackend {
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
         self.group_rank()?;
-        let arm = Arc::new(sparkflash_runtime::GroupLanes::new(
+        self.fused = Some(sparkflash_runtime::Fusion::group(
             self.lanes(capacity)?,
-            sparkflash_runtime::watched_hub(hub)?,
+            hub,
             self.wire(),
-        ));
-        self.fused = Some(Fused::Group(sparkflash_runtime::FusedEngine::start(
-            arm, capacity,
-        )?));
+            capacity,
+        )?);
         Ok(())
     }
 
@@ -6160,18 +6145,8 @@ impl ModelBackend for Qwen4ExpDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match &self.fused {
-            Some(Fused::Local(engine)) => {
-                return engine
-                    .open()
-                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
-            }
-            Some(Fused::Group(engine)) => {
-                return engine
-                    .open()
-                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
-            }
-            None => {}
+        if let Some(fused) = &self.fused {
+            return fused.open();
         }
         DeviceSequence::allocate(Arc::clone(&self.shared), self.context_limit)
             .map(|session| Box::new(session) as Box<dyn ModelSession>)

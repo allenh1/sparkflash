@@ -39,6 +39,7 @@ use sparkflash_kernels::images::{dory_cubin, qwen4_exp_cubin};
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
 use sparkflash_ops::gemv::CudaHandle;
+use sparkflash_ops::packed::{self, Form, Packed, PackedSet, Placement};
 // dory_mma_wide's tile is the shared wide tile: its geometry, launch and when a projection
 // takes it are the dispatcher's.
 use sparkflash_ops::projection::{
@@ -67,6 +68,9 @@ struct DeviceMat {
     pointer: Deviceptr,
     rows: usize,
     columns: usize,
+    /// The same rows in the packed form ([sparkflash_ops::packed]), beside the BF16 rows the
+    /// wide tiles read: the decode GEMVs' bits from about three quarters of the bytes.
+    packed: Option<Packed>,
 }
 
 /// One attention sublayer's device weights.
@@ -249,6 +253,7 @@ struct Kernels {
     loop_combine: Kernel,
     justnorm: Kernel,
     logit_scale: Kernel,
+    packed: packed::Kernels,
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context
@@ -260,6 +265,8 @@ pub(crate) struct DeviceShared {
     cuda: CudaHandle,
     kernels: Kernels,
     weights: DeviceWeights,
+    /// The packed copies of the weights' projections.
+    packed: PackedSet,
     config: DoryConfig,
     stage: DoryStage,
     context: usize,
@@ -268,7 +275,8 @@ pub(crate) struct DeviceShared {
 
 impl Drop for DeviceShared {
     fn drop(&mut self) {
-        let pointers = self.weights.pointers();
+        let mut pointers = self.weights.pointers();
+        pointers.extend(self.packed.allocations());
         let references: Vec<&Deviceptr> = pointers.iter().collect();
         self.cuda.free_buffers(&references);
     }
@@ -438,19 +446,43 @@ impl DeviceShared {
         // Without this switch every prefix/loop/suffix state copy is a blocking D2D copy in the
         // serving loop. Qwen enables the same switch at its open.
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
+        let form = Form::from_env()?;
         let kernels = Kernels::load(&cuda, config.head_dim)?;
         let source = open_checkpoint(directory).map_err(|error| error.to_string())?;
         let mut total = 0usize;
         let weights = DeviceWeights::upload(&cuda, &config, &stage, &source, &mut total)?;
-        Ok(Self {
+        let mut shared = Self {
             cuda,
             kernels,
             weights,
+            packed: PackedSet::new(form, Placement::Beside),
             config,
             stage,
             context,
             allocated_bytes: total,
-        })
+        };
+        shared.pack()?;
+        Ok(shared)
+    }
+
+    /// Packs every projection beside its BF16 rows (none under [Form::Bf16]): the decode GEMVs
+    /// read the packed rows, the wide tiles the BF16 ones. A matrix whose packed rows do not
+    /// unpack to its BF16 rows refuses the open.
+    fn pack(&mut self) -> Result<(), String> {
+        let matrices: Vec<_> = self
+            .weights
+            .projections()
+            .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+            .collect();
+        let (_, packed_bytes) = self
+            .packed
+            .pack(&self.cuda, &self.kernels.packed, &matrices, 0)?;
+        self.allocated_bytes += packed_bytes;
+        for matrix in self.weights.projections() {
+            matrix.packed = self.packed.get(matrix.pointer);
+        }
+        eprintln!("[dory] {}", self.packed.summary());
+        Ok(())
     }
 
     pub(crate) fn cuda(&self) -> &Cuda {
@@ -512,11 +544,31 @@ impl Kernels {
             loop_combine: named(dory_cubin(), "dory_loop_combine")?,
             justnorm: named(dory_cubin(), "dory_justnorm")?,
             logit_scale: named(dory_cubin(), "dory_logit_scale")?,
+            packed: packed::Kernels::load(cuda)?,
         })
     }
 }
 
 impl DeviceWeights {
+    /// Every projection the GEMVs read: the blocks' and the head (the embedding is a gather).
+    fn projections(&mut self) -> impl Iterator<Item = &mut DeviceMat> {
+        self.lm_head
+            .iter_mut()
+            .chain(self.blocks.iter_mut().flatten().flat_map(|block| {
+                let DeviceBlock { attention, mlp } = block;
+                [
+                    &mut attention.q,
+                    &mut attention.k,
+                    &mut attention.v,
+                    &mut attention.g,
+                    &mut attention.o,
+                    &mut mlp.gate,
+                    &mut mlp.up,
+                    &mut mlp.down,
+                ]
+            }))
+    }
+
     fn pointers(&self) -> Vec<Deviceptr> {
         let mut pointers: Vec<Deviceptr> = [
             self.embed.map(|embed| embed.pointer),
@@ -752,6 +804,7 @@ fn upload_matrix(
         pointer,
         rows,
         columns,
+        packed: None,
     })
 }
 
@@ -2190,7 +2243,17 @@ fn copy(
         .map_err(|error| BackendError::new(DEVICE, error))
 }
 
-/// `batch` rows of `input` share each read of `matrix`; `output` is `[batch][rows]`.
+/// A matrix's packed rows when a GEMV over `input` can read them: packed, and the activations a
+/// 16-byte load (the packed walk has no column walk to fall back on; the BF16 walk is the same
+/// bits).
+fn packed_for(matrix: &DeviceMat, input: Deviceptr) -> Option<Packed> {
+    matrix
+        .packed
+        .filter(|_| (input.0 as usize).is_multiple_of(16))
+}
+
+/// `batch` rows of `input` share each read of `matrix`; `output` is `[batch][rows]`. The token
+/// GEMV reads the packed rows when there are some.
 fn gemv_batch(
     cuda: &Cuda,
     kernels: &Kernels,
@@ -2231,6 +2294,11 @@ fn gemv_batch(
             ));
         }
         Route::RowGemv => {}
+    }
+    if let Some(rows) = packed_for(matrix, input) {
+        let call = packed::gemv(rows, input, output, (matrix.rows, matrix.columns), batch, 1)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        return launch(cuda, kernels.packed.gemv, call.grid, call.block, &call.args);
     }
     let call = sparkflash_ops::calls::gemv_bf16(
         matrix.pointer.0,
@@ -2313,6 +2381,29 @@ fn gemv_group(
                 batch as u64,
             ],
         );
+    }
+    // Packed matrices take the packed launch, whose rows have q4e_gemv4_bf16's bits; a group
+    // that mixes the two forms goes out a matrix at a time, which is the same bits.
+    let packed_parts: Vec<_> = projections
+        .iter()
+        .filter_map(|(matrix, output)| Some((packed_for(matrix, input)?, *output, matrix.rows)))
+        .collect();
+    if packed_parts.len() == projections.len() {
+        let call = packed::gemv4(&packed_parts, input, first.columns, batch)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        return launch(
+            cuda,
+            kernels.packed.gemv4,
+            call.grid,
+            call.block,
+            &call.args,
+        );
+    }
+    if !packed_parts.is_empty() {
+        for (matrix, output) in projections {
+            gemv_batch(cuda, kernels, matrix, input, *output, batch)?;
+        }
+        return Ok(());
     }
     let total: usize = slots.iter().map(|(_, rows, _)| rows).sum();
     let rows_per_block = if batch > 1 { 16 } else { 8 };
@@ -2404,9 +2495,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        ATTENTION_LANES, DeviceMat, DeviceShared, DoryDeviceBackend, DoryStage, Kernels,
-        LANE_BATCH, LANE_IDLE, PREFILL_BATCH, PREFILL_Q, SPLIT_MAX, StageCore, attention_fits,
-        decode_split, lane_word, launch, profile_refusal, prompt_chunks,
+        ATTENTION_LANES, DeviceMat, DeviceShared, DoryDeviceBackend, DoryStage, Form, Kernels,
+        LANE_BATCH, LANE_IDLE, PREFILL_BATCH, PREFILL_Q, PackedSet, Placement, SPLIT_MAX,
+        StageCore, TOKEN_ROWS, attention_fits, decode_split, lane_word, launch, profile_refusal,
+        prompt_chunks,
     };
     use crate::config::{DoryConfig, KvCacheMode};
     use sparkflash_model::profile::ModelProfile;
@@ -2781,6 +2873,7 @@ mod tests {
     #[test]
     #[ignore = "needs a Dory/Qwen cubin and a CUDA device"]
     fn a_grouped_chunk_projection_is_each_matrix_alone_bit_for_bit() {
+        // Also: the token GEMVs over the packed copies are the BF16 walks' bits.
         if !DoryDeviceBackend::available() {
             eprintln!("skipping the grouped projection check: this build has no Dory cubin");
             return;
@@ -2809,8 +2902,9 @@ mod tests {
             let matrices: Vec<DeviceMat> = shape
                 .iter()
                 .map(|&rows| {
+                    // Every 97th weight far under its neighbours, so the packed form escapes some.
                     let weights: Vec<u16> = (0..rows * columns)
-                        .map(|_| to_bf16(stream.next() * 0.1))
+                        .map(|at| to_bf16(stream.next() * if at % 97 == 0 { 1e-7 } else { 0.1 }))
                         .collect();
                     let pointer = alloc(weights.len() * 2);
                     cuda.copy_htod(&pointer, &u16_bytes(&weights))
@@ -2819,6 +2913,7 @@ mod tests {
                         pointer,
                         rows,
                         columns,
+                        packed: None,
                     }
                 })
                 .collect();
@@ -2852,6 +2947,56 @@ mod tests {
                     assert!(first.iter().any(|&byte| byte != 0));
                 }
             }
+            let mut set = PackedSet::new(Form::Packed, Placement::Beside);
+            let list: Vec<_> = matrices
+                .iter()
+                .map(|matrix| (matrix.pointer, matrix.rows, matrix.columns))
+                .collect();
+            set.pack(&cuda, &kernels.packed, &list, 0)
+                .expect("the matrices pack");
+            let packed: Vec<DeviceMat> = matrices
+                .iter()
+                .map(|matrix| DeviceMat {
+                    packed: set.get(matrix.pointer),
+                    ..*matrix
+                })
+                .collect();
+            assert!(packed.iter().all(|matrix| matrix.packed.is_some()));
+            let same = |batch: usize, what: &str| {
+                for ((matrix, one), two) in matrices.iter().zip(&grouped).zip(&alone) {
+                    let mut first = vec![0u8; batch * matrix.rows * 4];
+                    let mut second = first.clone();
+                    cuda.copy_dtoh(&mut first, one).expect("the BF16 output");
+                    cuda.copy_dtoh(&mut second, two).expect("the packed output");
+                    assert!(
+                        first == second,
+                        "a {}-row matrix of {shape:?} at {batch} rows differs packed ({what})",
+                        matrix.rows
+                    );
+                }
+            };
+            for batch in 1..=TOKEN_ROWS {
+                let bf16: Vec<(&DeviceMat, Deviceptr)> =
+                    matrices.iter().zip(grouped.iter().copied()).collect();
+                super::gemv_group(&cuda, &kernels, &bf16, input_buffer, batch)
+                    .expect("the BF16 group");
+                let rows: Vec<(&DeviceMat, Deviceptr)> =
+                    packed.iter().zip(alone.iter().copied()).collect();
+                super::gemv_group(&cuda, &kernels, &rows, input_buffer, batch)
+                    .expect("the packed group");
+                same(batch, "grouped");
+                for ((bf16, rows), (one, two)) in
+                    matrices.iter().zip(&packed).zip(grouped.iter().zip(&alone))
+                {
+                    super::gemv_batch(&cuda, &kernels, bf16, input_buffer, *one, batch)
+                        .expect("the BF16 GEMV");
+                    super::gemv_batch(&cuda, &kernels, rows, input_buffer, *two, batch)
+                        .expect("the packed GEMV");
+                }
+                same(batch, "alone");
+            }
+            let held: Vec<Deviceptr> = set.allocations().collect();
+            cuda.free_buffers(&held.iter().collect::<Vec<_>>());
         }
     }
 

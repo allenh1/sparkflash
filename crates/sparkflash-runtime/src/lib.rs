@@ -44,7 +44,7 @@ pub use fused::{
     rewind_request,
 };
 pub use group::{
-    GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
+    Fusion, GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
     mirror_until_the_group_ends, watched_hub,
 };
 pub use ledger::{Ledger, Mode, Strategy};

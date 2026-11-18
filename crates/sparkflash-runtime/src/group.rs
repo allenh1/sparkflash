@@ -41,10 +41,10 @@ use sparkflash_comm::control::{
     Tp4ControlFrame, Tp4ControlHub, Tp4ControlWorker, Tp4DeviceImage, Tp4FrameSampler,
     control_read_is_idle, exit_now, watch_leader, watch_workers,
 };
-use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
+use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
-use crate::fused::{FusedArm, Part};
+use crate::fused::{FusedArm, FusedEngine, Part};
 use crate::ledger::{Ledger, Mode, Strategy};
 
 /// What an arm decides about its group's frames.
@@ -414,6 +414,53 @@ pub fn mirror_lanes<A: FusedArm, W: GroupWire>(
                 ));
             }
         }
+    }
+}
+
+/// The engine a fused backend's sessions are handles on: its own lanes, or rank 0 of a group's,
+/// every lane's prompt and step broadcast before it runs ([GroupLanes]). Every arm that fuses keeps
+/// one of these, so starting either form and opening a session on it is written once.
+pub enum Fusion<A: FusedArm> {
+    /// This process alone.
+    Local(Arc<FusedEngine<A>>),
+    /// Rank 0 of a group.
+    Group(Arc<FusedEngine<GroupLanes<A, TextWire>>>),
+}
+
+impl<A: FusedArm> Fusion<A> {
+    /// `capacity` lanes of `arm` on this process.
+    ///
+    /// # Errors
+    /// As [FusedEngine::start].
+    pub fn local(arm: A, capacity: usize) -> Result<Self, BackendError> {
+        Ok(Self::Local(FusedEngine::start(Arc::new(arm), capacity)?))
+    }
+
+    /// Rank 0 of a group: `arm`'s `capacity` lanes, every frame broadcast through `hub` first
+    /// (watched, [watched_hub]) and refused first as `wire` refuses it; each worker replays them
+    /// ([mirror_until_the_group_ends]) over lanes of its own.
+    ///
+    /// # Errors
+    /// A watch that cannot start, then as [FusedEngine::start].
+    pub fn group(
+        arm: A,
+        hub: Tp4ControlHub,
+        wire: TextWire,
+        capacity: usize,
+    ) -> Result<Self, BackendError> {
+        let arm = GroupLanes::new(arm, watched_hub(hub)?, wire);
+        Ok(Self::Group(FusedEngine::start(Arc::new(arm), capacity)?))
+    }
+
+    /// A session on the engine: one pooled lane for one request.
+    ///
+    /// # Errors
+    /// As [FusedEngine::open].
+    pub fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        Ok(match self {
+            Self::Local(engine) => Box::new(engine.open()?),
+            Self::Group(engine) => Box::new(engine.open()?),
+        })
     }
 }
 

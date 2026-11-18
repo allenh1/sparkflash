@@ -49,8 +49,8 @@ use sparkflash_model::{
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Opened, Part, Resume,
-    RoundArm, StepWall, Strategy, TextWire, mirror_until_the_group_ends, run_round, watched_hub,
+    ExpertUnionWall, FusedArm, Fusion, Ledger, Mode, Opened, Part, Resume, RoundArm, StepWall,
+    Strategy, TextWire, mirror_until_the_group_ends, run_round,
 };
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
@@ -119,15 +119,7 @@ pub struct Glm5NextDeviceBackend {
     context_limit: usize,
     /// Set by [Glm5NextDeviceBackend::enable_fusion] or [Glm5NextDeviceBackend::enable_group_fusion]:
     /// sessions become handles on this engine.
-    fused: Option<Fused>,
-}
-
-/// The engine a fused backend's sessions are handles on.
-enum Fused {
-    /// This rank alone.
-    Local(Arc<FusedEngine<GlmFusion>>),
-    /// Rank 0 of a group: every lane's prompt and step is broadcast before it runs.
-    Group(Arc<FusedEngine<GroupLanes<GlmFusion, TextWire>>>),
+    fused: Option<Fusion<GlmFusion>>,
 }
 
 impl GlmFusion {
@@ -656,8 +648,7 @@ impl Glm5NextDeviceBackend {
     /// A slot the rank cannot allocate, a thread that cannot start, or a
     /// [sparkflash_runtime::JOINT_ROUNDS_ENV] that is neither on nor off.
     pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
-        let arm = Arc::new(self.lanes()?);
-        self.fused = Some(Fused::Local(FusedEngine::start(arm, capacity)?));
+        self.fused = Some(Fusion::local(self.lanes()?, capacity)?);
         Ok(())
     }
 
@@ -676,8 +667,7 @@ impl Glm5NextDeviceBackend {
         hub: Tp4ControlHub,
     ) -> Result<(), BackendError> {
         let wire = TextWire::new("glm", "GLM", self.context_limit);
-        let arm = Arc::new(GroupLanes::new(self.lanes()?, watched_hub(hub)?, wire));
-        self.fused = Some(Fused::Group(FusedEngine::start(arm, capacity)?));
+        self.fused = Some(Fusion::group(self.lanes()?, hub, wire, capacity)?);
         Ok(())
     }
 
@@ -868,18 +858,8 @@ impl ModelBackend for Glm5NextDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match &self.fused {
-            Some(Fused::Local(engine)) => {
-                return engine
-                    .open()
-                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
-            }
-            Some(Fused::Group(engine)) => {
-                return engine
-                    .open()
-                    .map(|session| Box::new(session) as Box<dyn ModelSession>);
-            }
-            None => {}
+        if let Some(fused) = &self.fused {
+            return fused.open();
         }
         let spec = self.shared.spec.get().cloned();
         let rank = self

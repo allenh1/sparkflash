@@ -90,6 +90,7 @@ use sparkflash_ops::gemv::{
 };
 use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
 use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, GdnNames, TensorNames};
+use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
@@ -97,7 +98,7 @@ use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
 use sparkflash_runtime::{
-    FusedArm, FusedEngine, GroupLanes, Ledger, Mode, Part, Resume, Strategy, TextWire, resume,
+    FusedArm, Fusion, Ledger, Mode, Part, Resume, Strategy, TextWire, resume,
 };
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
@@ -384,6 +385,38 @@ struct GdnLayer {
     norm: Deviceptr,
 }
 
+impl Layer {
+    /// Every BF16 projection the layer's GEMVs read.
+    fn bf16_projections(&self) -> Vec<GpuMat> {
+        let mut projections = vec![self.o];
+        match self.mixer {
+            Mixer::Gqa { q, k, v, .. } => projections.extend([q, k, v]),
+            Mixer::Gdn(gdn) => projections.extend([gdn.qkv, gdn.z, gdn.b, gdn.a]),
+        }
+        let mlp = |mlp: Mlp| [mlp.gate, mlp.up, mlp.down];
+        match self.ffn {
+            LayerFfn::Dense(dense) => projections.extend(mlp(dense)),
+            LayerFfn::Routed {
+                router,
+                shared,
+                shared_gate,
+                ..
+            } => {
+                projections.push(router);
+                projections.extend(shared.into_iter().flat_map(mlp));
+                projections.extend(shared_gate);
+            }
+        }
+        projections
+            .into_iter()
+            .filter_map(|projection| match projection {
+                Proj::Bf16(mat) => Some(mat),
+                Proj::Fp8(_) => None,
+            })
+            .collect()
+    }
+}
+
 /// One projection's weights on the device: BF16, or E4M3 codes under one BF16 inverse scale a
 /// 128 x 128 tile, as the checkpoint stores the tensor.
 #[derive(Debug, Clone, Copy)]
@@ -457,6 +490,7 @@ struct Kernels {
     deinterleave: Kernel,
     embed: Kernel,
     gemv: Kernel,
+    packed: packed::Kernels,
     rmsnorm: Kernel,
     rope: Kernel,
     swiglu: Kernel,
@@ -571,6 +605,7 @@ impl Kernels {
             deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
             embed: named(qwen4_exp_cubin(), "q4e_embed")?,
             gemv: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
+            packed: packed::Kernels::load(cuda)?,
             rmsnorm: named(qwen4_exp_cubin(), "q4e_rmsnorm")?,
             rope: named(qwen4_exp_cubin(), "q4e_rope")?,
             swiglu: named(qwen4_exp_cubin(), "q4e_swiglu")?,
@@ -631,6 +666,8 @@ struct Shared {
     /// Every weight allocation, freed once.
     owned: Vec<Deviceptr>,
     weight_bytes: usize,
+    /// The packed copies the token GEMVs read ([sparkflash_ops::packed]); `owned` frees them.
+    packed: PackedSet,
     /// The group's sums of each branch's partial rows, on a tensor-parallel rank.
     sums: Option<RowSums>,
     /// Which share of each sharded axis this rank holds.
@@ -655,13 +692,7 @@ pub struct DenseDeviceBackend {
     shared: Arc<Shared>,
     /// The fused engine its sessions open on once [Self::enable_fusion] (or, on rank 0 of a
     /// group, [Self::enable_group_fusion]) has run.
-    fused: Option<Fused>,
-}
-
-/// The fused engine a backend's sessions open on: its own lanes, or a group's on rank 0.
-enum Fused {
-    Local(Arc<FusedEngine<DenseLanes>>),
-    Group(Arc<FusedEngine<GroupLanes<DenseLanes, TextWire>>>),
+    fused: Option<Fusion<DenseLanes>>,
 }
 
 impl DenseDeviceBackend {
@@ -767,6 +798,24 @@ impl DenseDeviceBackend {
                 return Err(error);
             }
         };
+        // The token GEMVs read a packed copy of every BF16 projection; the wide tiles keep the
+        // BF16 rows, so the copy sits beside them.
+        let mut packed = PackedSet::new(Form::from_env()?, Placement::Beside);
+        let matrices: Vec<_> = std::iter::once(head)
+            .chain(layers.iter().flat_map(Layer::bf16_projections))
+            .map(|mat| (mat.pointer, mat.rows, mat.columns))
+            .collect();
+        let packed_bytes = match packed.pack(&cuda, &kernels.packed, &matrices, 0) {
+            Ok((_, packed_bytes)) => packed_bytes,
+            Err(error) => {
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error);
+            }
+        };
+        owned.extend(packed.allocations());
+        let weight_bytes = weight_bytes + packed_bytes;
+        eprintln!("[dense] {}", packed.summary());
         let lanes = SequenceLanes::plan(
             &cuda,
             context,
@@ -821,6 +870,7 @@ impl DenseDeviceBackend {
                 linear_sizes,
                 owned,
                 weight_bytes,
+                packed,
                 sums,
                 shard,
             }),
@@ -857,7 +907,7 @@ impl DenseDeviceBackend {
             ));
         }
         let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
-        self.fused = Some(Fused::Local(FusedEngine::start(Arc::new(arm), capacity)?));
+        self.fused = Some(Fusion::local(arm, capacity)?);
         Ok(())
     }
 
@@ -877,12 +927,8 @@ impl DenseDeviceBackend {
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
         self.group_rank()?;
-        let arm = GroupLanes::new(
-            DenseLanes::new(Arc::clone(&self.shared), capacity)?,
-            sparkflash_runtime::watched_hub(hub)?,
-            self.wire(),
-        );
-        self.fused = Some(Fused::Group(FusedEngine::start(Arc::new(arm), capacity)?));
+        let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
+        self.fused = Some(Fusion::group(arm, hub, self.wire(), capacity)?);
         Ok(())
     }
 
@@ -954,10 +1000,8 @@ impl ModelBackend for DenseDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        match &self.fused {
-            Some(Fused::Local(engine)) => return Ok(Box::new(engine.open()?)),
-            Some(Fused::Group(engine)) => return Ok(Box::new(engine.open()?)),
-            None => {}
+        if let Some(fused) = &self.fused {
+            return fused.open();
         }
         Ok(Box::new(
             self.session()
@@ -1173,7 +1217,9 @@ impl Uploads<'_> {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .flat_map(|word| f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes())
+                .flat_map(|word| {
+                    f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes()
+                })
                 .collect(),
             other => {
                 return Err(format!(
@@ -1863,11 +1909,28 @@ impl Shared {
         rows: usize,
         policy: Option<WidePolicy>,
     ) -> Result<(), BackendError> {
-        let gemv = |input: u64, output: u64, batch: usize| {
-            self.call(
+        // The packed copy where there is one and the activations are a 16-byte load: the same
+        // bits from about three quarters of the bytes.
+        let packed = self.packed.get(mat.pointer);
+        let gemv = |input: u64, output: u64, batch: usize| match packed
+            .filter(|_| input.is_multiple_of(16))
+        {
+            Some(rows) => self.call(
+                self.kernels.packed.gemv,
+                packed::gemv(
+                    rows,
+                    Deviceptr(input),
+                    Deviceptr(output),
+                    (mat.rows, mat.columns),
+                    batch,
+                    1,
+                )
+                .map_err(|error| BackendError::new(DEVICE, error))?,
+            ),
+            None => self.call(
                 self.kernels.gemv,
                 calls::gemv_bf16(mat.pointer.0, input, output, (mat.rows, mat.columns), batch),
-            )
+            ),
         };
         match route_bf16(policy, mat.rows, mat.columns, rows) {
             Route::RowGemv => gemv(input, output, rows),
@@ -2849,10 +2912,10 @@ impl ModelSession for DenseDeviceSession {
     }
 }
 
-/// The arm behind the shared fused engine ([FusedEngine]): a slot is one [Sequence], a step is
-/// one walk over every member's row, and a prompt runs a [CHUNK_ROWS]-row part at a time
-/// between the members' steps. The engine thread runs one job at a time, so the slots share one
-/// scratch.
+/// The arm behind the shared fused engine ([sparkflash_runtime::FusedEngine]): a slot is one
+/// [Sequence], a step is one walk over every member's row, and a prompt runs a [CHUNK_ROWS]-row
+/// part at a time between the members' steps. The engine thread runs one job at a time, so the
+/// slots share one scratch.
 pub struct DenseLanes {
     shared: Arc<Shared>,
     scratch: Mutex<Scratch>,
