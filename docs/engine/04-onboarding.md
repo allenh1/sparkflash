@@ -574,6 +574,38 @@ that deploy waits for direction like any other.
 Gate: the CLI and web tests, one boot per arm. Value: adding a family is one table entry, and a
 forgotten site is a compile error.
 
+#### Phase 2: what the first commit landed
+
+`sparkflash_model::ARMS` is now the serving-arm table: eight entries (DeepSeek, Qwen NVFP4,
+Qwen FP8, Qwen3.6-35B-A3B, GLM, Dory, Inkling, and the shared dense arm). Each `Arm` supplies
+the console name and served model id, its registry weight selectors, the `model_type` spellings its carried profile
+answers for, the profile TOML, the default context, its ledger declaration (reusing
+`ARM_LEDGERS`), the tokenizer/chat-template id, and the conversion defaults. `sparkflash arms
+--list` prints that table; `--ledger` is unchanged. `MODELS` stays the registry, and a test
+holds every arm's selectors to it.
+
+The `DEFAULTS` table records DeepSeek's scheduler/serving values with the line that states each
+(4096-row idle chunk, 2048-row busy chunk, 64 rows a step, the 16-row band wall and its 27/4/2.3
+ms terms, and the 64-deep queue). A carried profile that departs from one is refused unless its
+section (or the document root) carries `measured = "docs/…"`; the message names the key.
+
+Neutral names `SPARKFLASH_DRAFT`, `SPARKFLASH_DRAFT_DEPTH`, `SPARKFLASH_DRAFT_DRAFTS`,
+`SPARKFLASH_DRAFT_POLICY` and `SPARKFLASH_DRAFT_MIN_DEPTH` write the speculation fields.
+The per-model GLM and Qwen spec names are refused with the replacement named. Inkling's own
+drafting names stay aliases because phase 0's console and arm still read them; the lane-memory
+name was already neutral. The tests added here read the tree: every `sparkflash-model-*` crate
+must be named in both CI files, and direct `env::var`/`env::var_os` reads in a model crate are
+limited to the one recorded table (GLM 2, Inkling 20, Qwen 2 including its test helper) until
+phase 7 moves them through `profile.rs`.
+
+This makes the *model table* one, not the serving paths. The audit's nine construction sites
+still exist and a new family still edits them: DeepSeek's own server, the pack host, the pack
+group/lane group, the dynamic pack identity, Inkling's host and group, Dory's host, Dory's
+recurrence ring, and the dynamic dense host/group. It also still edits `codec()` and its
+`Dialect`/response-engine match, the converter's family list and `default_convert_world`, the
+CLI's typed GLM/Qwen rank loaders, and the vision/MTP wiring, none of which is read from `ARMS`
+yet. The rank openers did not leave `serve.rs` in this commit; that is phase 6.
+
 ### Phase 3: the stack chooses the kernel. Bit-neutral. M to L
 
 * The compute class, the catalogue assertion and its first `WAIVERS` table.

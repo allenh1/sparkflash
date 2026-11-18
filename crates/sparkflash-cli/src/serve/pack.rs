@@ -62,6 +62,7 @@ pub(super) const DEEPSEEK_PROFILE_TOML: &str =
     include_str!("../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.toml");
 
 /// The carried profile of the Dory host-reference arm.
+#[cfg(test)]
 pub(super) const DORY_PROFILE_TOML: &str =
     include_str!("../../../sparkflash-model-dory/config/dory1_0_4b_bf16.toml");
 
@@ -71,15 +72,9 @@ pub(super) const DORY_PROFILE_TOML: &str =
 /// typed profile; a novel family gets `ModelProfile::default()` plus the declared environment
 /// overrides, which is the documented fallback (issue #17 step 2.2).
 pub(super) fn profile_toml_for_family(family: &str) -> Option<&'static str> {
-    match family {
-        "deepseek_v41" => Some(DEEPSEEK_PROFILE_TOML),
-        "qwen4_exp" | "qwen4_exp_text" => Some(QwenArm::PROFILE_TOML),
-        "qwen3_5_moe" | "qwen3_5_moe_text" => Some(Qwen36Arm::PROFILE_TOML),
-        "glm5_next" => Some(GlmArm::PROFILE_TOML),
-        "dory" => Some(DORY_PROFILE_TOML),
-        "inkling2" => Some(sparkflash_model_inkling2::PROFILE_TOML),
-        _ => None,
-    }
+    // The family spelling and the profile beside it are one fact in `ARMS`; a released pack's
+    // `PackArm::PROFILE_TOML` is the same TOML the table carries (a test holds them equal).
+    sparkflash_model::arm_for_family(family).and_then(|arm| arm.profile_toml())
 }
 
 /// Opens one rank of a pack's group stepping `lanes` fused lanes ([`PackArm::OPEN_LANES`]).
@@ -961,10 +956,10 @@ impl GlmDrafting {
 ///
 /// Either drafter says how sure it is of each draft (the block drafter's selector, the MTP
 /// layer's softmax), so the depth is DeepSeek's: adaptive unless `speculation.depth_policy` says
-/// fixed (`SPARKFLASH_GLM_DRAFT_POLICY`), at least `speculation.min_depth`, against the drafter's
-/// own step cost. The chain is `speculation.drafts` (`SPARKFLASH_GLM_DRAFTS`), else the whole
-/// block for a block drafter, else `speculation.depth` (`SPARKFLASH_GLM_SPEC_DEPTH`; the carried
-/// profile says 3), else 2. `speculation.enabled=false` (`SPARKFLASH_GLM_SPEC=off`) drafts
+/// fixed (`SPARKFLASH_DRAFT_POLICY`), at least `speculation.min_depth`, against the drafter's
+/// own step cost. The chain is `speculation.drafts` (`SPARKFLASH_DRAFT_DRAFTS`), else the whole
+/// block for a block drafter, else `speculation.depth` (`SPARKFLASH_DRAFT_DEPTH`; the carried
+/// profile says 3), else 2. `speculation.enabled=false` (`SPARKFLASH_DRAFT=off`) drafts
 /// nothing.
 ///
 /// # Errors
@@ -1570,6 +1565,26 @@ mod tests {
         "../../../sparkflash-model-deepseek-v41/config/deepseek_v41_flash.released.json"
     );
     #[test]
+    fn the_arms_table_carries_the_same_profile_as_the_pack() {
+        for (family, toml) in [
+            ("deepseek_v41", DEEPSEEK_PROFILE_TOML),
+            ("qwen4_exp", QwenArm::PROFILE_TOML),
+            ("qwen4_exp_text", QwenArm::PROFILE_TOML),
+            ("qwen3_5_moe", Qwen36Arm::PROFILE_TOML),
+            ("glm5_next", GlmArm::PROFILE_TOML),
+            ("dory", DORY_PROFILE_TOML),
+            ("inkling2", sparkflash_model_inkling2::PROFILE_TOML),
+        ] {
+            assert_eq!(
+                profile_toml_for_family(family),
+                Some(toml),
+                "{family} moved out of ARMS"
+            );
+        }
+        assert_eq!(profile_toml_for_family("a_dynamic_family"), None);
+    }
+
+    #[test]
     fn every_carried_profile_parses_and_keeps_its_registry_identity() {
         for (name, toml) in [
             ("DeepSeek-V4.1-Flash", DEEPSEEK_PROFILE_TOML),
@@ -1613,7 +1628,7 @@ mod tests {
         assert_eq!(carried.speculation.depth, Some(7));
         let overridden = QwenArm::profile_from(|name| match name {
             "SPARKFLASH_QWEN4_PREFILL_CHUNK" => Some("2048".to_owned()),
-            "SPARKFLASH_QWEN4_SPEC_DEPTH" => Some("5".to_owned()),
+            "SPARKFLASH_DRAFT_DEPTH" => Some("5".to_owned()),
             _ => None,
         })
         .expect("an environment override is valid");

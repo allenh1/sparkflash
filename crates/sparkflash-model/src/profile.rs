@@ -52,6 +52,16 @@ pub enum ProfileError {
         /// The accepted domain.
         expected: &'static str,
     },
+    /// A per-model setting name this phase replaced with a neutral one.
+    #[error("{name}={value:?} is a per-model setting name; use {replacement}")]
+    Refused {
+        /// The environment variable.
+        name: &'static str,
+        /// The value found.
+        value: String,
+        /// The neutral name that replaces it.
+        replacement: &'static str,
+    },
     /// The file could not be read.
     #[error("profile {path}: {source}")]
     Io {
@@ -93,6 +103,9 @@ pub struct RuntimeProfile {
     pub rows: Option<usize>,
     /// First position of the multi-row verify.
     pub rows_from: Option<usize>,
+    /// Where the section's departure from a [crate::DEFAULTS] entry was measured. Required
+    /// when a field below overrides one, refused by name otherwise.
+    pub measured: Option<String>,
 }
 
 /// Which projection path a bulk prefill takes.
@@ -162,6 +175,9 @@ pub struct PrefillProfile {
     pub index_pack_log: Option<String>,
     /// Checksum the packed store after each pack. Only `1` arms the probe.
     pub index_pack_verify: Option<String>,
+    /// Where the section's departure from a [crate::DEFAULTS] entry was measured. Required
+    /// when a field below overrides one, refused by name otherwise.
+    pub measured: Option<String>,
 }
 
 /// The decode section.
@@ -574,6 +590,9 @@ pub struct ModelProfile {
     pub plan: PlanProfile,
     /// Diagnostics.
     pub diagnostics: DiagnosticsProfile,
+    /// Where the document's departure from a [crate::DEFAULTS] entry was measured, when the
+    /// citation is stated once at the root instead of beside the key's section.
+    pub measured: Option<String>,
 }
 
 /// The profile the process booted with.
@@ -642,16 +661,13 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_DECODE_MMA", "decode.tensor_cores"),
     ("SPARKFLASH_GLM_LATENT_CACHE", "attention.latent_cache"),
     ("SPARKFLASH_DSPARK", "speculation.enabled"),
-    ("SPARKFLASH_QWEN4_SPEC", "speculation.enabled"),
-    ("SPARKFLASH_QWEN4_SPEC_DEPTH", "speculation.depth"),
+    ("SPARKFLASH_DRAFT_DEPTH", "speculation.depth"),
+    ("SPARKFLASH_DRAFT_DRAFTS", "speculation.drafts"),
     ("SPARKFLASH_DSPARK_K", "speculation.dspark_k"),
     ("SPARKFLASH_DSPARK_DEPTH", "speculation.depth_policy"),
     ("SPARKFLASH_DSPARK_MIN_DEPTH", "speculation.min_depth"),
-    ("SPARKFLASH_QWEN4_DFLASH2_DEPTH", "speculation.depth_policy"),
-    (
-        "SPARKFLASH_QWEN4_DFLASH2_MIN_DEPTH",
-        "speculation.min_depth",
-    ),
+    ("SPARKFLASH_DRAFT_POLICY", "speculation.depth_policy"),
+    ("SPARKFLASH_DRAFT_MIN_DEPTH", "speculation.min_depth"),
     (
         "SPARKFLASH_INKLING_DRAFT_POLICY",
         "speculation.depth_policy",
@@ -669,11 +685,6 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_QWEN4_MTP_FOLD", "speculation.mtp_fold_scale"),
     ("SPARKFLASH_QWEN4_DFLASH2", "speculation.drafter"),
     ("SPARKFLASH_DRAFT", "speculation.enabled"),
-    ("SPARKFLASH_GLM_SPEC", "speculation.enabled"),
-    ("SPARKFLASH_GLM_SPEC_DEPTH", "speculation.depth"),
-    ("SPARKFLASH_GLM_DRAFTS", "speculation.drafts"),
-    ("SPARKFLASH_GLM_DRAFT_POLICY", "speculation.depth_policy"),
-    ("SPARKFLASH_GLM_DRAFT_MIN_DEPTH", "speculation.min_depth"),
     ("SPARKFLASH_GLM_DFLASH2", "speculation.drafter"),
     ("SPARKFLASH_GLM_PROF", "diagnostics.profile"),
     ("SPARKFLASH_SEQUENCE_PARALLEL", "sequence.parallel"),
@@ -805,6 +816,31 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_DRAFT_LOGITS_MMA_ROWS", "drafter.logits_rows"),
     ("SPARKFLASH_DRAFT_SEED_SPLIT", "drafter.seed_split"),
     ("SPARKFLASH_DRAFT_TABLE", "drafter.row_table"),
+];
+
+/// Per-model setting names phase 2 replaces, and the neutral name that replaces each.
+///
+/// A process that sets one is refused at boot with a message naming its replacement; the
+/// neutral name writes the same typed field. Inkling's own switch and its depth/policy names
+/// remain aliases because phase 0's console launches Inkling with them and the arm reads them
+/// directly; they move when that arm's settings do. The deployed site files move in the deploy
+/// that carries this phase.
+pub const REFUSED_ENV: &[(&str, &str)] = &[
+    ("SPARKFLASH_GLM_SPEC", "SPARKFLASH_DRAFT"),
+    ("SPARKFLASH_GLM_SPEC_DEPTH", "SPARKFLASH_DRAFT_DEPTH"),
+    ("SPARKFLASH_GLM_DRAFTS", "SPARKFLASH_DRAFT_DRAFTS"),
+    ("SPARKFLASH_GLM_DRAFT_POLICY", "SPARKFLASH_DRAFT_POLICY"),
+    (
+        "SPARKFLASH_GLM_DRAFT_MIN_DEPTH",
+        "SPARKFLASH_DRAFT_MIN_DEPTH",
+    ),
+    ("SPARKFLASH_QWEN4_SPEC", "SPARKFLASH_DRAFT"),
+    ("SPARKFLASH_QWEN4_SPEC_DEPTH", "SPARKFLASH_DRAFT_DEPTH"),
+    ("SPARKFLASH_QWEN4_DFLASH2_DEPTH", "SPARKFLASH_DRAFT_POLICY"),
+    (
+        "SPARKFLASH_QWEN4_DFLASH2_MIN_DEPTH",
+        "SPARKFLASH_DRAFT_MIN_DEPTH",
+    ),
 ];
 
 /// Reads and writes one `Option<bool>` field of a [ModelProfile].
@@ -1092,6 +1128,7 @@ impl ModelProfile {
     pub fn from_toml(text: &str) -> Result<Self, ProfileError> {
         let profile: Self =
             toml::from_str(text).map_err(|error| ProfileError::Parse(error.to_string()))?;
+        crate::defaults::check_profile(&profile, text)?;
         profile.validate()?;
         Ok(profile)
     }
@@ -1198,6 +1235,15 @@ impl ModelProfile {
         &mut self,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> Result<(), ProfileError> {
+        for (name, replacement) in REFUSED_ENV {
+            if let Some(value) = lookup(name) {
+                return Err(ProfileError::Refused {
+                    name,
+                    value,
+                    replacement,
+                });
+            }
+        }
         for (name, _) in ENV_OVERRIDES {
             if let Some(value) = lookup(name) {
                 self.apply_one(name, &value)?;
@@ -1517,7 +1563,7 @@ probe = "hash"
             .apply_env(|name| match name {
                 "SPARKFLASH_QWEN4_PREFILL_CHUNK" => Some("2048".to_owned()),
                 "SPARKFLASH_QWEN4_PROBE" => Some("dump".to_owned()),
-                "SPARKFLASH_QWEN4_SPEC" => Some("0".to_owned()),
+                "SPARKFLASH_DRAFT" => Some("0".to_owned()),
                 _ => None,
             })
             .expect("the overrides are valid");
@@ -1637,13 +1683,36 @@ probe = "hash"
     }
 
     #[test]
-    fn the_neutral_draft_switch_and_the_glm_alias_move_the_same_field() {
-        for name in ["SPARKFLASH_DRAFT", "SPARKFLASH_GLM_SPEC"] {
+    fn the_neutral_draft_switches_move_the_speculation_fields() {
+        for (name, field) in [
+            ("SPARKFLASH_DRAFT", "speculation.enabled"),
+            ("SPARKFLASH_DRAFT_DEPTH", "speculation.depth"),
+            ("SPARKFLASH_DRAFT_DRAFTS", "speculation.drafts"),
+            ("SPARKFLASH_DRAFT_POLICY", "speculation.depth_policy"),
+            ("SPARKFLASH_DRAFT_MIN_DEPTH", "speculation.min_depth"),
+        ] {
+            let value = accepted_value(field);
             let mut profile = ModelProfile::default();
             profile
-                .apply_env(|candidate| (candidate == name).then(|| "on".to_owned()))
+                .apply_env(|candidate| (candidate == name).then(|| value.to_owned()))
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert_eq!(profile.speculation.enabled, Some(true), "{name}");
+            assert_ne!(profile, ModelProfile::default(), "{name} moved nothing");
+        }
+    }
+
+    #[test]
+    fn every_per_model_spec_name_is_refused_with_its_replacement() {
+        for (name, replacement) in REFUSED_ENV {
+            let mut profile = ModelProfile::default();
+            let error = profile
+                .apply_env(|candidate| (candidate == *name).then(|| "off".to_owned()))
+                .expect_err("a per-model name is refused");
+            let text = error.to_string();
+            assert!(text.contains(name), "{name}: {text}");
+            assert!(
+                text.contains(replacement),
+                "{name}'s refusal should name {replacement}: {text}"
+            );
         }
     }
 

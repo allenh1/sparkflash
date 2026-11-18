@@ -12,16 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `sparkflash arms --ledger`: what each serving arm states of the runtime's strategies.
+//! `sparkflash arms --list|--ledger`: the serving arms and the strategies each states.
 //!
-//! The command reads `sparkflash_model::ARM_LEDGERS`, the same declaration an arm's
-//! `FusedArm::ledger` returns at boot, so the gap table is a preview of the boot line and not a
-//! second hand-kept list. No device is opened: an arm with no checkpoint and no cubin still
-//! prints.
+//! `--list` reads `sparkflash_model::ARMS`, the one model table: the console id, the registry
+//! weight selectors, the default context, the tokenizer and chat template, the conversion
+//! defaults and the ledger pointer. `--ledger` reads `sparkflash_model::ARM_LEDGERS`, the same
+//! declaration an arm's `FusedArm::ledger` returns at boot, so the gap table is a preview of the
+//! boot line and not a second hand-kept list. No device is opened: an arm with no checkpoint and
+//! no cubin still prints.
 
 use std::process::ExitCode;
 
-use sparkflash_model::{ARM_LEDGERS, Strategy};
+use sparkflash_model::{ARM_LEDGERS, ARMS, ArmLedger, Strategy};
+
+/// Render the arm table as Markdown: one row an entry in `sparkflash_model::ARMS`.
+#[must_use]
+pub fn render_arms() -> String {
+    let mut out = String::from(
+        "| arm | model id | weights | context | tokenizer | chat template | conversion | ledger |\n",
+    );
+    out.push_str("| :-- | :-- | :-- | :-- | :-- | :-- | :-- | :-- |\n");
+    for arm in ARMS {
+        let weights = if arm.weights().is_empty() {
+            "the checkpoint".to_owned()
+        } else {
+            arm.weights().join(", ")
+        };
+        let conversion = arm.conversion();
+        let released = if conversion.released {
+            "released"
+        } else {
+            "dynamic"
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | TP{} {} | {} |\n",
+            arm.id(),
+            arm.model_id(),
+            weights.replace('|', "\\|"),
+            if arm.default_context() == 0 {
+                "the checkpoint's".to_owned()
+            } else {
+                arm.default_context().to_string()
+            },
+            arm.tokenizer().tokenizer_id,
+            arm.tokenizer().chat_template,
+            conversion.world_size,
+            released,
+            arm.ledger().arm,
+        ));
+    }
+    out
+}
 
 /// Render the gap table as Markdown: one row an arm, one column a strategy.
 #[must_use]
@@ -56,7 +97,7 @@ pub fn render() -> String {
 
 /// What the numerics registry holds for an arm: a capture, a registered but uncaptured entry, or
 /// no entry at all.
-fn numerics(declaration: &sparkflash_model::ArmLedger) -> String {
+fn numerics(declaration: &ArmLedger) -> String {
     let registry = sparkflash_model::numerics::Registry::embedded()
         .expect("the embedded numerics registry parses");
     let mut registered = false;
@@ -78,28 +119,59 @@ fn numerics(declaration: &sparkflash_model::ArmLedger) -> String {
 }
 
 /// Entry point called by `main.rs` with the arguments after `arms`.
-pub fn run(mut args: impl Iterator<Item = String>) -> ExitCode {
-    let Some(flag) = args.next() else {
-        eprintln!("sparkflash arms: usage: sparkflash arms --ledger");
-        return ExitCode::FAILURE;
-    };
-    if flag != "--ledger" {
-        eprintln!("sparkflash arms: unknown argument {flag:?}; usage: sparkflash arms --ledger");
+pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
+    const USAGE: &str = "usage: sparkflash arms [--list] [--ledger]";
+    let mut list = false;
+    let mut ledger = false;
+    for flag in args {
+        match flag.as_str() {
+            "--list" => list = true,
+            "--ledger" => ledger = true,
+            other => {
+                eprintln!("sparkflash arms: unknown argument {other:?}; {USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if !list && !ledger {
+        eprintln!("sparkflash arms: {USAGE}");
         return ExitCode::FAILURE;
     }
-    if let Some(extra) = args.next() {
-        eprintln!(
-            "sparkflash arms: unexpected argument {extra:?}; usage: sparkflash arms --ledger"
-        );
-        return ExitCode::FAILURE;
+    if list {
+        print!("{}", render_arms());
     }
-    print!("{}", render());
+    if ledger {
+        print!("{}", render());
+    }
     ExitCode::SUCCESS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_arm_table_names_every_entry_and_its_items() {
+        let text = render_arms();
+        for arm in ARMS {
+            assert!(text.contains(arm.id()), "missing {}", arm.id());
+            assert!(text.contains(arm.model_id()), "missing {}", arm.model_id());
+            assert!(
+                text.contains(arm.tokenizer().chat_template),
+                "missing {}'s chat template",
+                arm.id()
+            );
+            for weights in arm.weights() {
+                assert!(text.contains(weights), "missing {weights}");
+            }
+            assert!(
+                text.contains(arm.ledger().arm),
+                "missing {}'s ledger",
+                arm.id()
+            );
+        }
+        assert!(text.starts_with("| arm | model id | weights |"));
+    }
 
     #[test]
     fn the_table_names_every_arm_and_every_strategy() {

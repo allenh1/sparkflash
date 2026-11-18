@@ -1218,8 +1218,8 @@ fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() 
     assert_eq!(drafts(&carried, true, 7), Ok(Some((7, true))));
     // The environment picks the chain and the rule.
     let env = GlmArm::profile_from(|name| match name {
-        "SPARKFLASH_GLM_DRAFTS" => Some("2".to_owned()),
-        "SPARKFLASH_GLM_DRAFT_POLICY" => Some("fixed".to_owned()),
+        "SPARKFLASH_DRAFT_DRAFTS" => Some("2".to_owned()),
+        "SPARKFLASH_DRAFT_POLICY" => Some("fixed".to_owned()),
         _ => None,
     })
     .expect("the profile under the environment")
@@ -1232,7 +1232,7 @@ fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() 
         ..SpeculationProfile::default()
     };
     assert_eq!(drafts(&spec(None, None), false, 15), Ok(Some((2, true))));
-    // SPARKFLASH_GLM_SPEC=off decodes a token a step, as drafts=0 does.
+    // SPARKFLASH_DRAFT=off decodes a token a step, as drafts=0 does.
     assert_eq!(drafts(&spec(Some(false), None), true, 7), Ok(None));
     assert_eq!(drafts(&spec(Some(false), Some(0)), true, 7), Ok(None));
     assert_eq!(drafts(&spec(None, Some(0)), false, 15), Ok(None));
