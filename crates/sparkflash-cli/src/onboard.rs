@@ -601,6 +601,10 @@ mod tests {
         assert!(text.contains("lm_head"), "no lm_head in:\n{text}");
         assert!(text.contains("parts needing a PartExec:"));
         assert!(text.contains("parts with tensor-core gaps:"));
+        assert!(
+            text.contains("waived lm_head bf16 decode"),
+            "the head's waived gap is not named:\n{text}"
+        );
     }
 
     #[test]
