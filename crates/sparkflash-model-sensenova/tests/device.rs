@@ -163,23 +163,21 @@ fn the_device_arm_matches_the_host_on_one_token() {
             );
         }
     }
+    // Same process, same graph machinery: the chunk check runs here so the two never capture at
+    // the same time.
+    chunks_match_their_single_rows(directory.path());
 }
 
 /// A chunk must be the one-row steps it stands in for, row for row.
 ///
 /// The verifier depends on this exactly: a verify forward is one chunk over the anchor and the
 /// drafts, and the rows it keeps are the rows those single steps would have produced.
-#[test]
-fn a_chunk_equals_the_single_rows_it_stands_in_for() {
-    if !sparkflash_model_sensenova::SenseNovaDeviceBackend::available() {
-        eprintln!("no SenseNova/Qwen cubin; skipping the chunk test");
-        return;
-    }
+/// Run from the parity test, not as a test of its own: graph capture is process-wide, so two
+/// device tests running in parallel capture each other's launches.
+fn chunks_match_their_single_rows(directory: &Path) {
     use sparkflash_model::backend::ModelBackend;
-    let directory = tempfile::tempdir().expect("temporary directory");
-    write_tiny(directory.path());
     let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open_with_cache(
-        directory.path(),
+        directory,
         ModelDescriptor::sensenova_loop_9b(),
         256,
         true,

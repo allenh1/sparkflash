@@ -173,10 +173,14 @@ walk, but it reads the weights once a token. The next changes, in order:
    Fewer, fatter FP8 GEMVs read the same elements and pay the same issue cost; PDL already
    overlaps the small kernels' tails. What does help is doing more tokens per weight pass, which
    is exactly the speculative verify: at 8 rows the 14.1 GB is read once for 8 positions.
-2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
-   `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
-   chunked GDN scan, both of which the shared images already carry. This is the largest single
-   prefill win (the Dory and Qwen notes measure 4-10x).
+2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit `q4p_dense_fp8`.
+   That image used to build empty on the consumer part: one routed-expert entry
+   (`q4p_moe_gate_up_fp8`) declares 61 KiB of static shared, over the 48 KiB a CUDA 12.9 ptxas
+   allows an sm_120 entry, and one entry over the limit empties the whole image. It is now left
+   out of the sm_120 device pass, so the image builds and carries `q4p_dense_fp8`,
+   `q4p_dense_mma` and `q4p_dense_rows`. What remains is the arm's side: a chunked GQA and a
+   chunked GDN scan over the same rows (both shared images already carry them), and a host loop
+   that walks the chunk. The verify keeps the 8-row GEMV; prefill takes the tensor cores.
 3. **AWQ 4-bit decode.** The official 4-bit release is the configuration that reaches 256K on a
    16 GB card. It needs one int4 group-wise GEMV (or a dequantize-on-load path) and a 4-bit
    weight plan; the loop/mHC/cache plan does not change.

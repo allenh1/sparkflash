@@ -1721,6 +1721,11 @@ extern "C" __global__ __launch_bounds__(128) void q4p_moe_rows_gate_up_capped(
 // down pass applies the routing weight - probabilities[(slot / topk) * topk + slot % topk] - on
 // the way to q4e_moe_combine's [slot][hidden] partials. This is a grouped accumulation order, so
 // it is a D67 numerics note against the scalar token path, not a bit-identity claim.
+// The six-stage FP8 MoE tile is 61 KiB of static shared, over the 48 KiB an sm_120 entry may
+// declare with CUDA 12.9's ptxas, and one entry over the limit empties the whole image. The
+// consumer part serves SenseNova's dense projections, not a routed MoE, so the entry is left out
+// of the sm_120 device pass and the dense entries build; a GB10 image still carries it.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ != 1200
 extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_moe_gate_up_fp8(
     const unsigned long long* __restrict__ table, const int4* __restrict__ items,
     const float* __restrict__ a, float* __restrict__ out, unsigned int cols,
@@ -1738,6 +1743,7 @@ extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_moe_gate_up_fp8(
             topk);
     }
 }
+#endif
 
 // gate_up's [items][32][2 * intermediate] f32 rows -> the SwiGLU'd [slots][intermediate] f32
 // rows the down pass takes. One slot row per blockIdx.y.
