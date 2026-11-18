@@ -279,10 +279,34 @@ is the only variable left.
 The GEMM is not the fault. `/tmp/fp4shapes.cu` reproduces the arm's quantiser and GEMM at the served
 shapes against a sampled host decode; extended with two- and three-row cases on both the wide and the
 narrow form it is exact there too — `worst 0.000000` at `tokens` 1, 2, 3, 5, 8, 16 and 128, on
-`cols` 256/4096/8192/12288 against `inner` 4096/12288. What is left is the arm's side of the
-invocation, and the FP4 arm is the only one that also switches the `z`/`b`/`a` projections to a
-single combined 4,224-column matrix (`attach_fp4` builds it, so `SPARKFLASH_SENSENOVA_FP8=1` skips
-it), which is the next thing to bisect.
+`cols` 256/4096/8192/12288 against `inner` 4096/12288.
+
+### The separate z/b/a stride
+
+Bisecting the arm's side found one real bug, and it was under the other arm.
+`SPARKFLASH_SENSENOVA_NO_ZCB=1` takes the combined matrix out so a chunk's `z` can be compared at
+the same precision, and on the way it showed that the two standalone 32-column `b`/`a` GEMVs were
+being read by the scan through a **4,096-wide stride**: `b_stride` was `z.rows` — the width of the
+`z` projection, which is what a *combined* row is — while `scratch.b` is a 1,024 by 32 buffer. Only
+row 0 landed where it was written; every later row read the neighbouring buffer.
+
+That is on the E4M3 path, which is the one that had been tracking the host, and fixing it moved the
+arm a long way:
+
+| prompt 2, E4M3 | step 0 | step 1 | step 2 | step 3 | step 4 |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| before | 4.93 | 1.08 | 2.13 | 2.12 | 0.89 |
+| after | 0.31 | 0.12 | 0.21 | 0.16 | 0.07 |
+
+with the argmax equal to the host's at every step. The same run now also agrees chunk-versus-row to
+the digit under `NO_ZCB`, so the two arms of the chunk test are a fair comparison from here.
+
+What that does **not** explain is the NVFP4 gap: with the combined matrix in place the chunk still
+disagrees with the row walk by 16.6-19.4 while using a GEMM that is exact, so the combined
+4,224-column `z`/`b`/`a` matrix — built once at load by `sensenova_fp4_append` and only present
+when `attach_fp4` ran — is the remaining suspect. With `NO_ZCB` the NVFP4 arm is *consistent*
+(chunk and row agree exactly) but still 24 from the host with a constant argmax, so NVFP4 has a
+second fault of its own that `NO_ZCB` exposes rather than fixes. Both are open.
 
 ```bash
 SPARKFLASH_CUDA_ARCH=sm_120a cargo test --release -p sparkflash-model-sensenova --test device

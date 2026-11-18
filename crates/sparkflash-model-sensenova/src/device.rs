@@ -815,7 +815,10 @@ impl DeviceShared {
         // The linear visits' z, b and a read one activation: append them into a single
         // 4,224-column projection so the visit issues one pass, not three (two of which were the
         // 32-column GEMVs that cost 36 ms a chunk).
-        if let Some(append) = kernels.fp4_append {
+        // The combined z/b/a matrix can be taken out on its own, so a chunk's z can be compared
+        // against three separate projections of the same activation at the same precision.
+        let combine_zba = std::env::var("SPARKFLASH_SENSENOVA_NO_ZCB").is_err();
+        if let Some(append) = kernels.fp4_append.filter(|_| combine_zba) {
             for layer in &mut weights.layers {
                 let (Some(z), Some(b), Some(a)) = (layer.z.and_then(|m| m.fp4), layer.b.and_then(|m| m.fp4), layer.a.and_then(|m| m.fp4)) else {
                     continue;
@@ -2179,11 +2182,18 @@ impl DeviceSession {
         if debug {
             self.report("gdn z", self.scratch.z.offset(last * zb_stride * 4), zb_stride)?;
         }
-        // Where the three sit inside the combined output: z from 0, b after it, then a.
-        let (b_base, a_base) = if layer.zcb.is_some() && rows <= PREFILL_ROWS {
-            (self.scratch.z.offset(value_width * 4), self.scratch.z.offset((value_width + 32) * 4))
+        // Where the three sit inside the combined output: z from 0, b after it, then a. The
+        // combined matrix's rows are the whole 4,224 columns wide, while the two standalone
+        // GEMVs write 32 columns a row; the scan reads both through this stride, so it has to be
+        // the container's and not the projection's.
+        let (b_base, a_base, ba_stride) = if layer.zcb.is_some() && rows <= PREFILL_ROWS {
+            (
+                self.scratch.z.offset(value_width * 4),
+                self.scratch.z.offset((value_width + 32) * 4),
+                zb_stride,
+            )
         } else {
-            (self.scratch.b, self.scratch.a)
+            (self.scratch.b, self.scratch.a, config.linear.value_heads)
         };
         if layer.zcb.is_none() {
             shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
@@ -2191,7 +2201,7 @@ impl DeviceSession {
         }
         clock.mark("  gdn ba", drain)?;
         if debug {
-            self.report("gdn b", b_base.offset(last * zb_stride * 4), config.linear.value_heads)?;
+            self.report("gdn b", b_base.offset(last * ba_stride * 4), config.linear.value_heads)?;
         }
         let conv = state.conv.expect("conv state");
         let recurrent = state.recurrent.expect("recurrent state");
@@ -2233,9 +2243,9 @@ impl DeviceSession {
             &[
                 self.scratch.conv_out.0,
                 b_base.0,
-                zb_stride as u64,
+                ba_stride as u64,
                 a_base.0,
-                zb_stride as u64,
+                ba_stride as u64,
                 layer.a_log.expect("a log").0,
                 layer.dt_bias.expect("dt bias").0,
                 params.0,
@@ -2252,7 +2262,7 @@ impl DeviceSession {
         )?;
         clock.mark("  gdn params", drain)?;
         if debug {
-            self.report("gdn a", a_base, config.linear.value_heads)?;
+            self.report("gdn a", a_base.offset(last * ba_stride * 4), config.linear.value_heads)?;
             self.report("gdn qscale", params, rows * heads)?;
             self.report("gdn kscale", params.offset(stride as usize), rows * heads)?;
             self.report("gdn beta", params.offset(2 * stride as usize), rows * heads)?;
