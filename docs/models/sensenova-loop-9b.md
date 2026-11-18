@@ -240,10 +240,23 @@ Keeping FP8 for decode as well is the other half of the ask, and it does not fit
 | the card | 15.92 |
 
 which leaves 0.4 GiB for the KV caches, the activations and the scratch, and it fails on the first
-48 MiB request (`cuMemAlloc(50331648) failed: 2`). So on a 16 GB part the 4-bit chunk and an 8-bit
-decode copy cannot both be resident; a decode that reads FP8 has to be the *same* copy the chunk
-reads, which means 8-bit weights everywhere and the slower ceiling, or the 4-bit tile for both,
-which is what the arm does today. A 512-row chunk's stage budget, taken with
+48 MiB request (`cuMemAlloc(50331648) failed: 2`). Dropping the combined z/b/a matrix — about
+300 MiB across the 32 physical layers — was tried as the way out and does not close it either.
+
+So on a 16 GB part the 4-bit chunk and an 8-bit decode copy cannot both be resident; a decode that
+reads FP8 has to be the *same* copy the chunk reads, which means 8-bit weights everywhere and the
+slower ceiling, or the 4-bit tile for both, which is what the arm does today.
+
+What makes the trade sharp rather than academic is that the tile is the *worse* kernel at one row.
+On the fixed arm, through `serve` at an 8K context:
+
+| | decode | prefill (833 tokens) |
+| :-- | :-- | :-- |
+| four-bit tile for everything (shipped) | **30.8 tok/s** (32.5 ms a token) | **4,139 tok/s** |
+| E4M3 tiled GEMV decode | **45 tok/s** (22.4 ms) — the figure in the status line above | ~1,200 tok/s |
+
+so the eight-bit decode is 46% faster a token and roughly three and a half times slower a chunk.
+A 512-row chunk's stage budget, taken with
 `SPARKFLASH_SENSENOVA_TIME=2`, is 89.5 ms in total: dense 54 ms (MLP down 14.1, up 10.5, gate
 10.4, GDN qkv 5.4, z 3.5, out 3.5, head 2.3, full q 1.8, kv 1.4, o 1.2) and everything else 35.6 ms
 (full attention core 9.1, GDN scan 9.0, norm+mHC 9.6, swiglu 2.7, conv 2.5, merge 1.3). A 12,000
