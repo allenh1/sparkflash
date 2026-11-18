@@ -116,24 +116,51 @@ fn the_device_arm_matches_the_host_on_one_token() {
     let source = open_checkpoint(directory.path()).expect("checkpoint opens");
     let weights = SenseNovaWeights::load(&config, &source).expect("host weights");
     let host = weights.forward_prompt(&[1, 2, 3]).expect("host token");
-    let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open(
-        directory.path(),
-        ModelDescriptor::sensenova_loop_9b(),
-        256,
-    );
-    let Ok(backend) = backend else {
-        eprintln!("the device arm refused the fixture: {:?}", backend.err());
-        return;
-    };
     use sparkflash_model::backend::ModelBackend;
-    let mut session = backend.open_session().expect("device session");
-    let step = session.prefill(&[1, 2, 3]).expect("device prefill");
-    assert_eq!(step.logits.len(), host.len());
-    let worst = step
-        .logits
-        .iter()
-        .zip(&host)
-        .map(|(device, host)| (device - host).abs())
-        .fold(0.0f32, f32::max);
-    assert!(worst < 5e-3, "device and host diverge by {worst}");
+    // The BF16 cache is the exact-arithmetic path: nothing but the kernels' own rounding
+    // separates the two. The 8-bit cache adds the E4M3 round of every cached key and value,
+    // which moves the logits by about a percent, so it gets its own bound and an argmax claim.
+    for (kv_fp8, bound) in [(false, 5e-3f32), (true, 2e-2f32)] {
+        let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open_with_cache(
+            directory.path(),
+            ModelDescriptor::sensenova_loop_9b(),
+            256,
+            kv_fp8,
+        );
+        let Ok(backend) = backend else {
+            eprintln!("the device arm refused the fixture: {:?}", backend.err());
+            return;
+        };
+        let mut session = backend.open_session().expect("device session");
+        let step = session.prefill(&[1, 2, 3]).expect("device prefill");
+        assert_eq!(step.logits.len(), host.len());
+        let worst = step
+            .logits
+            .iter()
+            .zip(&host)
+            .map(|(device, host)| (device - host).abs())
+            .fold(0.0f32, f32::max);
+        let scale = host.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+        assert!(
+            worst < bound,
+            "kv_fp8={kv_fp8}: device and host diverge by {worst} (host max {scale}); \
+             host[0..4]={:?} device[0..4]={:?}",
+            &host[..4],
+            &step.logits[..4]
+        );
+        if kv_fp8 {
+            let argmax = |values: &[f32]| {
+                values
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(index, _)| index)
+            };
+            assert_eq!(
+                argmax(&step.logits),
+                argmax(&host),
+                "the 8-bit cache must not move the first token"
+            );
+        }
+    }
 }

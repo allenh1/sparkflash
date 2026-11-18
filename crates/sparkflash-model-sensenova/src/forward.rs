@@ -502,6 +502,9 @@ impl SenseNovaWeights {
             }
         }
         let final_hidden = rms_norm(&x, &self.norm, config.rms_norm_eps as f32);
+        if debug {
+            report("host final hidden", &final_hidden);
+        }
         let logits = self.lm_head.matvec(&final_hidden);
         state.position += 1;
         Ok(logits)

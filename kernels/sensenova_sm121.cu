@@ -101,15 +101,28 @@ extern "C" __global__ void sensenova_mhc_pre(const float* __restrict__ streams,
     }
     const float mean = __fdiv_rn(squares[0], (float)width);
     const float scale = rsqrtf(__fadd_rn(mean, epsilon));
-    if (lane < 8) {
-        float accumulator = 0.0f;
-        for (int index = 0; index < width; ++index) {
-            accumulator = __fadd_rn(
-                accumulator,
-                __fmul_rn(weight[(unsigned long long)lane * width + index],
-                          __fmul_rn(flat[index], scale)));
+    // One warp a router row: the released loop ran lane row over all width columns in order,
+    // which is 8192 serial dependent FMAs on eight lanes and cost 0.4 ms a router. A warp holds
+    // the same row, so the sum is a tree over the lanes and the row streams coalesced.
+    {
+        const int warp = threadIdx.x >> 5;
+        const int sub = threadIdx.x & 31;
+        if (warp < 8) {
+            const unsigned long long base = (unsigned long long)warp * width;
+            float accumulator = 0.0f;
+            for (int index = sub; index < width; index += 32) {
+                accumulator = __fadd_rn(
+                    accumulator, __fmul_rn(weight[base + index], __fmul_rn(flat[index], scale)));
+            }
+#pragma unroll
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                accumulator = __fadd_rn(
+                    accumulator, __shfl_down_sync(0xFFFFFFFFu, accumulator, stride));
+            }
+            if (sub == 0) {
+                logits[warp] = __fadd_rn(accumulator, bias[warp]);
+            }
         }
-        logits[lane] = __fadd_rn(accumulator, bias[lane]);
     }
     __syncthreads();
     if (lane == 0) {

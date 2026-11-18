@@ -103,11 +103,12 @@ struct Kernels {
 }
 
 struct Weights {
-    /// The BF16 embedding table on the host: one row is copied to the device a token.
+    /// The BF16 embedding table on the host: one row is copied to the device a token. The full
+    /// table is 2 GB, so it stays in host memory and only the token's row crosses the bus.
     host_embed: Vec<u8>,
-    /// The BF16 LM head on the host: 2 GB on a 16 GB card is the difference between a 256K
-    /// 8-bit cache and no 256K at all. Its matvec is the host's one long stage a token.
-    host_head: Vec<u8>,
+    /// The BF16 LM head on the device. Projecting it on the host cost 100-200 ms a token; one
+    /// device GEMV reads the same 2 GB at close to the card's bandwidth (2.3 ms).
+    head: DeviceMat,
     norm: Deviceptr,
     layers: Vec<DeviceLayer>,
 }
@@ -163,8 +164,25 @@ impl SenseNovaDeviceBackend {
     /// A missing image, a CUDA context that cannot open, or a tensor whose shape disagrees.
     pub fn open(
         directory: &Path,
+        descriptor: ModelDescriptor,
+        context: usize,
+    ) -> Result<Self, String> {
+        let kv_fp8 = active().attention.kv_cache.unwrap_or(KvCacheMode::Fp8) == KvCacheMode::Fp8;
+        Self::open_with_cache(directory, descriptor, context, kv_fp8)
+    }
+
+    /// Opens the checkpoint with an explicit K/V cache precision.
+    ///
+    /// The serving profile picks this (`attention.kv_cache`); the parity tests name it because
+    /// the cached E4M3 round is a property they measure, not one they inherit from the profile.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_with_cache(
+        directory: &Path,
         mut descriptor: ModelDescriptor,
         context: usize,
+        kv_fp8: bool,
     ) -> Result<Self, String> {
         if !Self::available() {
             return Err(
@@ -195,7 +213,6 @@ impl SenseNovaDeviceBackend {
                 config.head_dim
             ));
         }
-        let kv_fp8 = active().attention.kv_cache.unwrap_or(KvCacheMode::Fp8) == KvCacheMode::Fp8;
         let shared = DeviceShared::open(directory, config, context, kv_fp8)?;
         descriptor.context_tokens = context;
         Ok(Self {
@@ -357,6 +374,12 @@ impl DeviceShared {
         {
             return Err("the embedding and LM head must be BF16 [vocab, hidden]".to_owned());
         }
+        let head = DeviceMat {
+            pointer: upload(host_head.len(), &host_head)?,
+            scales: None,
+            rows: config.vocab_size,
+            columns: config.hidden_size,
+        };
         let norm = vector(
             &source,
             "model.language_model.norm.weight",
@@ -574,7 +597,7 @@ impl DeviceShared {
             kernels,
             weights: Weights {
                 host_embed,
-                host_head,
+                head,
                 norm,
                 layers,
             },
@@ -754,6 +777,7 @@ struct Scratch {
     attn_out: Deviceptr,
     partials: Deviceptr,
     coeffs: Deviceptr,
+    logits: Deviceptr,
     pointers: Vec<Deviceptr>,
 }
 
@@ -831,6 +855,7 @@ impl DeviceSession {
             attn_out: alloc(query * 4)?,
             partials: alloc(config.num_attention_heads * 16 * (config.head_dim + 2) * 4)?,
             coeffs: alloc(8 * 4)?,
+            logits: alloc(config.vocab_size * 4)?,
             pointers,
         };
         let mut visits = Vec::with_capacity(config.visits());
@@ -931,6 +956,10 @@ impl DeviceSession {
                 ),
             ));
         }
+        let timed = std::env::var("SPARKFLASH_SENSENOVA_TIME").is_ok();
+        let per_visit = std::env::var("SPARKFLASH_SENSENOVA_TIME").as_deref() == Ok("2");
+        let started = std::time::Instant::now();
+        let mut visit_clock = started;
         let position = self.position;
         let row = token as usize * hidden * 2;
         let embed = &shared.weights.host_embed[row..row + hidden * 2];
@@ -944,6 +973,7 @@ impl DeviceSession {
             .cuda
             .copy_htod(&self.scratch.hidden, &widened)
             .map_err(|error| BackendError::new(DEVICE, error))?;
+        let after_embed = started.elapsed();
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
         if debug {
             self.report("embed", self.scratch.hidden, hidden)?;
@@ -1117,6 +1147,22 @@ impl DeviceSession {
                     hidden,
                 )?;
             }
+            if per_visit {
+                shared
+                    .cuda
+                    .synchronize()
+                    .map_err(|error| BackendError::new(DEVICE, error))?;
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "sensenova visit {visit:2} layer {physical:2} {} {:.2} ms",
+                    match config.layer_types[physical] {
+                        LayerType::Full => "full",
+                        LayerType::Linear => "linear",
+                    },
+                    (now - visit_clock).as_secs_f64() * 1e3
+                );
+                visit_clock = now;
+            }
         }
         shared.rmsnorm(
             self.scratch.hidden,
@@ -1126,23 +1172,43 @@ impl DeviceSession {
             hidden,
             1,
         )?;
-        let mut hidden_bytes = vec![0u8; hidden * 4];
+        if debug {
+            self.report("device final hidden", self.scratch.normed, hidden)?;
+        }
+        if timed {
+            shared
+                .cuda
+                .synchronize()
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+        }
+        let after_device = started.elapsed();
+        shared.gemv(
+            &shared.weights.head,
+            self.scratch.normed,
+            self.scratch.logits,
+            1,
+        )?;
+        let mut logit_bytes = vec![0u8; config.vocab_size * 4];
         shared
             .cuda
-            .copy_dtoh(&mut hidden_bytes, &self.scratch.normed)
+            .copy_dtoh(&mut logit_bytes, &self.scratch.logits)
             .map_err(|error| BackendError::new(DEVICE, error))?;
-        let final_hidden: Vec<f32> = hidden_bytes
+        let logits: Vec<f32> = logit_bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
-        let logits = host_matvec(
-            &shared.weights.host_head,
-            config.vocab_size,
-            hidden,
-            &final_hidden,
-        );
+        if timed {
+            let total = started.elapsed();
+            eprintln!(
+                "sensenova time: embed {:.2} ms, device {:.2} ms, head {:.2} ms, total {:.2} ms",
+                after_embed.as_secs_f64() * 1e3,
+                (after_device - after_embed).as_secs_f64() * 1e3,
+                (total - after_device).as_secs_f64() * 1e3,
+                total.as_secs_f64() * 1e3
+            );
+        }
         self.position += 1;
         Ok(logits)
     }
@@ -1472,36 +1538,6 @@ impl DeviceSession {
         }
         Ok(())
     }
-}
-
-/// A BF16 [rows, columns] matvec on the host, split over the process cores.
-fn host_matvec(weights: &[u8], rows: usize, columns: usize, input: &[f32]) -> Vec<f32> {
-    let threads = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(32)
-        .max(1);
-    let chunk = rows.div_ceil(threads).max(1);
-    let mut out = vec![0.0f32; rows];
-    std::thread::scope(|scope| {
-        for (index, block) in out.chunks_mut(chunk).enumerate() {
-            let first = index * chunk;
-            scope.spawn(move || {
-                for (offset, slot) in block.iter_mut().enumerate() {
-                    let base = (first + offset) * columns * 2;
-                    let mut accumulator = 0.0f32;
-                    for (column, value) in input.iter().enumerate() {
-                        let pair = &weights[base + column * 2..base + column * 2 + 2];
-                        accumulator +=
-                            sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([
-                                pair[0], pair[1],
-                            ])) * value;
-                    }
-                    *slot = accumulator;
-                }
-            });
-        }
-    });
-    out
 }
 
 impl ModelBackend for SenseNovaDeviceBackend {

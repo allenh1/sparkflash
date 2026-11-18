@@ -1,10 +1,10 @@
 # SenseNova-Loop-9B (FP8 / BF16)
 
 Status: **host reference on every target, and a TP=1 device arm served on the RTX 5080.** The FP8
-mirror boots at its **160K** default with an **8-bit K/V cache**, keeps the embedding and LM head
-on the host, matches the host reference's argmax on the first token (worst logit delta 0.063 from
-the E4M3 K/V round) and decodes at about **6.4 tok/s** including a short prompt. The pack is
-`sparkflash-model-sensenova`; the served selector is `sensenova-loop-9b-fp8`.
+mirror boots at its **160K** default with an **8-bit K/V cache**, keeps only the embedding on the
+host, matches the host reference's argmax on the first token (worst logit delta 0.063 from the
+E4M3 K/V round) and decodes at about **44 tok/s** (22.5 ms a token, 5.5x the first arm). The pack
+is `sparkflash-model-sensenova`; the served selector is `sensenova-loop-9b-fp8`.
 
 SenseNova-Loop-9B is a 9.4B-parameter multimodal decoder released by SenseTime on 2026-11-17
 (Apache-2.0). It is a Qwen3.5 hybrid stack with two structural additions:
@@ -51,7 +51,7 @@ Not in BF16. The text weights alone are 18.8 GB. FP8 fits at a short context:
 | :-- | --: | --: | --: | --: |
 | BF16 KV | 11.0 GB | 56 KiB | 9.2 GB | 14.7 GB |
 | 8-bit KV | 11.0 GB | 28 KiB | 4.6 GB | 7.3 GB |
-| FP8 head/embed also on host | 6.9 GB | 28 KiB | 4.6 GB | 7.3 GB |
+| FP8 body + BF16 LM head on device, embedding on host | 9.0 GB | 28 KiB | 4.6 GB | 7.3 GB |
 | AWQ 4-bit + 8-bit KV | ~5.5 GB | 28 KiB | 4.6 GB | 7.3 GB |
 
 Per-token KV is **56 KiB in BF16, 28 KiB in 8-bit**: 14 full-attention visits x 4 KV heads x
@@ -59,11 +59,12 @@ Per-token KV is **56 KiB in BF16, 28 KiB in 8-bit**: 14 full-attention visits x 
 layers inside the loop hold two independent caches each. The GDN side is 42 recurrent visits,
 ~84 MiB of f32 state plus ~4 MiB of convolution history per sequence, also per visit.
 
-The arm defaults to **160K**. With FP8 weights, an 8-bit K/V cache and the BF16 embedding/LM head
-on the host, the device holds about 11.6 GiB (6.9 GiB of weights, 4.6 GiB of cache); the server
-reported 8.6 GiB resident after a short request, so there is headroom. 256K with 8-bit KV needs
-~14.2 GiB of cache plus weights and only just misses on a 16 GB card with the host head; the model
-card's 256K assumes 4-bit weights. The 5080 is sm_120, not the
+The arm defaults to **160K**. With FP8 weights, an 8-bit K/V cache, the BF16 LM head on the device
+and the embedding on the host, the device plan is 8.4 GiB of weights plus 4.6 GiB of cache at 160K
+(13.3 GiB); the server reported 10.8 GiB resident after a short request, because the caches are only
+touched as far as the sequence reaches. 256K needs ~7.3 GiB of cache: with the BF16 head that is
+16.6 GiB and just misses on a 16 GB card, which is why 160K is the default; the model card's 256K
+assumes 4-bit weights. The 5080 is sm_120, not the
 sm_121 GB10 the tree was written for: build with `SPARKFLASH_CUDA_ARCH=sm_120`. The consumer part
 has no block-scaled MMA, so the prefill images are skipped by the build script; the token, scan
 and attention images this arm uses compile cleanly.
@@ -92,9 +93,13 @@ mHC's router is not GLM's and is not interchangeable with it:
 * the merge is `mix @ streams + post[:, None] * branch[None, :]`.
 
 The host reference in `src/forward.rs` is the oracle for this. The device arm's
-`sensenova_mhc_pre`/`sensenova_mhc_post` kernels implement the same schedule, and the tiny
-fixture's device-vs-host test holds them to 5e-3 on the logits (the device kernel accumulates the
-router's 8 x 8192 projection in fp32, so the remaining difference is launch order).
+`sensenova_mhc_pre`/`sensenova_mhc_post` kernels implement the same schedule. The router's
+8 x 8192 projection is one warp a row, summed as a tree over the lanes: the released loop ran
+eight lanes over all 8192 columns in order, which is 8192 dependent FMAs on eight lanes and cost
+0.4 ms a router - 0.79 ms a layer, the largest single item in the first arm's 125 ms token. The
+tiny fixture holds the device to 5e-3 of the host with a BF16 K/V cache (the exact-arithmetic
+path) and to 2e-2 with the 8-bit cache, whose E4M3 round is a measured property of the arm rather
+than a kernel difference.
 
 ## Serving
 
@@ -117,7 +122,7 @@ Every projection and every block body is a shared kernel:
 
 | stage | kernel |
 | :-- | :-- |
-| embedding | `q4e_embed` |
+| embedding | host row copy, 8 KiB a token |
 | dense projection | `q4e_gemv_bf16` or `q4e_gemv_tiled_e4m3_tile` (128x128 tile) |
 | RMSNorm | `q4e_rmsnorm` |
 | GQA q/gate split | `sensenova_qgate` |
@@ -129,13 +134,13 @@ Every projection and every block body is a shared kernel:
 | Gated DeltaNet | `q4e_gdn_conv` + `q4e_gdn_recur` |
 | SwiGLU | `q4e_swiglu` |
 | mHC | `sensenova_mhc_pre` / `_post` / `_leave` |
-| LM head | `q4e_gemv_bf16` |
+| LM head | `q4e_gemv_bf16` (2 GB BF16 on the device) |
 
 The weights are uploaded once per **physical** layer; the two loop visits reuse them. All 56
 visit caches are allocated at open: 14 8-bit KV caches of `context * 1024` bytes plus one f32
-scale a token and KV head, and 42 GDN state pairs. The embedding row and the final hidden are the
-only host transfers; the LM head's 2 GB BF16 matvec runs on the host, which is what makes 160K
-fit beside the FP8 weights.
+scale a token and KV head, and 42 GDN state pairs. The embedding row is the only host upload and
+the 1 MB of logits the only download: the LM head's 2 GB BF16 matvec is one device GEMV, because
+a host matvec of that table cost 100-200 ms a token, and the row it replaces is 8 KiB.
 
 ### What is deliberately next
 
@@ -143,8 +148,10 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-1. **Move the LM head back to the device for shorter contexts.** At 160K the device has ~7 GiB
-   spare; a device head is ~2 GB and would restore the 13 tok/s measured with the 4K profile.
+1. **Fewer kernels a visit, or one graph.** The body now reads its 12.1 GB at ~600 GB/s while the
+   single big head GEMV reads its 2 GB at ~870 GB/s; the gap is the ten dependent launches a visit,
+   not bandwidth. Fusing q/k/v, z/b/a and gate/up into batched tiled GEMVs, or capturing the 56
+   visits as a CUDA graph with the position as the only updated argument, is the next ~25%.
 2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
    `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
    chunked GDN scan, both of which the shared images already carry. This is the largest single
