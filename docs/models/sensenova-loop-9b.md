@@ -242,6 +242,25 @@ while the rows grow linearly. A session that re-prefills a 40K conversation ever
 sees a few hundred tokens a second, not the ~1,000 the short-prompt figures suggest - which is
 why prefix reuse matters more than the peak number.
 
+Prefix reuse is what turns that curve into a flat line, and it only pays when the sequence is still
+held. The held pool keeps one sequence a slot, so at the default - one slot on a single card - any
+interleaved request takes the slot: a client that asks for a conversation title between turns throws
+away the conversation the next turn continues, and the reuse never lands. A five-turn session with
+a title request between each turn, measured through `serve` at a 32K context and
+`SPARKFLASH_HELD_SEQUENCES=2`:
+
+| turn | prompt | cached | |
+| :-- | --: | --: | :-- |
+| 1 | 743 | 0 | cold |
+| 2 | 1,081 | 767 | 71% |
+| 3 | 1,421 | 1,107 | 78% |
+| 4 | 1,757 | 1,443 | 82% |
+| 5 | 2,094 | 1,780 | 85% |
+| titles x4 | 236 | 0 | 59 tokens each, never a prefix |
+
+69.5% of the 7,332 prompt tokens were served from the cache, and the four title calls no longer cost
+the conversation its prefix. At the default capacity the same session caches nothing.
+
 **The target is now a 15,000 tok/s floor on the shipped FP8 checkpoint.** That floor is a compute
 bound, not a byte one: the block-scaled FP8 MMA peaks at 224 TFLOPS on this part and the E4M3 arm
 reaches ~56 of them, so 15,000 tok/s (a 1,024-row chunk in 68 ms) is above what 8-bit operands can
