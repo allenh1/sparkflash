@@ -1,0 +1,41 @@
+# SenseNova-Loop-9B (FP8) runtime profile.
+#
+# The checkpoint is 11.0 GB of text weights in 128x128-tile E4M3, plus fp32 mHC routers and
+# bf16 norms/embeddings. On a 16 GB RTX 5080 that fills the card at a short context; the 4-bit
+# path is what reaches the 512K window. This profile carries policy, not shape: the checkpoint's
+# config.json is the source of truth.
+
+model = "sensenova/SenseNova-Loop-9B"
+family = "sensenova_loop"
+weights = "sensenova-loop-9b-fp8"
+
+[runtime]
+context_tokens = 524288
+concurrency = 1
+
+[prefill]
+enabled = true
+# The first device arm feeds a prompt one row at a time, so prefill and decode share the same
+# token GEMV arithmetic and a prompt's logits do not depend on its width. The tensor-core chunk
+# is the next change on the same plan.
+chunk = 64
+tensor_cores = false
+exact = true
+
+[decode]
+# Decode is the FP8 tile GEMV and the shared full-attention/GDN bodies; no stage runs on the
+# tensor cores.
+tensor_cores = false
+
+[speculation]
+# The release has no MTP stage; every draft is a later arm's.
+enabled = false
+
+[sequence]
+parallel = false
+overlap = false
+
+[diagnostics]
+profile = false
+trace = false
+spec_trace = false

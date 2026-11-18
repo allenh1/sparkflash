@@ -24,6 +24,7 @@ members = [
     "crates/sparkflash-model-dory",
     "crates/sparkflash-model-dense",
     "crates/sparkflash-model-inkling2",
+    "crates/sparkflash-model-sensenova",
     "crates/sparkflash-weights",
     "crates/sparkflash-api",
     "crates/sparkflash-serve",
@@ -59,6 +60,7 @@ sparkflash-model-glm5-next = { path = "crates/sparkflash-model-glm5-next" }
 sparkflash-model-dory = { path = "crates/sparkflash-model-dory" }
 sparkflash-model-dense = { path = "crates/sparkflash-model-dense" }
 sparkflash-model-inkling2 = { path = "crates/sparkflash-model-inkling2" }
+sparkflash-model-sensenova = { path = "crates/sparkflash-model-sensenova" }
 sparkflash-weights = { path = "crates/sparkflash-weights" }
 sparkflash-api = { path = "crates/sparkflash-api" }
 sparkflash-serve = { path = "crates/sparkflash-serve" }

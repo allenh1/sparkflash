@@ -66,6 +66,8 @@ fn hyper() -> Residual {
         manifold: true,
         sinkhorn_iters: 20,
         epsilon: 1e-6,
+        fixed_identity: false,
+        pre_scale: 1.0,
     })
 }
 

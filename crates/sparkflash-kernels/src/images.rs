@@ -55,6 +55,8 @@ pub enum Image {
     Inkling,
     /// The Dory1.0-4B nGPT token kernels.
     Dory,
+    /// The SenseNova-Loop YaRN, query/gate and mHC kernels.
+    SenseNova,
     /// The DeepSeek kernels loaded from the shared PTX set.
     Deepseek,
     /// The RoCEnante one-shot collective.
@@ -120,6 +122,11 @@ const MOE_PLAN: &[u8] = &[];
 const INKLING: &[u8] = include_bytes!(env!("SPARKFLASH_INKLING_CUBIN"));
 #[cfg(not(sparkflash_model_cubin))]
 const INKLING: &[u8] = &[];
+
+#[cfg(sparkflash_model_cubin)]
+const SENSENOVA: &[u8] = include_bytes!(env!("SPARKFLASH_SENSENOVA_CUBIN"));
+#[cfg(not(sparkflash_model_cubin))]
+const SENSENOVA: &[u8] = &[];
 
 #[cfg(sparkflash_model_cubin)]
 const DORY: &[u8] = include_bytes!(env!("SPARKFLASH_DORY_CUBIN"));
@@ -203,6 +210,12 @@ pub fn inkling_cubin() -> &'static [u8] {
 #[must_use]
 pub fn dory_cubin() -> &'static [u8] {
     DORY
+}
+
+/// The SenseNova-Loop token image, empty on a CPU-only build.
+#[must_use]
+pub fn sensenova_cubin() -> &'static [u8] {
+    SENSENOVA
 }
 
 impl Image {
@@ -488,6 +501,13 @@ impl Image {
                 "dory_rope_norm_lanes",
                 "dory_slerp",
             ],
+            Self::SenseNova => &[
+                "sensenova_mhc_leave",
+                "sensenova_mhc_post",
+                "sensenova_mhc_pre",
+                "sensenova_qgate",
+                "sensenova_rope",
+            ],
             Self::Rocenante => &["rocenante_oneshot_allreduce_bf16_tp4"],
             Self::Deepseek => &[
                 "b12x_bf16a_mxfp8w_dense_sm121",
@@ -750,6 +770,7 @@ impl Image {
             Self::MoePlan => moe_plan_cubin(),
             Self::Inkling => inkling_cubin(),
             Self::Dory => dory_cubin(),
+            Self::SenseNova => sensenova_cubin(),
             // DeepSeek loads its kernels through the shared driver from the PTX set, and the
             // RoCEnante path compiles its own image at run time.
             Self::Deepseek | Self::Rocenante => &[],
@@ -779,6 +800,7 @@ impl Image {
             Self::MoePlan => "moe_plan_sm121",
             Self::Inkling => "inkling_sm121",
             Self::Dory => "dory_sm121",
+            Self::SenseNova => "sensenova_sm121",
             Self::Deepseek => "deepseek_ptx",
             Self::Rocenante => "rocenante_oneshot_sm121",
         }

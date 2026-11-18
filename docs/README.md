@@ -14,6 +14,7 @@
 | [DECISIONS.md](DECISIONS.md) | The decision register: one row per hard-to-reverse choice, cited from source comments as `Dnn` |
 | [models/qwen38-flash-next-nvfp4.md](models/qwen38-flash-next-nvfp4.md) | Qwen3.8-Flash-Next (NVFP4): architecture, quantisation, the PLE n-gram table on the Engram paging path, and the TP=1 device arm |
 | [models/glm53-flash.md](models/glm53-flash.md) | GLM-5.3-Flash (FP8, TP=4): the released architecture, its serving frontend (backend, prompt codec, descriptor), the tiny-fixture run, and what the arm does not serve yet |
+| [models/sensenova-loop-9b.md](models/sensenova-loop-9b.md) | SenseNova-Loop-9B (FP8/BF16): the 56-visit loop, two-stream mHC, 5080 memory budget, host reference and device arm |
 | [models/dory1-4b-bf16.md](models/dory1-4b-bf16.md) | NVIDIA Nemotron Labs Dory1.0-4B (BF16): looped nGPT arithmetic, the 507-name tensor plan, the TP=1 device arm and the CPU host reference |
 | [models/qwen36-35b-a3b-fp8.md](models/qwen36-35b-a3b-fp8.md) | Qwen3.6-35B-A3B (FP8): the Qwen3.5-MoE hybrid on the generalised Qwen device arm at TP=1 (plain residual, full attention, FP8 dense), and what it still refuses |
 | [models/inkling2-small-tp4.md](models/inkling2-small-tp4.md) | Inkling 2 Small (NVFP4): the 594B/17B-active hybrid, four-Spark memory feasibility, and the parts, kernels and arm it needs |

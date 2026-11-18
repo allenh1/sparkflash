@@ -79,8 +79,10 @@ pub use descriptor::{
     INKLING2_SMALL_WEIGHTS_ID, INKLING2_UNPADDED_VOCAB_SIZE, INKLING2_VOCAB_SIZE, MODELS,
     ModelDescriptor, QWEN36_CONTEXT_TOKENS, QWEN36_FLASH_35B_A3B_FP8_ID,
     QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID, QWEN36_MAX_OUTPUT_TOKENS, QWEN36_VOCAB_SIZE,
-    V41_CONTEXT_TOKENS, V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, canonical_model_type,
-    default_model, find_model, find_model_by_type, find_model_by_weights, model_context_tokens,
+    SENSENOVA_LOOP_9B_CONTEXT_TOKENS, SENSENOVA_LOOP_9B_ID, SENSENOVA_LOOP_9B_MAX_OUTPUT_TOKENS,
+    SENSENOVA_LOOP_9B_VOCAB_SIZE, SENSENOVA_LOOP_9B_WEIGHTS_ID, V41_CONTEXT_TOKENS,
+    V41_MAX_OUTPUT_TOKENS, V41_VOCAB_SIZE, WEIGHT_IDS, canonical_model_type, default_model,
+    find_model, find_model_by_type, find_model_by_weights, model_context_tokens,
     model_max_output_tokens,
 };
 pub use engine::{DEFAULT_ENGINE_KIND, ENGINE_NAMES, EngineKind, parse_engine_kind};

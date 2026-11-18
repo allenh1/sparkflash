@@ -2549,6 +2549,10 @@ pub const HOST_REFERENCE_PARTS: &[Part] = &[
     Part::DenseMlp,
     Part::Moe,
     Part::LmHead,
+    // SenseNova-Loop's two-stream router is executed by the pack's host reference, not by the
+    // generic dynamic host; listing it here keeps the boot gate from refusing the family before
+    // its own route runs.
+    Part::ManifoldHyperConnection,
 ];
 
 /// The parts `architecture` names that the host reference backend does not execute.

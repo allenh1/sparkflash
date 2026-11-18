@@ -1,0 +1,1454 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The SenseNova-Loop device arm.
+//!
+//! The walk follows the host reference's execution plan exactly: each of the 56 visits owns a
+//! KV cache or a GDN state, the physical layer's weights are uploaded once, and the two mHC
+//! passes are the only model-specific launches. Every projection and every block body is the
+//! shared Qwen token, attention or scan kernel. A prompt is fed one row at a time, so prefill
+//! and decode use the same arithmetic and the same weight pass; the tensor-core prefill is the
+//! next change on this plan.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
+use sparkflash_kernels::images::{
+    qwen4_attn_cubin, qwen4_exp_cubin, qwen4_scan_cubin, sensenova_cubin,
+};
+use sparkflash_model::ModelDescriptor;
+use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_ops::gemv::{
+    GEMV_MAX_BATCH, GpuMat, GpuMatE4m3Tile, TILED_GEMV_PARTIALS, gemv_e4m3_tile,
+};
+use sparkflash_ops::sampler::Sampler;
+use sparkflash_weights::safetensors::open_checkpoint;
+use sparkflash_weights::{DType, TensorSpec, WeightSource};
+
+use crate::config::{LayerType, SenseNovaConfig};
+use crate::forward::yarn_attention_scale;
+use crate::tensor::SenseNovaTensorPlan;
+
+const DEVICE: &str = "sensenova_device";
+const BLOCK: u32 = 256;
+
+/// One uploaded matrix, BF16 or E4M3 with its tile scales.
+#[derive(Debug, Clone, Copy)]
+struct DeviceMat {
+    pointer: Deviceptr,
+    scales: Option<Deviceptr>,
+    rows: usize,
+    columns: usize,
+}
+
+/// One layer's uploaded weights.
+#[derive(Debug, Clone, Copy)]
+struct DeviceLayer {
+    input_norm: Deviceptr,
+    post_norm: Deviceptr,
+    q: Option<DeviceMat>,
+    k: Option<DeviceMat>,
+    v: Option<DeviceMat>,
+    o: Option<DeviceMat>,
+    q_norm: Option<Deviceptr>,
+    k_norm: Option<Deviceptr>,
+    qkv: Option<DeviceMat>,
+    z: Option<DeviceMat>,
+    b: Option<DeviceMat>,
+    a: Option<DeviceMat>,
+    out: Option<DeviceMat>,
+    conv: Option<Deviceptr>,
+    a_log: Option<Deviceptr>,
+    dt_bias: Option<Deviceptr>,
+    gdn_norm: Option<Deviceptr>,
+    gate: DeviceMat,
+    up: DeviceMat,
+    down: DeviceMat,
+    mhc_attn: Option<(Deviceptr, Deviceptr)>,
+    mhc_ffn: Option<(Deviceptr, Deviceptr)>,
+}
+
+struct Kernels {
+    embed: Kernel,
+    copy_flat: Kernel,
+    gemv_bf16: Kernel,
+    gemv_fp8: Kernel,
+    rmsnorm: Kernel,
+    swiglu: Kernel,
+    add: Kernel,
+    gdn_conv: Kernel,
+    gdn_recur: Kernel,
+    rope: Kernel,
+    qgate: Kernel,
+    cache_bf16: Kernel,
+    attn_full: Kernel,
+    attn_full_combine: Kernel,
+    mhc_pre: Kernel,
+    mhc_post: Kernel,
+    mhc_leave: Kernel,
+}
+
+struct Weights {
+    embed: DeviceMat,
+    lm_head: DeviceMat,
+    norm: Deviceptr,
+    layers: Vec<DeviceLayer>,
+}
+
+pub(crate) struct DeviceShared {
+    cuda: CudaHandle,
+    kernels: Kernels,
+    weights: Weights,
+    config: SenseNovaConfig,
+    inv_freq: Deviceptr,
+    rope_scale: f32,
+    tiled_partials: Deviceptr,
+    tiled_counters: Deviceptr,
+    context: usize,
+    allocated: usize,
+    pointers: Vec<Deviceptr>,
+}
+
+// SAFETY: a Kernel is an opaque driver function word; the context that owns it lives in the
+// shared backend and outlives every session.
+unsafe impl Send for Kernels {}
+unsafe impl Sync for Kernels {}
+
+use sparkflash_ops::gemv::CudaHandle;
+
+impl Drop for DeviceShared {
+    fn drop(&mut self) {
+        let references: Vec<&Deviceptr> = self.pointers.iter().collect();
+        self.cuda.free_buffers(&references);
+    }
+}
+
+/// The SenseNova-Loop model on the device.
+pub struct SenseNovaDeviceBackend {
+    descriptor: ModelDescriptor,
+    shared: Arc<DeviceShared>,
+}
+
+impl SenseNovaDeviceBackend {
+    /// Whether this build embeds the images the arm launches.
+    #[must_use]
+    pub fn available() -> bool {
+        !sensenova_cubin().is_empty()
+            && !qwen4_exp_cubin().is_empty()
+            && !qwen4_attn_cubin().is_empty()
+            && !qwen4_scan_cubin().is_empty()
+    }
+
+    /// Opens the checkpoint and uploads the text backbone.
+    ///
+    /// # Errors
+    /// A missing image, a CUDA context that cannot open, or a tensor whose shape disagrees.
+    pub fn open(
+        directory: &Path,
+        mut descriptor: ModelDescriptor,
+        context: usize,
+    ) -> Result<Self, String> {
+        if !Self::available() {
+            return Err(
+                "this build has no SenseNova/Qwen cubin: rebuild on a host with nvcc, or set \
+                 SPARKFLASH_NVCC"
+                    .to_owned(),
+            );
+        }
+        let config = SenseNovaConfig::from_checkpoint_dir(directory)
+            .map_err(|error| format!("{}: {error}", directory.join("config.json").display()))?;
+        if context == 0 || context > config.max_position_embeddings {
+            return Err(format!(
+                "context {context} is outside 1..={} for the checkpoint",
+                config.max_position_embeddings
+            ));
+        }
+        // The mHC kernel is the released two-stream, fixed-count router; a checkpoint that
+        // changes the stream count, fixes the identity, or scales the branch is another kernel.
+        if config.mhc.streams != 2 || config.mhc.fixed_identity || config.mhc.pre_scale != 1.0 {
+            return Err(format!(
+                "the SenseNova device arm implements two streams, a learned mix and pre_scale 1.0,                  not streams={}, fixed_identity={}, pre_scale={}",
+                config.mhc.streams, config.mhc.fixed_identity, config.mhc.pre_scale
+            ));
+        }
+        if config.head_dim > 256 {
+            return Err(format!(
+                "the shared attention body takes head_dim at most 256, not {}",
+                config.head_dim
+            ));
+        }
+        let shared = DeviceShared::open(directory, config, context)?;
+        descriptor.context_tokens = context;
+        Ok(Self {
+            descriptor,
+            shared: Arc::new(shared),
+        })
+    }
+
+    /// The device bytes the weights and scratch claimed.
+    #[must_use]
+    pub fn weight_bytes(&self) -> usize {
+        self.shared.allocated
+    }
+}
+
+impl DeviceShared {
+    fn open(directory: &Path, config: SenseNovaConfig, context: usize) -> Result<Self, String> {
+        let cuda = CudaHandle::new(Cuda::load()?);
+        sparkflash_kernels::cuda_driver::enable_forward_async_launches();
+        let gdn_shared = (config.linear.key_dim * config.linear.value_dim * 4) as u32;
+        let kernels = Kernels::load(&cuda, gdn_shared)?;
+        let source = open_checkpoint(directory).map_err(|error| error.to_string())?;
+        let plan = SenseNovaTensorPlan::served(&config);
+        // The released checkpoint is a superset of the text plan: it also carries the 27-layer
+        // vision tower. Check that every served tensor is present; the extras are the tower the
+        // first arm does not load (and `source.spec` would catch a missing one at upload anyway).
+        for spec in plan.specs() {
+            source.spec(&spec.name).map_err(|error| {
+                format!("the checkpoint does not match the SenseNova plan: {error}")
+            })?;
+        }
+        let mut pointers = Vec::new();
+        let mut allocated = 0usize;
+        let mut upload = |bytes: usize, data: &[u8]| -> Result<Deviceptr, String> {
+            let pointer = cuda.alloc(bytes, &mut allocated)?;
+            cuda.copy_htod(&pointer, data)?;
+            pointers.push(pointer);
+            Ok(pointer)
+        };
+        let mat = |source: &dyn WeightSource,
+                   name: &str,
+                   rows: usize,
+                   columns: usize,
+                   upload: &mut dyn FnMut(usize, &[u8]) -> Result<Deviceptr, String>|
+         -> Result<DeviceMat, String> {
+            let spec = source.spec(name).map_err(|error| error.to_string())?;
+            if spec.shape != [rows, columns] {
+                return Err(format!(
+                    "{name} is {:?}, expected [{rows}, {columns}]",
+                    spec.shape
+                ));
+            }
+            match spec.dtype {
+                DType::BF16 => {
+                    let bytes = source.read(name).map_err(|error| error.to_string())?;
+                    Ok(DeviceMat {
+                        pointer: upload(rows * columns * 2, &bytes)?,
+                        scales: None,
+                        rows,
+                        columns,
+                    })
+                }
+                DType::F8E4M3 => {
+                    let bytes = source.read(name).map_err(|error| error.to_string())?;
+                    let scale_name = format!("{name}_scale_inv");
+                    let scale_spec = source
+                        .spec(&scale_name)
+                        .map_err(|error| error.to_string())?;
+                    let expected = vec![rows.div_ceil(128), columns.div_ceil(128)];
+                    if scale_spec.shape != expected {
+                        return Err(format!(
+                            "{scale_name} is {:?}, expected {expected:?}",
+                            scale_spec.shape
+                        ));
+                    }
+                    let scales = source
+                        .read(&scale_name)
+                        .map_err(|error| error.to_string())?;
+                    Ok(DeviceMat {
+                        pointer: upload(rows * columns, &bytes)?,
+                        scales: Some(upload(
+                            rows.div_ceil(128) * columns.div_ceil(128) * 2,
+                            &scales,
+                        )?),
+                        rows,
+                        columns,
+                    })
+                }
+                DType::F32 => {
+                    let bytes = source.read(name).map_err(|error| error.to_string())?;
+                    Ok(DeviceMat {
+                        pointer: upload(rows * columns * 4, &bytes)?,
+                        scales: None,
+                        rows,
+                        columns,
+                    })
+                }
+                other => Err(format!("{name} is {other:?}, expected BF16, F32 or E4M3")),
+            }
+        };
+        let vector = |source: &dyn WeightSource,
+                      name: &str,
+                      elements: usize,
+                      upload: &mut dyn FnMut(usize, &[u8]) -> Result<Deviceptr, String>|
+         -> Result<Deviceptr, String> {
+            let spec: TensorSpec = source.spec(name).map_err(|error| error.to_string())?;
+            if spec.elements() as usize != elements {
+                return Err(format!(
+                    "{name} is {:?}, expected {elements} values",
+                    spec.shape
+                ));
+            }
+            let bytes = source.read(name).map_err(|error| error.to_string())?;
+            upload(bytes.len(), &bytes)
+        };
+        let vector_bf16 = |source: &dyn WeightSource,
+                           name: &str,
+                           elements: usize,
+                           upload: &mut dyn FnMut(usize, &[u8]) -> Result<Deviceptr, String>|
+         -> Result<Deviceptr, String> {
+            let spec = source.spec(name).map_err(|error| error.to_string())?;
+            if spec.elements() as usize != elements {
+                return Err(format!(
+                    "{name} is {:?}, expected {elements} values",
+                    spec.shape
+                ));
+            }
+            let bytes = source.read(name).map_err(|error| error.to_string())?;
+            let converted: Vec<u8> = match spec.dtype {
+                DType::BF16 => bytes,
+                DType::F32 => bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|chunk| {
+                        sparkflash_weights::quant::f32_to_bf16_bits(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ]))
+                        .to_le_bytes()
+                    })
+                    .collect(),
+                other => return Err(format!("{name} is {other:?}, expected BF16 or F32")),
+            };
+            upload(converted.len(), &converted)
+        };
+        let embed = mat(
+            &source,
+            "model.language_model.embed_tokens.weight",
+            config.vocab_size,
+            config.hidden_size,
+            &mut upload,
+        )?;
+        let lm_head = mat(
+            &source,
+            "lm_head.weight",
+            config.vocab_size,
+            config.hidden_size,
+            &mut upload,
+        )?;
+        let norm = vector(
+            &source,
+            "model.language_model.norm.weight",
+            config.hidden_size,
+            &mut upload,
+        )?;
+        let hidden = config.hidden_size;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for (index, kind) in config.layer_types.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{index}");
+            let mut layer = DeviceLayer {
+                input_norm: vector(
+                    &source,
+                    &format!("{prefix}.input_layernorm.weight"),
+                    hidden,
+                    &mut upload,
+                )?,
+                post_norm: vector(
+                    &source,
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    hidden,
+                    &mut upload,
+                )?,
+                q: None,
+                k: None,
+                v: None,
+                o: None,
+                q_norm: None,
+                k_norm: None,
+                qkv: None,
+                z: None,
+                b: None,
+                a: None,
+                out: None,
+                conv: None,
+                a_log: None,
+                dt_bias: None,
+                gdn_norm: None,
+                gate: mat(
+                    &source,
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    config.intermediate_size,
+                    hidden,
+                    &mut upload,
+                )?,
+                up: mat(
+                    &source,
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    config.intermediate_size,
+                    hidden,
+                    &mut upload,
+                )?,
+                down: mat(
+                    &source,
+                    &format!("{prefix}.mlp.down_proj.weight"),
+                    hidden,
+                    config.intermediate_size,
+                    &mut upload,
+                )?,
+                mhc_attn: None,
+                mhc_ffn: None,
+            };
+            match kind {
+                LayerType::Full => {
+                    let heads = config.num_attention_heads;
+                    layer.q = Some(mat(
+                        &source,
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                        2 * heads * config.head_dim,
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.k = Some(mat(
+                        &source,
+                        &format!("{prefix}.self_attn.k_proj.weight"),
+                        config.kv_width(),
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.v = Some(mat(
+                        &source,
+                        &format!("{prefix}.self_attn.v_proj.weight"),
+                        config.kv_width(),
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.o = Some(mat(
+                        &source,
+                        &format!("{prefix}.self_attn.o_proj.weight"),
+                        hidden,
+                        heads * config.head_dim,
+                        &mut upload,
+                    )?);
+                    layer.q_norm = Some(vector(
+                        &source,
+                        &format!("{prefix}.self_attn.q_norm.weight"),
+                        config.head_dim,
+                        &mut upload,
+                    )?);
+                    layer.k_norm = Some(vector(
+                        &source,
+                        &format!("{prefix}.self_attn.k_norm.weight"),
+                        config.head_dim,
+                        &mut upload,
+                    )?);
+                }
+                LayerType::Linear => {
+                    let fused = config.linear_projection_width();
+                    let value = config.linear_value_width();
+                    layer.qkv = Some(mat(
+                        &source,
+                        &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                        fused,
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.z = Some(mat(
+                        &source,
+                        &format!("{prefix}.linear_attn.in_proj_z.weight"),
+                        value,
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.b = Some(mat(
+                        &source,
+                        &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                        config.linear.value_heads,
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.a = Some(mat(
+                        &source,
+                        &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                        config.linear.value_heads,
+                        hidden,
+                        &mut upload,
+                    )?);
+                    layer.out = Some(mat(
+                        &source,
+                        &format!("{prefix}.linear_attn.out_proj.weight"),
+                        hidden,
+                        value,
+                        &mut upload,
+                    )?);
+                    layer.conv = Some(vector(
+                        &source,
+                        &format!("{prefix}.linear_attn.conv1d.weight"),
+                        fused * config.linear.conv_kernel,
+                        &mut upload,
+                    )?);
+                    layer.a_log = Some(vector_bf16(
+                        &source,
+                        &format!("{prefix}.linear_attn.A_log"),
+                        config.linear.value_heads,
+                        &mut upload,
+                    )?);
+                    layer.dt_bias = Some(vector_bf16(
+                        &source,
+                        &format!("{prefix}.linear_attn.dt_bias"),
+                        config.linear.value_heads,
+                        &mut upload,
+                    )?);
+                    layer.gdn_norm = Some(vector(
+                        &source,
+                        &format!("{prefix}.linear_attn.norm.weight"),
+                        config.linear.value_dim,
+                        &mut upload,
+                    )?);
+                }
+            }
+            if index >= config.mhc.start && index < config.mhc.end {
+                let rows = 2 * config.mhc.streams
+                    + if config.mhc.fixed_identity {
+                        0
+                    } else {
+                        config.mhc.streams * config.mhc.streams
+                    };
+                let width = config.mhc.streams * hidden;
+                let load = |name: &str,
+                            upload: &mut dyn FnMut(usize, &[u8]) -> Result<Deviceptr, String>|
+                 -> Result<(Deviceptr, Deviceptr), String> {
+                    Ok((
+                        mat(
+                            &source,
+                            &format!("{prefix}.{name}.weight"),
+                            rows,
+                            width,
+                            upload,
+                        )?
+                        .pointer,
+                        vector(&source, &format!("{prefix}.{name}.bias"), rows, upload)?,
+                    ))
+                };
+                layer.mhc_attn = Some(load("mhc_attn", &mut upload)?);
+                layer.mhc_ffn = Some(load("mhc_ffn", &mut upload)?);
+            }
+            layers.push(layer);
+        }
+        let inv = crate::forward::yarn_inv_freq(&config);
+        let rope_scale = yarn_attention_scale(&config);
+        let inv_bytes: Vec<u8> = inv
+            .iter()
+            .flat_map(|value| (*value as f32).to_le_bytes())
+            .collect();
+        let inv_freq = upload(inv_bytes.len(), &inv_bytes)?;
+        let partials = cuda.alloc(TILED_GEMV_PARTIALS * 4, &mut allocated)?;
+        let counters = cuda.alloc(TILED_GEMV_PARTIALS, &mut allocated)?;
+        // The tiled GEMV's per-tile counters are atomically incremented from zero; device
+        // allocations are not zeroed, so clear them before the first split launch.
+        cuda.memset_d8_async(counters, 0, TILED_GEMV_PARTIALS)?;
+        pointers.push(partials);
+        pointers.push(counters);
+        Ok(Self {
+            cuda,
+            kernels,
+            weights: Weights {
+                embed,
+                lm_head,
+                norm,
+                layers,
+            },
+            config,
+            inv_freq,
+            rope_scale,
+            tiled_partials: partials,
+            tiled_counters: counters,
+            context,
+            allocated,
+            pointers,
+        })
+    }
+
+    fn launch(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        self.cuda
+            .launch_async(kernel, grid, block, args)
+            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
+    }
+
+    fn rmsnorm(
+        &self,
+        input: Deviceptr,
+        weight: Deviceptr,
+        output: Deviceptr,
+        width: usize,
+        group: usize,
+        batch: usize,
+    ) -> Result<(), BackendError> {
+        self.launch(
+            self.kernels.rmsnorm,
+            (((batch * width) / group) as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                input.0,
+                weight.0,
+                output.0,
+                width as u64,
+                group as u64,
+                (self.config.rms_norm_eps as f32).to_bits() as u64,
+                1,
+                0,
+            ],
+        )
+    }
+
+    fn gemv(
+        &self,
+        matrix: &DeviceMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if let Some(scales) = matrix.scales {
+            for base in (0..rows).step_by(GEMV_MAX_BATCH) {
+                let count = GEMV_MAX_BATCH.min(rows - base);
+                gemv_e4m3_tile(
+                    self,
+                    self.kernels.gemv_fp8,
+                    &GpuMatE4m3Tile {
+                        weight: matrix.pointer,
+                        scales,
+                        rows: matrix.rows,
+                        columns: matrix.columns,
+                    },
+                    input.offset(base * matrix.columns * 4),
+                    output.offset(base * matrix.rows * 4),
+                    count,
+                )?;
+            }
+            return Ok(());
+        }
+        let rows_per_block = if rows > 1 { 16 } else { 8 };
+        self.launch(
+            self.kernels.gemv_bf16,
+            (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                matrix.pointer.0,
+                input.0,
+                output.0,
+                matrix.rows as u64,
+                matrix.columns as u64,
+                rows as u64,
+            ],
+        )
+    }
+}
+
+impl sparkflash_ops::gemv::GemvDevice for DeviceShared {
+    fn launch(
+        &self,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), BackendError> {
+        DeviceShared::launch(self, kernel, grid, block, args)
+    }
+
+    fn gemv(
+        &self,
+        matrix: &GpuMat,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        let matrix = DeviceMat {
+            pointer: matrix.pointer,
+            scales: None,
+            rows: matrix.rows,
+            columns: matrix.columns,
+        };
+        DeviceShared::gemv(self, &matrix, input, output, rows)
+    }
+
+    fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
+        (self.tiled_partials, self.tiled_counters)
+    }
+}
+
+impl Kernels {
+    fn load(cuda: &Cuda, gdn_shared: u32) -> Result<Self, String> {
+        let load = |image: &'static [u8], name: &'static str| {
+            cuda.load_named(image, name).map(|(_, kernel)| kernel)
+        };
+        Ok(Self {
+            embed: load(qwen4_exp_cubin(), "q4e_embed")?,
+            copy_flat: load(qwen4_exp_cubin(), "q4e_copy_flat")?,
+            gemv_bf16: load(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
+            gemv_fp8: load(qwen4_exp_cubin(), "q4e_gemv_tiled_e4m3_tile")?,
+            rmsnorm: load(qwen4_exp_cubin(), "q4e_rmsnorm")?,
+            swiglu: load(qwen4_exp_cubin(), "q4e_swiglu")?,
+            add: load(qwen4_exp_cubin(), "q4e_add")?,
+            gdn_conv: load(qwen4_exp_cubin(), "q4e_gdn_conv")?,
+            gdn_recur: cuda
+                .load_named_shared(qwen4_exp_cubin(), "q4e_gdn_recur", gdn_shared)
+                .map(|(_, kernel)| kernel)?,
+            rope: load(sensenova_cubin(), "sensenova_rope")?,
+            qgate: load(sensenova_cubin(), "sensenova_qgate")?,
+            cache_bf16: load(qwen4_attn_cubin(), "q4e_cache_bf16")?,
+            attn_full: load(qwen4_attn_cubin(), "q4e_attn_full")?,
+            attn_full_combine: load(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
+            mhc_pre: load(sensenova_cubin(), "sensenova_mhc_pre")?,
+            mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
+            mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
+        })
+    }
+}
+
+struct Scratch {
+    hidden: Deviceptr,
+    branch: Deviceptr,
+    normed: Deviceptr,
+    attention: Deviceptr,
+    ffn: Deviceptr,
+    streams: Deviceptr,
+    qkv: Deviceptr,
+    z: Deviceptr,
+    b: Deviceptr,
+    a: Deviceptr,
+    conv_out: Deviceptr,
+    gdn_out: Deviceptr,
+    q_interleaved: Deviceptr,
+    query: Deviceptr,
+    gate: Deviceptr,
+    key: Deviceptr,
+    value: Deviceptr,
+    attn_out: Deviceptr,
+    partials: Deviceptr,
+    coeffs: Deviceptr,
+    logits: Deviceptr,
+    pointers: Vec<Deviceptr>,
+}
+
+#[derive(Clone, Copy)]
+struct VisitState {
+    keys: Option<Deviceptr>,
+    values: Option<Deviceptr>,
+    conv: Option<Deviceptr>,
+    recurrent: Option<Deviceptr>,
+}
+
+struct DeviceSession {
+    shared: Arc<DeviceShared>,
+    scratch: Scratch,
+    visits: Vec<VisitState>,
+    position: usize,
+    sampler: Sampler,
+    sampling: Sampling,
+}
+
+impl Drop for DeviceSession {
+    fn drop(&mut self) {
+        let _ = self.shared.cuda.make_current();
+        let mut references: Vec<&Deviceptr> = self.scratch.pointers.iter().collect();
+        for visit in &self.visits {
+            references.extend(visit.keys.as_ref());
+            references.extend(visit.values.as_ref());
+            references.extend(visit.conv.as_ref());
+            references.extend(visit.recurrent.as_ref());
+        }
+        self.shared.cuda.free_buffers(&references);
+    }
+}
+
+impl DeviceSession {
+    fn open(shared: Arc<DeviceShared>) -> Result<Self, String> {
+        // The generic host driver opens sessions on a serving worker, not on the thread that
+        // loaded the context. A CUDA context is per-thread, so bind it before any allocation.
+        shared.cuda.make_current()?;
+        let config = &shared.config;
+        let hidden = config.hidden_size;
+        let query = config.num_attention_heads * config.head_dim;
+        let kv = config.kv_width();
+        let fused = config.linear_projection_width();
+        let value = config.linear_value_width();
+        let mut pointers = Vec::new();
+        let mut allocated = shared.allocated;
+        let mut alloc = |bytes: usize| -> Result<Deviceptr, String> {
+            let pointer = shared.cuda.alloc(bytes, &mut allocated)?;
+            pointers.push(pointer);
+            Ok(pointer)
+        };
+        let scratch = Scratch {
+            hidden: alloc(hidden * 4)?,
+            branch: alloc(hidden.max(config.intermediate_size) * 4)?,
+            normed: alloc(hidden * 4)?,
+            attention: alloc(hidden * 4)?,
+            ffn: alloc(hidden.max(config.intermediate_size) * 4)?,
+            streams: alloc(2 * hidden * 4)?,
+            qkv: alloc(fused * 4)?,
+            z: alloc(value * 4)?,
+            b: alloc(config.linear.value_heads * 4)?,
+            a: alloc(config.linear.value_heads * 4)?,
+            conv_out: alloc(fused * 4)?,
+            gdn_out: alloc(value * 4)?,
+            q_interleaved: alloc(2 * query * 4)?,
+            query: alloc(query * 4)?,
+            gate: alloc(query * 4)?,
+            key: alloc(kv * 4)?,
+            value: alloc(kv * 4)?,
+            attn_out: alloc(query * 4)?,
+            partials: alloc(config.num_attention_heads * 16 * (config.head_dim + 2) * 4)?,
+            coeffs: alloc(8 * 4)?,
+            logits: alloc(config.vocab_size * 4)?,
+            pointers,
+        };
+        let mut visits = Vec::with_capacity(config.visits());
+        for physical in config.execution_plan() {
+            let state = match config.layer_types[physical] {
+                LayerType::Full => VisitState {
+                    keys: Some(shared.cuda.alloc(shared.context * kv * 2, &mut allocated)?),
+                    values: Some(shared.cuda.alloc(shared.context * kv * 2, &mut allocated)?),
+                    conv: None,
+                    recurrent: None,
+                },
+                LayerType::Linear => VisitState {
+                    keys: None,
+                    values: None,
+                    conv: Some(shared.cuda.alloc(
+                        config.linear.conv_kernel.saturating_sub(1) * fused * 4,
+                        &mut allocated,
+                    )?),
+                    recurrent: Some(shared.cuda.alloc(
+                        config.linear.value_heads
+                            * config.linear.key_dim
+                            * config.linear.value_dim
+                            * 4,
+                        &mut allocated,
+                    )?),
+                },
+            };
+            visits.push(state);
+        }
+        // The convolution and recurrent states start at zero.
+        for visit in &visits {
+            if let Some(pointer) = visit.conv {
+                shared.cuda.memset_d8_async(
+                    pointer,
+                    0,
+                    config.linear.conv_kernel.saturating_sub(1) * fused * 4,
+                )?;
+            }
+            if let Some(pointer) = visit.recurrent {
+                shared.cuda.memset_d8_async(
+                    pointer,
+                    0,
+                    config.linear.value_heads * config.linear.key_dim * config.linear.value_dim * 4,
+                )?;
+            }
+        }
+        Ok(Self {
+            shared,
+            scratch,
+            visits,
+            position: 0,
+            sampler: Sampler::new(),
+            sampling: Sampling::default(),
+        })
+    }
+
+    fn forward(&mut self, token: u32) -> Result<Vec<f32>, BackendError> {
+        let shared = Arc::clone(&self.shared);
+        shared
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        let config = &shared.config;
+        let hidden = config.hidden_size;
+        if token as usize >= config.vocab_size {
+            return Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "token {token} is outside the vocabulary {}",
+                    config.vocab_size
+                ),
+            ));
+        }
+        let position = self.position;
+        shared.launch(
+            shared.kernels.embed,
+            (hidden.div_ceil(256) as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                shared.weights.embed.pointer.0,
+                self.scratch.hidden.0,
+                token as u64,
+                hidden as u64,
+                hidden as u64,
+                0,
+            ],
+        )?;
+        let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
+        if debug {
+            self.report("embed", self.scratch.hidden, hidden)?;
+        }
+        for (visit, physical) in config.execution_plan().into_iter().enumerate() {
+            let layer = &shared.weights.layers[physical];
+            let state = self.visits[visit];
+            let uses_mhc = layer.mhc_attn.is_some();
+            if uses_mhc {
+                if physical == config.mhc.start {
+                    shared.launch(
+                        shared.kernels.copy_flat,
+                        (hidden.div_ceil(256) as u32, 1, 1),
+                        (BLOCK, 1, 1),
+                        &[self.scratch.streams.0, self.scratch.hidden.0, hidden as u64],
+                    )?;
+                    shared.launch(
+                        shared.kernels.copy_flat,
+                        (hidden.div_ceil(256) as u32, 1, 1),
+                        (BLOCK, 1, 1),
+                        &[
+                            self.scratch.streams.offset(hidden * 4).0,
+                            self.scratch.hidden.0,
+                            hidden as u64,
+                        ],
+                    )?;
+                }
+                let (weight, bias) = layer.mhc_attn.expect("router");
+                shared.launch(
+                    shared.kernels.mhc_pre,
+                    (1, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.streams.0,
+                        weight.0,
+                        bias.0,
+                        self.scratch.branch.0,
+                        self.scratch.coeffs.0,
+                        hidden as u64,
+                        config.mhc.streams as u64,
+                        config.mhc.iterations as u64,
+                        (config.mhc.epsilon as f32).to_bits() as u64,
+                    ],
+                )?;
+                shared.rmsnorm(
+                    self.scratch.branch,
+                    layer.input_norm,
+                    self.scratch.normed,
+                    hidden,
+                    hidden,
+                    1,
+                )?;
+            } else {
+                shared.rmsnorm(
+                    self.scratch.hidden,
+                    layer.input_norm,
+                    self.scratch.normed,
+                    hidden,
+                    hidden,
+                    1,
+                )?;
+            }
+            match config.layer_types[physical] {
+                LayerType::Full => self.full_attention(layer, state, position)?,
+                LayerType::Linear => self.linear_attention(layer, state)?,
+            };
+            if debug {
+                self.report(
+                    &format!("visit {visit} layer {physical} attention"),
+                    self.scratch.attention,
+                    hidden,
+                )?;
+            }
+            if uses_mhc {
+                shared.launch(
+                    shared.kernels.mhc_post,
+                    (1, hidden.div_ceil(256) as u32, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.streams.0,
+                        self.scratch.attention.0,
+                        self.scratch.coeffs.0,
+                        hidden as u64,
+                    ],
+                )?;
+                let (weight, bias) = layer.mhc_ffn.expect("router");
+                shared.launch(
+                    shared.kernels.mhc_pre,
+                    (1, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.streams.0,
+                        weight.0,
+                        bias.0,
+                        self.scratch.branch.0,
+                        self.scratch.coeffs.0,
+                        hidden as u64,
+                        config.mhc.streams as u64,
+                        config.mhc.iterations as u64,
+                        (config.mhc.epsilon as f32).to_bits() as u64,
+                    ],
+                )?;
+                shared.rmsnorm(
+                    self.scratch.branch,
+                    layer.post_norm,
+                    self.scratch.normed,
+                    hidden,
+                    hidden,
+                    1,
+                )?;
+            } else {
+                shared.launch(
+                    shared.kernels.add,
+                    (hidden.div_ceil(256) as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.hidden.0,
+                        self.scratch.attention.0,
+                        hidden as u64,
+                    ],
+                )?;
+                shared.rmsnorm(
+                    self.scratch.hidden,
+                    layer.post_norm,
+                    self.scratch.normed,
+                    hidden,
+                    hidden,
+                    1,
+                )?;
+            }
+            self.mlp(layer)?;
+            if debug {
+                self.report(
+                    &format!("device visit {visit} layer {physical} ffn"),
+                    self.scratch.ffn,
+                    hidden,
+                )?;
+            }
+            if uses_mhc {
+                shared.launch(
+                    shared.kernels.mhc_post,
+                    (1, hidden.div_ceil(256) as u32, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.streams.0,
+                        self.scratch.ffn.0,
+                        self.scratch.coeffs.0,
+                        hidden as u64,
+                    ],
+                )?;
+                if physical == config.mhc.end - 1 {
+                    shared.launch(
+                        shared.kernels.mhc_leave,
+                        (hidden.div_ceil(256) as u32, 1, 1),
+                        (BLOCK, 1, 1),
+                        &[self.scratch.streams.0, self.scratch.hidden.0, hidden as u64],
+                    )?;
+                }
+            } else {
+                shared.launch(
+                    shared.kernels.add,
+                    (hidden.div_ceil(256) as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[self.scratch.hidden.0, self.scratch.ffn.0, hidden as u64],
+                )?;
+            }
+            if debug {
+                self.report(
+                    &format!("device hidden after visit {visit}"),
+                    self.scratch.hidden,
+                    hidden,
+                )?;
+            }
+        }
+        shared.rmsnorm(
+            self.scratch.hidden,
+            shared.weights.norm,
+            self.scratch.normed,
+            hidden,
+            hidden,
+            1,
+        )?;
+        shared.gemv(
+            &shared.weights.lm_head,
+            self.scratch.normed,
+            self.scratch.logits,
+            1,
+        )?;
+        let mut bytes = vec![0u8; config.vocab_size * 4];
+        shared
+            .cuda
+            .copy_dtoh(&mut bytes, &self.scratch.logits)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        self.position += 1;
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect())
+    }
+
+    fn report(&self, label: &str, pointer: Deviceptr, width: usize) -> Result<(), BackendError> {
+        let mut bytes = vec![0u8; width * 4];
+        self.shared
+            .cuda
+            .copy_dtoh(&mut bytes, &pointer)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        let values: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        let finite = values.iter().filter(|value| value.is_finite()).count();
+        let max = values
+            .iter()
+            .filter(|value| value.is_finite())
+            .fold(0.0f32, |a, b| a.max(b.abs()));
+        eprintln!("{label}: {finite}/{} finite, max {max}", values.len());
+        Ok(())
+    }
+
+    fn mlp(&mut self, layer: &DeviceLayer) -> Result<(), BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let intermediate = shared.config.intermediate_size;
+        let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
+        shared.gemv(&layer.gate, self.scratch.normed, self.scratch.branch, 1)?;
+        if debug {
+            self.report("device mlp gate", self.scratch.branch, intermediate)?;
+        }
+        shared.gemv(&layer.up, self.scratch.normed, self.scratch.ffn, 1)?;
+        if debug {
+            self.report("device mlp up", self.scratch.ffn, intermediate)?;
+        }
+        shared.launch(
+            shared.kernels.swiglu,
+            (intermediate.div_ceil(256) as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                self.scratch.branch.0,
+                self.scratch.ffn.0,
+                self.scratch.branch.0,
+                intermediate as u64,
+            ],
+        )?;
+        if debug {
+            self.report("device mlp hidden", self.scratch.branch, intermediate)?;
+        }
+        shared.gemv(&layer.down, self.scratch.branch, self.scratch.ffn, 1)?;
+        if debug {
+            self.report("device mlp down", self.scratch.ffn, intermediate)?;
+        }
+        Ok(())
+    }
+
+    fn full_attention(
+        &mut self,
+        layer: &DeviceLayer,
+        state: VisitState,
+        position: usize,
+    ) -> Result<(), BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let config = &shared.config;
+        let heads = config.num_attention_heads;
+        let kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let query = heads * head_dim;
+        let kv = kv_heads * head_dim;
+        let (q, k, v, o) = (
+            layer.q.expect("q"),
+            layer.k.expect("k"),
+            layer.v.expect("v"),
+            layer.o.expect("o"),
+        );
+        shared.gemv(&q, self.scratch.normed, self.scratch.q_interleaved, 1)?;
+        shared.launch(
+            shared.kernels.qgate,
+            (heads as u32, 1, 1),
+            (256, 1, 1),
+            &[
+                self.scratch.q_interleaved.0,
+                self.scratch.query.0,
+                self.scratch.gate.0,
+                head_dim as u64,
+                heads as u64,
+                1,
+            ],
+        )?;
+        shared.gemv(&k, self.scratch.normed, self.scratch.key, 1)?;
+        shared.gemv(&v, self.scratch.normed, self.scratch.value, 1)?;
+        shared.rmsnorm(
+            self.scratch.query,
+            layer.q_norm.expect("q norm"),
+            self.scratch.query,
+            head_dim,
+            head_dim,
+            heads,
+        )?;
+        shared.rmsnorm(
+            self.scratch.key,
+            layer.k_norm.expect("k norm"),
+            self.scratch.key,
+            head_dim,
+            head_dim,
+            kv_heads,
+        )?;
+        shared.launch(
+            shared.kernels.rope,
+            (heads as u32, 1, 1),
+            (128, 1, 1),
+            &[
+                self.scratch.query.0,
+                head_dim as u64,
+                config.rope.dims as u64,
+                position as u64,
+                shared.inv_freq.0,
+                u64::from(shared.rope_scale.to_bits()),
+                query as u64,
+                1,
+            ],
+        )?;
+        shared.launch(
+            shared.kernels.rope,
+            (kv_heads as u32, 1, 1),
+            (128, 1, 1),
+            &[
+                self.scratch.key.0,
+                head_dim as u64,
+                config.rope.dims as u64,
+                position as u64,
+                shared.inv_freq.0,
+                u64::from(shared.rope_scale.to_bits()),
+                kv as u64,
+                1,
+            ],
+        )?;
+        let keys = state.keys.expect("keys");
+        let values = state.values.expect("values");
+        let cache_blocks = kv.div_ceil(256) as u32;
+        shared.launch(
+            shared.kernels.cache_bf16,
+            (cache_blocks, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                keys.offset(position * kv * 2).0,
+                self.scratch.key.0,
+                kv as u64,
+            ],
+        )?;
+        shared.launch(
+            shared.kernels.cache_bf16,
+            (cache_blocks, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                values.offset(position * kv * 2).0,
+                self.scratch.value.0,
+                kv as u64,
+            ],
+        )?;
+        let splits = ((position + 256) / 256).min(16) as u32;
+        shared.launch(
+            shared.kernels.attn_full,
+            (heads as u32, 1, splits),
+            (BLOCK, 1, 1),
+            &[
+                self.scratch.query.0,
+                keys.0,
+                values.0,
+                self.scratch.partials.0,
+                position as u64,
+                heads as u64,
+                kv_heads as u64,
+                head_dim as u64,
+                (heads / kv_heads.max(1)) as u64,
+            ],
+        )?;
+        shared.launch(
+            shared.kernels.attn_full_combine,
+            (heads as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                self.scratch.partials.0,
+                self.scratch.gate.0,
+                self.scratch.attn_out.0,
+                position as u64,
+                heads as u64,
+                head_dim as u64,
+            ],
+        )?;
+        shared.gemv(&o, self.scratch.attn_out, self.scratch.attention, 1)
+    }
+
+    fn linear_attention(
+        &mut self,
+        layer: &DeviceLayer,
+        state: VisitState,
+    ) -> Result<(), BackendError> {
+        let shared = Arc::clone(&self.shared);
+        let config = &shared.config;
+        let key_width = config.linear.key_heads * config.linear.key_dim;
+        let value_width = config.linear_value_width();
+        let fused = 2 * key_width + value_width;
+        let (qkv, z, b, a, out) = (
+            layer.qkv.expect("qkv"),
+            layer.z.expect("z"),
+            layer.b.expect("b"),
+            layer.a.expect("a"),
+            layer.out.expect("out"),
+        );
+        let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
+        shared.gemv(&qkv, self.scratch.normed, self.scratch.qkv, 1)?;
+        if debug {
+            self.report("gdn qkv", self.scratch.qkv, fused)?;
+        }
+        shared.gemv(&z, self.scratch.normed, self.scratch.z, 1)?;
+        if debug {
+            self.report("gdn z", self.scratch.z, value_width)?;
+        }
+        shared.gemv(&b, self.scratch.normed, self.scratch.b, 1)?;
+        if debug {
+            self.report("gdn b", self.scratch.b, config.linear.value_heads)?;
+        }
+        shared.gemv(&a, self.scratch.normed, self.scratch.a, 1)?;
+        if debug {
+            self.report("gdn a", self.scratch.a, config.linear.value_heads)?;
+        }
+        let conv = state.conv.expect("conv state");
+        let recurrent = state.recurrent.expect("recurrent state");
+        shared.launch(
+            shared.kernels.gdn_conv,
+            (fused.div_ceil(256) as u32, 1, 1),
+            (BLOCK, 1, 1),
+            &[
+                self.scratch.qkv.0,
+                conv.0,
+                layer.conv.expect("conv weight").0,
+                self.scratch.conv_out.0,
+                fused as u64,
+                config.linear.conv_kernel as u64,
+                1,
+                0,
+                0,
+                0,
+            ],
+        )?;
+        if debug {
+            self.report("gdn conv", self.scratch.conv_out, fused)?;
+        }
+        shared.launch(
+            shared.kernels.gdn_recur,
+            (config.linear.value_heads as u32, 1, 1),
+            (128, 1, 1),
+            &[
+                self.scratch.conv_out.0,
+                self.scratch.z.0,
+                self.scratch.b.0,
+                self.scratch.a.0,
+                layer.a_log.expect("a log").0,
+                layer.dt_bias.expect("dt bias").0,
+                layer.gdn_norm.expect("gdn norm").0,
+                recurrent.0,
+                recurrent.0,
+                self.scratch.gdn_out.0,
+                key_width as u64,
+                config.linear.value_heads as u64,
+                config.linear.key_dim as u64,
+                config.linear.value_dim as u64,
+                (config.linear.value_heads / config.linear.key_heads.max(1)) as u64,
+                (config.rms_norm_eps as f32).to_bits() as u64,
+                0,
+                1,
+                (config.linear.key_dim * config.linear.value_dim * 4) as u64,
+                0,
+            ],
+        )?;
+        if debug {
+            self.report("gdn recur", self.scratch.gdn_out, value_width)?;
+        }
+        shared.gemv(&out, self.scratch.gdn_out, self.scratch.attention, 1)?;
+        if debug {
+            self.report("gdn out", self.scratch.attention, config.hidden_size)?;
+        }
+        Ok(())
+    }
+}
+
+impl ModelBackend for SenseNovaDeviceBackend {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        let session = DeviceSession::open(Arc::clone(&self.shared))
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        Ok(Box::new(session))
+    }
+}
+
+impl ModelSession for DeviceSession {
+    fn set_sampling(&mut self, sampling: Sampling) {
+        self.sampling = sampling;
+        self.sampler.reset();
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        if tokens.is_empty() {
+            return Err(BackendError::new(DEVICE, "an empty prompt"));
+        }
+        let mut logits = Vec::new();
+        for token in tokens {
+            logits = self.forward(*token)?;
+        }
+        self.sampler.reset();
+        self.sampler.record_prompt(tokens);
+        let chosen = self.sampler.choose(&logits, &self.sampling);
+        Ok(StepOutput {
+            next_token: Some(chosen as u32),
+            logits,
+            draft: Vec::new(),
+        })
+    }
+
+    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        if self.position >= self.shared.context {
+            return Err(BackendError::new(
+                DEVICE,
+                format!(
+                    "the sequence is past the served context {}",
+                    self.shared.context
+                ),
+            ));
+        }
+        let logits = self.forward(token)?;
+        self.sampler.record(token);
+        let chosen = self.sampler.choose(&logits, &self.sampling);
+        Ok(StepOutput {
+            next_token: Some(chosen as u32),
+            logits,
+            draft: Vec::new(),
+        })
+    }
+
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        None
+    }
+}

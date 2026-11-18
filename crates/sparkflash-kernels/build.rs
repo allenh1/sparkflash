@@ -335,6 +335,11 @@ const MODEL_IMAGES: &[(&str, &str, &str)] = &[
     ),
     ("dory_sm121.cu", "dory_sm121.cubin", "SPARKFLASH_DORY_CUBIN"),
     (
+        "sensenova_sm121.cu",
+        "sensenova_sm121.cubin",
+        "SPARKFLASH_SENSENOVA_CUBIN",
+    ),
+    (
         "inkling_sm121.cu",
         "inkling_sm121.cubin",
         "SPARKFLASH_INKLING_CUBIN",
@@ -608,6 +613,22 @@ fn compile_cubin(nvcc: &Path, arch: &str, source: &Path, cubin: &Path) -> bool {
         return true;
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("uses too much shared data")
+        || stderr.contains("not supported on .target")
+        || stderr.contains("Ptx assembly aborted")
+    {
+        // An older ptxas (CUDA 12.9 here) caps an sm_120/sm_121 entry at 48 KiB of shared
+        // memory, while the GB10 part and CUDA 13.x allow more. One image that needs the wider
+        // limit must not fail every other image's build: leave its cubin empty so `Image::available`
+        // reports it, and let the arm that needs it refuse at boot.
+        println!(
+            "cargo:warning=sparkflash-kernels: {} exceeds this ptxas's shared-memory limit for {arch}; \
+             the image is built empty",
+            source.display()
+        );
+        let _ = std::fs::write(cubin, b"");
+        return true;
+    }
     if stderr.contains("Unsupported gpu architecture")
         || stderr.contains("unsupported architecture")
         || stderr.contains("unsupported CUDA gpu architecture")

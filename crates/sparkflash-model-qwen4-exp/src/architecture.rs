@@ -127,6 +127,8 @@ pub(crate) fn tiny_architecture() -> Architecture {
             manifold: false,
             sinkhorn_iters: 0,
             epsilon: 0.0,
+            fixed_identity: false,
+            pre_scale: 1.0,
         })
     };
     Architecture {

@@ -168,6 +168,9 @@ pub struct LoopSchedule {
     pub loops: usize,
     /// Whether each loop keeps its own KV cache.
     pub per_loop_kv: bool,
+    /// Stored units per [`Layer`]: two for Dory (an attention sublayer and an MLP sublayer),
+    /// one for a looped decoder whose physical layers are each one [`Layer`] (SenseNova).
+    pub units_per_layer: usize,
 }
 
 /// One decoder layer.
@@ -471,6 +474,10 @@ pub struct HyperConnection {
     pub sinkhorn_iters: usize,
     /// The mix's epsilon.
     pub epsilon: f64,
+    /// Whether the mix is a fixed identity (no learned combination matrix).
+    pub fixed_identity: bool,
+    /// A scale applied to the mixed-in branch, when the release declares one.
+    pub pre_scale: f64,
 }
 
 /// A lookup that lands on a layer's input.
@@ -764,8 +771,8 @@ impl Architecture {
         let embedding_tied_to_head = optional_bool(text, "tie_word_embeddings")?.unwrap_or(false);
         let attention_bias = optional_bool(text, "attention_bias")?.unwrap_or(false);
 
-        let layers = layers(text, &family)?;
-        let looped = loop_schedule(text, &family)?;
+        let layers = layers(root, text, &family)?;
+        let looped = loop_schedule(root, text, &family)?;
         let quantization = quantization(root)?;
         let vision = vision(root, hidden_size)?;
         let mtp = mtp(root, text, hidden_size)?;
@@ -1178,9 +1185,12 @@ impl Architecture {
             && looped.per_loop_kv
             && looped.loops > 1
         {
-            // Only the recurrent slice is replayed; the input and output blocks run once.
-            let start = looped.input_sublayers / 2;
-            let end = start + looped.recurrent_sublayers / 2;
+            // Only the recurrent slice is replayed; the input and output blocks run once. The
+            // schedule counts stored units (Dory has two per layer) and this walk indexes
+            // [`Layer`]s, so the unit width divides both boundaries.
+            let unit = looped.units_per_layer.max(1);
+            let start = looped.input_sublayers / unit;
+            let end = start + looped.recurrent_sublayers / unit;
             let extra = (looped.loops - 1) as u64;
             for layer in self.layers.get(start..end).unwrap_or_default() {
                 match &layer.attention.kind {
@@ -1198,7 +1208,30 @@ impl Architecture {
                         per_token = per_token
                             .saturating_add(latent_bytes(width, latent_fp8).saturating_mul(extra));
                     }
-                    AttentionKind::Gdn(_) | AttentionKind::Kda(_) => {}
+                    // A recurrent visit keeps its own convolution and delta-rule state. The
+                    // shared state is a fixed cost, so a replay multiplies it rather than
+                    // adding a per-token row.
+                    AttentionKind::Gdn(gdn) => {
+                        fixed =
+                            fixed.saturating_add(gdn_state_bytes(gdn, world).saturating_mul(extra));
+                    }
+                    AttentionKind::Kda(kda) => {
+                        let heads = ((kda.heads as u64).div_ceil(world)).max(1);
+                        let head = kda.head_dim as u64;
+                        let history = kda.conv_kernel.saturating_sub(1) as u64;
+                        let states = history
+                            .saturating_mul(3)
+                            .saturating_mul(heads)
+                            .saturating_mul(head)
+                            .saturating_mul(4)
+                            .saturating_add(
+                                heads
+                                    .saturating_mul(head)
+                                    .saturating_mul(head)
+                                    .saturating_mul(8),
+                            );
+                        fixed = fixed.saturating_add(states.saturating_mul(extra));
+                    }
                     AttentionKind::Inkling { .. } => {}
                 }
             }
@@ -1279,7 +1312,7 @@ impl Architecture {
     pub fn zero_centered_norms(&self) -> bool {
         matches!(
             self.family.as_str(),
-            "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen4_exp" | "qwen4_exp_text"
+            "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen4_exp" | "qwen4_exp_text" | "sensenova_loop"
         )
     }
 
@@ -1378,7 +1411,7 @@ impl Architecture {
     }
 }
 
-fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
+fn layers(root: &Value, text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
     if family == "dory" {
         return dory_layers(text);
     }
@@ -1472,7 +1505,7 @@ fn layers(text: &Value, family: &str) -> Result<Vec<Layer>, ConfigError> {
         let ratio = ratios.get(index).copied().unwrap_or(0);
         let attention = attention(text, index, kind, ratio, &schedule)?;
         let ffn = ffn(text, index, first_dense, &mlp_types)?;
-        let residual = residual(text)?;
+        let residual = residual_for(root, text, index)?;
         let mut sides = Vec::new();
         if engram_layers.contains(&index) {
             sides.push(Side::Engram(engram_geometry.clone()));
@@ -1578,7 +1611,45 @@ fn dory_layers(text: &Value) -> Result<Vec<Layer>, ConfigError> {
 }
 
 /// The loop metadata of a looped Dory checkpoint.
-fn loop_schedule(text: &Value, family: &str) -> Result<Option<LoopSchedule>, ConfigError> {
+fn loop_schedule(
+    root: &Value,
+    text: &Value,
+    family: &str,
+) -> Result<Option<LoopSchedule>, ConfigError> {
+    if family == "sensenova_loop" {
+        let schedule = object(root, "loop_settings")
+            .or_else(|| object(text, "loop_settings"))
+            .ok_or_else(|| invalid("a sensenova_loop checkpoint needs loop_settings"))?;
+        let start = required_usize(schedule, "start", "loop_settings")?;
+        let end = required_usize(schedule, "end", "loop_settings")?;
+        let count = required_usize(schedule, "eval_count", "loop_settings")?;
+        let count = match schedule.get("counts") {
+            Some(value) => {
+                let counts = usize_list(Some(value))?;
+                if counts != [count] {
+                    return Err(invalid(
+                        "only a fixed-count loop checkpoint is supported: counts must be [eval_count]",
+                    ));
+                }
+                count
+            }
+            None => count,
+        };
+        let layer_count = required_usize(text, "num_hidden_layers", "text_config")?;
+        if start >= end || end > layer_count || count == 0 {
+            return Err(invalid(format!(
+                "invalid loop interval or eval_count: start={start}, end={end}, count={count}, layers={layer_count}"
+            )));
+        }
+        return Ok(Some(LoopSchedule {
+            input_sublayers: start,
+            recurrent_sublayers: end - start,
+            output_sublayers: layer_count - end,
+            loops: count,
+            per_loop_kv: true,
+            units_per_layer: 1,
+        }));
+    }
     if family != "dory" {
         return Ok(None);
     }
@@ -1625,6 +1696,7 @@ fn loop_schedule(text: &Value, family: &str) -> Result<Option<LoopSchedule>, Con
         output_sublayers,
         loops,
         per_loop_kv,
+        units_per_layer: 2,
     }))
 }
 
@@ -1967,6 +2039,41 @@ fn group_limit(text: &Value) -> Result<Option<GroupLimit>, ConfigError> {
     Ok((groups > 1 && kept < groups).then_some(GroupLimit { groups, kept }))
 }
 
+/// The residual a layer at `index` uses.
+///
+/// A release may scope manifold hyper-connections to a range of layers through a root `mhc`
+/// object (SenseNova-Loop's `[start, end)`), while its prefix and suffix run a plain residual.
+/// Every other release declares the geometry on the text configuration, which applies to every
+/// layer and is read by [residual].
+fn residual_for(root: &Value, text: &Value, index: usize) -> Result<Residual, ConfigError> {
+    let Some(mhc) = object(root, "mhc").or_else(|| object(text, "mhc")) else {
+        return residual(text);
+    };
+    let start = required_usize(mhc, "start", "mhc")?;
+    let end = required_usize(mhc, "end", "mhc")?;
+    if index < start || index >= end {
+        return Ok(Residual::Plain);
+    }
+    let streams = required_usize(mhc, "streams", "mhc")?;
+    if streams < 2 {
+        return Err(invalid("mhc.streams must be at least two"));
+    }
+    let iterations = required_usize(mhc, "iterations", "mhc")?;
+    if iterations == 0 {
+        return Err(invalid("mhc.iterations must be positive"));
+    }
+    Ok(Residual::Hyper(HyperConnection {
+        streams,
+        lowrank: None,
+        manifold: true,
+        sinkhorn_iters: iterations,
+        // The released router normalises its input with `rsqrt(mean(x^2) + 1e-6)`.
+        epsilon: 1e-6,
+        fixed_identity: optional_bool(mhc, "fixed_identity")?.unwrap_or(false),
+        pre_scale: optional_f64(mhc, "pre_scale")?.unwrap_or(1.0),
+    }))
+}
+
 fn residual(text: &Value) -> Result<Residual, ConfigError> {
     let streams = optional_usize(text, "hc_mult")?
         .or(optional_usize(text, "hc_count")?)
@@ -1980,6 +2087,8 @@ fn residual(text: &Value) -> Result<Residual, ConfigError> {
         manifold: optional_bool(text, "mhc")?.unwrap_or(false),
         sinkhorn_iters: optional_usize(text, "hc_sinkhorn_iters")?.unwrap_or(0),
         epsilon: optional_f64(text, "hc_eps")?.unwrap_or(0.0),
+        fixed_identity: false,
+        pre_scale: 1.0,
     }))
 }
 

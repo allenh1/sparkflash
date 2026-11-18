@@ -74,6 +74,8 @@ pub fn tiny_architecture() -> Architecture {
             manifold: true,
             sinkhorn_iters: 20,
             epsilon: 1e-6,
+            fixed_identity: false,
+            pre_scale: 1.0,
         })
     }
     fn moe() -> Ffn {

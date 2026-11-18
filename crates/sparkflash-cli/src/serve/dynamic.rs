@@ -570,6 +570,14 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             context,
             options,
         ),
+        "sensenova_loop" => serve_sensenova(
+            checkpoint,
+            descriptor,
+            seam,
+            dialect,
+            context,
+            options,
+        ),
         "dory" => match options.recurrence.as_ref() {
             #[cfg(feature = "cuda")]
             Some(group) => super::recurrence::serve(
@@ -937,6 +945,83 @@ fn serve_inkling_group(
                 .to_owned(),
         )
     }
+}
+
+/// Serves a SenseNova-Loop checkpoint through its device arm, or its f32 host reference when this
+/// build carries no SenseNova/Qwen cubin.
+fn serve_sensenova(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    if sparkflash_model_sensenova::SenseNovaDeviceBackend::available() {
+        let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open(
+            &checkpoint.directory,
+            descriptor.clone(),
+            context,
+        )
+        .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+        let banner = format!(
+            "{} ({}) at TP=1 on {}, context {context}, SenseNova device arm (56 visits, {} device bytes)",
+            descriptor.id,
+            descriptor.weights_id,
+            checkpoint.directory.display(),
+            backend.weight_bytes(),
+        );
+        return serve_backend(
+            Box::new(backend),
+            descriptor,
+            seam,
+            dialect,
+            options,
+            &banner,
+        );
+    }
+    serve_sensenova_host(checkpoint, descriptor, seam, dialect, context, options)
+}
+
+/// Serves a SenseNova-Loop checkpoint through its pack's f32 host reference.
+///
+/// The arm owns the 56-visit plan, the per-visit caches and the mHC router; the generic dynamic
+/// host backend does not execute a loop or a hyper-connection.
+fn serve_sensenova_host(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    let config =
+        sparkflash_model_sensenova::SenseNovaConfig::from_checkpoint_dir(&checkpoint.directory)
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let source = sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+    let backend = sparkflash_model_sensenova::SenseNovaHostBackend::open(
+        descriptor.clone(),
+        config,
+        &source,
+        context,
+    )
+    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+    let banner = format!(
+        "{} ({}) at TP=1 on {}, context {context}, SenseNova f32 host reference ({} visits)",
+        descriptor.id,
+        descriptor.weights_id,
+        checkpoint.directory.display(),
+        backend.weights().config.visits(),
+    );
+    serve_backend(
+        Box::new(backend),
+        descriptor,
+        seam,
+        dialect,
+        options,
+        &banner,
+    )
 }
 
 fn serve_host(

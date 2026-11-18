@@ -101,6 +101,21 @@ pub const DORY1_0_4B_MAX_OUTPUT_TOKENS: usize = DORY1_0_4B_CONTEXT_TOKENS;
 /// The vocabulary of the released Dory1.0-4B checkpoint.
 pub const DORY1_0_4B_VOCAB_SIZE: usize = 131_072;
 
+/// The served id of the SenseNova-Loop-9B checkpoint.
+pub const SENSENOVA_LOOP_9B_ID: &str = "sensenova/SenseNova-Loop-9B";
+
+/// The control-plane weight selector for the SenseNova-Loop FP8 release.
+pub const SENSENOVA_LOOP_9B_WEIGHTS_ID: &str = "sensenova-loop-9b-fp8";
+
+/// The released context window of SenseNova-Loop-9B (512K via YaRN).
+pub const SENSENOVA_LOOP_9B_CONTEXT_TOKENS: usize = 524_288;
+
+/// The output ceiling this build serves for SenseNova-Loop-9B.
+pub const SENSENOVA_LOOP_9B_MAX_OUTPUT_TOKENS: usize = 32_768;
+
+/// The vocabulary of the released SenseNova-Loop-9B checkpoint.
+pub const SENSENOVA_LOOP_9B_VOCAB_SIZE: usize = 248_320;
+
 /// The served id of the Inkling-2-Small NVFP4 checkpoint.
 pub const INKLING2_SMALL_ID: &str = "thinkingmachines/Inkling-2-Small";
 
@@ -130,6 +145,7 @@ pub const WEIGHT_IDS: &[&str] = &[
     QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
     GLM53_FLASH_WEIGHTS_ID,
     DORY1_0_4B_BF16_WEIGHTS_ID,
+    SENSENOVA_LOOP_9B_WEIGHTS_ID,
     INKLING2_SMALL_WEIGHTS_ID,
 ];
 
@@ -266,6 +282,26 @@ impl ModelDescriptor {
         }
     }
 
+    /// The released sensenova/SenseNova-Loop-9B descriptor.
+    ///
+    /// A looped Qwen3.5 hybrid: 56 layer visits from 32 stored layers, two-stream mHC over the
+    /// looped block, 512K YaRN context and a 27-layer vision tower. The first arm serves the
+    /// text backbone; the tower is in the checkpoint but not declared until it is loaded.
+    #[must_use]
+    pub fn sensenova_loop_9b() -> Self {
+        Self {
+            id: SENSENOVA_LOOP_9B_ID.to_owned(),
+            family: "sensenova_loop".to_owned(),
+            model_type: "sensenova_loop".to_owned(),
+            label: "SenseNova".to_owned(),
+            weights_id: SENSENOVA_LOOP_9B_WEIGHTS_ID.to_owned(),
+            context_tokens: SENSENOVA_LOOP_9B_CONTEXT_TOKENS,
+            max_output_tokens: SENSENOVA_LOOP_9B_MAX_OUTPUT_TOKENS,
+            vocab_size: SENSENOVA_LOOP_9B_VOCAB_SIZE,
+            capabilities: Capabilities::ALL,
+        }
+    }
+
     /// The released thinkingmachines/Inkling-2-Small descriptor.
     ///
     /// The backbone is the served model. The checkpoint also carries a 23-layer vision tower
@@ -397,6 +433,7 @@ pub static MODELS: LazyLock<Vec<ModelDescriptor>> = LazyLock::new(|| {
         ModelDescriptor::qwen36_flash_35b_a3b_fp8(),
         ModelDescriptor::glm53_flash(),
         ModelDescriptor::dory1_0_4b_bf16(),
+        ModelDescriptor::sensenova_loop_9b(),
         ModelDescriptor::inkling2_small(),
     ]
 });
