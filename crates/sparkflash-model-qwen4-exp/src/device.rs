@@ -56,7 +56,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use sparkflash_runtime::Resume;
+use sparkflash_runtime::{Opened, Part as PromptPart, Resume};
 
 use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{
@@ -84,9 +84,9 @@ use crate::tensor::{DEVICE_RESIDENT_BYTES, Role};
 mod batch;
 mod blocks;
 mod dflash;
+mod fusion;
 mod prefill;
 pub(crate) mod tp;
-mod walk;
 
 use dflash::DFLASH2_STEP_COST;
 pub use dflash::embedded_dflash2_cubin;
@@ -2091,7 +2091,7 @@ pub struct Qwen4ExpDeviceBackend {
     /// session runs its own forward on its own stream, the one-row-a-session path.
     /// The engine sessions are handles on, once [Qwen4ExpDeviceBackend::enable_fusion] or
     /// [Qwen4ExpDeviceBackend::enable_group_fusion] ran.
-    fused: Option<sparkflash_runtime::Fusion<sparkflash_runtime::Runtime<walk::QwenWalk>>>,
+    fused: Option<sparkflash_runtime::Fusion<fusion::QwenFusion>>,
 }
 
 impl std::fmt::Debug for Qwen4ExpDeviceBackend {
@@ -2839,12 +2839,9 @@ impl Qwen4ExpDeviceBackend {
         sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
     }
 
-    /// The runtime over this backend's sequences, with room for `capacity` in one pass.
-    fn lanes(
-        &self,
-        capacity: usize,
-    ) -> Result<sparkflash_runtime::Runtime<walk::QwenWalk>, BackendError> {
-        walk::runtime(Arc::clone(&self.shared), self.context_limit, capacity)
+    /// The fused arm over this backend's sequences, with room for `capacity` in one pass.
+    fn lanes(&self, capacity: usize) -> Result<fusion::QwenFusion, BackendError> {
+        fusion::QwenFusion::new(Arc::clone(&self.shared), self.context_limit, capacity)
     }
 
     /// What the group's frames carry and rank 0 refuses: the arm serves text.
@@ -3052,6 +3049,9 @@ struct DeviceSequence {
     consumed: Vec<u32>,
     /// How many of the last prefill's tokens its caches already held, for the request's usage.
     prefill_cached: usize,
+    /// The prompt running a chunk at a time, between its first chunk and its last
+    /// ([DeviceSequence::begin_prompt]).
+    prompting: Option<Prompting>,
     /// Floats per token in the indexer's block-score row; the chunk's score grid strides by it.
     score_stride: usize,
     /// Each sparse layer's BF16 key cache, `context_limit * kv_proj_width` elements in the
@@ -3104,9 +3104,6 @@ struct DeviceSequence {
     linear_a: Deviceptr,
     linear_out: Deviceptr,
     logits: Deviceptr,
-    /// The widened row of the last prompt chunk whose head the runtime has not asked for yet
-    /// ([Self::deferred_logits]).
-    pending_head: Option<Deviceptr>,
     probabilities: Deviceptr,
     expert_indices: Deviceptr,
     /// The routed block order the shared plan writes, so the expert kernels need no inline sort.
@@ -4962,12 +4959,7 @@ impl DeviceSequence {
         } else if self.own_rows.is_some() {
             self.gather_features()?;
         }
-        // The prompt walk defers its head to the last chunk: it asks for the last row's widened
-        // residual here and runs the mixer, the language head and the read-back in
-        // [Self::deferred_logits], when the runtime heads the finished prompt.
-        let defer = logit_rows == usize::MAX;
-        let head_rows = if defer { 1 } else { logit_rows };
-        let last_hyper = match head_rows {
+        let last_hyper = match logit_rows {
             0 => None,
             rows => Some(self.head_rows(batch, rows)?),
         };
@@ -4978,45 +4970,17 @@ impl DeviceSequence {
             self.position += batch;
             return Ok(None);
         };
-        if defer {
-            self.pending_head = Some(last_hyper);
-            prof::report(self.position + batch - 1, batch);
-            self.position += batch;
-            return Ok(None);
-        }
-        let logits = self.finish_head(last_hyper, head_rows)?;
+        // The head sees only the logit rows; in a decode or a verify they are every row.
+        self.probe_rows = logit_rows;
+        let (mixed, _) = self.hyper(&weights.mixer, last_hyper, false, logit_rows)?;
+        self.gemv(&weights.lm_head, mixed, self.logits, logit_rows)?;
+        self.probe_finite(48, "logits", self.logits, config.vocab_size * logit_rows)?;
+        self.prof_mark("lm_head")?;
+        let logits = self.read_logits(logit_rows)?;
+        self.prof_mark("logits_dtoh")?;
         prof::report(self.position + batch - 1, batch);
         self.position += batch;
         Ok(Some(logits))
-    }
-
-    /// Fold the last row(s) of a forward into logits: the mixer, the language head and the
-    /// read-back. A prompt walk stores the last chunk's widened row and calls this from
-    /// [Self::deferred_logits], so a chunk's head does not run until the prompt ends.
-    fn finish_head(
-        &mut self,
-        last_hyper: Deviceptr,
-        rows: usize,
-    ) -> Result<Vec<f32>, BackendError> {
-        let config = Arc::clone(&self.backend.config);
-        let weights = &self.backend.weights;
-        // The head sees only the logit rows; in a decode or a verify they are every row.
-        self.probe_rows = rows;
-        let (mixed, _) = self.hyper(&weights.mixer, last_hyper, false, rows)?;
-        self.gemv(&weights.lm_head, mixed, self.logits, rows)?;
-        self.probe_finite(48, "logits", self.logits, config.vocab_size * rows)?;
-        self.prof_mark("lm_head")?;
-        let logits = self.read_logits(rows)?;
-        self.prof_mark("logits_dtoh")?;
-        Ok(logits)
-    }
-
-    /// The logits the last deferred prompt chunk left: the head the prompt walk did not run.
-    fn deferred_logits(&mut self) -> Result<Vec<f32>, BackendError> {
-        let hyper = self.pending_head.take().ok_or_else(|| {
-            BackendError::new("qwen4_device", "the prompt walk left no deferred head row")
-        })?;
-        self.finish_head(hyper, 1)
     }
 
     /// The first `rows` rows of the logits buffer, copied straight into the vector they are
@@ -5590,7 +5554,7 @@ impl DeviceSequence {
             position: 0,
             consumed: Vec::new(),
             prefill_cached: 0,
-            pending_head: None,
+            prompting: None,
             score_stride,
             keys: buffers.keys,
             values: buffers.values,
@@ -6088,6 +6052,80 @@ impl DeviceSequence {
         Ok(())
     }
 
+    /// Whether the last verify already holds the step fed `token`.
+    pub(super) fn holds(&self, token: u32) -> bool {
+        self.spec_queue
+            .first()
+            .is_some_and(|pending| pending.token == token)
+    }
+
+    /// The caller never used the last `count` steps this sequence answered from its verify: the
+    /// tokens fed for them leave the history and the sampler, and the state goes back to where
+    /// the first of them belongs ([Self::unwind]).
+    ///
+    /// # Errors
+    /// More answers than the last verify served, or a driver failure.
+    pub(super) fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let served = self.spec_served.len();
+        if count > served {
+            return Err(BackendError::new(
+                "qwen4_device",
+                format!("{count} answers to give back, and the last verify served {served}"),
+            ));
+        }
+        let pending = self
+            .spec_served
+            .drain(served - count..)
+            .next()
+            .expect("the served answers were just counted");
+        self.spec_queue.clear();
+        self.unwind(&pending)?;
+        self.consumed.truncate(self.consumed.len() - count);
+        let history = self.sampler.history().len();
+        self.sampler.truncate(history - count);
+        Ok(())
+    }
+
+    /// Opens this sequence's round on `token` for a shared walk ([sparkflash_runtime::RoundArm]):
+    /// the step its last verify holds, or the chance each leading run of its drafts is accepted.
+    /// The drafts stay here until the walk takes its share of them ([Self::take_drafts]).
+    ///
+    /// # Errors
+    /// A driver failure while a chain is given back.
+    pub(super) fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = self.feed(token)? {
+            return Ok(Opened::Held(step));
+        }
+        let mut chain = self
+            .spec
+            .chain(&self.spec_confidence, self.spec_drafts.len());
+        chain.truncate(self.spec_drafts.len());
+        Ok(Opened::Round(chain))
+    }
+
+    /// The first `depth` drafts of the opened round and the drafter's confidence in each, for the
+    /// walk that verifies them; the rest are dropped.
+    pub(super) fn take_drafts(&mut self, depth: usize) -> (Vec<u32>, Vec<f32>) {
+        let mut drafts = std::mem::take(&mut self.spec_drafts);
+        let mut confidence = std::mem::take(&mut self.spec_confidence);
+        drafts.truncate(depth);
+        confidence.truncate(depth);
+        (drafts, confidence)
+    }
+
+    /// Records `token` as fed, for a walk that runs it without drafts.
+    pub(super) fn feed_plain(&mut self, token: u32) {
+        self.sampler.record(token);
+        self.consumed.push(token);
+    }
+
     /// The position the sequence can go back to ([Self::rewind]): the end of its last prompt,
     /// while the copies hold it.
     fn rewind_point(&self) -> Option<usize> {
@@ -6226,7 +6264,13 @@ impl ModelSession for DeviceSequence {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        self.prefill_prompt(tokens)
+        let mut part = self.begin_prompt(tokens)?;
+        loop {
+            match part {
+                PromptPart::Done(step) => return Ok(step),
+                PromptPart::More => part = self.prompt_part()?,
+            }
+        }
     }
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
         self.backend
@@ -6254,11 +6298,13 @@ impl ModelSession for DeviceSequence {
 }
 
 impl DeviceSequence {
-    /// A prompt on the direct (unfused) session path: take up the held prefix or the rewind
-    /// point, then forward the prefill plan's chunks. The fused engine drives the same chunks
-    /// through [sparkflash_runtime::Walk] instead, where the runtime owns the prefix match and the
-    /// parts; this path stays for a session the engine was not started for.
-    fn prefill_prompt(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+    /// Starts a prompt ([ModelSession::prefill]) and forwards its first chunk;
+    /// [Self::prompt_part] forwards each next one. The chunks are the prefill plan's
+    /// ([PrefillPlan::forwards]), so running them a part at a time between other sequences' steps
+    /// changes no bits: everything a chunk leaves for the next (the caches, the MTP's stash, the
+    /// drafter's rings) is this sequence's own.
+    pub(super) fn begin_prompt(&mut self, tokens: &[u32]) -> Result<PromptPart, BackendError> {
+        self.prompting = None;
         if tokens.is_empty() {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -6269,6 +6315,11 @@ impl DeviceSequence {
             .cuda
             .make_current()
             .map_err(|error| BackendError::new("qwen4_device", error))?;
+        // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
+        // case only the tokens past it are forwarded. Its sampler history is the whole prompt
+        // either way: the penalties count every token the request reads.
+        // One that parts from the history, or that the sequence ran ahead of, may still keep the
+        // last prompt and go past it: the sequence goes back to that prompt's end first.
         let current = self.spec_queue.is_empty() && self.position == self.consumed.len();
         let reused = match sparkflash_runtime::resume(
             &self.consumed,
@@ -6278,46 +6329,94 @@ impl DeviceSequence {
         ) {
             Some(Resume::Extend(held)) => held,
             Some(Resume::Rewind(point)) => {
-                self.rewind_state(point)?;
+                self.rewind(point)?;
                 point
             }
             None => {
-                self.rewind_state(0)?;
-                0
+                return Err(BackendError::new(
+                    "qwen4_device",
+                    format!(
+                        "a prefill must extend the {} token(s) this sequence holds by at least \
+                         one, or go past its rewind point; this one does neither",
+                        self.consumed.len()
+                    ),
+                ));
             }
         };
+        // The prompt forwards past the point: its own end is the next one.
         if let Some(point) = self.point.as_mut() {
             point.forget();
         }
         self.prefill_cached = reused;
         self.sampler.record_prompt(tokens);
         self.consumed.extend_from_slice(&tokens[reused..]);
+        // A proposal drafted past the previous end anchors on a token the new suffix replaces; it
+        // is re-drafted from the new end below, like a fresh prompt's.
         self.spec_drafts.clear();
         self.spec_confidence.clear();
         self.spec_served.clear();
-        let suffix = &tokens[reused..];
-        let mut logits = None;
-        for range in self.backend.prefill.forwards(suffix.len()) {
-            let start = self.position;
-            let chunk = &suffix[range.clone()];
-            logits = self.forward_batch(chunk, usize::from(range.end == suffix.len()), 0)?;
-            if self.drafting() {
-                let end = self.position + suffix.len() - range.end;
-                let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
-                    draft
-                        .config
-                        .window_commits((start, chunk.len()), end, DENSE_ROWS)
-                        .collect()
-                });
-                for (row, rows, position) in commits {
-                    self.dflash_commit(row, rows, position)?;
-                }
-            } else if self.spec_enabled {
-                self.assemble_mtp_rows(chunk.len())?;
-                self.mtp_pass(chunk, start, false)?;
-                self.stash_last_hyper(chunk.len())?;
+        let tokens = tokens[reused..].to_vec();
+        // Each chunk reads its own PLE rows in one pass (ple_step). A whole-prompt pass here would
+        // read them all twice: past 1,024 tokens the prompt names more rows than the table's cache
+        // keeps, so the chunks would find most of them evicted again.
+        let forwards = self.backend.prefill.forwards(tokens.len());
+        // The first draft block sits just past the prompt and reaches `window_left` positions
+        // back; nothing before that is ever read from the rings ([Dflash2Config::window_commits]).
+        let end = self.position + tokens.len();
+        self.prompting = Some(Prompting {
+            tokens,
+            forwards,
+            at: 0,
+            end,
+        });
+        self.prompt_part()
+    }
+
+    /// Forwards the running prompt's next chunk ([Self::begin_prompt]); the last one ends the
+    /// prompt and answers its first step.
+    pub(super) fn prompt_part(&mut self) -> Result<PromptPart, BackendError> {
+        let mut prompting = self.prompting.take().ok_or_else(|| {
+            BackendError::new(
+                "qwen4_device",
+                "this sequence has no prompt running a chunk at a time",
+            )
+        })?;
+        self.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let is_last = prompting.at + 1 == prompting.forwards.len();
+        let rows = prompting.forwards[prompting.at].clone();
+        let chunk = &prompting.tokens[rows];
+        let logits = self.forward_batch(chunk, usize::from(is_last), 0)?;
+        let start = self.position - chunk.len();
+        if self.drafting() {
+            // The drafter's context path takes the chunk DENSE_ROWS rows at a time, as its
+            // projections split when that was the chunk.
+            let commits: Vec<_> = self.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
+                draft
+                    .config
+                    .window_commits((start, chunk.len()), prompting.end, DENSE_ROWS)
+                    .collect()
+            });
+            for (row, rows, position) in commits {
+                self.dflash_commit(row, rows, position)?;
             }
+        } else if self.spec_enabled {
+            // The MTP reads the prompt one row behind the model, so each chunk feeds it the rows
+            // assembled from the previous chunk's last state and this one's. Its own key and value
+            // caches have to cover the prompt too, or its first draft would attend to nothing.
+            self.assemble_mtp_rows(chunk.len())?;
+            self.mtp_pass(chunk, start, false)?;
+            self.stash_last_hyper(chunk.len())?;
         }
+        prompting.at += 1;
+        if !is_last {
+            self.prompting = Some(prompting);
+            return Ok(PromptPart::More);
+        }
+        // The prompt's end, before any draft past it: the state a next prompt that keeps this one
+        // goes back to.
         self.keep_point()?;
         let logits = logits.unwrap_or_default();
         let next_token = self.next(&logits);
@@ -6326,15 +6425,28 @@ impl DeviceSequence {
             if self.drafting() {
                 self.dflash_propose(token, position)?;
             } else if self.spec_enabled {
+                // The first generated token's own embedding is the last row the MTP has not seen.
                 self.draft_chain(token, position)?;
             }
         }
-        Ok(StepOutput {
+        Ok(PromptPart::Done(StepOutput {
             next_token,
             logits,
             draft: Vec::new(),
-        })
+        }))
     }
+}
+
+/// A prompt running a chunk at a time ([DeviceSequence::begin_prompt]).
+struct Prompting {
+    /// The tokens it forwards: the prompt past what the caches held.
+    tokens: Vec<u32>,
+    /// Its chunks, as the prefill plan splits it.
+    forwards: Vec<std::ops::Range<usize>>,
+    /// The chunks forwarded so far.
+    at: usize,
+    /// The position past its last token.
+    end: usize,
 }
 
 /// Load the cubin and exercise two kernels on synthetic buffers.

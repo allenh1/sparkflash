@@ -35,9 +35,7 @@ use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::ledger::{Ledger, Mode, Strategy};
 use crate::pool::{LaneMemory, LanePool};
 use crate::resume::{Restore, checkpoint_after, rewind_plan};
-use crate::rounds::{Opened, RoundArm};
-use crate::share::StepWall;
-use crate::walk::{Drafter, HeadRow, Pass, PassMask, Segment, Segments, Vision, Walk};
+use crate::walk::{Drafter, HeadRow, Pass, Segment, Vision, Walk};
 
 /// A prompt the runtime is feeding a chunk at a time.
 #[derive(Debug)]
@@ -96,24 +94,30 @@ pub struct Runtime<W: Walk> {
     chunk: ChunkPolicy,
     lanes: Mutex<LanePool>,
     rewind: bool,
-    /// Whether drafting lanes verify their rounds in one shared walk
-    /// ([crate::JOINT_ROUNDS_ENV]); off, a step is one plain row a member.
-    joint_rounds: bool,
 }
 
 impl<W: Walk> Runtime<W> {
     /// A runtime over `walk`, with `free_bytes` free for chunk sizing (zero: not measured).
     ///
     /// # Errors
-    /// A [`crate::REWIND_ENV`] or [`crate::JOINT_ROUNDS_ENV`] that is not a switch.
+    /// A [`crate::REWIND_ENV`] that is not a switch, or a walk whose drafter the runtime's
+    /// step cannot drive yet.
     pub fn new(walk: W, free_bytes: u64) -> Result<Self, BackendError> {
+        if W::Drafter::PRESENT {
+            return Err(BackendError::new(
+                "runtime",
+                format!(
+                    "{} declares a drafter ({}), and the runtime's step has no round path for it;                      serve this arm on its own fused arm until the runtime drafts, or remove the                      drafter",
+                    std::any::type_name::<W>(),
+                    std::any::type_name::<W::Drafter>()
+                ),
+            ));
+        }
         let layout = walk.layout().clone();
         let limits = walk.limits();
         let chunk = ChunkPolicy::new(limits, free_bytes, layout.bytes_per_row());
         let lane_bytes = layout.bytes_at(limits.context);
         let rewind = crate::fused::rewind().map_err(|error| BackendError::new("runtime", error))?;
-        let joint_rounds =
-            crate::joint_rounds().map_err(|error| BackendError::new("runtime", error))?;
         Ok(Self {
             walk,
             layout,
@@ -121,7 +125,6 @@ impl<W: Walk> Runtime<W> {
             chunk,
             lanes: Mutex::new(LanePool::new(lane_bytes)),
             rewind,
-            joint_rounds,
         })
     }
 
@@ -291,14 +294,10 @@ impl<W: Walk> Runtime<W> {
 /// with no device and no instance.
 #[must_use]
 pub fn ledger_for<W: Walk>() -> Ledger {
-    runtime_ledger::<W>(None, None, None)
+    runtime_ledger::<W>(None, None)
 }
 
-fn runtime_ledger<W: Walk>(
-    chunk: Option<usize>,
-    rewind: Option<bool>,
-    joint_rounds: Option<bool>,
-) -> Ledger {
+fn runtime_ledger<W: Walk>(chunk: Option<usize>, rewind: Option<bool>) -> Ledger {
     let mut ledger = Ledger::new(std::any::type_name::<W>());
     let caps = W::CAPABILITIES;
     ledger.set(
@@ -320,15 +319,19 @@ fn runtime_ledger<W: Walk>(
         },
     );
     if W::Drafter::PRESENT {
-        // The row is true of the step: Runtime::step shares the rounds when these hold and the
-        // switch is on, and loops them one member at a time when it is off.
-        let joint = caps.passes.contains(PassMask::VERIFY)
-            && caps.segments == Segments::Many
-            && joint_rounds.unwrap_or(true);
-        ledger.drafting(
-            Some(std::any::type_name::<W::Drafter>().to_owned()),
-            joint,
-            true,
+        // The runtime can state the arm's drafter, but its step does not drive it: the row is
+        // off until the round path lands. [Runtime::new] refuses such a walk outright, so a boot
+        // can never print a drafting strategy the step does not run.
+        let why = format!(
+            "{} declares a drafter ({}); the runtime's step has no round path yet",
+            std::any::type_name::<W>(),
+            std::any::type_name::<W::Drafter>()
+        );
+        ledger.set(Strategy::Drafting, Mode::off(why.clone()));
+        ledger.set(Strategy::JointRounds, Mode::off(why));
+        ledger.set(
+            Strategy::Runs,
+            Mode::off("the runtime's step does not draft"),
         );
     } else {
         ledger.drafting(None, false, false);
@@ -477,17 +480,6 @@ where
                 "a prompt in parts was stepped before it finished",
             ));
         }
-        let joint = self.joint_rounds
-            && W::Drafter::PRESENT
-            && W::CAPABILITIES.passes.contains(PassMask::VERIFY)
-            && W::CAPABILITIES.segments == Segments::Many;
-        if joint && members.len() > 1 {
-            let steps = crate::run_round(self, members)?;
-            for (slot, token) in members.iter_mut() {
-                slot.history.push(*token);
-            }
-            return Ok(steps);
-        }
         self.plain_step(members)
     }
 
@@ -569,44 +561,7 @@ where
     }
 
     fn ledger(&self) -> Ledger {
-        runtime_ledger::<W>(
-            Some(self.chunk.rows()),
-            Some(self.rewind),
-            Some(self.joint_rounds),
-        )
-    }
-}
-
-/// The runtime's side of a joint round: its slots lend their sequences to the walk, and the
-/// row share is the walk's own wall and budget.
-impl<W: Walk> RoundArm for Runtime<W> {
-    type Member = RuntimeSlot<W>;
-
-    fn open(&self, slot: &mut RuntimeSlot<W>, token: u32) -> Result<Opened, BackendError> {
-        self.walk.open_round(&mut slot.seq, token)
-    }
-
-    fn verify(
-        &self,
-        round: &mut [(&mut RuntimeSlot<W>, u32, usize)],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut seqs: Vec<(&mut W::Seq, u32, usize)> = Vec::with_capacity(round.len());
-        for entry in round.iter_mut() {
-            seqs.push((&mut entry.0.seq, entry.1, entry.2));
-        }
-        self.walk.verify_round(&mut seqs)
-    }
-
-    fn wall(&self) -> &dyn StepWall {
-        self.walk.round_wall()
-    }
-
-    fn budget(&self, seqs: usize) -> usize {
-        self.walk.round_budget(seqs)
-    }
-
-    fn floor(&self) -> f64 {
-        self.walk.round_floor()
+        runtime_ledger::<W>(Some(self.chunk.rows()), Some(self.rewind))
     }
 }
 
@@ -935,7 +890,7 @@ mod tests {
 
     #[test]
     fn the_ledger_says_when_the_rewind_switch_is_off() {
-        let ledger = runtime_ledger::<ToyWalk>(Some(256), Some(false), None);
+        let ledger = runtime_ledger::<ToyWalk>(Some(256), Some(false));
         assert_eq!(
             ledger.mode(Strategy::Rewind),
             Mode::off(format!("{}=off keeps no rewind point", crate::REWIND_ENV))
@@ -986,10 +941,10 @@ mod tests {
         assert_eq!(CHUNK_SIZES.iter().copied().max(), Some(65_535));
     }
 
-    /// A drafter marker: the toy drafting walk publishes one.
-    struct PresentDrafter;
+    /// A drafter marker for the construction refusal.
+    struct RefusedDrafter;
 
-    impl Drafter<DraftingWalk> for PresentDrafter {
+    impl Drafter<RefusedWalk> for RefusedDrafter {
         const PRESENT: bool = true;
 
         fn describe(&self) -> String {
@@ -997,193 +952,99 @@ mod tests {
         }
     }
 
-    /// A walk over the toy sequence that drafts a two-deep chain and records whether the runtime
-    /// shared the round ([Walk::verify_round]) or looped it.
-    struct DraftingWalk {
-        toy: ToyWalk,
-        wall: crate::share::ExpertUnionWall,
-        verified: Mutex<Vec<Vec<(u32, usize)>>>,
-        plain: Mutex<usize>,
+    /// A walk that declares a drafter; the runtime has no round path to drive it yet.
+    struct RefusedWalk {
+        layout: StateLayout,
+        limits: Limits,
     }
 
-    impl DraftingWalk {
+    impl RefusedWalk {
         fn new() -> Self {
             Self {
-                toy: ToyWalk::new(256, 4_096),
-                wall: crate::share::ExpertUnionWall {
-                    fixed_ms: 24.0,
-                    expert_ms: 1.0,
-                    row_ms: 0.5,
-                    seq_ms: 0.5,
-                    experts: 8,
-                    top_k: 2,
-                },
-                verified: Mutex::new(Vec::new()),
-                plain: Mutex::new(0),
+                layout: StateLayout::new(vec![Region::Positional {
+                    name: "toy",
+                    bytes_per_row: 4,
+                }]),
+                limits: Limits::new(8, 1_024),
             }
         }
     }
 
-    impl Walk for DraftingWalk {
+    impl Walk for RefusedWalk {
         type Seq = ToySeq;
-        type Drafter = PresentDrafter;
+        type Drafter = RefusedDrafter;
         type Vision = NoVision;
 
         const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
 
         fn layout(&self) -> &StateLayout {
-            self.toy.layout()
+            &self.layout
         }
 
-        fn open(&self, memory: LaneMemory) -> Result<Self::Seq, BackendError> {
-            self.toy.open(memory)
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ToySeq::default())
         }
 
         fn limits(&self) -> Limits {
-            self.toy.limits()
+            self.limits
         }
 
-        fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
-            self.toy.set_sampling(seq, sampling);
-        }
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
 
         fn walk(
             &self,
             segments: &mut [Segment<'_, Self::Seq>],
-            pass: Pass<'_>,
+            _pass: Pass<'_>,
         ) -> Result<Hidden, BackendError> {
-            *self.plain.lock().expect("the plain walk record") += 1;
-            self.toy.walk(segments, pass)
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
         }
 
         fn head(
             &self,
-            hidden: &Hidden,
+            _hidden: &Hidden,
             rows: &mut [HeadRow<'_, Self::Seq>],
         ) -> Result<Vec<StepOutput>, BackendError> {
-            self.toy.head(hidden, rows)
-        }
-
-        fn open_round(&self, _seq: &mut Self::Seq, _token: u32) -> Result<Opened, BackendError> {
-            Ok(Opened::Round(vec![0.9, 0.8]))
-        }
-
-        fn verify_round(
-            &self,
-            round: &mut [(&mut Self::Seq, u32, usize)],
-        ) -> Result<Vec<StepOutput>, BackendError> {
-            self.verified.lock().expect("the round record").push(
-                round
-                    .iter()
-                    .map(|(_, token, depth)| (*token, *depth))
-                    .collect(),
-            );
-            Ok(round
+            Ok(rows
                 .iter_mut()
-                .map(|(seq, token, _)| {
-                    seq.rows.push(*token);
-                    StepOutput {
-                        next_token: Some(*token + 1),
-                        ..StepOutput::default()
-                    }
+                .map(|_| StepOutput {
+                    next_token: Some(0),
+                    ..StepOutput::default()
                 })
                 .collect())
         }
-
-        fn round_wall(&self) -> &dyn StepWall {
-            &self.wall
-        }
-
-        fn round_budget(&self, seqs: usize) -> usize {
-            seqs * 2
-        }
     }
 
-    fn drafting_runtime() -> Runtime<DraftingWalk> {
-        Runtime::new(DraftingWalk::new(), 0).expect("the runtime starts")
-    }
-
-    fn two_members(runtime: &Runtime<DraftingWalk>) -> Vec<(RuntimeSlot<DraftingWalk>, u32)> {
-        vec![
-            (runtime.open_slot().expect("a slot"), 10),
-            (runtime.open_slot().expect("a slot"), 20),
-        ]
-    }
-
-    /// A drafting arm's multi-member step is one shared round: one verify pass, no plain walk.
+    /// A drafting walk cannot be constructed: the runtime's step would silently drop the draft,
+    /// so it refuses at boot and its ledger says so.
     #[test]
-    fn a_drafting_step_shares_one_verify_pass() {
-        let runtime = drafting_runtime();
-        let mut members = two_members(&runtime);
-        let steps = runtime.step(&mut members).expect("one round");
-        assert_eq!(steps.len(), 2);
-        let rounds = runtime.walk().verified.lock().expect("the round record");
-        assert_eq!(rounds.len(), 1, "one verify pass for both members");
-        assert_eq!(rounds[0].len(), 2, "both members walked");
-        assert_eq!(
-            *runtime.walk().plain.lock().expect("the plain walk record"),
-            0
-        );
-        assert_eq!(members[0].0.history(), &[10]);
-        assert_eq!(members[1].0.history(), &[20]);
+    fn a_walk_with_a_drafter_is_refused_until_the_runtime_has_a_round_path() {
+        let error = match Runtime::new(RefusedWalk::new(), 0) {
+            Ok(_) => panic!("the drafter is refused"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("round path"), "{error}");
+        assert!(error.message().contains("RefusedWalk"), "{error}");
+        let ledger = ledger_for::<RefusedWalk>();
+        assert!(matches!(ledger.mode(Strategy::Drafting), Mode::Off(_)));
+        assert!(matches!(ledger.mode(Strategy::JointRounds), Mode::Off(_)));
+        assert!(matches!(ledger.mode(Strategy::Runs), Mode::Off(_)));
     }
 
-    /// A lone drafting member decodes alone: the round is not worth a shared pass.
+    /// Drafted-equals-plain is claimed only by an arm that declares a drafter.
     #[test]
-    fn a_lone_drafting_member_steps_plainly() {
-        let runtime = drafting_runtime();
-        let mut members = vec![(runtime.open_slot().expect("a slot"), 10)];
-        runtime.step(&mut members).expect("one step");
-        assert!(
-            runtime
-                .walk()
-                .verified
-                .lock()
-                .expect("the round record")
-                .is_empty()
-        );
-        assert_eq!(
-            *runtime.walk().plain.lock().expect("the plain walk record"),
-            1
-        );
-    }
-
-    /// With the switch off the same arm loops its rounds one member at a time, and the ledger
-    /// says so.
-    #[test]
-    fn the_joint_round_switch_off_loops_and_shows_in_the_ledger() {
-        let previous = std::env::var(crate::JOINT_ROUNDS_ENV).ok();
-        // SAFETY: the test sets a process variable the runtime reads when it starts; tests that
-        // read it start no drafting runtime of their own.
-        unsafe { std::env::set_var(crate::JOINT_ROUNDS_ENV, "off") };
-        let runtime = drafting_runtime();
-        let mut members = two_members(&runtime);
-        let stepped = runtime.step(&mut members);
-        let ledger = runtime.ledger();
-        // SAFETY: restoring the variable the test replaced.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(crate::JOINT_ROUNDS_ENV, value),
-                None => std::env::remove_var(crate::JOINT_ROUNDS_ENV),
-            }
-        }
-        stepped.expect("one plain step");
-        assert!(
-            runtime
-                .walk()
-                .verified
-                .lock()
-                .expect("the round record")
-                .is_empty()
-        );
-        assert_eq!(
-            *runtime.walk().plain.lock().expect("the plain walk record"),
-            1
-        );
-        assert!(matches!(
-            ledger.mode(Strategy::JointRounds),
-            Mode::Looped(_)
-        ));
+    fn the_seventh_check_requires_a_drafter() {
+        use crate::ConformanceCheck;
+        let drafted = ConformanceCheck::DraftedEqualsPlain;
+        assert!(crate::checks_for::<RefusedWalk>().contains(&drafted));
+        assert!(!crate::checks_for::<ToyWalk>().contains(&drafted));
+        assert!(crate::check_claims::<RefusedWalk>(&[drafted]).is_ok());
+        assert!(crate::check_claims::<ToyWalk>(&[drafted]).is_err());
+        assert_eq!(ConformanceCheck::ALL.len(), 7);
     }
 
     crate::conformance!(ToyWalk);

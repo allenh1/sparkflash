@@ -29,7 +29,7 @@
 use sparkflash_model::backend::BackendError;
 
 use crate::layout::StateKind;
-use crate::walk::{PassMask, Segments, Walk};
+use crate::walk::{Drafter, PassMask, Segments, Walk};
 
 /// One check the generated arm tests cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,17 +46,21 @@ pub enum ConformanceCheck {
     TpWithinExactness,
     /// No format widened without a record, and bytes per token within the floor.
     NoUnrecordedWidening,
+    /// A drafting arm answers the same tokens with and without a draft, including when the
+    /// draft is rejected.
+    DraftedEqualsPlain,
 }
 
 impl ConformanceCheck {
     /// Every check [`conformance!`] emits, in the order it emits them.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::WholePromptEqualsChunked,
         Self::AloneEqualsFour,
         Self::ContinuedEqualsCold,
         Self::RewoundEqualsCold,
         Self::TpWithinExactness,
         Self::NoUnrecordedWidening,
+        Self::DraftedEqualsPlain,
     ];
 
     /// The name the list and a failure print.
@@ -69,12 +73,36 @@ impl ConformanceCheck {
             Self::RewoundEqualsCold => "rewound turn = cold",
             Self::TpWithinExactness => "TP 1 = TP 2 = TP 4 within exactness",
             Self::NoUnrecordedWidening => "no unrecorded widening",
+            Self::DraftedEqualsPlain => "drafted = plain",
         }
     }
 }
 
-/// The const list `conformance!(Arm)` claims, checkable without a device.
+/// Every generated check, including the one only a drafting arm can claim.
 pub const CONFORMANCE_CHECKS: &[ConformanceCheck] = &ConformanceCheck::ALL;
+
+/// The checks an arm without a drafter claims: every check but [ConformanceCheck::DraftedEqualsPlain].
+const NON_DRAFTING_CHECKS: [ConformanceCheck; 6] = [
+    ConformanceCheck::WholePromptEqualsChunked,
+    ConformanceCheck::AloneEqualsFour,
+    ConformanceCheck::ContinuedEqualsCold,
+    ConformanceCheck::RewoundEqualsCold,
+    ConformanceCheck::TpWithinExactness,
+    ConformanceCheck::NoUnrecordedWidening,
+];
+
+/// The checks `W` claims: every one, plus drafted-equals-plain when the arm declares a drafter.
+///
+/// This is the const the `conformance!` macro publishes, so a dense-style arm does not fail a
+/// check it has no drafter to run, and a drafting arm cannot leave the check out.
+#[must_use]
+pub const fn checks_for<W: Walk + ?Sized>() -> &'static [ConformanceCheck] {
+    if W::Drafter::PRESENT {
+        CONFORMANCE_CHECKS
+    } else {
+        &NON_DRAFTING_CHECKS
+    }
+}
 
 /// Whether an arm's declared capabilities can support every check it claims.
 ///
@@ -92,6 +120,7 @@ pub fn check_claims<W: Walk>(claims: &[ConformanceCheck]) -> Result<(), String> 
                 caps.state != StateKind::None
             }
             ConformanceCheck::TpWithinExactness | ConformanceCheck::NoUnrecordedWidening => true,
+            ConformanceCheck::DraftedEqualsPlain => W::Drafter::PRESENT,
         };
         if !supported {
             return Err(format!(
@@ -141,7 +170,7 @@ macro_rules! conformance {
             pub const ARM: &str = stringify!($arm);
 
             /// The checks the arm claims; checkable without a device.
-            pub const CHECKS: &[$crate::ConformanceCheck] = $crate::CONFORMANCE_CHECKS;
+            pub const CHECKS: &[$crate::ConformanceCheck] = $crate::checks_for::<$arm>();
 
             #[test]
             fn the_arm_claims_every_generated_check() {
@@ -189,6 +218,13 @@ macro_rules! conformance {
                 $crate::run_check::<$arm>($crate::ConformanceCheck::NoUnrecordedWidening)
                     .expect("the check needs a device");
             }
+
+            #[test]
+            #[ignore = "needs the arm's device fixture; run scripts/onboard-gate.sh <arm>"]
+            fn drafted_equals_plain() {
+                $crate::run_check::<$arm>($crate::ConformanceCheck::DraftedEqualsPlain)
+                    .expect("the check needs a device");
+            }
         }
     };
 }
@@ -198,8 +234,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_check_has_a_name_and_there_are_six() {
-        assert_eq!(ConformanceCheck::ALL.len(), 6);
+    fn every_check_has_a_name_and_there_are_seven() {
+        assert_eq!(ConformanceCheck::ALL.len(), 7);
         for check in ConformanceCheck::ALL {
             assert!(!check.name().is_empty());
         }
