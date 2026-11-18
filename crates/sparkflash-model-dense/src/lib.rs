@@ -3035,7 +3035,9 @@ impl FusedArm for DenseLanes {
     }
 
     fn ledger(&self) -> Ledger {
-        let mut ledger = Ledger::new("dense");
+        let mut ledger = Ledger::from_declaration(
+            sparkflash_model::ledger_for_arm("dense").expect("the dense arm is declared"),
+        );
         ledger.set(
             Strategy::PromptParts,
             Mode::native(format!("{CHUNK_ROWS}-row chunks")),
@@ -3047,6 +3049,17 @@ impl FusedArm for DenseLanes {
             "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
         };
         ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
+        ledger.set(
+            Strategy::Rewind,
+            if self.shared.rewind {
+                Mode::native("a prompt that goes back to the last prompt's end")
+            } else {
+                Mode::off(format!(
+                    "{}=off keeps no rewind point",
+                    sparkflash_runtime::REWIND_ENV
+                ))
+            },
+        );
         ledger
     }
 }

@@ -573,7 +573,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
     pub(super) fn ledger(&self) -> sparkflash_runtime::Ledger {
         use sparkflash_runtime::{Ledger, Mode, Strategy};
         let (_, budget) = self.device.lane_memory();
-        let mut ledger = Ledger::new("DeepSeek");
+        let mut ledger = Ledger::from_declaration(
+            sparkflash_model::ledger_for_arm("DeepSeek").expect("the DeepSeek arm is declared"),
+        );
         ledger.set(
             Strategy::Lanes,
             if self.exchange.is_some() {

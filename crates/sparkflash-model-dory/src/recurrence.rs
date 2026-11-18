@@ -1289,7 +1289,9 @@ impl DoryRecurrenceBackend {
     pub fn ledger(&self) -> Ledger {
         let lanes = self.lanes();
         let drafting = self.group.draft_lanes > 0;
-        let mut ledger = Ledger::new("Dory");
+        let mut ledger = Ledger::from_declaration(
+            sparkflash_model::ledger_for_arm("Dory").expect("the Dory arm is declared"),
+        );
         ledger
             .set(
                 Strategy::Lanes,
@@ -1325,6 +1327,17 @@ impl DoryRecurrenceBackend {
                         sparkflash_runtime::REWIND_ENV
                     )
                 }),
+            )
+            .set(
+                Strategy::Rewind,
+                if self.group.rewind {
+                    Mode::native("a prompt that goes back to the last prompt, all but its last id")
+                } else {
+                    Mode::off(format!(
+                        "{}=off keeps no rewind point",
+                        sparkflash_runtime::REWIND_ENV
+                    ))
+                },
             )
             .set(
                 Strategy::Group,
