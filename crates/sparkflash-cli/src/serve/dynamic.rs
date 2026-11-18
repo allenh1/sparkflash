@@ -962,7 +962,10 @@ fn serve_sensenova(
     context: usize,
     options: &ServeOptions,
 ) -> Result<ExitCode, String> {
-    if sparkflash_model_sensenova::SenseNovaDeviceBackend::available() {
+    // `SPARKFLASH_SENSENOVA_HOST` serves the f32 host reference instead: the same plan and the
+    // same weights through an independent arithmetic, which is what a text-level A/B needs.
+    let force_host = std::env::var("SPARKFLASH_SENSENOVA_HOST").is_ok();
+    if !force_host && sparkflash_model_sensenova::SenseNovaDeviceBackend::available() {
         let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open(
             &checkpoint.directory,
             descriptor.clone(),

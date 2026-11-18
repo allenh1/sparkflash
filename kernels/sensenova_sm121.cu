@@ -928,9 +928,11 @@ extern "C" __global__ void sensenova_gdn_scan(
                 recall0 += held[j][0] * k4.x + held[j][1] * k4.y;
                 recall1 += held[j][2] * k4.z + held[j][3] * k4.w;
             }
+            // The four lanes of a group hold a quarter of the key dimension each, so the recall is
+            // the sum over them: a shuffle returns the neighbour's value, it does not add it.
             float recall = ((recall0 + recall1) * decay);
-            recall = __shfl_xor_sync(0xFFFFFFFFu, recall, 1);
-            recall = __shfl_xor_sync(0xFFFFFFFFu, recall, 2);
+            recall += __shfl_xor_sync(0xFFFFFFFFu, recall, 1);
+            recall += __shfl_xor_sync(0xFFFFFFFFu, recall, 2);
             const float delta = (sh_v[t][mine] - recall * kk) * scale_beta;
             const float kd = kk * delta;
             float out0 = 0.0f, out1 = 0.0f;
@@ -946,8 +948,8 @@ extern "C" __global__ void sensenova_gdn_scan(
                 out1 += held[j][2] * q4.z + held[j][3] * q4.w;
             }
             float output = (out0 + out1) * qq;
-            output = __shfl_xor_sync(0xFFFFFFFFu, output, 1);
-            output = __shfl_xor_sync(0xFFFFFFFFu, output, 2);
+            output += __shfl_xor_sync(0xFFFFFFFFu, output, 1);
+            output += __shfl_xor_sync(0xFFFFFFFFu, output, 2);
             if (group == 0) {
                 out[(unsigned long long)(t0 + t) * heads * value_dim + head * value_dim +
                     column_index] = output;
