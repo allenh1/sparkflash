@@ -29,10 +29,12 @@
 
 pub mod architecture;
 pub mod arm;
+pub mod arms;
 pub mod backend;
 pub mod capabilities;
 pub mod compose;
 pub mod config;
+pub mod defaults;
 pub mod descriptor;
 pub mod dflash2;
 pub mod engine;
@@ -56,10 +58,15 @@ pub use arm::{
     Admission, AdmissionRefusal, KvPlan, MEMORY_FLOOR_BYTES, NODE_MEMORY_BUDGET_BYTES,
     PackIdentity, gib, kv_budget_bytes,
 };
+pub use arms::{
+    ARMS, Arm, Conversion, DeepSeek, Dense, Dory, Glm, Inkling, Qwen, Qwen36, QwenFp8, Tokenizer,
+    arm_for_family, arm_for_weights, numerics_status,
+};
 pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;
 pub use compose::{LayerStep, StepRole};
 pub use config::ConfigError;
+pub use defaults::{DEFAULTS, DefaultValue, Defaults, check_profile};
 pub use descriptor::{
     DEFAULT_MODEL_ID, DEFAULT_WEIGHTS_ID, DORY1_0_4B_BF16_ID, DORY1_0_4B_BF16_WEIGHTS_ID,
     DORY1_0_4B_CONTEXT_TOKENS, DORY1_0_4B_MAX_OUTPUT_TOKENS, DORY1_0_4B_VOCAB_SIZE,
