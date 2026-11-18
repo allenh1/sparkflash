@@ -823,6 +823,13 @@ fn linear_attention(
     let b_values = b.matvec(x);
     let a_values = a.matvec(x);
     let mixed = &convolved[0];
+    if std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok() {
+        report("host gdn raw", &raw);
+        report("host gdn conv", mixed);
+        report("host gdn z", &z_values);
+        report("host gdn b", &b_values);
+        report("host gdn a", &a_values);
+    }
     let groups = gdn.value_heads / gdn.key_heads.max(1);
     let mut queries = vec![0.0f32; gdn.value_heads * gdn.key_dim];
     let mut keys = vec![0.0f32; gdn.value_heads * gdn.key_dim];
@@ -851,9 +858,13 @@ fn linear_attention(
             .collect();
     }
     let mut core = vec![0.0f32; value_width];
+    let mut host_decay = vec![0.0f32; gdn.value_heads];
+    let mut host_beta = vec![0.0f32; gdn.value_heads];
     for head in 0..gdn.value_heads {
         let decay = (-a_log[head].exp() * softplus(a_values[head] + dt_bias[head])).exp();
         let beta = sigmoid(b_values[head]);
+        host_decay[head] = decay;
+        host_beta[head] = beta;
         delta_rule_step(
             &mut state.recurrent[head],
             Decay::Head(decay),
@@ -863,6 +874,11 @@ fn linear_attention(
             &qn[head * gdn.key_dim..(head + 1) * gdn.key_dim],
             &mut core[head * gdn.value_dim..(head + 1) * gdn.value_dim],
         );
+    }
+    if std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok() {
+        report("host gdn decay", &host_decay);
+        report("host gdn beta", &host_beta);
+        report("host gdn core", &core);
     }
     let mut normed = vec![0.0f32; value_width];
     for head in 0..gdn.value_heads {
@@ -876,6 +892,9 @@ fn linear_attention(
         normed[head * gdn.value_dim..(head + 1) * gdn.value_dim].copy_from_slice(&gated);
     }
     advance_conv_history(&mut state.conv_history, vec![raw], gdn.conv_kernel);
+    if std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok() {
+        report("host gdn normed", &normed);
+    }
     Ok(out.matvec(&normed))
 }
 
@@ -903,12 +922,20 @@ fn mlp(gate: &Mat, up: &Mat, down: &Mat, x: &[f32]) -> Vec<f32> {
 }
 
 fn report(label: &str, values: &[f32]) {
+    let head = &values[..3.min(values.len())];
     let finite = values.iter().filter(|value| value.is_finite()).count();
     let max = values
         .iter()
         .filter(|value| value.is_finite())
         .fold(0.0f32, |a, b| a.max(b.abs()));
-    eprintln!("{label}: {finite}/{} finite, max {max}", values.len());
+    let _ = head;
+    let taps = [0usize, values.len() / 4, values.len() / 2, values.len() * 3 / 4, values.len() - 1];
+    let mean: f32 = values.iter().sum::<f32>() / values.len().max(1) as f32;
+    eprintln!(
+        "{label}: {finite}/{} finite, max {max}, mean {mean}, taps {:?}",
+        values.len(),
+        taps.iter().map(|at| values[*at]).collect::<Vec<_>>()
+    );
 }
 
 fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {

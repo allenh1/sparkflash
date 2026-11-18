@@ -63,8 +63,10 @@ fn tiny_config() -> String {
     ]);
     text["linear_num_key_heads"] = 2.into();
     text["linear_num_value_heads"] = 4.into();
-    text["linear_key_head_dim"] = 16.into();
-    text["linear_value_head_dim"] = 16.into();
+    // The GDN kernels hold a key head at 128 values (the scan's fragment) and split the value
+    // head into 32-column parts, so the fixture keeps a head a head rather than scaling it down.
+    text["linear_key_head_dim"] = 128.into();
+    text["linear_value_head_dim"] = 128.into();
     text["partial_rotary_factor"] = 0.25.into();
     text["rope_parameters"] = serde_json::json!({
         "rope_theta": 10_000_000.0, "partial_rotary_factor": 0.25,

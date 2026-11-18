@@ -56,7 +56,14 @@ const ROWS: usize = 8;
 
 /// The rows one prefill chunk takes. The tensor-core projection tiles 128 rows, so a chunk is
 /// one tile row; the decode GEMV's eight-row tile stays for the verify.
-const PREFILL_ROWS: usize = 512;
+const PREFILL_ROWS: usize = 1024;
+
+/// `SPARKFLASH_SENSENOVA_FP8` forces the E4M3 prefill path, so the NVFP4 tiles can be bisected
+/// against a path whose numerics are already at parity.
+fn fp4_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("SPARKFLASH_SENSENOVA_FP8").is_ok())
+}
 
 /// The dynamic shared memory `q4p_dense_fp8` asks for: GLM_Q8_SHARED in
 /// shared_prefill_mma_sm121.cuh - four stages of a 128x32 activation tile, a 128x32 weight tile
@@ -745,6 +752,9 @@ impl DeviceShared {
             allocated,
             ..
         } = self;
+        if fp4_disabled() {
+            return Ok(());
+        }
         let Some(quantise) = kernels.quant_weights_fp4 else {
             return Ok(());
         };
@@ -792,7 +802,13 @@ impl DeviceShared {
                         columns as u64,
                     ],
                 )?;
+                // The FP8 bytes have no reader left at that point: every projection now runs the
+                // FP4 GEMM, at any row count, and the decode pads a step to the 128-row tile.
+                // Releasing them buys back 9 GiB for the cache.
+                cuda.free_buffers(&[&matrix.pointer, &scales]);
                 matrix.fp4 = Some((codes, block_scales));
+                matrix.pointer = codes;
+                matrix.scales = None;
                 quantised += rows * columns / 2 + rows * (columns / 16);
             }
         }
@@ -862,9 +878,16 @@ impl DeviceShared {
         block: (u32, u32, u32),
         args: &[u64],
     ) -> Result<(), BackendError> {
-        self.cuda
-            .launch_async(kernel, grid, block, args)
-            .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
+        self.cuda.launch_async(kernel, grid, block, args).map_err(|error| {
+            if std::env::var("SPARKFLASH_SENSENOVA_LAUNCH").is_ok() {
+                eprintln!(
+                    "launch {} grid={grid:?} block={block:?} shared={} args={args:?}",
+                    kernel.name(),
+                    kernel.shared_bytes()
+                );
+            }
+            BackendError::new(DEVICE, format!("{}: {error}", kernel.name()))
+        })
     }
 
     fn rmsnorm(
@@ -908,7 +931,7 @@ impl DeviceShared {
     ) -> Result<(), BackendError> {
         // The prefill tile: a char-complete 128-row chunk through the NVFP4 GEMM. The activation
         // is quantised into the caller's scratch block first, one block scale a 16 values.
-        if rows > GEMV_MAX_BATCH
+        if !fp4_disabled()
             && rows <= PREFILL_ROWS
             && matrix.rows % 128 == 0
             && matrix.columns % 128 == 0
@@ -938,16 +961,18 @@ impl DeviceShared {
             // 128-row tile needs; a chunk under 256 rows has only the narrow form left.
             let (kernel, columns_tile, rows_tile) = if matrix.rows >= 8192 {
                 (wide, 256, 128)
-            } else if rows >= 256 && matrix.rows >= 4096 {
-                (tall, 128, 256)
             } else {
                 (narrow, 128, 128)
             };
+            let _ = tall;
             return self.launch(
                 kernel,
+                // The kernel walks the tiles itself: a persistent grid of two blocks an SM keeps
+                // every launch one wave and reuses the weight column tile in L2.
                 (
-                    (matrix.rows / columns_tile) as u32,
-                    rows.div_ceil(rows_tile) as u32,
+                    (((matrix.rows / columns_tile) as usize).saturating_mul(rows.div_ceil(rows_tile)))
+                        .min(168) as u32,
+                    1,
                     1,
                 ),
                 (256, 1, 1),
@@ -1351,6 +1376,30 @@ impl DeviceSession {
                     0,
                     config.linear.value_heads * config.linear.key_dim * config.linear.value_dim * 4,
                 )?;
+            }
+        }
+        if std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok() {
+            let _ = shared.cuda.synchronize();
+            for (index, visit) in visits.iter().enumerate() {
+                let Some(pointer) = visit.recurrent else { continue };
+                let bytes = config.linear.value_heads
+                    * config.linear.key_dim
+                    * config.linear.value_dim
+                    * 4;
+                let mut values = vec![0u8; bytes];
+                let _ = shared.cuda.copy_dtoh(&mut values, &pointer);
+                let floats: Vec<f32> = values
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect();
+                let max = floats.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+                let nonzero = floats.iter().filter(|v| **v != 0.0).count();
+                eprintln!(
+                    "session state visit {index}: {nonzero} non-zero of {}, max {max}",
+                    floats.len()
+                );
             }
         }
         let mut session = Self {
@@ -1798,7 +1847,13 @@ impl DeviceSession {
             .iter()
             .filter(|value| value.is_finite())
             .fold(0.0f32, |a, b| a.max(b.abs()));
-        eprintln!("{label}: {finite}/{} finite, max {max}", values.len());
+        let taps = [0usize, values.len() / 4, values.len() / 2, values.len() * 3 / 4, values.len() - 1];
+        let mean: f32 = values.iter().sum::<f32>() / values.len().max(1) as f32;
+        eprintln!(
+            "{label}: {finite}/{} finite, max {max}, mean {mean}, taps {:?}",
+            values.len(),
+            taps.iter().map(|at| values[*at]).collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -1960,7 +2015,29 @@ impl DeviceSession {
             }
             // A chunk takes the eight-rows-a-block form, which decodes the cache once for eight
             // query rows; a decode step keeps the split kernel (one row, many splits).
-            if rows >= 128 {
+            // The chunk kernel holds one head's 256 values, which is the served head; a narrower
+            // head (the parity fixture's) takes the split form, which carries its own combine.
+            let split = rows == 1 || head_dim != 256;
+            if split {
+                shared.launch(
+                    shared.kernels.attn_q8,
+                    (heads as u32, rows as u32, FULL_SPLITS),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.query.0,
+                        keys.0,
+                        values.0,
+                        k_scales.0,
+                        v_scales.0,
+                        self.scratch.partials.0,
+                        self.scratch.position.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        head_dim as u64,
+                        (heads / kv_heads.max(1)) as u64,
+                    ],
+                )?;
+            } else {
                 shared.launch(
                     shared.kernels.attn_prefill,
                     (heads as u32, (rows as u32).div_ceil(8), 1),
@@ -1979,25 +2056,6 @@ impl DeviceSession {
                         head_dim as u64,
                         (heads / kv_heads.max(1)) as u64,
                         rows as u64,
-                    ],
-                )?;
-            } else {
-                shared.launch(
-                    shared.kernels.attn_q8,
-                    (heads as u32, rows as u32, FULL_SPLITS),
-                    (BLOCK, 1, 1),
-                    &[
-                        self.scratch.query.0,
-                        keys.0,
-                        values.0,
-                        k_scales.0,
-                        v_scales.0,
-                        self.scratch.partials.0,
-                        self.scratch.position.0,
-                        heads as u64,
-                        kv_heads as u64,
-                        head_dim as u64,
-                        (heads / kv_heads.max(1)) as u64,
                     ],
                 )?;
             }
@@ -2043,7 +2101,7 @@ impl DeviceSession {
         clock.mark("  full attention core", drain)?;
         // The chunk form gates and normalises inside itself; only the split form needs the
         // combine pass.
-        if shared.kv_fp8 && rows < 128 {
+        if shared.kv_fp8 && (rows == 1 || head_dim != 256) {
             shared.launch(
                 shared.kernels.attn_combine,
                 (heads as u32, rows as u32, 1),
@@ -2109,7 +2167,7 @@ impl DeviceSession {
         // it as a single pass, and the b/a GEMVs it replaced (36 ms a chunk) are gone. Below the
         // tile the three matrices stay separate and take the decode GEMV.
         let (zb_matrix, zb_out, zb_stride) = match layer.zcb {
-            Some(combined) if rows > GEMV_MAX_BATCH => (combined, self.scratch.z, combined.rows),
+            Some(combined) if rows <= PREFILL_ROWS => (combined, self.scratch.z, combined.rows),
             _ => (z, self.scratch.z, z.rows),
         };
         shared.project_matrix(&zb_matrix, self.scratch.normed, zb_out, rows, quant)?;
@@ -2118,12 +2176,12 @@ impl DeviceSession {
             self.report("gdn z", self.scratch.z, zb_stride)?;
         }
         // Where the three sit inside the combined output: z from 0, b after it, then a.
-        let (b_base, a_base) = if layer.zcb.is_some() && rows > GEMV_MAX_BATCH {
+        let (b_base, a_base) = if layer.zcb.is_some() && rows <= PREFILL_ROWS {
             (self.scratch.z.offset(value_width * 4), self.scratch.z.offset((value_width + 32) * 4))
         } else {
             (self.scratch.b, self.scratch.a)
         };
-        if layer.zcb.is_none() || rows <= GEMV_MAX_BATCH {
+        if layer.zcb.is_none() {
             shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
             shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
         }
@@ -2189,6 +2247,13 @@ impl DeviceSession {
             ],
         )?;
         clock.mark("  gdn params", drain)?;
+        if debug {
+            self.report("gdn a", a_base, config.linear.value_heads)?;
+            self.report("gdn qscale", params, rows * heads)?;
+            self.report("gdn kscale", params.offset(stride as usize), rows * heads)?;
+            self.report("gdn beta", params.offset(2 * stride as usize), rows * heads)?;
+            self.report("gdn factor", params.offset(3 * stride as usize), rows * heads)?;
+        }
         let parts = config.linear.value_dim / 32;
         shared.launch(
             shared.kernels.gdn_scan,

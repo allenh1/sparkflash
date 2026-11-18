@@ -521,6 +521,13 @@ __device__ __forceinline__ uint32_t sensenova_pair_off(uint32_t row, uint32_t pa
     return row * 32u + ((pair ^ (row & 1u)) << 4);
 }
 
+// Where a 16-value block of an inner run is packed. The stage's four blocks are not in K order: a
+// pair of 16-byte groups carries block 0 above block 2 and the second pair block 1 above block 3,
+// so the block half a lane's pair selects is block & 1 and its position in the stage block >> 1.
+__host__ __device__ __forceinline__ uint32_t sensenova_fp4_slot(uint32_t inner, uint32_t block) {
+    return (block >> 2) * 32u + ((block & 1u) << 4) + ((block >> 1u) & 1u) * 8u;
+}
+
 // x[rows][inner] f32 -> codes[rows][inner / 2] (two nibbles a byte) and scales[rows][inner / 16]
 // E4M3. One thread a 16-value block: its own amax, its own scale, its own eight packed bytes.
 extern "C" __global__ void sensenova_quant_fp4(const float* __restrict__ x,
@@ -549,7 +556,9 @@ extern "C" __global__ void sensenova_quant_fp4(const float* __restrict__ x,
     for (unsigned int i = 0; i < 16u; ++i) {
         packed |= (uint64_t)sensenova_e2m1(values[i] * inverse) << (4u * i);
     }
-    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)at * 8u) = packed;
+    const unsigned int row = at / blocks;
+    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)row * (inner >> 1) +
+                                 sensenova_fp4_slot(inner, at - row * blocks)) = packed;
 }
 
 // An FP8 [cols][inner] matrix with a BF16 inverse scale a 128x128 tile -> the same NVFP4 form:
@@ -585,7 +594,8 @@ extern "C" __global__ void sensenova_quant_weights_fp4(const uint8_t* __restrict
     for (unsigned int i = 0; i < 16u; ++i) {
         packed |= (uint64_t)sensenova_e2m1(values[i] * inverse) << (4u * i);
     }
-    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)at * 8u) = packed;
+    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)col * (inner >> 1) +
+                                 sensenova_fp4_slot(inner, block)) = packed;
 }
 
 // out[t][c] = a[t][:] . w[c][:] over NVFP4 operands. BM rows x BN columns a block, eight warps,
@@ -597,7 +607,8 @@ __device__ __forceinline__ void sensenova_dense_fp4_body(const uint8_t* __restri
                                                          const uint8_t* __restrict__ as,
                                                          float* __restrict__ out,
                                                          unsigned int cols, unsigned int inner,
-                                                         unsigned int tokens) {
+                                                         unsigned int tokens, unsigned int n0,
+                                                         unsigned int m0) {
     constexpr int MT = BM / WM / 16;
     constexpr int NT = BN / WN / 8;
     constexpr unsigned STAGE_BYTES = BM * 32u + BN * 32u + BM * 4u + BN * 4u;
@@ -605,8 +616,6 @@ __device__ __forceinline__ void sensenova_dense_fp4_body(const uint8_t* __restri
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
-    const unsigned int n0 = blockIdx.x * BN;
-    const unsigned int m0 = blockIdx.y * BM;
     const unsigned int stages = inner / 64u;
     const unsigned int packed = inner >> 1;
     auto s_a = [&](unsigned int buf) { return sensenova_fp4_shared + buf * STAGE_BYTES; };
@@ -672,16 +681,18 @@ __device__ __forceinline__ void sensenova_dense_fp4_body(const uint8_t* __restri
         uint32_t af[MT][4], bf[NT][2], sfa[MT], sfb[NT];
         const uint8_t* a_tile = s_a(buf);
         const uint8_t* w_tile = s_w(buf);
+        const unsigned int odd = chunk & 1u;
 #pragma unroll
         for (int mt = 0; mt < MT; ++mt) {
             const unsigned int row = wm * (BM / WM) + mt * 16u + gr;
-            const uint2 lo = *reinterpret_cast<const uint2*>(a_tile + sensenova_pair_off(row, chunk));
-            const uint2 hi =
-                *reinterpret_cast<const uint2*>(a_tile + sensenova_pair_off(row + 8u, chunk));
-            af[mt][0] = lo.x;
-            af[mt][1] = hi.x;
-            af[mt][2] = lo.y;
-            af[mt][3] = hi.y;
+            const uint4 lo = *reinterpret_cast<const uint4*>(a_tile + sensenova_pair_off(row, chunk >> 1));
+            const uint4 hi =
+                *reinterpret_cast<const uint4*>(a_tile + sensenova_pair_off(row + 8u, chunk >> 1));
+            af[mt][0] = odd ? lo.y : lo.x;
+            af[mt][1] = odd ? hi.y : hi.x;
+            af[mt][2] = odd ? lo.w : lo.z;
+            af[mt][3] = odd ? hi.w : hi.z;
+            // Row a+8b's scale comes from lane 4a+b: bit 0 of the lane selects the +8 half.
             sfa[mt] = scale_a_lane
                           ? reinterpret_cast<const uint32_t*>(s_as(buf))[wm * (BM / WM) + mt * 16u +
                                                                         gr + 8u * (lane & 1u)]
@@ -690,9 +701,9 @@ __device__ __forceinline__ void sensenova_dense_fp4_body(const uint8_t* __restri
 #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const unsigned int col = wn * (BN / WN) + nt * 8u + gr;
-            const uint2 v = *reinterpret_cast<const uint2*>(w_tile + sensenova_pair_off(col, chunk));
-            bf[nt][0] = v.x;
-            bf[nt][1] = v.y;
+            const uint4 v = *reinterpret_cast<const uint4*>(w_tile + sensenova_pair_off(col, chunk >> 1));
+            bf[nt][0] = odd ? v.y : v.x;
+            bf[nt][1] = odd ? v.w : v.z;
             sfb[nt] = scale_b_lane
                           ? reinterpret_cast<const uint32_t*>(s_ws(buf))[wn * (BN / WN) + nt * 8u + gr]
                           : 0u;
@@ -728,7 +739,17 @@ extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_wide(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
     const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
     unsigned int inner, unsigned int tokens) {
-    sensenova_dense_fp4_body<128, 256, 4, 2, 4>(w, ws, a, as, out, cols, inner, tokens);
+    // One CTA a resident block, walking the tiles: a 512-row chunk is a fixed number of tiles,
+    // and a grid of exactly that many leaves the tail wave idle. Column first, so the blocks
+    // running at once read a column tile's weights for all its row tiles while they are in L2.
+    const unsigned int row_tiles = (tokens + 127u) / 128u;
+    const unsigned int total = (cols / 256u) * row_tiles;
+    for (unsigned int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        __syncthreads();
+        sensenova_dense_fp4_body<128, 256, 4, 2, 4>(w, ws, a, as, out, cols, inner, tokens,
+                                                    (tile / row_tiles) * 256u,
+                                                    (tile % row_tiles) * 128u);
+    }
 }
 
 // A 256-row x 128-column block, eight warps of 64 x 64: the tall form. Its 256 rows halve the
@@ -738,7 +759,14 @@ extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_tall(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
     const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
     unsigned int inner, unsigned int tokens) {
-    sensenova_dense_fp4_body<256, 128, 6, 4, 2>(w, ws, a, as, out, cols, inner, tokens);
+    const unsigned int row_tiles = (tokens + 255u) / 256u;
+    const unsigned int total = (cols / 128u) * row_tiles;
+    for (unsigned int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        __syncthreads();
+        sensenova_dense_fp4_body<256, 128, 6, 4, 2>(w, ws, a, as, out, cols, inner, tokens,
+                                                    (tile / row_tiles) * 128u,
+                                                    (tile % row_tiles) * 256u);
+    }
 }
 
 // A 128-row x 128-column block, eight warps of 64 x 32: the narrow form, whose 32 column tiles
@@ -747,7 +775,14 @@ extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_narrow(
     const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
     const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
     unsigned int inner, unsigned int tokens) {
-    sensenova_dense_fp4_body<128, 128, 6, 2, 4>(w, ws, a, as, out, cols, inner, tokens);
+    const unsigned int row_tiles = (tokens + 127u) / 128u;
+    const unsigned int total = (cols / 128u) * row_tiles;
+    for (unsigned int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        __syncthreads();
+        sensenova_dense_fp4_body<128, 128, 6, 2, 4>(w, ws, a, as, out, cols, inner, tokens,
+                                                    (tile / row_tiles) * 128u,
+                                                    (tile % row_tiles) * 128u);
+    }
 }
 #endif
 
@@ -978,11 +1013,11 @@ extern "C" __global__ void sensenova_fp4_append(const uint8_t* __restrict__ src_
     for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < total; index += gridDim.x * blockDim.x) {
         const int row = index / blocks;
         const int block = index - row * blocks;
-        const uint64_t value = *reinterpret_cast<const uint64_t*>(src_codes +
-                                                                  ((unsigned long long)row * packed +
-                                                                   block * 8u));
-        *reinterpret_cast<uint64_t*>(dst_codes + ((unsigned long long)(dst_offset + row) * packed +
-                                                  block * 8u)) = value;
+        const unsigned int slot = sensenova_fp4_slot((unsigned)inner, (unsigned)block);
+        const uint64_t value =
+            *reinterpret_cast<const uint64_t*>(src_codes + (unsigned long long)row * packed + slot);
+        *reinterpret_cast<uint64_t*>(dst_codes + (unsigned long long)(dst_offset + row) * packed + slot) =
+            value;
         dst_scales[(unsigned long long)(dst_offset + row) * blocks + block] =
             src_scales[(unsigned long long)row * blocks + block];
     }
@@ -1006,10 +1041,13 @@ extern "C" __global__ void sensenova_gdn_conv(const float* __restrict__ raw,
     if (first >= rows) return;
     const int last = min(rows, first + row_block);
     float held[8];
+    // held[history - back] is the row `back` steps back, which is also where the state keeps it,
+    // so a block that starts mid-chunk reads the same slot it would have carried.
     for (int back = 1; back <= history; ++back) {
         const int at = first - back;
-        held[back - 1] = at >= 0 ? raw[(unsigned long long)at * width + column]
-                                 : state[(history - back) * width + column];
+        const int slot = history - back;
+        held[slot] = at >= 0 ? raw[(unsigned long long)at * width + column]
+                             : state[slot * width + column];
     }
     const __nv_bfloat16* channel = weight + (unsigned long long)column * taps;
     float w[8];
@@ -1108,25 +1146,32 @@ extern "C" __global__ void sensenova_attn_prefill(
         if (!active) continue;
         // This row's logits for the tile: a lane takes the slots it can see and reduces the
         // eight-dimension product across the warp, so every lane then holds each slot's sum.
-        float tile_max = -INFINITY;
-        for (int slot = lane; slot < count; slot += 32) {
+        // One slot a step, the warp's 32 lanes covering the head's 256 dimensions eight at a time:
+        // the reduction has to be over the same slot in every lane, so the slot is the loop counter
+        // and never the lane, and no lane leaves the shuffle before it has joined it.
+        for (int slot = 0; slot < count; ++slot) {
             const int at = base + slot;
             float dot = 0.0f;
             if (at < visible) {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    dot += held[i] * sensenova_e4m3(sh_k[slot][dims + i]);
-                }
-#pragma unroll
-                for (int offset = 16; offset > 0; offset >>= 1) {
-                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, offset);
-                }
-                dot *= sh_ks[slot] * scale;
-            } else {
-                dot = -INFINITY;
+                const unsigned int low = *reinterpret_cast<const unsigned int*>(&sh_k[slot][dims]);
+                const unsigned int high =
+                    *reinterpret_cast<const unsigned int*>(&sh_k[slot][dims + 4]);
+                dot = held[0] * sensenova_e4m3((unsigned char)(low & 0xFFu)) +
+                      held[1] * sensenova_e4m3((unsigned char)((low >> 8) & 0xFFu)) +
+                      held[2] * sensenova_e4m3((unsigned char)((low >> 16) & 0xFFu)) +
+                      held[3] * sensenova_e4m3((unsigned char)((low >> 24) & 0xFFu)) +
+                      held[4] * sensenova_e4m3((unsigned char)(high & 0xFFu)) +
+                      held[5] * sensenova_e4m3((unsigned char)((high >> 8) & 0xFFu)) +
+                      held[6] * sensenova_e4m3((unsigned char)((high >> 16) & 0xFFu)) +
+                      held[7] * sensenova_e4m3((unsigned char)((high >> 24) & 0xFFu));
             }
-            sh_logits[warp][slot] = dot;
-            tile_max = fmaxf(tile_max, dot);
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                dot += __shfl_xor_sync(0xFFFFFFFFu, dot, offset);
+            }
+            if (lane == 0) {
+                sh_logits[warp][slot] = at < visible ? dot * sh_ks[slot] * scale : -INFINITY;
+            }
         }
         __syncwarp();
         // The tile's logits are all in shared: fold them into the running maximum and sum.
@@ -1144,12 +1189,22 @@ extern "C" __global__ void sensenova_attn_prefill(
         maximum = next;
 #pragma unroll
         for (int i = 0; i < 8; ++i) accumulator[i] *= rescale;
+        // Four codes a load: a lane reads its eight dimensions as two words and decodes the
+        // bytes from them, which is a third of the instructions the byte-at-a-time loop took.
+        const int dim_bytes = dims;
         for (int slot = 0; slot < count; ++slot) {
             const float weight = sh_logits[warp][slot] * sh_vs[slot];
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                accumulator[i] += weight * sensenova_e4m3(sh_v[slot][dims + i]);
-            }
+            const unsigned int low = *reinterpret_cast<const unsigned int*>(&sh_v[slot][dim_bytes]);
+            const unsigned int high =
+                *reinterpret_cast<const unsigned int*>(&sh_v[slot][dim_bytes + 4]);
+            accumulator[0] += weight * sensenova_e4m3((unsigned char)(low & 0xFFu));
+            accumulator[1] += weight * sensenova_e4m3((unsigned char)((low >> 8) & 0xFFu));
+            accumulator[2] += weight * sensenova_e4m3((unsigned char)((low >> 16) & 0xFFu));
+            accumulator[3] += weight * sensenova_e4m3((unsigned char)((low >> 24) & 0xFFu));
+            accumulator[4] += weight * sensenova_e4m3((unsigned char)(high & 0xFFu));
+            accumulator[5] += weight * sensenova_e4m3((unsigned char)((high >> 8) & 0xFFu));
+            accumulator[6] += weight * sensenova_e4m3((unsigned char)((high >> 16) & 0xFFu));
+            accumulator[7] += weight * sensenova_e4m3((unsigned char)((high >> 24) & 0xFFu));
         }
         __syncwarp();
     }
