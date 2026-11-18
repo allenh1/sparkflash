@@ -65,10 +65,13 @@ mod tests {
     #[test]
     fn the_kv_plan_counts_the_replayed_recurrent_slice() {
         let architecture = architecture_from_carried().expect("the released document parses");
-        // BF16 K/V: 36 attention layers at 2 * 4 heads * 256 values * 2 bytes, plus the
-        // 20 recurrent layers once more for the second loop.
+        // BF16 K/V is 2 * 4 heads * 256 values * 2 bytes a full-attention layer. Nine of the
+        // 36 attention layers are full; the 27 sliding ones charge their 1023-position window
+        // as a fixed cache. The 20 attention layers inside the recurrent slice are replayed by
+        // the second loop, so the plan charges each of them once more per token.
         let plan = architecture.kv_plan(1, false).expect("the plan");
-        assert_eq!(plan.per_token(), (36 + 20) * 2 * 4 * 256 * 2);
-        assert_eq!(plan.fixed(), 0);
+        let layer = 2 * 4 * 256 * 2;
+        assert_eq!(plan.per_token(), (9 + 20) * layer);
+        assert_eq!(plan.fixed(), 27 * layer * (1024 - 1));
     }
 }
