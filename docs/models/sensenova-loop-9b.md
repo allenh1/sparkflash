@@ -170,13 +170,13 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-0. **Multi-row forward (in progress).** The kernels are already batch-shaped - `sensenova_attn_full_q8`
-   derives `visible = *position + row + 1` from `blockIdx.y`, `sensenova_cache_q8` takes a row
-   count, the mHC kernels index `row`, `q4e_gdn_conv`/`q4e_gdn_recur` take a `batch` and a
-   snapshot, and the GEMV tile is eight rows. A first pass (per-row activation buffers, `rows`
-   through every launch, `prefill` in chunks of eight) compiles and runs but is not correct yet:
-   a three-row chunk reproduces the *second* token's hidden state in row 0 after the first visit.
-   It is reverted until that is found, because a wrong chunk is worse than a slow one.
+0. **Multi-row forward (done).** A chunk now walks the whole visit list over up to 1,024 rows:
+   the prefill tile 128 rows at a time, the GDN convolution and scan over the chunk, and
+   `sensenova_attn_prefill` eight query rows a block. It is checked against the row walk it
+   stands in for — `the_device_chunk_matches_its_single_rows_on_the_release` reports a delta of
+   0, 0 and 2.66 with the argmax equal at 2, 3 and 8 rows — which is the property the speculative
+   verify needs. The rows>1 history is at the end of this file; the last two faults were the
+   standalone `b`/`a` row stride and `attach_fp4` releasing the 32-row projections' E4M3 bytes.
 1. **Batch the verify, not the launches.** Fusing kernels was measured and does not pay. Two
    variants were built and served at 160K: the norm folded into both mHC routers (plus an
    `add_norm` for the plain-residual visits) ran 22.3 -> 23.2 ms, and `gate`/`up` concatenated
@@ -247,66 +247,55 @@ Four correctness bugs found on the way, all of them silent:
 Text check, run against the f32 host reference (`SPARKFLASH_SENSENOVA_HOST=1`, which serves the
 same plan and weights through independent arithmetic): on the FP8 checkpoint the host answers
 "The capital of France is" → " Paris.\nParis is a major city in Europe" and "1, 2, 3, 4, 5, 6, 7," →
-" 8, 9, 10,". The device arm still does not: a one-token prompt tracks the host to within the FP4
-round (first-token argmax equal, worst logit 1.23), but a five-token prompt diverges at step 0
-(worst 16.5), and `the_device_tracks_the_host_over_a_prompt_and_a_few_steps` in
-`tests/real_parity.rs` is the harness that shows it.
+" 8, 9, 10,". The device now tracks it on a chunk as well as on a decode step:
+`the_device_tracks_the_host_over_a_prompt_and_a_few_steps` in `tests/real_parity.rs` reports the
+argmax equal at every step of a two-token prompt and at four of five for a five-token one, with the
+worst logit delta 4.2–6.1 against the 16.5 it was before the fix below.
 
-### The rows>1 bug is in the NVFP4 prefill path
+### The rows>1 bug: the 32-row projections lost their weights
 
 The host comparison cannot tell a chunk bug from a precision difference, because the two arms fold
-their sums in different orders either way. Two measurements separate them, and both are cheap
-because a captured graph makes a four-step comparison two seconds.
+their sums in different orders either way. So there is a second test,
+`the_device_chunk_matches_its_single_rows_on_the_release`, that asks the device only about itself:
+one session prefills `[1..n]` as a chunk, another walks the same tokens one at a time, and the last
+rows are compared. A captured graph makes it a two-second run on the real 11 GB checkpoint.
 
-`the_device_chunk_matches_its_single_rows_on_the_release` asks the device only about itself: one
-session prefills `[1..n]` as a chunk, another walks the same tokens one at a time, and the last
-rows are compared. `SPARKFLASH_SENSENOVA_FP8=1` is the only variable.
+It localised the fault to the NVFP4 arm — the E4M3 arm agreed at every row count — and ruled out the
+GEMM: `/tmp/fp4shapes.cu` reproduces the arm's quantiser and GEMM at the served shapes against a
+sampled host decode, and extended with two- and three-row cases on both the wide and the narrow form
+it is exact there too (`worst 0.000000` at `tokens` 1, 2, 3, 5, 8, 16 and 128).
 
-| rows | NVFP4 chunk vs one-row | E4M3 chunk vs one-row |
+Two bugs were behind it, both in the arm's own setup and neither in a kernel:
+
+- **The standalone `b`/`a` row stride.** The scan reads `b[row * b_stride + head]`, and on the path
+  without the combined z/b/a matrix that stride was `z.rows` — 4,096, the width of a *combined* row
+  — while `scratch.b` is 1,024 by 32. Only row 0 landed where the GEMV wrote it. This one was on the
+  E4M3 path, and fixing it took that arm's worst host delta over a two-token prompt and four steps
+  from 4.93/1.08/2.13/2.12/0.89 to 0.31/0.12/0.21/0.16/0.07.
+- **`attach_fp4` converted the 32-row projections and freed their E4M3 bytes.** It walked every
+  E4M3 matrix on the argument that every projection now runs the FP4 GEMM. The GDN gate and decay
+  projections are 32 rows, so they fail the prefill tile's 128-row guard in `project_matrix` and are
+  read by the **decode GEMV** — which needs exactly the bytes the loop had released. They were
+  decoding nibbles as bf16. The loop now skips the shapes the tile cannot take, before the conversion
+  and before the free, with the same 128-multiple test `project_matrix` uses.
+
+The second one is what the arm has been chasing for several rounds, and it moves everything:
+
+| | before | after |
 | :-- | :-- | :-- |
-| 2 | 18.22, argmax 52028 against 220 | 4.82, argmax equal |
-| 3 | 16.60, argmax 105 against 5 | 5.52, argmax equal |
-| 8 | 19.40, argmax 2 against 271 | 6.01, argmax equal |
+| chunk vs one-row, rows 2 / 3 / 8 | 18.22 / 16.60 / 19.40, argmax flipped at all three | 0 / 0 / 2.66, argmax equal at all three |
+| prompt 2, step 0 | argmax 52028 against the host's 220, worst 19.07 | argmax 220, worst 5.43 |
+| prompt 5, steps 1–4 | worst 16.5 | argmax equal, worst 4.6–6.1 |
+| `NO_ZCB` arm on NVFP4 | constant argmax 169699, 24 from the host | argmax equal, worst 2.2–5.4 |
 
-So the chunk machinery the two arms share — the chunked convolution, the scan's slice loop, the mHC
-kernels, the cache write, the prefill attention — is sound; only the NVFP4 arm moves. The E4M3 arm's
-4.8–6.0 is the floor a chunk-versus-decode comparison has at all, because a chunk runs `attn_prefill`
-and `sensenova_gdn_conv`/`_scan` where a decode step runs `sensenova_attn_q8`/`_combine` and
-`q4e_gdn_conv`/`_recur`. A second arm of the same test, which runs `prefill` one row at a time so
-that both sides use the chunk kernels, returns the same numbers to the digit, so the row count really
-is the only variable left.
+A chunk is now literally the row walk it stands in for, which is what the speculative verify needs:
+the rows it keeps are the rows those single steps would have produced. What is left is
+precision-sized — the 4.2–6.1 of logit delta is the NVFP4 activation round plus the difference
+between the chunk kernels (`attn_prefill`, `sensenova_gdn_conv`/`_scan`) and the decode ones
+(`sensenova_attn_q8`/`_combine`, `q4e_gdn_conv`/`_recur`).
 
-The GEMM is not the fault. `/tmp/fp4shapes.cu` reproduces the arm's quantiser and GEMM at the served
-shapes against a sampled host decode; extended with two- and three-row cases on both the wide and the
-narrow form it is exact there too — `worst 0.000000` at `tokens` 1, 2, 3, 5, 8, 16 and 128, on
-`cols` 256/4096/8192/12288 against `inner` 4096/12288.
-
-### The separate z/b/a stride
-
-Bisecting the arm's side found one real bug, and it was under the other arm.
-`SPARKFLASH_SENSENOVA_NO_ZCB=1` takes the combined matrix out so a chunk's `z` can be compared at
-the same precision, and on the way it showed that the two standalone 32-column `b`/`a` GEMVs were
-being read by the scan through a **4,096-wide stride**: `b_stride` was `z.rows` — the width of the
-`z` projection, which is what a *combined* row is — while `scratch.b` is a 1,024 by 32 buffer. Only
-row 0 landed where it was written; every later row read the neighbouring buffer.
-
-That is on the E4M3 path, which is the one that had been tracking the host, and fixing it moved the
-arm a long way:
-
-| prompt 2, E4M3 | step 0 | step 1 | step 2 | step 3 | step 4 |
-| :-- | :-- | :-- | :-- | :-- | :-- |
-| before | 4.93 | 1.08 | 2.13 | 2.12 | 0.89 |
-| after | 0.31 | 0.12 | 0.21 | 0.16 | 0.07 |
-
-with the argmax equal to the host's at every step. The same run now also agrees chunk-versus-row to
-the digit under `NO_ZCB`, so the two arms of the chunk test are a fair comparison from here.
-
-What that does **not** explain is the NVFP4 gap: with the combined matrix in place the chunk still
-disagrees with the row walk by 16.6-19.4 while using a GEMM that is exact, so the combined
-4,224-column `z`/`b`/`a` matrix — built once at load by `sensenova_fp4_append` and only present
-when `attach_fp4` ran — is the remaining suspect. With `NO_ZCB` the NVFP4 arm is *consistent*
-(chunk and row agree exactly) but still 24 from the host with a constant argmax, so NVFP4 has a
-second fault of its own that `NO_ZCB` exposes rather than fixes. Both are open.
+`SPARKFLASH_SENSENOVA_NO_ZCB=1` takes the combined 4,224-column z/b/a matrix out, which is how the
+stride bug above showed itself; it is kept because it is a real second path through the visit.
 
 ```bash
 SPARKFLASH_CUDA_ARCH=sm_120a cargo test --release -p sparkflash-model-sensenova --test device
