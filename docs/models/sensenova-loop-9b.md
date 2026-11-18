@@ -211,3 +211,50 @@ SPARKFLASH_CUDA_ARCH=sm_120 cargo test -p sparkflash-model-sensenova --test devi
 
 The fixture is a seeded 8-layer/56-visit-shaped tiny checkpoint; the tests pin the released plan,
 the 772-name FP8 plan and its byte total, the host forward, and device-vs-host logits on the 5080.
+
+
+## Where the 5080 arm stands
+
+The prefill engine is the NVFP4 block-scaled MMA (`mma.sync.aligned.kind::mxf4nvf4`), which one
+m16n8k64 instruction a four SM cycles runs at ~890 TFLOPS peak on this part; measured prefill has
+climbed 240 tok/s (the eight-row GEMV) → 917 (E4M3 MMA) → 2,017 (NVFP4) → 2,987 (parallel scan) →
+3,982 (fused z/b/a, chunked conv) → 5,077 (register-state scan) → 5,640 (persistent GEMM) → 6,244
+tok/s on a 569-token prompt with 1,024-row chunks. A 512-row chunk's stage budget, taken with
+`SPARKFLASH_SENSENOVA_TIME=2`, is 89.5 ms in total: dense 54 ms (MLP down 14.1, up 10.5, gate
+10.4, GDN qkv 5.4, z 3.5, out 3.5, head 2.3, full q 1.8, kv 1.4, o 1.2) and everything else 35.6 ms
+(full attention core 9.1, GDN scan 9.0, norm+mHC 9.6, swiglu 2.7, conv 2.5, merge 1.3). A 12,000
+tok/s chunk is 42.6 ms, so the GEMM has to carry ~450 TFLOPS *and* the non-GEMM passes have to
+halve; the next levers in order are an MMA attention core, a scan that is not one block a head's
+32 columns, and folding the norm/mHC/swiglu passes into the GEMM epilogues.
+
+Four correctness bugs found on the way, all of them silent:
+
+- **The NVFP4 block order.** A 16-value block is two 4-byte halves of a 16-byte pair, and a pair
+  carries block 0 above block 2 rather than two adjacent blocks; the quantisers pack block `j` at
+  `sensenova_fp4_slot` and the GEMM reads a `uint4` and selects the half. `fp4validate` and a
+  sweep over every served projection shape now reproduce the quantised reference exactly.
+- **The prefill attention reduction.** Each lane held a *different* key but the logits were summed
+  across the warp, so a chunk's rows read the wrong keys. It matches the host exactly now.
+- **The GDN scan's two warp reductions** used `=` instead of `+=` on a shuffle, so the recall and
+  the output carried one lane's 32 keys instead of all 128 — a per-head scalar error that made
+  every visit's GDN output wrong. This one *is* what made the served text boilerplate.
+- **The chunked convolution's state fill** wrote the taps back to front, so any row block starting
+  from history carried the wrong taps.
+
+Text check, run against the f32 host reference (`SPARKFLASH_SENSENOVA_HOST=1`, which serves the
+same plan and weights through independent arithmetic): on the FP8 checkpoint the host answers
+"The capital of France is" → " Paris.\nParis is a major city in Europe" and "1, 2, 3, 4, 5, 6, 7," →
+" 8, 9, 10,". The device arm still does not: a one-token prompt tracks the host to within the FP4
+round (first-token argmax equal, worst logit 1.23), but a five-token prompt diverges at step 0
+(worst 16.5), so the remaining bug is in a rows>1 path — the chunked conv, the scan's slice loop,
+the mHC kernels or the cache write — and `the_device_tracks_the_host_over_a_prompt_and_a_few_steps`
+in `tests/real_parity.rs` is the harness that shows it.
+
+```bash
+SPARKFLASH_CUDA_ARCH=sm_120a cargo test --release -p sparkflash-model-sensenova --test device
+SPARKFLASH_CUDA_ARCH=sm_120a SENSENOVA_FP8_DIR=/home/allenh1/models/sensenova-fp8 \
+  cargo test --release -p sparkflash-model-sensenova --test real_parity -- --ignored --nocapture
+```
+
+The arm must be built with `SPARKFLASH_CUDA_ARCH=sm_120a`: the block-scaled MMA does not exist for
+plain `sm_120`, and an image without it silently falls back to the GEMV path.
