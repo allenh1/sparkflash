@@ -538,7 +538,7 @@ where
     }
 
     fn max_batch(&self) -> usize {
-        self.limits.rows
+        self.walk.max_segments().clamp(1, self.limits.rows)
     }
 
     fn ledger(&self) -> Ledger {
@@ -604,6 +604,8 @@ mod tests {
     struct ToyWalk {
         layout: StateLayout,
         limits: Limits,
+        /// The most segments one walk takes, when narrower than the pass width.
+        segments: usize,
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
         sampling: Mutex<Option<Sampling>>,
     }
@@ -616,9 +618,15 @@ mod tests {
                     bytes_per_row: 4,
                 }]),
                 limits: Limits::new(rows, context),
+                segments: rows,
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
             }
+        }
+
+        fn with_segments(mut self, segments: usize) -> Self {
+            self.segments = segments;
+            self
         }
     }
 
@@ -639,6 +647,10 @@ mod tests {
 
         fn limits(&self) -> Limits {
             self.limits
+        }
+
+        fn max_segments(&self) -> usize {
+            self.segments
         }
 
         fn set_sampling(&self, _seq: &mut Self::Seq, sampling: Sampling) {
@@ -799,6 +811,17 @@ mod tests {
             Some(sampling),
             "a renewed slot keeps the request's sampler"
         );
+    }
+
+    #[test]
+    fn the_batch_cap_is_the_walks_and_not_the_pass_width() {
+        // A prompt chunk may be wider than a token batch: the runtime caps members at the walk's
+        // own answer, not at the prompt pass limit.
+        let capped =
+            Runtime::new(ToyWalk::new(64, 4_096).with_segments(3), 0).expect("the runtime starts");
+        assert_eq!(capped.max_batch(), 3);
+        assert_eq!(capped.limits().rows, 64);
+        assert_eq!(runtime(64).max_batch(), 64, "the default is the pass width");
     }
 
     #[test]
