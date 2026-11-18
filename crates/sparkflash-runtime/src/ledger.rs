@@ -29,51 +29,8 @@
 
 use std::fmt;
 
-/// One strategy the runtime offers an arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Strategy {
-    /// Several requests' rows in one walk ([crate::FusedEngine]).
-    Lanes,
-    /// A long prompt a chunk at a time between the decoders' steps ([crate::FusedArm::begin_prompt]).
-    PromptParts,
-    /// Speculative drafting and a verify walk.
-    Drafting,
-    /// Every drafting lane's round verified in one walk ([crate::run_round]).
-    JointRounds,
-    /// A verify's accepted run handed to the request in one reply ([crate::FusedArm::ready]).
-    Runs,
-    /// A later prompt continuing what a slot holds ([crate::FusedArm::history]).
-    PrefixReuse,
-    /// Rank 0 decides and broadcasts, every other rank replays ([crate::GroupLanes]).
-    Group,
-}
-
-impl Strategy {
-    /// Every strategy, in the order the ledger prints them.
-    pub const ALL: [Self; 7] = [
-        Self::Lanes,
-        Self::PromptParts,
-        Self::Drafting,
-        Self::JointRounds,
-        Self::Runs,
-        Self::PrefixReuse,
-        Self::Group,
-    ];
-
-    /// The name the ledger prints.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Lanes => "lanes",
-            Self::PromptParts => "prompt parts",
-            Self::Drafting => "drafting",
-            Self::JointRounds => "joint rounds",
-            Self::Runs => "multi-token runs",
-            Self::PrefixReuse => "prefix reuse",
-            Self::Group => "group",
-        }
-    }
-}
+pub use sparkflash_model::ledger::Strategy;
+use sparkflash_model::ledger::{ArmLedger, State};
 
 /// How an arm runs one strategy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +41,16 @@ pub enum Mode {
     Looped(String),
     /// Not run; the detail says why (an opt-out, or what the arm lacks).
     Off(String),
+}
+
+impl From<State> for Mode {
+    fn from(state: State) -> Self {
+        match state {
+            State::Native(detail) => Self::Native(detail.to_owned()),
+            State::Looped(detail) => Self::Looped(detail.to_owned()),
+            State::Off(detail) => Self::Off(detail.to_owned()),
+        }
+    }
 }
 
 impl Mode {
@@ -147,10 +114,51 @@ impl Ledger {
         }
     }
 
+    /// The ledger an arm declares, as the model registry holds it.
+    ///
+    /// The declaration is the same fact `sparkflash arms --ledger` prints without a device, so a
+    /// boot and the preview cannot disagree about what an arm states.
+    #[must_use]
+    pub fn from_declaration(declaration: &ArmLedger) -> Self {
+        let mut ledger = Self::new(declaration.arm);
+        for (strategy, state) in declaration.rows {
+            ledger.set(*strategy, (*state).into());
+        }
+        ledger
+    }
+
     /// The arm's name.
     #[must_use]
     pub fn arm(&self) -> &str {
         &self.arm
+    }
+
+    /// Every strategy this ledger leaves out, in ledger order.
+    #[must_use]
+    pub fn unstated(&self) -> Vec<Strategy> {
+        Strategy::ALL
+            .iter()
+            .copied()
+            .filter(|strategy| !self.states(*strategy))
+            .collect()
+    }
+
+    /// Refuses a ledger with a strategy left out, naming every one.
+    ///
+    /// # Errors
+    /// One or more [Strategy]s the arm never stated.
+    pub fn require_complete(&self) -> Result<(), String> {
+        let missing = self.unstated();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let names: Vec<&str> = missing.iter().map(|strategy| strategy.name()).collect();
+        Err(format!(
+            "ledger {}: the arm states no {}; every arm must state every strategy, and the \
+             declaration is sparkflash-model's ARM_LEDGERS",
+            self.arm,
+            names.join(", ")
+        ))
     }
 
     /// States `strategy`'s mode, replacing what was stated before.
@@ -252,10 +260,13 @@ mod tests {
             );
         assert_eq!(
             ledger.line(),
-            "ledger toy: lanes native (4 slots); prompt parts off (the arm runs its prompts \
-             whole); drafting off (the arm does not state it); joint rounds off (the arm does not \
-             state it); multi-token runs off (the arm does not state it); prefix reuse off (the \
-             arm does not state it); group off (the arm does not state it)"
+            "ledger toy: lanes native (4 slots); chunked prefill off (the arm runs its prompts \
+             whole); tensor-core prompt off (the arm does not state it); tensor-core decode off \
+             (the arm does not state it); drafting off (the arm does not state it); joint rounds \
+             off (the arm does not state it); multi-token runs off (the arm does not state it); \
+             prefix reuse off (the arm does not state it); rewind off (the arm does not state \
+             it); stored-format arithmetic off (the arm does not state it); group off (the arm \
+             does not state it)"
         );
     }
 
@@ -291,5 +302,25 @@ mod tests {
         for strategy in [Strategy::Drafting, Strategy::JointRounds, Strategy::Runs] {
             assert_eq!(ledger.mode(strategy), Mode::off("no drafter configured"));
         }
+    }
+
+    #[test]
+    fn a_declaration_states_every_strategy_and_a_new_ledger_states_none() {
+        let declaration = sparkflash_model::ledger_for_arm("dense").expect("the dense declaration");
+        let ledger = Ledger::from_declaration(declaration);
+        assert_eq!(ledger.arm(), "dense");
+        assert!(ledger.unstated().is_empty());
+        assert!(ledger.require_complete().is_ok());
+        assert_eq!(
+            ledger.mode(Strategy::TensorCoreDecode),
+            Mode::off("row GEMV; decode.tensor_cores=true is refused")
+        );
+
+        let toy = Ledger::new("toy");
+        let missing = toy.unstated();
+        assert_eq!(missing, Strategy::ALL);
+        let error = toy.require_complete().unwrap_err();
+        assert!(error.contains("chunked prefill"), "{error}");
+        assert!(error.contains("tensor-core decode"), "{error}");
     }
 }

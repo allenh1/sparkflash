@@ -4148,6 +4148,18 @@ fn tp4_rank_config(
         "--tp4-rank requires --checkpoint DIR: the four ranks serve one released sharded checkpoint"
             .to_owned()
     })?;
+    // The context belongs to the arm being served: `--model` names it, else the checkpoint's own
+    // configuration does. A group with no pack (a dynamic family) sizes its own state, and the
+    // default arm is the fallback.
+    let pack = options
+        .model
+        .as_deref()
+        .and_then(pack::Pack::named)
+        .or_else(|| pack::Pack::detect(&pack::checkpoint_directory(&checkpoint)));
+    let default_context = pack.map_or(
+        sparkflash_model::descriptor::V41_CONTEXT_TOKENS,
+        pack::Pack::default_context,
+    );
     Ok(Tp4RankConfig {
         rank: tp4.rank,
         world_size: tp4.world_size,
@@ -4156,9 +4168,7 @@ fn tp4_rank_config(
         control_port: tp4.control_port,
         checkpoint,
         element_limit: options.element_limit,
-        context: options
-            .context
-            .unwrap_or(sparkflash_model_glm5_next::DEFAULT_DEVICE_CONTEXT),
+        context: options.context.unwrap_or(default_context),
         timeout,
     })
 }
@@ -8866,6 +8876,44 @@ mod tests {
 
     use super::*;
     use sparkflash_model_deepseek_v41::encoding::reference_tokenizer_path;
+
+    #[cfg(feature = "tp4-serve")]
+    #[test]
+    fn a_tp4_group_takes_the_context_from_the_arm_it_serves() {
+        let directory = tempfile::tempdir().expect("a temporary checkpoint");
+        for (model, expected) in [
+            (
+                sparkflash_model::descriptor::GLM53_FLASH_ID,
+                sparkflash_model::descriptor::GLM53_CONTEXT_TOKENS,
+            ),
+            (
+                sparkflash_model::descriptor::QWEN38_FLASH_NEXT_ID,
+                sparkflash_model::descriptor::QWEN38_CONTEXT_TOKENS,
+            ),
+        ] {
+            let options = ServeOptions::parse(
+                [
+                    "--model",
+                    model,
+                    "--checkpoint",
+                    directory.path().to_str().expect("a UTF-8 path"),
+                    "--tp4-rank",
+                    "0",
+                    "--tp4-world-size",
+                    "2",
+                    "--tp4-peers",
+                    "127.0.0.1,127.0.0.2",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("the group options parse");
+            let tp4 = options.tp4.as_ref().expect("--tp4-rank is set");
+            let config =
+                tp4_rank_config(&options, tp4, Duration::from_secs(1)).expect("the rank config");
+            assert_eq!(config.context, expected, "{model}");
+        }
+    }
 
     #[test]
     fn a_window_is_reused_only_by_a_prompt_that_extends_all_of_it() {

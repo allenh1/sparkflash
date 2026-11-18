@@ -115,8 +115,9 @@ Short and cached prompts take the exact rows path. Long uncached prompts take th
 
 ## Serving
 
-- Up to 32 sequences run at once and more wait in a bounded queue. Up to eight decoding
-  sequences share one speculative step; past eight, each gets one plain token per step.
+- Up to 32 sequences run at once and more wait in a bounded queue. Up to thirty-two decoding
+  sequences share one speculative step (`R_MAX / 2`: 32 anchors within the step's 64 rows);
+  past thirty-two, each gets one plain token per step.
 - **Prefix reuse.** A request whose prompt extends a previous turn reuses that turn's KV, and
   concurrent requests sharing a prefix prefill it once. Cached turns are scheduled first.
 - **Decoders keep running through long prefills.** A long prompt is prefilled in chunks between

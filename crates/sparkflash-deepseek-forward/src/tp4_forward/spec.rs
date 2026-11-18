@@ -2055,8 +2055,10 @@ fn serve_ticks(
         }
     }
     if inputs.rank == 0 {
+        let ledger = batch.ledger();
+        ledger.require_complete()?;
         println!("sparkflash serve: {}", batch.describe());
-        println!("sparkflash serve: {}", batch.ledger());
+        println!("sparkflash serve: {ledger}");
     }
     // SPARKFLASH_TICK_AHEAD=0: rank 0 decides each tick when the last one ends, and the
     // workers wait for its frame at every step.

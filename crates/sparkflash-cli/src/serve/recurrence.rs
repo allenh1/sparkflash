@@ -392,7 +392,11 @@ mod group {
             links,
         )
         .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
-        eprintln!("sparkflash serve: {}", backend.ledger());
+        let ledger = backend.ledger();
+        ledger
+            .require_complete()
+            .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
+        eprintln!("sparkflash serve: {ledger}");
         let banner = format!(
             "{} ({}) as recurrence rank 0/{world} ({}) on {}, context {context}, {lanes} \
              lane(s), drafting at up to {draft_lanes}, {:.2} GB of weights on the device",

@@ -559,10 +559,11 @@ impl<A: FusedArm> FusedEngine<A> {
             ));
         }
         let parts = prompt_parts().map_err(|error| BackendError::new("fused", error))?;
-        eprintln!(
-            "sparkflash serve: {}",
-            engine_ledger(&*arm, capacity, parts)
-        );
+        let ledger = engine_ledger(&*arm, capacity, parts);
+        ledger
+            .require_complete()
+            .map_err(|error| BackendError::new("fused", error))?;
+        eprintln!("sparkflash serve: {ledger}");
         let mut pool: Vec<Option<A::Slot>> = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             pool.push(Some(arm.open_slot()?));
@@ -1213,6 +1214,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A toy arm's complete ledger: every strategy stated, none of the engine's strategies claimed.
+    /// The engine overwrites the rows it decides itself, and a toy that runs whole prompts says so.
+    fn stated(arm: &'static str) -> Ledger {
+        let mut ledger = Ledger::new(arm);
+        for strategy in Strategy::ALL {
+            ledger.set(strategy, Mode::off("the toy arm does not state it"));
+        }
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::off("the arm runs its prompts whole"),
+        );
+        ledger.set(Strategy::Group, Mode::off("one rank"));
+        ledger
+    }
+
     /// A toy arm: a slot is its position, a step is the next token, and the engine's batching is
     /// visible in the counters.
     struct Toy {
@@ -1221,6 +1237,10 @@ mod tests {
     }
 
     impl FusedArm for Toy {
+        fn ledger(&self) -> Ledger {
+            stated("toy")
+        }
+
         type Slot = usize;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -1371,6 +1391,10 @@ mod tests {
     }
 
     impl FusedArm for Keeper {
+        fn ledger(&self) -> Ledger {
+            stated("keeper")
+        }
+
         type Slot = Held;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -1465,6 +1489,10 @@ mod tests {
     }
 
     impl FusedArm for Extender {
+        fn ledger(&self) -> Ledger {
+            stated("extender")
+        }
+
         type Slot = Held;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -1564,6 +1592,10 @@ mod tests {
     }
 
     impl FusedArm for Rewinder {
+        fn ledger(&self) -> Ledger {
+            stated("rewinder")
+        }
+
         type Slot = Pointed;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -1678,6 +1710,10 @@ mod tests {
     }
 
     impl FusedArm for Budget {
+        fn ledger(&self) -> Ledger {
+            stated("budget")
+        }
+
         type Slot = Counted;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -1819,6 +1855,10 @@ mod tests {
     const HELD: usize = 3;
 
     impl FusedArm for Rounds {
+        fn ledger(&self) -> Ledger {
+            stated("rounds")
+        }
+
         type Slot = Drafting;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
@@ -2000,6 +2040,10 @@ mod tests {
     }
 
     impl FusedArm for Parted {
+        fn ledger(&self) -> Ledger {
+            stated("parted")
+        }
+
         type Slot = Summing;
 
         fn open_slot(&self) -> Result<Summing, BackendError> {
@@ -2159,5 +2203,57 @@ mod tests {
             ledger.mode(Strategy::PromptParts),
             Mode::off(format!("{PROMPT_PARTS_ENV}=off"))
         );
+    }
+
+    struct Unstated;
+
+    impl FusedArm for Unstated {
+        type Slot = ();
+
+        fn open_slot(&self) -> Result<Self::Slot, BackendError> {
+            Ok(())
+        }
+
+        fn holds_request(&self, _slot: &Self::Slot) -> bool {
+            false
+        }
+
+        fn renew(&self, _slot: &mut Self::Slot) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn set_sampling(&self, _slot: &mut Self::Slot, _sampling: Sampling) {}
+
+        fn prefill(
+            &self,
+            _slot: &mut Self::Slot,
+            _tokens: &[u32],
+        ) -> Result<StepOutput, BackendError> {
+            Ok(StepOutput::default())
+        }
+
+        fn step(&self, members: &mut [(Self::Slot, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(members
+                .iter_mut()
+                .map(|(_slot, _token)| StepOutput::default())
+                .collect())
+        }
+
+        fn speculation(&self, _slot: &Self::Slot) -> Speculation {
+            Speculation::default()
+        }
+    }
+
+    #[test]
+    fn an_arm_that_states_nothing_is_refused_at_boot() {
+        let error = FusedEngine::start(Arc::new(Unstated), 1)
+            .err()
+            .expect("an unstated ledger is refused")
+            .to_string();
+        assert!(error.contains("tensor-core prompt"), "{error}");
+        assert!(error.contains("drafting"), "{error}");
+        assert!(error.contains("tensor-core decode"), "{error}");
+        assert!(error.contains("stored-format arithmetic"), "{error}");
+        assert!(error.contains("rewind"), "{error}");
     }
 }

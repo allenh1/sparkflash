@@ -374,14 +374,31 @@ fn device_family(family: &str, directory: &Path) -> bool {
 /// The typed profile a family serves: its carried preset when one exists, else the default with
 /// the process environment's declared overrides.
 fn profile(architecture: &Architecture) -> Result<ModelProfile, String> {
+    profile_with(architecture, |name| std::env::var(name).ok())
+}
+
+/// [profile], with the environment read through `lookup` so a test can set one switch.
+fn profile_with(
+    architecture: &Architecture,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ModelProfile, String> {
     let mut profile = match pack::profile_toml_for_family(&architecture.family) {
         Some(toml) => ModelProfile::from_toml(toml)
             .map_err(|error| format!("the {} profile: {error}", architecture.family))?,
         None => ModelProfile::default(),
     };
     profile
-        .apply_process_env()
+        .apply_env(lookup)
         .map_err(|error| format!("the {} profile: {error}", architecture.family))?;
+    if architecture.family == "inkling2" && profile.decode.tensor_cores == Some(true) {
+        return Err(format!(
+            "the Inkling arm ({}) decodes on its row token GEMV and never reads the tensor-core \
+             tile, but decode.tensor_cores = true (SPARKFLASH_DECODE_MMA=on) is set. Set \
+             SPARKFLASH_DECODE_MMA=off, or unset it, to run the row GEMV Inkling serves; its \
+             tensor-core decode is a later phase",
+            sparkflash_model::descriptor::INKLING2_SMALL_ID
+        ));
+    }
     Ok(profile)
 }
 
@@ -1069,9 +1086,25 @@ pub(crate) fn names_deepseek(options: &ServeOptions) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DenseDevice, dense_device, dense_lanes, device_family};
+    use super::{DenseDevice, dense_device, dense_lanes, device_family, profile_with};
     use sparkflash_model::Target;
     use sparkflash_ops::engine_plan::EnginePlan;
+
+    #[test]
+    fn inkling_refuses_tensor_core_decode_where_its_profile_is_read() {
+        let architecture =
+            sparkflash_model::Architecture::from_json(sparkflash_model_inkling2::carried_config())
+                .expect("the carried Inkling config parses");
+        let error = profile_with(&architecture, |name| match name {
+            "SPARKFLASH_DECODE_MMA" => Some("on".to_owned()),
+            _ => None,
+        })
+        .expect_err("Inkling reads decode.tensor_cores and cannot honour it");
+        assert!(error.contains("Inkling"), "{error}");
+        assert!(error.contains("SPARKFLASH_DECODE_MMA"), "{error}");
+        assert!(error.contains("row token GEMV"), "{error}");
+        profile_with(&architecture, |_| None).expect("the carried Inkling profile boots");
+    }
 
     #[test]
     fn the_dense_arms_lanes_are_the_flag_the_profile_or_four() {

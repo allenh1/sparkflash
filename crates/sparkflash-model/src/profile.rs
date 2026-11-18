@@ -668,6 +668,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ),
     ("SPARKFLASH_QWEN4_MTP_FOLD", "speculation.mtp_fold_scale"),
     ("SPARKFLASH_QWEN4_DFLASH2", "speculation.drafter"),
+    ("SPARKFLASH_DRAFT", "speculation.enabled"),
     ("SPARKFLASH_GLM_SPEC", "speculation.enabled"),
     ("SPARKFLASH_GLM_SPEC_DEPTH", "speculation.depth"),
     ("SPARKFLASH_GLM_DRAFTS", "speculation.drafts"),
@@ -1632,6 +1633,17 @@ probe = "hash"
                 ModelProfile::default(),
                 "{name} left {field} at its default"
             );
+        }
+    }
+
+    #[test]
+    fn the_neutral_draft_switch_and_the_glm_alias_move_the_same_field() {
+        for name in ["SPARKFLASH_DRAFT", "SPARKFLASH_GLM_SPEC"] {
+            let mut profile = ModelProfile::default();
+            profile
+                .apply_env(|candidate| (candidate == name).then(|| "on".to_owned()))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(profile.speculation.enabled, Some(true), "{name}");
         }
     }
 

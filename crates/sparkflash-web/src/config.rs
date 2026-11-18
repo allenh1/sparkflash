@@ -452,7 +452,7 @@ pub enum Drafting {
     Default,
     /// Draft with the model's drafter (`SPARKFLASH_INKLING_DRAFT=dspark` for Inkling).
     On,
-    /// Never draft (`SPARKFLASH_GLM_SPEC=off`, `SPARKFLASH_INKLING_DRAFT=off`).
+    /// Never draft (`SPARKFLASH_DRAFT=off`; Inkling's own `SPARKFLASH_INKLING_DRAFT=off`).
     Off,
 }
 
@@ -1770,8 +1770,10 @@ impl SparkConfig {
             (Drafting::Default, _) => None,
             (Drafting::On, true) => Some(("SPARKFLASH_INKLING_DRAFT", "dspark")),
             (Drafting::Off, true) => Some(("SPARKFLASH_INKLING_DRAFT", "off")),
-            (Drafting::On, false) => Some(("SPARKFLASH_GLM_SPEC", "on")),
-            (Drafting::Off, false) => Some(("SPARKFLASH_GLM_SPEC", "off")),
+            // The neutral switch every packed arm reads. GLM's own name still works as an
+            // alias until phase 2 refuses it and the deployed site files move.
+            (Drafting::On, false) => Some(("SPARKFLASH_DRAFT", "on")),
+            (Drafting::Off, false) => Some(("SPARKFLASH_DRAFT", "off")),
         };
         if let Some((key, value)) = drafting {
             env.insert(key.to_owned(), value.to_owned());
@@ -2210,7 +2212,7 @@ mod tests {
         glm.runtime.max_context_tokens = GLM_CONTEXT_TOKENS;
         glm.runtime.drafting = Drafting::Off;
         glm.validate().expect("GLM drafts");
-        assert_eq!(glm.launch_env()["SPARKFLASH_GLM_SPEC"], "off");
+        assert_eq!(glm.launch_env()["SPARKFLASH_DRAFT"], "off");
         glm.runtime.prefill_chunk = Some(4096);
         let error = glm.validate().expect_err("GLM has no prefill chunk knob");
         assert!(error.message.contains("runtime.prefill_chunk"), "{error}");

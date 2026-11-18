@@ -375,7 +375,9 @@ impl FusedArm for GlmFusion {
     }
 
     fn ledger(&self) -> Ledger {
-        let mut ledger = Ledger::new("GLM");
+        let mut ledger = Ledger::from_declaration(
+            sparkflash_model::ledger_for_arm("GLM").expect("the GLM arm is declared"),
+        );
         ledger.set(Strategy::PromptParts, Mode::native("bulk prefill chunks"));
         let block = self
             .shared
@@ -399,6 +401,17 @@ impl FusedArm for GlmFusion {
             "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
         };
         ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
+        ledger.set(
+            Strategy::Rewind,
+            if rewinds {
+                Mode::native("a prompt that goes back to the last prompt's end")
+            } else {
+                Mode::off(format!(
+                    "{}=off keeps no rewind point",
+                    sparkflash_runtime::REWIND_ENV
+                ))
+            },
+        );
         ledger
     }
 }

@@ -154,6 +154,18 @@ pub(super) trait PackArm {
     /// The pack's response dialect over the driver: its reasoning and tool channels.
     fn respond(driver: Arc<dyn ApiInferenceEngine>) -> Arc<dyn ApiInferenceEngine>;
 
+    /// Refuses a typed profile field this arm reads but cannot honour.
+    ///
+    /// The check runs wherever the profile is read, so the single-node arm and the group agree:
+    /// an unhonoured field is a boot refusal naming the switch, never a setting accepted and
+    /// dropped. The default honours every field.
+    ///
+    /// # Errors
+    /// A field this arm cannot serve.
+    fn check_profile(_profile: &ModelProfile) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Parse the carried profile and apply the process environment as overrides.
     ///
     /// The TOML is the source of truth; the environment only wins where an operator set one of
@@ -164,6 +176,8 @@ pub(super) trait PackArm {
             .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
         profile
             .apply_env(lookup)
+            .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
+        Self::check_profile(&profile)
             .map_err(|error| format!("the {} profile: {error}", Self::NAME))?;
         Ok(profile)
     }
@@ -485,6 +499,19 @@ impl PackArm for GlmArm {
     #[cfg(feature = "tp4-serve")]
     const OPEN_LANES: Option<GroupLanesOpen> = Some(open_glm_lanes);
 
+    fn check_profile(profile: &ModelProfile) -> Result<(), String> {
+        if profile.decode.tensor_cores == Some(true) {
+            return Err(format!(
+                "the GLM arm ({}) decodes on its row GEMV and never reads the tensor-core tile, \
+                 but decode.tensor_cores = true (SPARKFLASH_DECODE_MMA=on) is set. Set \
+                 SPARKFLASH_DECODE_MMA=off, or unset it, to run the row GEMV GLM serves; its \
+                 tensor-core decode is a later phase",
+                Self::MODEL_ID
+            ));
+        }
+        Ok(())
+    }
+
     fn write_fixture(directory: &Path) -> Result<Self::Config, String> {
         let config = Glm5NextConfig::tiny();
         sparkflash_model_glm5_next::checkpoint::write_synthetic_checkpoint(
@@ -752,6 +779,14 @@ impl Pack {
     /// The served id of this pack.
     pub(super) fn model_id(self) -> &'static str {
         self.descriptor().id.as_str()
+    }
+
+    /// The context one sequence of this arm allocates when the operator gave no `--context`.
+    ///
+    /// It is the arm's own default from the registry, not another model's: the `--tp4-rank`
+    /// group used to take GLM's window whatever arm it served.
+    pub(super) fn default_context(self) -> usize {
+        self.descriptor().context_tokens
     }
 
     /// The pack `model` names: a registry model id, weights id, family or id leaf, in any case.
@@ -1584,6 +1619,20 @@ mod tests {
         .expect("an environment override is valid");
         assert_eq!(overridden.prefill.chunk, Some(2048));
         assert_eq!(overridden.speculation.depth, Some(5));
+    }
+
+    #[test]
+    fn glm_refuses_tensor_core_decode_where_its_profile_is_read() {
+        let error = GlmArm::profile_from(|name| match name {
+            "SPARKFLASH_DECODE_MMA" => Some("on".to_owned()),
+            _ => None,
+        })
+        .expect_err("GLM reads decode.tensor_cores and cannot honour it");
+        assert!(error.contains("GLM"), "{error}");
+        assert!(error.contains("SPARKFLASH_DECODE_MMA"), "{error}");
+        assert!(error.contains("row GEMV"), "{error}");
+        // The carried profile's decode.tensor_cores = false is accepted.
+        GlmArm::profile_from(|_| None).expect("the carried GLM profile boots");
     }
 
     #[test]

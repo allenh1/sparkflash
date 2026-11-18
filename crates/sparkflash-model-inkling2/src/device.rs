@@ -3480,7 +3480,9 @@ impl FusedArm for InklingLanes {
     }
 
     fn ledger(&self) -> Ledger {
-        let mut ledger = Ledger::new("Inkling");
+        let mut ledger = Ledger::from_declaration(
+            sparkflash_model::ledger_for_arm("Inkling").expect("the Inkling arm is declared"),
+        );
         ledger.set(
             Strategy::PromptParts,
             Mode::native(format!(

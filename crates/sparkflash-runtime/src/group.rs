@@ -811,6 +811,15 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// A toy arm's complete ledger: every strategy stated, none claimed.
+    fn stated(arm: &'static str) -> Ledger {
+        let mut ledger = Ledger::new(arm);
+        for strategy in Strategy::ALL {
+            ledger.set(strategy, Mode::off("the toy arm does not state it"));
+        }
+        ledger
+    }
+
     /// Waits for the mirror to reach a state; the control channel is one-way for rank 0, so a
     /// test observes the worker rather than reading an acknowledgement.
     fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
@@ -869,6 +878,10 @@ mod tests {
     }
 
     impl FusedArm for ToyLanes {
+        fn ledger(&self) -> Ledger {
+            stated("toy lanes")
+        }
+
         type Slot = Vec<u32>;
 
         fn open_slot(&self) -> Result<Self::Slot, BackendError> {
