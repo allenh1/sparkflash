@@ -545,6 +545,29 @@ pub trait Walk: 'static {
         Self::CAPABILITIES
     }
 
+    /// Whether `seq` already holds its answer for a step fed `token`: a verify's row the arm
+    /// kept ([`sparkflash_model::verdict`]). The engine keeps feeding a member the token its last
+    /// step chose while this says yes, so a drafting arm's whole round reaches the request in one
+    /// reply. The default holds none.
+    fn ready(&self, seq: &Self::Seq, token: u32) -> bool {
+        let _ = (seq, token);
+        false
+    }
+
+    /// Puts `seq`'s state at `to`, the position the caller keeps, after the last `count`
+    /// answers went unused.
+    ///
+    /// The default truncates the state ([`LaneState::rewind`]). An arm whose caches cannot go
+    /// back (they consumed the rows the caller did not use) may leave them where they are and
+    /// name none while the state is ahead of the history; the next prompt then goes back to the
+    /// rewind point, and the state's position is what tells the runtime the history lags it.
+    ///
+    /// # Errors
+    /// An arm that cannot put its state at `to`.
+    fn give_back(&self, seq: &mut Self::Seq, to: usize) -> Result<(), BackendError> {
+        seq.rewind(to)
+    }
+
     /// The speculative counters of `seq`'s request, as the arm's drafter kept them.
     ///
     /// The runtime owns the slot and cannot see inside a walk, so an arm that drafts reports its

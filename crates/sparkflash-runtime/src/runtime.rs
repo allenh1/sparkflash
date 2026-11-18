@@ -468,6 +468,10 @@ where
         self.plain_step(members)
     }
 
+    fn ready(&self, slot: &Self::Slot, token: u32) -> bool {
+        self.walk.ready(&slot.seq, token)
+    }
+
     fn speculation(&self, slot: &Self::Slot) -> Speculation {
         // The counters are the drafter's, which only the arm can read; the slot's own field is
         // the fallback for a walk that states nothing.
@@ -541,7 +545,7 @@ where
                 ),
             )
         })?;
-        slot.seq.rewind(to)?;
+        self.walk.give_back(&mut slot.seq, to)?;
         slot.history.truncate(to);
         slot.point = slot.point.filter(|point| *point <= to);
         slot.cached = slot.cached.min(to);
@@ -622,6 +626,10 @@ mod tests {
         kept_past: usize,
         /// What the walk reports for a sequence's speculative counters.
         counters: Speculation,
+        /// Tokens whose answer the walk says it already holds.
+        held: Mutex<Vec<u32>>,
+        /// The positions the runtime asked the walk to put its state back to.
+        gives: Mutex<Vec<usize>>,
     }
 
     impl ToyWalk {
@@ -636,6 +644,8 @@ mod tests {
                 sampling: Mutex::new(None),
                 kept_past: 0,
                 counters: Speculation::default(),
+                held: Mutex::new(Vec::new()),
+                gives: Mutex::new(Vec::new()),
             }
         }
 
@@ -671,6 +681,16 @@ mod tests {
 
         fn speculation(&self, _seq: &Self::Seq) -> Speculation {
             self.counters
+        }
+
+        fn ready(&self, _seq: &Self::Seq, token: u32) -> bool {
+            self.held.lock().expect("the held list").contains(&token)
+        }
+
+        fn give_back(&self, _seq: &mut Self::Seq, to: usize) -> Result<(), BackendError> {
+            // This walk's state cannot go back; it records the ask and stays where it is.
+            self.gives.lock().expect("the give-back list").push(to);
+            Ok(())
         }
 
         fn walk(
@@ -820,6 +840,37 @@ mod tests {
                 drafts_proposed: 9,
                 drafts_accepted: 4,
             }
+        );
+    }
+
+    /// The runtime asks the walk what a slot already holds and what a give-back does, so an
+    /// arm whose caches cannot go back (they consumed the unused answers) keeps its own rule.
+    #[test]
+    fn the_walk_answers_a_run_and_a_give_back() {
+        let runtime =
+            Runtime::new(ToyWalk::new(256, 4_096).keeping(2), 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime.prefill(&mut slot, &[1, 2, 3]).expect("the prompt");
+        runtime.walk().held.lock().expect("the held list").push(42);
+        assert!(runtime.ready(&slot, 42), "the walk holds this answer");
+        assert!(!runtime.ready(&slot, 41));
+        runtime
+            .give_back(&mut slot, 2)
+            .expect("the walk takes the give-back");
+        assert_eq!(slot.history(), &[1]);
+        assert_eq!(
+            runtime
+                .walk()
+                .gives
+                .lock()
+                .expect("the give-back list")
+                .as_slice(),
+            &[1]
+        );
+        assert_eq!(
+            slot.seq().rows.len(),
+            5,
+            "the walk kept its state where it was; its position says the history lags it"
         );
     }
 
