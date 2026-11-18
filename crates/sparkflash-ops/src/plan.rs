@@ -497,13 +497,99 @@ impl KernelPhase {
     }
 }
 
+/// Which compute unit a kernel body runs on.
+///
+/// The stack chooses the body, so the class is a property of the symbol and not of the arm that
+/// happens to call it. [Self::TensorCore] is a body multiply-accumulating on the MMA tile;
+/// [Self::Row] is a dot-product body over a few token rows (a row GEMV or matvec);
+/// [Self::Elementwise] is a body that reads each value without a matrix product. A GEMM-class
+/// part needs a [Self::TensorCore] body in every pass it accepts, or a [crate::parts::WAIVERS]
+/// line that names the gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ComputeClass {
+    /// The body multiply-accumulates on the tensor-core tile.
+    TensorCore,
+    /// The body is a row dot product (a GEMV, a matvec, or a few-row tile that is not MMA).
+    Row,
+    /// The body is elementwise, a reduction, a gather or a quantiser.
+    Elementwise,
+}
+
+impl ComputeClass {
+    /// Whether this body is a matrix product the catalogue can route by row count.
+    #[must_use]
+    pub const fn is_gemm(self) -> bool {
+        matches!(self, Self::TensorCore | Self::Row)
+    }
+
+    /// The stable name used in diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::TensorCore => "tensor_core",
+            Self::Row => "row",
+            Self::Elementwise => "elementwise",
+        }
+    }
+}
+
+/// The token-row band a kernel body is written for.
+///
+/// A row GEMV reads at most [crate::gemv::GEMV_MAX_BATCH] rows a launch, a bulk tile starts at
+/// the arm's row threshold, and an elementwise body usually serves every row count. The band is
+/// half of what lets the stack answer "is there a tensor-core body for this pass?" without
+/// knowing which arm is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RowBand {
+    /// The fewest token rows the body takes.
+    pub first: usize,
+    /// The most token rows the body takes, inclusive.
+    pub last: usize,
+}
+
+impl RowBand {
+    /// Every positive row count.
+    pub const ALL: Self = Self {
+        first: 1,
+        last: usize::MAX,
+    };
+
+    /// A band from `first` to `last`, inclusive.
+    #[must_use]
+    pub const fn new(first: usize, last: usize) -> Self {
+        Self { first, last }
+    }
+
+    /// The bands from `first` rows up.
+    #[must_use]
+    pub const fn from(first: usize) -> Self {
+        Self {
+            first,
+            last: usize::MAX,
+        }
+    }
+
+    /// The bands of at most `last` rows.
+    #[must_use]
+    pub const fn at_most(last: usize) -> Self {
+        Self { first: 1, last }
+    }
+
+    /// Whether `rows` token rows fall in the band.
+    #[must_use]
+    pub const fn contains(self, rows: usize) -> bool {
+        rows >= self.first && rows <= self.last
+    }
+}
+
 /// One exported kernel symbol and the arithmetic it accepts.
 ///
-/// Precision and phase are per symbol, not per image or per part. An image can export a bf16 GEMM
-/// beside an NVFP4 quantiser, and a part can have a prefill body and a decode body in different
-/// images. The resolver selects a symbol only when this symbol's own mask contains the requested
-/// precision and this symbol's own phase serves the requested pass; there is no fallback to
-/// "the image exports something".
+/// Precision, phase, compute class and the row band are per symbol, not per image or per part. An
+/// image can export a bf16 GEMM beside an NVFP4 quantiser, and a part can have a prefill body and
+/// a decode body in different images. The resolver selects a symbol only when this symbol's own
+/// mask contains the requested precision, this symbol's own phase serves the requested pass, and
+/// this symbol's own row band contains the launch's rows; there is no fallback to "the image
+/// exports something".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KernelSymbol {
     /// The name the driver loads.
@@ -512,36 +598,61 @@ pub struct KernelSymbol {
     pub precisions: PrecisionMask,
     /// The pass this symbol belongs to.
     pub phase: KernelPhase,
+    /// The compute unit this body runs on.
+    pub class: ComputeClass,
+    /// The token-row band this body is written for.
+    pub rows: RowBand,
 }
 
 impl KernelSymbol {
     /// A symbol accepting exactly `precisions` in both passes.
     #[must_use]
-    pub const fn both(name: &'static str, precisions: &[Precision]) -> Self {
+    pub const fn both(
+        name: &'static str,
+        precisions: &[Precision],
+        class: ComputeClass,
+        rows: RowBand,
+    ) -> Self {
         Self {
             name,
             precisions: PrecisionMask::from_slice(precisions),
             phase: KernelPhase::Both,
+            class,
+            rows,
         }
     }
 
     /// A bulk-prefill symbol accepting exactly `precisions`.
     #[must_use]
-    pub const fn prefill(name: &'static str, precisions: &[Precision]) -> Self {
+    pub const fn prefill(
+        name: &'static str,
+        precisions: &[Precision],
+        class: ComputeClass,
+        rows: RowBand,
+    ) -> Self {
         Self {
             name,
             precisions: PrecisionMask::from_slice(precisions),
             phase: KernelPhase::Prefill,
+            class,
+            rows,
         }
     }
 
     /// A token/decode symbol accepting exactly `precisions`.
     #[must_use]
-    pub const fn decode(name: &'static str, precisions: &[Precision]) -> Self {
+    pub const fn decode(
+        name: &'static str,
+        precisions: &[Precision],
+        class: ComputeClass,
+        rows: RowBand,
+    ) -> Self {
         Self {
             name,
             precisions: PrecisionMask::from_slice(precisions),
             phase: KernelPhase::Decode,
+            class,
+            rows,
         }
     }
 
@@ -549,6 +660,15 @@ impl KernelSymbol {
     #[must_use]
     pub const fn accepts(&self, precision: Precision) -> bool {
         self.precisions.contains(precision)
+    }
+
+    /// Whether this symbol serves `precision` for `rows` token rows in the requested pass.
+    ///
+    /// All three properties are the symbol's own: a body does not inherit its image's precision,
+    /// its caller's pass or another body's row band.
+    #[must_use]
+    pub const fn serves(&self, precision: Precision, phase: KernelPhase, rows: usize) -> bool {
+        self.accepts(precision) && self.phase.serves(phase) && self.rows.contains(rows)
     }
 }
 

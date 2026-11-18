@@ -55,7 +55,7 @@ use sparkflash_model::Architecture;
 use sparkflash_model::architecture::WeightFormat;
 
 use crate::gemv::E4M3_TILE;
-use crate::plan::{KernelSymbol, Precision, ShapeConstraint};
+use crate::plan::{ComputeClass, KernelPhase, KernelSymbol, Precision, RowBand, ShapeConstraint};
 use sparkflash_model::Part;
 use sparkflash_model::Target;
 use sparkflash_model::parts::PartSet;
@@ -358,18 +358,116 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
 }
 
 /// A symbol accepting exactly these precisions in both passes.
+///
+/// The unqualified helpers describe elementwise bodies (norms, rope, scans, quantisers, combines).
+/// A GEMM body names its class and row band explicitly with the helpers below, so the catalogue
+/// assertion can find it.
 const fn sym(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
-    KernelSymbol::both(name, precisions)
+    KernelSymbol::both(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
 }
 
 /// A bulk-prefill symbol accepting exactly these precisions.
 const fn pre(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
-    KernelSymbol::prefill(name, precisions)
+    KernelSymbol::prefill(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
 }
 
 /// A token/decode symbol accepting exactly these precisions.
 const fn dec(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
-    KernelSymbol::decode(name, precisions)
+    KernelSymbol::decode(name, precisions, ComputeClass::Elementwise, RowBand::ALL)
+}
+
+/// A row GEMV's band: at most eight token rows a launch.
+const ROW_BAND: RowBand = RowBand::at_most(crate::gemv::GEMV_MAX_BATCH);
+
+/// The first row a bulk tile takes on GLM, Inkling and Dory (`MAX_ROWS`/`BATCH_ROWS` = 8).
+const TILE_FIRST: usize = crate::gemv::GEMV_MAX_BATCH + 1;
+
+/// The last row Qwen's few-row tensor tile takes (`GEMM_MIN_BATCH` = 64).
+const ROWS_TILE_LAST: usize = crate::projection::QWEN_GEMM_MIN_BATCH - 1;
+
+/// A tensor-core body over every row count, in both passes.
+const fn tc(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(name, precisions, ComputeClass::TensorCore, RowBand::ALL)
+}
+
+/// A tensor-core body from `TILE_FIRST` rows up, in the bulk-prefill pass.
+const fn tc_tile(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::prefill(
+        name,
+        precisions,
+        ComputeClass::TensorCore,
+        RowBand::from(TILE_FIRST),
+    )
+}
+
+/// A tensor-core body from Qwen's grouped threshold up, in the bulk-prefill pass.
+const fn tc_chunk(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::prefill(
+        name,
+        precisions,
+        ComputeClass::TensorCore,
+        RowBand::from(crate::projection::QWEN_GEMM_MIN_BATCH),
+    )
+}
+
+/// A tensor-core body over Qwen's few-row tile, in both passes.
+const fn tc_rows(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(
+        name,
+        precisions,
+        ComputeClass::TensorCore,
+        RowBand::at_most(ROWS_TILE_LAST),
+    )
+}
+
+/// A tensor-core body from `TILE_FIRST` rows up, in both passes.
+const fn tc_wide(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(
+        name,
+        precisions,
+        ComputeClass::TensorCore,
+        RowBand::from(TILE_FIRST),
+    )
+}
+
+/// A tensor-core body for one token row, in the token pass.
+const fn tc_one(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(
+        name,
+        precisions,
+        ComputeClass::TensorCore,
+        RowBand::at_most(1),
+    )
+}
+
+/// A row body over every row count, in both passes (a non-MMA tile).
+const fn row_all(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(name, precisions, ComputeClass::Row, RowBand::ALL)
+}
+
+/// A row body over at most eight token rows, in both passes.
+const fn row(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(name, precisions, ComputeClass::Row, ROW_BAND)
+}
+
+/// A non-MMA few-row tile over Qwen's rows band, in both passes.
+const fn row_rows(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::both(
+        name,
+        precisions,
+        ComputeClass::Row,
+        RowBand::at_most(ROWS_TILE_LAST),
+    )
+}
+
+/// A row body over at most eight token rows, in the token pass.
+const fn row_dec(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(name, precisions, ComputeClass::Row, ROW_BAND)
+}
+
+/// A row body for one token row, in the token pass.
+const fn row_one(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(name, precisions, ComputeClass::Row, RowBand::at_most(1))
 }
 
 /// A catalogue entry on the one target the kernels are built for today.
@@ -443,11 +541,11 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::LmHead,
         Image::Deepseek,
         &[
-            sym("cert_lm_head_sm121", &[Precision::Bf16]),
-            sym("cert_lm_head_batched_sm121", &[Precision::Bf16]),
+            row("cert_lm_head_sm121", &[Precision::Bf16]),
+            row("cert_lm_head_batched_sm121", &[Precision::Bf16]),
             sym("lm_head_reduce_sm121", &[Precision::Bf16]),
-            sym("opt_lm_head", &[Precision::Bf16]),
-            sym("opt_rows_lm_head", &[Precision::Bf16]),
+            row("opt_lm_head", &[Precision::Bf16]),
+            row("opt_rows_lm_head", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -455,8 +553,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::LmHead,
         Image::Qwen4Exp,
         &[
-            sym("q4e_argmax_slices", &[Precision::Bf16, Precision::Fp8E4M3]),
-            sym(
+            row("q4e_argmax_slices", &[Precision::Bf16, Precision::Fp8E4M3]),
+            row(
                 "q4e_argmax_prob_slices",
                 &[Precision::Bf16, Precision::Fp8E4M3],
             ),
@@ -683,12 +781,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::Deepseek,
         &[
-            sym("b12x_mxfp8_dense_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_dense_split_k_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_split_k_sm121", &[Precision::MxFp8]),
             sym("swiglu_mxfp8_quant_sm121", &[Precision::MxFp8]),
-            sym("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
-            sym("opt_mma_f32a_f32o", &[Precision::F32]),
-            sym("opt_mma_fp8_bf16o", &[Precision::Fp8E4M3]),
+            tc("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
+            tc("opt_mma_f32a_f32o", &[Precision::F32]),
+            tc("opt_mma_fp8_bf16o", &[Precision::Fp8E4M3]),
             sym("shared_swiglu_f32", &[Precision::F32]),
         ],
         true,
@@ -697,13 +795,13 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::BLOCK_PREFILL,
         &[
-            pre("glm_prefill_bf16_mma", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_wide", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
-            pre("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
-            pre("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
-            pre("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_bf16_mma", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_wide", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
+            tc_tile("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
             pre("glm_quantise_rows", &[Precision::F32]),
         ],
         false,
@@ -715,8 +813,8 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::PREFILL,
         &[
-            pre("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
-            pre("q4p_dense_fp8", &[Precision::Fp8E4M3]),
+            tc_chunk("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
+            tc_chunk("q4p_dense_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_epilogue", &[Precision::Bf16]),
         ],
         false,
@@ -725,16 +823,16 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::TOKEN,
         &[
-            sym("q4e_gemm_bf16", &[Precision::Bf16, Precision::F32]),
-            sym("q4e_shared_gate_up", &[Precision::Bf16, Precision::F32]),
+            row_all("q4e_gemm_bf16", &[Precision::Bf16, Precision::F32]),
+            row("q4e_shared_gate_up", &[Precision::Bf16, Precision::F32]),
             // The same body is the Activation part's; it runs over the projected chunk in
             // prefill and over a token's row in decode, so both entries describe one phase.
             sym("q4e_swiglu", &[Precision::Bf16, Precision::F32]),
             dec("q4e_quantize_e4m3_rows", &[Precision::Bf16]),
-            dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
-            dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
+            row_dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
+            row_dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
             // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
-            dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
+            row_dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -742,16 +840,16 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::DECODE,
         &[
-            dec(
+            row_dec(
                 "q4e_gemv_tiled_bf16_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
             // The same GEMV over the packed form's planes (sparkflash_ops::packed).
-            dec(
+            row_dec(
                 "q4e_gemv_tiled_packed_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
-            dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
+            row_dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -761,22 +859,22 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::Deepseek,
         &[
-            sym("b12x_mxfp8_dense_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_dense_split_k_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_dense_par_k_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_dense_tile_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_dense_warp_sm121", &[Precision::MxFp8]),
-            dec("b12x_mxfp8_dense_m1_sm121", &[Precision::MxFp8]),
-            sym("b12x_bf16a_mxfp8w_dense_sm121", &[Precision::MxFp8]),
-            sym("b12x_bf16a_mxfp8w_wo_a_sm121", &[Precision::MxFp8]),
-            sym("b12x_mxfp8_wo_a_sm121", &[Precision::MxFp8]),
-            dec("b12x_mxfp8_gemv_m1_sm121", &[Precision::MxFp8]),
-            dec("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::Bf16]),
-            dec("b12x_hostw_gemv_m1_f32w_f32o_sm121", &[Precision::F32]),
-            sym("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
-            sym("opt_mma_f32a_f32o", &[Precision::F32]),
-            sym("opt_mma_fp8_bf16o", &[Precision::Fp8E4M3]),
-            sym("opt_mma_fp8_f32o", &[Precision::Fp8E4M3]),
+            tc("b12x_mxfp8_dense_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_split_k_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_par_k_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_tile_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_dense_warp_sm121", &[Precision::MxFp8]),
+            tc_one("b12x_mxfp8_dense_m1_sm121", &[Precision::MxFp8]),
+            tc("b12x_bf16a_mxfp8w_dense_sm121", &[Precision::MxFp8]),
+            tc("b12x_bf16a_mxfp8w_wo_a_sm121", &[Precision::MxFp8]),
+            tc("b12x_mxfp8_wo_a_sm121", &[Precision::MxFp8]),
+            row_one("b12x_mxfp8_gemv_m1_sm121", &[Precision::MxFp8]),
+            row_one("b12x_hostw_gemv_m1_bf16w_sm121", &[Precision::Bf16]),
+            row_one("b12x_hostw_gemv_m1_f32w_f32o_sm121", &[Precision::F32]),
+            tc("opt_mma_bf16a_bf16o", &[Precision::Bf16]),
+            tc("opt_mma_f32a_f32o", &[Precision::F32]),
+            tc("opt_mma_fp8_bf16o", &[Precision::Fp8E4M3]),
+            tc("opt_mma_fp8_f32o", &[Precision::Fp8E4M3]),
         ],
         true,
     ),
@@ -784,12 +882,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::PREFILL,
         &[
-            pre("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
-            pre("q4p_dense_fp8", &[Precision::Fp8E4M3]),
-            pre("q4p_dense_rows", &[Precision::Bf16]),
-            pre("q4p_gemm_rows", &[Precision::Bf16]),
+            tc_chunk("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
+            tc_chunk("q4p_dense_fp8", &[Precision::Fp8E4M3]),
+            tc_rows("q4p_dense_rows", &[Precision::Bf16]),
+            row_rows("q4p_gemm_rows", &[Precision::Bf16]),
             // The hyper connection's up projection and stream mix for a few rows.
-            pre("q4p_hyper_up_rows", &[Precision::Bf16]),
+            row_rows("q4p_hyper_up_rows", &[Precision::Bf16]),
             pre("q4p_split_bf16", &[Precision::Bf16]),
         ],
         false,
@@ -798,13 +896,13 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::BLOCK_PREFILL,
         &[
-            pre("glm_prefill_bf16_mma", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_wide", &[Precision::Bf16]),
-            pre("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
-            pre("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
-            pre("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
-            pre("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_bf16_mma", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_mma_bf16a", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_wide", &[Precision::Bf16]),
+            tc_tile("glm_prefill_bf16_wide_bf16a", &[Precision::Bf16]),
+            tc_tile("glm_prefill_fp8b128_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
+            tc_tile("glm_prefill_q8_mma", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -812,13 +910,13 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::TOKEN,
         &[
-            sym("q4e_gemm_bf16", &[Precision::Bf16, Precision::F32]),
-            dec("q4e_gemv_bf16", &[Precision::Bf16]),
-            dec("q4e_gemv4_bf16", &[Precision::Bf16]),
-            dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
-            dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
+            row_all("q4e_gemm_bf16", &[Precision::Bf16, Precision::F32]),
+            row_dec("q4e_gemv_bf16", &[Precision::Bf16]),
+            row_dec("q4e_gemv4_bf16", &[Precision::Bf16]),
+            row_dec("q4e_gemv_tiled_bf16", &[Precision::Bf16]),
+            row_dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
             // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
-            dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
+            row_dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -826,16 +924,16 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::DECODE,
         &[
-            dec(
+            row_dec(
                 "q4e_gemv_tiled_bf16_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
             // The same GEMV over the packed form's planes (sparkflash_ops::packed).
-            dec(
+            row_dec(
                 "q4e_gemv_tiled_packed_parts",
                 &[Precision::Bf16, Precision::F32],
             ),
-            dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
+            row_dec("q4e_gemv_tiled_e4m3_block", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -992,14 +1090,14 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::Deepseek,
         &[
-            sym("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
-            sym("b12x_mxfp4_moe_stored_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_gate_up_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_gate_up_k3_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_down_combine_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_down_combine_k3_sm121", &[Precision::NvFp4]),
-            sym("opt_mma_moe_gate_up", &[Precision::NvFp4]),
-            sym("opt_mma_moe_down", &[Precision::NvFp4]),
+            tc("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
+            tc("b12x_mxfp4_moe_stored_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_gate_up_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_gate_up_k3_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_down_combine_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_down_combine_k3_sm121", &[Precision::NvFp4]),
+            tc("opt_mma_moe_gate_up", &[Precision::NvFp4]),
+            tc("opt_mma_moe_down", &[Precision::NvFp4]),
             sym("moe_expert_stage_sm121", &[Precision::Bf16]),
         ],
         true,
@@ -1012,11 +1110,11 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::Inkling,
         &[
-            sym(
+            row_all(
                 "inkling_nvfp4_expert_matvec",
                 &[Precision::NvFp4, Precision::F32],
             ),
-            sym(
+            row_all(
                 "inkling_mxfp8_expert_matvec",
                 &[Precision::MxFp8, Precision::F32],
             ),
@@ -1030,12 +1128,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             // These bodies decode packed E2M1 codes, so their operand class is NVFP4 alone.
             // A BF16 or F32 document has no routed-expert body here.
-            dec("q4e_expert_gate_up", &[Precision::NvFp4]),
-            dec("q4e_expert_down", &[Precision::NvFp4]),
+            row_dec("q4e_expert_gate_up", &[Precision::NvFp4]),
+            row_dec("q4e_expert_down", &[Precision::NvFp4]),
             // The token FP8 experts are the short-batch path (a decode step and a chunk below
             // GEMM_MIN_BATCH); the grouped FP8 tile in the PREFILL entry below is the chunk path.
-            sym("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
-            sym("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
+            row("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
+            row("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -1047,29 +1145,29 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::PREFILL,
         &[
-            pre("q4p_moe_gate_up", &[Precision::NvFp4]),
-            pre("q4p_moe_down", &[Precision::NvFp4]),
-            pre("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
-            pre("q4p_moe_rows_down", &[Precision::NvFp4]),
-            pre("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
+            tc_tile("q4p_moe_gate_up", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down", &[Precision::NvFp4]),
+            tc_rows("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
+            tc_rows("q4p_moe_rows_down", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
-            pre("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
+            tc_tile("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
             // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
             // softcapped SwiGLU; its down pass is q4p_moe_down.
-            pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
-            pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
-            pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_mx8", &[Precision::MxFp8]),
             // The down passes over the row split's gathered runs, with no join before them.
-            pre("q4p_moe_down_runs", &[Precision::NvFp4]),
-            pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_runs", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
             // The six passes' head-only forms (SPARKFLASH_INKLING_PLANES=head).
-            pre("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
-            pre("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
-            pre("q4p_moe_down_head", &[Precision::NvFp4]),
-            pre("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
-            pre("q4p_moe_down_runs_head", &[Precision::NvFp4]),
-            pre("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_runs_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
         ],
         false,
     ),
@@ -1077,19 +1175,19 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::Moe,
         Image::BLOCK_ROUTED_EXPERTS,
         &[
-            pre("glm_moe_fp8b128_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_fp8b128_mma", &[Precision::Fp8E4M3]),
             // `_bf16a` names the BF16 activations and accumulator, not the stored weights: the
             // body reads E4M3 codes with a 128x128 BF16 tile scale, so its operand class is FP8.
             // A BF16 document therefore has no routed-expert body in either pass.
-            pre("glm_moe_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
-            pre("glm_moe_q8_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_q8_mma", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
     sm121(
         Part::Moe,
         Image::DECODE,
-        &[dec("q4e_expert_gemv_e4m3_block", &[Precision::Fp8E4M3])],
+        &[row_dec("q4e_expert_gemv_e4m3_block", &[Precision::Fp8E4M3])],
         false,
     ),
     // Router, combine and grouped GEMM are their own catalogue identities. Sharing Part::Moe
@@ -1158,12 +1256,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::GroupedMoeGemm,
         Image::Deepseek,
         &[
-            sym("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
-            sym("b12x_mxfp4_moe_stored_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_gate_up_sm121", &[Precision::NvFp4]),
-            sym("opt_moe_down_combine_sm121", &[Precision::NvFp4]),
-            sym("opt_mma_moe_gate_up", &[Precision::NvFp4]),
-            sym("opt_mma_moe_down", &[Precision::NvFp4]),
+            tc("b12x_mxfp4_moe_sm121", &[Precision::NvFp4]),
+            tc("b12x_mxfp4_moe_stored_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_gate_up_sm121", &[Precision::NvFp4]),
+            tc("opt_moe_down_combine_sm121", &[Precision::NvFp4]),
+            tc("opt_mma_moe_gate_up", &[Precision::NvFp4]),
+            tc("opt_mma_moe_down", &[Precision::NvFp4]),
         ],
         true,
     ),
@@ -1173,12 +1271,12 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             // These bodies decode packed E2M1 codes, so their operand class is NVFP4 alone.
             // A BF16 or F32 document has no routed-expert body here.
-            dec("q4e_expert_gate_up", &[Precision::NvFp4]),
-            dec("q4e_expert_down", &[Precision::NvFp4]),
+            row_dec("q4e_expert_gate_up", &[Precision::NvFp4]),
+            row_dec("q4e_expert_down", &[Precision::NvFp4]),
             // The token FP8 bodies serve a decode step and a short prefill chunk; a real chunk
             // resolves the grouped `q4p_moe_*_fp8` symbols below.
-            sym("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
-            sym("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
+            row("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
+            row("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -1186,29 +1284,29 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::GroupedMoeGemm,
         Image::PREFILL,
         &[
-            pre("q4p_moe_gate_up", &[Precision::NvFp4]),
-            pre("q4p_moe_down", &[Precision::NvFp4]),
-            pre("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
-            pre("q4p_moe_rows_down", &[Precision::NvFp4]),
-            pre("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
+            tc_tile("q4p_moe_gate_up", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down", &[Precision::NvFp4]),
+            tc_rows("q4p_moe_rows_gate_up", &[Precision::NvFp4]),
+            tc_rows("q4p_moe_rows_down", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_fp8", &[Precision::Fp8E4M3]),
             pre("q4p_moe_swiglu_fp8", &[Precision::Fp8E4M3]),
-            pre("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
+            tc_tile("q4p_moe_down_fp8", &[Precision::Fp8E4M3]),
             // Inkling-2-Small's gate_up pass: the same body over an interleaved w13 with the
             // softcapped SwiGLU; its down pass is q4p_moe_down.
-            pre("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_capped", &[Precision::NvFp4]),
             // The same two passes over Inkling's MXFP8 layers (E4M3 bytes, a ue8m0 code a 32).
-            pre("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
-            pre("q4p_moe_down_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_gate_up_capped_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_mx8", &[Precision::MxFp8]),
             // The down passes over the row split's gathered runs, with no join before them.
-            pre("q4p_moe_down_runs", &[Precision::NvFp4]),
-            pre("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_runs", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_runs_mx8", &[Precision::MxFp8]),
             // The six passes' head-only forms (SPARKFLASH_INKLING_PLANES=head).
-            pre("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
-            pre("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
-            pre("q4p_moe_down_head", &[Precision::NvFp4]),
-            pre("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
-            pre("q4p_moe_down_runs_head", &[Precision::NvFp4]),
-            pre("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_gate_up_capped_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_gate_up_capped_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_mx8_head", &[Precision::MxFp8]),
+            tc_tile("q4p_moe_down_runs_head", &[Precision::NvFp4]),
+            tc_tile("q4p_moe_down_runs_mx8_head", &[Precision::MxFp8]),
         ],
         false,
     ),
@@ -1216,19 +1314,19 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::GroupedMoeGemm,
         Image::BLOCK_ROUTED_EXPERTS,
         &[
-            pre("glm_moe_fp8b128_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_fp8b128_mma", &[Precision::Fp8E4M3]),
             // `_bf16a` names the BF16 activations and accumulator, not the stored weights: the
             // body reads E4M3 codes with a 128x128 BF16 tile scale, so its operand class is FP8.
             // A BF16 document therefore has no routed-expert body in either pass.
-            pre("glm_moe_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
-            pre("glm_moe_q8_mma", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_fp8b128_mma_bf16a", &[Precision::Fp8E4M3]),
+            tc_tile("glm_moe_q8_mma", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
     sm121(
         Part::GroupedMoeGemm,
         Image::DECODE,
-        &[dec("q4e_expert_gemv_e4m3_block", &[Precision::Fp8E4M3])],
+        &[row_dec("q4e_expert_gemv_e4m3_block", &[Precision::Fp8E4M3])],
         false,
     ),
     sm121(
@@ -1542,12 +1640,369 @@ pub const CATALOGUE: &[PartKernel] = &[
         Image::Dory,
         &[
             sym("dory_mlp_epilogue", &[Precision::Bf16]),
-            sym("dory_mma_wide", &[Precision::Bf16]),
-            sym("dory_mma_wide4", &[Precision::Bf16]),
+            tc_wide("dory_mma_wide", &[Precision::Bf16]),
+            tc_wide("dory_mma_wide4", &[Precision::Bf16]),
         ],
         false,
     ),
 ];
+
+/// One line in [WAIVERS]: a GEMM-class gap the stack may not close yet.
+///
+/// A waiver names the part, the precision and pass it stands for, the token-row band where the
+/// non-tensor-core body runs, and the evidence. `part: None` records a whole-arm property the
+/// catalogue cannot express (DeepSeek's three bit dependences). A band is where the waiver
+/// applies, not where the missing body would be; the assertion probes one token row and one
+/// prompt row, and a waiver covers a probe when the probe falls inside its band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Waiver {
+    /// The part the gap belongs to, or `None` for a whole-arm property.
+    pub part: Option<Part>,
+    /// The precision the gap belongs to, or `None` for every precision.
+    pub precision: Option<Precision>,
+    /// The pass the gap belongs to.
+    pub phase: KernelPhase,
+    /// The token-row band where the non-tensor-core body runs.
+    pub rows: RowBand,
+    /// Why the line stands: the registry entry or document that holds the number.
+    pub measurement: &'static str,
+}
+
+/// The catalogue's first waiver table.
+///
+/// Each line is a gap that exists today and is allowed to stand because closing it changes bits,
+/// or because no measurement has been recorded. A line citing a document names the line that
+/// holds the number; a line with no number says so. The lines below are grouped as the phase-3
+/// plan asks: GLM's and Inkling's row-GEMV decode, Dory's, the heads on row GEMVs, and
+/// DeepSeek's three bit dependences.
+pub const WAIVERS: &[Waiver] = &[
+    // The vocabulary head is a row dot product in every arm: the certified head, the per-row
+    // screen and Qwen's argmax slices are all row bodies. A tensor-core head exists nowhere yet.
+    Waiver {
+        part: Some(Part::LmHead),
+        precision: Some(Precision::Bf16),
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "heads are row GEMVs in every catalogue entry (cert_lm_head_sm121, \
+                      opt_lm_head, opt_rows_lm_head, q4e_argmax_*); no tensor-core head body and \
+                      no measurement recorded",
+    },
+    Waiver {
+        part: Some(Part::LmHead),
+        precision: Some(Precision::Fp8E4M3),
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "Qwen's FP8 head is the row body q4e_argmax_prob_slices; no tensor-core \
+                      head body and no measurement recorded",
+    },
+    // GLM's and Inkling's decode steps keep the row GEMV. Their prompt tiles start at nine rows
+    // (MAX_ROWS/BATCH_ROWS = 8), so the token band is the gap. The numbers are the row-count
+    // thresholds, not a speed measurement; none is recorded.
+    Waiver {
+        part: Some(Part::DenseGemm),
+        precision: Some(Precision::Bf16),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "GLM keeps MAX_ROWS (8) row GEMV rows before glm_prefill_bf16_*; Inkling \
+                      keeps BATCH_ROWS (8) before its tile. Row band from the released \
+                      constants; no one-row measurement recorded",
+    },
+    Waiver {
+        part: Some(Part::DenseMlp),
+        precision: None,
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "GLM (MAX_ROWS = 8), Inkling (BATCH_ROWS = 8) and Dory (TOKEN_ROWS = 8) \
+                      keep the row GEMV on this band; Dory's dory_mma_wide starts at nine rows \
+                      (crates/sparkflash-model-dory/src/device.rs:60-62). No tensor-core \
+                      few-row body and no one-row measurement recorded",
+    },
+    // Dory's attention and head are outside this assertion's GEMM parts; its MLP gap is the
+    // DenseMlp line above. Its projections take q4e_gemv_bf16 on the same band.
+    Waiver {
+        part: Some(Part::DenseGemm),
+        precision: Some(Precision::Bf16),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "Dory's projections keep q4e_gemv_bf16 on at most TOKEN_ROWS = 8 rows \
+                      (crates/sparkflash-model-dory/src/device.rs:1910, 2265-2296); no \
+                      tensor-core few-row body and no one-row measurement recorded",
+    },
+    // DeepSeek's row-GEMV decode bodies are the shared token bodies phase 3b will make common;
+    // today the catalogue has the m1 bodies beside the tile bodies.
+    Waiver {
+        part: Some(Part::DenseGemm),
+        precision: Some(Precision::MxFp8),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(1),
+        measurement: "DeepSeek launches b12x_mxfp8_gemv_m1_sm121 on the one-row band \
+                      (crates/sparkflash-deepseek-forward); the tile body exists from one row \
+                      and no one-row measurement of the tile is recorded",
+    },
+    // Moe f32 is the routed matvec's activation/arithmetic precision; no tensor-core body claims
+    // f32 in either pass.
+    Waiver {
+        part: Some(Part::Moe),
+        precision: Some(Precision::F32),
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "Inkling's routed experts are row matvecs (inkling_*_expert_matvec); no \
+                      tensor-core f32 routed body and no measurement recorded",
+    },
+    // The grouped FP8/MXFP8 tile is prefill-only; the token pass runs the row experts.
+    Waiver {
+        part: Some(Part::GroupedMoeGemm),
+        precision: Some(Precision::Fp8E4M3),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "Qwen's q4e_expert_*_fp8 token experts are row bodies below \
+                      GEMM_MIN_BATCH = 64; the grouped FP8 tile is prefill-only \
+                      (crates/sparkflash-ops/src/parts.rs:1035-1038). No one-row measurement \
+                      recorded",
+    },
+    Waiver {
+        part: Some(Part::GroupedMoeGemm),
+        precision: Some(Precision::MxFp8),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "Inkling's MXFP8 experts are row matvecs; the grouped MXFP8 bodies \
+                      (q4p_moe_*_mx8) are prefill-only. No one-row measurement recorded",
+    },
+    Waiver {
+        part: Some(Part::Moe),
+        precision: Some(Precision::Fp8E4M3),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "Qwen's q4e_expert_*_fp8 token experts are row bodies below \
+                      GEMM_MIN_BATCH = 64; GLM's grouped FP8 tile is prefill-only. No one-row \
+                      measurement recorded",
+    },
+    Waiver {
+        part: Some(Part::Moe),
+        precision: Some(Precision::MxFp8),
+        phase: KernelPhase::Decode,
+        rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
+        measurement: "Inkling's MXFP8 experts are row matvecs; the grouped MXFP8 bodies are \
+                      prefill-only. No one-row measurement recorded",
+    },
+    // DeepSeek's three bit dependences: documented properties of its paths, not missing bodies.
+    Waiver {
+        part: None,
+        precision: None,
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "DeepSeek's bulk path differs from its one-row path in the last bits \
+                      (docs/design.md:113)",
+    },
+    Waiver {
+        part: None,
+        precision: None,
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "a DeepSeek idle prompt over about 2.6K tokens moves its bits with the \
+                      chunk boundary (docs/optimization-strategy.md:497)",
+    },
+    Waiver {
+        part: None,
+        precision: None,
+        phase: KernelPhase::Both,
+        rows: RowBand::ALL,
+        measurement: "a DeepSeek request resumed from a reused lane can give different greedy \
+                      text than the same request prefilled whole (docs/NUMERICS.md:281)",
+    },
+];
+
+/// The part classes the catalogue assertion checks.
+///
+/// A part is GEMM-class when its arithmetic is a matrix product of weights: the dense projection,
+/// the dense MLP, the routed experts, the grouped expert GEMM and the vocabulary head.
+const fn is_gemm_class(part: Part) -> bool {
+    matches!(
+        part,
+        Part::DenseGemm | Part::DenseMlp | Part::Moe | Part::GroupedMoeGemm | Part::LmHead
+    )
+}
+
+/// Every precision a kernel can name.
+const PRECISIONS: [Precision; 5] = [
+    Precision::F32,
+    Precision::Bf16,
+    Precision::Fp8E4M3,
+    Precision::MxFp8,
+    Precision::NvFp4,
+];
+
+/// The row-count probe for the prompt pass (Qwen's chunk threshold, one bulk row count).
+const PROMPT_PROBE_ROWS: usize = crate::projection::QWEN_GEMM_MIN_BATCH;
+
+/// The row-count probe for the token pass.
+const TOKEN_PROBE_ROWS: usize = 1;
+
+const fn same_part(left: Part, right: Part) -> bool {
+    left as u8 == right as u8
+}
+
+const fn same_precision(left: Precision, right: Precision) -> bool {
+    left as u8 == right as u8
+}
+
+const fn same_class(left: ComputeClass, right: ComputeClass) -> bool {
+    left as u8 == right as u8
+}
+
+/// Whether a catalogue entry of `part` has a tensor-core body serving the probe.
+const fn has_tensor_body(
+    part: Part,
+    precision: Precision,
+    phase: KernelPhase,
+    rows: usize,
+) -> bool {
+    let mut entry_index = 0;
+    while entry_index < CATALOGUE.len() {
+        let entry = &CATALOGUE[entry_index];
+        if same_part(entry.part, part) {
+            let mut symbol_index = 0;
+            while symbol_index < entry.symbols.len() {
+                let symbol = &entry.symbols[symbol_index];
+                if same_class(symbol.class, ComputeClass::TensorCore)
+                    && symbol.serves(precision, phase, rows)
+                {
+                    return true;
+                }
+                symbol_index += 1;
+            }
+        }
+        entry_index += 1;
+    }
+    false
+}
+
+/// Whether any GEMM body of `part` claims `precision`.
+const fn part_accepts(part: Part, precision: Precision) -> bool {
+    let mut entry_index = 0;
+    while entry_index < CATALOGUE.len() {
+        let entry = &CATALOGUE[entry_index];
+        if same_part(entry.part, part) {
+            let mut symbol_index = 0;
+            while symbol_index < entry.symbols.len() {
+                let symbol = &entry.symbols[symbol_index];
+                if symbol.class.is_gemm() && symbol.accepts(precision) {
+                    return true;
+                }
+                symbol_index += 1;
+            }
+        }
+        entry_index += 1;
+    }
+    false
+}
+
+/// Whether a waiver line covers a probe.
+const fn waived(part: Part, precision: Precision, phase: KernelPhase, rows: usize) -> bool {
+    let mut index = 0;
+    while index < WAIVERS.len() {
+        let waiver = &WAIVERS[index];
+        let part_matches = match waiver.part {
+            Some(waiver_part) => same_part(waiver_part, part),
+            None => false,
+        };
+        let precision_matches = match waiver.precision {
+            Some(waiver_precision) => same_precision(waiver_precision, precision),
+            None => true,
+        };
+        if part_matches
+            && precision_matches
+            && waiver.phase.serves(phase)
+            && waiver.rows.contains(rows)
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// Whether one GEMM-class part has a tensor-core body in both passes, at or below its accepted
+/// precisions, or a waiver for each gap.
+const fn gemm_part_has_bodies(part: Part) -> bool {
+    let mut index = 0;
+    while index < PRECISIONS.len() {
+        let precision = PRECISIONS[index];
+        if part_accepts(part, precision) {
+            if !has_tensor_body(part, precision, KernelPhase::Prefill, PROMPT_PROBE_ROWS)
+                && !waived(part, precision, KernelPhase::Prefill, PROMPT_PROBE_ROWS)
+            {
+                return false;
+            }
+            if !has_tensor_body(part, precision, KernelPhase::Decode, TOKEN_PROBE_ROWS)
+                && !waived(part, precision, KernelPhase::Decode, TOKEN_PROBE_ROWS)
+            {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Whether one part is allowed by the catalogue assertion.
+///
+/// The match is exhaustive on purpose: adding a [Part] variant makes this module fail to compile
+/// until the new part is called GEMM-class or elementwise here. A GEMM-class part is then held to
+/// [gemm_part_has_bodies], while a non-GEMM part must also disagree with [is_gemm_class], so the
+/// two statements of the classification cannot drift apart.
+const fn part_bodies_ok(part: Part) -> bool {
+    match part {
+        Part::DenseGemm | Part::DenseMlp | Part::Moe | Part::GroupedMoeGemm | Part::LmHead => {
+            gemm_part_has_bodies(part)
+        }
+        Part::Embedding
+        | Part::RmsNorm
+        | Part::MlaAttention
+        | Part::Csa2Compression
+        | Part::SparseIndexer
+        | Part::GqaAttention
+        | Part::GdnScan
+        | Part::KdaScan
+        | Part::Activation
+        | Part::Rope
+        | Part::RelativeAttention
+        | Part::ShortConv
+        | Part::BlockAttentionResidual
+        | Part::SoftcappedActivation
+        | Part::Quantize
+        | Part::LayerNorm
+        | Part::MoeRouter
+        | Part::MoeCombine
+        | Part::MoePlan
+        | Part::Collective
+        | Part::HyperConnection
+        | Part::ManifoldHyperConnection
+        | Part::Engram
+        | Part::Ple
+        | Part::Mtp
+        | Part::Vision => !is_gemm_class(part),
+    }
+}
+
+/// Whether every part in [Part::ALL] satisfies the catalogue assertion.
+const fn every_part_has_bodies() -> bool {
+    let mut index = 0;
+    while index < Part::ALL.len() {
+        if !part_bodies_ok(Part::ALL[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+const _: () = assert!(
+    every_part_has_bodies(),
+    "a GEMM-class part needs a tensor-core body for every precision it accepts in both passes, \
+     or a WAIVERS line naming the part, the row band and the measurement; a new Part variant \
+     must also be classified in part_bodies_ok"
+);
 
 /// The catalogue entries that implement part on target, in catalogue order.
 pub fn kernels(part: Part, target: Target) -> impl Iterator<Item = &'static PartKernel> {
@@ -3576,5 +4031,99 @@ mod tests {
         let refusal =
             host_reference_rope_refusal(&architecture).expect("a non-unit default is refused");
         assert!(refusal.contains("default with factor 4"), "{refusal}");
+    }
+
+    #[test]
+    fn the_gemm_class_list_is_the_matrix_product_parts() {
+        for part in [
+            Part::DenseGemm,
+            Part::DenseMlp,
+            Part::Moe,
+            Part::GroupedMoeGemm,
+            Part::LmHead,
+        ] {
+            assert!(is_gemm_class(part), "{part} is GEMM-class");
+        }
+        for part in Part::ALL {
+            if !is_gemm_class(*part) {
+                assert!(
+                    !matches!(
+                        part,
+                        Part::DenseGemm
+                            | Part::DenseMlp
+                            | Part::Moe
+                            | Part::GroupedMoeGemm
+                            | Part::LmHead
+                    ),
+                    "{part} needs an assertion"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_waiver_table_names_the_released_gaps() {
+        for waiver in WAIVERS {
+            assert!(
+                !waiver.measurement.trim().is_empty(),
+                "a waiver line must name its evidence"
+            );
+            assert!(
+                waiver.rows.first <= waiver.rows.last,
+                "a waiver's row band must be ordered"
+            );
+        }
+        let has = |part: Part, phase: KernelPhase| {
+            WAIVERS
+                .iter()
+                .any(|waiver| waiver.part == Some(part) && waiver.phase.serves(phase))
+        };
+        // GLM's and Inkling's row-GEMV decode.
+        assert!(has(Part::DenseGemm, KernelPhase::Decode));
+        assert!(has(Part::DenseMlp, KernelPhase::Decode));
+        assert!(has(Part::Moe, KernelPhase::Decode));
+        // Dory's decode is the DenseMlp/DenseGemm row band above.
+        assert!(WAIVERS.iter().any(|waiver| {
+            waiver
+                .measurement
+                .contains("dory_mma_wide starts at nine rows")
+        }));
+        // The heads on row GEMVs.
+        assert!(has(Part::LmHead, KernelPhase::Both));
+        // DeepSeek's three bit dependences cite the documents that hold the numbers.
+        for document in [
+            "docs/design.md:113",
+            "docs/optimization-strategy.md:497",
+            "docs/NUMERICS.md:281",
+        ] {
+            assert!(
+                WAIVERS
+                    .iter()
+                    .any(|waiver| waiver.part.is_none() && waiver.measurement.contains(document)),
+                "{document} is cited"
+            );
+        }
+    }
+
+    #[test]
+    fn every_catalogue_gemm_class_body_has_a_pass_band() {
+        for entry in CATALOGUE {
+            for symbol in entry.symbols {
+                if !symbol.class.is_gemm() {
+                    continue;
+                }
+                assert!(
+                    symbol.rows.first >= 1 && symbol.rows.first <= symbol.rows.last,
+                    "{} has an empty row band",
+                    symbol.name
+                );
+                assert!(
+                    symbol.phase.serves(KernelPhase::Decode)
+                        || symbol.phase.serves(KernelPhase::Prefill),
+                    "{} serves no pass",
+                    symbol.name
+                );
+            }
+        }
     }
 }

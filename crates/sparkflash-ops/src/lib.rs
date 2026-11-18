@@ -124,8 +124,8 @@ pub use error::OpError;
 pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
 pub use parts_backend::{PartsDeviceBackend, PartsDeviceRank, PartsLayer};
 pub use plan::{
-    DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind, OpPlan, Operand,
-    PartGeometry, Precision, PrecisionMask, ShapeConstraint, StreamId,
+    ComputeClass, DType, KernelId, KernelPhase, KernelSymbol, Launch, Layout, Matrix, OpKind,
+    OpPlan, Operand, PartGeometry, Precision, PrecisionMask, RowBand, ShapeConstraint, StreamId,
 };
 pub use resolver::{Availability, KernelResolver, PlanContext, ResolveError, ResolvedKernel};
 pub use slot_pack::{PackSlot, SlotPack};
