@@ -32,12 +32,21 @@
 //! The plan, and what is still to move here, is
 //! [docs/engine/03-runtime.md](../../../docs/engine/03-runtime.md).
 
+pub mod chunk;
+pub mod conformance;
 pub mod fused;
 pub mod group;
+pub mod layout;
 pub mod ledger;
+pub mod pool;
+pub mod resume;
 pub mod rounds;
+pub mod runtime;
 pub mod share;
+pub mod walk;
 
+pub use chunk::{CHUNK_SIZES, ChunkPolicy, quantise};
+pub use conformance::{CONFORMANCE_CHECKS, ConformanceCheck, check_claims, run_check};
 pub use fused::{
     FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
     PROMPT_PARTS_ENV, Part, REWIND_ENV, Resume, extends, prompt_parts, resume, rewind,
@@ -47,6 +56,14 @@ pub use group::{
     Fusion, GroupLane, GroupLanes, GroupWire, Split, TextWire, end_group, mirror_lanes,
     mirror_until_the_group_ends, watched_hub,
 };
+pub use layout::{LaneState, Limits, Region, StateKind, StateLayout};
 pub use ledger::{Ledger, Mode, Strategy};
+pub use pool::{LaneMemory, LanePool};
+pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
+pub use runtime::{Runtime, RuntimeSlot, ledger_for};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};
+pub use walk::{
+    Absent, Drafter, HeadInput, HeadRow, Hidden, NoVision, OutputConstraint, Pass, PassKind,
+    PassMask, Segment, Segments, Vision, Walk, WalkCapabilities, WalkHook,
+};

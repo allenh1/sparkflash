@@ -103,6 +103,10 @@ use sparkflash_runtime::{
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
 
+mod walk;
+
+pub use walk::DenseWalk;
+
 /// The host-facing name of a device refusal.
 const DEVICE: &str = "dense_device";
 
@@ -2666,7 +2670,8 @@ fn walk(
     mut trace: Option<&mut Vec<Vec<f32>>>,
 ) -> Result<(), BackendError> {
     let refuse = |message: String| Err(BackendError::new(DEVICE, message));
-    let rows: usize = segments.iter().map(|(_, tokens)| tokens.len()).sum();
+    let lengths: Vec<usize> = segments.iter().map(|(_, tokens)| tokens.len()).collect();
+    let rows = walk::row_plan(&lengths).rows;
     if rows == 0 || rows > CHUNK_ROWS {
         return refuse(format!("a walk takes 1..={CHUNK_ROWS} rows, not {rows}"));
     }
