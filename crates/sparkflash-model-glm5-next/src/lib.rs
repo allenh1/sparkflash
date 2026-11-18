@@ -39,6 +39,8 @@
 //!   device rank behind `ModelBackend`/`ModelSession` so the generic host driver can serve it: a
 //!   session reuses a kept prefix, and one that has been told to draft verifies the MTP layer's or
 //!   the DFlash 2 drafter's chain with the shared rule (`sparkflash_model::spec`).
+//! * [walk] is the arm as `sparkflash_runtime::Walk`: the same device calls the serving loop ran,
+//!   with the runtime owning the prompt parts, reuse, rewind, the lanes and the ledger.
 //!
 //! # Attribution
 //!
@@ -235,7 +237,7 @@ pub use device::{DFLASH2_STEP_COST, DeviceRank, DeviceSequence, MAX_ROWS, MTP_ST
 pub use forward::{Glm5NextWeights, ReferenceState};
 pub use serve::Glm5NextDeviceBackend;
 pub use tensor::{Glm5NextTensorPlan, Role, Split};
-pub use walk::{GlmDrafter, GlmSequence, GlmWalk};
+pub use walk::{GlmSequence, GlmWalk};
 
 #[cfg(test)]
 mod tests {

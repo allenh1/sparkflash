@@ -14,8 +14,11 @@
 
 //! GLM-5.3-Flash as a Walk.
 //!
-//! The runtime drives the arm: it owns the prompt parts, the history, reuse, rewind, the lane
-//! pool, give-back and the ledger, and this walk supplies only what GLM alone knows.
+//! The runtime drives an arm: it owns the prompt parts, the history, reuse, rewind, the lane
+//! pool, give-back and the ledger, and this walk supplies only what GLM alone knows. GLM's
+//! serving construction still opens its own [crate::serve::GlmFusion] in this pass, because the
+//! runtime has no draft path yet (see [Walk::Drafter]); this is the arm that commits onto it
+//! next, with its arithmetic already the same calls the fusion arm makes.
 //!
 //! * [Walk::layout] is what the rank's caches are: every sparse (DSA) layer holds a positional
 //!   latent row and its indexer's rows a position, and every linear (KDA) layer holds a
@@ -46,9 +49,9 @@ use sparkflash_model::ledger::State;
 use sparkflash_model::{DepthPolicy, Queue, Speculator, kept_to_end, verdict};
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
-    ComputeDeclaration, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory,
-    LaneState, Limits, NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments,
-    StateKind, StateLayout, Walk, WalkCapabilities, share_rows,
+    Absent, ComputeDeclaration, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
+    Limits, NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind,
+    StateLayout, Walk, WalkCapabilities, share_rows,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -95,7 +98,7 @@ struct Verified {
     chunk: Chain,
     /// The drafter's confidence in each draft it proposed.
     confidence: Vec<f32>,
-    /// One row of full-vocabulary logits a row of `chunk`.
+    /// One row of full-vocabulary logits for a row of `chunk`.
     rows: Vec<Vec<f32>>,
 }
 
@@ -334,19 +337,6 @@ impl LaneState for GlmSequence {
     }
 }
 
-/// GLM's draft source: the checkpoint's MTP layer, or the DFlash 2 block drafter the profile
-/// loaded ([crate::serve::Glm5NextDeviceBackend::enable_speculation]). The ledger states it
-/// statically; a deployment that configures no drafter runs the same sequences without rounds.
-pub struct GlmDrafter;
-
-impl Drafter<GlmWalk> for GlmDrafter {
-    const PRESENT: bool = true;
-
-    fn describe(&self) -> String {
-        "MTP or DFlash 2".to_owned()
-    }
-}
-
 /// The GLM-5.3-Flash arm, exposed to the shared runtime as a Walk.
 pub struct GlmWalk {
     shared: Arc<Shared>,
@@ -421,25 +411,32 @@ fn layout_of(plan: sparkflash_model::KvPlan) -> StateLayout {
 /// The runtime over a GLM walk: the serving arm the backend opens when it fuses its lanes, and
 /// the arm a session outside the engine steps through.
 ///
+/// [crate::serve::GlmFusion] still serves in this pass, because the runtime has no draft path
+/// yet ([Walk::Drafter]); the next commit opens this instead.
+///
 /// # Errors
 /// A device allocation the first slot cannot make, a [sparkflash_runtime::REWIND_ENV] that is
 /// not a switch, or a [sparkflash_runtime::JOINT_ROUNDS_ENV] that is not one.
-// The serving construction moves onto this in the next commit; until then its only caller is
-// that commit.
 #[allow(dead_code)]
 pub(crate) fn runtime(
     shared: Arc<Shared>,
     context_limit: usize,
-) -> Result<Arc<Runtime<GlmWalk>>, BackendError> {
+) -> Result<Runtime<GlmWalk>, BackendError> {
     let walk = GlmWalk::new(shared, context_limit)?;
     // No free-memory figure is measured for the chunk: the rank's scratch decides the width,
     // which is what its profile's prefill.chunk sized.
-    Runtime::new(walk, 0).map(Arc::new)
+    Runtime::new(walk, 0)
 }
 
 impl Walk for GlmWalk {
     type Seq = GlmSequence;
-    type Drafter = GlmDrafter;
+    /// The runtime has no draft path yet: [sparkflash_runtime::Runtime] steps one row a member
+    /// and its [sparkflash_runtime::Runtime::verify] heads only each member's anchor, so an arm
+    /// that named a drafter here would lose its rounds silently. GLM's rounds run inside
+    /// [Walk::walk]/[Walk::head] until the runtime gains one shape for them (shared with Qwen
+    /// and Inkling); this pass leaves [crate::serve::GlmFusion] serving, and the next one names
+    /// the arm's MTP/DFlash 2 source here.
+    type Drafter = Absent<&'static str>;
     type Vision = NoVision;
 
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
@@ -571,6 +568,8 @@ impl Walk for GlmWalk {
             let seq = &mut *row.seq;
             let fed = match &row.input {
                 HeadInput::Prompt(tokens) => {
+                    // The prompt's chunks are done: the next prompt starts a new one.
+                    seq.prefill_open = false;
                     // Its sampler history is the whole prompt: the penalties count every token
                     // the request reads, however many chunks the prompt ran in.
                     seq.sampler.reset();
@@ -664,9 +663,12 @@ impl GlmWalk {
         // the one step that verified it: a batch wider than that runs the plain token path, which
         // is the same tokens by the arm's own measurement.
         if self.shared.spec.get().is_none() || segments.len() > MAX_ROWS {
-            if self.shared.spec.get().is_some() {
-                for segment in segments.iter_mut() {
-                    let seq = &mut *segment.seq;
+            for segment in segments.iter_mut() {
+                let seq = &mut *segment.seq;
+                seq.prefill_open = false;
+                if self.shared.spec.get().is_some() {
+                    // A batch wider than one verify step runs without the round: a stale queue
+                    // would answer a token this step's own row did not produce.
                     seq.pending.clear();
                     seq.confidence.clear();
                     seq.verified = None;
@@ -688,6 +690,8 @@ impl GlmWalk {
         for (index, segment) in segments.iter_mut().enumerate() {
             let token = segment.rows[0];
             let seq = &mut *segment.seq;
+            // A step ends any prompt that was running a chunk at a time, and a held answer is
+            // still a step of this turn: both clear the last round's row.
             seq.prefill_open = false;
             seq.verified = None;
             if segment.rows.len() == 1 && seq.holds(token) {
