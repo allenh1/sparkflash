@@ -16,6 +16,8 @@
 // two-stream manifold-constrained hyper-connection. Everything else is the shared Qwen token,
 // attention and scan images.
 
+#include <cstdint>
+
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -454,3 +456,288 @@ extern "C" __global__ void sensenova_attn_combine(const float* __restrict__ part
         out[at + dim] = gate != nullptr ? value / (1.0f + __expf(-gate[at + dim])) : value;
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// The prefill GEMM: NVFP4 weights and activations through the mxf4nvf4 block-scaled MMA.
+//
+// The 5080 (sm_120a) runs one m16n8k64 e2m1 MMA every 4 SM cycles - 2048 MAC a cycle, twice the
+// FP8 form and four times the BF16 body the first prefill used - and carries the block scales in
+// the instruction, so the accumulator needs no per-tile fold. The operands are ModelOpt NVFP4:
+// two E2M1 nibbles a byte (the low nibble the even column) with one E4M3 scale a 16 values, which
+// is exactly the MMA's own block, so a scale never has to be applied by hand.
+//
+// The fragment layout (measured on the part, not assumed): lane l holds A row l/4 and l/4+8, its
+// K 16*(l%4) block as eight contiguous nibbles - the low four in the first register, the high
+// four in the third for A (second for B) - so a lane reads one 8-byte run a row and needs no
+// ldmatrix. Lane 4a+2b supplies the A scale of row a+8b and lane 4c the B scale of column c, a
+// u32 of the four 16-value blocks the stage covers.
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1200
+
+// D += A x B over one 64-value K block, E2M1 x E2M1 with ue4m3 block scales.
+__device__ __forceinline__ void sensenova_mma_fp4(float d[4], const uint32_t a[4], uint32_t b0,
+                                                  uint32_t b1, uint32_t sfa, uint32_t sfb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3},{%10},{%11,%12},{%13},{%14,%15};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa),
+          "h"((uint16_t)0), "h"((uint16_t)0), "r"(sfb), "h"((uint16_t)0), "h"((uint16_t)0));
+}
+
+__device__ __forceinline__ uint32_t sensenova_smem(const void* p) {
+    return (uint32_t)__cvta_generic_to_shared(p);
+}
+__device__ __forceinline__ void sensenova_cp16(uint32_t dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+}
+__device__ __forceinline__ void sensenova_cp4(uint32_t dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(dst), "l"(src));
+}
+__device__ __forceinline__ void sensenova_commit() { asm volatile("cp.async.commit_group;"); }
+template <int N>
+__device__ __forceinline__ void sensenova_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
+}
+
+// The E2M1 magnitude of |v| / scale: the eight codes 0, 0.5, 1, 1.5, 2, 3, 4, 6, nearest first.
+__device__ __forceinline__ uint32_t sensenova_e2m1(float value) {
+    const float magnitude = fabsf(value);
+    const uint32_t code = magnitude <= 0.25f   ? 0u
+                          : magnitude <= 0.75f ? 1u
+                          : magnitude <= 1.25f ? 2u
+                          : magnitude <= 1.75f ? 3u
+                          : magnitude <= 2.50f ? 4u
+                          : magnitude <= 3.50f ? 5u
+                          : magnitude <= 5.00f ? 6u
+                                               : 7u;
+    return code | (value < 0.0f ? 8u : 0u);
+}
+
+// How far a lane's 16-value K block sits from the start of its row: the low nibble first, so a
+// block is eight bytes.
+__device__ __forceinline__ uint32_t sensenova_pair_off(uint32_t row, uint32_t pair) {
+    return row * 32u + ((pair ^ (row & 1u)) << 4);
+}
+
+// x[rows][inner] f32 -> codes[rows][inner / 2] (two nibbles a byte) and scales[rows][inner / 16]
+// E4M3. One thread a 16-value block: its own amax, its own scale, its own eight packed bytes.
+extern "C" __global__ void sensenova_quant_fp4(const float* __restrict__ x,
+                                               uint8_t* __restrict__ codes,
+                                               uint8_t* __restrict__ scales, unsigned int rows,
+                                               unsigned int inner) {
+    const unsigned int blocks = inner >> 4;
+    const unsigned int at = blockIdx.x * blockDim.x + threadIdx.x;
+    if (at >= rows * blocks) return;
+    const float* source = x + (unsigned long long)at * 16u;
+    float values[16];
+    float largest = 0.0f;
+#pragma unroll
+    for (unsigned int i = 0; i < 16u; ++i) {
+        values[i] = source[i];
+        largest = fmaxf(largest, fabsf(values[i]));
+    }
+    float scale = largest / 6.0f;
+    __nv_fp8_storage_t storage = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
+    float stored = sensenova_e4m3(storage);
+    if (stored == 0.0f) stored = 1.0f;
+    const float inverse = 1.0f / stored;
+    scales[at] = (uint8_t)storage;
+    uint64_t packed = 0;
+#pragma unroll
+    for (unsigned int i = 0; i < 16u; ++i) {
+        packed |= (uint64_t)sensenova_e2m1(values[i] * inverse) << (4u * i);
+    }
+    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)at * 8u) = packed;
+}
+
+// An FP8 [cols][inner] matrix with a BF16 inverse scale a 128x128 tile -> the same NVFP4 form:
+// codes[cols][inner / 2] and scales[cols][inner / 16]. One thread a 16-value block.
+extern "C" __global__ void sensenova_quant_weights_fp4(const uint8_t* __restrict__ w,
+                                                       const __nv_bfloat16* __restrict__ ws,
+                                                       uint8_t* __restrict__ codes,
+                                                       uint8_t* __restrict__ scales,
+                                                       unsigned int cols, unsigned int inner) {
+    const unsigned int blocks = inner >> 4;
+    const unsigned int at = blockIdx.x * blockDim.x + threadIdx.x;
+    if (at >= cols * blocks) return;
+    const unsigned int col = at / blocks;
+    const unsigned int block = at % blocks;
+    const float tile = __bfloat162float(ws[(col >> 7) * (inner >> 7) + (block >> 3)]);
+    const uint8_t* source = w + (unsigned long long)col * inner + block * 16u;
+    float values[16];
+    float largest = 0.0f;
+#pragma unroll
+    for (unsigned int i = 0; i < 16u; ++i) {
+        const __nv_fp8_storage_t storage = source[i];
+        values[i] = (float)(*reinterpret_cast<const __nv_fp8_e4m3*>(&storage)) * tile;
+        largest = fmaxf(largest, fabsf(values[i]));
+    }
+    float scale = largest / 6.0f;
+    __nv_fp8_storage_t storage = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
+    float stored = sensenova_e4m3(storage);
+    if (stored == 0.0f) stored = 1.0f;
+    const float inverse = 1.0f / stored;
+    scales[at] = (uint8_t)storage;
+    uint64_t packed = 0;
+#pragma unroll
+    for (unsigned int i = 0; i < 16u; ++i) {
+        packed |= (uint64_t)sensenova_e2m1(values[i] * inverse) << (4u * i);
+    }
+    *reinterpret_cast<uint64_t*>(codes + (unsigned long long)at * 8u) = packed;
+}
+
+// out[t][c] = a[t][:] . w[c][:] over NVFP4 operands. BM rows x BN columns a block, eight warps,
+// the K dimension in 64-value stages through STAGES cp.async buffers.
+template <int BM, int BN, int STAGES, int WM, int WN>
+__device__ __forceinline__ void sensenova_dense_fp4_body(const uint8_t* __restrict__ w,
+                                                         const uint8_t* __restrict__ ws,
+                                                         const uint8_t* __restrict__ a,
+                                                         const uint8_t* __restrict__ as,
+                                                         float* __restrict__ out,
+                                                         unsigned int cols, unsigned int inner,
+                                                         unsigned int tokens) {
+    constexpr int MT = BM / WM / 16;
+    constexpr int NT = BN / WN / 8;
+    constexpr unsigned STAGE_BYTES = BM * 32u + BN * 32u + BM * 4u + BN * 4u;
+    extern __shared__ __align__(128) uint8_t sensenova_fp4_shared[];
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int n0 = blockIdx.x * BN;
+    const unsigned int m0 = blockIdx.y * BM;
+    const unsigned int stages = inner / 64u;
+    const unsigned int packed = inner >> 1;
+    auto s_a = [&](unsigned int buf) { return sensenova_fp4_shared + buf * STAGE_BYTES; };
+    auto s_w = [&](unsigned int buf) { return s_a(buf) + BM * 32u; };
+    auto s_as = [&](unsigned int buf) { return s_w(buf) + BN * 32u; };
+    auto s_ws = [&](unsigned int buf) { return s_as(buf) + BM * 4u; };
+
+    // A stage is BM + BN rows of 32 bytes: two 16-byte runs a row, 256 threads covering the
+    // larger of the two tiles two rows at a time.
+    auto issue = [&](unsigned int stage, unsigned int buf) {
+#pragma unroll
+        for (unsigned int i = 0; i < 2u; ++i) {
+            const unsigned int at = tid + i * 256u;
+            const unsigned int row = at >> 1;
+            const unsigned int pair = at & 1u;
+            if (row < BM) {
+                sensenova_cp16(sensenova_smem(s_a(buf) + sensenova_pair_off(row, pair)),
+                               a + (unsigned long long)(m0 + row) * packed + stage * 32u +
+                                   pair * 16u);
+            }
+            if (row < BN) {
+                sensenova_cp16(sensenova_smem(s_w(buf) + sensenova_pair_off(row, pair)),
+                               w + (unsigned long long)(n0 + row) * packed + stage * 32u +
+                                   pair * 16u);
+            }
+        }
+        if (tid < BM) {
+            sensenova_cp4(sensenova_smem(s_as(buf) + tid * 4u),
+                          as + (unsigned long long)(m0 + tid) * (inner >> 4) + stage * 4u);
+        }
+        if (tid < BN) {
+            sensenova_cp4(sensenova_smem(s_ws(buf) + tid * 4u),
+                          ws + (unsigned long long)(n0 + tid) * (inner >> 4) + stage * 4u);
+        }
+    };
+
+    const unsigned int wm = warp / WN, wn = warp % WN;
+    float acc[MT][NT][4];
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+    const unsigned int chunk = lane & 3u;
+    const unsigned int gr = lane >> 2;
+    const bool scale_a_lane = (lane & 3u) < 2u;
+    const bool scale_b_lane = (lane & 3u) == 0u;
+
+#pragma unroll
+    for (int stage = 0; stage + 1 < STAGES; ++stage) {
+        if (stage < (int)stages) issue(stage, stage);
+        sensenova_commit();
+    }
+    for (unsigned int stage = 0; stage < stages; ++stage) {
+        sensenova_wait<STAGES - 2>();
+        __syncthreads();
+        const unsigned int next = stage + STAGES - 1u;
+        if (next < stages) issue(next, next % STAGES);
+        sensenova_commit();
+        const unsigned int buf = stage % STAGES;
+        uint32_t af[MT][4], bf[NT][2], sfa[MT], sfb[NT];
+        const uint8_t* a_tile = s_a(buf);
+        const uint8_t* w_tile = s_w(buf);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+            const unsigned int row = wm * (BM / WM) + mt * 16u + gr;
+            const uint2 lo = *reinterpret_cast<const uint2*>(a_tile + sensenova_pair_off(row, chunk));
+            const uint2 hi =
+                *reinterpret_cast<const uint2*>(a_tile + sensenova_pair_off(row + 8u, chunk));
+            af[mt][0] = lo.x;
+            af[mt][1] = hi.x;
+            af[mt][2] = lo.y;
+            af[mt][3] = hi.y;
+            sfa[mt] = scale_a_lane
+                          ? reinterpret_cast<const uint32_t*>(s_as(buf))[wm * (BM / WM) + mt * 16u +
+                                                                        gr + 8u * (lane & 1u)]
+                          : 0u;
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const unsigned int col = wn * (BN / WN) + nt * 8u + gr;
+            const uint2 v = *reinterpret_cast<const uint2*>(w_tile + sensenova_pair_off(col, chunk));
+            bf[nt][0] = v.x;
+            bf[nt][1] = v.y;
+            sfb[nt] = scale_b_lane
+                          ? reinterpret_cast<const uint32_t*>(s_ws(buf))[wn * (BN / WN) + nt * 8u + gr]
+                          : 0u;
+        }
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt)
+                sensenova_mma_fp4(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1], sfa[mt], sfb[nt]);
+    }
+
+    const unsigned int q = lane & 3u;
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned int row = m0 + wm * (BM / WM) + mt * 16u + gr + 8u * half;
+            if (row >= tokens) continue;
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const unsigned long long base =
+                    (unsigned long long)row * cols + n0 + wn * (BN / WN) + nt * 8u + 2u * q;
+                *reinterpret_cast<float2*>(out + base) =
+                    make_float2(acc[mt][nt][2 * half], acc[mt][nt][2 * half + 1]);
+            }
+        }
+    }
+}
+
+// A 128-row x 256-column block, eight warps of 64 x 64: the shape a 12,288-wide projection
+// wants. 55,296 B of shared memory (STAGES = 4).
+extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_wide(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
+    const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
+    unsigned int inner, unsigned int tokens) {
+    sensenova_dense_fp4_body<128, 256, 4, 2, 4>(w, ws, a, as, out, cols, inner, tokens);
+}
+
+// A 128-row x 128-column block, eight warps of 64 x 32: the narrow form, whose 32 column tiles
+// fill the card where the wide one's 16 would not.
+extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_narrow(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
+    const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
+    unsigned int inner, unsigned int tokens) {
+    sensenova_dense_fp4_body<128, 128, 6, 2, 4>(w, ws, a, as, out, cols, inner, tokens);
+}
+#endif
+

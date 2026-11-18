@@ -67,6 +67,71 @@ const DENSE_SHARED: u32 = 4 * (128 * 64 + 128 * 64 + 128 * 4) + 128 * 4 + 128 * 
 /// build their graphs at once.
 static CAPTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Where a forward's time goes, one launch group at a time.
+///
+/// Under `SPARKFLASH_SENSENOVA_TIME=2` each mark drains the stream, so a mark's span is the work
+/// the launches before it queued: the numbers are the device's own, at the cost of one round trip
+/// a mark. The spans are summed by name and printed once at the end of the forward, which is what
+/// makes a prefill's stage budget readable without a profiler.
+#[derive(Debug)]
+struct StageClock {
+    on: bool,
+    last: std::time::Instant,
+    spans: Vec<(&'static str, f64)>,
+}
+
+impl StageClock {
+    fn new(on: bool) -> Self {
+        StageClock {
+            on,
+            last: std::time::Instant::now(),
+            spans: Vec::new(),
+        }
+    }
+
+    /// Closes the span since the last mark, named `label`, once the stream is drained.
+    fn mark<E>(
+        &mut self,
+        label: &'static str,
+        sync: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if !self.on {
+            return Ok(());
+        }
+        sync()?;
+        let now = std::time::Instant::now();
+        self.spans.push((label, (now - self.last).as_secs_f64() * 1e3));
+        self.last = now;
+        Ok(())
+    }
+
+    /// Prints the summed spans by name, largest first, then the total.
+    fn report(&self, rows: usize) {
+        if !self.on {
+            return;
+        }
+        let mut totals: Vec<(&'static str, f64)> = Vec::new();
+        for (label, ms) in &self.spans {
+            match totals.iter_mut().find(|(name, _)| name == label) {
+                Some(entry) => entry.1 += ms,
+                None => totals.push((label, *ms)),
+            }
+        }
+        totals.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f64 = totals.iter().map(|(_, ms)| ms).sum();
+        for (label, ms) in &totals {
+            eprintln!(
+                "sensenova stage: {label:<18} {ms:8.2} ms {:5.1}%",
+                ms / total * 100.0
+            );
+        }
+        eprintln!(
+            "sensenova stage: total {total:.2} ms over {rows} rows ({:.1} tok/s)",
+            rows as f64 / (total / 1e3)
+        );
+    }
+}
+
 /// One uploaded matrix, BF16 or E4M3 with its tile scales.
 #[derive(Debug, Clone, Copy)]
 struct DeviceMat {
@@ -74,6 +139,9 @@ struct DeviceMat {
     scales: Option<Deviceptr>,
     rows: usize,
     columns: usize,
+    /// The same E4M3 matrix as NVFP4: two E2M1 nibbles a byte and one E4M3 scale a 16 values.
+    /// The prefill GEMM reads this form; the decode GEMV reads the bytes above.
+    fp4: Option<(Deviceptr, Deviceptr)>,
 }
 
 /// One layer's uploaded weights.
@@ -126,6 +194,11 @@ struct Kernels {
     mhc_enter: Kernel,
     /// The tensor-core dense projection, when the prefill image carries it.
     dense_fp8: Option<Kernel>,
+    /// The NVFP4 prefill path: the two operand quantisers and the wide and narrow GEMMs.
+    quant_fp4: Option<Kernel>,
+    quant_weights_fp4: Option<Kernel>,
+    dense_fp4_wide: Option<Kernel>,
+    dense_fp4_narrow: Option<Kernel>,
 }
 
 struct Weights {
@@ -304,6 +377,7 @@ impl DeviceShared {
                         scales: None,
                         rows,
                         columns,
+                        fp4: None,
                     })
                 }
                 DType::F8E4M3 => {
@@ -330,6 +404,8 @@ impl DeviceShared {
                         )?),
                         rows,
                         columns,
+                        // Quantised once the whole shared state exists (attach_fp4).
+                        fp4: None,
                     })
                 }
                 DType::F32 => {
@@ -339,6 +415,7 @@ impl DeviceShared {
                         scales: None,
                         rows,
                         columns,
+                        fp4: None,
                     })
                 }
                 other => Err(format!("{name} is {other:?}, expected BF16, F32 or E4M3")),
@@ -405,6 +482,7 @@ impl DeviceShared {
             scales: None,
             rows: config.vocab_size,
             columns: config.hidden_size,
+            fp4: None,
         };
         let norm = vector(
             &source,
@@ -618,7 +696,7 @@ impl DeviceShared {
         cuda.memset_d8_async(counters, 0, TILED_GEMV_PARTIALS)?;
         pointers.push(partials);
         pointers.push(counters);
-        Ok(Self {
+        let mut shared = Self {
             cuda,
             kernels,
             weights: Weights {
@@ -636,7 +714,87 @@ impl DeviceShared {
             kv_fp8,
             allocated,
             pointers,
-        })
+        };
+        shared.attach_fp4()?;
+        Ok(shared)
+    }
+
+    /// Quantises every E4M3 projection to the NVFP4 form the prefill GEMM reads.
+    ///
+    /// It runs once, after the checkpoint is resident: a 16-value block's amax decides its own
+    /// E4M3 scale and the nibble the value rounds to, so the device reads the FP8 bytes rather
+    /// than a host copy, and the bytes stay for the decode GEMV.
+    fn attach_fp4(&mut self) -> Result<(), String> {
+        let Self {
+            cuda,
+            kernels,
+            weights,
+            pointers,
+            allocated,
+            ..
+        } = self;
+        let Some(quantise) = kernels.quant_weights_fp4 else {
+            return Ok(());
+        };
+        let mut quantised = 0usize;
+        for layer in &mut weights.layers {
+            let mut slots: Vec<&mut DeviceMat> = Vec::new();
+            for optional in [
+                &mut layer.q,
+                &mut layer.k,
+                &mut layer.v,
+                &mut layer.o,
+                &mut layer.qkv,
+                &mut layer.z,
+                &mut layer.b,
+                &mut layer.a,
+                &mut layer.out,
+            ] {
+                if let Some(matrix) = optional {
+                    slots.push(matrix);
+                }
+            }
+            slots.push(&mut layer.gate);
+            slots.push(&mut layer.up);
+            slots.push(&mut layer.down);
+            for matrix in slots {
+                let (Some(scales), None) = (matrix.scales, matrix.fp4) else {
+                    continue;
+                };
+                let rows = matrix.rows;
+                let columns = matrix.columns;
+                let codes = cuda.alloc(rows * columns / 2, allocated)?;
+                let block_scales = cuda.alloc(rows * (columns / 16), allocated)?;
+                pointers.push(codes);
+                pointers.push(block_scales);
+                cuda.launch_async(
+                    quantise,
+                    (((rows * columns / 16).div_ceil(256)) as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        matrix.pointer.0,
+                        scales.0,
+                        codes.0,
+                        block_scales.0,
+                        rows as u64,
+                        columns as u64,
+                    ],
+                )?;
+                matrix.fp4 = Some((codes, block_scales));
+                quantised += rows * columns / 2 + rows * (columns / 16);
+            }
+        }
+        *allocated += 0;
+        if quantised == 0 {
+            eprintln!("sensenova: no NVFP4 prefill weights (the image carries no quantiser)");
+        } else {
+            eprintln!(
+                "sensenova: quantised {:.2} GiB of projections to NVFP4",
+                quantised as f64 / (1u64 << 30) as f64
+            );
+        }
+        cuda.synchronize()?;
+        Ok(())
     }
 
     fn launch(
@@ -688,7 +846,61 @@ impl DeviceShared {
         input: Deviceptr,
         output: Deviceptr,
         rows: usize,
+        quantize: (Deviceptr, Deviceptr),
     ) -> Result<(), BackendError> {
+        // The prefill tile: a char-complete 128-row chunk through the NVFP4 GEMM. The activation
+        // is quantised into the caller's scratch block first, one block scale a 16 values.
+        if rows >= 128
+            && rows % 128 == 0
+            && matrix.rows % 128 == 0
+            && matrix.columns % 128 == 0
+            && let Some((codes, scales)) = matrix.fp4
+            && let (Some(quantise), Some(wide), Some(narrow)) = (
+                self.kernels.quant_fp4,
+                self.kernels.dense_fp4_wide,
+                self.kernels.dense_fp4_narrow,
+            )
+        {
+            let (a_codes, a_scales) = quantize;
+            self.launch(
+                quantise,
+                (((rows * matrix.columns / 16).div_ceil(256)) as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    input.0,
+                    a_codes.0,
+                    a_scales.0,
+                    rows as u64,
+                    matrix.columns as u64,
+                ],
+            )?;
+            // A 12,288-wide projection fills the card with 256-column tiles; a 4,096-wide one
+            // needs the 128-column form to reach 32 blocks.
+            let (kernel, columns_tile) = if matrix.rows >= 8192 {
+                (wide, 256)
+            } else {
+                (narrow, 128)
+            };
+            return self.launch(
+                kernel,
+                (
+                    (matrix.rows / columns_tile) as u32,
+                    (rows / 128) as u32,
+                    1,
+                ),
+                (256, 1, 1),
+                &[
+                    codes.0,
+                    scales.0,
+                    a_codes.0,
+                    a_scales.0,
+                    output.0,
+                    matrix.rows as u64,
+                    matrix.columns as u64,
+                    rows as u64,
+                ],
+            );
+        }
         if rows > GEMV_MAX_BATCH && matrix.scales.is_some() && matrix.rows % 128 == 0
             && matrix.columns % 128 == 0
             && let Some(kernel) = self.kernels.dense_fp8
@@ -786,12 +998,38 @@ impl sparkflash_ops::gemv::GemvDevice for DeviceShared {
             scales: None,
             rows: matrix.rows,
             columns: matrix.columns,
+            fp4: None,
         };
         DeviceShared::gemv(self, &matrix, input, output, rows)
     }
 
     fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
         (self.tiled_partials, self.tiled_counters)
+    }
+}
+
+/// The dynamic shared memory the wide NVFP4 GEMM asks for: four stages of a 128-row and a
+/// 256-row operand tile, each a 32-byte row, plus the rows' block scales.
+const DENSE_FP4_WIDE_SHARED: u32 = 4 * (128 * 32 + 256 * 32 + 128 * 4 + 256 * 4);
+
+/// The narrow engine's: six stages of two 128-row tiles and their scales.
+const DENSE_FP4_NARROW_SHARED: u32 = 6 * (128 * 32 + 128 * 32 + 128 * 4 + 128 * 4);
+
+/// A kernel of the image that may be absent (an older toolchain, or a build for an architecture
+/// the block-scaled MMA does not exist on): the arm falls back rather than refusing to load.
+fn optional(cuda: &Cuda, name: &'static str, shared: u32) -> Option<Kernel> {
+    let loaded = if shared == 0 {
+        cuda.load_named(sensenova_cubin(), name).map(|(_, kernel)| kernel)
+    } else {
+        cuda.load_named_shared(sensenova_cubin(), name, shared)
+            .map(|(_, kernel)| kernel)
+    };
+    match loaded {
+        Ok(kernel) => Some(kernel),
+        Err(error) => {
+            eprintln!("sensenova: no {name}: {error}");
+            None
+        }
     }
 }
 
@@ -836,7 +1074,11 @@ impl Kernels {
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
             mhc_enter: load(sensenova_cubin(), "sensenova_mhc_enter")?,
-            dense_fp8: dense
+            dense_fp8: dense,
+            quant_fp4: optional(cuda, "sensenova_quant_fp4", 0),
+            quant_weights_fp4: optional(cuda, "sensenova_quant_weights_fp4", 0),
+            dense_fp4_wide: optional(cuda, "sensenova_dense_fp4_wide", DENSE_FP4_WIDE_SHARED),
+            dense_fp4_narrow: optional(cuda, "sensenova_dense_fp4_narrow", DENSE_FP4_NARROW_SHARED),
         })
     }
 }
@@ -863,6 +1105,9 @@ struct Scratch {
     partials: Deviceptr,
     coeffs: Deviceptr,
     logits: Deviceptr,
+    /// The FP4 activation of the projection in flight: nibbles, then one E4M3 scale a 16 values.
+    fp4_codes: Deviceptr,
+    fp4_scales: Deviceptr,
     /// The token index the kernels read. A device word, not an argument, so one captured graph
     /// serves every position.
     position: Deviceptr,
@@ -931,6 +1176,7 @@ impl DeviceSession {
         // Every activation buffer holds ROWS tokens: a verify or a prefill chunk runs the same
         // visit list over that many rows, which is what makes one weight pass serve them all.
         let mut wide = |count: usize| -> Result<Deviceptr, String> { alloc(PREFILL_ROWS * count * 4) };
+        let fp4_inner = config.intermediate_size.max(config.hidden_size);
         let scratch = Scratch {
             hidden: wide(hidden)?,
             branch: wide(hidden.max(config.intermediate_size))?,
@@ -954,6 +1200,9 @@ impl DeviceSession {
             coeffs: wide(8)?,
             // A verify reads every row's logits; a prefill chunk only the last row's.
             logits: alloc(ROWS * config.vocab_size * 4)?,
+            // The widest activation a prefill block quantises is the MLP's intermediate.
+            fp4_codes: alloc(PREFILL_ROWS * fp4_inner / 2)?,
+            fp4_scales: alloc(PREFILL_ROWS * (fp4_inner / 16))?,
             position: alloc(4)?,
             pointers,
         };
@@ -1230,6 +1479,8 @@ impl DeviceSession {
         let hidden = config.hidden_size;
         let position = self.position;
         let mut visit_clock = std::time::Instant::now();
+        let mut clock = StageClock::new(per_visit);
+        let drain = || shared.cuda.synchronize().map_err(|error| BackendError::new(DEVICE, error));
         for (visit, physical) in config.execution_plan().into_iter().enumerate() {
             let layer = &shared.weights.layers[physical];
             let state = self.visits[visit];
@@ -1283,10 +1534,13 @@ impl DeviceSession {
                     rows,
                 )?;
             }
-            match config.layer_types[physical] {
-                LayerType::Full => self.full_attention(layer, state, position, rows)?,
-                LayerType::Linear => self.linear_attention(layer, state, rows)?,
+            clock.mark("attn norm+mhc", drain)?;
+            let attention = match config.layer_types[physical] {
+                LayerType::Full => self.full_attention(layer, state, position, rows, &mut clock),
+                LayerType::Linear => self.linear_attention(layer, state, rows, &mut clock),
             };
+            attention?;
+            clock.mark("attention", drain)?;
             if debug {
                 self.report(
                     &format!("visit {visit} layer {physical} attention"),
@@ -1306,6 +1560,7 @@ impl DeviceSession {
                         hidden as u64,
                     ],
                 )?;
+                clock.mark("attn merge", drain)?;
                 let (weight, bias) = layer.mhc_ffn.expect("router");
                 shared.launch(
                     shared.kernels.mhc_pre,
@@ -1351,7 +1606,9 @@ impl DeviceSession {
                     rows,
                 )?;
             }
-            self.mlp(layer, rows)?;
+            clock.mark("ffn norm+mhc", drain)?;
+            self.mlp(layer, rows, &mut clock)?;
+            clock.mark("mlp", drain)?;
             if debug {
                 self.report(
                     &format!("device visit {visit} layer {physical} ffn"),
@@ -1431,6 +1688,7 @@ impl DeviceSession {
         if debug {
             self.report("device final hidden", self.scratch.normed, hidden)?;
         }
+        clock.mark("ffn merge+leave", drain)?;
         // A verify needs every row's pick, so its head runs over all of them; a prefill chunk
         // needs the row that predicts the next token, and a one-row step is one row.
         let head_rows = if rows <= ROWS { rows } else { 1 };
@@ -1441,7 +1699,10 @@ impl DeviceSession {
                 .offset((rows - head_rows) * hidden * 4),
             self.scratch.logits,
             head_rows,
-        )
+        )?;
+        clock.mark("final norm+head", drain)?;
+        clock.report(rows);
+        Ok(())
     }
 
     fn report(&self, label: &str, pointer: Deviceptr, width: usize) -> Result<(), BackendError> {
@@ -1465,15 +1726,24 @@ impl DeviceSession {
         Ok(())
     }
 
-    fn mlp(&mut self, layer: &DeviceLayer, rows: usize) -> Result<(), BackendError> {
+    fn mlp(
+        &mut self,
+        layer: &DeviceLayer,
+        rows: usize,
+        clock: &mut StageClock,
+    ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
+        let quant = (self.scratch.fp4_codes, self.scratch.fp4_scales);
         let intermediate = shared.config.intermediate_size;
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.project_matrix(&layer.gate, self.scratch.normed, self.scratch.branch, rows)?;
+        let drain = || shared.cuda.synchronize().map_err(|error| BackendError::new(DEVICE, error));
+        shared.project_matrix(&layer.gate, self.scratch.normed, self.scratch.branch, rows, quant)?;
+        clock.mark("  mlp gate", drain)?;
         if debug {
             self.report("device mlp gate", self.scratch.branch, rows * intermediate)?;
         }
-        shared.project_matrix(&layer.up, self.scratch.normed, self.scratch.ffn, rows)?;
+        shared.project_matrix(&layer.up, self.scratch.normed, self.scratch.ffn, rows, quant)?;
+        clock.mark("  mlp up", drain)?;
         if debug {
             self.report("device mlp up", self.scratch.ffn, rows * intermediate)?;
         }
@@ -1488,10 +1758,12 @@ impl DeviceSession {
                 (rows * intermediate) as u64,
             ],
         )?;
+        clock.mark("  mlp swiglu", drain)?;
         if debug {
             self.report("device mlp hidden", self.scratch.branch, rows * intermediate)?;
         }
-        shared.project_matrix(&layer.down, self.scratch.branch, self.scratch.ffn, rows)?;
+        shared.project_matrix(&layer.down, self.scratch.branch, self.scratch.ffn, rows, quant)?;
+        clock.mark("  mlp down", drain)?;
         if debug {
             self.report("device mlp down", self.scratch.ffn, rows * intermediate)?;
         }
@@ -1504,9 +1776,12 @@ impl DeviceSession {
         state: VisitState,
         position: usize,
         rows: usize,
+        clock: &mut StageClock,
     ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let config = &shared.config;
+        let drain = || shared.cuda.synchronize().map_err(|error| BackendError::new(DEVICE, error));
+        let quant = (self.scratch.fp4_codes, self.scratch.fp4_scales);
         let heads = config.num_attention_heads;
         let kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
@@ -1518,7 +1793,8 @@ impl DeviceSession {
             layer.v.expect("v"),
             layer.o.expect("o"),
         );
-        shared.project_matrix(&q, self.scratch.normed, self.scratch.q_interleaved, rows)?;
+        shared.project_matrix(&q, self.scratch.normed, self.scratch.q_interleaved, rows, quant)?;
+        clock.mark("  full q", drain)?;
         shared.launch(
             shared.kernels.qgate,
             (heads as u32, rows as u32, 1),
@@ -1532,8 +1808,9 @@ impl DeviceSession {
                 rows as u64,
             ],
         )?;
-        shared.project_matrix(&k, self.scratch.normed, self.scratch.key, rows)?;
-        shared.project_matrix(&v, self.scratch.normed, self.scratch.value, rows)?;
+        shared.project_matrix(&k, self.scratch.normed, self.scratch.key, rows, quant)?;
+        shared.project_matrix(&v, self.scratch.normed, self.scratch.value, rows, quant)?;
+        clock.mark("  full kv", drain)?;
         shared.rmsnorm(
             self.scratch.query,
             layer.q_norm.expect("q norm"),
@@ -1662,6 +1939,7 @@ impl DeviceSession {
                 ],
             )?;
         }
+        clock.mark("  full attention core", drain)?;
         if shared.kv_fp8 {
             shared.launch(
                 shared.kernels.attn_combine,
@@ -1691,7 +1969,10 @@ impl DeviceSession {
                 ],
             )?;
         }
-        shared.project_matrix(&o, self.scratch.attn_out, self.scratch.attention, rows)
+        clock.mark("  full combine", drain)?;
+        shared.project_matrix(&o, self.scratch.attn_out, self.scratch.attention, rows, quant)?;
+        clock.mark("  full o", drain)?;
+        Ok(())
     }
 
     fn linear_attention(
@@ -1699,9 +1980,12 @@ impl DeviceSession {
         layer: &DeviceLayer,
         state: VisitState,
         rows: usize,
+        clock: &mut StageClock,
     ) -> Result<(), BackendError> {
         let shared = Arc::clone(&self.shared);
         let config = &shared.config;
+        let drain = || shared.cuda.synchronize().map_err(|error| BackendError::new(DEVICE, error));
+        let quant = (self.scratch.fp4_codes, self.scratch.fp4_scales);
         let key_width = config.linear.key_heads * config.linear.key_dim;
         let value_width = config.linear_value_width();
         let fused = 2 * key_width + value_width;
@@ -1713,21 +1997,21 @@ impl DeviceSession {
             layer.out.expect("out"),
         );
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
-        shared.project_matrix(&qkv, self.scratch.normed, self.scratch.qkv, rows)?;
+        shared.project_matrix(&qkv, self.scratch.normed, self.scratch.qkv, rows, quant)?;
+        clock.mark("  gdn qkv", drain)?;
         if debug {
             self.report("gdn qkv", self.scratch.qkv, fused)?;
         }
-        shared.project_matrix(&z, self.scratch.normed, self.scratch.z, rows)?;
+        shared.project_matrix(&z, self.scratch.normed, self.scratch.z, rows, quant)?;
+        clock.mark("  gdn z", drain)?;
         if debug {
             self.report("gdn z", self.scratch.z, value_width)?;
         }
         shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
+        shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
+        clock.mark("  gdn ba", drain)?;
         if debug {
             self.report("gdn b", self.scratch.b, config.linear.value_heads)?;
-        }
-        shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
-        if debug {
-            self.report("gdn a", self.scratch.a, config.linear.value_heads)?;
         }
         let conv = state.conv.expect("conv state");
         let recurrent = state.recurrent.expect("recurrent state");
@@ -1748,6 +2032,7 @@ impl DeviceSession {
                 0,
             ],
         )?;
+        clock.mark("  gdn conv", drain)?;
         if debug {
             self.report("gdn conv", self.scratch.conv_out, fused)?;
         }
@@ -1778,10 +2063,12 @@ impl DeviceSession {
                 0,
             ],
         )?;
+        clock.mark("  gdn recur", drain)?;
         if debug {
             self.report("gdn recur", self.scratch.gdn_out, value_width)?;
         }
-        shared.project_matrix(&out, self.scratch.gdn_out, self.scratch.attention, rows)?;
+        shared.project_matrix(&out, self.scratch.gdn_out, self.scratch.attention, rows, quant)?;
+        clock.mark("  gdn out", drain)?;
         if debug {
             self.report("gdn out", self.scratch.attention, config.hidden_size)?;
         }
