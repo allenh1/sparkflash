@@ -18,6 +18,7 @@
 //! can be exercised as a library, with injected probes, without spawning a process.
 
 pub mod allocator;
+pub mod arms;
 #[cfg(feature = "cuda")]
 pub use sparkflash_deepseek_forward::attention_device;
 pub mod attn_seam_weights;
