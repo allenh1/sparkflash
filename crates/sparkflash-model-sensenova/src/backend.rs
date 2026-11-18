@@ -84,6 +84,7 @@ impl ModelBackend for SenseNovaHostBackend {
             context: self.context,
             sampler: Sampler::new(),
             sampling: Sampling::default(),
+            held: Vec::new(),
         }))
     }
 }
@@ -96,6 +97,9 @@ struct SenseNovaSession {
     sampling: Sampling,
     /// The ids that end the sequence, from the checkpoint's own configuration.
     eos: Vec<u32>,
+    /// Every id this state has forwarded and still holds, in order ([ModelSession]
+    /// `reusable_prefix`).
+    held: Vec<u32>,
 }
 
 impl SenseNovaSession {
@@ -143,8 +147,9 @@ impl ModelSession for SenseNovaSession {
         for token in tokens {
             logits = self.forward(*token)?;
         }
+        self.held.extend_from_slice(tokens);
         self.sampler.reset();
-        self.sampler.record_prompt(tokens);
+        self.sampler.record_prompt(&self.held);
         let next_token = self.next(&logits);
         Ok(StepOutput {
             next_token,
@@ -155,6 +160,7 @@ impl ModelSession for SenseNovaSession {
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
         let logits = self.forward(token)?;
+        self.held.push(token);
         self.sampler.record(token);
         let next_token = self.next(&logits);
         Ok(StepOutput {
@@ -164,7 +170,9 @@ impl ModelSession for SenseNovaSession {
         })
     }
 
+    /// The ids this reference state already covers, so a follow-up turn forwards only its own
+    /// suffix instead of walking the whole conversation again.
     fn reusable_prefix(&self) -> Option<&[u32]> {
-        None
+        Some(self.held.as_slice())
     }
 }

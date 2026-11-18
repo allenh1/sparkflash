@@ -1245,6 +1245,15 @@ struct DeviceSession {
     sampling: Sampling,
     /// The ids that end the sequence: `<|im_end|>` and `<|endoftext|>` from the checkpoint.
     eos: Vec<u32>,
+    /// The rewind point: the linear visits' states at the end of the last prompt.
+    checkpoint: sparkflash_kernels::checkpoint::Checkpoint,
+    /// How many prompt ids the rewind point covers, reported as the cache hit.
+    cached: usize,
+    /// Every id this state has forwarded and still holds, in order.
+    ///
+    /// The per-visit KV caches and GDN recurrent states cover exactly these positions, so this is
+    /// the prefix a following request may continue from ([ModelSession::reusable_prefix]).
+    held: Vec<u32>,
 }
 
 impl Drop for DeviceSession {
@@ -1280,6 +1289,24 @@ impl DeviceSession {
         let value = config.linear_value_width();
         let mut pointers = Vec::new();
         let mut allocated = shared.allocated;
+        // The rewind point copies each linear visit's convolution and recurrent state. The KV
+        // caches need nothing: they are written at an index, so a shorter position reads only
+        // what was written before it. The copies are what let a follow-up turn go back to the end
+        // of the last prompt instead of re-prefilling the whole conversation.
+        let mut region_sizes = Vec::new();
+        for physical in config.execution_plan() {
+            if config.layer_types[physical] == LayerType::Linear {
+                region_sizes.push(config.linear.conv_kernel.saturating_sub(1) * fused * 4);
+                region_sizes.push(
+                    config.linear.value_heads * config.linear.key_dim * config.linear.value_dim * 4,
+                );
+            }
+        }
+        let arena_bytes = sparkflash_kernels::checkpoint::Checkpoint::arena_bytes(&region_sizes);
+        let arena = shared.cuda.alloc(arena_bytes, &mut allocated)?;
+        pointers.push(arena);
+        let checkpoint =
+            sparkflash_kernels::checkpoint::Checkpoint::new(arena, region_sizes);
         let mut alloc = |bytes: usize| -> Result<Deviceptr, String> {
             let pointer = shared.cuda.alloc(bytes, &mut allocated)?;
             pointers.push(pointer);
@@ -1425,6 +1452,9 @@ impl DeviceSession {
             sampler: Sampler::new(),
             sampling: Sampling::default(),
             eos,
+            held: Vec::new(),
+            checkpoint,
+            cached: 0,
         };
         session.graph = session.capture_graph();
         Ok(session)
@@ -2348,6 +2378,65 @@ impl ModelBackend for SenseNovaDeviceBackend {
 }
 
 impl DeviceSession {
+    /// The live regions the rewind point copies, in the order their sizes were computed.
+    fn point_regions(&self) -> Vec<Deviceptr> {
+        let mut live = Vec::new();
+        for visit in &self.visits {
+            if let (Some(conv), Some(recurrent)) = (visit.conv, visit.recurrent) {
+                live.extend([conv, recurrent]);
+            }
+        }
+        live
+    }
+
+    /// Copies the recurrent states to the arena, as the state at the end of a prompt.
+    fn save_point(&mut self) -> Result<(), BackendError> {
+        let live = self.point_regions();
+        let point = self.held.len();
+        self.checkpoint
+            .save(&self.shared.cuda, None, &live, point)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        Ok(())
+    }
+
+    /// Puts the recurrent states back to `point`, undoing everything past it.
+    fn rewind(&mut self, point: usize) -> Result<(), BackendError> {
+        let live = self.point_regions();
+        self.checkpoint
+            .restore(&self.shared.cuda, None, &live, point)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        self.position = point;
+        self.held.truncate(point);
+        self.checkpoint.forget();
+        Ok(())
+    }
+
+    /// Clears the recurrent states, so a prompt that matches nothing starts from zero.
+    fn restart(&mut self) -> Result<(), BackendError> {
+        let config = &self.shared.config;
+        let conv_bytes = config.linear.conv_kernel.saturating_sub(1)
+            * config.linear_projection_width()
+            * 4;
+        let recurrent_bytes = config.linear.value_heads
+            * config.linear.key_dim
+            * config.linear.value_dim
+            * 4;
+        for visit in &self.visits {
+            for (region, bytes) in [(visit.conv, conv_bytes), (visit.recurrent, recurrent_bytes)] {
+                if let Some(region) = region {
+                    self.shared
+                        .cuda
+                        .memset_d8_async(region, 0, bytes)
+                        .map_err(|error| BackendError::new(DEVICE, error))?;
+                }
+            }
+        }
+        self.position = 0;
+        self.held.clear();
+        self.checkpoint.forget();
+        Ok(())
+    }
+
     /// Chooses the next token, ending the sequence at an end-of-generation id.
     ///
     /// The released configuration names two stop ids (`<|endoftext|>` and `<|im_end|>`), and the
@@ -2375,17 +2464,43 @@ impl ModelSession for DeviceSession {
         if tokens.is_empty() {
             return Err(BackendError::new(DEVICE, "an empty prompt"));
         }
+        // Where this prompt takes up the state: past everything it holds, past the end of the
+        // last prompt (a rewind), or nowhere (a fresh start).
+        let current = self.position == self.held.len();
+        let point = self.checkpoint.point();
+        let start = match sparkflash_runtime::fused::resume(&self.held, current, point, tokens) {
+            Some(sparkflash_runtime::fused::Resume::Extend(at)) => at,
+            Some(sparkflash_runtime::fused::Resume::Rewind(at)) => {
+                self.rewind(at)?;
+                at
+            }
+            // Nothing of the state serves this prompt: restart it. The KV caches are written
+            // at an index, so only the recurrent states have to be cleared.
+            None if !self.held.is_empty() => {
+                self.restart()?;
+                0
+            }
+            None => 0,
+        };
+        // The hit this request reports: the ids it did not have to forward.
+        self.cached = start;
         // A prompt runs in chunks of ROWS: every projection then reads its weights once for the
         // whole chunk, and the causal attention the kernels implement makes the rows of one
         // chunk exactly the rows of the one-token steps they stand in for.
         let mut logits = Vec::new();
-        for chunk in tokens.chunks(PREFILL_ROWS) {
+        for chunk in tokens[start..].chunks(PREFILL_ROWS) {
             let all = self.forward_rows(chunk)?;
             // A chunk under the verify tile returns every row; only the last one predicts.
             logits = all[all.len() - self.shared.config.vocab_size..].to_vec();
         }
+        self.held.extend_from_slice(&tokens[start..]);
+        // The history is everything the state holds, not just this call's ids: a following
+        // request forwards only the part its prompt adds, and a penalty must still see the
+        // tokens in front of it or a continued turn samples differently from a cold one.
         self.sampler.reset();
-        self.sampler.record_prompt(tokens);
+        self.sampler.record_prompt(&self.held);
+        // The prompt is consumed: this is the point a later turn may come back to.
+        self.save_point()?;
         let next_token = self.next(&logits);
         Ok(StepOutput {
             next_token,
@@ -2405,6 +2520,7 @@ impl ModelSession for DeviceSession {
             ));
         }
         let logits = self.forward_rows(&[token])?;
+        self.held.push(token);
         self.sampler.record(token);
         let next_token = self.next(&logits);
         Ok(StepOutput {
@@ -2414,7 +2530,24 @@ impl ModelSession for DeviceSession {
         })
     }
 
+    /// The end of the last prompt, which the rewind point holds and a prompt may go back to.
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        let point = self.checkpoint.point()?;
+        (point < self.position && point <= self.held.len()).then(|| &self.held[..point])
+    }
+
+    /// The prompt ids the state answered from, reported as the request's cache hit.
+    fn cached_tokens(&self) -> usize {
+        self.cached
+    }
+
+    /// The ids every visit's cache and recurrent state already cover.
+    ///
+    /// Nothing is left pending - a decode step consumes the token it is handed and returns the
+    /// next one - so the held history is exactly the state's position. Reporting it is what lets
+    /// the serving adapter hand a follow-up turn to this session instead of re-prefilling the
+    /// whole conversation: without it every request was a fresh sequence.
     fn reusable_prefix(&self) -> Option<&[u32]> {
-        None
+        Some(self.held.as_slice())
     }
 }
