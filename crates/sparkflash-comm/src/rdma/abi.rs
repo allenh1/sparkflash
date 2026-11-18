@@ -108,8 +108,11 @@ pub enum GidKind {
     /// A RoCEv2 IPv4 GID, `::ffff:a.b.c.d`. This is the family an IPv4 RoCEv2 GID index reports
     /// and the family the live cluster uses (vLLM sets `NCCL_IB_GID_INDEX=3`).
     RoceV2Ipv4([u8; 4]),
-    /// Any other 128-bit GID (IPv6 link-local or global, or a vendor form). Reported, not assumed.
-    OtherIpv6,
+    /// An IPv6 GID, link-local (`fe80::/10`, the entry every RoCE port lists) or global. The
+    /// address vector is the same as for an IPv4 GID (global routing, the peer's GID as the
+    /// destination); the rail's open checks that the entry is RoCE v2 and names that rail's own
+    /// interface.
+    Ipv6,
 }
 
 impl IbvGid {
@@ -123,7 +126,7 @@ impl IbvGid {
         if raw[..10].iter().all(|byte| *byte == 0) && raw[10] == 0xff && raw[11] == 0xff {
             return GidKind::RoceV2Ipv4([raw[12], raw[13], raw[14], raw[15]]);
         }
-        GidKind::OtherIpv6
+        GidKind::Ipv6
     }
 
     /// Human-readable form for bring-up reports and errors.
@@ -135,7 +138,7 @@ impl IbvGid {
                 "RoCEv2 IPv4 {}.{}.{}.{}",
                 octets[0], octets[1], octets[2], octets[3]
             ),
-            GidKind::OtherIpv6 => {
+            GidKind::Ipv6 => {
                 let mut text = String::with_capacity(16 * 3);
                 for (index, byte) in self.raw.iter().enumerate() {
                     if index != 0 && index % 2 == 0 {
@@ -987,7 +990,7 @@ mod tests {
         ipv6[1] = 0x80;
         ipv6[15] = 1;
         let gid = IbvGid { raw: ipv6 };
-        assert_eq!(gid.kind(), GidKind::OtherIpv6);
+        assert_eq!(gid.kind(), GidKind::Ipv6);
         assert!(gid.describe().starts_with("fe80"));
     }
 

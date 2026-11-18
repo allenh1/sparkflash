@@ -33,7 +33,9 @@
 //!    port that is not ACTIVE at 200 Gb/s or faster, and lets `SPARKFLASH_RAIL_DEVICES` pin the
 //!    f1 twins on a host whose f0 functions are DOWN;
 //! 2. dlopen libibverbs, open the rail devices by their measured names, query port 1 (state, link
-//!    layer, negotiated MTU) and GID index 3 (the RoCEv2 IPv4 GID the deployed vLLM recipe uses);
+//!    layer, negotiated MTU) and the configured GID index (3 by default, the RoCEv2 IPv4 GID the
+//!    deployed vLLM recipe uses; the link-local RoCEv2 IPv6 GID, index 1, where a rail's IPv4 GID
+//!    does not resolve with the host's routing);
 //! 3. allocate one PD, one CQ, one MR over a bounded staging buffer and one RC QP per peer per rail;
 //! 4. exchange the per-(rail, peer) QP numbers, GIDs, staging addresses and remote keys over the
 //!    TCP control plane in [`qpinfo`];
@@ -114,7 +116,10 @@ pub struct RdmaConfig {
     pub peers: Vec<String>,
     /// Port rank 0 listens on and every rank connects to.
     pub control_port: u16,
-    /// GID table index used for the RoCEv2 IPv4 GID.
+    /// GID table index of the RoCEv2 GID every rail opens: `SPARK_COMM_GID_INDEX`, else the
+    /// `NCCL_IB_GID_INDEX` the site gave the collective group, else [DEFAULT_GID_INDEX]. An IPv4
+    /// (`::ffff:a.b.c.d`) or an IPv6 entry, link-local or global ([`open_rail`] checks either
+    /// against the rail's interface).
     pub gid_index: u8,
     /// HCA port number.
     pub port: u8,
@@ -191,7 +196,7 @@ impl RdmaConfig {
             rank,
             peers,
             control_port: env_parsed("SPARK_COMM_CONTROL_PORT", DEFAULT_CONTROL_PORT)?,
-            gid_index: env_parsed("SPARK_COMM_GID_INDEX", DEFAULT_GID_INDEX)?,
+            gid_index: env_parsed("SPARK_COMM_GID_INDEX", nccl_gid_index()?)?,
             port: env_parsed("SPARK_COMM_RDMA_PORT", DEFAULT_RDMA_PORT)?,
             rail_count: std::env::var("SPARK_COMM_RAIL_COUNT")
                 .ok()
@@ -269,6 +274,17 @@ where
         }),
         _ => Ok(default),
     }
+}
+
+/// The GID index the collective group was given (`NCCL_IB_GID_INDEX`), which the exchange takes
+/// when `SPARK_COMM_GID_INDEX` does not say: one site setting puts both transports on the GID
+/// that routes, and the launchers already forward it to every rank. [DEFAULT_GID_INDEX] when
+/// neither is set.
+///
+/// # Errors
+/// [`CommError::InvalidLayout`] for a value that is not an index.
+fn nccl_gid_index() -> Result<u8, CommError> {
+    env_parsed("NCCL_IB_GID_INDEX", DEFAULT_GID_INDEX)
 }
 
 /// Reads the live sysfs fabric and resolves the rails this host should register.
@@ -384,15 +400,43 @@ pub(crate) fn open_rail(
                 }
             }
         }
-        abi::GidKind::OtherIpv6 => {
-            // Refused rather than guessed at: the backend builds RoCEv2 IPv4 AH
-            // attributes (hop limit, is_global, sgid_index), and a different GID family
-            // would produce a QP that connects but never carries a packet.
-            return Err(CommError::FabricUnavailable(format!(
-                "rail {rail_index} device {name} GID index {} is an IPv6 GID ({}); this backend builds RoCEv2 IPv4 address vectors only (the deployed vLLM recipe uses GID index 3, the ::ffff:a.b.c.d form)",
-                config.gid_index,
-                gid.describe()
-            )));
+        abi::GidKind::Ipv6 => {
+            // The address vector does not depend on the family (global routing, the peer's GID
+            // as the destination, this index as the source), so an IPv6 GID carries the same
+            // traffic; the link-local one is what NCCL runs on (NCCL_IB_GID_INDEX=1) where a
+            // rail's IPv4 GID does not resolve with the host's routing. Two checks stand in for
+            // the IPv4 arm's. The entry must be RoCE v2: a port lists its link-local address
+            // twice, RoCE v1 at one index and v2 at the next, and a v1 entry builds a queue pair
+            // this RoCEv2 backend's peers never reach. And the address must be one the rail's
+            // netdev carries, or the index names another interface.
+            match gid_type(&name, config.port, config.gid_index) {
+                Some(kind) if kind.eq_ignore_ascii_case("RoCE v2") => {}
+                Some(kind) => {
+                    return Err(CommError::FabricUnavailable(format!(
+                        "rail {rail_index} device {name}: GID index {} ({}) is a {kind} entry; this backend speaks RoCEv2 (point SPARK_COMM_GID_INDEX at the RoCE v2 entry of the same address)",
+                        config.gid_index,
+                        gid.describe()
+                    )));
+                }
+                None => eprintln!(
+                    "sparkflash rdma: rail {rail_index} device {name}: the type of GID index {} ({}) is not readable from sysfs, so a RoCE v1 entry on this rail would build a queue pair that connects and never delivers",
+                    config.gid_index,
+                    gid.describe()
+                ),
+            }
+            let bound = netdev_ipv6(&netdev);
+            if bound.is_empty() {
+                eprintln!(
+                    "sparkflash rdma: rail {rail_index} device {name}: {netdev} has no IPv6 address to check GID index {} against, so a wrong index on this rail would build a queue pair that connects and never delivers",
+                    config.gid_index
+                );
+            } else if !bound.contains(&gid.raw) {
+                return Err(CommError::FabricUnavailable(format!(
+                    "rail {rail_index} device {name}: GID index {} is {}, which {netdev} does not carry: the index names another interface's address, which builds a queue pair that connects and never delivers (point SPARK_COMM_GID_INDEX at this rail's GID)",
+                    config.gid_index,
+                    gid.describe()
+                )));
+            }
         }
     }
     Ok(OpenedRail {
@@ -409,32 +453,64 @@ pub(crate) fn open_rail(
 /// A small `getifaddrs` walk rather than a shell-out: this runs once per rail at open, but it is
 /// the only cross-check between a GID index and the interface it is supposed to name.
 fn netdev_ipv4(netdev: &str) -> Option<[u8; 4]> {
+    let mut found = None;
+    netdev_addresses(netdev, libc::AF_INET, |address| {
+        // SAFETY: the walk hands over only AF_INET entries, whose address is a sockaddr_in.
+        let socket = unsafe { &*address.cast::<libc::sockaddr_in>() };
+        found.get_or_insert(socket.sin_addr.s_addr.to_ne_bytes());
+    });
+    found
+}
+
+/// Every IPv6 address bound to `netdev` (its link-local one and any other), as GID bytes.
+fn netdev_ipv6(netdev: &str) -> Vec<[u8; 16]> {
+    let mut found = Vec::new();
+    netdev_addresses(netdev, libc::AF_INET6, |address| {
+        // SAFETY: the walk hands over only AF_INET6 entries, whose address is a sockaddr_in6.
+        let socket = unsafe { &*address.cast::<libc::sockaddr_in6>() };
+        found.push(socket.sin6_addr.s6_addr);
+    });
+    found
+}
+
+/// Calls `each` with every `family` address bound to `netdev`, in `getifaddrs` order.
+fn netdev_addresses(
+    netdev: &str,
+    family: libc::c_int,
+    mut each: impl FnMut(*const libc::sockaddr),
+) {
     // SAFETY: getifaddrs fills a list this function walks and frees; every pointer it reads is
-    // checked for null and the address family before it is cast.
+    // checked for null and the address family before it is handed on.
     unsafe {
         let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut list) != 0 || list.is_null() {
-            return None;
+            return;
         }
-        let mut found = None;
         let mut node = list;
         while !node.is_null() {
             let entry = &*node;
             if !entry.ifa_addr.is_null()
-                && (*entry.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
+                && (*entry.ifa_addr).sa_family == family as libc::sa_family_t
                 && !entry.ifa_name.is_null()
                 && std::ffi::CStr::from_ptr(entry.ifa_name).to_string_lossy() == netdev
             {
-                let socket = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
-                let octets = socket.sin_addr.s_addr.to_ne_bytes();
-                found = Some(octets);
-                break;
+                each(entry.ifa_addr.cast_const());
             }
             node = entry.ifa_next;
         }
         libc::freeifaddrs(list);
-        found
     }
+}
+
+/// The RoCE type sysfs lists for GID `index` of `device`'s `port` (`"RoCE v2"`, `"IB/RoCE v1"`),
+/// or `None` when it cannot be read.
+fn gid_type(device: &str, port: u8, index: u8) -> Option<String> {
+    std::fs::read_to_string(format!(
+        "{SYSFS_INFINIBAND_ROOT}/{device}/ports/{port}/gid_attrs/types/{index}"
+    ))
+    .ok()
+    .map(|kind| kind.trim().to_owned())
+    .filter(|kind| !kind.is_empty())
 }
 
 /// Refuses a registration whose base is not the address it was asked to cover: every remote offset
