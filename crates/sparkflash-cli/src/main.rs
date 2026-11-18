@@ -16,8 +16,8 @@
 //!
 //! The binary is a thin dispatcher: each subcommand is one arm here and the logic lives in
 //! the crate that owns it, so everything the binary can do is also reachable as a library call
-//! and testable without a process. `models`, `doctor`, `trace`, `pack-engram` and `serve` are
-//! implemented today.
+//! and testable without a process. `models`, `onboard`, `doctor`, `trace`, `pack-engram` and
+//! `serve` are implemented today.
 //!
 //! The arms parse differently on purpose. `doctor` parses its own arguments inside
 //! `sparkflash_cli::doctor` because it takes a repeated `--nodes` list and echoes probe output
@@ -31,7 +31,7 @@
 use std::process::ExitCode;
 
 use clap::Parser;
-use sparkflash_cli::{arms, convert, device_chain, doctor, inkling_tp4, models, serve};
+use sparkflash_cli::{arms, convert, device_chain, doctor, inkling_tp4, models, onboard, serve};
 use sparkflash_engram::packer::{CliArgs, run_cli};
 
 /// `pack-engram` options, shared verbatim with the standalone binary.
@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         Some("pack-engram") => pack_engram(args),
         Some("convert") => convert::run(args),
         Some("models") => models::run(),
+        Some("onboard") => onboard::run(args),
         Some("arms") => arms::run(args),
         Some("serve") => serve::run(args),
         Some("device-chain") => device_chain::run(args),
@@ -69,7 +70,7 @@ fn main() -> ExitCode {
         Some("--web") | Some("web") => sparkflash_web::run(args),
         _ => {
             println!(
-                "sparkflash: usage: sparkflash <models|arms|--web|doctor|trace|pack-engram|convert|serve|device-chain|inkling-tp4>"
+                "sparkflash: usage: sparkflash <models|onboard|arms|--web|doctor|trace|pack-engram|convert|serve|device-chain|inkling-tp4>"
             );
             ExitCode::SUCCESS
         }

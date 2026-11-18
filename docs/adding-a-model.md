@@ -383,31 +383,32 @@ time and refuses `--concurrency` and `--fuse-batch`. `--kv-budget-gib` is refuse
 and an arm without a fused batch or a KV budget says so at TP=1. A directory of rank files named by an environment variable resolves through
 `converted_rank_file`, which refuses a directory that holds no file for the rank.
 
-## 6. Checklist
+## 6. What you supply
 
-- [ ] the released `config.json` parses through `Architecture`, and every string it selects is
-      one this build knows;
-- [ ] the arm's `Architecture::parts()` is a subset of the build's catalogue, or the missing parts
-      are named in the refusal;
-- [ ] the config parses, validates, and its boot summary is in the startup log;
-- [ ] nothing in section 5 is reimplemented in the arm;
-- [ ] no `.cu`/`.cuh` and no kernel build script in the model crate;
-- [ ] no dependency on another model crate;
-- [ ] every op is a plan, validated before its first launch, and the scan launches the rank
-      plan's `ScanPlan` (section 2b);
-- [ ] the arm serves through `FusedArm` (and `RoundArm` to draft), and its ledger states every
-      strategy it runs, so the boot line shows none as `the arm does not state it`;
-- [ ] BF16 projections route through `sparkflash_ops::projection` with a `WidePolicy`; a split-K or
-      FP8 tile launches through `SplitTile` / `Fp8Tile`, and GQA attention through `GqaBody`;
-- [ ] `scripts/served-gate.py all PORT --long FILE` passes on the served arm, and its `lanes` and
-      `interleave` digests are kept (`--out`) as the baseline the next build must equal;
-- [ ] the parity harness passes layer by layer against the host reference;
-- [ ] new environment aliases are in `ENV_OVERRIDES` and documented here;
-- [ ] the arm is registered in the model registry and has a descriptor;
-- [ ] every profile override the arm adds is classified in `sparkflash_model::numerics` as
-      arithmetic or neutral, and each configuration it serves has a captured reference in
-      `numerics/registry.toml` ([NUMERICS.md](NUMERICS.md));
-- [ ] the arm's profile names its registry model (`model`, section 3).
+Only what this family alone has:
+
+- how its released config maps onto parts (`Architecture`);
+- the arithmetic of a part no other model has;
+- its weight names, tokenizer and chat template.
+
+Everything else is read from one registration or refused by the compiler:
+
+- **The compiler.** `sparkflash_ops::parts::{CATALOGUE, WAIVERS}` and the const assertion over
+  `Part::ALL` make a GEMM-class part without a tensor-core body, or without a `WAIVERS` line
+  naming the gap and its measurement, a compile error. `Architecture::parts()` is the only
+  description of what the model needs; `parts::missing` is the catalogue's answer.
+- **The `ARMS` table.** `sparkflash_model::ARMS` is the one model registration: arm id, model
+  id, weights, profile, default context, ledger, tokenizer and chat template, and conversion
+  defaults. `MODELS` is the descriptor list. `DEFAULTS` holds DeepSeek's measured defaults; an
+  arm profile departs from one only with `measured = "docs/…"`.
+- **`sparkflash onboard ORG/REPO`.** Before any code is written it prints the parts `CATALOGUE`
+  already has, the parts that need a `PartExec` (no tensor-core body in a pass and no `WAIVERS`
+  line), the stored format of each weight class, the fit at TP 1, 2 and 4, and the stored
+  bytes-per-token floor from `stored_bytes_floor`/`bytes_per_token_floor`. `--config FILE`
+  reads a document from disk; otherwise it uses the hub cache and only then the Hub.
+- **`scripts/onboard-gate.sh <arm>`.** Runs `scripts/served-gate.py all` and writes the first
+  numerics reference through `scripts/numerics.py`, the registry's authority. It prints the exact
+  commands (dry run by default) and states that the generated conformance runner is still a stub.
 
 ## 7. The dynamic Hugging Face path (no new arm)
 

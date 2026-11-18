@@ -37,6 +37,7 @@ pub use sparkflash_deepseek_forward::layer_attention_stages;
 pub use sparkflash_deepseek_forward::layer_device;
 pub use sparkflash_deepseek_forward::logits_dump;
 pub mod models;
+pub mod onboard;
 #[cfg(feature = "cuda")]
 pub use sparkflash_deepseek_forward::moe_device;
 pub use sparkflash_deepseek_forward::resident_weights;
