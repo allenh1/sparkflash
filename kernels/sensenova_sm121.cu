@@ -731,6 +731,16 @@ extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_wide(
     sensenova_dense_fp4_body<128, 256, 4, 2, 4>(w, ws, a, as, out, cols, inner, tokens);
 }
 
+// A 256-row x 128-column block, eight warps of 64 x 64: the tall form. Its 256 rows halve the
+// column tiles a chunk reads the weights for, and it reaches 300 TFLOPS on a 4,096-wide
+// projection where the 128-row tile's 32 columns stop at 262.
+extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_tall(
+    const uint8_t* __restrict__ w, const uint8_t* __restrict__ ws, const uint8_t* __restrict__ a,
+    const uint8_t* __restrict__ as, float* __restrict__ out, unsigned int cols,
+    unsigned int inner, unsigned int tokens) {
+    sensenova_dense_fp4_body<256, 128, 6, 4, 2>(w, ws, a, as, out, cols, inner, tokens);
+}
+
 // A 128-row x 128-column block, eight warps of 64 x 32: the narrow form, whose 32 column tiles
 // fill the card where the wide one's 16 would not.
 extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_narrow(
@@ -1021,6 +1031,135 @@ extern "C" __global__ void sensenova_gdn_conv(const float* __restrict__ raw,
         for (int back = 1; back <= history; ++back) {
             state[(history - back) * width + column] = held[history - back];
         }
+    }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Full attention over a prefill chunk.
+//
+// sensenova_attn_full_q8 gives one block to a (head, row, split), so the 8-bit K and V are
+// decoded once per query row and 131k blocks run for a 512-row chunk: 17 ms of a 100 ms chunk.
+// Here a block is a head's eight query rows at once, a warp a row, and the K/V tile a 64-key
+// slice staged once in shared for all eight: the decode is amortised eight ways and the blocks
+// fall to a few thousand. The softmax is online against a running maximum, as the split form's is.
+#define SENSENOVA_PREFILL_ROWS 8
+#define SENSENOVA_PREFILL_TILE 64
+
+extern "C" __global__ void sensenova_attn_prefill(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const unsigned char* __restrict__ keys, const unsigned char* __restrict__ values,
+    const float* __restrict__ k_scales, const float* __restrict__ v_scales,
+    float* __restrict__ out, const int* __restrict__ position, int heads, int kv_heads,
+    int head_dim, int groups, int rows) {
+    __shared__ unsigned char sh_k[SENSENOVA_PREFILL_TILE][256];
+    __shared__ unsigned char sh_v[SENSENOVA_PREFILL_TILE][256];
+    __shared__ float sh_ks[SENSENOVA_PREFILL_TILE];
+    __shared__ float sh_vs[SENSENOVA_PREFILL_TILE];
+    __shared__ float sh_q[SENSENOVA_PREFILL_ROWS][256];
+    __shared__ float sh_logits[SENSENOVA_PREFILL_ROWS][SENSENOVA_PREFILL_TILE];
+    const int head = blockIdx.x;
+    const int first_row = blockIdx.y * SENSENOVA_PREFILL_ROWS;
+    const int lane = threadIdx.x & 31u;
+    const int warp = threadIdx.x >> 5u;
+    if (head_dim != 256 || warp >= SENSENOVA_PREFILL_ROWS) return;
+    const int kv_head = head / (groups > 0 ? groups : 1);
+    const int row = first_row + warp;
+    const bool active = row < rows;
+    const int last_row = first_row + min(SENSENOVA_PREFILL_ROWS, rows - first_row);
+    const int limit = *position + last_row;   // the last key any row of the group sees
+    const int kv_row = kv_heads * 256;
+    const float scale = 1.0f / sqrtf(256.0f);
+    const int dims = lane * 8;   // this lane's eight head dimensions
+
+    for (int index = threadIdx.x; index < SENSENOVA_PREFILL_ROWS * 256; index += blockDim.x) {
+        const int r = index / 256;
+        const int d = index - r * 256;
+        const int at = first_row + r;
+        sh_q[r][d] = at < rows ? q[((unsigned long long)at * heads + head) * 256 + d] : 0.0f;
+    }
+    __syncthreads();
+
+    float held[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) held[i] = active ? sh_q[warp][dims + i] : 0.0f;
+    float accumulator[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) accumulator[i] = 0.0f;
+    float maximum = -INFINITY;
+    float sum = 0.0f;
+    const int visible = active ? *position + row + 1 : 0;
+
+    for (int base = 0; base < limit; base += SENSENOVA_PREFILL_TILE) {
+        const int count = min(SENSENOVA_PREFILL_TILE, limit - base);
+        __syncthreads();
+        for (int index = threadIdx.x; index < count * 256; index += blockDim.x) {
+            const int slot = index / 256;
+            const int d = index - slot * 256;
+            const unsigned long long src = (unsigned long long)(base + slot) * kv_row + kv_head * 256 + d;
+            sh_k[slot][d] = keys[src];
+            sh_v[slot][d] = values[src];
+        }
+        if (threadIdx.x < count) {
+            sh_ks[threadIdx.x] = k_scales[(unsigned long long)(base + threadIdx.x) * kv_heads + kv_head];
+            sh_vs[threadIdx.x] = v_scales[(unsigned long long)(base + threadIdx.x) * kv_heads + kv_head];
+        }
+        __syncthreads();
+        if (!active) continue;
+        // This row's logits for the tile: a lane takes the slots it can see and reduces the
+        // eight-dimension product across the warp, so every lane then holds each slot's sum.
+        float tile_max = -INFINITY;
+        for (int slot = lane; slot < count; slot += 32) {
+            const int at = base + slot;
+            float dot = 0.0f;
+            if (at < visible) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    dot += held[i] * sensenova_e4m3(sh_k[slot][dims + i]);
+                }
+#pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, offset);
+                }
+                dot *= sh_ks[slot] * scale;
+            } else {
+                dot = -INFINITY;
+            }
+            sh_logits[warp][slot] = dot;
+            tile_max = fmaxf(tile_max, dot);
+        }
+        __syncwarp();
+        // The tile's logits are all in shared: fold them into the running maximum and sum.
+        float slot_max = -INFINITY;
+        for (int slot = 0; slot < count; ++slot) slot_max = fmaxf(slot_max, sh_logits[warp][slot]);
+        const float next = fmaxf(maximum, slot_max);
+        const float rescale = __expf(maximum - next);
+        float tile_sum = 0.0f;
+        for (int slot = 0; slot < count; ++slot) {
+            const float weight = __expf(sh_logits[warp][slot] - next);
+            sh_logits[warp][slot] = weight;
+            tile_sum += weight;
+        }
+        sum = sum * rescale + tile_sum;
+        maximum = next;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) accumulator[i] *= rescale;
+        for (int slot = 0; slot < count; ++slot) {
+            const float weight = sh_logits[warp][slot] * sh_vs[slot];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                accumulator[i] += weight * sensenova_e4m3(sh_v[slot][dims + i]);
+            }
+        }
+        __syncwarp();
+    }
+    if (!active) return;
+    const unsigned long long at = ((unsigned long long)row * heads + head) * 256;
+    const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (int i = 0; i < 8; ++i) {
+        const float value = accumulator[i] * inverse;
+        const float g = gate[at + dims + i];
+        out[at + dims + i] = value / (1.0f + __expf(-g));
     }
 }
 

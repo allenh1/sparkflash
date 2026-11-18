@@ -193,6 +193,7 @@ struct Kernels {
     cache_q8: Kernel,
     attn_q8: Kernel,
     attn_combine: Kernel,
+    attn_prefill: Kernel,
     mhc_pre: Kernel,
     mhc_post: Kernel,
     mhc_leave: Kernel,
@@ -207,6 +208,7 @@ struct Kernels {
     quant_fp4: Option<Kernel>,
     quant_weights_fp4: Option<Kernel>,
     dense_fp4_wide: Option<Kernel>,
+    dense_fp4_tall: Option<Kernel>,
     dense_fp4_narrow: Option<Kernel>,
 }
 
@@ -906,14 +908,15 @@ impl DeviceShared {
     ) -> Result<(), BackendError> {
         // The prefill tile: a char-complete 128-row chunk through the NVFP4 GEMM. The activation
         // is quantised into the caller's scratch block first, one block scale a 16 values.
-        if rows >= 128
-            && rows % 128 == 0
+        if rows > GEMV_MAX_BATCH
+            && rows <= PREFILL_ROWS
             && matrix.rows % 128 == 0
             && matrix.columns % 128 == 0
             && let Some((codes, scales)) = matrix.fp4
-            && let (Some(quantise), Some(wide), Some(narrow)) = (
+            && let (Some(quantise), Some(wide), Some(tall), Some(narrow)) = (
                 self.kernels.quant_fp4,
                 self.kernels.dense_fp4_wide,
+                self.kernels.dense_fp4_tall,
                 self.kernels.dense_fp4_narrow,
             )
         {
@@ -931,17 +934,20 @@ impl DeviceShared {
                 ],
             )?;
             // A 12,288-wide projection fills the card with 256-column tiles; a 4,096-wide one
-            // needs the 128-column form to reach 32 blocks.
-            let (kernel, columns_tile) = if matrix.rows >= 8192 {
-                (wide, 256)
+            // takes the 256-row tile, whose two row passes over the weights beat the four a
+            // 128-row tile needs; a chunk under 256 rows has only the narrow form left.
+            let (kernel, columns_tile, rows_tile) = if matrix.rows >= 8192 {
+                (wide, 256, 128)
+            } else if rows >= 256 && matrix.rows >= 4096 {
+                (tall, 128, 256)
             } else {
-                (narrow, 128)
+                (narrow, 128, 128)
             };
             return self.launch(
                 kernel,
                 (
                     (matrix.rows / columns_tile) as u32,
-                    (rows / 128) as u32,
+                    rows.div_ceil(rows_tile) as u32,
                     1,
                 ),
                 (256, 1, 1),
@@ -1068,6 +1074,9 @@ impl sparkflash_ops::gemv::GemvDevice for DeviceShared {
 /// 256-row operand tile, each a 32-byte row, plus the rows' block scales.
 const DENSE_FP4_WIDE_SHARED: u32 = 4 * (128 * 32 + 256 * 32 + 128 * 4 + 256 * 4);
 
+/// The tall engine's: six stages of a 256-row and a 128-row tile.
+const DENSE_FP4_TALL_SHARED: u32 = 6 * (256 * 32 + 128 * 32 + 256 * 4 + 128 * 4);
+
 /// The narrow engine's: six stages of two 128-row tiles and their scales.
 const DENSE_FP4_NARROW_SHARED: u32 = 6 * (128 * 32 + 128 * 32 + 128 * 4 + 128 * 4);
 
@@ -1127,6 +1136,7 @@ impl Kernels {
             cache_q8: load(sensenova_cubin(), "sensenova_cache_q8")?,
             attn_q8: load(sensenova_cubin(), "sensenova_attn_full_q8")?,
             attn_combine: load(sensenova_cubin(), "sensenova_attn_combine")?,
+            attn_prefill: load(sensenova_cubin(), "sensenova_attn_prefill")?,
             mhc_pre: load(sensenova_cubin(), "sensenova_mhc_pre")?,
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
@@ -1139,6 +1149,7 @@ impl Kernels {
             quant_fp4: optional(cuda, "sensenova_quant_fp4", 0),
             quant_weights_fp4: optional(cuda, "sensenova_quant_weights_fp4", 0),
             dense_fp4_wide: optional(cuda, "sensenova_dense_fp4_wide", DENSE_FP4_WIDE_SHARED),
+            dense_fp4_tall: optional(cuda, "sensenova_dense_fp4_tall", DENSE_FP4_TALL_SHARED),
             dense_fp4_narrow: optional(cuda, "sensenova_dense_fp4_narrow", DENSE_FP4_NARROW_SHARED),
         })
     }
@@ -1947,24 +1958,49 @@ impl DeviceSession {
                     ],
                 )?;
             }
-            shared.launch(
-                shared.kernels.attn_q8,
-                (heads as u32, rows as u32, FULL_SPLITS),
-                (BLOCK, 1, 1),
-                &[
-                    self.scratch.query.0,
-                    keys.0,
-                    values.0,
-                    k_scales.0,
-                    v_scales.0,
-                    self.scratch.partials.0,
-                    self.scratch.position.0,
-                    heads as u64,
-                    kv_heads as u64,
-                    head_dim as u64,
-                    (heads / kv_heads.max(1)) as u64,
-                ],
-            )?;
+            // A chunk takes the eight-rows-a-block form, which decodes the cache once for eight
+            // query rows; a decode step keeps the split kernel (one row, many splits).
+            if rows >= 128 {
+                shared.launch(
+                    shared.kernels.attn_prefill,
+                    (heads as u32, (rows as u32).div_ceil(8), 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.query.0,
+                        self.scratch.gate.0,
+                        keys.0,
+                        values.0,
+                        k_scales.0,
+                        v_scales.0,
+                        self.scratch.attn_out.0,
+                        self.scratch.position.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        head_dim as u64,
+                        (heads / kv_heads.max(1)) as u64,
+                        rows as u64,
+                    ],
+                )?;
+            } else {
+                shared.launch(
+                    shared.kernels.attn_q8,
+                    (heads as u32, rows as u32, FULL_SPLITS),
+                    (BLOCK, 1, 1),
+                    &[
+                        self.scratch.query.0,
+                        keys.0,
+                        values.0,
+                        k_scales.0,
+                        v_scales.0,
+                        self.scratch.partials.0,
+                        self.scratch.position.0,
+                        heads as u64,
+                        kv_heads as u64,
+                        head_dim as u64,
+                        (heads / kv_heads.max(1)) as u64,
+                    ],
+                )?;
+            }
         } else {
             let cache_blocks = kv.div_ceil(256) as u32;
             shared.launch(
@@ -2005,7 +2041,9 @@ impl DeviceSession {
             )?;
         }
         clock.mark("  full attention core", drain)?;
-        if shared.kv_fp8 {
+        // The chunk form gates and normalises inside itself; only the split form needs the
+        // combine pass.
+        if shared.kv_fp8 && rows < 128 {
             shared.launch(
                 shared.kernels.attn_combine,
                 (heads as u32, rows as u32, 1),
@@ -2019,7 +2057,7 @@ impl DeviceSession {
                     head_dim as u64,
                 ],
             )?;
-        } else {
+        } else if !shared.kv_fp8 {
             shared.launch(
                 shared.kernels.attn_full_combine,
                 (heads as u32, 1, 1),
@@ -2071,7 +2109,7 @@ impl DeviceSession {
         // it as a single pass, and the b/a GEMVs it replaced (36 ms a chunk) are gone. Below the
         // tile the three matrices stay separate and take the decode GEMV.
         let (zb_matrix, zb_out, zb_stride) = match layer.zcb {
-            Some(combined) if rows >= 128 => (combined, self.scratch.z, combined.rows),
+            Some(combined) if rows > GEMV_MAX_BATCH => (combined, self.scratch.z, combined.rows),
             _ => (z, self.scratch.z, z.rows),
         };
         shared.project_matrix(&zb_matrix, self.scratch.normed, zb_out, rows, quant)?;
@@ -2080,12 +2118,12 @@ impl DeviceSession {
             self.report("gdn z", self.scratch.z, zb_stride)?;
         }
         // Where the three sit inside the combined output: z from 0, b after it, then a.
-        let (b_base, a_base) = if layer.zcb.is_some() && rows >= 128 {
+        let (b_base, a_base) = if layer.zcb.is_some() && rows > GEMV_MAX_BATCH {
             (self.scratch.z.offset(value_width * 4), self.scratch.z.offset((value_width + 32) * 4))
         } else {
             (self.scratch.b, self.scratch.a)
         };
-        if layer.zcb.is_none() || rows < 128 {
+        if layer.zcb.is_none() || rows <= GEMV_MAX_BATCH {
             shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
             shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
         }
