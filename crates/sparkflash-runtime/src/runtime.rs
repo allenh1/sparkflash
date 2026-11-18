@@ -431,11 +431,13 @@ where
                 }
                 point
             }
-            None => {
-                slot.seq.rewind(0)?;
-                0
-            }
+            None => 0,
         };
+        // A prompt from the start clears the arm's state even when the history was already
+        // empty, as the arm's own prefill did: the lane may hold a rewound prefix.
+        if start == 0 && !matches!(answer, Some(Resume::Rewind(_))) {
+            slot.seq.rewind(0)?;
+        }
         slot.history.truncate(start);
         slot.cached = start;
         if start == 0 {
