@@ -3104,6 +3104,9 @@ struct DeviceSequence {
     linear_a: Deviceptr,
     linear_out: Deviceptr,
     logits: Deviceptr,
+    /// The widened row of the last prompt chunk whose head the runtime has not asked for yet
+    /// ([Self::deferred_logits]).
+    pending_head: Option<Deviceptr>,
     probabilities: Deviceptr,
     expert_indices: Deviceptr,
     /// The routed block order the shared plan writes, so the expert kernels need no inline sort.
@@ -4959,7 +4962,12 @@ impl DeviceSequence {
         } else if self.own_rows.is_some() {
             self.gather_features()?;
         }
-        let last_hyper = match logit_rows {
+        // The prompt walk defers its head to the last chunk: it asks for the last row's widened
+        // residual here and runs the mixer, the language head and the read-back in
+        // [Self::deferred_logits], when the runtime heads the finished prompt.
+        let defer = logit_rows == usize::MAX;
+        let head_rows = if defer { 1 } else { logit_rows };
+        let last_hyper = match head_rows {
             0 => None,
             rows => Some(self.head_rows(batch, rows)?),
         };
@@ -4970,17 +4978,45 @@ impl DeviceSequence {
             self.position += batch;
             return Ok(None);
         };
-        // The head sees only the logit rows; in a decode or a verify they are every row.
-        self.probe_rows = logit_rows;
-        let (mixed, _) = self.hyper(&weights.mixer, last_hyper, false, logit_rows)?;
-        self.gemv(&weights.lm_head, mixed, self.logits, logit_rows)?;
-        self.probe_finite(48, "logits", self.logits, config.vocab_size * logit_rows)?;
-        self.prof_mark("lm_head")?;
-        let logits = self.read_logits(logit_rows)?;
-        self.prof_mark("logits_dtoh")?;
+        if defer {
+            self.pending_head = Some(last_hyper);
+            prof::report(self.position + batch - 1, batch);
+            self.position += batch;
+            return Ok(None);
+        }
+        let logits = self.finish_head(last_hyper, head_rows)?;
         prof::report(self.position + batch - 1, batch);
         self.position += batch;
         Ok(Some(logits))
+    }
+
+    /// Fold the last row(s) of a forward into logits: the mixer, the language head and the
+    /// read-back. A prompt walk stores the last chunk's widened row and calls this from
+    /// [Self::deferred_logits], so a chunk's head does not run until the prompt ends.
+    fn finish_head(
+        &mut self,
+        last_hyper: Deviceptr,
+        rows: usize,
+    ) -> Result<Vec<f32>, BackendError> {
+        let config = Arc::clone(&self.backend.config);
+        let weights = &self.backend.weights;
+        // The head sees only the logit rows; in a decode or a verify they are every row.
+        self.probe_rows = rows;
+        let (mixed, _) = self.hyper(&weights.mixer, last_hyper, false, rows)?;
+        self.gemv(&weights.lm_head, mixed, self.logits, rows)?;
+        self.probe_finite(48, "logits", self.logits, config.vocab_size * rows)?;
+        self.prof_mark("lm_head")?;
+        let logits = self.read_logits(rows)?;
+        self.prof_mark("logits_dtoh")?;
+        Ok(logits)
+    }
+
+    /// The logits the last deferred prompt chunk left: the head the prompt walk did not run.
+    fn deferred_logits(&mut self) -> Result<Vec<f32>, BackendError> {
+        let hyper = self.pending_head.take().ok_or_else(|| {
+            BackendError::new("qwen4_device", "the prompt walk left no deferred head row")
+        })?;
+        self.finish_head(hyper, 1)
     }
 
     /// The first `rows` rows of the logits buffer, copied straight into the vector they are
@@ -5554,6 +5590,7 @@ impl DeviceSequence {
             position: 0,
             consumed: Vec::new(),
             prefill_cached: 0,
+            pending_head: None,
             score_stride,
             keys: buffers.keys,
             values: buffers.values,

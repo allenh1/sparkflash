@@ -31,15 +31,28 @@ use std::sync::{Arc, Mutex};
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_runtime::{
-    ChunkPolicy, ComputeDeclaration, Drafter, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
-    Limits, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout,
-    Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
+    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Runtime, Segment,
+    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
 };
 
 use sparkflash_kernels::cuda_driver::Deviceptr;
 
 use super::batch::{BatchBuffers, MAX_BATCH};
 use super::{DENSE_ROWS, DeviceSequence, SequenceShared};
+
+/// A shared round's cost at TP=1 on a GB10-class node, from the block drafter's own step cost
+/// (the old Qwen fused arm's measurement): about 10 new experts a row at 0.8 ms each, the rest of
+/// a step fixed, and a few milliseconds a member past the first for its own attention,
+/// recurrence and draft. The expert counts are the checkpoint's, set in [QwenWalk::new].
+const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
+    fixed_ms: 50.4,
+    expert_ms: 0.81,
+    row_ms: 0.5,
+    seq_ms: 6.0,
+    experts: 0,
+    top_k: 0,
+};
 
 /// The Qwen arm, exposed to the shared runtime as a [Walk].
 pub(super) struct QwenWalk {
@@ -53,8 +66,8 @@ pub(super) struct QwenWalk {
     members: usize,
     /// The steps a token or verify pass already resolved, in segment order, for the head.
     pending: Mutex<VecDeque<StepOutput>>,
-    /// The last prompt chunk's logits row, for the prompt head.
-    logits: Mutex<Vec<f32>>,
+    /// What a shared round of this arm costs, for the row share.
+    wall: ExpertUnionWall,
 }
 
 impl QwenWalk {
@@ -67,6 +80,11 @@ impl QwenWalk {
     ) -> Result<Self, BackendError> {
         let layout = layout_of(&shared.config);
         let limits = Limits::new(pass_rows(shared.prefill.chunk), context_limit);
+        let wall = ExpertUnionWall {
+            experts: shared.config.num_experts,
+            top_k: shared.config.num_experts_per_tok,
+            ..JOINT_WALL
+        };
         Ok(Self {
             shared,
             layout,
@@ -74,7 +92,7 @@ impl QwenWalk {
             batch: Mutex::new(None),
             members: capacity.clamp(1, MAX_BATCH),
             pending: Mutex::new(VecDeque::new()),
-            logits: Mutex::new(Vec::new()),
+            wall,
         })
     }
 
@@ -116,12 +134,12 @@ impl QwenWalk {
     /// A prompt chunk: the prefill plan's forwards, each on the arm's own prompt path.
     fn prompt_chunk(&self, seq: &mut DeviceSequence, rows: &[u32]) -> Result<(), BackendError> {
         seq.consumed.extend_from_slice(rows);
-        let mut logits = None;
         for range in self.shared.prefill.forwards(rows.len()) {
             let start = seq.position;
             let end_of_chunk = range.end;
             let chunk = &rows[range];
-            logits = seq.forward_batch(chunk, 1, 0)?;
+            // The head of a prompt runs once, from [Walk::head], on the last chunk's row.
+            seq.forward_batch(chunk, usize::MAX, 0)?;
             if seq.drafting() {
                 let end = seq.position + rows.len().saturating_sub(end_of_chunk);
                 let commits: Vec<_> = seq.backend.dflash.as_ref().map_or_else(Vec::new, |draft| {
@@ -138,13 +156,6 @@ impl QwenWalk {
                 seq.mtp_pass(chunk, start, false)?;
                 seq.stash_last_hyper(chunk.len())?;
             }
-        }
-        if let Some(logits) = logits {
-            *self
-                .logits
-                .lock()
-                .map_err(|_| BackendError::new("qwen4_device", "the logits are poisoned"))? =
-                logits;
         }
         Ok(())
     }
@@ -376,6 +387,53 @@ impl Walk for QwenWalk {
         self.members
     }
 
+    /// Opens a member's round: the step its last verify holds, or the chain it drafts next.
+    fn open_round(&self, seq: &mut DeviceSequence, token: u32) -> Result<Opened, BackendError> {
+        seq.backend
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        if let Some(step) = seq.feed(token)? {
+            return Ok(Opened::Held(step));
+        }
+        let mut chain = seq.spec.chain(&seq.spec_confidence, seq.spec_drafts.len());
+        chain.truncate(seq.spec_drafts.len());
+        Ok(Opened::Round(chain))
+    }
+
+    /// One batch of every member's anchor and the first depth drafts it opened: the batch's
+    /// verify folds each member's rows back into its step and its next chain.
+    fn verify_round(
+        &self,
+        round: &mut [(&mut DeviceSequence, u32, usize)],
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        let mut drafts = Vec::with_capacity(round.len());
+        let mut confidence = Vec::with_capacity(round.len());
+        let mut tokens = Vec::with_capacity(round.len());
+        for (seq, token, depth) in round.iter_mut() {
+            let mut draft = std::mem::take(&mut seq.spec_drafts);
+            draft.truncate(*depth);
+            let mut sure = std::mem::take(&mut seq.spec_confidence);
+            sure.truncate(*depth);
+            drafts.push(draft);
+            confidence.push(sure);
+            tokens.push(*token);
+        }
+        let mut members: Vec<&mut DeviceSequence> = Vec::with_capacity(round.len());
+        for (seq, _, _) in round.iter_mut() {
+            members.push(&mut **seq);
+        }
+        self.batch(&mut members, &drafts, &confidence, &tokens)
+    }
+
+    fn round_wall(&self) -> &dyn StepWall {
+        &self.wall
+    }
+
+    fn round_budget(&self, seqs: usize) -> usize {
+        seqs * self.shared.verify_rows.saturating_sub(1)
+    }
+
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         seq.set_sampling(sampling);
     }
@@ -442,12 +500,12 @@ impl Walk for QwenWalk {
             return Ok(steps);
         }
         drop(pending);
-        // A prompt head: the last chunk's logits row, chosen with the prompt in the sampler.
-        let logits = self
-            .logits
-            .lock()
-            .map_err(|_| BackendError::new("qwen4_device", "the logits are poisoned"))?
-            .clone();
+        // A prompt head: the last chunk's deferred row, folded into logits here and chosen with
+        // the prompt in the sampler.
+        let logits = match rows.first_mut() {
+            Some(row) => row.seq.deferred_logits()?,
+            None => Vec::new(),
+        };
         if logits.is_empty() {
             return Err(BackendError::new(
                 "qwen4_device",
@@ -601,6 +659,7 @@ impl DeviceSequence {
         self.position = 0;
         self.consumed.clear();
         self.prefill_cached = 0;
+        self.pending_head = None;
         self.spec_queue.clear();
         self.spec_served.clear();
         self.spec_drafts.clear();
