@@ -201,12 +201,24 @@ pub enum LatentCacheMode {
     Fp8,
 }
 
+/// The K/V cache representation of a grouped-query arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvCacheMode {
+    /// Keep the released BF16 K/V rows.
+    Bf16,
+    /// Keep one E4M3 code a value with a per-(token, KV head) inverse scale.
+    Fp8,
+}
+
 /// The attention section.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AttentionProfile {
     /// The latent-cache representation.
     pub latent_cache: Option<LatentCacheMode>,
+    /// The grouped-query K/V cache representation.
+    pub kv_cache: Option<KvCacheMode>,
     /// Selected tokens per sparse query.
     pub selected_tokens: Option<usize>,
 }
@@ -660,6 +672,7 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
     ("SPARKFLASH_GLM_PREFILL_ACTIVATION", "prefill.activation"),
     ("SPARKFLASH_DECODE_MMA", "decode.tensor_cores"),
     ("SPARKFLASH_GLM_LATENT_CACHE", "attention.latent_cache"),
+    ("SPARKFLASH_KV_CACHE", "attention.kv_cache"),
     ("SPARKFLASH_DSPARK", "speculation.enabled"),
     ("SPARKFLASH_DRAFT_DEPTH", "speculation.depth"),
     ("SPARKFLASH_DRAFT_DRAFTS", "speculation.drafts"),
@@ -1119,6 +1132,7 @@ const TEXT_FIELDS: &[(&str, TextField)] = &[
 const ENUM_FIELDS: &[&str] = &[
     "prefill.activation",
     "attention.latent_cache",
+    "attention.kv_cache",
     "diagnostics.probe",
     "drafter.logits",
     "speculation.depth_policy",
@@ -1323,6 +1337,13 @@ impl ModelProfile {
                     other => return Err(env_error(name, other, field, "auto, f32 or fp8")),
                 });
             }
+            "attention.kv_cache" => {
+                self.attention.kv_cache = Some(match value {
+                    "bf16" => KvCacheMode::Bf16,
+                    "fp8" => KvCacheMode::Fp8,
+                    other => return Err(env_error(name, other, field, "bf16 or fp8")),
+                });
+            }
             "diagnostics.probe" => {
                 self.diagnostics.probe = Some(match value {
                     "0" | "off" => ProbeMode::Off,
@@ -1395,6 +1416,7 @@ impl ModelProfile {
         row!("prefill.drafting_prompt", self.prefill.drafting_prompt);
         row!("decode.tensor_cores", self.decode.tensor_cores);
         row!("attention.latent_cache", self.attention.latent_cache);
+        row!("attention.kv_cache", self.attention.kv_cache);
         row!("attention.selected_tokens", self.attention.selected_tokens);
         row!("speculation.enabled", self.speculation.enabled);
         row!("speculation.depth", self.speculation.depth);
@@ -1626,6 +1648,7 @@ probe = "hash"
         } else {
             match field {
                 "prefill.activation" | "attention.latent_cache" | "drafter.logits" => "fp8",
+                "attention.kv_cache" => "fp8",
                 "diagnostics.probe" => "hash",
                 "speculation.depth_policy" => "fixed",
                 other => panic!("{other} has no accepted value"),

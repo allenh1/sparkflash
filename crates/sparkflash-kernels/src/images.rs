@@ -502,6 +502,8 @@ impl Image {
                 "dory_slerp",
             ],
             Self::SenseNova => &[
+                "sensenova_attn_full_q8",
+                "sensenova_cache_q8",
                 "sensenova_mhc_leave",
                 "sensenova_mhc_post",
                 "sensenova_mhc_pre",

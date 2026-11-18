@@ -52,5 +52,7 @@ fn the_device_and_host_agree_on_the_first_token() {
         &step.logits[..4.min(step.logits.len())],
     );
     assert_eq!(host_arg, device_arg);
-    assert!(worst < 0.05, "worst {worst}");
+    // The device keeps the 8-bit K/V cache the 160K default needs; its E4M3 round is the
+    // only difference from the f32 host reference at this position.
+    assert!(worst < 0.1, "worst {worst}");
 }

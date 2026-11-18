@@ -43,6 +43,11 @@ pub use forward::{
 };
 pub use tensor::{Role, SenseNovaTensorPlan};
 
+/// The context the FP8 device arm admits when the operator does not name one: 160K with the
+/// 8-bit K/V cache and the embedding/head on the host. It leaves about 2 GiB of device headroom
+/// on a 16 GB card; 256K needs 4-bit weights, because the 8-bit cache alone is 7.5 GB there.
+pub const DEFAULT_CONTEXT: usize = 163_840;
+
 /// The carried runtime profile for the FP8 release.
 pub const PROFILE_TOML: &str = include_str!("../config/sensenova_loop_9b_fp8.toml");
 

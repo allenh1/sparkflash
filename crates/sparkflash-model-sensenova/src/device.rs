@@ -30,6 +30,7 @@ use sparkflash_kernels::images::{
 };
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::profile::{KvCacheMode, active};
 use sparkflash_ops::gemv::{
     GEMV_MAX_BATCH, GpuMat, GpuMatE4m3Tile, TILED_GEMV_PARTIALS, gemv_e4m3_tile,
 };
@@ -81,7 +82,6 @@ struct DeviceLayer {
 }
 
 struct Kernels {
-    embed: Kernel,
     copy_flat: Kernel,
     gemv_bf16: Kernel,
     gemv_fp8: Kernel,
@@ -95,14 +95,19 @@ struct Kernels {
     cache_bf16: Kernel,
     attn_full: Kernel,
     attn_full_combine: Kernel,
+    cache_q8: Kernel,
+    attn_q8: Kernel,
     mhc_pre: Kernel,
     mhc_post: Kernel,
     mhc_leave: Kernel,
 }
 
 struct Weights {
-    embed: DeviceMat,
-    lm_head: DeviceMat,
+    /// The BF16 embedding table on the host: one row is copied to the device a token.
+    host_embed: Vec<u8>,
+    /// The BF16 LM head on the host: 2 GB on a 16 GB card is the difference between a 256K
+    /// 8-bit cache and no 256K at all. Its matvec is the host's one long stage a token.
+    host_head: Vec<u8>,
     norm: Deviceptr,
     layers: Vec<DeviceLayer>,
 }
@@ -117,6 +122,7 @@ pub(crate) struct DeviceShared {
     tiled_partials: Deviceptr,
     tiled_counters: Deviceptr,
     context: usize,
+    kv_fp8: bool,
     allocated: usize,
     pointers: Vec<Deviceptr>,
 }
@@ -189,7 +195,8 @@ impl SenseNovaDeviceBackend {
                 config.head_dim
             ));
         }
-        let shared = DeviceShared::open(directory, config, context)?;
+        let kv_fp8 = active().attention.kv_cache.unwrap_or(KvCacheMode::Fp8) == KvCacheMode::Fp8;
+        let shared = DeviceShared::open(directory, config, context, kv_fp8)?;
         descriptor.context_tokens = context;
         Ok(Self {
             descriptor,
@@ -205,7 +212,12 @@ impl SenseNovaDeviceBackend {
 }
 
 impl DeviceShared {
-    fn open(directory: &Path, config: SenseNovaConfig, context: usize) -> Result<Self, String> {
+    fn open(
+        directory: &Path,
+        config: SenseNovaConfig,
+        context: usize,
+        kv_fp8: bool,
+    ) -> Result<Self, String> {
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
         let gdn_shared = (config.linear.key_dim * config.linear.value_dim * 4) as u32;
@@ -334,20 +346,17 @@ impl DeviceShared {
             };
             upload(converted.len(), &converted)
         };
-        let embed = mat(
-            &source,
-            "model.language_model.embed_tokens.weight",
-            config.vocab_size,
-            config.hidden_size,
-            &mut upload,
-        )?;
-        let lm_head = mat(
-            &source,
-            "lm_head.weight",
-            config.vocab_size,
-            config.hidden_size,
-            &mut upload,
-        )?;
+        let host_embed = source
+            .read("model.language_model.embed_tokens.weight")
+            .map_err(|error| error.to_string())?;
+        let host_head = source
+            .read("lm_head.weight")
+            .map_err(|error| error.to_string())?;
+        if host_embed.len() != config.vocab_size * config.hidden_size * 2
+            || host_head.len() != config.vocab_size * config.hidden_size * 2
+        {
+            return Err("the embedding and LM head must be BF16 [vocab, hidden]".to_owned());
+        }
         let norm = vector(
             &source,
             "model.language_model.norm.weight",
@@ -564,8 +573,8 @@ impl DeviceShared {
             cuda,
             kernels,
             weights: Weights {
-                embed,
-                lm_head,
+                host_embed,
+                host_head,
                 norm,
                 layers,
             },
@@ -575,6 +584,7 @@ impl DeviceShared {
             tiled_partials: partials,
             tiled_counters: counters,
             context,
+            kv_fp8,
             allocated,
             pointers,
         })
@@ -699,7 +709,6 @@ impl Kernels {
             cuda.load_named(image, name).map(|(_, kernel)| kernel)
         };
         Ok(Self {
-            embed: load(qwen4_exp_cubin(), "q4e_embed")?,
             copy_flat: load(qwen4_exp_cubin(), "q4e_copy_flat")?,
             gemv_bf16: load(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
             gemv_fp8: load(qwen4_exp_cubin(), "q4e_gemv_tiled_e4m3_tile")?,
@@ -715,6 +724,8 @@ impl Kernels {
             cache_bf16: load(qwen4_attn_cubin(), "q4e_cache_bf16")?,
             attn_full: load(qwen4_attn_cubin(), "q4e_attn_full")?,
             attn_full_combine: load(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
+            cache_q8: load(sensenova_cubin(), "sensenova_cache_q8")?,
+            attn_q8: load(sensenova_cubin(), "sensenova_attn_full_q8")?,
             mhc_pre: load(sensenova_cubin(), "sensenova_mhc_pre")?,
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
@@ -743,7 +754,6 @@ struct Scratch {
     attn_out: Deviceptr,
     partials: Deviceptr,
     coeffs: Deviceptr,
-    logits: Deviceptr,
     pointers: Vec<Deviceptr>,
 }
 
@@ -751,6 +761,8 @@ struct Scratch {
 struct VisitState {
     keys: Option<Deviceptr>,
     values: Option<Deviceptr>,
+    k_scales: Option<Deviceptr>,
+    v_scales: Option<Deviceptr>,
     conv: Option<Deviceptr>,
     recurrent: Option<Deviceptr>,
 }
@@ -771,6 +783,8 @@ impl Drop for DeviceSession {
         for visit in &self.visits {
             references.extend(visit.keys.as_ref());
             references.extend(visit.values.as_ref());
+            references.extend(visit.k_scales.as_ref());
+            references.extend(visit.v_scales.as_ref());
             references.extend(visit.conv.as_ref());
             references.extend(visit.recurrent.as_ref());
         }
@@ -817,21 +831,47 @@ impl DeviceSession {
             attn_out: alloc(query * 4)?,
             partials: alloc(config.num_attention_heads * 16 * (config.head_dim + 2) * 4)?,
             coeffs: alloc(8 * 4)?,
-            logits: alloc(config.vocab_size * 4)?,
             pointers,
         };
         let mut visits = Vec::with_capacity(config.visits());
         for physical in config.execution_plan() {
             let state = match config.layer_types[physical] {
-                LayerType::Full => VisitState {
-                    keys: Some(shared.cuda.alloc(shared.context * kv * 2, &mut allocated)?),
-                    values: Some(shared.cuda.alloc(shared.context * kv * 2, &mut allocated)?),
-                    conv: None,
-                    recurrent: None,
-                },
+                LayerType::Full => {
+                    let row_bytes = if shared.kv_fp8 {
+                        shared.context * kv
+                    } else {
+                        shared.context * kv * 2
+                    };
+                    let k_scale = if shared.kv_fp8 {
+                        Some(shared.cuda.alloc(
+                            shared.context * config.num_key_value_heads * 4,
+                            &mut allocated,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let v_scale = if shared.kv_fp8 {
+                        Some(shared.cuda.alloc(
+                            shared.context * config.num_key_value_heads * 4,
+                            &mut allocated,
+                        )?)
+                    } else {
+                        None
+                    };
+                    VisitState {
+                        keys: Some(shared.cuda.alloc(row_bytes, &mut allocated)?),
+                        values: Some(shared.cuda.alloc(row_bytes, &mut allocated)?),
+                        k_scales: k_scale,
+                        v_scales: v_scale,
+                        conv: None,
+                        recurrent: None,
+                    }
+                }
                 LayerType::Linear => VisitState {
                     keys: None,
                     values: None,
+                    k_scales: None,
+                    v_scales: None,
                     conv: Some(shared.cuda.alloc(
                         config.linear.conv_kernel.saturating_sub(1) * fused * 4,
                         &mut allocated,
@@ -892,19 +932,18 @@ impl DeviceSession {
             ));
         }
         let position = self.position;
-        shared.launch(
-            shared.kernels.embed,
-            (hidden.div_ceil(256) as u32, 1, 1),
-            (BLOCK, 1, 1),
-            &[
-                shared.weights.embed.pointer.0,
-                self.scratch.hidden.0,
-                token as u64,
-                hidden as u64,
-                hidden as u64,
-                0,
-            ],
-        )?;
+        let row = token as usize * hidden * 2;
+        let embed = &shared.weights.host_embed[row..row + hidden * 2];
+        let mut widened = Vec::with_capacity(hidden * 4);
+        for pair in embed.as_chunks::<2>().0 {
+            let value =
+                sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+            widened.extend_from_slice(&value.to_le_bytes());
+        }
+        shared
+            .cuda
+            .copy_htod(&self.scratch.hidden, &widened)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
         let debug = std::env::var("SPARKFLASH_SENSENOVA_DEBUG").is_ok();
         if debug {
             self.report("embed", self.scratch.hidden, hidden)?;
@@ -1087,24 +1126,25 @@ impl DeviceSession {
             hidden,
             1,
         )?;
-        shared.gemv(
-            &shared.weights.lm_head,
-            self.scratch.normed,
-            self.scratch.logits,
-            1,
-        )?;
-        let mut bytes = vec![0u8; config.vocab_size * 4];
+        let mut hidden_bytes = vec![0u8; hidden * 4];
         shared
             .cuda
-            .copy_dtoh(&mut bytes, &self.scratch.logits)
+            .copy_dtoh(&mut hidden_bytes, &self.scratch.normed)
             .map_err(|error| BackendError::new(DEVICE, error))?;
-        self.position += 1;
-        Ok(bytes
+        let final_hidden: Vec<f32> = hidden_bytes
             .as_chunks::<4>()
             .0
             .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect())
+            .collect();
+        let logits = host_matvec(
+            &shared.weights.host_head,
+            config.vocab_size,
+            hidden,
+            &final_hidden,
+        );
+        self.position += 1;
+        Ok(logits)
     }
 
     fn report(&self, label: &str, pointer: Deviceptr, width: usize) -> Result<(), BackendError> {
@@ -1244,44 +1284,86 @@ impl DeviceSession {
         )?;
         let keys = state.keys.expect("keys");
         let values = state.values.expect("values");
-        let cache_blocks = kv.div_ceil(256) as u32;
-        shared.launch(
-            shared.kernels.cache_bf16,
-            (cache_blocks, 1, 1),
-            (BLOCK, 1, 1),
-            &[
-                keys.offset(position * kv * 2).0,
-                self.scratch.key.0,
-                kv as u64,
-            ],
-        )?;
-        shared.launch(
-            shared.kernels.cache_bf16,
-            (cache_blocks, 1, 1),
-            (BLOCK, 1, 1),
-            &[
-                values.offset(position * kv * 2).0,
-                self.scratch.value.0,
-                kv as u64,
-            ],
-        )?;
         let splits = ((position + 256) / 256).min(16) as u32;
-        shared.launch(
-            shared.kernels.attn_full,
-            (heads as u32, 1, splits),
-            (BLOCK, 1, 1),
-            &[
-                self.scratch.query.0,
-                keys.0,
-                values.0,
-                self.scratch.partials.0,
-                position as u64,
-                heads as u64,
-                kv_heads as u64,
-                head_dim as u64,
-                (heads / kv_heads.max(1)) as u64,
-            ],
-        )?;
+        if shared.kv_fp8 {
+            let k_scales = state.k_scales.expect("k scales");
+            let v_scales = state.v_scales.expect("v scales");
+            for (source, codes, scales) in [
+                (self.scratch.key, keys, k_scales),
+                (self.scratch.value, values, v_scales),
+            ] {
+                shared.launch(
+                    shared.kernels.cache_q8,
+                    (kv_heads as u32, 1, 1),
+                    (BLOCK, 1, 1),
+                    &[
+                        source.0,
+                        codes.0,
+                        scales.0,
+                        position as u64,
+                        1,
+                        kv_heads as u64,
+                        head_dim as u64,
+                    ],
+                )?;
+            }
+            shared.launch(
+                shared.kernels.attn_q8,
+                (heads as u32, 1, splits),
+                (BLOCK, 1, 1),
+                &[
+                    self.scratch.query.0,
+                    keys.0,
+                    values.0,
+                    k_scales.0,
+                    v_scales.0,
+                    self.scratch.partials.0,
+                    position as u64,
+                    heads as u64,
+                    kv_heads as u64,
+                    head_dim as u64,
+                    (heads / kv_heads.max(1)) as u64,
+                ],
+            )?;
+        } else {
+            let cache_blocks = kv.div_ceil(256) as u32;
+            shared.launch(
+                shared.kernels.cache_bf16,
+                (cache_blocks, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    keys.offset(position * kv * 2).0,
+                    self.scratch.key.0,
+                    kv as u64,
+                ],
+            )?;
+            shared.launch(
+                shared.kernels.cache_bf16,
+                (cache_blocks, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    values.offset(position * kv * 2).0,
+                    self.scratch.value.0,
+                    kv as u64,
+                ],
+            )?;
+            shared.launch(
+                shared.kernels.attn_full,
+                (heads as u32, 1, splits),
+                (BLOCK, 1, 1),
+                &[
+                    self.scratch.query.0,
+                    keys.0,
+                    values.0,
+                    self.scratch.partials.0,
+                    position as u64,
+                    heads as u64,
+                    kv_heads as u64,
+                    head_dim as u64,
+                    (heads / kv_heads.max(1)) as u64,
+                ],
+            )?;
+        }
         shared.launch(
             shared.kernels.attn_full_combine,
             (heads as u32, 1, 1),
@@ -1390,6 +1472,36 @@ impl DeviceSession {
         }
         Ok(())
     }
+}
+
+/// A BF16 [rows, columns] matvec on the host, split over the process cores.
+fn host_matvec(weights: &[u8], rows: usize, columns: usize, input: &[f32]) -> Vec<f32> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(32)
+        .max(1);
+    let chunk = rows.div_ceil(threads).max(1);
+    let mut out = vec![0.0f32; rows];
+    std::thread::scope(|scope| {
+        for (index, block) in out.chunks_mut(chunk).enumerate() {
+            let first = index * chunk;
+            scope.spawn(move || {
+                for (offset, slot) in block.iter_mut().enumerate() {
+                    let base = (first + offset) * columns * 2;
+                    let mut accumulator = 0.0f32;
+                    for (column, value) in input.iter().enumerate() {
+                        let pair = &weights[base + column * 2..base + column * 2 + 2];
+                        accumulator +=
+                            sparkflash_weights::quant::bf16_to_f32(u16::from_le_bytes([
+                                pair[0], pair[1],
+                            ])) * value;
+                    }
+                    *slot = accumulator;
+                }
+            });
+        }
+    });
+    out
 }
 
 impl ModelBackend for SenseNovaDeviceBackend {

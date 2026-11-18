@@ -10,7 +10,7 @@ family = "sensenova_loop"
 weights = "sensenova-loop-9b-fp8"
 
 [runtime]
-context_tokens = 524288
+context_tokens = 163840
 concurrency = 1
 
 [prefill]
@@ -21,6 +21,11 @@ enabled = true
 chunk = 64
 tensor_cores = false
 exact = true
+
+[attention]
+# The 8-bit K/V cache: one E4M3 code a value with a per-(token, KV head) inverse scale. At
+# 160K it is 4.6 GB; the embedding and LM head stay on the host so the FP8 weights fit beside it.
+kv_cache = "fp8"
 
 [decode]
 # Decode is the FP8 tile GEMV and the shared full-attention/GDN bodies; no stage runs on the

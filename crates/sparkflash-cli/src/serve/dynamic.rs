@@ -470,6 +470,11 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         (true, None) => context.min(INKLING_GROUP_DEFAULT_CONTEXT),
         _ => context,
     };
+    let context = if options.context.is_none() && checkpoint.plan.family() == "sensenova_loop" {
+        context.min(sparkflash_model_sensenova::DEFAULT_CONTEXT)
+    } else {
+        context
+    };
     if context == 0 || (window != 0 && context > window) {
         return Err(format!(
             "context limit {context} is outside 1..={window} for {}",

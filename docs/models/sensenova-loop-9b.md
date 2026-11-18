@@ -1,10 +1,10 @@
 # SenseNova-Loop-9B (FP8 / BF16)
 
 Status: **host reference on every target, and a TP=1 device arm served on the RTX 5080.** The FP8
-mirror boots at a 4,096-token context in 11.03 GB of weights, matches the host reference on the
-first token (worst logit delta 4.1e-3, same argmax) and decodes at about **13 tok/s** including a
-short prompt. The pack is `sparkflash-model-sensenova`; the served selector is
-`sensenova-loop-9b-fp8`.
+mirror boots at its **160K** default with an **8-bit K/V cache**, keeps the embedding and LM head
+on the host, matches the host reference's argmax on the first token (worst logit delta 0.063 from
+the E4M3 K/V round) and decodes at about **6.4 tok/s** including a short prompt. The pack is
+`sparkflash-model-sensenova`; the served selector is `sensenova-loop-9b-fp8`.
 
 SenseNova-Loop-9B is a 9.4B-parameter multimodal decoder released by SenseTime on 2026-11-17
 (Apache-2.0). It is a Qwen3.5 hybrid stack with two structural additions:
@@ -47,19 +47,23 @@ BF16 inverse scale a 128x128 tile. Norms, embeddings, the LM head, the convoluti
 
 Not in BF16. The text weights alone are 18.8 GB. FP8 fits at a short context:
 
-| Form | Weights | KV @ 16K | KV @ 32K | KV @ 256K |
+| Form | Weights | KV/token | KV @ 160K | KV @ 256K |
 | :-- | --: | --: | --: | --: |
-| BF16 | 18.8 GB | 0.47 GB | 0.94 GB | 7.5 GB |
-| FP8 | 11.0 GB | 0.47 GB | 0.94 GB | 7.5 GB |
-| AWQ 4-bit + 8-bit KV | ~5.5 GB | 0.24 GB | 0.47 GB | 3.75 GB |
+| BF16 KV | 11.0 GB | 56 KiB | 9.2 GB | 14.7 GB |
+| 8-bit KV | 11.0 GB | 28 KiB | 4.6 GB | 7.3 GB |
+| FP8 head/embed also on host | 6.9 GB | 28 KiB | 4.6 GB | 7.3 GB |
+| AWQ 4-bit + 8-bit KV | ~5.5 GB | 28 KiB | 4.6 GB | 7.3 GB |
 
-Per-token KV is **28 KiB**: 14 full-attention visits x 4 KV heads x 256 x 2 B. The loop is why
-there are 14 rather than 8 caches: the six full-attention layers inside the loop hold two
-independent caches each. The GDN side is 42 recurrent visits, ~84 MiB of f32 state plus ~4 MiB of
-convolution history per sequence, also per visit.
+Per-token KV is **56 KiB in BF16, 28 KiB in 8-bit**: 14 full-attention visits x 4 KV heads x
+256 x 2 B for K and V. The loop is why there are 14 rather than 8 caches: the six full-attention
+layers inside the loop hold two independent caches each. The GDN side is 42 recurrent visits,
+~84 MiB of f32 state plus ~4 MiB of convolution history per sequence, also per visit.
 
-On a 16 GB card, FP8 at 16K-32K is the practical first target. The 512K window needs the 4-bit
-weights **and** an 8-bit KV cache (the model card's ~15 GiB at 256K). The 5080 is sm_120, not the
+The arm defaults to **160K**. With FP8 weights, an 8-bit K/V cache and the BF16 embedding/LM head
+on the host, the device holds about 11.6 GiB (6.9 GiB of weights, 4.6 GiB of cache); the server
+reported 8.6 GiB resident after a short request, so there is headroom. 256K with 8-bit KV needs
+~14.2 GiB of cache plus weights and only just misses on a 16 GB card with the host head; the model
+card's 256K assumes 4-bit weights. The 5080 is sm_120, not the
 sm_121 GB10 the tree was written for: build with `SPARKFLASH_CUDA_ARCH=sm_120`. The consumer part
 has no block-scaled MMA, so the prefill images are skipped by the build script; the token, scan
 and attention images this arm uses compile cleanly.
@@ -118,7 +122,9 @@ Every projection and every block body is a shared kernel:
 | RMSNorm | `q4e_rmsnorm` |
 | GQA q/gate split | `sensenova_qgate` |
 | YaRN RoPE | `sensenova_rope` (host-precomputed inverse frequencies and attention scale) |
-| KV append | `q4e_cache_bf16` |
+| 8-bit KV append | `sensenova_cache_q8` (E4M3, one f32 scale a token and KV head) |
+| 8-bit attention | `sensenova_attn_full_q8` + `q4e_attn_full_combine` |
+| BF16 KV fallback | `q4e_cache_bf16` + `q4e_attn_full` |
 | full attention | `q4e_attn_full` + `q4e_attn_full_combine` |
 | Gated DeltaNet | `q4e_gdn_conv` + `q4e_gdn_recur` |
 | SwiGLU | `q4e_swiglu` |
@@ -126,9 +132,10 @@ Every projection and every block body is a shared kernel:
 | LM head | `q4e_gemv_bf16` |
 
 The weights are uploaded once per **physical** layer; the two loop visits reuse them. All 56
-visit caches are allocated at open: 14 BF16 KV caches of `context * 1024 * 2` bytes and 42 GDN
-state pairs. The forward has no host synchronization between layers; the only read back is the
-logit row the sampler needs.
+visit caches are allocated at open: 14 8-bit KV caches of `context * 1024` bytes plus one f32
+scale a token and KV head, and 42 GDN state pairs. The embedding row and the final hidden are the
+only host transfers; the LM head's 2 GB BF16 matvec runs on the host, which is what makes 160K
+fit beside the FP8 weights.
 
 ### What is deliberately next
 
@@ -136,15 +143,15 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
-1. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
+1. **Move the LM head back to the device for shorter contexts.** At 160K the device has ~7 GiB
+   spare; a device head is ~2 GB and would restore the 13 tok/s measured with the 4K profile.
+2. **Chunked tensor-core prefill.** The 4,096-wide dense projections fit the shared
    `glm_prefill_fp8b128_mma` shape; the routed-expert-free stack needs a chunked GQA and a
    chunked GDN scan, both of which the shared images already carry. This is the largest single
    prefill win (the Dory and Qwen notes measure 4-10x).
-2. **AWQ 4-bit decode.** The official 4-bit release is the configuration that reaches 256K on a
+3. **AWQ 4-bit decode.** The official 4-bit release is the configuration that reaches 256K on a
    16 GB card. It needs one int4 group-wise GEMV (or a dequantize-on-load path) and a 4-bit
    weight plan; the loop/mHC/cache plan does not change.
-3. **8-bit KV.** The model card's 256K figure assumes it. The cache is the only per-token growth
-   this arm has, so halving it doubles the context a card can hold.
 4. **Prefix reuse across turns.** The per-visit caches already hold everything a continuation
    needs; the arm reports no reusable prefix yet.
 5. **Vision.** The 27-layer tower is 0.55 GB in FP8 and is not loaded. Image spans need mRoPE

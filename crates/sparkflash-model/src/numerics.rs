@@ -74,6 +74,7 @@ pub const ARITHMETIC_FIELDS: &[&str] = &[
     "prefill.pair",
     "decode.tensor_cores",
     "attention.latent_cache",
+    "attention.kv_cache",
     "sequence.parallel",
     "sequence.overlap",
     "plan.threads",
