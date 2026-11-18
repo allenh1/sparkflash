@@ -785,6 +785,14 @@ impl DeviceShared {
                 };
                 let rows = matrix.rows;
                 let columns = matrix.columns;
+                // Only the shapes the prefill tile can take are converted. A matrix whose width
+                // is not a 128-row multiple - the GDN gate and decay projections are 32 rows -
+                // never reaches the FP4 GEMM: it is read by the decode GEMV, which needs the
+                // E4M3 bytes this loop would free. Converting it left that GEMV reading nibbles
+                // as bf16.
+                if rows % 128 != 0 || columns % 128 != 0 {
+                    continue;
+                }
                 let codes = cuda.alloc(rows * columns / 2, allocated)?;
                 let block_scales = cuda.alloc(rows * (columns / 16), allocated)?;
                 pointers.push(codes);
