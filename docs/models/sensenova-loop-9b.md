@@ -225,6 +225,23 @@ tok/s on 3,624 through `serve` — which is why the row-length history above is 
 on the fixed arm it is 4,169 tok/s on 826 prompt tokens and 2,902 on 3,567, at either an 8K or a
 160K context; the 6,244 above is from before the `attach_fp4` fix and the two are not yet reconciled.
 
+Prefill is not flat in prompt length, and the curve is what a long conversation feels. Measured
+through `serve` on the fixed arm, one prompt a request:
+
+| prompt tokens | ttft | prefill |
+| :-- | :-- | :-- |
+| 265 | 0.36 s | 784 tok/s |
+| 1,057 | 0.80 s | 989 tok/s |
+| 2,641 | 2.82 s | 944 tok/s |
+| 6,601 | 8.44 s | 785 tok/s |
+| 15,841 | 27.2 s | 582 tok/s |
+| 33,001 | 103 s | 320 tok/s |
+
+Each chunk scans the whole cache in front of it, so the cost grows with the square of the prompt
+while the rows grow linearly. A session that re-prefills a 40K conversation every turn therefore
+sees a few hundred tokens a second, not the ~1,000 the short-prompt figures suggest - which is
+why prefix reuse matters more than the peak number.
+
 **The target is now a 15,000 tok/s floor on the shipped FP8 checkpoint.** That floor is a compute
 bound, not a byte one: the block-scaled FP8 MMA peaks at 224 TFLOPS on this part and the E4M3 arm
 reaches ~56 of them, so 15,000 tok/s (a 1,024-row chunk in 68 ms) is above what 8-bit operands can

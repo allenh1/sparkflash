@@ -207,7 +207,17 @@ impl HostDriver {
         let (ready, reported) = std::sync::mpsc::channel();
         let metrics = Arc::new(Metrics::new());
         let backend: Arc<dyn ModelBackend> = Arc::from(backend);
-        let pool = Arc::new(HeldPool::new(options.concurrency));
+        // How many sequences are kept for a following request. One a worker is serving is not
+        // in `kept`, so the worker count is the floor; a client that interleaves an unrelated
+        // request (a title call) would otherwise take the only slot and evict the conversation
+        // that the next turn continues. The knob exists because a kept sequence holds its
+        // whole KV cache: at a long context two of them do not fit on one card.
+        let kept_sequences = std::env::var("SPARKFLASH_HELD_SEQUENCES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(options.concurrency)
+            .max(options.concurrency);
+        let pool = Arc::new(HeldPool::new(kept_sequences));
         let mut handles = Vec::with_capacity(options.concurrency);
         for worker in 0..options.concurrency {
             let backend = Arc::clone(&backend);
