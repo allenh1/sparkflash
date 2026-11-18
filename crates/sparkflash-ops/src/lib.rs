@@ -24,6 +24,7 @@
 //! * plan is the vocabulary: dtypes, layouts, streams, OpPlan and Launch.
 //! * gemm, attention, scan, epilogue and collective are the typed plans.
 //! * images exposes the shared cubins, so no model crate compiles CUDA.
+//! * formats types a weight's stored format and its scales.
 //! * parts is the per-target catalogue: which image and symbols implement each model part.
 //! * parity is the bring-up harness an arm runs against its host reference.
 //! * gemv, gdn and tp are the shared launch helpers the Qwen, GLM and DeepSeek arms call.
@@ -94,6 +95,7 @@ pub mod doorbell;
 pub mod engine_plan;
 pub mod epilogue;
 pub mod error;
+pub mod formats;
 pub mod gemm;
 pub mod images;
 pub mod indexer;
@@ -121,6 +123,10 @@ pub use engine_plan::{
     EngineBuilder, EnginePlan, LayerExecution, PartRequirement, PlanError, PrecisionPolicy,
 };
 pub use error::OpError;
+pub use formats::{
+    Bf16, F32, Format, FormatKind, Fp8E4m3, Mat, MxFp8, NvFp4, PackedBf16, PackedOrder,
+    ScaleLayout, Scales, Tensor, UploadError, upload,
+};
 pub use parts::{CATALOGUE, PartKernel, carried, image_available, kernels, missing};
 pub use parts_backend::{PartsDeviceBackend, PartsDeviceRank, PartsLayer};
 pub use plan::{

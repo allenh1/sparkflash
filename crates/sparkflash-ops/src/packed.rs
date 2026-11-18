@@ -166,7 +166,7 @@ fn walk_steps(columns: usize) -> usize {
 }
 
 /// One packed row's bytes: plane A, plane B, plane C, padded to a 16-byte load.
-fn row_bytes(columns: usize) -> usize {
+pub(crate) fn row_bytes(columns: usize) -> usize {
     (columns + columns / 2 + 32 * walk_steps(columns)).next_multiple_of(ALIGN)
 }
 
