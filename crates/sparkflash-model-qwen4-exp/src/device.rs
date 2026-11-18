@@ -226,19 +226,11 @@ pub(super) fn fill_plain_injection(
     cuda.copy_htod(&pointer, &ones)
 }
 
-/// Keys a q4e_attn_full CTA takes a pass (Q4E_FULL_TILE).
-pub const FULL_ATTENTION_TILE: usize = 256;
-
-/// The most CTAs q4e_attn_full splits one row's context over (Q4E_FULL_SPLITS).
-pub const FULL_ATTENTION_SPLITS: usize = 16;
-
-/// The splits a row that sees `visible` positions takes (q4e_full_splits).
-#[must_use]
-pub fn full_attention_splits(visible: usize) -> usize {
-    visible
-        .div_ceil(FULL_ATTENTION_TILE)
-        .clamp(1, FULL_ATTENTION_SPLITS)
-}
+// The split full attention's tile, split count and rule are the shared call's
+// ([sparkflash_ops::calls::FullAttention]).
+pub use sparkflash_ops::calls::{
+    FULL_ATTENTION_SPLITS, FULL_ATTENTION_TILE, full_attention_splits,
+};
 
 /// The rows an MTP verify forward takes at most: the token being decoded and two chained drafts.
 const MTP_VERIFY_ROWS: usize = 3;
@@ -3945,25 +3937,18 @@ impl DeviceSequence {
         output: Deviceptr,
         batch: usize,
     ) -> Result<(), BackendError> {
-        const WARPS: usize = 8;
         let mut base = 0usize;
         while base < batch {
             let count = GEMV_MAX_BATCH.min(batch - base);
-            // Two rows a warp for a batch, one for a single row: the grid must match the kernel's
-            // row-to-warp mapping or half the blocks exit unused.
-            let rows_per_block = if count > 1 { WARPS * 2 } else { WARPS };
-            self.launch(
+            self.call(
                 self.backend.kernels.gemv_bf16,
-                (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
-                ((WARPS * 32) as u32, 1, 1),
-                &[
+                sparkflash_ops::calls::gemv_bf16(
                     matrix.pointer.0,
                     input.offset(base * matrix.columns * 4).0,
                     output.offset(base * matrix.rows * 4).0,
-                    matrix.rows as u64,
-                    matrix.columns as u64,
-                    count as u64,
-                ],
+                    (matrix.rows, matrix.columns),
+                    count,
+                ),
             )?;
             base += count;
         }
@@ -4009,22 +3994,15 @@ impl DeviceSequence {
                 ],
             );
         }
-        // Two rows a warp for a batch, one for a single row: the grid must match the kernel's
-        // row-to-warp mapping or half the blocks exit unused.
-        const WARPS: usize = 8;
-        let rows_per_block = if batch > 1 { WARPS * 2 } else { WARPS };
-        self.launch(
+        self.call(
             self.backend.kernels.gemv_bf16,
-            (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
-            ((WARPS * 32) as u32, 1, 1),
-            &[
+            sparkflash_ops::calls::gemv_bf16(
                 matrix.pointer.0,
                 input.0,
                 output.0,
-                matrix.rows as u64,
-                matrix.columns as u64,
-                batch as u64,
-            ],
+                (matrix.rows, matrix.columns),
+                batch,
+            ),
         )
     }
 

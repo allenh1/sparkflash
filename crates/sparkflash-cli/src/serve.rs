@@ -190,6 +190,8 @@ mod inkling_group;
 pub use device::DeviceServeOptions;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_comm::control::*;
+#[cfg(test)]
+mod dense_parity;
 pub(crate) mod dynamic;
 mod dynamic_host;
 mod pack;

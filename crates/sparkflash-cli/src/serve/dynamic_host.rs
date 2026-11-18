@@ -15,10 +15,11 @@
 //! The dynamic host backend: a model-independent reference forward over the parts the dynamic
 //! path supports.
 //!
-//! Phase 4's `EngineBuilder` is merged, but only the released Qwen and GLM arms implement it
-//! (`PartsDeviceBackend`), and a checkpoint that is not one of those presets has no device arm.
-//! This module is the honest host path the issue allows when a full device serve is unavailable:
-//! it runs [Architecture]'s layer walk over a [WeightSource] with f32 arithmetic, on the CPU. It
+//! A checkpoint that is not one of the released presets is served on the device by the shared
+//! dense arm (`sparkflash_model_dense`) when it is the dense grouped-query decoder that arm
+//! executes; everything else, and an operator who opts out (`SPARKFLASH_DENSE_DEVICE=0`), lands
+//! here. This module is the honest host path the issue allows when a device serve is unavailable,
+//! and the reference the dense arm's per-layer parity report is taken against: it runs [Architecture]'s layer walk over a [WeightSource] with f32 arithmetic, on the CPU. It
 //! is a correctness and bring-up path, not a performance claim; every weight is read per step, so
 //! it is meant for the tiny synthetic checkpoints the zero-code test writes.
 //!
@@ -344,6 +345,14 @@ impl ModelBackend for DynamicHostBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        Ok(Box::new(self.host_session()?))
+    }
+}
+
+impl DynamicHostBackend {
+    /// A session of its concrete type, for a caller that reads its per-layer trace (the shared
+    /// dense device arm's parity gate).
+    pub(crate) fn host_session(&self) -> Result<HostSession, BackendError> {
         let mut kv = Vec::with_capacity(self.architecture.layers.len());
         let mut gdn = Vec::with_capacity(self.architecture.layers.len());
         for layer in &self.architecture.layers {
@@ -367,7 +376,7 @@ impl ModelBackend for DynamicHostBackend {
                 }
             }
         }
-        Ok(Box::new(HostSession {
+        Ok(HostSession {
             backend: Arc::new(SessionShared {
                 architecture: Arc::clone(&self.architecture),
                 names: Arc::clone(&self.names),
@@ -378,7 +387,8 @@ impl ModelBackend for DynamicHostBackend {
             gdn,
             position: 0,
             history: Vec::new(),
-        }))
+            trace: None,
+        })
     }
 }
 
@@ -403,16 +413,35 @@ struct GdnState {
     recurrent: Vec<Vec<f32>>,
 }
 
-struct HostSession {
+pub(crate) struct HostSession {
     backend: Arc<SessionShared>,
     kv: Vec<Option<KvCache>>,
     gdn: Vec<Option<GdnState>>,
     position: usize,
     history: Vec<u32>,
+    /// Each layer's residual after it, a position at a time, while tracing.
+    trace: Option<Vec<Vec<f32>>>,
 }
 
 impl HostSession {
-    fn forward(&mut self, token: u32) -> Result<Vec<f32>, String> {
+    /// Starts (or stops) recording each layer's residual after it.
+    #[cfg(test)]
+    pub(crate) fn trace(&mut self, on: bool) {
+        self.trace = on.then(|| vec![Vec::new(); self.backend.architecture.layers.len()]);
+    }
+
+    /// The recorded residuals, a `[positions][hidden]` row-major run a layer, and a fresh record.
+    #[cfg(test)]
+    pub(crate) fn take_trace(&mut self) -> Vec<Vec<f32>> {
+        let layers = self.backend.architecture.layers.len();
+        self.trace
+            .as_mut()
+            .map(|trace| std::mem::replace(trace, vec![Vec::new(); layers]))
+            .unwrap_or_default()
+    }
+
+    /// One position: `token`'s logits after every layer.
+    pub(crate) fn forward(&mut self, token: u32) -> Result<Vec<f32>, String> {
         let shared = &self.backend;
         let architecture = &shared.architecture;
         if token as usize >= architecture.vocab_size {
@@ -490,6 +519,9 @@ impl HostSession {
             };
             for (value, update) in x.iter_mut().zip(&ffn) {
                 *value += update;
+            }
+            if let Some(trace) = self.trace.as_mut() {
+                trace[index].extend_from_slice(&x);
             }
         }
         let norm = decode_host_tensor(shared.source.as_ref(), &shared.names.norm, ELEMENT_LIMIT)

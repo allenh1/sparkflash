@@ -38,7 +38,7 @@ use sparkflash_ops::moe::{MoePlanCall, combine_grid};
 use super::prefill::{ATTENTION_CHUNK, Projection};
 use super::{
     Dense, DeviceSequence, GEMM_MIN_BATCH, GEMV_MAX_BATCH, GpuBranch, GpuExperts, GpuMoe,
-    MAX_SELECTED_TOKENS, full_attention_splits,
+    MAX_SELECTED_TOKENS,
 };
 
 impl DeviceSequence {
@@ -98,21 +98,17 @@ impl DeviceSequence {
             [self.qg, self.kv_row, self.value_row, self.index_row],
             batch,
         )?;
-        let deint_blocks = attn_width.div_ceil(256).max(1) as u32;
         // The whole chunk goes through each projection once, instead of the chunk
         // going through every projection once per token: 13 launches per chunk
         // rather than 13 per token on every sparse layer.
-        self.launch(
+        self.call(
             kernels.deinterleave,
-            (deint_blocks, batch as u32, 1),
-            (256, 1, 1),
-            &[
+            calls::deinterleave(
                 self.qg.0,
-                self.query.0,
-                self.gate.0,
-                config.num_attention_heads as u64,
-                config.head_dim as u64,
-            ],
+                (self.query.0, self.gate.0),
+                (config.num_attention_heads, config.head_dim),
+                batch,
+            ),
         )?;
         self.norm(
             self.query,
@@ -402,39 +398,27 @@ impl DeviceSequence {
         let config = &self.backend.config;
         let kernels = &*self.backend.kernels;
         let attn_width = config.attn_out_width();
-        let heads = config.num_attention_heads as u32;
         let mut base = 0usize;
         while base < batch {
             let rows = ATTENTION_CHUNK.min(batch - base);
-            let at = position + base;
-            self.launch(
-                kernels.attn_full,
-                (heads, rows as u32, full_attention_splits(at + rows) as u32),
-                (256, 1, 1),
-                &[
-                    self.query.offset(base * attn_width * 4).0,
-                    keys.0,
-                    values.0,
-                    self.qsa_block_scores.0,
-                    at as u64,
-                    config.num_attention_heads as u64,
-                    config.num_key_value_heads as u64,
-                    config.head_dim as u64,
-                    config.query_groups() as u64,
-                ],
-            )?;
-            self.launch(
+            let attention = calls::FullAttention {
+                query: self.query.offset(base * attn_width * 4).0,
+                keys: keys.0,
+                values: values.0,
+                partials: self.qsa_block_scores.0,
+                position: position + base,
+                rows,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+            };
+            self.call(kernels.attn_full, attention.call())?;
+            self.call(
                 kernels.attn_full_combine,
-                (heads, rows as u32, 1),
-                (256, 1, 1),
-                &[
-                    self.qsa_block_scores.0,
+                attention.combine(
                     self.gate.offset(base * attn_width * 4).0,
                     self.attention_out.offset(base * attn_width * 4).0,
-                    at as u64,
-                    config.num_attention_heads as u64,
-                    config.head_dim as u64,
-                ],
+                ),
             )?;
             self.prof_mark("sparse_attn")?;
             base += rows;

@@ -433,9 +433,24 @@ spelling, any other in the one shared convention of `sparkflash_ops::naming` (ru
 names, a shared expert's gate, a tied head) from its headers, `NamingDialect::names` spells every
 tensor from the `Architecture`, and `ArchitectureTensorPlan::named` plans them (shapes, rank
 splits, roles, FP8 tile scales) in forward order. The converter, the host reference and the
-web's fit read that one plan; a novel family has no device arm yet, so:
+web's fit read that one plan, and:
 
-- a novel family is served by the CPU reference backend in
+- a novel family that is a dense BF16 grouped-query decoder (embedding, RMSNorm, GQA with or
+  without the per-head output gate and `q_norm`/`k_norm`, plain `rotate_half` RoPE over the
+  leading rotated dimensions, a dense unclamped SwiGLU, a plain residual and the head) is served
+  on the device by the shared dense arm, `sparkflash-model-dense` (runtime step 19), with no code
+  of its own: it reads the `Architecture`, the shared names, `DraftUploader` and the typed
+  `sparkflash_ops::calls`, and its prompt projections take the shared wide tile
+  (`WidePolicy::DENSE`). `sparkflash_ops::parts::dense_device_refusal` is its gate, and it names
+  what it refuses (a window, a rope scaling, another activation, a bias, a non-BF16 projection,
+  an MoE layer, a widened residual...). It gates on its own launch list rather than the kernel
+  catalogue, whose rows pin the released presets' shapes. Its check is a per-layer parity report
+  against the host reference (`cli/src/serve/dense_parity.rs`), not a recorded digest: it keeps
+  BF16 keys and values where the reference keeps f32. It holds one sequence at TP1;
+  `SPARKFLASH_DENSE_DEVICE=0` keeps such a checkpoint on the host reference and `=1` refuses to
+  boot unless the arm opens. Unset, the boot line names which backend answers and, on the host,
+  why the arm did not;
+- any other novel family is served by the CPU reference backend in
   `sparkflash-cli/src/serve/dynamic_host.rs`, which executes the parts in
   `sparkflash-cli/src/dynamic.rs::DYNAMIC_PARTS` (embedding, RMSNorm, GQA, Gated DeltaNet,
   dense SwiGLU, routed/shared MoE, LM head, plain residual) with the shared names and f32

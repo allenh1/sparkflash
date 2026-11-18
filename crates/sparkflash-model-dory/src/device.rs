@@ -2232,23 +2232,14 @@ fn gemv_batch(
         }
         Route::RowGemv => {}
     }
-    // The kernel covers two rows a warp for a batch (16 rows a block at 256 threads) and one row
-    // a warp for a single row; the grid must match that mapping or half the blocks exit unused.
-    let rows_per_block = if batch > 1 { 16 } else { 8 };
-    launch(
-        cuda,
-        kernels.gemv_bf16,
-        (matrix.rows.div_ceil(rows_per_block) as u32, 1, 1),
-        (256, 1, 1),
-        &[
-            matrix.pointer.0,
-            input.0,
-            output.0,
-            matrix.rows as u64,
-            matrix.columns as u64,
-            batch as u64,
-        ],
-    )
+    let call = sparkflash_ops::calls::gemv_bf16(
+        matrix.pointer.0,
+        input.0,
+        output.0,
+        (matrix.rows, matrix.columns),
+        batch,
+    );
+    launch(cuda, kernels.gemv_bf16, call.grid, call.block, &call.args)
 }
 
 /// Up to four projections of one `input`, each into its own output.

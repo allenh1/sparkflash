@@ -23,11 +23,13 @@
 //! process environment applied.
 //!
 //! A resolved preset family is served by its existing device arm with the checkpoint's own
-//! identity. Any other family is served by [super::dynamic_host::DynamicHostBackend], the CPU
-//! reference path that runs [Architecture]'s parts. Phase 4's `EngineBuilder` is merged and the
-//! released Qwen/GLM arms implement it, but a novel family has no arm to implement it; the host
-//! path is the honest substitute the issue allows, and the limitation is stated in the boot
-//! line and in docs/adding-a-model.md section 7.
+//! identity. Any other family that is the dense grouped-query decoder the shared dense arm
+//! executes ([sparkflash_ops::parts::dense_device_refusal]) is served on the device by
+//! [sparkflash_model_dense::DenseDeviceBackend], with no code of its own; the rest, and an
+//! operator who opts out with [DENSE_DEVICE_ENV]`=0`, are served by
+//! [super::dynamic_host::DynamicHostBackend], the CPU reference path that runs [Architecture]'s
+//! parts. The boot line names which one answers and, on the host, why the device arm did not;
+//! docs/adding-a-model.md section 7 states the limits.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -384,8 +386,8 @@ fn profile(architecture: &Architecture) -> Result<ModelProfile, String> {
 /// Serves a dynamically resolved checkpoint.
 ///
 /// A preset family that this build has an arm for is served by that arm, with the checkpoint's
-/// own id, window and tokenizer. Any other resolved family is served by the CPU reference host
-/// backend, because the shared `EngineBuilder` backend is phase 4 and is not on this base.
+/// own id, window and tokenizer. Any other resolved family is served by the shared dense device
+/// arm when it takes the checkpoint, else by the CPU reference host backend ([serve_novel]).
 ///
 /// # Errors
 /// The resolution or plan failed, the plan has unresolved parts (the exact list is returned),
@@ -394,7 +396,7 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
     #[cfg(feature = "tp4-serve")]
     if options.tp4.is_some() {
         return Err(
-            "a dynamically resolved model serves at TP=1 on this base: the shared EngineBuilder is TP1 and a novel family has no device arm. Name a released preset with --model to use its group, or drop the --tp4-rank flags"
+            "a dynamically resolved model serves at TP=1 on this base: the shared EngineBuilder and the shared dense device arm are TP1. Name a released preset with --model to use its group, or drop the --tp4-rank flags"
                 .to_owned(),
         );
     }
@@ -539,8 +541,106 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
             ),
             None => serve_dory_host(checkpoint, descriptor, seam, dialect, context, options),
         },
-        _ => serve_host(checkpoint, descriptor, seam, dialect, context, options),
+        _ => serve_novel(checkpoint, descriptor, seam, dialect, context, options),
     }
+}
+
+/// The variable that chooses where a family no pack transcribes runs: unset prefers the shared
+/// dense device arm and states why when the host reference answers instead, `1` requires the
+/// arm (a checkpoint it cannot open is a boot refusal), and `0` keeps the host reference.
+pub(crate) const DENSE_DEVICE_ENV: &str = "SPARKFLASH_DENSE_DEVICE";
+
+/// What [DENSE_DEVICE_ENV] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseDevice {
+    /// The arm when it takes the checkpoint, else the host reference with the reason.
+    Prefer,
+    /// The arm, or a refusal.
+    Require,
+    /// The host reference.
+    Off,
+}
+
+fn dense_device(value: Option<&str>) -> Result<DenseDevice, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(DenseDevice::Prefer),
+        Some("1" | "on" | "true") => Ok(DenseDevice::Require),
+        Some("0" | "off" | "false") => Ok(DenseDevice::Off),
+        Some(other) => Err(format!(
+            "{DENSE_DEVICE_ENV}={other:?} is neither 1 (require the shared dense device arm) nor \
+             0 (serve on the host reference); unset it to prefer the arm"
+        )),
+    }
+}
+
+/// Serves a family no pack transcribes: on the shared dense device arm when it takes the
+/// checkpoint and [DENSE_DEVICE_ENV] allows it, else on the host reference, naming why.
+fn serve_novel(
+    checkpoint: DynamicCheckpoint,
+    descriptor: ModelDescriptor,
+    seam: Arc<dyn PromptCodec>,
+    dialect: Dialect,
+    context: usize,
+    options: &ServeOptions,
+) -> Result<ExitCode, String> {
+    let wanted = dense_device(std::env::var(DENSE_DEVICE_ENV).ok().as_deref())?;
+    let reason = if wanted == DenseDevice::Off {
+        format!("{DENSE_DEVICE_ENV}=0")
+    } else {
+        let opened = sparkflash_ops::parts::dynamic_device_arm(&checkpoint.architecture)
+            .and_then(|arm| {
+                if arm == sparkflash_ops::parts::DENSE_DEVICE_ARM {
+                    Ok(())
+                } else {
+                    Err(format!("{arm} is not this path's"))
+                }
+            })
+            .and_then(|()| {
+                let source =
+                    sparkflash_weights::safetensors::open_checkpoint(&checkpoint.directory)
+                        .map_err(|error| format!("{}: {error}", checkpoint.directory.display()))?;
+                sparkflash_model_dense::DenseDeviceBackend::open(
+                    descriptor.clone(),
+                    &checkpoint.architecture,
+                    &source,
+                    context,
+                )
+            });
+        match opened {
+            Ok(backend) => {
+                let banner = format!(
+                    "{} ({}) at TP=1 on {}, context {context}, shared dense device arm ({:.2} GiB \
+                     of BF16 weights)",
+                    descriptor.id,
+                    descriptor.weights_id,
+                    checkpoint.directory.display(),
+                    backend.weight_bytes() as f64 / f64::from(1u32 << 30)
+                );
+                return serve_backend(
+                    Box::new(backend),
+                    descriptor,
+                    seam,
+                    dialect,
+                    options,
+                    &banner,
+                );
+            }
+            Err(reason) if wanted == DenseDevice::Require => {
+                return Err(format!(
+                    "--model {}: {DENSE_DEVICE_ENV}=1 requires the shared dense device arm: \
+                     {reason}",
+                    checkpoint.model_id
+                ));
+            }
+            Err(reason) => reason,
+        }
+    };
+    eprintln!(
+        "sparkflash serve: {} runs on the host reference, not the shared dense device arm: \
+         {reason}",
+        checkpoint.model_id
+    );
+    serve_host(checkpoint, descriptor, seam, dialect, context, options)
 }
 
 /// Serves an Inkling checkpoint through its pack's f32 host reference.
@@ -779,9 +879,21 @@ pub(crate) fn names_deepseek(options: &ServeOptions) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::device_family;
+    use super::{DenseDevice, dense_device, device_family};
     use sparkflash_model::Target;
     use sparkflash_ops::engine_plan::EnginePlan;
+
+    #[test]
+    fn the_dense_device_switch_prefers_requires_or_refuses() {
+        assert_eq!(dense_device(None), Ok(DenseDevice::Prefer));
+        assert_eq!(dense_device(Some(" ")), Ok(DenseDevice::Prefer));
+        assert_eq!(dense_device(Some("1")), Ok(DenseDevice::Require));
+        assert_eq!(dense_device(Some("0")), Ok(DenseDevice::Off));
+        assert_eq!(dense_device(Some("off")), Ok(DenseDevice::Off));
+        // A value it does not know is refused, not read as either answer.
+        let refused = dense_device(Some("maybe")).expect_err("an unknown value is refused");
+        assert!(refused.contains("SPARKFLASH_DENSE_DEVICE"), "{refused}");
+    }
 
     #[test]
     fn the_qwen_text_alias_dispatches_to_the_qwen_arm() {

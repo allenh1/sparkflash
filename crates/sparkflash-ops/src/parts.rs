@@ -1679,7 +1679,9 @@ const DORY_QWEN_SYMBOLS: &[&str] = &["q4e_embed", "q4e_gemv4_bf16", "q4e_gemv_bf
 /// reference: the Qwen3.5/3.6-MoE (`qwen3_5_moe`) arm reads the FP8 release, whose routed experts
 /// and wide dense projections are E4M3 on 128x128 tiles, but not the BF16 release's fused
 /// `mlp.experts.gate_up_proj`, which no device kernel reads yet. This is the one rule the CLI's
-/// dynamic route, the arm's own load and the web browser agree on.
+/// dynamic route, the arm's own load and the web browser agree on. A family no pack transcribes
+/// is the shared dense arm's ([DENSE_DEVICE_ARM]) when [dense_device_refusal] takes it and this
+/// build carries its kernels ([dense_device_images]).
 ///
 /// # Errors
 /// Why no device arm serves the checkpoint, so the host reference is its executor.
@@ -1719,9 +1721,15 @@ pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, S
         return Ok("the Dory device arm");
     }
     if family != "qwen3_5_moe" {
-        return Err(format!(
-            "this build has no device arm for the {family} family"
-        ));
+        // A family no pack transcribes is the shared dense arm's when it is the dense
+        // grouped-query decoder that arm executes and this build carries its kernels.
+        if let Some(refusal) = dense_device_refusal(architecture) {
+            return Err(format!(
+                "this build has no device arm for the {family} family: {refusal}"
+            ));
+        }
+        dense_device_images()?;
+        return Ok(DENSE_DEVICE_ARM);
     }
     let tile = |format: WeightFormat| {
         matches!(
@@ -1750,6 +1758,174 @@ pub fn dynamic_device_arm(architecture: &Architecture) -> Result<&'static str, S
         ));
     }
     Ok("the Qwen3.5-MoE device arm")
+}
+
+/// The name [dynamic_device_arm] gives the shared dense arm.
+pub const DENSE_DEVICE_ARM: &str = "the shared dense device arm";
+
+/// The token-image kernels the shared dense arm launches.
+pub const DENSE_TOKEN_SYMBOLS: &[&str] = &[
+    "q4e_add",
+    "q4e_deinterleave",
+    "q4e_embed",
+    "q4e_gemv_bf16",
+    "q4e_rmsnorm",
+    "q4e_rope",
+    "q4e_swiglu",
+];
+
+/// The attention-image kernels the shared dense arm launches.
+pub const DENSE_ATTENTION_SYMBOLS: &[&str] =
+    &["q4e_attn_full", "q4e_attn_full_combine", "q4e_cache_bf16"];
+
+/// The image entry of the shared wide tile the dense arm's prompt projections launch
+/// ([crate::projection::WideTile]); the Dory image carries it.
+pub const DENSE_WIDE_SYMBOL: &str = "dory_mma_wide";
+
+/// The largest head the split full attention takes (`Q4E_BLOCK`).
+pub const DENSE_MAX_HEAD_DIM: usize = 256;
+
+/// Whether this build's images carry every kernel the shared dense arm launches.
+///
+/// # Errors
+/// The image or the symbols this build is missing.
+pub fn dense_device_images() -> Result<(), String> {
+    for (image, symbols) in [
+        (Image::Qwen4Exp, DENSE_TOKEN_SYMBOLS),
+        (Image::Qwen4Attn, DENSE_ATTENTION_SYMBOLS),
+        (Image::Dory, &[DENSE_WIDE_SYMBOL][..]),
+    ] {
+        if !image.available() {
+            return Err(format!(
+                "this build has no {image:?} cubin, which the shared dense arm launches from"
+            ));
+        }
+        let missing: Vec<&str> = symbols
+            .iter()
+            .copied()
+            .filter(|symbol| !image.exported_symbols().contains(symbol))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "the {image:?} image does not list the kernels the shared dense arm launches: \
+                 {missing:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Why the shared dense device arm cannot execute `architecture`, if it cannot.
+///
+/// The arm runs the host reference's arithmetic on the token image: a BF16 embedding, RMSNorm,
+/// grouped-query attention (with or without the per-head output gate and q/k norms, plain
+/// rotate-half RoPE over the leading rotated dimensions), a dense SwiGLU, a plain residual and
+/// the head, on one rank. It is gated by a per-layer parity report against that reference, so it
+/// takes nothing the reference does not execute, and nothing the reference does that its kernels
+/// do not (a linear rotary rule, another activation, a clamp). Everything else is refused by
+/// name, and the host reference stays that checkpoint's executor.
+#[must_use]
+pub fn dense_device_refusal(architecture: &Architecture) -> Option<String> {
+    use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, Residual};
+    if let Some(refusal) = host_reference_structure_refusal(architecture) {
+        return Some(refusal);
+    }
+    if architecture.quantization.dense_format != WeightFormat::Bf16 {
+        return Some(format!(
+            "its dense projections are {}, and the arm reads BF16",
+            architecture.quantization.dense_format.name()
+        ));
+    }
+    if architecture.hidden_size == 0
+        || architecture.vocab_size == 0
+        || architecture.layers.is_empty()
+    {
+        return Some("the checkpoint declares an empty model".to_owned());
+    }
+    let whole = [
+        (architecture.looped.is_some(), "a looped recurrence"),
+        (architecture.inkling.is_some(), "Inkling-2's attention"),
+        (architecture.attention_bias, "attention biases"),
+    ];
+    if let Some((_, what)) = whole.iter().find(|(declared, _)| *declared) {
+        return Some(format!(
+            "it declares {what}, which the arm does not execute"
+        ));
+    }
+    for layer in &architecture.layers {
+        let index = layer.index;
+        let attention = &layer.attention;
+        let AttentionKind::Gqa { kv_heads, .. } = attention.kind else {
+            return Some(format!(
+                "layer {index} is not grouped-query attention, the only attention the arm runs"
+            ));
+        };
+        let declared = [
+            (attention.window.is_some(), "a sliding window"),
+            (attention.compression.is_some(), "a compressed cache"),
+            (attention.indexer.is_some(), "a sparse indexer"),
+            (attention.rope.mrope_section.is_some(), "an mRoPE section"),
+            (!layer.sides.is_empty(), "a side table"),
+            (
+                !matches!(layer.residual, Residual::Plain),
+                "a widened residual",
+            ),
+        ];
+        if let Some((_, what)) = declared.iter().find(|(declared, _)| *declared) {
+            return Some(format!(
+                "layer {index} declares {what}, which the arm does not execute"
+            ));
+        }
+        if attention.heads == 0
+            || kv_heads == 0
+            || !attention.heads.is_multiple_of(kv_heads)
+            || attention.head_dim == 0
+            || attention.head_dim > DENSE_MAX_HEAD_DIM
+        {
+            return Some(format!(
+                "layer {index}'s attention ({} heads over {kv_heads} key/value heads of {}) is \
+                 not one the split attention takes (whole groups, heads of 1..={DENSE_MAX_HEAD_DIM})",
+                attention.heads, attention.head_dim
+            ));
+        }
+        let rope = &attention.rope;
+        if !rope.rotated_dims.min(attention.head_dim).is_multiple_of(2) {
+            return Some(format!(
+                "layer {index} rotates {} dimensions a head, which is not even",
+                rope.rotated_dims
+            ));
+        }
+        if rope.rotated_dims >= 2
+            && let Some(scaling) = &rope.scaling
+            && !matches!(scaling.kind.to_ascii_lowercase().as_str(), "" | "default")
+        {
+            return Some(format!(
+                "layer {index} declares rope.scaling {:?} (factor {}); the arm's rotary is the \
+                 plain rule",
+                scaling.kind, scaling.factor
+            ));
+        }
+        match &layer.ffn {
+            Ffn::Dense(dense) if dense.activation == Activation::Silu && dense.clamp.is_none() => {}
+            Ffn::Dense(dense) => {
+                return Some(format!(
+                    "layer {index}'s MLP is {:?}{}, and the arm runs an unclamped SwiGLU",
+                    dense.activation,
+                    if dense.clamp.is_some() {
+                        " clamped"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            Ffn::Moe(_) => {
+                return Some(format!(
+                    "layer {index} routes experts, and the arm runs dense MLPs"
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Why the host reference backend cannot execute `architecture`, if it cannot.
@@ -2448,6 +2624,77 @@ mod tests {
         let mut other = fp8.clone();
         other.family = "novel_family".to_owned();
         assert!(dynamic_device_arm(&other).is_err());
+    }
+
+    /// A dense grouped-query family no pack names is the shared dense arm's, and what that arm
+    /// does not execute is refused by name.
+    #[test]
+    fn a_dense_gqa_family_is_the_shared_dense_arms_and_the_rest_is_named() {
+        let document = serde_json::json!({
+            "model_type": "acme_dense",
+            "hidden_size": 256,
+            "intermediate_size": 512,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 256,
+            "max_position_embeddings": 512,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu"
+        });
+        let parse = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut document = document.clone();
+            edit(&mut document);
+            Architecture::from_json(&document.to_string()).expect("the document parses")
+        };
+        let dense = parse(&|_| {});
+        assert_eq!(dense_device_refusal(&dense), None);
+        let arm = dynamic_device_arm(&dense);
+        if dense_device_images().is_ok() {
+            assert_eq!(arm, Ok(DENSE_DEVICE_ARM));
+        } else {
+            assert!(arm.expect_err("no images, no arm").contains("cubin"));
+        }
+        for (edit, named) in [
+            (
+                &(|document: &mut serde_json::Value| {
+                    document["sliding_window"] = serde_json::json!(128);
+                    document["use_sliding_window"] = serde_json::json!(true);
+                }) as &dyn Fn(&mut serde_json::Value),
+                "sliding window",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["rope_scaling"] = serde_json::json!({"type": "linear", "factor": 2.0});
+                },
+                "rope.scaling",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["hidden_act"] = serde_json::json!("gelu");
+                },
+                "SwiGLU",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["attention_bias"] = serde_json::json!(true);
+                },
+                "attention biases",
+            ),
+            (
+                &|document: &mut serde_json::Value| {
+                    document["head_dim"] = serde_json::json!(512);
+                },
+                "heads of 1..=256",
+            ),
+        ] {
+            let architecture = parse(edit);
+            let refusal = dense_device_refusal(&architecture)
+                .or_else(|| host_reference_structure_refusal(&architecture))
+                .expect("the shape is refused");
+            assert!(refusal.contains(named), "{named}: {refusal}");
+        }
     }
 
     /// Qwen3.6-35B-A3B is a covered host family: its vision tower and MTP stage are stored but

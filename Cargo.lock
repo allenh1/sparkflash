@@ -2373,6 +2373,7 @@ dependencies = [
  "sparkflash-kv",
  "sparkflash-model",
  "sparkflash-model-deepseek-v41",
+ "sparkflash-model-dense",
  "sparkflash-model-dory",
  "sparkflash-model-glm5-next",
  "sparkflash-model-inkling2",
@@ -2545,6 +2546,16 @@ dependencies = [
  "sparkflash-weights",
  "thiserror 2.0.21",
  "tokenizers",
+]
+
+[[package]]
+name = "sparkflash-model-dense"
+version = "0.1.0"
+dependencies = [
+ "sparkflash-kernels",
+ "sparkflash-model",
+ "sparkflash-ops",
+ "sparkflash-weights",
 ]
 
 [[package]]

@@ -110,6 +110,14 @@ impl WidePolicy {
         min_rows: 1,
         off_shape: OffShape::Gemv,
     };
+
+    /// The shared dense arm's prompt walk: past the row GEMV's rows the tile, else the row GEMV a
+    /// group of rows at a time. Decode rows keep the row GEMV, as on GLM; the arm has no skinny
+    /// kernel.
+    pub const DENSE: Self = Self {
+        min_rows: GEMV_MAX_BATCH + 1,
+        off_shape: OffShape::Gemv,
+    };
 }
 
 /// The kernel a projection takes.

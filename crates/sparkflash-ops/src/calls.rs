@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Typed calls of the token image's shared kernels: norm, rotary, residual add, SwiGLU, copy,
-//! embedding and the BF16 cache append.
+//! embedding, the BF16 cache append, the row GEMV, the head deinterleave and the split full
+//! attention.
 //!
 //! Every device arm launches these bodies from the Qwen token image (`kernels/qwen4_exp_sm121.cu`
 //! and `kernels/qwen4_attn_sm121.cu`), the block drafter ([crate::dflash]) included, and each
@@ -280,9 +281,215 @@ impl Rope {
     }
 }
 
+/// The warps of a row GEMV block (`q4e_gemv_bf16`): [BLOCK] threads.
+pub const GEMV_WARPS: usize = BLOCK as usize / 32;
+
+/// `q4e_gemv_bf16`: `output[t][r] = weight[r] . input[t]` for `batch` rows (at most
+/// [crate::gemv::GEMV_MAX_BATCH]) over a row-major `rows x columns` BF16 weight.
+///
+/// One output row a warp for a single row, two for a batch: the grid follows the kernel's
+/// row-to-warp mapping, or half the blocks exit unused.
+#[must_use]
+pub const fn gemv_bf16(
+    weight: u64,
+    input: u64,
+    output: u64,
+    (rows, columns): (usize, usize),
+    batch: usize,
+) -> Call<6> {
+    let per_block = if batch > 1 {
+        GEMV_WARPS * 2
+    } else {
+        GEMV_WARPS
+    };
+    Call {
+        grid: (rows.div_ceil(per_block) as u32, 1, 1),
+        block: (BLOCK, 1, 1),
+        args: [
+            weight,
+            input,
+            output,
+            rows as u64,
+            columns as u64,
+            batch as u64,
+        ],
+    }
+}
+
+/// `q4e_deinterleave`: a gated query projection's `[head0 query | head0 gate | ...]` rows split
+/// into `[rows][heads * head_dim]` queries and gates.
+#[must_use]
+pub const fn deinterleave(
+    interleaved: u64,
+    (query, gate): (u64, u64),
+    (heads, head_dim): (usize, usize),
+    rows: usize,
+) -> Call<5> {
+    Call {
+        grid: (flat_blocks(heads * head_dim), rows as u32, 1),
+        block: (BLOCK, 1, 1),
+        args: [interleaved, query, gate, heads as u64, head_dim as u64],
+    }
+}
+
+/// Keys a `q4e_attn_full` block takes a pass (`Q4E_FULL_TILE`).
+pub const FULL_ATTENTION_TILE: usize = 256;
+
+/// The most blocks `q4e_attn_full` splits one row's context over (`Q4E_FULL_SPLITS`).
+pub const FULL_ATTENTION_SPLITS: usize = 16;
+
+/// The splits a row that sees `visible` positions takes (`q4e_full_splits`).
+#[must_use]
+pub const fn full_attention_splits(visible: usize) -> usize {
+    let splits = visible.div_ceil(FULL_ATTENTION_TILE);
+    if splits == 0 {
+        1
+    } else if splits > FULL_ATTENTION_SPLITS {
+        FULL_ATTENTION_SPLITS
+    } else {
+        splits
+    }
+}
+
+/// `q4e_attn_full` and `q4e_attn_full_combine`: causal grouped-query attention of `rows` query
+/// rows at absolute `position` over a BF16 `[position][kv_heads * head_dim]` key and value
+/// cache, each row's context split over up to [FULL_ATTENTION_SPLITS] blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullAttention {
+    /// The queries, `[rows][heads][head_dim]` f32.
+    pub query: u64,
+    /// The cached keys, BF16.
+    pub keys: u64,
+    /// The cached values, BF16.
+    pub values: u64,
+    /// The split partials, `[rows][heads][FULL_ATTENTION_SPLITS][head_dim + 2]` f32
+    /// ([Self::partial_floats]).
+    pub partials: u64,
+    /// The first row's absolute position: row `t` sees `position + t + 1` keys.
+    pub position: usize,
+    /// The query rows.
+    pub rows: usize,
+    /// The query heads.
+    pub heads: usize,
+    /// The key/value heads.
+    pub kv_heads: usize,
+    /// A head's floats (at most [BLOCK]).
+    pub head_dim: usize,
+}
+
+impl FullAttention {
+    /// The partial floats `rows` rows of `heads` heads of `head_dim` take.
+    #[must_use]
+    pub const fn partial_floats(rows: usize, heads: usize, head_dim: usize) -> usize {
+        rows * heads * FULL_ATTENTION_SPLITS * (head_dim + 2)
+    }
+
+    /// The split pass: a block a (head, row, split).
+    #[must_use]
+    pub const fn call(&self) -> Call<9> {
+        let groups = match self.heads.checked_div(self.kv_heads) {
+            Some(groups) => groups,
+            None => 1,
+        };
+        Call {
+            grid: (
+                self.heads as u32,
+                self.rows as u32,
+                full_attention_splits(self.position + self.rows) as u32,
+            ),
+            block: (BLOCK, 1, 1),
+            args: [
+                self.query,
+                self.keys,
+                self.values,
+                self.partials,
+                self.position as u64,
+                self.heads as u64,
+                self.kv_heads as u64,
+                self.head_dim as u64,
+                groups as u64,
+            ],
+        }
+    }
+
+    /// The combine into `out` (`[rows][heads][head_dim]`), times `sigmoid(gate)` when `gate`
+    /// is not null: a block a (head, row).
+    #[must_use]
+    pub const fn combine(&self, gate: u64, out: u64) -> Call<6> {
+        Call {
+            grid: (self.heads as u32, self.rows as u32, 1),
+            block: (BLOCK, 1, 1),
+            args: [
+                self.partials,
+                gate,
+                out,
+                self.position as u64,
+                self.heads as u64,
+                self.head_dim as u64,
+            ],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_attention_and_projection_calls_are_the_arms_old_lists() {
+        // Qwen's row GEMV (device.rs), one row and a batch.
+        assert_eq!(
+            gemv_bf16(1, 2, 3, (100, 64), 1),
+            Call {
+                grid: (13, 1, 1),
+                block: (256, 1, 1),
+                args: [1, 2, 3, 100, 64, 1],
+            }
+        );
+        assert_eq!(gemv_bf16(1, 2, 3, (100, 64), 4).grid, (7, 1, 1));
+        // Qwen's head deinterleave (blocks.rs).
+        assert_eq!(
+            deinterleave(1, (2, 3), (16, 256), 5),
+            Call {
+                grid: (16, 5, 1),
+                block: (256, 1, 1),
+                args: [1, 2, 3, 16, 256],
+            }
+        );
+        // Qwen's full attention (blocks.rs) at a position past one split.
+        let attention = FullAttention {
+            query: 1,
+            keys: 2,
+            values: 3,
+            partials: 4,
+            position: 300,
+            rows: 7,
+            heads: 16,
+            kv_heads: 2,
+            head_dim: 256,
+        };
+        assert_eq!(
+            attention.call(),
+            Call {
+                grid: (16, 7, 2),
+                block: (256, 1, 1),
+                args: [1, 2, 3, 4, 300, 16, 2, 256, 8],
+            }
+        );
+        assert_eq!(
+            attention.combine(5, 6),
+            Call {
+                grid: (16, 7, 1),
+                block: (256, 1, 1),
+                args: [4, 5, 6, 300, 16, 256],
+            }
+        );
+        assert_eq!(full_attention_splits(0), 1);
+        assert_eq!(full_attention_splits(256), 1);
+        assert_eq!(full_attention_splits(257), 2);
+        assert_eq!(full_attention_splits(1 << 20), 16);
+        assert_eq!(FullAttention::partial_floats(2, 3, 4), 2 * 3 * 16 * 6);
+    }
 
     #[test]
     fn the_calls_are_the_arms_old_lists() {
