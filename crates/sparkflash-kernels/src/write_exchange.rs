@@ -45,13 +45,16 @@
 //! port is `SPARK_COMM_CONTROL_PORT`; the collectives themselves run on the rails
 //! `select_rails_from_live_fabric` resolves (`SPARK_COMM_RAIL_COUNT` of them, two unless told
 //! otherwise), and the GIDs come from each rank's own record, so the two do not have to be the
-//! same interface.
+//! same interface. A TP group's launcher passes its own rank table and a control port beside its
+//! own ([shared_in], [GroupTable]), so a group opens the exchange by default without being told
+//! twice; the variables still win when set. [ExchangeState::exchange_on] is one slot exchange on
+//! any stream, the device leg every TP group's collective shares (sparkflash_ops::doorbell).
 
 use std::sync::{Mutex, OnceLock};
 
 use sparkflash_comm::rdma::{ExchangeStats, RdmaConfig, SlabLayout, WriteExchange};
 
-use crate::cuda_driver::{Cuda, HostMapped, Kernel, Module};
+use crate::cuda_driver::{Cuda, HostMapped, Kernel, Module, StreamEvent};
 
 /// The switch that selects the exchange over the NCCL group.
 pub const EXCHANGE_ENV: &str = "SPARKFLASH_EXCHANGE";
@@ -61,6 +64,11 @@ pub const STAGE_SYMBOL: &str = "opt_exchange_stage_bf16";
 
 /// The collect kernel's symbol in the same image.
 pub const COLLECT_SYMBOL: &str = "opt_exchange_collect";
+
+/// The widest round a model arm's collectives send through the exchange by default, in bytes: a
+/// decode step's residual sums and logit gather fit (Inkling's logit slice is 200,060 bytes a rank
+/// at TP4), and so does a prefill chunk of a few rows; a wider payload stays on the NCCL group.
+pub const DOORBELL_ROW_CAP: usize = 256 * 1024;
 
 /// Arrival flags the exchange kernel can watch: one warp, a lane to a flag.
 const KERNEL_FLAG_LANES: usize = 32;
@@ -108,6 +116,12 @@ pub struct ExchangeState {
     collect: Kernel,
     /// The modules the kernels were loaded from; they must outlive the kernels.
     _modules: [Module; 2],
+    /// The raw stream the last [Self::exchange_on] round was launched on (0, the default stream,
+    /// before the first).
+    stream: u64,
+    /// The event that orders a round on a new stream behind the rounds on the last one, made on
+    /// the first switch.
+    switch: Option<StreamEvent>,
 }
 
 // SAFETY: every field is plain data, a page-locked allocation the driver owns, or a CUDA function
@@ -191,13 +205,34 @@ impl ExchangeState {
         world: usize,
         what: &dyn std::fmt::Display,
     ) -> Result<Round, String> {
+        self.stage_on(cuda, 0, row, row_bytes, rank, world, what)
+    }
+
+    /// [Self::stage] on the raw stream `stream` (0 is the default stream, through [Cuda::launch]).
+    /// The caller keeps rounds in submit order on the device; [Self::exchange_on] does that across
+    /// streams.
+    ///
+    /// # Errors
+    /// As [Self::stage].
+    #[allow(clippy::too_many_arguments)]
+    fn stage_on(
+        &mut self,
+        cuda: &Cuda,
+        stream: u64,
+        row: u64,
+        row_bytes: usize,
+        rank: usize,
+        world: usize,
+        what: &dyn std::fmt::Display,
+    ) -> Result<Round, String> {
         let round = self
             .submit(row_bytes)
             .map_err(|error| format!("direct-RDMA exchange: {error}"))?;
         // A launch that fails here leaves the round reserved and its doorbell un-rung. Telling the
         // exchange is not optional: without it the pump posts the skipped round from whatever
         // bytes are in the row, and the peers fold them.
-        if let Err(error) = cuda.launch(
+        if let Err(error) = cuda.launch_on_raw(
+            stream,
             self.kernel,
             (1, 1, 1),
             (STAGE_THREADS, 1, 1),
@@ -237,6 +272,24 @@ impl ExchangeState {
         rank: usize,
         world: usize,
     ) -> Result<(), String> {
+        self.collect_on(cuda, 0, round, slots, bytes, rank, world)
+    }
+
+    /// [Self::collect_slots] on the raw stream `stream`, behind the round's stage kernel there.
+    ///
+    /// # Errors
+    /// A launch the driver refused.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_on(
+        &self,
+        cuda: &Cuda,
+        stream: u64,
+        round: &Round,
+        slots: u64,
+        bytes: usize,
+        rank: usize,
+        world: usize,
+    ) -> Result<(), String> {
         // The sixteen-byte copy when both buffers and the slot are aligned for it.
         let unit = if (round.set | slots | bytes as u64) & 15 == 0 {
             16usize
@@ -244,7 +297,8 @@ impl ExchangeState {
             1
         };
         let blocks = (world * bytes / unit).div_ceil(COLLECT_THREADS as usize) as u32;
-        cuda.launch(
+        cuda.launch_on_raw(
+            stream,
             self.collect,
             (blocks, 1, 1),
             (COLLECT_THREADS, 1, 1),
@@ -257,6 +311,56 @@ impl ExchangeState {
                 unit as u64,
             ],
         )
+    }
+
+    /// One slot exchange on the raw stream `stream`, the device leg of a TP collective's
+    /// `exchange_on_device`: this rank's `bytes` at `send` reach every peer's
+    /// `slots + rank * bytes`, and every peer's land at this rank's `slots + peer * bytes`, behind
+    /// whatever `stream` already holds. Bits are moved and nothing is summed, so the fold the
+    /// caller launches behind it gives the bits the NCCL group's exchange gives.
+    ///
+    /// Rounds must reach the device in the order they were submitted - the row sets alternate by
+    /// the round's parity and the doorbell is one sequence word - so a round on a stream other
+    /// than the last round's first orders that stream behind the last one with an event. A run
+    /// that keeps its collectives on one stream never pays for it.
+    ///
+    /// # Errors
+    /// A payload wider than a round, a refused submit, or a launch or ordering the driver refused;
+    /// a collect that does not launch marks the exchange failed, since its round is already rung.
+    #[allow(clippy::too_many_arguments)]
+    pub fn exchange_on(
+        &mut self,
+        cuda: &Cuda,
+        stream: u64,
+        send: u64,
+        slots: u64,
+        bytes: usize,
+        rank: usize,
+        world: usize,
+        what: &dyn std::fmt::Display,
+    ) -> Result<(), String> {
+        if bytes > self.row_cap() {
+            return Err(format!(
+                "{what}: {bytes} bytes are wider than the exchange's {} -byte round",
+                self.row_cap()
+            ));
+        }
+        if stream != self.stream {
+            let event = match &self.switch {
+                Some(event) => event,
+                None => self.switch.insert(cuda.stream_event()?),
+            };
+            cuda.order_raw(event, self.stream, stream)?;
+            self.stream = stream;
+        }
+        let round = self.stage_on(cuda, stream, send, bytes, rank, world, what)?;
+        self.collect_on(cuda, stream, &round, slots, bytes, rank, world)
+            .inspect_err(|error| {
+                self.fail(&format!(
+                    "{what}: the collect kernel for round {} did not launch: {error}",
+                    round.seq
+                ));
+            })
     }
 }
 
@@ -411,6 +515,18 @@ pub struct Opening {
     pub replaces: &'static str,
 }
 
+/// The group's own address table, for a launcher that already knows where every rank is: a TP
+/// group's `--tp4-peers` and a control port beside its own. It stands in for `SPARK_COMM_PEERS`
+/// and `SPARK_COMM_CONTROL_PORT` when those are unset, so every group opens the exchange without
+/// being told twice; a run that sets them still wins.
+#[derive(Debug, Clone)]
+pub struct GroupTable {
+    /// One control-plane address per rank, in rank order.
+    pub peers: Vec<String>,
+    /// The port rank 0's control plane listens on.
+    pub control_port: u16,
+}
+
 /// The shared exchange, opened on the first call.
 ///
 /// `cubin` returns the image that carries [STAGE_SYMBOL] and [COLLECT_SYMBOL]; it is called once,
@@ -428,6 +544,25 @@ pub fn shared<C: AsRef<[u8]>>(
     opening: Opening,
     cubin: impl FnOnce() -> Result<C, String>,
 ) -> Result<Option<&'static Mutex<ExchangeState>>, String> {
+    shared_in(cuda, world, rank, opening, None, cubin)
+}
+
+/// [shared], with `table` as the address table when the environment names none.
+///
+/// A table counts as configuration: the group told every rank where its peers are, so a failed
+/// open refuses the run (naming `SPARKFLASH_EXCHANGE=nccl`, the opt-out) instead of leaving one
+/// rank on the NCCL group while its peers wait at the exchange's rendezvous.
+///
+/// # Errors
+/// As [shared].
+pub fn shared_in<C: AsRef<[u8]>>(
+    cuda: &Cuda,
+    world: usize,
+    rank: usize,
+    opening: Opening,
+    table: Option<GroupTable>,
+    cubin: impl FnOnce() -> Result<C, String>,
+) -> Result<Option<&'static Mutex<ExchangeState>>, String> {
     let selection = selection()?;
     if selection == Selection::Off || world < 2 {
         return Ok(None);
@@ -438,13 +573,20 @@ pub fn shared<C: AsRef<[u8]>>(
     // that named a table has committed, even if that table is malformed: a rank whose variables are
     // wrong must be refused, not quietly parked on the other collective while its peers rendezvous.
     // So the test is the presence of the variable, not whether it parsed.
-    let configured = std::env::var("SPARK_COMM_PEERS")
+    let from_env = std::env::var("SPARK_COMM_PEERS")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
-    let opened = SHARED.get_or_init(|| open(cuda, world, rank, opening, cubin));
+    let derived = !from_env && table.is_some();
+    let configured = from_env || derived;
+    let opened = SHARED.get_or_init(|| open(cuda, world, rank, opening, table, cubin));
     match opened {
         Ok(state) => Ok(Some(state)),
         Err(error) => {
+            if derived {
+                return Err(format!(
+                    "{error}; the exchange is the default for every TP group (its peer table is the group's own), so set {EXCHANGE_ENV}=nccl to run this one on the NCCL group"
+                ));
+            }
             if selection == Selection::Required || configured {
                 return Err(error.clone());
             }
@@ -466,10 +608,23 @@ fn open<C: AsRef<[u8]>>(
     world: usize,
     rank: usize,
     opening: Opening,
+    table: Option<GroupTable>,
     cubin: impl FnOnce() -> Result<C, String>,
 ) -> Result<Mutex<ExchangeState>, String> {
     let row_cap = opening.row_cap;
-    let config = RdmaConfig::from_env(world, rank).map_err(|error| {
+    let peers_set = std::env::var("SPARK_COMM_PEERS").is_ok_and(|value| !value.trim().is_empty());
+    let config = match table {
+        Some(table) if !peers_set => {
+            RdmaConfig::from_env_with_peers(world, rank, table.peers).map(|mut config| {
+                if std::env::var_os("SPARK_COMM_CONTROL_PORT").is_none() {
+                    config.control_port = table.control_port;
+                }
+                config
+            })
+        }
+        _ => RdmaConfig::from_env(world, rank),
+    }
+    .map_err(|error| {
         format!(
             "direct-RDMA exchange: {error} (SPARK_COMM_PEERS must name one address per rank, and SPARK_COMM_CONTROL_PORT must not collide with the NCCL bootstrap)"
         )
@@ -537,5 +692,7 @@ fn open<C: AsRef<[u8]>>(
         kernel,
         collect,
         _modules: [module, collect_module],
+        stream: 0,
+        switch: None,
     }))
 }

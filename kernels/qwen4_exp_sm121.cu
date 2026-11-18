@@ -572,6 +572,9 @@ extern "C" __global__ void q4e_gemv4_bf16(
 // The packed BF16 form (kernels/bf16_packed_sm121.cuh): its walks repeat q4e_dot_chunk's sums
 // above, so it is included after them.
 #include "bf16_packed_sm121.cuh"
+// The direct-RDMA exchange's stage and collect kernels, which every TP group's doorbell leg
+// (sparkflash_ops::doorbell) loads from this image.
+#include "opt_exchange_sm121.cuh"
 
 // One half of a batch's tokens: the first ceil(batch / 2), or the rest. A batched packed walk
 // takes a pair of rows against one half, so it holds Q4E_HALF_BATCH sums a row.

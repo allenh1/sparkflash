@@ -257,6 +257,10 @@ impl Image {
                 "q4e_unpack_bf16",
                 "q4e_widen_streams",
                 "q4e_zero",
+                // kernels/opt_exchange_sm121.cuh: the direct-RDMA exchange's device side, every
+                // TP group's doorbell leg (sparkflash_ops::doorbell).
+                "opt_exchange_collect",
+                "opt_exchange_stage_bf16",
             ],
             Self::Qwen4Attn => &[
                 "q4e_attn",

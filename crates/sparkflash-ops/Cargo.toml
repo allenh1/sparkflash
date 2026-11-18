@@ -29,6 +29,11 @@ half = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# The direct-RDMA exchange as every TP group's device leg (src/doorbell.rs), over
+# sparkflash_kernels::write_exchange and sparkflash-comm's verbs backend.
+rdma = ["sparkflash-kernels/rdma"]
+
 [dev-dependencies]
 serde = { workspace = true }
 tempfile = { workspace = true }

@@ -4656,9 +4656,51 @@ fn open_pack_collective(
         crate::tp4_host::tp4_seams(config.rank, config.world_size, transport, Wire::F32);
     if let Some(reduce) = reduce {
         collective = Box::new(crate::tp4_reduce::DeviceExchange::new(collective, reduce)?);
+        collective = with_group_doorbell(collective, config)?;
     }
     let tp = TpRuntime::new(layout, collective).map_err(|error| error.to_string())?;
     Ok((tp, BitGatherHandle::new(gather)))
+}
+
+/// `collective` with the direct-RDMA exchange in front of its NCCL device leg
+/// ([sparkflash_ops::doorbell]), the default for every pack model's group of two or more ranks.
+///
+/// The exchange's address table is the group's own `--tp4-peers` and its control port the one
+/// past the serve control port, unless `SPARK_COMM_PEERS` and `SPARK_COMM_CONTROL_PORT` say
+/// otherwise; `SPARKFLASH_EXCHANGE=nccl` keeps the NCCL group.
+#[cfg(feature = "tp4-serve")]
+fn with_group_doorbell(
+    collective: Box<dyn sparkflash_weights::tp::TpCollective>,
+    config: &Tp4RankConfig,
+) -> Result<Box<dyn sparkflash_weights::tp::TpCollective>, String> {
+    #[cfg(feature = "rdma")]
+    {
+        let control_port = config.control_port.checked_add(1).ok_or_else(|| {
+            format!(
+                "--tp4-control-port {} leaves no port for the direct-RDMA exchange's control plane; set SPARK_COMM_CONTROL_PORT",
+                config.control_port
+            )
+        })?;
+        let table = sparkflash_kernels::write_exchange::GroupTable {
+            peers: config.peers.iter().map(ToString::to_string).collect(),
+            control_port,
+        };
+        sparkflash_ops::doorbell::with_doorbell(collective, table)
+    }
+    #[cfg(not(feature = "rdma"))]
+    {
+        let _ = config;
+        match std::env::var("SPARKFLASH_EXCHANGE")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            None | Some("" | "0" | "nccl" | "off" | "NCCL" | "OFF") => Ok(collective),
+            Some(other) => Err(format!(
+                "SPARKFLASH_EXCHANGE={other:?}: this build has no direct-RDMA exchange (it was built without the rdma feature); unset it or say nccl"
+            )),
+        }
+    }
 }
 
 /// One GLM-5.3-Flash rank of a group as it comes off the disk: its weights, drafter and

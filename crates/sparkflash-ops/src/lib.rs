@@ -89,6 +89,8 @@ pub mod calls;
 pub mod codec;
 pub mod collective;
 pub mod dflash;
+#[cfg(feature = "rdma")]
+pub mod doorbell;
 pub mod engine_plan;
 pub mod epilogue;
 pub mod error;

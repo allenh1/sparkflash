@@ -28,8 +28,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 type CuResult = i32;
 
@@ -1589,6 +1589,28 @@ fn sync_launches_requested(env: Option<&str>) -> bool {
         None => false,
         Some(value) => !value.is_empty() && value != "0",
     }
+}
+
+/// What every blocking device-to-host readback ([Cuda::copy_dtoh], [Cuda::copy_dtoh_on],
+/// [Cuda::copy_dtoh_mapped_on]) asks once its copy has landed, when something registered it
+/// ([watch_readbacks]).
+static READBACK_WATCH: OnceLock<fn() -> Result<(), String>> = OnceLock::new();
+
+/// Makes every blocking readback of this process call `check` once its copy has landed, and fail
+/// with its error.
+///
+/// A collective whose device leg can give a round up without the stream noticing (the direct-RDMA
+/// exchange, whose kernel leaves its wait when the host abandons the round) registers its own
+/// failure check here, so no arm reads back - and serves - a step that held a failed round, and no
+/// arm has to remember to ask. The first registration stands; a process that never registers pays
+/// one atomic load a readback.
+pub fn watch_readbacks(check: fn() -> Result<(), String>) {
+    let _ = READBACK_WATCH.set(check);
+}
+
+/// The registered readback check's verdict, `Ok` when none is registered.
+fn readback_check() -> Result<(), String> {
+    READBACK_WATCH.get().map_or(Ok(()), |check| check())
 }
 
 /// Turns the async launch path on or off and returns the value in force.
@@ -3312,7 +3334,7 @@ impl Cuda {
                 self.completed
                     .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
             }
-            Ok(())
+            readback_check()
         }
     }
 
@@ -4313,6 +4335,62 @@ impl Cuda {
             .map_err(|r| format!("cuLaunchKernel on the run stream failed: {r}"))
     }
 
+    /// Launches a kernel on a stream named by its raw handle, the form a collective's
+    /// `exchange_on_device(stream, ..)` receives it in: 0 is the default stream and goes through
+    /// [Self::launch], anything else is a stream of this context ([RunStream::raw],
+    /// [SideStream::raw]).
+    ///
+    /// # Errors
+    /// A non-default stream inside a graph segment, or the driver's cuLaunchKernel failure code.
+    pub fn launch_on_raw(
+        &self,
+        stream: u64,
+        kernel: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        args: &[u64],
+    ) -> Result<(), String> {
+        if stream == 0 {
+            return self.launch(kernel, grid, block, args);
+        }
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("launch_on_raw: a graph segment is active".to_owned());
+        }
+        self.launch_kernel(stream as usize as CuStream, kernel, grid, block, args)
+            .map_err(|r| format!("cuLaunchKernel on stream {stream:#x} failed: {r}"))
+    }
+
+    /// Orders everything queued on the raw stream `after` from now on behind everything queued so
+    /// far on the raw stream `before` (0 is the default stream for either), through `event`. The
+    /// host does not wait.
+    ///
+    /// # Errors
+    /// Inside a graph segment, or the driver's cuEventRecord or cuStreamWaitEvent failure code.
+    pub fn order_raw(&self, event: &StreamEvent, before: u64, after: u64) -> Result<(), String> {
+        if self.graph_mode.load(Ordering::Relaxed) != GRAPH_DIRECT {
+            return Err("order_raw: a graph segment is active".to_owned());
+        }
+        let record: libloading::Symbol<unsafe extern "C" fn(CuEvent, CuStream) -> CuResult> =
+            self.sym(b"cuEventRecord")?;
+        let wait: libloading::Symbol<unsafe extern "C" fn(CuStream, CuEvent, u32) -> CuResult> =
+            self.sym(b"cuStreamWaitEvent")?;
+        // SAFETY: the symbols come from this context's library, the event is live and both raw
+        // handles are streams of this context (0 is its default stream).
+        unsafe {
+            let r = record(event.0, before as usize as CuStream);
+            if r != 0 {
+                return Err(format!("cuEventRecord on stream {before:#x} failed: {r}"));
+            }
+            let r = wait(after as usize as CuStream, event.0, 0);
+            if r != 0 {
+                return Err(format!(
+                    "cuStreamWaitEvent on stream {after:#x} failed: {r}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Queues one device-to-device copy on a session's stream and returns without draining: it
     /// runs after the launches queued there before it and before those queued after, as
     /// [Cuda::copy_dtod_async] does on the default stream for the launches there.
@@ -4459,7 +4537,7 @@ impl Cuda {
         self.synchronize_stream(stream)?;
         self.completed
             .store(self.issued.load(Ordering::Relaxed), Ordering::Relaxed);
-        Ok(())
+        readback_check()
     }
 
     /// Blocks until everything queued on a session's stream has run.

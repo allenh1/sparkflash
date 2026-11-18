@@ -643,11 +643,13 @@ pub struct NcclExchange {
     doorbell: Option<&'static Mutex<sparkflash_kernels::write_exchange::ExchangeState>>,
 }
 
-/// The widest round the doorbell carries for this arm: a decode step's logit slice is the
-/// widest of its collectives (50,015 f32 a rank at TP4, 200,060 bytes), and the residual sums
+/// The widest round the doorbell carries for this arm, every arm's ([write_exchange's
+/// cap](sparkflash_kernels::write_exchange::DOORBELL_ROW_CAP)): a decode step's logit slice is
+/// the widest of its collectives (50,015 f32 a rank at TP4, 200,060 bytes), and the residual sums
 /// are 18 KiB. A prefill chunk of a few rows fits too; a wider one stays on NCCL, which the open
 /// banner says.
-pub const DOORBELL_ROW_CAP: usize = 256 * 1024;
+#[cfg(feature = "rdma")]
+pub const DOORBELL_ROW_CAP: usize = sparkflash_kernels::write_exchange::DOORBELL_ROW_CAP;
 
 /// What the open banner says the doorbell replaces in this arm.
 #[cfg(feature = "rdma")]
@@ -817,12 +819,19 @@ impl Exchange for NcclExchange {
             })?;
             if bytes <= state.row_cap() {
                 let (rank, world) = (self.host.rank, self.host.world);
-                let cuda = &self.reduce.context;
                 // The stage kernel copies `send` into this rank's row of the round and rings the
                 // doorbell; the collect kernel behind it copies the peers' rows into their slots.
                 // Both are on the default stream, which is the one the walk folds on.
-                let round = state.stage(cuda, send, bytes, rank, world, &"inkling exchange")?;
-                return state.collect_slots(cuda, &round, slots, bytes, rank, world);
+                return state.exchange_on(
+                    &self.reduce.context,
+                    0,
+                    send,
+                    slots,
+                    bytes,
+                    rank,
+                    world,
+                    &"inkling exchange",
+                );
             }
         }
         let mut reduce = self
