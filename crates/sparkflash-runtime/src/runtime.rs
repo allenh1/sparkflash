@@ -20,9 +20,9 @@
 //! implementing [`FusedArm`], group mirroring and the fused engine's lanes. A model supplies
 //! only the walk and the head.
 //!
-//! The engine itself is not replaced here. `FusedEngine` still schedules the existing arms,
-//! and dense still serves through [`crate::FusedArm`]; this type is additive until the arms
-//! move onto it.
+//! The engine itself is not replaced here: `FusedEngine` still schedules the lanes, and this
+//! type is the one `FusedArm` a walk needs. The dense arm serves through it; the other arms
+//! move onto it in the same phase, first dense as the proof.
 
 use std::sync::Mutex;
 
@@ -283,10 +283,10 @@ impl<W: Walk> Runtime<W> {
 /// with no device and no instance.
 #[must_use]
 pub fn ledger_for<W: Walk>() -> Ledger {
-    runtime_ledger::<W>(None)
+    runtime_ledger::<W>(None, None)
 }
 
-fn runtime_ledger<W: Walk>(chunk: Option<usize>) -> Ledger {
+fn runtime_ledger<W: Walk>(chunk: Option<usize>, rewind: Option<bool>) -> Ledger {
     let mut ledger = Ledger::new(std::any::type_name::<W>());
     let caps = W::CAPABILITIES;
     ledger.set(
@@ -337,7 +337,17 @@ fn runtime_ledger<W: Walk>(chunk: Option<usize>) -> Ledger {
     ledger.set(Strategy::TensorCorePrompt, caps.compute.prompt.into());
     ledger.set(Strategy::TensorCoreDecode, caps.compute.token.into());
     ledger.set(Strategy::StoredArithmetic, caps.compute.stored.into());
-    ledger.set(Strategy::Rewind, caps.compute.rewind.into());
+    // Rewind is declared by the arm and decided by the runtime's switch: when the switch is off
+    // the ledger says so, and the same constant the walk declares cannot print native.
+    ledger.set(
+        Strategy::Rewind,
+        match (rewind, caps.compute.rewind) {
+            (Some(false), _) => {
+                Mode::off(format!("{}=off keeps no rewind point", crate::REWIND_ENV))
+            }
+            (_, state) => state.into(),
+        },
+    );
     ledger
 }
 
@@ -372,12 +382,14 @@ where
         let sampling = slot.sampling;
         let old = std::mem::replace(slot, fresh);
         slot.sampling = sampling;
+        self.walk.set_sampling(&mut slot.seq, sampling);
         self.release_lane(old.lane);
         Ok(())
     }
 
     fn set_sampling(&self, slot: &mut Self::Slot, sampling: Sampling) {
         slot.sampling = sampling;
+        self.walk.set_sampling(&mut slot.seq, sampling);
     }
 
     fn prefill(&self, slot: &mut Self::Slot, tokens: &[u32]) -> Result<StepOutput, BackendError> {
@@ -474,8 +486,29 @@ where
     }
 
     fn room(&self, slot: &Self::Slot, prompt: Option<&[u32]>) -> bool {
-        let added = prompt.map_or(1, <[u32]>::len);
-        slot.history.len().saturating_add(added) <= self.limits.context
+        // A prompt's final position is its own length: it either extends the history or rewinds
+        // to the point and forwards the rest. A step adds one row to the history.
+        let positions = match prompt {
+            Some(prompt) => prompt.len(),
+            None => slot.history.len().saturating_add(1),
+        };
+        if positions > self.limits.context {
+            return false;
+        }
+        // The arm answers the physical question: its lane memory may be narrower than the
+        // context, and a prompt that starts over uses the chunks a fresh lane needs.
+        match prompt {
+            Some(prompt) => {
+                let point = slot
+                    .point
+                    .filter(|point| *point <= slot.history.len())
+                    .map(|point| &slot.history[..point]);
+                let continues = crate::fused::extends(&slot.history, prompt)
+                    || point.is_some_and(|point| crate::fused::extends(point, prompt));
+                slot.seq.room(prompt.len(), !continues)
+            }
+            None => slot.seq.room(positions, false),
+        }
     }
 
     fn release(&self, slot: &mut Self::Slot) -> Result<(), BackendError> {
@@ -507,7 +540,7 @@ where
     }
 
     fn ledger(&self) -> Ledger {
-        runtime_ledger::<W>(Some(self.chunk.rows()))
+        runtime_ledger::<W>(Some(self.chunk.rows()), Some(self.rewind))
     }
 }
 
@@ -560,6 +593,10 @@ mod tests {
             }
             Ok(())
         }
+
+        fn room(&self, _positions: usize, _reset: bool) -> bool {
+            true
+        }
     }
 
     struct ToyWalk {
@@ -599,6 +636,8 @@ mod tests {
         fn limits(&self) -> Limits {
             self.limits
         }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
 
         fn walk(
             &self,
@@ -763,6 +802,20 @@ mod tests {
         assert_eq!(last.0, PassKind::Verify { rows: 3 });
         assert_eq!(last.1, vec![3]);
         assert_eq!(members[0].0.history(), &[1, 11, 12, 13]);
+    }
+
+    #[test]
+    fn the_ledger_says_when_the_rewind_switch_is_off() {
+        let ledger = runtime_ledger::<ToyWalk>(Some(256), Some(false));
+        assert_eq!(
+            ledger.mode(Strategy::Rewind),
+            Mode::off(format!("{}=off keeps no rewind point", crate::REWIND_ENV))
+        );
+        // Without an instance (the preview path) the declaration is what the arm states.
+        assert!(matches!(
+            ledger_for::<ToyWalk>().mode(Strategy::Rewind),
+            Mode::Native(_)
+        ));
     }
 
     #[test]
