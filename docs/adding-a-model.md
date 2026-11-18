@@ -446,8 +446,16 @@ web's fit read that one plan, and:
   an MoE layer, a widened residual...). It gates on its own launch list rather than the kernel
   catalogue, whose rows pin the released presets' shapes. Its check is a per-layer parity report
   against the host reference (`cli/src/serve/dense_parity.rs`), not a recorded digest: it keeps
-  BF16 keys and values where the reference keeps f32. It holds one sequence at TP1;
-  `SPARKFLASH_DENSE_DEVICE=0` keeps such a checkpoint on the host reference and `=1` refuses to
+  BF16 keys and values where the reference keeps f32. It serves at TP1 on the serving contract
+  (runtime step 20): `DenseLanes` is a `FusedArm`, so the shared `FusedEngine` steps its lanes
+  together (four by default; `--concurrency` or the profile's `runtime.concurrency` sets them,
+  and a mismatch is refused), feeds long prompts in 256-row parts between other lanes' steps,
+  keeps each conversation for its next turn, and goes back to the prompt when a turn parts from
+  the reply (`SPARKFLASH_REWIND=0` keeps only extensions). Each lane's keys and values grow in
+  `SequenceLanes` memory, and the boot prints the arm's ledger. A member of a fused step gets the
+  bits it would get alone, and `scripts/served-gate.py` gates it served
+  (`scripts/dense-synthetic-checkpoint.py` writes a random checkpoint of a family no pack names
+  for that); `SPARKFLASH_DENSE_DEVICE=0` keeps such a checkpoint on the host reference and `=1` refuses to
   boot unless the arm opens. Unset, the boot line names which backend answers and, on the host,
   why the arm did not;
 - any other novel family is served by the CPU reference backend in

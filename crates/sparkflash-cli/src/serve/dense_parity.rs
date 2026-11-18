@@ -22,6 +22,10 @@
 //! row GEMV a group at a time). The arm keeps its key/value cache in BF16 where the reference
 //! keeps f32, so the bound is a tolerance, and the next token must agree at every step.
 //!
+//! The arm's serving contract is checked here too, on the same fixtures: fused lanes answer every
+//! step's logits to the bit as each conversation alone, and a kept lane continues its
+//! conversation or goes back to the end of its prompt.
+//!
 //! Without the kernels or a CUDA device the test says so and passes: the gate runs where the arm
 //! can.
 
@@ -29,7 +33,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use sparkflash_model::{Architecture, Capabilities, ModelDescriptor};
+use sparkflash_model::{Architecture, Capabilities, ModelBackend, ModelDescriptor, ModelSession};
 use sparkflash_model_dense::DenseDeviceBackend;
 use sparkflash_ops::parity::{ParityReport, Tolerance};
 use sparkflash_ops::plan::OpKind;
@@ -226,9 +230,16 @@ fn argmax(values: &[f32]) -> u32 {
     best as u32
 }
 
-/// Runs `fixture` through both backends and returns the report, or `None` where the arm cannot
-/// run.
-fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport> {
+/// The fixture on the dense arm, with what opened it, or `None` where the arm cannot run.
+fn open(
+    fixture: &Fixture,
+    what: &str,
+) -> Option<(
+    Architecture,
+    ModelDescriptor,
+    Arc<Memory>,
+    DenseDeviceBackend,
+)> {
     let architecture =
         Architecture::from_json(&fixture.config.to_string()).expect("the fixture parses");
     let family = architecture.family.clone();
@@ -236,11 +247,11 @@ fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport
         panic!("the dense arm refuses the {family} fixture: {refusal}");
     }
     if !DenseDeviceBackend::available() {
-        eprintln!("skipping the {family} parity report: this build has no dense-arm kernels");
+        eprintln!("skipping the {family} {what}: this build has no dense-arm kernels");
         return None;
     }
     if let Err(error) = sparkflash_kernels::cuda_driver::Cuda::load() {
-        eprintln!("skipping the {family} parity report: no CUDA device ({error})");
+        eprintln!("skipping the {family} {what}: no CUDA device ({error})");
         return None;
     }
     let context = architecture.max_position_embeddings;
@@ -253,6 +264,15 @@ fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport
     let source = Arc::new(fixture.source());
     let device = DenseDeviceBackend::open(descriptor.clone(), &architecture, &*source, context)
         .expect("the dense arm opens");
+    Some((architecture, descriptor, source, device))
+}
+
+/// Runs `fixture` through both backends and returns the report, or `None` where the arm cannot
+/// run.
+fn parity(fixture: &Fixture, prompt: usize, steps: usize) -> Option<ParityReport> {
+    let (architecture, descriptor, source, device) = open(fixture, "parity report")?;
+    let family = architecture.family.clone();
+    let context = descriptor.context_tokens;
     let host =
         DynamicHostBackend::open(descriptor, Arc::new(architecture.clone()), source, context)
             .expect("the host reference opens");
@@ -346,4 +366,129 @@ fn a_gated_normed_tied_checkpoint_matches_the_host_reference_layer_by_layer() {
 fn a_prompt_of_decode_rows_matches_the_host_reference_layer_by_layer() {
     // Six rows stay on the row GEMV's batch, the decode path's kernel.
     assert_passed(parity(&gated(), 6, 2));
+}
+
+/// One conversation turn: each step's token and its logits' bits, the prompt's first.
+type Turn = Vec<(u32, Vec<u32>)>;
+
+/// `prompt` and `steps` decode steps on `session`, feeding each step's token.
+fn converse(session: &mut dyn ModelSession, prompt: &[u32], steps: usize) -> Turn {
+    let mut turn = Turn::new();
+    let mut step = session.prefill(prompt).expect("the prompt");
+    for index in 0..=steps {
+        let token = step.next_token.expect("the arm picks every token");
+        turn.push((
+            token,
+            step.logits.iter().map(|value| value.to_bits()).collect(),
+        ));
+        if index < steps {
+            step = session.decode(token).expect("a decode step");
+        }
+    }
+    turn
+}
+
+fn prompt_of(length: usize, salt: usize) -> Vec<u32> {
+    (0..length)
+        .map(|index| ((index * 31 + salt * 7 + 3) % 251) as u32)
+        .collect()
+}
+
+#[test]
+fn fused_lanes_answer_every_step_as_each_conversation_alone() {
+    let Some((_, _, _, mut backend)) = open(&gated(), "fused lanes") else {
+        return;
+    };
+    backend.enable_fusion(4).expect("the fused engine starts");
+    // A decode-sized prompt, a wide-tile one, one in two parts and one of a single id.
+    let prompts: Vec<Vec<u32>> = [(5, 1), (40, 2), (300, 3), (1, 4)]
+        .into_iter()
+        .map(|(length, salt)| prompt_of(length, salt))
+        .collect();
+    let steps = 6;
+    let alone: Vec<Turn> = prompts
+        .iter()
+        .map(|prompt| {
+            let mut session = backend.open_session().expect("a lane");
+            converse(&mut *session, prompt, steps)
+        })
+        .collect();
+    let backend = &backend;
+    let together: Vec<Turn> = std::thread::scope(|scope| {
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|prompt| {
+                scope.spawn(move || {
+                    let mut session = backend.open_session().expect("a lane");
+                    converse(&mut *session, prompt, steps)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a lane's thread"))
+            .collect()
+    });
+    for (index, (alone, together)) in alone.iter().zip(&together).enumerate() {
+        assert_eq!(
+            alone.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            together.iter().map(|(token, _)| *token).collect::<Vec<_>>(),
+            "conversation {index}: the tokens differ together"
+        );
+        assert!(
+            alone == together,
+            "conversation {index}: a step's logits differ together"
+        );
+    }
+}
+
+#[test]
+fn a_kept_lane_continues_its_conversation_and_goes_back_to_its_prompt() {
+    let Some((_, _, _, mut backend)) = open(&plain(), "kept lane") else {
+        return;
+    };
+    backend.enable_fusion(1).expect("the fused engine starts");
+    let first = prompt_of(20, 5);
+    let mut session = backend.open_session().expect("a lane");
+    let reply = converse(&mut *session, &first, 4);
+    // The lane holds the prompt and every token fed since: the reply's last pick was not fed.
+    let mut held = first.clone();
+    held.extend(reply[..reply.len() - 1].iter().map(|(token, _)| *token));
+    let mut next = held.clone();
+    next.extend([9, 10]);
+    let continued = session.prefill(&next).expect("the continued turn");
+    assert_eq!(
+        session.cached_tokens(),
+        held.len(),
+        "the turn continues the lane"
+    );
+    let mut cold = backend.session().expect("a cold session");
+    let expected = cold.forward(&next).expect("the cold prompt");
+    let worst = expected
+        .iter()
+        .zip(&continued.logits)
+        .map(|(cold, continued)| (cold - continued).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("a continued turn's logits against cold: largest difference {worst:e}");
+    assert!(
+        worst <= 4.0 * TOLERANCE.absolute,
+        "a continued turn's logits are {worst} from cold"
+    );
+    // Two steps past that turn, a prompt that parts from their reply goes back to the end of
+    // the last prompt.
+    let token = continued.next_token.expect("the arm picks every token");
+    let after = session.decode(token).expect("a decode step");
+    let _ = session
+        .decode(after.next_token.expect("the arm picks every token"))
+        .expect("a decode step");
+    let mut parted = next.clone();
+    parted.push(if token == 77 { 78 } else { 77 });
+    session
+        .prefill(&parted)
+        .expect("a turn from the prompt's end");
+    assert_eq!(
+        session.cached_tokens(),
+        next.len(),
+        "the turn goes back to the end of the last prompt"
+    );
 }

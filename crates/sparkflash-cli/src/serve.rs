@@ -723,6 +723,9 @@ pub struct ServeOptions {
     /// default of 1 is the serial path; a value above 1 is refused for the V4.1 reference engine,
     /// which has its own [Self::continuous_batching] scheduler.
     pub concurrency: usize,
+    /// Whether `--concurrency` was given, so an arm with its own lane default (the shared dense
+    /// device arm's) tells an operator's 1 from the default.
+    pub concurrency_set: bool,
     /// Step the packed model's concurrent sessions as one batch over the weights.
     ///
     /// Only the Qwen3.8-Flash-Next device arm implements it; a packed backend without a fused
@@ -878,6 +881,9 @@ impl ServeOptions {
             1
         });
         let packed = pack.is_some_and(pack::Pack::is_arm);
+        // A model no pack names resolves through the dynamic path, whose shared dense device arm
+        // steps lanes; the dynamic path refuses the lane knobs for every other family it serves.
+        let dynamic_model = pack.is_none() && cli.model.is_some() && !cli.synthetic;
         let group = group_from_cli(
             cli.rank,
             cli.world,
@@ -1065,7 +1071,7 @@ impl ServeOptions {
         // The Inkling device group fuses its own lanes: rank 0's engine steps every waiting
         // request's row in one walk and broadcasts each step, so the group takes both knobs.
         let fused_group = fuse_batch && group.is_some();
-        if fuse_batch && !packed && !fused_group {
+        if fuse_batch && !packed && !fused_group && !dynamic_model {
             return Err("--fuse-batch is the packed model\u{27}s knob; the V4.1 engine batches with --continuous-batching".to_owned());
         }
         if fuse_batch && concurrency < 2 {
@@ -1082,7 +1088,12 @@ impl ServeOptions {
         }
         // Dory's latent-recurrence group holds one sequence lane a concurrent request on every
         // rank; one Dory process stays serial.
-        if !packed && concurrency != 1 && cli.recurrence_rank.is_none() && !fused_group {
+        if !packed
+            && concurrency != 1
+            && cli.recurrence_rank.is_none()
+            && !fused_group
+            && !dynamic_model
+        {
             return Err(
                 "--concurrency is the packed-model host driver's knob; the V4.1 engine uses --continuous-batching/--max-batch"
                     .to_owned(),
@@ -1264,6 +1275,7 @@ impl ServeOptions {
                 continuous_batching: cli.continuous_batching,
                 max_batch,
                 concurrency,
+                concurrency_set: cli.concurrency.is_some(),
                 fuse_batch,
                 kv_budget_gib: cli.kv_budget_gib,
                 element_limit,

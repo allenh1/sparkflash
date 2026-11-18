@@ -29,7 +29,9 @@
 //! operator who opts out with [DENSE_DEVICE_ENV]`=0`, are served by
 //! [super::dynamic_host::DynamicHostBackend], the CPU reference path that runs [Architecture]'s
 //! parts. The boot line names which one answers and, on the host, why the device arm did not;
-//! docs/adding-a-model.md section 7 states the limits.
+//! docs/adding-a-model.md section 7 states the limits. The dense arm serves on the shared
+//! [sparkflash_runtime::FusedEngine] with [dense_lanes] lanes; the host reference answers one
+//! request at a time and refuses `--concurrency` and `--fuse-batch`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -491,6 +493,25 @@ pub(crate) fn serve(options: &ServeOptions) -> Result<ExitCode, String> {
         "sparkflash serve: dynamic plan {}",
         checkpoint.plan.boot_summary()
     );
+    // Only a family the match below sends to serve_novel steps lanes on this path (the shared
+    // dense device arm); every other family keeps one request at a time here, as before.
+    let family = checkpoint.plan.family();
+    let novel = !matches!(
+        family,
+        "qwen4_exp" | "qwen4_exp_text" | "glm5_next" | "inkling2" | "dory"
+    ) && !(on_device && matches!(family, "qwen3_5_moe" | "qwen3_5_moe_text"));
+    if !novel
+        && (options.concurrency != 1 || options.fuse_batch)
+        && options.group.is_none()
+        && options.recurrence.is_none()
+    {
+        return Err(format!(
+            "--model {} is a {family} checkpoint, which this path serves one request at a time: \
+             --concurrency and --fuse-batch step the shared dense device arm's lanes; name the \
+             released preset for its own lanes",
+            checkpoint.model_id
+        ));
+    }
     match checkpoint.plan.family() {
         "qwen4_exp" | "qwen4_exp_text" => super::pack::serve_arm_identity::<super::pack::QwenArm>(
             options,
@@ -607,21 +628,30 @@ fn serve_novel(
                 )
             });
         match opened {
-            Ok(backend) => {
+            Ok(mut backend) => {
+                let lanes = dense_lanes(
+                    options.concurrency_set.then_some(options.concurrency),
+                    sparkflash_model::active_profile().runtime.concurrency,
+                )?;
+                backend
+                    .enable_fusion(lanes)
+                    .map_err(|error| format!("--model {}: {error}", checkpoint.model_id))?;
                 let banner = format!(
                     "{} ({}) at TP=1 on {}, context {context}, shared dense device arm ({:.2} GiB \
-                     of BF16 weights)",
+                     of BF16 weights, {lanes} lanes)",
                     descriptor.id,
                     descriptor.weights_id,
                     checkpoint.directory.display(),
                     backend.weight_bytes() as f64 / f64::from(1u32 << 30)
                 );
+                let mut options = options.clone();
+                options.concurrency = lanes;
                 return serve_backend(
                     Box::new(backend),
                     descriptor,
                     seam,
                     dialect,
-                    options,
+                    &options,
                     &banner,
                 );
             }
@@ -635,12 +665,38 @@ fn serve_novel(
             Err(reason) => reason,
         }
     };
+    if options.concurrency != 1 || options.fuse_batch {
+        return Err(format!(
+            "--model {}: --concurrency and --fuse-batch step the shared dense device arm's lanes, \
+             and the host reference, which serves one request at a time, answers instead: \
+             {reason}",
+            checkpoint.model_id
+        ));
+    }
     eprintln!(
         "sparkflash serve: {} runs on the host reference, not the shared dense device arm: \
          {reason}",
         checkpoint.model_id
     );
     serve_host(checkpoint, descriptor, seam, dialect, context, options)
+}
+
+/// The lanes the shared dense device arm steps: `--concurrency` when given, else the profile's
+/// `runtime.concurrency` (`SPARKFLASH_LANES`), else the lanes every other device arm serves by
+/// default ([super::pack::GROUP_LANES]). `--concurrency 1` keeps one lane, which still keeps its
+/// conversation between requests.
+///
+/// # Errors
+/// A flag and a profile that ask for different lanes.
+fn dense_lanes(flag: Option<usize>, profile: Option<usize>) -> Result<usize, String> {
+    match (flag, profile) {
+        (Some(flag), Some(profile)) if flag != profile => Err(format!(
+            "--concurrency {flag} and the profile's runtime.concurrency = {profile} ask the shared \
+             dense device arm for different lanes; give one"
+        )),
+        (Some(lanes), _) | (None, Some(lanes)) => Ok(lanes),
+        (None, None) => Ok(super::pack::GROUP_LANES),
+    }
 }
 
 /// Serves an Inkling checkpoint through its pack's f32 host reference.
@@ -879,9 +935,18 @@ pub(crate) fn names_deepseek(options: &ServeOptions) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{DenseDevice, dense_device, device_family};
+    use super::{DenseDevice, dense_device, dense_lanes, device_family};
     use sparkflash_model::Target;
     use sparkflash_ops::engine_plan::EnginePlan;
+
+    #[test]
+    fn the_dense_arms_lanes_are_the_flag_the_profile_or_four() {
+        assert_eq!(dense_lanes(None, None), Ok(super::super::pack::GROUP_LANES));
+        assert_eq!(dense_lanes(Some(1), None), Ok(1));
+        assert_eq!(dense_lanes(None, Some(8)), Ok(8));
+        assert_eq!(dense_lanes(Some(8), Some(8)), Ok(8));
+        assert!(dense_lanes(Some(2), Some(8)).is_err());
+    }
 
     #[test]
     fn the_dense_device_switch_prefers_requires_or_refuses() {

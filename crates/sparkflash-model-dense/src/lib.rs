@@ -26,14 +26,23 @@
 //! reference does not execute, and nothing the reference does that these kernels do not. Its
 //! gate is a per-layer parity report against that reference (the CLI's `dense_parity` test),
 //! not a recorded digest: the arm keeps its KV cache in BF16 where the reference keeps f32, so a
-//! row agrees to a tolerance rather than to the bit. It holds one sequence on one rank.
+//! row agrees to a tolerance rather than to the bit.
+//!
+//! It serves on the shared runtime's contract ([DenseLanes], a [FusedArm]): fused lanes whose
+//! decode rows share one walk, prompts a chunk at a time between the lanes' steps, kept
+//! conversations and a rewind point to the end of each prompt, its caches on the shared lane
+//! memory ([SequenceLanes]), and the ledger. It runs on one rank.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{dory_cubin, qwen4_attn_cubin, qwen4_exp_cubin};
+use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
 use sparkflash_model::architecture::{AttentionKind, Ffn};
-use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::backend::{
+    BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
+};
+use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{Architecture, Capabilities, ModelDescriptor};
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::DraftUploader;
@@ -42,6 +51,7 @@ use sparkflash_ops::gemv::{CudaHandle, GEMV_MAX_BATCH, GpuMat};
 use sparkflash_ops::naming::{AttentionNames, FfnNames, TensorNames};
 use sparkflash_ops::projection::{Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16};
 use sparkflash_ops::sampler::Sampler;
+use sparkflash_runtime::{FusedArm, FusedEngine, Ledger, Mode, Part, Resume, Strategy, resume};
 use sparkflash_weights::{DType, WeightSource};
 
 /// The host-facing name of a device refusal.
@@ -180,6 +190,11 @@ struct Shared {
     zero_centred: bool,
     policy: Option<WidePolicy>,
     context: usize,
+    /// The sequences' key/value caches' lanes, for sequences of `context` positions.
+    lanes: Arc<SequenceLanes<LaneParts>>,
+    /// Whether a sequence keeps a rewind point at the end of each prompt
+    /// ([sparkflash_runtime::REWIND_ENV], on by default).
+    rewind: bool,
     /// Every weight allocation, freed once.
     owned: Vec<Deviceptr>,
     weight_bytes: usize,
@@ -187,6 +202,8 @@ struct Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
+        // Every sequence holds the shared state, so each has given its lane back by now.
+        self.lanes.drain(&self.cuda);
         let references: Vec<&Deviceptr> = self.owned.iter().collect();
         self.cuda.free_buffers(&references);
     }
@@ -196,6 +213,8 @@ impl Drop for Shared {
 pub struct DenseDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
+    /// The fused engine its sessions open on once [Self::enable_fusion] has run.
+    fused: Option<Arc<FusedEngine<DenseLanes>>>,
 }
 
 impl DenseDeviceBackend {
@@ -205,14 +224,15 @@ impl DenseDeviceBackend {
         sparkflash_ops::parts::dense_device_images().is_ok()
     }
 
-    /// Opens `architecture`'s checkpoint from `source` under `descriptor`, with caches for
+    /// Opens `architecture`'s checkpoint from `source` under `descriptor`, for sequences of
     /// `context` tokens.
     ///
     /// # Errors
     /// A checkpoint the arm does not execute ([sparkflash_ops::parts::dense_device_refusal]), a
-    /// missing kernel, a profile field the arm cannot honour, a tensor that is not BF16 at the
-    /// shape the architecture names, a zero context or one past the checkpoint's window, or a
-    /// CUDA context that cannot open.
+    /// missing kernel, a profile field the arm cannot honour, a [sparkflash_runtime::REWIND_ENV]
+    /// that is not a switch, a tensor that is not BF16 at the shape the architecture names, a
+    /// zero context or one past the checkpoint's window, a CUDA context that cannot open, or a
+    /// device without the virtual memory management the lanes need.
     pub fn open(
         mut descriptor: ModelDescriptor,
         architecture: &Architecture,
@@ -229,7 +249,9 @@ impl DenseDeviceBackend {
                 "context {context} is outside 1..={window} for the checkpoint"
             ));
         }
-        let policy = profile_policy(sparkflash_model::profile::active())?;
+        let profile = sparkflash_model::profile::active();
+        let policy = profile_policy(profile)?;
+        let rewind = sparkflash_runtime::rewind()?;
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
         let cuda = CudaHandle::new(Cuda::load()?);
         sparkflash_kernels::cuda_driver::enable_forward_async_launches();
@@ -244,9 +266,29 @@ impl DenseDeviceBackend {
                 return Err(error);
             }
         };
+        let lanes = SequenceLanes::plan(
+            &cuda,
+            context,
+            0,
+            profile.runtime.lane_memory_mb,
+            |layout| LaneParts::plan(layout, &layers, context),
+        );
+        let lanes = match lanes {
+            Ok(lanes) => Arc::new(lanes),
+            Err(error) => {
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error);
+            }
+        };
+        eprintln!(
+            "[dense] sequences of {context} positions back their caches as they grow: {}",
+            lanes.describe()
+        );
         descriptor.context_tokens = context;
         Ok(Self {
             descriptor,
+            fused: None,
             shared: Arc::new(Shared {
                 cuda,
                 kernels,
@@ -260,6 +302,8 @@ impl DenseDeviceBackend {
                 zero_centred: architecture.zero_centered_norms(),
                 policy,
                 context,
+                lanes,
+                rewind,
                 owned,
                 weight_bytes,
             }),
@@ -278,6 +322,19 @@ impl DenseDeviceBackend {
     /// The session buffers or caches do not fit on the device.
     pub fn session(&self) -> Result<DenseDeviceSession, String> {
         DenseDeviceSession::open(Arc::clone(&self.shared))
+    }
+
+    /// Serves this backend's sessions on the shared fused engine: `capacity` lanes whose decode
+    /// rows share one walk, whose prompts run a part at a time between the lanes' steps, and which
+    /// keep their conversations between requests. Call it before the backend is shared with the
+    /// serving driver, with the driver's concurrency as the capacity.
+    ///
+    /// # Errors
+    /// A zero capacity, a scratch or lane the device refuses, or a thread that cannot start.
+    pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
+        let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
+        self.fused = Some(FusedEngine::start(Arc::new(arm), capacity)?);
+        Ok(())
     }
 }
 
@@ -308,6 +365,9 @@ impl ModelBackend for DenseDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        if let Some(engine) = &self.fused {
+            return Ok(Box::new(engine.open()?));
+        }
         Ok(Box::new(
             self.session()
                 .map_err(|error| BackendError::new(DEVICE, error))?,
@@ -317,10 +377,10 @@ impl ModelBackend for DenseDeviceBackend {
 
 /// The wide-tile policy a typed profile asks of the arm, or the field it cannot honour.
 ///
-/// The arm's chunk, its prompt-and-decode split and its one sequence are fixed by its kernels;
-/// a field it does not honour is refused by name rather than accepted and dropped. The one field
-/// it does honour is `prefill.tensor_cores = false`, which keeps every projection on the row
-/// GEMV.
+/// The arm's chunk and its prompt-and-decode split are fixed by its kernels; a field it does not
+/// honour is refused by name rather than accepted and dropped. It honours
+/// `prefill.tensor_cores = false`, which keeps every projection on the row GEMV; its lanes
+/// (`runtime.concurrency`) and lane memory (`runtime.lane_memory_mb`) are the serving engine's.
 fn profile_policy(
     profile: &sparkflash_model::profile::ModelProfile,
 ) -> Result<Option<WidePolicy>, String> {
@@ -355,13 +415,6 @@ fn profile_policy(
     }
     if profile.sequence.parallel == Some(true) || profile.sequence.overlap == Some(true) {
         return refuse("runs on one rank, without sequence parallelism or overlap");
-    }
-    if let Some(concurrency) = profile.runtime.concurrency
-        && concurrency > 1
-    {
-        return refuse(&format!(
-            "holds one sequence a session, not runtime.concurrency = {concurrency}"
-        ));
     }
     if matches!(
         profile.attention.latent_cache,
@@ -485,13 +538,14 @@ impl Shared {
     }
 
     /// `output[rows][mat.rows] = input[rows][mat.columns] x matᵀ` on the kernel
-    /// [route_bf16] picks under the arm's policy.
+    /// [route_bf16] picks under `policy` (`None` keeps the row GEMV).
     fn project(
         &self,
         mat: &GpuMat,
         input: u64,
         output: u64,
         rows: usize,
+        policy: Option<WidePolicy>,
     ) -> Result<(), BackendError> {
         let gemv = |input: u64, output: u64, batch: usize| {
             self.call(
@@ -499,7 +553,7 @@ impl Shared {
                 calls::gemv_bf16(mat.pointer.0, input, output, (mat.rows, mat.columns), batch),
             )
         };
-        match route_bf16(self.policy, mat.rows, mat.columns, rows) {
+        match route_bf16(policy, mat.rows, mat.columns, rows) {
             Route::RowGemv => gemv(input, output, rows),
             Route::BatchedGemv => {
                 for start in (0..rows).step_by(GEMV_MAX_BATCH) {
@@ -537,7 +591,33 @@ impl Shared {
     }
 }
 
-/// The f32 scratch one pass of [CHUNK_ROWS] rows takes, sized for the widest layer.
+/// Where each layer's key and value caches lie in a sequence's lane ([SequenceLanes], the lane
+/// memory every other arm's sequences use): a `[capacity][kv_width]` BF16 run each, backed only as
+/// far as the sequence has reached, from one pool the backend's sequences share.
+#[derive(Debug)]
+struct LaneParts {
+    caches: Vec<[usize; 2]>,
+}
+
+impl LaneParts {
+    fn plan(layout: &mut Layout, layers: &[Layer], capacity: usize) -> Self {
+        Self {
+            caches: layers
+                .iter()
+                .map(|layer| {
+                    let row = layer.shape.kv_width() * 2;
+                    [
+                        layout.part(capacity * row, row, 0),
+                        layout.part(capacity * row, row, 0),
+                    ]
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The f32 scratch one walk of [CHUNK_ROWS] rows takes, sized for the widest layer, and room for
+/// `logit_rows` rows of logits.
 struct Buffers {
     tokens: Deviceptr,
     x: Deviceptr,
@@ -553,6 +633,7 @@ struct Buffers {
     ffn_gate: Deviceptr,
     ffn_up: Deviceptr,
     logits: Deviceptr,
+    logit_rows: usize,
 }
 
 impl Buffers {
@@ -576,36 +657,21 @@ impl Buffers {
     }
 }
 
-/// One sequence on the device: its scratch, its BF16 key/value caches and its sampler.
-pub struct DenseDeviceSession {
+/// A walk's scratch on the device, freed with it. Nothing in it outlives a walk but the logits the
+/// walk's caller reads back, so the slots of one engine share one.
+struct Scratch {
     shared: Arc<Shared>,
     buffers: Buffers,
-    /// Each layer's `[context][kv_width]` BF16 keys and values.
-    caches: Vec<(Deviceptr, Deviceptr)>,
-    position: usize,
-    sampler: Sampler,
-    sampling: Sampling,
-    /// Each layer's residual after it, every row in position order, while tracing.
-    trace: Option<Vec<Vec<f32>>>,
 }
 
-// SAFETY: the session's device pointers name allocations it alone writes; the shared weights are
-// read-only, and the context handle is Send.
-unsafe impl Send for DenseDeviceSession {}
-
-impl Drop for DenseDeviceSession {
+impl Drop for Scratch {
     fn drop(&mut self) {
-        let mut references: Vec<&Deviceptr> = self.buffers.all().to_vec();
-        for (keys, values) in &self.caches {
-            references.push(keys);
-            references.push(values);
-        }
-        self.shared.cuda.free_buffers(&references);
+        self.shared.cuda.free_buffers(&self.buffers.all());
     }
 }
 
-impl DenseDeviceSession {
-    fn open(shared: Arc<Shared>) -> Result<Self, String> {
+impl Scratch {
+    fn new(shared: Arc<Shared>, logit_rows: usize) -> Result<Self, String> {
         let widest = |of: fn(&Shape) -> usize| {
             shared
                 .layers
@@ -616,6 +682,7 @@ impl DenseDeviceSession {
         };
         let rows = CHUNK_ROWS;
         let hidden = shared.hidden;
+        let logit_rows = logit_rows.clamp(1, CHUNK_ROWS);
         let floats = [
             rows,
             rows * hidden,
@@ -630,33 +697,20 @@ impl DenseDeviceSession {
             rows * hidden,
             rows * widest(|shape| shape.intermediate),
             rows * widest(|shape| shape.intermediate),
-            shared.vocab,
+            logit_rows * shared.vocab,
         ];
-        let mut pointers = Vec::with_capacity(floats.len() + 2 * shared.layers.len());
+        let mut pointers = Vec::with_capacity(floats.len());
         let mut total = 0usize;
-        let allocated = (|| {
-            for count in floats {
-                pointers.push(shared.cuda.alloc(count.max(1) * 4, &mut total)?);
+        for count in floats {
+            match shared.cuda.alloc(count.max(1) * 4, &mut total) {
+                Ok(pointer) => pointers.push(pointer),
+                Err(error) => {
+                    let references: Vec<&Deviceptr> = pointers.iter().collect();
+                    shared.cuda.free_buffers(&references);
+                    return Err(error);
+                }
             }
-            let mut caches = Vec::with_capacity(shared.layers.len());
-            for layer in &shared.layers {
-                let bytes = shared.context * layer.shape.kv_width() * 2;
-                let keys = shared.cuda.alloc(bytes.max(4), &mut total)?;
-                pointers.push(keys);
-                let values = shared.cuda.alloc(bytes.max(4), &mut total)?;
-                pointers.push(values);
-                caches.push((keys, values));
-            }
-            Ok::<_, String>(caches)
-        })();
-        let caches = match allocated {
-            Ok(caches) => caches,
-            Err(error) => {
-                let references: Vec<&Deviceptr> = pointers.iter().collect();
-                shared.cuda.free_buffers(&references);
-                return Err(error);
-            }
-        };
+        }
         let p = |index: usize| pointers[index];
         let buffers = Buffers {
             tokens: p(0),
@@ -673,208 +727,390 @@ impl DenseDeviceSession {
             ffn_gate: p(11),
             ffn_up: p(12),
             logits: p(13),
+            logit_rows,
         };
+        Ok(Self { shared, buffers })
+    }
+}
+
+/// One sequence on the device: its lane of BF16 key/value caches, the ids whose rows they hold,
+/// the point it can go back to, and its sampler.
+///
+/// Every cache row is addressed by its position and attention reads only the rows before a
+/// query's own, so the sequence goes back to any prefix of its history by moving its position:
+/// the rewind point needs no copy of anything (as Dory's lanes, unlike the recurrent arms').
+pub struct Sequence {
+    shared: Arc<Shared>,
+    lane: SequenceLane<LaneParts>,
+    /// Each layer's keys and values in the lane.
+    caches: Vec<(Deviceptr, Deviceptr)>,
+    /// The ids whose rows the caches hold, in position order: the last prompt and every token
+    /// stepped since. Its length is the sequence's position.
+    history: Vec<u32>,
+    /// The end of the last prompt, when [sparkflash_runtime::REWIND_ENV] keeps one.
+    point: Option<usize>,
+    /// How many of the last prompt's ids the sequence already held.
+    cached: usize,
+    /// A prompt running a part at a time, and the next id of it to forward.
+    prompt: Option<(Vec<u32>, usize)>,
+    sampler: Sampler,
+    sampling: Sampling,
+}
+
+impl Drop for Sequence {
+    fn drop(&mut self) {
+        self.lane.free(&self.shared.cuda);
+    }
+}
+
+impl Sequence {
+    fn open(shared: Arc<Shared>) -> Result<Self, String> {
+        let lane = SequenceLane::reserve(&shared.cuda, &shared.lanes)?;
+        let base = lane.base();
+        let caches = shared
+            .lanes
+            .parts()
+            .caches
+            .iter()
+            .map(|[keys, values]| (base.offset(*keys), base.offset(*values)))
+            .collect();
         Ok(Self {
             shared,
-            buffers,
+            lane,
             caches,
-            position: 0,
+            history: Vec::new(),
+            point: None,
+            cached: 0,
+            prompt: None,
             sampler: Sampler::new(),
             sampling: Sampling::default(),
-            trace: None,
         })
     }
 
-    /// Starts (or stops) recording each layer's residual after it, every row.
-    pub fn trace(&mut self, on: bool) {
-        self.trace = on.then(|| vec![Vec::new(); self.shared.layers.len()]);
+    fn position(&self) -> usize {
+        self.history.len()
     }
 
-    /// The recorded residuals, a `[positions][hidden]` row-major run a layer, and a fresh record.
-    #[must_use]
-    pub fn take_trace(&mut self) -> Vec<Vec<f32>> {
-        let layers = self.shared.layers.len();
-        self.trace
-            .as_mut()
-            .map(|trace| std::mem::replace(trace, vec![Vec::new(); layers]))
-            .unwrap_or_default()
-    }
-
-    /// Runs `tokens` from the session's position and returns the last row's logits.
-    ///
-    /// # Errors
-    /// A token outside the vocabulary, a sequence past the served context, or a device failure.
-    pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, BackendError> {
-        let refuse = |message: String| Err(BackendError::new(DEVICE, message));
+    /// Starts `tokens` as a prompt: past the history or the rewind point it extends
+    /// ([sparkflash_runtime::resume]), else from the start, and runs its first part.
+    fn begin(
+        &mut self,
+        b: &Buffers,
+        tokens: &[u32],
+        trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Part, BackendError> {
         if tokens.is_empty() {
-            return refuse("the step has no tokens".to_owned());
+            return Err(BackendError::new(DEVICE, "the prompt has no tokens"));
         }
-        if let Some(token) = tokens
-            .iter()
-            .find(|token| **token as usize >= self.shared.vocab)
-        {
+        let start = match resume(&self.history, true, self.point, tokens) {
+            Some(Resume::Extend(held) | Resume::Rewind(held)) => held,
+            None => 0,
+        };
+        self.history.truncate(start);
+        if start == 0 {
+            self.point = None;
+        }
+        self.cached = start;
+        self.prompt = Some((tokens.to_vec(), start));
+        self.part(b, trace)
+    }
+
+    /// Runs the next [CHUNK_ROWS] ids of the prompt [Self::begin] started; after the last, the
+    /// prompt's first step.
+    fn part(
+        &mut self,
+        b: &Buffers,
+        trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<Part, BackendError> {
+        let Some((tokens, next)) = self.prompt.take() else {
+            return Err(BackendError::new(
+                DEVICE,
+                "the sequence has no prompt in parts",
+            ));
+        };
+        let end = (next + CHUNK_ROWS).min(tokens.len());
+        let shared = Arc::clone(&self.shared);
+        walk(
+            &shared,
+            b,
+            &mut [(&mut *self, &tokens[next..end])],
+            shared.policy,
+            trace,
+        )?;
+        if end < tokens.len() {
+            self.prompt = Some((tokens, end));
+            return Ok(Part::More);
+        }
+        let logits = head(&shared, b, end - next - 1, 1)?;
+        self.sampler.reset();
+        self.sampler.record_prompt(&tokens);
+        let token = self.sampler.choose(&logits, &self.sampling);
+        self.point = shared.rewind.then_some(tokens.len());
+        Ok(Part::Done(StepOutput {
+            next_token: Some(token),
+            logits,
+            draft: Vec::new(),
+        }))
+    }
+
+    /// The whole of `tokens` as a prompt: [Self::begin], then every part.
+    fn prefill(
+        &mut self,
+        b: &Buffers,
+        tokens: &[u32],
+        mut trace: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<StepOutput, BackendError> {
+        let mut part = self.begin(b, tokens, trace.as_deref_mut())?;
+        loop {
+            match part {
+                Part::Done(step) => return Ok(step),
+                Part::More => part = self.part(b, trace.as_deref_mut())?,
+            }
+        }
+    }
+}
+
+/// One walk over the segments' rows, laid out one after another: each sequence's ids at its own
+/// position. The row-wise stages (norms, projections, the MLP, the residual adds) take every row
+/// at once and the per-sequence stages (rotary, the cache appends, attention) each segment's
+/// rows, so a row computes as it would alone wherever the projections take the same kernel: a
+/// fused step passes no wide policy, and a row GEMV row is the same sum at any batch.
+///
+/// The residual of every row is left in `b.x`; each sequence's history takes its ids.
+fn walk(
+    shared: &Shared,
+    b: &Buffers,
+    segments: &mut [(&mut Sequence, &[u32])],
+    policy: Option<WidePolicy>,
+    mut trace: Option<&mut Vec<Vec<f32>>>,
+) -> Result<(), BackendError> {
+    let refuse = |message: String| Err(BackendError::new(DEVICE, message));
+    let rows: usize = segments.iter().map(|(_, tokens)| tokens.len()).sum();
+    if rows == 0 || rows > CHUNK_ROWS {
+        return refuse(format!("a walk takes 1..={CHUNK_ROWS} rows, not {rows}"));
+    }
+    let mut ids = Vec::with_capacity(rows * 4);
+    for (sequence, tokens) in segments.iter_mut() {
+        if tokens.is_empty() {
+            return refuse("a segment has no tokens".to_owned());
+        }
+        if let Some(token) = tokens.iter().find(|token| **token as usize >= shared.vocab) {
             return refuse(format!(
                 "token {token} is outside the checkpoint vocabulary {}",
-                self.shared.vocab
+                shared.vocab
             ));
         }
-        if self.position + tokens.len() > self.shared.context {
+        let reach = sequence.position() + tokens.len();
+        if reach > shared.context {
             return refuse(format!(
                 "the sequence is past the served context {}",
-                self.shared.context
+                shared.context
             ));
         }
-        let mut last = 0;
-        for chunk in tokens.chunks(CHUNK_ROWS) {
-            self.pass(chunk)?;
-            last = chunk.len();
-        }
-        let shared = Arc::clone(&self.shared);
-        let b = &self.buffers;
-        let hidden = shared.hidden;
-        shared.norm(
-            RmsNorm::new(
-                b.x.0 + ((last - 1) * hidden * 4) as u64,
-                shared.norm.0,
-                b.normed.0,
-                hidden,
-                shared.eps,
-            ),
-            1,
-        )?;
-        shared.project(&shared.head, b.normed.0, b.logits.0, 1)?;
-        let mut bytes = vec![0u8; shared.vocab * 4];
-        shared
-            .cuda
-            .copy_dtoh(&mut bytes, &b.logits)
-            .map_err(|error| BackendError::new(DEVICE, format!("the logits: {error}")))?;
-        Ok(floats(&bytes))
+        sequence
+            .lane
+            .back(&shared.cuda, reach)
+            .map_err(|error| BackendError::new(DEVICE, format!("the lane memory: {error}")))?;
+        ids.extend(tokens.iter().flat_map(|token| token.to_le_bytes()));
     }
-
-    /// One pass of at most [CHUNK_ROWS] rows through every layer.
-    fn pass(&mut self, tokens: &[u32]) -> Result<(), BackendError> {
-        let shared = Arc::clone(&self.shared);
-        let kernels = shared.kernels;
-        let b = &self.buffers;
-        let rows = tokens.len();
-        let position = self.position;
-        let hidden = shared.hidden;
-        let device = |error: String| BackendError::new(DEVICE, error);
-        let ids: Vec<u8> = tokens
-            .iter()
-            .flat_map(|token| token.to_le_bytes())
-            .collect();
-        shared.cuda.copy_htod(&b.tokens, &ids).map_err(device)?;
-        shared.call(
-            kernels.embed,
-            calls::embed_rows(
-                shared.embed.pointer.0,
-                b.x.0,
-                b.tokens.0,
-                (hidden, hidden),
-                rows,
-            ),
+    let kernels = shared.kernels;
+    let hidden = shared.hidden;
+    let device = |error: String| BackendError::new(DEVICE, error);
+    shared.cuda.copy_htod(&b.tokens, &ids).map_err(device)?;
+    shared.call(
+        kernels.embed,
+        calls::embed_rows(
+            shared.embed.pointer.0,
+            b.x.0,
+            b.tokens.0,
+            (hidden, hidden),
+            rows,
+        ),
+    )?;
+    for (index, layer) in shared.layers.iter().enumerate() {
+        let shape = layer.shape;
+        let (query_width, kv_width) = (shape.query_width(), shape.kv_width());
+        shared.norm(
+            RmsNorm::new(b.x.0, layer.input_norm.0, b.normed.0, hidden, shared.eps),
+            rows,
         )?;
-        for (index, layer) in shared.layers.iter().enumerate() {
-            let shape = layer.shape;
-            let (query_width, kv_width) = (shape.query_width(), shape.kv_width());
-            shared.norm(
-                RmsNorm::new(b.x.0, layer.input_norm.0, b.normed.0, hidden, shared.eps),
-                rows,
+        let projected_query = if shape.gated { b.interleaved } else { b.query };
+        shared.project(&layer.q, b.normed.0, projected_query.0, rows, policy)?;
+        shared.project(&layer.k, b.normed.0, b.key.0, rows, policy)?;
+        shared.project(&layer.v, b.normed.0, b.value.0, rows, policy)?;
+        if shape.gated {
+            shared.call(
+                kernels.deinterleave,
+                calls::deinterleave(
+                    b.interleaved.0,
+                    (b.query.0, b.gate.0),
+                    (shape.heads, shape.head_dim),
+                    rows,
+                ),
             )?;
-            let projected_query = if shape.gated { b.interleaved } else { b.query };
-            shared.project(&layer.q, b.normed.0, projected_query.0, rows)?;
-            shared.project(&layer.k, b.normed.0, b.key.0, rows)?;
-            shared.project(&layer.v, b.normed.0, b.value.0, rows)?;
-            if shape.gated {
-                shared.call(
-                    kernels.deinterleave,
-                    calls::deinterleave(
-                        b.interleaved.0,
-                        (b.query.0, b.gate.0),
-                        (shape.heads, shape.head_dim),
-                        rows,
-                    ),
+        }
+        for (gains, values, width) in [
+            (layer.q_norm, b.query, query_width),
+            (layer.k_norm, b.key, kv_width),
+        ] {
+            if let Some(gains) = gains {
+                shared.norm(
+                    RmsNorm::new(values.0, gains.0, values.0, width, shared.eps)
+                        .groups(shape.head_dim, true),
+                    rows,
                 )?;
             }
-            for (gains, values, width) in [
-                (layer.q_norm, b.query, query_width),
-                (layer.k_norm, b.key, kv_width),
-            ] {
-                if let Some(gains) = gains {
-                    shared.norm(
-                        RmsNorm::new(values.0, gains.0, values.0, width, shared.eps)
-                            .groups(shape.head_dim, true),
-                        rows,
-                    )?;
-                }
-            }
+        }
+        let mut first = 0usize;
+        for (sequence, tokens) in segments.iter() {
+            let count = tokens.len();
+            let position = sequence.position();
+            let row = |base: Deviceptr, width: usize| base.0 + (first * width * 4) as u64;
             if shape.rotary >= 2 {
                 for (values, heads, width) in [
                     (b.query, shape.heads, query_width),
                     (b.key, shape.kv_heads, kv_width),
                 ] {
                     let rope = Rope {
-                        rows: values.0,
+                        rows: row(values, width),
                         heads,
                         head_dim: shape.head_dim,
                         rotary: shape.rotary,
                         position,
                         theta: shape.theta,
                         row_stride: width,
-                        tokens: rows,
+                        tokens: count,
                     };
                     shared.call(kernels.rope, rope.call())?;
                 }
             }
-            let (keys, values) = self.caches[index];
+            let (keys, values) = sequence.caches[index];
             let at = (position * kv_width * 2) as u64;
             shared.call(
                 kernels.cache,
-                calls::cache_bf16(keys.0 + at, b.key.0, rows * kv_width),
+                calls::cache_bf16(keys.0 + at, row(b.key, kv_width), count * kv_width),
             )?;
             shared.call(
                 kernels.cache,
-                calls::cache_bf16(values.0 + at, b.value.0, rows * kv_width),
+                calls::cache_bf16(values.0 + at, row(b.value, kv_width), count * kv_width),
             )?;
+            // The partials are one segment's: the combine reads them before the next segment's
+            // attention writes them, both on the one stream.
             let attention = FullAttention {
-                query: b.query.0,
+                query: row(b.query, query_width),
                 keys: keys.0,
                 values: values.0,
                 partials: b.partials.0,
                 position,
-                rows,
+                rows: count,
                 heads: shape.heads,
                 kv_heads: shape.kv_heads,
                 head_dim: shape.head_dim,
             };
             shared.call(kernels.attention, attention.call())?;
-            let gate = if shape.gated { b.gate.0 } else { 0 };
-            shared.call(kernels.combine, attention.combine(gate, b.attended.0))?;
-            shared.project(&layer.o, b.attended.0, b.projected.0, rows)?;
-            shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
-            shared.norm(
-                RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
-                rows,
-            )?;
-            shared.project(&layer.gate, b.normed.0, b.ffn_gate.0, rows)?;
-            shared.project(&layer.up, b.normed.0, b.ffn_up.0, rows)?;
-            let width = rows * shape.intermediate;
+            let gate = if shape.gated {
+                row(b.gate, query_width)
+            } else {
+                0
+            };
             shared.call(
-                kernels.swiglu,
-                calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, width),
+                kernels.combine,
+                attention.combine(gate, row(b.attended, query_width)),
             )?;
-            shared.project(&layer.down, b.ffn_up.0, b.projected.0, rows)?;
-            shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
-            if let Some(trace) = self.trace.as_mut() {
-                let mut bytes = vec![0u8; rows * hidden * 4];
-                shared.cuda.copy_dtoh(&mut bytes, &b.x).map_err(device)?;
-                trace[index].extend(floats(&bytes));
-            }
+            first += count;
         }
-        self.position += rows;
-        Ok(())
+        shared.project(&layer.o, b.attended.0, b.projected.0, rows, policy)?;
+        shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
+        shared.norm(
+            RmsNorm::new(b.x.0, layer.post_norm.0, b.normed.0, hidden, shared.eps),
+            rows,
+        )?;
+        shared.project(&layer.gate, b.normed.0, b.ffn_gate.0, rows, policy)?;
+        shared.project(&layer.up, b.normed.0, b.ffn_up.0, rows, policy)?;
+        let width = rows * shape.intermediate;
+        shared.call(
+            kernels.swiglu,
+            calls::swiglu(b.ffn_gate.0, b.ffn_up.0, b.ffn_up.0, width),
+        )?;
+        shared.project(&layer.down, b.ffn_up.0, b.projected.0, rows, policy)?;
+        shared.call(kernels.add, calls::add(b.x.0, b.projected.0, rows * hidden))?;
+        if let Some(trace) = trace.as_deref_mut() {
+            let mut bytes = vec![0u8; rows * hidden * 4];
+            shared.cuda.copy_dtoh(&mut bytes, &b.x).map_err(device)?;
+            trace[index].extend(floats(&bytes));
+        }
     }
+    for (sequence, tokens) in segments.iter_mut() {
+        sequence.history.extend_from_slice(tokens);
+    }
+    Ok(())
+}
+
+/// The logits of `count` residual rows of the last walk from row `first`, row after row: the
+/// final norm and the head on the row GEMV.
+fn head(
+    shared: &Shared,
+    b: &Buffers,
+    first: usize,
+    count: usize,
+) -> Result<Vec<f32>, BackendError> {
+    if count == 0 || count > b.logit_rows {
+        return Err(BackendError::new(
+            DEVICE,
+            format!(
+                "the scratch holds 1..={} rows of logits, not {count}",
+                b.logit_rows
+            ),
+        ));
+    }
+    let hidden = shared.hidden;
+    shared.norm(
+        RmsNorm::new(
+            b.x.0 + (first * hidden * 4) as u64,
+            shared.norm.0,
+            b.normed.0,
+            hidden,
+            shared.eps,
+        ),
+        count,
+    )?;
+    shared.project(&shared.head, b.normed.0, b.logits.0, count, None)?;
+    let mut bytes = vec![0u8; count * shared.vocab * 4];
+    shared
+        .cuda
+        .copy_dtoh(&mut bytes, &b.logits)
+        .map_err(|error| BackendError::new(DEVICE, format!("the logits: {error}")))?;
+    Ok(floats(&bytes))
+}
+
+/// One fused step: a row a member, each its own token, and each member's next.
+fn step(
+    shared: &Shared,
+    b: &Buffers,
+    members: &mut [(&mut Sequence, u32)],
+    trace: Option<&mut Vec<Vec<f32>>>,
+) -> Result<Vec<StepOutput>, BackendError> {
+    let tokens: Vec<u32> = members.iter().map(|(_, token)| *token).collect();
+    let mut segments: Vec<(&mut Sequence, &[u32])> = members
+        .iter_mut()
+        .zip(tokens.chunks(1))
+        .map(|((sequence, _), token)| (&mut **sequence, token))
+        .collect();
+    walk(shared, b, &mut segments, None, trace)?;
+    let logits = head(shared, b, 0, segments.len())?;
+    Ok(segments
+        .iter_mut()
+        .zip(logits.chunks(shared.vocab))
+        .map(|((sequence, token), logits)| {
+            sequence.sampler.record(token[0]);
+            let chosen = sequence.sampler.choose(logits, &sequence.sampling);
+            StepOutput {
+                next_token: Some(chosen),
+                logits: logits.to_vec(),
+                draft: Vec::new(),
+            }
+        })
+        .collect())
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -886,40 +1122,234 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// One sequence with its own scratch, outside the fused engine: the parity gate's session, which
+/// records each layer's residual.
+pub struct DenseDeviceSession {
+    sequence: Sequence,
+    scratch: Scratch,
+    /// Each layer's residual after it, every row in position order, while tracing.
+    trace: Option<Vec<Vec<f32>>>,
+}
+
+impl DenseDeviceSession {
+    fn open(shared: Arc<Shared>) -> Result<Self, String> {
+        Ok(Self {
+            scratch: Scratch::new(Arc::clone(&shared), 1)?,
+            sequence: Sequence::open(shared)?,
+            trace: None,
+        })
+    }
+
+    /// Starts (or stops) recording each layer's residual after it, every row.
+    pub fn trace(&mut self, on: bool) {
+        self.trace = on.then(|| vec![Vec::new(); self.sequence.shared.layers.len()]);
+    }
+
+    /// The recorded residuals, a `[positions][hidden]` row-major run a layer, and a fresh record.
+    #[must_use]
+    pub fn take_trace(&mut self) -> Vec<Vec<f32>> {
+        let layers = self.sequence.shared.layers.len();
+        self.trace
+            .as_mut()
+            .map(|trace| std::mem::replace(trace, vec![Vec::new(); layers]))
+            .unwrap_or_default()
+    }
+
+    /// Runs `tokens` from the session's position, [CHUNK_ROWS] rows a walk, and returns the last
+    /// row's logits. The sampler does not see them.
+    ///
+    /// # Errors
+    /// A token outside the vocabulary, a sequence past the served context, or a device failure.
+    pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>, BackendError> {
+        let shared = Arc::clone(&self.sequence.shared);
+        let b = &self.scratch.buffers;
+        let mut last = 0;
+        for chunk in tokens.chunks(CHUNK_ROWS) {
+            walk(
+                &shared,
+                b,
+                &mut [(&mut self.sequence, chunk)],
+                shared.policy,
+                self.trace.as_mut(),
+            )?;
+            last = chunk.len();
+        }
+        if last == 0 {
+            return Err(BackendError::new(DEVICE, "the step has no tokens"));
+        }
+        head(&shared, b, last - 1, 1)
+    }
+}
+
 impl ModelSession for DenseDeviceSession {
     fn set_sampling(&mut self, sampling: Sampling) {
         // Penalties, temperature, top-k and top-p run on the host over the row every step copies
         // back, so a sampled request is served rather than approximated by the greedy pick.
-        self.sampling = sampling;
-        self.sampler.reset();
+        self.sequence.sampling = sampling;
+        self.sequence.sampler.reset();
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        let logits = self.forward(tokens)?;
-        self.sampler.reset();
-        self.sampler.record_prompt(tokens);
-        let token = self.sampler.choose(&logits, &self.sampling);
-        Ok(StepOutput {
-            next_token: Some(token),
-            logits,
-            draft: Vec::new(),
-        })
+        // A session outside the engine starts every prompt over.
+        self.sequence.history.clear();
+        self.sequence.point = None;
+        self.sequence
+            .prefill(&self.scratch.buffers, tokens, self.trace.as_mut())
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        let logits = self.forward(&[token])?;
-        self.sampler.record(token);
-        let chosen = self.sampler.choose(&logits, &self.sampling);
-        Ok(StepOutput {
-            next_token: Some(chosen),
-            logits,
-            draft: Vec::new(),
-        })
+        let shared = Arc::clone(&self.sequence.shared);
+        let mut steps = step(
+            &shared,
+            &self.scratch.buffers,
+            &mut [(&mut self.sequence, token)],
+            self.trace.as_mut(),
+        )?;
+        Ok(steps.remove(0))
     }
 
     fn reusable_prefix(&self) -> Option<&[u32]> {
-        // A fresh request opens a fresh session; the arm does not promise a prefix state yet.
+        // Kept conversations are the fused engine's ([DenseLanes]).
         None
+    }
+}
+
+/// The arm behind the shared fused engine ([FusedEngine]): a slot is one [Sequence], a step is
+/// one walk over every member's row, and a prompt runs a [CHUNK_ROWS]-row part at a time
+/// between the members' steps. The engine thread runs one job at a time, so the slots share one
+/// scratch.
+pub struct DenseLanes {
+    shared: Arc<Shared>,
+    scratch: Mutex<Scratch>,
+    /// The most members one walk holds.
+    rows: usize,
+}
+
+impl DenseLanes {
+    fn new(shared: Arc<Shared>, capacity: usize) -> Result<Self, BackendError> {
+        let rows = capacity.clamp(1, CHUNK_ROWS);
+        let scratch = Scratch::new(Arc::clone(&shared), rows)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        Ok(Self {
+            shared,
+            scratch: Mutex::new(scratch),
+            rows,
+        })
+    }
+
+    fn scratch(&self) -> Result<std::sync::MutexGuard<'_, Scratch>, BackendError> {
+        self.scratch
+            .lock()
+            .map_err(|_| BackendError::new(DEVICE, "the walk's scratch is poisoned"))
+    }
+}
+
+impl FusedArm for DenseLanes {
+    type Slot = Sequence;
+
+    fn open_slot(&self) -> Result<Sequence, BackendError> {
+        Sequence::open(Arc::clone(&self.shared)).map_err(|error| BackendError::new(DEVICE, error))
+    }
+
+    fn holds_request(&self, slot: &Sequence) -> bool {
+        !slot.history.is_empty() || slot.prompt.is_some()
+    }
+
+    fn renew(&self, slot: &mut Sequence) -> Result<(), BackendError> {
+        let mut fresh = self.open_slot()?;
+        // The request's sampling reached the old sequence before its prompt replaced it.
+        fresh.sampling = slot.sampling;
+        *slot = fresh;
+        Ok(())
+    }
+
+    fn set_sampling(&self, slot: &mut Sequence, sampling: Sampling) {
+        slot.sampling = sampling;
+        slot.sampler.reset();
+    }
+
+    fn prefill(&self, slot: &mut Sequence, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        let scratch = self.scratch()?;
+        slot.prefill(&scratch.buffers, tokens, None)
+    }
+
+    /// A prompt's [CHUNK_ROWS]-row chunks run one a part; the arm serves text, so a prompt with
+    /// images is refused as [FusedArm::prefill_images] refuses it.
+    fn begin_prompt(
+        &self,
+        slot: &mut Sequence,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<Part, BackendError> {
+        if !images.is_empty() {
+            return self.prefill_images(slot, tokens, images).map(Part::Done);
+        }
+        let scratch = self.scratch()?;
+        slot.begin(&scratch.buffers, tokens, None)
+    }
+
+    fn next_part(&self, slot: &mut Sequence) -> Result<Part, BackendError> {
+        let scratch = self.scratch()?;
+        slot.part(&scratch.buffers, None)
+    }
+
+    fn step(&self, members: &mut [(Sequence, u32)]) -> Result<Vec<StepOutput>, BackendError> {
+        let scratch = self.scratch()?;
+        let mut members: Vec<(&mut Sequence, u32)> = members
+            .iter_mut()
+            .map(|(sequence, token)| (sequence, *token))
+            .collect();
+        step(&self.shared, &scratch.buffers, &mut members, None)
+    }
+
+    fn speculation(&self, _slot: &Sequence) -> Speculation {
+        Speculation::default()
+    }
+
+    /// A slot keeps its sequence between requests: the next prompt that extends it forwards only
+    /// the rest ([Sequence::begin]).
+    fn history<'s>(&self, slot: &'s Sequence) -> Option<&'s [u32]> {
+        Some(&slot.history)
+    }
+
+    /// The end of the last prompt, which a prompt that parts from the reply goes back to.
+    fn rewind_prefix<'s>(&self, slot: &'s Sequence) -> Option<&'s [u32]> {
+        slot.point
+            .filter(|point| *point <= slot.history.len())
+            .map(|point| &slot.history[..point])
+    }
+
+    fn cached_tokens(&self, slot: &Sequence) -> usize {
+        slot.cached
+    }
+
+    /// The sequences' caches share one pool: a prompt that does not continue the slot's history
+    /// starts over, so it counts the chunks the reset gives back.
+    fn room(&self, slot: &Sequence, prompt: Option<&[u32]>) -> bool {
+        match prompt {
+            Some(tokens) => slot.lane.room(tokens.len(), !self.continues(slot, tokens)),
+            None => slot.lane.room(slot.position() + 1, false),
+        }
+    }
+
+    fn max_batch(&self) -> usize {
+        self.rows
+    }
+
+    fn ledger(&self) -> Ledger {
+        let mut ledger = Ledger::new("dense");
+        ledger.set(
+            Strategy::PromptParts,
+            Mode::native(format!("{CHUNK_ROWS}-row chunks")),
+        );
+        ledger.drafting(None, false, false);
+        let reuse = if self.shared.rewind {
+            "a prompt that extends a lane's sequence, or goes back to the last prompt's end"
+        } else {
+            "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
+        };
+        ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
+        ledger
     }
 }
 
@@ -949,7 +1379,12 @@ mod tests {
         assert!(refused(|profile| profile.decode.tensor_cores = Some(true)).contains("decode"));
         assert!(refused(|profile| profile.speculation.enabled = Some(true)).contains("drafter"));
         assert!(refused(|profile| profile.sequence.parallel = Some(true)).contains("one rank"));
-        assert!(refused(|profile| profile.runtime.concurrency = Some(4)).contains("concurrency"));
+        let mut lanes = ModelProfile::default();
+        lanes.runtime.concurrency = Some(4);
+        assert!(
+            profile_policy(&lanes).is_ok(),
+            "the engine's lanes are honoured"
+        );
         let mut chunk = ModelProfile::default();
         chunk.prefill.chunk = Some(CHUNK_ROWS);
         assert!(
