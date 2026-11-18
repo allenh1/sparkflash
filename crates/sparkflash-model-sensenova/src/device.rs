@@ -159,6 +159,10 @@ struct DeviceLayer {
     z: Option<DeviceMat>,
     b: Option<DeviceMat>,
     a: Option<DeviceMat>,
+    /// z, b and a as one 4,224-column NVFP4 projection: they read the same activation, so one
+    /// pass over the weights serves all three, and the b/a GEMVs (36 ms a chunk on their own)
+    /// disappear into it.
+    zcb: Option<DeviceMat>,
     out: Option<DeviceMat>,
     conv: Option<Deviceptr>,
     a_log: Option<Deviceptr>,
@@ -179,6 +183,7 @@ struct Kernels {
     swiglu: Kernel,
     add: Kernel,
     gdn_conv: Kernel,
+    gdn_conv_chunk: Kernel,
     gdn_recur: Kernel,
     rope: Kernel,
     qgate: Kernel,
@@ -192,6 +197,10 @@ struct Kernels {
     mhc_post: Kernel,
     mhc_leave: Kernel,
     mhc_enter: Kernel,
+    gdn_params: Kernel,
+    gdn_scan: Kernel,
+    gdn_gate: Kernel,
+    fp4_append: Option<Kernel>,
     /// The tensor-core dense projection, when the prefill image carries it.
     dense_fp8: Option<Kernel>,
     /// The NVFP4 prefill path: the two operand quantisers and the wide and narrow GEMMs.
@@ -517,6 +526,7 @@ impl DeviceShared {
                 z: None,
                 b: None,
                 a: None,
+                zcb: None,
                 out: None,
                 conv: None,
                 a_log: None,
@@ -782,6 +792,52 @@ impl DeviceShared {
                 )?;
                 matrix.fp4 = Some((codes, block_scales));
                 quantised += rows * columns / 2 + rows * (columns / 16);
+            }
+        }
+        // The linear visits' z, b and a read one activation: append them into a single
+        // 4,224-column projection so the visit issues one pass, not three (two of which were the
+        // 32-column GEMVs that cost 36 ms a chunk).
+        if let Some(append) = kernels.fp4_append {
+            for layer in &mut weights.layers {
+                let (Some(z), Some(b), Some(a)) = (layer.z.and_then(|m| m.fp4), layer.b.and_then(|m| m.fp4), layer.a.and_then(|m| m.fp4)) else {
+                    continue;
+                };
+                let source = layer.z.expect("z");
+                let (rows, columns) = (source.rows, source.columns);
+                let combined_rows = rows + 128;
+                let codes = cuda.alloc(combined_rows * columns / 2, allocated)?;
+                let block_scales = cuda.alloc(combined_rows * (columns / 16), allocated)?;
+                pointers.push(codes);
+                pointers.push(block_scales);
+                cuda.memset_d8_async(codes, 0, combined_rows * columns / 2)?;
+                cuda.memset_d8_async(block_scales, 0, combined_rows * (columns / 16))?;
+                for (index, (matrix, offset)) in
+                    [(z, 0usize), (b, rows), (a, rows + 32)].into_iter().enumerate()
+                {
+                    let _ = index;
+                    let source = [layer.z, layer.b, layer.a][index].expect("matrix").rows;
+                    cuda.launch_async(
+                        append,
+                        (((source * (columns / 16)).div_ceil(256)) as u32, 1, 1),
+                        (BLOCK, 1, 1),
+                        &[
+                            matrix.0.0,
+                            matrix.1.0,
+                            codes.0,
+                            block_scales.0,
+                            source as u64,
+                            columns as u64,
+                            offset as u64,
+                        ],
+                    )?;
+                }
+                layer.zcb = Some(DeviceMat {
+                    pointer: codes,
+                    scales: Some(block_scales),
+                    rows: combined_rows,
+                    columns,
+                    fp4: Some((codes, block_scales)),
+                });
             }
         }
         *allocated += 0;
@@ -1059,6 +1115,7 @@ impl Kernels {
             swiglu: load(qwen4_exp_cubin(), "q4e_swiglu")?,
             add: load(qwen4_exp_cubin(), "q4e_add")?,
             gdn_conv: load(qwen4_exp_cubin(), "q4e_gdn_conv")?,
+            gdn_conv_chunk: load(sensenova_cubin(), "sensenova_gdn_conv")?,
             gdn_recur: cuda
                 .load_named_shared(qwen4_exp_cubin(), "q4e_gdn_recur", gdn_shared)
                 .map(|(_, kernel)| kernel)?,
@@ -1074,6 +1131,10 @@ impl Kernels {
             mhc_post: load(sensenova_cubin(), "sensenova_mhc_post")?,
             mhc_leave: load(sensenova_cubin(), "sensenova_mhc_leave")?,
             mhc_enter: load(sensenova_cubin(), "sensenova_mhc_enter")?,
+            gdn_params: load(sensenova_cubin(), "sensenova_gdn_params")?,
+            gdn_scan: load(sensenova_cubin(), "sensenova_gdn_scan")?,
+            gdn_gate: load(sensenova_cubin(), "sensenova_gdn_gate")?,
+            fp4_append: optional(cuda, "sensenova_fp4_append", 0),
             dense_fp8: dense,
             quant_fp4: optional(cuda, "sensenova_quant_fp4", 0),
             quant_weights_fp4: optional(cuda, "sensenova_quant_weights_fp4", 0),
@@ -1108,6 +1169,8 @@ struct Scratch {
     /// The FP4 activation of the projection in flight: nibbles, then one E4M3 scale a 16 values.
     fp4_codes: Deviceptr,
     fp4_scales: Deviceptr,
+    /// The scan's per-row scalars: q scale, k scale, beta, decay, one block a visit.
+    gdn_params: Deviceptr,
     /// The token index the kernels read. A device word, not an argument, so one captured graph
     /// serves every position.
     position: Deviceptr,
@@ -1185,7 +1248,8 @@ impl DeviceSession {
             ffn: wide(hidden.max(config.intermediate_size))?,
             streams: wide(2 * hidden)?,
             qkv: wide(fused)?,
-            z: wide(value)?,
+            // z, then b and a when the combined projection carries them (128 columns more).
+            z: wide(value + 128)?,
             b: wide(config.linear.value_heads)?,
             a: wide(config.linear.value_heads)?,
             conv_out: wide(fused)?,
@@ -1203,6 +1267,7 @@ impl DeviceSession {
             // The widest activation a prefill block quantises is the MLP's intermediate.
             fp4_codes: alloc(PREFILL_ROWS * fp4_inner / 2)?,
             fp4_scales: alloc(PREFILL_ROWS * (fp4_inner / 16))?,
+            gdn_params: alloc(PREFILL_ROWS * config.linear.value_heads * 4 * 4)?,
             position: alloc(4)?,
             pointers,
         };
@@ -2002,22 +2067,44 @@ impl DeviceSession {
         if debug {
             self.report("gdn qkv", self.scratch.qkv, fused)?;
         }
-        shared.project_matrix(&z, self.scratch.normed, self.scratch.z, rows, quant)?;
+        // z, b and a are one 4,224-column projection of the same activation: the prefill issues
+        // it as a single pass, and the b/a GEMVs it replaced (36 ms a chunk) are gone. Below the
+        // tile the three matrices stay separate and take the decode GEMV.
+        let (zb_matrix, zb_out, zb_stride) = match layer.zcb {
+            Some(combined) if rows >= 128 => (combined, self.scratch.z, combined.rows),
+            _ => (z, self.scratch.z, z.rows),
+        };
+        shared.project_matrix(&zb_matrix, self.scratch.normed, zb_out, rows, quant)?;
         clock.mark("  gdn z", drain)?;
         if debug {
-            self.report("gdn z", self.scratch.z, value_width)?;
+            self.report("gdn z", self.scratch.z, zb_stride)?;
         }
-        shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
-        shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
+        // Where the three sit inside the combined output: z from 0, b after it, then a.
+        let (b_base, a_base) = if layer.zcb.is_some() && rows >= 128 {
+            (self.scratch.z.offset(value_width * 4), self.scratch.z.offset((value_width + 32) * 4))
+        } else {
+            (self.scratch.b, self.scratch.a)
+        };
+        if layer.zcb.is_none() || rows < 128 {
+            shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
+            shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
+        }
         clock.mark("  gdn ba", drain)?;
         if debug {
-            self.report("gdn b", self.scratch.b, config.linear.value_heads)?;
+            self.report("gdn b", b_base, config.linear.value_heads)?;
         }
         let conv = state.conv.expect("conv state");
         let recurrent = state.recurrent.expect("recurrent state");
+        // The chunk form: rows split over blocks, the taps in registers, the state written once.
+        // The row-at-a-time kernel it replaces cost 9 ms a chunk, most of it state traffic.
+        const CONV_ROWS: usize = 64;
         shared.launch(
-            shared.kernels.gdn_conv,
-            (fused.div_ceil(256) as u32, 1, 1),
+            shared.kernels.gdn_conv_chunk,
+            (
+                fused.div_ceil(BLOCK as usize) as u32,
+                rows.div_ceil(CONV_ROWS) as u32,
+                1,
+            ),
             (BLOCK, 1, 1),
             &[
                 self.scratch.qkv.0,
@@ -2027,40 +2114,79 @@ impl DeviceSession {
                 fused as u64,
                 config.linear.conv_kernel as u64,
                 rows as u64,
-                0,
-                0,
-                0,
+                CONV_ROWS as u64,
             ],
         )?;
         clock.mark("  gdn conv", drain)?;
         if debug {
             self.report("gdn conv", self.scratch.conv_out, fused)?;
         }
+        // The scan's per-row scalars first - they never look at the state - then the recurrence,
+        // whose blocks are a head's 32 value columns at a time, then the head's gated norm.
+        let heads = config.linear.value_heads;
+        let params = self.scratch.gdn_params;
+        let stride = (rows * heads * 4) as u64;
         shared.launch(
-            shared.kernels.gdn_recur,
-            (config.linear.value_heads as u32, 1, 1),
+            shared.kernels.gdn_params,
+            (heads as u32, rows.div_ceil(8) as u32, 1),
+            (32, 8, 1),
+            &[
+                self.scratch.conv_out.0,
+                b_base.0,
+                zb_stride as u64,
+                a_base.0,
+                zb_stride as u64,
+                layer.a_log.expect("a log").0,
+                layer.dt_bias.expect("dt bias").0,
+                params.0,
+                params.offset(stride as usize).0,
+                params.offset(2 * stride as usize).0,
+                params.offset(3 * stride as usize).0,
+                key_width as u64,
+                heads as u64,
+                config.linear.key_dim as u64,
+                config.linear.value_dim as u64,
+                (heads / config.linear.key_heads.max(1)) as u64,
+                rows as u64,
+            ],
+        )?;
+        clock.mark("  gdn params", drain)?;
+        let parts = config.linear.value_dim / 32;
+        shared.launch(
+            shared.kernels.gdn_scan,
+            (heads as u32, parts as u32, 1),
             (128, 1, 1),
             &[
                 self.scratch.conv_out.0,
-                self.scratch.z.0,
-                self.scratch.b.0,
-                self.scratch.a.0,
-                layer.a_log.expect("a log").0,
-                layer.dt_bias.expect("dt bias").0,
-                layer.gdn_norm.expect("gdn norm").0,
+                params.0,
+                params.offset(stride as usize).0,
+                params.offset(2 * stride as usize).0,
+                params.offset(3 * stride as usize).0,
                 recurrent.0,
                 recurrent.0,
                 self.scratch.gdn_out.0,
                 key_width as u64,
-                config.linear.value_heads as u64,
+                heads as u64,
                 config.linear.key_dim as u64,
                 config.linear.value_dim as u64,
-                (config.linear.value_heads / config.linear.key_heads.max(1)) as u64,
+                (heads / config.linear.key_heads.max(1)) as u64,
+                rows as u64,
+            ],
+        )?;
+        clock.mark("  gdn scan", drain)?;
+        shared.launch(
+            shared.kernels.gdn_gate,
+            (heads as u32, rows as u32, 1),
+            (128, 1, 1),
+            &[
+                self.scratch.gdn_out.0,
+                self.scratch.z.0,
+                layer.gdn_norm.expect("gdn norm").0,
+                heads as u64,
+                config.linear.value_dim as u64,
                 (config.rms_norm_eps as f32).to_bits() as u64,
                 0,
                 rows as u64,
-                (config.linear.key_dim * config.linear.value_dim * 4) as u64,
-                0,
             ],
         )?;
         clock.mark("  gdn recur", drain)?;

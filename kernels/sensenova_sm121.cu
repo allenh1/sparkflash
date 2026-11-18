@@ -741,3 +741,286 @@ extern "C" __global__ void __launch_bounds__(256) sensenova_dense_fp4_narrow(
 }
 #endif
 
+
+// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------
+// The Gated DeltaNet recurrence over a prefill chunk.
+//
+// The first form gave a head one block of 128 threads, one a value column, and walked the rows
+// one at a time: each column's chain is 128 dependent shared-memory reads for the recall and 128
+// more for the update, so a block spent thousands of cycles a row and 42 visits of a 512-row
+// chunk cost 120 ms, a fifth of the whole prefill.
+//
+// Here a block owns 32 of a head's 128 value columns as four warps, and each column's key
+// dimension is split four ways inside the warp: lane (r, c) holds keys r, r + 4, ... of column
+// c, so the recall is 32 reads and the update 32 more, and the two cross-lane sums are warp
+// shuffles. The state slice lives in shared memory for the whole chunk, read and written once.
+// The row's q, k, beta and decay do not depend on the state, so a separate pass computes them
+// for every row ahead of the scan.
+
+// The per-row scalars the scan reads: q's and k's RMS scales, beta, and the decay factor.
+extern "C" __global__ void sensenova_gdn_params(const float* __restrict__ mixed,
+                                                const float* __restrict__ b, int b_stride,
+                                                const float* __restrict__ a, int a_stride,
+                                                const __nv_bfloat16* __restrict__ a_log,
+                                                const __nv_bfloat16* __restrict__ dt_bias,
+                                                float* __restrict__ q_scale,
+                                                float* __restrict__ k_scale,
+                                                float* __restrict__ beta,
+                                                float* __restrict__ factor, int key_width,
+                                                int heads, int key_dim, int value_dim,
+                                                int groups, int rows) {
+    const int head = blockIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    if (row >= rows) return;
+    const int key_head = head / groups;
+    const int conv_width = key_width * 2 + heads * value_dim;
+    const int lane = threadIdx.x;
+    const float* row_ptr = mixed + (unsigned long long)row * conv_width;
+    const float* q = row_ptr + key_head * key_dim;
+    const float* k = row_ptr + key_width + key_head * key_dim;
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (int key = lane; key < key_dim; key += 32) {
+        q_sum += q[key] * q[key];
+        k_sum += k[key] * k[key];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        q_sum += __shfl_xor_sync(0xFFFFFFFFu, q_sum, offset);
+        k_sum += __shfl_xor_sync(0xFFFFFFFFu, k_sum, offset);
+    }
+    if (lane == 0) {
+        const unsigned long long at = (unsigned long long)row * heads + head;
+        q_scale[at] = rsqrtf(q_sum + 1e-6f) * rsqrtf((float)key_dim);
+        k_scale[at] = rsqrtf(k_sum + 1e-6f);
+        beta[at] = 1.0f / (1.0f + expf(-b[(unsigned long long)row * b_stride + head]));
+        const float decay =
+            -expf(__bfloat162float(a_log[head])) *
+            logf(1.0f + expf(a[(unsigned long long)row * a_stride + head] +
+                             __bfloat162float(dt_bias[head])));
+        factor[at] = expf(decay);
+    }
+}
+
+// A block's 32 value columns of one head's state: lane (r, c) owns the four keys
+// 16 j + 4 r of column c and keeps them in registers for the whole chunk, so a row costs no
+// state traffic at all - only the row's k and q, read out of shared memory. The state is loaded
+// from global once and written back once.
+#define SENSENOVA_SCAN_ROWS 12
+#define SENSENOVA_SCAN_COLUMNS 32
+
+extern "C" __global__ void sensenova_gdn_scan(
+    const float* __restrict__ mixed, const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale, const float* __restrict__ beta,
+    const float* __restrict__ factor, const float* __restrict__ state, float* __restrict__ state_out,
+    float* __restrict__ out, int key_width, int heads, int key_dim, int value_dim, int groups,
+    int rows) {
+    __shared__ float sh_q[SENSENOVA_SCAN_ROWS][128];
+    __shared__ float sh_k[SENSENOVA_SCAN_ROWS][128];
+    __shared__ float sh_v[SENSENOVA_SCAN_ROWS][SENSENOVA_SCAN_COLUMNS];
+    __shared__ float sh_scale[4][SENSENOVA_SCAN_ROWS];
+    const int head = blockIdx.x;
+    const int part = blockIdx.y;
+    const int key_head = head / groups;
+    const int conv_width = key_width * 2 + heads * value_dim;
+    const int first = part * SENSENOVA_SCAN_COLUMNS;
+    const int lane = threadIdx.x & 31u;
+    const int warp = threadIdx.x >> 5u;
+    const int group = lane & 3u;    // the four-key run this lane holds of every 16
+    const int column = lane >> 2u;  // 0..7 within the warp
+    const int mine = warp * 8 + column;
+    if (value_dim % SENSENOVA_SCAN_COLUMNS != 0 || key_dim != 128) return;
+    const unsigned long long base = (unsigned long long)head * key_dim * value_dim;
+    const int column_index = first + mine;
+
+    // The lane's 32 state values: keys 16 j + 4 group + i.
+    float held[8][4];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            held[j][i] =
+                state[base + (unsigned long long)(16 * j + 4 * group + i) * value_dim + column_index];
+        }
+    }
+
+    for (int t0 = 0; t0 < rows; t0 += SENSENOVA_SCAN_ROWS) {
+        const int slice = min(SENSENOVA_SCAN_ROWS, rows - t0);
+        for (int t = warp; t < slice; t += blockDim.x >> 5) {
+            const float* row_ptr = mixed + (unsigned long long)(t0 + t) * conv_width;
+#pragma unroll
+            for (int key = lane; key < 128; key += 32) {
+                sh_q[t][key] = row_ptr[key_head * 128 + key];
+                sh_k[t][key] = row_ptr[key_width + key_head * 128 + key];
+            }
+        }
+        for (int index = threadIdx.x; index < slice * SENSENOVA_SCAN_COLUMNS; index += blockDim.x) {
+            const int t = index / SENSENOVA_SCAN_COLUMNS;
+            const int col = index - t * SENSENOVA_SCAN_COLUMNS;
+            sh_v[t][col] = mixed[(unsigned long long)(t0 + t) * conv_width + key_width * 2 +
+                                 head * value_dim + first + col];
+        }
+        for (int index = threadIdx.x; index < slice; index += blockDim.x) {
+            const unsigned long long at = (unsigned long long)(t0 + index) * heads + head;
+            sh_scale[0][index] = q_scale[at];
+            sh_scale[1][index] = k_scale[at];
+            sh_scale[2][index] = beta[at];
+            sh_scale[3][index] = factor[at];
+        }
+        __syncthreads();
+        for (int t = 0; t < slice; ++t) {
+            const float qq = sh_scale[0][t];
+            const float kk = sh_scale[1][t];
+            const float scale_beta = sh_scale[2][t];
+            const float decay = sh_scale[3][t];
+            const float* k_row = sh_k[t];
+            const float* q_row = sh_q[t];
+            float recall0 = 0.0f, recall1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float4 k4 = *reinterpret_cast<const float4*>(k_row + 16 * j + 4 * group);
+                recall0 += held[j][0] * k4.x + held[j][1] * k4.y;
+                recall1 += held[j][2] * k4.z + held[j][3] * k4.w;
+            }
+            float recall = ((recall0 + recall1) * decay);
+            recall = __shfl_xor_sync(0xFFFFFFFFu, recall, 1);
+            recall = __shfl_xor_sync(0xFFFFFFFFu, recall, 2);
+            const float delta = (sh_v[t][mine] - recall * kk) * scale_beta;
+            const float kd = kk * delta;
+            float out0 = 0.0f, out1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float4 k4 = *reinterpret_cast<const float4*>(k_row + 16 * j + 4 * group);
+                const float4 q4 = *reinterpret_cast<const float4*>(q_row + 16 * j + 4 * group);
+                held[j][0] = held[j][0] * decay + k4.x * kd;
+                held[j][1] = held[j][1] * decay + k4.y * kd;
+                held[j][2] = held[j][2] * decay + k4.z * kd;
+                held[j][3] = held[j][3] * decay + k4.w * kd;
+                out0 += held[j][0] * q4.x + held[j][1] * q4.y;
+                out1 += held[j][2] * q4.z + held[j][3] * q4.w;
+            }
+            float output = (out0 + out1) * qq;
+            output = __shfl_xor_sync(0xFFFFFFFFu, output, 1);
+            output = __shfl_xor_sync(0xFFFFFFFFu, output, 2);
+            if (group == 0) {
+                out[(unsigned long long)(t0 + t) * heads * value_dim + head * value_dim +
+                    column_index] = output;
+            }
+        }
+        if (t0 + slice < rows) __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            state_out[base + (unsigned long long)(16 * j + 4 * group + i) * value_dim +
+                      column_index] = held[j][i];
+        }
+    }
+}
+// The head's gated RMSNorm of its raw outputs, in place: one block a (row, head), a warp a
+// reduction level.
+extern "C" __global__ void sensenova_gdn_gate(float* __restrict__ out, const float* __restrict__ z,
+                                               const __nv_bfloat16* __restrict__ norm,
+                                               int heads, int value_dim, float eps,
+                                               int sigmoid_gate, int rows) {
+    __shared__ float partials[32];
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= rows) return;
+    const unsigned long long at = (unsigned long long)row * heads * value_dim +
+                                  (unsigned long long)head * value_dim;
+    float* values = out + at;
+    const float* gate = z + at;
+    float sum = 0.0f;
+    for (int index = threadIdx.x; index < value_dim; index += blockDim.x) {
+        sum += values[index] * values[index];
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_xor_sync(0xFFFFFFFFu, sum, offset);
+    if ((threadIdx.x & 31u) == 0u) partials[threadIdx.x >> 5u] = sum;
+    __syncthreads();
+    const int warps = (blockDim.x + 31u) >> 5u;
+    float total = 0.0f;
+    for (int index = 0; index < warps; ++index) total += partials[index];
+    const float scale = rsqrtf(total / (float)value_dim + eps);
+    for (int index = threadIdx.x; index < value_dim; index += blockDim.x) {
+        const float activated = sigmoid_gate
+                                    ? (1.0f / (1.0f + expf(-gate[index])))
+                                    : (gate[index] / (1.0f + expf(-gate[index])));
+        values[index] = values[index] * scale * __bfloat162float(norm[index]) * activated;
+    }
+}
+
+
+// Copies NVFP4 rows from one matrix into another's row range: how a layer's z, b and a become the
+// single 4,224-column projection the prefill issues. Zeroed first, so the pad rows read as zeros.
+extern "C" __global__ void sensenova_fp4_append(const uint8_t* __restrict__ src_codes,
+                                                 const uint8_t* __restrict__ src_scales,
+                                                 uint8_t* __restrict__ dst_codes,
+                                                 uint8_t* __restrict__ dst_scales, int rows,
+                                                 int inner, int dst_offset) {
+    const int packed = inner >> 1;
+    const int blocks = inner >> 4;
+    const int total = rows * blocks;
+    for (int index = blockIdx.x * blockDim.x + threadIdx.x; index < total; index += gridDim.x * blockDim.x) {
+        const int row = index / blocks;
+        const int block = index - row * blocks;
+        const uint64_t value = *reinterpret_cast<const uint64_t*>(src_codes +
+                                                                  ((unsigned long long)row * packed +
+                                                                   block * 8u));
+        *reinterpret_cast<uint64_t*>(dst_codes + ((unsigned long long)(dst_offset + row) * packed +
+                                                  block * 8u)) = value;
+        dst_scales[(unsigned long long)(dst_offset + row) * blocks + block] =
+            src_scales[(unsigned long long)row * blocks + block];
+    }
+}
+
+
+// The Gated DeltaNet convolution over a chunk: one thread a channel, its taps in registers, and
+// the rows split over blocks - row t reads raw[t-1..t-3], so every block after the first starts
+// from the raw stream rather than the serial chain the old kernel walked. Only the last row block
+// writes the convolution state back.
+extern "C" __global__ void sensenova_gdn_conv(const float* __restrict__ raw,
+                                               float* __restrict__ state,
+                                               const __nv_bfloat16* __restrict__ weight,
+                                               float* __restrict__ out, int width, int taps,
+                                               int rows, int row_block) {
+    const int history = taps - 1;
+    if (history < 0 || history > 7) return;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const int first = blockIdx.y * row_block;
+    if (first >= rows) return;
+    const int last = min(rows, first + row_block);
+    float held[8];
+    for (int back = 1; back <= history; ++back) {
+        const int at = first - back;
+        held[back - 1] = at >= 0 ? raw[(unsigned long long)at * width + column]
+                                 : state[(history - back) * width + column];
+    }
+    const __nv_bfloat16* channel = weight + (unsigned long long)column * taps;
+    float w[8];
+    for (int tap = 0; tap < taps; ++tap) w[tap] = __bfloat162float(channel[tap]);
+    for (int t = first; t < last; ++t) {
+        const float src = raw[(unsigned long long)t * width + column];
+        // held[history-1] is the previous row, held[0] the oldest.
+        float accumulator = 0.0f;
+        for (int tap = 0; tap < taps; ++tap) {
+            const int back = history - tap;
+            const float source = back == 0 ? src : held[history - back];
+            accumulator += w[tap] * source;
+        }
+        out[(unsigned long long)t * width + column] = accumulator / (1.0f + expf(-accumulator));
+        for (int index = 0; index + 1 < history; ++index) held[index] = held[index + 1];
+        if (history > 0) held[history - 1] = src;
+    }
+    if (last == rows) {
+        for (int back = 1; back <= history; ++back) {
+            state[(history - back) * width + column] = held[history - back];
+        }
+    }
+}
+
