@@ -65,9 +65,17 @@ fn fp4_disabled() -> bool {
     *OFF.get_or_init(|| std::env::var("SPARKFLASH_SENSENOVA_FP8").is_ok())
 }
 
-/// The dynamic shared memory `q4p_dense_fp8` asks for: GLM_Q8_SHARED in
-/// shared_prefill_mma_sm121.cuh - four stages of a 128x32 activation tile, a 128x32 weight tile
-/// and the rows' activation scales, then the rows' activation rows and the column tile's scales.
+/// `SPARKFLASH_SENSENOVA_DENSE_BF16` forces the dequantising BF16 bulk tile for the dense
+/// projections: the reference the block-scaled FP8 tile is bisected against.
+fn dense_bf16() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("SPARKFLASH_SENSENOVA_DENSE_BF16").is_ok())
+}
+
+/// The dynamic shared memory the block-scaled projection asks for: GLM_Q8_SHARED in
+/// shared_prefill_mma_sm121.cuh - four stages of a 128x64 E4M3 activation tile, a 128x64 E4M3
+/// weight tile and the rows' activation scales, then the rows' activation rows and the column
+/// tile's weight scales. `q4p_dense_fp8` (the BF16 reference tile) shares the request.
 const DENSE_SHARED: u32 = 4 * (128 * 64 + 128 * 64 + 128 * 4) + 128 * 4 + 128 * 4;
 
 /// Serialises graph capture: the driver's capture mode is process-wide, so two sessions must not
@@ -209,8 +217,12 @@ struct Kernels {
     gdn_scan: Kernel,
     gdn_gate: Kernel,
     fp4_append: Option<Kernel>,
-    /// The tensor-core dense projection, when the prefill image carries it.
+    /// The tensor-core dense projection over BF16 weights, when the prefill image carries it.
     dense_fp8: Option<Kernel>,
+    /// The block-scaled E4M3 dense projection and its dynamic activation quantiser, when this
+    /// image carries them.
+    dense_fp8_q8: Option<Kernel>,
+    quant_fp8: Kernel,
     /// The NVFP4 prefill path: the two operand quantisers and the wide and narrow GEMMs.
     quant_fp4: Option<Kernel>,
     quant_weights_fp4: Option<Kernel>,
@@ -999,6 +1011,50 @@ impl DeviceShared {
                 ],
             );
         }
+        // The checkpoint's own W8A8 arithmetic: the activation quantised to E4M3 a 128-column
+        // block, the codes and the E4M3 weight block into the block-scaled FP8 tensor core. The
+        // BF16 body below stays the reference (SPARKFLASH_SENSENOVA_DENSE_BF16 bisects them).
+        // A matrix of fewer than 128 rows takes the same tile with a partial column tile: the q8
+        // body derives its live 32-column groups from the column count, so the GDN gates' 32-row
+        // b and a projections (a 4,096-wide dot product a row) ride the tensor cores instead of
+        // the decode GEMV's eight-row tiles.
+        if rows > GEMV_MAX_BATCH
+            && matrix.scales.is_some()
+            && matrix.rows % 32 == 0
+            && matrix.columns % 128 == 0
+            && !dense_bf16()
+            && let Some(kernel) = self.kernels.dense_fp8_q8
+        {
+            let (codes, scales) = quantize;
+            let blocks = matrix.columns / 128;
+            self.launch(
+                self.kernels.quant_fp8,
+                (((rows * blocks).div_ceil(8)) as u32, 1, 1),
+                (BLOCK, 1, 1),
+                &[
+                    input.0,
+                    codes.0,
+                    scales.0,
+                    rows as u64,
+                    matrix.columns as u64,
+                ],
+            )?;
+            return self.launch(
+                kernel,
+                (matrix.rows.div_ceil(128) as u32, rows.div_ceil(128) as u32, 1),
+                (256, 1, 1),
+                &[
+                    matrix.pointer.0,
+                    matrix.scales.expect("scales").0,
+                    codes.0,
+                    scales.0,
+                    output.0,
+                    matrix.rows as u64,
+                    matrix.columns as u64,
+                    rows as u64,
+                ],
+            );
+        }
         if rows > GEMV_MAX_BATCH && matrix.scales.is_some() && matrix.rows % 128 == 0
             && matrix.columns % 128 == 0
             && let Some(kernel) = self.kernels.dense_fp8
@@ -1152,6 +1208,15 @@ impl Kernels {
                 }
             }
         };
+        // The block-scaled FP8 tile: the arm's own image, so a toolchain that skipped it leaves
+        // the BF16 body above as the projection.
+        let dense_q8 = match cuda.load_named_shared(sensenova_cubin(), "sensenova_dense_fp8_q8", DENSE_SHARED) {
+            Ok((_, kernel)) => Some(kernel),
+            Err(error) => {
+                eprintln!("sensenova: no block-scaled FP8 dense projection: {error}");
+                None
+            }
+        };
         Ok(Self {
             copy_flat: load(qwen4_exp_cubin(), "q4e_copy_flat")?,
             gemv_bf16: load(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
@@ -1182,6 +1247,8 @@ impl Kernels {
             gdn_gate: load(sensenova_cubin(), "sensenova_gdn_gate")?,
             fp4_append: optional(cuda, "sensenova_fp4_append", 0),
             dense_fp8: dense,
+            dense_fp8_q8: dense_q8,
+            quant_fp8: load(sensenova_cubin(), "sensenova_quant_fp8")?,
             quant_fp4: optional(cuda, "sensenova_quant_fp4", 0),
             quant_weights_fp4: optional(cuda, "sensenova_quant_weights_fp4", 0),
             dense_fp4_wide: optional(cuda, "sensenova_dense_fp4_wide", DENSE_FP4_WIDE_SHARED),
@@ -1341,7 +1408,9 @@ impl DeviceSession {
             // A verify reads every row's logits; a prefill chunk only the last row's.
             logits: alloc(ROWS * config.vocab_size * 4)?,
             // The widest activation a prefill block quantises is the MLP's intermediate.
-            fp4_codes: alloc(PREFILL_ROWS * fp4_inner / 2)?,
+            // A full byte a value: the FP4 quantiser packs two nibbles into each of the first
+            // half's bytes, and the FP8 quantiser writes one E4M3 code a value over the whole.
+            fp4_codes: alloc(PREFILL_ROWS * fp4_inner)?,
             fp4_scales: alloc(PREFILL_ROWS * (fp4_inner / 16))?,
             gdn_params: alloc(PREFILL_ROWS * config.linear.value_heads * 4 * 4)?,
             position: alloc(4)?,
@@ -2238,8 +2307,10 @@ impl DeviceSession {
             (self.scratch.b, self.scratch.a, config.linear.value_heads)
         };
         if layer.zcb.is_none() {
-            shared.gemv(&b, self.scratch.normed, self.scratch.b, rows)?;
-            shared.gemv(&a, self.scratch.normed, self.scratch.a, rows)?;
+            // Through the projection, not the decode GEMV: a chunk takes the 32-row tile on the
+            // tensor cores, and only a step or a verify (rows <= GEMV_MAX_BATCH) pays the GEMV.
+            shared.project_matrix(&b, self.scratch.normed, self.scratch.b, rows, quant)?;
+            shared.project_matrix(&a, self.scratch.normed, self.scratch.a, rows, quant)?;
         }
         clock.mark("  gdn ba", drain)?;
         if debug {

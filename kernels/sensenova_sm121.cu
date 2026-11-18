@@ -22,6 +22,10 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+// The block-scaled E4M3 bulk-prefill tile (shared_prefill_mma_sm121.cuh): the q8 body the dense
+// projections run, and glm_q8_codes, the activation rule this arm's quantiser applies.
+#include "shared_prefill_mma_sm121.cuh"
+
 #define SENSENOVA_BLOCK 256
 
 __device__ __forceinline__ float sensenova_sigmoid(float x) {
@@ -1228,5 +1232,51 @@ extern "C" __global__ void sensenova_attn_prefill(
         const float g = gate[at + dims + i];
         out[at + dims + i] = value / (1.0f + __expf(-g));
     }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// The E4M3 dense projection on the block-scaled FP8 tensor core.
+//
+// Every other projection the arm launched went through shared_prefill_mma_body, which decodes
+// each E4M3 weight block to bf16 in shared memory and then issues *two* bf16 MMAs a fragment
+// (the activation's bf16 head and the bf16 of its remainder). At a 1024-row chunk that put the
+// three MLP projections at 25-31 TFLOP/s: half the tensor peak by mechanism, half of what is
+// left to the decode and the doubled instruction count.
+//
+// The checkpoint is a W8A8-FP8 release - quantization_config says activation_scheme "dynamic",
+// weight_block_size [128, 128] - so its own arithmetic is one E4M3 code an activation value with
+// a scale a 128-value group. That is what these two kernels do: quantise the chunk's activation
+// row-wise (amax / 448 a 128-column block), then run the shared q8 tile body, which puts the
+// codes straight into mma.sync.kind::mxf8f6f4.block_scale (m16n8k32 E4M3 x E4M3, twice the bf16
+// rate, no decode) and folds each 128-column block's scaled partial into the f32 total.
+// ---------------------------------------------------------------------------------------------
+
+// x ([rows][cols] f32, cols a multiple of 128) as E4M3 codes q ([rows][cols]) and one f32 scale a
+// 128-column block, s ([rows][cols / 128]). One warp a block: four values a lane, one warp
+// shuffle ring for the amax, then the same amax / 448 rule the decode GEMV applies.
+extern "C" __global__ void sensenova_quant_fp8(const float* __restrict__ x,
+                                               uint8_t* __restrict__ q, float* __restrict__ s,
+                                               int rows, int cols) {
+    const int unit = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int lane = (int)(threadIdx.x & 31u);
+    const int per_row = cols >> 7;
+    if (unit >= rows * per_row) return;
+    const unsigned long long at = (unsigned long long)unit * 128u + (unsigned long long)lane * 4u;
+    float scale;
+    const uint32_t codes = glm_q8_codes(*reinterpret_cast<const float4*>(x + at), scale);
+    *reinterpret_cast<uint32_t*>(q + at) = codes;
+    if (lane == 0) s[unit] = scale;
+}
+
+// The dense projection over those codes and an E4M3 weight block-scaled a 128 x 128 tile (the
+// checkpoint's own bf16 inverse scale): the shared 128 x 128 q8 tile, four cp.async stages of
+// 64 K, grid (cols / 128, tokens / 128) in glm_raster order.
+extern "C" __global__ __launch_bounds__(OM_THREADS) void sensenova_dense_fp8_q8(
+    const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ ws,
+    const uint8_t* __restrict__ a, const float* __restrict__ as, float* __restrict__ out,
+    unsigned int cols, unsigned int inner, unsigned int tokens) {
+    shared_prefill_q8_body<false, __nv_bfloat16>(a, as, w, ws, nullptr, nullptr, out, cols, inner,
+                                                 tokens, nullptr, 1u, nullptr);
 }
 

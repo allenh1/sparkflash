@@ -219,11 +219,38 @@ The prefill engine is the NVFP4 block-scaled MMA (`mma.sync.aligned.kind::mxf4nv
 m16n8k64 instruction a four SM cycles runs at ~890 TFLOPS peak on this part; measured prefill has
 climbed 240 tok/s (the eight-row GEMV) → 917 (E4M3 MMA) → 2,017 (NVFP4) → 2,987 (parallel scan) →
 3,982 (fused z/b/a, chunked conv) → 5,077 (register-state scan) → 5,640 (persistent GEMM) → 6,244
-tok/s on a 569-token prompt with 1,024-row chunks. The E4M3 fallback (`SPARKFLASH_SENSENOVA_FP8=1`,
-the path the bisect below uses) is far slower — measured 1,230 tok/s on 834 prompt tokens and 1,063
-tok/s on 3,624 through `serve` — which is why the row-length history above is all NVFP4. Re-measured
-on the fixed arm it is 4,169 tok/s on 826 prompt tokens and 2,902 on 3,567, at either an 8K or a
-160K context; the 6,244 above is from before the `attach_fp4` fix and the two are not yet reconciled.
+tok/s on a 569-token prompt with 1,024-row chunks. Re-measured on the fixed arm it is 4,169 tok/s on
+826 prompt tokens and 2,902 on 3,567, at either an 8K or a 160K context; the 6,244 above is from
+before the `attach_fp4` fix and the two are not yet reconciled.
+
+The E4M3 path (`SPARKFLASH_SENSENOVA_FP8=1`, the one that keeps an eight-bit copy for decode) ran
+the *BF16* tile until recently, and that is why it was three and a half times slower a chunk: the
+body decoded every E4M3 weight block to bf16 in shared memory and then issued two bf16
+`m16n8k16` MMAs a fragment, one for the activation's bf16 head and one for the bf16 of its
+remainder. Half the peak by mechanism, a decode on every weight chunk, and twice the instructions.
+The checkpoint is a W8A8-FP8 release (`activation_scheme: "dynamic"`, `weight_block_size [128, 128]`),
+so its own arithmetic is one E4M3 code a value with a scale a 128-value group, and the
+`mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32` form takes those operands
+directly. `sensenova_quant_fp8` quantises the chunk row-wise and `sensenova_dense_fp8_q8` runs the
+shared 128 x 128 q8 tile, which folds each block's activation scale and the tile's bf16 weight
+scale into a per-128-column partial sum. On the same binary, a 1,725-token prompt, back to back:
+
+| dense projection tile | prefill | 1024-row chunk |
+| :-- | --: | --: |
+| BF16 (`SPARKFLASH_SENSENOVA_DENSE_BF16=1`, the reference) | 806 tok/s | 1,281 ms |
+| block-scaled E4M3 (shipped) | **2,599 tok/s** | **302 ms** |
+
+a 3.2x chunk, with the dense projections at 157-172 TFLOP/s — about 70% of the 225 TFLOP/s this
+part's FP8 `mma.sync` reaches (the 450 headline needs `tcgen05`, which sm_120 does not have). The
+same gate gives the GDN gates' 32-row `b` and `a` projections the tensor cores instead of the
+decode GEMV, 88 ms → 7 ms a chunk. Decode is untouched: `rows <= GEMV_MAX_BATCH` still takes the
+GEMV, and it measures 30-34 tok/s either way.
+
+What is left in a 302 ms chunk is no longer the projections (170 ms, at their roofline): full
+attention 49 ms is still the decode-shaped kernel, one warp a row and one key at a time with a
+five-shuffle reduction, about 20x off a tensor-core roofline; the norm/mhc/merge and GDN
+scan/conv/recur block is another ~70 ms of small latency-bound kernels. Those are worth perhaps
+another 1.3-1.5x, and not 3x.
 
 Prefill is not flat in prompt length, and the curve is what a long conversation feels. Measured
 through `serve` on the fixed arm, one prompt a request:
@@ -261,10 +288,14 @@ a title request between each turn, measured through `serve` at a 32K context and
 69.5% of the 7,332 prompt tokens were served from the cache, and the four title calls no longer cost
 the conversation its prefix. At the default capacity the same session caches nothing.
 
-**The target is now a 15,000 tok/s floor on the shipped FP8 checkpoint.** That floor is a compute
-bound, not a byte one: the block-scaled FP8 MMA peaks at 224 TFLOPS on this part and the E4M3 arm
-reaches ~56 of them, so 15,000 tok/s (a 1,024-row chunk in 68 ms) is above what 8-bit operands can
-reach at any efficiency. It is reachable on the four-bit tile, whose m16n8k64 form peaks at ~890.
+**The target is a 15,000 tok/s floor on the shipped FP8 checkpoint, and it is out of reach.** The
+floor is a compute bound, not a byte one. A 1,024-row chunk is ~23 GFLOP a row, so 15,000 tok/s is
+348 TFLOP/s on the whole chunk and ~500 on the projections alone; the block-scaled FP8
+`mma.sync` form peaks at 225 TFLOP/s on this part (the 450 TFLOP/s headline is `tcgen05`, which
+sm_120 does not have). The E4M3 arm now reaches 157-172 TFLOP/s, ~70% of that peak, so a further
+1.4x is all the headroom the eight-bit instruction leaves: the honest ceiling for FP8 prefill is
+around 4,000 tok/s, not 15,000. It is reachable on the four-bit tile, whose m16n8k64 form peaks at
+~890.
 Keeping FP8 for decode as well is the other half of the ask, and it does not fit:
 
 | resident | GiB |
