@@ -164,3 +164,45 @@ fn the_device_arm_matches_the_host_on_one_token() {
         }
     }
 }
+
+/// A chunk must be the one-row steps it stands in for, row for row.
+///
+/// The verifier depends on this exactly: a verify forward is one chunk over the anchor and the
+/// drafts, and the rows it keeps are the rows those single steps would have produced.
+#[test]
+fn a_chunk_equals_the_single_rows_it_stands_in_for() {
+    if !sparkflash_model_sensenova::SenseNovaDeviceBackend::available() {
+        eprintln!("no SenseNova/Qwen cubin; skipping the chunk test");
+        return;
+    }
+    use sparkflash_model::backend::ModelBackend;
+    let directory = tempfile::tempdir().expect("temporary directory");
+    write_tiny(directory.path());
+    let backend = sparkflash_model_sensenova::SenseNovaDeviceBackend::open_with_cache(
+        directory.path(),
+        ModelDescriptor::sensenova_loop_9b(),
+        256,
+        true,
+    );
+    let Ok(backend) = backend else {
+        eprintln!("the device arm refused the fixture: {:?}", backend.err());
+        return;
+    };
+    for rows in [2usize, 3, 8] {
+        let tokens: Vec<u32> = (1..=rows as u32).collect();
+        let mut chunked = backend.open_session().expect("chunk session");
+        let together = chunked.prefill(&tokens).expect("chunk prefill").logits;
+        let mut single = backend.open_session().expect("single session");
+        let mut apart = single.prefill(&tokens[..1]).expect("first row").logits;
+        for token in &tokens[1..] {
+            apart = single.decode(*token).expect("single row").logits;
+        }
+        let worst = together
+            .iter()
+            .zip(&apart)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("rows {rows}: worst chunk-vs-single delta {worst}");
+        assert!(worst < 5e-3, "rows {rows} diverge by {worst}");
+    }
+}
