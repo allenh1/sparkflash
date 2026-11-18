@@ -72,6 +72,7 @@ sparkflash-engine = { workspace = true }
 sparkflash-device = { workspace = true }
 sparkflash-web = { workspace = true }
 axum = { workspace = true }
+ureq = { version = "2.12", default-features = false }
 # The streaming detokeniser step: host continuous batching keeps the tokenizers DecodeStream state
 # in its per-request scheduler slots, and step_decode_stream is the crate's public entry for it.
 tokenizers = "0.23"
