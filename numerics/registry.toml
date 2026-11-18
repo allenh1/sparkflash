@@ -124,6 +124,34 @@ report = "docs/numerics/glm53/v1-e4m3-window.md"
 captured = "2026-11-03"
 note = "The shipped default: E4M3 latent cache, bulk FP8 prefill, default context."
 
+# Inkling-2-Small and Dory1.0-4B are registered before their first capture: both entries name the
+# configuration, version and evidence, and leave `reference` and `fingerprint` out. That is the
+# registry's uncaptured state (docs/NUMERICS.md §5): the binary reports them unregistered and
+# `scripts/numerics.py check` says no reference has been captured, rather than comparing against
+# one. Phase 5 of docs/engine/04-onboarding.md takes their first reference after tensor-core
+# decode, so each entry is registered at the arithmetic it will be measured on.
+[[config]]
+model = "thinkingmachines/Inkling-2-Small"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+captured = "2026-11-18"
+note = "Registered, not yet captured; the four-rank device group's first reference is phase 5's."
+
+[[config]]
+model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+captured = "2026-11-18"
+note = "Registered, not yet captured; the four-rank recurrence ring's first reference is phase 5's."
+
 [[anchor]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
 world = 1

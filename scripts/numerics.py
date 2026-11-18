@@ -570,6 +570,13 @@ def declaration_findings(
             report = entry.get("report")
             if report and read_head(report) is None:
                 findings.append(f"{table} {key_text(key)}: report {report} does not exist")
+            if "reference" not in entry:
+                if table == "config":
+                    # Registered, not yet captured: no reference to match, and the entry is
+                    # reported as uncaptured by run_ci.
+                    continue
+                findings.append(f"{table} {key_text(key)}: an anchor must name a captured reference")
+                continue
             path = f"{NUMERICS}/{entry['reference']}"
             named.add(path)
             reference = loaded(read_head, path)
@@ -631,8 +638,17 @@ def declaration_findings(
         if entry["evidence"] != old["evidence"] and not bumped:
             findings.append(f"{name}: evidence {old['evidence']} -> {entry['evidence']} without a version bump")
         # The fingerprint is the bits: a reference moved to another path with the same bits is a
-        # rename, which needs no bump and is no declared change.
-        old_path, new_path = f"{NUMERICS}/{old['reference']}", f"{NUMERICS}/{entry['reference']}"
+        # rename, which needs no bump and is no declared change. A first capture fills an
+        # uncaptured entry and is not an arithmetic change; removing one is refused.
+        old_reference, new_reference = old.get("reference"), entry.get("reference")
+        if old_reference is None and new_reference is None:
+            continue
+        if old_reference is None:
+            continue
+        if new_reference is None:
+            findings.append(f"{name}: removed its captured reference; a capture is not withdrawn")
+            continue
+        old_path, new_path = f"{NUMERICS}/{old_reference}", f"{NUMERICS}/{new_reference}"
         bits_changed = old["fingerprint"] != entry["fingerprint"]
         file_changed = new_path in changed or old_path in changed
         if not bumped:
@@ -730,7 +746,9 @@ def declaration_findings(
         stale = [
             f"{NUMERICS}/{entry['reference']}"
             for entry in head["config"]
-            if entry["model"] in models and changed.get(f"{NUMERICS}/{entry['reference']}") not in ("A", "M")
+            if entry["model"] in models
+            and "reference" in entry
+            and changed.get(f"{NUMERICS}/{entry['reference']}") not in ("A", "M")
         ]
         if stale:
             what = ", ".join(moved) if before and after else "adding the profile" if after else "removing the profile"
@@ -824,6 +842,9 @@ def run_ci(base_argument: str | None) -> int:
         f"numerics ci: base {base[:12]}, {configs} configuration(s), {anchors} anchor(s), "
         f"{len(changed)} changed path(s); prerequisites missing: {missing or 'none'}"
     )
+    uncaptured = [entry for entry in head_registry["config"] if "reference" not in entry]
+    for entry in uncaptured:
+        print(f"numerics ci: uncaptured {key_text(dict(zip(KEY_FIELDS, entry_key(entry))))}: registered, no reference yet")
     for finding in findings:
         print(f"FAIL {finding}")
     print("numerics ci: " + ("FAIL" if findings else "PASS"))
@@ -1314,7 +1335,7 @@ def command_capture(args: argparse.Namespace) -> int:
         registered = lookup(parse_registry((REPO / REGISTRY).read_text(), REGISTRY), reference["key"])
         print("\nregistry entry (numerics/registry.toml):\n")
         print(entry_snippet(reference, relative_reference(args.out), registered))
-        if registered and registered["fingerprint"] != reference["fingerprint"]:
+        if registered and registered.get("fingerprint") not in (None, reference["fingerprint"]):
             print(
                 f"\nthe bits differ from version {registered['version']}'s: unless this capture only "
                 f"extends that one, it is version {registered['version'] + 1}, with its own report "
@@ -1336,6 +1357,10 @@ def command_check(args: argparse.Namespace) -> int:
         entry = lookup(registry, key)
         if entry is None:
             raise NumericsFailure(f"{key_text(key)} has no registry entry; this configuration is unregistered")
+        if "reference" not in entry:
+            raise NumericsFailure(
+                f"{key_text(key)} has no reference captured yet, nothing vouches for its bits"
+            )
         if numerics["status"] != "registered":
             raise NumericsFailure(
                 f"the server reports {key_text(key)} as {numerics['status']} "

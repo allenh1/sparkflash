@@ -118,6 +118,11 @@ architecture (or `host`):
 | `report` | the quality report under `docs/numerics/`: required from version 2; a version-1 entry may name the baseline report that measured it |
 | `captured`, `note` | when, and what a reader should know |
 
+`reference` and `fingerprint` are omitted together for a configuration that is registered but
+not yet captured: the binary reports it `unregistered`, and `check` refuses with "no reference
+captured yet" rather than comparing. A first capture fills both in; from then on a changed capture
+is a declared change.
+
 `[[retired]]` keeps a removed configuration's last version, so removing and re-adding one cannot
 reset it. A reference's `server` card is what the capturing binary reported, and it is outside the
 fingerprint: the registry can name a capture's fingerprint only after the capture exists, so a

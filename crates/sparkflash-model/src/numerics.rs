@@ -423,10 +423,14 @@ pub struct ConfigEntry {
     pub version: u32,
     /// What the reference fingerprints.
     pub evidence: Evidence,
-    /// The reference file, relative to `numerics/`.
-    pub reference: String,
-    /// The sha256 of the reference's canonical capture.
-    pub fingerprint: String,
+    /// The reference file, relative to `numerics/`. `None` with no [Self::fingerprint] means the
+    /// configuration is registered but not yet captured.
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// The sha256 of the reference's canonical capture. `None` with no [Self::reference] means
+    /// the configuration is registered but not yet captured.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
     /// The quality report a declared change committed; required from version 2 on.
     #[serde(default)]
     pub report: Option<String>,
@@ -438,6 +442,16 @@ pub struct ConfigEntry {
 }
 
 impl ConfigEntry {
+    /// Whether a capture vouches for this entry's bits.
+    ///
+    /// A configuration may be registered before its first capture: `reference` and
+    /// `fingerprint` are then both absent, and the entry answers
+    /// [NumericsStatus::Unregistered] until `scripts/numerics.py capture` fills them in.
+    #[must_use]
+    pub fn is_captured(&self) -> bool {
+        self.reference.is_some()
+    }
+
     /// The entry's lookup key.
     #[must_use]
     pub fn key(&self) -> ConfigKey {
@@ -576,7 +590,12 @@ impl Registry {
                     "{key}: version 0; versions start at 1"
                 )));
             }
-            check_reference(&key, &entry.reference, &entry.fingerprint, &entry.captured)?;
+            check_reference(
+                &key,
+                entry.reference.as_deref(),
+                entry.fingerprint.as_deref(),
+                &entry.captured,
+            )?;
             if entry.version > 1 && entry.report.is_none() {
                 return Err(NumericsError::Invalid(format!(
                     "{key}: version {} declares an arithmetic change but names no report",
@@ -616,8 +635,8 @@ impl Registry {
             check_key(&key)?;
             check_reference(
                 &key,
-                &anchor.reference,
-                &anchor.fingerprint,
+                Some(&anchor.reference),
+                Some(&anchor.fingerprint),
                 &anchor.captured,
             )?;
             if !anchored.insert(anchor.model.clone()) {
@@ -676,28 +695,39 @@ fn check_key(key: &ConfigKey) -> Result<(), NumericsError> {
 
 fn check_reference(
     key: &ConfigKey,
-    reference: &str,
-    fingerprint: &str,
+    reference: Option<&str>,
+    fingerprint: Option<&str>,
     captured: &str,
 ) -> Result<(), NumericsError> {
-    if !reference.starts_with("references/")
-        || !reference.ends_with(".json")
-        || reference
-            .split('/')
-            .any(|part| part.is_empty() || part == "..")
-    {
-        return Err(NumericsError::Invalid(format!(
-            "{key}: reference {reference:?} is not a .json path under references/"
-        )));
-    }
-    if fingerprint.len() != 64
-        || !fingerprint
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(NumericsError::Invalid(format!(
-            "{key}: fingerprint {fingerprint:?} is not 64 lowercase hex digits"
-        )));
+    match (reference, fingerprint) {
+        (None, None) => {}
+        (Some(reference), Some(fingerprint)) => {
+            if !reference.starts_with("references/")
+                || !reference.ends_with(".json")
+                || reference
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "..")
+            {
+                return Err(NumericsError::Invalid(format!(
+                    "{key}: reference {reference:?} is not a .json path under references/"
+                )));
+            }
+            if fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(NumericsError::Invalid(format!(
+                    "{key}: fingerprint {fingerprint:?} is not 64 lowercase hex digits"
+                )));
+            }
+        }
+        _ => {
+            return Err(NumericsError::Invalid(format!(
+                "{key}: reference and fingerprint are declared together, or both left out for an \
+                 uncaptured configuration"
+            )));
+        }
     }
     let date = captured.as_bytes();
     let well_formed = date.len() == 10
@@ -786,7 +816,7 @@ impl NumericsIdentity {
     pub fn status(&self) -> NumericsStatus {
         if !self.overrides.is_empty() {
             NumericsStatus::Overridden
-        } else if self.entry.is_some() {
+        } else if self.entry.as_ref().is_some_and(ConfigEntry::is_captured) {
             NumericsStatus::Registered
         } else {
             NumericsStatus::Unregistered
@@ -811,12 +841,14 @@ impl NumericsIdentity {
             self.status().name()
         );
         if let Some(entry) = &self.entry {
-            line.push_str(&format!(
-                " registered_version={} fingerprint={} evidence={}",
-                entry.version,
-                &entry.fingerprint[..16],
-                evidence_name(entry.evidence)
-            ));
+            line.push_str(&format!(" registered_version={}", entry.version));
+            if let Some(fingerprint) = &entry.fingerprint {
+                line.push_str(&format!(
+                    " fingerprint={} evidence={}",
+                    &fingerprint[..16],
+                    evidence_name(entry.evidence)
+                ));
+            }
         }
         if !self.overrides.is_empty() {
             line.push_str(&format!(" overrides={}", self.overrides.join(",")));
@@ -836,7 +868,7 @@ impl NumericsIdentity {
             "profile": self.key.profile.name(),
             "version": self.version(),
             "registered_version": entry.map(|entry| entry.version),
-            "fingerprint": entry.map(|entry| entry.fingerprint.as_str()),
+            "fingerprint": entry.and_then(|entry| entry.fingerprint.as_deref()),
             "evidence": entry.map(|entry| evidence_name(entry.evidence)),
             "world": self.key.world,
             "plan": self.key.plan,
@@ -961,6 +993,36 @@ mod tests {
         }
         assert!(arithmetic_switches().any(|name| name == "SPARKFLASH_QWEN4_PREFILL_MMA"));
         assert!(!arithmetic_switches().any(|name| name == "SPARKFLASH_LANES"));
+    }
+
+    #[test]
+    fn an_uncaptured_configuration_parses_and_claims_no_version() {
+        let uncaptured = "[[config]]\nmodel = \"nvidia/Qwen3.8-Flash-Next-NVFP4\"\nworld = 4\n\
+             profile = \"reference\"\nplan = \"tp\"\narch = \"sm_121a\"\nversion = 1\n\
+             evidence = \"logprobs\"\ncaptured = \"2026-11-03\"\n\
+             note = \"registered, not yet captured\"\n";
+        let registry =
+            Registry::from_toml(&registry_with(uncaptured)).expect("no capture is legal");
+        let key = ConfigKey::tp(QWEN, 4, NumericsProfile::Reference, "sm_121a");
+        let identity = NumericsIdentity::resolve(&registry, key, |_| None);
+        assert_eq!(identity.status(), NumericsStatus::Unregistered);
+        assert_eq!(identity.version(), None);
+        assert_eq!(identity.entry.as_ref().map(|entry| entry.version), Some(1));
+        assert_eq!(identity.card()["fingerprint"], Value::Null);
+        assert!(!identity.boot_line().contains("fingerprint="));
+
+        // Both present is a capture; one present without the other is refused.
+        Registry::from_toml(&registry_with(&entry(1, ""))).expect("a capture is legal");
+        for lone in [
+            uncaptured.to_owned() + "reference = \"references/q.json\"\n",
+            uncaptured.to_owned()
+                + "fingerprint = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+        ] {
+            let error = Registry::from_toml(&registry_with(&lone))
+                .expect_err("one half of a capture is refused")
+                .to_string();
+            assert!(error.contains("reference and fingerprint"), "{error}");
+        }
     }
 
     #[test]
