@@ -80,34 +80,58 @@ pub const SKINNY_MAX_COLUMNS: usize = 32;
 /// The inner step the skinny kernels read: eight floats a lane, 32 lanes.
 pub const SKINNY_INNER_MULTIPLE: usize = 256;
 
+/// Qwen's released grouped-tile threshold: `GEMM_MIN_BATCH` tokens.
+///
+/// Kept here as a named value because the same boundary appears in the catalogue's row bands, in
+/// the legacy policy and in Qwen's own dispatcher. It is not a shared default.
+pub const QWEN_GEMM_MIN_BATCH: usize = 64;
+
 /// When an arm's BF16 projections take the wide tile.
+///
+/// The fields are private: a released arm names one of the constants below, and a new arm has no
+/// per-model constant to name, so it takes [Self::DEFAULT]. That is what keeps a new family from
+/// inventing thresholds its bits were not recorded under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidePolicy {
     /// The fewest rows the tile takes. Below it the row GEMV runs.
-    pub min_rows: usize,
+    min_rows: usize,
+    /// The row GEMV's batch width: above this many rows the GEMV runs a group at a time.
+    row_batch: usize,
     /// What a shape the tile does not cover takes, at `min_rows` rows or more.
-    pub off_shape: OffShape,
+    off_shape: OffShape,
 }
 
 impl WidePolicy {
-    /// GLM's bulk prefill: past the row GEMV's rows, the tile, else the skinny kernel or the row
-    /// GEMV.
+    /// GLM's bulk prefill (`MAX_ROWS` = 8): past the row GEMV's rows, the tile, else the
+    /// skinny kernel or the row GEMV.
     pub const GLM: Self = Self {
         min_rows: GEMV_MAX_BATCH + 1,
+        row_batch: GEMV_MAX_BATCH,
         off_shape: OffShape::Skinny,
     };
 
-    /// Dory's prompt walk: past the row GEMV's rows the tile or nothing, since the token GEMV
-    /// would change the chunk's arithmetic.
+    /// Qwen's chunk path (`GEMM_MIN_BATCH` = 64): below 64 rows the row GEMV, from 64 the
+    /// grouped tile, else the row GEMV. Qwen keeps its own dispatcher; this is the same boundary
+    /// expressed once, so the catalogue's row band and the policy cannot drift.
+    pub const QWEN: Self = Self {
+        min_rows: QWEN_GEMM_MIN_BATCH,
+        row_batch: GEMV_MAX_BATCH,
+        off_shape: OffShape::Gemv,
+    };
+
+    /// Dory's prompt walk (`TOKEN_ROWS` = 8): past the row GEMV's rows the tile or nothing,
+    /// since the token GEMV would change the chunk's arithmetic.
     pub const DORY: Self = Self {
         min_rows: GEMV_MAX_BATCH + 1,
+        row_batch: GEMV_MAX_BATCH,
         off_shape: OffShape::Refuse,
     };
 
-    /// Inkling's tensor walk: the tile at every row count (the prompt's bits do not depend on its
-    /// chunk widths), else the row GEMV.
+    /// Inkling's tensor walk (`BATCH_ROWS` = 8): the tile at every row count (the prompt's bits
+    /// do not depend on its chunk widths), else the row GEMV a group of eight at a time.
     pub const INKLING_TENSOR: Self = Self {
         min_rows: 1,
+        row_batch: GEMV_MAX_BATCH,
         off_shape: OffShape::Gemv,
     };
 
@@ -116,8 +140,91 @@ impl WidePolicy {
     /// kernel.
     pub const DENSE: Self = Self {
         min_rows: GEMV_MAX_BATCH + 1,
+        row_batch: GEMV_MAX_BATCH,
         off_shape: OffShape::Gemv,
     };
+
+    /// The policy a new arm gets when it names no legacy one.
+    ///
+    /// It takes the tile past the row GEMV's rows and refuses an uncovered shape, so an arm that
+    /// forgot to state what its uncovered prompt does cannot silently change its arithmetic.
+    pub const DEFAULT: Self = Self {
+        min_rows: GEMV_MAX_BATCH + 1,
+        row_batch: GEMV_MAX_BATCH,
+        off_shape: OffShape::Refuse,
+    };
+
+    /// The fewest rows the tile takes.
+    #[must_use]
+    pub const fn min_rows(self) -> usize {
+        self.min_rows
+    }
+
+    /// The row GEMV's batch width.
+    #[must_use]
+    pub const fn row_batch(self) -> usize {
+        self.row_batch
+    }
+
+    /// What an uncovered shape takes past `min_rows`.
+    #[must_use]
+    pub const fn off_shape(self) -> OffShape {
+        self.off_shape
+    }
+}
+
+/// A released arm's present row thresholds, named so its bits cannot move.
+///
+/// This is the only list a released arm may name. A new arm has no variant here and takes
+/// [WidePolicy::DEFAULT]; a future arm that needs a different boundary adds a variant and the
+/// measurement that justifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyPolicy {
+    /// GLM-5.
+    Glm,
+    /// Qwen3.8 and its siblings.
+    Qwen,
+    /// Inkling-2.
+    Inkling,
+    /// Dory.
+    Dory,
+    /// The shared dense arm.
+    Dense,
+}
+
+impl LegacyPolicy {
+    /// Every released policy, in the order its threshold was recorded.
+    pub const ALL: &'static [Self] = &[
+        Self::Glm,
+        Self::Qwen,
+        Self::Inkling,
+        Self::Dory,
+        Self::Dense,
+    ];
+
+    /// The stable name used in diagnostics.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Glm => "glm",
+            Self::Qwen => "qwen",
+            Self::Inkling => "inkling",
+            Self::Dory => "dory",
+            Self::Dense => "dense",
+        }
+    }
+
+    /// The policy the released arm runs today.
+    #[must_use]
+    pub const fn policy(self) -> WidePolicy {
+        match self {
+            Self::Glm => WidePolicy::GLM,
+            Self::Qwen => WidePolicy::QWEN,
+            Self::Inkling => WidePolicy::INKLING_TENSOR,
+            Self::Dory => WidePolicy::DORY,
+            Self::Dense => WidePolicy::DENSE,
+        }
+    }
 }
 
 /// The kernel a projection takes.
@@ -146,10 +253,10 @@ pub fn wide_fits(columns: usize, inner: usize) -> bool {
 #[must_use]
 pub fn route_bf16(policy: Option<WidePolicy>, columns: usize, inner: usize, rows: usize) -> Route {
     let Some(policy) = policy else {
-        return gemv(rows);
+        return gemv(rows, GEMV_MAX_BATCH);
     };
     if rows < policy.min_rows {
-        return gemv(rows);
+        return gemv(rows, policy.row_batch);
     }
     policy.bulk(columns, inner, rows)
 }
@@ -163,20 +270,20 @@ impl WidePolicy {
             return Route::Wide;
         }
         match self.off_shape {
-            OffShape::Gemv => gemv(rows),
+            OffShape::Gemv => gemv(rows, self.row_batch),
             OffShape::Skinny
                 if columns <= SKINNY_MAX_COLUMNS && inner.is_multiple_of(SKINNY_INNER_MULTIPLE) =>
             {
                 Route::Skinny
             }
-            OffShape::Skinny => gemv(rows),
+            OffShape::Skinny => gemv(rows, self.row_batch),
             OffShape::Refuse => Route::Refuse,
         }
     }
 }
 
-fn gemv(rows: usize) -> Route {
-    if rows <= GEMV_MAX_BATCH {
+fn gemv(rows: usize, row_batch: usize) -> Route {
+    if rows <= row_batch {
         Route::RowGemv
     } else {
         Route::BatchedGemv
@@ -343,17 +450,17 @@ pub fn fp8_tile_fits(columns: usize, inner: usize) -> bool {
 #[must_use]
 pub fn route_fp8(policy: Option<WidePolicy>, columns: usize, inner: usize, rows: usize) -> Route {
     let Some(policy) = policy else {
-        return gemv(rows);
+        return gemv(rows, GEMV_MAX_BATCH);
     };
     if rows < policy.min_rows {
-        return gemv(rows);
+        return gemv(rows, policy.row_batch);
     }
     if fp8_tile_fits(columns, inner) {
         return Route::Wide;
     }
     match policy.off_shape {
         OffShape::Refuse => Route::Refuse,
-        OffShape::Gemv | OffShape::Skinny => gemv(rows),
+        OffShape::Gemv | OffShape::Skinny => gemv(rows, policy.row_batch),
     }
 }
 
@@ -474,6 +581,101 @@ mod tests {
             route_bf16(Some(WidePolicy::DORY), 2048, 4096, 64),
             Route::Wide
         );
+    }
+
+    #[test]
+    fn each_legacy_policy_decides_at_its_boundary_rows() {
+        // (name, policy, the fewest rows the tile takes, what an uncovered BF16 shape takes
+        // past it, what an uncovered FP8 shape takes past it)
+        // `None` is the row GEMV, whose split between one row group and many depends on the
+        // row count.
+        let cases = [
+            ("glm", WidePolicy::GLM, 9, Some(Route::Skinny), None),
+            ("qwen", WidePolicy::QWEN, 64, None, None),
+            ("inkling", WidePolicy::INKLING_TENSOR, 1, None, None),
+            (
+                "dory",
+                WidePolicy::DORY,
+                9,
+                Some(Route::Refuse),
+                Some(Route::Refuse),
+            ),
+            ("dense", WidePolicy::DENSE, 9, None, None),
+        ];
+        for (name, policy, min_rows, uncovered_bf16, uncovered_fp8) in cases {
+            assert_eq!(policy.min_rows(), min_rows, "{name} min_rows");
+            assert_eq!(policy.row_batch(), GEMV_MAX_BATCH, "{name} row_batch");
+            for rows in [1, 7, 8, 9, 63, 64, 65, 4096] {
+                let below = if rows <= GEMV_MAX_BATCH {
+                    Route::RowGemv
+                } else {
+                    Route::BatchedGemv
+                };
+                let wide = rows >= min_rows;
+                // A shape the tile covers: the tile past the policy's threshold, the row GEMV
+                // below it.
+                assert_eq!(
+                    route_bf16(Some(policy), 4096, 2048, rows),
+                    if wide { Route::Wide } else { below },
+                    "{name} BF16 at {rows} rows"
+                );
+                assert_eq!(
+                    route_fp8(Some(policy), 4096, 2048, rows),
+                    if wide { Route::Wide } else { below },
+                    "{name} FP8 at {rows} rows"
+                );
+                // A shape the tile does not cover: the policy's declared fallback. GLM's 24
+                // columns over 4096 inner values take the skinny kernel; the default refuses.
+                let bf16 = match uncovered_bf16 {
+                    Some(route) if wide => route,
+                    _ => below,
+                };
+                let fp8 = match uncovered_fp8 {
+                    Some(route) if wide => route,
+                    _ => below,
+                };
+                assert_eq!(
+                    route_bf16(Some(policy), 24, 4096, rows),
+                    bf16,
+                    "{name} uncovered BF16 at {rows} rows"
+                );
+                assert_eq!(
+                    route_fp8(Some(policy), 4096, 2080, rows),
+                    fp8,
+                    "{name} uncovered FP8 at {rows} rows"
+                );
+            }
+        }
+        // A new arm names no legacy policy and gets the refusing default.
+        assert_eq!(WidePolicy::DEFAULT.min_rows(), GEMV_MAX_BATCH + 1);
+        assert_eq!(WidePolicy::DEFAULT.off_shape(), OffShape::Refuse);
+        assert_eq!(
+            route_bf16(Some(WidePolicy::DEFAULT), 4096, 2048, 9),
+            Route::Wide
+        );
+        assert_eq!(
+            route_bf16(Some(WidePolicy::DEFAULT), 24, 4096, 9),
+            Route::Refuse
+        );
+    }
+
+    #[test]
+    fn the_legacy_policies_are_the_released_thresholds() {
+        let thresholds = LegacyPolicy::ALL
+            .iter()
+            .map(|legacy| (legacy.name(), legacy.policy().min_rows()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thresholds,
+            [
+                ("glm", GEMV_MAX_BATCH + 1),
+                ("qwen", QWEN_GEMM_MIN_BATCH),
+                ("inkling", 1),
+                ("dory", GEMV_MAX_BATCH + 1),
+                ("dense", GEMV_MAX_BATCH + 1),
+            ]
+        );
+        assert_eq!(QWEN_GEMM_MIN_BATCH, 64);
     }
 
     #[test]
