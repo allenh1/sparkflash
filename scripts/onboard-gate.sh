@@ -109,17 +109,15 @@ fi
 
 if [ -z "$MODEL" ] && [ -n "$BIN" ] && [ -x "$BIN" ]; then
     row="$("$BIN" arms --list 2>/dev/null | awk -F'|' -v want="$ARM" '
-        { for (i = 1; i <= NF; i++) { gsub(/^ +| +$/, "", $i) } if ($2 == want) print $3 "|" $7 }')"
+        { for (i = 1; i <= NF; i++) { gsub(/^ +| +$/, "", $i) } if ($2 == want) print $3 }')"
     if [ -n "$row" ]; then
-        MODEL="${row%%|*}"
-        conversion="${row#*|}"
-        if [ -z "$WORLD" ]; then
-            world="$(printf '%s' "$conversion" | sed -n 's/^TP\([0-9][0-9]*\).*/\1/p')"
-            WORLD="${world:-4}"
-        fi
+        MODEL="$row"
     fi
 fi
 MODEL="${MODEL:-$ARM}"
+# The route's conversion default is not its serving width (Dory converts at TP1 and serves the
+# four-rank group), so the first reference is taken at the group's world unless --world says
+# otherwise.
 WORLD="${WORLD:-4}"
 
 if [ -z "$REFERENCE" ]; then
