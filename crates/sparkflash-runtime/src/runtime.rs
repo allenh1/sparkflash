@@ -421,7 +421,11 @@ where
                 },
             ));
         }
-        let current = slot.prompt.is_none();
+        // The history may lag the arm's position: a walk that verified drafts keeps their rows
+        // in the sequence while the caller has only been given the anchor's token. A prompt may
+        // extend the history only when the state ends exactly where the history does; otherwise
+        // the rewind point is the resume, as an arm that owns the rule asks for.
+        let current = slot.prompt.is_none() && slot.seq.position() == slot.history.len();
         let answer = resume(&slot.history, current, slot.point, tokens);
         let start = match answer {
             Some(Resume::Extend(held)) => held,
@@ -606,6 +610,9 @@ mod tests {
         limits: Limits,
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
         sampling: Mutex<Option<Sampling>>,
+        /// Rows the walk keeps past the ones the caller was given tokens for, as a verify keeps
+        /// its drafts' rows. Zero is the plain walk.
+        kept_past: usize,
     }
 
     impl ToyWalk {
@@ -618,7 +625,14 @@ mod tests {
                 limits: Limits::new(rows, context),
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
+                kept_past: 0,
             }
+        }
+
+        /// The same walk, keeping `kept_past` rows past what the caller was given.
+        fn keeping(mut self, kept_past: usize) -> Self {
+            self.kept_past = kept_past;
+            self
         }
     }
 
@@ -663,6 +677,8 @@ mod tests {
             for segment in segments {
                 segment.seq.rows.extend_from_slice(segment.rows);
                 rows += segment.rows.len();
+                // A verify's rows stay in the state past the tokens the caller is given.
+                segment.seq.rows.extend(vec![u32::MAX; self.kept_past]);
             }
             Ok(Hidden::new(rows))
         }
@@ -744,6 +760,31 @@ mod tests {
             1,
             "the shared prefix was not forwarded again"
         );
+    }
+
+    /// A state that ends past the history (a verify kept its drafts' rows) cannot extend the
+    /// history: the next prompt goes back to the rewind point instead of forwarding at a position
+    /// the caller's text does not reach.
+    #[test]
+    fn a_prompt_extends_the_history_only_where_the_state_ends() {
+        let runtime =
+            Runtime::new(ToyWalk::new(256, 4_096).keeping(2), 0).expect("the runtime starts");
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime
+            .prefill(&mut slot, &[1, 2, 3])
+            .expect("the first prompt");
+        // The walk kept two rows the caller was never given a token for.
+        assert_eq!(slot.seq().rows, vec![1, 2, 3, u32::MAX, u32::MAX]);
+        assert_eq!(slot.history(), &[1, 2, 3]);
+        runtime
+            .prefill(&mut slot, &[1, 2, 3, 9])
+            .expect("the continuation");
+        assert_eq!(
+            slot.seq().rows,
+            vec![1, 2, 3, 9, u32::MAX, u32::MAX],
+            "the prompt went back to the point instead of forwarding from the kept rows"
+        );
+        assert_eq!(slot.history(), &[1, 2, 3, 9]);
     }
 
     #[test]
