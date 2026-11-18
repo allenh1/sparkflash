@@ -221,8 +221,29 @@ climbed 240 tok/s (the eight-row GEMV) → 917 (E4M3 MMA) → 2,017 (NVFP4) → 
 3,982 (fused z/b/a, chunked conv) → 5,077 (register-state scan) → 5,640 (persistent GEMM) → 6,244
 tok/s on a 569-token prompt with 1,024-row chunks. The E4M3 fallback (`SPARKFLASH_SENSENOVA_FP8=1`,
 the path the bisect below uses) is far slower — measured 1,230 tok/s on 834 prompt tokens and 1,063
-tok/s on 3,624 through `serve` — which is why the row-length history above is all NVFP4. A 512-row
-chunk's stage budget, taken with
+tok/s on 3,624 through `serve` — which is why the row-length history above is all NVFP4. Re-measured
+on the fixed arm it is 4,169 tok/s on 826 prompt tokens and 2,902 on 3,567, at either an 8K or a
+160K context; the 6,244 above is from before the `attach_fp4` fix and the two are not yet reconciled.
+
+**The target is now a 15,000 tok/s floor on the shipped FP8 checkpoint.** That floor is a compute
+bound, not a byte one: the block-scaled FP8 MMA peaks at 224 TFLOPS on this part and the E4M3 arm
+reaches ~56 of them, so 15,000 tok/s (a 1,024-row chunk in 68 ms) is above what 8-bit operands can
+reach at any efficiency. It is reachable on the four-bit tile, whose m16n8k64 form peaks at ~890.
+Keeping FP8 for decode as well is the other half of the ask, and it does not fit:
+
+| resident | GiB |
+| :-- | :-- |
+| text weights as E4M3 | 10.25 |
+| NVFP4 codes | 5.12 |
+| NVFP4 block scales | 0.16 |
+| both | 15.53 |
+| the card | 15.92 |
+
+which leaves 0.4 GiB for the KV caches, the activations and the scratch, and it fails on the first
+48 MiB request (`cuMemAlloc(50331648) failed: 2`). So on a 16 GB part the 4-bit chunk and an 8-bit
+decode copy cannot both be resident; a decode that reads FP8 has to be the *same* copy the chunk
+reads, which means 8-bit weights everywhere and the slower ceiling, or the 4-bit tile for both,
+which is what the arm does today. A 512-row chunk's stage budget, taken with
 `SPARKFLASH_SENSENOVA_TIME=2`, is 89.5 ms in total: dense 54 ms (MLP down 14.1, up 10.5, gate
 10.4, GDN qkv 5.4, z 3.5, out 3.5, head 2.3, full q 1.8, kv 1.4, o 1.2) and everything else 35.6 ms
 (full attention core 9.1, GDN scan 9.0, norm+mHC 9.6, swiglu 2.7, conv 2.5, merge 1.3). A 12,000
