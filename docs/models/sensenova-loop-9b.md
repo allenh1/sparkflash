@@ -157,6 +157,13 @@ The first device arm feeds a prompt one row at a time. That keeps prefill and de
 token GEMV arithmetic (a prompt's logits do not depend on its width) and is the simplest correct
 walk, but it reads the weights once a token. The next changes, in order:
 
+0. **Multi-row forward (in progress).** The kernels are already batch-shaped - `sensenova_attn_full_q8`
+   derives `visible = *position + row + 1` from `blockIdx.y`, `sensenova_cache_q8` takes a row
+   count, the mHC kernels index `row`, `q4e_gdn_conv`/`q4e_gdn_recur` take a `batch` and a
+   snapshot, and the GEMV tile is eight rows. A first pass (per-row activation buffers, `rows`
+   through every launch, `prefill` in chunks of eight) compiles and runs but is not correct yet:
+   a three-row chunk reproduces the *second* token's hidden state in row 0 after the first visit.
+   It is reverted until that is found, because a wrong chunk is worse than a slow one.
 1. **Batch the verify, not the launches.** Fusing kernels was measured and does not pay. Two
    variants were built and served at 160K: the norm folded into both mHC routers (plus an
    `add_norm` for the plain-residual visits) ran 22.3 -> 23.2 ms, and `gate`/`up` concatenated
