@@ -48,10 +48,10 @@
 //! not a recorded digest: the arm keeps its KV cache in BF16 where the reference keeps f32, so a
 //! row agrees to a tolerance rather than to the bit.
 //!
-//! It serves on the shared runtime's contract ([DenseLanes], a [FusedArm]): fused lanes whose
-//! decode rows share one walk, prompts a chunk at a time between the lanes' steps, kept
-//! conversations and a rewind point to the end of each prompt, its caches on the shared lane
-//! memory ([SequenceLanes]), and the ledger.
+//! It serves on the shared runtime's contract ([DenseLanes], a [sparkflash_runtime::Runtime]
+//! over [DenseWalk]): the runtime owns the fused lanes, the prompt parts, kept conversations,
+//! the rewind point and the ledger, and the arm supplies only the walk and its head. Its caches
+//! stay on the shared lane memory ([SequenceLanes]).
 //!
 //! It runs on one rank or on a tensor-parallel group ([DenseDeviceBackend::open_rank]): a rank
 //! holds its share of every attention layer's query heads (and of the key/value heads, which a
@@ -64,7 +64,7 @@
 //! fused lanes and every other rank replays them ([DenseDeviceBackend::enable_group_fusion],
 //! [DenseDeviceBackend::mirror_group]).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
@@ -74,10 +74,8 @@ use sparkflash_kernels::images::{
 };
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
 use sparkflash_model::architecture::{Activation, AttentionKind, Ffn, WeightFormat};
-use sparkflash_model::backend::{
-    BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput,
-};
-use sparkflash_model::vision::VisionImage;
+use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
+use sparkflash_model::ledger::State;
 use sparkflash_model::{Architecture, Capabilities, ModelDescriptor, TpAxis, TpPlan};
 use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
@@ -97,9 +95,7 @@ use sparkflash_ops::projection::{
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
-use sparkflash_runtime::{
-    FusedArm, Fusion, Ledger, Mode, Part, Resume, Strategy, TextWire, resume,
-};
+use sparkflash_runtime::{Fusion, TextWire};
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -107,11 +103,22 @@ mod walk;
 
 pub use walk::DenseWalk;
 
+/// The dense arm's sequence, as the runtime drives it. The runtime owns the prompt parts, the
+/// history, reuse, rewind, the lane pool and the ledger; this arm supplies the walk.
+pub type DenseLanes = sparkflash_runtime::Runtime<DenseWalk>;
+
 /// The host-facing name of a device refusal.
 const DEVICE: &str = "dense_device";
 
-/// The prompt rows one pass of the layer walk takes: two of the wide tile's 128-row blocks.
+/// The prompt rows one pass of the layer walk takes: two of the wide tile's 128-row blocks. The
+/// runtime's [sparkflash_runtime::ChunkPolicy] reads this as the walk's [sparkflash_runtime::Limits], so a
+/// dense prompt keeps the 256-row chunks its kernels were chosen for.
 pub const CHUNK_ROWS: usize = 256;
+
+/// The dense arm's token step: the row GEMV, not a tensor-core body. The walk's capability row
+/// and the profile check that refuses `decode.tensor_cores = true` read this one value, so the
+/// ledger and the refusal cannot disagree.
+pub(crate) const TOKEN_DECODE: State = State::Off("row GEMV; decode.tensor_cores=true is refused");
 
 /// One layer's attention and MLP shape. A Gated DeltaNet layer's attention fields are zero and
 /// its geometry is `linear`'s.
@@ -661,9 +668,6 @@ struct Shared {
     context: usize,
     /// The sequences' key/value caches' lanes, for sequences of `context` positions.
     lanes: Arc<SequenceLanes<LaneParts>>,
-    /// Whether a sequence keeps a rewind point at the end of each prompt
-    /// ([sparkflash_runtime::REWIND_ENV], on by default).
-    rewind: bool,
     /// The recurrent regions of a sequence, in layer order: each Gated DeltaNet layer's conv
     /// history and delta-rule state, in bytes. Its rewind point copies these.
     linear_sizes: Vec<usize>,
@@ -870,7 +874,6 @@ impl DenseDeviceBackend {
                 policy,
                 context,
                 lanes,
-                rewind,
                 linear_sizes,
                 owned,
                 weight_bytes,
@@ -910,7 +913,7 @@ impl DenseDeviceBackend {
                  enable_group_fusion and mirror them on the others with mirror_group",
             ));
         }
-        let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
+        let arm = walk::runtime(Arc::clone(&self.shared), capacity)?;
         self.fused = Some(Fusion::local(arm, capacity)?);
         Ok(())
     }
@@ -931,7 +934,7 @@ impl DenseDeviceBackend {
         hub: sparkflash_comm::control::Tp4ControlHub,
     ) -> Result<(), BackendError> {
         self.group_rank()?;
-        let arm = DenseLanes::new(Arc::clone(&self.shared), capacity)?;
+        let arm = walk::runtime(Arc::clone(&self.shared), capacity)?;
         self.fused = Some(Fusion::group(arm, hub, self.wire(), capacity)?);
         Ok(())
     }
@@ -948,8 +951,8 @@ impl DenseDeviceBackend {
         capacity: usize,
     ) -> Result<std::convert::Infallible, String> {
         self.group_rank().map_err(|error| error.to_string())?;
-        let lanes = DenseLanes::new(Arc::clone(&self.shared), capacity)
-            .map_err(|error| error.to_string())?;
+        let lanes =
+            walk::runtime(Arc::clone(&self.shared), capacity).map_err(|error| error.to_string())?;
         sparkflash_runtime::mirror_until_the_group_ends(control, &lanes, &self.wire(), capacity)
     }
 
@@ -1046,8 +1049,12 @@ fn profile_policy(
              which are not bit-identical, but prefill.exact = true",
         );
     }
-    if profile.decode.tensor_cores == Some(true) {
-        return refuse("decodes on the row GEMV, but decode.tensor_cores = true");
+    if profile.decode.tensor_cores == Some(true)
+        && let State::Off(why) = TOKEN_DECODE
+    {
+        // The walk's capability row and this refusal are the same constant, so a dense arm that
+        // ever declares a tensor-core token body stops refusing the switch by the same edit.
+        return refuse(&format!("cannot honour decode.tensor_cores = true: {why}"));
     }
     if profile.speculation.enabled == Some(true) {
         return refuse("has no drafter, but speculation.enabled = true");
@@ -2461,12 +2468,6 @@ pub struct Sequence {
     /// The ids whose rows the caches hold, in position order: the last prompt and every token
     /// stepped since. Its length is the sequence's position.
     history: Vec<u32>,
-    /// The end of the last prompt, when [sparkflash_runtime::REWIND_ENV] keeps one.
-    point: Option<usize>,
-    /// How many of the last prompt's ids the sequence already held.
-    cached: usize,
-    /// A prompt running a part at a time, and the next id of it to forward.
-    prompt: Option<(Vec<u32>, usize)>,
     sampler: Sampler,
     sampling: Sampling,
 }
@@ -2502,9 +2503,6 @@ impl Sequence {
             caches,
             checkpoint,
             history: Vec::new(),
-            point: None,
-            cached: 0,
-            prompt: None,
             sampler: Sampler::new(),
             sampling: Sampling::default(),
         })
@@ -2545,103 +2543,6 @@ impl Sequence {
                 .call(kernels.zero, calls::zero(region.0, bytes / 4))?;
         }
         Ok(())
-    }
-
-    /// Starts `tokens` as a prompt: past the history or the rewind point it extends
-    /// ([sparkflash_runtime::resume]), else from the start, and runs its first part.
-    fn begin(
-        &mut self,
-        b: &Buffers,
-        tokens: &[u32],
-        trace: Option<&mut Vec<Vec<f32>>>,
-    ) -> Result<Part, BackendError> {
-        if tokens.is_empty() {
-            return Err(BackendError::new(DEVICE, "the prompt has no tokens"));
-        }
-        let start = match resume(&self.history, true, self.point, tokens) {
-            Some(Resume::Extend(held)) => held,
-            Some(Resume::Rewind(point)) => {
-                // The attention caches go back by the position; the recurrent state by its copy.
-                if let Some(checkpoint) = &self.checkpoint {
-                    let live = self.linear_regions();
-                    checkpoint
-                        .restore(&self.shared.cuda, None, &live, point)
-                        .map_err(|error| {
-                            BackendError::new(DEVICE, format!("the rewind point: {error}"))
-                        })?;
-                }
-                point
-            }
-            None => 0,
-        };
-        self.history.truncate(start);
-        if start == 0 {
-            self.point = None;
-            self.clear_linear()?;
-        }
-        self.cached = start;
-        self.prompt = Some((tokens.to_vec(), start));
-        self.part(b, trace)
-    }
-
-    /// Runs the next [CHUNK_ROWS] ids of the prompt [Self::begin] started; after the last, the
-    /// prompt's first step.
-    fn part(
-        &mut self,
-        b: &Buffers,
-        trace: Option<&mut Vec<Vec<f32>>>,
-    ) -> Result<Part, BackendError> {
-        let Some((tokens, next)) = self.prompt.take() else {
-            return Err(BackendError::new(
-                DEVICE,
-                "the sequence has no prompt in parts",
-            ));
-        };
-        let end = (next + CHUNK_ROWS).min(tokens.len());
-        let shared = Arc::clone(&self.shared);
-        walk(
-            &shared,
-            b,
-            &mut [(&mut *self, &tokens[next..end])],
-            shared.policy,
-            trace,
-        )?;
-        if end < tokens.len() {
-            self.prompt = Some((tokens, end));
-            return Ok(Part::More);
-        }
-        let logits = head(&shared, b, end - next - 1, 1)?;
-        self.sampler.reset();
-        self.sampler.record_prompt(&tokens);
-        let token = self.sampler.choose(&logits, &self.sampling);
-        self.point = shared.rewind.then_some(tokens.len());
-        let live = self.linear_regions();
-        if let Some(checkpoint) = self.checkpoint.as_mut() {
-            checkpoint
-                .save(&shared.cuda, None, &live, tokens.len())
-                .map_err(|error| BackendError::new(DEVICE, format!("the rewind point: {error}")))?;
-        }
-        Ok(Part::Done(StepOutput {
-            next_token: Some(token),
-            logits,
-            draft: Vec::new(),
-        }))
-    }
-
-    /// The whole of `tokens` as a prompt: [Self::begin], then every part.
-    fn prefill(
-        &mut self,
-        b: &Buffers,
-        tokens: &[u32],
-        mut trace: Option<&mut Vec<Vec<f32>>>,
-    ) -> Result<StepOutput, BackendError> {
-        let mut part = self.begin(b, tokens, trace.as_deref_mut())?;
-        loop {
-            match part {
-                Part::Done(step) => return Ok(step),
-                Part::More => part = self.part(b, trace.as_deref_mut())?,
-            }
-        }
     }
 }
 
@@ -2893,11 +2794,39 @@ impl ModelSession for DenseDeviceSession {
     }
 
     fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        // A session outside the engine starts every prompt over.
+        if tokens.is_empty() {
+            return Err(BackendError::new(DEVICE, "the prompt has no tokens"));
+        }
+        // A session outside the engine starts every prompt over: the caches go back to position
+        // zero and the recurrent state to the empty sequence's.
         self.sequence.history.clear();
-        self.sequence.point = None;
-        self.sequence
-            .prefill(&self.scratch.buffers, tokens, self.trace.as_mut())
+        self.sequence.clear_linear()?;
+        self.sequence.sampler.reset();
+        let shared = Arc::clone(&self.sequence.shared);
+        let Self {
+            sequence,
+            scratch,
+            trace,
+        } = self;
+        let mut last = 0;
+        for chunk in tokens.chunks(CHUNK_ROWS) {
+            walk(
+                &shared,
+                &scratch.buffers,
+                &mut [(&mut *sequence, chunk)],
+                shared.policy,
+                trace.as_mut(),
+            )?;
+            last = chunk.len();
+        }
+        let logits = head(&shared, &scratch.buffers, last - 1, 1)?;
+        sequence.sampler.record_prompt(tokens);
+        let token = sequence.sampler.choose(&logits, &sequence.sampling);
+        Ok(StepOutput {
+            next_token: Some(token),
+            logits,
+            draft: Vec::new(),
+        })
     }
 
     fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
@@ -2917,163 +2846,34 @@ impl ModelSession for DenseDeviceSession {
     }
 }
 
-/// The arm behind the shared fused engine ([sparkflash_runtime::FusedEngine]): a slot is one
-/// [Sequence], a step is one walk over every member's row, and a prompt runs a [CHUNK_ROWS]-row
-/// part at a time between the members' steps. The engine thread runs one job at a time, so the
-/// slots share one scratch.
-pub struct DenseLanes {
-    shared: Arc<Shared>,
-    scratch: Mutex<Scratch>,
-    /// The most members one walk holds.
-    rows: usize,
-}
-
-impl DenseLanes {
-    fn new(shared: Arc<Shared>, capacity: usize) -> Result<Self, BackendError> {
-        let rows = capacity.clamp(1, CHUNK_ROWS);
-        let scratch = Scratch::new(Arc::clone(&shared), rows)
-            .map_err(|error| BackendError::new(DEVICE, error))?;
-        Ok(Self {
-            shared,
-            scratch: Mutex::new(scratch),
-            rows,
-        })
-    }
-
-    fn scratch(&self) -> Result<std::sync::MutexGuard<'_, Scratch>, BackendError> {
-        self.scratch
-            .lock()
-            .map_err(|_| BackendError::new(DEVICE, "the walk's scratch is poisoned"))
-    }
-}
-
-impl FusedArm for DenseLanes {
-    type Slot = Sequence;
-
-    fn open_slot(&self) -> Result<Sequence, BackendError> {
-        Sequence::open(Arc::clone(&self.shared)).map_err(|error| BackendError::new(DEVICE, error))
-    }
-
-    fn holds_request(&self, slot: &Sequence) -> bool {
-        !slot.history.is_empty() || slot.prompt.is_some()
-    }
-
-    fn renew(&self, slot: &mut Sequence) -> Result<(), BackendError> {
-        let mut fresh = self.open_slot()?;
-        // The request's sampling reached the old sequence before its prompt replaced it.
-        fresh.sampling = slot.sampling;
-        *slot = fresh;
-        Ok(())
-    }
-
-    fn set_sampling(&self, slot: &mut Sequence, sampling: Sampling) {
-        slot.sampling = sampling;
-        slot.sampler.reset();
-    }
-
-    fn prefill(&self, slot: &mut Sequence, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        let scratch = self.scratch()?;
-        slot.prefill(&scratch.buffers, tokens, None)
-    }
-
-    /// A prompt's [CHUNK_ROWS]-row chunks run one a part; the arm serves text, so a prompt with
-    /// images is refused as [FusedArm::prefill_images] refuses it.
-    fn begin_prompt(
-        &self,
-        slot: &mut Sequence,
-        tokens: &[u32],
-        images: &[VisionImage],
-    ) -> Result<Part, BackendError> {
-        if !images.is_empty() {
-            return self.prefill_images(slot, tokens, images).map(Part::Done);
-        }
-        let scratch = self.scratch()?;
-        slot.begin(&scratch.buffers, tokens, None)
-    }
-
-    fn next_part(&self, slot: &mut Sequence) -> Result<Part, BackendError> {
-        let scratch = self.scratch()?;
-        slot.part(&scratch.buffers, None)
-    }
-
-    fn step(&self, members: &mut [(Sequence, u32)]) -> Result<Vec<StepOutput>, BackendError> {
-        let scratch = self.scratch()?;
-        let mut members: Vec<(&mut Sequence, u32)> = members
-            .iter_mut()
-            .map(|(sequence, token)| (sequence, *token))
-            .collect();
-        step(&self.shared, &scratch.buffers, &mut members, None)
-    }
-
-    fn speculation(&self, _slot: &Sequence) -> Speculation {
-        Speculation::default()
-    }
-
-    /// A slot keeps its sequence between requests: the next prompt that extends it forwards only
-    /// the rest ([Sequence::begin]).
-    fn history<'s>(&self, slot: &'s Sequence) -> Option<&'s [u32]> {
-        Some(&slot.history)
-    }
-
-    /// The end of the last prompt, which a prompt that parts from the reply goes back to.
-    fn rewind_prefix<'s>(&self, slot: &'s Sequence) -> Option<&'s [u32]> {
-        slot.point
-            .filter(|point| *point <= slot.history.len())
-            .map(|point| &slot.history[..point])
-    }
-
-    fn cached_tokens(&self, slot: &Sequence) -> usize {
-        slot.cached
-    }
-
-    /// The sequences' caches share one pool: a prompt that does not continue the slot's history
-    /// starts over, so it counts the chunks the reset gives back.
-    fn room(&self, slot: &Sequence, prompt: Option<&[u32]>) -> bool {
-        match prompt {
-            Some(tokens) => slot.lane.room(tokens.len(), !self.continues(slot, tokens)),
-            None => slot.lane.room(slot.position() + 1, false),
-        }
-    }
-
-    fn max_batch(&self) -> usize {
-        self.rows
-    }
-
-    fn ledger(&self) -> Ledger {
-        let mut ledger = Ledger::from_declaration(
-            sparkflash_model::ledger_for_arm("dense").expect("the dense arm is declared"),
-        );
-        ledger.set(
-            Strategy::PromptParts,
-            Mode::native(format!("{CHUNK_ROWS}-row chunks")),
-        );
-        ledger.drafting(None, false, false);
-        let reuse = if self.shared.rewind {
-            "a prompt that extends a lane's sequence, or goes back to the last prompt's end"
-        } else {
-            "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
-        };
-        ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
-        ledger.set(
-            Strategy::Rewind,
-            if self.shared.rewind {
-                Mode::native("a prompt that goes back to the last prompt's end")
-            } else {
-                Mode::off(format!(
-                    "{}=off keeps no rewind point",
-                    sparkflash_runtime::REWIND_ENV
-                ))
-            },
-        );
-        ledger
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_ROWS, profile_policy};
+    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, profile_policy};
+    use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
     use sparkflash_ops::projection::WidePolicy;
+    use sparkflash_runtime::Walk;
+
+    /// The walk's token-decode capability row and the profile refusal are the same constant, so
+    /// the ledger cannot state one thing while the switch is refused for another.
+    #[test]
+    fn the_decode_row_and_the_profile_refusal_are_one_source() {
+        assert_eq!(
+            <DenseWalk as Walk>::CAPABILITIES.compute.token,
+            TOKEN_DECODE,
+            "the walk states the token row the profile check reads"
+        );
+        let mut profile = ModelProfile::default();
+        profile.decode.tensor_cores = Some(true);
+        let State::Off(why) = TOKEN_DECODE else {
+            panic!("dense declares a tensor-core token body; delete the refusal with the row");
+        };
+        let error = profile_policy(&profile).expect_err("the switch is refused");
+        assert!(
+            error.contains(why),
+            "the refusal names the same reason the ledger row does: {error}"
+        );
+    }
 
     #[test]
     fn the_profile_fields_the_arm_does_not_honour_are_refused() {

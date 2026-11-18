@@ -14,12 +14,12 @@
 
 //! The dense arm as a Walk.
 //!
-//! The serving loop is not moved yet: DenseLanes still runs the fused engine, and this adapter
-//! is the shape the arm supplies when it does. It routes every Pass to the same free walk the
-//! existing loop calls, with the policy the existing loop uses for that pass: token rows pass no
-//! wide policy (a row GEMV is the same sum at any batch), and a bulk or paired prompt pass
-//! takes the arm's WidePolicy. Its head is the existing host logits path; the device head is
-//! phase 4's.
+//! The runtime drives it: [runtime] opens a [`sparkflash_runtime::Runtime`] over this walk, and
+//! the runtime owns the prompt parts, history, reuse, rewind, lane pool and ledger. This walk
+//! routes every Pass to the same free walk the old serving loop called, with the policy that
+//! loop used for that pass: token rows pass no wide policy (a row GEMV is the same sum at any
+//! batch), and a bulk or paired prompt pass takes the arm's WidePolicy. Its head is the
+//! existing host logits path; the device head is phase 4's.
 //!
 //! The layout and limits are the arm's: attention layers are positional BF16 key/value caches,
 //! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is
@@ -27,17 +27,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use sparkflash_model::backend::{BackendError, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, StepOutput};
 use sparkflash_model::ledger::State;
 use sparkflash_ops::projection::WidePolicy;
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, HeadInput, HeadRow, Hidden, LaneMemory, LaneState, Limits,
-    NoVision, Pass, PassKind, PassMask, Region, Segment, Segments, StateKind, StateLayout, Walk,
-    WalkCapabilities,
+    NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind, StateLayout,
+    Walk, WalkCapabilities,
 };
 
 use super::{
-    CHUNK_ROWS, DEVICE, Mixer, Scratch, Sequence, Shared, head as dense_head, walk as dense_walk,
+    CHUNK_ROWS, DEVICE, Mixer, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
+    walk as dense_walk,
 };
 
 /// The rows of one walk, as offsets into the pass's residual buffer. The existing walk and this
@@ -82,7 +83,6 @@ impl DenseWalk {
     ///
     /// # Errors
     /// A device allocation the scratch cannot make.
-    #[allow(dead_code)] // Phase 4's serving loop is the caller; the adapter tests use the row plan.
     pub(crate) fn new(shared: Arc<Shared>, capacity: usize) -> Result<Self, BackendError> {
         let rows = capacity.clamp(1, CHUNK_ROWS);
         let scratch = Scratch::new(Arc::clone(&shared), rows)
@@ -104,9 +104,22 @@ impl DenseWalk {
     }
 }
 
+/// The runtime over a dense walk for `shared`'s weights and `capacity` lanes: the serving arm the
+/// dense backend opens. The runtime owns the prompt parts, history, reuse, rewind, lane pool and
+/// ledger; the walk only runs rows and heads them.
+///
+/// # Errors
+/// A device allocation the walk's scratch cannot make, or a `SPARKFLASH_REWIND` that is not a
+/// switch.
+pub(crate) fn runtime(
+    shared: Arc<Shared>,
+    capacity: usize,
+) -> Result<Runtime<DenseWalk>, BackendError> {
+    Runtime::new(DenseWalk::new(shared, capacity)?, 0)
+}
+
 /// The arm's state, as the runtime needs to see it: one positional region a GQA layer, one
 /// recurrent region for every Gated DeltaNet layer together.
-#[allow(dead_code)] // Reached through DenseWalk::new, which phase 4's serving loop calls.
 fn layout_of(shared: &Shared) -> StateLayout {
     let mut regions = Vec::new();
     let mut recurrent = 0usize;
@@ -174,11 +187,12 @@ impl LaneState for Sequence {
                 .map_err(|error| BackendError::new(DEVICE, format!("the rewind point: {error}")))?;
         }
         self.history.truncate(to);
-        self.cached = 0;
-        self.prompt = None;
         self.sampler.truncate(to);
-        self.point = None;
         Ok(())
+    }
+
+    fn room(&self, positions: usize, reset: bool) -> bool {
+        self.lane.room(positions, reset)
     }
 }
 
@@ -192,10 +206,11 @@ impl Walk for DenseWalk {
         segments: Segments::Many,
         state: StateKind::Both,
         // The arm's own four rows, word for word the declaration in
-        // `sparkflash_model::ARM_LEDGERS`; a test below holds them equal.
+        // `sparkflash_model::ARM_LEDGERS`; a test below holds them equal. The token row is the
+        // same constant the profile check that refuses `decode.tensor_cores = true` reads.
         compute: ComputeDeclaration {
             prompt: State::Native("prompt projections on the shared wide tile"),
-            token: State::Off("row GEMV; decode.tensor_cores=true is refused"),
+            token: TOKEN_DECODE,
             stored: State::Native("BF16, FP8 E4M3 and NVFP4 parts run in their stored formats"),
             rewind: State::Native("a prompt that goes back to the last prompt's end"),
         },
@@ -212,6 +227,11 @@ impl Walk for DenseWalk {
 
     fn limits(&self) -> Limits {
         self.limits
+    }
+
+    fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
+        seq.sampling = sampling;
+        seq.sampler.reset();
     }
 
     fn walk(
@@ -294,6 +314,8 @@ impl Walk for DenseWalk {
 
 #[cfg(test)]
 mod tests {
+    use sparkflash_runtime::FusedArm;
+
     use super::*;
 
     #[test]
@@ -325,6 +347,173 @@ mod tests {
         assert_eq!(paired.offsets, [0, CHUNK_ROWS, CHUNK_ROWS + 1]);
     }
 
+    /// One row the runtime handed a dense-shaped walk: the pass kind and each segment's rows.
+    type Recorded = (PassKind, Vec<usize>);
+
+    #[derive(Default)]
+    struct RecordedSeq {
+        rows: Vec<u32>,
+    }
+
+    impl LaneState for RecordedSeq {
+        fn position(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn checkpoint(&mut self, _at: usize) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
+            self.rows.truncate(to);
+            Ok(())
+        }
+
+        fn room(&self, _positions: usize, _reset: bool) -> bool {
+            true
+        }
+    }
+
+    /// A walk with dense's limits and no device, recording every pass the runtime gives it.
+    struct RecordingWalk {
+        layout: StateLayout,
+        limits: Limits,
+        passes: Mutex<Vec<Recorded>>,
+    }
+
+    impl Walk for RecordingWalk {
+        type Seq = RecordedSeq;
+        type Drafter = Absent<&'static str>;
+        type Vision = NoVision;
+
+        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Both);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(RecordedSeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            let lengths: Vec<usize> = segments.iter().map(|segment| segment.rows.len()).collect();
+            self.passes
+                .lock()
+                .expect("the pass record")
+                .push((pass.kind, lengths));
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            let _ = hidden;
+            Ok(rows
+                .iter_mut()
+                .map(|row| {
+                    let token = row.seq.rows.last().copied().unwrap_or(0);
+                    StepOutput {
+                        logits: vec![0.0; 2],
+                        next_token: Some(token),
+                        draft: Vec::new(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    /// The runtime over a walk with dense's limits: CHUNK_ROWS a pass, a served context.
+    fn dense_shaped_runtime() -> Runtime<RecordingWalk> {
+        Runtime::new(
+            RecordingWalk {
+                layout: StateLayout::new(vec![
+                    Region::Positional {
+                        name: "kv",
+                        bytes_per_row: 4,
+                    },
+                    Region::Recurrent {
+                        name: "gated-deltanet",
+                        bytes: 16,
+                    },
+                ]),
+                limits: Limits::new(CHUNK_ROWS, 32_768),
+                passes: Mutex::new(Vec::new()),
+            },
+            0,
+        )
+        .expect("the runtime starts")
+    }
+
+    fn prompt_passes(len: usize) -> Vec<Recorded> {
+        let runtime = dense_shaped_runtime();
+        assert_eq!(
+            runtime.chunk_policy().rows(),
+            CHUNK_ROWS,
+            "dense's chunk size comes from its limits through ChunkPolicy"
+        );
+        let mut slot = runtime.open_slot().expect("a slot");
+        runtime
+            .prefill(&mut slot, &vec![7u32; len])
+            .expect("the prefill");
+        runtime
+            .walk()
+            .passes
+            .lock()
+            .expect("the pass record")
+            .clone()
+    }
+
+    /// The runtime's prompt loop is dense's old one: 256-row chunks and the remainder, in order.
+    #[test]
+    fn the_runtime_hands_dense_256_row_bulk_chunks() {
+        assert_eq!(
+            prompt_passes(600),
+            vec![
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 88 }, vec![88]),
+            ],
+            "a long prompt runs 256 rows a pass and its remainder last"
+        );
+        assert_eq!(
+            prompt_passes(257),
+            vec![
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 1 }, vec![1]),
+            ]
+        );
+    }
+
+    /// A prompt that fits the chunk is one whole pass, as the old loop ran it.
+    #[test]
+    fn a_dense_prompt_that_fits_runs_whole() {
+        for len in [1usize, 255, CHUNK_ROWS] {
+            assert_eq!(
+                prompt_passes(len),
+                vec![(PassKind::Bulk { rows: len }, vec![len])],
+                "a {len}-row prompt is one pass"
+            );
+        }
+    }
+
     #[test]
     fn the_layout_is_positional_attention_and_recurrent_gated_deltanet() {
         let positional = StateLayout::new(vec![Region::Positional {
@@ -344,6 +533,19 @@ mod tests {
         ]);
         assert_eq!(both.kind(), StateKind::Both);
         assert!(both.needs_checkpoint());
+    }
+
+    /// The runtime's boot ledger states the token row the profile refusal reads, so a dense boot
+    /// and the `decode.tensor_cores` check cannot disagree.
+    #[test]
+    fn the_runtime_ledger_states_the_refusal_row() {
+        use sparkflash_runtime::{Mode, Strategy, ledger_for};
+        let ledger = ledger_for::<DenseWalk>();
+        assert_eq!(
+            ledger.mode(Strategy::TensorCoreDecode),
+            Mode::from(TOKEN_DECODE)
+        );
+        assert!(!ledger.line().contains("the arm does not state it"));
     }
 
     /// The adapter's four declared rows are the arm's static declaration, so the two cannot
