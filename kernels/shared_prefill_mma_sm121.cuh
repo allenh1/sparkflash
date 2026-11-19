@@ -422,6 +422,164 @@ __device__ __forceinline__ void shared_prefill_mma_body(
 }
 
 
+// ---------------------------------------------------------------------------------------------
+// The few-row (token) form of the tile.
+// ---------------------------------------------------------------------------------------------
+
+// The most token rows a few-row launch carries, and the bytes one warp stages one 32-column K
+// block of its eight weight rows into: eight rows of 32 bf16 words (64 bytes) plus 16, so the
+// eight row addresses of an ldmatrix phase start four words apart and cover every bank once.
+#define SPM_ROWS_MAX 8u
+#define SPM_ROWS_STRIDE 80u
+
+// `stage` writes the 32-column K block `kb` of the warp's eight weight rows into `tile` - row
+// `threadIdx.x >> 2` and part `threadIdx.x & 3`, eight bf16 words a part - and returns the scale
+// that block's 128-column K block was stored with (unread when kScaled is false).
+//
+// The chain is the prompt tile's: for each 16-column step of the block, the activation's bf16
+// head MMA and then the bf16 of what the head leaves, K ascending, into one f32 accumulator. With
+// kScaled the 128-column fold is the prompt body's too: the four stages of a block accumulate
+// into a separate sum, which is multiplied by that block's scale and added to the total in
+// ascending block order, the last and short block included, as shared_prefill_mma_body folds it.
+template <bool kScaled, class Stage>
+__device__ __forceinline__ void shared_prefill_mma_rows_chain(
+    Stage &stage, const float *__restrict__ a, uint32_t inner, uint32_t tokens, bool live,
+    uint32_t n0, uint32_t k_blocks, unsigned char *tile, float acc[4]) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t g = lane >> 2;
+    const uint32_t q = lane & 3u;
+    const bool low_row = g < tokens;
+    const bool high_row = g + 8u < tokens;
+    const float *a_low = a + (unsigned long long)g * inner + 2u * q;
+    const float *a_high = a_low + 8ull * inner;
+    // ldmatrix's row addresses: lane l points its matrix l / 8 - the 16-byte part (l / 8) of a
+    // row - at staged row l % 8, the layout q4p_rows_tile fills.
+    const uint32_t parts = om_smem(tile + (lane & 7u) * SPM_ROWS_STRIDE + 16u * (lane >> 3));
+    float part[4];
+#pragma unroll
+    for (uint32_t r = 0; r < 4u; ++r) {
+        acc[r] = 0.0f;
+        part[r] = 0.0f;
+    }
+    for (uint32_t kb = 0; kb < k_blocks; ++kb) {
+        __syncwarp();
+        const float scale = stage(kb, n0, tile, live);
+        (void)scale;
+        __syncwarp();
+        uint32_t b[4];
+        om_ldsm4(parts, b[0], b[1], b[2], b[3]);
+#pragma unroll
+        for (uint32_t ks = 0; ks < 2u; ++ks) {
+            const uint32_t k = kb * 32u + ks * 16u;
+            const float2 zero = make_float2(0.0f, 0.0f);
+            const float2 v[4] = {
+                low_row ? __ldg(reinterpret_cast<const float2 *>(a_low + k)) : zero,
+                high_row ? __ldg(reinterpret_cast<const float2 *>(a_high + k)) : zero,
+                low_row ? __ldg(reinterpret_cast<const float2 *>(a_low + k + 8u)) : zero,
+                high_row ? __ldg(reinterpret_cast<const float2 *>(a_high + k + 8u)) : zero,
+            };
+            uint32_t head[4];
+            uint32_t rest[4];
+#pragma unroll
+            for (uint32_t r = 0; r < 4u; ++r) {
+                const __nv_bfloat16 h0 = __float2bfloat16_rn(v[r].x);
+                const __nv_bfloat16 h1 = __float2bfloat16_rn(v[r].y);
+                head[r] = ob_pack(h0, h1);
+                rest[r] = ob_pack(__float2bfloat16_rn(v[r].x - __bfloat162float(h0)),
+                                  __float2bfloat16_rn(v[r].y - __bfloat162float(h1)));
+            }
+            float *dst = kScaled ? part : acc;
+            ob_mma(dst, head, b[2u * ks], b[2u * ks + 1u]);
+            ob_mma(dst, rest, b[2u * ks], b[2u * ks + 1u]);
+        }
+        if constexpr (kScaled) {
+            if ((kb & 3u) == 3u || kb + 1u == k_blocks) {
+#pragma unroll
+                for (uint32_t r = 0; r < 4u; ++r) {
+                    acc[r] += part[r] * scale;
+                    part[r] = 0.0f;
+                }
+            }
+        }
+    }
+}
+
+// One CTA of the few-row grid: four warps, each an m16 x n8 tile of up to [SPM_ROWS_MAX] token
+// rows by eight output columns, over the 32-column K blocks of `inner`. The wrapper supplies the
+// staging (a BF16 row, an E4M3 row with its block scale, a packed row) and the output is one
+// f32 per row and column, the tile's own bits for the same row.
+template <bool kScaled, class Stage>
+__device__ __forceinline__ void shared_prefill_mma_rows_body(
+    Stage &stage, const float *__restrict__ a, float *__restrict__ out, uint32_t cols,
+    uint32_t inner, uint32_t tokens) {
+    __shared__ __align__(16) unsigned char tile[4][8u * SPM_ROWS_STRIDE];
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5;
+    if (warp >= 4u) return;
+    const uint32_t g = lane >> 2;
+    const uint32_t q = lane & 3u;
+    const uint32_t n0 = (blockIdx.x * 4u + warp) * 8u;
+    const bool live = n0 < cols;
+    float acc[4];
+    shared_prefill_mma_rows_chain<kScaled>(stage, a, inner, min(tokens, SPM_ROWS_MAX), live, n0,
+                                            inner >> 5, tile[warp], acc);
+    if (!live) return;
+#pragma unroll
+    for (uint32_t half = 0; half < 2u; ++half) {
+        const uint32_t token = g + 8u * half;
+        if (token >= tokens) continue;
+        *reinterpret_cast<float2 *>(out + (unsigned long long)token * cols + n0 + 2u * q) =
+            make_float2(acc[2u * half], acc[2u * half + 1u]);
+    }
+}
+
+// A BF16 weight row's 32-column K block, staged as it stands.
+struct SpmRowsBf16 {
+    const __nv_bfloat16 *w;
+    uint32_t inner;
+    __device__ __forceinline__ float operator()(uint32_t kb, uint32_t n0, unsigned char *tile,
+                                                bool live) const {
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t r = lane >> 2;
+        const uint32_t part = lane & 3u;
+        const uint4 value =
+            live ? __ldg(reinterpret_cast<const uint4 *>(
+                       w + (unsigned long long)(n0 + r) * inner + kb * 32u + 8u * part))
+                 : make_uint4(0u, 0u, 0u, 0u);
+        *reinterpret_cast<uint4 *>(tile + r * SPM_ROWS_STRIDE + 16u * part) = value;
+        return 1.0f;
+    }
+};
+
+// An E4M3 weight row's 32-column K block, widened to the bf16 words the prompt tile stages
+// (ob_e4m3x2 at unit scale: the scale is the 128-column block's, applied after accumulation),
+// and that block's scale as the release stores it - GLM's f32, Qwen's bf16.
+template <typename ScaleT>
+struct SpmRowsFp8 {
+    const uint8_t *w;
+    const ScaleT *ws;
+    uint32_t inner;
+    __device__ __forceinline__ float operator()(uint32_t kb, uint32_t n0, unsigned char *tile,
+                                                bool live) const {
+        const uint32_t lane = threadIdx.x & 31u;
+        const uint32_t r = lane >> 2;
+        const uint32_t part = lane & 3u;
+        uint2 codes = make_uint2(0u, 0u);
+        if (live) {
+            codes = __ldg(reinterpret_cast<const uint2 *>(
+                w + (unsigned long long)(n0 + r) * inner + kb * 32u + 8u * part));
+        }
+        const uint4 value =
+            make_uint4(ob_e4m3x2(codes.x, 1.0f), ob_e4m3x2(codes.x >> 16, 1.0f),
+                       ob_e4m3x2(codes.y, 1.0f), ob_e4m3x2(codes.y >> 16, 1.0f));
+        *reinterpret_cast<uint4 *>(tile + r * SPM_ROWS_STRIDE + 16u * part) = value;
+        // One block scale a 128 x 128 tile, [cols / 128][inner / 128]; a warp's eight columns
+        // lie in one 128-column block.
+        return live ? spm_scale<ScaleT>(__ldg(&ws[(n0 >> 7) * (inner >> 7) + (kb >> 2)])) : 0.0f;
+    }
+};
+
+
 // A bf16x2 of two f32 (lo in the low half), each rounded as __float2bfloat16_rn rounds it, and
 // the two halves of one back as f32.
 __device__ __forceinline__ uint32_t glm_bf16x2(float lo, float hi) {

@@ -440,6 +440,14 @@ const fn tc_one(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     )
 }
 
+/// A tensor-core token body over the one-to-eight row band, in the token pass.
+///
+/// A decode step, a speculative verify and a short chunk all run here; a row is the prompt
+/// tile's, so a continued turn resumes on the bits a cold prefill of it leaves.
+const fn tc_token(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
+    KernelSymbol::decode(name, precisions, ComputeClass::TensorCore, ROW_BAND)
+}
+
 /// A row body over every row count, in both passes (a non-MMA tile).
 const fn row_all(name: &'static str, precisions: &[Precision]) -> KernelSymbol {
     KernelSymbol::both(name, precisions, ComputeClass::Row, RowBand::ALL)
@@ -976,6 +984,9 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseMlp,
         Image::DECODE,
         &[
+            // The FP8 tile's few-row form, over GLM's f32 128 x 128 block scales: one to eight
+            // rows, a row the tile's bits.
+            tc_token("glm_decode_fp8b128_rows", &[Precision::Fp8E4M3]),
             row_dec(
                 "q4e_gemv_tiled_bf16_parts",
                 &[Precision::Bf16, Precision::F32],
@@ -1020,6 +1031,10 @@ pub const CATALOGUE: &[PartKernel] = &[
         &[
             tc_chunk("q4p_dense_mma", &[Precision::Bf16, Precision::Fp8E4M3]),
             tc_chunk("q4p_dense_fp8", &[Precision::Fp8E4M3]),
+            // The E4M3 token body (Qwen's bf16 block scales) and the packed BF16 token body,
+            // both on the tile's chain: one to eight rows, a row the tile's bits.
+            tc_token("q4p_dense_fp8_rows", &[Precision::Fp8E4M3]),
+            tc_token("q4p_dense_packed_rows", &[Precision::Bf16]),
             tc_rows("q4p_dense_rows", &[Precision::Bf16]),
             row_rows("q4p_gemm_rows", &[Precision::Bf16]),
             // The hyper connection's up projection and stream mix for a few rows.
@@ -1060,6 +1075,9 @@ pub const CATALOGUE: &[PartKernel] = &[
         Part::DenseGemm,
         Image::DECODE,
         &[
+            // The FP8 tile's few-row form, over GLM's f32 128 x 128 block scales: one to eight
+            // rows, a row the tile's bits.
+            tc_token("glm_decode_fp8b128_rows", &[Precision::Fp8E4M3]),
             row_dec(
                 "q4e_gemv_tiled_bf16_parts",
                 &[Precision::Bf16, Precision::F32],

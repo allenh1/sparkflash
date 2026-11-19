@@ -53,6 +53,9 @@
 #include "q4e_common_sm121.cuh"
 #include "shared_swiglu_sm121.cuh"
 #include "q4e_gemv_sm121.cuh"
+// The shared bulk-prefill tile body: its few-row (token) form is the FP8 dense projection's
+// decode body below.
+#include "shared_prefill_mma_sm121.cuh"
 #include "bf16_packed_sm121.cuh"
 
 #define Q4E_BLOCK 256
@@ -61,6 +64,19 @@
 #define Q4E_MAX_TOPK 64
 
 #define q4e_e4m3 spark_fp8_e4m3_decode
+
+// The FP8 tile body's few-row form (a decode step, a speculative verify, a short chunk), on the
+// shared tile's MMA chain: one CTA 32 output columns by up to SPM_ROWS_MAX token rows, a row
+// the FP8 tile's bits - the same E4M3 -> bf16 words, the same head-then-remainder chain over
+// K, and GLM's f32 128 x 128 block scale folded in ascending block order. The grid is
+// (cols / 32, 1, 1) rounded up, 128 threads; cols must be a multiple of 8 and inner of 128.
+extern "C" __global__ __launch_bounds__(128) void glm_decode_fp8b128_rows(
+    const uint8_t* __restrict__ w, const float* __restrict__ ws, const float* __restrict__ a,
+    float* __restrict__ out, uint32_t cols, uint32_t inner, uint32_t tokens) {
+    OPT_PDL_ENTRY();
+    SpmRowsFp8<float> stage{w, ws, inner};
+    shared_prefill_mma_rows_body<true>(stage, a, out, cols, inner, tokens);
+}
 
 // The budget selection for GLM-5.3-Flash's indexer (topk::top_pools with the tail always kept);
 // q4e_qsa_pick's variant stays in the attention image.

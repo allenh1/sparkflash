@@ -119,6 +119,22 @@ extern "C" __global__ __launch_bounds__(OM_THREADS) void q4p_dense_fp8(
         a, w, ws, nullptr, nullptr, out, cols, inner, tokens, inner, cols, 0, 0);
 }
 
+// The FP8 body's few-row form (a decode step, a speculative verify, a short chunk): one CTA 32
+// output columns by up to SPM_ROWS_MAX token rows, on the shared tile's MMA chain
+// (shared_prefill_mma_rows_body). A row is the tile's: the same E4M3 -> bf16 words, the same
+// head-then-remainder chain over K, the same 128 x 128 block scale folded in ascending block
+// order, so a row gets the tile's bits at every row count. The grid is (cols / 32, 1, 1)
+// rounded up, 128 threads; cols must be a multiple of 8, inner of 32 (of 128 for the scale
+// grid), and the operands 16-byte aligned.
+extern "C" __global__ __launch_bounds__(128) void q4p_dense_fp8_rows(
+    const uint8_t* __restrict__ w, const __nv_bfloat16* __restrict__ ws,
+    const float* __restrict__ a, float* __restrict__ out, unsigned int cols, unsigned int inner,
+    unsigned int tokens) {
+    OPT_PDL_ENTRY();
+    SpmRowsFp8<__nv_bfloat16> stage{w, ws, inner};
+    shared_prefill_mma_rows_body<true>(stage, a, out, cols, inner, tokens);
+}
+
 // A weight load for a stream read once: no L1 line, and the L2 fetches the 256 bytes around it,
 // so a lane's 16 bytes and its neighbours' come from DRAM as one burst.
 __device__ __forceinline__ uint4 q4p_stream16(const void* p) {
@@ -507,6 +523,66 @@ __device__ __forceinline__ void q4p_rows_tile(const Source& source, const float*
             }
         }
     }
+}
+
+// The packed form's tiled layout (bf16_packed_sm121.cuh) as the few-row tile's stage: lane
+// (row, part) rebuilds its eight words of the row's chunk - plane-A bytes, plane-B word and the
+// step's top - patches the escapes that fall in it, and stages them as SpmRowsBf16 stages a BF16
+// row, so the MMA chain after the stage is the same chain with the same words.
+struct Q4pRowsPackedStage {
+    const unsigned char* base;  // the matrix's first packed row
+    const unsigned int* offsets;
+    const unsigned int* entries;
+    unsigned long long row_bytes;
+    unsigned int columns;
+    __device__ __forceinline__ float operator()(unsigned int kb, unsigned int n0,
+                                                unsigned char* tile, bool live) const {
+        const unsigned int lane = threadIdx.x & 31u;
+        const unsigned int r = lane >> 2;
+        const unsigned int part = lane & 3u;
+        const int chunk = (int)(4u * kb + part);
+        const Q4ePackedAt at = q4e_packed_at(chunk, (int)(columns >> 3));
+        const unsigned int a_at = (unsigned int)q4e_packed_tiled_a(at, chunk & 31);
+        const unsigned int b_at = (unsigned int)q4e_packed_tiled_b(at, chunk & 31);
+        const unsigned int c_at = columns + columns / 2u + at.step * 32u + (chunk & 31);
+        uint4 value[1] = {make_uint4(0u, 0u, 0u, 0u)};
+        if (live) {
+            const unsigned char* row = base + (unsigned long long)(n0 + r) * row_bytes;
+            const uint2 mant = __ldg(reinterpret_cast<const uint2*>(row + a_at));
+            const unsigned int nib =
+                __ldg(reinterpret_cast<const unsigned int*>(row + columns + b_at));
+            const unsigned int top = (unsigned int)__ldg(row + c_at);
+            value[0] = q4e_packed_chunk(mant, nib, top * 0x01010101u);
+            const unsigned int begin = __ldg(offsets + n0 + r);
+            const unsigned int end = __ldg(offsets + n0 + r + 1u);
+            if (begin != end) {
+                Q4ePackedRow escapes;
+                escapes.entries = entries;
+                escapes.begin = begin;
+                escapes.end = end;
+                q4e_packed_patch<1>(value, chunk, escapes);
+            }
+        }
+        *reinterpret_cast<uint4*>(tile + r * SPM_ROWS_STRIDE + 16u * part) = value[0];
+        return 1.0f;
+    }
+};
+
+// The packed form's few-row form: one CTA 32 output columns by up to SPM_ROWS_MAX token rows over
+// a packed copy in the tiled layout, the shared tile's MMA chain and words
+// (shared_prefill_mma_rows_body). The output is the BF16 prompt body's bits for the same row -
+// the packed walk rebuilds the checkpoint's words, escapes and offsets included - so a decode
+// step reads three quarters of the weight bytes for the tile's arithmetic. The grid is
+// (cols / 32, 1, 1) rounded up, 128 threads; cols must be a multiple of 8, inner of 256 (the
+// form's packing rule), and the packed rows 16-byte aligned.
+extern "C" __global__ __launch_bounds__(128) void q4p_dense_packed_rows(
+    const float* __restrict__ a, const unsigned char* __restrict__ packed,
+    const unsigned int* __restrict__ offsets, const unsigned int* __restrict__ entries,
+    unsigned long long row_bytes, float* __restrict__ out, unsigned int cols,
+    unsigned int inner, unsigned int tokens) {
+    OPT_PDL_ENTRY();
+    Q4pRowsPackedStage stage{packed, offsets, entries, row_bytes, inner};
+    shared_prefill_mma_rows_body<false>(stage, a, out, cols, inner, tokens);
 }
 
 // q4p_dense_mma for a few rows - a decode step, a speculative verify, a short chunk - to the same
