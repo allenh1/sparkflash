@@ -835,8 +835,10 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "q4e_attn_full_combine",
                 &[Precision::Bf16, Precision::Fp8E4M3],
             ),
-            // The BF16 cache a boundary row appends to its lane.
+            // The BF16 cache a boundary row appends to its lane, and the row-at-a-time form
+            // the sparse indexer writes its keys through.
             sym("q4e_cache_bf16", &[Precision::Bf16]),
+            sym("q4e_cache_rows_bf16", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1076,6 +1078,9 @@ pub const CATALOGUE: &[PartKernel] = &[
             row_dec("q4e_gemv4_packed", &[Precision::Bf16]),
             sym("q4e_pack_bf16", &[Precision::Bf16]),
             sym("q4e_unpack_bf16", &[Precision::Bf16]),
+            // The K-split fold of the token GEMM: an elementwise reduction of f32 partials to
+            // the BF16 epilogue, launched beside q4e_gemm_bf16.
+            sym("q4e_gemm_reduce", &[Precision::Bf16, Precision::F32]),
         ],
         false,
     ),
@@ -1122,6 +1127,8 @@ pub const CATALOGUE: &[PartKernel] = &[
             sym("q4e_add", &[Precision::Bf16, Precision::F32]),
             sym("q4e_deinterleave", &[Precision::Bf16, Precision::F32]),
             sym("q4e_zero", &[Precision::Bf16, Precision::F32]),
+            // A flat copy of an f32 state or widened-stream region.
+            sym("q4e_copy_flat", &[Precision::F32]),
         ],
         false,
     ),
@@ -1689,6 +1696,11 @@ pub const CATALOGUE: &[PartKernel] = &[
                     Precision::F32,
                 ],
             ),
+            // The widened streams themselves are f32: the fold to the branch's width, the
+            // widen back out, and the injection the residual takes.
+            sym("q4e_fold_streams", &[Precision::F32]),
+            sym("q4e_widen_streams", &[Precision::F32]),
+            sym("q4e_inject", &[Precision::F32]),
         ],
         false,
     ),
