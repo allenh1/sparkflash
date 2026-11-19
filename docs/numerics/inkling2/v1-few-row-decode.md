@@ -125,9 +125,10 @@ python3 scripts/numerics.py check --url http://127.0.0.1:8000 \
     --reference numerics/references/inkling2-tp4-sm121a.json
 ```
 
-The declaration check (`python3 scripts/numerics.py ci`) still reports the missing prerequisites
-(`anchor`, `coverage`, `monitors`) for every configuration until that work lands, but this entry
-is no longer one of its uncaptured ones: it has a reference and a fingerprint.
+The declaration check (`python3 scripts/numerics.py ci`) still reports the missing coverage and
+monitor prerequisites, and Inkling-2 has no `[[anchor]]`, so this entry cannot bump until those
+land; it is no longer one of the check's uncaptured ones, because it has a reference and a
+fingerprint.
 
 ## Reading
 

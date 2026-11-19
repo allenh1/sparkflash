@@ -21,6 +21,9 @@
     numerics.py check --url URL [--reference FILE]
     numerics.py compare --anchor REFERENCE --candidate CAPTURE [--floor COMPARE.json]
                         [--json OUT] [--markdown OUT]
+    numerics.py coverage --dump FILE [--layout FILE] [--min-inputs N]
+    numerics.py monitors --reference REF.json --candidate CAND.json
+                        --layer-bar X --expert-bar Y [--json OUT] [--markdown OUT]
     numerics.py fingerprint FILE...
     numerics.py ci [--base REV]
     numerics.py self-test
@@ -35,6 +38,11 @@ check    recaptures the server's registered reference and fails on any bit that 
 compare  scores a teacher-forced capture against the anchor it was forced from: per-token NLL
          delta, top-1 agreement and a KL lower bound. --floor puts another comparison (the TP=1 to
          TP=4 divergence) beside it.
+coverage judges a coverage dump against the model's expert layout: every decoder layer present,
+         one hit count per routed expert, every routed expert positive, and at least the declared
+         number of inputs.
+monitors compares a candidate monitor dump with the reference forward, per layer and per expert,
+         and fails every relative-L2 bar it exceeds.
 ci       the declaration check: a changed reference without a version bump fails, a bump without a
          change fails, a bump while a prerequisite is false fails, an anchor never changes, every
          fingerprint must match its file, an arm profile's arithmetic setting changes only with
@@ -70,9 +78,21 @@ DEFAULT_SUITE = REPO / NUMERICS / "prompts" / "reference.json"
 REFERENCE_SCHEMA = "sparkflash-numerics-reference/1"
 SUITE_SCHEMA = "sparkflash-numerics-prompts/1"
 COMPARE_SCHEMA = "sparkflash-numerics-compare/1"
+COVERAGE_SCHEMA = "sparkflash-numerics-coverage/1"
+MONITORS_SCHEMA = "sparkflash-numerics-monitors/1"
+MONITOR_RESULT_SCHEMA = "sparkflash-numerics-monitor-result/1"
+LAYOUT_SCHEMA = "sparkflash-numerics-expert-layout/1"
+LAYOUTS = f"{NUMERICS}/layouts/"
 PREREQUISITES = ("anchor", "declaration_check", "coverage", "monitors")
+# The prerequisites that gate every version bump. 'anchor' is not here: it is a per-model
+# requirement (docs/NUMERICS.md section 5), looked up for the bumping configuration's own model.
+GATING_PREREQUISITES = ("declaration_check", "coverage", "monitors")
 KEY_FIELDS = ("model", "world", "profile", "plan", "arch")
 EVIDENCE = ("logprobs", "text")
+# A text reference holds no token ids and no logprobs, so it cannot be teacher-forced. A
+# configuration with text evidence is exempt from the per-model anchor requirement; it also
+# cannot bump, because there is no comparison that would justify the change.
+ANCHOR_EXEMPT_EVIDENCE = ("text",)
 TOKEN_ID_PREFIX = "token_id:"
 # The arm profiles (docs/adding-a-model.md §3): the defaults each arm serves. Each names the
 # registry model it configures (`model`), which a sparkflash-model test holds to the descriptor its
@@ -470,6 +490,123 @@ def missing_prerequisites(registry: dict) -> list[str]:
     return [name for name in PREREQUISITES if not registry["prerequisites"][name]]
 
 
+def anchor_for(registry: dict, model: str) -> dict | None:
+    """The frozen anchor for one model, if the registry holds one.
+
+    An anchor is per model (docs/NUMERICS.md §4): the declaration check looks up the bumping
+    configuration's own model, not a single global answer that every arm has to satisfy.
+    """
+    return next((anchor for anchor in registry["anchor"] if anchor["model"] == model), None)
+
+
+def forced_captures(paths: list[str], read: Callable[[str], bytes | None]) -> dict[str, set[str]]:
+    """The anchor fingerprints each model has a committed capture teacher-forced from.
+
+    A capture names the reference whose tokens it was fed via `forced_from.fingerprint`; that is
+    the input side of the comparison `scripts/numerics.py compare` scores. The map is by model,
+    and a malformed capture simply contributes nothing (the comparison is then missing).
+    """
+    forced: dict[str, set[str]] = {}
+    for path in paths:
+        data = read(path)
+        if data is None:
+            continue
+        try:
+            capture = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if capture.get("schema") != REFERENCE_SCHEMA:
+            continue
+        source = capture.get("forced_from") or {}
+        fingerprint, key = source.get("fingerprint"), capture.get("key") or {}
+        model = key.get("model")
+        if isinstance(fingerprint, str) and isinstance(model, str):
+            forced.setdefault(model, set()).add(fingerprint)
+    return forced
+
+
+def anchor_coverage(registry: dict, forced: dict[str, set[str]]) -> dict:
+    """Which models the per-model anchor prerequisite covers, and which it does not.
+
+    A captured configuration with `logprobs` evidence can be teacher-forced, so its model needs
+    a frozen anchor and at least one committed capture forced from that anchor. A model whose
+    every captured configuration has `text` evidence is exempt: text holds no ids to feed, so
+    there is no comparison to make. The exemption does not make such a model bumpable; a text
+    evidence change is refused separately.
+    """
+    bumpable: set[str] = set()
+    text: set[str] = set()
+    for entry in registry["config"]:
+        if "reference" not in entry:
+            continue
+        if entry["evidence"] in ANCHOR_EXEMPT_EVIDENCE:
+            text.add(entry["model"])
+        else:
+            bumpable.add(entry["model"])
+    anchors = {anchor["model"]: anchor for anchor in registry["anchor"]}
+    covered: dict[str, dict] = {}
+    uncovered: dict[str, str] = {}
+    for model in sorted(bumpable):
+        anchor = anchors.get(model)
+        if anchor is None:
+            uncovered[model] = "the registry holds no [[anchor]] for it"
+        elif anchor["evidence"] in ANCHOR_EXEMPT_EVIDENCE:
+            uncovered[model] = (
+                f"its anchor's evidence is {anchor['evidence']!r}, which has no token ids to teacher-force"
+            )
+        elif anchor["fingerprint"] not in forced.get(model, set()):
+            uncovered[model] = (
+                f"no committed capture is teacher-forced from its anchor {anchor['fingerprint'][:16]}"
+            )
+        else:
+            covered[model] = anchor
+    return {
+        "exempt": sorted(text - bumpable),
+        "bumpable": sorted(bumpable),
+        "covered": covered,
+        "uncovered": uncovered,
+    }
+
+
+def anchor_findings(
+    registry: dict,
+    read_head: Callable[[str], bytes | None],
+    capture_paths: list[str],
+) -> tuple[list[str], dict]:
+    """The [[anchor]]-scoped check: every anchor is usable, and every model that needs one has one.
+
+    The aggregate `prerequisites.anchor` flag is a report of this coverage, not a gate on a model
+    that has its own anchor. A false flag with an uncovered model is consistent; a true flag with
+    one is not, and is refused.
+    """
+    findings: list[str] = []
+    forced = forced_captures(capture_paths, read_head)
+    for anchor in registry["anchor"]:
+        model = anchor["model"]
+        if anchor.get("evidence") in ANCHOR_EXEMPT_EVIDENCE:
+            findings.append(
+                f"anchor {model}: evidence {anchor['evidence']!r} has no token ids, so no comparison "
+                "can be teacher-forced from it; an anchor must hold logprobs"
+            )
+        if anchor["fingerprint"] not in forced.get(model, set()):
+            findings.append(
+                f"anchor {model}: no committed capture under {CAPTURES} is teacher-forced from "
+                f"{anchor['fingerprint'][:16]}; the anchor has no comparison"
+            )
+    coverage = anchor_coverage(registry, forced)
+    # The aggregate flag reports coverage; it does not gate a model that has its own anchor. A
+    # false flag with an uncovered model is therefore consistent, and each bump is refused by the
+    # per-model lookup in declaration_findings. A true flag that claims more than the registry
+    # holds is not.
+    if registry["prerequisites"]["anchor"] and coverage["uncovered"]:
+        findings.append(
+            "prerequisites.anchor is true, but these models have no anchor coverage: "
+            f"{sorted(coverage['uncovered'])}; the flag reports the aggregate, so it cannot claim "
+            "more than the registry holds"
+        )
+    return findings, coverage
+
+
 def entry_snippet(reference: dict, reference_path: str, registered: dict | None = None) -> str:
     """The registry entry for a capture: version 1 of a new configuration, or the `registered`
     entry it recaptures with its version, report and note kept, since only a declaration moves
@@ -540,12 +677,15 @@ def declaration_findings(
     read_base: Callable[[str], bytes | None],
     read_head: Callable[[str], bytes | None],
     changed: dict[str, str],
+    forced: dict[str, set[str]] | None = None,
 ) -> list[str]:
     """Every way the head registry breaks the declaration rules against the base.
 
     `changed` maps each repository path the diff touches under numerics/, docs/numerics/, the arm
     profiles and [CLASSIFICATION] to its git status letter (A, M or D); `read_base` and
-    `read_head` return a path's bytes at either end, or None.
+    `read_head` return a path's bytes at either end, or None. `forced` maps a model to the anchor
+    fingerprints a committed capture was teacher-forced from; None means the caller has no
+    captures to judge (the synthetic self-test), so the comparison half is not checked.
     """
     findings: list[str] = []
 
@@ -666,12 +806,46 @@ def declaration_findings(
                 f"{name}: declared non-change: version {entry['version']} names the same bits as "
                 f"version {old['version']}; a version is bumped only by a change"
             )
-        if base_missing or head_missing:
+        gating_missing = [
+            prerequisite
+            for prerequisite in GATING_PREREQUISITES
+            if prerequisite in base_missing or prerequisite in head_missing
+        ]
+        if gating_missing:
             findings.append(
                 f"{name}: version {entry['version']} declares an arithmetic change, but "
-                f"prerequisites {[name for name in PREREQUISITES if name in base_missing or name in head_missing]} "
-                "are not in place "
+                f"prerequisites {gating_missing} are not in place "
                 "(docs/NUMERICS.md §5); until they are, the gate is bit-exact"
+            )
+        # The anchor is per model (docs/NUMERICS.md §4): this entry is judged against its own
+        # model's frozen anchor and the teacher-forced capture made from it. A text reference has
+        # no token ids to force, so it can neither be anchored nor bump; that is DeepSeek's
+        # exemption, and it is an exemption from participating, not a waiver that lets it change.
+        anchor = anchor_for(head, entry["model"])
+        if entry["evidence"] in ANCHOR_EXEMPT_EVIDENCE:
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change on "
+                f"{entry['evidence']!r} evidence, but a text reference holds no token ids to "
+                "teacher-force, so no quality comparison can justify it (docs/NUMERICS.md §2, §5)"
+            )
+        elif anchor is None:
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change, but the model "
+                f"{entry['model']!r} has no [[anchor]] in the registry; add the model's frozen "
+                "anchor and a teacher-forced comparison first (docs/NUMERICS.md §4, §5)"
+            )
+        elif anchor.get("evidence") in ANCHOR_EXEMPT_EVIDENCE:
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change, but the anchor "
+                f"for {entry['model']!r} holds {anchor['evidence']!r} evidence, which cannot be "
+                "teacher-forced (docs/NUMERICS.md §4)"
+            )
+        elif forced is not None and anchor["fingerprint"] not in forced.get(entry["model"], set()):
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change, but no committed "
+                f"capture under {CAPTURES} is teacher-forced from {entry['model']!r}'s anchor "
+                f"{anchor['fingerprint'][:16]}; run scripts/numerics.py compare and commit its "
+                "evidence first (docs/NUMERICS.md §4)"
             )
         report = entry.get("report")
         if not report:
@@ -835,12 +1009,41 @@ def run_ci(base_argument: str | None) -> int:
         changed[path] = status[0]
     for path in untracked.splitlines():
         changed[path] = "A"
-    findings = declaration_findings(base_registry, head_registry, read_base, read_head, changed)
+    capture_root = REPO / NUMERICS / "captures"
+    capture_paths = (
+        sorted(str(path.relative_to(REPO)) for path in capture_root.rglob("*.json"))
+        if capture_root.is_dir()
+        else []
+    )
+    forced = forced_captures(capture_paths, read_head)
+    findings = declaration_findings(
+        base_registry, head_registry, read_base, read_head, changed, forced
+    )
+    anchor_checks, coverage = anchor_findings(head_registry, read_head, capture_paths)
+    findings += anchor_checks
     configs, anchors = len(head_registry["config"]), len(head_registry["anchor"])
     missing = missing_prerequisites(head_registry)
     print(
         f"numerics ci: base {base[:12]}, {configs} configuration(s), {anchors} anchor(s), "
         f"{len(changed)} changed path(s); prerequisites missing: {missing or 'none'}"
+    )
+    print(
+        "numerics ci: anchor coverage: "
+        + (
+            "covered " + ", ".join(sorted(coverage["covered"]))
+            if coverage["covered"]
+            else "no logprobs model is anchored"
+        )
+        + (
+            "; exempt (text evidence) " + ", ".join(coverage["exempt"])
+            if coverage["exempt"]
+            else ""
+        )
+        + (
+            "; not covered " + ", ".join(sorted(coverage["uncovered"]))
+            if coverage["uncovered"]
+            else ""
+        )
     )
     uncaptured = [entry for entry in head_registry["config"] if "reference" not in entry]
     for entry in uncaptured:
@@ -1002,6 +1205,418 @@ def render_comparison(result: dict, floor: dict | None) -> str:
         "The KL column is a lower bound: it partitions the vocabulary into the tokens both arms list"
         " in their top-k and one bucket for the rest.",
     ]
+    return "\n".join(lines) + "\n"
+
+
+# --- coverage and monitors --------------------------------------------------------------------
+
+
+def load_json(path: Path, origin: str | None = None) -> dict:
+    where = origin or str(path)
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise NumericsFailure(f"{where}: {error}") from error
+    if not isinstance(document, dict):
+        raise NumericsFailure(f"{where}: the document is not a JSON object")
+    return document
+
+
+def is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def layout_experts(layout: dict, origin: str) -> list[int]:
+    """The routed-expert count of every decoder layer, from a versioned expert layout.
+
+    The spans are contiguous and start at zero, so the layout cannot skip a layer or overlap one.
+    A dense layer is a span with zero experts; it is still a layer the dump must account for.
+    """
+    if layout.get("schema") != LAYOUT_SCHEMA:
+        raise NumericsFailure(
+            f"{origin}: schema {layout.get('schema')!r} is not {LAYOUT_SCHEMA}"
+        )
+    model = layout.get("model")
+    if not isinstance(model, str) or not model:
+        raise NumericsFailure(f"{origin}: the layout names no model")
+    spans = layout.get("layers")
+    if not isinstance(spans, list) or not spans:
+        raise NumericsFailure(f"{origin}: the layout holds no layer spans")
+    counts: list[int] = []
+    for span in spans:
+        if not isinstance(span, dict):
+            raise NumericsFailure(f"{origin}: a layer span is not an object")
+        first, count, experts = span.get("first"), span.get("count"), span.get("experts")
+        if not all(is_integer(value) for value in (first, count, experts)):
+            raise NumericsFailure(f"{origin}: a layer span needs integer first, count and experts")
+        if first != len(counts):
+            raise NumericsFailure(
+                f"{origin}: the layer spans must start at 0 and be contiguous; a span starts at "
+                f"{first}, but {len(counts)} layers are already described"
+            )
+        if count <= 0:
+            raise NumericsFailure(f"{origin}: a layer span has count {count}; it must be positive")
+        if experts < 0:
+            raise NumericsFailure(f"{origin}: a layer span has {experts} experts; it cannot be negative")
+        counts.extend([experts] * count)
+    return counts
+
+
+def find_layout(model: str, override: Path | None) -> tuple[dict, str]:
+    if override is not None:
+        layout = load_json(override)
+        if layout.get("model") != model:
+            raise NumericsFailure(
+                f"{override}: the layout names {layout.get('model')!r}, but the dump names {model!r}"
+            )
+        return layout, str(override)
+    root = REPO / LAYOUTS
+    if not root.is_dir():
+        raise NumericsFailure(f"{root}: no expert layouts are committed")
+    for path in sorted(root.glob("*.json")):
+        layout = load_json(path)
+        if layout.get("model") == model:
+            return layout, str(path.relative_to(REPO))
+    raise NumericsFailure(
+        f"no expert layout under {LAYOUTS} names model {model!r}; add one before judging coverage "
+        "(docs/NUMERICS.md §5)"
+    )
+
+
+def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int) -> dict:
+    """Judge one coverage dump against a model's expert layout.
+
+    Every decoder layer must appear once, with one hit count per routed expert; a dense layer has
+    an empty hit list. Every routed expert of every layer must have a positive count, and the dump
+    must name at least the declared number of inputs.
+    """
+    if dump.get("schema") != COVERAGE_SCHEMA:
+        raise NumericsFailure(f"coverage dump: schema {dump.get('schema')!r} is not {COVERAGE_SCHEMA}")
+    if not isinstance(dump.get("model"), str) or not dump["model"]:
+        raise NumericsFailure("coverage dump: the dump names no model")
+    if min_inputs < 1:
+        raise NumericsFailure(f"--min-inputs {min_inputs}: a coverage run needs at least one input")
+    expected = layout_experts(layout, layout_origin)
+    if dump["model"] != layout.get("model"):
+        raise NumericsFailure(
+            f"coverage dump: the dump names {dump['model']!r}, but {layout_origin} names "
+            f"{layout.get('model')!r}"
+        )
+    inputs = dump.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        raise NumericsFailure("coverage dump: it holds no inputs")
+    names = set()
+    for entry in inputs:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+            raise NumericsFailure("coverage dump: every input needs a non-empty name")
+        if entry["name"] in names:
+            raise NumericsFailure(f"coverage dump: input {entry['name']!r} appears more than once")
+        names.add(entry["name"])
+        if "tokens" in entry and (not is_integer(entry["tokens"]) or entry["tokens"] <= 0):
+            raise NumericsFailure(
+                f"coverage dump: input {entry['name']!r} has tokens {entry['tokens']!r}; it must be positive"
+            )
+    if len(inputs) < min_inputs:
+        raise NumericsFailure(
+            f"coverage dump: it names {len(inputs)} input(s), but the declared coverage suite has "
+            f"{min_inputs}; a prerequisite run does not get to shorten the suite"
+        )
+    layers = dump.get("layers")
+    if not isinstance(layers, list):
+        raise NumericsFailure("coverage dump: layers is not a list")
+    by_layer: dict[int, list] = {}
+    for entry in layers:
+        if not isinstance(entry, dict) or not is_integer(entry.get("layer")):
+            raise NumericsFailure("coverage dump: every layer entry needs an integer layer")
+        number = entry["layer"]
+        if number < 0 or number >= len(expected):
+            raise NumericsFailure(
+                f"coverage dump: layer {number} is outside the layout's {len(expected)} layers"
+            )
+        if number in by_layer:
+            raise NumericsFailure(f"coverage dump: layer {number} appears more than once")
+        hits = entry.get("hits")
+        if not isinstance(hits, list) or not all(is_integer(hit) and hit >= 0 for hit in hits):
+            raise NumericsFailure(f"coverage dump: layer {number} needs a list of non-negative hit counts")
+        by_layer[number] = hits
+    covered = []
+    total_experts = 0
+    for number, experts in enumerate(expected):
+        if number not in by_layer:
+            raise NumericsFailure(
+                f"coverage dump: layer {number} is missing; every layer must be accounted for, "
+                "including a dense layer with an empty hit list"
+            )
+        hits = by_layer[number]
+        if experts == 0:
+            if hits:
+                raise NumericsFailure(
+                    f"coverage dump: layer {number} is dense (no routed experts), but it holds "
+                    f"{len(hits)} hit count(s)"
+                )
+            covered.append({"layer": number, "experts": 0, "hits": 0, "min": None, "max": None})
+            continue
+        if len(hits) != experts:
+            raise NumericsFailure(
+                f"coverage dump: layer {number} has {len(hits)} hit count(s) for {experts} routed "
+                "experts; the count must match the layout exactly"
+            )
+        missing = [expert for expert, hit in enumerate(hits) if hit == 0]
+        if missing:
+            shown = ", ".join(str(expert) for expert in missing[:8])
+            more = "" if len(missing) <= 8 else f" and {len(missing) - 8} more"
+            raise NumericsFailure(
+                f"coverage dump: layer {number} never reaches expert(s) {shown}{more}; the coverage "
+                "inputs must reach every routed expert of every layer"
+            )
+        total_experts += experts
+        covered.append(
+            {"layer": number, "experts": experts, "hits": sum(hits), "min": min(hits), "max": max(hits)}
+        )
+    return {
+        "schema": COVERAGE_SCHEMA,
+        "model": dump["model"],
+        "inputs": len(inputs),
+        "layers": covered,
+        "experts": total_experts,
+        "layout": layout_origin,
+    }
+
+
+def render_coverage(result: dict) -> str:
+    lines = [
+        f"coverage: {result['model']}, {len(result['layers'])} layer(s), "
+        f"{result['experts']} routed expert(s), {result['inputs']} input(s); layout {result['layout']}",
+        "",
+        "| layer | routed experts | hits | min | max |",
+        "| --: | --: | --: | --: | --: |",
+    ]
+    for layer in result["layers"]:
+        if layer["experts"] == 0:
+            lines.append(f"| {layer['layer']} | 0 (dense) | - | - | - |")
+        else:
+            lines.append(
+                f"| {layer['layer']} | {layer['experts']} | {layer['hits']} | {layer['min']} | {layer['max']} |"
+            )
+    lines += [
+        "",
+        f"PASS coverage: every routed expert of every layer has a positive hit count over "
+        f"{result['inputs']} input(s).",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def check_monitor_dump(dump: dict, origin: str) -> dict:
+    """The shape of one monitor dump: a probe, a fixed sample, and per-layer/per-expert values."""
+    if dump.get("schema") != MONITORS_SCHEMA:
+        raise NumericsFailure(f"{origin}: schema {dump.get('schema')!r} is not {MONITORS_SCHEMA}")
+    if not isinstance(dump.get("model"), str) or not dump["model"]:
+        raise NumericsFailure(f"{origin}: the dump names no model")
+    probe = dump.get("probe")
+    if (
+        not isinstance(probe, dict)
+        or not isinstance(probe.get("name"), str)
+        or not isinstance(probe.get("prompt_ids"), list)
+        or not all(is_integer(token) for token in probe["prompt_ids"])
+        or not is_integer(probe.get("position"))
+        or probe["position"] < 0
+    ):
+        raise NumericsFailure(
+            f"{origin}: the probe needs a name, integer prompt_ids and a non-negative position"
+        )
+    sample = dump.get("sample")
+    if (
+        not isinstance(sample, dict)
+        or not is_integer(sample.get("width"))
+        or sample["width"] <= 0
+        or not isinstance(sample.get("indices"), list)
+        or not sample["indices"]
+        or not all(is_integer(index) for index in sample["indices"])
+    ):
+        raise NumericsFailure(
+            f"{origin}: the sample needs a positive width and a non-empty list of integer indices"
+        )
+    indices = sample["indices"]
+    if any(left >= right for left, right in zip(indices, indices[1:])):
+        raise NumericsFailure(f"{origin}: the sampled indices must be strictly increasing")
+    if indices[0] < 0 or indices[-1] >= sample["width"]:
+        raise NumericsFailure(
+            f"{origin}: a sampled index is outside the declared width {sample['width']}"
+        )
+    layers = dump.get("layers")
+    if not isinstance(layers, list) or not layers:
+        raise NumericsFailure(f"{origin}: the dump holds no layers")
+    seen_layers = set()
+    normalized = []
+    for entry in layers:
+        if not isinstance(entry, dict) or not is_integer(entry.get("layer")):
+            raise NumericsFailure(f"{origin}: every layer entry needs an integer layer")
+        number = entry["layer"]
+        if number < 0 or number in seen_layers:
+            raise NumericsFailure(f"{origin}: layer {number} is negative or appears more than once")
+        seen_layers.add(number)
+        values = entry.get("values")
+        if not isinstance(values, list) or len(values) != len(indices):
+            raise NumericsFailure(
+                f"{origin}: layer {number} needs one value per sampled index ({len(indices)})"
+            )
+        if not all(is_number(value) and math.isfinite(value) for value in values):
+            raise NumericsFailure(f"{origin}: layer {number} holds a non-finite or non-numeric value")
+        experts = entry.get("experts")
+        if not isinstance(experts, list) or not experts:
+            raise NumericsFailure(f"{origin}: layer {number} holds no expert values")
+        seen_experts = set()
+        normalized_experts = []
+        for expert in experts:
+            if not isinstance(expert, dict) or not is_integer(expert.get("expert")):
+                raise NumericsFailure(f"{origin}: layer {number} has an expert without an integer id")
+            identifier = expert["expert"]
+            if identifier < 0 or identifier in seen_experts:
+                raise NumericsFailure(
+                    f"{origin}: layer {number} expert {identifier} is negative or appears more than once"
+                )
+            seen_experts.add(identifier)
+            expert_values = expert.get("values")
+            if not isinstance(expert_values, list) or len(expert_values) != len(indices):
+                raise NumericsFailure(
+                    f"{origin}: layer {number} expert {identifier} needs one value per sampled index"
+                )
+            if not all(
+                is_number(value) and math.isfinite(value) for value in expert_values
+            ):
+                raise NumericsFailure(
+                    f"{origin}: layer {number} expert {identifier} holds a non-finite or non-numeric value"
+                )
+            normalized_experts.append({"expert": identifier, "values": expert_values})
+        normalized.append({"layer": number, "values": values, "experts": normalized_experts})
+    return {
+        "model": dump["model"],
+        "probe": probe,
+        "sample": sample,
+        "layers": sorted(normalized, key=lambda layer: layer["layer"]),
+    }
+
+
+def relative_error(reference: list[float], candidate: list[float], origin: str) -> float:
+    """The relative L2 error of the candidate sample against the reference sample."""
+    if len(reference) != len(candidate):
+        raise NumericsFailure(f"{origin}: {len(reference)} reference value(s) against {len(candidate)}")
+    denominator = math.sqrt(math.fsum(value * value for value in reference))
+    numerator = math.sqrt(math.fsum((left - right) ** 2 for left, right in zip(reference, candidate)))
+    if denominator == 0.0:
+        if numerator == 0.0:
+            return 0.0
+        raise NumericsFailure(
+            f"{origin}: the reference sample is all zeros, so the relative error is undefined"
+        )
+    return numerator / denominator
+
+
+def judge_monitors(reference: dict, candidate: dict, layer_bar: float, expert_bar: float) -> dict:
+    """Compare a candidate forward's sample with the reference forward's, per layer and expert."""
+    if not math.isfinite(layer_bar) or layer_bar <= 0.0:
+        raise NumericsFailure(f"--layer-bar {layer_bar}: a bar must be finite and positive")
+    if not math.isfinite(expert_bar) or expert_bar <= 0.0:
+        raise NumericsFailure(f"--expert-bar {expert_bar}: a bar must be finite and positive")
+    if reference["model"] != candidate["model"]:
+        raise NumericsFailure(
+            f"the reference names {reference['model']!r}, the candidate {candidate['model']!r}"
+        )
+    if reference["probe"] != candidate["probe"]:
+        raise NumericsFailure(
+            "the two dumps ran different probes; a monitor compares the same forward input"
+        )
+    if reference["sample"] != candidate["sample"]:
+        raise NumericsFailure(
+            "the two dumps sampled different indices or widths; a monitor compares like with like"
+        )
+    reference_layers = {layer["layer"]: layer for layer in reference["layers"]}
+    candidate_layers = {layer["layer"]: layer for layer in candidate["layers"]}
+    if reference_layers.keys() != candidate_layers.keys():
+        raise NumericsFailure(
+            "the two dumps do not hold the same layers: "
+            f"reference {sorted(reference_layers)}, candidate {sorted(candidate_layers)}"
+        )
+    failures, results = [], []
+    for number in sorted(reference_layers):
+        left, right = reference_layers[number], candidate_layers[number]
+        layer_error = relative_error(left["values"], right["values"], f"layer {number}")
+        layer_ok = layer_error <= layer_bar
+        if not layer_ok:
+            failures.append(f"layer {number}: {layer_error:.6e} > layer bar {layer_bar:.6e}")
+        reference_experts = {expert["expert"]: expert for expert in left["experts"]}
+        candidate_experts = {expert["expert"]: expert for expert in right["experts"]}
+        if reference_experts.keys() != candidate_experts.keys():
+            raise NumericsFailure(
+                f"layer {number}: the two dumps do not hold the same experts: "
+                f"reference {sorted(reference_experts)}, candidate {sorted(candidate_experts)}"
+            )
+        experts, worst = [], None
+        for expert in sorted(reference_experts):
+            error = relative_error(
+                reference_experts[expert]["values"],
+                candidate_experts[expert]["values"],
+                f"layer {number} expert {expert}",
+            )
+            ok = error <= expert_bar
+            if not ok:
+                failures.append(
+                    f"layer {number} expert {expert}: {error:.6e} > expert bar {expert_bar:.6e}"
+                )
+            experts.append({"expert": expert, "rel_error": error, "ok": ok})
+            if worst is None or error > worst["rel_error"]:
+                worst = {"expert": expert, "rel_error": error}
+        results.append(
+            {
+                "layer": number,
+                "rel_error": layer_error,
+                "ok": layer_ok,
+                "worst_expert": worst,
+                "experts": experts,
+            }
+        )
+    return {
+        "schema": MONITOR_RESULT_SCHEMA,
+        "model": reference["model"],
+        "probe": reference["probe"],
+        "sample": reference["sample"],
+        "bars": {"layer": layer_bar, "expert": expert_bar},
+        "layers": results,
+        "failures": failures,
+        "pass": not failures,
+    }
+
+
+def render_monitors(result: dict) -> str:
+    lines = [
+        f"monitors: {result['model']}, probe {result['probe']['name']!r}, "
+        f"{len(result['layers'])} layer(s), sample {len(result['sample']['indices'])} of "
+        f"{result['sample']['width']} values",
+        "",
+        "| layer | relative error | layer bar | worst expert | worst expert error | expert bar |",
+        "| --: | --: | --: | --: | --: | --: |",
+    ]
+    for layer in result["layers"]:
+        worst = layer["worst_expert"]
+        worst_text = "-" if worst is None else f"{worst['expert']}"
+        worst_error = "-" if worst is None else f"{worst['rel_error']:.3e}"
+        lines.append(
+            f"| {layer['layer']} | {layer['rel_error']:.3e} | {result['bars']['layer']:.3e} | "
+            f"{worst_text} | {worst_error} | {result['bars']['expert']:.3e} |"
+        )
+    lines.append("")
+    if result["pass"]:
+        lines.append(
+            f"PASS monitors: every layer is within {result['bars']['layer']:.3e} and every routed "
+            f"expert within {result['bars']['expert']:.3e} of the reference forward."
+        )
+    else:
+        lines.append(f"FAIL monitors: {len(result['failures'])} bar(s) exceeded")
+        lines += [f"  {failure}" for failure in result["failures"]]
     return "\n".join(lines) + "\n"
 
 
@@ -1273,6 +1888,19 @@ def main(argv: list[str]) -> int:
     compare_parser.add_argument("--json", type=Path)
     compare_parser.add_argument("--markdown", type=Path)
 
+    coverage_parser = commands.add_parser("coverage", help="judge a coverage dump against a model's expert layout")
+    coverage_parser.add_argument("--dump", required=True, type=Path)
+    coverage_parser.add_argument("--layout", type=Path, help="the model's expert layout; looked up by model by default")
+    coverage_parser.add_argument("--min-inputs", type=int, default=1, help="the coverage suite's input count")
+
+    monitors_parser = commands.add_parser("monitors", help="compare a candidate monitor dump with the reference forward")
+    monitors_parser.add_argument("--reference", required=True, type=Path)
+    monitors_parser.add_argument("--candidate", required=True, type=Path)
+    monitors_parser.add_argument("--layer-bar", required=True, type=float)
+    monitors_parser.add_argument("--expert-bar", required=True, type=float)
+    monitors_parser.add_argument("--json", type=Path)
+    monitors_parser.add_argument("--markdown", type=Path)
+
     fingerprint_parser = commands.add_parser("fingerprint", help="print the fingerprint of reference files")
     fingerprint_parser.add_argument("files", nargs="+", type=Path)
 
@@ -1289,6 +1917,10 @@ def main(argv: list[str]) -> int:
             return command_check(args)
         if args.command == "compare":
             return command_compare(args)
+        if args.command == "coverage":
+            return command_coverage(args)
+        if args.command == "monitors":
+            return command_monitors(args)
         if args.command == "fingerprint":
             for path in args.files:
                 print(f"{fingerprint(load_reference(path))}  {path}")
@@ -1396,6 +2028,32 @@ def command_check(args: argparse.Namespace) -> int:
     print(f"FAIL {fresh['fingerprint']} != {reference['fingerprint']}")
     print(f"first difference: {first_difference(reference, fresh)}")
     return 1
+
+
+def command_coverage(args: argparse.Namespace) -> int:
+    dump = load_json(args.dump)
+    model = dump.get("model")
+    if not isinstance(model, str) or not model:
+        raise NumericsFailure(f"{args.dump}: the dump names no model")
+    layout, origin = find_layout(model, args.layout)
+    result = judge_coverage(dump, layout, origin, args.min_inputs)
+    print(render_coverage(result), end="")
+    return 0
+
+
+def command_monitors(args: argparse.Namespace) -> int:
+    reference = check_monitor_dump(load_json(args.reference), str(args.reference))
+    candidate = check_monitor_dump(load_json(args.candidate), str(args.candidate))
+    result = judge_monitors(reference, candidate, args.layer_bar, args.expert_bar)
+    markdown = render_monitors(result)
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if args.markdown:
+        args.markdown.parent.mkdir(parents=True, exist_ok=True)
+        args.markdown.write_text(markdown)
+    print(markdown, end="")
+    return 0 if result["pass"] else 1
 
 
 def command_compare(args: argparse.Namespace) -> int:

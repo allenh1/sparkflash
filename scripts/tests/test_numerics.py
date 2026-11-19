@@ -572,5 +572,409 @@ class DeclarationTests(unittest.TestCase):
                 self.assertEqual(NUMERICS.run_ci(base), 0, out.getvalue())
 
 
+def synthetic_layout(model: str = MODEL, spans: list | None = None) -> dict:
+    return {
+        "schema": NUMERICS.LAYOUT_SCHEMA,
+        "model": model,
+        "layers": spans
+        or [
+            {"first": 0, "count": 1, "experts": 0},
+            {"first": 1, "count": 2, "experts": 3},
+        ],
+    }
+
+
+def coverage_dump(layers: list, inputs: list | None = None, model: str = MODEL) -> dict:
+    return {
+        "schema": NUMERICS.COVERAGE_SCHEMA,
+        "model": model,
+        "inputs": [{"name": name, "tokens": 4} for name in (inputs or ["a", "b"])],
+        "layers": layers,
+        "captured": "2026-11-19",
+    }
+
+
+class CoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.layout = synthetic_layout()
+
+    def judge(self, dump: dict, min_inputs: int = 2):
+        return NUMERICS.judge_coverage(dump, self.layout, "layout.json", min_inputs)
+
+    def test_every_layer_and_expert_is_judged(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 2, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ]
+        )
+        result = self.judge(dump)
+        self.assertEqual(result["experts"], 6)
+        self.assertEqual([layer["hits"] for layer in result["layers"]], [0, 6, 15])
+        markdown = NUMERICS.render_coverage(result)
+        self.assertIn("PASS coverage", markdown)
+        self.assertIn("0 (dense)", markdown)
+
+    def test_a_missing_layer_is_refused(self):
+        dump = coverage_dump([{"layer": 0, "hits": []}, {"layer": 1, "hits": [1, 2, 3]}])
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "layer 2 is missing"):
+            self.judge(dump)
+
+    def test_an_unreached_expert_is_refused(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 0, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ]
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, r"expert\(s\) 1"):
+            self.judge(dump)
+
+    def test_a_wrong_expert_count_is_refused(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 2]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ]
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "hit count"):
+            self.judge(dump)
+
+    def test_a_dense_layer_with_hits_is_refused(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": [1]},
+                {"layer": 1, "hits": [1, 2, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ]
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "dense"):
+            self.judge(dump)
+
+    def test_a_duplicate_or_short_input_list_is_refused(self):
+        layers = [
+            {"layer": 0, "hits": []},
+            {"layer": 1, "hits": [1, 2, 3]},
+            {"layer": 2, "hits": [4, 5, 6]},
+        ]
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "more than once"):
+            self.judge(coverage_dump(layers, inputs=["a", "a"]))
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "declared coverage suite"):
+            self.judge(coverage_dump(layers, inputs=["a"]), min_inputs=2)
+
+    def test_an_unknown_layer_is_refused(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 2, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+                {"layer": 3, "hits": [1]},
+            ]
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "outside the layout"):
+            self.judge(dump)
+
+    def test_a_span_must_be_contiguous(self):
+        layout = synthetic_layout(
+            spans=[{"first": 0, "count": 1, "experts": 0}, {"first": 2, "count": 1, "experts": 3}]
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "contiguous"):
+            NUMERICS.layout_experts(layout, "layout.json")
+
+    def test_the_dump_and_layout_must_name_the_same_model(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 2, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ],
+            model="toy/other",
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "names"):
+            self.judge(dump)
+
+    def test_the_command_writes_the_judgement(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 2, 3]},
+                {"layer": 2, "hits": [4, 5, 6]},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            dump_path = Path(directory) / "coverage.json"
+            layout_path = Path(directory) / "layout.json"
+            dump_path.write_text(json.dumps(dump))
+            layout_path.write_text(json.dumps(self.layout))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(
+                    NUMERICS.main(
+                        [
+                            "coverage",
+                            "--dump",
+                            str(dump_path),
+                            "--layout",
+                            str(layout_path),
+                            "--min-inputs",
+                            "2",
+                        ]
+                    ),
+                    0,
+                )
+        self.assertIn("PASS coverage", out.getvalue())
+
+
+def monitor_dump(layer_values, experts, model: str = MODEL, probe: dict | None = None) -> dict:
+    return {
+        "schema": NUMERICS.MONITORS_SCHEMA,
+        "model": model,
+        "probe": probe or {"name": "p", "prompt_ids": [1, 2], "position": 0},
+        "sample": {"width": 4, "indices": [0, 1]},
+        "layers": [
+            {
+                "layer": 0,
+                "values": layer_values,
+                "experts": [{"expert": expert, "values": values} for expert, values in experts],
+            }
+        ],
+    }
+
+
+class MonitorTests(unittest.TestCase):
+    def setUp(self):
+        self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
+
+    def test_the_reference_against_itself_is_zero(self):
+        result = NUMERICS.judge_monitors(self.reference, self.reference, 1e-3, 1e-3)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["layers"][0]["rel_error"], 0.0)
+        self.assertTrue(all(expert["rel_error"] == 0.0 for expert in result["layers"][0]["experts"]))
+        self.assertIn("PASS monitors", NUMERICS.render_monitors(result))
+
+    def test_an_expert_bar_can_fail_while_the_layer_bar_passes(self):
+        candidate = monitor_dump([1.0, 2.0], [(0, [1.1, 0.0]), (1, [0.0, 2.0])])
+        result = NUMERICS.judge_monitors(self.reference, candidate, 1.0, 0.05)
+        self.assertFalse(result["pass"])
+        self.assertTrue(result["layers"][0]["ok"])
+        self.assertFalse(next(expert for expert in result["layers"][0]["experts"] if expert["expert"] == 0)["ok"])
+        self.assertIn("expert 0", result["failures"][0])
+
+    def test_a_layer_bar_can_fail_on_its_own(self):
+        candidate = monitor_dump([1.2, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
+        result = NUMERICS.judge_monitors(self.reference, candidate, 0.05, 1.0)
+        self.assertFalse(result["pass"])
+        self.assertFalse(result["layers"][0]["ok"])
+        self.assertIn("layer 0", result["failures"][0])
+
+    def test_a_zero_reference_sample_is_refused_not_divided_by(self):
+        reference = monitor_dump([0.0, 0.0], [(0, [0.0, 0.0]), (1, [0.0, 0.0])])
+        candidate = monitor_dump([1.0, 0.0], [(0, [0.0, 0.0]), (1, [0.0, 0.0])])
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "all zeros"):
+            NUMERICS.judge_monitors(reference, candidate, 1.0, 1.0)
+
+    def test_a_different_probe_sample_or_model_is_refused(self):
+        other_probe = monitor_dump(
+            [1.0, 2.0],
+            [(0, [1.0, 0.0]), (1, [0.0, 2.0])],
+            probe={"name": "q", "prompt_ids": [1, 2], "position": 0},
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "different probes"):
+            NUMERICS.judge_monitors(self.reference, other_probe, 1.0, 1.0)
+        other_model = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])], model="toy/other")
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "reference names"):
+            NUMERICS.judge_monitors(self.reference, other_model, 1.0, 1.0)
+        other_sample = json.loads(json.dumps(self.reference))
+        other_sample["sample"]["indices"] = [0, 2]
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "sampled different"):
+            NUMERICS.judge_monitors(self.reference, other_sample, 1.0, 1.0)
+
+    def test_a_missing_layer_or_expert_is_refused(self):
+        missing_expert = json.loads(json.dumps(self.reference))
+        missing_expert["layers"][0]["experts"].pop()
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "same experts"):
+            NUMERICS.judge_monitors(self.reference, missing_expert, 1.0, 1.0)
+        missing_layer = json.loads(json.dumps(self.reference))
+        missing_layer["layers"].append(dict(missing_layer["layers"][0], layer=1))
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "same layers"):
+            NUMERICS.judge_monitors(self.reference, missing_layer, 1.0, 1.0)
+
+    def test_a_malformed_dump_is_refused(self):
+        for mutate, needle in [
+            (lambda dump: dump.update(schema="other"), "schema"),
+            (lambda dump: dump["sample"].update(indices=[1, 1]), "strictly increasing"),
+            (lambda dump: dump["layers"][0]["values"].__setitem__(0, math.inf), "non-finite"),
+            (lambda dump: dump["layers"][0]["experts"].append({"expert": 0, "values": [1.0, 2.0]}), "more than once"),
+        ]:
+            dump = json.loads(json.dumps(self.reference))
+            mutate(dump)
+            with self.assertRaisesRegex(NUMERICS.NumericsFailure, needle):
+                NUMERICS.check_monitor_dump(dump, "dump.json")
+
+    def test_bars_must_be_finite_and_positive(self):
+        for layer_bar, expert_bar in [(0.0, 1.0), (float("nan"), 1.0), (1.0, -1.0)]:
+            with self.assertRaisesRegex(NUMERICS.NumericsFailure, "finite and positive"):
+                NUMERICS.judge_monitors(self.reference, self.reference, layer_bar, expert_bar)
+
+    def test_the_command_fails_a_bar_and_writes_its_result(self):
+        candidate = monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (1, [0.0, 2.0])])
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "reference.json"
+            candidate_path = Path(directory) / "candidate.json"
+            result_path = Path(directory) / "result.json"
+            reference_path.write_text(json.dumps(self.reference))
+            candidate_path.write_text(json.dumps(candidate))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(
+                    NUMERICS.main(
+                        [
+                            "monitors",
+                            "--reference",
+                            str(reference_path),
+                            "--candidate",
+                            str(candidate_path),
+                            "--layer-bar",
+                            "0.05",
+                            "--expert-bar",
+                            "0.05",
+                            "--json",
+                            str(result_path),
+                        ]
+                    ),
+                    1,
+                )
+            result = json.loads(result_path.read_text())
+        self.assertFalse(result["pass"])
+        self.assertEqual(result["schema"], NUMERICS.MONITOR_RESULT_SCHEMA)
+        self.assertIn("FAIL monitors", out.getvalue())
+
+
+def synthetic_text_reference(text: str = "abc") -> dict:
+    reference = {
+        "schema": NUMERICS.REFERENCE_SCHEMA,
+        "evidence": "text",
+        "key": {"model": "m", "world": 4, "profile": "reference", "plan": "tp", "arch": "sm_121a"},
+        "settings": {"max_tokens": len(text)},
+        "forced_from": None,
+        "prompts": [
+            {"name": "p", "prompt_ids": [1, 2], "text": text, "finish_reason": "length"}
+        ],
+    }
+    reference["fingerprint"] = NUMERICS.fingerprint(reference)
+    return reference
+
+
+class AnchorTests(unittest.TestCase):
+    def setUp(self):
+        self.old = NUMERICS.synthetic_reference([5, 6], -0.25)
+        self.flipped = NUMERICS.synthetic_reference([5, 6], next_ulp(-0.25))
+        self.anchor = NUMERICS.synthetic_reference([9], -0.5)
+        self.path = "numerics/references/q.json"
+        self.anchor_path = NUMERICS.ANCHOR_PATH
+        self.report = "docs/numerics/m/2.md"
+
+    def files(self, reference: dict, report: bytes = b"report") -> Callable[[str], bytes | None]:
+        store = {
+            self.path: NUMERICS.render_reference(reference).encode(),
+            self.anchor_path: NUMERICS.render_reference(self.anchor).encode(),
+            self.report: report,
+        }
+        return store.get
+
+    def registries(self, head_entry: dict, anchor: bool = True, flag: bool = False):
+        base = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], anchor)
+        head = NUMERICS.synthetic_registry([head_entry], anchor)
+        for registry in (base, head):
+            registry["prerequisites"] = {
+                "anchor": flag,
+                "declaration_check": True,
+                "coverage": True,
+                "monitors": True,
+            }
+        return base, head
+
+    def test_a_bump_uses_its_own_models_anchor_not_a_global_flag(self):
+        entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        base, head = self.registries(entry)
+        forced = {"m": {self.anchor["fingerprint"]}}
+        findings = NUMERICS.declaration_findings(
+            base, head, self.files(self.old), self.files(self.flipped), {self.path: "M", self.report: "A"}, forced
+        )
+        self.assertEqual(findings, [], findings)
+        self.assertFalse(head["prerequisites"]["anchor"], "the global flag stays false")
+
+    def test_a_bump_without_its_models_anchor_names_the_model(self):
+        entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        base, head = self.registries(entry)
+        head["anchor"] = []
+        findings = NUMERICS.declaration_findings(
+            base,
+            head,
+            self.files(self.old),
+            self.files(self.flipped),
+            {self.path: "M", self.report: "A"},
+            {"m": {self.anchor["fingerprint"]}},
+        )
+        self.assertTrue(any("'m' has no [[anchor]]" in finding for finding in findings), findings)
+
+    def test_a_bump_without_a_teacher_forced_capture_is_refused(self):
+        entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        base, head = self.registries(entry)
+        findings = NUMERICS.declaration_findings(
+            base, head, self.files(self.old), self.files(self.flipped), {self.path: "M", self.report: "A"}, {}
+        )
+        self.assertTrue(any("teacher-forced" in finding for finding in findings), findings)
+
+    def test_a_text_evidence_bump_is_refused_even_with_an_anchor(self):
+        text = synthetic_text_reference()
+        entry = dict(NUMERICS.synthetic_entry(2, text, report=self.report), evidence="text")
+        base, head = self.registries(entry)
+        findings = NUMERICS.declaration_findings(
+            base,
+            head,
+            self.files(self.old),
+            self.files(text),
+            {self.path: "M", self.report: "A"},
+            {"m": {self.anchor["fingerprint"]}},
+        )
+        self.assertTrue(any("text reference holds no token ids" in finding for finding in findings), findings)
+
+    def test_anchor_coverage_is_per_model_and_excuses_text_evidence(self):
+        registry = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        coverage = NUMERICS.anchor_coverage(registry, {})
+        self.assertEqual(coverage["uncovered"], {"m": "the registry holds no [[anchor]] for it"})
+        self.assertEqual(coverage["exempt"], [])
+
+        text = synthetic_text_reference()
+        text_entry = dict(NUMERICS.synthetic_entry(1, text), evidence="text")
+        registry = NUMERICS.synthetic_registry([text_entry], False)
+        coverage = NUMERICS.anchor_coverage(registry, {})
+        self.assertEqual(coverage["bumpable"], [])
+        self.assertEqual(coverage["exempt"], ["m"])
+
+    def test_anchor_findings_require_a_committed_forced_capture(self):
+        registry = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], True)
+        capture = {
+            "schema": NUMERICS.REFERENCE_SCHEMA,
+            "evidence": "logprobs",
+            "key": {"model": "m", "world": 4, "profile": "reference", "plan": "tp", "arch": "sm_121a"},
+            "forced_from": {"fingerprint": self.anchor["fingerprint"], "reference": "references/anchor.json"},
+        }
+        read = {"numerics/captures/m/forced.json": json.dumps(capture).encode()}.get
+        findings, coverage = NUMERICS.anchor_findings(
+            registry, read, ["numerics/captures/m/forced.json"]
+        )
+        self.assertEqual(findings, [], findings)
+        self.assertEqual(sorted(coverage["covered"]), ["m"])
+
+        findings, _ = NUMERICS.anchor_findings(registry, read, [])
+        self.assertTrue(any("no committed capture" in finding for finding in findings), findings)
+        registry["prerequisites"]["anchor"] = True
+        findings, _ = NUMERICS.anchor_findings(registry, read, [])
+        self.assertTrue(any("prerequisites.anchor is true" in finding for finding in findings), findings)
+
+
 if __name__ == "__main__":
     unittest.main()

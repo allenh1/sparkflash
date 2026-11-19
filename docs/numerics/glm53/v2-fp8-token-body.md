@@ -3,10 +3,11 @@
 **Registry state: version 1 is still the captured entry; version 2's capture exists as evidence.**
 The capture was taken on the served world-4 configuration on 2026-11-19 and is committed under
 `numerics/captures/glm53/`. It is not the entry's `reference`: naming new bits at version 1 is an
-undeclared change, and the registry may not bump while `anchor`, `coverage` and `monitors` are
-false (`scripts/numerics.py ci`). Version 2 lands as one diff - the reference, the bump and this
-report - once those prerequisites are in place. Until then version 1's reference stands, and this
-page records how far the tip's bits move from it.
+undeclared change, and the registry may not bump while `coverage` and `monitors` are false
+(`scripts/numerics.py ci`). GLM-5.3's own `[[anchor]]` and the captures teacher-forced from it
+are in place, so the per-model anchor requirement does not block this bump; the two dumps do.
+Version 2 lands as one diff - the reference, the bump and this report - once they are in place.
+Until then version 1's reference stands, and this page records how far the tip's bits move from it.
 
 Version 2 of the world-4 sm_121a configuration moves GLM's one-to-eight-row block-scaled FP8
 projections from the tiled row GEMV (`q4e_gemv_tiled_e4m3_block`) to the shared tile's few-row
@@ -122,8 +123,8 @@ version 1's, and the difference is large enough that it is a served change and n
 note. Retrieval is essentially unchanged; the raw continuation is the worst prompt at 75.8 %
 top-1.
 
-Version 1 remains the only reference the registry names until the prerequisites allow version 2 to
-declare this capture.
+Version 1 remains the only reference the registry names until the coverage and monitor dumps
+allow version 2 to declare this capture.
 
 The body covers the FP8 precision of GLM's decode; BF16 projections still take the tiled GEMV,
 and the `WAIVERS` lines in `crates/sparkflash-ops/src/parts.rs` now say so and cite

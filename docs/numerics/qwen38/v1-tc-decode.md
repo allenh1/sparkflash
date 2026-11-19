@@ -101,7 +101,8 @@ their top-20 plus one bucket for the rest.
 
 What this cannot settle: the suite is 988 tokens from eight prompts, so a flip count of 6 against
 1 or 2 is a small-number difference. Coverage inputs and per-layer monitors (§5's prerequisites)
-are not built, so a change confined to experts these prompts do not reach would not show here.
+are implemented in `scripts/numerics.py`, but no real dump is committed yet, so a change confined
+to experts these prompts do not reach would not show here.
 What it does settle: version 1 decodes exactly as it prefills. A continued turn is the bits of
 the cold one, which the token-kernel decode could not give at any distance.
 

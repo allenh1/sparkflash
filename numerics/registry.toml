@@ -24,21 +24,33 @@
 # entry it serves at boot and on /v1/models.
 #
 # [[anchor]] entries are the frozen quality references a declared change is measured against
-# (docs/NUMERICS.md §4). They are never edited or removed.
+# (docs/NUMERICS.md §4). They are never edited or removed. There is one per model: a bump is
+# looked up against the bumping configuration's own anchor, not a global flag.
 
 schema = 1
 
-# The four prerequisites docs/NUMERICS.md §5 names. Until every one is true, no configuration may
-# bump its version, which is to say no arithmetic change may land; `scripts/numerics.py ci`
-# enforces that. Turning one on is a reviewed edit with the tool or data it names in the same diff.
+# The four prerequisites docs/NUMERICS.md §5 names. The three global ones gate every bump; the
+# anchor is per model: a configuration may bump when its own model has a frozen anchor below and a
+# committed capture teacher-forced from it. `scripts/numerics.py ci` looks up the bumping entry's
+# model and names it when it is missing; it also refuses a true `anchor` flag whose coverage is
+# incomplete. Turning a prerequisite on is a reviewed edit with the tool or data it names in the
+# same diff.
 [prerequisites]
-# The frozen anchors below, plus the teacher-forced comparison (`scripts/numerics.py compare`).
+# Per model. Qwen3.8 and GLM-5.3 have an anchor and a committed teacher-forced capture; Inkling-2
+# and Dory1.0 have no anchor, so they cannot bump; DeepSeek is exempt because its device path
+# serves no logprobs and a text reference cannot teacher-force, and a text-evidence bump is
+# refused. The flag is the aggregate and is false while Inkling-2 and Dory1.0 lack anchors; false
+# does not block a model that has its own anchor.
 anchor = false
 # The CI declaration check (`scripts/numerics.py ci`, run by the scripts-tests job).
 declaration_check = true
 # Inputs that reach every routed expert of every layer, with the per-layer hit counts to prove it.
+# Implemented: `scripts/numerics.py coverage --dump ... --min-inputs N` judges one against
+# numerics/layouts/. False because no real dump is committed yet; flip it with the first one.
 coverage = false
-# Per-layer and per-expert relative error against the reference forward.
+# Per-layer and per-expert relative error against the reference forward. Implemented:
+# `scripts/numerics.py monitors --reference ... --candidate ... --layer-bar X --expert-bar Y`.
+# False because no real reference/candidate pair is committed yet; flip it with the first one.
 monitors = false
 
 # Qwen3.8-Flash-Next: the host driver at world 1, the TP driver at 2 and 4. Each world sums in its

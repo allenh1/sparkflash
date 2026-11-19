@@ -80,7 +80,12 @@ monitors flag) and the rarity of these changes are the mitigations.
 - **Anchor.** One frozen reference per model, captured at high precision (today's arithmetic at
   the smallest world size, or BF16 activations). Every numerics version of the model is measured
   against it. Anchors are `[[anchor]]` entries in the registry; the declaration check refuses any
-  edit to one, its removal, or a change to its file.
+  edit to one, its removal, or a change to its file. The anchor requirement is **per model**: a
+  configuration may bump only when its own model has an anchor and a committed capture
+  teacher-forced from that anchor. A model whose evidence is `text` has no token ids to force and
+  is exempt from the anchor requirement, but it also cannot bump: there is no comparison that
+  would justify the change. That is DeepSeek's position, and it is why the aggregate
+  `[prerequisites] anchor` flag can be false without blocking a model that has its own anchor.
 - **Teacher-forced comparison.** The anchor's own generated tokens are fed through the candidate
   (`forced_tokens`, §6), and every position's distribution is compared: NLL delta, top-1
   agreement and a KL lower bound. Both arms see the same tokens, so a near-tie changes one
@@ -194,17 +199,110 @@ kernel or a default set in Rust, is the bit gate's to catch.
 
 ### Prerequisites
 
-No version may be bumped, which is to say no arithmetic change may land, until all four are true
-in the registry's `[prerequisites]`:
+No version may be bumped, which is to say no arithmetic change may land, until the three global
+prerequisites are true in the registry's `[prerequisites]` **and** the bumping configuration's own
+model has a frozen anchor and a teacher-forced comparison:
 
 | Prerequisite | State |
 | :-- | :-- |
-| `anchor`: the anchors and the teacher-forced comparison | Qwen3.8 and GLM-5.3 anchored and compared; DeepSeek has no anchor, because its device path serves no logprobs and cannot teacher-force |
+| `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8 and GLM-5.3 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 and Dory1.0 do not, so their configurations cannot bump until they are anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
 | `declaration_check`: the CI check above | **done** |
-| `coverage`: inputs that reach every routed expert of every layer, with hit counts | not started |
-| `monitors`: per-layer and per-expert relative error against the reference | not started |
+| `coverage`: inputs that reach every routed expert of every layer, with hit counts | **implemented**, no dump committed: the `coverage` command below judges one, and the flag stays false until a real dump is in the repository |
+| `monitors`: per-layer and per-expert relative error against the reference | **implemented**, no dump committed: the `monitors` command below compares two, and the flag stays false until a real pair is in the repository |
 
-Until then the gate is exactly the bit gate.
+Until then the gate is exactly the bit gate. The per-model anchor gate is enforced by
+`scripts/numerics.py ci`: a bump whose model has no `[[anchor]]`, whose anchor has no committed
+teacher-forced capture, or whose evidence is `text` is refused with the model named, while a
+model that has its own anchor is not blocked by another model's missing one.
+
+#### The coverage dump
+
+A coverage run writes one JSON document for one served configuration. It holds the inputs that
+ran and, for every decoder layer, one hit count per routed expert. A dense layer is still a
+layer: it appears with an empty hit list. The format is versioned as
+`sparkflash-numerics-coverage/1`:
+
+```json
+{
+  "schema": "sparkflash-numerics-coverage/1",
+  "model": "zai-org/GLM-5.3-Flash",
+  "inputs": [{"name": "retrieval", "tokens": 1024}],
+  "layers": [
+    {"layer": 0, "hits": []},
+    {"layer": 3, "hits": [12, 4, 1]}
+  ],
+  "captured": "2026-11-19"
+}
+```
+
+The model's expert layout is committed under `numerics/layouts/` as
+`sparkflash-numerics-expert-layout/1`: contiguous spans of decoder layers, each with the number
+of routed experts in them (`0` for a dense layer), with the released configuration it came from.
+The checkpoint's MTP/draft layers are listed under `draft_layers` but are not judged by this dump
+yet; they run in the drafter's pass.
+
+```bash
+python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --min-inputs 8
+```
+
+The command refuses a dump whose schema or model is wrong, whose model has no committed layout,
+whose layer list omits, repeats or invents a layer, whose hit list does not have exactly one
+non-negative integer per routed expert, whose dense layer carries hits, whose routed expert has
+zero hits, or that names fewer distinct inputs than the declared coverage suite (`--min-inputs`).
+It prints the per-layer hit count and the min/max per layer, and exits non-zero on the first
+refusal.
+
+#### The monitor dump
+
+A monitor run samples the reference forward and the candidate forward on the same probe. Each
+dump records, for every decoder layer and every routed expert, the values at a fixed set of hidden
+indices, so `monitors` can compute a relative L2 error without shipping whole activations. The
+format is versioned as `sparkflash-numerics-monitors/1`:
+
+```json
+{
+  "schema": "sparkflash-numerics-monitors/1",
+  "model": "zai-org/GLM-5.3-Flash",
+  "probe": {"name": "retrieval", "prompt_ids": [1, 2, 3], "position": 0},
+  "sample": {"width": 4096, "indices": [0, 1, 2, 3]},
+  "layers": [
+    {"layer": 3, "values": [0.1, 0.2, 0.3, 0.4],
+     "experts": [{"expert": 0, "values": [0.1, 0.2, 0.3, 0.4]}]}
+  ],
+  "captured": "2026-11-19"
+}
+```
+
+```bash
+python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-reference.json \
+    --candidate numerics/monitors/glm53-tp4-candidate.json --layer-bar 2e-3 --expert-bar 5e-3
+```
+
+The error is `||candidate - reference|| / ||reference||` on the sampled values. The command refuses
+two dumps that name different models, probes or sampled indices, that do not hold the same layers
+and experts, that hold a non-finite value, or whose reference sample is all zeros (the relative
+error is undefined); it refuses a bar that is not finite and positive; and it exits non-zero when
+any layer exceeds `--layer-bar` or any expert exceeds `--expert-bar`, printing every failure and
+writing the per-layer and per-expert result when asked. The bars are supplied by the run: this
+page does not invent a bar the data has not measured.
+
+#### Emission sites
+
+The dump is written by the serving side, never reconstructed from a report. The Rust writer is
+`sparkflash_model::numerics_coverage::Recorder`; a recorder is created with the model's per-layer
+expert counts, and each router decision calls `Recorder::hit(layer, expert)`. It is opt-in:
+`SPARKFLASH_NUMERICS_COVERAGE` names the output path and is unset by default, and
+`SPARKFLASH_NUMERICS_MODEL` overrides the model id for a tiny fixture. With the switch unset the
+caller holds `None` and records nothing.
+
+| Model | Coverage emission site | Monitor emission site |
+| :-- | :-- | :-- |
+| Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `Blocks::routed_experts` | the same device arm, `Blocks::routed_experts`'s `expert_accumulator`; the host reference's expert body in `moe_forward` |
+| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` | `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts`; the host reference's `Moe::apply` |
+| DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine |
+
+Only the Qwen host reference is wired in this change. The device sites are named, not wired: they
+need a device context and a cluster window, and the first real dump is still ahead.
 
 ### Across architectures and versions
 
@@ -227,6 +325,12 @@ python3 scripts/numerics.py check --url http://127.0.0.1:8000
 # Teacher-force a candidate on an anchor's tokens, then score it.
 python3 scripts/numerics.py capture --url http://127.0.0.1:8000 --forced-from numerics/references/qwen38-anchor.json --top-logprobs 20 --out numerics/captures/qwen38/tp4-v1.json
 python3 scripts/numerics.py compare --anchor numerics/references/qwen38-anchor.json --candidate numerics/captures/qwen38/tp4-v1.json --markdown docs/numerics/qwen38/v1-tp-floor.md
+
+# Judge the coverage dump a run wrote against the model's committed expert layout.
+python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --min-inputs 8
+
+# Compare a candidate monitor dump with the reference forward, per layer and per expert.
+python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-reference.json --candidate numerics/monitors/glm53-tp4-candidate.json --layer-bar 2e-3 --expert-bar 5e-3 --json numerics/monitors/glm53-tp4-result.json
 ```
 
 The prompt suite is [`numerics/prompts/reference.json`](../numerics/prompts/reference.json). A
@@ -304,6 +408,26 @@ What the round established:
   not measured here.
 - **A capture must ask for greedy.** The API samples at its default temperature of 1.0 when a
   request names none, so `numerics.py` sends `temperature: 0` explicitly.
+
+### The anchor question, answered
+
+The old table said the anchor prerequisite was satisfied by "Qwen3.8 and GLM-5.3 anchored and
+compared", while the flag was false and named DeepSeek as the reason. That reading made one arm's
+inability to serve logprobs a global veto. The intended reading is the one §4 states: one anchor
+per model, and a configuration is measured against its own model's anchor. The tool now enforces
+that. Qwen3.8 and GLM-5.3 have an anchor and a committed capture teacher-forced from it, so they
+are covered. DeepSeek is **exempt from the anchor requirement and from bumping**: its device path
+serves no logprobs, a text reference has no token ids to teacher-force, and §2 freezes its
+arithmetic until it has been measured under this policy. If a logprobs path for DeepSeek lands,
+the exemption ends with it, and an anchor capture would be the first requirement.
+
+The aggregate `anchor` flag is **false**, and that is the honest value: Inkling-2 and Dory1.0
+have captured `logprobs` references but no `[[anchor]]`, so they are not covered and cannot bump.
+The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
+with an uncovered model fails `ci`. The two new dumps are implemented, but no real coverage or
+monitor dump is committed, so `coverage` and `monitors` are also false; they are not flipped on
+synthetic data. The first real dumps need the cluster commands below, and the device emission
+sites are named in §5.
 
 ## How this reconciles the earlier decisions
 
