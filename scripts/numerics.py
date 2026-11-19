@@ -38,7 +38,8 @@ capture  runs a prompt suite against a running server and writes a reference: ev
          the greedy text where the path serves no logprobs (evidence "text"). --forced-from feeds
          another reference's tokens through the server instead (teacher forcing), which is what
          compare reads. Its server card names the build it came from: --binary (or SPARKFLASH_BIN)
-         is hashed into binary_sha256, and --repo (default: this checkout) supplies the commit.
+         is hashed into binary_sha256, and the served card's build.id supplies the commit; --repo
+         (default: this checkout) is the fallback, and capture warns when neither names one.
          Either may be unknown; the card then records null and a one-line reason, never a guess.
 check    recaptures the server's registered reference and fails on any bit that differs. It also
          fails when the server does not report the registry entry this checkout has.
@@ -93,6 +94,12 @@ DEFAULT_SUITE = REPO / NUMERICS / "prompts" / "reference.json"
 DEFAULT_COVERAGE_CORPUS = REPO / NUMERICS / "coverage" / "corpus.json"
 
 REFERENCE_SCHEMA = "sparkflash-numerics-reference/1"
+# A capture taken after the build record landed writes `server.build_source`: the key's presence is
+# how the declaration check tells a new reference from one that predates the field, so a reference
+# committed before it is grandfathered by the absent key (docs/NUMERICS.md §5).
+BUILD_SOURCE = "build_source"
+BUILD_SOURCES = ("card", "repo")
+UNKNOWN_BUILD = "unknown"
 SUITE_SCHEMA = "sparkflash-numerics-prompts/1"
 COMPARE_SCHEMA = "sparkflash-numerics-compare/1"
 COVERAGE_SCHEMA = "sparkflash-numerics-coverage/1"
@@ -217,6 +224,47 @@ def check_reference_shape(reference: dict, origin: str) -> None:
         digest = server.get("binary_sha256")
         if isinstance(digest, str) and not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise NumericsFailure(f"{origin}: server.binary_sha256 is not 64 lowercase hex digits")
+        # The build record's version note: a new capture says where its commit came from, and a
+        # reference without this key predates the record and is grandfathered.
+        source = server.get(BUILD_SOURCE)
+        if source is not None and source not in BUILD_SOURCES:
+            raise NumericsFailure(
+                f"{origin}: server.{BUILD_SOURCE} {source!r} is not one of {list(BUILD_SOURCES)}"
+            )
+
+
+def build_record_commit(reference: dict) -> str | None:
+    """The commit a reference's server card records, or None when it names no build."""
+    server = reference.get("server")
+    if not isinstance(server, dict):
+        return None
+    commit = server.get("commit")
+    if not isinstance(commit, str):
+        return None
+    value = commit.strip()
+    if not value or value.lower().startswith(UNKNOWN_BUILD):
+        return None
+    return value
+
+
+def build_record_problem(reference: dict) -> str | None:
+    """Why a capture written after the build record landed cannot name its build.
+
+    A reference that predates the record has no `server.build_source` key and is grandfathered:
+    the capture command writes that key unconditionally, so a reference added from now on is
+    judged. A dirty build passes, because its `-dirty` marker still names the commit, and the
+    marker is what tells a reader the tree was not exact.
+    """
+    server = reference.get("server")
+    if not isinstance(server, dict) or BUILD_SOURCE not in server:
+        return None
+    if build_record_commit(reference) is None:
+        return (
+            "server.commit names no build the capture came from; the served card reported no "
+            "commit (or 'unknown'), so this reference cannot say which binary produced its bits "
+            "(docs/NUMERICS.md §5)"
+        )
+    return None
 
 
 def load_reference(path: Path) -> dict:
@@ -348,12 +396,41 @@ def git_at(repo: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=False, check=False)
 
 
-def build_identity(binary: Path | None, repo: Path | None) -> dict:
-    """The build a capture came from: the binary's sha256 and the commit of the tree it was built from.
+def card_build_commit(card: dict | None) -> tuple[str | None, str | None]:
+    """The commit a served card names, and the one-line reason it names no commit.
 
-    Both are facts the server cannot report through the API, so the operator names them. When one
-    cannot be determined the card records null and a one-line reason; a value is never guessed. The
-    reason names no host path, because the reference is committed.
+    `/v1/models` reports the build it was compiled from as `build.id` (the commit, with
+    `-dirty` when the tree was dirty at build time). A card that reports `unknown` names no
+    commit, so the caller falls back to `--repo` exactly as it would for a card with no id.
+    """
+    if not isinstance(card, dict):
+        return None, "the capture has no served card to read a build from"
+    build = card.get("build")
+    if not isinstance(build, dict):
+        return None, "the served card has no build record"
+    raw = build.get("id")
+    if not isinstance(raw, str) or not raw.strip():
+        return None, "the served card reports no build id"
+    value = raw.strip()
+    if value.lower().startswith(UNKNOWN_BUILD):
+        return None, f"the served card reports build id {value!r}, which does not name a commit"
+    if value.endswith("-dirty"):
+        return value, (
+            "the served card reports a dirty build; server.commit keeps its -dirty marker, so the "
+            "build it names is not an exact tree"
+        )
+    return value, None
+
+
+def build_identity(binary: Path | None, repo: Path | None, card: dict | None = None) -> dict:
+    """The build a capture came from: its binary, its commit and where the commit was read.
+
+    The commit is the served card's `build.id` first, because that is the only record the running
+    binary made of its own build; `--repo` is a fallback for a build that reports nothing. A dirty
+    build keeps its `-dirty` marker in `server.commit`, so the reader sees it is not an exact
+    tree. When a field cannot be determined the card records null and `build_note` gives the
+    one-line reason; a value is never guessed. The reason names no host path, because the reference
+    is committed. `build_source` is the version note a new capture writes: "card", "repo", or null.
     """
     reasons = []
     digest = None
@@ -365,20 +442,35 @@ def build_identity(binary: Path | None, repo: Path | None) -> dict:
         except OSError as error:
             reasons.append(f"the binary is not readable: {error.strerror or error}")
     commit = None
-    if repo is None:
-        reasons.append("no --repo named the tree the server was built from")
+    source = None
+    card_commit, card_reason = card_build_commit(card)
+    if card_commit is not None:
+        commit, source = card_commit, "card"
+        if card_reason is not None:
+            reasons.append(card_reason)
     else:
-        shown = git_at(repo, "rev-parse", "HEAD")
-        if shown.returncode != 0:
-            reasons.append("the tree named by --repo is not a git work tree with a HEAD")
+        if card is not None:
+            reasons.append(card_reason)
+        if repo is None:
+            reasons.append("no --repo named the tree the server was built from")
         else:
-            commit = shown.stdout.decode().strip()
-            if git_at(repo, "status", "--porcelain").stdout.strip():
-                reasons.append(
-                    "the tree named by --repo has uncommitted changes, so its commit does not "
-                    "name the exact build"
-                )
-    return {"binary_sha256": digest, "commit": commit, "build_note": "; ".join(reasons) or None}
+            shown = git_at(repo, "rev-parse", "HEAD")
+            if shown.returncode != 0:
+                reasons.append("the tree named by --repo is not a git work tree with a HEAD")
+            else:
+                commit = shown.stdout.decode().strip()
+                source = "repo"
+                if git_at(repo, "status", "--porcelain").stdout.strip():
+                    reasons.append(
+                        "the tree named by --repo has uncommitted changes, so its commit does not "
+                        "name the exact build"
+                    )
+    return {
+        "binary_sha256": digest,
+        "commit": commit,
+        "build_note": "; ".join(reasons) or None,
+        "build_source": source,
+    }
 
 
 def key_text(key: dict) -> str:
@@ -509,6 +601,13 @@ def capture(
     settings = {"max_tokens": max_tokens}
     if evidence == "logprobs":
         settings["top_logprobs"] = top_logprobs
+    server_build = build_identity(binary, repo, card)
+    if server_build["build_source"] != "card":
+        print(
+            f"warning: {url}: the served card names no build commit; server.commit is "
+            f"{server_build['commit'] or 'null'} (docs/NUMERICS.md §5)",
+            file=sys.stderr,
+        )
     reference = {
         "schema": REFERENCE_SCHEMA,
         "evidence": evidence,
@@ -517,7 +616,7 @@ def capture(
             "numerics": card["numerics"],
             "build": card.get("build"),
             "checkpoint": checkpoint_identity(card.get("checkpoint")),
-            **build_identity(binary, repo),
+            **server_build,
         },
         "settings": settings,
         "forced_from": forced_from,
@@ -977,6 +1076,19 @@ def declaration_findings(
             findings.append(f"{path}: no registry entry names this reference; evidence for a report goes under {CAPTURES}")
         if path.startswith(CAPTURES) and status != "A":
             findings.append(f"{path}: a committed capture is evidence for a report and is never edited or deleted")
+        # A reference this change adds must name the build its capture came from. The key a new
+        # capture writes is the version note: an older reference has no build_source and is
+        # grandfathered (docs/NUMERICS.md §5).
+        if path.startswith(REFERENCES) and status == "A":
+            data = read_head(path)
+            if data is not None:
+                try:
+                    added = json.loads(data)
+                except json.JSONDecodeError:
+                    added = None
+                problem = build_record_problem(added) if isinstance(added, dict) else None
+                if problem:
+                    findings.append(f"{path}: {problem}")
 
     base_registry = base or {"config": [], "anchor": [], "retired": [], "prerequisites": {}}
     base_missing = missing_prerequisites(base) if base else list(PREREQUISITES)
@@ -988,6 +1100,23 @@ def declaration_findings(
 
     # Anchors are frozen: never edited, never removed, never their file rewritten.
     head_anchors = {anchor["model"]: anchor for anchor in head["anchor"]}
+    base_anchor_models = {anchor["model"] for anchor in base_registry["anchor"]}
+    for anchor in head["anchor"]:
+        if anchor["model"] in base_anchor_models:
+            continue
+        # A new anchor's card must name its build too; the same version note grandfathers an anchor
+        # whose reference predates the build record.
+        path = f"{NUMERICS}/{anchor['reference']}"
+        data = read_head(path)
+        if data is None:
+            continue
+        try:
+            anchored = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        problem = build_record_problem(anchored) if isinstance(anchored, dict) else None
+        if problem:
+            findings.append(f"anchor {anchor['model']}: {problem}")
     for anchor in base_registry["anchor"]:
         mine = head_anchors.get(anchor["model"])
         if mine is None:
@@ -3318,7 +3447,7 @@ def main(argv: list[str]) -> int:
         "--repo",
         type=Path,
         default=REPO,
-        help="the checkout the server was built from; its HEAD commit goes in the server card",
+        help="fallback tree when the served card names no commit; its HEAD commit goes in the server card",
     )
 
     check_parser = commands.add_parser("check", help="recapture the registered reference, bit for bit")

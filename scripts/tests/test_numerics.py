@@ -42,6 +42,16 @@ SPEC.loader.exec_module(NUMERICS)
 
 MODEL = "toy/numerics"
 VOCAB = 50
+# The build id a served card reports in these tests: a plausible short commit, so a capture's
+# server.commit is visibly the card's value and not the test checkout's HEAD.
+CARD_COMMIT = "a6ef32e4"
+
+
+def with_server(reference: dict, **server) -> dict:
+    """A copy of a reference whose server card is `server`, leaving the fingerprinted bits alone."""
+    named = json.loads(json.dumps(reference))
+    named["server"] = server
+    return named
 
 
 def next_ulp(value: float) -> float:
@@ -56,10 +66,17 @@ class FakeServer:
     zero temperature samples, as the API does at its default of 1.0.
     """
 
-    def __init__(self, shift: float = 0.0, ignore_forced: bool = False, forced_decoding: bool = True):
+    def __init__(
+        self,
+        shift: float = 0.0,
+        ignore_forced: bool = False,
+        forced_decoding: bool = True,
+        build_id: str | None = CARD_COMMIT,
+    ):
         self.shift = shift
         self.ignore_forced = ignore_forced
         self.forced_decoding = forced_decoding
+        self.build_id = build_id
         self.requests: list[dict] = []
 
     def row(self, prefix: list[int]) -> list[float]:
@@ -106,7 +123,7 @@ class FakeServer:
         return {
             "id": MODEL,
             "capabilities": {"forced_decoding": True} if self.forced_decoding else {},
-            "build": {"version": "0", "id": "test"},
+            "build": {"version": "0", "id": self.build_id},
             "checkpoint": "/home/someone/.cache/huggingface/hub/models--org--name/snapshots/abc123",
             "numerics": {
                 "status": "unregistered",
@@ -306,34 +323,58 @@ class CaptureTests(unittest.TestCase):
         git("commit", "-q", "-m", "server")
         return git, git("rev-parse", "HEAD")
 
-    def test_a_capture_names_the_binary_and_the_commit_it_was_built_from(self):
+    def test_a_capture_records_the_commit_the_served_card_names(self):
+        prompts = [{"name": "a", "prompt_ids": [1]}]
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "sparkflash"
+            binary.write_bytes(b"the build")
+            git, checkout = self.git_repo(directory)
+            with serving(FakeServer()) as url:
+                reference = NUMERICS.capture(
+                    url, prompts, "logprobs", 4, 2, None, 30.0, binary=binary, repo=Path(directory)
+                )
+        server = reference["server"]
+        self.assertEqual(server["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
+        # The served card's build id wins: --repo here names a different, real checkout.
+        self.assertNotEqual(checkout, CARD_COMMIT)
+        self.assertEqual(server["commit"], CARD_COMMIT)
+        self.assertEqual(server["build_source"], "card")
+        self.assertIsNone(server["build_note"])
+
+    def test_the_repo_is_a_fallback_when_the_card_names_no_commit(self):
         prompts = [{"name": "a", "prompt_ids": [1]}]
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "sparkflash"
             binary.write_bytes(b"the build")
             git, commit = self.git_repo(directory)
-            with serving(FakeServer()) as url:
+            with serving(FakeServer(build_id=None)) as url:
                 reference = NUMERICS.capture(
                     url, prompts, "logprobs", 4, 2, None, 30.0, binary=binary, repo=Path(directory)
                 )
-            # A tree with uncommitted changes does not name an exact build; the reason says so.
-            binary.write_bytes(b"rebuilt")
-            dirty = NUMERICS.build_identity(binary, Path(directory))
         server = reference["server"]
-        self.assertEqual(server["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
         self.assertEqual(server["commit"], commit)
-        self.assertIsNone(server["build_note"])
-        self.assertEqual(dirty["commit"], commit)
-        self.assertIn("uncommitted changes", dirty["build_note"])
+        self.assertEqual(server["build_source"], "repo")
+        self.assertIn("no build id", server["build_note"])
 
-    def test_a_capture_without_a_build_records_null_and_a_reason(self):
-        with serving(FakeServer()) as url:
+    def test_a_dirty_served_build_is_recorded_dirty(self):
+        with serving(FakeServer(build_id=f"{CARD_COMMIT}-dirty")) as url:
+            reference = capture(url)
+        server = reference["server"]
+        self.assertEqual(server["commit"], f"{CARD_COMMIT}-dirty")
+        self.assertEqual(server["build_source"], "card")
+        self.assertIn("dirty", server["build_note"])
+
+    def test_a_capture_warns_when_the_served_card_names_no_commit(self):
+        with serving(FakeServer(build_id=None)) as url, contextlib.redirect_stderr(io.StringIO()) as warning:
             reference = capture(url)
         server = reference["server"]
         self.assertIsNone(server["binary_sha256"])
         self.assertIsNone(server["commit"])
+        self.assertIsNone(server["build_source"])
         self.assertIn("no --binary", server["build_note"])
+        self.assertIn("no build id", server["build_note"])
         self.assertIn("no --repo", server["build_note"])
+        self.assertIn("names no build commit", warning.getvalue())
 
     def test_a_build_that_cannot_be_determined_names_no_host_path(self):
         missing = Path(tempfile.gettempdir()) / "not-a-sparkflash-binary"
@@ -372,6 +413,9 @@ class CaptureTests(unittest.TestCase):
         reference["server"] = {"binary_sha256": "A" * 64}
         with self.assertRaisesRegex(NUMERICS.NumericsFailure, "64 lowercase hex"):
             NUMERICS.check_reference_shape(reference, "bad")
+        reference["server"] = {"build_source": "guessed"}
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "build_source"):
+            NUMERICS.check_reference_shape(reference, "bad")
 
     def test_the_capture_command_hashes_the_binary_from_the_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,10 +430,13 @@ class CaptureTests(unittest.TestCase):
                 )
             reference = json.loads(out.read_text())
         self.assertEqual(reference["server"]["binary_sha256"], hashlib.sha256(b"the build").hexdigest())
-        expected = subprocess.run(
+        checkout = subprocess.run(
             ["git", "-C", str(NUMERICS.REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
         ).stdout.strip()
-        self.assertEqual(reference["server"]["commit"], expected)
+        # --repo defaults to this checkout, but the served card's build id is what the dump records.
+        self.assertNotEqual(reference["server"]["commit"], checkout)
+        self.assertEqual(reference["server"]["commit"], CARD_COMMIT)
+        self.assertEqual(reference["server"]["build_source"], "card")
         self.assertIn("binary sha256", printed.getvalue())
 
     def test_the_suite_is_tokenized_by_the_server(self):
@@ -530,6 +577,63 @@ class DeclarationTests(unittest.TestCase):
         self.assertTrue(any("stray.json: no registry entry" in finding for finding in findings), findings)
         self.assertTrue(any("captures/x.json: a committed capture" in finding for finding in findings), findings)
         findings = NUMERICS.declaration_findings(base, head, read, read, {"numerics/captures/y.json": "A"})
+        self.assertEqual(findings, [])
+
+    def test_a_new_reference_without_a_build_is_refused(self):
+        # A capture taken after the record landed writes build_source; with no commit it cannot
+        # say which binary produced its bits, so the reference is refused.
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        missing = with_server(self.old, build_source="card", commit=None)
+        read = {self.path: NUMERICS.render_reference(missing).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertTrue(any("server.commit names no build" in finding for finding in findings), findings)
+
+    def test_a_new_reference_that_says_unknown_is_refused(self):
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        unknown = with_server(self.old, build_source="card", commit="unknown")
+        read = {self.path: NUMERICS.render_reference(unknown).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertTrue(any("server.commit names no build" in finding for finding in findings), findings)
+
+    def test_a_new_dirty_build_is_accepted_and_named_dirty(self):
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        dirty = with_server(self.old, build_source="card", commit=f"{CARD_COMMIT}-dirty")
+        read = {self.path: NUMERICS.render_reference(dirty).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {self.path: "A"})
+        self.assertEqual(findings, [])
+
+    def test_a_grandfathered_reference_without_the_build_key_passes(self):
+        # A reference committed before the record existed has no build_source; the absent key is
+        # the grandfather note, so it is accepted without a commit.
+        base = NUMERICS.synthetic_registry([], False)
+        head = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], False)
+        findings = NUMERICS.declaration_findings(base, head, self.store(self.old), self.store(self.old), {self.path: "A"})
+        self.assertEqual(findings, [])
+
+    def test_a_new_anchor_without_a_build_is_refused(self):
+        anchored = with_server(self.old, build_source="card", commit=None)
+        entry = NUMERICS.synthetic_entry(1, self.old)
+        base = NUMERICS.synthetic_registry([entry], False)
+        head = NUMERICS.synthetic_registry([entry], True)
+        head["anchor"][0]["reference"] = "references/q.json"
+        head["anchor"][0]["fingerprint"] = entry["fingerprint"]
+        read = {self.path: NUMERICS.render_reference(anchored).encode()}.get
+        findings = NUMERICS.declaration_findings(base, head, read, read, {})
+        self.assertTrue(
+            any("anchor m:" in finding and "server.commit names no build" in finding for finding in findings),
+            findings,
+        )
+
+    def test_a_grandfathered_anchor_without_the_build_key_passes(self):
+        entry = NUMERICS.synthetic_entry(1, self.old)
+        base = NUMERICS.synthetic_registry([entry], False)
+        head = NUMERICS.synthetic_registry([entry], True)
+        head["anchor"][0]["reference"] = "references/q.json"
+        head["anchor"][0]["fingerprint"] = entry["fingerprint"]
+        findings = NUMERICS.declaration_findings(base, head, self.store(self.old), self.store(self.old), {})
         self.assertEqual(findings, [])
 
     def test_a_version_moves_by_one(self):
