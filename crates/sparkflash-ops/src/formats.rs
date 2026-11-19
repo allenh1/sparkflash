@@ -596,7 +596,8 @@ impl<F: Format> Mat<F> {
 ///
 /// The checks are the two a bare device pointer cannot make:
 ///
-/// 1. the container's dtype and shape are this format's stored form
+/// 1. the container's dtype and shape are this format's stored form, its packing, or the
+///    logical shape with the container's unit dimensions dropped
 ///    ([sparkflash_weights::TensorSpec::is_stored_as]);
 /// 2. the scale plane has exactly the entry count the layout needs
 ///    ([ScaleLayout::entries]).
@@ -1104,5 +1105,30 @@ mod tests {
         })
         .expect_err("an inverse scale is f32 or bf16");
         assert!(error.to_string().contains("f32 or bf16"), "{error}");
+    }
+
+    #[test]
+    fn the_inkling_fixture_short_convolution_uploads_as_bf16() {
+        // `model.llm.layers.0.attn_sconv.weight` is the fixture's 3-D short-convolution weight,
+        // `[hidden, 1, kernel]`; the boot flattens it to the `[hidden, kernel]` matrix the
+        // arithmetic sees and still passes the container's 3-D spec (`device::type_slots`).
+        // Upload dereferences nothing, so the address need not be a live device pointer.
+        let stored = spec(
+            "model.llm.layers.0.attn_sconv.weight",
+            StoredDType::BF16,
+            &[32, 1, 4],
+        );
+        let mat: Mat<Bf16> = upload(Tensor {
+            stored: &stored,
+            shape: &[32, 4],
+            data: Deviceptr(0x1000),
+            stride: 8,
+            scales: Scales::none(),
+        })
+        .expect("the fixture's short-convolution weight uploads as bf16");
+        assert_eq!((mat.rows(), mat.columns(), mat.stride()), (32, 4, 8));
+        assert_eq!(mat.spec().dtype, StoredDType::BF16);
+        assert_eq!(mat.spec().shape, vec![32, 4]);
+        assert_eq!(mat.bytes_per_token(), 256);
     }
 }

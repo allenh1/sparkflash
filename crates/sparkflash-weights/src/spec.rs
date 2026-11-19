@@ -45,14 +45,29 @@ impl TensorSpec {
 
     /// Whether `stored`, a tensor as its container reports it, holds this logical spec.
     ///
-    /// That is the same dtype and shape, or, for an FP4 E2M1 spec, the NVFP4 packing of it:
-    /// ModelOpt stores the codes as `U8` ([crate::nvfp4::NVFP4_STORED_DTYPE]) with the last
-    /// dimension halved, the same bytes. A container that already reports the logical FP4 view
-    /// (the safetensors source does for `I8`) matches as itself. Anything else is a different
-    /// tensor.
+    /// That is the same dtype and shape; or the same dtype, elements and logical shape with the
+    /// container's unit dimensions dropped: a 1-D convolution's weight is reported as
+    /// `[out, in/groups, kernel]`, and when `in/groups` is one the arithmetic sees the
+    /// `[out, kernel]` matrix - the same values in the same order, since a unit dimension carries
+    /// no stride. Only unit dimensions may vanish, so the squeezed rank and the element count are
+    /// the logical ones; and only under the same dtype, so a `U8` tensor never stands in for one
+    /// of another format. Or, for an FP4 E2M1 spec, the NVFP4 packing of it: ModelOpt stores the
+    /// codes as `U8` ([crate::nvfp4::NVFP4_STORED_DTYPE]) with the last dimension halved, the same
+    /// bytes. A container that already reports the logical FP4 view (the safetensors source does
+    /// for `I8`) matches as itself. Anything else is a different tensor.
     pub fn is_stored_as(&self, stored: &TensorSpec) -> bool {
-        if self.dtype == stored.dtype && self.shape == stored.shape {
-            return true;
+        if self.dtype == stored.dtype {
+            if self.shape == stored.shape {
+                return true;
+            }
+            // The container's shape without its unit dimensions: the matrix a 1-D convolution's
+            // arithmetic sees when its input has one channel. `eq` compares the lengths too, so a
+            // squeezed shape of another rank is a different tensor even when the element count
+            // matches, and the explicit count keeps that refusal independent of the shape walk.
+            let squeezed = stored.shape.iter().copied().filter(|&dim| dim != 1);
+            if self.elements() == stored.elements() && self.shape.iter().copied().eq(squeezed) {
+                return true;
+            }
         }
         if self.dtype != DType::F4E2M1 || stored.dtype != crate::nvfp4::NVFP4_STORED_DTYPE {
             return false;
@@ -94,5 +109,29 @@ mod tests {
         assert!(!bytes.is_stored_as(&spec(DType::U8, &[640, 640])));
         let bf16 = spec(DType::BF16, &[640, 2560]);
         assert!(!bf16.is_stored_as(&spec(DType::U8, &[640, 1280])));
+    }
+
+    #[test]
+    fn a_unit_dimension_is_the_same_tensor() {
+        // The container's 1-D convolution weight is `[out, in/groups, kernel]`; with one input
+        // channel the arithmetic sees `[out, kernel]` and the row-major bytes are the same.
+        let logical = spec(DType::BF16, &[32, 4]);
+        assert!(logical.is_stored_as(&spec(DType::BF16, &[32, 1, 4])));
+        // A unit dimension may lead or trail; it carries no stride either way.
+        assert!(logical.is_stored_as(&spec(DType::BF16, &[1, 32, 4])));
+        assert!(logical.is_stored_as(&spec(DType::BF16, &[32, 4, 1])));
+
+        // Another kernel: 160 elements are not 128.
+        assert!(!logical.is_stored_as(&spec(DType::BF16, &[32, 1, 5])));
+        // The same element count with a shape of another rank once the unit dimensions are gone.
+        assert!(!logical.is_stored_as(&spec(DType::BF16, &[128])));
+        // A genuine flattening is not a unit dimension: `[4, 2, 32]` is not the matrix `[8, 32]`.
+        assert!(!spec(DType::BF16, &[8, 32]).is_stored_as(&spec(DType::BF16, &[4, 2, 32])));
+
+        // Only the same dtype may stand in, so a U8 or F32 tensor never passes as BF16.
+        assert!(!logical.is_stored_as(&spec(DType::U8, &[32, 1, 4])));
+        assert!(!logical.is_stored_as(&spec(DType::F32, &[32, 1, 4])));
+        // And the FP4 packing rule is unchanged: a U8 spec is not a BF16 one, packed or not.
+        assert!(!logical.is_stored_as(&spec(DType::U8, &[32, 2])));
     }
 }
