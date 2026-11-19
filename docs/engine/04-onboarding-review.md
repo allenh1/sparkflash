@@ -419,9 +419,16 @@ The ban is a test, not a convention: `crates/sparkflash-ops/tests/kernel_lookup.
 `load_function`, and holds each file to a recorded count with a reason. A converted arm must
 tighten its line; an unconverted one records "not converted yet: phase 7 runs by arm".
 
-The second arm is Qwen, and it is the shape the rest should follow: 11 string lookups became 2
+The second arm is Qwen, and it is the shape the rest followed: 11 string lookups became 2
 (the two loaders inside `Bound`), the prefill and drafter files lost theirs entirely, and the
-table went from 15 lines to 13 with no other crate's line touched. Six symbols Qwen already
+table went from 15 lines to 13 with no other crate's line touched. GLM (14 to 2), Inkling
+(6 to 2, across the device, tower and drafter files) and Dory (4 to 2) then took the same shape,
+each with its own local `Bound`, its typed uploads (`Mat<Bf16>`/`Mat<Fp8E4m3>` for GLM,
+`Mat<Bf16>`/`Mat<MxFp8>`/`Mat<NvFp4>` for Inkling, `Mat<Bf16>` for Dory) and its own boot
+ledger; GLM and Inkling record their widenings (BF16 bias read at f32, the L2-clip gains).
+Every model crate is now two loaders plus typed matrices; DeepSeek's forward is the last arm and
+phase 6 folds it anyway. The packed copies in these three arms still flow through the shared
+`PackedSet` handles rather than as their own ledger rows - a deliberate gap the report states. Six symbols Qwen already
 launched were missing from the catalogue and were added to its existing entries, which is the
 cost a conversion pays when the catalogue was written from the launches it could see. Weights load
 as `Mat<Bf16>`, `Mat<Fp8E4m3>` and `Mat<NvFp4>` through `upload`, vectors stay `Deviceptr` with
