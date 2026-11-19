@@ -38,21 +38,23 @@
 //! (members x (1 + depth)). With SPARKFLASH_INKLING_DRAFT unset the round is the plain step and
 //! the runtime takes its answer without a walk ([Draft::Held]).
 //!
-//! The arm still serves through [InklingLanes]; this walk is what the runtime drives when the
-//! construction site switches over. The runtime's vision path is not wired yet, so a prompt with
-//! images still takes [InklingLanes::prefill_images].
+//! The arm serves through this walk: the group's rank 0 and workers both drive
+//! [sparkflash_runtime::Runtime] over it, and a single session is the runtime's one-slot
+//! adapter. The image path is [InklingVision]: the runtime encodes a prompt's fresh images once
+//! through rank 0's tower and passes them with each chunk, and this walk injects their rows.
 
 use std::sync::{Arc, Mutex};
 
-use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
+use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
+use sparkflash_model::vision::VisionImage;
 use sparkflash_runtime::{
     ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory,
-    LaneState, Limits, NoVision, Opened, Pass, PassKind, PassMask, Region, Segment as RunSegment,
-    Segments, StateKind, StateLayout, StepWall, Walk, WalkCapabilities,
+    LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Segment as RunSegment, Segments,
+    StateKind, StateLayout, StepWall, Vision, Walk, WalkCapabilities,
 };
 
-use super::chunk::{Rows, Segment, walk_rows};
+use super::chunk::{Injection, Rows, Segment, exchange_sum, walk_rows};
 use super::{
     BATCH_ROWS, Chunk, ChunkWidths, DEVICE, DraftState, Drafter as DraftKind, InklingDeviceSession,
     JOINT_WALL, Opening, PrefillWalk, Shared, choose, open_buffer,
@@ -157,7 +159,7 @@ pub struct InklingWalk {
     limits: Limits,
     /// The rows one lane step and one prompt chunk walk in, shared by every sequence: the engine
     /// steps one pass at a time, so a buffer a lane - about 0.7 MiB a row - is lent rather than
-    /// held per lane ([InklingLanes]).
+    /// held per lane.
     buffer: Mutex<Option<Chunk>>,
     /// The shared walk's buffer when drafting members verify together: as wide as the widest
     /// round.
@@ -216,6 +218,7 @@ impl InklingWalk {
         seq: &mut InklingSequence,
         rows: &[u32],
         after: usize,
+        images: &[VisionImage],
     ) -> Result<Hidden, BackendError> {
         let shared = &self.shared;
         let start = seq.session.state.position;
@@ -241,34 +244,51 @@ impl InklingWalk {
         } else {
             vec![1; rows.len()]
         };
+        let row_bytes = shared.hidden() * std::mem::size_of::<f32>();
+        let injections = self.image_injections(seq, images, start, rows.len(), row_bytes)?;
         let mut walked = 0usize;
         for take in splits {
             let slice = &rows[walked..walked + take];
             let first = seq.session.state.position;
-            let logits = if take == 1 && shared.prefill_walk != PrefillWalk::Tensor {
-                seq.session.step(slice[0])?
-            } else {
-                let walk = if shared.prefill_walk.chunked() {
-                    shared.prefill_walk
+            // The chunk's own image rows, with the source moved past the rows earlier in the
+            // same run: an image row is always a chunk's, never the decode step's.
+            let pieces: Vec<Injection> = injections
+                .iter()
+                .filter_map(|run| {
+                    let from = run.row.max(walked);
+                    let to = (run.row + run.count).min(walked + take);
+                    (from < to).then(|| Injection {
+                        row: from - walked,
+                        source: run.source.offset((from - run.row) * row_bytes),
+                        count: to - from,
+                    })
+                })
+                .collect();
+            let logits =
+                if take == 1 && shared.prefill_walk != PrefillWalk::Tensor && pieces.is_empty() {
+                    seq.session.step(slice[0])?
                 } else {
-                    PrefillWalk::Chunk
+                    let walk = if shared.prefill_walk.chunked() {
+                        shared.prefill_walk
+                    } else {
+                        PrefillWalk::Chunk
+                    };
+                    let taps = seq.session.drafter.as_ref().map(DraftState::sink);
+                    let mut held = self.lock_buffer(&self.buffer, "the lanes' row")?;
+                    open_buffer(shared, &mut held, take, 1)?;
+                    let chunk = held.as_mut().expect("the row buffer was just opened");
+                    walk_rows(
+                        shared,
+                        Rows::Chunk(&mut seq.session.state),
+                        chunk,
+                        slice,
+                        walk,
+                        &pieces,
+                        taps,
+                    )?
+                    .pop()
+                    .ok_or_else(|| BackendError::new(DEVICE, "a chunk answered no row"))?
                 };
-                let taps = seq.session.drafter.as_ref().map(DraftState::sink);
-                let mut held = self.lock_buffer(&self.buffer, "the lanes' row")?;
-                open_buffer(shared, &mut held, take, 1)?;
-                let chunk = held.as_mut().expect("the row buffer was just opened");
-                walk_rows(
-                    shared,
-                    Rows::Chunk(&mut seq.session.state),
-                    chunk,
-                    slice,
-                    walk,
-                    &[],
-                    taps,
-                )?
-                .pop()
-                .ok_or_else(|| BackendError::new(DEVICE, "a chunk answered no row"))?
-            };
             seq.session
                 .inject(take, first)
                 .map_err(|error| BackendError::new(DEVICE, error.to_string()))?;
@@ -278,6 +298,46 @@ impl InklingWalk {
             walked += take;
         }
         Ok(Hidden::new(rows.len()))
+    }
+
+    /// The prompt's encoded image rows as chunk-relative runs, one a fresh image whose span
+    /// overlaps this chunk. `first` is the chunk's first position and `rows` its width, so the
+    /// same run list serves every chunk the runtime cuts: only the overlap moves.
+    fn image_injections(
+        &self,
+        seq: &InklingSequence,
+        images: &[VisionImage],
+        first: usize,
+        rows: usize,
+        row_bytes: usize,
+    ) -> Result<Vec<Injection>, BackendError> {
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let buffer = seq.session.images.ok_or_else(|| {
+            BackendError::new(
+                DEVICE,
+                "a prompt chunk carries images the rank never encoded",
+            )
+        })?;
+        let mut runs = Vec::with_capacity(images.len());
+        let mut at = 0usize;
+        for image in images {
+            let count = image.span.grid.image_rows();
+            let from = image.span.start.max(first);
+            let to = (image.span.start + count).min(first + rows);
+            if from < to {
+                runs.push(Injection {
+                    row: from - first,
+                    source: buffer
+                        .offset(at * row_bytes)
+                        .offset((from - image.span.start) * row_bytes),
+                    count: to - from,
+                });
+            }
+            at += count;
+        }
+        Ok(runs)
     }
 
     /// One token a lane ([Rows::Lanes]), the arm's fused token walk.
@@ -348,7 +408,7 @@ impl InklingWalk {
     }
 
     /// One walk of every segment's anchor and drafts ([Rows::Segments]), answering every row's
-    /// logits: the body [InklingLanes]'s round runs.
+    /// logits: the body the drafter's verify runs.
     fn verify_rows(
         &self,
         segments: &mut [RunSegment<'_, InklingSequence>],
@@ -515,6 +575,13 @@ pub struct InklingDrafter {
 impl Drafter<InklingWalk> for InklingDrafter {
     const PRESENT: bool = true;
 
+    /// The rank drafts only when SPARKFLASH_INKLING_DRAFT named one. Off, the runtime runs one
+    /// plain token pass over every lane, the arm's old fused `Rows::Lanes` step, rather than a
+    /// held decode a lane.
+    fn drafts(&self) -> bool {
+        self.present
+    }
+
     /// The arm's round already folded each member's rows into its step: a verify answers
     /// [InklingDeviceSession::close]'s step.
     type Rows = StepOutput;
@@ -615,10 +682,135 @@ impl Drafter<InklingWalk> for InklingDrafter {
     }
 }
 
+/// Inkling's image path: rank 0's vision tower, encoded once a prompt.
+///
+/// The runtime calls [Vision::encode] when a prompt starts over or carries fresh images after
+/// the reused prefix, and [Vision::clear] when its chunks are done. Rank 0 alone runs the
+/// tower; every rank's rows arrive through the group's sum, so a worker's buffer carries rank
+/// 0's rows exactly as its prompt path did ([InklingDeviceSession::encode_images] before this).
+pub struct InklingVision;
+
+impl Vision<InklingWalk> for InklingVision {
+    const PRESENT: bool = true;
+
+    fn encode(
+        walk: &InklingWalk,
+        seq: &mut InklingSequence,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<(), BackendError> {
+        let shared = &walk.shared;
+        shared
+            .cuda
+            .make_current()
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        shared
+            .span_check()
+            .check(tokens, images)
+            .map_err(|error| BackendError::new("request", error))?;
+        seq.session.free_images();
+        if images.is_empty() {
+            return Ok(());
+        }
+        if shared.encodes() && shared.vision.is_none() {
+            return Err(BackendError::new(
+                "vision",
+                format!(
+                    "the request carries {} images and this rank holds no vision tower",
+                    images.len()
+                ),
+            ));
+        }
+        // The images the reused prefix does not already hold: the arm encoded the others in
+        // the prompt that wrote those positions.
+        let start = seq.session.state.position;
+        let fresh: Vec<&VisionImage> = images
+            .iter()
+            .filter(|image| image.span.start >= start)
+            .collect();
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        let hidden = shared.hidden();
+        let row_bytes = hidden * std::mem::size_of::<f32>();
+        let rows: usize = fresh.iter().map(|image| image.span.grid.image_rows()).sum();
+        let mut total = 0usize;
+        let buffer = shared
+            .cuda
+            .alloc(rows * row_bytes, &mut total)
+            .map_err(|error| BackendError::new(DEVICE, error))?;
+        let fill = || -> Result<(), BackendError> {
+            shared
+                .cuda
+                .memset_d8_async(buffer, 0, rows * row_bytes)
+                .map_err(|error| BackendError::new(DEVICE, error))?;
+            if shared.encodes() {
+                let tower = shared
+                    .vision
+                    .as_ref()
+                    .ok_or_else(|| BackendError::new(DEVICE, "rank 0 holds no vision tower"))?;
+                let mut tower = tower.lock().map_err(|_| {
+                    BackendError::new(DEVICE, "the vision tower's lock is poisoned")
+                })?;
+                let mut at = 0usize;
+                for image in &fresh {
+                    let grid = &image.span.grid;
+                    let made = tower
+                        .encode(
+                            &shared.cuda,
+                            &image.pixels,
+                            grid.best_height,
+                            grid.best_width,
+                            buffer.offset(at * row_bytes),
+                        )
+                        .map_err(|error| BackendError::new(DEVICE, error))?;
+                    if made != grid.image_rows() {
+                        return Err(BackendError::new(
+                            DEVICE,
+                            format!(
+                                "the tower made {made} rows of a span that holds {}",
+                                grid.image_rows()
+                            ),
+                        ));
+                    }
+                    at += made;
+                }
+            }
+            let piece = shared.prefill_chunk.max(1);
+            let mut done = 0usize;
+            while done < rows {
+                let count = piece.min(rows - done);
+                exchange_sum(shared, buffer.offset(done * row_bytes), count * hidden)?;
+                done += count;
+            }
+            Ok(())
+        };
+        match fill() {
+            Ok(()) => {
+                seq.session.images = Some(buffer);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = shared.cuda.synchronize();
+                shared.cuda.free_buffers(&[&buffer]);
+                Err(error)
+            }
+        }
+    }
+
+    fn clear(walk: &InklingWalk, seq: &mut InklingSequence) {
+        if let Err(error) = walk.shared.cuda.make_current() {
+            debug_assert!(false, "the vision path's clear lost its context: {error}");
+            return;
+        }
+        seq.session.free_images();
+    }
+}
+
 impl Walk for InklingWalk {
     type Seq = InklingSequence;
     type Drafter = InklingDrafter;
-    type Vision = NoVision;
+    type Vision = InklingVision;
 
     const CAPABILITIES: WalkCapabilities = WalkCapabilities {
         // A prompt runs in the arm's chunks, a step runs one row a lane, and a round verifies an
@@ -660,6 +852,12 @@ impl Walk for InklingWalk {
         self.max_batch
     }
 
+    fn rewind_slack(&self) -> usize {
+        // The sliding cache keeps its window and a widest chunk of rows past the prompt's end;
+        // the arm's old rewind point also reserved the drafts a verify may add.
+        self.shared.prefill_chunk.saturating_sub(self.drafter.depth)
+    }
+
     fn set_sampling(&self, seq: &mut Self::Seq, sampling: Sampling) {
         seq.session.set_sampling(sampling);
         seq.clear_answers();
@@ -684,8 +882,9 @@ impl Walk for InklingWalk {
                 }
                 let after = pass.prompt_end.unwrap_or(0);
                 let segment = &mut segments[0];
+                let images = segment.images;
                 let (seq, rows) = (&mut *segment.seq, segment.rows);
-                self.walk_bulk(seq, rows, after)?
+                self.walk_bulk(seq, rows, after, images)?
             }
             PassKind::TokenRows => self.walk_tokens(segments)?,
             PassKind::Verify { .. } => {
@@ -890,6 +1089,21 @@ mod tests {
         assert_eq!(drafter.budget(4), BATCH_ROWS - 4);
         assert_eq!(drafter.budget(8), 0);
         assert_eq!(drafter.describe(), "DSpark, up to 7 drafts");
+        assert!(drafter.drafts());
+        let off = InklingDrafter {
+            present: false,
+            kind: None,
+            depth: 0,
+            wall: ExpertUnionWall {
+                experts: 0,
+                top_k: 0,
+                ..JOINT_WALL
+            },
+        };
+        assert!(
+            !off.drafts(),
+            "an off drafter must take the plain lanes step"
+        );
     }
 
     /// The layout is both kinds: the key and value rows are positional, the convolution
@@ -921,11 +1135,16 @@ mod tests {
 
     /// The walk and its sequences are what a fused engine thread takes.
     #[test]
+    #[allow(clippy::assertions_on_constants)] // the claim is the point: it is a type constant
     fn the_walk_and_its_sequences_are_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<InklingWalk>();
         assert_send_sync::<InklingSequence>();
         assert_eq!(<InklingWalk as Walk>::CAPABILITIES.segments, Segments::Many);
+        assert!(
+            <<InklingWalk as Walk>::Vision as Vision<InklingWalk>>::PRESENT,
+            "the arm serves images through its tower"
+        );
     }
 
     sparkflash_runtime::conformance!(super::InklingWalk);
