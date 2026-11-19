@@ -567,14 +567,26 @@ places and all other five traces hold (its clock at tick 9 was 1144 against 1373
 decision 42 the split is by launcher and rep, not by build. The cross-build pairs reproduce the
 first run's shape at r0 and then disagree at r1, which is what arrival timing looks like.
 
-**Conclusion, stated at the strength the evidence supports:** the served tick's decisions are the
-same across the move except at the admission decisions, where one build differs from itself as
-much as it differs from the other. The A/B's strict criterion (all three pairs identical) is
-not met, and it should not be read as a policy divergence. What would settle it is a workload
-whose admissions are deterministic - requests admitted one per tick, or a barrier the server
-observes - so the admission lines stop being a race. Until then, phase 6 step 4's claim is "the
-decisions agree outside the admission race, measured on 4 pairs and 3 repetitions", not "the
-decisions are identical".
+A third run staggered the requests (`--stagger 0.25`, one every quarter second) so each tick's
+admission set stops being a race. All three cross-build pairs still differ, and the same-build
+control still differs in the same place (old r0/r1 and r0/r2, new r0/r1 and r0/r2), at the
+admission of the seventh request: tick 10's batch, or deferred one tick. Both builds emit both
+variants across their own launches.
+
+The harness can now say what that is. `--diff --unordered` compares the traces as multisets of
+decisions, and on this run every cross-build pair is **identical as a multiset: 87 decisions,
+none added, none removed** - only the tick at which one admission lands differs, and the same
+build differs from itself in exactly that way. `--ignore-tick` (order kept, ticks dropped) still
+reports a difference, which is what makes the distinction visible: the two traces are a `place`
+and a `hold` swapped, not a different set of decisions.
+
+**Conclusion, stated at the strength the evidence supports:** across four pairs, three staggered
+repetitions and same-build controls, the two builds run the same 87 decisions; the only
+difference is the tick boundary at which one admission is placed, which is not stable for either
+build on its own. Phase 6 step 4's claim is therefore "the moved engine makes the same
+decisions as the frozen one, up to tick-boundary admission jitter", not "identical traces". A
+strictly identical trace would need admissions that no real-time scheduler decides by arrival,
+which is a property of the workload, not of the engine.
 
 Two build facts this run exposed, both now checked before any window stops the cluster: the
 binary embeds `numerics/registry.toml`, so a stale build can ship a registry that disagrees with
