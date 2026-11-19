@@ -639,11 +639,19 @@ impl<W: Walk> TickEngine<W> {
     /// run.
     #[must_use]
     pub fn busy(&self) -> bool {
-        !self.admissions.is_empty()
-            || !self.fed.is_empty()
-            || self.requests.iter().any(|request| {
-                !request.done && matches!(request.phase, Phase::Waiting | Phase::Prefill { .. })
-            })
+        // A waiting prompt can advance only while a lane is free; a decoding request only when
+        // its caller has fed a row. When neither is true the engine has nothing to do, and the
+        // serving thread waits for a job instead of ticking.
+        !self.fed.is_empty()
+            || self
+                .requests
+                .iter()
+                .any(|request| !request.done && matches!(request.phase, Phase::Prefill { .. }))
+            || (!self.free.is_empty()
+                && self
+                    .requests
+                    .iter()
+                    .any(|request| !request.done && request.phase == Phase::Waiting))
     }
 
     /// What id holds after its last job.
@@ -852,6 +860,9 @@ impl<W: Walk> TickEngine<W> {
                 );
                 continue;
             };
+            // The lane is claimed before the prompt starts, so a start that fails releases it
+            // rather than leaving a half-rewound slot off the free list.
+            self.requests[index].lane = Some(lane);
             let sampling = self.requests[index].sampling;
             self.runtime.walk().set_sampling(slot.seq_mut(), sampling);
             let start = match self.runtime.start_prompt_slot(slot, &wanted, &new_images) {
@@ -882,11 +893,7 @@ impl<W: Walk> TickEngine<W> {
                 false,
                 self.config.chunk_min,
             );
-            {
-                let request = &mut self.requests[index];
-                request.lane = Some(lane);
-                request.phase = Phase::Prefill { target, bulk };
-            }
+            self.requests[index].phase = Phase::Prefill { target, bulk };
             self.free.retain(|free| *free != lane);
             let id = self.requests[index].id;
             self.lanes[lane].seq = Some(id);
@@ -1162,13 +1169,15 @@ impl<W: Walk> TickEngine<W> {
                 );
             }
             DecodePlan::Plain { .. } => {
-                let seqs = rows.len();
+                let mut seqs = 0;
                 let mut walked = 0;
                 let mut rest = rows;
                 while !rest.is_empty() {
                     let take = self.config.rows_max.min(rest.len());
                     let group: Vec<Fed> = rest.drain(..take).collect();
-                    walked += self.step_rows(group, StepMode::Plain, events).1;
+                    let (stepped, rows) = self.step_rows(group, StepMode::Plain, events);
+                    seqs += stepped;
+                    walked += rows;
                 }
                 self.record(
                     now,
@@ -1202,7 +1211,6 @@ impl<W: Walk> TickEngine<W> {
         mode: StepMode,
         events: &mut Vec<TickEvent>,
     ) -> (usize, usize) {
-        let seqs = group.len();
         let mut members = Vec::with_capacity(group.len());
         let mut lanes = Vec::with_capacity(group.len());
         let mut stepping = Vec::with_capacity(group.len());
@@ -1222,6 +1230,7 @@ impl<W: Walk> TickEngine<W> {
             stepping.push(*fed);
             members.push((slot, fed.token));
         }
+        let seqs = members.len();
         let answer = self.runtime.step_mode_slots(&mut members, mode);
         // A step that ran appends the fed token to the history; the request's token list
         // follows it. A step that failed appended nothing.
