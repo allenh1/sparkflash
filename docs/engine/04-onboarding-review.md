@@ -520,6 +520,36 @@ emission cherry-picked (`512c9910`; the emission commit `de642922` changes `tick
 move `4d144208` introduces, so the literal pre-move tree cannot take it as a cherry-pick) and the
 branch head. Their `tick.rs` and `batch.rs` are identical, which is what makes the comparison a
 decision comparison rather than a source comparison.
+### The first served A/B: three pairs identical, one admission tick apart
+
+The harness finally ran on the four-rank group at `d126c66c` (old build `512c9910`, new
+`d126c66c`; both staged on all four ranks, all four boots at 26.5 s). Four pairs, one rep, eight
+launches in 4 m 23 s:
+
+| pair | decisions | verdict |
+| :-- | --: | :-- |
+| 1 stream, 2,048 prompt | 33 | identical |
+| 8 streams, 2,048 prompt | 61 | identical |
+| 1 stream, 16,384 prompt | 38 | identical |
+| 8 streams, 16,384 prompt | 87 | **different** |
+
+The difference is at the admission boundary and nothing else diverges: at tick 9, decision 21,
+the old build places seq 1 (`place seq=1 lane=3 shared=0 start=0 target=16414 path=bulk:22`) and
+the new one holds (`hold 0:22`). Old admits sequences 0, 1 and 2 before the tick's prefill; new
+admits only 0 and defers 1-7 to tick 10, and the remaining 86 lines are the same sequence shifted
+by that one tick.
+
+By the plan's rule - "a pair that differs only in an admission tick is reported, not excused" -
+the A/B **fails**. What the rule cannot say is whether the deferral is policy or arrival timing:
+concurrent admissions depend on when rank 0's stream receives the requests, and one rep cannot
+separate the two. Repeating the pair (the script's `--reps`) is the experiment that would: a
+timing difference appears in some reps and not others, a policy difference in all of them. That
+repetition is owed, and the 8-stream 16K pair is the one to repeat first.
+
+Two build facts this run exposed, both now checked before any window stops the cluster: the
+binary embeds `numerics/registry.toml`, so a stale build can ship a registry that disagrees with
+the tree - here an invalid `[[retired]]` field stopped the binary at boot - and the launcher `cd`s
+into the repo tree on every rank, so the tree must exist on all four.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
