@@ -331,14 +331,32 @@ pub enum Evidence {
     Text,
 }
 
-/// The committed pair a true `monitors` flag rests on (docs/NUMERICS.md §5).
+/// One model's committed coverage dump (docs/NUMERICS.md §5).
+///
+/// The bar is the registry's shared [Prerequisites::coverage_slots]; `min_inputs` is the coverage
+/// suite's declared input floor. A model without a row has no coverage prerequisite, so an
+/// unapproved bump on it is refused by `scripts/numerics.py ci` with the model named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoverageEntry {
+    /// The model the dump is for; one row a model.
+    pub model: String,
+    /// The committed dump, under `numerics/coverage/`.
+    pub dump: String,
+    /// The declared coverage suite's input floor.
+    pub min_inputs: usize,
+}
+
+/// One model's committed monitor pair (docs/NUMERICS.md §5).
 ///
 /// The two dumps are judged at the declared relative-error bars. The judge compares the experts
 /// both builds routed to and reports the ones only one did, because a router may change a row's
 /// expert on a different hidden state; that divergence is a measured fact, not a malformed pair.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MonitorPair {
+pub struct MonitorsEntry {
+    /// The model the pair is for; one row a model.
+    pub model: String,
     /// The reference build's dump, under `numerics/monitors/`.
     pub reference: String,
     /// The candidate build's dump, under `numerics/monitors/`.
@@ -351,10 +369,10 @@ pub struct MonitorPair {
 
 /// The prerequisites docs/NUMERICS.md §5 names before an arithmetic change may land.
 ///
-/// `anchor` is per model: a configuration is judged against its own model's frozen anchor and a
-/// committed capture teacher-forced from it, not against this aggregate. The other three gate
-/// every bump. This flag reports whether every `logprobs` model is anchored; a false value does
-/// not block a model that has its own anchor.
+/// `anchor`, `coverage` and `monitors` are per model: a configuration is judged against its own
+/// model's rows, not against these aggregates. Each flag reports whether every captured `logprobs`
+/// model has its own passing row; a false value does not block a model that has its row.
+/// `declaration_check` gates every bump. [Registry::missing_for] answers the per-model question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prerequisites {
@@ -367,16 +385,10 @@ pub struct Prerequisites {
     /// A fraction of the layout's slots, not a count, and not 1.0 by default: real serving
     /// reached 92-93% of Qwen3.8's 48x512 slots, so the agreed bar is 0.93 (docs/NUMERICS.md §5).
     pub coverage_slots: f64,
-    /// Coverage inputs that reach at least [`Self::coverage_slots`] of the routed slots.
+    /// Reported per model: a [[coverage]] row that reaches [`Self::coverage_slots`].
     pub coverage: bool,
-    /// The committed dump the true `coverage` flag rests on, under `numerics/coverage/`.
-    #[serde(default)]
-    pub coverage_dump: Option<String>,
-    /// Per-layer and per-expert error monitors.
+    /// Reported per model: a [[monitors]] row that meets its bars.
     pub monitors: bool,
-    /// The committed pair the true `monitors` flag rests on.
-    #[serde(default)]
-    pub monitors_pair: Option<MonitorPair>,
 }
 
 impl Prerequisites {
@@ -591,6 +603,12 @@ pub struct Registry {
     /// The frozen anchors.
     #[serde(default)]
     pub anchor: Vec<AnchorEntry>,
+    /// The per-model coverage evidence (docs/NUMERICS.md §5); one row a model.
+    #[serde(default)]
+    pub coverage: Vec<CoverageEntry>,
+    /// The per-model monitor evidence (docs/NUMERICS.md §5); one row a model.
+    #[serde(default)]
+    pub monitors: Vec<MonitorsEntry>,
     /// The served configurations.
     #[serde(default)]
     pub config: Vec<ConfigEntry>,
@@ -641,15 +659,27 @@ impl Registry {
                  routed (layer, expert) slots a coverage dump must reach"
             )));
         }
-        match &self.prerequisites.monitors_pair {
-            Some(pair) => check_monitor_pair(pair)?,
-            None if self.prerequisites.monitors => {
-                return Err(NumericsError::Invalid(
-                    "prerequisites.monitors is true, but it names no monitors_pair; the flag is                      flipped by the reviewed edit that commits the pair it rests on                      (docs/NUMERICS.md §5)"
-                        .to_owned(),
-                ));
+        let mut covered = BTreeSet::new();
+        for row in &self.coverage {
+            check_model(&row.model)?;
+            check_coverage_entry(row)?;
+            if !covered.insert(row.model.clone()) {
+                return Err(NumericsError::Invalid(format!(
+                    "{} has more than one [[coverage]] row; one row a model",
+                    row.model
+                )));
             }
-            None => {}
+        }
+        let mut monitored = BTreeSet::new();
+        for row in &self.monitors {
+            check_model(&row.model)?;
+            check_monitors_entry(row)?;
+            if !monitored.insert(row.model.clone()) {
+                return Err(NumericsError::Invalid(format!(
+                    "{} has more than one [[monitors]] row; one row a model",
+                    row.model
+                )));
+            }
         }
         let mut seen = BTreeSet::new();
         for entry in &self.config {
@@ -736,47 +766,97 @@ impl Registry {
     pub fn anchor_for(&self, model: &str) -> Option<&AnchorEntry> {
         self.anchor.iter().find(|anchor| anchor.model == model)
     }
+
+    /// The coverage row for a model, if the registry holds one.
+    #[must_use]
+    pub fn coverage_for(&self, model: &str) -> Option<&CoverageEntry> {
+        self.coverage.iter().find(|row| row.model == model)
+    }
+
+    /// The monitors row for a model, if the registry holds one.
+    #[must_use]
+    pub fn monitors_for(&self, model: &str) -> Option<&MonitorsEntry> {
+        self.monitors.iter().find(|row| row.model == model)
+    }
+
+    /// The per-model prerequisites a bump on `model` needs that the registry does not hold.
+    ///
+    /// This answers the per-model question [Prerequisites] reports the aggregate of: the model's
+    /// own frozen anchor, its own [[coverage]] row and its own [[monitors]] row. The global
+    /// [Prerequisites::declaration_check] is not repeated here; [Prerequisites::missing] reports
+    /// it. Whether a row's dump passes its bar is `scripts/numerics.py ci`'s judgement - the
+    /// embedded registry names the evidence, it does not read it - so a present row is answered as
+    /// present here.
+    #[must_use]
+    pub fn missing_for(&self, model: &str) -> Vec<&'static str> {
+        [
+            ("anchor", self.anchor_for(model).is_some()),
+            ("coverage", self.coverage_for(model).is_some()),
+            ("monitors", self.monitors_for(model).is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, present)| (!present).then_some(name))
+        .collect()
+    }
 }
 
-fn check_monitor_pair(pair: &MonitorPair) -> Result<(), NumericsError> {
-    for (field, path) in [
-        ("reference", &pair.reference),
-        ("candidate", &pair.candidate),
-    ] {
+fn check_coverage_entry(row: &CoverageEntry) -> Result<(), NumericsError> {
+    if !row.dump.starts_with("numerics/coverage/")
+        || !row.dump.ends_with(".json")
+        || row.dump.split('/').any(|part| part == ".." || part == ".")
+    {
+        return Err(NumericsError::Invalid(format!(
+            "[[coverage]] {:?}: dump {:?} is not a JSON dump under numerics/coverage/",
+            row.model, row.dump
+        )));
+    }
+    if row.min_inputs == 0 {
+        return Err(NumericsError::Invalid(format!(
+            "[[coverage]] {:?}: min_inputs 0; it is the declared coverage suite's input floor",
+            row.model
+        )));
+    }
+    Ok(())
+}
+
+fn check_monitors_entry(row: &MonitorsEntry) -> Result<(), NumericsError> {
+    for (field, path) in [("reference", &row.reference), ("candidate", &row.candidate)] {
         if !path.starts_with("numerics/monitors/")
             || !path.ends_with(".json")
             || path.split('/').any(|part| part == ".." || part == ".")
         {
             return Err(NumericsError::Invalid(format!(
-                "prerequisites.monitors_pair.{field} {path:?} is not a JSON dump under \
-                 numerics/monitors/"
+                "[[monitors]] {:?}: {field} {path:?} is not a JSON dump under numerics/monitors/",
+                row.model
             )));
         }
     }
-    for (field, bar) in [
-        ("layer_bar", pair.layer_bar),
-        ("expert_bar", pair.expert_bar),
-    ] {
+    for (field, bar) in [("layer_bar", row.layer_bar), ("expert_bar", row.expert_bar)] {
         if !(bar.is_finite() && bar > 0.0) {
             return Err(NumericsError::Invalid(format!(
-                "prerequisites.monitors_pair.{field} {bar} is not finite and positive; it is the \
-                 relative-error bar a committed monitor pair must meet"
+                "[[monitors]] {:?}: {field} {bar} is not finite and positive; it is the \
+                 relative-error bar a committed monitor row must meet",
+                row.model
             )));
         }
     }
     Ok(())
 }
 
-fn check_key(key: &ConfigKey) -> Result<(), NumericsError> {
+fn check_model(model: &str) -> Result<(), NumericsError> {
     if !crate::descriptor::MODELS
         .iter()
-        .any(|model| model.id == key.model)
+        .any(|known| known.id == model)
     {
         return Err(NumericsError::Invalid(format!(
-            "{key}: {:?} is not a model id this build serves",
-            key.model
+            "{model:?} is not a model id this build serves"
         )));
     }
+    Ok(())
+}
+
+fn check_key(key: &ConfigKey) -> Result<(), NumericsError> {
+    check_model(&key.model)?;
     if key.world == 0 {
         return Err(NumericsError::Invalid(format!("{key}: world 0")));
     }
@@ -1030,7 +1110,21 @@ mod tests {
     use super::*;
 
     const QWEN: &str = "nvidia/Qwen3.8-Flash-Next-NVFP4";
+    const GLM: &str = "zai-org/GLM-5.3-Flash";
     const FINGERPRINT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const COVERAGE_ROW: &str = concat!(
+        "[[coverage]]\n",
+        "model = \"nvidia/Qwen3.8-Flash-Next-NVFP4\"\n",
+        "dump = \"numerics/coverage/q.json\"\n",
+        "min_inputs = 8\n",
+    );
+    const MONITORS_ROW: &str = concat!(
+        "[[monitors]]\n",
+        "model = \"zai-org/GLM-5.3-Flash\"\n",
+        "reference = \"numerics/monitors/r.json\"\n",
+        "candidate = \"numerics/monitors/c.json\"\n",
+        "layer_bar = 0.5\nexpert_bar = 0.5\n",
+    );
 
     fn registry_with(entries: &str) -> String {
         format!(
@@ -1300,9 +1394,8 @@ mod tests {
 
     #[test]
     fn prerequisites_name_what_is_missing() {
-        // Derived from the registry rather than spelled out, so turning a prerequisite on is one
-        // reviewed edit and not two. On 2026-11-19 all four are on: anchor, declaration_check,
-        // coverage (with its swept dump) and monitors (with the first judged pair).
+        // The aggregate flags are reports of the per-model rows; derived from the registry rather
+        // than spelled out, so turning one on is one reviewed edit and not two.
         let registry = Registry::embedded().unwrap();
         let expected: Vec<&str> = [
             ("anchor", registry.prerequisites.anchor),
@@ -1318,33 +1411,139 @@ mod tests {
         .map(|(name, _)| *name)
         .collect();
         assert_eq!(registry.prerequisites.missing(), expected);
-        assert!(registry.prerequisites.monitors_pair.is_some());
     }
 
     #[test]
-    fn a_true_monitors_flag_requires_a_pair() {
-        let text = registry_with("").replace("monitors = false", "monitors = true");
-        let error = Registry::from_toml(&text).unwrap_err().to_string();
-        assert!(error.contains("monitors_pair"), "{error}");
+    fn the_per_model_rows_answer_for_their_model() {
+        let registry = Registry::embedded().unwrap();
+        // Qwen3.8 has the coverage row; GLM-5.3 has the monitors row. Neither has both, which is
+        // why both aggregate flags are false and every unapproved bump is refused today.
+        assert!(registry.coverage_for(QWEN).is_some());
+        assert!(registry.monitors_for(QWEN).is_none());
+        assert!(registry.monitors_for(GLM).is_some());
+        assert!(registry.coverage_for(GLM).is_none());
+        assert_eq!(registry.coverage_for(QWEN).unwrap().min_inputs, 8);
+        assert_eq!(registry.missing_for(QWEN), ["monitors"]);
+        assert_eq!(registry.missing_for(GLM), ["coverage"]);
+        assert_eq!(
+            registry.missing_for("acme/unknown"),
+            ["anchor", "coverage", "monitors"]
+        );
     }
 
     #[test]
-    fn a_malformed_monitor_pair_is_refused() {
-        let good = "monitors_pair = { reference = \"numerics/monitors/r.json\", \
-                    candidate = \"numerics/monitors/c.json\", layer_bar = 0.5, expert_bar = 0.5 }";
-        let text =
-            registry_with("").replace("monitors = false", &format!("monitors = false\n{good}"));
-        Registry::from_toml(&text).expect("a false flag may name a well-formed pair");
-        for bad in [
-            good.replace("numerics/monitors/r.json", "docs/numerics/r.json"),
-            good.replace("numerics/monitors/r.json", "numerics/monitors/../r.json"),
-            good.replace("layer_bar = 0.5", "layer_bar = 0.0"),
-            good.replace("expert_bar = 0.5", "expert_bar = -1.0"),
+    fn the_per_model_tables_parse() {
+        let text = registry_with(&format!("{COVERAGE_ROW}{MONITORS_ROW}"));
+        let registry = Registry::from_toml(&text).expect("well-formed per-model rows parse");
+        assert_eq!(registry.coverage.len(), 1);
+        assert_eq!(registry.coverage[0].dump, "numerics/coverage/q.json");
+        assert_eq!(registry.coverage[0].min_inputs, 8);
+        assert_eq!(registry.monitors.len(), 1);
+        assert_eq!(registry.monitors[0].model, GLM);
+        assert_eq!(registry.monitors[0].layer_bar, 0.5);
+    }
+
+    #[test]
+    fn the_aggregate_flags_are_reports_not_rows() {
+        // A true flag makes a claim about every captured logprobs model; `scripts/numerics.py ci`
+        // judges it against the rows and their dumps. The parser only reads the rows it is given.
+        let text = registry_with(COVERAGE_ROW)
+            .replace("coverage = false", "coverage = true")
+            .replace("monitors = false", "monitors = true");
+        let registry = Registry::from_toml(&text).expect("the aggregate flags are reports");
+        assert!(registry.prerequisites.coverage);
+        assert!(registry.prerequisites.monitors);
+    }
+
+    #[test]
+    fn a_malformed_coverage_row_is_refused() {
+        Registry::from_toml(&registry_with(COVERAGE_ROW)).expect("a well-formed row parses");
+        for (bad, needle) in [
+            (
+                COVERAGE_ROW.replace("numerics/coverage/q.json", "docs/numerics/q.json"),
+                "coverage",
+            ),
+            (
+                COVERAGE_ROW.replace("numerics/coverage/q.json", "numerics/coverage/../q.json"),
+                "coverage",
+            ),
+            (
+                COVERAGE_ROW.replace("numerics/coverage/q.json", "numerics/coverage/q.txt"),
+                "coverage",
+            ),
+            (
+                COVERAGE_ROW.replace("min_inputs = 8", "min_inputs = 0"),
+                "coverage",
+            ),
+            (
+                COVERAGE_ROW.replace("min_inputs = 8", "min_inputs = -1"),
+                "min_inputs",
+            ),
+            (COVERAGE_ROW.replace("min_inputs = 8\n", ""), "min_inputs"),
+            (
+                COVERAGE_ROW.replace("model = \"nvidia/Qwen3.8-Flash-Next-NVFP4\"\n", ""),
+                "model",
+            ),
+            (
+                COVERAGE_ROW.replace(
+                    "model = \"nvidia/Qwen3.8-Flash-Next-NVFP4\"",
+                    "model = \"nvidia/Qwen3.8-Flash-Next-NVFP4\"\nunknown_key = 1",
+                ),
+                "unknown",
+            ),
+            (COVERAGE_ROW.replace(QWEN, "acme/unknown"), "not a model id"),
+            (format!("{COVERAGE_ROW}{COVERAGE_ROW}"), "more than one"),
         ] {
-            let text =
-                registry_with("").replace("monitors = false", &format!("monitors = false\n{bad}"));
-            let error = Registry::from_toml(&text).unwrap_err().to_string();
-            assert!(error.contains("monitors_pair"), "{error}");
+            let error = Registry::from_toml(&registry_with(&bad))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{needle}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_monitors_row_is_refused() {
+        Registry::from_toml(&registry_with(MONITORS_ROW)).expect("a well-formed row parses");
+        for (bad, needle) in [
+            (
+                MONITORS_ROW.replace("numerics/monitors/r.json", "docs/numerics/r.json"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("numerics/monitors/r.json", "numerics/monitors/../r.json"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("numerics/monitors/c.json", "numerics/monitors/c.txt"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("layer_bar = 0.5", "layer_bar = 0.0"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("expert_bar = 0.5", "expert_bar = -1.0"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("expert_bar = 0.5", "expert_bar = nan"),
+                "monitors",
+            ),
+            (
+                MONITORS_ROW.replace("model = \"zai-org/GLM-5.3-Flash\"\n", ""),
+                "model",
+            ),
+            (
+                MONITORS_ROW.replace("layer_bar = 0.5", "surprise = 1"),
+                "unknown",
+            ),
+            (MONITORS_ROW.replace(GLM, "acme/unknown"), "not a model id"),
+            (format!("{MONITORS_ROW}{MONITORS_ROW}"), "more than one"),
+        ] {
+            let error = Registry::from_toml(&registry_with(&bad))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{needle}: {error}");
         }
     }
 }

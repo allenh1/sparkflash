@@ -59,11 +59,12 @@ monitors compares a candidate monitor dump with the reference forward, per layer
          expert, reports the experts only one dump routed to, and fails every relative-L2 bar it
          exceeds.
 ci       the declaration check: a changed reference without a version bump fails, a bump without a
-         change fails, a bump while a prerequisite is false fails, a true coverage or monitors flag
-         whose named dump or pair fails its bar fails, an anchor never changes, every
-         fingerprint must match its file, an arm profile's arithmetic setting changes only with
-         every reference of the model it names recaptured, and a field joins the neutral list only
-         with a report.
+         change fails, an unapproved bump whose own model has no [[coverage]] row, no [[monitors]]
+         row, or a row that is malformed or misses its bar fails with the model named (an approved
+         bump needs neither), a true coverage or monitors aggregate flag that claims more than the
+         rows hold fails, an anchor never changes, every fingerprint must match its file, an arm
+         profile's arithmetic setting changes only with every reference of the model it names
+         recaptured, and a field joins the neutral list only with a report.
 """
 
 from __future__ import annotations
@@ -112,13 +113,17 @@ MONITOR_RESULT_SCHEMA = "sparkflash-numerics-monitor-result/1"
 LAYOUT_SCHEMA = "sparkflash-numerics-expert-layout/1"
 LAYOUTS = f"{NUMERICS}/layouts/"
 MONITORS = f"{NUMERICS}/monitors/"
-# The table a true `monitors` flag rests on: the two committed dumps and the bars they are judged
-# at (docs/NUMERICS.md section 5). The shape is exact so a typo cannot silently leave a bar unset.
-MONITOR_PAIR_FIELDS = ("reference", "candidate", "layer_bar", "expert_bar")
+# The per-model evidence tables (docs/NUMERICS.md section 5). A `[[coverage]]` row names one
+# model's committed dump and the suite's input floor; a `[[monitors]]` row names one model's pair
+# and the bars it is judged at. The shapes are exact so a typo cannot silently leave a bar unset.
+COVERAGE_ROW_FIELDS = ("model", "dump", "min_inputs")
+MONITOR_ROW_FIELDS = ("model", "reference", "candidate", "layer_bar", "expert_bar")
 PREREQUISITES = ("anchor", "declaration_check", "coverage", "monitors")
-# The prerequisites that gate every version bump. 'anchor' is not here: it is a per-model
-# requirement (docs/NUMERICS.md section 5), looked up for the bumping configuration's own model.
-GATING_PREREQUISITES = ("declaration_check", "coverage", "monitors")
+# The prerequisites that gate every version bump globally. 'anchor', 'coverage' and 'monitors' are
+# not here: they are per-model requirements (docs/NUMERICS.md section 5), looked up for the bumping
+# configuration's own model. The aggregate flags report those lookups; they do not gate them.
+GATING_PREREQUISITES = ("declaration_check",)
+
 KEY_FIELDS = ("model", "world", "profile", "plan", "arch")
 # An owner's recorded approval of one declared change (docs/NUMERICS.md §5): a one-line decision,
 # the day it was taken, and the report that justifies the change. It sits beside the version it
@@ -681,54 +686,99 @@ def coverage_bar(value: object, origin: str) -> float:
 def monitor_bar(value: object, field: str, origin: str) -> float:
     """One declared monitor bar: a finite, positive relative error. Zero would be a bit gate."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise NumericsFailure(
-            f"{origin}: prerequisites.monitors_pair.{field} {value!r} is not a number"
-        )
+        raise NumericsFailure(f"{origin}: {field} {value!r} is not a number")
     bar = float(value)
     if not math.isfinite(bar) or bar <= 0.0:
         raise NumericsFailure(
-            f"{origin}: prerequisites.monitors_pair.{field} {value!r} is not finite and positive; "
-            "it is the relative-error bar a committed monitor pair must meet"
+            f"{origin}: {field} {value!r} is not finite and positive; it is the relative-error "
+            "bar a committed monitor row must meet"
         )
     return bar
 
 
-def monitor_pair(value: object, origin: str) -> dict:
-    """The pair a true monitors flag rests on: two committed dumps and their two bars."""
+def evidence_path(value: object, directory: str, field: str, origin: str) -> str:
+    """A JSON dump under one of the numerics evidence directories, nothing else."""
+    if not isinstance(value, str) or not value:
+        raise NumericsFailure(f"{origin}: {field} is not a non-empty string")
+    parts = PurePosixPath(value).parts
+    if (
+        not value.startswith(directory)
+        or not value.endswith(".json")
+        or "." in parts
+        or ".." in parts
+    ):
+        raise NumericsFailure(
+            f"{origin}: {field} {value!r} is not a JSON dump under {directory}"
+        )
+    return value
+
+
+def row_label(table: str, value: object, origin: str) -> str:
+    """The error prefix for one evidence row, naming its model whenever the row says one."""
+    model = value.get("model") if isinstance(value, dict) else None
+    if isinstance(model, str) and model:
+        return f"{origin}: [[{table}]] {model!r}"
+    return f"{origin}: [[{table}]]"
+
+
+def row_fields(
+    table: str, value: object, fields: tuple[str, ...], origin: str
+) -> dict:
+    """One evidence table's exact shape, refusing a missing key, an unknown one or no model."""
     if not isinstance(value, dict):
-        raise NumericsFailure(f"{origin}: prerequisites.monitors_pair is not a table")
-    missing = [field for field in MONITOR_PAIR_FIELDS if field not in value]
-    unknown = sorted(set(value) - set(MONITOR_PAIR_FIELDS))
+        raise NumericsFailure(f"{origin}: [[{table}]] is not a table")
+    label = row_label(table, value, origin)
+    missing = [field for field in fields if field not in value]
+    unknown = sorted(set(value) - set(fields))
     if missing:
         raise NumericsFailure(
-            f"{origin}: prerequisites.monitors_pair is missing {missing}; it needs "
-            f"{list(MONITOR_PAIR_FIELDS)}"
+            f"{label} is missing {missing}; it needs {list(fields)}"
         )
     if unknown:
         raise NumericsFailure(
-            f"{origin}: prerequisites.monitors_pair has unknown key(s) {unknown}; it needs "
-            f"{list(MONITOR_PAIR_FIELDS)}"
+            f"{label} has unknown key(s) {unknown}; it needs {list(fields)}"
         )
-    for field in ("reference", "candidate"):
-        path = value[field]
-        if not isinstance(path, str) or not path:
-            raise NumericsFailure(
-                f"{origin}: prerequisites.monitors_pair.{field} is not a non-empty string"
-            )
-        parts = PurePosixPath(path).parts
-        if (
-            not path.startswith(MONITORS)
-            or not path.endswith(".json")
-            or "." in parts
-            or ".." in parts
-        ):
-            raise NumericsFailure(
-                f"{origin}: prerequisites.monitors_pair.{field} {path!r} is not a JSON dump under "
-                f"{MONITORS}"
-            )
-    monitor_bar(value["layer_bar"], "layer_bar", origin)
-    monitor_bar(value["expert_bar"], "expert_bar", origin)
+    model = value["model"]
+    if not isinstance(model, str) or not model:
+        raise NumericsFailure(f"{label}: model is not a non-empty string")
     return value
+
+
+def coverage_row(value: object, origin: str) -> dict:
+    """One model's committed coverage dump and its suite input floor (docs/NUMERICS.md §5)."""
+    row = row_fields("coverage", value, COVERAGE_ROW_FIELDS, origin)
+    label = row_label("coverage", row, origin)
+    evidence_path(row["dump"], f"{NUMERICS}/coverage/", "dump", label)
+    inputs = row["min_inputs"]
+    if isinstance(inputs, bool) or not isinstance(inputs, int) or inputs <= 0:
+        raise NumericsFailure(
+            f"{label}: min_inputs {inputs!r} is not a positive integer; it is the declared "
+            "coverage suite's input floor"
+        )
+    return row
+
+
+def monitors_row(value: object, origin: str) -> dict:
+    """One model's committed monitor pair and the bars it is judged at (docs/NUMERICS.md §5)."""
+    row = row_fields("monitors", value, MONITOR_ROW_FIELDS, origin)
+    label = row_label("monitors", row, origin)
+    for field in ("reference", "candidate"):
+        evidence_path(row[field], MONITORS, field, label)
+    monitor_bar(row["layer_bar"], "layer_bar", label)
+    monitor_bar(row["expert_bar"], "expert_bar", label)
+    return row
+
+
+def one_row_a_model(rows: list[dict], table: str, origin: str) -> None:
+    """Refuse a second row for a model: one row a model, so the lookup is unambiguous."""
+    seen = set()
+    for row in rows:
+        if row["model"] in seen:
+            raise NumericsFailure(
+                f"{origin}: [[{table}]] has more than one row for model {row['model']!r}; "
+                "one row a model"
+            )
+        seen.add(row["model"])
 
 
 def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
@@ -744,30 +794,16 @@ def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
     # history); the head always states it. A bar that is present is valid everywhere.
     if require_bar or "coverage_slots" in prerequisites:
         coverage_bar(prerequisites.get("coverage_slots"), origin)
-    dump = prerequisites.get("coverage_dump")
-    if dump is not None:
-        if not isinstance(dump, str) or not dump:
-            raise NumericsFailure(f"{origin}: prerequisites.coverage_dump is not a non-empty string")
-        if not dump.startswith(f"{NUMERICS}/coverage/") or not dump.endswith(".json"):
-            raise NumericsFailure(
-                f"{origin}: prerequisites.coverage_dump {dump!r} is not a JSON dump under "
-                f"{NUMERICS}/coverage/"
-            )
-    elif prerequisites["coverage"]:
-        raise NumericsFailure(
-            f"{origin}: prerequisites.coverage is true, but it names no coverage_dump; the flag "
-            "is flipped by the reviewed edit that commits the dump it rests on (docs/NUMERICS.md §5)"
-        )
-    pair = prerequisites.get("monitors_pair")
-    if pair is not None:
-        monitor_pair(pair, origin)
-    elif prerequisites["monitors"]:
-        raise NumericsFailure(
-            f"{origin}: prerequisites.monitors is true, but it names no monitors_pair; the flag "
-            "is flipped by the reviewed edit that commits the pair it rests on "
-            "(docs/NUMERICS.md §5)"
-        )
-    for table in ("config", "anchor", "retired"):
+    # The evidence is per model (docs/NUMERICS.md §5): every row is validated here, so a malformed
+    # row cannot silently leave a bar unset, and two rows for one model cannot disagree.
+    for table, check in (("coverage", coverage_row), ("monitors", monitors_row)):
+        rows = registry.get(table, [])
+        if not isinstance(rows, list):
+            raise NumericsFailure(f"{origin}: [[{table}]] is not an array of tables")
+        for row in rows:
+            check(row, origin)
+        one_row_a_model(rows, table, origin)
+    for table in ("config", "anchor", "retired", "coverage", "monitors"):
         registry.setdefault(table, [])
     return registry
 
@@ -775,9 +811,9 @@ def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
 def approval_problem(entry: dict) -> str | None:
     """Why an entry's `approved` block is not a usable record, or None when it is well formed.
 
-    The block names the owner's decision that lets one bump land past the three global
-    prerequisites (docs/NUMERICS.md §5). Its report's existence and freshness are judged at the
-    bump, because a carried record's report belongs to an earlier change.
+    The block names the owner's decision that lets one bump land past its model's coverage and
+    monitors prerequisites (docs/NUMERICS.md §5). Its report's existence and freshness are judged
+    at the bump, because a carried record's report belongs to an earlier change.
     """
     approved = entry.get("approved")
     if approved is None:
@@ -829,6 +865,32 @@ def anchor_for(registry: dict, model: str) -> dict | None:
     configuration's own model, not a single global answer that every arm has to satisfy.
     """
     return next((anchor for anchor in registry["anchor"] if anchor["model"] == model), None)
+
+
+def coverage_for(registry: dict, model: str) -> dict | None:
+    """The coverage row for one model, if the registry holds one (docs/NUMERICS.md §5)."""
+    return next((row for row in registry.get("coverage", []) if row["model"] == model), None)
+
+
+def monitors_for(registry: dict, model: str) -> dict | None:
+    """The monitors row for one model, if the registry holds one (docs/NUMERICS.md §5)."""
+    return next((row for row in registry.get("monitors", []) if row["model"] == model), None)
+
+
+def logprobs_models(registry: dict) -> list[str]:
+    """The models whose captured evidence is logprobs: what the aggregate flags report over.
+
+    A model with no captured reference is not yet part of the aggregate: it has nothing a
+    prerequisite could qualify. Text evidence is exempt from these comparisons, as it is from the
+    anchor, because a text reference has no token ids and no logprobs to compare.
+    """
+    return sorted(
+        {
+            entry["model"]
+            for entry in registry.get("config", [])
+            if "reference" in entry and entry.get("evidence") not in ANCHOR_EXEMPT_EVIDENCE
+        }
+    )
 
 
 def forced_captures(paths: list[str], read: Callable[[str], bytes | None]) -> dict[str, set[str]]:
@@ -1196,24 +1258,39 @@ def declaration_findings(
             for prerequisite in GATING_PREREQUISITES
             if prerequisite in base_missing or prerequisite in head_missing
         ]
-        if gating_missing:
-            # The approval path (docs/NUMERICS.md §5): an entry may carry the owner's recorded
-            # decision instead, and its report is what this change adds. It replaces only these
-            # three global prerequisites; the declared change, the entry's own report and the
-            # per-model anchor rules below still apply.
-            if approval is None or problem is not None or read_head(approval["report"]) is None:
-                findings.append(
-                    f"{name}: version {entry['version']} declares an arithmetic change, but "
-                    f"prerequisites {gating_missing} are not in place "
-                    "(docs/NUMERICS.md §5); until they are, the gate is bit-exact, or record the "
-                    "owner's approval as decision, date and report beside the entry"
-                )
-            elif changed.get(approval["report"]) not in ("A", "M"):
-                findings.append(
-                    f"{name}: version {entry['version']} would land under the approval recorded at "
-                    f"version {old['version']}, but its report {approval['report']} is not new or "
-                    "changed in this change; an approval names the report that justifies its bump"
-                )
+        # Coverage and monitors are per model, like the anchor (docs/NUMERICS.md §5): this bump is
+        # judged against its own model's rows, not against the aggregate flags. A model with no row
+        # has that prerequisite missing, and a row that does not pass is not usable. The approval
+        # path replaces these per-model problems (and the global declaration check) for one bump;
+        # the declared change, the entry's own report and the model's anchor below still apply.
+        per_model = model_evidence_problems(head, read_head, entry["model"])
+        approval_ok = (
+            approval is not None
+            and problem is None
+            and read_head(approval["report"]) is not None
+        )
+        if gating_missing and not approval_ok:
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change, but "
+                f"prerequisites {gating_missing} are not in place "
+                "(docs/NUMERICS.md §5); until they are, the gate is bit-exact, or record the "
+                "owner's approval as decision, date and report beside the entry"
+            )
+        if per_model and not approval_ok:
+            findings.append(
+                f"{name}: version {entry['version']} declares an arithmetic change, but "
+                f"{entry['model']!r} has no passing per-model evidence: "
+                + "; ".join(per_model)
+                + " (docs/NUMERICS.md §5); add the model's [[coverage]] and [[monitors]] rows "
+                "with their committed evidence, or record the owner's approval as decision, "
+                "date and report beside the entry"
+            )
+        if (gating_missing or per_model) and approval_ok and changed.get(approval["report"]) not in ("A", "M"):
+            findings.append(
+                f"{name}: version {entry['version']} would land under the approval recorded at "
+                f"version {old['version']}, but its report {approval['report']} is not new or "
+                "changed in this change; an approval names the report that justifies its bump"
+            )
         # The anchor is per model (docs/NUMERICS.md §4): this entry is judged against its own
         # model's frozen anchor and the teacher-forced capture made from it. A text reference has
         # no token ids to force, so it can neither be anchored nor bump; that is DeepSeek's
@@ -1387,103 +1464,182 @@ def read_at(revision: str | None) -> Callable[[str], bytes | None]:
     return read
 
 
-def coverage_findings(registry: dict, read: Callable[[str], bytes | None]) -> list[str]:
-    """Judge the dump the coverage prerequisite rests on, when its flag is true.
-
-    The flag is not a claim on its own: it is true only when `coverage_dump` names a committed
-    dump whose model has a committed layout and whose reached slots meet `coverage_slots`. A
-    false flag decides nothing and needs no dump.
-    """
-    prerequisites = registry["prerequisites"]
-    if not prerequisites["coverage"]:
-        return []
-    path = prerequisites["coverage_dump"]
+def coverage_row_result(registry: dict, row: dict, read: Callable[[str], bytes | None]) -> dict:
+    """Judge one model's [[coverage]] row: its dump against its layout and the shared bar."""
+    path = row["dump"]
     data = read(path)
     if data is None:
-        return [
-            f"prerequisites.coverage is true, but its coverage_dump {path} does not exist; the "
-            "flag is flipped by the reviewed edit that commits the dump (docs/NUMERICS.md §5)"
-        ]
+        raise NumericsFailure(
+            f"its [[coverage]] dump {path} does not exist; a row is committed with its dump "
+            "(docs/NUMERICS.md §5)"
+        )
     try:
         dump = json.loads(data)
     except json.JSONDecodeError as error:
-        return [f"prerequisites.coverage_dump {path}: not JSON ({error})"]
-    try:
-        model = dump.get("model")
-        if not isinstance(model, str) or not model:
-            raise NumericsFailure("the dump names no model")
-        layout, origin = find_layout(model, None)
-        result = judge_coverage(dump, layout, origin, 1, prerequisites.get("coverage_slots"))
-    except NumericsFailure as error:
-        return [f"prerequisites.coverage_dump {path}: {error}"]
-    if result["passes"]:
+        raise NumericsFailure(f"its [[coverage]] dump {path} is not JSON ({error})") from error
+    if not isinstance(dump, dict):
+        raise NumericsFailure(f"its [[coverage]] dump {path} is not a JSON object")
+    model = dump.get("model")
+    if model != row["model"]:
+        raise NumericsFailure(
+            f"its [[coverage]] dump {path} names {model!r}, but the row is for {row['model']!r}"
+        )
+    layout, layout_origin = find_layout(row["model"], None)
+    return judge_coverage(
+        dump,
+        layout,
+        layout_origin,
+        row["min_inputs"],
+        registry["prerequisites"].get("coverage_slots"),
+    )
+
+
+def coverage_row_findings(registry: dict, read: Callable[[str], bytes | None]) -> tuple[dict[str, dict], list[str]]:
+    """Judge every committed [[coverage]] row: the passing ones by model, and the findings."""
+    results, findings = {}, []
+    for row in registry.get("coverage", []):
+        try:
+            result = coverage_row_result(registry, row, read)
+        except NumericsFailure as error:
+            findings.append(f"[[coverage]] {row['model']!r}: {error}")
+            continue
+        if result["passes"]:
+            results[row["model"]] = result
+        else:
+            findings.append(
+                f"[[coverage]] {row['model']!r}: achieved {result['coverage']:.2%} of "
+                f"{result['experts']} routed (layer, expert) slots, below the declared "
+                f"{result['bar']:.2%} bar"
+            )
+    return results, findings
+
+
+def coverage_aggregate_findings(registry: dict, results: dict[str, dict]) -> list[str]:
+    """The aggregate `coverage` flag's own claim: true only when every captured model passes.
+
+    A false flag with a model lacking a row is consistent - the per-model bump check is what
+    refuses that model - but a true flag that claims more than the rows hold is not
+    (docs/NUMERICS.md §5).
+    """
+    if not registry["prerequisites"]["coverage"]:
+        return []
+    uncovered = [model for model in logprobs_models(registry) if model not in results]
+    if not uncovered:
         return []
     return [
-        f"prerequisites.coverage_dump {path}: achieved {result['coverage']:.2%} of "
-        f"{result['experts']} routed (layer, expert) slots, below the declared "
-        f"{result['bar']:.2%} bar"
+        "prerequisites.coverage is true, but these captured logprobs models have no passing "
+        f"[[coverage]] row: {uncovered}; the flag reports the aggregate, so it cannot claim more "
+        "than the registry holds"
     ]
 
 
-def monitor_pair_result(
-    registry: dict, read: Callable[[str], bytes | None]
-) -> tuple[dict | None, list[str]]:
-    """Judge the committed pair a true monitors flag rests on, and return its result.
+def coverage_findings(registry: dict, read: Callable[[str], bytes | None]) -> list[str]:
+    """The [[coverage]]-scoped check: every row is judged, and the aggregate flag reports them.
 
-    The flag is not a claim on its own: it is true only when `monitors_pair` names two committed
-    dumps that parse, run the same model and probe, and meet the declared layer and expert bars
-    over the experts both hold. A false flag decides nothing and reads no pair.
+    A row is evidence, so it is judged whether or not the aggregate flag is true.
     """
-    prerequisites = registry["prerequisites"]
-    if not prerequisites["monitors"]:
-        return None, []
-    pair = prerequisites.get("monitors_pair")
-    if pair is None:
-        return None, [
-            "prerequisites.monitors is true, but it names no monitors_pair; the flag is flipped by "
-            "the reviewed edit that commits the pair it rests on (docs/NUMERICS.md §5)"
-        ]
-    try:
-        monitor_pair(pair, "prerequisites")
-    except NumericsFailure as error:
-        return None, [str(error)]
-    missing = [
-        path for path in (pair["reference"], pair["candidate"]) if read(path) is None
-    ]
+    results, findings = coverage_row_findings(registry, read)
+    return findings + coverage_aggregate_findings(registry, results)
+
+
+def monitor_row_result(row: dict, read: Callable[[str], bytes | None]) -> tuple[dict | None, list[str]]:
+    """Judge one model's [[monitors]] row: two committed dumps at the row's bars."""
+    label = f"[[monitors]] {row['model']!r}"
+    missing = [path for path in (row["reference"], row["candidate"]) if read(path) is None]
     if missing:
-        return None, [
-            f"prerequisites.monitors is true, but its monitors_pair does not exist: "
-            f"{', '.join(missing)}; the flag is flipped by the reviewed edit that commits the pair "
-            "(docs/NUMERICS.md §5)"
-        ]
+        return None, [f"{label}: its dump does not exist: {', '.join(missing)}"]
     dumps = {}
-    for path in (pair["reference"], pair["candidate"]):
+    for path in (row["reference"], row["candidate"]):
         data = read(path)
         assert data is not None
         try:
             document = json.loads(data)
         except json.JSONDecodeError as error:
-            return None, [f"prerequisites.monitors_pair {path}: not JSON ({error})"]
+            return None, [f"{label}: {path} is not JSON ({error})"]
         try:
             dumps[path] = check_monitor_dump(document, path)
         except NumericsFailure as error:
-            return None, [str(error)]
+            return None, [f"{label}: {error}"]
+        if dumps[path]["model"] != row["model"]:
+            return None, [
+                f"{label}: {path} names {dumps[path]['model']!r}, but the row is for "
+                f"{row['model']!r}"
+            ]
     try:
         result = judge_monitors(
-            dumps[pair["reference"]],
-            dumps[pair["candidate"]],
-            float(pair["layer_bar"]),
-            float(pair["expert_bar"]),
+            dumps[row["reference"]],
+            dumps[row["candidate"]],
+            float(row["layer_bar"]),
+            float(row["expert_bar"]),
         )
     except NumericsFailure as error:
-        return None, [f"prerequisites.monitors_pair: {error}"]
-    findings = [f"prerequisites.monitors_pair: {failure}" for failure in result["failures"]]
-    return result, findings
+        return None, [f"{label}: {error}"]
+    return result, [f"{label}: {failure}" for failure in result["failures"]]
+
+
+def monitor_row_results(
+    registry: dict, read: Callable[[str], bytes | None]
+) -> tuple[dict[str, dict], list[str]]:
+    """Judge every committed [[monitors]] row: the passing ones by model, and the findings."""
+    results, findings = {}, []
+    for row in registry.get("monitors", []):
+        result, problems = monitor_row_result(row, read)
+        findings += problems
+        if result is not None and result["pass"]:
+            results[row["model"]] = result
+    return results, findings
+
+
+def monitors_aggregate_findings(registry: dict, results: dict[str, dict]) -> list[str]:
+    """The aggregate `monitors` flag's own claim: true only when every captured model passes."""
+    if not registry["prerequisites"]["monitors"]:
+        return []
+    uncovered = [model for model in logprobs_models(registry) if model not in results]
+    if not uncovered:
+        return []
+    return [
+        "prerequisites.monitors is true, but these captured logprobs models have no passing "
+        f"[[monitors]] row: {uncovered}; the flag reports the aggregate, so it cannot claim more "
+        "than the registry holds"
+    ]
 
 
 def monitors_findings(registry: dict, read: Callable[[str], bytes | None]) -> list[str]:
-    """The bar findings of the pair a true monitors flag names, or [] when it passes."""
-    return monitor_pair_result(registry, read)[1]
+    """The [[monitors]]-scoped check: every row is judged, and the aggregate flag reports them."""
+    results, findings = monitor_row_results(registry, read)
+    return findings + monitors_aggregate_findings(registry, results)
+
+
+def model_evidence_problems(registry: dict, read: Callable[[str], bytes | None], model: str) -> list[str]:
+    """Why one model's own coverage and monitors prerequisites are not in place.
+
+    A bump is judged against the bumping entry's model (docs/NUMERICS.md §5), not against the
+    aggregate flags: a model with no row has that prerequisite missing, and a row whose dump is
+    absent, names another model, or misses its bar is not usable. An `approved` record replaces
+    these problems for one bump; nothing else does.
+    """
+    problems = []
+    coverage = coverage_for(registry, model)
+    if coverage is None:
+        problems.append(f"the model {model!r} has no [[coverage]] row")
+    else:
+        try:
+            result = coverage_row_result(registry, coverage, read)
+        except NumericsFailure as error:
+            problems.append(f"the model {model!r}'s [[coverage]] row is unusable: {error}")
+        else:
+            if not result["passes"]:
+                problems.append(
+                    f"the model {model!r}'s [[coverage]] dump achieves {result['coverage']:.2%}, "
+                    f"below the declared {result['bar']:.2%} bar"
+                )
+    monitors = monitors_for(registry, model)
+    if monitors is None:
+        problems.append(f"the model {model!r} has no [[monitors]] row")
+    else:
+        _, row_findings = monitor_row_result(monitors, read)
+        problems += row_findings
+    return problems
 
 
 def run_ci(base_argument: str | None) -> int:
@@ -1515,60 +1671,80 @@ def run_ci(base_argument: str | None) -> int:
     findings = declaration_findings(
         base_registry, head_registry, read_base, read_head, changed, forced
     )
-    anchor_checks, coverage = anchor_findings(head_registry, read_head, capture_paths)
+    anchor_checks, anchor_coverage = anchor_findings(head_registry, read_head, capture_paths)
     findings += anchor_checks
-    findings += coverage_findings(head_registry, read_head)
-    monitor_result, monitor_checks = monitor_pair_result(head_registry, read_head)
+    coverage_results, coverage_checks = coverage_row_findings(head_registry, read_head)
+    findings += coverage_checks
+    findings += coverage_aggregate_findings(head_registry, coverage_results)
+    monitor_results, monitor_checks = monitor_row_results(head_registry, read_head)
     findings += monitor_checks
+    findings += monitors_aggregate_findings(head_registry, monitor_results)
+    prerequisites = head_registry["prerequisites"]
     configs, anchors = len(head_registry["config"]), len(head_registry["anchor"])
     missing = missing_prerequisites(head_registry)
     print(
         f"numerics ci: base {base[:12]}, {configs} configuration(s), {anchors} anchor(s), "
-        f"{len(changed)} changed path(s); prerequisites missing: {missing or 'none'}"
+        f"{len(head_registry['coverage'])} coverage row(s), "
+        f"{len(head_registry['monitors'])} monitors row(s), "
+        f"{len(changed)} changed path(s); aggregate prerequisites missing: {missing or 'none'}"
     )
-    prerequisites = head_registry["prerequisites"]
-    if prerequisites["coverage"]:
-        print(
-            f"numerics ci: coverage prerequisite: {prerequisites['coverage_dump']} at "
-            f"{coverage_bar(prerequisites.get('coverage_slots'), REGISTRY):.2%} of routed "
-            "(layer, expert) slots"
+    bar = coverage_bar(prerequisites.get("coverage_slots"), REGISTRY)
+    for row in head_registry["coverage"]:
+        result = coverage_results.get(row["model"])
+        state = (
+            f"{result['covered_experts']} of {result['experts']} routed (layer, expert) slots "
+            f"({result['coverage']:.2%}), bar {bar:.2%}, {result['inputs']} input(s) >= "
+            f"{row['min_inputs']}"
+            if result is not None
+            else f"FAILED, bar {bar:.2%}, min_inputs {row['min_inputs']}"
         )
-    if prerequisites["monitors"]:
-        pair = prerequisites["monitors_pair"]
+        print(f"numerics ci: coverage row {row['model']}: {row['dump']} {state}")
+    for row in head_registry["monitors"]:
+        result = monitor_results.get(row["model"])
         print(
-            f"numerics ci: monitors prerequisite: {pair['reference']} vs {pair['candidate']} at "
-            f"layer bar {float(pair['layer_bar']):.3e} and expert bar "
-            f"{float(pair['expert_bar']):.3e}"
+            f"numerics ci: monitors row {row['model']}: {row['reference']} vs "
+            f"{row['candidate']} at layer bar {float(row['layer_bar']):.3e} and expert bar "
+            f"{float(row['expert_bar']):.3e}"
         )
-        if monitor_result is not None:
-            routing = monitor_result["routing"]
-            maxima = monitor_result["maxima"]
+        if result is not None:
+            routing = result["routing"]
+            maxima = result["maxima"]
             expert_maximum = (
                 "no shared expert"
                 if maxima["expert"] is None
                 else f"{maxima['expert']:.3e}"
             )
             print(
-                f"numerics ci: monitors routing: {routing['layers_differing']} of "
-                f"{len(monitor_result['layers'])} layer(s) differ, "
-                f"{routing['experts_unshared']} expert(s) unshared; achieved maxima layer "
-                f"{maxima['layer']:.3e}, expert {expert_maximum}"
+                f"numerics ci: monitors routing {row['model']}: {routing['layers_differing']} of "
+                f"{len(result['layers'])} layer(s) differ, {routing['experts_unshared']} expert(s) "
+                f"unshared; achieved maxima layer {maxima['layer']:.3e}, expert {expert_maximum}"
             )
+    for name, results in (("coverage", coverage_results), ("monitors", monitor_results)):
+        uncovered = [model for model in logprobs_models(head_registry) if model not in results]
+        state = (
+            "every captured logprobs model has a passing row"
+            if not uncovered
+            else "no passing row for " + ", ".join(uncovered)
+        )
+        print(
+            f"numerics ci: aggregate {name} prerequisite: "
+            f"{'true' if prerequisites[name] else 'false'}; {state}"
+        )
     print(
         "numerics ci: anchor coverage: "
         + (
-            "covered " + ", ".join(sorted(coverage["covered"]))
-            if coverage["covered"]
+            "covered " + ", ".join(sorted(anchor_coverage["covered"]))
+            if anchor_coverage["covered"]
             else "no logprobs model is anchored"
         )
         + (
-            "; exempt (text evidence) " + ", ".join(coverage["exempt"])
-            if coverage["exempt"]
+            "; exempt (text evidence) " + ", ".join(anchor_coverage["exempt"])
+            if anchor_coverage["exempt"]
             else ""
         )
         + (
-            "; not covered " + ", ".join(sorted(coverage["uncovered"]))
-            if coverage["uncovered"]
+            "; not covered " + ", ".join(sorted(anchor_coverage["uncovered"]))
+            if anchor_coverage["uncovered"]
             else ""
         )
     )
@@ -3076,6 +3252,8 @@ def synthetic_registry(entries: list[dict], prerequisites: bool) -> dict:
         "config": entries,
         "anchor": anchors,
         "retired": [],
+        "coverage": [],
+        "monitors": [],
     }
 
 
@@ -3173,14 +3351,16 @@ def self_test() -> int:
         ),
         ("a report that does not exist", False, synthetic_entry(1, old, report=report), old, {}, None, True),
         ("a longer capture extends, it does not change", False, synthetic_entry(1, longer), longer, {path: "M"}, None, False),
+        # Coverage and monitors are per model (docs/NUMERICS.md section 5), and model "m" has
+        # neither row, so even a correctly declared change is refused outside the approval path.
         (
-            "a declared change with its report",
+            "a declared change with its report but no per-model evidence",
             True,
             synthetic_entry(2, flipped, report=report),
             flipped,
             {path: "M", report: "A"},
             {report: b"x"},
-            False,
+            True,
         ),
         (
             "a stopped capture that only changes its finish reason",

@@ -530,6 +530,83 @@ monitors = false
 """
 
 
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+    return repr(value)
+
+
+def rows_toml(table: str, rows: list[dict]) -> str:
+    """One per-model evidence table as TOML, in the registry's [[table]] shape."""
+    parts = []
+    for row in rows:
+        parts.append(f"[[{table}]]")
+        parts.extend(f"{key} = {_toml_value(value)}" for key, value in row.items())
+        parts.append("")
+    return "\n".join(parts) + ("\n" if parts else "")
+
+
+def registry_text(
+    coverage: list[dict] | None = None,
+    monitors: list[dict] | None = None,
+    coverage_flag: bool = False,
+    monitors_flag: bool = False,
+) -> str:
+    """The toy registry with the per-model evidence rows a test needs."""
+    text = TOY_REGISTRY.replace(
+        "coverage = false", f"coverage = {'true' if coverage_flag else 'false'}"
+    ).replace("monitors = false", f"monitors = {'true' if monitors_flag else 'false'}")
+    return text + rows_toml("coverage", coverage or []) + rows_toml("monitors", monitors or [])
+
+
+def coverage_row(model: str = MODEL, dump: str = "numerics/coverage/toy.json", inputs: int = 2) -> dict:
+    return {"model": model, "dump": dump, "min_inputs": inputs}
+
+
+def monitors_row(model: str = MODEL, bars: float = 0.5) -> dict:
+    return {
+        "model": model,
+        "reference": "numerics/monitors/ref.json",
+        "candidate": "numerics/monitors/cand.json",
+        "layer_bar": bars,
+        "expert_bar": bars,
+    }
+
+
+def captured(model: str = MODEL, evidence: str = "logprobs") -> dict:
+    """A captured configuration, enough for the aggregate flags' model set."""
+    return {"model": model, "evidence": evidence, "reference": "references/q.json"}
+
+
+def evidence_files(model: str = MODEL) -> dict[str, bytes]:
+    """Passing synthetic coverage and monitor dumps for the model's rows."""
+    return {
+        "numerics/coverage/toy.json": json.dumps(
+            coverage_dump(
+                [
+                    {"layer": 0, "hits": []},
+                    {"layer": 1, "hits": [1, 1, 1]},
+                    {"layer": 2, "hits": [1, 1, 1]},
+                ],
+                model=model,
+            )
+        ).encode(),
+        "numerics/monitors/ref.json": json.dumps(
+            monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])], model=model)
+        ).encode(),
+        "numerics/monitors/cand.json": json.dumps(
+            monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])], model=model)
+        ).encode(),
+    }
+
+
 class DeclarationTests(unittest.TestCase):
     def setUp(self):
         self.old = NUMERICS.synthetic_reference([5, 6], -0.25)
@@ -949,6 +1026,103 @@ approved = { decision = "The owner's recorded decision", date = "2026-11-18", re
         self.assertIsNone(NUMERICS.approval_problem(registry["config"][0]))
 
 
+class PerModelBumpTests(unittest.TestCase):
+    """A bump is judged against the bumping entry's own model, not the aggregate flags."""
+
+    def setUp(self):
+        self.old = NUMERICS.synthetic_reference([5, 6], -0.25)
+        self.flipped = NUMERICS.synthetic_reference([5, 6], next_ulp(-0.25))
+        self.anchor = NUMERICS.synthetic_reference([9], -0.5)
+        self.path = "numerics/references/q.json"
+        self.report = "docs/numerics/m/2.md"
+        self.approval_report = "docs/numerics/m/approval.md"
+        self.approval = {
+            "decision": "The owner's recorded decision for this change",
+            "date": "2026-11-18",
+            "report": self.approval_report,
+        }
+        layout = mock.patch.object(
+            NUMERICS, "find_layout", return_value=(synthetic_layout(model="m"), "layout.json")
+        )
+        layout.start()
+        self.addCleanup(layout.stop)
+
+    def judge(
+        self,
+        head_entry: dict,
+        coverage_rows: list | None = None,
+        monitors_rows: list | None = None,
+        changed: dict | None = None,
+        extra: dict | None = None,
+    ) -> list:
+        base = NUMERICS.synthetic_registry([NUMERICS.synthetic_entry(1, self.old)], True)
+        head = NUMERICS.synthetic_registry([head_entry], True)
+        for registry in (base, head):
+            registry["coverage"] = (
+                [coverage_row("m")] if coverage_rows is None else coverage_rows
+            )
+            registry["monitors"] = (
+                [monitors_row("m")] if monitors_rows is None else monitors_rows
+            )
+        changed = changed if changed is not None else {self.path: "M", self.report: "A"}
+        files = {
+            self.path: NUMERICS.render_reference(self.flipped).encode(),
+            NUMERICS.ANCHOR_PATH: NUMERICS.render_reference(self.anchor).encode(),
+            self.report: b"x",
+            self.approval_report: b"approved",
+            **evidence_files("m"),
+            **(extra or {}),
+        }
+        base_files = dict(files, **{self.path: NUMERICS.render_reference(self.old).encode()})
+        return NUMERICS.declaration_findings(
+            base,
+            head,
+            base_files.get,
+            files.get,
+            changed,
+            {"m": {self.anchor["fingerprint"]}},
+        )
+
+    def bumped(self, **overrides) -> dict:
+        entry = NUMERICS.synthetic_entry(2, self.flipped, report=self.report)
+        entry.update(overrides)
+        return entry
+
+    def test_an_unapproved_bump_with_no_row_names_the_model(self):
+        entry = self.bumped()
+        findings = self.judge(entry, coverage_rows=[], monitors_rows=[])
+        self.assertTrue(
+            any("no passing per-model evidence" in finding and "'m'" in finding for finding in findings),
+            findings,
+        )
+        self.assertTrue(any("no [[coverage]] row" in finding for finding in findings), findings)
+        self.assertTrue(any("no [[monitors]] row" in finding for finding in findings), findings)
+
+    def test_an_unapproved_bump_with_a_failing_row_names_the_model(self):
+        entry = self.bumped()
+        findings = self.judge(
+            entry,
+            coverage_rows=[coverage_row("m", dump="numerics/coverage/missing.json")],
+        )
+        self.assertTrue(
+            any("'m'" in finding and "unusable" in finding for finding in findings), findings
+        )
+
+    def test_an_unapproved_bump_with_its_models_passing_rows_passes(self):
+        findings = self.judge(self.bumped())
+        self.assertEqual(findings, [], findings)
+
+    def test_an_approved_bump_needs_no_row(self):
+        entry = self.bumped(approved=dict(self.approval))
+        findings = self.judge(
+            entry,
+            coverage_rows=[],
+            monitors_rows=[],
+            changed={self.path: "M", self.report: "A", self.approval_report: "A"},
+        )
+        self.assertEqual(findings, [], findings)
+
+
 def synthetic_layout(model: str = MODEL, spans: list | None = None) -> dict:
     return {
         "schema": NUMERICS.LAYOUT_SCHEMA,
@@ -1065,9 +1239,39 @@ class CoverageTests(unittest.TestCase):
         # A base written before the bar existed stays readable; only its own bar is judged.
         self.assertNotIn("coverage_slots", NUMERICS.parse_registry(without, "toy")["prerequisites"])
 
-    def test_a_true_coverage_flag_requires_a_named_dump(self):
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "names no coverage_dump"):
-            NUMERICS.parse_registry(TOY_REGISTRY.replace("coverage = false", "coverage = true"), "toy")
+    def test_a_malformed_coverage_row_is_refused_at_parse(self):
+        good = coverage_row()
+        NUMERICS.parse_registry(registry_text(coverage=[good]), "toy")
+        cases = [
+            dict(good, dump="docs/numerics/q.json"),
+            dict(good, dump="numerics/coverage/../q.json"),
+            dict(good, dump="numerics/coverage/q.txt"),
+            dict(good, min_inputs=0),
+            dict(good, min_inputs=-1),
+            dict(good, min_inputs=True),
+            {key: value for key, value in good.items() if key != "dump"},
+            {key: value for key, value in good.items() if key != "model"},
+            dict(good, surprise=1),
+        ]
+        for row in cases:
+            with self.subTest(row=row):
+                with self.assertRaises(NUMERICS.NumericsFailure, msg=str(row)) as refused:
+                    NUMERICS.parse_registry(registry_text(coverage=[row]), "toy")
+                self.assertIn("coverage", str(refused.exception))
+                if "model" in row:
+                    self.assertIn(MODEL, str(refused.exception), "a malformed row names its model")
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "not a table"):
+            NUMERICS.coverage_row("nope", "toy")
+
+    def test_one_coverage_row_a_model_is_refused(self):
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "one row a model"):
+            NUMERICS.parse_registry(registry_text(coverage=[coverage_row(), coverage_row()]), "toy")
+
+    def test_a_true_coverage_flag_is_reported_not_enforced_at_parse(self):
+        # The aggregate is ci's claim about the rows; parsing does not invent rows for it.
+        registry = NUMERICS.parse_registry(registry_text(coverage_flag=True), "toy")
+        self.assertTrue(registry["prerequisites"]["coverage"])
+        self.assertEqual(registry["coverage"], [])
 
     def test_a_wrong_expert_count_is_refused(self):
         dump = coverage_dump(
@@ -1196,7 +1400,7 @@ class CoverageTests(unittest.TestCase):
 
 
 class CoveragePrerequisiteTests(unittest.TestCase):
-    """What `ci` does with the coverage flag: judge the dump the flag names."""
+    """What ci does with the per-model [[coverage]] rows and the aggregate flag."""
 
     def setUp(self):
         self.dump = coverage_dump(
@@ -1206,51 +1410,80 @@ class CoveragePrerequisiteTests(unittest.TestCase):
                 {"layer": 2, "hits": [1, 0, 0]},
             ]
         )
+        layout = mock.patch.object(
+            NUMERICS, "find_layout", return_value=(synthetic_layout(), "layout.json")
+        )
+        layout.start()
+        self.addCleanup(layout.stop)
 
-    def registry(self, coverage: bool = True, bar: float = 0.5) -> dict:
+    def registry(self, coverage_flag: bool = True, bar: float = 0.5, rows: list | None = None, models: list | None = None) -> dict:
         return {
             "prerequisites": {
-                "coverage": coverage,
+                "anchor": False,
+                "declaration_check": True,
+                "coverage": coverage_flag,
                 "coverage_slots": bar,
-                "coverage_dump": "numerics/coverage/toy.json",
-            }
+                "monitors": False,
+            },
+            "coverage": [coverage_row()] if rows is None else rows,
+            "monitors": [],
+            "config": [captured()] if models is None else models,
         }
 
-    def test_a_false_flag_makes_no_claim_and_reads_no_dump(self):
+    def reader(self, dump: dict | None = None):
+        return lambda path: json.dumps(self.dump if dump is None else dump).encode()
+
+    def test_no_rows_and_a_false_flag_reads_nothing(self):
         def read(path: str) -> bytes | None:
-            self.fail(f"a false coverage flag read {path}")
+            self.fail(f"a registry with no coverage row read {path}")
 
-        self.assertEqual(NUMERICS.coverage_findings(self.registry(False), read), [])
+        self.assertEqual(NUMERICS.coverage_findings(self.registry(False, rows=[]), read), [])
 
-    def test_a_missing_dump_is_named(self):
-        findings = NUMERICS.coverage_findings(self.registry(), lambda path: None)
+    def test_a_committed_row_is_judged_even_when_the_flag_is_false(self):
+        findings = NUMERICS.coverage_findings(self.registry(False), lambda path: None)
         self.assertTrue(any("does not exist" in finding for finding in findings), findings)
         self.assertTrue(any("numerics/coverage/toy.json" in finding for finding in findings), findings)
 
+    def test_a_missing_dump_is_named_with_its_model(self):
+        findings = NUMERICS.coverage_findings(self.registry(), lambda path: None)
+        self.assertTrue(any("does not exist" in finding for finding in findings), findings)
+        self.assertTrue(any("numerics/coverage/toy.json" in finding for finding in findings), findings)
+        self.assertTrue(any(f"[[coverage]] {MODEL!r}" in finding for finding in findings), findings)
+
     def test_a_dump_below_the_bar_names_both_fractions(self):
-        with mock.patch.object(NUMERICS, "find_layout", return_value=(synthetic_layout(), "layout.json")):
-            findings = NUMERICS.coverage_findings(
-                self.registry(bar=0.93), lambda path: json.dumps(self.dump).encode()
-            )
+        findings = NUMERICS.coverage_findings(self.registry(bar=0.93), self.reader())
         self.assertTrue(any("50.00%" in finding and "93.00%" in finding for finding in findings), findings)
 
     def test_a_dump_at_the_bar_passes(self):
-        with mock.patch.object(NUMERICS, "find_layout", return_value=(synthetic_layout(), "layout.json")):
-            findings = NUMERICS.coverage_findings(
-                self.registry(bar=0.5), lambda path: json.dumps(self.dump).encode()
-            )
-        self.assertEqual(findings, [])
+        self.assertEqual(NUMERICS.coverage_findings(self.registry(bar=0.5), self.reader()), [])
 
     def test_a_dump_for_another_model_is_refused(self):
-        with mock.patch.object(
-            NUMERICS,
-            "find_layout",
-            side_effect=NUMERICS.NumericsFailure("no expert layout names model 'toy/other'"),
-        ):
-            findings = NUMERICS.coverage_findings(
-                self.registry(), lambda path: json.dumps(dict(self.dump, model="toy/other")).encode()
-            )
-        self.assertTrue(any("no expert layout" in finding for finding in findings), findings)
+        findings = NUMERICS.coverage_findings(
+            self.registry(), self.reader(dict(self.dump, model="toy/other"))
+        )
+        self.assertTrue(any("names 'toy/other'" in finding for finding in findings), findings)
+
+    def test_the_true_flag_names_every_model_without_a_passing_row(self):
+        # The aggregate is a claim about every captured logprobs model: a true flag that claims
+        # more than the rows hold is a finding, and it names the model.
+        models = [captured(MODEL), captured("toy/other")]
+        findings = NUMERICS.coverage_findings(self.registry(models=models), self.reader())
+        self.assertTrue(
+            any("prerequisites.coverage is true" in finding and "toy/other" in finding for finding in findings),
+            findings,
+        )
+
+    def test_a_true_flag_with_no_rows_names_every_captured_model(self):
+        models = [captured(MODEL), captured("toy/other")]
+        findings = NUMERICS.coverage_findings(self.registry(rows=[], models=models), self.reader())
+        self.assertTrue(any("toy/other" in finding for finding in findings), findings)
+
+    def test_a_false_flag_with_an_uncovered_model_is_consistent(self):
+        models = [captured(MODEL), captured("toy/other")]
+        self.assertEqual(
+            NUMERICS.coverage_findings(self.registry(False, rows=[], models=models), self.reader()),
+            [],
+        )
 
 
 def monitor_dump(layer_values, experts, model: str = MODEL, probe: dict | None = None) -> dict:
@@ -1477,155 +1710,139 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("routing:", out.getvalue())
 
 
-def _toml_value(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, float):
-        if math.isnan(value):
-            return "nan"
-        if math.isinf(value):
-            return "inf" if value > 0 else "-inf"
-    return repr(value)
-
-
-def registry_with_pair(monitors: bool, pair: dict | None) -> str:
-    text = TOY_REGISTRY
-    if pair is not None:
-        fields = ", ".join(f"{key} = {_toml_value(value)}" for key, value in pair.items())
-        text = text.replace(
-            "monitors = false\n", f"monitors = false\nmonitors_pair = {{ {fields} }}\n"
-        )
-    if monitors:
-        text = text.replace("monitors = false", "monitors = true")
-    return text
-
-
 class MonitorPrerequisiteTests(unittest.TestCase):
-    """What `ci` does with the monitors flag: judge the committed pair the flag names."""
+    """What ci does with the per-model [[monitors]] rows and the aggregate flag."""
 
     def setUp(self):
         self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
         self.candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])])
-        self.pair = {
-            "reference": "numerics/monitors/ref.json",
-            "candidate": "numerics/monitors/cand.json",
-            "layer_bar": 0.5,
-            "expert_bar": 0.5,
+        self.row = monitors_row()
+
+    def registry(self, monitors_flag: bool = True, rows: list | None = None, models: list | None = None, bars: float = 0.5) -> dict:
+        return {
+            "prerequisites": {
+                "anchor": False,
+                "declaration_check": True,
+                "coverage": False,
+                "coverage_slots": 0.93,
+                "monitors": monitors_flag,
+            },
+            "coverage": [],
+            "monitors": [monitors_row(bars=bars)] if rows is None else rows,
+            "config": [captured()] if models is None else models,
         }
 
-    def registry(self, monitors: bool = True, pair: dict | None = None) -> dict:
-        prerequisites = {
-            "anchor": False,
-            "declaration_check": True,
-            "coverage": False,
-            "coverage_slots": 0.93,
-            "monitors": monitors,
+    def reader(self, documents: dict[str, dict] | None = None):
+        docs = documents or {
+            self.row["reference"]: self.reference,
+            self.row["candidate"]: self.candidate,
         }
-        if pair is not None:
-            prerequisites["monitors_pair"] = pair
-        return {"prerequisites": prerequisites}
+        return lambda path: json.dumps(docs[path]).encode() if path in docs else None
 
-    def reader(self, documents: dict[str, dict]):
-        return lambda path: json.dumps(documents[path]).encode() if path in documents else None
-
-    def test_a_true_flag_judges_the_pair_it_names_and_reports_routing(self):
-        result, findings = NUMERICS.monitor_pair_result(
-            self.registry(True, self.pair),
-            self.reader(
-                {
-                    self.pair["reference"]: self.reference,
-                    self.pair["candidate"]: self.candidate,
-                }
-            ),
-        )
+    def test_a_row_judges_the_pair_it_names_and_reports_routing(self):
+        result, findings = NUMERICS.monitor_row_result(self.row, self.reader())
         self.assertEqual(findings, [])
         self.assertTrue(result["pass"])
         self.assertEqual(result["routing"]["layers_differing"], 1)
         self.assertEqual(result["routing"]["experts_unshared"], 2)
         self.assertEqual(result["maxima"]["layer"], 0.0)
 
-    def test_a_false_flag_makes_no_claim_and_reads_no_pair(self):
+    def test_no_rows_and_a_false_flag_reads_nothing(self):
         def read(path: str) -> bytes | None:
-            self.fail(f"a false monitors flag read {path}")
+            self.fail(f"a registry with no monitors row read {path}")
 
-        self.assertEqual(NUMERICS.monitors_findings(self.registry(False, self.pair), read), [])
+        self.assertEqual(NUMERICS.monitors_findings(self.registry(False, rows=[]), read), [])
 
-    def test_a_missing_pair_dump_is_named(self):
-        findings = NUMERICS.monitors_findings(self.registry(True, self.pair), lambda path: None)
+    def test_a_committed_row_is_judged_even_when_the_flag_is_false(self):
+        findings = NUMERICS.monitors_findings(self.registry(False), lambda path: None)
         self.assertTrue(any("does not exist" in finding for finding in findings), findings)
-        self.assertTrue(any(self.pair["reference"] in finding for finding in findings), findings)
-        self.assertTrue(any(self.pair["candidate"] in finding for finding in findings), findings)
+
+    def test_a_missing_row_dump_names_its_model(self):
+        findings = NUMERICS.monitors_findings(self.registry(), lambda path: None)
+        self.assertTrue(any("does not exist" in finding for finding in findings), findings)
+        self.assertTrue(any(self.row["reference"] in finding for finding in findings), findings)
+        self.assertTrue(any(self.row["candidate"] in finding for finding in findings), findings)
+        self.assertTrue(any(f"[[monitors]] {MODEL!r}" in finding for finding in findings), findings)
 
     def test_a_mismatched_pair_is_refused(self):
         other = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0])], model="toy/other")
         findings = NUMERICS.monitors_findings(
-            self.registry(True, self.pair),
-            self.reader({self.pair["reference"]: self.reference, self.pair["candidate"]: other}),
+            self.registry(),
+            self.reader({self.row["reference"]: self.reference, self.row["candidate"]: other}),
         )
-        self.assertTrue(any("reference names" in finding for finding in findings), findings)
+        self.assertTrue(any("names 'toy/other'" in finding for finding in findings), findings)
 
-    def test_an_over_bar_pair_fails(self):
+    def test_an_over_bar_row_fails(self):
         candidate = monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (2, [0.0, 2.0])])
         findings = NUMERICS.monitors_findings(
-            self.registry(True, dict(self.pair, layer_bar=0.05, expert_bar=0.05)),
-            self.reader(
-                {self.pair["reference"]: self.reference, self.pair["candidate"]: candidate}
-            ),
+            self.registry(bars=0.05),
+            self.reader({self.row["reference"]: self.reference, self.row["candidate"]: candidate}),
         )
         self.assertTrue(any("layer bar" in finding for finding in findings), findings)
         self.assertTrue(any("expert bar" in finding for finding in findings), findings)
 
-    def test_a_true_flag_without_a_pair_is_refused_at_parse(self):
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "names no monitors_pair"):
-            NUMERICS.parse_registry(registry_with_pair(True, None), "toy")
-
-    def test_a_malformed_pair_is_refused_at_parse(self):
-        cases = [
-            dict(self.pair, reference="docs/numerics/ref.json"),
-            dict(self.pair, reference="numerics/monitors/../ref.json"),
-            dict(self.pair, candidate="numerics/monitors/cand.txt"),
-            dict(self.pair, layer_bar=0.0),
-            dict(self.pair, expert_bar=-1.0),
-            dict(self.pair, layer_bar=float("nan")),
-            dict(self.pair, layer_bar=True),
-            {key: value for key, value in self.pair.items() if key != "candidate"},
-            dict(self.pair, surprise=1),
-        ]
-        for pair in cases:
-            with self.subTest(pair=pair):
-                with self.assertRaisesRegex(NUMERICS.NumericsFailure, "monitors_pair"):
-                    NUMERICS.parse_registry(registry_with_pair(False, pair), "toy")
-        not_a_table = TOY_REGISTRY.replace(
-            "monitors = false\n", 'monitors = false\nmonitors_pair = "nope"\n'
+    def test_the_true_flag_names_every_model_without_a_passing_row(self):
+        models = [captured(MODEL), captured("toy/other")]
+        findings = NUMERICS.monitors_findings(self.registry(models=models), self.reader())
+        self.assertTrue(
+            any("prerequisites.monitors is true" in finding and "toy/other" in finding for finding in findings),
+            findings,
         )
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "not a table"):
-            NUMERICS.parse_registry(not_a_table, "toy")
 
-    def test_a_false_flag_may_name_a_pair_without_claiming_it(self):
-        # A false flag decides nothing; the pointer may be in place for the reviewed flip.
-        registry = NUMERICS.parse_registry(registry_with_pair(False, self.pair), "toy")
-        self.assertEqual(registry["prerequisites"]["monitors_pair"], self.pair)
+    def test_a_false_flag_with_an_uncovered_model_is_consistent(self):
+        models = [captured(MODEL), captured("toy/other")]
+        self.assertEqual(
+            NUMERICS.monitors_findings(self.registry(False, rows=[], models=models), self.reader()),
+            [],
+        )
+
+    def test_a_malformed_row_is_refused_at_parse(self):
+        cases = [
+            dict(self.row, reference="docs/numerics/ref.json"),
+            dict(self.row, reference="numerics/monitors/../ref.json"),
+            dict(self.row, candidate="numerics/monitors/cand.txt"),
+            dict(self.row, layer_bar=0.0),
+            dict(self.row, expert_bar=-1.0),
+            dict(self.row, layer_bar=float("nan")),
+            dict(self.row, layer_bar=True),
+            {key: value for key, value in self.row.items() if key != "candidate"},
+            {key: value for key, value in self.row.items() if key != "model"},
+            dict(self.row, surprise=1),
+        ]
+        for row in cases:
+            with self.subTest(row=row):
+                with self.assertRaises(NUMERICS.NumericsFailure, msg=str(row)) as refused:
+                    NUMERICS.parse_registry(registry_text(monitors=[row]), "toy")
+                self.assertIn("monitors", str(refused.exception))
+                if "model" in row:
+                    self.assertIn(MODEL, str(refused.exception), "a malformed row names its model")
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "not a table"):
+            NUMERICS.monitors_row("nope", "toy")
+
+    def test_one_row_a_model_is_refused(self):
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "one row a model"):
+            NUMERICS.parse_registry(
+                registry_text(monitors=[monitors_row(), monitors_row()]), "toy"
+            )
 
 
 class MonitorCiTests(unittest.TestCase):
-    """`ci` with the flag false, true, a missing pair and an over-bar pair."""
+    """ci with the aggregate flag false, true, a missing row and an over-bar row."""
 
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.repo = Path(self.directory.name)
         (self.repo / "numerics" / "monitors").mkdir(parents=True)
-        self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
-        self.candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])])
-        self.pair = {
-            "reference": "numerics/monitors/ref.json",
-            "candidate": "numerics/monitors/cand.json",
-            "layer_bar": 0.5,
-            "expert_bar": 0.5,
-        }
-        self.write_registry(False, None)
+        (self.repo / "numerics" / "references").mkdir(parents=True)
+        self.old = NUMERICS.synthetic_reference([5, 6], -0.25)
+        (self.repo / "numerics" / "references" / "q.json").write_text(
+            NUMERICS.render_reference(self.old)
+        )
+        self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])], model="m")
+        self.candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])], model="m")
+        self.row = monitors_row(model="m")
+        self.write_registry(False, [])
         self.git("init", "-q")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "base")
@@ -1648,8 +1865,16 @@ class MonitorCiTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
 
-    def write_registry(self, monitors: bool, pair: dict | None) -> None:
-        (self.repo / "numerics" / "registry.toml").write_text(registry_with_pair(monitors, pair))
+    def config_toml(self) -> str:
+        entry = NUMERICS.synthetic_entry(1, self.old)
+        return "\n[[config]]\n" + "\n".join(
+            f"{key} = {json.dumps(value)}" for key, value in entry.items()
+        ) + "\n"
+
+    def write_registry(self, monitors_flag: bool, rows: list[dict]) -> None:
+        (self.repo / "numerics" / "registry.toml").write_text(
+            registry_text(monitors=rows, monitors_flag=monitors_flag) + self.config_toml()
+        )
 
     def write_dump(self, name: str, dump: dict) -> None:
         (self.repo / "numerics" / "monitors" / name).write_text(json.dumps(dump))
@@ -1662,15 +1887,61 @@ class MonitorCiTests(unittest.TestCase):
             code = NUMERICS.run_ci(self.base)
         return code, out.getvalue()
 
-    def test_a_false_flag_names_no_pair_and_needs_no_dumps(self):
-        # The flag is false at the base and the head; a missing pointer and missing dumps claim
-        # nothing, so ci passes.
-        self.write_registry(False, dict(self.pair, reference="numerics/monitors/absent.json"))
+    def test_no_rows_and_a_false_flag_passes(self):
         code, out = self.ci()
         self.assertEqual(code, 0, out)
 
-    def test_a_true_flag_without_a_pair_is_refused(self):
-        self.write_registry(True, None)
+    def test_a_true_flag_without_a_row_is_refused_with_the_model_named(self):
+        self.write_registry(True, [])
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("prerequisites.monitors is true", out)
+        self.assertIn("'m'", out)
+
+    def test_a_true_flag_passes_a_row_inside_the_bars(self):
+        self.write_registry(True, [self.row])
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", self.candidate)
+        code, out = self.ci()
+        self.assertEqual(code, 0, out)
+        self.assertIn("monitors row m:", out)
+        self.assertIn("monitors routing m: 1 of 1 layer(s) differ", out)
+        self.assertIn("achieved maxima", out)
+
+    def test_a_false_flag_still_judges_a_committed_row(self):
+        # A committed row is evidence: it is judged whether or not the aggregate flag is on.
+        self.write_registry(False, [self.row])
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("does not exist", out)
+
+    def test_a_true_flag_fails_a_missing_row_dump(self):
+        self.write_registry(True, [self.row])
+        self.write_dump("ref.json", self.reference)
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("does not exist", out)
+        self.assertIn(self.row["candidate"], out)
+
+    def test_a_true_flag_fails_a_mismatched_row(self):
+        self.write_registry(True, [self.row])
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", monitor_dump([1.0, 2.0], [(0, [1.0, 0.0])], model="toy/other"))
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("names 'toy/other'", out)
+
+    def test_a_true_flag_fails_an_over_bar_row(self):
+        self.write_registry(True, [monitors_row(model="m", bars=0.05)])
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (2, [0.0, 2.0])], model="m"))
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("layer bar", out)
+        self.assertIn("expert bar", out)
+
+    def test_one_row_a_model_is_refused(self):
+        self.write_registry(True, [self.row, self.row])
         with (
             mock.patch.object(NUMERICS, "REPO", self.repo),
             contextlib.redirect_stdout(io.StringIO()),
@@ -1678,43 +1949,7 @@ class MonitorCiTests(unittest.TestCase):
         ):
             code = NUMERICS.main(["ci", "--base", self.base])
         self.assertEqual(code, 1)
-        self.assertIn("names no monitors_pair", error.getvalue())
-
-    def test_a_true_flag_passes_a_pair_inside_the_bars(self):
-        self.write_registry(True, self.pair)
-        self.write_dump("ref.json", self.reference)
-        self.write_dump("cand.json", self.candidate)
-        code, out = self.ci()
-        self.assertEqual(code, 0, out)
-        self.assertIn("monitors prerequisite", out)
-        self.assertIn("monitors routing: 1 of 1 layer(s) differ", out)
-        self.assertIn("achieved maxima", out)
-
-    def test_a_true_flag_fails_a_missing_pair_dump(self):
-        self.write_registry(True, self.pair)
-        self.write_dump("ref.json", self.reference)
-        code, out = self.ci()
-        self.assertEqual(code, 1)
-        self.assertIn("does not exist", out)
-        self.assertIn(self.pair["candidate"], out)
-
-    def test_a_true_flag_fails_a_mismatched_pair(self):
-        self.write_registry(True, self.pair)
-        self.write_dump("ref.json", self.reference)
-        self.write_dump("cand.json", monitor_dump([1.0, 2.0], [(0, [1.0, 0.0])], model="toy/other"))
-        code, out = self.ci()
-        self.assertEqual(code, 1)
-        self.assertIn("reference names", out)
-
-    def test_a_true_flag_fails_an_over_bar_pair(self):
-        self.write_registry(True, dict(self.pair, layer_bar=0.05, expert_bar=0.05))
-        self.write_dump("ref.json", self.reference)
-        self.write_dump("cand.json", monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (2, [0.0, 2.0])]))
-        code, out = self.ci()
-        self.assertEqual(code, 1)
-        self.assertIn("prerequisites.monitors_pair", out)
-        self.assertIn("layer bar", out)
-        self.assertIn("expert bar", out)
+        self.assertIn("one row a model", error.getvalue())
 
 
 def synthetic_text_reference(text: str = "abc") -> dict:
@@ -1740,12 +1975,18 @@ class AnchorTests(unittest.TestCase):
         self.path = "numerics/references/q.json"
         self.anchor_path = NUMERICS.ANCHOR_PATH
         self.report = "docs/numerics/m/2.md"
+        layout = mock.patch.object(
+            NUMERICS, "find_layout", return_value=(synthetic_layout(model="m"), "layout.json")
+        )
+        layout.start()
+        self.addCleanup(layout.stop)
 
     def files(self, reference: dict, report: bytes = b"report") -> Callable[[str], bytes | None]:
         store = {
             self.path: NUMERICS.render_reference(reference).encode(),
             self.anchor_path: NUMERICS.render_reference(self.anchor).encode(),
             self.report: report,
+            **evidence_files("m"),
         }
         return store.get
 
@@ -1757,8 +1998,11 @@ class AnchorTests(unittest.TestCase):
                 "anchor": flag,
                 "declaration_check": True,
                 "coverage": True,
+                "coverage_slots": 0.93,
                 "monitors": True,
             }
+            registry["coverage"] = [coverage_row("m")]
+            registry["monitors"] = [monitors_row("m")]
         return base, head
 
     def test_a_bump_uses_its_own_models_anchor_not_a_global_flag(self):
