@@ -205,12 +205,8 @@ mod tests {
     fn an_unset_switch_emits_nothing() {
         assert!(Recorder::from_lookup(|_| None, "toy/model", vec![2]).is_none());
         assert!(
-            Recorder::from_lookup(
-                |name| (name == ENV).then(|| String::new()),
-                "toy/model",
-                vec![2]
-            )
-            .is_none(),
+            Recorder::from_lookup(|name| (name == ENV).then(String::new), "toy/model", vec![2])
+                .is_none(),
             "an empty path is off"
         );
     }

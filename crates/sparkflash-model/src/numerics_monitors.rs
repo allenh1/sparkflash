@@ -354,13 +354,9 @@ impl Recorder {
                 }
             }
         }
-        self.dump
-            .layers
-            .sort_by(|left, right| left.layer.cmp(&right.layer));
+        self.dump.layers.sort_by_key(|left| left.layer);
         for layer in &mut self.dump.layers {
-            layer
-                .experts
-                .sort_by(|left, right| left.expert.cmp(&right.expert));
+            layer.experts.sort_by_key(|left| left.expert);
         }
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
@@ -448,7 +444,7 @@ mod tests {
         );
         assert!(
             Recorder::from_lookup(
-                |name| (name == ENV).then(|| String::new()),
+                |name| (name == ENV).then(String::new),
                 "toy/model",
                 probe(),
                 2
