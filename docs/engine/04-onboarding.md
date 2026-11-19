@@ -715,6 +715,20 @@ Value: DeepSeek stops being a separate program, the other models gain batched pr
 tick-ahead, the time-based decode share and prefix adoption, and the CLI loses most of 14,545
 lines.
 
+#### Phase 6, step 6: the rank openers left `serve.rs` first
+
+Step 6 is "the CLI path folds into the common entry", and its first slice is the one phase 2
+named and could not take: the rank openers. The packed arms' group-rank construction moved into
+their own crates (`sparkflash-model-glm5-next/src/rank.rs`, `sparkflash-model-qwen4-exp/src/rank.rs`)
+and the rank seam into `sparkflash-serve::tp4`. Measured: `crates/sparkflash-cli/src` 36,987 ->
+36,566 lines, `serve.rs` 11,771 -> 11,449, and the `one_stack` gate lowered to 36,567. Phase 2's
+note ("the rank openers did not leave `serve.rs` in this commit; that is phase 6") stands for
+that commit; this is the one it pointed at. What remains of the plan's "about 900" is the two
+group step adapters (about 490 lines), blocked on the seam trait's `MergedPosition`; the
+measurements, the inventory and the window gate are in
+[04-onboarding-review.md](04-onboarding-review.md#phase-6-step-6-first-slice-the-rank-openers-leave-serverrs).
+DeepSeek's 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`, `tp4_chain.rs`,
+`tp4_device_runner.rs`, `serve/device.rs`) is untouched and is the rest of step 6.
 #### Phase 6: what the tick trace emits now
 
 `Batch` emits the scheduler's live trace when `SPARKFLASH_TICK_TRACE=PATH` names a file. Rank 0

@@ -1377,6 +1377,128 @@ four boot fixes carried, or a capture that records its commit in the first place
 The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
 Without that field, a frozen reference can only say that bits moved, never which commit moved
 them, and every bisect pays for the same information twice.
+### Phase 6, step 6, first slice: the rank openers leave `serve.rs`
+
+Commits `a593e069` (the fold) and `f869952f` (the ratchet). Phase 2 named this slice and could
+not take it: "the rank openers (about 900 lines) leave `serve.rs`", and "the rank openers did
+not leave `serve.rs` in this commit; that is phase 6". This is phase 6's step 6, first slice.
+Measured instead of estimated, as the phase asks.
+
+**The inventory.** Read at `f869952f`, after the slice. Every file the CLI serves from, what it
+owns, and whether the runtime could own it:
+
+| file | lines | owns | could the runtime own it |
+| :-- | --: | :-- | :-- |
+| `serve.rs` | 11,449 | the serve entry: option parsing, the engine choice, the reference CPU engine thread, the DeepSeek host group's driver (`Tp4EngineSpec`, `Tp4Driver`), the group transport opener (`open_pack_collective`, `with_group_doorbell`), the three rank step adapters (`HostTp4Rank`, `GlmTp4Rank`, `QwenTp4Rank`), the request loop and the response events | partly: the transport opener is mechanism 7 step 3's, and the step adapters are the response engine's shapes |
+| `tp4_host.rs` | 5,245 | DeepSeek's host TP=4 rank: the resident checkpoint, the per-rank sequence, the lockstep host forward, the tcp seams (`tp4_seams`, `tcp_config`) and the prompt-logprob rank contract | yes, when `Batch` moves (step 4); the seams are step 3's |
+| `device_chain.rs` | 5,180 | the `device-chain` subcommand: a staged harness (`--plan-only`, `--dry-run`, `--run-stage`), not a served path | no: it is a harness |
+| `tp4_chain.rs` | 2,001 | the four-rank device arm's control channel and device epoch (Hello/Ready/Request/Token/End/Error) | yes: `sparkflash_runtime::group` is the same idea for the tick engine |
+| `serve/device.rs` | 1,883 | `--tp4-device`: DeepSeek's device forward with DSpark behind the API | yes: the runtime's rounds, after step 4 |
+| `serve/pack.rs` | 2,226 | the pack registry, `PackArm`, and the common entry both shapes run (single node and group) | it *is* the common entry |
+| `serve/dynamic.rs`, `serve/dynamic_host.rs` | 1,172, 1,592 | the zero-code dynamic HF family's own host and group openers | no: it opens a family no arm names |
+| `serve/dense_parity.rs` | 1,382 | a `#[cfg(test)]` module: the dense arm's parity fixtures | — |
+| `glm_tp4.rs`, `inkling_tp4.rs` | 782, 173 | per-arm `device-chain --run-stage` harnesses | no: harnesses |
+| `serve/recurrence.rs`, `serve/inkling_group.rs` | 421, 76 | Dory's recurrence ring and Inkling's group options | the ring, after DeepSeek (mechanism 7's closing note) |
+
+The plan's 14,545-line figure is exactly `device_chain.rs` + `tp4_host.rs` + `tp4_chain.rs` +
+`tp4_device_runner.rs` + `serve/device.rs` (5,180 + 5,245 + 2,001 + 236 + 1,883). This slice
+does not touch those five files: they are DeepSeek's serving path, and they are what the later
+slices of step 6 fold. What the runtime already owns is the strategies: `sparkflash-runtime` is
+13,664 lines (`walk`, `runtime`, `fused`, `group`, `pool`, `resume`, `rounds`, `chunk`, `tick`,
+`ledger`, `layout`, `share`), and the rank seam now sits beside them in `sparkflash-serve::tp4`
+(`Tp4RankConfig`, `checkpoint_directory`), where both an arm crate and the CLI can read it.
+
+**What moved.** Opening a rank is arm construction, so the arms hold it:
+
+* `sparkflash-model-glm5-next/src/rank.rs` (new, 463 lines): `load_rank` (the checkpoint's
+  `config.json`, the CUDA handle, the plan-agreement line, the collective call, the latent
+  cache, the converted rank file or the checkpoint's tensors, the block drafter, the drafting
+  rule), `open_rank` (the window allocation and the load line), `open_lanes` (the fused lanes,
+  rank 0's hub and a worker's mirror), `glm_drafting`/`GlmDrafting` and `CONVERTED_DIR_ENV`.
+* `sparkflash-model-qwen4-exp/src/rank.rs` (new, 168 lines): `load_rank` (the checkpoint's
+  `config.json`, the collective call, the converted rank file, the load line) and `open_lanes`,
+  plus `read_config` and `CONVERTED_DIR_ENV`.
+* `sparkflash-serve/src/tp4.rs` (new, 73 lines): the rank seam, `Tp4RankConfig` and
+  `checkpoint_directory`, because an arm's crate cannot read a type only the CLI names.
+* `sparkflash-weights/src/rank_file.rs` (+27): `converted_rank_file`, the reader both arms'
+  converted-rank-file paths and the CLI's single-node path now share.
+
+The CLI keeps what is the group's and not the arm's: the collective opener, called back into the
+arm with the same four arguments; the control-channel worker loop; the three step adapters that
+map a rank's answer onto `Tp4RankApi`; and the resolution of `attention.latent_cache` and its
+deprecated `SPARKFLASH_GLM_KV_CACHE` spelling, because that is the process's reading of the
+environment, not a rank's (a model crate reads no environment here, which the arm table's
+`ENV_READ_EXCEPTIONS` still holds at GLM 2 / Qwen 3).
+
+**Before and after**, measured with the ratchet's own rule (every `.rs` under
+`crates/sparkflash-cli/src`, line counts):
+
+| | before (`a53057f3`) | after (`f869952f`) |
+| :-- | --: | --: |
+| `crates/sparkflash-cli/src` (the ratchet's measure) | 36,987 | **36,566** |
+| `serve.rs` | 11,771 | **11,449** |
+| `serve/pack.rs` | 2,325 | **2,226** |
+| `sparkflash-model-glm5-next/src/rank.rs` | — | 463 |
+| `sparkflash-model-qwen4-exp/src/rank.rs` | — | 168 |
+| `sparkflash-serve/src/tp4.rs` | — | 73 |
+| `sparkflash-weights/src/rank_file.rs` | 1,046 | 1,073 |
+
+So 421 lines left the CLI and 731 arrived in the crates that own them; the difference is the
+documentation and the new seam's doc comments, which a shared type and a public opener carry and
+a private one did not have to.
+
+**What the ratchet holds.** `CLI_SOURCE_LINE_LIMIT` is **36,567** in
+`crates/sparkflash-ops/tests/one_stack.rs`, one above the measured 36,566, the convention the
+previous gate used. It was 36,988; it did not rise. The test still asserts the same three
+things: the total, no `tp4_forward.rs` in the CLI, and the DeepSeek device forward in its own
+crate.
+
+**No arm's boot path changed.** The moved code is construction around the rank, not the rank's
+step: the same `config.json` read with the same refusal wording, the same collective opened with
+the same label, hidden width and run string, the same plan-agreement line before the gather, the
+same rank-loaded line with the same origin and collective label, the same drafting line on rank 0
+only, the same window allocation (`new_block_drafting_sequence` / `new_drafting_sequence` /
+`new_sequence`) in the same order, and the same load milliseconds in the first metrics report.
+Nothing in this slice touches a kernel, an arithmetic choice or a scheduling decision; the
+`glm_drafting` rule, the depth policy and the collective's wire are the same code moved.
+
+**The window gate.** No boot is possible on this host (no GPU, no checkpoint), so the fold is
+owed one window. Build the frozen tip and this one (`git worktree add /tmp/pre-fold a53057f3`),
+then boot each arm's group in both builds and compare the boots and one served request:
+
+```sh
+cargo build --release -p sparkflash-cli   # default features: cuda + tp4-serve
+# GLM, one request at a time and then fused lanes (the two shapes openers serve)
+sparkflash serve --model glm-5.3-flash --checkpoint /models/GLM-5.3-Flash \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D
+sparkflash serve --model glm-5.3-flash --checkpoint /models/GLM-5.3-Flash \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D --fuse-batch --concurrency 4
+# Qwen, the same two shapes
+sparkflash serve --model qwen3.8-flash-next --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D
+sparkflash serve --model qwen3.8-flash-next --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D --fuse-batch --concurrency 4
+```
+
+Pass: every rank's stderr is the same lines in the same order in both builds (the plan
+agreement word included, which is why the `fnv1a` that computes it moved to the shared weights
+crate rather than a second copy), and one greedy request of the same prompt returns the same
+token ids with the same `cached_tokens` on both. One rank that prints a different agreement
+word, or one request that returns a different id, is a failed fold. A second boot with
+`SPARKFLASH_GLM_KV_CACHE=f32` and one with it unset covers the one setting the CLI still
+resolves for the GLM rank.
+
+**What is left of the opener.** The step adapters (`GlmTp4Rank` with its step/speculate bodies,
+`QwenTp4Rank` with its session step) are response-engine shapes and stayed in `serve.rs`
+(about 490 lines together). They cannot move yet for one concrete reason: the trait they
+implement, `Tp4RankApi`, names `sparkflash_model_deepseek_v41::prompt_ranks::MergedPosition` in
+`prefill_prompt_logprobs`, and a model crate may not depend on another model crate
+(`no_model_crate_depends_on_another_model_crate`). The next slice, in order: `Sampler` (17
+lines, today in the Qwen crate and used by the GLM adapter) and `MergedPosition` move to
+`sparkflash-model`, the trait moves to `sparkflash-serve::tp4`, and then the two adapters follow
+the openers into their arms. That is the remaining ~490 lines of the plan's "about 900".
+
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
