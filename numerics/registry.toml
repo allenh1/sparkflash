@@ -46,11 +46,12 @@ schema = 1
 # Turning a prerequisite on is a reviewed edit with the tool or data it names in the same diff.
 [prerequisites]
 # Per model. Qwen3.8 and GLM-5.3 have an anchor and a committed teacher-forced capture; Inkling-2
-# and Dory1.0 have no anchor, so they cannot bump; DeepSeek is exempt because its device path
-# serves no logprobs and a text reference cannot teacher-force, and a text-evidence bump is
-# refused. The flag is the aggregate and is false while Inkling-2 and Dory1.0 lack anchors; false
-# does not block a model that has its own anchor.
-anchor = false
+# DeepSeek is exempt because its device path serves no logprobs and a text reference cannot
+# teacher-force, and a text-evidence bump is refused. The flag is the aggregate over every model
+# whose captured evidence is logprobs: it is true from 2026-11-19, when Inkling-2's anchor (world
+# 4, top-20) and Dory1.0's (world 1) joined Qwen3.8's and GLM-5.3's, each with a committed
+# teacher-forced capture scoring exactly zero. A model without its own anchor still cannot bump.
+anchor = true
 # The CI declaration check (`scripts/numerics.py ci`, run by the scripts-tests job).
 declaration_check = true
 # The coverage bar: the fraction of (layer, routed-expert) slots a committed coverage dump must
@@ -204,7 +205,7 @@ reference = "references/dory10-tp1-sm121a.json"
 fingerprint = "99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3"
 captured = "2026-11-19"
 report = "docs/numerics/dory10/v1-few-row-decode.md"
-note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. Its speed, its distance from the row-GEMV decode, and the world-2 recurrence ring are unmeasured (docs/numerics/dory10/v1-few-row-decode.md)."
+note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. The world-2 recurrence ring was captured on 2026-11-19 and is bit-identical to this reference (8/8 prompts, 1024/1024 logprobs, top-1 100%; numerics/captures/dory10/world2-ring.json), so the ring needs no entry of its own. Its speed, its distance from the row-GEMV decode and the ring's speed against a single process are unmeasured (docs/numerics/dory10/v1-few-row-decode.md)."
 
 [[retired]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
@@ -258,3 +259,20 @@ configuration as the reference above, taken as its own capture with top-20 logpr
 --context 8192. The teacher-forced capture beside it
 (numerics/captures/dory10/v1-anchor-forced.json) scores exactly zero against this anchor,
 which is what makes the comparison harness add nothing to a measured distance."""
+
+[[anchor]]
+model = "thinkingmachines/Inkling-2-Small"
+world = 4
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+evidence = "logprobs"
+reference = "references/inkling2-anchor.json"
+fingerprint = "c5ffbac96581dbe54e86995e641870fba386d98b57cd561cfbeced2777cf370e"
+captured = "2026-11-19"
+note = """
+World 4 is Inkling's only served world, so the anchor is its arithmetic as served: the same
+configuration as the reference above, captured separately with top-20 logprobs and 16 tokens a
+prompt, with the launcher the capture used (LANES=4, tensor prefill, context 1,048,576). The
+teacher-forced capture beside it (numerics/captures/inkling2/v1-anchor-forced.json) scores
+exactly zero against this anchor over 128 scored positions."""

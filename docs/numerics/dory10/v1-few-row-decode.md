@@ -27,9 +27,13 @@ arithmetic this change lands, and the capture pins it. Two captures are bit-iden
 1 and 2, not 4; the phase-0 registration at world 4 could only have been served by rewriting
 `n_recurrent_loops`. The ring also serves under the TP=1 numerics key by design: its rank 0
 calls `serve_backend` (world 1) because each rank runs the same kernels on the latent rows it
-receives. That claim cites `tests/recurrence.rs`, which does not exist - the ring's bits against
-a single process are **not tested** - so this reference is the world-1 configuration, and the
-ring's world-2 capture and that test are the named follow-up.
+receives. Both halves of that claim are now measured. `crates/sparkflash-model-dory/tests/recurrence.rs`
+holds the ring against the single process on a GPU (eight tests: the loopback ring, concurrent
+lanes, the drafting passes, the end-of-turn id and the drafting rollback, each bit for bit), and
+the served world-2 ring's capture of 2026-11-19 is **bit-identical to this reference**: 8 of 8
+prompts, 1024 of 1024 logprobs, top-1 agreement 100%, and its own teacher-forced replay scores
+exactly zero (`numerics/captures/dory10/world2-ring.json` and `-forced.json`). So the ring needs
+no separate registry entry: its arithmetic is this one.
 
 ## What changed
 
@@ -97,12 +101,14 @@ rows, which no longer exists on this branch.
 - **The sliding window's effect on a continued turn.** The body is a per-row arithmetic and does
   not change the cache or the window, but a continued turn's tokens after a >8-row reply were not
   compared with a cold prompt.
-- **The recurrence ring.** Its legal width with this checkpoint is 2; no world-2 capture exists
-  and the claim that its bits equal one process's is untested.
+- **The recurrence ring's speed.** Its bits are measured (the world-2 capture equals this
+  reference and the loopback tests hold it to a single process), but tokens a second at world 2
+  against world 1 were not compared.
 
 ## Reading
 
 The device test establishes that a decode row is the prompt tile's row, so the packed copy does
 not change the arithmetic. The cluster capture establishes that the released checkpoint serves
-deterministically at world 1 and pins the bits by a fingerprint. What the arm still owes is the
-ring: a world-2 capture, a test that its bits are a single process's, and the speed A/B.
+deterministically at world 1 and pins the bits by a fingerprint. The ring's capture and its tests have
+since landed (2026-11-19) and agree with this reference bit for bit; what remains is its speed
+A/B.
