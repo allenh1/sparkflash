@@ -513,6 +513,8 @@ struct Kernels {
     combine: Kernel,
     cache: Kernel,
     wide: Kernel,
+    /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
+    argmax: Kernel,
     moe: Option<MoeKernels>,
     fp8: Option<Fp8Kernels>,
     gdn: Option<GdnKernels>,
@@ -531,6 +533,10 @@ struct GdnKernels {
     gate: Kernel,
     zero: Kernel,
 }
+
+/// Threads in the block `q4e_argmax_slices` reduces a vocabulary with: the 32 warps its block
+/// reduction holds.
+const ARGMAX_BLOCK: u32 = 1024;
 
 /// The block-scaled FP8 projections' kernels, loaded when the checkpoint declares FP8: the
 /// tiled E4M3 GEMV for decode rows and the FP8 tensor-core tile for prompt chunks.
@@ -627,6 +633,7 @@ impl Kernels {
             attention: named(qwen4_attn_cubin(), "q4e_attn_full")?,
             combine: named(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
             cache: named(qwen4_attn_cubin(), "q4e_cache_bf16")?,
+            argmax: named(qwen4_exp_cubin(), "q4e_argmax_slices")?,
             wide: cuda
                 .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
                 .map(|(_, kernel)| kernel)?,
@@ -2240,6 +2247,8 @@ struct Buffers {
     ffn_gate: Deviceptr,
     ffn_up: Deviceptr,
     logits: Deviceptr,
+    /// The greedy head's pick a row, from `q4e_argmax_slices`.
+    picks: Deviceptr,
     /// A routed layer's router logits, `[rows][experts]`.
     router: Deviceptr,
     /// The picked experts (i32) and their weights, `[rows][top_k]` each.
@@ -2273,7 +2282,7 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn all(&self) -> [&Deviceptr; 32] {
+    fn all(&self) -> [&Deviceptr; 33] {
         [
             &self.tokens,
             &self.x,
@@ -2307,6 +2316,7 @@ impl Buffers {
             &self.gdn_a,
             &self.gdn_qk,
             &self.gdn_decay,
+            &self.picks,
         ]
     }
 }
@@ -2391,6 +2401,7 @@ impl Scratch {
             rows * linear(|geometry| geometry.heads),
             linear(|geometry| geometry.qk_floats(CHUNK_ROWS)),
             rows * linear(|geometry| 2 * geometry.heads),
+            rows,
         ];
         let mut pointers = Vec::with_capacity(floats.len());
         let mut total = 0usize;
@@ -2438,6 +2449,7 @@ impl Scratch {
             gdn_a: p(29),
             gdn_qk: p(30),
             gdn_decay: p(31),
+            picks: p(32),
             logit_rows,
         };
         // The counters start at zero; every tiled launch leaves them so.
@@ -2653,14 +2665,14 @@ fn walk(
     Ok(())
 }
 
-/// The logits of `count` residual rows of the last walk from row `first`, row after row: the
-/// final norm and the head on the row GEMV.
-fn head(
+/// The final norm and the LM head of `count` residual rows from row `first`, leaving their
+/// logits in the scratch row after row.
+fn head_logits(
     shared: &Shared,
     b: &Buffers,
     first: usize,
     count: usize,
-) -> Result<Vec<f32>, BackendError> {
+) -> Result<(), BackendError> {
     if count == 0 || count > b.logit_rows {
         return Err(BackendError::new(
             DEVICE,
@@ -2681,13 +2693,70 @@ fn head(
         ),
         count,
     )?;
-    shared.project_bf16(&shared.head, b.normed.0, b.logits.0, count, None)?;
+    shared.project_bf16(&shared.head, b.normed.0, b.logits.0, count, None)
+}
+
+/// The logits of `count` residual rows of the last walk from row `first`, row after row: the
+/// final norm and the head on the row GEMV.
+fn head(
+    shared: &Shared,
+    b: &Buffers,
+    first: usize,
+    count: usize,
+) -> Result<Vec<f32>, BackendError> {
+    head_logits(shared, b, first, count)?;
     let mut bytes = vec![0u8; count * shared.vocab * 4];
     shared
         .cuda
         .copy_dtoh(&mut bytes, &b.logits)
         .map_err(|error| BackendError::new(DEVICE, format!("the logits: {error}")))?;
     Ok(floats(&bytes))
+}
+
+/// The chosen token of each of `count` residual rows from row `first`, on the device: the final
+/// norm and head as [head], then the vocabulary-wide argmax (`q4e_argmax_slices`) writes one
+/// u32 a row. Only the picks cross to the host, not the logits.
+///
+/// The kernel is the host [sparkflash_ops::sampler::argmax] for a finite row: the higher value
+/// wins and a tie takes the lower index. A NaN never wins. (A row whose first logit is NaN is
+/// the kernel's documented exception: it answers 0.) With every logit finite, a greedy request
+/// therefore gets the host sampler's token.
+fn head_choices(
+    shared: &Shared,
+    b: &Buffers,
+    first: usize,
+    count: usize,
+) -> Result<Vec<u32>, BackendError> {
+    head_logits(shared, b, first, count)?;
+    let rows = u32::try_from(count).map_err(|_| {
+        BackendError::new(DEVICE, format!("{count} head rows do not fit one launch"))
+    })?;
+    shared
+        .cuda
+        .launch_async(
+            shared.kernels.argmax,
+            (rows, 1, 1),
+            (ARGMAX_BLOCK, 1, 1),
+            &[
+                b.logits.0,
+                b.picks.0,
+                1,
+                u64::from(rows),
+                shared.vocab as u64,
+            ],
+        )
+        .map_err(|error| BackendError::new(DEVICE, format!("q4e_argmax_slices: {error}")))?;
+    let mut bytes = vec![0u8; count * 4];
+    shared
+        .cuda
+        .copy_dtoh(&mut bytes, &b.picks)
+        .map_err(|error| BackendError::new(DEVICE, format!("the picks: {error}")))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
+        .collect())
 }
 
 /// One fused step: a row a member, each its own token, and each member's next.
@@ -2852,10 +2921,110 @@ impl ModelSession for DenseDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, profile_policy};
+    use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
     use sparkflash_ops::projection::WidePolicy;
+    use sparkflash_ops::sampler::Sampler;
     use sparkflash_runtime::Walk;
+
+    /// The token the device head's kernel chooses, transcribed from `q4e_argmax_slices`: the
+    /// higher value wins, a tie takes the lower index, a NaN never wins, and a row whose first
+    /// logit is NaN answers 0.
+    fn device_argmax(row: &[f32]) -> u32 {
+        let mut value = f32::NEG_INFINITY;
+        let mut index = u32::MAX;
+        for (at, &logit) in row.iter().enumerate() {
+            if logit > value || (logit == value && (at as u32) < index) {
+                value = logit;
+                index = at as u32;
+            }
+        }
+        if row.first().is_some_and(|value| value.is_nan()) {
+            0
+        } else {
+            index
+        }
+    }
+
+    /// The toy rows: a clear maximum, a tie (the lower index), a negative row and a one-entry
+    /// row. A greedy sampler and the device kernel must agree on every one.
+    fn toy_rows() -> Vec<Vec<f32>> {
+        vec![
+            vec![0.5, -1.0, 2.0, 0.0],
+            vec![3.0, 3.0, 1.0, -2.0],
+            vec![-3.0, -2.0, -1.0, -4.0],
+            vec![7.0],
+            vec![1.0, 1.0, 1.0, 1.0],
+        ]
+    }
+
+    #[test]
+    fn the_device_choice_is_the_host_samplers_token_on_the_toy_rows() {
+        for row in toy_rows() {
+            let mut host = Sampler::new();
+            let expected = host.choose(&row, &Sampling::default());
+            assert_eq!(
+                device_argmax(&row),
+                expected,
+                "the device kernel's argmax on {row:?}"
+            );
+        }
+    }
+
+    /// The same comparison against the real kernel, where this build and host have a CUDA device
+    /// and the Qwen4-Exp image. Without either it says so and passes, as the arm's other device
+    /// gates do.
+    #[test]
+    fn the_cuda_head_choice_is_the_host_samplers_token_on_the_toy_rows() {
+        let Ok(cuda) = sparkflash_kernels::cuda_driver::Cuda::load() else {
+            eprintln!("skipping the device head choice: no CUDA device");
+            return;
+        };
+        let image = sparkflash_kernels::images::qwen4_exp_cubin();
+        if image.is_empty() {
+            eprintln!("skipping the device head choice: this build has no Qwen4-Exp cubin");
+            return;
+        }
+        let (_, argmax) = cuda
+            .load_named(image, "q4e_argmax_slices")
+            .expect("the Qwen4-Exp image carries q4e_argmax_slices");
+        let rows = toy_rows();
+        let vocab = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == vocab));
+        let flat: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut total = 0;
+        let logits = cuda.alloc(flat.len(), &mut total).expect("the toy logits");
+        cuda.copy_htod(&logits, &flat)
+            .expect("the toy logits upload");
+        let picks = cuda
+            .alloc(rows.len() * 4, &mut total)
+            .expect("the toy picks");
+        cuda.launch(
+            argmax,
+            (rows.len() as u32, 1, 1),
+            (1024, 1, 1),
+            &[logits.0, picks.0, 1, rows.len() as u64, vocab as u64],
+        )
+        .expect("the argmax launches");
+        let mut bytes = vec![0u8; rows.len() * 4];
+        cuda.copy_dtoh(&mut bytes, &picks)
+            .expect("the toy picks download");
+        cuda.free_buffers(&[&logits, &picks]);
+        for (row, word) in rows.iter().zip(bytes.as_chunks::<4>().0) {
+            let chosen = u32::from_le_bytes(*word);
+            let mut host = Sampler::new();
+            assert_eq!(
+                chosen,
+                host.choose(row, &Sampling::default()),
+                "the kernel's argmax on {row:?}"
+            );
+        }
+    }
 
     /// The walk's token-decode capability row and the profile refusal are the same constant, so
     /// the ledger cannot state one thing while the switch is refused for another.

@@ -40,7 +40,7 @@ use sparkflash_runtime::{
 
 use super::{
     CHUNK_ROWS, DEVICE, Mixer, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
-    walk as dense_walk,
+    head_choices as dense_head_choices, walk as dense_walk,
 };
 
 /// The rows of one walk, as offsets into the pass's residual buffer. The existing walk and this
@@ -275,6 +275,55 @@ impl Walk for DenseWalk {
         }
         let scratch = self.scratch()?;
         let contiguous = rows.iter().enumerate().all(|(index, row)| row.row == index);
+        // Record each row's token before asking whether its sampler is greedy: a prompt's record
+        // resets and fills the history the penalty check reads.
+        for row in rows.iter_mut() {
+            match &row.input {
+                HeadInput::Prompt(tokens) => {
+                    row.seq.sampler.reset();
+                    row.seq.sampler.record_prompt(tokens);
+                }
+                HeadInput::Token(token) => row.seq.sampler.record(*token),
+            }
+        }
+        // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
+        // Choose it on the device and copy one u32 a row, not the vocabulary.
+        if rows
+            .iter()
+            .all(|row| row.seq.sampler.takes_argmax(&row.seq.sampling))
+        {
+            let picks: Vec<u32> = if contiguous {
+                dense_head_choices(&self.shared, &scratch.buffers, 0, rows.len())?
+            } else {
+                rows.iter()
+                    .map(|row| dense_head_choices(&self.shared, &scratch.buffers, row.row, 1))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            if picks.len() != rows.len() {
+                return Err(BackendError::new(
+                    DEVICE,
+                    format!(
+                        "the head was asked for {} rows and made {}",
+                        rows.len(),
+                        picks.len()
+                    ),
+                ));
+            }
+            return Ok(rows
+                .iter()
+                .zip(picks)
+                .map(|(_, pick)| StepOutput {
+                    logits: Vec::new(),
+                    next_token: Some(pick),
+                    draft: Vec::new(),
+                })
+                .collect());
+        }
+        // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw
+        // stay on the host over the logits the step copies back.
         let logits: Vec<Vec<f32>> = if contiguous {
             dense_head(&self.shared, &scratch.buffers, 0, rows.len())?
                 .chunks(self.shared.vocab)
@@ -298,13 +347,6 @@ impl Walk for DenseWalk {
         rows.iter_mut()
             .zip(logits)
             .map(|(row, logits)| {
-                match &row.input {
-                    HeadInput::Prompt(tokens) => {
-                        row.seq.sampler.reset();
-                        row.seq.sampler.record_prompt(tokens);
-                    }
-                    HeadInput::Token(token) => row.seq.sampler.record(*token),
-                }
                 let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
                 Ok(StepOutput {
                     logits,
