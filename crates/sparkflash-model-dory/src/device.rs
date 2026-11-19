@@ -35,7 +35,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
-use sparkflash_kernels::images::{dory_cubin, qwen4_exp_cubin};
+use sparkflash_kernels::images::{dory_cubin, qwen4_exp_cubin, qwen4_prefill_cubin};
 use sparkflash_model::ModelDescriptor;
 use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampling, StepOutput};
 use sparkflash_ops::gemv::CudaHandle;
@@ -241,6 +241,9 @@ struct Kernels {
     embed: Kernel,
     gemv_bf16: Kernel,
     gemv4_bf16: Kernel,
+    /// The wide tile's few-row BF16 body (`q4p_dense_rows`): a decode row is
+    /// `dory_mma_wide`'s row, and the body takes the matrix's packed copy where there is one.
+    dense_rows: Kernel,
     mma_wide: Kernel,
     mma_wide4: Kernel,
     rope_norm: Kernel,
@@ -526,6 +529,7 @@ impl Kernels {
             embed: named(qwen4_exp_cubin(), "q4e_embed")?,
             gemv_bf16: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
             gemv4_bf16: named(qwen4_exp_cubin(), "q4e_gemv4_bf16")?,
+            dense_rows: named(qwen4_prefill_cubin(), "q4p_dense_rows")?,
             mma_wide: cuda
                 .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
                 .map(|(_, kernel)| kernel)?,
@@ -2252,6 +2256,69 @@ fn packed_for(matrix: &DeviceMat, input: Deviceptr) -> Option<Packed> {
         .filter(|_| (input.0 as usize).is_multiple_of(16))
 }
 
+/// Whether the few-row body takes a projection at `batch` rows: whole eight-column writes, a
+/// whole 32-column K run and a 16-byte-aligned activation, which every projection the arm
+/// serves has.
+fn dense_rows_fits(matrix: &DeviceMat, input: Deviceptr, batch: usize) -> bool {
+    (1..=TOKEN_ROWS).contains(&batch)
+        && matrix.rows.is_multiple_of(8)
+        && matrix.columns.is_multiple_of(32)
+        && input.0.is_multiple_of(8)
+        && matrix.pointer.0.is_multiple_of(8)
+}
+
+/// One to four projections of one `input` of `batch` rows through `q4p_dense_rows`, the wide
+/// tile's few-row body: each output's row is `dory_mma_wide`'s row, and a matrix with a packed
+/// copy is read from the copy (its BF16 rows' bits from three quarters of the bytes).
+fn dense_rows(
+    cuda: &Cuda,
+    kernels: &Kernels,
+    projections: &[(&DeviceMat, Deviceptr)],
+    input: Deviceptr,
+    batch: usize,
+) -> Result<(), BackendError> {
+    let mut args = [0u64; 61];
+    args[0] = input.0;
+    args[1] = projections[0].0.columns as u64;
+    args[2] = batch as u64;
+    args[3] = projections[0].1.0;
+    args[4] = 0;
+    args[5] = u64::from(1.0f32.to_bits());
+    args[6] = projections.len() as u64;
+    let mut columns = 0usize;
+    for (slot, (matrix, output)) in projections.iter().enumerate() {
+        args[7 + slot * 5..7 + slot * 5 + 5].copy_from_slice(&[
+            matrix.pointer.0,
+            output.0,
+            output.0,
+            matrix.rows as u64,
+            1,
+        ]);
+        if let Some(copy) = matrix
+            .packed
+            .filter(|copy| copy.admits(batch, matrix.columns, input).is_ok())
+        {
+            let [rows, offsets, entries] = copy.planes();
+            args[45 + slot * 4..45 + slot * 4 + 4].copy_from_slice(&[
+                rows,
+                offsets,
+                entries,
+                copy.row_bytes() as u64,
+            ]);
+        }
+        columns += matrix.rows.div_ceil(32);
+    }
+    args[27] = columns as u64;
+    args[28] = 0;
+    launch(
+        cuda,
+        kernels.dense_rows,
+        (columns as u32, batch.div_ceil(16) as u32, 1),
+        (128, 1, 1),
+        &args,
+    )
+}
+
 /// `batch` rows of `input` share each read of `matrix`; `output` is `[batch][rows]`. The token
 /// GEMV reads the packed rows when there are some.
 fn gemv_batch(
@@ -2294,6 +2361,11 @@ fn gemv_batch(
             ));
         }
         Route::RowGemv => {}
+    }
+    // A decode step, a verify or a few lanes: the wide tile's few-row body, so the row is the
+    // prompt tile's. A shape it does not take keeps the packed or BF16 row GEMV.
+    if dense_rows_fits(matrix, input, batch) {
+        return dense_rows(cuda, kernels, &[(matrix, output)], input, batch);
     }
     if let Some(rows) = packed_for(matrix, input) {
         let call = packed::gemv(rows, input, output, (matrix.rows, matrix.columns), batch, 1)
@@ -2344,6 +2416,14 @@ fn gemv_group(
     let Some(&(first, first_output)) = projections.first() else {
         return Ok(());
     };
+    // Up to four few-row projections of one input as one q4p_dense_rows launch: each output's
+    // row is dory_mma_wide's, and the launch is the tile's chain cut for the rows.
+    if projections
+        .iter()
+        .all(|(matrix, _)| dense_rows_fits(matrix, input, batch))
+    {
+        return dense_rows(cuda, kernels, projections, input, batch);
+    }
     // A missing slot is zero rows of the first matrix: the kernel never reaches it.
     let slot = |index: usize| {
         projections
@@ -2497,11 +2577,39 @@ mod tests {
     use super::{
         ATTENTION_LANES, DeviceMat, DeviceShared, DoryDeviceBackend, DoryStage, Form, Kernels,
         LANE_BATCH, LANE_IDLE, PREFILL_BATCH, PREFILL_Q, PackedSet, Placement, SPLIT_MAX,
-        StageCore, TOKEN_ROWS, attention_fits, decode_split, lane_word, launch, profile_refusal,
-        prompt_chunks,
+        StageCore, TOKEN_ROWS, attention_fits, decode_split, dense_rows_fits, lane_word, launch,
+        profile_refusal, prompt_chunks,
     };
     use crate::config::{DoryConfig, KvCacheMode};
     use sparkflash_model::profile::ModelProfile;
+
+    /// The routing band: one to eight rows take the wide tile's few-row body, and the ninth,
+    /// a shape without whole eight-column writes or a whole 32-column K run, and an unaligned
+    /// activation keep the packed or BF16 row GEMV.
+    #[test]
+    fn the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight() {
+        let mat = |rows, columns| DeviceMat {
+            pointer: Deviceptr(0),
+            rows,
+            columns,
+            packed: None,
+        };
+        for rows in 1..=TOKEN_ROWS {
+            assert!(
+                dense_rows_fits(&mat(4096, 4096), Deviceptr(0), rows),
+                "{rows} rows take the body"
+            );
+        }
+        assert!(!dense_rows_fits(
+            &mat(4096, 4096),
+            Deviceptr(0),
+            TOKEN_ROWS + 1
+        ));
+        assert!(!dense_rows_fits(&mat(4092, 4096), Deviceptr(0), 1));
+        assert!(!dense_rows_fits(&mat(4096, 4112), Deviceptr(0), 1));
+        assert!(!dense_rows_fits(&mat(4096, 4096), Deviceptr(4), 1));
+        assert!(dense_rows_fits(&mat(4096, 4096), Deviceptr(16), 1));
+    }
 
     #[test]
     fn profile_fields_the_arm_does_not_honor_are_refused() {
