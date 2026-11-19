@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Hunter L. Allen
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""tick-trace-ab.py: the phase-6 step-4 A/B, on the tick trace the server writes.
+
+The gate is two claims. First, the decisions the new engine makes on a fixed workload are the
+ones the old build made: same lanes, same prompt order, same holds, same chunk boundaries, same
+bulk/exact choice, same spec/shared/plain decode plan. Second, alternated served launches at 1, 8
+and 16 streams and 2K and 16K prompts keep that true several times each.
+
+The server writes the trace when `SPARKFLASH_TICK_TRACE` names a file (rank 0; the group makes
+the same decisions). Each launch here gets its own file, so the comparison is between whole
+served runs, not between two processes sharing one.
+
+Usage:
+  scripts/tick-trace-ab.py --old PATH --new PATH --checkpoint DIR [--model ID]
+  scripts/tick-trace-ab.py --old PATH --new PATH --checkpoint DIR --dry-run
+  scripts/tick-trace-ab.py --diff OLD.trace NEW.trace
+
+  --old / --new       the two `sparkflash` binaries. Both must be built from a tree that emits
+                      the tick trace: the new engine, and the frozen pre-move build with this
+                      emission commit cherry-picked onto it (trace only; no decision changes).
+  --checkpoint DIR    the DeepSeek-V4.1 checkpoint the server serves (`sparkflash serve
+                      --checkpoint`). One is needed; no checkpoint, no served path.
+  --model ID          passed through to `serve --model` for a packed checkpoint.
+  --streams           comma list, default 1,8,16.
+  --prompt-tokens     comma list, default 2048,16384.
+  --reps              launches of each build for each pair, default 3.
+  --max-tokens        completion length a request asks for, default 16.
+  --out DIR           the traces and server logs, default target/tick-trace-ab.
+  --bind HOST:PORT    default 127.0.0.1:8000; one launch at a time.
+  --timeout SECONDS   readiness/request timeout, default 3600.
+  --dry-run           print the exact commands and workload, run nothing.
+  --diff A B          compare two trace files and print the first differing decision.
+
+A difference is reported with the tick index and both lines; the script exits non-zero. The
+injected clock is deliberately left out of the comparison: two live builds measure different wall
+times, and the decision sequence is what must match. The replay gate
+(sparkflash-runtime/tests/tick_trace.rs, plus the forward crate's CPU mirror) is the
+host-independent check of the same decisions.
+"""
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+LINE = re.compile(r"^t=(\d+) clock=(\d+) (.*)$")
+
+
+def parse_trace(path):
+    """[(tick, decision, line, line_number)] with the injected clock dropped."""
+    rows = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            match = LINE.match(line)
+            if not match:
+                raise SystemExit("%s:%d: not a tick trace line: %r" % (path, number, line))
+            rows.append((int(match.group(1)), match.group(3), line, number))
+    return rows
+
+
+def first_difference(old_path, new_path):
+    """(tick, old line, new line, why) or None when the decision sequences agree."""
+    old = parse_trace(old_path)
+    new = parse_trace(new_path)
+    if not old and not new:
+        return ("-", "-", "-", "both traces are empty")
+    for index in range(max(len(old), len(new))):
+        if index >= len(old):
+            tick, decision, line, number = new[index]
+            return (tick, "-(ends)", "%s:%d" % (line, number), "the old trace ends first")
+        if index >= len(new):
+            tick, decision, line, number = old[index]
+            return (tick, "%s:%d" % (line, number), "-(ends)", "the new trace ends first")
+        old_tick, old_decision, old_line, old_number = old[index]
+        new_tick, new_decision, new_line, new_number = new[index]
+        if old_decision != new_decision:
+            return (
+                old_tick if old_tick == new_tick else "%d/%d" % (old_tick, new_tick),
+                "%s:%d" % (old_line, old_number),
+                "%s:%d" % (new_line, new_number),
+                "decision %d differs" % index,
+            )
+        if old_tick != new_tick:
+            # The same decisions at different tick numbers are a different schedule.
+            return (
+                "%d/%d" % (old_tick, new_tick),
+                "%s:%d" % (old_line, old_number),
+                "%s:%d" % (new_line, new_number),
+                "decision %d ran at a different tick" % index,
+            )
+    return None
+
+
+def report_diff(label, old_path, new_path):
+    difference = first_difference(old_path, new_path)
+    if difference is None:
+        print("RESULT %s: identical (%d decisions)" % (label, len(parse_trace(old_path))))
+        return True
+    tick, old_line, new_line, why = difference
+    print("RESULT %s: DIFFERENT at tick %s (%s)" % (label, tick, why))
+    print("  old %s" % old_line)
+    print("  new %s" % new_line)
+    return False
+
+
+def prompt_text(tokens):
+    """A deterministic prompt of roughly `tokens` ids; the server reports the real count."""
+    return " ".join(["alpha"] * tokens)
+
+
+def ask(url, text, max_tokens, timeout):
+    body = {
+        "messages": [{"role": "user", "content": text}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+    }
+    request = urllib.request.Request(
+        url + "/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"content-type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        answer = json.load(response)
+    return answer.get("usage", {}).get("prompt_tokens", -1)
+
+
+def model_id(url, timeout):
+    with urllib.request.urlopen(url + "/v1/models", timeout=timeout) as response:
+        return json.load(response)["data"][0]["id"]
+
+
+def wait_ready(url, process, timeout):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            model_id(url, 5)
+            return True
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
+            last = error
+            time.sleep(0.5)
+    print("tick-trace-ab: not ready in %ss: %s" % (timeout, last), file=sys.stderr)
+    return False
+
+
+def workload(url, streams, text, max_tokens, timeout):
+    """All streams start together; the answer's prompt_tokens checks the size."""
+    barrier = threading.Barrier(streams)
+
+    def one(_):
+        barrier.wait()
+        try:
+            return ask(url, text, max_tokens, timeout)
+        except Exception as error:  # a failed stream is reported, not silently compared
+            return "error: %s" % error
+
+    with cf.ThreadPoolExecutor(max_workers=streams) as pool:
+        return list(pool.map(one, range(streams)))
+
+
+def launch(binary, args, trace_path, log_path, timeout):
+    environment = dict(os.environ)
+    environment["SPARKFLASH_TICK_TRACE"] = trace_path
+    command = [binary, "serve"] + args
+    print("LAUNCH %s" % " ".join(command))
+    print("  SPARKFLASH_TICK_TRACE=%s" % trace_path)
+    log = open(log_path, "w", encoding="utf-8")
+    process = subprocess.Popen(
+        command, stdout=log, stderr=subprocess.STDOUT, env=environment
+    )
+    try:
+        ready = wait_ready("http://" + args[args.index("--bind") + 1], process, timeout)
+        if not ready:
+            tail(log_path)
+            return None
+        return process, log
+    except Exception:
+        process.kill()
+        log.close()
+        raise
+
+
+def stop(process, log, grace=120):
+    if process.poll() is None:
+        process.send_signal(signal.SIGTERM)
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=30)
+    log.close()
+
+
+def tail(path, lines=40):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            print("".join(handle.readlines()[-lines:]), file=sys.stderr)
+    except OSError:
+        pass
+
+
+def server_args(args):
+    out = ["--bind", args.bind]
+    if args.checkpoint:
+        out += ["--checkpoint", args.checkpoint]
+    if args.model:
+        out += ["--model", args.model]
+    if args.synthetic:
+        out.append("--synthetic")
+    return out
+
+
+def run(args):
+    os.makedirs(args.out, exist_ok=True)
+    streams = [int(value) for value in args.streams.split(",")]
+    prompts = [int(value) for value in args.prompt_tokens.split(",")]
+    bind_host, bind_port = args.bind.rsplit(":", 1)
+    url = "http://%s:%s" % (bind_host, bind_port)
+    ok = True
+    pairs = 0
+    for tokens in prompts:
+        text = prompt_text(tokens)
+        for count in streams:
+            for rep in range(args.reps):
+                order = [("old", args.old), ("new", args.new)]
+                if rep % 2:
+                    order.reverse()
+                label = "s%d-p%d-r%d" % (count, tokens, rep)
+                traces = {}
+                for name, binary in order:
+                    trace_path = os.path.join(args.out, "%s-%s.trace" % (label, name))
+                    log_path = os.path.join(args.out, "%s-%s.log" % (label, name))
+                    started = launch(binary, server_args(args), trace_path, log_path, args.timeout)
+                    if started is None:
+                        ok = False
+                        traces[name] = None
+                        continue
+                    process, log = started
+                    try:
+                        seen = workload(url, count, text, args.max_tokens, args.timeout)
+                        print(
+                            "WORKLOAD %s %s prompt_tokens=%s"
+                            % (label, name, sorted({value for value in seen if isinstance(value, int)}))
+                        )
+                        for value in seen:
+                            if not isinstance(value, int):
+                                print("  %s" % value, file=sys.stderr)
+                                ok = False
+                    finally:
+                        stop(process, log)
+                    traces[name] = trace_path
+                if traces.get("old") and traces.get("new"):
+                    pairs += 1
+                    if not report_diff(label, traces["old"], traces["new"]):
+                        ok = False
+                else:
+                    print("RESULT %s: a trace is missing" % label)
+                    ok = False
+    print("tick-trace-ab: %d pair(s), %s" % (pairs, "PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def dry_run(args):
+    args_served = server_args(args)
+    streams = [int(value) for value in args.streams.split(",")]
+    prompts = [int(value) for value in args.prompt_tokens.split(",")]
+    print("# one release binary per build; both need the tick-trace emission")
+    for binary in (args.old, args.new):
+        print("#   %s serve %s" % (binary, " ".join(args_served)))
+    for tokens in prompts:
+        for count in streams:
+            for rep in range(args.reps):
+                label = "s%d-p%d-r%d" % (count, tokens, rep)
+                order = ["old", "new"] if rep % 2 == 0 else ["new", "old"]
+                for name in order:
+                    trace = os.path.join(args.out, "%s-%s.trace" % (label, name))
+                    print(
+                        "SPARKFLASH_TICK_TRACE=%s %s serve %s"
+                        % (
+                            trace,
+                            args.old if name == "old" else args.new,
+                            " ".join(args_served),
+                        )
+                    )
+                print(
+                    "#   then %d concurrent greedy chat requests of %d prompt tokens, "
+                    "%d completion tokens" % (count, tokens, args.max_tokens)
+                )
+    print("# diff each pair with: scripts/tick-trace-ab.py --diff OLD.trace NEW.trace")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--old", help="the frozen pre-move sparkflash binary")
+    parser.add_argument("--new", help="the new-engine sparkflash binary")
+    parser.add_argument("--checkpoint", help="the DeepSeek-V4.1 checkpoint directory")
+    parser.add_argument("--model", help="pass through to serve --model")
+    parser.add_argument("--synthetic", action="store_true", help="serve --synthetic (no checkpoint)")
+    parser.add_argument("--streams", default="1,8,16")
+    parser.add_argument("--prompt-tokens", default="2048,16384")
+    parser.add_argument("--reps", type=int, default=3)
+    parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument("--out", default="target/tick-trace-ab")
+    parser.add_argument("--bind", default="127.0.0.1:8000")
+    parser.add_argument("--timeout", type=float, default=3600)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--diff", nargs=2, metavar=("OLD", "NEW"))
+    args = parser.parse_args()
+
+    if args.diff:
+        return 0 if report_diff("diff", args.diff[0], args.diff[1]) else 1
+    if args.dry_run:
+        return dry_run(args)
+    if not args.old or not args.new:
+        parser.error("--old and --new are required (or --dry-run / --diff)")
+    if not args.checkpoint and not args.synthetic:
+        parser.error("--checkpoint is required (or --synthetic)")
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

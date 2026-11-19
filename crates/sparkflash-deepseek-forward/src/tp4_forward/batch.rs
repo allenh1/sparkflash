@@ -69,10 +69,10 @@ use sparkflash_kernels::cuda_driver::HostMapped;
 use sparkflash_model::speculation::DepthPolicy;
 use sparkflash_model::vision::ImageSpan;
 use sparkflash_runtime::tick::{
-    ADOPT_MIN, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
-    SHARE_MIN_ROWS, TickRows, bulk_budget, bulk_from, bulk_rows, common_prefix, decode_plan,
-    decoder_resume, hold_prefill, pick_lane, prefill_order, reusable_shared, runs_decoder,
-    skip_end_after, tick_rows, whole_chunk_fits,
+    ADOPT_MIN, Decision, DecodePlan, DecodeShare, LaneCandidate, PREFIX_REUSE_MIN_ROWS, QUEUE,
+    SHARE_MIN_ROWS, TickRows, TraceSink, WallClock, bulk_budget, bulk_from, bulk_rows,
+    common_prefix, decode_plan, decoder_resume, hold_prefill, pick_lane, prefill_order,
+    reusable_shared, runs_decoder, skip_end_after, tick_rows, whole_chunk_fits,
 };
 use sparkflash_vision::IMAGE_TOKEN_ID;
 use std::sync::Arc;
@@ -137,6 +137,20 @@ fn decode_share_from_env() -> DecodeShare {
         profile.prefill.decode_share.unwrap_or(0.5),
         profile.prefill.deadline_ms.unwrap_or(200_000.0),
     )
+}
+
+/// The trace file the live path was asked for (`SPARKFLASH_TICK_TRACE`), on rank 0 only: every
+/// rank makes the same decisions, so one file is the group's. The path is created/overwritten at
+/// each tick's end; an empty value or a non-rank-0 process asks for nothing.
+fn trace_sink(rank: usize) -> Option<TraceSink> {
+    if rank != 0 {
+        return None;
+    }
+    let path = std::env::var_os("SPARKFLASH_TICK_TRACE")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(TraceSink::new(path, Box::new(WallClock::new())))
 }
 
 /// The modelled wall of a shared speculative step over several sequences that verify drafted rows
@@ -380,6 +394,9 @@ pub(super) struct Batch<'b, 'a, 'r> {
     tick_chunk: bool,
     print: bool,
     trace: bool,
+    /// The decisions this scheduler made, when `SPARKFLASH_TICK_TRACE` asked for them: an
+    /// injected clock and the file they are written to. None (the default) costs a branch.
+    tick_trace: Option<TraceSink>,
     /// The ms the running tick's prefill waited for Engram reads, for the trace.
     read_wait_ms: f64,
     preemptions: usize,
@@ -468,6 +485,7 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                     .diagnostics
                     .batch_trace
                     .unwrap_or(false),
+            tick_trace: trace_sink(inputs.rank),
             read_wait_ms: 0.0,
             preemptions: 0,
         })
@@ -784,6 +802,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         })
     }
 
+    /// Records one decision in the live trace, when `SPARKFLASH_TICK_TRACE` asked for one. The
+    /// tick is the scheduler's own counter and the clock is the sink's (injected); no wall-time
+    /// reading reaches the trace from here.
+    fn traced(&mut self, decision: Decision) {
+        if let Some(trace) = self.tick_trace.as_mut() {
+            trace.record(self.ticks, decision);
+        }
+    }
+
     /// Whether the decoders have had less than their share when `since_ms` passed since the
     /// last long chunk.
     fn hold_since(&self, since_ms: f64) -> bool {
@@ -820,6 +847,9 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         self.read_wait_ms = 0.0;
         let mut out = Vec::new();
         self.place(&mut out)?;
+        // Rank 0's hold for this tick (the value every rank runs): a decision, recorded with the
+        // placement it followed, as the replay records it.
+        self.traced(Decision::Hold { hold });
         let decoding = self.decoding();
         let mut prefilled = None;
         let mut long_chunk = None;
@@ -879,6 +909,10 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         }
         self.seqs.retain(|seq| !seq.done);
         self.keep_awake();
+        // The tick's decisions are complete now; write them before the next tick can fail.
+        if let Some(trace) = self.tick_trace.as_mut() {
+            trace.flush();
+        }
         self.slide()?;
         Ok(out)
     }
@@ -1241,6 +1275,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             } else {
                 Phase::Prefill { target, bulk }
             };
+            let id = seq.id;
+            self.traced(Decision::Place {
+                seq: id,
+                lane,
+                shared,
+                start,
+                target,
+                bulk,
+            });
         }
     }
 
@@ -1554,6 +1597,13 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
                 break;
             }
             let n = R_MAX.min(target - p);
+            self.traced(Decision::Prefill {
+                seq: self.seqs[index].id,
+                from: p,
+                rows: n,
+                target,
+                bulk: false,
+            });
             let layers = self.prefill_layers(lane, p, n, target);
             let seq = &self.seqs[index];
             if let Some(reader) = inputs.engram {
@@ -1715,6 +1765,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let several = ways > 1 && n > R_MAX && p + n < target && chunk(p + n, 1) > R_MAX;
         let lane = self.seqs[index].lane.ok_or("prefill: no lane")?;
         if !several {
+            self.traced(Decision::Prefill {
+                seq: id,
+                from: p,
+                rows: n,
+                target,
+                bulk: true,
+            });
+        }
+        if !several {
             let staged = &inputs.staged[..self.prefill_layers(lane, p, n, target)];
             // A later slot's reads are for a chunk this tick runs on the first rows state.
             self.wait_prefill_more()?;
@@ -1814,6 +1873,15 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             let buffer_i = current_i.as_ref().map_or(buffer, |current| current.buffer);
             slots.push((state_i, end, n_i, current_i, staging_i, buffer_i));
             end += n_i;
+        }
+        for &(_, p, n, ..) in &slots {
+            self.traced(Decision::Prefill {
+                seq: id,
+                from: p,
+                rows: n,
+                target,
+                bulk: true,
+            });
         }
         for slot in slots.len() - 1..more.len() {
             self.wait_prefill_slot(slot)?;
@@ -2032,6 +2100,16 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
             )?;
             slots.push((index, state, lane, p, n, target, current, staging));
         }
+        for &(index, _, _, p, n, target, ..) in &slots {
+            let id = self.seqs[index].id;
+            self.traced(Decision::Prefill {
+                seq: id,
+                from: p,
+                rows: n,
+                target,
+                bulk: true,
+            });
+        }
         let chunks: Vec<_> = slots
             .iter()
             .map(|(_, state, lane, p, n, _, current, staging)| {
@@ -2139,24 +2217,27 @@ impl<'b, 'a, 'r> Batch<'b, 'a, 'r> {
         let constrained = decoding
             .iter()
             .any(|&index| self.seqs[index].constraint.is_some());
-        match decode_plan(
-            decoding.len(),
+        let seqs = decoding.len();
+        let (rows, plan) = match decode_plan(
+            seqs,
             constrained,
             self.spec_floor,
             self.exchange.is_some(),
             R_MAX,
         ) {
-            DecodePlan::None => Ok(0),
-            DecodePlan::Spec => self.spec_step(decoding[0], out, ahead),
+            DecodePlan::None => return Ok(0),
+            DecodePlan::Spec => (self.spec_step(decoding[0], out, ahead)?, "spec"),
             DecodePlan::Plain { .. } => {
                 let mut rows = 0;
                 for group in decoding.chunks(R_MAX) {
                     rows += self.plain_step(group, out, &mut *ahead)?;
                 }
-                Ok(rows)
+                (rows, "plain")
             }
-            DecodePlan::Shared => self.spec_multi_step(&decoding, out, ahead),
-        }
+            DecodePlan::Shared => (self.spec_multi_step(&decoding, out, ahead)?, "shared"),
+        };
+        self.traced(Decision::Decode { seqs, rows, plan });
+        Ok(rows)
     }
 
     /// Starts the Engram reads of sequence `index`'s anchor row, to run under its draft.

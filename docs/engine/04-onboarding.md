@@ -715,6 +715,50 @@ Value: DeepSeek stops being a separate program, the other models gain batched pr
 tick-ahead, the time-based decode share and prefix adoption, and the CLI loses most of 14,545
 lines.
 
+#### Phase 6: what the tick trace emits now
+
+`Batch` emits the scheduler's live trace when `SPARKFLASH_TICK_TRACE=PATH` names a file. Rank 0
+writes it (the group makes the same decisions); every other rank records nothing. It is off by
+default and costs one `Option` branch a decision when off. The decisions are the ones the replay
+records: `Place` after the lane and start are fixed (lane, shared rows, start, target,
+bulk/exact), `Hold` as rank 0's answer for the tick, `Prefill` for each exact step and each bulk
+chunk (from, rows, target, bulk/exact), and `Decode` (sequences, rows, spec/shared/plain). Each
+entry takes its millisecond reading from the sink's `Clock`, never from `Instant::elapsed`:
+`WallClock` in a live process, `InjectedClock` in the CPU gate, so the replay and the live
+decisions compare as decisions. The file is rewritten at each tick's end, so a run that is still
+up has the decisions it has already made.
+
+The gate is `crates/sparkflash-deepseek-forward/src/tp4_forward/live_trace.rs`: a CPU mirror of
+`Batch::tick`'s order (place, hold, the first prefill in prompt order, decode) drives the same
+shared functions and records through the same `TickTrace`; for the fixed 30-tick workload of
+`sparkflash-runtime/tests/tick_trace.rs` its rendered trace must equal `tick::replay`'s text. It
+needs no device. The device-only decisions `Batch` makes (`resume_boundary`, lane memory and
+growth, adoption, paired chunks, preemption, the actual step, the drafter's depth) are not in
+that mirror; a device run's trace is the only check of those, and it still owes the cluster.
+
+`scripts/tick-trace-ab.py` is the served A/B. It runs the same workload through the old and new
+binaries, alternating the launch order, and diffs the decisions (ignoring the injected clock,
+which differs between two live builds); it reports the first differing decision with its tick
+index and exits non-zero. `--dry-run` prints the exact commands. It needs a release binary per
+build that emits the trace (the frozen pre-move build with this emission commit cherry-picked;
+trace only, no decision change) and a DeepSeek-V4.1 checkpoint:
+
+```
+cargo build --release -p sparkflash-cli
+scripts/tick-trace-ab.py --dry-run --old /path/old/sparkflash --new /path/new/sparkflash \
+    --checkpoint /models/DeepSeek-V4.1-Flash
+scripts/tick-trace-ab.py --old /path/old/sparkflash --new /path/new/sparkflash \
+    --checkpoint /models/DeepSeek-V4.1-Flash --streams 1,8,16 \
+    --prompt-tokens 2048,16384 --reps 3
+```
+
+**Not run here:** this host has no checkpoint, no serving build and no GPU. The served A/B still
+owes the cluster: one launch pair at each of 1, 8 and 16 streams at 2K and 16K prompts, several
+of each, and the first-difference report. Concurrent admissions depend on when rank 0's stream
+receives the requests, so a pair that differs only in an admission tick is reported, not excused;
+the trace's decision sequence is the verdict. The device-only decisions above are in the same
+cluster run, not in the CPU mirror.
+
 ### Phase 7: the released arms take the typed API. Bit-neutral. L
 
 Every kernel call site in GLM, Qwen, Inkling, Dory and DeepSeek moves to `Mat<F>` and bound
