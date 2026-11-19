@@ -1266,6 +1266,13 @@ impl DeviceLinear {
     }
 }
 
+/// Whether the arm's decode steps take the tile's few-row body: `decode.tensor_cores`, on by
+/// default and in the shipped `glm53_flash.toml`, where `SPARKFLASH_DECODE_MMA=off` is the
+/// only opt-out. The value is fixed when the rank loads, as the profile is.
+fn decode_tensor_cores(profile: &sparkflash_model::ModelProfile) -> bool {
+    profile.decode.tensor_cores.unwrap_or(true)
+}
+
 /// The FP8 tile body's row rule: one to [MAX_ROWS] token rows take it, and a prefill-sized
 /// batch keeps the bulk GEMM. The body stages the same eight rows the tiled GEMV's largest
 /// launch does, and its own `SPM_ROWS_MAX` is eight.
@@ -1295,6 +1302,43 @@ fn fp8_token_body_fits(linear: &DeviceLinear, rows: usize) -> bool {
         let (first, end) = (starts[part], starts[part + 1]);
         end <= first || ((end - first).is_multiple_of(8) && first.is_multiple_of(FP8_BLOCK))
     })
+}
+
+/// The body a projection takes inside a walk: the bulk GEMM past the arm's step, the tile's
+/// few-row FP8 body, or the tiled GEMV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenRoute {
+    /// Past [MAX_ROWS] rows: the bulk tensor-core GEMM.
+    Bulk,
+    /// The shared tile's few-row body over each part of an FP8 projection.
+    TokenBody,
+    /// The tiled GEMV, whose bits a verified row is defined by.
+    TiledGemv,
+}
+
+/// Which body `linear` takes for `rows` rows under the decode switch.
+///
+/// The tile's few-row body takes an FP8 part only when `decode_tensor_cores` is on and the
+/// part fits ([fp8_token_body_fits]), the operands are eight-byte aligned and the batch is one
+/// to [MAX_ROWS] rows. A BF16 part and a shape the body does not fit keep the tiled GEMV in
+/// both switch states; a batch past [MAX_ROWS] takes the bulk GEMM whatever the switch says.
+fn token_route(
+    linear: &DeviceLinear,
+    input: Deviceptr,
+    rows: usize,
+    decode_tensor_cores: bool,
+) -> TokenRoute {
+    if rows > MAX_ROWS {
+        return TokenRoute::Bulk;
+    }
+    if decode_tensor_cores
+        && fp8_token_body_fits(linear, rows)
+        && input.0.is_multiple_of(8)
+        && linear.weight.data().0.is_multiple_of(8)
+    {
+        return TokenRoute::TokenBody;
+    }
+    TokenRoute::TiledGemv
 }
 
 /// The FP8 tile's few-row body over each part of `linear`: one launch a part, over the part's
@@ -2587,6 +2631,10 @@ pub struct DeviceRank {
     exact_prefill: bool,
     /// How the bulk prefill's GEMMs take their f32 activations.
     prefill_activation: PrefillActivation,
+    /// Whether a decode step's one-to-eight-row block-scaled FP8 projections take the tile's
+    /// few-row body (`decode.tensor_cores`, on by default and in the shipped profile); off
+    /// (`SPARKFLASH_DECODE_MMA=off`) puts them back on the tiled GEMV.
+    decode_tensor_cores: bool,
     /// The fewest rows a device-leg all-reduce takes in two shots ([Self::reduce_into]).
     two_shot_rows: usize,
     /// Whether a bulk step's hyper-connections run on each rank's own rows
@@ -2848,6 +2896,7 @@ impl DeviceRank {
                 config,
                 sparkflash_model::active_profile(),
             )?,
+            decode_tensor_cores: decode_tensor_cores(sparkflash_model::active_profile()),
             two_shot_rows: sparkflash_weights::tp::two_shot_rows().map_err(weights_error)?,
             sequence_parallel: sparkflash_model::active_profile()
                 .sequence
@@ -3754,8 +3803,9 @@ impl DeviceRank {
 
     /// `output = W input` for `rows` rows, BF16 or block-scaled FP8 by the weight, each of a fused
     /// projection's parts as one block of every row's outputs. A prefill-sized batch takes the
-    /// bulk tensor-core GEMM; a decode step's FP8 part takes the tile's few-row body, and its
-    /// BF16 part the tiled GEMV, whose bits a verified row is defined by.
+    /// bulk tensor-core GEMM; a decode step's FP8 part takes the tile's few-row body while
+    /// `decode.tensor_cores` is on, and its BF16 part the tiled GEMV, whose bits a verified row
+    /// is defined by. The switch off puts the FP8 part back on that tiled GEMV too.
     fn gemv(
         &self,
         linear: &DeviceLinear,
@@ -3763,16 +3813,11 @@ impl DeviceRank {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
-        if rows > MAX_ROWS {
-            return self.bulk_gemm(linear, input, output, rows);
+        match token_route(linear, input, rows, self.decode_tensor_cores) {
+            TokenRoute::Bulk => self.bulk_gemm(linear, input, output, rows),
+            TokenRoute::TokenBody => self.fp8_token_body(linear, input, output, rows),
+            TokenRoute::TiledGemv => self.gemv_small(linear, input, output, rows),
         }
-        if fp8_token_body_fits(linear, rows)
-            && input.0.is_multiple_of(8)
-            && linear.weight.data().0.is_multiple_of(8)
-        {
-            return self.fp8_token_body(linear, input, output, rows);
-        }
-        self.gemv_small(linear, input, output, rows)
     }
 
     /// The FP8 tile's few-row body over each part of `linear`: one launch a part, over the
@@ -7346,6 +7391,91 @@ mod tests {
             !fits(1, 144, [128, 136, 144]),
             "a part whose scale block does not start on 128 rows"
         );
+    }
+
+    /// `decode.tensor_cores` chooses the FP8 decode body by value: on takes the tile's few-row
+    /// body, off puts the same projection back on the tiled GEMV. A BF16 part and a shape the
+    /// body does not fit take the tiled GEMV either way, and a batch past the arm's step takes
+    /// the bulk GEMM whatever the switch says.
+    #[test]
+    fn the_decode_switch_picks_the_token_body_or_the_tiled_gemv() {
+        let fp8 = || {
+            DeviceLinear::view(Deviceptr(0), 256, 512, true, Some(Deviceptr(0)))
+                .parted([128, 256, 256])
+        };
+        let bf16 = || DeviceLinear::view(Deviceptr(0), 256, 512, false, None);
+        // A K run that is not whole 128-column blocks: the body does not fit it.
+        let narrow = || DeviceLinear::view(Deviceptr(0), 256, 500, true, Some(Deviceptr(0)));
+        let input = Deviceptr(8);
+        for rows in 1..=MAX_ROWS {
+            assert_eq!(
+                token_route(&fp8(), input, rows, true),
+                TokenRoute::TokenBody,
+                "{rows} FP8 rows with the switch on"
+            );
+            assert_eq!(
+                token_route(&fp8(), input, rows, false),
+                TokenRoute::TiledGemv,
+                "{rows} FP8 rows with the switch off"
+            );
+            for switch in [true, false] {
+                assert_eq!(
+                    token_route(&bf16(), input, rows, switch),
+                    TokenRoute::TiledGemv,
+                    "{rows} BF16 rows, switch {switch}"
+                );
+                assert_eq!(
+                    token_route(&narrow(), input, rows, switch),
+                    TokenRoute::TiledGemv,
+                    "{rows} narrow rows, switch {switch}"
+                );
+            }
+        }
+        for rows in [MAX_ROWS + 1, 512] {
+            for switch in [true, false] {
+                assert_eq!(
+                    token_route(&fp8(), input, rows, switch),
+                    TokenRoute::Bulk,
+                    "{rows} rows, switch {switch}"
+                );
+            }
+        }
+    }
+
+    /// The shipped `glm53_flash.toml` leaves `decode.tensor_cores` unset and the code default
+    /// is on, so the one-to-eight-row FP8 parts take the tile's few-row body: the value version
+    /// 2's capture measured. A future edit that moved either default would move the served bits
+    /// with no capture, so this test holds both the field and the routing by value.
+    #[test]
+    fn the_shipped_profile_decodes_on_the_token_body() {
+        let mut profile =
+            sparkflash_model::ModelProfile::from_toml(include_str!("../config/glm53_flash.toml"))
+                .expect("the shipped GLM profile");
+        assert_eq!(profile.decode.tensor_cores, None, "the file names no value");
+        assert!(
+            decode_tensor_cores(&profile),
+            "the code default is the body"
+        );
+        let fp8 = DeviceLinear::view(Deviceptr(0), 256, 512, true, Some(Deviceptr(0)));
+        for rows in 1..=MAX_ROWS {
+            assert_eq!(
+                token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
+                TokenRoute::TokenBody,
+                "{rows} rows of the shipped profile"
+            );
+        }
+        // `SPARKFLASH_DECODE_MMA=off` is the same typed field, so it selects the tiled GEMV.
+        profile
+            .apply_env(|name| (name == "SPARKFLASH_DECODE_MMA").then(|| "off".to_owned()))
+            .expect("off is a switch value");
+        assert_eq!(profile.decode.tensor_cores, Some(false));
+        for rows in 1..=MAX_ROWS {
+            assert_eq!(
+                token_route(&fp8, Deviceptr(8), rows, decode_tensor_cores(&profile)),
+                TokenRoute::TiledGemv,
+                "{rows} rows with SPARKFLASH_DECODE_MMA=off"
+            );
+        }
     }
 
     #[test]
