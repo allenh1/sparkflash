@@ -418,6 +418,17 @@ The ban is a test, not a convention: `crates/sparkflash-ops/tests/kernel_lookup.
 `sparkflash-model-*` crate and the DeepSeek forward for `load_named`, `load_named_shared` and
 `load_function`, and holds each file to a recorded count with a reason. A converted arm must
 tighten its line; an unconverted one records "not converted yet: phase 7 runs by arm".
+
+The second arm is Qwen, and it is the shape the rest should follow: 11 string lookups became 2
+(the two loaders inside `Bound`), the prefill and drafter files lost theirs entirely, and the
+table went from 15 lines to 13 with no other crate's line touched. Six symbols Qwen already
+launched were missing from the catalogue and were added to its existing entries, which is the
+cost a conversion pays when the catalogue was written from the launches it could see. Weights load
+as `Mat<Bf16>`, `Mat<Fp8E4m3>` and `Mat<NvFp4>` through `upload`, vectors stay `Deviceptr` with
+the reason at `Uploader::vector`, and the boot builds a `FormatLedger` whose widen log is empty
+because this arm reads every weight at its stored format. Device parity is unmeasured on this
+host; the report names the thirteen device targets a CUDA host should run rather than implying
+they passed.
 ### The GLM capture, and what a four-rank boot needs
 
 The arm does boot at world 4 on the branch. Three windows on the cluster (head `sg1-oneill`, four
