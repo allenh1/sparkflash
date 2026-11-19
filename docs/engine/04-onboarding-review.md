@@ -594,8 +594,9 @@ the tree - here an invalid `[[retired]]` field stopped the binary at boot - and 
 into the repo tree on every rank, so the tree must exist on all four.
 ### The tick engine: dense on DeepSeek's scheduler
 
-Commits `ededb08b`, `0807eed5`, `27328381` and `ee722ef6` land phase 6 step 4's remaining part
-and step 5's first arm. `crates/sparkflash-runtime/src/engine.rs` is the engine; dense's
+Commits `ededb08b` and `0807eed5` (the engine and the runtime primitives it drives),
+`27328381` (the tick-ahead hook), `ee722ef6` (dense's move) and `5d9a0d01` (its fixes) land
+phase 6 step 4's remaining part and step 5's first arm. `crates/sparkflash-runtime/src/engine.rs` is the engine; dense's
 single-process serving path is the first arm on it. `FusedEngine` and `GroupLanes` are not
 deleted: every other arm still serves through them, and so does dense's tensor-parallel group.
 
