@@ -42,7 +42,9 @@ pub use convert::{
     InklingRecords, RankFileSource, RankSlot, SLOT_CHUNK_BYTES, convert_rank, rank_slots,
     verify_rank, visit_rank,
 };
-pub use device::{InklingDeviceBackend, InklingVisionTower};
+pub use device::{
+    InklingDeviceBackend, InklingDrafter, InklingSequence, InklingVisionTower, InklingWalk,
+};
 pub use device_plan::{
     BufferPlan, Collective, InklingDevicePlan, LayerSchedule, Op, Pass, Step, TapLayout, TauRule,
     VOCAB_ALIGNMENT,

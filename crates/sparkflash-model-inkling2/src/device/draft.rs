@@ -306,6 +306,12 @@ impl DraftModel {
         self.kv_heads * HEAD_DIM * std::mem::size_of::<f32>()
     }
 
+    /// The bytes the Markov feature holds: what a prompt-boundary checkpoint copies of the
+    /// sequence's drafter state ([DraftState::feature]).
+    pub(super) fn feature_bytes(&self) -> usize {
+        self.hidden * std::mem::size_of::<f32>()
+    }
+
     /// Loads the drafter from `directory`'s [DRAFT_FILE] onto this rank: the block's shares, the
     /// fusion weights, the Markov head, and its fold against this rank's head slice.
     ///

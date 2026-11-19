@@ -79,6 +79,9 @@ mod chunk;
 mod draft;
 mod packed;
 mod tower;
+mod walk;
+
+pub use walk::{InklingDrafter, InklingSequence, InklingWalk};
 
 use chunk::{
     BandOut, Injection, Rows, Segment, band_exchange, band_mix, exchange_gather, exchange_sum,
@@ -3077,6 +3080,15 @@ impl ModelBackend for InklingDeviceBackend {
 }
 
 impl InklingDeviceBackend {
+    /// The same rank and weights as an [InklingWalk]: what the shared runtime drives when this
+    /// arm moves off its own fusion.
+    ///
+    /// # Errors
+    /// A lane plan or a switch the walk cannot honour.
+    pub fn walk_arm(&self) -> Result<InklingWalk, BackendError> {
+        InklingWalk::new(Arc::clone(&self.shared))
+    }
+
     /// This rank's sessions as fused lanes: a slot a request, and each step one walk over every
     /// waiting lane's row ([FusedArm]), at most `max_batch` rows a step.
     ///
@@ -5544,6 +5556,17 @@ impl InklingDeviceSession {
                 Err(error)
             }
         }
+    }
+
+    /// Copies the state a rewind restores at the prompt's end ([Boundary]) when the switch keeps
+    /// one: the convolution histories and the drafter's feature, which the cache rows do not
+    /// hold.
+    fn save_boundary(&mut self, point: usize) -> Result<(), String> {
+        if let Some(boundary) = self.boundary.as_mut() {
+            boundary.save(&self.shared, &self.state, self.drafter.as_ref(), point)?;
+            boundary.images.clone_from(&self.held_images);
+        }
+        Ok(())
     }
 
     /// A fresh sequence on this rank: its own cache, histories and stack, no chunk buffer yet.
