@@ -483,6 +483,29 @@ version 1 and pins the arithmetic the decode change lands. The report says exact
 the two things it cannot show - the distance from the row-GEMV decode and the speed - in an
 explicit list rather than implying them. `numerics.py ci` now reports Dory as the only uncaptured
 configuration.
+### Dory, and a registration that could not be served
+
+The fifth window captured Dory1.0-4B's first reference as a single process at world 1: `/readyz`
+in 3 s, two bit-identical captures (`99715d00…`), and `check --reference` passing on two separate
+boots. Restore took 18 s after a 9 m 56 s window.
+
+It also found that the phase-0 registration was unservable. The release carries **two** recurrent
+loops, and `DoryStage::of_rank` refuses a group whose width does not divide them, so the ring's
+legal widths are 1 and 2 - the world-4 entry could only have been served by rewriting
+`n_recurrent_loops` in a host-side config view, which changes the model rather than measuring it.
+The window deliberately did not do that. The registry now holds a world-1 reference and a
+`[[retired]]` entry for world 4 that says why.
+
+The ring also reports a **world-1** numerics key by design: `recurrence.rs` serves rank 0
+through `serve_backend`, whose comment claims each rank runs the same kernels on the latent rows
+so the arithmetic is the TP=1 arm's bit for bit. That comment cites `tests/recurrence.rs`, and
+there is no such file - the claim is untested. Until it is, the world-1 reference is the only
+measured Dory configuration, and a world-2 capture plus a ring-versus-single-process test are the
+named follow-up rather than a second reference invented to match a broken registration.
+
+Phase 5's three arms are now measured: GLM's declared change with a delta, Inkling's and Dory's
+first references with their speed gaps stated. `numerics.py ci` reports no uncaptured
+configuration.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

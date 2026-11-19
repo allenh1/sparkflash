@@ -16,11 +16,20 @@ limitations under the License.
 
 # Dory1.0-4B-BF16, numerics version 1: the decode rows on the wide tile's few-row body
 
-**Registry state: version 1, uncaptured.** The registry entry names the world-4 sm_121a
-configuration and leaves `reference` and `fingerprint` out: no checkpoint has been captured for
-this arm, so there is no earlier reference to move and no fingerprint to invent. Version 1 is the
-configuration's first reference, and it is the arithmetic this change lands, so the entry keeps
-version 1 and gains this report instead of a bump.
+**Registry state: version 1, captured on 2026-11-19 at world 1.** The entry points at
+`numerics/references/dory10-tp1-sm121a.json` (`99715d0072eab1e1…`). It is the configuration's
+first reference, so there is no earlier reference to move and no bump: version 1 is the
+arithmetic this change lands, and the capture pins it. Two captures are bit-identical and a
+`check` passed on two boots; the numbers are below.
+
+**The world-4 entry was retired.** The released checkpoint carries two recurrent loops and
+`DoryStage::of_rank` refuses a world that does not divide them, so the ring's legal widths are
+1 and 2, not 4; the phase-0 registration at world 4 could only have been served by rewriting
+`n_recurrent_loops`. The ring also serves under the TP=1 numerics key by design: its rank 0
+calls `serve_backend` (world 1) because each rank runs the same kernels on the latent rows it
+receives. That claim cites `tests/recurrence.rs`, which does not exist - the ring's bits against
+a single process are **not tested** - so this reference is the world-1 configuration, and the
+ring's world-2 capture and that test are the named follow-up.
 
 ## What changed
 
@@ -41,7 +50,7 @@ its remainder, K ascending), so a decode row is a cold prompt row.
   (whole eight-column writes and a whole 32-column K run) keeps the BF16 row GEMV.
 - No body was added: the catalogue's BF16 few-row body serves this precision.
 
-## What was measured
+## What was measured before the cluster
 
 - **The decode row is the prompt tile's row.** On the sm_121a device, at every token count from
   1 to 8, `q4p_dense_rows` over the same BF16 weights and f32 activations is bit-equal, row by
@@ -57,40 +66,43 @@ its remainder, K ascending), so a decode row is a cold prompt row.
   and an unaligned activation
   (`device::tests::the_decode_band_takes_the_wide_tiles_few_row_body_from_one_to_eight`).
 
-The device run, on the sm_121a host:
+## Measured on the cluster, 2026-11-19
+
+Served as one process at world 1 on the head node from the branch built at `f1f86bf4` (release,
+`5a092d5a`), the released snapshot untouched, `/readyz` in 3 s. The server reported its identity
+as `world=1 profile=reference plan=tp arch=sm_121a`, status `unregistered` before the capture.
+
+Two captures are bit-identical and `check --reference` passed on two separate boots:
 
 ```text
-$ cargo test -p sparkflash-kernels --test token_bodies_device -- --ignored --nocapture --test-threads=1
-running 3 tests
-test the_bf16_rows_body_is_the_wide_tiles_row ... ok
-test the_fp8_token_bodies_are_the_tiles_rows ... ok
-test the_packed_token_body_is_the_bf16_tiles_row ... ok
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3  dory10-tp1-v1-a.json
+99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3  dory10-tp1-v1-b.json
 ```
 
-## What could not be measured
+The lanes probe was partial - it was stopped by the window's time budget - but the numbers it
+did produce were 16.6 tok/s alone and 16.6 tok/s aggregate for four at once, with all four lanes
+bit-identical to alone.
 
-- **The served delta.** No cluster window and no released Dory checkpoint were available, so the
-  change was not captured against a reference: the mean NLL delta, top-1 agreement and greedy
-  text flips against the row-GEMV decode are **unmeasured**. The registry entry stays uncaptured
-  until the world-4 recurrence ring takes its first reference.
+There is **no served delta** to report, and that is the honest shape of a first reference. The
+measurement of this change against the row-GEMV decode would need a build that still runs the old
+rows, which no longer exists on this branch.
+
+## What is still not measured
+
+- **The change against the row-GEMV arithmetic.** The body is the tile's row (the device test
+  above), but how far the served logits move from the GEMV's was never captured.
 - **The speed A/B.** Whether the one-row step is flat or slower and whether the several-row step
   is faster are both **unmeasured**. The plan expects flat-to-slightly-slower at one row and
   faster at several; that is not evidence.
 - **The sliding window's effect on a continued turn.** The body is a per-row arithmetic and does
   not change the cache or the window, but a continued turn's tokens after a >8-row reply were not
-  compared with a cold prompt here (no checkpoint).
-
-To measure the served configuration, on the cluster with Dory served at world 4:
-
-```bash
-python3 scripts/numerics.py capture --url http://127.0.0.1:8001 --out numerics/references/dory10-tp4-sm121a.json
-python3 scripts/numerics.py check --url http://127.0.0.1:8001 --reference numerics/references/dory10-tp4-sm121a.json
-```
+  compared with a cold prompt.
+- **The recurrence ring.** Its legal width with this checkpoint is 2; no world-2 capture exists
+  and the claim that its bits equal one process's is untested.
 
 ## Reading
 
-The property this change establishes is the device test's: a decode row is the prompt tile's
-row, so a continued turn resumes on the bits a cold prompt leaves, and the packed copy does not
-change the arithmetic. What it does not establish, until the cluster capture, is how far the
-served logits move and whether the step got faster.
+The device test establishes that a decode row is the prompt tile's row, so the packed copy does
+not change the arithmetic. The cluster capture establishes that the released checkpoint serves
+deterministically at world 1 and pins the bits by a fingerprint. What the arm still owes is the
+ring: a world-2 capture, a test that its bits are a single process's, and the speed A/B.

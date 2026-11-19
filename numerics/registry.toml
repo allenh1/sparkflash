@@ -131,8 +131,8 @@ note = "Version 1's reference, captured before decode moved to the tile's few-ro
 # registry's uncaptured state (docs/NUMERICS.md §5): the binary reports them unregistered and
 # `scripts/numerics.py check` says no reference has been captured, rather than comparing against
 # one. Phase 5 of docs/engine/04-onboarding.md takes their first reference after tensor-core
-# decode, so each entry was registered at the arithmetic it will be measured on. Inkling's was
-# taken on 2026-11-19; Dory's is still owed and its entry is the registry's only uncaptured one.
+# decode, so each entry was registered at the arithmetic it will be measured on. Both were taken
+# on 2026-11-19; the registry has no uncaptured configuration left.
 [[config]]
 model = "thinkingmachines/Inkling-2-Small"
 world = 4
@@ -147,17 +147,34 @@ captured = "2026-11-19"
 report = "docs/numerics/inkling2/v1-few-row-decode.md"
 note = "The four-rank group's first reference, captured on the branch at 5a092d5a with the arm launched by scripts/inkling-serve-group.sh: two runs bit-identical and the served gate's lanes check PASS. It pins the arithmetic the decode change lands (head and one-to-eight-row experts on the prompt tiles' bodies: q4p_dense_rows; q4p_moe_rows_gate_up_capped/_down, and the MXFP8 tile), so version 1 is the change itself and not a bump. Its speed and its distance from the row-GEMV decode are unmeasured (docs/numerics/inkling2/v1-few-row-decode.md)."
 
+# Dory1.0-4B's world-4 registration could not be served from the released checkpoint: it carries
+# two recurrent loops, and `DoryStage::of_rank` refuses a world that does not divide them, so the
+# ring's legal widths are 1 and 2. The entry was retired rather than served with a rewritten
+# `n_recurrent_loops`, which would have changed the model rather than measured it. The reference is
+# the world-1 configuration, which is also the numerics key the ring reports (recurrence.rs serves
+# rank 0 through `serve_backend`, world 1).
 [[config]]
+model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+version = 1
+evidence = "logprobs"
+reference = "references/dory10-tp1-sm121a.json"
+fingerprint = "99715d0072eab1e1cef89dbfe990faa2de2b053320c61b25726855aa460e22e3"
+captured = "2026-11-19"
+report = "docs/numerics/dory10/v1-few-row-decode.md"
+note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. Its speed, its distance from the row-GEMV decode, and the world-2 recurrence ring are unmeasured (docs/numerics/dory10/v1-few-row-decode.md)."
+
+[[retired]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 world = 4
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
 version = 1
-evidence = "logprobs"
-captured = "2026-11-18"
-report = "docs/numerics/dory10/v1-few-row-decode.md"
-note = "Registered, not yet captured; the four-rank recurrence ring's first reference is phase 5's. Its one-to-eight-row projections now run the wide tile's few-row body (q4p_dense_rows, packed copies included), which v1-few-row-decode.md declares. Version 1 is the first reference and is that arithmetic; no reference or fingerprint is invented until the capture."
+note = "Registered before the arm was wired; the release carries two recurrent loops, so a group of four cannot split them (DoryStage::of_rank). Replaced by the world-1 entry."
 
 [[anchor]]
 model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
