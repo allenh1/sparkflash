@@ -113,7 +113,7 @@ const EXEMPTIONS: &[Exemption] = &[
     Exemption {
         crate_name: "sparkflash-model-dory",
         file: "src/device.rs",
-        sites: 4,
+        sites: 2,
         why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
               launch in the crate holds the resolved handle",
     },
