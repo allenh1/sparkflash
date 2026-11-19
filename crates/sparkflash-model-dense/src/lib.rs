@@ -1059,14 +1059,15 @@ impl DenseDeviceBackend {
             &shapes,
             &mut owned,
         );
-        let (embed, head, norm, layers, weight_bytes, mut ledger_rows, widen) = match uploaded {
-            Ok(uploaded) => uploaded,
-            Err(error) => {
-                let references: Vec<&Deviceptr> = owned.iter().collect();
-                cuda.free_buffers(&references);
-                return Err(error);
-            }
-        };
+        let (embed, head, norm, layers, weight_bytes, mut ledger_rows, widen, labels) =
+            match uploaded {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    let references: Vec<&Deviceptr> = owned.iter().collect();
+                    cuda.free_buffers(&references);
+                    return Err(error);
+                }
+            };
         // The token GEMVs read a packed copy of every BF16 projection; the wide tiles keep the
         // BF16 rows, so the copy sits beside them. Each packed copy is a `Mat<Bf16>` too, with
         // the form's word layout as its scales, so the uploader checks the row geometry.
@@ -1088,8 +1089,15 @@ impl DenseDeviceBackend {
                 continue;
             };
             let planes = copy.planes();
+            let name = labels
+                .iter()
+                .find(|(address, _)| address == &pointer.0)
+                .map_or_else(
+                    || format!("packed {rows} x {columns} BF16 projection"),
+                    |(_, name)| format!("packed {name}"),
+                );
             let spec = TensorSpec {
-                name: format!("packed {rows} x {columns} BF16 projection"),
+                name,
                 dtype: DType::BF16,
                 shape: vec![*rows, *columns],
             };
@@ -1456,6 +1464,7 @@ type Uploaded = (
     usize,
     Vec<LedgerRow>,
     WidenLog,
+    Vec<(u64, String)>,
 );
 
 /// The typed matrix of a stored BF16 tensor this arm reads: [upload] checks the container's
@@ -1630,6 +1639,9 @@ struct Uploads<'a> {
     /// Every part's stored and arithmetic format and the bytes it reads for one token, in upload
     /// order: the boot format ledger's rows.
     rows: Vec<LedgerRow>,
+    /// Each uploaded matrix's device address and its checkpoint name, so the packed copies built
+    /// after the upload can be named in the ledger.
+    labels: Vec<(u64, String)>,
     /// The one widening this load path takes (a BF16 router bias read at f32), recorded with its
     /// reason so boot can accept it.
     widen: WidenLog,
@@ -1643,8 +1655,9 @@ impl Uploads<'_> {
     }
 
     /// One ledger row for a typed matrix, with the bytes one token reads from it.
-    fn record(&mut self, part: &str, format: FormatKind, bytes: u128) {
+    fn record(&mut self, part: &str, format: FormatKind, bytes: u128, data: Deviceptr) {
         self.rows.push(LedgerRow::new(part, format, format, bytes));
+        self.labels.push((data.0, part.to_owned()));
     }
 
     fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<Mat<Bf16>, String> {
@@ -1660,13 +1673,19 @@ impl Uploads<'_> {
             Scales::none(),
         )?;
         self.keep(mat.pointer, rows * columns * 2);
-        self.record(name, typed.format(), typed.bytes_per_token());
+        self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
         Ok(typed)
     }
 
     fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
         bf16(self.source, name, &[width])?;
         let pointer = self.uploader.vector(name, width)?;
+        self.rows.push(LedgerRow::new(
+            name,
+            FormatKind::Bf16,
+            FormatKind::Bf16,
+            (width * 2) as u128,
+        ));
         Ok(self.keep(pointer, width * 2))
     }
 
@@ -1719,7 +1738,7 @@ impl Uploads<'_> {
             let data = self.keep(self.uploader.bytes(&codes)?, codes.len());
             let blocks = self.keep(self.uploader.bytes(&scales)?, scales.len());
             let typed = typed_nvfp4(&spec, out_rows, out_columns, data, blocks, entries, global)?;
-            self.record(name, typed.format(), typed.bytes_per_token());
+            self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
             return Ok(Proj::NvFp4(typed));
         }
         if spec.dtype != DType::F8E4M3 {
@@ -1734,7 +1753,7 @@ impl Uploads<'_> {
                 Scales::none(),
             )?;
             self.keep(mat.pointer, mat.rows * mat.columns * 2);
-            self.record(name, typed.format(), typed.bytes_per_token());
+            self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
             return Ok(Proj::Bf16(typed));
         }
         if !self.formats.fp8 {
@@ -1766,7 +1785,7 @@ impl Uploads<'_> {
             grid,
             DType::BF16,
         )?;
-        self.record(name, typed.format(), typed.bytes_per_token());
+        self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
         Ok(Proj::Fp8(typed))
     }
 
@@ -1848,6 +1867,12 @@ impl Uploads<'_> {
         runs: &[Run],
     ) -> Result<Deviceptr, String> {
         let mat = self.uploader.mat_parts(name, (rows, width), runs)?;
+        self.rows.push(LedgerRow::new(
+            name,
+            FormatKind::Bf16,
+            FormatKind::Bf16,
+            (mat.rows * width * 2) as u128,
+        ));
         Ok(self.keep(mat.pointer, mat.rows * width * 2))
     }
 
@@ -2089,7 +2114,7 @@ impl Uploads<'_> {
                 let spec = self.source.spec(name).map_err(|error| error.to_string())?;
                 let typed = typed_bf16(&spec, 1, hidden, pointer, hidden * 2, Scales::none())?;
                 self.keep(pointer, hidden * 2);
-                self.record(name, typed.format(), typed.bytes_per_token());
+                self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
                 Some(Proj::Bf16(typed))
             }
             None => None,
@@ -2129,12 +2154,17 @@ fn upload(
         formats,
         owned,
         bytes: 0,
+        labels: Vec::new(),
         rows: Vec::new(),
         widen: WidenLog::new(),
     };
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
     let embed = up.mat(&names.embed, vocab, hidden)?;
+    // A token gathers one embedding row, not the whole table.
+    if let Some(row) = up.rows.last_mut() {
+        row.bytes_per_token = (hidden * 2) as u128;
+    }
     let head = if names.head_tied() {
         embed.clone()
     } else {
@@ -2172,7 +2202,9 @@ fn upload(
             ffn,
         });
     }
-    Ok((embed, head, norm, layers, up.bytes, up.rows, up.widen))
+    Ok((
+        embed, head, norm, layers, up.bytes, up.rows, up.widen, up.labels,
+    ))
 }
 
 /// Refuses a tensor that is not BF16 at `shape`.
