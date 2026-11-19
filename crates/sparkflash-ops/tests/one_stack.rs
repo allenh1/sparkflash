@@ -126,11 +126,13 @@ fn the_ops_crate_is_a_workspace_member() {
 /// pack registry and the shared architecture directly. Phase 6's first fold moved the packed
 /// arms' group-rank openers into the arm crates (`sparkflash-model-glm5-next/src/rank.rs`,
 /// `sparkflash-model-qwen4-exp/src/rank.rs`) and the rank seam into `sparkflash-serve::tp4`:
-/// 36,987 -> 36,566 measured, so the gate is one above it. Still owed: DeepSeek's 14,545-line
-/// serving path (`device_chain.rs`, `tp4_host.rs`, `tp4_chain.rs`, `tp4_device_runner.rs`,
-/// `serve/device.rs`) folds into the common entry, and the group step adapters follow the rank
-/// seam into the arm crates. The gate is lowered as those land; it never rises.
-const CLI_SOURCE_LINE_LIMIT: usize = 36_567;
+/// 36,987 -> 36,566 measured. The second fold moved the seam's step contract (`Tp4RankApi` and
+/// the step shapes) into `sparkflash-serve::tp4` and the GLM and Qwen step adapters into their
+/// arms: 36,566 -> 35,972 measured, so the gate is one above it. Still owed: DeepSeek's
+/// 14,545-line serving path (`device_chain.rs`, `tp4_host.rs`, `tp4_chain.rs`,
+/// `tp4_device_runner.rs`, `serve/device.rs`) folds into the common entry. The gate is lowered as
+/// those land; it never rises.
+const CLI_SOURCE_LINE_LIMIT: usize = 35_973;
 
 #[test]
 fn the_deepseek_forward_is_out_of_the_cli_and_the_cli_is_below_34k_lines() {
