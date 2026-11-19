@@ -588,7 +588,7 @@ ones refused, the `Defaults` table, the `env::var` ban. The rank openers (about 
 `serve.rs`.
 
 The deployed site files use the old names. They change in the deploy that carries this phase, and
-that deploy waits for direction like any other.
+that deploy waits for the owner's go-ahead.
 
 Gate: the CLI and web tests, one boot per arm. Value: adding a family is one table entry, and a
 forgotten site is a compile error.
@@ -612,7 +612,8 @@ Neutral names `SPARKFLASH_DRAFT`, `SPARKFLASH_DRAFT_DEPTH`, `SPARKFLASH_DRAFT_DR
 `SPARKFLASH_DRAFT_POLICY` and `SPARKFLASH_DRAFT_MIN_DEPTH` write the speculation fields.
 The per-model GLM and Qwen spec names are refused with the replacement named. Inkling's own
 drafting names stay aliases because phase 0's console and arm still read them; the lane-memory
-name was already neutral. The tests added here read the tree: every `sparkflash-model-*` crate
+name was already neutral. Inkling's vision switch has since moved to the neutral
+`SPARKFLASH_VISION`, and its old name is refused. The tests added here read the tree: every `sparkflash-model-*` crate
 must be named in both CI files, and direct `env::var`/`env::var_os` reads in a model crate are
 limited to the one recorded table (GLM 2, Inkling 20, Qwen 2 including its test helper) until
 phase 7 moves them through `profile.rs`.
@@ -799,7 +800,7 @@ compiler holds it.
 Taken on 2026-11-18.
 
 1. **Per-model setting names are refused**, with a message naming the replacement. The deployed
-   site files change in the same deploy.
+   site files change in the same deploy, which waits for the owner's go-ahead.
 2. **The dense arm's bits move** in phase 4. Its first numerics reference is taken there.
 3. **Inkling and Dory get tensor-core decode**, as GLM does (phase 5). Other servers do the same
    at every row count; the evidence is under mechanism 3.

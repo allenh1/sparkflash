@@ -40,6 +40,13 @@
 #                       context's); forwarded to every rank, which must refuse the same growth
 #   SPARKFLASH_JOINT_ROUNDS off runs drafting lanes' rounds one after another instead of in one
 #                       shared walk (default: on); forwarded to every rank, whose walks must match
+#   SPARKFLASH_VISION    on (default) loads rank 0's vision tower, off serves text only; forwarded
+#                       to every rank, which must choose the same engine. Its per-model name
+#                       SPARKFLASH_INKLING_VISION is refused with this name in the message.
+#
+# The deployed site file that still sets SPARKFLASH_INKLING_VISION changes in the deploy that
+# carries the rename, and that deploy waits for the owner's go-ahead. This script does not edit
+# the deployed file.
 SITE=${INKLING_SITE:-$HOME/inkling-bin/site.env}
 # shellcheck disable=SC1090
 [ -f "$SITE" ] && source "$SITE"
@@ -72,6 +79,9 @@ RANK_ENV+=(SPARK_COMM_PEERS="$SPARK_COMM_PEERS" SPARK_COMM_CONTROL_PORT="$SPARK_
 [ -n "${SPARKFLASH_REUSE_BY_TEXT:-}" ] && RANK_ENV+=(SPARKFLASH_REUSE_BY_TEXT="$SPARKFLASH_REUSE_BY_TEXT")
 [ -n "${SPARKFLASH_LANE_MEMORY_MB:-}" ] && RANK_ENV+=(SPARKFLASH_LANE_MEMORY_MB="$SPARKFLASH_LANE_MEMORY_MB")
 [ -n "${SPARKFLASH_JOINT_ROUNDS:-}" ] && RANK_ENV+=(SPARKFLASH_JOINT_ROUNDS="$SPARKFLASH_JOINT_ROUNDS")
+# The vision switch's name is neutral, so the Inkling-prefixed loop below no longer carries it; a
+# rank that loaded the tower and one that did not would choose different engines.
+[ -n "${SPARKFLASH_VISION:-}" ] && RANK_ENV+=(SPARKFLASH_VISION="$SPARKFLASH_VISION")
 [ -n "${SPARKFLASH_NCCL_LIB:-}" ] && RANK_ENV+=(LD_LIBRARY_PATH="$SPARKFLASH_NCCL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
 for name in $(compgen -v | grep '^NCCL_'); do
   RANK_ENV+=("$name=${!name}")

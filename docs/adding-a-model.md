@@ -313,6 +313,16 @@ Rules for a new switch:
 3. document the field and alias in this guide;
 4. never let a behaviour be reachable only through an undocumented variable.
 
+`diagnostics.vision` is the neutral vision switch. Its alias `SPARKFLASH_VISION` is on unless
+it is `off` (or the profile's other off spellings, `0` and `false`); the profile's parser
+refuses anything else. Inkling's group reads the same variable at open as well as through the
+profile, because every rank must choose the same engine: a rank 0 with the tower keeps the fused
+group, and a text-only rank 0 takes the tick group and refuses an image before any frame. The
+per-model `SPARKFLASH_INKLING_VISION` is refused by `REFUSED_ENV` with `SPARKFLASH_VISION` in
+the message. The deployed site file that still sets the old name changes in the deploy that
+carries this rename, and that deploy waits for the owner's go-ahead; the repository does not edit
+the deployed file.
+
 ### What still reads the environment directly
 
 Three classes stay raw, and none of them moves a served response's arithmetic:

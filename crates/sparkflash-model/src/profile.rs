@@ -538,7 +538,7 @@ pub struct DiagnosticsProfile {
     pub shared_tp: Option<bool>,
     /// Require io_uring rather than falling back.
     pub require_io_uring: Option<bool>,
-    /// Enable the vision tower.
+    /// Enable the vision tower (the neutral `SPARKFLASH_VISION`).
     pub vision: Option<bool>,
     /// Print the per-batch speculative trace.
     pub batch_trace: Option<bool>,
@@ -821,10 +821,13 @@ pub const ENV_OVERRIDES: &[(&str, &str)] = &[
 /// Per-model setting names phase 2 replaces, and the neutral name that replaces each.
 ///
 /// A process that sets one is refused at boot with a message naming its replacement; the
-/// neutral name writes the same typed field. Inkling's own switch and its depth/policy names
-/// remain aliases because phase 0's console launches Inkling with them and the arm reads them
-/// directly; they move when that arm's settings do. The deployed site files move in the deploy
-/// that carries this phase.
+/// neutral name writes the same typed field. Inkling's own drafting switch and its depth/policy
+/// names remain aliases because phase 0's console launches Inkling with them and the arm reads
+/// them directly; they move when that arm's settings do. The vision switch has moved: its
+/// neutral name is the [ENV_OVERRIDES] alias for `diagnostics.vision`, which DeepSeek's device
+/// path reads through the profile and Inkling's group reads at open under the same name, so the
+/// Inkling name is refused here. The deployed site file that still sets the old name changes in
+/// the deploy that carries this rename, and that deploy waits for the owner's go-ahead.
 pub const REFUSED_ENV: &[(&str, &str)] = &[
     ("SPARKFLASH_GLM_SPEC", "SPARKFLASH_DRAFT"),
     ("SPARKFLASH_GLM_SPEC_DEPTH", "SPARKFLASH_DRAFT_DEPTH"),
@@ -841,6 +844,7 @@ pub const REFUSED_ENV: &[(&str, &str)] = &[
         "SPARKFLASH_QWEN4_DFLASH2_MIN_DEPTH",
         "SPARKFLASH_DRAFT_MIN_DEPTH",
     ),
+    ("SPARKFLASH_INKLING_VISION", "SPARKFLASH_VISION"),
 ];
 
 /// Reads and writes one `Option<bool>` field of a [ModelProfile].
@@ -1714,6 +1718,23 @@ probe = "hash"
                 "{name}'s refusal should name {replacement}: {text}"
             );
         }
+    }
+
+    /// The Inkling vision switch's per-model name is refused with the neutral switch named: the
+    /// replacement is already the [ENV_OVERRIDES] alias for `diagnostics.vision`, which
+    /// DeepSeek's device path and Inkling's group both read.
+    #[test]
+    fn the_inkling_vision_name_is_refused_with_the_neutral_switch() {
+        let mut profile = ModelProfile::default();
+        let error = profile
+            .apply_env(|name| (name == "SPARKFLASH_INKLING_VISION").then(|| "off".to_owned()))
+            .expect_err("the per-model vision name is refused");
+        let text = error.to_string();
+        assert!(text.contains("SPARKFLASH_INKLING_VISION"), "{text}");
+        assert!(
+            text.contains("SPARKFLASH_VISION"),
+            "the refusal should name the neutral switch: {text}"
+        );
     }
 
     /// A cost-model value that is not the shape the reader parses is refused when the profile is

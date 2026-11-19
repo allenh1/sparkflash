@@ -1116,7 +1116,11 @@ broadcast frame (`Request`, `LaneRequest`) as spans and keys, never pixels. `Spa
 on rank 0 before the broadcast and identically on every worker, any span a rank could not prefill:
 a request with images when no tower is loaded, a span whose stride, grid or delimiters are not the
 codec's, one past the prompt's end, overlapping spans, and a stray placeholder outside every span.
-`SPARKFLASH_INKLING_VISION=off` serves text only; any other value than `on` or `off` is refused.
+`SPARKFLASH_VISION=off` (or `0`, `false`) serves text only and unset or `on` (`1`,
+`true`) loads the tower; any other value is refused. The switch was
+`SPARKFLASH_INKLING_VISION`, which is now refused with `SPARKFLASH_VISION` in the message. The
+deployed site file that still sets the old name changes in the deploy that carries this rename,
+and that deploy waits for the owner's go-ahead.
 
 **Bits.** The device tower is held to the f32 host reference
 (`tests/vision.rs::the_device_tower_matches_the_host_reference`: the released width, heads, patch,

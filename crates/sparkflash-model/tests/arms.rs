@@ -37,6 +37,10 @@ const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
     // out of the profile.
     ("sparkflash-model-dense", 2),
     ("sparkflash-model-glm5-next", 2),
+    // The arm's own switches stay at the point of use. One of the twenty is the neutral
+    // SPARKFLASH_VISION read at a group's open: the profile's alias writes diagnostics.vision
+    // for DeepSeek, and the group reads the same variable directly so every rank chooses the
+    // same engine. The per-model SPARKFLASH_INKLING_VISION is refused by profile.rs.
     ("sparkflash-model-inkling2", 20),
     // The device arm reads the numerics dumps' switches once a session
     // (SPARKFLASH_NUMERICS_COVERAGE/_MONITORS/_MODEL/_SAMPLE). They select a diagnostic dump

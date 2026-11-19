@@ -77,19 +77,33 @@ use crate::vision::SpanCheck;
 
 /// The switch for rank 0's vision tower: `on` (the default) loads it from the checkpoint when the
 /// checkpoint has one, `off` serves text only, and the group then refuses a request with images
-/// as a missing capability. Any other value is refused at open.
-pub const VISION_ENV: &str = "SPARKFLASH_INKLING_VISION";
+/// as a missing capability. Any other value is refused at open. The name is neutral because
+/// DeepSeek's device path reads it too; the per-model `SPARKFLASH_INKLING_VISION` is refused by
+/// [sparkflash_model::profile::REFUSED_ENV] with this name in the message.
+pub const VISION_ENV: &str = "SPARKFLASH_VISION";
+
+/// What [VISION_ENV] asks for. The spellings are the profile's boolean ones, because the same
+/// name is the profile's `diagnostics.vision` alias.
+///
+/// # Errors
+/// A value that is not a boolean.
+fn vision_request(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(true),
+        Some("on" | "1" | "true") => Ok(true),
+        Some("off" | "0" | "false") => Ok(false),
+        Some(other) => Err(format!("{VISION_ENV}={other}: expected on or off")),
+    }
+}
 
 /// Whether rank 0 loads the tower ([VISION_ENV]).
 ///
 /// # Errors
-/// A value that is neither `on` nor `off`.
+/// A value that is not a boolean, or a variable that is not UTF-8.
 fn vision_wanted() -> Result<bool, String> {
     match std::env::var(VISION_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(true),
-        Ok(value) if value == "on" => Ok(true),
-        Ok(value) if value == "off" => Ok(false),
-        Ok(value) => Err(format!("{VISION_ENV}={value}: expected on or off")),
+        Err(std::env::VarError::NotPresent) => vision_request(None),
+        Ok(value) => vision_request(Some(&value)),
         Err(error) => Err(format!("{VISION_ENV}: {error}")),
     }
 }
@@ -623,6 +637,24 @@ mod tests {
             wire.admit(&[7, 9, 11], &[]).is_ok(),
             "a prompt with no image is admitted"
         );
+    }
+
+    /// The neutral switch keeps the split the Inkling name had: unset or `on` loads rank 0's
+    /// tower, `off` serves text only, and anything else is refused with the switch named. The
+    /// other boolean spellings are the profile's own (`SPARKFLASH_VISION` is its
+    /// `diagnostics.vision` alias), so a `0` that turns the tower off for DeepSeek does here
+    /// too.
+    #[test]
+    fn the_neutral_vision_switch_keeps_the_tower_and_text_only_split() {
+        for on in [None, Some("on"), Some("1"), Some("true")] {
+            assert_eq!(vision_request(on), Ok(true), "{on:?} loads the tower");
+        }
+        for off in [Some("off"), Some("0"), Some("false")] {
+            assert_eq!(vision_request(off), Ok(false), "{off:?} serves text only");
+        }
+        let error = vision_request(Some("yes")).expect_err("an unknown value is refused");
+        assert!(error.contains(VISION_ENV), "{error}");
+        assert_eq!(VISION_ENV, "SPARKFLASH_VISION");
     }
 
     #[test]

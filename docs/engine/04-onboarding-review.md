@@ -1478,14 +1478,16 @@ the group would deadlock on its first image. The fused group orders the frame fi
 images today. So:
 
 * a group whose rank 0 loaded the tower (the default when the checkpoint has one and
-  `SPARKFLASH_INKLING_VISION` is not `off`) keeps **`Fusion::group`**, unchanged;
-* a **text-only** group (`SPARKFLASH_INKLING_VISION=off`, or a checkpoint that describes no
+  `SPARKFLASH_VISION` is not `off`) keeps **`Fusion::group`**, unchanged;
+* a **text-only** group (`SPARKFLASH_VISION=off`, or a checkpoint that describes no
   tower) is the tick group, and `InklingWire::serves_images = false` refuses an image request
   *before* any frame - a refusal, not a deadlock, and not a group that dies after the request
   went out.
 
-`SPARKFLASH_INKLING_VISION` must be the same on every rank, like the rank files; a rank that
+`SPARKFLASH_VISION` must be the same on every rank, like the rank files; a rank that
 chose the other engine refuses rank 0's frames by name rather than running a different row. The
+name is neutral because DeepSeek's device path reads the same switch; the Inkling name it
+replaced, `SPARKFLASH_INKLING_VISION`, is refused with `SPARKFLASH_VISION` in the message. The
 alternative - carrying the encode on the tick group - is a wire change (the request frame would
 have to precede rank 0's start and a start frame follow it), and it is not written here: no
 cluster was available to check it, and the fused group keeps the image path exactly as it was, so
@@ -1575,7 +1577,13 @@ Pass criteria, in order:
    device test's session path) and **TP=4** (the text-only group, with
    `SPARKFLASH_INKLING_VISION=off` on every rank), at **2K and 16K** prompt tokens, **one and
    four** concurrent requests (the group's `--fuse-batch --concurrency 4`), several reps each,
-   alternating the launch order:
+   alternating the launch order.
+
+   These commands predate the switch's neutral name: they set `SPARKFLASH_INKLING_VISION`,
+   which is now refused with `SPARKFLASH_VISION` named. The deployed site file changes in the
+   deploy that carries that rename, and that deploy waits for the owner's go-ahead; this review
+   does not edit it.
+
    ```sh
    SPARKFLASH_INKLING_VISION=off CONTEXT=32768 LANES=4 \
      ./scripts/inkling-serve-group.sh launch     # each build in turn, alternating
@@ -1584,7 +1592,7 @@ Pass criteria, in order:
    difference is a regression, not a scheduling variance, because the move changes when a row
    runs and not which row. Sampled runs need the same seed and temperature, which the group's
    sampler frame carries whole.
-4. **The image path is unchanged.** With the tower loaded (no `SPARKFLASH_INKLING_VISION`), one
+4. **The image path is unchanged.** With the tower loaded (no `SPARKFLASH_VISION`), one
    image prompt at TP=4 on both builds: both must take `Fusion::group` and answer the same token
    ids. Pass: identical, and the boot line says "the fused group, images on". A text-only group
    must refuse the same request before any frame ("this group serves text only").
