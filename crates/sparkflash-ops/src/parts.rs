@@ -1391,7 +1391,11 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::MoeRouter,
         Image::ROUTED_EXPERTS,
-        &[sym("q4e_router", &[Precision::Bf16, Precision::F32])],
+        &[
+            sym("q4e_router", &[Precision::Bf16, Precision::F32]),
+            // The shared score/top-k/renormalise body the dense arm launches.
+            sym("q4e_route", &[Precision::Bf16, Precision::F32]),
+        ],
         false,
     ),
     sm121(

@@ -3651,6 +3651,73 @@ mod tests {
         }
     }
 
+    /// Every symbol `Kernels::load` resolves, with its image and precision. A symbol that drifts
+    /// out of the catalogue then fails here, on the CPU, rather than at a device boot.
+    const LOADED_SYMBOLS: &[(Image, &str, Precision)] = &[
+        (Image::Qwen4Exp, "q4e_add", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_sum_slots", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_deinterleave", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_embed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_pack_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_unpack_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_packed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv4_packed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rmsnorm", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rope", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_swiglu", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_swiglu_clamped", Precision::Bf16),
+        (
+            Image::Qwen4Exp,
+            "q4e_gemv_tiled_e4m3_tile",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Exp, "q4e_zero", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_argmax_slices", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full_combine", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_cache_bf16", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_dense_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Moe, "q4e_route", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_moe_combine", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_expert_gate_up_bf16", Precision::Bf16),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_bf16_clamped",
+            Precision::Bf16,
+        ),
+        (Image::Qwen4Moe, "q4e_expert_down_bf16", Precision::Bf16),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_fp8",
+            Precision::Fp8E4M3,
+        ),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_fp8_clamped",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Moe, "q4e_expert_down_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Moe, "q4e_expert_gate_up", Precision::NvFp4),
+        (Image::Qwen4Moe, "q4e_expert_down", Precision::NvFp4),
+        (Image::Dory, "dory_mma_wide", Precision::Bf16),
+        (Image::MoePlan, "moe_plan", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_conv", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_conv_state", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_prep", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_scan", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_gate", Precision::Bf16),
+    ];
+
+    #[test]
+    fn every_kernel_the_arm_loads_is_in_the_catalogue() {
+        for (image, symbol, precision) in LOADED_SYMBOLS {
+            Bound::carried(*image, symbol, *precision).unwrap_or_else(|error| {
+                panic!("{image:?} {symbol} at {}: {error}", precision.name())
+            });
+        }
+    }
+
     /// A bound handle names a symbol the image exports and the catalogue carries at the
     /// handle's precision; a launch site never looks a kernel up by string.
     #[test]
