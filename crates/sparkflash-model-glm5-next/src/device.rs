@@ -2672,12 +2672,14 @@ impl DeviceRank {
     /// This is [Glm5NextConfig::architecture]'s plan at this rank's world size and the latent
     /// representation the layers were built with, so a serving walk's [crate::walk::GlmWalk]
     /// layout describes the caches the rank actually holds rather than a compiled-in guess.
-    #[must_use]
-    pub fn kv_plan(&self) -> sparkflash_model::KvPlan {
+    ///
+    /// # Errors
+    /// A configuration the shared plan cannot model (its own error says which), which a serving
+    /// walk must not turn into an empty layout.
+    pub fn kv_plan(&self) -> Result<sparkflash_model::KvPlan, sparkflash_model::ConfigError> {
         self.config
             .architecture
             .kv_plan(self.layout.world_size, self.latent_fp8())
-            .unwrap_or_else(|_| sparkflash_model::KvPlan::new(0, 0))
     }
 
     /// Whether this rank's sparse layers store their latent cache as E4M3 codes.

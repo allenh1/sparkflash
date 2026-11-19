@@ -29,18 +29,27 @@
 //!   quantises the first, so a GLM prompt still runs the 4096-row chunks its kernels and scratch
 //!   were sized for.
 //! * [Walk::walk] runs the same calls the old serving loop ran: a bulk prompt through
-//!   [DeviceRank::begin_prefill]/[DeviceRank::prefill_chunk] (the tensor-core chunk path), a
-//!   token row through [DeviceRank::forward_batch_greedy] (the row-GEMV decode path), and a
-//!   speculative round through [DeviceRank::draft_chain] and [DeviceRank::verify_batch].
+//!   [DeviceRank::begin_prefill]/[DeviceRank::prefill_chunk] (the tensor-core chunk path) and a
+//!   token row through [DeviceRank::forward_batch_greedy] (the row-GEMV decode path). It does
+//!   not draft (see below).
 //! * [Walk::head] is the arm's existing head: the host sampler over the row the greedy step left
-//!   on the device, or the round's [sparkflash_model::verdict] and
-//!   [DeviceRank::commit] when the walk verified a chain.
+//!   on the device, or a verified chain's [sparkflash_model::verdict] and [DeviceRank::commit].
 //!
-//! The drafting machinery moved here with its arithmetic unchanged: a chain drafted by the MTP
-//! layer or the DFlash 2 block drafter, one verify step over every member's anchor and the rows
-//! the share gave it, and each member keeping the leading run it would have picked alone. The
-//! engine's [sparkflash_runtime::Walk::ready] drain hands the whole run back in one reply, as
-//! [crate::serve::GlmFusion] did.
+//! # The drafting gap
+//!
+//! [Walk::ready] and [Walk::speculation] are defaulted on [Walk] and [Drafter] is a marker, so
+//! a drafting arm on the runtime silently loses its verified runs: the engine hands back one
+//! token a step and the reported counters stay zero even though the arm drafted. GLM therefore
+//! names [Absent] and its token path is a plain one-row-a-member step; [crate::serve::GlmFusion]
+//! still serves, so nothing is slower in this pass.
+//!
+//! The round's arithmetic is here, ready for the contract: [GlmSequence::draft_after] (the MTP
+//! layer's or the DFlash 2 block drafter's chain), [GlmSequence::settle] (the verdict, the
+//! commit and the queue of kept answers), [GlmWalk::budget] with [GlmWalk::wall] and
+//! [GlmWalk::joint_rounds] for the row share, and the defaulted [Walk::ready],
+//! [Walk::give_back] and [Walk::speculation] overrides. When the contract lands, ready,
+//! give-back and speculation belong on [Drafter] as required methods, and the arm's source is
+//! the checkpoint's MTP layer or the loaded block drafter.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -51,7 +60,7 @@ use sparkflash_ops::sampler::Sampler;
 use sparkflash_runtime::{
     Absent, ComputeDeclaration, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory, LaneState,
     Limits, NoVision, Pass, PassKind, PassMask, Region, Runtime, Segment, Segments, StateKind,
-    StateLayout, Walk, WalkCapabilities, share_rows,
+    StateLayout, Walk, WalkCapabilities,
 };
 use sparkflash_weights::tp::{BitGatherHandle, TpRuntime};
 
@@ -157,6 +166,10 @@ impl GlmSequence {
     /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows
     /// ([DeviceRank::draft_chain]), with the drafter's confidence in each draft it proposed,
     /// which the depth was chosen from and the round's verdict calibrates.
+    ///
+    /// The future drafter contract's round calls this; nothing does while the walk does not
+    /// draft.
+    #[allow(dead_code)]
     fn draft_after(
         &mut self,
         rank: &DeviceRank,
@@ -187,7 +200,9 @@ impl GlmSequence {
     }
 
     /// A verify of `verified` answered its rows: keep what the model chose, give the rest back
-    /// before the rank's next step, and queue the kept rows for the calls that feed them.
+    /// before the rank's next step, and queue the kept rows for the calls that feed them. The
+    /// future drafter contract's round calls this; [Walk::head] calls it for a
+    /// [PassKind::Verify] pass.
     fn settle(
         &mut self,
         rank: &DeviceRank,
@@ -345,9 +360,12 @@ pub struct GlmWalk {
     limits: Limits,
     /// Whether drafting members verify their rounds in one walk
     /// ([sparkflash_runtime::JOINT_ROUNDS_ENV]); off, each member's chain is verified whole
-    /// without the row share.
+    /// without the row share. The future drafter contract's round reads this.
+    #[allow(dead_code)]
     joint_rounds: bool,
-    /// What a shared walk costs, for the row share.
+    /// What a shared walk costs, for the row share. The future drafter contract's round reads
+    /// this.
+    #[allow(dead_code)]
     wall: ExpertUnionWall,
 }
 
@@ -363,8 +381,11 @@ impl GlmWalk {
                 .lock()
                 .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
             let config = rank.config();
+            let plan = rank.kv_plan().map_err(|error| {
+                BackendError::new("glm5_device", format!("the rank's cache plan: {error}"))
+            })?;
             (
-                rank.kv_plan(),
+                plan,
                 rank.prefill_rows(),
                 ExpertUnionWall {
                     experts: config.n_routed_experts,
@@ -432,10 +453,9 @@ impl Walk for GlmWalk {
     type Seq = GlmSequence;
     /// The runtime has no draft path yet: [sparkflash_runtime::Runtime] steps one row a member
     /// and its [sparkflash_runtime::Runtime::verify] heads only each member's anchor, so an arm
-    /// that named a drafter here would lose its rounds silently. GLM's rounds run inside
-    /// [Walk::walk]/[Walk::head] until the runtime gains one shape for them (shared with Qwen
-    /// and Inkling); this pass leaves [crate::serve::GlmFusion] serving, and the next one names
-    /// the arm's MTP/DFlash 2 source here.
+    /// that named a drafter here would lose its rounds silently (see the module's drafting gap).
+    /// GLM's source is the checkpoint's MTP layer or the loaded DFlash 2 block drafter; the
+    /// contract that can carry it is the next pass's, shared with Qwen and Inkling.
     type Drafter = Absent<&'static str>;
     type Vision = NoVision;
 
@@ -471,14 +491,9 @@ impl Walk for GlmWalk {
             .rank
             .lock()
             .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let spec = self.shared.spec.get();
-        let sequence = match spec {
-            Some(_) if rank.has_block_drafter() => {
-                rank.new_block_drafting_sequence(self.context_limit)?
-            }
-            Some(_) => rank.new_drafting_sequence(self.context_limit)?,
-            None => rank.new_sequence(self.context_limit)?,
-        };
+        // The walk does not draft in this pass, so it opens a plain sequence: the MTP layer's
+        // and the block drafter's state are the future drafter contract's to ask for.
+        let sequence = rank.new_sequence(self.context_limit)?;
         drop(rank);
         Ok(GlmSequence::new(Arc::clone(&self.shared), sequence))
     }
@@ -647,108 +662,35 @@ impl Walk for GlmWalk {
 }
 
 impl GlmWalk {
-    /// One token a segment: every member's round, or a plain step where the arm does not draft.
+    /// One token a segment: every member's row through the rank's batched greedy path, whose
+    /// last kept row's logits [Walk::head] reads back.
     ///
-    /// A drafting member opens its round on the token it was fed, drafting its chain with the
-    /// rank's own drafter; the rows of one walk are then shared among the chains, and one
-    /// [DeviceRank::verify_batch] verifies every member's anchor and the drafts it was given.
-    /// Each member keeps its leading run in [Walk::head], as its round alone would.
+    /// The walk does not draft in this pass (see [Walk::Drafter]): a round is the future
+    /// drafter contract's, and the bodies it will use are [GlmSequence::draft_after],
+    /// [GlmSequence::settle] and [Self::budget]. A batch wider than [MAX_ROWS] rows still runs
+    /// as one call: [DeviceRank::forward_batch_greedy] splits it a step at a time.
     fn token_rows(
         &self,
         rank: &mut DeviceRank,
         segments: &mut [Segment<'_, GlmSequence>],
     ) -> Result<Hidden, BackendError> {
         let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
-        // A verify is one step of at most MAX_ROWS rows, and every member's commit must follow
-        // the one step that verified it: a batch wider than that runs the plain token path, which
-        // is the same tokens by the arm's own measurement.
-        if self.shared.spec.get().is_none() || segments.len() > MAX_ROWS {
-            for segment in segments.iter_mut() {
-                let seq = &mut *segment.seq;
-                seq.prefill_open = false;
-                if self.shared.spec.get().is_some() {
-                    // A batch wider than one verify step runs without the round: a stale queue
-                    // would answer a token this step's own row did not produce.
-                    seq.pending.clear();
-                    seq.confidence.clear();
-                    seq.verified = None;
-                }
-            }
-            let mut batch: Vec<(&mut DeviceSequence, &[u32])> = segments
-                .iter_mut()
-                .map(|segment| (&mut segment.seq.sequence, segment.rows))
-                .collect();
-            rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
-            return Ok(Hidden::new(rows));
+        for segment in segments.iter_mut() {
+            // A step ends any prompt that was running a chunk at a time.
+            segment.seq.prefill_open = false;
         }
-        // Open each member's round: a member whose last verify already holds the fed token's row
-        // takes no row of the walk.
-        let mut opened: Vec<usize> = Vec::new();
-        let mut chains: Vec<Vec<f64>> = Vec::new();
-        let mut chunks: Vec<Chain> = Vec::new();
-        let mut confidences: Vec<Vec<f32>> = Vec::new();
-        for (index, segment) in segments.iter_mut().enumerate() {
-            let token = segment.rows[0];
-            let seq = &mut *segment.seq;
-            // A step ends any prompt that was running a chunk at a time, and a held answer is
-            // still a step of this turn: both clear the last round's row.
-            seq.prefill_open = false;
-            seq.verified = None;
-            if segment.rows.len() == 1 && seq.holds(token) {
-                continue;
-            }
-            let (chunk, confidence) = seq.draft_after(rank, token)?;
-            let drafts = chunk.len() - 1;
-            let mut chain = seq
-                .spec
-                .as_ref()
-                .map_or_else(Vec::new, |spec| spec.chain(&seq.confidence, drafts));
-            chain.truncate(drafts);
-            chains.push(chain);
-            chunks.push(chunk);
-            confidences.push(confidence);
-            opened.push(index);
-        }
-        if opened.is_empty() {
-            return Ok(Hidden::new(rows));
-        }
-        let depths = if self.joint_rounds {
-            share_rows(&chains, self.budget(opened.len()), 0.0, &self.wall)
-        } else {
-            let room = MAX_ROWS.saturating_sub(opened.len()) / opened.len().max(1);
-            chains.iter().map(|chain| chain.len().min(room)).collect()
-        };
-        for (chunk, &depth) in chunks.iter_mut().zip(&depths) {
-            chunk.truncate(depth + 1);
-        }
-        let mut chunked = chunks.iter();
         let mut batch: Vec<(&mut DeviceSequence, &[u32])> = segments
             .iter_mut()
-            .enumerate()
-            .filter(|(index, _)| opened.contains(index))
-            .map(|(_, segment)| {
-                let chunk = chunked.next().expect("one chunk a member");
-                (&mut segment.seq.sequence, chunk.as_slice())
-            })
+            .map(|segment| (&mut segment.seq.sequence, segment.rows))
             .collect();
-        let verified = rank.verify_batch(&self.shared.tp, &self.shared.gather, &mut batch)?;
-        drop(batch);
-        for ((index, chunk), (confidence, rows)) in opened
-            .iter()
-            .zip(chunks)
-            .zip(confidences.into_iter().zip(verified))
-        {
-            segments[*index].seq.verified = Some(Verified {
-                chunk,
-                confidence,
-                rows,
-            });
-        }
+        rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
         Ok(Hidden::new(rows))
     }
 
     /// The most drafts one walk of `seqs` members verifies in all: one row a member is its
-    /// anchor, and a step is at most [MAX_ROWS] rows.
+    /// anchor, and a step is at most [MAX_ROWS] rows. The future drafter contract's row share
+    /// reads this; nothing calls it while the walk does not draft.
+    #[allow(dead_code)]
     fn budget(&self, seqs: usize) -> usize {
         let depth = self.shared.spec.get().map_or(0, |spec| spec.drafts);
         (seqs * depth).min(MAX_ROWS.saturating_sub(seqs))
@@ -817,6 +759,22 @@ mod tests {
         assert!(both.needs_checkpoint());
         assert_eq!(both.bytes_per_row(), 20_160);
         assert_eq!(both.bytes_at(2), 40_320 + 4_096);
+    }
+
+    /// The walk declares no drafter while its token path is one plain row a member, so the
+    /// ledger and the path cannot disagree about whether GLM drafts through the runtime.
+    #[test]
+    fn the_walk_declares_no_drafter_while_it_has_no_round_path() {
+        assert!(
+            !<<GlmWalk as Walk>::Drafter as sparkflash_runtime::Drafter<GlmWalk>>::PRESENT,
+            "the token path does not draft; a drafter name here would be the loaded gun"
+        );
+        let ledger = ledger_for::<GlmWalk>();
+        assert!(
+            matches!(ledger.mode(Strategy::Drafting), Mode::Off(_)),
+            "the runtime ledger states GLM's drafting off: {}",
+            ledger.line()
+        );
     }
 
     /// A profile's 4096-row chunk survives the runtime's ChunkPolicy quantization.
