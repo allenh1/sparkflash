@@ -214,6 +214,7 @@ test-workspace:
     - cargo test -p sparkflash-model-qwen4-exp
     - cargo test -p sparkflash-model-glm5-next
     - cargo test -p sparkflash-model-dense -p sparkflash-model-inkling2 -p sparkflash-model-dory
+    - cargo test -p sparkflash-model-sensenova
     - cargo test -p sparkflash-deepseek-forward
     - cargo test -p sparkflash-kv -p sparkflash-engram -p sparkflash-scheduler -p sparkflash-device -p sparkflash-web
     - cargo test -p sparkflash-weights -p sparkflash-trace

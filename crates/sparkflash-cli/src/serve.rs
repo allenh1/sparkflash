@@ -5910,7 +5910,7 @@ fn serve_with_seam(
         .with_tokenizer(seam)
         .with_api_key(options.api_key.clone())
         .with_cors(options.cors.clone())
-        .with_model_aliases(model_aliases())
+        .with_model_aliases(serving_aliases(options))
         .with_served_checkpoint(served_checkpoint)
         .with_build_id(std::env::var("SPARKFLASH_BUILD_ID").ok())
         .with_numerics(numerics)
@@ -6440,6 +6440,30 @@ fn drain_timeout() -> Duration {
 /// set it to a few seconds, which is the same purpose as a preStop hook.
 fn drain_delay() -> Duration {
     drain_millis_env("SPARKFLASH_SERVE_DRAIN_DELAY_MS", Duration::ZERO)
+}
+
+/// The name the checkpoint's own directory gives it.
+///
+/// The dynamic route used to advertise this as the served model id, so a client configured
+/// with a path to the checkpoint sends the directory's name. The id is the registry's now,
+/// which is stable across how a directory happens to be named; the directory's stem stays an
+/// alias so the same client keeps answering without an edit.
+fn checkpoint_stem(options: &ServeOptions) -> Option<String> {
+    options
+        .checkpoint
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// [model_aliases] plus the checkpoint directory's own name.
+fn serving_aliases(options: &ServeOptions) -> Vec<String> {
+    let mut aliases = model_aliases();
+    if let Some(stem) = checkpoint_stem(options) {
+        aliases.push(stem);
+    }
+    aliases
 }
 
 /// Reads a positive millisecond duration from \`name\`, or returns \`default\` for unset/invalid.

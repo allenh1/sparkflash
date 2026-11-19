@@ -117,6 +117,13 @@ const EXEMPTIONS: &[Exemption] = &[
         why: "the two loaders in Bound: the catalogue and the image are checked once, and every \
               launch in the crate holds the resolved handle",
     },
+    Exemption {
+        crate_name: "sparkflash-model-sensenova",
+        file: "src/device.rs",
+        sites: 6,
+        why: "not converted yet: the arm's bodies are one boot table, and converting it needs a \
+              catalogue row a part, which the arm has not landed",
+    },
 ];
 
 fn workspace() -> PathBuf {

@@ -1844,6 +1844,9 @@ mod tests {
                 "Inkling" => sparkflash_model::Architecture::from_json(
                     sparkflash_model_inkling2::carried_config(),
                 ),
+                "SenseNova" => sparkflash_model::Architecture::from_json(
+                    sparkflash_model_sensenova::carried_config(),
+                ),
                 other => panic!("{other} has a carried profile but no config in this test"),
             }
             .unwrap_or_else(|error| panic!("{}: {error}", arm.id()));

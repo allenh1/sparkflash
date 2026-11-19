@@ -64,8 +64,8 @@ pub use arm::{
     PackIdentity, gib, kv_budget_bytes,
 };
 pub use arms::{
-    ARMS, Arm, Conversion, DeepSeek, Dense, Dory, Glm, Inkling, Qwen, Qwen36, QwenFp8, Tokenizer,
-    arm_for_family, arm_for_weights, numerics_status,
+    ARMS, Arm, Conversion, DeepSeek, Dense, Dory, Glm, Inkling, Qwen, Qwen36, QwenFp8, SenseNova,
+    Tokenizer, arm_for_family, arm_for_weights, numerics_status,
 };
 pub use backend::{BackendError, ModelBackend, ModelSession, Sampling, Speculation, StepOutput};
 pub use capabilities::Capabilities;

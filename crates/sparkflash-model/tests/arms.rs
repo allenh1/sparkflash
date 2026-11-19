@@ -51,6 +51,13 @@ const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
     // path, not served arithmetic, so they stay out of the profile table like the recorders'
     // own reads in sparkflash-model; the third read is the device arm's `Switches`.
     ("sparkflash-model-qwen4-exp", 3),
+    // The SenseNova arm's bisect switches: the 8-bit/4-bit prefill selector, the BF16 dense
+    // tile it is compared against, and the launch/graph/clock levers a kernel is staged with.
+    // They are diagnostic, not served settings, and the four remaining reads are the ignored
+    // device tests' fixture directory and prompt length; docs/models/sensenova-loop-9b.md lists
+    // every one. Moving the selectors through profile.rs is the same phase-7 change the others
+    // wait on.
+    ("sparkflash-model-sensenova", 21),
 ];
 
 /// The repository root, from this crate's manifest directory.

@@ -53,6 +53,12 @@ pub const PROFILE_TOML: &str = include_str!("../config/sensenova_loop_9b_fp8.tom
 
 use sparkflash_model::ModelDescriptor;
 
+/// The released configuration carried in this crate.
+#[must_use]
+pub fn carried_config() -> &'static str {
+    include_str!("../config/sensenova_loop_9b.hf.json")
+}
+
 /// The descriptor this pack serves.
 #[must_use]
 pub fn descriptor() -> ModelDescriptor {

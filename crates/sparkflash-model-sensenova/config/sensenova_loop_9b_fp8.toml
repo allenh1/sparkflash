@@ -1,9 +1,9 @@
 # SenseNova-Loop-9B (FP8) runtime profile.
 #
 # The checkpoint is 11.0 GB of text weights in 128x128-tile E4M3, plus fp32 mHC routers and
-# bf16 norms/embeddings. On a 16 GB RTX 5080 that fills the card at a short context; the 4-bit
-# path is what reaches the 512K window. This profile carries policy, not shape: the checkpoint's
-# config.json is the source of truth.
+# bf16 norms/embeddings. On a 16 GB RTX 5080 that fills the card: the 8-bit copy is what leaves
+# room for a 128K context beside it, and the 4-bit copy is what fits more. This profile carries
+# policy, not shape: the checkpoint's config.json is the source of truth.
 
 model = "sensenova/SenseNova-Loop-9B"
 family = "sensenova_loop"
@@ -14,22 +14,23 @@ context_tokens = 163840
 concurrency = 1
 
 [prefill]
+measured = "docs/models/sensenova-loop-9b.md"
 enabled = true
-# The first device arm feeds a prompt one row at a time, so prefill and decode share the same
-# token GEMV arithmetic and a prompt's logits do not depend on its width. The tensor-core chunk
-# is the next change on the same plan.
-chunk = 64
-tensor_cores = false
+# 1024 rows a chunk: the tensor-core tile tiles 128 rows and the chunk is eight of them, which
+# is where the projections read their weights once for the whole chunk. A 512-row chunk pays a
+# launch a chunk without shortening the pass, and the 4,096 the DeepSeek default states was
+# measured for a chunk that then has to fit beside a 4-bit expert table this arm does not have.
+chunk = 1024
+tensor_cores = true
 exact = true
 
 [attention]
-# The 8-bit K/V cache: one E4M3 code a value with a per-(token, KV head) inverse scale. At
-# 160K it is 4.6 GB; the embedding and LM head stay on the host so the FP8 weights fit beside it.
+# The 8-bit K/V cache: one E4M3 code a value with a per-(token, KV head) inverse scale.
 kv_cache = "fp8"
 
 [decode]
-# Decode is the FP8 tile GEMV and the shared full-attention/GDN bodies; no stage runs on the
-# tensor cores.
+# Decode is the E4M3 tiled GEMV: at one row the tile is 30.8 tok/s against the GEMV's 44, so
+# the tensor cores are the chunk's, not the step's.
 tensor_cores = false
 
 [speculation]

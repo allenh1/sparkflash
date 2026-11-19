@@ -29,7 +29,7 @@ use crate::descriptor::{
     GLM53_CONTEXT_TOKENS, GLM53_FLASH_WEIGHTS_ID, INKLING2_CONTEXT_TOKENS,
     INKLING2_SMALL_WEIGHTS_ID, QWEN36_CONTEXT_TOKENS, QWEN36_FLASH_35B_A3B_FP8_WEIGHTS_ID,
     QWEN38_CONTEXT_TOKENS, QWEN38_FLASH_NEXT_FP8_WEIGHTS_ID, QWEN38_FLASH_NEXT_WEIGHTS_ID,
-    V41_CONTEXT_TOKENS,
+    SENSENOVA_LOOP_9B_CONTEXT_TOKENS, SENSENOVA_LOOP_9B_WEIGHTS_ID, V41_CONTEXT_TOKENS,
 };
 use crate::ledger::{ArmLedger, ledger_for_arm};
 
@@ -383,6 +383,55 @@ impl Arm for Inkling {
     }
 }
 
+
+/// The SenseNova-Loop-9B arm: a Qwen3.5 hybrid whose stored 32 layers are visited 56 times.
+///
+/// The first arm on the dynamic route that owns a looped plan and a two-stream hyper-connection
+/// router, which is why it is registered here rather than as a typed pack: the pack path has no
+/// way to say "layer 4 through 28 twice".
+pub struct SenseNova;
+impl Arm for SenseNova {
+    fn id(&self) -> &'static str {
+        "SenseNova"
+    }
+    fn model_id(&self) -> &'static str {
+        crate::descriptor::SENSENOVA_LOOP_9B_ID
+    }
+    fn weights(&self) -> &'static [&'static str] {
+        &[SENSENOVA_LOOP_9B_WEIGHTS_ID]
+    }
+    fn families(&self) -> &'static [&'static str] {
+        &["sensenova_loop"]
+    }
+    fn profile_toml(&self) -> Option<&'static str> {
+        Some(include_str!(
+            "../../sparkflash-model-sensenova/config/sensenova_loop_9b_fp8.toml"
+        ))
+    }
+    fn default_context(&self) -> usize {
+        SENSENOVA_LOOP_9B_CONTEXT_TOKENS
+    }
+    fn ledger(&self) -> &'static ArmLedger {
+        ledger_for_arm("SenseNova").expect("the SenseNova ledger is declared")
+    }
+    fn tokenizer(&self) -> Tokenizer {
+        Tokenizer {
+            // The release ships a Qwen tokenizer and a ChatML template; the arm renders with
+            // the shared Qwen codec, not the checkpoint's own jinja.
+            tokenizer_id: crate::descriptor::SENSENOVA_LOOP_9B_ID,
+            chat_template: "qwen",
+        }
+    }
+    fn conversion(&self) -> Conversion {
+        // The FP8 pack is a conversion of the released checkpoint rather than a release of its
+        // own, so the dynamic path is what boots it.
+        Conversion {
+            world_size: 1,
+            released: false,
+        }
+    }
+}
+
 /// The shared dense arm: the walk a dynamic family lands on. It serves no registry selector
 /// and carries no profile; the checkpoint's own document supplies both the window and the
 /// tokenizer.
@@ -429,7 +478,7 @@ impl Arm for Dense {
 /// selectors with their own checkpoints, and they share the Qwen ledger and profile. The dense
 /// arm is last because it serves no registry model.
 pub static ARMS: &[&dyn Arm] = &[
-    &DeepSeek, &Qwen, &QwenFp8, &Qwen36, &Glm, &Dory, &Inkling, &Dense,
+    &DeepSeek, &Qwen, &QwenFp8, &Qwen36, &Glm, &Dory, &Inkling, &SenseNova, &Dense,
 ];
 
 /// The arm whose carried profile answers for `family`, if any.

@@ -437,6 +437,59 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             ),
         ],
     },
+    ArmLedger {
+        arm: "SenseNova",
+        weights_ids: &[crate::descriptor::SENSENOVA_LOOP_9B_WEIGHTS_ID],
+        rows: &[
+            (
+                Strategy::Lanes,
+                State::Off(
+                    "the host driver steps one request a turn; --concurrency shares the device, \
+                     not the walk",
+                ),
+            ),
+            (
+                Strategy::PromptParts,
+                State::Native("1024-row chunks, each one pass over the weights"),
+            ),
+            (
+                Strategy::TensorCorePrompt,
+                State::Native(
+                    "block-scaled E4M3 x E4M3 mma.sync m16n8k32 over a 128 x 128 tile, \
+                     157-172 TFLOP/s",
+                ),
+            ),
+            (
+                Strategy::TensorCoreDecode,
+                State::Off("the E4M3 tiled GEMV a row, 44 tok/s; the tile is slower at one row"),
+            ),
+            (Strategy::Drafting, State::Off("the release carries no MTP stage")),
+            (Strategy::JointRounds, State::Off("no drafter")),
+            (
+                Strategy::Runs,
+                State::Off("a step returns the one token it decoded"),
+            ),
+            (
+                Strategy::PrefixReuse,
+                State::Native(
+                    "the host driver keeps the sequence and resumes from the longest shared \
+                     prefix",
+                ),
+            ),
+            (
+                Strategy::Rewind,
+                State::Native("a changed turn moves the checkpoint back to the last prompt's end"),
+            ),
+            (
+                Strategy::StoredArithmetic,
+                State::Native(
+                    "E4M3 weights with the checkpoint's own 128 x 128 W8A8 dynamic activation \
+                     scheme; the 4-bit copy is a separate packed form, never a widening",
+                ),
+            ),
+            (Strategy::Group, State::Off("one card, no tensor-parallel group")),
+        ],
+    },
 ];
 
 impl ArmLedger {

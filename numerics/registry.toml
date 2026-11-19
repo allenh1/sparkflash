@@ -226,6 +226,23 @@ captured = "2026-11-19"
 report = "docs/numerics/dory10/v1-few-row-decode.md"
 note = "The released checkpoint's first reference, single process at world 1: two captures bit-identical and `check` passing on two boots. It pins the arithmetic the decode change lands (projections on the wide tile's few-row body, q4p_dense_rows), so version 1 is the change itself and not a bump. The world-2 recurrence ring was captured on 2026-11-19 and is bit-identical to this reference (8/8 prompts, 1024/1024 logprobs, top-1 100%; numerics/captures/dory10/world2-ring.json), so the ring needs no entry of its own. Its speed, its distance from the row-GEMV decode and the ring's speed against a single process are unmeasured (docs/numerics/dory10/v1-few-row-decode.md). The world-2 ring capture was taken on the binary ef3d022e, whose own card names no commit; its commit a6ef32e4 is inferred from the staged source tree, whose Cargo.toml, crates/sparkflash-model-glm5-next/src/lib.rs and crates/sparkflash-cli/src/serve.rs match it byte for byte."
 
+# SenseNova-Loop-9B's FP8 release, registered before its first capture: the configuration,
+# version and evidence are named and `reference` and `fingerprint` are left out, which is the
+# registry's uncaptured state (docs/NUMERICS.md §5). The arm serves the text backbone on one
+# RTX 5080 at 8-bit weights and an 8-bit K/V cache, with the projections on the block-scaled
+# E4M3 tile and the step on the tiled GEMV. The capture waits for a reference run on that card,
+# which reports sm_120a rather than the group's sm_121a.
+[[config]]
+model = "sensenova/SenseNova-Loop-9B"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_120a"
+version = 1
+evidence = "logprobs"
+captured = "2026-11-19"
+note = "Registered, not yet captured, on this date. The 56-visit plan and the two-stream mHC router are the arm's, and the checkpoint is served from a local FP8 conversion of the released preview (128 x 128-tile E4M3, the checkpoint's own W8A8 dynamic activation scheme). No anchor is frozen for the model, so the arm cannot bump until one is (docs/models/sensenova-loop-9b.md)."
+
 [[retired]]
 model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
 world = 4
