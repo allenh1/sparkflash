@@ -42,9 +42,10 @@ python3 scripts/numerics.py monitors \
 The pair passes. Its achieved maxima are **3.158e-01** per layer and **3.511e-01** per shared
 expert. The bars are a **regression guard, not a quality claim**: they sit above the measured
 maxima so a later pair that moves further fails, and they say nothing about whether the candidate's
-arithmetic is good enough to ship. `[prerequisites] monitors` stays false until the reviewed edit
-that flips it; `numerics/registry.toml` already names the pair and these bars in
-`monitors_pair`, and `scripts/numerics.py ci` judges that pair when the flag is true.
+arithmetic is good enough to ship. `numerics/registry.toml` names the pair and these bars in
+GLM-5.3's `[[monitors]]` row, and `scripts/numerics.py ci` judges every committed row. The
+aggregate `[prerequisites] monitors` flag is false because Qwen3.8, Inkling-2 and Dory1.0 have no
+row; a true flag requires a passing row for every captured logprobs model.
 
 ## What a routing divergence means
 

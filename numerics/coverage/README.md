@@ -16,8 +16,11 @@ limitations under the License.
 
 # Coverage dumps and the growing suite
 
-No real dump is committed yet, so `[prerequisites] coverage` stays false. Do not add a dump that
-was not produced by a serving run; a synthetic fixture belongs in the self-tests, not here.
+Qwen3.8 world 1's swept dump is committed at 24,494 of 24,576 routed slots (99.67%) and is named
+by Qwen's `[[coverage]]` row. The aggregate `[prerequisites] coverage` flag is false because
+GLM-5.3, Inkling-2 and Dory1.0 have no coverage row, so an unapproved bump on any of them is
+refused. Do not add a dump that was not produced by a serving run; a synthetic fixture belongs in
+the self-tests, not here.
 
 ## The bar, and the judge
 
@@ -47,10 +50,22 @@ without the gate: it prints the missing count per layer and writes every missing
 it does not decide a prerequisite. The 48x512 Qwen3.8 layout has 24,576 routed slots; the two
 cluster runs left about 1,720-1,966 of them unreached after 240-330 inputs.
 
-`[prerequisites] coverage` turns true only in a reviewed edit that also sets
-`coverage_dump = "numerics/coverage/<dump>.json"` and commits that dump. `scripts/numerics.py ci`
-then judges the named dump at `coverage_slots` and fails a true flag whose dump is missing, names
-another model, or is below the bar. A false flag makes no claim and names no dump.
+A model's evidence is one `[[coverage]]` row in `numerics/registry.toml`:
+
+```toml
+[[coverage]]
+model = "<model id>"
+dump = "numerics/coverage/<dump>.json"
+min_inputs = 8
+```
+
+There is one row a model; a second is refused. The row is validated at parse (model present, dump
+under `numerics/coverage/` and `.json`, `min_inputs` positive), and `scripts/numerics.py ci`
+judges the dump at the shared `coverage_slots` whether or not the aggregate flag is true.
+`[prerequisites] coverage` is the aggregate report over every captured logprobs model: it turns
+true only when each has a passing row, and a true flag that claims more than the rows hold is a
+finding. A false flag with an uncovered model is consistent; the per-model bump check is what
+refuses that model, naming it.
 
 ## The sweep
 

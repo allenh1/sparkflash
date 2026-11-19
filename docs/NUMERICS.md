@@ -139,10 +139,10 @@ An entry may also carry the owner's approval of one declared change, as a nested
 approved = { decision = "tensor-core decode is an approved arithmetic change", date = "2026-11-18", report = "docs/numerics/qwen38/v2-approval.md" }
 ```
 
-The approval replaces only the three global prerequisites (§5). The declared change, the entry's own
-`report` and the per-model anchor rule still apply. It is part of the record, like a version: the
-declaration check refuses its removal, and refuses an empty `decision` or `date`, a `report` that
-does not exist, and an approved bump that changes nothing.
+The approval replaces the per-model coverage and monitors prerequisites (§5). The declared change,
+the entry's own `report` and the per-model anchor rule still apply. It is part of the record, like
+a version: the declaration check refuses its removal, and refuses an empty `decision` or `date`, a
+`report` that does not exist, and an approved bump that changes nothing.
 
 `[[retired]]` keeps a removed configuration's last version, so removing and re-adding one cannot
 reset it. A reference's `server` card is what the capturing binary reported, and it is outside the
@@ -251,57 +251,98 @@ kernel or a default set in Rust, is the bit gate's to catch.
 
 ### Prerequisites
 
-No version may be bumped, which is to say no arithmetic change may land, until the three global
-prerequisites are true in the registry's `[prerequisites]` **and** the bumping configuration's own
-model has a frozen anchor and a teacher-forced comparison — **or** the entry carries an `approved`
-record, the owner's decision that one declared change is expected, which replaces the three global
-flags but nothing else:
+No version may be bumped, which is to say no arithmetic change may land, until the global
+`declaration_check` is true **and** the bumping configuration's own model has all three of its
+per-model prerequisites — a frozen anchor with a teacher-forced comparison, its own `[[coverage]]`
+row that passes, and its own `[[monitors]]` row that passes — **or** the entry carries an
+`approved` record, the owner's decision that one declared change is expected, which replaces the
+coverage and monitors prerequisites but nothing else.
+
+`anchor`, `coverage` and `monitors` are **per model**, shaped like `[[anchor]]`: the registry
+holds one row a model, and `ci` resolves the bumping entry's model to its rows. A model with no
+row has that prerequisite missing, so it cannot lean on another model's evidence. The
+`[prerequisites]` flags are the **aggregate report** over every model whose captured evidence is
+`logprobs`: `ci` prints which models each flag covers, and a true flag that claims more than the
+registry holds is a finding (a false flag with an uncovered model is consistent — the per-model
+lookup is what refuses that model).
 
 | Prerequisite | State |
 | :-- | :-- |
-| `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8, GLM-5.3 and Dory1.0 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 does not, so its configuration cannot bump until it is anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
-| `declaration_check`: the CI check above | **done** |
-| `coverage`: inputs that reach at least `coverage_slots` of the routed (layer, expert) slots, with hit counts | **done**: Qwen3.8 world 1's swept dump reaches **24,494 of 24,576** slots (99.67%) over 416 inputs, and `ci` judges it at the declared **0.93**; `coverage-gaps` reports what a partial dump misses and `coverage-sweep` grows the suite |
-| `monitors`: per-layer and per-shared-expert relative error against the reference, with any routing divergence reported | **implemented and measured**, the flag is **false**: the committed GLM-5.3 pair is judged at layer bar **0.5** and expert bar **0.5**, and passes with maxima **3.158e-01** per layer and **3.511e-01** per shared expert. 7 of 42 layers routed one row to a different expert, leaving 14 experts unshared (7 reference-only, 7 candidate-only) and 329 shared. The flag is flipped only by a reviewed edit; `ci` then judges the pair named in `monitors_pair` |
+| `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8, GLM-5.3, Inkling-2 and Dory1.0 each have a `[[anchor]]` and a committed capture teacher-forced from it; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **true**; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. |
+| `declaration_check`: the CI check above | **done**, and global: it gates every bump. |
+| `coverage`: inputs that reach at least `coverage_slots` of the routed (layer, expert) slots, with hit counts | per model. **Qwen3.8 world 1 has its row** — the swept dump reaches **24,494 of 24,576** slots (99.67%) over 416 inputs, judged at the declared **0.93** with `min_inputs = 8`. **GLM-5.3, Inkling-2 and Dory1.0 have no row**, so an unapproved bump on any of them is refused with the model named; the aggregate flag is therefore **false**. |
+| `monitors`: per-layer and per-shared-expert relative error against the reference, with any routing divergence reported | per model. **GLM-5.3 has its row** — the committed pair is judged at layer bar **0.5** and expert bar **0.5**, and passes with maxima **3.158e-01** per layer and **3.511e-01** per shared expert; 7 of 42 layers routed one row to a different expert, leaving 14 experts unshared (7 reference-only, 7 candidate-only) and 329 shared. **Qwen3.8, Inkling-2 and Dory1.0 have no row**, so the aggregate flag is **false**. |
 
-`[prerequisites]` also states the coverage bar, `coverage_slots`, and — when the flag is true —
-`coverage_dump`. `coverage_slots` is the fraction of (layer, routed-expert) slots a committed dump
-must reach, in (0, 1]; it is **0.93**, not 1.0: real serving reached 92-93% of Qwen3.8's 48x512
-slots with 240-330 inputs and every layer still carried gaps, so requiring every slot would have
-made the prerequisite unattainable. `coverage = true` is a claim that the dump named by
-`coverage_dump` is committed, names a model with a committed layout, and reaches the bar;
-`scripts/numerics.py ci` judges exactly that dump and fails a true flag whose dump is missing,
-belongs to another model, or is below the bar. Turning it on is a reviewed edit adding both the
-pointer and the dump in the same change; a false flag names no dump and makes no claim.
+**No model has both rows today.** Qwen3.8 has coverage and no pair; GLM-5.3 has a pair and no
+dump; Inkling-2 and Dory1.0 have neither. Every *unapproved* bump is therefore refused, naming the
+model and the missing item; an approved bump still lands, because the approval replaces exactly
+these two prerequisites. Nothing here grows a model's coverage or judges a new pair: that is the
+coverage and monitor windows' work, and it adds the model's row in the same reviewed change.
 
-`[prerequisites]` also states the monitor pair:
+The coverage evidence is one row a model:
 
 ```toml
-monitors_pair = { reference = "numerics/monitors/glm53-tp4-v1-reference.json", candidate = "numerics/monitors/glm53-tp4-v2-candidate.json", layer_bar = 0.5, expert_bar = 0.5 }
+[[coverage]]
+model = "nvidia/Qwen3.8-Flash-Next-NVFP4"
+dump = "numerics/coverage/qwen38-world1.json"
+min_inputs = 8
 ```
 
-The two paths must be JSON dumps under `numerics/monitors/`, and the bars finite and positive; a
-missing key, an unknown
-key, a path elsewhere or a bar outside those rules is refused when the registry is parsed. The
-table may be present while `monitors` is false — it is the pointer a reviewed flip uses — but a
-true flag without it is refused at parse. `monitors = true` is a claim that both dumps are
-committed, parse, name the same model and probe, share their sampled indices and layer set, and
-meet the declared layer and expert bars over the experts both routed to; `scripts/numerics.py ci`
-judges exactly that and fails a true flag whose pair is missing, mismatched or over a bar.
+`dump` is a JSON dump under `numerics/coverage/` and `min_inputs` is the coverage suite's declared
+input floor (a positive integer; the dump must name at least that many distinct inputs). The bar is
+the shared `coverage_slots`, which is the fraction of (layer, routed-expert) slots a committed dump
+must reach, in (0, 1]; it is **0.93**, not 1.0: real serving reached 92-93% of Qwen3.8's 48x512
+slots with 240-330 inputs and every layer still carried gaps, so requiring every slot would have
+made the prerequisite unattainable. The row's model must have a committed layout under
+`numerics/layouts/`, and the dump must name that model or it is refused.
+
+The monitor evidence is also one row a model:
+
+```toml
+[[monitors]]
+model = "zai-org/GLM-5.3-Flash"
+reference = "numerics/monitors/glm53-tp4-v1-reference.json"
+candidate = "numerics/monitors/glm53-tp4-v2-candidate.json"
+layer_bar = 0.5
+expert_bar = 0.5
+```
+
+Both paths must be JSON dumps under `numerics/monitors/`, and the bars finite and positive. The
+bars are a regression guard, not a quality claim: they sit just above the measured maxima so a
+later change that doubles the error fails.
+
+A row is validated when the registry is parsed: its model is present and non-empty, its paths are
+under the right directory and end in `.json`, its bars are finite and positive, its
+`min_inputs` is positive, and there is **one row a model** (a second row for the same model is
+refused). A malformed row fails the parse with the model named. A committed row is evidence and is
+judged by `ci` whether or not the aggregate flag is true; the flag only adds the aggregate claim.
+
+`ci` resolves the bumping entry's model to its `[[coverage]]` and `[[monitors]]` rows in
+`declaration_findings`. An unapproved bump whose model has no row, whose row is malformed (the
+parse refuses it first), or whose row fails its bar is refused, and the finding names the model and
+the reason:
+
+```text
+<configuration>: version N declares an arithmetic change, but '<model>' has no passing per-model
+evidence: the model '<model>' has no [[coverage]] row; ... (docs/NUMERICS.md §5); add the model's
+[[coverage]] and [[monitors]] rows with their committed evidence, or record the owner's approval
+```
 
 An `approved` record accepts that one bump when its `decision` is a non-empty one line, its
-`date` is the day the decision was taken, and its `report` exists and is new or changed in the same
-diff. The declared change (a changed fingerprint), the entry's own `report` and the per-model anchor
-and teacher-forced comparison still apply, so a model with no anchor cannot bump under an approval.
+`date` is the day the decision was taken, and its `report` exists and is new or changed in the
+same diff. It replaces the coverage and monitors prerequisites (per model, whatever rows exist);
+the declared change (a changed fingerprint), the entry's own `report` and the model's anchor and
+teacher-forced comparison still apply, so a model with no anchor cannot bump under an approval.
 The record stays with the entry afterwards and its removal is refused. This is how a deliberate
-arithmetic change whose output shift the owner has accepted lands while `coverage` and `monitors`
-are still false. A defect is still a defect: the approval says a shift is expected, not that any
-output is acceptable.
+arithmetic change whose output shift the owner has accepted lands while a model's coverage or
+monitor evidence is missing. A defect is still a defect: the approval says a shift is expected,
+not that any output is acceptable.
 
-Otherwise the gate is exactly the bit gate. The per-model anchor gate is enforced by
-`scripts/numerics.py ci`: a bump whose model has no `[[anchor]]`, whose anchor has no committed
-teacher-forced capture, or whose evidence is `text` is refused with the model named, while a
-model that has its own anchor is not blocked by another model's missing one.
+Otherwise the gate is exactly the bit gate. The per-model rules are enforced by
+`scripts/numerics.py ci`: a bump whose model has no `[[anchor]]`, no `[[coverage]]` row or no
+`[[monitors]]` row, whose anchor has no committed teacher-forced capture, or whose evidence is
+`text` is refused with the model named, while a model that has its own evidence is not blocked
+by another model's missing row.
 
 #### The coverage dump
 
@@ -473,8 +514,9 @@ maxima **3.158e-01** per layer and **3.511e-01** per shared expert; 7 of 42 laye
 to a different expert, leaving 14 experts unshared (7 reference-only, 7 candidate-only) and 329
 shared. The bars are a **regression guard, not a quality claim**: they sit above the measured
 maxima so a future pair that moves further is caught, and they say nothing about whether the
-candidate is good enough to ship. The registry's `monitors_pair` names this pair and these bars;
-`[prerequisites] monitors` remains false until the reviewed edit that flips it.
+candidate is good enough to ship. The registry's `[[monitors]]` row for GLM-5.3 names this pair
+and these bars; the aggregate `[prerequisites] monitors` flag is false because Qwen3.8, Inkling-2
+and Dory1.0 have no row, so an unapproved bump on any of them is refused.
 
 The Rust writer is `sparkflash_model::numerics_monitors::Recorder`. It is off unless
 `SPARKFLASH_NUMERICS_MONITORS` names an output path; `SPARKFLASH_NUMERICS_SAMPLE` sets the number
@@ -507,8 +549,9 @@ above record.
 A real reference/candidate pair needs two builds. The echo of one process is not a candidate. The
 first real pair is committed under `numerics/monitors/` — GLM-5.3's reference build
 (`SPARKFLASH_DECODE_MMA=off`, the tiled row GEMV) against the shipped default (the FP8 few-row
-body) — and `numerics/registry.toml` names it in `monitors_pair`. `[prerequisites] monitors`
-stays false until the reviewed edit that flips it. On the cluster, with the wired Qwen3.8 host
+body) — and `numerics/registry.toml` names it in GLM-5.3's `[[monitors]]` row. The aggregate
+`[prerequisites] monitors` flag stays false while any captured logprobs model has no row. On the
+cluster, with the wired Qwen3.8 host
 reference:
 
 ```bash
@@ -918,16 +961,17 @@ serves no logprobs, a text reference has no token ids to teacher-force, and §2 
 arithmetic until it has been measured under this policy. If a logprobs path for DeepSeek lands,
 the exemption ends with it, and an anchor capture would be the first requirement.
 
-The aggregate `anchor` flag is **false**, and that is the honest value: Inkling-2 and Dory1.0
-have captured `logprobs` references but no `[[anchor]]`, so they are not covered and cannot bump.
-The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
-with an uncovered model fails `ci`. The coverage bar is declared at 0.93 and the swept Qwen3.8
-dump is committed at 24,494 of 24,576 slots (99.67%), so `coverage` is true. The first real
-monitor pair — the GLM-5.3 reference/candidate retake — is committed under `numerics/monitors/`
-and judged at layer bar 0.5 and expert bar 0.5: 7 of 42 layers routed one row to a different
-expert (14 experts unshared, 329 shared), with maxima 3.158e-01 per layer and 3.511e-01 per shared
-expert. `monitors` remains false until the reviewed edit that flips it; the bars are a regression
-guard, not a quality claim. Neither flag was flipped on synthetic data. The coverage suite is now
+All four logprobs models now have an anchor and a committed teacher-forced capture, so the
+aggregate `anchor` flag is **true**; a true flag with an uncovered model still fails `ci`. The
+coverage and monitor evidence is per model (§5). Qwen3.8 has a `[[coverage]]` row — its swept
+dump reaches 24,494 of 24,576 slots (99.67%) at the declared 0.93 — and GLM-5.3 has a
+`[[monitors]]` row: the committed reference/candidate pair is judged at layer bar 0.5 and expert
+bar 0.5, with 7 of 42 layers routing one row to a different expert (14 experts unshared, 329
+shared) and maxima 3.158e-01 per layer and 3.511e-01 per shared expert. Inkling-2 and Dory1.0 have
+neither row, and GLM-5.3 has no coverage dump while Qwen3.8 has no monitor pair, so both aggregate
+flags are **false** and every unapproved bump is refused with the model named. An approved bump
+needs neither row. No flag was flipped on synthetic data, and no model's coverage was grown or new
+pair judged to make a flag true. The coverage suite is now
 growable: `coverage-gaps` names the missing experts, `coverage-sweep` measures a deterministic
 corpus and writes the kept prompts as the next batch, and the corpus and generator live under
 `numerics/coverage/`. The commands that wrote the coverage dump and the monitor pair are in §5;
