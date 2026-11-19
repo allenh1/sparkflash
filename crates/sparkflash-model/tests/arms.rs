@@ -36,7 +36,11 @@ const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
     // SPARKFLASH_TOKENIZER_DIR; both are the check's fixture, not a served setting, so they stay
     // out of the profile.
     ("sparkflash-model-dense", 2),
-    ("sparkflash-model-glm5-next", 2),
+    // Two are the L2 prefetch knobs. The third is the monitor dump's switches, read once when
+    // the rank loads (`SPARKFLASH_NUMERICS_MONITORS` and its `_MODEL`/`_SAMPLE` overrides,
+    // `crates/sparkflash-model-glm5-next/src/device/numerics.rs`); they select a diagnostic dump
+    // path, not served arithmetic, so they stay out of the profile table like Qwen's.
+    ("sparkflash-model-glm5-next", 3),
     // The arm's own switches stay at the point of use. One of the twenty is the neutral
     // SPARKFLASH_VISION read at a group's open: the profile's alias writes diagnostics.vision
     // for DeepSeek, and the group reads the same variable directly so every rank chooses the

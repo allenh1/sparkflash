@@ -85,6 +85,7 @@
 //! half the BF16 head's bytes, and a draft is only a proposal the verify checks against the BF16
 //! head, so the copy changes how many drafts a verify keeps, never what it keeps.
 
+use std::cell::RefCell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -119,6 +120,8 @@ use sparkflash_ops::projection::{
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::{host_sum, reduce_scatter, reduce_two_shot, takes_two_shots};
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
+
+mod numerics;
 
 fn cubin_available() -> bool {
     !images::qwen4_exp_cubin().is_empty() && !images::glm_decode_cubin().is_empty()
@@ -2648,6 +2651,12 @@ pub struct DeviceRank {
     steps: u64,
     /// LM heads this rank has run, a step's or a draft's: each overwrites the last one's logits.
     heads: AtomicU64,
+    /// The numerics monitor switch, read once when the rank loads (docs/NUMERICS.md section 5).
+    monitors: numerics::Switches,
+    /// This step's monitor recorder; `None` between steps and with the switch off.
+    record: RefCell<Option<numerics::Forward>>,
+    /// Whether `SPARKFLASH_NUMERICS_MONITORS` names a path, checked a layer without a borrow.
+    monitoring: bool,
     /// The side stream [Self::prefetch] warms the L2 from, unless SPARKFLASH_L2_PREFETCH=0.
     prefetch: Option<Prefetch>,
     /// Recorded after each embedding launch that reads a token slab ([Self::embed_rows]).
@@ -2868,6 +2877,10 @@ impl DeviceRank {
         let prefetch = Prefetch::new(&cuda)?;
         let tokens_staged = TokenFence(cuda.stream_event().map_err(cuda_error)?);
         let kda_scan = Self::kda_scan_plan(config, layout)?;
+        // The monitor switch is read once, when the rank loads: a forward then pays one `Option`
+        // check and a layer one, and off does no formatting or allocation.
+        let monitors = numerics::Switches::from_env(crate::MODEL_ID, config.hidden_size);
+        let monitoring = !monitors.is_off();
         let mut rank = Self {
             cuda,
             stream,
@@ -2908,6 +2921,9 @@ impl DeviceRank {
                 .unwrap_or(1.0 / config.hc_mult as f32),
             steps: 0,
             heads: AtomicU64::new(0),
+            monitors,
+            record: RefCell::new(None),
+            monitoring,
             prefetch,
             prof: Mutex::new(sparkflash_model::StageProfiler::new(
                 Self::profile_enabled()?
@@ -5389,7 +5405,7 @@ impl DeviceRank {
 
     /// Each row's routed experts in ascending expert order, each times its weight, then the shared
     /// expert, into `partial`.
-    fn moe(&self, moe: &DeviceMoe, rows: usize) -> Result<(), BackendError> {
+    fn moe(&self, moe: &DeviceMoe, layer: Option<usize>, rows: usize) -> Result<(), BackendError> {
         let s = &self.scratch;
         let config = &self.config;
         let (hidden, width, topk) = (
@@ -5425,7 +5441,7 @@ impl DeviceRank {
         )?;
         self.prof_mark("moe_router");
         if rows > MAX_ROWS {
-            return self.bulk_moe(moe, rows);
+            return self.bulk_moe(moe, layer, rows);
         }
         self.expert_gemv(
             moe.gate_up,
@@ -5460,14 +5476,19 @@ impl DeviceRank {
             rows,
         )?;
         self.prof_mark("moe_down");
-        self.combine_experts(rows)
+        self.combine_experts(layer, rows)
     }
 
     /// The routed experts over a prefill chunk, grouped by expert: one item (up to
     /// [MOE_ITEM_ROWS] slots) a block set, the same tensor-core body as a dense projection. The
     /// gate/up GEMM reads each item row from its token's row, and the down GEMM writes each kept
     /// row, times its routing weight, to its slot's row.
-    fn bulk_moe(&self, moe: &DeviceMoe, rows: usize) -> Result<(), BackendError> {
+    fn bulk_moe(
+        &self,
+        moe: &DeviceMoe,
+        layer: Option<usize>,
+        rows: usize,
+    ) -> Result<(), BackendError> {
         let s = &self.scratch;
         let config = &self.config;
         let (hidden, width, topk) = (
@@ -5503,7 +5524,7 @@ impl DeviceRank {
             && hidden.is_multiple_of(FP8_BLOCK)
         {
             self.bulk_moe_q8(moe, rows, items)?;
-            return self.combine_experts(rows);
+            return self.combine_experts(layer, rows);
         }
         let mma = if self.prefill_activation == PrefillActivation::Bf16 {
             self.kernels.prefill_moe_mma_bf16a.kernel
@@ -5554,7 +5575,7 @@ impl DeviceRank {
                 s.expert_weights.0,
             ],
         )?;
-        self.combine_experts(rows)
+        self.combine_experts(layer, rows)
     }
 
     /// [Self::bulk_moe]'s GEMMs over the release's dynamic activation: the chunk's rows quantised
@@ -5625,7 +5646,10 @@ impl DeviceRank {
     }
 
     /// The routed experts' rows and the shared expert's into each row's partial.
-    fn combine_experts(&self, rows: usize) -> Result<(), BackendError> {
+    ///
+    /// `layer` is the decoder layer, for the monitor probe (docs/NUMERICS.md section 5); `None` is
+    /// the MTP layer's draft pass, which is not recorded. The layer index changes no arithmetic.
+    fn combine_experts(&self, layer: Option<usize>, rows: usize) -> Result<(), BackendError> {
         let s = &self.scratch;
         let config = &self.config;
         let (grid, block) = combine_grid(config.hidden_size, rows);
@@ -5644,7 +5668,110 @@ impl DeviceRank {
                 config.hidden_size as u64,
                 config.hc_mult as u64,
             ],
-        )
+        )?;
+        if let Some(layer) = layer {
+            self.record_layer(layer);
+        }
+        Ok(())
+    }
+
+    /// Open this forward's monitor recorder, when the switch names a path and this is rank 0.
+    ///
+    /// The dump is rank 0's slot of the tensor-parallel expert sum: the shared expert and the
+    /// routed experts' columns are split, so `partial` and `expert_out` hold this rank's partial
+    /// products. Every rank computes its slot the same way, and a reference build and a candidate
+    /// run the same split, so the judge compares like with like. With the switch off, this is one
+    /// `Option` check.
+    fn begin_monitor(&self, tokens: &[u32], position: usize) {
+        if !self.monitoring || self.layout.rank != 0 {
+            return;
+        }
+        self.record.replace(self.monitors.begin(tokens, position));
+    }
+
+    /// Write the monitor dump this step filled, if it had one. A write that fails is logged once
+    /// and serving continues; the dump is a diagnostic, not part of the answer.
+    fn finish_monitor(&self) {
+        if let Some(forward) = self.record.replace(None) {
+            forward.finish();
+        }
+    }
+
+    /// Record this layer's probe row: the combined output and each routed expert's body.
+    ///
+    /// With the switch off this is one `bool` check a layer. On, it copies back the probe's row of
+    /// the router's ids and weights, the layer's combined row and each slot's weighted expert row,
+    /// and hands them to [numerics::record_probe]. A read-back failure is a diagnostic's failure:
+    /// it is logged once, the recorder is dropped and the layer's arithmetic is untouched.
+    fn record_layer(&self, layer: usize) {
+        if !self.monitoring || self.record.borrow().is_none() {
+            return;
+        }
+        match self.read_probe_row(layer) {
+            Ok(probe) => {
+                numerics::record_probe(
+                    &mut self.record.borrow_mut(),
+                    layer,
+                    &probe.routed,
+                    &probe.values,
+                    &probe.experts,
+                );
+            }
+            Err(error) => {
+                numerics::warn_read_back(&error);
+                self.record.replace(None);
+            }
+        }
+    }
+
+    /// Read back the first forward's probe row: `(expert id, combine weight)` and each slot's row
+    /// as the down projection wrote it, `weight * body`.
+    fn read_probe_row(&self, layer: usize) -> Result<numerics::ProbeRow, String> {
+        let s = &self.scratch;
+        let config = &self.config;
+        let (hidden, topk) = (config.hidden_size, config.num_experts_per_tok);
+        let mut ids = vec![0u8; topk * 4];
+        self.cuda
+            .copy_dtoh_on(&self.stream, &mut ids, &s.expert_indices)
+            .map_err(|error| format!("layer {layer}: the router ids: {error}"))?;
+        let mut weights = vec![0u8; topk * 4];
+        self.cuda
+            .copy_dtoh_on(&self.stream, &mut weights, &s.expert_weights)
+            .map_err(|error| format!("layer {layer}: the router weights: {error}"))?;
+        let mut row = vec![0u8; hidden * 4];
+        self.cuda
+            .copy_dtoh_on(&self.stream, &mut row, &s.partial)
+            .map_err(|error| format!("layer {layer}: the combined row: {error}"))?;
+        let ids: Vec<i32> = ids
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_le_bytes(*chunk))
+            .collect();
+        let weights = numerics::floats(&weights);
+        let mut routed = Vec::with_capacity(topk);
+        let mut experts = Vec::with_capacity(topk);
+        for (slot, id) in ids.iter().enumerate() {
+            let Ok(expert) = usize::try_from(*id) else {
+                continue;
+            };
+            let weight = weights.get(slot).copied().unwrap_or(0.0);
+            let mut bytes = vec![0u8; hidden * 4];
+            self.cuda
+                .copy_dtoh_on(
+                    &self.stream,
+                    &mut bytes,
+                    &s.expert_out.offset(slot * hidden * 4),
+                )
+                .map_err(|error| format!("layer {layer} expert {expert}: {error}"))?;
+            experts.push(numerics::floats(&bytes));
+            routed.push((expert, weight));
+        }
+        Ok(numerics::ProbeRow {
+            routed,
+            values: numerics::floats(&row),
+            experts,
+        })
     }
 
     /// Refuses a sequence this rank cannot run `tokens` through.
@@ -6225,6 +6352,11 @@ impl DeviceRank {
         let config = &self.config;
         let (hc, hidden) = (config.hc_mult, config.hidden_size);
         let rows = tokens.len();
+        // The first forward through the rank is the monitor probe (docs/NUMERICS.md section 5).
+        // With the switch off, this is one `Option` check a forward.
+        if let Some(run) = runs.first() {
+            self.begin_monitor(&tokens[run.first..run.first + run.len], run.position);
+        }
         // A sequence-parallel step widens, mixes and folds this rank's rows alone.
         let share = self.sequence_parallel(tp, runs, rows, device_leg);
         let (first, count) = share.map_or((0, rows), |share| (share.first, share.live));
@@ -6262,7 +6394,7 @@ impl DeviceRank {
                     self.prof_mark("mlp");
                 }
                 DeviceFfn::Moe(moe) => {
-                    self.moe(moe, rows)?;
+                    self.moe(moe, Some(index), rows)?;
                     self.prof_mark("moe");
                 }
             }
@@ -6281,6 +6413,7 @@ impl DeviceRank {
             )?;
             self.capture(index, runs)?;
         }
+        self.finish_monitor();
         self.prof_mark("tail");
         self.launch(
             self.kernels.fold.kernel,
@@ -6819,7 +6952,8 @@ impl DeviceRank {
                 (s.collapsed, hidden),
                 rows,
             )?;
-            self.moe(&mtp.moe, rows)?;
+            // The MTP layer is a draft pass, not a decoder layer: it records no probe.
+            self.moe(&mtp.moe, None, rows)?;
             match self.draft_head {
                 Some(head) => self.prefetch(&[(head.weight, head.rows * head.columns)])?,
                 None => self.prefetch(&[self.lm_head.span()])?,

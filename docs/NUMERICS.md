@@ -506,7 +506,7 @@ run, not merged.
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |
 | Qwen3.8-Flash-Next | `crates/sparkflash-model-qwen4-exp/src/forward.rs`, `moe_forward` (the host reference forward; **wired**, test `the_reference_forward_can_record_routing_for_a_coverage_dump`), and the world-1 device arm's `crates/sparkflash-model-qwen4-exp/src/device/blocks.rs`, `DeviceSequence::mlp_branch` after the router launch (**wired**, `DeviceSequence::record_routing`) | the same host reference `moe_forward` (**wired**, test `the_reference_forward_can_record_a_monitor_dump`), and the world-1 device arm's `DeviceSequence::record_probe` after `moe_combine` (**wired**, sampling `branch` and each slot of `expert_accumulator`); the TP arm is named |
-| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` — **named** | `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts`; the host reference's `Moe::apply` — **named** |
+| GLM-5.3-Flash | `crates/sparkflash-model-glm5-next/src/forward.rs`, `Moe::apply`, and the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `Glm5NextDevice::moe` / `bulk_moe` — **named** | the device arm's `crates/sparkflash-model-glm5-next/src/device.rs`, `combine_experts` after its combine kernel (**wired**, `DeviceRank::record_layer` and `crates/sparkflash-model-glm5-next/src/device/numerics.rs`, sampling `partial` and each slot of `expert_out` on rank 0); the host reference's `Moe::apply` — **named** |
 | DeepSeek-V4.1-Flash | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn` (the selected ids are already copied to the host at `moe_device.rs:643`) — **named** | `crates/sparkflash-deepseek-forward/src/moe_device.rs`, `MoeDeviceBackendImpl::ffn`'s routed combine — **named** |
 
 The Qwen host reference is wired for **both** dumps and is covered by the two CPU tests named
@@ -523,6 +523,21 @@ arm — the path the cluster window exercised — is wired for both as well:
   expert's `expert_accumulator` slot, divided by its routing weight — the expert kernels write
   `weight * body` there. The MTP layer is a draft pass and is not recorded.
 
+GLM's device arm is wired for the monitor dump too:
+
+- `DeviceRank::begin_monitor` opens the recorder once a step from the step's first run
+  (`crates/sparkflash-model-glm5-next/src/device/numerics.rs`, `Switches::begin`), and
+  `DeviceRank::combine_experts` records each routed layer after its combine kernel.
+- `combine_experts` now takes the decoder layer as a parameter (`Option<usize>`): the token and
+  bulk paths pass the layer's index, and the MTP layer's draft pass passes `None`, so the draft is
+  not recorded. The parameter changes no arithmetic.
+- `record_layer` copies back the probe row's routed ids and weights, the layer's `partial` row and
+  each slot's `expert_out` row, and `numerics::record_probe` divides each expert row by its routing
+  weight and samples at the document's indices. The dump is rank 0's slot of the tensor-parallel
+  expert sum — the shared and routed experts' columns are split, so `partial` and `expert_out` hold
+  this rank's partial products — and the rank gate keeps one writer a launch. A reference build
+  and a candidate run the same split, so the judge compares like with like.
+
 Both switches read **once** when a session is made: `SPARKFLASH_NUMERICS_COVERAGE` and
 `SPARKFLASH_NUMERICS_MONITORS` name output paths, `SPARKFLASH_NUMERICS_MODEL` overrides the dump's
 model id, and `SPARKFLASH_NUMERICS_SAMPLE` sets the monitor sample's evenly spaced hidden-index
@@ -532,14 +547,13 @@ serving continues; a request never fails for a diagnostic. The rules — the doc
 input naming and accumulation, and the one-probe rule — are unit-tested with a synthetic table in
 `crates/sparkflash-model-qwen4-exp/src/device/numerics.rs`, so they need no GPU.
 
-The other arms are **named, not wired**. GLM's `combine_experts(rows)` does not receive the layer
-index and the routed ids and weights are device-resident, so a recorder there cannot name the
-layer it counts. DeepSeek's `ffn` does have its ids on the host, but the forward crate calls the
-backend one layer at a time with no per-forward boundary, so a recorder there would open one input
-per layer and a layer list the judge refuses. The Qwen TP arm's `mlp_branch` leaves only this
-rank's share of the expert sum in `branch`, so monitor dumps are the world-1 arm's; a sharded arm
-logs once and records none. The device-batch path (`DeviceSequence::forward_rows`) is not wired.
-Wiring those is a device window's work, and the first real dumps are still ahead.
+The other arms are **named, not wired**. DeepSeek's `ffn` does have its ids on the host, but the
+forward crate calls the backend one layer at a time with no per-forward boundary, so a recorder
+there would open one input per layer and a layer list the judge refuses. The Qwen TP arm's
+`mlp_branch` leaves only this rank's share of the expert sum in `branch`, so monitor dumps are the
+world-1 arm's; a sharded arm logs once and records none. The device-batch path
+(`DeviceSequence::forward_rows`) is not wired. Wiring DeepSeek is a device window's work, and the
+first real dumps are still ahead.
 
 The exact window command for the Qwen3.8 world-1 dumps (both switches on in one process, the
 first forward is the probe, then the two judges):
@@ -571,6 +585,65 @@ python3 scripts/numerics.py coverage --dump "$W/qwen38-coverage.json" --min-inpu
 python3 scripts/numerics.py monitors --reference "$W/qwen38-monitors-reference.json" \
   --candidate "$W/qwen38-monitors.json" --layer-bar <declared> --expert-bar <declared>
 ```
+
+The GLM-5.3-Flash arm serves only at world 4, so its pair is the two builds the declaration names:
+version 1's row-GEMV build (the arithmetic the registry's version-1 reference was captured on) and
+the tip, which decodes the FP8 parts on the tile's few-row body. Only rank 0 records — the dump is
+rank 0's slot of the tensor-parallel expert sum — so run with rank 0 local, use a fresh path for
+each build, and send the probe after `/readyz`:
+
+```bash
+W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-glm53-monitors
+mkdir -p "$W"
+cat > "$W/one.json" <<'JSON'
+{"schema": "sparkflash-numerics-prompts/1",
+ "prompts": [{"name": "probe", "prompt": "<the fixed probe prompt>"}]}
+JSON
+
+# Reference build: version 1's row-GEMV build.
+SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
+SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
+SPARKFLASH_CHECKPOINT="$GLM_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$GLM_TOKENIZER" \
+SPARKFLASH_CONVERTED_DIR="$GLM_CONVERTED_DIR" \
+SPARKFLASH_CONTEXT=131072 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_BIN="$GLM_V1_ROW_GEMV_BIN" \
+SPARKFLASH_NUMERICS_MONITORS="$W/glm53-monitors-reference.json" \
+SPARKFLASH_NUMERICS_SAMPLE=8 \
+SPARKFLASH_NUMERICS_MODEL=zai-org/GLM-5.3-Flash \
+  scripts/serve-four-node.sh launch
+python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
+  --suite "$W/one.json" --out "$W/reference-drive.json" --max-tokens 1
+scripts/serve-four-node.sh stop
+
+# Candidate build: the tip. Same nodes, checkpoint, tokenizer, context and probe.
+SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
+SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
+SPARKFLASH_CHECKPOINT="$GLM_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$GLM_TOKENIZER" \
+SPARKFLASH_CONVERTED_DIR="$GLM_CONVERTED_DIR" \
+SPARKFLASH_CONTEXT=131072 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_BIN="$GLM_TIP_BIN" \
+SPARKFLASH_NUMERICS_MONITORS="$W/glm53-monitors-candidate.json" \
+SPARKFLASH_NUMERICS_SAMPLE=8 \
+SPARKFLASH_NUMERICS_MODEL=zai-org/GLM-5.3-Flash \
+  scripts/serve-four-node.sh launch
+python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
+  --suite "$W/one.json" --out "$W/candidate-drive.json" --max-tokens 1
+scripts/serve-four-node.sh stop
+
+# The window's bars; this page does not invent them.
+python3 scripts/numerics.py monitors \
+  --reference "$W/glm53-monitors-reference.json" \
+  --candidate "$W/glm53-monitors-candidate.json" \
+  --layer-bar <declared> --expert-bar <declared> \
+  --json "$W/glm53-monitors-result.json"
+```
+
+The probe is the first step's first run. A boot warmup that reaches a MoE layer first becomes the
+probe, so a fresh path and a post-`/readyz` request are what name the forward the two builds share.
 
 ### Across architectures and versions
 
