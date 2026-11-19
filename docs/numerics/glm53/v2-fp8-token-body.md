@@ -1,13 +1,12 @@
 # GLM-5.3-Flash, numerics version 2: decode on the FP8 E4M3 token body
 
-**Registry state: version 1 is still the captured entry; version 2's capture exists as evidence.**
-The capture was taken on the served world-4 configuration on 2026-11-19 and is committed under
-`numerics/captures/glm53/`. It is not the entry's `reference`: naming new bits at version 1 is an
-undeclared change, and the registry may not bump while `coverage` and `monitors` are false
-(`scripts/numerics.py ci`). GLM-5.3's own `[[anchor]]` and the captures teacher-forced from it
-are in place, so the per-model anchor requirement does not block this bump; the two dumps do.
-Version 2 lands as one diff - the reference, the bump and this report - once they are in place.
-Until then version 1's reference stands, and this page records how far the tip's bits move from it.
+**Registry state: version 2, declared on 2026-11-19 under the owner's approval of 2026-11-18**
+("tensor-core decode on every arm is an approved arithmetic change"). The entry names
+`references/glm53-tp4-sm121a-v2.json` (`451be41b…`), the served world-4 capture of 2026-11-19,
+which replaced `references/glm53-tp4-sm121a.json` (`827ec5f6…`). The bump uses the registry's
+approval path, so `coverage` and `monitors` do not gate it; GLM-5.3's own `[[anchor]]` and the
+captures teacher-forced from it are in place. The forced capture under `numerics/captures/glm53/`
+remains the evidence behind this page, and the separation below is what attributes the delta.
 
 Version 2 of the world-4 sm_121a configuration moves GLM's one-to-eight-row block-scaled FP8
 projections from the tiled row GEMV (`q4e_gemv_tiled_e4m3_block`) to the shared tile's few-row
@@ -117,6 +116,47 @@ the tile's few-row body by shape alone (`fp8_token_body_fits`), so `off` served 
 kernel. This fix gates the route on the switch. The separation capture has to be retaken on a
 build that carries it, against this capture, before version 2 declares: only then does `off`
 measure the tiled GEMV's bits and the body's own share separate from the move's.
+
+## The separation: the whole delta is the body
+
+The first v2 window could not attribute the delta: it compared the tip against version 1, and the
+tip also carried the arm's move onto `Runtime<Walk>` and its 4,096-row prefill chunking. The
+switch that separates them (`SPARKFLASH_DECODE_MMA=off`) was **inert** on that build - the arm
+chose the body by shape and never read the switch, while its ledger declared "row GEMV" - so the
+window's "off" capture was bit-identical to "on" and proved nothing. That declaration defect is
+fixed (`2cdec4ec`, `524db2b0`): the switch now selects the tiled GEMV, the ledger states the
+FP8 parts on the tile body and the BF16 parts on the GEMV, and `decode.tensor_cores = true` is
+accepted.
+
+The retaken separation, on one build, same launcher, same prompts, both teacher-forced from
+version 1's reference:
+
+| capture | mean NLL delta | top-1 agreement | positions differing |
+| :-- | --: | --: | --: |
+| `SPARKFLASH_DECODE_MMA=off` (tiled GEMV) | **+0.000e+00** | **100.0000 %** | 0 of 997 |
+| shipped default (tile body) | +1.3731e-01 | 93.3801 % | 989 of 997 |
+
+Off reproduces version 1 bit for bit, so the arm's other changes did not move the arithmetic:
+**version 1 is the tiled row GEMV, and the entire delta above is the FP8 token body's.**
+
+**The tail, and why it is precision rather than a defect.** The 20 worst positions were listed
+and inspected. They spread across six of the eight prompts (raw continuation contributes eleven
+of the twenty, the hardest prompt at 75.8 % top-1); their positions carry no shape or boundary
+pattern (the body routes every 1-to-8-row FP8 part the body fits, so a position has no tile,
+column or block identity to differ on); and the free-running capture's text stays coherent where
+the flips land, so the body chooses plausible alternatives rather than garbage. The three largest
+are translation position 80 (+1.446e+01), summary position 68 (+1.145e+01) and translation
+position 83 (+8.833e+00), each a position where version 1 was nearly certain and the body chose a
+different, still plausible token. Eleven positions sit above 5 nats and 65 above 1. That is a
+wide but unstructured tail, which is what an accumulation-order change on saturated logits looks
+like; it is not the signature of a broken part. It is recorded here so a later change that makes
+it *structured* can be told apart.
+
+**Known and accepted: decode is not the bulk prefill's arithmetic.** A decode row takes f32
+activations on the tile, where the release's bulk prefill takes `glm_prefill_q8_mma`'s dynamic
+E4M3 activations, so a continued turn does not equal a cold q8 prefill. That is a property of the
+shipped release's two paths, not a defect of this change, and it is why the generated checks do
+not claim continued-equals-cold on GLM.
 
 ## What is still not measured
 

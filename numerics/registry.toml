@@ -156,13 +156,14 @@ world = 4
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 1
+version = 2
 evidence = "logprobs"
-reference = "references/glm53-tp4-sm121a.json"
-fingerprint = "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6"
+reference = "references/glm53-tp4-sm121a-v2.json"
+fingerprint = "451be41bb5fbe34db4646d2167647fad282be34b2f144523fe4549d101be30fa"
 report = "docs/numerics/glm53/v2-fp8-token-body.md"
-captured = "2026-11-03"
-note = "Version 1's reference, captured before decode moved to the tile's few-row body. The 1..=8-row FP8 token body is wired (glm_decode_fp8b128_rows) and its served delta is now measured at world 4: numerics/captures/glm53/e4m3-token-body-v2.json and its forced capture, +1.373e-01 mean NLL with 93.38% top-1 agreement against this reference, deterministic over two runs (docs/numerics/glm53/v2-fp8-token-body.md). The bump to version 2 still waits on the anchor, coverage and monitors prerequisites; until then this entry keeps version 1 and its reference."
+captured = "2026-11-19"
+approved = { decision = "tensor-core decode on every arm is an approved arithmetic change", date = "2026-11-18", report = "docs/numerics/glm53/v2-fp8-token-body.md" }
+note = "Version 2: the one-to-eight-row FP8 projections run the shared tile's few-row body (glm_decode_fp8b128_rows) instead of the tiled row GEMV (q4e_gemv_tiled_e4m3_block). The separation capture settles attribution: the same build with SPARKFLASH_DECODE_MMA=off, which runs the GEMV, reproduces version 1's reference exactly (0 of 997 positions differ, top-1 100%), so the whole +1.373e-01 mean NLL and 93.38% top-1 agreement is the body's. Decode takes f32 activations where the bulk prefill takes the q8 path, so a continued turn is not a cold one; known and accepted, not a defect. The tail is recorded in the report: 11 positions above 5 nats, worst 1.446e+01 at translation position 80, spread across six of the eight prompts with no shape or position pattern. Approved by the owner on 2026-11-18 (decision above); the coverage and monitor prerequisites are not yet on."
 
 # Inkling-2-Small and Dory1.0-4B were registered before their first capture: both entries named
 # the configuration, version and evidence and left `reference` and `fingerprint` out. That is the
