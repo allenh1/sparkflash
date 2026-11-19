@@ -148,7 +148,8 @@ does not exist, and an approved bump that changes nothing.
 reset it. A reference's `server` card is what the capturing binary reported, and it is outside the
 fingerprint: the registry can name a capture's fingerprint only after the capture exists, so a
 first capture reads `unregistered`, and a recapture names the version and fingerprint it replaced.
-The registry entry is the record; `check` and `ci` accept the card's shape but never compare it.
+The registry entry is the record; `check` and `ci` accept the card's shape and never compare the
+card against the fingerprint, though `ci` does require a new capture's card to name its build.
 The card names the build the capture came from. `binary_sha256` is the sha256 of the server
 binary named by `capture --binary` (or `SPARKFLASH_BIN`). `commit` is the served card's
 `build.id`: the commit the binary was compiled from, with `-dirty` appended when the source tree
