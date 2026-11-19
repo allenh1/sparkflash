@@ -297,7 +297,9 @@ The dump is written by the serving side, never reconstructed from a report. The 
 expert counts, and each router decision calls `Recorder::hit(layer, expert)`. It is opt-in:
 `SPARKFLASH_NUMERICS_COVERAGE` names the output path and is unset by default, and
 `SPARKFLASH_NUMERICS_MODEL` overrides the model id for a tiny fixture. With the switch unset the
-caller holds `None` and records nothing.
+caller holds `None` and records nothing. The recorder merges the document already at the path, so
+a serving process accumulates a suite across forwards (`input-0`, `input-1`, ...); a document
+for another model or expert layout is replaced by the new run, not merged.
 
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |

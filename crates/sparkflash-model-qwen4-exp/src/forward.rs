@@ -999,7 +999,7 @@ impl Qwen4ExpWeights {
             self.layers.iter().map(|_| config.num_experts).collect(),
         );
         if let Some(recorder) = coverage.as_mut() {
-            recorder.input(format!("position-{start_position}"), tokens.len());
+            recorder.input_auto(tokens.len());
         }
         let mut hyper: Vec<Vec<f32>> = Vec::with_capacity(tokens.len());
         for token in tokens {

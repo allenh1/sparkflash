@@ -27,7 +27,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// The dump schema this module writes.
 pub const SCHEMA: &str = "sparkflash-numerics-coverage/1";
@@ -39,7 +39,7 @@ pub const ENV: &str = "SPARKFLASH_NUMERICS_COVERAGE";
 pub const MODEL_ENV: &str = "SPARKFLASH_NUMERICS_MODEL";
 
 /// One input the recording forward ran.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
     /// The input's name, unique within the dump.
     pub name: String,
@@ -48,7 +48,7 @@ pub struct Input {
 }
 
 /// One decoder layer's hit counts, one per routed expert.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layer {
     /// The zero-based decoder layer.
     pub layer: usize,
@@ -57,10 +57,10 @@ pub struct Layer {
 }
 
 /// The coverage document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Dump {
     /// [SCHEMA].
-    pub schema: &'static str,
+    pub schema: String,
     /// The served model id, or [MODEL_ENV]'s override.
     pub model: String,
     /// The inputs that were run.
@@ -90,7 +90,7 @@ impl Recorder {
             .collect();
         Self {
             dump: Dump {
-                schema: SCHEMA,
+                schema: SCHEMA.to_owned(),
                 model: model.into(),
                 inputs: Vec::new(),
                 layers,
@@ -113,7 +113,27 @@ impl Recorder {
         let model = lookup(MODEL_ENV)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| model.to_owned());
-        Some(Self::new(model, experts, path))
+        let mut recorder = Self::new(model, experts, path);
+        // A serving process handles several forwards. Merge the document already at the path so
+        // the coverage suite accumulates across them; a dump for another model or layout is not
+        // merged, and is replaced by this run's document.
+        if let Ok(bytes) = std::fs::read(&recorder.path)
+            && let Ok(stored) = serde_json::from_slice::<Dump>(&bytes)
+            && stored.schema == SCHEMA
+            && stored.model == recorder.dump.model
+            && stored.layers.len() == recorder.dump.layers.len()
+            && stored
+                .layers
+                .iter()
+                .zip(&recorder.dump.layers)
+                .all(|(stored, mine)| {
+                    stored.layer == mine.layer && stored.hits.len() == mine.hits.len()
+                })
+        {
+            recorder.dump.inputs = stored.inputs;
+            recorder.dump.layers = stored.layers;
+        }
+        Some(recorder)
     }
 
     /// A recorder from the process environment, or `None` when the switch is unset.
@@ -128,6 +148,15 @@ impl Recorder {
             name: name.into(),
             tokens,
         });
+    }
+
+    /// Open an input named after the document's input count (`input-0`, `input-1`, ...).
+    ///
+    /// A serving process handles several forwards; the count is read from the merged document, so
+    /// the names stay unique across a suite without the caller tracking them.
+    pub fn input_auto(&mut self, tokens: usize) {
+        let name = format!("input-{}", self.dump.inputs.len());
+        self.input(name, tokens);
     }
 
     /// Record one routing decision. An out-of-range layer or expert is ignored, never a panic in
@@ -219,6 +248,54 @@ mod tests {
         assert_eq!(recorder.dump().inputs.len(), 1);
         assert_eq!(recorder.dump().inputs[0].name, "probe");
         assert_eq!(recorder.dump().inputs[0].tokens, 4);
+    }
+
+    #[test]
+    fn a_second_recorder_at_the_same_path_merges_the_suite() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("coverage.json");
+        let mut first = Recorder::new("toy/model", vec![2], &path);
+        first.input_auto(3);
+        first.hit(0, 0);
+        first.write().expect("the first dump writes");
+        let mut second = Recorder::from_lookup(
+            |name| (name == ENV).then(|| path.to_string_lossy().into_owned()),
+            "toy/model",
+            vec![2],
+        )
+        .expect("the switch is set");
+        assert_eq!(second.dump().inputs.len(), 1, "the first input is merged");
+        second.input_auto(4);
+        second.hit(0, 1);
+        second.write().expect("the second dump writes");
+        let text = std::fs::read_to_string(&path).expect("the dump is readable");
+        let document: serde_json::Value = serde_json::from_str(&text).expect("the dump is JSON");
+        assert_eq!(document["inputs"].as_array().map(Vec::len), Some(2));
+        assert_eq!(document["inputs"][0]["name"], "input-0");
+        assert_eq!(document["inputs"][1]["name"], "input-1");
+        assert_eq!(document["layers"][0]["hits"], serde_json::json!([1, 1]));
+    }
+
+    #[test]
+    fn a_dump_for_another_model_is_not_merged() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("coverage.json");
+        let mut other = Recorder::new("toy/other", vec![2], &path);
+        other.input_auto(3);
+        other.hit(0, 0);
+        other.write().expect("the other dump writes");
+        let mine = Recorder::from_lookup(
+            |name| (name == ENV).then(|| path.to_string_lossy().into_owned()),
+            "toy/model",
+            vec![2],
+        )
+        .expect("the switch is set");
+        assert_eq!(mine.dump().model, "toy/model");
+        assert!(
+            mine.dump().inputs.is_empty(),
+            "another model's inputs are not merged"
+        );
+        assert_eq!(mine.dump().layers[0].hits, vec![0, 0]);
     }
 
     #[test]
