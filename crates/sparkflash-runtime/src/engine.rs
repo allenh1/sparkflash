@@ -76,13 +76,18 @@ use crate::walk::{Drafter, Hidden, PassMask, Vision, Walk, WalkHook};
 /// TickConfig::deepseek is DeepSeek's serving default, the values crate::tick::replay::Config
 /// replays. TickConfig::for_walk is the same model narrowed to an arm's own limits: its
 /// ChunkPolicy chunk, its Limits::rows, and no decoder-layer skip (only an arm with DeepSeek's
-/// decoder stack has one).
+/// decoder stack has one). A drafting arm's profile adds its verify width as the member cap, its
+/// drafter's depth and floor, and the Spec/Shared/Plain decode plan shapes; for_runtime narrows
+/// the shared shape by the runtime's own joint-rounds switch.
 #[derive(Clone, Copy, Debug)]
 pub struct TickConfig {
     /// The lanes the pool holds.
     pub lanes: usize,
     /// The most rows one step may hold (R_MAX).
     pub rows_max: usize,
+    /// The most members one batch may hold: the arm's verify width ([Limits::members]). A plain
+    /// decode group never exceeds it, and a shared round verifies at most this many lanes.
+    pub members: usize,
     /// The rows at a prompt's end that run the decoder layers.
     pub decoder_warm: usize,
     /// The rows one idle tick's exact prefill runs.
@@ -107,6 +112,9 @@ pub struct TickConfig {
     pub decoder_skip: bool,
     /// The batch-speculation switch: Some when this arm drafts, None when it does not.
     pub batch_spec: Option<f64>,
+    /// Whether several decoding lanes verify in one shared pass: the runtime's joint rounds.
+    /// With this off, or with more lanes than the verify width, the decode runs plain rows.
+    pub shared_rounds: bool,
     /// The row share's least chance a draft is given a row.
     pub share_floor: f64,
     /// The shared step's cost model.
@@ -125,6 +133,7 @@ impl TickConfig {
         Self {
             lanes,
             rows_max: 64,
+            members: 64,
             decoder_warm: 2541,
             exact_tick_rows: 4096,
             chunk_min: 96,
@@ -137,6 +146,7 @@ impl TickConfig {
             exchange: true,
             decoder_skip: true,
             batch_spec: Some(0.2),
+            shared_rounds: true,
             share_floor: 0.2,
             model: (23.0, 4.0, 23.0, 4.0, 2.3),
             k: 5,
@@ -144,16 +154,18 @@ impl TickConfig {
         }
     }
 
-    /// The tick an arm serves with: its own chunk and row width, the rest DeepSeek's.
+    /// The tick an arm serves with: its own chunk, row width and verify width, the rest
+    /// DeepSeek's.
     #[must_use]
     pub fn for_walk<W: Walk + ?Sized>(walk: &W, lanes: usize) -> Self {
         let limits = walk.limits();
         let chunk = ChunkPolicy::for_limits(limits).rows();
-        let drafts = W::Drafter::PRESENT && walk.drafter().drafts();
+        let draft = W::Drafter::PRESENT && walk.drafter().drafts();
         Self {
             lanes,
-            // A token step holds one row a member; a prompt chunk is as wide as the arm's pass.
+            // A prompt chunk is as wide as the arm's pass; a verify is as wide as its batch.
             rows_max: limits.rows.max(1),
+            members: limits.members.max(1),
             decoder_warm: 0,
             exact_tick_rows: chunk,
             chunk_min: chunk,
@@ -166,12 +178,25 @@ impl TickConfig {
             // Dense (and every arm but DeepSeek) has no row exchange to pair chunks over.
             exchange: false,
             decoder_skip: false,
-            batch_spec: drafts.then_some(0.2),
-            share_floor: 0.2,
+            batch_spec: draft.then_some(0.2),
+            // A drafting arm's shapes: its drafter's own depths, shared across the members of one
+            // verify when the runtime verifies them in one pass.
+            shared_rounds: draft,
+            share_floor: if draft { walk.drafter().floor() } else { 0.2 },
             model: (23.0, 4.0, 23.0, 4.0, 2.3),
-            k: 5,
+            k: if draft { walk.drafter().budget(1) } else { 0 },
             chunk_rows: chunk,
         }
+    }
+
+    /// [Self::for_walk] with the runtime's own joint-rounds switch: a drafting arm whose joint
+    /// rounds are off takes plain rows for the lanes that would have shared a verify, exactly as
+    /// its runtime would.
+    #[must_use]
+    pub fn for_runtime<W: Walk>(runtime: &Runtime<W>, lanes: usize) -> Self {
+        let mut config = Self::for_walk(runtime.walk(), lanes);
+        config.shared_rounds = config.batch_spec.is_some() && runtime.joint_rounds();
+        config
     }
 
     fn tick_rows(&self) -> TickRows {
@@ -294,8 +319,8 @@ pub struct Kept {
 struct Ahead {
     decoding: usize,
     batch_spec: Option<f64>,
-    exchange: bool,
-    rows_max: usize,
+    shared_rounds: bool,
+    members: usize,
     drafter: bool,
     plan: Option<DecodePlan>,
 }
@@ -305,8 +330,8 @@ impl Ahead {
         plan_for(
             self.decoding,
             self.batch_spec,
-            self.exchange,
-            self.rows_max,
+            self.shared_rounds,
+            self.members,
             self.drafter,
         )
     }
@@ -319,24 +344,36 @@ impl WalkHook for Ahead {
     }
 }
 
-/// The tick's decode plan: crate::tick::decode_plan's, except that an arm which declares no
-/// drafter has no speculative step to take. Its single sequence runs one plain row and the trace
-/// says plain, because calling the row spec would name a row the arm never walked.
+/// The tick's decode plan: a drafting arm's Spec/Shared/Plain shapes, and crate::tick::decode_plan
+/// for an arm which declares no drafter.
+///
+/// A drafting arm takes one of three shapes. One decoding row is `Spec`: that member's round,
+/// drafted and verified alone. Several rows whose anchors fit the verify width are `Shared` when
+/// the runtime verifies its lanes' rounds in one pass: every member's chain in one verify. Anything
+/// wider than the verify width, or a rank whose joint rounds are off, runs `Plain`: one row a
+/// member, in groups no wider than the verify width. That is the old runtime's own rule, which
+/// chose the joint round for every batch it was handed.
+///
+/// An arm with no drafter has no speculative step to take. Its single sequence runs one plain row
+/// and the trace says plain, because calling the row spec would name a row the arm never walked.
 fn plan_for(
     rows: usize,
     batch_spec: Option<f64>,
-    exchange: bool,
-    rows_max: usize,
+    shared_rounds: bool,
+    members: usize,
     drafter: bool,
 ) -> DecodePlan {
-    let plan = decode_plan(rows, false, batch_spec, exchange, rows_max);
+    let members = members.max(1);
     if drafter {
-        return plan;
+        if rows > 1 && shared_rounds && batch_spec.is_some() && rows <= members {
+            return DecodePlan::Shared;
+        }
+        return decode_plan(rows, false, batch_spec, shared_rounds, members);
     }
-    match plan {
+    match decode_plan(rows, false, batch_spec, shared_rounds, members) {
         DecodePlan::None => DecodePlan::None,
         _ => DecodePlan::Plain {
-            groups: rows.div_ceil(rows_max.max(1)),
+            groups: rows.div_ceil(members),
         },
     }
 }
@@ -395,7 +432,7 @@ impl<W: Walk> TickEngine<W> {
                 ),
             ));
         }
-        let config = TickConfig::for_walk(runtime.walk(), capacity);
+        let config = TickConfig::for_runtime(&runtime, capacity);
         let mut slots = Vec::with_capacity(capacity);
         for _ in 0..capacity {
             slots.push(Some(runtime.open_slot()?));
@@ -436,8 +473,11 @@ impl<W: Walk> TickEngine<W> {
                 ),
             ));
         }
-        if config.rows_max == 0 {
-            return Err(BackendError::new("tick", "a step needs at least one row"));
+        if config.rows_max == 0 || config.members == 0 {
+            return Err(BackendError::new(
+                "tick",
+                "a step needs at least one row and one member",
+            ));
         }
         let limits = self.runtime.limits();
         if config.rows_max > limits.rows || config.bulk_cap.is_some_and(|cap| cap > limits.rows) {
@@ -447,6 +487,15 @@ impl<W: Walk> TickEngine<W> {
                     "the config asks for {} rows and the walk takes {}",
                     config.rows_max.max(config.bulk_cap.unwrap_or(0)),
                     limits.rows
+                ),
+            ));
+        }
+        if config.members > limits.members {
+            return Err(BackendError::new(
+                "tick",
+                format!(
+                    "the config batches {} members and the walk verifies {}",
+                    config.members, limits.members
                 ),
             ));
         }
@@ -465,6 +514,16 @@ impl<W: Walk> TickEngine<W> {
     #[must_use]
     pub fn with_trace(mut self) -> Self {
         self.trace = Some(TraceSink::in_memory());
+        self
+    }
+
+    /// Decides the tick-ahead plan as the [Ahead] hook would have, for `rows` decode rows.
+    ///
+    /// This is the state the hook leaves between a tick's prefill walk and its decode. The CPU
+    /// gate uses it to show that a plan is not an execution: a plan that names no round still
+    /// has one run, and the engine never lets a stale plan skip the rows the caller fed.
+    pub fn with_ahead(&mut self, rows: usize, plan: DecodePlan) -> &mut Self {
+        self.ahead = Some((rows, plan));
         self
     }
 
@@ -1103,8 +1162,8 @@ impl<W: Walk> TickEngine<W> {
         Ahead {
             decoding: self.fed.len(),
             batch_spec: self.config.batch_spec,
-            exchange: self.config.exchange,
-            rows_max: self.config.rows_max,
+            shared_rounds: self.config.shared_rounds,
+            members: self.config.members,
             drafter: W::Drafter::PRESENT && self.walk().drafter().drafts(),
             plan: None,
         }
@@ -1139,11 +1198,16 @@ impl<W: Walk> TickEngine<W> {
         if rows.is_empty() {
             return;
         }
+        // The tick-ahead plan is a decision, not an execution: the hook may only name the
+        // plan, so a plan that would run nothing is re-decided here and every nonempty
+        // decode still runs its row.
         let plan = self
             .ahead
             .take()
             .filter(|(decided, _)| *decided == rows.len())
-            .map_or_else(|| self.plan(rows.len()), |(_, plan)| plan);
+            .map(|(_, plan)| plan)
+            .filter(|plan| !matches!(plan, DecodePlan::None))
+            .unwrap_or_else(|| self.plan(rows.len()));
         match plan {
             DecodePlan::None => {}
             DecodePlan::Spec => {
@@ -1173,7 +1237,7 @@ impl<W: Walk> TickEngine<W> {
                 let mut walked = 0;
                 let mut rest = rows;
                 while !rest.is_empty() {
-                    let take = self.config.rows_max.min(rest.len());
+                    let take = self.config.members.min(rest.len());
                     let group: Vec<Fed> = rest.drain(..take).collect();
                     let (stepped, rows) = self.step_rows(group, StepMode::Plain, events);
                     seqs += stepped;
@@ -1197,8 +1261,8 @@ impl<W: Walk> TickEngine<W> {
         plan_for(
             rows,
             self.config.batch_spec,
-            self.config.exchange,
-            self.config.rows_max,
+            self.config.shared_rounds,
+            self.config.members,
             W::Drafter::PRESENT && self.walk().drafter().drafts(),
         )
     }
