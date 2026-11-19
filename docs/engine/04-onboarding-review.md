@@ -1788,6 +1788,110 @@ lines, today in the Qwen crate and used by the GLM adapter) and `MergedPosition`
 `sparkflash-model`, the trait moves to `sparkflash-serve::tp4`, and then the two adapters follow
 the openers into their arms. That is the remaining ~490 lines of the plan's "about 900".
 
+### Phase 6, step 6, second slice: the rank step adapters follow the openers
+
+Commits `700fa47d` (the shared sampler and merged position), `04584ad4` (the rank step contract
+and the adapters), `3ff9c822` (the gate) and the docs commit that follows them (this section). The
+first slice named the remaining ~490 lines and the two concrete blockers: `Sampler` (the Qwen
+crate's re-export, applied by the GLM adapter) and `MergedPosition` (the DeepSeek pack's type,
+named by the trait in the CLI) had no shared home, and `Tp4RankApi` itself lived in `serve.rs`.
+This slice removes both blockers and moves the adapters.
+
+**What moved.**
+
+* `crates/sparkflash-model/src/sampler.rs` (604 lines): `Sampler`, `SamplerMark`, `argmax` and the
+  penalties/top-k/top-p/draw arithmetic, moved whole from `sparkflash-ops/src/sampler.rs`, which
+  now re-exports it (`sparkflash_ops::sampler` keeps every existing path). The packs and the CLI
+  read `sparkflash_model::Sampler`; the sampler's own tests moved with the code.
+* `crates/sparkflash-model/src/prompt_ranks.rs` (45 lines): `MergedAlternative` and
+  `MergedPosition`, moved from the DeepSeek pack and re-exported there
+  (`sparkflash_model_deepseek_v41::prompt_ranks` and the `sparkflash-engine` facade keep their
+  paths).
+* `crates/sparkflash-serve/src/tp4.rs` (73 -> 256 lines): `Tp4RankApi`, `Tp4Step`, `Tp4Sampling`,
+  `Tp4RankMetrics` and `PROMPT_LOGPROBS_REFUSED_PREFIX`. The CLI re-exports the four types from
+  `serve::` and the constant from `tp4_host::`, so the driver, the pack registry and the loopback
+  tests are unchanged.
+* `crates/sparkflash-model-glm5-next/src/rank.rs` (456 -> 833 lines): `GlmTp4Rank` (the struct,
+  `step`, `speculate` and the trait impl), `reusable_prefix` with its test, and the public
+  `open_serve_rank` that boxes the adapter.
+* `crates/sparkflash-model-qwen4-exp/src/rank.rs` (168 -> 372 lines): `QwenTp4Rank` (the struct, the
+  session `step` and the trait impl), the per-step counter delta as `this_step` with its test, and
+  `open_serve_rank`.
+* The CLI keeps its entry points (`open_glm_tp4_rank`, `open_qwen_tp4_rank`), now one call each
+  into the arm with the collective opener it already owns. `HostTp4Rank` stays in `serve.rs`: it
+  adapts DeepSeek's host rank, which is the 14,545-line serving path the later slices of step 6
+  fold, not a packed arm.
+
+**Before and after**, measured with the ratchet's own rule (every `.rs` under
+`crates/sparkflash-cli/src`, line counts):
+
+| | before (`67146b74`) | after |
+| :-- | --: | --: |
+| `crates/sparkflash-cli/src` (the ratchet's measure) | 36,566 | **35,972** |
+| `serve.rs` | 11,449 | **10,853** |
+| `sparkflash-cli/src/tp4_host.rs` | 5,245 | 5,247 |
+| `sparkflash-serve/src/tp4.rs` | 73 | 256 |
+| `sparkflash-model-glm5-next/src/rank.rs` | 456 | 833 |
+| `sparkflash-model-qwen4-exp/src/rank.rs` | 168 | 372 |
+| `sparkflash-model/src/sampler.rs` | — | 604 |
+| `sparkflash-model/src/prompt_ranks.rs` | — | 45 |
+| `sparkflash-ops/src/sampler.rs` | 599 | 42 |
+| `sparkflash-model-deepseek-v41/src/prompt_ranks.rs` | 872 | 853 |
+
+So 596 lines left `serve.rs` and 594 left the CLI (two lines arrived in `tp4_host.rs` as the
+re-export's doc); the seam and the two arms gained 183 + 377 + 204 lines, and the sampler and the
+merged position moved out of the crates that had them (599 -> 42 in `ops`, 872 -> 853 in the
+DeepSeek pack).
+
+**What the ratchet holds.** `CLI_SOURCE_LINE_LIMIT` is **35,973** in
+`crates/sparkflash-ops/tests/one_stack.rs`, one above the measured 35,972, the convention the
+previous gate used. It was 36,567; it did not rise. The test still asserts the same three things:
+the total, no `tp4_forward.rs` in the CLI, and the DeepSeek device forward in its own crate.
+
+**No arithmetic, kernel or scheduling decision changed.** The adapter bodies are the first
+slice's code, re-read line by line against `67146b74:crates/sparkflash-cli/src/serve.rs`; a
+normalised `diff` of the moved blocks is empty except the seam's import paths, the refusal
+prefix's `format!` argument, and the extracted `this_step` (the same three `saturating_sub`
+calls). The `Sampler` file and its tests are the moved text, and the new
+`the_ops_sampler_is_the_models_sampler` test pins the old path and the neutral home to one type,
+so the re-export cannot fork into two histories. The one transcription the diff caught
+(`self.held.extend_from_slice(&prompt[cached..])` in the GLM prefill) is restored: a window that
+forgot the rows it ran is the one behaviour this move could lose without a kernel changing.
+
+**Tests.** The moved inline tests run in their new crates: the whole sampler suite in
+`sparkflash-model`, the GLM `reusable_prefix` cases (the prompt rows a request may reuse) and the
+new Qwen `this_step` case (a step's share of a session's counters, including a reset or backwards
+counter reporting zero rather than a wrap). `cargo test -p sparkflash-cli -p sparkflash-serve -p
+sparkflash-model` passes; the CLI's loopback driver tests still drive their fake ranks through the
+`serve::` re-exports, so the trait's contract is exercised at its new path.
+
+**The window gate.** No boot is possible on this host (no GPU, no checkpoint), so the fold is owed
+one window. Build the frozen tip and this one (`git worktree add /tmp/pre-step6b 67146b74`), then
+boot each arm's four-rank group in both builds and compare the boots and one request:
+
+```sh
+cargo build --release -p sparkflash-cli   # default features: cuda + tp4-serve
+# GLM, four ranks, one greedy request, then four fused lanes
+sparkflash serve --model glm-5.3-flash --checkpoint /models/GLM-5.3-Flash \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D
+sparkflash serve --model glm-5.3-flash --checkpoint /models/GLM-5.3-Flash \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D --fuse-batch --concurrency 4
+# Qwen, the same two shapes
+sparkflash serve --model qwen3.8-flash-next --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D
+sparkflash serve --model qwen3.8-flash-next --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+    --tp4-rank R --tp4-world-size 4 --tp4-peers A,B,C,D --fuse-batch --concurrency 4
+```
+
+Pass: every rank's stderr is the same seven load lines in the same order in both builds (the plan
+agreement word included, which is why the `fnv1a` that computes it is the shared weights crate's),
+and one greedy request of the same prompt per arm returns the same token ids with the same
+`cached_tokens` on both. Rank 0's first metrics report must carry the same `load_ms` magnitude.
+One different token, `cached_tokens` or agreement word is a failed fold. Because the first
+request's `cached_tokens` is zero on both builds, the one counter the adapters' window
+bookkeeping feeds is only exercised by a second turn of the same conversation; the window sends
+that second greedy turn too, and a build that dropped the bookkeeping answers a different count.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
