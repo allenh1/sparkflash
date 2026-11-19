@@ -506,6 +506,20 @@ named follow-up rather than a second reference invented to match a broken regist
 Phase 5's three arms are now measured: GLM's declared change with a delta, Inkling's and Dory's
 first references with their speed gaps stated. `numerics.py ci` reports no uncaptured
 configuration.
+### The served A/B: what the harness got wrong
+
+`scripts/tick-trace-ab.py` was written against "the server", but it launched a single serve
+process. That process takes the reference engine, which never constructs `Batch`, and
+`SPARKFLASH_TICK_TRACE` is only read in `Batch` on the four-rank device path - so the committed
+harness would have produced empty traces and reported nothing. It now takes `--site-script`,
+launches the site's group through `serve-four-node.sh` with `SPARKFLASH_BIN` naming the build,
+and the launcher forwards `SPARKFLASH_TICK_TRACE` to the ranks (only rank 0 writes it).
+
+The two builds for the A/B are staged on the head node: the frozen pre-move build with the trace
+emission cherry-picked (`512c9910`; the emission commit `de642922` changes `tick.rs`, which the
+move `4d144208` introduces, so the literal pre-move tree cannot take it as a cherry-pick) and the
+branch head. Their `tick.rs` and `batch.rs` are identical, which is what makes the comparison a
+decision comparison rather than a source comparison.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
