@@ -325,6 +325,54 @@ The device-only differences this move leaves for the cluster gate:
   same tokens expected, one more forward pass of the reply tokens, and only when the reply is
   longer than `rewind_slack` does it start over.
 
+### The sealing pass: an arm supplies a walk, not a strategy
+
+Three commits after Inkling's move close the last way an arm could supply its own strategy
+(`6b07a1ff`, `20dd08b3`, `6261935f`; 9 files, +669 / -149, 148 of the deletions the per-arm
+lane and pack dispatch). Phase 1's guarantee is now a property of the compiler and of two tests:
+a model crate cannot implement a strategy, and `Pack` no longer names a family.
+
+* **`FusedArm` is sealed.** `fused.rs:186` adds a crate-private `sealed` module and `fused.rs:200`
+  makes `Sealed` the supertrait, so a crate outside `sparkflash-runtime` cannot implement it. The
+  only implementors are `Runtime<W>` and `GroupLanes<A, W>`; every arm is a `Walk`.
+  `tests/sealed.rs:53` scans every `.rs` under `crates/` and fails if a model crate implements
+  `FusedArm`, and `tests/sealed.rs:93` names the walks as the arms' only strategy-facing trait.
+  Cost: one line in the sealed module's doc says why ("the runtime owns every strategy; an arm is
+  a `Walk`").
+* **`OPEN_LANES` is gone.** `PackArm::open_lanes` (`pack.rs:124`) is required and takes the
+  operator's lane count: `--concurrency` when set, otherwise the arm's own `Limits`. It returns
+  rank 0's backend and the resolved count, and `serve_group_lanes` passes that count to the host
+  driver. The `Option` that remains is rank 0 against a worker whose mirror ends, so the group's
+  refusal is "rank 0 opened no lanes", never "this arm has no lanes". Qwen and GLM read
+  `Runtime::limits().members` (4 and 8 at their own widths); `runtime.rs:2422` boots a world-2
+  `GroupLanes` over a toy arm and asserts the lane width comes from `Limits`.
+* **`Pack` is an identity, not a family list.** `Pack` is `{ descriptor, route }` (`pack.rs:769`)
+  and the routes are serving shapes: `Reference` (DeepSeek's V4.1 engine), `Typed` (a
+  `PackArm` behind the host driver) and `Dynamic` (Dory, Inkling, and a novel checkpoint). One
+  table keyed by the registry's weights selector picks the typed arm (`pack.rs:714`), with one
+  `PackArm` implementation an arithmetic; Qwen's FP8 release is a selector there, not a variant.
+  `Pack::is_arm` is deleted. Two family checks are kept deliberately because their serving paths
+  are distinct rather than selected: `is_inkling` (its `--rank` device group, `pack.rs:907`) and
+  `is_dory` (its `--recurrence-rank` ring, `pack.rs:912`).
+
+The evidence in the branch: `cargo test -p sparkflash-runtime` (74 + 2 + 1 + 2, 7 pre-existing
+conformance stubs ignored), `cargo test -p sparkflash-cli` (exit 0, 275 lib plus the integration
+suites), `cargo check --workspace`, clippy with `-D warnings` on both crates, and `cargo fmt
+--check`. A new CPU test (`pack.rs:1892`) walks every registry id to a `Pack` and lays out an
+`EnginePlan` at world 2, and `pack.rs:1966` boots each Qwen `PackArm`'s group lane width on the
+device. The arm the device run could not measure is GLM: its tiny fixture's 32-wide hidden is
+refused by the mixer's 256-column threads (a pre-existing fixture limit), so GLM's device lane
+boot is covered only by the CPU world-2 plan.
+
+What remains separate, and why it is not a defect:
+
+* DeepSeek, Dory and Inkling still serve on their own group shapes; only the `PackArm` families
+  (Qwen, Qwen FP8, Qwen3.6, GLM) take `open_lanes` into `GroupLanes`/`Runtime`. DeepSeek's move
+  is phase 6; Dory and Inkling are `Dynamic` by decision, and their device groups
+  (`--recurrence-rank`, `--rank`) are the reason their checks stay.
+* No real two-process TP2 group was booted: the device host has one GPU. World-2 evidence is
+  plan construction (CPU), the CPU `GroupLanes` over a world-2 runtime, and TP1 device runs of
+  each `PackArm`.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
