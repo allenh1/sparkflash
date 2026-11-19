@@ -77,12 +77,16 @@ coverage_dump = "numerics/coverage/qwen38-world1.json"
 # pointer and the dump it names, in the same reviewed change. Its model must have a committed
 # layout under numerics/layouts/. Example once a real dump exists:
 # coverage_dump = "numerics/coverage/qwen38-world1.json"
-# Per-layer and per-expert relative error against the reference forward. Implemented:
-# `scripts/numerics.py monitors --reference ... --candidate ... --layer-bar X --expert-bar Y`, and
-# the Qwen host reference writes the dump under SPARKFLASH_NUMERICS_MONITORS. False because no real
-# reference/candidate pair is committed yet: one process's echo is not a candidate. Flip it with
-# the first pair from a reference build and a candidate build.
+# Per-layer and per-shared-expert relative error against the reference forward, with the routing
+# divergence reported beside it: a row may reach a different expert on a slightly different hidden
+# state, and the judge compares the experts both dumps hold, counts the rest, and fails on the bars
+# only. The pair named below is the first real one: GLM-5.3 at world 4, the reference build
+# (`SPARKFLASH_DECODE_MMA=off`, the tiled row GEMV) against the shipped default (the FP8 few-row
+# body). The flag stays false until the reviewed edit that turns it on; the pair and its bars are
+# already here so that edit only flips the flag. `scripts/numerics.py ci` then judges the two
+# dumps at these bars and fails a true flag whose pair is missing, mismatched or over a bar.
 monitors = false
+monitors_pair = { reference = "numerics/monitors/glm53-tp4-v1-reference.json", candidate = "numerics/monitors/glm53-tp4-v2-candidate.json", layer_bar = 0.5, expert_bar = 0.5 }
 
 # Qwen3.8-Flash-Next: the host driver at world 1, the TP driver at 2 and 4. Each world sums in its
 # own order, so each has its own reference. Version 1 decodes on the tensor cores, in the

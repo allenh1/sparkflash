@@ -331,6 +331,24 @@ pub enum Evidence {
     Text,
 }
 
+/// The committed pair a true `monitors` flag rests on (docs/NUMERICS.md §5).
+///
+/// The two dumps are judged at the declared relative-error bars. The judge compares the experts
+/// both builds routed to and reports the ones only one did, because a router may change a row's
+/// expert on a different hidden state; that divergence is a measured fact, not a malformed pair.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorPair {
+    /// The reference build's dump, under `numerics/monitors/`.
+    pub reference: String,
+    /// The candidate build's dump, under `numerics/monitors/`.
+    pub candidate: String,
+    /// The per-layer relative-error bar.
+    pub layer_bar: f64,
+    /// The per-shared-expert relative-error bar.
+    pub expert_bar: f64,
+}
+
 /// The prerequisites docs/NUMERICS.md §5 names before an arithmetic change may land.
 ///
 /// `anchor` is per model: a configuration is judged against its own model's frozen anchor and a
@@ -356,6 +374,9 @@ pub struct Prerequisites {
     pub coverage_dump: Option<String>,
     /// Per-layer and per-expert error monitors.
     pub monitors: bool,
+    /// The committed pair the true `monitors` flag rests on.
+    #[serde(default)]
+    pub monitors_pair: Option<MonitorPair>,
 }
 
 impl Prerequisites {
@@ -620,6 +641,16 @@ impl Registry {
                  routed (layer, expert) slots a coverage dump must reach"
             )));
         }
+        match &self.prerequisites.monitors_pair {
+            Some(pair) => check_monitor_pair(pair)?,
+            None if self.prerequisites.monitors => {
+                return Err(NumericsError::Invalid(
+                    "prerequisites.monitors is true, but it names no monitors_pair; the flag is                      flipped by the reviewed edit that commits the pair it rests on                      (docs/NUMERICS.md §5)"
+                        .to_owned(),
+                ));
+            }
+            None => {}
+        }
         let mut seen = BTreeSet::new();
         for entry in &self.config {
             let key = entry.key();
@@ -705,6 +736,35 @@ impl Registry {
     pub fn anchor_for(&self, model: &str) -> Option<&AnchorEntry> {
         self.anchor.iter().find(|anchor| anchor.model == model)
     }
+}
+
+fn check_monitor_pair(pair: &MonitorPair) -> Result<(), NumericsError> {
+    for (field, path) in [
+        ("reference", &pair.reference),
+        ("candidate", &pair.candidate),
+    ] {
+        if !path.starts_with("numerics/monitors/")
+            || !path.ends_with(".json")
+            || path.split('/').any(|part| part == ".." || part == ".")
+        {
+            return Err(NumericsError::Invalid(format!(
+                "prerequisites.monitors_pair.{field} {path:?} is not a JSON dump under \
+                 numerics/monitors/"
+            )));
+        }
+    }
+    for (field, bar) in [
+        ("layer_bar", pair.layer_bar),
+        ("expert_bar", pair.expert_bar),
+    ] {
+        if !(bar.is_finite() && bar > 0.0) {
+            return Err(NumericsError::Invalid(format!(
+                "prerequisites.monitors_pair.{field} {bar} is not finite and positive; it is the \
+                 relative-error bar a committed monitor pair must meet"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn check_key(key: &ConfigKey) -> Result<(), NumericsError> {
@@ -1241,18 +1301,34 @@ mod tests {
     #[test]
     fn prerequisites_name_what_is_missing() {
         let registry = Registry::embedded().unwrap();
-        let missing = registry.prerequisites.missing();
-        assert_eq!(
-            missing.is_empty(),
-            registry.prerequisites
-                == Prerequisites {
-                    anchor: true,
-                    declaration_check: true,
-                    coverage_slots: 0.93,
-                    coverage: true,
-                    coverage_dump: None,
-                    monitors: true,
-                }
-        );
+        assert_eq!(registry.prerequisites.missing(), vec!["monitors"]);
+        assert!(registry.prerequisites.monitors_pair.is_some());
+    }
+
+    #[test]
+    fn a_true_monitors_flag_requires_a_pair() {
+        let text = registry_with("").replace("monitors = false", "monitors = true");
+        let error = Registry::from_toml(&text).unwrap_err().to_string();
+        assert!(error.contains("monitors_pair"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_monitor_pair_is_refused() {
+        let good = "monitors_pair = { reference = \"numerics/monitors/r.json\", \
+                    candidate = \"numerics/monitors/c.json\", layer_bar = 0.5, expert_bar = 0.5 }";
+        let text =
+            registry_with("").replace("monitors = false", &format!("monitors = false\n{good}"));
+        Registry::from_toml(&text).expect("a false flag may name a well-formed pair");
+        for bad in [
+            good.replace("numerics/monitors/r.json", "docs/numerics/r.json"),
+            good.replace("numerics/monitors/r.json", "numerics/monitors/../r.json"),
+            good.replace("layer_bar = 0.5", "layer_bar = 0.0"),
+            good.replace("expert_bar = 0.5", "expert_bar = -1.0"),
+        ] {
+            let text =
+                registry_with("").replace("monitors = false", &format!("monitors = false\n{bad}"));
+            let error = Registry::from_toml(&text).unwrap_err().to_string();
+            assert!(error.contains("monitors_pair"), "{error}");
+        }
     }
 }

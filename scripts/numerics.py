@@ -54,10 +54,12 @@ coverage-sweep sends a deterministic corpus to a server that is writing the dump
          before and after each prompt, keeps a prompt only when its forward reached a slot no earlier
          kept prompt reached, and writes the kept prompts as the next suite. The dump is the
          evidence; the selection is measured, never the generator's opinion.
-monitors compares a candidate monitor dump with the reference forward, per layer and per expert,
-         and fails every relative-L2 bar it exceeds.
+monitors compares a candidate monitor dump with the reference forward, per layer and per shared
+         expert, reports the experts only one dump routed to, and fails every relative-L2 bar it
+         exceeds.
 ci       the declaration check: a changed reference without a version bump fails, a bump without a
-         change fails, a bump while a prerequisite is false fails, an anchor never changes, every
+         change fails, a bump while a prerequisite is false fails, a true coverage or monitors flag
+         whose named dump or pair fails its bar fails, an anchor never changes, every
          fingerprint must match its file, an arm profile's arithmetic setting changes only with
          every reference of the model it names recaptured, and a field joins the neutral list only
          with a report.
@@ -102,6 +104,10 @@ MONITORS_SCHEMA = "sparkflash-numerics-monitors/1"
 MONITOR_RESULT_SCHEMA = "sparkflash-numerics-monitor-result/1"
 LAYOUT_SCHEMA = "sparkflash-numerics-expert-layout/1"
 LAYOUTS = f"{NUMERICS}/layouts/"
+MONITORS = f"{NUMERICS}/monitors/"
+# The table a true `monitors` flag rests on: the two committed dumps and the bars they are judged
+# at (docs/NUMERICS.md section 5). The shape is exact so a typo cannot silently leave a bar unset.
+MONITOR_PAIR_FIELDS = ("reference", "candidate", "layer_bar", "expert_bar")
 PREREQUISITES = ("anchor", "declaration_check", "coverage", "monitors")
 # The prerequisites that gate every version bump. 'anchor' is not here: it is a per-model
 # requirement (docs/NUMERICS.md section 5), looked up for the bumping configuration's own model.
@@ -573,6 +579,59 @@ def coverage_bar(value: object, origin: str) -> float:
     return bar
 
 
+def monitor_bar(value: object, field: str, origin: str) -> float:
+    """One declared monitor bar: a finite, positive relative error. Zero would be a bit gate."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise NumericsFailure(
+            f"{origin}: prerequisites.monitors_pair.{field} {value!r} is not a number"
+        )
+    bar = float(value)
+    if not math.isfinite(bar) or bar <= 0.0:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.monitors_pair.{field} {value!r} is not finite and positive; "
+            "it is the relative-error bar a committed monitor pair must meet"
+        )
+    return bar
+
+
+def monitor_pair(value: object, origin: str) -> dict:
+    """The pair a true monitors flag rests on: two committed dumps and their two bars."""
+    if not isinstance(value, dict):
+        raise NumericsFailure(f"{origin}: prerequisites.monitors_pair is not a table")
+    missing = [field for field in MONITOR_PAIR_FIELDS if field not in value]
+    unknown = sorted(set(value) - set(MONITOR_PAIR_FIELDS))
+    if missing:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.monitors_pair is missing {missing}; it needs "
+            f"{list(MONITOR_PAIR_FIELDS)}"
+        )
+    if unknown:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.monitors_pair has unknown key(s) {unknown}; it needs "
+            f"{list(MONITOR_PAIR_FIELDS)}"
+        )
+    for field in ("reference", "candidate"):
+        path = value[field]
+        if not isinstance(path, str) or not path:
+            raise NumericsFailure(
+                f"{origin}: prerequisites.monitors_pair.{field} is not a non-empty string"
+            )
+        parts = PurePosixPath(path).parts
+        if (
+            not path.startswith(MONITORS)
+            or not path.endswith(".json")
+            or "." in parts
+            or ".." in parts
+        ):
+            raise NumericsFailure(
+                f"{origin}: prerequisites.monitors_pair.{field} {path!r} is not a JSON dump under "
+                f"{MONITORS}"
+            )
+    monitor_bar(value["layer_bar"], "layer_bar", origin)
+    monitor_bar(value["expert_bar"], "expert_bar", origin)
+    return value
+
+
 def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
     try:
         registry = tomllib.loads(text)
@@ -599,6 +658,15 @@ def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
         raise NumericsFailure(
             f"{origin}: prerequisites.coverage is true, but it names no coverage_dump; the flag "
             "is flipped by the reviewed edit that commits the dump it rests on (docs/NUMERICS.md §5)"
+        )
+    pair = prerequisites.get("monitors_pair")
+    if pair is not None:
+        monitor_pair(pair, origin)
+    elif prerequisites["monitors"]:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.monitors is true, but it names no monitors_pair; the flag "
+            "is flipped by the reviewed edit that commits the pair it rests on "
+            "(docs/NUMERICS.md §5)"
         )
     for table in ("config", "anchor", "retired"):
         registry.setdefault(table, [])
@@ -1228,6 +1296,67 @@ def coverage_findings(registry: dict, read: Callable[[str], bytes | None]) -> li
     ]
 
 
+def monitor_pair_result(
+    registry: dict, read: Callable[[str], bytes | None]
+) -> tuple[dict | None, list[str]]:
+    """Judge the committed pair a true monitors flag rests on, and return its result.
+
+    The flag is not a claim on its own: it is true only when `monitors_pair` names two committed
+    dumps that parse, run the same model and probe, and meet the declared layer and expert bars
+    over the experts both hold. A false flag decides nothing and reads no pair.
+    """
+    prerequisites = registry["prerequisites"]
+    if not prerequisites["monitors"]:
+        return None, []
+    pair = prerequisites.get("monitors_pair")
+    if pair is None:
+        return None, [
+            "prerequisites.monitors is true, but it names no monitors_pair; the flag is flipped by "
+            "the reviewed edit that commits the pair it rests on (docs/NUMERICS.md §5)"
+        ]
+    try:
+        monitor_pair(pair, "prerequisites")
+    except NumericsFailure as error:
+        return None, [str(error)]
+    missing = [
+        path for path in (pair["reference"], pair["candidate"]) if read(path) is None
+    ]
+    if missing:
+        return None, [
+            f"prerequisites.monitors is true, but its monitors_pair does not exist: "
+            f"{', '.join(missing)}; the flag is flipped by the reviewed edit that commits the pair "
+            "(docs/NUMERICS.md §5)"
+        ]
+    dumps = {}
+    for path in (pair["reference"], pair["candidate"]):
+        data = read(path)
+        assert data is not None
+        try:
+            document = json.loads(data)
+        except json.JSONDecodeError as error:
+            return None, [f"prerequisites.monitors_pair {path}: not JSON ({error})"]
+        try:
+            dumps[path] = check_monitor_dump(document, path)
+        except NumericsFailure as error:
+            return None, [str(error)]
+    try:
+        result = judge_monitors(
+            dumps[pair["reference"]],
+            dumps[pair["candidate"]],
+            float(pair["layer_bar"]),
+            float(pair["expert_bar"]),
+        )
+    except NumericsFailure as error:
+        return None, [f"prerequisites.monitors_pair: {error}"]
+    findings = [f"prerequisites.monitors_pair: {failure}" for failure in result["failures"]]
+    return result, findings
+
+
+def monitors_findings(registry: dict, read: Callable[[str], bytes | None]) -> list[str]:
+    """The bar findings of the pair a true monitors flag names, or [] when it passes."""
+    return monitor_pair_result(registry, read)[1]
+
+
 def run_ci(base_argument: str | None) -> int:
     base = resolve_base(base_argument)
     read_base, read_head = read_at(base), read_at(None)
@@ -1260,6 +1389,8 @@ def run_ci(base_argument: str | None) -> int:
     anchor_checks, coverage = anchor_findings(head_registry, read_head, capture_paths)
     findings += anchor_checks
     findings += coverage_findings(head_registry, read_head)
+    monitor_result, monitor_checks = monitor_pair_result(head_registry, read_head)
+    findings += monitor_checks
     configs, anchors = len(head_registry["config"]), len(head_registry["anchor"])
     missing = missing_prerequisites(head_registry)
     print(
@@ -1273,6 +1404,27 @@ def run_ci(base_argument: str | None) -> int:
             f"{coverage_bar(prerequisites.get('coverage_slots'), REGISTRY):.2%} of routed "
             "(layer, expert) slots"
         )
+    if prerequisites["monitors"]:
+        pair = prerequisites["monitors_pair"]
+        print(
+            f"numerics ci: monitors prerequisite: {pair['reference']} vs {pair['candidate']} at "
+            f"layer bar {float(pair['layer_bar']):.3e} and expert bar "
+            f"{float(pair['expert_bar']):.3e}"
+        )
+        if monitor_result is not None:
+            routing = monitor_result["routing"]
+            maxima = monitor_result["maxima"]
+            expert_maximum = (
+                "no shared expert"
+                if maxima["expert"] is None
+                else f"{maxima['expert']:.3e}"
+            )
+            print(
+                f"numerics ci: monitors routing: {routing['layers_differing']} of "
+                f"{len(monitor_result['layers'])} layer(s) differ, "
+                f"{routing['experts_unshared']} expert(s) unshared; achieved maxima layer "
+                f"{maxima['layer']:.3e}, expert {expert_maximum}"
+            )
     print(
         "numerics ci: anchor coverage: "
         + (

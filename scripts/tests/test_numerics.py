@@ -1373,6 +1373,246 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("routing:", out.getvalue())
 
 
+def _toml_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "nan"
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+    return repr(value)
+
+
+def registry_with_pair(monitors: bool, pair: dict | None) -> str:
+    text = TOY_REGISTRY
+    if pair is not None:
+        fields = ", ".join(f"{key} = {_toml_value(value)}" for key, value in pair.items())
+        text = text.replace(
+            "monitors = false\n", f"monitors = false\nmonitors_pair = {{ {fields} }}\n"
+        )
+    if monitors:
+        text = text.replace("monitors = false", "monitors = true")
+    return text
+
+
+class MonitorPrerequisiteTests(unittest.TestCase):
+    """What `ci` does with the monitors flag: judge the committed pair the flag names."""
+
+    def setUp(self):
+        self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
+        self.candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])])
+        self.pair = {
+            "reference": "numerics/monitors/ref.json",
+            "candidate": "numerics/monitors/cand.json",
+            "layer_bar": 0.5,
+            "expert_bar": 0.5,
+        }
+
+    def registry(self, monitors: bool = True, pair: dict | None = None) -> dict:
+        prerequisites = {
+            "anchor": False,
+            "declaration_check": True,
+            "coverage": False,
+            "coverage_slots": 0.93,
+            "monitors": monitors,
+        }
+        if pair is not None:
+            prerequisites["monitors_pair"] = pair
+        return {"prerequisites": prerequisites}
+
+    def reader(self, documents: dict[str, dict]):
+        return lambda path: json.dumps(documents[path]).encode() if path in documents else None
+
+    def test_a_true_flag_judges_the_pair_it_names_and_reports_routing(self):
+        result, findings = NUMERICS.monitor_pair_result(
+            self.registry(True, self.pair),
+            self.reader(
+                {
+                    self.pair["reference"]: self.reference,
+                    self.pair["candidate"]: self.candidate,
+                }
+            ),
+        )
+        self.assertEqual(findings, [])
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["routing"]["layers_differing"], 1)
+        self.assertEqual(result["routing"]["experts_unshared"], 2)
+        self.assertEqual(result["maxima"]["layer"], 0.0)
+
+    def test_a_false_flag_makes_no_claim_and_reads_no_pair(self):
+        def read(path: str) -> bytes | None:
+            self.fail(f"a false monitors flag read {path}")
+
+        self.assertEqual(NUMERICS.monitors_findings(self.registry(False, self.pair), read), [])
+
+    def test_a_missing_pair_dump_is_named(self):
+        findings = NUMERICS.monitors_findings(self.registry(True, self.pair), lambda path: None)
+        self.assertTrue(any("does not exist" in finding for finding in findings), findings)
+        self.assertTrue(any(self.pair["reference"] in finding for finding in findings), findings)
+        self.assertTrue(any(self.pair["candidate"] in finding for finding in findings), findings)
+
+    def test_a_mismatched_pair_is_refused(self):
+        other = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0])], model="toy/other")
+        findings = NUMERICS.monitors_findings(
+            self.registry(True, self.pair),
+            self.reader({self.pair["reference"]: self.reference, self.pair["candidate"]: other}),
+        )
+        self.assertTrue(any("reference names" in finding for finding in findings), findings)
+
+    def test_an_over_bar_pair_fails(self):
+        candidate = monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (2, [0.0, 2.0])])
+        findings = NUMERICS.monitors_findings(
+            self.registry(True, dict(self.pair, layer_bar=0.05, expert_bar=0.05)),
+            self.reader(
+                {self.pair["reference"]: self.reference, self.pair["candidate"]: candidate}
+            ),
+        )
+        self.assertTrue(any("layer bar" in finding for finding in findings), findings)
+        self.assertTrue(any("expert bar" in finding for finding in findings), findings)
+
+    def test_a_true_flag_without_a_pair_is_refused_at_parse(self):
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "names no monitors_pair"):
+            NUMERICS.parse_registry(registry_with_pair(True, None), "toy")
+
+    def test_a_malformed_pair_is_refused_at_parse(self):
+        cases = [
+            dict(self.pair, reference="docs/numerics/ref.json"),
+            dict(self.pair, reference="numerics/monitors/../ref.json"),
+            dict(self.pair, candidate="numerics/monitors/cand.txt"),
+            dict(self.pair, layer_bar=0.0),
+            dict(self.pair, expert_bar=-1.0),
+            dict(self.pair, layer_bar=float("nan")),
+            dict(self.pair, layer_bar=True),
+            {key: value for key, value in self.pair.items() if key != "candidate"},
+            dict(self.pair, surprise=1),
+        ]
+        for pair in cases:
+            with self.subTest(pair=pair):
+                with self.assertRaisesRegex(NUMERICS.NumericsFailure, "monitors_pair"):
+                    NUMERICS.parse_registry(registry_with_pair(False, pair), "toy")
+        not_a_table = TOY_REGISTRY.replace(
+            "monitors = false\n", 'monitors = false\nmonitors_pair = "nope"\n'
+        )
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "not a table"):
+            NUMERICS.parse_registry(not_a_table, "toy")
+
+    def test_a_false_flag_may_name_a_pair_without_claiming_it(self):
+        # A false flag decides nothing; the pointer may be in place for the reviewed flip.
+        registry = NUMERICS.parse_registry(registry_with_pair(False, self.pair), "toy")
+        self.assertEqual(registry["prerequisites"]["monitors_pair"], self.pair)
+
+
+class MonitorCiTests(unittest.TestCase):
+    """`ci` with the flag false, true, a missing pair and an over-bar pair."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name)
+        (self.repo / "numerics" / "monitors").mkdir(parents=True)
+        self.reference = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (1, [0.0, 2.0])])
+        self.candidate = monitor_dump([1.0, 2.0], [(0, [1.0, 0.0]), (2, [0.0, 2.0])])
+        self.pair = {
+            "reference": "numerics/monitors/ref.json",
+            "candidate": "numerics/monitors/cand.json",
+            "layer_bar": 0.5,
+            "expert_bar": 0.5,
+        }
+        self.write_registry(False, None)
+        self.git("init", "-q")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base")
+        self.base = self.git("rev-parse", "HEAD")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                *args,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def write_registry(self, monitors: bool, pair: dict | None) -> None:
+        (self.repo / "numerics" / "registry.toml").write_text(registry_with_pair(monitors, pair))
+
+    def write_dump(self, name: str, dump: dict) -> None:
+        (self.repo / "numerics" / "monitors" / name).write_text(json.dumps(dump))
+
+    def ci(self) -> tuple[int, str]:
+        with (
+            mock.patch.object(NUMERICS, "REPO", self.repo),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            code = NUMERICS.run_ci(self.base)
+        return code, out.getvalue()
+
+    def test_a_false_flag_names_no_pair_and_needs_no_dumps(self):
+        # The flag is false at the base and the head; a missing pointer and missing dumps claim
+        # nothing, so ci passes.
+        self.write_registry(False, dict(self.pair, reference="numerics/monitors/absent.json"))
+        code, out = self.ci()
+        self.assertEqual(code, 0, out)
+
+    def test_a_true_flag_without_a_pair_is_refused(self):
+        self.write_registry(True, None)
+        with (
+            mock.patch.object(NUMERICS, "REPO", self.repo),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as error,
+        ):
+            code = NUMERICS.main(["ci", "--base", self.base])
+        self.assertEqual(code, 1)
+        self.assertIn("names no monitors_pair", error.getvalue())
+
+    def test_a_true_flag_passes_a_pair_inside_the_bars(self):
+        self.write_registry(True, self.pair)
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", self.candidate)
+        code, out = self.ci()
+        self.assertEqual(code, 0, out)
+        self.assertIn("monitors prerequisite", out)
+        self.assertIn("monitors routing: 1 of 1 layer(s) differ", out)
+        self.assertIn("achieved maxima", out)
+
+    def test_a_true_flag_fails_a_missing_pair_dump(self):
+        self.write_registry(True, self.pair)
+        self.write_dump("ref.json", self.reference)
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("does not exist", out)
+        self.assertIn(self.pair["candidate"], out)
+
+    def test_a_true_flag_fails_a_mismatched_pair(self):
+        self.write_registry(True, self.pair)
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", monitor_dump([1.0, 2.0], [(0, [1.0, 0.0])], model="toy/other"))
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("reference names", out)
+
+    def test_a_true_flag_fails_an_over_bar_pair(self):
+        self.write_registry(True, dict(self.pair, layer_bar=0.05, expert_bar=0.05))
+        self.write_dump("ref.json", self.reference)
+        self.write_dump("cand.json", monitor_dump([1.2, 2.0], [(0, [1.1, 0.0]), (2, [0.0, 2.0])]))
+        code, out = self.ci()
+        self.assertEqual(code, 1)
+        self.assertIn("prerequisites.monitors_pair", out)
+        self.assertIn("layer bar", out)
+        self.assertIn("expert bar", out)
+
+
 def synthetic_text_reference(text: str = "abc") -> dict:
     reference = {
         "schema": NUMERICS.REFERENCE_SCHEMA,
