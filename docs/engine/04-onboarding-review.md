@@ -744,6 +744,141 @@ direct chunks).
 5. Its own A/B. Under the regression clause, an arm that measures slower stays on
    `FusedEngine`, and the plan records why.
 
+Items 2 and 3 are done in the section below; item 1's frame and item 4's mirror are still
+missing, and item 5 has not run.
+
+### The drafting arm and GLM on the tick engine
+
+Commits `d49dc2ba` (the engine's drafting profile and its CPU gate) and `f92bbe05` (GLM's
+single-process move). `TickConfig::for_walk` no longer narrows DeepSeek's profile to a plain
+arm: a drafting arm's config carries the profile's chunk and rows, its verify width as the
+member cap (`TickConfig::members`, read from `Limits::members`), its drafter's depth (`k`) and
+floor, and the `shared_rounds` switch. `for_runtime` sets that switch from
+`Runtime::joint_rounds()`, so the engine's plan is the runtime's own rule, not a second one.
+
+**The three shapes.** A drafting arm's decode plan is one of three, and each is pinned by
+`crates/sparkflash-runtime/tests/tick_engine_drafter.rs` on a CPU walk with a drafter:
+
+* `Plain`: a batch wider than the verify width, or a rank whose joint rounds are off, steps
+  one row a member in groups no wider than `members`. `a_plain_batch_steps_one_row_a_member`
+  feeds two rows, sees one `TokenRows(2)` pass and no verify, and the trace says
+  `plan=plain`.
+* `Shared`: several decoding rows whose anchors fit the verify width run one joint round.
+  `a_fitting_batch_verifies_in_one_shared_round` feeds three rows, sees exactly one `Verify`
+  pass of three members (not one a lane), and the trace says `plan=shared`.
+* `Spec`: one decoding row runs its own round.
+  `a_speculative_round_keeps_its_accepted_rows_only` hands the drafter a chain whose second
+  draft is deliberately wrong: the round keeps the anchor and the first draft, the request
+  receives two steps, the history ends at the accepted draft, and the rejected token never
+  reaches the history. The trace says `plan=spec`.
+* The tick-ahead plan is not an execution. `a_stale_tick_ahead_plan_does_not_skip_a_round`
+  injects a plan for one row that names no round; the engine re-decides and the verify runs.
+  The decode path filters `DecodePlan::None` for a nonempty row set, and `with_ahead` is the
+  gate seam that makes the case reachable.
+
+**GLM.** `Glm5NextDeviceBackend::enable_fusion` now opens `TickServe` over `GlmWalk` instead of
+`Fusion::local` over `Runtime<GlmWalk>`. The executor is the same `Runtime`: a prompt is still
+`run_part_rows` in the `ChunkPolicy` chunk, a decode is still `step_mode_slots` with the
+runtime's `Round`, and the round is the same `GlmDrafter` verify and settle. `TickConfig` is
+GLM's profile: `DEFAULT_PREFILL_ROWS` **4,096** rows a prompt chunk; `MAX_ROWS`
+(`GEMV_MAX_BATCH`) **8** as the verify width, anchors plus drafts a step;
+`decoder_skip = false` (only DeepSeek has decoder layers); `exchange = false` at TP=1 (no row
+exchange); the
+MTP/DFlash depth in `k`. The CPU shape tests pin the config and the chunks: a 5,000-row prompt
+runs **4,096 then 904** rows, the same split the runtime's `ChunkPolicy` chose before, and
+three decoding lanes take **one shared verify of at most 8 rows**. GLM's generated checks now
+have `tick_engine() == true`, so `whole = chunked = token`, `alone = four`,
+`continued = cold`, `rewound = cold`, `drafted = plain` and `no unrecorded widening` run
+through the engine's protocol exactly as dense's do.
+
+**Which path changed, and why the tokens cannot move on paper.** GLM's TP=1 path is the only
+released arm's path this branch changed. Dense's `for_walk` config gains `members`, but
+`Limits::new` makes members equal rows, so its plans and its committed trace are unchanged;
+DeepSeek's `TickConfig::deepseek` sets `members = 64` to match its row width. GLM's tokens
+cannot move on paper because the walk and the runtime calls are the same: the engine chooses
+*when*, not *what* - the same 4,096-row chunks, the same one-row plain step, the same `Round`
+with the drafter's own depth and the same `verdict` settlement. The scheduler is different
+(tick boundaries, the hold, the decode share), and a greedy token does not depend on when its
+chunk ran. The one arm-level property this leans on is `drafted = plain`, which the generated
+check measures on the device; it is **unverified here**, so the paper argument is not a
+measurement.
+
+One non-default path is named rather than implied: with `JOINT_ROUNDS=off` the engine plans
+`Plain` for a batch of decoding lanes - one plain row a member, no draft - where the fused
+runtime ran one round a lane. The switch is off only when an operator sets it; the default
+is joint, and the A/B above runs the default. The emitted tokens are still the
+`drafted = plain` property's, but the drafting itself is off on that path, so if the off
+setting must keep drafting the engine needs a fourth execution shape (a lone round a
+member) before it may replace `Fusion::local` for that operator.
+
+**Measured on this host (CPU; it has no GPU).**
+
+* `cargo test -p sparkflash-runtime --test tick_engine_drafter`: 5 passed - the three shapes,
+  the rejected draft and the stale ahead plan.
+* `cargo test -p sparkflash-runtime`: 87 passed, 7 ignored (77 library tests including the
+  existing committed engine trace, 2 sealed, 5 drafter, 2 engine-trace, 1 tick-trace).
+* `cargo test -p sparkflash-model-glm5-next`: 93 passed, 8 ignored (71 library tests, 11
+  `device_forward`, 4 `engine_builder`, 7 `serve_tiny`). The new CPU tests are
+  `the_tick_config_is_the_glm_profile`, `the_tick_engine_hands_glm_4096_row_chunks`,
+  `the_tick_engine_keeps_glms_joint_round` and `the_generated_checks_drive_the_tick_engine`.
+* `cargo clippy -p sparkflash-runtime -p sparkflash-model-glm5-next --all-targets --
+  -D warnings` and `cargo fmt --all -- --check` are clean.
+
+**Unverified without a cluster.**
+
+* GLM's device conformance through the engine: `scripts/onboard-gate.sh GLM` (the seven
+  checks), a served gate at one and four lanes, and a numerics check on a freshly booted
+  server as `NUMERICS.md` requires.
+* The live trace on GLM: `WallClock` readings, the per-tick flush and the rank-0 rule.
+* Speed: no step time, tokens/s or time to first token. The regression clause's A/B has not
+  run, so nothing here says the tick engine is as fast as the fused one.
+* The group: no TP2/TP4 boot ran, and GLM's group is not on the engine (below).
+
+**What a cluster window must measure.**
+
+1. `scripts/onboard-gate.sh GLM`: the seven generated checks through the engine,
+   PASS/FAIL/SKIP/NEEDS-FIXTURE.
+2. A served gate at one and four lanes, then a numerics check per `NUMERICS.md`; the same
+   prompts through the pre-move `Fusion::local` build and this one, comparing token ids for
+   greedy and sampled requests.
+3. Alternated launches of the old and new builds at 1, 4, 8 and 16 streams and at 2K and 16K
+   prompts, several reps each; compare token streams and each request's `cached_tokens`, and
+   diff a live `SPARKFLASH_TICK_TRACE` from each launch as decisions. A pair that differs only
+   in an admission tick is reported, not excused.
+4. Chunk sizes from the trace: every prompt chunk is 4,096 rows except its tail, and no decode
+   batch exceeds 8 members.
+5. Speed, and this is the one thing the A/B must measure first: TP=1 at one request and at
+   four lanes, the old fused path against the tick engine - mean step time and tokens/s with
+   the token stream beside them. Under the regression clause, if the tick engine is slower,
+   GLM returns to `Fusion::local` and this section records the measurement and why.
+
+**The group did not move.** `enable_group_fusion` and `mirror_group` still build
+`Fusion::group` over `Runtime<GlmWalk>`, so GLM at TP>1 keeps the old schedule. The
+rows-carrying frame alone is not enough; the tick group needs both halves, and neither is
+written here:
+
+* **Frames.** a `LaneRows { lane, rows }` that says "run exactly these rows of the prompt",
+  so a worker calls `Runtime::run_part_rows` instead of `next_part`; and a `LaneStepMode` that
+  carries the engine's mode (`Plain`, `Round { joint: false }` or `Round { joint: true }`) with
+  the `(lane, token)` members, so a worker runs `step_mode_slots` with the same shape. The
+  existing `LaneRequest` must also carry the start `start_prompt_slot` chose, or the worker
+  must refuse a start that differs, because every row count is a position from that start.
+* **Rank 0.** `TickServe`/`TickEngine` needs a group form that broadcasts those frames before
+  `start_prompt_slot`, each `run_part_rows_hooked` and each `step_mode_slots`, and before
+  `give_back`/`release`. Its `TickConfig` is `for_walk` with `exchange = true`, and only the
+  prompt chunks and steps are broadcast: the lane choice, the hold and the tick-ahead plan
+  stay rank 0's, as they are for `Fusion::group`.
+* **The worker.** a mirror over `Runtime<W>` replaying those frames in order; the existing
+  `FusedArm` mirror cannot express the tick's rows because its `LaneRequest` runs a prompt and
+  its `LanePart` runs the next `ChunkPolicy` chunk, neither of which is a row count rank 0
+  decided.
+
+The frame can be added later without touching another arm: only GLM's group would open the
+tick form, and the existing `Fusion::group` path for Qwen, Inkling, Dory and dense's TP>1
+stays as it is. It was not added here because it is a new wire protocol and a second mirror,
+and its TP>1 bits cannot be checked on this host; moving it without the cluster gate would
+make an unverified bit claim for a released arm, which phase 6 forbids.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
