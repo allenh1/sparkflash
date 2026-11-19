@@ -1343,6 +1343,40 @@ change that would need a real `Vision` impl, not a wire.
   deviation): `Pass::Paired` is unused, and a preempted prompt is served to its end.
 * **The group runs text only** (above): `TextWire` refuses images before the request frame.
 
+### The Inkling reference no longer matches, and how far the bisect reached
+
+A window serving inkling-2-Small at world 4 on the branch head ran `scripts/numerics.py check` and
+it **fails**: the server serves `397907e6…` where the registry names `387647bc…`, with the first
+difference at the first position of the first prompt (`logprobs 'dee893bf' != '09f288bf'`). That
+is not a chunking or timing difference: the very first generated token has a different
+distribution.
+
+Four windows were spent narrowing it, and they establish this much:
+
+* **The context is not the cause.** The reference was captured at the launcher's default
+  1,048,576 positions; every failing run used `CONTEXT=32768`. A run at 1,048,576 on the same
+  binary produces the same failing fingerprint, character for character.
+* **The conversion commit cannot be measured as committed.** `540ae6d0` ("load every kernel
+  through a bound handle") does not boot: its tree has none of the six
+  `inkling_block_residual_chain_*` catalogue entries, its uploader refuses the short convolution
+  (`[4608, 1, 4]` as `[4608, 4]`) and the stacked experts (`U8 [384, 4608, 2304]` as a
+  `Mat<Nvfp4>`), and its checked-in registry spells the retired Dory entry's reason as `note`.
+  With exactly those four fixes cherry-picked (`parts.rs` entries, the unit-dimension rule, the
+  leading-dimension collapse, and the field rename) it boots and serves the **same** `397907e6…`,
+  so the move is at or before the conversion, not after it.
+* **The capture is an ancestor of the conversion**, and between them the only commit that touches
+  Inkling is the conversion itself. What remains unattributed is the build the reference was
+  actually captured on: the capture's `server` card records the checkpoint, the world and the
+  plan, but **not the commit**, so a bit difference between two builds cannot be pinned to one.
+
+The consequence is stated rather than hidden: inkling-2-Small's registered version 1 now names a
+reference the branch does not reproduce, and it cannot be re-declared because `coverage` and
+`monitors` are still false. The next step is a bisect forward from the capture commit with the
+four boot fixes carried, or a capture that records its commit in the first place.
+
+The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
+Without that field, a frozen reference can only say that bits moved, never which commit moved
+them, and every bisect pays for the same information twice.
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
