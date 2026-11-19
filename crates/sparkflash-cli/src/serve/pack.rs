@@ -39,7 +39,6 @@ use sparkflash_ops::EngineBuilder;
 use sparkflash_ops::engine_plan::EnginePlan;
 use sparkflash_ops::parts::serving_language;
 use sparkflash_ops::resolver::{Availability, KernelResolver};
-use sparkflash_weights::rank_file::{find_converted_rank_file, rank_file_name};
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 
 use super::{CHECKPOINT_CONFIG_NAME, EXIT_REFUSED, ServeOptions, serve_with_seam};
@@ -52,7 +51,7 @@ use super::{
 };
 
 /// The variable naming a directory of Qwen3.8-Flash-Next rank files (`sparkflash convert`).
-pub(super) const QWEN_CONVERTED_DIR_ENV: &str = "SPARKFLASH_QWEN_CONVERTED_DIR";
+pub(super) use sparkflash_model_qwen4_exp::rank::CONVERTED_DIR_ENV as QWEN_CONVERTED_DIR_ENV;
 /// Where an Inkling run reads its converted rank file, when one is staged.
 pub(super) const INKLING_CONVERTED_DIR_ENV: &str = "SPARKFLASH_INKLING_CONVERTED_DIR";
 
@@ -286,7 +285,8 @@ impl PackArm for QwenArm {
         }
         // A converted rank file is one slab read instead of 77.8 GiB of per-tensor uploads. The
         // checkpoint directory stays the configuration, tokenizer and host-paged PLE source.
-        let converted = converted_rank_file(QWEN_CONVERTED_DIR_ENV, 0, 1)?;
+        let converted =
+            sparkflash_weights::rank_file::converted_rank_file(QWEN_CONVERTED_DIR_ENV, 0, 1)?;
         let backend = match (converted.as_deref(), plan) {
             // The plan-aware open is the arm's EngineBuilder, so the plan's target/world gate
             // and the shared rank boot check run before the arm uploads a weight. The converted
@@ -1017,13 +1017,10 @@ fn serve_arm<A: PackArm>(options: &ServeOptions) -> Result<ExitCode, String> {
 }
 
 /// The directory a checkpoint path names: the path itself, or the directory holding the file.
-pub(super) fn checkpoint_directory(checkpoint: &Path) -> PathBuf {
-    if checkpoint.is_dir() {
-        checkpoint.to_path_buf()
-    } else {
-        checkpoint.parent().unwrap_or(Path::new(".")).to_path_buf()
-    }
-}
+///
+/// The rule is the rank seam's ([sparkflash_serve::tp4::checkpoint_directory]), because an arm's
+/// rank opener resolves the same path the single-node arm does.
+pub(super) use sparkflash_serve::tp4::checkpoint_directory;
 
 /// The configuration of the checkpoint in `directory`, with the pack named in a refusal.
 pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, String> {
@@ -1031,16 +1028,13 @@ pub(super) fn read_config<A: PackArm>(directory: &Path) -> Result<A::Config, Str
         .map_err(|error| format!("cannot read the {} configuration: {error}", A::NAME))
 }
 
-/// The converted rank file for rank `rank` of `world` in the directory `var` names.
-///
-/// `None` when `var` is unset or empty. A configured directory that does not hold this rank's file
-/// is a refusal, not a silent fallback to the checkpoint's tensors.
 /// Turns the profile's speculation section into the GLM arm's drafter and depth.
 ///
 /// The fields are the typed ones ([sparkflash_model::profile::SpeculationProfile]) and the
 /// environment names that set them are declared in [sparkflash_model::profile::ENV_OVERRIDES], so
 /// a switch here is a documented field rather than a new variable read at the point of use. The
-/// drafts and their depth rule are [glm_drafting]'s, which the four-rank group reads too.
+/// drafts and their depth rule are [sparkflash_model_glm5_next::glm_drafting]'s, which the
+/// four-rank group reads too.
 fn apply_speculation(
     backend: &mut sparkflash_model_glm5_next::Glm5NextDeviceBackend,
     profile: &ModelProfile,
@@ -1055,86 +1049,13 @@ fn apply_speculation(
     let (block, most) = backend
         .drafting_limits()
         .map_err(|error| error.to_string())?;
-    let Some(drafting) = glm_drafting(spec, block, most)? else {
+    let Some(drafting) = sparkflash_model_glm5_next::glm_drafting(spec, block, most)? else {
         return Ok(());
     };
     eprintln!("sparkflash serve: GLM speculating {}", drafting.label());
     backend
         .enable_speculation(drafting.drafts, Some(drafting.policy))
         .map_err(|error| error.to_string())
-}
-
-/// How a GLM rank drafts: the most drafts a step verifies and the shared depth rule over them.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GlmDrafting {
-    /// The most drafts a step proposes and verifies after its token.
-    pub(crate) drafts: usize,
-    /// [sparkflash_model::DepthPolicy::from_speculation] over [Self::drafts].
-    pub(crate) policy: sparkflash_model::DepthPolicy,
-}
-
-impl GlmDrafting {
-    /// For the serve log: the chain and its rule.
-    pub(crate) fn label(&self) -> String {
-        format!(
-            "up to {} draft(s) a step, {} depth",
-            self.drafts,
-            if self.policy.is_adaptive() {
-                "adaptive"
-            } else {
-                "fixed"
-            }
-        )
-    }
-}
-
-/// The GLM arm's drafting from the profile's speculation section, for a rank with a block drafter
-/// (`block`) or the MTP layer, drafting at most `most`. `None` drafts nothing.
-///
-/// Either drafter says how sure it is of each draft (the block drafter's selector, the MTP
-/// layer's softmax), so the depth is DeepSeek's: adaptive unless `speculation.depth_policy` says
-/// fixed (`SPARKFLASH_DRAFT_POLICY`), at least `speculation.min_depth`, against the drafter's
-/// own step cost. The chain is `speculation.drafts` (`SPARKFLASH_DRAFT_DRAFTS`), else the whole
-/// block for a block drafter, else `speculation.depth` (`SPARKFLASH_DRAFT_DEPTH`; the carried
-/// profile says 3), else 2. `speculation.enabled=false` (`SPARKFLASH_DRAFT=off`) drafts
-/// nothing.
-///
-/// # Errors
-/// A chain past what the rank drafts, or a draft count asked for with speculation off.
-pub(crate) fn glm_drafting(
-    spec: &sparkflash_model::profile::SpeculationProfile,
-    block: bool,
-    most: usize,
-) -> Result<Option<GlmDrafting>, String> {
-    let drafts = match (spec.enabled, spec.drafts) {
-        (Some(false), None | Some(0)) => return Ok(None),
-        (Some(false), Some(drafts)) => {
-            return Err(format!(
-                "speculation.enabled=false with speculation.drafts={drafts}: say one or the other"
-            ));
-        }
-        (_, Some(drafts)) => drafts,
-        (_, None) if block => most,
-        (_, None) => spec.depth.unwrap_or(2),
-    };
-    if drafts == 0 {
-        return Ok(None);
-    }
-    if drafts > most {
-        return Err(format!(
-            "{drafts} drafts a step (speculation.drafts or speculation.depth) is past the {most}              this rank's {} drafts",
-            if block { "block drafter" } else { "MTP layer" }
-        ));
-    }
-    let cost = if block {
-        sparkflash_model_glm5_next::DFLASH2_STEP_COST
-    } else {
-        sparkflash_model_glm5_next::MTP_STEP_COST
-    };
-    Ok(Some(GlmDrafting {
-        drafts,
-        policy: sparkflash_model::DepthPolicy::from_speculation(spec, drafts, cost),
-    }))
 }
 
 /// The one KV admission rule every single-node arm runs before it uploads a weight.
@@ -1161,26 +1082,6 @@ pub(super) fn admit(
         concurrency = options.concurrency,
     );
     Ok(())
-}
-
-pub(super) fn converted_rank_file(
-    var: &str,
-    rank: usize,
-    world: usize,
-) -> Result<Option<PathBuf>, String> {
-    let Some(directory) = std::env::var_os(var).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let directory = PathBuf::from(directory);
-    find_converted_rank_file(&directory, rank, world)
-        .map(Some)
-        .ok_or_else(|| {
-            format!(
-                "{var}={} holds no {} for rank {rank} of {world}",
-                directory.display(),
-                rank_file_name(rank, world)
-            )
-        })
 }
 
 /// The window this run serves: `--context`, else the pack's default capped by the checkpoint's.

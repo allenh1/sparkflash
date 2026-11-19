@@ -868,7 +868,7 @@ fn serve_inkling_host(
         rank: 0,
         world_size: 1,
     };
-    let converted = crate::serve::pack::converted_rank_file(
+    let converted = sparkflash_weights::rank_file::converted_rank_file(
         crate::serve::pack::INKLING_CONVERTED_DIR_ENV,
         layout.rank,
         layout.world_size,

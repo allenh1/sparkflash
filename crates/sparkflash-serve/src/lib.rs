@@ -24,5 +24,6 @@
 
 pub mod bootlog;
 pub mod host;
+pub mod tp4;
 
 pub use host::{HostDriver, HostOptions, REUSE_BY_TEXT_ENV};

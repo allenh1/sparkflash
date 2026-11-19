@@ -27,6 +27,7 @@ sparkflash-kernels = { workspace = true }
 sparkflash-model = { workspace = true }
 sparkflash-runtime = { workspace = true }
 sparkflash-ops = { workspace = true }
+sparkflash-serve = { workspace = true }
 sparkflash-weights = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +35,6 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-sparkflash-serve = { workspace = true }
 sparkflash-api = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

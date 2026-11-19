@@ -172,7 +172,7 @@ use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
 #[cfg(feature = "tp4-serve")]
-use sparkflash_model_glm5_next::device::CudaHandle;
+use sparkflash_model_glm5_next::device::{CudaHandle, LatentCache};
 #[cfg(feature = "tp4-serve")]
 use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence};
 use sparkflash_model_inkling2::GroupOptions;
@@ -4103,39 +4103,10 @@ pub trait Tp4RankApi: Send {
 
 /// What rank 0 passes to the rank factory: the checkpoint and the group geometry, not a tokenizer.
 ///
-/// Token ids are the contract between serve and the rank; the tokenizer stays on rank 0 and never
-/// reaches a worker.
+/// The type is [sparkflash_serve::tp4]'s, because an arm's crate opens its own rank and reads the
+/// same struct: the seam is the group's and not the CLI's.
 #[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone)]
-pub struct Tp4RankConfig {
-    /// This process's rank.
-    pub rank: usize,
-    /// The number of ranks in the group.
-    pub world_size: usize,
-    /// Every rank's address, in rank order.
-    pub peers: Vec<IpAddr>,
-    /// Rank R binds the engine collective on base_port + R.
-    pub base_port: u16,
-    /// Rank 0's serve control port.
-    pub control_port: u16,
-    /// The released sharded checkpoint directory or index.
-    pub checkpoint: PathBuf,
-    /// The element cap for one tensor.
-    pub element_limit: usize,
-    /// The context one packed-model sequence allocates. The host reference rank sizes its own
-    /// sequence state from the checkpoint, so only a packed arm reads this.
-    pub context: usize,
-    /// The startup and control deadline.
-    pub timeout: Duration,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4RankConfig {
-    /// The control channel address.
-    fn control_address(&self) -> SocketAddr {
-        SocketAddr::new(self.peers[0], self.control_port)
-    }
-}
+pub use sparkflash_serve::tp4::Tp4RankConfig;
 
 /// Builds the serve rank config from the parsed options.
 #[cfg(feature = "tp4-serve")]
@@ -4600,11 +4571,6 @@ impl Tp4RankApi for GlmTp4Rank {
         }
     }
 }
-
-/// The variable naming a directory of GLM-5.3-Flash rank files (`sparkflash convert`).
-#[cfg(feature = "tp4-serve")]
-const GLM_CONVERTED_DIR_ENV: &str = "SPARKFLASH_GLM_CONVERTED_DIR";
-
 /// The engine collective of one rank of a pack's serve group: the TCP seams the pack's harness
 /// opens, on `base_port + rank`, with the run's NCCL communicator as their device leg.
 ///
@@ -4713,232 +4679,56 @@ fn with_group_doorbell(
     }
 }
 
-/// One GLM-5.3-Flash rank of a group as it comes off the disk: its weights, drafter and
-/// collective, and the drafting the profile asks of it. Both of the group's serving shapes open
-/// their rank here: one request at a time ([open_glm_tp4_rank]) and fused lanes
-/// ([open_glm_lanes]).
-#[cfg(feature = "tp4-serve")]
-struct GlmLoadedRank {
-    rank: DeviceRank,
-    tp: TpRuntime,
-    gather: BitGatherHandle,
-    config: sparkflash_model_glm5_next::Glm5NextConfig,
-    /// How many drafts a drafting request verifies after each token at most, and the depth rule;
-    /// `None` decodes a token a step ([pack::glm_drafting]).
-    drafting: Option<pack::GlmDrafting>,
-    /// Whether a DFlash 2 block drafter is loaded.
-    block: bool,
-    origin: String,
-    started: Instant,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl GlmLoadedRank {
-    /// The most drafts a step verifies; 0 decodes a token a step.
-    fn drafts(&self) -> usize {
-        self.drafting.as_ref().map_or(0, |drafting| drafting.drafts)
-    }
-
-    /// The shared speculator's depth rule for this rank's drafts.
-    fn depth_policy(&self) -> Option<sparkflash_model::DepthPolicy> {
-        self.drafting
-            .as_ref()
-            .map(|drafting| drafting.policy.clone())
-    }
-
-    /// Announces the load and answers how long it took.
-    fn announce(&self, rank: &Tp4RankConfig) -> u64 {
-        let load_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        eprintln!(
-            "sparkflash serve: GLM rank {}/{} loaded in {:.1} s from {}; {} collective",
-            rank.rank,
-            rank.world_size,
-            load_ms as f64 / 1000.0,
-            self.origin,
-            self.tp.label()
-        );
-        load_ms
-    }
-}
-
-/// Loads one GLM-5.3-Flash rank of the serve-owned group.
+/// The latent cache the GLM window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or f32
+/// for the expansion's exact arithmetic at a smaller window.
 ///
-/// The weights come from the checkpoint directory (or its index's parent), the configuration from
-/// its `config.json` or the carried release, and the collective from the same TCP seams the
-/// `glm-tp4` harness uses ([open_pack_collective]).
+/// `attention.latent_cache` is the file's setting and `SPARKFLASH_GLM_LATENT_CACHE` its alias
+/// (the typed profile raises the latter to one of the three modes). `auto` is the release's own
+/// choice, which is the E4M3 latent, and the older `SPARKFLASH_GLM_KV_CACHE` spelling still
+/// selects f32 when the profile leaves the arms of `auto` open. The mode is resolved here, in the
+/// process that reads the environment, and handed to the arm's rank opener.
 #[cfg(feature = "tp4-serve")]
-fn load_glm_tp4_rank(config: &Tp4RankConfig) -> Result<GlmLoadedRank, String> {
-    let started = Instant::now();
-    let directory = pack::checkpoint_directory(&config.checkpoint);
-    let glm_config = pack::read_config::<pack::GlmArm>(&directory)?;
-    let cuda = Arc::new(CudaHandle::new(
-        sparkflash_kernels::cuda_driver::Cuda::load().map_err(|error| format!("CUDA: {error}"))?,
-    ));
-    let layout = TpLayout {
-        rank: config.rank,
-        world_size: config.world_size,
-    };
-    let run = format!("glm-serve;{glm_config:?};{}", config.context);
-    // The agreement word, printed before the gather: a rank whose plan differs names the
-    // component here (its context, its configuration, or the digest itself) rather than only
-    // refusing in the bootstrap.
-    eprintln!(
-        "sparkflash serve: rank {} plan agreement {:016x}: context {}, configuration {:016x}, \
-         {} bytes",
-        config.rank,
-        sparkflash_engine::synthetic::fnv1a(run.as_bytes()),
-        config.context,
-        sparkflash_engine::synthetic::fnv1a(format!("{glm_config:?}").as_bytes()),
-        run.len()
-    );
-    let (tp, gather) = open_pack_collective(config, &cuda, "GLM", glm_config.hidden_size, &run)?;
-    // The latent cache the 1M window needs: E4M3 by default (vLLM's `fp8_ds_mla` trade), or
-    // f32 for the expansion's exact arithmetic at a smaller window.
-    //
-    // `attention.latent_cache` is the file's setting and `SPARKFLASH_GLM_LATENT_CACHE` its alias
-    // (the typed profile raises the latter to one of the three modes). `auto` is the release's
-    // own choice, which is the E4M3 latent, and the older `SPARKFLASH_GLM_KV_CACHE` spelling still
-    // selects f32 when the profile leaves the arms of `auto` open.
-    let latent_cache = match sparkflash_model::active_profile().attention.latent_cache {
-        Some(sparkflash_model::profile::LatentCacheMode::F32) => {
-            sparkflash_model_glm5_next::device::LatentCache::F32
-        }
-        Some(sparkflash_model::profile::LatentCacheMode::Fp8) => {
-            sparkflash_model_glm5_next::device::LatentCache::Fp8
-        }
+fn glm_latent_cache() -> Result<LatentCache, String> {
+    match sparkflash_model::active_profile().attention.latent_cache {
+        Some(sparkflash_model::profile::LatentCacheMode::F32) => Ok(LatentCache::F32),
+        Some(sparkflash_model::profile::LatentCacheMode::Fp8) => Ok(LatentCache::Fp8),
         Some(sparkflash_model::profile::LatentCacheMode::Auto) | None => {
             match std::env::var("SPARKFLASH_GLM_KV_CACHE").as_deref() {
-                Ok("f32") => sparkflash_model_glm5_next::device::LatentCache::F32,
-                Ok("fp8") | Err(_) => sparkflash_model_glm5_next::device::LatentCache::Fp8,
-                Ok(other) => {
-                    return Err(format!(
-                        "SPARKFLASH_GLM_KV_CACHE={other} is neither fp8 nor f32"
-                    ));
-                }
+                Ok("f32") => Ok(LatentCache::F32),
+                Ok("fp8") | Err(_) => Ok(LatentCache::Fp8),
+                Ok(other) => Err(format!(
+                    "SPARKFLASH_GLM_KV_CACHE={other} is neither fp8 nor f32"
+                )),
             }
         }
-    };
-    // The converted rank file is one allocation the arm uploads in place, read with the same
-    // parallel direct-I/O path the V4.1 ranks use: the checkpoint path re-reads and re-lays-out
-    // every tensor, which is the six-minute startup this replaces. A configured directory that
-    // does not hold this rank's file is a refusal, not a silent fallback to the slow path.
-    let (mut rank, origin) =
-        match pack::converted_rank_file(GLM_CONVERTED_DIR_ENV, config.rank, config.world_size)? {
-            Some(file) => {
-                let rank = DeviceRank::load_converted_with_cache(
-                    Arc::clone(&cuda),
-                    &glm_config,
-                    &file,
-                    layout,
-                    latent_cache,
-                )
-                .map_err(|error| format!("{}: {error}", file.display()))?;
-                (rank, format!("converted {}", file.display()))
-            }
-            None => {
-                let source = sparkflash_engine::safetensors::SafeTensorsSource::open(
-                    &directory,
-                    &directory.join(sparkflash_engine::safetensors::INDEX_NAME),
-                )
-                .map_err(|error| format!("{}: {error}", directory.display()))?;
-                let rank = DeviceRank::load_with_cache(
-                    Arc::clone(&cuda),
-                    &glm_config,
-                    &source,
-                    layout,
-                    latent_cache,
-                )
-                .map_err(|error| error.to_string())?;
-                (rank, format!("checkpoint {}", directory.display()))
-            }
-        };
-    if config.context == 0 || config.context > glm_config.max_position_embeddings {
-        return Err(format!(
-            "context limit {} is outside 1..={}",
-            config.context, glm_config.max_position_embeddings
-        ));
     }
-    // A DFlash 2 block drafter, when the profile names one: it proposes a whole block after each
-    // token, which is what takes this arm past the MTP layer's two drafts. Its depth is the
-    // shared speculator's, adaptive because the block drafter says how sure it is of each draft.
-    // The carried profile under the environment, as the single-GPU arm reads it.
-    let profile = <pack::GlmArm as pack::PackArm>::profile()?;
-    if let Some(drafter) = profile.speculation.drafter.as_deref() {
-        rank.load_block_drafter(std::path::Path::new(drafter))
-            .map_err(|error| format!("the DFlash 2 drafter {drafter}: {error}"))?;
-        eprintln!(
-            "sparkflash serve: GLM rank {}/{} drafts with the DFlash 2 drafter {drafter}",
-            config.rank, config.world_size
-        );
-    }
-    // A drafting request's prompt takes the bulk chunk, which captures the rows the drafter's first
-    // block reads, unless the profile keeps it on the token path (`prefill.drafting_prompt`).
-    rank.set_drafting_prefill(profile.prefill.drafting_prompt.unwrap_or(true));
-    let block = rank.has_block_drafter();
-    let drafting = pack::glm_drafting(&profile.speculation, block, rank.max_drafts())?;
-    if config.rank == 0 {
-        eprintln!(
-            "sparkflash serve: GLM group drafting: {}",
-            drafting
-                .as_ref()
-                .map_or_else(|| "off".to_owned(), pack::GlmDrafting::label)
-        );
-    }
-    Ok(GlmLoadedRank {
-        rank,
-        tp,
-        gather,
-        config: glm_config,
-        drafting,
-        block,
-        origin,
-        started,
-    })
 }
 
 /// Opens one GLM-5.3-Flash rank of the serve-owned group serving one request at a time.
+///
+/// The construction is the arm's ([sparkflash_model_glm5_next::rank::open_rank]); this maps its
+/// answer onto the serve seam's step adapter.
 #[cfg(feature = "tp4-serve")]
 fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
-    let loaded = load_glm_tp4_rank(config)?;
-    let rank = &loaded.rank;
-    // The window every request resets and reuses. Allocating it per request cost every rank about a
-    // second of a short prompt's first token at the 1M default; here a window that does not fit
-    // beside the weights is refused at startup, not at the first request. A drafting window also
-    // keeps the MTP layer's caches, and a block-drafting one the drafter's own.
-    let sequence = if loaded.block {
-        rank.new_block_drafting_sequence(config.context)
-            .map_err(|error| format!("the GLM request window: {error}"))?
-    } else if loaded.drafts() > 0 {
-        rank.new_drafting_sequence(config.context)
-            .map_err(|error| {
-                format!("the GLM request window: {error} (speculation.drafts=0 drafts nothing)")
-            })?
-    } else {
-        rank.new_sequence(config.context)
-            .map_err(|error| format!("the GLM request window: {error}"))?
-    };
-    let spec = sparkflash_model::Speculator::new(loaded.drafts(), loaded.depth_policy());
-    let load_ms = loaded.announce(config);
-    let GlmLoadedRank {
-        rank,
-        tp,
-        gather,
-        config: glm_config,
-        ..
-    } = loaded;
+    let latent_cache = glm_latent_cache()?;
+    let open =
+        |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
+            open_pack_collective(config, cuda, model, hidden, run)
+        };
+    let rank = sparkflash_model_glm5_next::rank::open_rank(config, latent_cache, open)?;
     Ok(Box::new(GlmTp4Rank {
-        eos: glm_config.eos_token_ids.clone(),
-        rank,
-        sequence,
+        eos: rank.eos,
+        rank: rank.rank,
+        sequence: rank.sequence,
         held: Vec::new(),
-        tp,
-        gather,
+        tp: rank.tp,
+        gather: rank.gather,
         sampler: Sampler::new(),
         sampling: sparkflash_model::Sampling::default(),
         logits: false,
-        spec,
+        spec: rank.spec,
         speculative: false,
-        load_ms,
+        load_ms: rank.load_ms,
         steps: 0,
         last_step_ms: 0,
     }))
@@ -4958,44 +4748,13 @@ fn open_glm_lanes(
     config: &Tp4RankConfig,
     lanes: Option<usize>,
 ) -> Result<(Option<Box<dyn sparkflash_model::ModelBackend>>, usize), String> {
-    let loaded = load_glm_tp4_rank(config)?;
-    let policy = loaded.depth_policy();
-    let drafts = loaded.drafts();
-    loaded.announce(config);
-    let mut backend = sparkflash_model_glm5_next::Glm5NextDeviceBackend::from_rank(
-        loaded.config,
-        loaded.rank,
-        loaded.tp,
-        loaded.gather,
-        config.context,
-    )
-    .map_err(|error| error.to_string())?;
-    // The operator's count when given, else the width this rank's walk states.
-    let lanes = match lanes {
-        Some(lanes) => lanes,
-        None => backend
-            .lane_limit()
-            .map_err(|error| format!("the group's lane width: {error}"))?,
-    };
-    backend
-        .enable_speculation(drafts, policy)
-        .map_err(|error| error.to_string())?;
-    if config.rank == 0 {
-        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
-            .map_err(|error| format!("rank 0 control channel: {error}"))?;
-        backend
-            .enable_group_fusion(lanes, hub)
-            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
-        eprintln!(
-            "sparkflash serve: GLM rank 0 steps {lanes} fused lanes over {} ranks, {drafts} draft(s)",
-            config.world_size
-        );
-        return Ok((Some(Box::new(backend)), lanes));
-    }
-    let mut control = tp4_control_worker(config)?;
-    match backend.mirror_group(&mut control, lanes)? {}
+    let latent_cache = glm_latent_cache()?;
+    let open =
+        |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
+            open_pack_collective(config, cuda, model, hidden, run)
+        };
+    sparkflash_model_glm5_next::rank::open_lanes(config, lanes, latent_cache, open)
 }
-
 /// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
 ///
 /// The backend holds this rank's share of the weights ([Qwen4ExpDeviceBackend::open_rank]) and
@@ -5129,10 +4888,16 @@ impl Tp4RankApi for QwenTp4Rank {
 /// `rank-R-of-W.bin` - one parallel direct-I/O read - instead of the checkpoint's tensors. The
 /// file must have been written for this rank's world
 /// (`sparkflash convert --tp-world-size W`); the checkpoint directory stays the configuration,
-/// tokenizer and host-paged PLE source.
+/// tokenizer and host-paged PLE source. The construction is the arm's
+/// ([sparkflash_model_qwen4_exp::rank::load_rank]); this maps its answer onto the serve seam's
+/// step adapter.
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
-    let (backend, cuda, load_ms) = load_qwen_tp4_rank(config)?;
+    let open =
+        |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
+            open_pack_collective(config, cuda, model, hidden, run)
+        };
+    let (backend, cuda, load_ms) = sparkflash_model_qwen4_exp::rank::load_rank(config, open)?;
     Ok(Box::new(QwenTp4Rank {
         backend,
         session: None,
@@ -5141,73 +4906,6 @@ fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Str
         steps: 0,
         last_step_ms: 0,
     }))
-}
-
-/// Loads one Qwen3.8-Flash-Next rank of the serve-owned group: its share of the weights (from the
-/// converted rank file when one is configured) over the group's collective. Both of the group's
-/// serving shapes open their rank here: one request at a time ([open_qwen_tp4_rank]) and fused
-/// lanes ([open_qwen_lanes]). Answers the backend, the handle the collective was opened in, and
-/// the load's milliseconds.
-#[cfg(feature = "tp4-serve")]
-fn load_qwen_tp4_rank(
-    config: &Tp4RankConfig,
-) -> Result<
-    (
-        sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend,
-        CudaHandle,
-        u64,
-    ),
-    String,
-> {
-    let started = Instant::now();
-    let directory = pack::checkpoint_directory(&config.checkpoint);
-    let qwen_config = pack::read_config::<pack::QwenArm>(&directory)?;
-    let cuda = CudaHandle::new(
-        sparkflash_kernels::cuda_driver::Cuda::load().map_err(|error| format!("CUDA: {error}"))?,
-    );
-    let (tp, _gather) = open_pack_collective(
-        config,
-        &cuda,
-        "Qwen3.8-Flash-Next",
-        qwen_config.hidden_size,
-        &format!("qwen-serve;{qwen_config:?};{}", config.context),
-    )?;
-    let label = tp.label();
-    let layout = TpLayout {
-        rank: config.rank,
-        world_size: config.world_size,
-    };
-    let converted =
-        pack::converted_rank_file(pack::QWEN_CONVERTED_DIR_ENV, layout.rank, layout.world_size)?;
-    let backend = match &converted {
-        Some(path) => {
-            sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank_converted(
-                &directory,
-                config.context,
-                tp,
-                path,
-            )
-        }
-        None => sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank(
-            &directory,
-            config.context,
-            tp,
-        ),
-    }
-    .map_err(|error| format!("{}: {error}", directory.display()))?;
-    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    eprintln!(
-        "sparkflash serve: Qwen rank {}/{} loaded in {:.1} s from {}{}; {label} collective",
-        config.rank,
-        config.world_size,
-        load_ms as f64 / 1000.0,
-        directory.display(),
-        converted.as_ref().map_or_else(String::new, |path| format!(
-            " (converted {})",
-            path.display()
-        )),
-    );
-    Ok((backend, cuda, load_ms))
 }
 
 /// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::open_lanes]):
@@ -5223,32 +4921,12 @@ fn open_qwen_lanes(
     config: &Tp4RankConfig,
     lanes: Option<usize>,
 ) -> Result<(Option<Box<dyn sparkflash_model::ModelBackend>>, usize), String> {
-    // The backend's own CUDA handle holds the primary context the collective was opened in
-    // (releases are refcounted), so this one may go once the rank is loaded.
-    let (mut backend, _cuda, _) = load_qwen_tp4_rank(config)?;
-    // The operator's count when given, else the width this rank's walk states.
-    let lanes = match lanes {
-        Some(lanes) => lanes,
-        None => backend
-            .lane_limit()
-            .map_err(|error| format!("the group's lane width: {error}"))?,
-    };
-    if config.rank == 0 {
-        let hub = Tp4ControlHub::start(config.control_address(), config.world_size, config.timeout)
-            .map_err(|error| format!("rank 0 control channel: {error}"))?;
-        backend
-            .enable_group_fusion(lanes, hub)
-            .map_err(|error| format!("cannot fuse the group's lanes: {error}"))?;
-        eprintln!(
-            "sparkflash serve: Qwen rank 0 steps {lanes} fused lanes over {} ranks",
-            config.world_size
-        );
-        return Ok((Some(Box::new(backend)), lanes));
-    }
-    let mut control = tp4_control_worker(config)?;
-    match backend.mirror_group(&mut control, lanes)? {}
+    let open =
+        |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
+            open_pack_collective(config, cuda, model, hidden, run)
+        };
+    sparkflash_model_qwen4_exp::rank::open_lanes(config, lanes, open)
 }
-
 /// What the TP=4 driver serves and how it opens its rank.
 ///
 /// The control channel, the request loop and the HTTP side are the same for every pack; this is the

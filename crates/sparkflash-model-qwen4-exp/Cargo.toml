@@ -28,6 +28,7 @@ sparkflash-weights = { workspace = true }
 sparkflash-engram = { workspace = true }
 sparkflash-kernels = { workspace = true }
 sparkflash-ops = { workspace = true }
+sparkflash-serve = { workspace = true }
 sparkflash-vision = { workspace = true }
 anyhow = { workspace = true }
 libm = "0.2"
@@ -41,7 +42,6 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-sparkflash-serve = { workspace = true }
 sparkflash-api = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }

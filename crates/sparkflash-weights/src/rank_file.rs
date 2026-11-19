@@ -93,6 +93,33 @@ pub fn find_converted_rank_file(dir: &Path, rank: usize, world: usize) -> Option
     candidate.is_file().then_some(candidate)
 }
 
+/// The converted rank file for rank `rank` of `world` in the directory `var` names.
+///
+/// `None` when `var` is unset or empty. A configured directory that does not hold this rank's file
+/// is a refusal, not a silent fallback to the checkpoint's tensors.
+///
+/// # Errors
+/// `var` is set and the directory holds no file for this rank.
+pub fn converted_rank_file(
+    var: &str,
+    rank: usize,
+    world: usize,
+) -> Result<Option<PathBuf>, String> {
+    let Some(directory) = std::env::var_os(var).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(directory);
+    find_converted_rank_file(&directory, rank, world)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "{var}={} holds no {} for rank {rank} of {world}",
+                directory.display(),
+                rank_file_name(rank, world)
+            )
+        })
+}
+
 /// `bytes` rounded up to whole [DATA_ALIGN_BYTES] pages.
 #[must_use]
 pub fn align_up_page(bytes: usize) -> usize {

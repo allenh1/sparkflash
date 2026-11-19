@@ -84,6 +84,7 @@ pub mod dflash;
 pub mod forward;
 pub mod ngram;
 pub mod ple;
+pub mod rank;
 pub mod sampling;
 pub mod tensor;
 pub mod vision;

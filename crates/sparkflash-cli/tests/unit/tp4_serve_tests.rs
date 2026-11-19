@@ -1224,8 +1224,9 @@ fn the_checkpoint_gate_serves_language_parts_and_deepseek_vision() {
 
 #[test]
 fn glm_drafting_reads_the_carried_profile_and_refuses_a_count_it_cannot_draft() {
-    use pack::{GlmArm, PackArm, glm_drafting};
+    use pack::{GlmArm, PackArm};
     use sparkflash_model::profile::{DepthMode, SpeculationProfile};
+    use sparkflash_model_glm5_next::glm_drafting;
     let drafts = |spec: &SpeculationProfile, block, most| {
         glm_drafting(spec, block, most).map(|drafting| {
             drafting.map(|drafting| (drafting.drafts, drafting.policy.is_adaptive()))
