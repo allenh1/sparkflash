@@ -227,7 +227,8 @@ fn fused_lanes_step_as_each_lane_decodes_alone() {
         fed.push(tokens);
     }
 
-    let lanes = device.lanes(4).expect("the lanes open");
+    let lanes = sparkflash_runtime::Runtime::new(device.walk_arm().expect("the walk"), 0)
+        .expect("the runtime opens");
     let mut slots = Vec::new();
     for (index, prompt) in prompts.iter().enumerate() {
         let mut slot = lanes.open_slot().expect("a lane");

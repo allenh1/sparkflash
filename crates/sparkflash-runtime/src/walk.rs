@@ -31,6 +31,7 @@
 
 use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
 use sparkflash_model::ledger::State;
+use sparkflash_model::vision::VisionImage;
 
 use crate::layout::{LaneState, Limits, StateKind, StateLayout};
 use crate::pool::LaneMemory;
@@ -207,20 +208,37 @@ impl<'a> Pass<'a> {
     }
 }
 
-/// One sequence's rows in a walk, and the tokens they forward.
+/// One sequence's rows in a walk, the tokens they forward, and the images the rows take.
 #[derive(Debug)]
 pub struct Segment<'a, S> {
     /// The sequence whose state the rows advance.
     pub seq: &'a mut S,
     /// The tokens, one a row; never empty.
     pub rows: &'a [u32],
+    /// The prompt's fresh images, in prompt order: the ones whose spans this prompt encodes.
+    ///
+    /// The runtime keeps them for the whole prompt and passes them with every chunk, because a
+    /// chunk may carry only part of an image; the arm caches what it encoded for the prompt and
+    /// injects the rows a chunk's positions take. Empty for a token or verify pass, and for an
+    /// arm whose [`Vision`] is [`NoVision`].
+    pub images: &'a [VisionImage],
 }
 
 impl<'a, S> Segment<'a, S> {
-    /// A segment of `rows` over `seq`.
+    /// A segment of `rows` over `seq`, taking no image rows.
     #[must_use]
     pub fn new(seq: &'a mut S, rows: &'a [u32]) -> Self {
-        Self { seq, rows }
+        Self {
+            seq,
+            rows,
+            images: &[],
+        }
+    }
+
+    /// A segment of `rows` over `seq`, whose image positions take `images`' rows.
+    #[must_use]
+    pub fn with_images(seq: &'a mut S, rows: &'a [u32], images: &'a [VisionImage]) -> Self {
+        Self { seq, rows, images }
     }
 }
 
@@ -509,6 +527,16 @@ pub trait Drafter<W: Walk + ?Sized> {
     /// Whether the arm has a drafter at all.
     const PRESENT: bool;
 
+    /// Whether this rank's round drafts now.
+    ///
+    /// [`Drafter::PRESENT`] is a property of the type; an arm whose draft head is compiled in
+    /// but configured off for this rank says so here, and the runtime runs one plain token pass
+    /// over every member instead of one held decode a member. That is the old fused
+    /// `Rows::Lanes` step: the tokens are the same, the launch is not.
+    fn drafts(&self) -> bool {
+        Self::PRESENT
+    }
+
     /// The rows a verify answer belongs to the arm: whatever its settle needs, never the
     /// runtime's host logits. A row the runtime never interprets can be `()`.
     type Rows;
@@ -584,14 +612,37 @@ pub trait Drafter<W: Walk + ?Sized> {
 /// An image path.
 ///
 /// Same terms as [`Drafter`]: the associated type is required, and an arm that serves text only
-/// names [`NoVision`].
+/// names [`NoVision`]. The runtime owns when a prompt starts, resumes and ends; this contract is
+/// what it calls at those points, so an arm's tower is encoded once a prompt and the rows are
+/// dropped when the prompt's chunks are done. The methods are associated because the runtime has
+/// only the walk, and the tower lives on it.
 pub trait Vision<W: Walk + ?Sized> {
     /// Whether the arm has a vision path at all.
     const PRESENT: bool;
 
+    /// Encodes `images` for `seq`, the fresh images of the prompt `tokens` whose first forwarded
+    /// position is `seq`'s. The rows stay with the sequence, where [`Walk::walk`] injects them
+    /// over the placeholders their spans name, and [Vision::clear] drops them.
+    ///
+    /// The runtime calls this once, before the prompt's first chunk, and never between chunks:
+    /// an image that spans several chunks is encoded once.
+    ///
+    /// # Errors
+    /// A span that does not fit the prompt, an image this rank has no tower for, or a device
+    /// failure.
+    fn encode(
+        walk: &W,
+        seq: &mut W::Seq,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<(), BackendError>;
+
+    /// Drops what [Vision::encode] made, once the prompt's rows are no longer in flight.
+    fn clear(walk: &W, seq: &mut W::Seq);
+
     /// One line for the ledger.
     #[must_use]
-    fn describe(&self) -> String {
+    fn describe() -> String {
         std::any::type_name::<Self>().to_owned()
     }
 }
@@ -683,6 +734,18 @@ pub struct NoVision;
 
 impl<W: Walk + ?Sized> Vision<W> for NoVision {
     const PRESENT: bool = false;
+
+    fn encode(
+        _walk: &W,
+        _seq: &mut W::Seq,
+        _tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<(), BackendError> {
+        debug_assert!(images.is_empty(), "a text-only walk was handed images");
+        Ok(())
+    }
+
+    fn clear(_walk: &W, _seq: &mut W::Seq) {}
 }
 
 /// One model arm's arithmetic, as the runtime drives it.
@@ -783,5 +846,17 @@ pub trait Walk: 'static {
     #[must_use]
     fn max_segments(&self) -> usize {
         self.limits().members
+    }
+
+    /// How many positions past the rewind point the state can still go back from.
+    ///
+    /// A cache that slides holds its window and a widest chunk: once a reply has written more
+    /// positions past the prompt's end than that, the rows the rewind reads are gone. An arm
+    /// whose state keeps every position leaves the default; an arm whose cache slides states the
+    /// reach, and the runtime starts a changed turn cold rather than rewind into overwritten
+    /// rows.
+    #[must_use]
+    fn rewind_slack(&self) -> usize {
+        usize::MAX
     }
 }

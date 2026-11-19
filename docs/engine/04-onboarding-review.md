@@ -186,8 +186,9 @@ stays where it is) and keeps phase 1's guarantee honest while the drafting phase
 carries what a bulk chunk could not, `Limits` separates rows a pass from members a batch, and the
 ledger derives its drafting rows from the drafter and the joint switch. A drafting walk that does
 not declare the verify pass is refused at boot. GLM and Qwen now serve on `Runtime<Walk>` with
-their own drafters and their fusion code deleted (960 and 561 lines out); Inkling is the last arm
-still on its own shape.
+their own drafters and their fusion code deleted (960 and 561 lines out). Inkling followed, and
+with it the last arm on its own shape: its `InklingLanes`, the serial group session and mirror,
+the `Prompting` part machine, the resume preamble and the rewind trio are gone.
 
 The device-only differences left for the cluster gate, reported by the two moves rather than
 measured:
@@ -265,6 +266,64 @@ is a separate call, but in a TP group the head rows are a collective (`tp.rs:545
 per-chunk cost can be a collective and not only a GEMM; and `Pass::bulk(rows)` carries no prompt
 end, where the old code limited drafter commits to a window before the prompt's end
 (`device.rs:6394-6400`), which the drafting contract must carry.
+
+### The third move: Inkling, and the image path
+
+Inkling moved onto `Runtime<InklingWalk>` in the same shape as GLM and Qwen. Its serving
+construction is the runtime on every rank, whether the group steps one request or four: the serial
+`GroupSession` + `mirror` path and the fused `InklingLanes` are replaced by one `GroupLanes` over
+`Runtime<InklingWalk>`, and a single `ModelSession` is the runtime's one-slot adapter
+(`RuntimeSession`). The kernels, the three chunk widths (4,096, 8,192 and 65,535) and the vision
+tower are unchanged.
+
+The image path is now the runtime's, and it is a contract rather than a marker:
+
+* `Segment` carries the prompt's fresh images to `Walk::walk`; the runtime keeps them for the
+  whole prompt and passes them with every chunk, so a chunk that holds part of an image still
+  sees it.
+* `Vision<W>` gains `encode` and `clear`. The runtime calls `encode` once, before a prompt's
+  first chunk, with the whole prompt and its images, and every chunk after it injects their rows.
+  `NoVision` is a text-only implementation with no bits of its own; the other arms keep naming
+  it.
+* A resumed prefix is accepted only when the images it holds are fed again at the same spans,
+  grids and content keys, and no new image lands inside it. A changed image starts the sequence
+  over, as the arm's own prompt path did.
+* `held_images` reports the runtime slot's spans, so the host driver's prefix reuse sees what the
+  arm holds.
+* `Walk::rewind_slack` states how far past the rewind point a sliding cache can still go back
+  (Inkling: its widest prompt chunk less the drafter's depth). A reply longer than that starts a
+  changed turn cold instead of reading overwritten ring rows.
+
+The no-drafter multi-lane step is resolved in the runtime, not deferred. `Drafter::drafts` is the
+instance's answer (`PRESENT` remains the type's): a rank whose DSpark or lookup drafter is
+configured off takes one plain token pass over every member — the old fused `Rows::Lanes` walk —
+rather than a held decode a lane. The ledger, `room` and `max_batch` read the same predicate.
+
+The device-only differences this move leaves for the cluster gate:
+
+* Inkling's no-drafter step now runs the walk's `Rows::Lanes` path (through `Walk::walk` with
+  `Pass::token_rows`) where the serial session's `decode` ran one row through `session.step`. The
+  arm's docs say a one-lane `Rows::Lanes` walk is the decode step; confirm the logits are
+  bit-equal on both the tiny fixture and the released checkpoint.
+* With a drafter configured, a lane's round now goes through `Drafter::open_round` /
+  `verify` / `settle` and the runtime's row share. A lone request keeps the drafter's own depth
+  and a verify's rows are the same `Rows::Segments` walk; confirm the tokens and the speculative
+  counters.
+* With `SPARKFLASH_JOINT_ROUNDS=off`, each lane runs its round alone, one walk a lane. This is
+  the contract's rule, not Inkling's old fused batch; confirm the tokens.
+* A rank whose drafter is off reports the runtime's drafting ledger rows (type-derived) while
+  `describe` says the switch is off; the boot line's ledger is the thing to read on the device.
+* The image path encodes a prompt's fresh images once through `Vision::encode` and frees them at
+  the prompt's end (or when the next prompt starts). Rank 0 runs the tower and every rank sums
+  the rows exactly as before; confirm an image prompt, a text continuation of one, a changed
+  image and a two-chunk image prompt (one whose span crosses the runtime's chunk width).
+* The rewind point is the runtime's `point` plus `rewind_slack`, and the resume preamble is the
+  runtime's. A continued turn, a changed turn after a long reply, and a turn that rewinds into
+  the previous prompt all need the tokens compared with the frozen arm.
+* After a drafted run whose last answer was not fed, the runtime reports a reusable history but
+  takes the rewind point (the old session gave the drafts back and extended the whole history):
+  same tokens expected, one more forward pass of the reply tokens, and only when the reply is
+  longer than `rewind_slack` does it start over.
 
 ## Order and ownership
 

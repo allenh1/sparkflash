@@ -26,7 +26,7 @@
 
 use std::sync::Mutex;
 
-use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput};
+use sparkflash_model::backend::{BackendError, ModelSession, Sampling, Speculation, StepOutput};
 use sparkflash_model::vision::{ImageSpan, VisionImage};
 
 use crate::chunk::ChunkPolicy;
@@ -43,6 +43,10 @@ use crate::walk::{Draft, Drafter, HeadRow, Pass, PassMask, Segment, Vision, Walk
 struct PromptState {
     tokens: Vec<u32>,
     next: usize,
+    /// The prompt's images, in prompt order: the spans the history holds when the prompt ends.
+    images: Vec<VisionImage>,
+    /// The images after the reused prefix, which the arm encoded once for the whole prompt.
+    fresh: Vec<VisionImage>,
 }
 
 /// One request's state: the arm's sequence, the runtime's history, and the prompt in flight.
@@ -58,6 +62,22 @@ pub struct RuntimeSlot<W: Walk> {
     cached: usize,
     prompt: Option<PromptState>,
     sampling: Sampling,
+    /// The images the reusable history holds: the last prompt's spans, as they were fed.
+    held_images: Vec<ImageSpan>,
+}
+
+/// Whether every image the state holds is fed again at the same span, grid and content key.
+fn images_hold(held: &[ImageSpan], images: &[VisionImage]) -> bool {
+    held.iter()
+        .all(|span| images.iter().any(|image| image.span == *span))
+}
+
+/// Whether every image that starts before `until` is one the state already holds; an image after
+/// it is the prompt's fresh work.
+fn images_within(images: &[VisionImage], until: usize, held: &[ImageSpan]) -> bool {
+    images
+        .iter()
+        .all(|image| image.span.start >= until || held.contains(&image.span))
 }
 
 impl<W: Walk> RuntimeSlot<W> {
@@ -199,7 +219,7 @@ impl<W: Walk> Runtime<W> {
         let end = (prompt.next + self.chunk.rows()).min(prompt.tokens.len());
         let rows = &prompt.tokens[prompt.next..end];
         let hidden = {
-            let mut segments = [Segment::new(&mut slot.seq, rows)];
+            let mut segments = [Segment::with_images(&mut slot.seq, rows, &prompt.fresh)];
             let pass = Pass::bulk(rows.len()).with_prompt_end(prompt.tokens.len() - end);
             self.walk.walk(&mut segments, pass)?
         };
@@ -208,6 +228,8 @@ impl<W: Walk> Runtime<W> {
             slot.prompt = Some(PromptState {
                 tokens: prompt.tokens,
                 next: end,
+                images: prompt.images,
+                fresh: prompt.fresh,
             });
             return Ok(Part::More);
         }
@@ -226,6 +248,10 @@ impl<W: Walk> Runtime<W> {
             }
         } else {
             slot.point = None;
+        }
+        slot.held_images = prompt.images.iter().map(|image| image.span).collect();
+        if W::Vision::PRESENT {
+            W::Vision::clear(&self.walk, &mut slot.seq);
         }
         Ok(Part::Done(step))
     }
@@ -437,6 +463,7 @@ impl<W: Walk> Runtime<W> {
             cached: 0,
             prompt: None,
             sampling: Sampling::default(),
+            held_images: Vec::new(),
         })
     }
 
@@ -472,22 +499,41 @@ impl<W: Walk> Runtime<W> {
         if tokens.is_empty() {
             return Err(BackendError::new("runtime", "the prompt has no tokens"));
         }
-        if !images.is_empty() {
-            return Err(BackendError::new(
-                "vision",
-                if W::Vision::PRESENT {
-                    "the runtime's vision path is not wired yet"
-                } else {
-                    "this arm has no vision path"
-                },
-            ));
+        if !images.is_empty() && !W::Vision::PRESENT {
+            return Err(BackendError::new("vision", "this arm has no vision path"));
         }
         // The history may lag the arm's position: a walk that verified drafts keeps their rows
         // in the sequence while the caller has only been given the anchor's token. A prompt may
         // extend the history only when the state ends exactly where the history does; otherwise
         // the rewind point is the resume, as an arm that owns the rule asks for.
         let current = slot.prompt.is_none() && slot.seq.position() == slot.history.len();
-        let answer = resume(&slot.history, current, slot.point, tokens);
+        // A sliding cache loses the rows a rewind reads once a long reply has written past the
+        // prompt's end: the arm states how far it can still go back.
+        let point = slot.point.filter(|point| {
+            *point <= slot.history.len() && slot.history.len() - *point <= self.walk.rewind_slack()
+        });
+        let answer = resume(&slot.history, current, point, tokens);
+        // A history is ids, and an image's placeholders are the same ids whatever the image, so
+        // a resume is only one the state can honour with the images it already holds: every held
+        // span must be fed again with the same grid and content key, and every image inside the
+        // reused prefix must be one the state already holds. Otherwise the sequence starts over,
+        // exactly as the arm's own prompt path did.
+        let answer = match answer {
+            Some(Resume::Extend(held))
+                if images_hold(&slot.held_images, images)
+                    && images_within(images, held, &slot.held_images) =>
+            {
+                Some(Resume::Extend(held))
+            }
+            Some(Resume::Rewind(point))
+                if images_hold(&slot.held_images, images)
+                    && images_within(images, point, &slot.held_images) =>
+            {
+                Some(Resume::Rewind(point))
+            }
+            Some(_) => None,
+            None => None,
+        };
         let start = match answer {
             Some(Resume::Extend(held)) => held,
             Some(Resume::Rewind(point)) => {
@@ -505,12 +551,30 @@ impl<W: Walk> Runtime<W> {
         }
         slot.history.truncate(start);
         slot.cached = start;
+        slot.held_images.retain(|span| span.end() <= start);
         if start == 0 {
             slot.point = None;
+        }
+        if W::Vision::PRESENT {
+            // Drop the last prompt's encoded rows before this prompt's: the reuse branches above
+            // are the only ones that keep an image, and they carry no fresh span.
+            W::Vision::clear(&self.walk, &mut slot.seq);
+        }
+        let fresh: Vec<VisionImage> = images
+            .iter()
+            .filter(|image| image.span.start >= start)
+            .cloned()
+            .collect();
+        if W::Vision::PRESENT {
+            // The whole list, so the arm can check every span against the prompt; it encodes
+            // only the images after the reused prefix.
+            W::Vision::encode(&self.walk, &mut slot.seq, tokens, images)?;
         }
         slot.prompt = Some(PromptState {
             tokens: tokens.to_vec(),
             next: start,
+            images: images.to_vec(),
+            fresh,
         });
         self.run_part(slot)
     }
@@ -538,9 +602,12 @@ impl<W: Walk> Runtime<W> {
                 "a prompt in parts was stepped before it finished",
             ));
         }
-        if W::Drafter::PRESENT {
+        if W::Drafter::PRESENT && self.walk.drafter().drafts() {
             self.draft_step(members)
         } else {
+            // No round drafts: one plain token pass over every member, the old fused
+            // `Rows::Lanes` step. Taking this branch for a rank whose drafter is compiled in but
+            // configured off is what keeps a held decode from becoming one per lane.
             self.plain_step(members)
         }
     }
@@ -579,6 +646,125 @@ impl<W: Walk> Runtime<W> {
             slot.history.push(*token);
         }
         Ok(steps)
+    }
+}
+
+/// One [`Walk`]'s single sequence as a [`ModelSession`].
+///
+/// A backend that serves on the runtime but whose callers speak [ModelSession] - a batch runner,
+/// a device test, the serial edge of a group - opens one of these. The sequence is a lane of
+/// [Runtime]: the prompt in [ChunkPolicy] chunks, the history, resume, rewind and the round path
+/// are the runtime's, so a session and an engine lane answer the same bits.
+pub struct RuntimeSession<W: Walk> {
+    runtime: Runtime<W>,
+    /// The one slot, taken for [`Runtime::step_slots`], which hands its member by value.
+    slot: Option<RuntimeSlot<W>>,
+}
+
+impl<W: Walk> RuntimeSession<W> {
+    /// Opens `runtime`'s first sequence.
+    ///
+    /// # Errors
+    /// An exhausted lane pool, or a sequence the arm cannot open.
+    pub fn open(runtime: Runtime<W>) -> Result<Self, BackendError> {
+        let slot = runtime.open_slot()?;
+        Ok(Self {
+            runtime,
+            slot: Some(slot),
+        })
+    }
+
+    /// The runtime the sequence is a lane of.
+    #[must_use]
+    pub fn runtime(&self) -> &Runtime<W> {
+        &self.runtime
+    }
+}
+
+impl<W> ModelSession for RuntimeSession<W>
+where
+    W: Walk + Send + Sync,
+    W::Seq: Send,
+{
+    fn set_sampling(&mut self, sampling: Sampling) {
+        let slot = self.slot.as_mut().expect("the session has its slot");
+        FusedArm::set_sampling(&self.runtime, slot, sampling);
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
+        let Self { runtime, slot } = self;
+        let slot = slot
+            .as_mut()
+            .ok_or_else(|| BackendError::new("runtime", "the session's slot is not here"))?;
+        runtime.prefill_slot(slot, tokens)
+    }
+
+    fn prefill_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[VisionImage],
+    ) -> Result<StepOutput, BackendError> {
+        let mut part = {
+            let Self { runtime, slot } = self;
+            let slot = slot
+                .as_mut()
+                .ok_or_else(|| BackendError::new("runtime", "the session's slot is not here"))?;
+            runtime.begin_prompt_slot(slot, tokens, images)?
+        };
+        loop {
+            match part {
+                Part::Done(step) => return Ok(step),
+                Part::More => {
+                    let Self { runtime, slot } = self;
+                    let slot = slot.as_mut().ok_or_else(|| {
+                        BackendError::new("runtime", "the session's slot is not here")
+                    })?;
+                    part = runtime.next_part_slot(slot)?;
+                }
+            }
+        }
+    }
+
+    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
+        let slot = self
+            .slot
+            .take()
+            .ok_or_else(|| BackendError::new("runtime", "the session's slot is not here"))?;
+        let mut members = [(slot, token)];
+        let answer = self.runtime.step_slots(&mut members);
+        let [pair] = members;
+        self.slot = Some(pair.0);
+        let mut steps = answer?;
+        steps
+            .pop()
+            .ok_or_else(|| BackendError::new("runtime", "a step answered no row"))
+    }
+
+    fn speculation(&self) -> Speculation {
+        let slot = self.slot.as_ref().expect("the session has its slot");
+        FusedArm::speculation(&self.runtime, slot)
+    }
+
+    fn reusable_prefix(&self) -> Option<&[u32]> {
+        let slot = self.slot.as_ref()?;
+        FusedArm::history(&self.runtime, slot)
+    }
+
+    fn rewind_prefix(&self) -> Option<&[u32]> {
+        let slot = self.slot.as_ref()?;
+        FusedArm::rewind_prefix(&self.runtime, slot)
+    }
+
+    fn held_images(&self) -> &[ImageSpan] {
+        self.slot
+            .as_ref()
+            .map_or(&[], |slot| FusedArm::held_images(&self.runtime, slot))
+    }
+
+    fn cached_tokens(&self) -> usize {
+        self.slot
+            .as_ref()
+            .map_or(0, |slot| FusedArm::cached_tokens(&self.runtime, slot))
     }
 }
 
@@ -727,13 +913,15 @@ where
 
     fn rewind_prefix<'s>(&self, slot: &'s Self::Slot) -> Option<&'s [u32]> {
         slot.point
-            .filter(|point| *point <= slot.history.len())
+            .filter(|point| {
+                *point <= slot.history.len()
+                    && slot.history.len() - *point <= self.walk.rewind_slack()
+            })
             .map(|point| &slot.history[..point])
     }
 
     fn held_images<'s>(&self, slot: &'s Self::Slot) -> &'s [ImageSpan] {
-        let _ = slot;
-        &[]
+        &slot.held_images
     }
 
     fn cached_tokens(&self, slot: &Self::Slot) -> usize {
@@ -744,7 +932,7 @@ where
         // A prompt's final position is its own length: it either extends the history or rewinds
         // to the point and forwards the rest. A step adds its anchor and, for a drafting walk,
         // the widest chain it may verify, so the reservation is the verify's rows and not one.
-        let step_rows = if W::Drafter::PRESENT {
+        let step_rows = if W::Drafter::PRESENT && self.walk.drafter().drafts() {
             1 + self.walk.drafter().budget(1)
         } else {
             1
@@ -793,11 +981,12 @@ where
         slot.history.truncate(to);
         slot.point = slot.point.filter(|point| *point <= to);
         slot.cached = slot.cached.min(to);
+        slot.held_images.retain(|span| span.end() <= to);
         Ok(())
     }
 
     fn max_batch(&self) -> usize {
-        if W::Drafter::PRESENT {
+        if W::Drafter::PRESENT && self.walk.drafter().drafts() {
             // A verify refuses more rows than the rank's verify batch: a drafting walk's member
             // cap is the arm's verify width, not its prompt chunk.
             self.limits.members.max(1)
@@ -827,6 +1016,7 @@ mod tests {
     use std::sync::Arc;
 
     use sparkflash_model::verdict;
+    use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
 
     use super::*;
     use crate::chunk::CHUNK_SIZES;
@@ -996,6 +1186,284 @@ mod tests {
                     })
                 })
                 .collect()
+        }
+    }
+
+    /// A walk whose image path records what the runtime did with a prompt's images: the whole
+    /// list and the fresh ones it was asked to encode, the passes that carried them, and the
+    /// clears. Its state is the toy's.
+    struct ImageWalk {
+        layout: StateLayout,
+        limits: Limits,
+        encoded: Arc<Mutex<Vec<(usize, usize)>>>,
+        cleared: Arc<Mutex<usize>>,
+        carried: Arc<Mutex<Vec<usize>>>,
+    }
+
+    /// The image contract's recorder for [ImageWalk].
+    struct ImageVision;
+
+    impl ImageWalk {
+        fn new() -> Self {
+            Self {
+                layout: StateLayout::new(vec![Region::Positional {
+                    name: "toy",
+                    bytes_per_row: 4,
+                }]),
+                limits: Limits::new(64, 4_096),
+                encoded: Arc::new(Mutex::new(Vec::new())),
+                cleared: Arc::new(Mutex::new(0)),
+                carried: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Walk for ImageWalk {
+        type Seq = ToySeq;
+        type Drafter = Absent<&'static str>;
+        type Vision = ImageVision;
+
+        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ToySeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            static ABSENT: Absent<&'static str> = Absent("the image walk drafts nothing");
+            &ABSENT
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            let _ = pass;
+            self.carried.lock().expect("the carry record").push(
+                segments
+                    .iter()
+                    .map(|segment| segment.images.len())
+                    .max()
+                    .unwrap_or(0),
+            );
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            rows.iter_mut()
+                .map(|row| {
+                    let token = row.seq.rows.last().copied().unwrap_or_default();
+                    Ok(StepOutput {
+                        logits: vec![f32::from(token as u16)],
+                        next_token: Some(token.wrapping_add(1)),
+                        draft: Vec::new(),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl Vision<ImageWalk> for ImageVision {
+        const PRESENT: bool = true;
+
+        fn encode(
+            walk: &ImageWalk,
+            seq: &mut ToySeq,
+            _tokens: &[u32],
+            images: &[VisionImage],
+        ) -> Result<(), BackendError> {
+            let start = seq.position();
+            let fresh = images
+                .iter()
+                .filter(|image| image.span.start >= start)
+                .count();
+            walk.encoded
+                .lock()
+                .expect("the encode record")
+                .push((images.len(), fresh));
+            Ok(())
+        }
+
+        fn clear(walk: &ImageWalk, _seq: &mut ToySeq) {
+            *walk.cleared.lock().expect("the clear record") += 1;
+        }
+    }
+
+    /// A drafter compiled in but configured off: the runtime must take the plain multi-lane
+    /// token pass, not one held decode a lane.
+    struct OffDrafter {
+        opened: Arc<Mutex<usize>>,
+    }
+
+    struct OffWall;
+
+    impl StepWall for OffWall {
+        fn ms(&self, _seqs: usize, _rows: usize) -> f64 {
+            0.0
+        }
+    }
+
+    static OFF_WALL: OffWall = OffWall;
+
+    /// The passes a walk was asked to run, and their segment widths.
+    type WalkRecord = Arc<Mutex<Vec<(PassKind, Vec<usize>)>>>;
+
+    struct OffWalk {
+        layout: StateLayout,
+        limits: Limits,
+        walks: WalkRecord,
+        drafter: OffDrafter,
+    }
+
+    impl OffWalk {
+        fn new() -> Self {
+            Self {
+                layout: StateLayout::new(vec![Region::Positional {
+                    name: "toy",
+                    bytes_per_row: 4,
+                }]),
+                limits: Limits::new(16, 4_096).with_members(4),
+                walks: Arc::new(Mutex::new(Vec::new())),
+                drafter: OffDrafter {
+                    opened: Arc::new(Mutex::new(0)),
+                },
+            }
+        }
+    }
+
+    impl Walk for OffWalk {
+        type Seq = ToySeq;
+        type Drafter = OffDrafter;
+        type Vision = NoVision;
+
+        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ToySeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            &self.drafter
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            self.walks.lock().expect("the walk record").push((
+                pass.kind,
+                segments.iter().map(|segment| segment.rows.len()).collect(),
+            ));
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            rows.iter_mut()
+                .map(|row| {
+                    let token = row.seq.rows.last().copied().unwrap_or_default();
+                    Ok(StepOutput {
+                        logits: vec![f32::from(token as u16)],
+                        next_token: Some(token.wrapping_add(1)),
+                        draft: Vec::new(),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl Drafter<OffWalk> for OffDrafter {
+        const PRESENT: bool = true;
+        type Rows = ();
+
+        fn drafts(&self) -> bool {
+            false
+        }
+
+        fn wall(&self) -> &dyn StepWall {
+            &OFF_WALL
+        }
+
+        fn open_round(&self, _seq: &mut ToySeq, token: u32) -> Result<Draft, BackendError> {
+            *self.opened.lock().expect("the open record") += 1;
+            Ok(Draft::Held(StepOutput {
+                logits: vec![f32::from(token as u16)],
+                next_token: Some(token.wrapping_add(1)),
+                draft: Vec::new(),
+            }))
+        }
+
+        fn verify(
+            &self,
+            _walk: &OffWalk,
+            _segments: &mut [Segment<'_, ToySeq>],
+            _depths: &[usize],
+        ) -> Result<Vec<Self::Rows>, BackendError> {
+            Err(BackendError::new("off", "no round drafts"))
+        }
+
+        fn settle(
+            &self,
+            _seq: &mut ToySeq,
+            _chunk: &[u32],
+            _rows: Self::Rows,
+        ) -> Result<StepOutput, BackendError> {
+            Err(BackendError::new("off", "no round drafts"))
+        }
+
+        fn budget(&self, _seqs: usize) -> usize {
+            0
+        }
+
+        fn ready(&self, _seq: &ToySeq, _token: u32) -> bool {
+            false
+        }
+
+        fn give_back(&self, seq: &mut ToySeq, to: usize) -> Result<(), BackendError> {
+            seq.rewind(to)
+        }
+
+        fn speculation(&self, _seq: &ToySeq) -> Speculation {
+            Speculation::default()
         }
     }
 
@@ -1813,6 +2281,139 @@ mod tests {
         assert!(crate::check_claims::<DraftWalk>(&[drafted]).is_ok());
         assert!(crate::check_claims::<ToyWalk>(&[drafted]).is_err());
         assert_eq!(ConformanceCheck::ALL.len(), 7);
+    }
+
+    /// The one-slot session adapter is the runtime: a prompt, a decode and the history a
+    /// caller reads all come from the same scheduling an engine lane gets.
+    #[test]
+    fn a_session_adapter_drives_the_runtime() {
+        let runtime = Runtime::new(ToyWalk::new(16, 64), 0).expect("the toy runtime");
+        let mut session = RuntimeSession::open(runtime).expect("the session opens");
+        let first = session.prefill(&[1, 2, 3]).expect("the prompt");
+        let fed = first.next_token.expect("a next token");
+        let second = session.decode(fed).expect("the decode");
+        assert_eq!(second.next_token, Some(fed.wrapping_add(1)));
+        assert_eq!(
+            session.reusable_prefix(),
+            Some([1, 2, 3, fed].as_slice()),
+            "the caller's history"
+        );
+        assert_eq!(session.cached_tokens(), 0, "the prompt was forwarded whole");
+        assert!(session.held_images().is_empty());
+    }
+
+    /// An image prompt reaches the walk with its images, is held and reported, and a changed
+    /// image starts the sequence over while the same one rides the prefix.
+    #[test]
+    fn a_prompt_carries_its_images_to_the_walk_and_holds_them() {
+        let walk = ImageWalk::new();
+        let encoded = Arc::clone(&walk.encoded);
+        let carried = Arc::clone(&walk.carried);
+        let runtime = Runtime::new(walk, 0).expect("the image walk serves");
+        let mut slot = runtime.open_slot().expect("a slot");
+        let span = ImageSpan {
+            start: 1,
+            grid: ImageGrid {
+                n_llm_h: 1,
+                n_llm_w: 1,
+                best_height: 40,
+                best_width: 40,
+                line_stride: 1,
+            },
+            key: [7; 32],
+        };
+        let image = VisionImage {
+            span,
+            pixels: Arc::from(Vec::<u8>::new()),
+        };
+        let prompt = [10u32, 200_054, 200_054, 200_054, 20, 30];
+        let mut part = runtime
+            .begin_prompt_slot(&mut slot, &prompt, std::slice::from_ref(&image))
+            .expect("the image prompt");
+        while matches!(part, Part::More) {
+            part = runtime.next_part_slot(&mut slot).expect("the next part");
+        }
+        assert_eq!(runtime.held_images(&slot), &[span]);
+        assert_eq!(*encoded.lock().expect("the encode record"), vec![(1, 1)]);
+        assert_eq!(*carried.lock().expect("the carry record"), vec![1]);
+        assert_eq!(runtime.cached_tokens(&slot), 0);
+
+        let mut longer = prompt.to_vec();
+        longer.extend_from_slice(&[40, 41]);
+        let mut part = runtime
+            .begin_prompt_slot(&mut slot, &longer, std::slice::from_ref(&image))
+            .expect("the continued prompt");
+        while matches!(part, Part::More) {
+            part = runtime.next_part_slot(&mut slot).expect("the next part");
+        }
+        assert_eq!(
+            runtime.cached_tokens(&slot),
+            prompt.len(),
+            "the same image rides the prefix"
+        );
+        assert_eq!(
+            *encoded.lock().expect("the encode record"),
+            vec![(1, 1), (1, 0)],
+            "the held image is not encoded again"
+        );
+
+        let changed = VisionImage {
+            span: ImageSpan {
+                key: [9; 32],
+                ..span
+            },
+            pixels: Arc::from(Vec::<u8>::new()),
+        };
+        let mut third = longer.clone();
+        third.push(50);
+        let mut part = runtime
+            .begin_prompt_slot(&mut slot, &third, std::slice::from_ref(&changed))
+            .expect("the changed image");
+        while matches!(part, Part::More) {
+            part = runtime.next_part_slot(&mut slot).expect("the next part");
+        }
+        assert_eq!(
+            runtime.cached_tokens(&slot),
+            0,
+            "a changed image starts over"
+        );
+        assert_eq!(
+            *encoded.lock().expect("the encode record"),
+            vec![(1, 1), (1, 0), (1, 1)]
+        );
+        assert_eq!(runtime.held_images(&slot), &[changed.span]);
+    }
+
+    /// A drafter compiled in but configured off runs one plain token pass over every member,
+    /// not a held decode a lane and not the round path.
+    #[test]
+    fn a_drafter_that_is_off_takes_the_plain_multi_lane_pass() {
+        let walk = OffWalk::new();
+        let opened = Arc::clone(&walk.drafter.opened);
+        let walks = Arc::clone(&walk.walks);
+        let runtime = Runtime::new(walk, 0).expect("the walk serves");
+        let mut slots: Vec<_> = (0..3)
+            .map(|_| runtime.open_slot().expect("a slot"))
+            .collect();
+        for slot in slots.iter_mut() {
+            runtime
+                .prefill_slot(slot, &[1, 2, 3])
+                .expect("the lane's prompt");
+        }
+        walks.lock().expect("the walk record").clear();
+        let mut members: Vec<_> = slots.into_iter().map(|slot| (slot, 7u32)).collect();
+        let steps = runtime.step_slots(&mut members).expect("a step");
+        assert_eq!(steps.len(), 3);
+        assert_eq!(
+            *opened.lock().expect("the open record"),
+            0,
+            "a held round opened a lane at a time"
+        );
+        assert_eq!(
+            *walks.lock().expect("the walk record"),
+            vec![(PassKind::TokenRows, vec![1, 1, 1])],
+            "the three members share one token pass"
+        );
     }
 
     crate::conformance!(ToyWalk);
