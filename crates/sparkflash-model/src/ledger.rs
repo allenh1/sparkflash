@@ -339,7 +339,9 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             ),
             (
                 Strategy::Group,
-                State::Native("a four-rank group over the shared RDMA exchange"),
+                State::Native(
+                    "a four-rank group on the tick engine: rank 0 decides each tick and the workers replay its rows; a rank 0 that holds the vision tower keeps the fused group, whose request frame is ordered before its image encode",
+                ),
             ),
         ],
     },

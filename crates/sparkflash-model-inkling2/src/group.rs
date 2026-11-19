@@ -31,9 +31,15 @@
 //! 3. the workers receive the same lane frames in the same order and run the same runtime over their own lanes, so every rank's sequence state advances identically and the collectives line up;
 //! 4. when the request ends, rank 0 keeps its lane (the runtime reuses a shared prefix) and the workers keep theirs; a lane *dropped* before its next prompt broadcasts its end, after which every rank discards the sequence and the next prompt starts clean.
 //!
-//! Every group, one lane or several, runs [GroupLanes] over the same
-//! [sparkflash_runtime::Runtime] on every rank: a lane's prompt and every fused step's members
-//! are broadcast in rank 0's order, so the workers step the same rows in the same order.
+//! Every group, one lane or several, runs the same [sparkflash_runtime::Runtime] on every rank,
+//! and rank 0's decisions are broadcast in its order, so the workers run the same rows in the
+//! same order. A text-only group runs the tick engine
+//! ([sparkflash_runtime::TickServe::start_group], [sparkflash_runtime::mirror_ticks_until_the_group_ends]):
+//! the frames carry the rows and the step shape rank 0 decided. A group whose rank 0 holds the
+//! vision tower keeps the fused engine ([FusedEngine] over [GroupLanes]): rank 0's image encode
+//! is a collective, the tick request frame follows rank 0's `start_prompt_slot` and so would
+//! wait behind it, and the fused group's frame is ordered before the encode for exactly that
+//! reason. [VISION_ENV] must be the same on every rank, like the rank files.
 //!
 //! Rank 0 refuses what every rank would refuse - a prompt over the context, an image span the
 //! tower cannot have made ([SpanCheck]) - before it broadcasts, so a bad request never reaches the
@@ -57,7 +63,8 @@ use sparkflash_model::backend::{BackendError, ModelBackend, ModelSession, Sampli
 use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
 use sparkflash_model::{ModelDescriptor, TpPlan};
 use sparkflash_runtime::{
-    FusedEngine, GroupLanes, GroupWire, Runtime, mirror_until_the_group_ends, watched_hub,
+    FusedEngine, GroupLanes, GroupWire, Runtime, TickServe, mirror_ticks_until_the_group_ends,
+    mirror_until_the_group_ends, watched_hub,
 };
 use sparkflash_weights::tp::TpLayout;
 
@@ -239,23 +246,37 @@ pub fn open_master(
     } else {
         String::new()
     };
-    let check = device.span_check();
-    // Lanes run ahead of rank 0's answers, so a rank that dies or fails mid-job ends the whole
-    // group rather than leave the rest in a collective (sparkflash_runtime::group).
-    let hub = watched_hub(hub)
-        .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
-    let lanes = device
-        .runtime()
-        .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
     let wire = InklingWire {
         context,
-        check: check.clone(),
+        check: device.span_check(),
+        serves_images: vision,
     };
-    let arm = GroupLanes::new(lanes, Arc::clone(&hub), wire);
-    let engine = FusedEngine::start(Arc::new(arm), group.lanes)
-        .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+    // Lanes run ahead of rank 0's answers, so a rank that dies or fails mid-job ends the whole
+    // group rather than leave the rest in a collective (sparkflash_runtime::group). The engine
+    // is the tick group unless this rank holds the tower: its image encode is a collective and
+    // the tick group's request frame follows rank 0's start, so the encode would run before the
+    // frame every worker's start waits for. [Engine] names the split; every rank must agree on
+    // it, which is why [VISION_ENV] has to be the same on all of them.
+    let (engine, engine_label) = if vision {
+        let hub = watched_hub(hub)
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+        let lanes = device
+            .runtime()
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+        let arm = GroupLanes::new(lanes, Arc::clone(&hub), wire);
+        let engine = FusedEngine::start(Arc::new(arm), group.lanes)
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+        (Engine::Fused(engine), "the fused group, images on")
+    } else {
+        let walk = device
+            .walk_arm()
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+        let engine = TickServe::start_group(walk, group.lanes, hub, wire)
+            .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+        (Engine::Tick(engine), "the tick group, text only")
+    };
     let banner = format!(
-        "TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{tower}{drafter}, Inkling device arm",
+        "TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{tower}{drafter}, {engine_label}, Inkling device arm",
         group.world,
         group.rank,
         descriptor.id,
@@ -273,6 +294,30 @@ pub fn open_master(
         weight_bytes,
         banner,
     })
+}
+
+/// What a group's rank 0 serves on.
+///
+/// The tick group is the group's serve face: rank 0 decides the tick and the workers replay its
+/// rows and step shape. A rank 0 that holds the vision tower keeps the fused group, whose request
+/// frame is ordered before rank 0's image encode; the tick group's frame follows rank 0's start,
+/// so the encode would run before the frame a worker's start waits for
+/// ([sparkflash_runtime::TickGroup]). A text-only rank 0 (no tower in the checkpoint, or
+/// [VISION_ENV]=off) takes the tick group and refuses an image request before any frame.
+enum Engine {
+    /// The tick engine: the scheduler, on every rank.
+    Tick(Arc<TickServe<InklingWalk>>),
+    /// The fused engine over [GroupLanes]: rank 0's image encode runs after the request frame.
+    Fused(Arc<FusedEngine<GroupLanes<Runtime<InklingWalk>, InklingWire>>>),
+}
+
+impl Engine {
+    fn open(&self) -> Result<Box<dyn ModelSession>, BackendError> {
+        match self {
+            Self::Tick(engine) => Ok(Box::new(engine.open()?)),
+            Self::Fused(engine) => Ok(Box::new(engine.open()?)),
+        }
+    }
 }
 
 /// Loads this rank's share of the DSpark drafter from `checkpoint` when the rank drafts with it
@@ -358,8 +403,19 @@ pub fn run_worker(
     )
     .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
     let drafter = load_drafter(&mut backend, checkpoint, group)?;
+    // The engine rank 0 chose, by the same rule and so with the same answer: a group that serves
+    // images is the fused one (rank 0's encode is ordered after the request frame there), and a
+    // text-only group is the tick one and replays its rows. [VISION_ENV] must be the same on
+    // every rank; a rank that chose differently refuses rank 0's frames by name rather than
+    // running a different row.
+    let vision = config.vision.is_some() && vision_wanted()?;
+    let engine_label = if vision {
+        "the fused group, images on"
+    } else {
+        "the tick group, text only"
+    };
     println!(
-        "sparkflash serve: TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{drafter}, Inkling device arm worker",
+        "sparkflash serve: TP{}/rank{} {} on {} ({} weight bytes, opened in {} ms), context {context}, {}{drafter}, {engine_label}, Inkling device arm worker",
         group.world,
         group.rank,
         descriptor.id,
@@ -368,14 +424,19 @@ pub fn run_worker(
         opened.elapsed().as_millis(),
         lanes_label(group.lanes)
     );
-    let lanes = backend
-        .runtime()
-        .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
     let wire = InklingWire {
         context,
         check: backend.span_check(),
+        serves_images: vision,
     };
-    mirror_until_the_group_ends(&mut control, &lanes, &wire, group.lanes)
+    let lanes = backend
+        .runtime()
+        .map_err(|error| format!("TP{}/rank{}: {error}", group.world, group.rank))?;
+    if vision {
+        mirror_until_the_group_ends(&mut control, &lanes, &wire, group.lanes)
+    } else {
+        mirror_ticks_until_the_group_ends(&mut control, &lanes, &wire, group.lanes)
+    }
 }
 
 /// The transport description every rank of the group forms.
@@ -396,6 +457,10 @@ fn transport(group: &GroupOptions) -> Result<TcpConfig, String> {
 pub struct InklingWire {
     context: usize,
     check: SpanCheck,
+    /// Whether this group's rank 0 holds the tower. A text-only group is on the tick engine,
+    /// whose request frame follows rank 0's start, so an image must be refused before the frame
+    /// rather than fail rank 0's encode after it ([Engine]).
+    serves_images: bool,
 }
 
 impl GroupWire for InklingWire {
@@ -408,6 +473,14 @@ impl GroupWire for InklingWire {
     }
 
     fn admit(&self, tokens: &[u32], images: &[VisionImage]) -> Result<(), BackendError> {
+        if !self.serves_images && !images.is_empty() {
+            return Err(BackendError::new(
+                "vision",
+                format!(
+                    "this group serves text only: its rank 0 holds no vision tower ({VISION_ENV}                      is off, or the checkpoint describes none)"
+                ),
+            ));
+        }
         admit(self.context, &self.check, tokens, images)
     }
 
@@ -447,7 +520,7 @@ fn admit(
         .map_err(|error| BackendError::new("request", error))
 }
 
-/// The rank-0 backend: one device rank served by the shared runtime through a fused engine.
+/// The rank-0 backend: one device rank served by the shared runtime through an [Engine].
 ///
 /// Every session is a handle on that engine, whether the group steps one request or several, so
 /// the serial session and its mirror are gone: the runtime owns the prompt parts, the history,
@@ -456,7 +529,7 @@ struct GroupBackend {
     descriptor: ModelDescriptor,
     device: InklingDeviceBackend,
     /// The runtime's lanes, every session a handle on this engine.
-    engine: Arc<FusedEngine<GroupLanes<Runtime<InklingWalk>, InklingWire>>>,
+    engine: Engine,
 }
 
 impl ModelBackend for GroupBackend {
@@ -473,7 +546,7 @@ impl ModelBackend for GroupBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        Ok(Box::new(self.engine.open()?))
+        self.engine.open()
     }
 }
 
@@ -515,6 +588,42 @@ fn frame_sampling(sampler: Option<Tp4FrameSampler>) -> Sampling {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A text-only group refuses an image before any frame: its rank 0 holds no tower, and the
+    /// tick group's request frame follows rank 0's start, so a refusal after the frame would end
+    /// the group rather than the request.
+    #[test]
+    fn a_text_only_group_refuses_an_image_before_any_frame() {
+        use sparkflash_model::vision::{ImageGrid, ImageSpan, VisionImage};
+
+        let wire = InklingWire {
+            context: 64,
+            check: SpanCheck::new(None, false),
+            serves_images: false,
+        };
+        let image = VisionImage {
+            span: ImageSpan {
+                start: 1,
+                grid: ImageGrid {
+                    n_llm_h: 1,
+                    n_llm_w: 1,
+                    best_height: 1,
+                    best_width: 1,
+                    line_stride: 1,
+                },
+                key: [0u8; 32],
+            },
+            pixels: Arc::from(&[][..]),
+        };
+        let error = wire
+            .admit(&[7, 9, 11], &[image])
+            .expect_err("a text-only group takes no image");
+        assert!(error.message().contains("text only"), "{error}");
+        assert!(
+            wire.admit(&[7, 9, 11], &[]).is_ok(),
+            "a prompt with no image is admitted"
+        );
+    }
 
     #[test]
     fn a_group_reads_one_rank_file_per_rank() {
