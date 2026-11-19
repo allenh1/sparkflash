@@ -539,6 +539,9 @@ struct Kernels {
     /// The same two GEMMs over the bf16 head of each activation alone, and the routed one.
     prefill_dense_bf16_bf16a: Kernel,
     prefill_dense_fp8_bf16a: Kernel,
+    /// The FP8 tile's few-row form (kernels/glm_decode_sm121.cu), the decode path's body: one
+    /// to eight rows, a row the prompt tile's bits over GLM's f32 128 x 128 block scales.
+    prefill_dense_fp8_rows: Kernel,
     /// The bulk routed-expert image (kernels/glm_moe_sm121.cu): the padded plan, the
     /// gather/SwiGLU/scatter, and the gate/up and down MMAs over f32 and E4M3 activations.
     prefill_moe_mma_bf16a: Kernel,
@@ -693,6 +696,7 @@ impl Kernels {
             prefill_dense_fp8: prefill("glm_prefill_fp8b128_mma")?,
             prefill_dense_bf16_bf16a: prefill_wide("glm_prefill_bf16_wide_bf16a")?,
             prefill_dense_fp8_bf16a: prefill("glm_prefill_fp8b128_mma_bf16a")?,
+            prefill_dense_fp8_rows: decode("glm_decode_fp8b128_rows")?,
             prefill_moe_mma_bf16a: glm_moe("glm_moe_fp8b128_mma_bf16a")?,
             prefill_moe_plan: plan("moe_plan")?,
             prefill_moe_mma: glm_moe("glm_moe_fp8b128_mma")?,
@@ -1047,6 +1051,91 @@ impl DeviceLinear {
         let size = if self.scales.is_some() { 1 } else { 2 };
         (self.weight, self.rows * self.columns * size)
     }
+}
+
+/// The FP8 tile body's row rule: one to [MAX_ROWS] token rows take it, and a prefill-sized
+/// batch keeps the bulk GEMM. The body stages the same eight rows the tiled GEMV's largest
+/// launch does, and its own `SPM_ROWS_MAX` is eight.
+fn fp8_token_body_rows(rows: usize) -> bool {
+    (1..=MAX_ROWS).contains(&rows)
+}
+
+/// Whether the FP8 tile body takes this projection at `rows` rows: the row rule, an E4M3
+/// weight with f32 128 x 128 block scales, a K run of whole 128-column blocks, and parts of
+/// whole eight-column output writes whose scales start on a 128-row block. A shape it does not
+/// take keeps the tiled GEMV.
+fn fp8_token_body_fits(linear: &DeviceLinear, rows: usize) -> bool {
+    if linear.scales.is_none()
+        || !fp8_token_body_rows(rows)
+        || !linear.columns.is_multiple_of(FP8_BLOCK)
+    {
+        return false;
+    }
+    let starts = [
+        0,
+        linear.parts[0],
+        linear.parts[1],
+        linear.parts[2],
+        linear.rows,
+    ];
+    (0..4).all(|part| {
+        let (first, end) = (starts[part], starts[part + 1]);
+        end <= first || ((end - first).is_multiple_of(8) && first.is_multiple_of(FP8_BLOCK))
+    })
+}
+
+/// The FP8 tile's few-row body over each part of `linear`: one launch a part, over the part's
+/// weight rows, its 128-column scale block and its outputs for all `rows` rows. The body's
+/// arguments are the prompt tile's (`w, ws, a, out, cols, inner, tokens`) and its activations
+/// are the f32 rows the GEMV read, so nothing is converted between the two.
+fn launch_fp8_token_body(
+    cuda: &Cuda,
+    stream: &RunStream,
+    kernel: Kernel,
+    linear: &DeviceLinear,
+    input: Deviceptr,
+    output: Deviceptr,
+    rows: usize,
+) -> Result<(), BackendError> {
+    let columns = linear.columns;
+    let scales = linear
+        .scales
+        .ok_or_else(|| refusal("the FP8 token body takes a block-scaled weight"))?;
+    let starts = [
+        0,
+        linear.parts[0],
+        linear.parts[1],
+        linear.parts[2],
+        linear.rows,
+    ];
+    for part in 0..4 {
+        let (first, end) = (starts[part], starts[part + 1]);
+        if end <= first {
+            continue;
+        }
+        let part_rows = end - first;
+        let weight = linear.weight.offset(first * columns);
+        let part_scales =
+            scales.offset((first / FP8_BLOCK) * (columns / FP8_BLOCK) * std::mem::size_of::<f32>());
+        let out = output.offset(rows * first * 4);
+        cuda.launch_on(
+            stream,
+            kernel,
+            (part_rows.div_ceil(32) as u32, 1, 1),
+            (128, 1, 1),
+            &[
+                weight.0,
+                part_scales.0,
+                input.0,
+                out.0,
+                part_rows as u64,
+                columns as u64,
+                rows as u64,
+            ],
+        )
+        .map_err(|error| cuda_error(format!("{}: {error}", kernel.name())))?;
+    }
+    Ok(())
 }
 
 /// One mHC mixer: the BF16 `fn` projection and the f32 base and scale.
@@ -3370,8 +3459,8 @@ impl DeviceRank {
 
     /// `output = W input` for `rows` rows, BF16 or block-scaled FP8 by the weight, each of a fused
     /// projection's parts as one block of every row's outputs. A prefill-sized batch takes the
-    /// bulk tensor-core GEMM; a decode step keeps the tiled GEMV, whose bits a verified row is
-    /// defined by.
+    /// bulk tensor-core GEMM; a decode step's FP8 part takes the tile's few-row body, and its
+    /// BF16 part the tiled GEMV, whose bits a verified row is defined by.
     fn gemv(
         &self,
         linear: &DeviceLinear,
@@ -3382,7 +3471,35 @@ impl DeviceRank {
         if rows > MAX_ROWS {
             return self.bulk_gemm(linear, input, output, rows);
         }
+        if fp8_token_body_fits(linear, rows)
+            && input.0.is_multiple_of(8)
+            && linear.weight.0.is_multiple_of(8)
+        {
+            return self.fp8_token_body(linear, input, output, rows);
+        }
         self.gemv_small(linear, input, output, rows)
+    }
+
+    /// The FP8 tile's few-row body over each part of `linear`: one launch a part, over the
+    /// part's weight rows, its 128-column scale block and its outputs for all `rows` rows. The
+    /// body's arguments are the prompt tile's (`w, ws, a, out, cols, inner, tokens`) and its
+    /// activations are the f32 rows the GEMV read, so nothing is converted between the two.
+    fn fp8_token_body(
+        &self,
+        linear: &DeviceLinear,
+        input: Deviceptr,
+        output: Deviceptr,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        launch_fp8_token_body(
+            &self.cuda,
+            &self.stream,
+            self.kernels.prefill_dense_fp8_rows,
+            linear,
+            input,
+            output,
+            rows,
+        )
     }
 
     /// The bulk prefill's projection: one tensor-core GEMM over all `rows` of each part, an FP8
@@ -6790,6 +6907,149 @@ mod tests {
             }
         }
         config
+    }
+
+    /// A decode step's FP8 projection, through the launch the arm makes, is the prompt tile's
+    /// row: the same E4M3 weights, GLM's f32 128 x 128 block scales and f32 activations, the
+    /// body over every part of a fused projection, and `glm_prefill_fp8b128_mma` over the same
+    /// operands. Each row of each launch is compared bit for bit.
+    #[test]
+    #[ignore = "needs a CUDA device and the GLM decode and prefill images"]
+    fn a_decode_step_on_the_token_body_is_the_prefill_tiles_row() {
+        use sparkflash_kernels::m4_quant::fp8_e4m3_encode;
+        use sparkflash_kernels::test_io;
+
+        let Some(cuda) = test_io::cuda_or_skip(
+            (!cubin_available() || images::glm_prefill_cubin().is_empty())
+                .then_some("the GLM decode and prefill images"),
+        ) else {
+            return;
+        };
+        let cuda = CudaHandle::new(cuda);
+        let run = cuda.run_stream().expect("a run stream");
+        let (_tile_module, tile) = cuda
+            .load_named(images::glm_prefill_cubin(), "glm_prefill_fp8b128_mma")
+            .expect("glm_prefill_fp8b128_mma");
+        let (_body_module, body) = cuda
+            .load_named(images::glm_decode_cubin(), "glm_decode_fp8b128_rows")
+            .expect("glm_decode_fp8b128_rows");
+
+        const COLS: usize = 256;
+        const INNER: usize = 512;
+        const TOKENS: usize = MAX_ROWS;
+        let weights: Vec<u8> = (0..COLS * INNER)
+            .map(|at| {
+                let value = ((at as u64 * 37 + 11) % 251) as f32 * 0.013 - 1.6;
+                fp8_e4m3_encode(value)
+            })
+            .collect();
+        let scales: Vec<f32> = (0..COLS.div_ceil(128) * (INNER / 128))
+            .map(|at| 0.5 + ((at as u64 * 13 + 5) % 17) as f32 * 0.0625)
+            .collect();
+        let activations: Vec<f32> = (0..TOKENS * INNER)
+            .map(|at| {
+                let mixed = (at as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((mixed >> 40) as f32) / ((1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect();
+
+        let weight = test_io::upload::<u8>(&cuda, &weights);
+        let scale = test_io::upload::<f32>(&cuda, &scales);
+        let input = test_io::upload::<f32>(&cuda, &activations);
+        let tile_out = test_io::upload::<f32>(&cuda, &vec![0.0; TOKENS * COLS]);
+        let body_out = test_io::upload::<f32>(&cuda, &vec![0.0; TOKENS * COLS]);
+        // Two whole-tile parts, as the MLA's fused projections are: the body's part offsets,
+        // weight slice and block-scale slice all have to line up with the tile's full matrix.
+        let linear = DeviceLinear {
+            weight,
+            scales: Some(scale),
+            rows: COLS,
+            columns: INNER,
+            parts: [COLS / 2, COLS, COLS],
+        };
+
+        for count in 1..=TOKENS {
+            cuda.launch(
+                tile,
+                (COLS.div_ceil(128) as u32, count.div_ceil(128) as u32, 1),
+                (256, 1, 1),
+                &[
+                    weight.0,
+                    scale.0,
+                    input.0,
+                    tile_out.0,
+                    COLS as u64,
+                    INNER as u64,
+                    count as u64,
+                ],
+            )
+            .expect("the prompt tile");
+            launch_fp8_token_body(&cuda, &run, body, &linear, input, body_out, count)
+                .expect("the token body");
+            let expected: Vec<u32> = test_io::download::<u32>(&cuda, &tile_out, count * COLS);
+            let got: Vec<u32> = test_io::download::<u32>(&cuda, &body_out, count * COLS);
+            // The tile writes [row][column]; the body writes each part's rows together, the
+            // layout the GEMV's callers read ([DeviceLinear::part]).
+            let starts = [0, linear.parts[0], linear.parts[1], linear.parts[2], COLS];
+            for (part, bounds) in starts.windows(2).enumerate() {
+                let (first, end) = (bounds[0], bounds[1]);
+                for token in 0..count {
+                    for column in first..end {
+                        let tile_at = token * COLS + column;
+                        let body_at = count * first + token * (end - first) + (column - first);
+                        assert_eq!(
+                            got[body_at],
+                            expected[tile_at],
+                            "{count} rows, part {part}, token {token}, column {column}: the body \
+                             {} and the tile {} must agree bit for bit",
+                            f32::from_bits(got[body_at]),
+                            f32::from_bits(expected[tile_at])
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The decode path's routing boundary: one to eight rows take the tile's FP8 body, and the
+    /// ninth keeps the bulk GEMM. A projection whose shape the body does not take is not routed
+    /// to it even inside the band.
+    #[test]
+    fn the_fp8_token_body_takes_one_to_eight_rows() {
+        assert_eq!(MAX_ROWS, 8, "the body's band is the arm's eight-row step");
+        for rows in 1..=MAX_ROWS {
+            assert!(fp8_token_body_rows(rows), "{rows} rows take the body");
+        }
+        for rows in [0, MAX_ROWS + 1, 512] {
+            assert!(!fp8_token_body_rows(rows), "{rows} rows do not");
+        }
+
+        let fits = |weight: u8, rows: usize, parts: [usize; 3]| {
+            let scales = (weight != 0).then_some(Deviceptr(0));
+            fp8_token_body_fits(
+                &DeviceLinear {
+                    weight: Deviceptr(0),
+                    scales,
+                    rows,
+                    columns: 512,
+                    parts,
+                },
+                8,
+            )
+        };
+        assert!(fits(1, 8, [8, 8, 8]), "one eight-row part");
+        assert!(fits(1, 256, [128, 256, 256]), "whole-tile parts");
+        assert!(!fits(0, 8, [8, 8, 8]), "a BF16 weight stays on the GEMV");
+        assert!(
+            !fits(1, 196, [128, 196, 196]),
+            "a part that is not whole eight-column writes"
+        );
+        assert!(
+            !fits(1, 144, [128, 136, 144]),
+            "a part whose scale block does not start on 128 rows"
+        );
     }
 
     #[test]
