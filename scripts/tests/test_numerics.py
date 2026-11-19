@@ -758,6 +758,14 @@ class ApprovalTests(unittest.TestCase):
         findings = self.judge(entry, self.changed, self.extra)
         self.assertTrue(any("approved is not a table" in finding for finding in findings), findings)
 
+    def test_an_approval_outside_the_documented_shape_is_refused(self):
+        approval = dict(self.approval, report="numerics/approval.md")
+        findings = self.judge(self.approved_entry(approval=approval), self.changed, self.extra)
+        self.assertTrue(any("under docs/numerics/" in finding for finding in findings), findings)
+        unknown = dict(self.approval, note="not a field of the record")
+        findings = self.judge(self.approved_entry(approval=unknown), self.changed, self.extra)
+        self.assertTrue(any("unknown key" in finding for finding in findings), findings)
+
     def test_an_approval_whose_report_does_not_exist_is_refused(self):
         findings = self.judge(self.approved_entry(), self.changed, {self.report: b"x"})
         self.assertTrue(
