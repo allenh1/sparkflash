@@ -266,6 +266,21 @@ impl<W: Walk> Runtime<W> {
         slot: &mut RuntimeSlot<W>,
         rows: usize,
     ) -> Result<Part, BackendError> {
+        self.run_part_rows_hooked(slot, rows, None)
+    }
+
+    /// [Self::run_part_rows] with `hook` between the last layer and the head
+    /// ([crate::walk::WalkHook]). The tick engine computes the next tick's decode plan there,
+    /// under the walk, which is where DeepSeek's tick-ahead decision lives.
+    ///
+    /// # Errors
+    /// A backend failure, a slot with no prompt in parts, or the hook's own failure.
+    pub fn run_part_rows_hooked(
+        &self,
+        slot: &mut RuntimeSlot<W>,
+        rows: usize,
+        hook: Option<&mut dyn crate::walk::WalkHook>,
+    ) -> Result<Part, BackendError> {
         let prompt = slot
             .prompt
             .take()
@@ -274,7 +289,10 @@ impl<W: Walk> Runtime<W> {
         let rows = &prompt.tokens[prompt.next..end];
         let hidden = {
             let mut segments = [Segment::with_images(&mut slot.seq, rows, &prompt.fresh)];
-            let pass = Pass::bulk(rows.len()).with_prompt_end(prompt.tokens.len() - end);
+            let mut pass = Pass::bulk(rows.len()).with_prompt_end(prompt.tokens.len() - end);
+            if let Some(hook) = hook {
+                pass = pass.with_hook(hook);
+            }
             self.walk.walk(&mut segments, pass)?
         };
         slot.history.extend_from_slice(rows);

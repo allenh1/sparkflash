@@ -27,7 +27,7 @@
 //! docs/engine/04-onboarding-review.md.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
 use sparkflash_runtime::tick::Clock;
@@ -82,13 +82,20 @@ impl LaneState for Seq {
 struct ReplayWalk {
     layout: StateLayout,
     limits: Limits,
+    /// How many walks the engine asked for the tick-ahead hook.
+    hooks: Arc<AtomicUsize>,
 }
 
 impl ReplayWalk {
     fn new(rows: usize, context: usize) -> Self {
+        Self::new_with_hooks(rows, context, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn new_with_hooks(rows: usize, context: usize, hooks: Arc<AtomicUsize>) -> Self {
         Self {
             layout: StateLayout::new(Vec::new()),
             limits: Limits::new(rows, context),
+            hooks,
         }
     }
 }
@@ -132,14 +139,19 @@ impl Walk for ReplayWalk {
     fn walk(
         &self,
         segments: &mut [Segment<'_, Self::Seq>],
-        _pass: Pass<'_>,
+        mut pass: Pass<'_>,
     ) -> Result<Hidden, BackendError> {
         let mut rows = 0;
         for segment in segments {
             segment.seq.rows.extend_from_slice(segment.rows);
             rows += segment.rows.len();
         }
-        Ok(Hidden::new(rows))
+        let hidden = Hidden::new(rows);
+        if let Some(hook) = pass.hook.take() {
+            self.hooks.fetch_add(1, Ordering::Relaxed);
+            hook.after_layers(&hidden)?;
+        }
+        Ok(hidden)
     }
 
     fn head(
@@ -279,8 +291,12 @@ fn run() -> String {
 
 #[test]
 fn the_serving_engine_answers_two_sessions_and_keeps_a_lane_s_prefix() {
-    let engine = sparkflash_runtime::TickServe::start(ReplayWalk::new(16, 64), 2)
-        .expect("the serving engine starts");
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let engine = sparkflash_runtime::TickServe::start(
+        ReplayWalk::new_with_hooks(16, 64, Arc::clone(&hooks)),
+        2,
+    )
+    .expect("the serving engine starts");
     let mut alone = engine.open().expect("a handle");
     let mut other = engine.open().expect("a handle");
     let first = alone.prefill(&[1, 2, 3]).expect("the prompt");
@@ -302,6 +318,10 @@ fn the_serving_engine_answers_two_sessions_and_keeps_a_lane_s_prefix() {
         alone.reusable_prefix(),
         Some([1, 2, 3, next].as_slice()),
         "the caller's history"
+    );
+    assert!(
+        hooks.load(Ordering::Relaxed) > 0,
+        "the engine asked the walk for the tick-ahead plan"
     );
     alone.park();
     // The lane keeps its history across requests, so a prompt that extends it resumes.

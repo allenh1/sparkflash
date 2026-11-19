@@ -64,7 +64,7 @@ use crate::tick::{
     common_prefix, decode_plan, hold_prefill, pick_lane, prefill_order, reusable_shared, tick_rows,
     whole_chunk_fits,
 };
-use crate::walk::{Drafter, PassMask, Vision, Walk};
+use crate::walk::{Drafter, Hidden, PassMask, Vision, Walk, WalkHook};
 
 /// What the tick engine decides from, and the values a serving run reads from its profile and
 /// the arm's crate::layout::Limits.
@@ -284,6 +284,59 @@ pub struct Kept {
     pub cached: usize,
 }
 
+/// The tick-ahead hook: the plan for the tick's decode rows, decided between the last layer and
+/// the head of the prefill walk. DeepSeek decides the next tick while the device works; this is
+/// where the engine makes the same decision, through crate::tick::decode_plan.
+struct Ahead {
+    decoding: usize,
+    batch_spec: Option<f64>,
+    exchange: bool,
+    rows_max: usize,
+    drafter: bool,
+    plan: Option<DecodePlan>,
+}
+
+impl Ahead {
+    fn decide(&self) -> DecodePlan {
+        plan_for(
+            self.decoding,
+            self.batch_spec,
+            self.exchange,
+            self.rows_max,
+            self.drafter,
+        )
+    }
+}
+
+impl WalkHook for Ahead {
+    fn after_layers(&mut self, _hidden: &Hidden) -> Result<(), BackendError> {
+        self.plan = Some(self.decide());
+        Ok(())
+    }
+}
+
+/// The tick's decode plan: crate::tick::decode_plan's, except that an arm which declares no
+/// drafter has no speculative step to take. Its single sequence runs one plain row and the trace
+/// says plain, because calling the row spec would name a row the arm never walked.
+fn plan_for(
+    rows: usize,
+    batch_spec: Option<f64>,
+    exchange: bool,
+    rows_max: usize,
+    drafter: bool,
+) -> DecodePlan {
+    let plan = decode_plan(rows, false, batch_spec, exchange, rows_max);
+    if drafter {
+        return plan;
+    }
+    match plan {
+        DecodePlan::None => DecodePlan::None,
+        _ => DecodePlan::Plain {
+            groups: rows.div_ceil(rows_max.max(1)),
+        },
+    }
+}
+
 /// DeepSeek's tick over one Walk.
 pub struct TickEngine<W: Walk> {
     runtime: Runtime<W>,
@@ -301,6 +354,9 @@ pub struct TickEngine<W: Walk> {
     admissions: VecDeque<RequestId>,
     /// Decode rows fed by callers and not yet run.
     fed: Vec<Fed>,
+    /// The next tick's decode plan, computed under the last prefill walk (the tick-ahead
+    /// hook): the row count it was decided for, and the plan.
+    ahead: Option<(usize, DecodePlan)>,
     /// The clock every decision is timed by.
     clock: Box<dyn Clock>,
     trace: Option<TraceSink>,
@@ -350,6 +406,7 @@ impl<W: Walk> TickEngine<W> {
             requests: Vec::new(),
             admissions: VecDeque::new(),
             fed: Vec::new(),
+            ahead: None,
             clock: Box::new(WallClock::new()),
             trace,
             tick: 0,
@@ -954,13 +1011,20 @@ impl<W: Walk> TickEngine<W> {
                 || crate::tick::runs_decoder(from, rows, target, self.config.decoder_warm);
             self.lanes[lane].skip_end =
                 crate::tick::skip_end_after(self.lanes[lane].skip_end, from, rows, decoder);
+            let mut ahead = self.ahead();
             let slot = self.slots[lane]
                 .as_mut()
                 .expect("a lane serving a prompt has its slot");
-            match self.runtime.run_part_rows(slot, rows) {
+            match self
+                .runtime
+                .run_part_rows_hooked(slot, rows, Some(&mut ahead))
+            {
                 Ok(part) => {
                     let tokens = self.requests[index].tokens[from..from + rows].to_vec();
                     self.lanes[lane].resident.extend_from_slice(&tokens);
+                    if let Some(plan) = ahead.plan {
+                        self.ahead = Some((ahead.decoding, plan));
+                    }
                     if let Part::Done(step) = part {
                         self.finish_prompt(index, step, events);
                     }
@@ -995,10 +1059,15 @@ impl<W: Walk> TickEngine<W> {
                     || crate::tick::runs_decoder(p, n, target, self.config.decoder_warm);
                 self.lanes[lane].skip_end =
                     crate::tick::skip_end_after(self.lanes[lane].skip_end, p, n, decoder);
+                let mut ahead = self.ahead();
                 let slot = self.slots[lane]
                     .as_mut()
                     .expect("a lane serving a prompt has its slot");
-                match self.runtime.run_part_rows(slot, n) {
+                let part = self.runtime.run_part_rows_hooked(slot, n, Some(&mut ahead));
+                if let Some(plan) = ahead.plan {
+                    self.ahead = Some((ahead.decoding, plan));
+                }
+                match part {
                     Ok(part) => {
                         p += n;
                         ran += n;
@@ -1015,6 +1084,19 @@ impl<W: Walk> TickEngine<W> {
             }
         }
         ran
+    }
+
+    /// The tick-ahead hook for the next prefill: its decode-row count is fixed at the tick's
+    /// start, and the plan it decides is used by the tick's decode.
+    fn ahead(&self) -> Ahead {
+        Ahead {
+            decoding: self.fed.len(),
+            batch_spec: self.config.batch_spec,
+            exchange: self.config.exchange,
+            rows_max: self.config.rows_max,
+            drafter: W::Drafter::PRESENT && self.walk().drafter().drafts(),
+            plan: None,
+        }
     }
 
     fn finish_prompt(&mut self, index: usize, step: StepOutput, events: &mut Vec<TickEvent>) {
@@ -1046,7 +1128,11 @@ impl<W: Walk> TickEngine<W> {
         if rows.is_empty() {
             return;
         }
-        let plan = self.plan(rows.len());
+        let plan = self
+            .ahead
+            .take()
+            .filter(|(decided, _)| *decided == rows.len())
+            .map_or_else(|| self.plan(rows.len()), |(_, plan)| plan);
         match plan {
             DecodePlan::None => {}
             DecodePlan::Spec => {
@@ -1092,26 +1178,16 @@ impl<W: Walk> TickEngine<W> {
         }
     }
 
-    /// The tick's decode plan: crate::tick::decode_plan's, except that an arm which declares no
-    /// drafter has no speculative step to take. Its single sequence runs one plain row and the
-    /// trace says plain, because calling the row spec would name a row the arm never walked.
+    /// The tick's decode plan: the one the prefill walk decided ahead when it fits the rows this
+    /// tick can run, else crate::tick::decode_plan over them.
     fn plan(&self, rows: usize) -> DecodePlan {
-        let plan = decode_plan(
+        plan_for(
             rows,
-            false,
             self.config.batch_spec,
             self.config.exchange,
             self.config.rows_max,
-        );
-        if W::Drafter::PRESENT && self.walk().drafter().drafts() {
-            return plan;
-        }
-        match plan {
-            DecodePlan::None => DecodePlan::None,
-            _ => DecodePlan::Plain {
-                groups: rows.div_ceil(self.config.rows_max.max(1)),
-            },
-        }
+            W::Drafter::PRESENT && self.walk().drafter().drafts(),
+        )
     }
 
     /// One runtime step over group, and every held answer after it. Returns the sequences and
@@ -1655,16 +1731,18 @@ fn serve<W>(
                 for event in events {
                     match event {
                         TickEvent::Prompt { id, step } => {
+                            // The record is published before the reply: a waiting handle reads
+                            // its kept lengths as soon as its answer arrives.
+                            refresh(&engine, id, handle_of(id, &requests), &stats);
                             if let Some(reply) = waiting.remove(&id) {
                                 let _ = reply.send(Ok(vec![step]));
                             }
-                            refresh(&engine, id, handle_of(id, &requests), &stats);
                         }
                         TickEvent::Decode { id, steps } => {
+                            refresh(&engine, id, handle_of(id, &requests), &stats);
                             if let Some(reply) = waiting.remove(&id) {
                                 let _ = reply.send(Ok(steps));
                             }
-                            refresh(&engine, id, handle_of(id, &requests), &stats);
                         }
                         TickEvent::Failed { id, error } => {
                             if let Some(reply) = waiting.remove(&id) {
