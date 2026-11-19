@@ -70,7 +70,7 @@ use std::sync::Arc;
 use sparkflash_kernels::checkpoint::Checkpoint;
 use sparkflash_kernels::cuda_driver::{Cuda, Deviceptr, Kernel};
 use sparkflash_kernels::images::{
-    dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
+    Image, dory_cubin, moe_plan_cubin, qwen4_attn_cubin, qwen4_exp_cubin, qwen4_moe_cubin,
     qwen4_prefill_cubin, qwen4_scan_cubin,
 };
 use sparkflash_kernels::lane_memory::{Layout, SequenceLane, SequenceLanes};
@@ -82,6 +82,10 @@ use sparkflash_ops::OpPlan;
 use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
+use sparkflash_ops::formats::{
+    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, NvFp4, PackedBf16, PackedOrder, Scales,
+    Tensor, upload as upload_format,
+};
 use sparkflash_ops::gdn::{self, GdnGeometry, gdn_qk_row};
 use sparkflash_ops::gemv::{
     CudaHandle, E4M3_TILE, GEMV_MAX_BATCH, GemvDevice, GpuMat, GpuMatE4m3Tile, TILED_GEMV_BLOCKS,
@@ -90,15 +94,17 @@ use sparkflash_ops::gemv::{
 use sparkflash_ops::moe::{Launch, MoePlanCall, combine_grid, router_score, token};
 use sparkflash_ops::naming::{AttentionNames, ExpertNames, FfnNames, GdnNames, TensorNames};
 use sparkflash_ops::packed::{self, Form, PackedSet, Placement};
+use sparkflash_ops::plan::Precision;
 use sparkflash_ops::projection::{
     Fp8Tile, Route, WIDE_SHARED, WidePolicy, WideTile, route_bf16, route_fp8,
 };
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
+use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire};
 use sparkflash_weights::tp::TpRuntime;
-use sparkflash_weights::{DType, WeightSource};
+use sparkflash_weights::{DType, TensorSpec, WeightSource};
 
 mod walk;
 
@@ -272,6 +278,10 @@ impl Shape {
             architecture.quantization.expert_format,
             WeightFormat::Fp8Tile { .. }
         );
+        let nvfp4_experts = matches!(
+            architecture.quantization.expert_format,
+            WeightFormat::NvFp4 { .. }
+        );
         let (intermediate, routed) = match &layer.ffn {
             Ffn::Dense(dense) => {
                 let (first, width) =
@@ -294,7 +304,9 @@ impl Shape {
                 // A share is whole runs of what the expert passes read at a time (a scale tile
                 // of FP8, eight BF16 columns), the remainder to the first ranks: an even split
                 // of a 136-wide expert is two 68-wide shares the BF16 passes cannot read.
-                let run = if fp8_experts {
+                let run = if nvfp4_experts {
+                    16
+                } else if fp8_experts {
                     E4M3_TILE
                 } else {
                     sparkflash_ops::parts::DENSE_BF16_EXPERT_RUN
@@ -360,7 +372,7 @@ impl Shape {
 }
 
 /// One layer's device weights.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Layer {
     shape: Shape,
     input_norm: Deviceptr,
@@ -372,7 +384,7 @@ struct Layer {
 }
 
 /// A layer's token mixer on the device.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Mixer {
     /// Grouped-query attention's projections and its q/k norms.
     Gqa {
@@ -388,7 +400,7 @@ enum Mixer {
 /// A Gated DeltaNet layer's weights: the fused q/k/v projection, the output gate's, the beta and
 /// decay logits', the conv (BF16 `[conv_width][taps]`), the decay vectors and the gated norm (BF16
 /// a value head's width).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct GdnLayer {
     qkv: Proj,
     z: Proj,
@@ -402,14 +414,16 @@ struct GdnLayer {
 
 impl Layer {
     /// Every BF16 projection the layer's GEMVs read.
-    fn bf16_projections(&self) -> Vec<GpuMat> {
-        let mut projections = vec![self.o];
-        match self.mixer {
-            Mixer::Gqa { q, k, v, .. } => projections.extend([q, k, v]),
-            Mixer::Gdn(gdn) => projections.extend([gdn.qkv, gdn.z, gdn.b, gdn.a]),
+    fn bf16_projections(&self) -> Vec<Mat<Bf16>> {
+        let mut projections = vec![self.o.clone()];
+        match &self.mixer {
+            Mixer::Gqa { q, k, v, .. } => projections.extend([q.clone(), k.clone(), v.clone()]),
+            Mixer::Gdn(gdn) => {
+                projections.extend([gdn.qkv.clone(), gdn.z.clone(), gdn.b.clone(), gdn.a.clone()])
+            }
         }
-        let mlp = |mlp: Mlp| [mlp.gate, mlp.up, mlp.down];
-        match self.ffn {
+        let mlp = |mlp: &Mlp| [mlp.gate.clone(), mlp.up.clone(), mlp.down.clone()];
+        match &self.ffn {
             LayerFfn::Dense(dense) => projections.extend(mlp(dense)),
             LayerFfn::Routed {
                 router,
@@ -417,49 +431,83 @@ impl Layer {
                 shared_gate,
                 ..
             } => {
-                projections.push(router);
-                projections.extend(shared.into_iter().flat_map(mlp));
-                projections.extend(shared_gate);
+                projections.push(router.clone());
+                if let Some(shared) = shared {
+                    projections.extend(mlp(shared));
+                }
+                projections.extend(shared_gate.clone());
             }
         }
         projections
             .into_iter()
             .filter_map(|projection| match projection {
                 Proj::Bf16(mat) => Some(mat),
-                Proj::Fp8(_) => None,
+                Proj::Fp8(_) | Proj::NvFp4(_) => None,
             })
             .collect()
     }
 }
 
 /// One projection's weights on the device: BF16, or E4M3 codes under one BF16 inverse scale a
-/// 128 x 128 tile, as the checkpoint stores the tensor.
-#[derive(Debug, Clone, Copy)]
+/// 128 x 128 tile, as the checkpoint stores the tensor. The matrix is the typed upload
+/// ([sparkflash_ops::formats::upload]), so its stored dtype and its format's scale count were
+/// checked when it was read.
+#[derive(Debug, Clone)]
 enum Proj {
-    Bf16(GpuMat),
-    Fp8(GpuMatE4m3Tile),
+    Bf16(Mat<Bf16>),
+    Fp8(Mat<Fp8E4m3>),
+    /// E2M1 codes under one E4M3 scale a 16-value group: the routed experts' form.
+    NvFp4(Mat<NvFp4>),
 }
 
 impl Proj {
     /// Output rows.
-    const fn rows(&self) -> usize {
+    fn rows(&self) -> usize {
         match self {
-            Self::Bf16(mat) => mat.rows,
-            Self::Fp8(mat) => mat.rows,
+            Self::Bf16(mat) => mat.rows(),
+            Self::Fp8(mat) => mat.rows(),
+            Self::NvFp4(mat) => mat.rows(),
         }
     }
 
     /// The token passes' table entries: the weight and its scale grid (none for BF16).
-    const fn table(&self) -> [u64; 2] {
+    fn table(&self) -> [u64; 2] {
         match self {
-            Self::Bf16(mat) => [mat.pointer.0, 0],
-            Self::Fp8(mat) => [mat.weight.0, mat.scales.0],
+            Self::Bf16(mat) => [mat.data().0, 0],
+            Self::Fp8(mat) => [
+                mat.data().0,
+                mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            ],
+            Self::NvFp4(mat) => [
+                mat.data().0,
+                mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            ],
+        }
+    }
+
+    /// The per-tensor f32 multiplier an NVFP4 expert's output takes.
+    fn global(&self) -> Option<f32> {
+        match self {
+            Self::NvFp4(mat) => match mat.scales() {
+                Scales::NvFp4 { global, .. } => Some(*global),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The storage form this projection was uploaded as.
+    fn form(&self) -> ExpertForm {
+        match self {
+            Self::Bf16(_) => ExpertForm::Bf16,
+            Self::Fp8(_) => ExpertForm::Fp8,
+            Self::NvFp4(_) => ExpertForm::NvFp4,
         }
     }
 }
 
 /// One SwiGLU MLP's projections: a dense layer's, or a routed layer's shared expert.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Mlp {
     gate: Proj,
     up: Proj,
@@ -467,7 +515,10 @@ struct Mlp {
 }
 
 /// A layer's MLP on the device.
-#[derive(Debug, Clone, Copy)]
+// A layer's tuple is one entry in a table of a few dozen; boxing the routed form would only move
+// the allocation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
 enum LayerFfn {
     Dense(Mlp),
     Routed {
@@ -475,6 +526,9 @@ enum LayerFfn {
         router: Proj,
         /// The selection's correction bias, f32 an expert, when selection adds one.
         bias: Option<Deviceptr>,
+        /// The NVFP4 experts' three per-tensor scales an expert (gate, up, down), when they
+        /// are stored that way.
+        scales: Option<Deviceptr>,
         /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
         /// BF16), up, its grid, down, its grid.
         table: Deviceptr,
@@ -484,38 +538,137 @@ enum LayerFfn {
     },
 }
 
+/// One loaded kernel and the catalogue entry it was resolved from: the image's symbol list and
+/// the catalogue's precision mask are checked at load, so a launch site holds a handle rather
+/// than a name it looked up.
+#[derive(Clone, Copy)]
+struct Bound {
+    /// The loaded driver function.
+    kernel: Kernel,
+    /// The arithmetic the catalogue entry accepts this body at.
+    precision: Precision,
+}
+
+impl Bound {
+    /// Whether `image` exports `symbol` and the catalogue carries it at `precision`.
+    fn carried(image: Image, symbol: &'static str, precision: Precision) -> Result<(), String> {
+        if !image.exported_symbols().contains(&symbol) {
+            return Err(format!("{} does not export {symbol}", image.name()));
+        }
+        let carried = sparkflash_ops::parts::CATALOGUE.iter().any(|entry| {
+            entry.image == image
+                && entry
+                    .symbols
+                    .iter()
+                    .any(|candidate| candidate.name == symbol && candidate.accepts(precision))
+        });
+        if !carried {
+            return Err(format!(
+                "the catalogue carries no {symbol} in {} accepting {}",
+                image.name(),
+                precision.name()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve `symbol` in `image` at `precision` and load it.
+    ///
+    /// # Errors
+    /// A symbol the image does not export, one the catalogue does not carry at this precision,
+    /// or the driver's load refusal.
+    fn new(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named(cubin, symbol)?;
+        Ok(Self { kernel, precision })
+    }
+
+    /// [Self::new] for a body loaded with a dynamic shared-memory reservation.
+    ///
+    /// # Errors
+    /// As [Self::new], or the driver's attribute call.
+    fn shared(
+        cuda: &Cuda,
+        image: Image,
+        cubin: &'static [u8],
+        symbol: &'static str,
+        precision: Precision,
+        shared_bytes: u32,
+    ) -> Result<Self, String> {
+        Self::carried(image, symbol, precision)?;
+        let (_, kernel) = cuda.load_named_shared(cubin, symbol, shared_bytes)?;
+        Ok(Self { kernel, precision })
+    }
+}
+
+impl From<Bound> for Kernel {
+    fn from(bound: Bound) -> Self {
+        bound.kernel
+    }
+}
+
 /// The routed layers' kernels, loaded when a layer routes.
 #[derive(Clone, Copy)]
 struct MoeKernels {
-    route: Kernel,
-    plan: Kernel,
-    gate_up: Kernel,
-    /// The gate/up pass under a `swiglu_limit`.
-    gate_up_clamped: Kernel,
-    down: Kernel,
-    combine: Kernel,
+    route: Bound,
+    plan: Bound,
+    gate_up: Bound,
+    /// The gate/up pass under a `swiglu_limit`; the NVFP4 body has none.
+    gate_up_clamped: Option<Bound>,
+    down: Bound,
+    combine: Bound,
+    /// Whether the expert bodies read the NVFP4 scale table (their arguments carry it).
+    nvfp4: bool,
 }
 
-/// The kernels this arm launches, loaded once.
+/// The packed BF16 form's four bodies ([sparkflash_ops::packed]), resolved through the catalogue
+/// like the projections.
+#[derive(Clone, Copy)]
+struct PackedKernels {
+    pack: Bound,
+    unpack: Bound,
+    gemv: Bound,
+    gemv4: Bound,
+}
+
+impl PackedKernels {
+    /// The plain handles [packed::PackedSet] takes.
+    fn raw(&self) -> packed::Kernels {
+        packed::Kernels {
+            pack: self.pack.kernel,
+            unpack: self.unpack.kernel,
+            gemv: self.gemv.kernel,
+            gemv4: self.gemv4.kernel,
+        }
+    }
+}
+
+/// The kernels this arm launches, loaded once and bound to the catalogue entry each runs.
 #[derive(Clone, Copy)]
 struct Kernels {
-    add: Kernel,
+    add: Bound,
     /// A group's row sum ([RowSums]) on the device legs.
-    sum_slots: Kernel,
-    deinterleave: Kernel,
-    embed: Kernel,
-    gemv: Kernel,
-    packed: packed::Kernels,
-    rmsnorm: Kernel,
-    rope: Kernel,
-    swiglu: Kernel,
-    swiglu_clamped: Kernel,
-    attention: Kernel,
-    combine: Kernel,
-    cache: Kernel,
-    wide: Kernel,
+    sum_slots: Bound,
+    deinterleave: Bound,
+    embed: Bound,
+    gemv: Bound,
+    packed: PackedKernels,
+    rmsnorm: Bound,
+    rope: Bound,
+    swiglu: Bound,
+    swiglu_clamped: Bound,
+    attention: Bound,
+    combine: Bound,
+    cache: Bound,
+    wide: Bound,
     /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
-    argmax: Kernel,
+    argmax: Bound,
     moe: Option<MoeKernels>,
     fp8: Option<Fp8Kernels>,
     gdn: Option<GdnKernels>,
@@ -525,14 +678,14 @@ struct Kernels {
 /// ([sparkflash_ops::gdn]) with the scan the [ScanPlan] resolves, and the zero a reset state takes.
 #[derive(Clone, Copy)]
 struct GdnKernels {
-    conv: Kernel,
-    history: Kernel,
-    prep: Kernel,
-    scan: Kernel,
+    conv: Bound,
+    history: Bound,
+    prep: Bound,
+    scan: Bound,
     /// The plan's scan grid and block.
     scan_launch: ((u32, u32, u32), (u32, u32, u32)),
-    gate: Kernel,
-    zero: Kernel,
+    gate: Bound,
+    zero: Bound,
 }
 
 /// Threads in the block `q4e_argmax_slices` reduces a vocabulary with: the 32 warps its block
@@ -543,8 +696,8 @@ const ARGMAX_BLOCK: u32 = 1024;
 /// tiled E4M3 GEMV for decode rows and the FP8 tensor-core tile for prompt chunks.
 #[derive(Clone, Copy)]
 struct Fp8Kernels {
-    gemv: Kernel,
-    tile: Kernel,
+    gemv: Bound,
+    tile: Bound,
 }
 
 // SAFETY: a Kernel is an opaque driver function word, and the handle only names it. The context
@@ -563,41 +716,90 @@ impl Kernels {
         formats: Formats,
         scan: Option<&ScanPlan>,
     ) -> Result<Self, String> {
-        let named = |image: &'static [u8], name: &'static str| {
-            cuda.load_named(image, name).map(|(_, kernel)| kernel)
+        let token = |symbol: &'static str, precision: Precision| {
+            Bound::new(cuda, Image::Qwen4Exp, qwen4_exp_cubin(), symbol, precision)
         };
-        let staged = |name: &'static str, bytes: u32| {
-            cuda.load_named_shared(qwen4_moe_cubin(), name, bytes)
-                .map(|(_, kernel)| kernel)
-        };
-        let (gate_up, gate_up_clamped, down) = if formats.fp8_experts {
-            (
-                "q4e_expert_gate_up_fp8",
-                "q4e_expert_gate_up_fp8_clamped",
-                "q4e_expert_down_fp8",
+        let attention = |symbol: &'static str, precision: Precision| {
+            Bound::new(
+                cuda,
+                Image::Qwen4Attn,
+                qwen4_attn_cubin(),
+                symbol,
+                precision,
             )
-        } else {
-            (
+        };
+        let (gate_up, gate_up_clamped, down, expert_precision) = match formats.expert {
+            ExpertForm::Fp8 => (
+                "q4e_expert_gate_up_fp8",
+                Some("q4e_expert_gate_up_fp8_clamped"),
+                "q4e_expert_down_fp8",
+                Precision::Fp8E4M3,
+            ),
+            ExpertForm::NvFp4 => (
+                "q4e_expert_gate_up",
+                None,
+                "q4e_expert_down",
+                Precision::NvFp4,
+            ),
+            ExpertForm::Bf16 => (
                 "q4e_expert_gate_up_bf16",
-                "q4e_expert_gate_up_bf16_clamped",
+                Some("q4e_expert_gate_up_bf16_clamped"),
                 "q4e_expert_down_bf16",
+                Precision::Bf16,
+            ),
+        };
+        let staged = |symbol: &'static str, precision: Precision, bytes: u32| {
+            Bound::shared(
+                cuda,
+                Image::Qwen4Moe,
+                qwen4_moe_cubin(),
+                symbol,
+                precision,
+                bytes,
             )
         };
         let moe = match stage {
             Some(bytes) => Some(MoeKernels {
-                route: named(qwen4_moe_cubin(), "q4e_route")?,
-                plan: named(moe_plan_cubin(), "moe_plan")?,
-                gate_up: staged(gate_up, bytes)?,
-                gate_up_clamped: staged(gate_up_clamped, bytes)?,
-                down: staged(down, bytes)?,
-                combine: named(qwen4_moe_cubin(), "q4e_moe_combine")?,
+                route: Bound::new(
+                    cuda,
+                    Image::Qwen4Moe,
+                    qwen4_moe_cubin(),
+                    "q4e_route",
+                    Precision::Bf16,
+                )?,
+                plan: Bound::new(
+                    cuda,
+                    Image::MoePlan,
+                    moe_plan_cubin(),
+                    "moe_plan",
+                    Precision::Bf16,
+                )?,
+                gate_up: staged(gate_up, expert_precision, bytes)?,
+                gate_up_clamped: gate_up_clamped
+                    .map(|symbol| staged(symbol, expert_precision, bytes))
+                    .transpose()?,
+                down: staged(down, expert_precision, bytes)?,
+                nvfp4: formats.expert == ExpertForm::NvFp4,
+                combine: Bound::new(
+                    cuda,
+                    Image::Qwen4Moe,
+                    qwen4_moe_cubin(),
+                    "q4e_moe_combine",
+                    Precision::Bf16,
+                )?,
             }),
             None => None,
         };
         let fp8 = if formats.fp8 {
             Some(Fp8Kernels {
-                gemv: named(qwen4_exp_cubin(), "q4e_gemv_tiled_e4m3_tile")?,
-                tile: named(qwen4_prefill_cubin(), "q4p_dense_fp8")?,
+                gemv: token("q4e_gemv_tiled_e4m3_tile", Precision::Fp8E4M3)?,
+                tile: Bound::new(
+                    cuda,
+                    Image::Qwen4Prefill,
+                    qwen4_prefill_cubin(),
+                    "q4p_dense_fp8",
+                    Precision::Fp8E4M3,
+                )?,
             })
         } else {
             None
@@ -605,39 +807,71 @@ impl Kernels {
         let gdn = match scan {
             Some(plan) => {
                 let launch = plan.launch();
+                let scan = |symbol: &'static str| {
+                    Bound::new(
+                        cuda,
+                        Image::Qwen4Scan,
+                        qwen4_scan_cubin(),
+                        symbol,
+                        Precision::Bf16,
+                    )
+                };
                 Some(GdnKernels {
-                    conv: named(qwen4_scan_cubin(), "q4p_gdn_conv")?,
-                    history: named(qwen4_scan_cubin(), "q4p_gdn_conv_state")?,
-                    prep: named(qwen4_scan_cubin(), "q4p_gdn_prep")?,
-                    scan: named(qwen4_scan_cubin(), launch.kernel.symbol)?,
+                    conv: scan("q4p_gdn_conv")?,
+                    history: scan("q4p_gdn_conv_state")?,
+                    prep: scan("q4p_gdn_prep")?,
+                    scan: scan(launch.kernel.symbol)?,
                     scan_launch: (launch.grid, launch.block),
-                    gate: named(qwen4_scan_cubin(), "q4p_gdn_gate")?,
-                    zero: named(qwen4_exp_cubin(), "q4e_zero")?,
+                    gate: scan("q4p_gdn_gate")?,
+                    zero: token("q4e_zero", Precision::Bf16)?,
                 })
             }
             None => None,
+        };
+        debug_assert!(
+            fp8.as_ref()
+                .is_none_or(|kernels| kernels.gemv.precision == Precision::Fp8E4M3),
+            "the FP8 GEMV resolves at FP8 E4M3"
+        );
+        debug_assert!(
+            moe.as_ref().is_none_or(|kernels| {
+                kernels.gate_up.precision == expert_precision
+                    && kernels.down.precision == expert_precision
+            }),
+            "the expert bodies resolve at the checkpoint's expert format"
+        );
+        let packed = PackedKernels {
+            pack: token("q4e_pack_bf16", Precision::Bf16)?,
+            unpack: token("q4e_unpack_bf16", Precision::Bf16)?,
+            gemv: token("q4e_gemv_packed", Precision::Bf16)?,
+            gemv4: token("q4e_gemv4_packed", Precision::Bf16)?,
         };
         Ok(Self {
             moe,
             fp8,
             gdn,
-            add: named(qwen4_exp_cubin(), "q4e_add")?,
-            sum_slots: named(qwen4_exp_cubin(), "q4e_sum_slots")?,
-            deinterleave: named(qwen4_exp_cubin(), "q4e_deinterleave")?,
-            embed: named(qwen4_exp_cubin(), "q4e_embed")?,
-            gemv: named(qwen4_exp_cubin(), "q4e_gemv_bf16")?,
-            packed: packed::Kernels::load(cuda)?,
-            rmsnorm: named(qwen4_exp_cubin(), "q4e_rmsnorm")?,
-            rope: named(qwen4_exp_cubin(), "q4e_rope")?,
-            swiglu: named(qwen4_exp_cubin(), "q4e_swiglu")?,
-            swiglu_clamped: named(qwen4_exp_cubin(), "q4e_swiglu_clamped")?,
-            attention: named(qwen4_attn_cubin(), "q4e_attn_full")?,
-            combine: named(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
-            cache: named(qwen4_attn_cubin(), "q4e_cache_bf16")?,
-            argmax: named(qwen4_exp_cubin(), "q4e_argmax_slices")?,
-            wide: cuda
-                .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
-                .map(|(_, kernel)| kernel)?,
+            add: token("q4e_add", Precision::Bf16)?,
+            sum_slots: token("q4e_sum_slots", Precision::Bf16)?,
+            deinterleave: token("q4e_deinterleave", Precision::Bf16)?,
+            embed: token("q4e_embed", Precision::Bf16)?,
+            gemv: token("q4e_gemv_bf16", Precision::Bf16)?,
+            packed,
+            rmsnorm: token("q4e_rmsnorm", Precision::Bf16)?,
+            rope: token("q4e_rope", Precision::Bf16)?,
+            swiglu: token("q4e_swiglu", Precision::Bf16)?,
+            swiglu_clamped: token("q4e_swiglu_clamped", Precision::Bf16)?,
+            attention: attention("q4e_attn_full", Precision::Bf16)?,
+            combine: attention("q4e_attn_full_combine", Precision::Bf16)?,
+            cache: attention("q4e_cache_bf16", Precision::Bf16)?,
+            argmax: token("q4e_argmax_slices", Precision::Bf16)?,
+            wide: Bound::shared(
+                cuda,
+                Image::Dory,
+                dory_cubin(),
+                "dory_mma_wide",
+                Precision::Bf16,
+                WIDE_SHARED,
+            )?,
         })
     }
 }
@@ -645,20 +879,33 @@ impl Kernels {
 /// The weight formats a checkpoint declares, which pick the kernels the arm loads.
 #[derive(Debug, Clone, Copy)]
 struct Formats {
-    /// Any projection or expert is block-scaled FP8.
+    /// Any dense projection is block-scaled FP8.
     fp8: bool,
-    /// The routed experts are block-scaled FP8 (else BF16).
-    fp8_experts: bool,
+    /// The stored format of the routed experts, which the arm reads at that format.
+    expert: ExpertForm,
+}
+
+/// The three storage forms the routed experts are read at, and the token bodies that read each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertForm {
+    Bf16,
+    Fp8,
+    /// E2M1 codes with one E4M3 scale a 16-value group and a per-tensor f32 scale.
+    NvFp4,
 }
 
 impl Formats {
     fn of(architecture: &Architecture) -> Self {
         let tiled = |format: WeightFormat| matches!(format, WeightFormat::Fp8Tile { .. });
         let quantization = &architecture.quantization;
-        let fp8_experts = tiled(quantization.expert_format);
+        let expert = match quantization.expert_format {
+            WeightFormat::Fp8Tile { .. } => ExpertForm::Fp8,
+            WeightFormat::NvFp4 { .. } => ExpertForm::NvFp4,
+            _ => ExpertForm::Bf16,
+        };
         Self {
-            fp8: fp8_experts || tiled(quantization.dense_format),
-            fp8_experts,
+            fp8: tiled(quantization.dense_format) || expert == ExpertForm::Fp8,
+            expert,
         }
     }
 }
@@ -667,8 +914,8 @@ impl Formats {
 struct Shared {
     cuda: CudaHandle,
     kernels: Kernels,
-    embed: GpuMat,
-    head: GpuMat,
+    embed: Mat<Bf16>,
+    head: Mat<Bf16>,
     norm: Deviceptr,
     layers: Vec<Layer>,
     hidden: usize,
@@ -812,22 +1059,24 @@ impl DenseDeviceBackend {
             &shapes,
             &mut owned,
         );
-        let (embed, head, norm, layers, weight_bytes) = match uploaded {
-            Ok(uploaded) => uploaded,
-            Err(error) => {
-                let references: Vec<&Deviceptr> = owned.iter().collect();
-                cuda.free_buffers(&references);
-                return Err(error);
-            }
-        };
+        let (embed, head, norm, layers, weight_bytes, mut ledger_rows, widen, labels) =
+            match uploaded {
+                Ok(uploaded) => uploaded,
+                Err(error) => {
+                    let references: Vec<&Deviceptr> = owned.iter().collect();
+                    cuda.free_buffers(&references);
+                    return Err(error);
+                }
+            };
         // The token GEMVs read a packed copy of every BF16 projection; the wide tiles keep the
-        // BF16 rows, so the copy sits beside them.
+        // BF16 rows, so the copy sits beside them. Each packed copy is a `Mat<Bf16>` too, with
+        // the form's word layout as its scales, so the uploader checks the row geometry.
         let mut packed = PackedSet::new(Form::from_env()?, Placement::Beside);
-        let matrices: Vec<_> = std::iter::once(head)
+        let matrices: Vec<_> = std::iter::once(head.clone())
             .chain(layers.iter().flat_map(Layer::bf16_projections))
-            .map(|mat| (mat.pointer, mat.rows, mat.columns))
+            .map(|mat| (mat.data(), mat.rows(), mat.columns()))
             .collect();
-        let packed_bytes = match packed.pack(&cuda, &kernels.packed, &matrices, 0) {
+        let packed_bytes = match packed.pack(&cuda, &kernels.packed.raw(), &matrices, 0) {
             Ok((_, packed_bytes)) => packed_bytes,
             Err(error) => {
                 let references: Vec<&Deviceptr> = owned.iter().collect();
@@ -835,8 +1084,61 @@ impl DenseDeviceBackend {
                 return Err(error);
             }
         };
+        for (pointer, rows, columns) in &matrices {
+            let Some(copy) = packed.get(*pointer) else {
+                continue;
+            };
+            let planes = copy.planes();
+            let name = labels
+                .iter()
+                .find(|(address, _)| address == &pointer.0)
+                .map_or_else(
+                    || format!("packed {rows} x {columns} BF16 projection"),
+                    |(_, name)| format!("packed {name}"),
+                );
+            let spec = TensorSpec {
+                name,
+                dtype: DType::BF16,
+                shape: vec![*rows, *columns],
+            };
+            let typed = match typed_bf16(
+                &spec,
+                *rows,
+                *columns,
+                Deviceptr(planes[0]),
+                copy.row_bytes(),
+                Scales::packed_bf16(PackedBf16 {
+                    escapes: Deviceptr(planes[2]),
+                    offsets: Deviceptr(planes[1]),
+                    row_bytes: copy.row_bytes(),
+                    order: PackedOrder::Walk,
+                }),
+            ) {
+                Ok(typed) => typed,
+                Err(error) => {
+                    let references: Vec<&Deviceptr> = owned.iter().collect();
+                    cuda.free_buffers(&references);
+                    return Err(error);
+                }
+            };
+            ledger_rows.push(LedgerRow::new(
+                typed.spec().name.clone(),
+                typed.format(),
+                typed.format(),
+                typed.bytes_per_token(),
+            ));
+        }
         owned.extend(packed.allocations());
         let weight_bytes = weight_bytes + packed_bytes;
+        let ledger = match FormatLedger::boot(ledger_rows, &widen) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                let references: Vec<&Deviceptr> = owned.iter().collect();
+                cuda.free_buffers(&references);
+                return Err(error.to_string());
+            }
+        };
+        eprintln!("[dense] {ledger}");
         eprintln!("[dense] {}", packed.summary());
         let lanes = SequenceLanes::plan(
             &cuda,
@@ -1154,17 +1456,195 @@ fn linear_sizes(layers: &[Layer]) -> Vec<usize> {
         .collect()
 }
 
-type Uploaded = (GpuMat, GpuMat, Deviceptr, Vec<Layer>, usize);
+type Uploaded = (
+    Mat<Bf16>,
+    Mat<Bf16>,
+    Deviceptr,
+    Vec<Layer>,
+    usize,
+    Vec<LedgerRow>,
+    WidenLog,
+    Vec<(u64, String)>,
+);
+
+/// The typed matrix of a stored BF16 tensor this arm reads: [upload] checks the container's
+/// stored dtype and the scale count of the format (none, or the packed word layout).
+fn typed_bf16(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    scales: Scales,
+) -> Result<Mat<Bf16>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Bf16>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored FP8 E4M3 tensor: [upload] checks the stored dtype and that the
+/// inverse-scale plane has exactly one entry a 128 x 128 tile.
+#[allow(clippy::too_many_arguments)]
+fn typed_fp8(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    stride: usize,
+    blocks: Deviceptr,
+    entries: usize,
+    scale_dtype: DType,
+) -> Result<Mat<Fp8E4m3>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns],
+    };
+    upload_format::<Fp8E4m3>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride,
+        scales: Scales::fp8_e4m3(blocks, entries, scale_dtype),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored NVFP4 expert weight: [upload] checks the packed U8 container
+/// against the logical shape and that the per-16 scale plane has one entry a group.
+fn typed_nvfp4(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    blocks: Deviceptr,
+    entries: usize,
+    global: f32,
+) -> Result<Mat<NvFp4>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns.div_ceil(2)],
+    };
+    upload_format::<NvFp4>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride: columns.div_ceil(2),
+        scales: Scales::nvfp4(blocks, entries, global),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The shape `runs` select from a `[rows, columns]` matrix: row runs stacked, or column runs
+/// side by side.
+fn run_shape(runs: &[Run], (rows, columns): (usize, usize)) -> Result<(usize, usize), String> {
+    let stacked = runs.iter().all(|run| matches!(run, Run::Rows(..)));
+    if runs.is_empty() {
+        return Err("no part of the matrix is named".to_owned());
+    }
+    if !stacked && !runs.iter().all(|run| matches!(run, Run::Columns(..))) {
+        return Err("the parts mix row and column runs".to_owned());
+    }
+    let mut total = 0;
+    for run in runs {
+        let (first, count, within) = match *run {
+            Run::Rows(first, count) => (first, count, rows),
+            Run::Columns(first, count) => (first, count, columns),
+        };
+        if count == 0 || first + count > within {
+            return Err(format!(
+                "{run:?} is not a part of a [{rows}, {columns}] matrix"
+            ));
+        }
+        total += count;
+    }
+    Ok(if stacked {
+        (total, columns)
+    } else {
+        (rows, total)
+    })
+}
+
+/// The bytes `runs` select from the row-major `bytes` of a `[rows, columns]` matrix stored
+/// `unit` logical values to a byte, and the logical shape of the selection.
+fn run_slice(
+    bytes: &[u8],
+    (rows, columns): (usize, usize),
+    runs: &[Run],
+    unit: usize,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    if !columns.is_multiple_of(unit) {
+        return Err(format!(
+            "the [{rows}, {columns}] matrix is not a whole number of {unit}-value groups"
+        ));
+    }
+    let (out_rows, out_columns) = run_shape(runs, (rows, columns))?;
+    let stored_columns = columns / unit;
+    let row = stored_columns;
+    if bytes.len() != rows * row {
+        return Err(format!(
+            "the tensor is {} bytes, expected {} for a [{rows}, {columns}] matrix {unit} values a byte",
+            bytes.len(),
+            rows * row
+        ));
+    }
+    if runs.iter().all(|run| matches!(run, Run::Rows(..))) {
+        let out = runs
+            .iter()
+            .flat_map(|run| match *run {
+                Run::Rows(first, count) | Run::Columns(first, count) => {
+                    &bytes[first * row..(first + count) * row]
+                }
+            })
+            .copied()
+            .collect();
+        return Ok((out_rows, out_columns, out));
+    }
+    let mut out = Vec::with_capacity(out_rows * out_columns / unit);
+    for index in 0..rows {
+        let start = index * row;
+        for run in runs {
+            let Run::Columns(first, count) = *run else {
+                unreachable!("the runs are all columns");
+            };
+            if !first.is_multiple_of(unit) || !count.is_multiple_of(unit) {
+                return Err(format!("{run:?} splits a {unit}-value column group"));
+            }
+            out.extend_from_slice(&bytes[start + first / unit..start + (first + count) / unit]);
+        }
+    }
+    Ok((out_rows, out_columns, out))
+}
 
 /// One upload's tensors: each checked at its architecture shape (BF16, or a projection's
-/// block-scaled E4M3), and every allocation in `owned` as it is made, so a failure part way frees
-/// what was uploaded.
+/// block-scaled E4M3), through [upload] so its stored dtype and scale count are checked too, and
+/// every allocation in `owned` as it is made, so a failure part way frees what was uploaded.
 struct Uploads<'a> {
     uploader: DraftUploader<'a>,
     source: &'a dyn WeightSource,
     formats: Formats,
     owned: &'a mut Vec<Deviceptr>,
     bytes: usize,
+    /// Every part's stored and arithmetic format and the bytes it reads for one token, in upload
+    /// order: the boot format ledger's rows.
+    rows: Vec<LedgerRow>,
+    /// Each uploaded matrix's device address and its checkpoint name, so the packed copies built
+    /// after the upload can be named in the ledger.
+    labels: Vec<(u64, String)>,
+    /// The one widening this load path takes (a BF16 router bias read at f32), recorded with its
+    /// reason so boot can accept it.
+    widen: WidenLog,
 }
 
 impl Uploads<'_> {
@@ -1174,16 +1654,43 @@ impl Uploads<'_> {
         pointer
     }
 
-    fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<GpuMat, String> {
-        bf16(self.source, name, &[rows, columns])?;
-        let mat = self.uploader.mat(name, rows, columns)?;
-        self.keep(mat.pointer, rows * columns * 2);
-        Ok(mat)
+    /// One ledger row for a typed matrix, with the bytes one token reads from it.
+    fn record(&mut self, part: &str, format: FormatKind, bytes: u128, data: Deviceptr) {
+        self.rows.push(LedgerRow::new(part, format, format, bytes));
+        self.labels.push((data.0, part.to_owned()));
     }
 
+    fn mat(&mut self, name: &str, rows: usize, columns: usize) -> Result<Mat<Bf16>, String> {
+        bf16(self.source, name, &[rows, columns])?;
+        let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+        let mat = self.uploader.mat(name, rows, columns)?;
+        let typed = typed_bf16(
+            &spec,
+            rows,
+            columns,
+            mat.pointer,
+            columns * 2,
+            Scales::none(),
+        )?;
+        self.keep(mat.pointer, rows * columns * 2);
+        self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
+        Ok(typed)
+    }
+
+    /// A BF16 vector (a norm, a rotary table, a conv filter).
+    ///
+    /// A vector stays a `Deviceptr`: [Mat] is a matrix with a row stride and a format's scale
+    /// plane, and these tensors have neither. Its stored and arithmetic formats and its bytes a
+    /// token are still ledger rows.
     fn vector(&mut self, name: &str, width: usize) -> Result<Deviceptr, String> {
         bf16(self.source, name, &[width])?;
         let pointer = self.uploader.vector(name, width)?;
+        self.rows.push(LedgerRow::new(
+            name,
+            FormatKind::Bf16,
+            FormatKind::Bf16,
+            (width * 2) as u128,
+        ));
         Ok(self.keep(pointer, width * 2))
     }
 
@@ -1202,11 +1709,57 @@ impl Uploads<'_> {
         runs: &[Run],
     ) -> Result<Proj, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+        if spec.dtype == DType::U8 {
+            if self.formats.expert != ExpertForm::NvFp4 {
+                return Err(format!(
+                    "{name} is U8, the NVFP4 expert form, and the checkpoint declares {:?} experts",
+                    self.formats.expert
+                ));
+            }
+            let codes = self.uploader.read(name, rows * columns.div_ceil(2))?;
+            let scales_name = name
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.weight_scale"))
+                .ok_or_else(|| format!("{name} is not a .weight, so it names no weight_scale"))?;
+            let global_name = name
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.weight_scale_2"))
+                .ok_or_else(|| format!("{name} is not a .weight, so it names no weight_scale_2"))?;
+            let scales = self
+                .uploader
+                .read(&scales_name, rows * columns.div_ceil(16))?;
+            let global = self.uploader.read(&global_name, 4)?;
+            let global = f32::from_le_bytes(
+                global
+                    .as_chunks::<4>()
+                    .0
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("{global_name} holds no f32"))?,
+            );
+            let (out_rows, out_columns, codes) = run_slice(&codes, (rows, columns), runs, 2)?;
+            let (_, _, scales) = run_slice(&scales, (rows, columns), runs, 16)?;
+            let entries = out_rows * out_columns.div_ceil(16);
+            let data = self.keep(self.uploader.bytes(&codes)?, codes.len());
+            let blocks = self.keep(self.uploader.bytes(&scales)?, scales.len());
+            let typed = typed_nvfp4(&spec, out_rows, out_columns, data, blocks, entries, global)?;
+            self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
+            return Ok(Proj::NvFp4(typed));
+        }
         if spec.dtype != DType::F8E4M3 {
             bf16(self.source, name, &[rows, columns])?;
             let mat = self.uploader.mat_parts(name, (rows, columns), runs)?;
+            let typed = typed_bf16(
+                &spec,
+                mat.rows,
+                mat.columns,
+                mat.pointer,
+                mat.columns * 2,
+                Scales::none(),
+            )?;
             self.keep(mat.pointer, mat.rows * mat.columns * 2);
-            return Ok(Proj::Bf16(mat));
+            self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
+            return Ok(Proj::Bf16(typed));
         }
         if !self.formats.fp8 {
             return Err(format!(
@@ -1227,7 +1780,18 @@ impl Uploads<'_> {
                 mat.columns
             ));
         }
-        Ok(Proj::Fp8(mat))
+        let typed = typed_fp8(
+            &spec,
+            mat.rows,
+            mat.columns,
+            mat.weight,
+            mat.columns,
+            mat.scales,
+            grid,
+            DType::BF16,
+        )?;
+        self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
+        Ok(Proj::Fp8(typed))
     }
 
     /// A SwiGLU of `width` columns, of which this rank holds `count` from `first`: the gate and up
@@ -1251,6 +1815,10 @@ impl Uploads<'_> {
     /// depthwise filter's channels or a per-head vector's heads.
     /// An f32 vector of `elements` on the device, from an F32 tensor or a BF16 one widened (a
     /// router's correction bias, which every rank holds whole).
+    ///
+    /// This is the one widen-line waiver: a vector is not a [Mat], and the stored BF16 tensor is
+    /// read at f32 arithmetic. The `widen` record below is what boot accepts, and the ledger row
+    /// says what was stored and what is read.
     fn floats(&mut self, name: &str, elements: usize) -> Result<Deviceptr, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
         if spec.elements() != elements as u128 {
@@ -1259,18 +1827,30 @@ impl Uploads<'_> {
                 spec.shape
             ));
         }
-        let bytes = match spec.dtype {
-            DType::F32 => self.uploader.read(name, elements * 4)?,
-            DType::BF16 => self
-                .uploader
-                .read(name, elements * 2)?
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|word| {
-                    f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes()
-                })
-                .collect(),
+        let (stored, bytes) = match spec.dtype {
+            DType::F32 => (FormatKind::F32, self.uploader.read(name, elements * 4)?),
+            DType::BF16 => {
+                // The one widening this arm takes, and it is exact: every BF16 value is an f32.
+                widen::<Bf16, F32Format>(
+                    name,
+                    "the router bias is f32 arithmetic; the release stores bf16, and every bf16 \
+                     value is an f32",
+                    &mut self.widen,
+                )
+                .map_err(|error| error.to_string())?;
+                (
+                    FormatKind::Bf16,
+                    self.uploader
+                        .read(name, elements * 2)?
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .flat_map(|word| {
+                            f32::from_bits(u32::from(u16::from_le_bytes(*word)) << 16).to_le_bytes()
+                        })
+                        .collect(),
+                )
+            }
             other => {
                 return Err(format!(
                     "{name} is {other:?}; the shared dense device arm reads an F32 or BF16 vector"
@@ -1278,6 +1858,14 @@ impl Uploads<'_> {
             }
         };
         let pointer = self.uploader.bytes(&bytes)?;
+        // The device arithmetic reads the f32 vector; the row says what was stored and what is
+        // read, and the record above is what lets boot accept the difference.
+        self.rows.push(LedgerRow::new(
+            name,
+            stored,
+            FormatKind::F32,
+            (elements * 4) as u128,
+        ));
         Ok(self.keep(pointer, elements * 4))
     }
 
@@ -1288,6 +1876,12 @@ impl Uploads<'_> {
         runs: &[Run],
     ) -> Result<Deviceptr, String> {
         let mat = self.uploader.mat_parts(name, (rows, width), runs)?;
+        self.rows.push(LedgerRow::new(
+            name,
+            FormatKind::Bf16,
+            FormatKind::Bf16,
+            (mat.rows * width * 2) as u128,
+        ));
         Ok(self.keep(mat.pointer, mat.rows * width * 2))
     }
 
@@ -1461,7 +2055,14 @@ impl Uploads<'_> {
             None => None,
         };
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
-        let fp8 = self.formats.fp8_experts;
+        let mut scales_table = Vec::with_capacity(routed.experts * 3 * 4);
+        let form = self.formats.expert;
+        if form == ExpertForm::NvFp4 && shape.clamp.is_some() {
+            return Err(format!(
+                "layer {index} stores NVFP4 experts under a swiglu_limit, and the NVFP4 token body \
+                 has no clamped form"
+            ));
+        }
         for (number, expert) in experts.iter().enumerate() {
             let Mlp { gate, up, down } = self.mlp(
                 expert,
@@ -1474,21 +2075,30 @@ impl Uploads<'_> {
                 (&up, &expert.up),
                 (&down, &expert.down),
             ] {
-                if matches!(proj, Proj::Fp8(_)) != fp8 {
+                if proj.form() != form {
                     return Err(format!(
-                        "layer {index}'s expert {number} stores {name} as {}, and the checkpoint \
-                         declares {} experts, the one form the expert passes are loaded in",
-                        if fp8 { "BF16" } else { "E4M3" },
-                        if fp8 { "block-scaled FP8" } else { "BF16" }
+                        "layer {index}'s expert {number} stores {name} as {:?}, and the checkpoint \
+                         declares {form:?} experts, the one form the expert passes are loaded in",
+                        proj.form()
                     ));
                 }
                 for address in proj.table() {
                     table.extend(address.to_le_bytes());
                 }
+                if let Some(global) = proj.global() {
+                    scales_table.extend(global.to_le_bytes());
+                }
             }
         }
         let table = self.uploader.bytes(&table)?;
         let table = self.keep(table, routed.experts * 6 * 8);
+        let scales = match form {
+            ExpertForm::NvFp4 => {
+                let bytes = self.uploader.bytes(&scales_table)?;
+                Some(self.keep(bytes, routed.experts * 3 * 4))
+            }
+            ExpertForm::Bf16 | ExpertForm::Fp8 => None,
+        };
         let shared = match (shared, shape.intermediate) {
             (Some(names), width) if width > 0 => Some(self.mlp(
                 names,
@@ -1516,11 +2126,11 @@ impl Uploads<'_> {
                     ));
                 }
                 let pointer = self.uploader.vector(name, hidden)?;
-                Some(Proj::Bf16(GpuMat {
-                    pointer: self.keep(pointer, hidden * 2),
-                    rows: 1,
-                    columns: hidden,
-                }))
+                let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+                let typed = typed_bf16(&spec, 1, hidden, pointer, hidden * 2, Scales::none())?;
+                self.keep(pointer, hidden * 2);
+                self.record(name, typed.format(), typed.bytes_per_token(), typed.data());
+                Some(Proj::Bf16(typed))
             }
             None => None,
         };
@@ -1532,6 +2142,7 @@ impl Uploads<'_> {
         Ok(LayerFfn::Routed {
             router,
             bias,
+            scales,
             table,
             shared,
             shared_gate,
@@ -1558,12 +2169,19 @@ fn upload(
         formats,
         owned,
         bytes: 0,
+        labels: Vec::new(),
+        rows: Vec::new(),
+        widen: WidenLog::new(),
     };
     let hidden = architecture.hidden_size;
     let vocab = architecture.vocab_size;
     let embed = up.mat(&names.embed, vocab, hidden)?;
+    // A token gathers one embedding row, not the whole table.
+    if let Some(row) = up.rows.last_mut() {
+        row.bytes_per_token = (hidden * 2) as u128;
+    }
     let head = if names.head_tied() {
-        embed
+        embed.clone()
     } else {
         up.mat(&names.head, vocab, hidden)?
     };
@@ -1599,7 +2217,9 @@ fn upload(
             ffn,
         });
     }
-    Ok((embed, head, norm, layers, up.bytes))
+    Ok((
+        embed, head, norm, layers, up.bytes, up.rows, up.widen, up.labels,
+    ))
 }
 
 /// Refuses a tensor that is not BF16 at `shape`.
@@ -1626,7 +2246,12 @@ impl Shared {
         }
     }
 
-    fn call<const N: usize>(&self, kernel: Kernel, call: Call<N>) -> Result<(), BackendError> {
+    fn call<const N: usize>(
+        &self,
+        kernel: impl Into<Kernel>,
+        call: Call<N>,
+    ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.cuda
             .launch_async(kernel, call.grid, call.block, &call.args)
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
@@ -1838,9 +2463,9 @@ impl Shared {
                 count,
             );
             self.cuda
-                .launch_async(kernels.scan, grid, block, &args)
+                .launch_async(kernels.scan.kernel, grid, block, &args)
                 .map_err(|error| {
-                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.name()))
+                    BackendError::new(DEVICE, format!("{}: {error}", kernels.scan.kernel.name()))
                 })?;
             first += count;
         }
@@ -1871,6 +2496,10 @@ impl Shared {
         match proj {
             Proj::Bf16(mat) => self.project_bf16(mat, input, output, rows, policy),
             Proj::Fp8(mat) => self.project_fp8(mat, b, input, output, rows, policy),
+            Proj::NvFp4(_) => Err(BackendError::new(
+                DEVICE,
+                "an NVFP4 dense projection: only the routed experts are stored that way",
+            )),
         }
     }
 
@@ -1880,7 +2509,7 @@ impl Shared {
     /// reference's arithmetic to a tolerance.
     fn project_fp8(
         &self,
-        mat: &GpuMatE4m3Tile,
+        mat: &Mat<Fp8E4m3>,
         b: &Buffers,
         input: u64,
         output: u64,
@@ -1901,8 +2530,13 @@ impl Shared {
         let gemv = |input: u64, output: u64, batch: usize| {
             gemv_e4m3_tile(
                 &tiled,
-                kernels.gemv,
-                mat,
+                kernels.gemv.kernel,
+                &GpuMatE4m3Tile {
+                    weight: mat.data(),
+                    scales: mat.scales().blocks().unwrap_or(Deviceptr(0)),
+                    rows: mat.rows(),
+                    columns: mat.columns(),
+                },
                 Deviceptr(input),
                 Deviceptr(output),
                 batch,
@@ -1911,31 +2545,36 @@ impl Shared {
         let batched = || {
             for start in (0..rows).step_by(GEMV_MAX_BATCH) {
                 gemv(
-                    input + (start * mat.columns * 4) as u64,
-                    output + (start * mat.rows * 4) as u64,
+                    input + (start * mat.columns() * 4) as u64,
+                    output + (start * mat.rows() * 4) as u64,
                     GEMV_MAX_BATCH.min(rows - start),
                 )?;
             }
             Ok(())
         };
-        let aligned = [mat.weight.0, input, output]
-            .iter()
-            .all(|address| address.is_multiple_of(16));
-        match route_fp8(policy, mat.rows, mat.columns, rows) {
+        let aligned = [
+            mat.data().0,
+            mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            input,
+            output,
+        ]
+        .iter()
+        .all(|address| address.is_multiple_of(16));
+        match route_fp8(policy, mat.rows(), mat.columns(), rows) {
             Route::RowGemv => gemv(input, output, rows),
             Route::Wide if aligned => {
                 let tile = Fp8Tile::call(
-                    mat.weight.0,
-                    mat.scales.0,
+                    mat.data().0,
+                    mat.scales().blocks().map_or(0, |blocks| blocks.0),
                     input,
                     output,
-                    mat.rows,
-                    mat.columns,
+                    mat.rows(),
+                    mat.columns(),
                     rows,
                 )
                 .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(kernels.tile, tile.grid, tile.block, &tile.args)
+                    .launch_async(kernels.tile.kernel, tile.grid, tile.block, &tile.args)
                     .map_err(|error| BackendError::new(DEVICE, format!("q4p_dense_fp8: {error}")))
             }
             Route::Wide | Route::BatchedGemv => batched(),
@@ -1943,7 +2582,8 @@ impl Shared {
                 DEVICE,
                 format!(
                     "the dense policy routed an FP8 {} x {} projection to {route:?}",
-                    mat.rows, mat.columns
+                    mat.rows(),
+                    mat.columns()
                 ),
             )),
         }
@@ -1953,7 +2593,7 @@ impl Shared {
     /// [route_bf16] picks under `policy` (`None` keeps the row GEMV).
     fn project_bf16(
         &self,
-        mat: &GpuMat,
+        mat: &Mat<Bf16>,
         input: u64,
         output: u64,
         rows: usize,
@@ -1961,7 +2601,7 @@ impl Shared {
     ) -> Result<(), BackendError> {
         // The packed copy where there is one and the activations are a 16-byte load: the same
         // bits from about three quarters of the bytes.
-        let packed = self.packed.get(mat.pointer);
+        let packed = self.packed.get(mat.data());
         let gemv = |input: u64, output: u64, batch: usize| match packed
             .filter(|_| input.is_multiple_of(16))
         {
@@ -1971,7 +2611,7 @@ impl Shared {
                     rows,
                     Deviceptr(input),
                     Deviceptr(output),
-                    (mat.rows, mat.columns),
+                    (mat.rows(), mat.columns()),
                     batch,
                     1,
                 )
@@ -1979,16 +2619,22 @@ impl Shared {
             ),
             None => self.call(
                 self.kernels.gemv,
-                calls::gemv_bf16(mat.pointer.0, input, output, (mat.rows, mat.columns), batch),
+                calls::gemv_bf16(
+                    mat.data().0,
+                    input,
+                    output,
+                    (mat.rows(), mat.columns()),
+                    batch,
+                ),
             ),
         };
-        match route_bf16(policy, mat.rows, mat.columns, rows) {
+        match route_bf16(policy, mat.rows(), mat.columns(), rows) {
             Route::RowGemv => gemv(input, output, rows),
             Route::BatchedGemv => {
                 for start in (0..rows).step_by(GEMV_MAX_BATCH) {
                     gemv(
-                        input + (start * mat.columns * 4) as u64,
-                        output + (start * mat.rows * 4) as u64,
+                        input + (start * mat.columns() * 4) as u64,
+                        output + (start * mat.rows() * 4) as u64,
                         GEMV_MAX_BATCH.min(rows - start),
                     )?;
                 }
@@ -1996,17 +2642,18 @@ impl Shared {
             }
             Route::Wide => {
                 let tile =
-                    WideTile::call(mat.pointer.0, input, output, mat.rows, mat.columns, rows)
+                    WideTile::call(mat.data().0, input, output, mat.rows(), mat.columns(), rows)
                         .map_err(|error| BackendError::new(DEVICE, error))?;
                 self.cuda
-                    .launch_async(self.kernels.wide, tile.grid, tile.block, &tile.args)
+                    .launch_async(self.kernels.wide.kernel, tile.grid, tile.block, &tile.args)
                     .map_err(|error| BackendError::new(DEVICE, format!("dory_mma_wide: {error}")))
             }
             route @ (Route::Skinny | Route::Refuse) => Err(BackendError::new(
                 DEVICE,
                 format!(
                     "the dense policy routed a {} x {} projection to {route:?}",
-                    mat.rows, mat.columns
+                    mat.rows(),
+                    mat.columns()
                 ),
             )),
         }
@@ -2021,10 +2668,11 @@ impl Shared {
 
     fn launch(
         &self,
-        kernel: Kernel,
+        kernel: impl Into<Kernel>,
         (grid, block): Launch,
         args: &[u64],
     ) -> Result<(), BackendError> {
+        let kernel = kernel.into();
         self.cuda
             .launch_async(kernel, grid, block, args)
             .map_err(|error| BackendError::new(DEVICE, format!("{}: {error}", kernel.name())))
@@ -2072,6 +2720,7 @@ impl Shared {
             LayerFfn::Routed {
                 router,
                 bias,
+                scales,
                 table,
                 shared,
                 shared_gate,
@@ -2109,8 +2758,14 @@ impl Shared {
             (rows * top_k, experts, top_k),
         );
         self.launch(kernels.plan, MoePlanCall::launch(), &plan.args())?;
-        let gate_up = [
-            table.0,
+        // The NVFP4 body reads the per-tensor scale table as its second argument; the BF16 and
+        // FP8 bodies read the same six-address table with no second table.
+        let mut gate_up = Vec::with_capacity(11);
+        gate_up.push(table.0);
+        if kernels.nvfp4 {
+            gate_up.push(scales.unwrap_or(Deviceptr(0)).0);
+        }
+        gate_up.extend([
             b.indices.0,
             b.sorted.0,
             b.runs.0,
@@ -2119,33 +2774,40 @@ impl Shared {
             top_k as u64,
             hidden as u64,
             intermediate as u64,
-        ];
+        ]);
         let grid = token::gate_up_grid(intermediate, top_k, rows);
         match layer.shape.clamp {
             None => self.launch(kernels.gate_up, grid, &gate_up)?,
             Some(limit) => {
-                let mut clamped = gate_up.to_vec();
+                let Some(clamped_kernel) = kernels.gate_up_clamped else {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "an NVFP4 expert pass under a swiglu_limit: the body has no clamped form",
+                    ));
+                };
+                let mut clamped = gate_up.clone();
                 clamped.push(u64::from(limit.to_bits()));
-                self.launch(kernels.gate_up_clamped, grid, &clamped)?;
+                self.launch(clamped_kernel, grid, &clamped)?;
             }
         }
-        self.launch(
-            kernels.down,
-            token::down_grid(hidden, top_k, rows),
-            &[
-                table.0,
-                b.indices.0,
-                b.sorted.0,
-                b.runs.0,
-                b.weights.0,
-                b.activated.0,
-                b.expert_partials.0,
-                top_k as u64,
-                hidden as u64,
-                intermediate as u64,
-                top_k as u64,
-            ],
-        )?;
+        let mut down = Vec::with_capacity(12);
+        down.push(table.0);
+        if kernels.nvfp4 {
+            down.push(scales.unwrap_or(Deviceptr(0)).0);
+        }
+        down.extend([
+            b.indices.0,
+            b.sorted.0,
+            b.runs.0,
+            b.weights.0,
+            b.activated.0,
+            b.expert_partials.0,
+            top_k as u64,
+            hidden as u64,
+            intermediate as u64,
+            top_k as u64,
+        ]);
+        self.launch(kernels.down, token::down_grid(hidden, top_k, rows), &down)?;
         match shared {
             Some(mlp) => self.mlp(mlp, layer.shape.clamp, b, b.shared_out, rows, policy)?,
             // The combine always adds a shared row; a layer without one adds zeros.
@@ -2205,8 +2867,22 @@ impl GemvDevice for Tiled<'_> {
         output: Deviceptr,
         rows: usize,
     ) -> Result<(), BackendError> {
+        let spec = TensorSpec {
+            name: "the tiled GEMV's matrix".to_owned(),
+            dtype: DType::BF16,
+            shape: vec![matrix.rows, matrix.columns],
+        };
+        let typed = typed_bf16(
+            &spec,
+            matrix.rows,
+            matrix.columns,
+            matrix.pointer,
+            matrix.columns * 2,
+            Scales::none(),
+        )
+        .map_err(|error| BackendError::new(DEVICE, error))?;
         self.shared
-            .project_bf16(matrix, input.0, output.0, rows, None)
+            .project_bf16(&typed, input.0, output.0, rows, None)
     }
 
     fn tiled_scratch(&self) -> (Deviceptr, Deviceptr) {
@@ -2651,7 +3327,7 @@ fn walk(
     shared.call(
         kernels.embed,
         calls::embed_rows(
-            shared.embed.pointer.0,
+            shared.embed.data().0,
             b.x.0,
             b.tokens.0,
             (hidden, hidden),
@@ -2763,7 +3439,7 @@ fn head_choices(
     shared
         .cuda
         .launch_async(
-            shared.kernels.argmax,
+            shared.kernels.argmax.kernel,
             (rows, 1, 1),
             (ARGMAX_BLOCK, 1, 1),
             &[
@@ -2949,13 +3625,269 @@ impl ModelSession for DenseDeviceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy};
+    use super::{
+        Bound, CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, run_slice,
+        typed_bf16, typed_fp8, typed_nvfp4,
+    };
+    use sparkflash_kernels::cuda_driver::Deviceptr;
+    use sparkflash_kernels::images::Image;
     use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
+    use sparkflash_ops::dflash::Part as Run;
+    use sparkflash_ops::formats::{Bf16, F32 as F32Format, FormatKind, Scales};
+    use sparkflash_ops::plan::Precision;
     use sparkflash_ops::projection::WidePolicy;
     use sparkflash_ops::sampler::Sampler;
+    use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
     use sparkflash_runtime::Walk;
+    use sparkflash_weights::{DType, TensorSpec};
+
+    fn spec(name: &str, dtype: DType, shape: &[usize]) -> TensorSpec {
+        TensorSpec {
+            name: name.to_owned(),
+            dtype,
+            shape: shape.to_vec(),
+        }
+    }
+
+    /// Every symbol `Kernels::load` resolves, with its image and precision. A symbol that drifts
+    /// out of the catalogue then fails here, on the CPU, rather than at a device boot.
+    const LOADED_SYMBOLS: &[(Image, &str, Precision)] = &[
+        (Image::Qwen4Exp, "q4e_add", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_sum_slots", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_deinterleave", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_embed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_pack_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_unpack_bf16", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv_packed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_gemv4_packed", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rmsnorm", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_rope", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_swiglu", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_swiglu_clamped", Precision::Bf16),
+        (
+            Image::Qwen4Exp,
+            "q4e_gemv_tiled_e4m3_tile",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Exp, "q4e_zero", Precision::Bf16),
+        (Image::Qwen4Exp, "q4e_argmax_slices", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_attn_full_combine", Precision::Bf16),
+        (Image::Qwen4Attn, "q4e_cache_bf16", Precision::Bf16),
+        (Image::Qwen4Prefill, "q4p_dense_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Moe, "q4e_route", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_moe_combine", Precision::Bf16),
+        (Image::Qwen4Moe, "q4e_expert_gate_up_bf16", Precision::Bf16),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_bf16_clamped",
+            Precision::Bf16,
+        ),
+        (Image::Qwen4Moe, "q4e_expert_down_bf16", Precision::Bf16),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_fp8",
+            Precision::Fp8E4M3,
+        ),
+        (
+            Image::Qwen4Moe,
+            "q4e_expert_gate_up_fp8_clamped",
+            Precision::Fp8E4M3,
+        ),
+        (Image::Qwen4Moe, "q4e_expert_down_fp8", Precision::Fp8E4M3),
+        (Image::Qwen4Moe, "q4e_expert_gate_up", Precision::NvFp4),
+        (Image::Qwen4Moe, "q4e_expert_down", Precision::NvFp4),
+        (Image::Dory, "dory_mma_wide", Precision::Bf16),
+        (Image::MoePlan, "moe_plan", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_conv", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_conv_state", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_prep", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_scan", Precision::Bf16),
+        (Image::Qwen4Scan, "q4p_gdn_gate", Precision::Bf16),
+    ];
+
+    #[test]
+    fn every_kernel_the_arm_loads_is_in_the_catalogue() {
+        for (image, symbol, precision) in LOADED_SYMBOLS {
+            Bound::carried(*image, symbol, *precision).unwrap_or_else(|error| {
+                panic!("{image:?} {symbol} at {}: {error}", precision.name())
+            });
+        }
+    }
+
+    /// A bound handle names a symbol the image exports and the catalogue carries at the
+    /// handle's precision; a launch site never looks a kernel up by string.
+    #[test]
+    fn a_bound_handle_names_a_catalogued_symbol_and_precision() {
+        Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Bf16)
+            .expect("the catalogue carries q4e_gemv_bf16 at bf16");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_gemv_bf16", Precision::Fp8E4M3)
+            .expect_err("q4e_gemv_bf16 is a bf16 body, not an FP8 one");
+        assert!(error.contains("accepting e4m3"), "{error}");
+        let error = Bound::carried(Image::Qwen4Exp, "q4e_not_a_kernel", Precision::Bf16)
+            .expect_err("the image does not export it");
+        assert!(error.contains("does not export"), "{error}");
+    }
+
+    /// The load path's two checks are [sparkflash_ops::formats::upload]'s: a tensor of another
+    /// stored dtype, or an FP8 tile whose inverse-scale plane is not one entry a 128 x 128 tile,
+    /// is refused before the matrix is built.
+    #[test]
+    fn the_load_path_checks_the_stored_dtype_and_the_scale_count() {
+        let bf16 = spec("layers.0.mlp.up_proj.weight", DType::BF16, &[4, 256]);
+        let typed = typed_bf16(&bf16, 4, 256, Deviceptr(0x1000), 512, Scales::none())
+            .expect("a BF16 projection");
+        assert_eq!(typed.format(), FormatKind::Bf16);
+        assert_eq!(typed.bytes_per_token(), 4 * 512);
+
+        // The same logical matrix stored as U8 codes is not a BF16 Mat.
+        let quantized = spec("layers.0.mlp.up_proj.weight", DType::U8, &[4, 128]);
+        let error = typed_bf16(&quantized, 4, 256, Deviceptr(0x1000), 128, Scales::none())
+            .expect_err("a U8 tensor is not a BF16 Mat");
+        assert!(error.contains("bf16"), "{error}");
+        assert!(error.contains("U8"), "{error}");
+
+        let fp8 = spec("layers.0.mlp.up_proj.weight", DType::F8E4M3, &[4, 256]);
+        let short = typed_fp8(
+            &fp8,
+            4,
+            256,
+            Deviceptr(0x2000),
+            256,
+            Deviceptr(0x3000),
+            1,
+            DType::BF16,
+        )
+        .expect_err("a 4 x 256 FP8 matrix has two 128 x 128 tiles");
+        assert!(short.contains("needs 2"), "{short}");
+        assert!(short.contains("has 1"), "{short}");
+        let typed = typed_fp8(
+            &fp8,
+            4,
+            256,
+            Deviceptr(0x2000),
+            256,
+            Deviceptr(0x3000),
+            2,
+            DType::BF16,
+        )
+        .expect("two inverse scales");
+        assert_eq!(typed.format(), FormatKind::Fp8E4m3);
+        assert_eq!(typed.bytes_per_token(), 4 * 256);
+    }
+
+    /// An NVFP4 expert weight is a packed U8 container read at its logical shape, with one
+    /// E4M3 scale a 16-value group and the per-tensor f32 the body multiplies in.
+    #[test]
+    fn the_nvfp4_expert_load_checks_the_packing_and_the_scale_groups() {
+        let weight = spec(
+            "layers.0.mlp.experts.0.gate_proj.weight",
+            DType::U8,
+            &[64, 128],
+        );
+        let typed = typed_nvfp4(
+            &weight,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            64 * 16,
+            0.25,
+        )
+        .expect("a 64 x 256 NVFP4 matrix");
+        assert_eq!(typed.format(), FormatKind::NvFp4);
+        assert_eq!(typed.rows(), 64);
+        assert_eq!(typed.columns(), 256);
+        assert_eq!(typed.bytes_per_token(), 64 * 128);
+        assert!(matches!(
+            typed.scales(),
+            sparkflash_ops::formats::Scales::NvFp4 { global: 0.25, .. }
+        ));
+
+        // One scale a group is 16 an expert row, not one a row.
+        let error = typed_nvfp4(
+            &weight,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            64,
+            0.25,
+        )
+        .expect_err("the scale plane is short");
+        assert!(error.contains("needs 1024"), "{error}");
+
+        // A BF16 container is not the packed E2M1 form.
+        let unpacked = spec(
+            "layers.0.mlp.experts.0.gate_proj.weight",
+            DType::BF16,
+            &[64, 256],
+        );
+        let error = typed_nvfp4(
+            &unpacked,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            1024,
+            0.25,
+        )
+        .expect_err("a BF16 container is not the packed E2M1 form");
+        assert!(error.contains("nvfp4"), "{error}");
+    }
+
+    /// The expert runs select rows or whole 16-column groups, and a run that splits a group is
+    /// refused rather than read at another group's scale.
+    #[test]
+    fn the_nvfp4_runs_slice_whole_scale_groups() {
+        let rows = 4;
+        let columns = 64;
+        let codes: Vec<u8> = (0..rows * columns / 2).map(|at| at as u8).collect();
+        let (out_rows, out_columns, selected) =
+            run_slice(&codes, (rows, columns), &[Run::Rows(1, 2)], 2).expect("two rows");
+        assert_eq!((out_rows, out_columns), (2, 64));
+        assert_eq!(selected, codes[32..96]);
+
+        let (out_rows, out_columns, selected) =
+            run_slice(&codes, (rows, columns), &[Run::Columns(16, 32)], 2).expect("32 columns");
+        assert_eq!((out_rows, out_columns), (4, 32));
+        assert_eq!(selected.len(), 4 * 16);
+
+        let scales: Vec<u8> = (0..rows * columns / 16).map(|at| at as u8).collect();
+        let error = run_slice(&scales, (rows, columns), &[Run::Columns(8, 16)], 16)
+            .expect_err("eight columns split a 16-value group");
+        assert!(error.contains("splits a 16-value column group"), "{error}");
+    }
+
+    /// Boot refuses a part read at a format its checkpoint does not store unless the load path
+    /// recorded the widening; the router bias is the one this arm takes.
+    #[test]
+    fn boot_refuses_a_widening_the_load_path_did_not_record() {
+        let rows = vec![LedgerRow::new(
+            "layers.0.ffn.router.bias",
+            FormatKind::Bf16,
+            FormatKind::F32,
+            32,
+        )];
+        let error = FormatLedger::boot(rows.clone(), &WidenLog::new())
+            .expect_err("an unrecorded widen is refused");
+        assert!(error.to_string().contains("layers.0.ffn.router.bias"));
+        assert!(error.to_string().contains("bf16"));
+        assert!(error.to_string().contains("f32"));
+
+        let mut log = WidenLog::new();
+        widen::<Bf16, F32Format>(
+            "layers.0.ffn.router.bias",
+            "every bf16 value is an f32",
+            &mut log,
+        )
+        .expect("the recorded widening");
+        let ledger = FormatLedger::boot(rows, &log).expect("a recorded widening boots");
+        assert!(ledger.to_string().contains("widened bf16 -> f32"));
+    }
 
     /// The token the device head's kernel chooses, transcribed from `q4e_argmax_slices`: the
     /// higher value wins, a tie takes the lower index, a NaN never wins, and a row whose first
@@ -3033,19 +3965,25 @@ mod tests {
         let input: Vec<u8> = (0..rows * inner)
             .flat_map(|_| next().to_le_bytes())
             .collect();
-        let (_, gemv) = cuda
-            .load_named(
-                sparkflash_kernels::images::qwen4_exp_cubin(),
-                "q4e_gemv_bf16",
-            )
-            .expect("the Qwen4-Exp image carries q4e_gemv_bf16");
-        let (_, wide) = cuda
-            .load_named_shared(
-                sparkflash_kernels::images::dory_cubin(),
-                "dory_mma_wide",
-                sparkflash_ops::projection::WIDE_SHARED,
-            )
-            .expect("the Dory image carries dory_mma_wide");
+        let gemv = Bound::new(
+            &cuda,
+            Image::Qwen4Exp,
+            sparkflash_kernels::images::qwen4_exp_cubin(),
+            "q4e_gemv_bf16",
+            Precision::Bf16,
+        )
+        .expect("the Qwen4-Exp image carries q4e_gemv_bf16")
+        .kernel;
+        let wide = Bound::shared(
+            &cuda,
+            Image::Dory,
+            sparkflash_kernels::images::dory_cubin(),
+            "dory_mma_wide",
+            Precision::Bf16,
+            sparkflash_ops::projection::WIDE_SHARED,
+        )
+        .expect("the Dory image carries dory_mma_wide")
+        .kernel;
         let mut total = 0;
         let w = cuda.alloc(weight.len(), &mut total).expect("the weights");
         let x = cuda.alloc(input.len(), &mut total).expect("the input");
@@ -3131,9 +4069,15 @@ mod tests {
             eprintln!("skipping the device head choice: this build has no Qwen4-Exp cubin");
             return;
         }
-        let (_, argmax) = cuda
-            .load_named(image, "q4e_argmax_slices")
-            .expect("the Qwen4-Exp image carries q4e_argmax_slices");
+        let argmax = Bound::new(
+            &cuda,
+            Image::Qwen4Exp,
+            image,
+            "q4e_argmax_slices",
+            Precision::Bf16,
+        )
+        .expect("the Qwen4-Exp image carries q4e_argmax_slices")
+        .kernel;
         let rows = toy_rows();
         let vocab = rows[0].len();
         assert!(rows.iter().all(|row| row.len() == vocab));

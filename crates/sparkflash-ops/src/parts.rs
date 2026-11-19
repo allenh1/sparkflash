@@ -835,6 +835,8 @@ pub const CATALOGUE: &[PartKernel] = &[
                 "q4e_attn_full_combine",
                 &[Precision::Bf16, Precision::Fp8E4M3],
             ),
+            // The BF16 cache a boundary row appends to its lane.
+            sym("q4e_cache_bf16", &[Precision::Bf16]),
         ],
         true,
     ),
@@ -1068,6 +1070,12 @@ pub const CATALOGUE: &[PartKernel] = &[
             row_dec("q4e_gemv_tiled_e4m3", &[Precision::Fp8E4M3]),
             // The Qwen3.5/3.6 FP8 release's block-scaled dense projections (BF16 tile scales).
             row_dec("q4e_gemv_tiled_e4m3_tile", &[Precision::Fp8E4M3]),
+            // The packed BF16 form's row walk and its load-time pack/unpack pair
+            // (sparkflash_ops::packed): the dense arm reads the same bits from fewer bytes.
+            row_dec("q4e_gemv_packed", &[Precision::Bf16]),
+            row_dec("q4e_gemv4_packed", &[Precision::Bf16]),
+            sym("q4e_pack_bf16", &[Precision::Bf16]),
+            sym("q4e_unpack_bf16", &[Precision::Bf16]),
         ],
         false,
     ),
@@ -1106,7 +1114,15 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::Activation,
         Image::TOKEN,
-        &[sym("q4e_swiglu", &[Precision::Bf16, Precision::F32])],
+        &[
+            sym("q4e_swiglu", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_swiglu_clamped", &[Precision::Bf16, Precision::F32]),
+            // The residual add, the chunk's layout fan-out and the state zero the dense arm
+            // launches beside its projections.
+            sym("q4e_add", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_deinterleave", &[Precision::Bf16, Precision::F32]),
+            sym("q4e_zero", &[Precision::Bf16, Precision::F32]),
+        ],
         false,
     ),
     sm121(
@@ -1375,7 +1391,11 @@ pub const CATALOGUE: &[PartKernel] = &[
     sm121(
         Part::MoeRouter,
         Image::ROUTED_EXPERTS,
-        &[sym("q4e_router", &[Precision::Bf16, Precision::F32])],
+        &[
+            sym("q4e_router", &[Precision::Bf16, Precision::F32]),
+            // The shared score/top-k/renormalise body the dense arm launches.
+            sym("q4e_route", &[Precision::Bf16, Precision::F32]),
+        ],
         false,
     ),
     sm121(
@@ -1443,6 +1463,20 @@ pub const CATALOGUE: &[PartKernel] = &[
             // resolves the grouped `q4p_moe_*_fp8` symbols below.
             row("q4e_expert_gate_up_fp8", &[Precision::Fp8E4M3]),
             row("q4e_expert_down_fp8", &[Precision::Fp8E4M3]),
+        ],
+        false,
+    ),
+    // The BF16 token expert bodies the shared dense arm's routed layers read. They are dense
+    // GEMMs an expert run, listed apart from the grouped entries so a BF16 document does not
+    // claim a tensor-core grouped body it has none of.
+    sm121(
+        Part::DenseGemm,
+        Image::ROUTED_EXPERTS,
+        &[
+            row_dec("q4e_expert_gate_up_bf16", &[Precision::Bf16]),
+            row_dec("q4e_expert_gate_up_bf16_clamped", &[Precision::Bf16]),
+            row_dec("q4e_expert_down_bf16", &[Precision::Bf16]),
+            row_dec("q4e_expert_gate_up_fp8_clamped", &[Precision::Fp8E4M3]),
         ],
         false,
     ),
@@ -2790,6 +2824,12 @@ fn dense_arm_reads(format: WeightFormat) -> bool {
     )
 }
 
+/// Whether the shared dense arm reads routed experts stored as `format`: [dense_arm_reads], or
+/// NVFP4 (E2M1 codes, one E4M3 scale a 16-value group and a per-tensor f32).
+fn dense_arm_reads_experts(format: WeightFormat) -> bool {
+    dense_arm_reads(format) || matches!(format, WeightFormat::NvFp4 { .. })
+}
+
 /// Why the shared dense arm's routed experts cannot execute `moe`, if they cannot.
 fn dense_moe_refusal(
     architecture: &Architecture,
@@ -2797,9 +2837,9 @@ fn dense_moe_refusal(
 ) -> Option<String> {
     use sparkflash_model::architecture::{Activation, Score};
     let format = architecture.quantization.expert_format;
-    if !dense_arm_reads(format) {
+    if !dense_arm_reads_experts(format) {
         return Some(format!(
-            "they are {}, and the arm reads BF16 or 128 x 128 block-scaled FP8 experts",
+            "they are {}, and the arm reads BF16, 128 x 128 block-scaled FP8 or NVFP4 experts",
             format.name()
         ));
     }
@@ -2825,13 +2865,13 @@ fn dense_moe_refusal(
         ));
     }
     let hidden = architecture.hidden_size;
-    let (multiple, rows) = if format == WeightFormat::Bf16 {
-        (DENSE_BF16_EXPERT_RUN, "BF16 rows eight columns at a time")
-    } else {
-        (
+    let (multiple, rows) = match format {
+        WeightFormat::Bf16 => (DENSE_BF16_EXPERT_RUN, "BF16 rows eight columns at a time"),
+        WeightFormat::NvFp4 { .. } => (16, "NVFP4 rows a 16-value scale group at a time"),
+        _ => (
             E4M3_TILE,
             "block-scaled FP8 rows a 128-column scale tile at a time",
-        )
+        ),
     };
     if !hidden.is_multiple_of(multiple)
         || moe.intermediate == 0
