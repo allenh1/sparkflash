@@ -364,8 +364,9 @@ pub(super) fn band_exchange(
 /// The body is the prompt tile's chain over one to eight rows: the arm's `BATCH_ROWS`, the
 /// precisions it stores (NVFP4 and MXFP8), both activation planes (`PLANES=both`), the grouped
 /// table, the shapes the bodies cover (whole 32-column K runs and whole eight-column writes;
-/// the NVFP4 bodies walk 128-column K blocks) and a band whose down projection does not gather.
-/// Everything else keeps the arm's row walk.
+/// the NVFP4 bodies walk 128-column K blocks; the down pass's 64- or 128-column CTAs tile the
+/// output rows) and a band whose down projection does not gather. Everything else keeps the arm's
+/// row walk.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn expert_rows_body_fits(
     rows: usize,
@@ -385,7 +386,14 @@ pub(super) fn expert_rows_body_fits(
         && table
         && hidden.is_multiple_of(32)
         && intermediate.is_multiple_of(32)
-        && down_rows.is_multiple_of(8)
+        // The down pass's grid covers the output columns in whole CTAs: 64 a CTA in the rows
+        // body, 128 in the MXFP8 tile body. A remainder would leave columns the mix reads
+        // unwritten, so a shape the grids do not tile keeps the row walk.
+        && down_rows.is_multiple_of(if experts == ExpertBody::MxFp8 {
+            grouped::DOWN_COLUMNS
+        } else {
+            grouped::ROWS_DOWN_COLUMNS
+        })
         && down_columns.is_multiple_of(32)
         && (if experts == ExpertBody::MxFp8 {
             // The MXFP8 body walks the tile's 64-column K stages.
@@ -3373,6 +3381,38 @@ mod tests {
             4096,
             2048,
             (4096, 2000)
+        ));
+        // The down pass's CTAs cover the output rows 64 (the rows body) or 128 (the MXFP8 tile)
+        // at a time. A remainder would leave columns the mix reads unwritten.
+        assert!(!fits(
+            1,
+            ExpertBody::NvFp4,
+            ActivationPlanes::Both,
+            false,
+            true,
+            4096,
+            2048,
+            (4128, 2048)
+        ));
+        assert!(!fits(
+            1,
+            ExpertBody::MxFp8,
+            ActivationPlanes::Both,
+            false,
+            true,
+            4096,
+            2048,
+            (4160, 2048)
+        ));
+        assert!(fits(
+            1,
+            ExpertBody::MxFp8,
+            ActivationPlanes::Both,
+            false,
+            true,
+            4096,
+            2048,
+            (4224, 2048)
         ));
     }
 
