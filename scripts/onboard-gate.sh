@@ -237,12 +237,12 @@ cat "$conformance_log"
 
 echo
 echo "onboard-gate: conformance result (crate $CRATE):"
-report="$(grep -E '^conformance: .*: (PASS|SKIP|FAIL|NEEDS-FIXTURE)(: |$)' "$conformance_log" || true)"
+report="$(grep -E 'conformance: .*: (PASS|SKIP|FAIL|NEEDS-FIXTURE)(: |$)' "$conformance_log" || true)"
 if [ -z "$report" ]; then
     echo "  FAIL  the conformance target produced no check result (exit $conformance_exit); see the log above"
     conformance_exit=1
 else
-    printf '%s\n' "$report" | sed -e 's/^conformance: //' -e 's/: PASS$/  PASS/' \
+    printf '%s\n' "$report" | sed -e 's/^.*conformance: /conformance: /' -e 's/^conformance: //' -e 's/: PASS$/  PASS/' \
         -e 's/: SKIP: /  SKIP  /' -e 's/: FAIL: /  FAIL  /' \
         -e 's/: NEEDS-FIXTURE: /  NEEDS-FIXTURE  /' | awk '{ printf "  %s\n", $0 }'
     if printf '%s\n' "$report" | grep -qE ': (FAIL|NEEDS-FIXTURE)(: |$)'; then
