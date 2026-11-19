@@ -145,15 +145,15 @@ does not exist, and an approved bump that changes nothing.
 reset it. A reference's `server` card is what the capturing binary reported, and it is outside the
 fingerprint: the registry can name a capture's fingerprint only after the capture exists, so a
 first capture reads `unregistered`, and a recapture names the version and fingerprint it replaced.
-The registry entry is the record; neither `check` nor `ci` reads the card. The card names the build
-the capture came from: `binary_sha256` is the sha256 of the server binary and `commit` is the git
-revision of the tree it was built from, taken from `capture --binary` (or `SPARKFLASH_BIN`) and
-`capture --repo` (default: the checkout the tool runs from). When either cannot be determined the
-card records null and `build_note` gives the one-line reason; a value is never invented. A reference
-captured before those fields existed simply has neither, and the card is outside the fingerprint, so
-naming a build changes no bits. `text` evidence is weaker than `logprobs`: an arithmetic change
-that flips no greedy token is invisible to it. DeepSeek's TP=4 device path is the only `text`
-configuration.
+The registry entry is the record; `check` and `ci` accept the card's shape but never compare it.
+The card names the build the capture came from: `binary_sha256` is the sha256 of the server binary
+and `commit` is the git revision of the tree it was built from, taken from `capture --binary` (or
+`SPARKFLASH_BIN`) and `capture --repo` (default: the checkout the tool runs from). When either
+cannot be determined the card records null and `build_note` gives the one-line reason; a value is
+never invented. A reference captured before those fields existed simply has neither, and the card
+is outside the fingerprint, so naming a build changes no bits. `text` evidence is weaker than
+`logprobs`: an arithmetic change that flips no greedy token is invisible to it. DeepSeek's TP=4
+device path is the only `text` configuration.
 
 ### The served identity
 
@@ -163,7 +163,9 @@ The binary embeds the registry. At boot every serve path prints one line:
 sparkflash numerics: <model> world=4 profile=reference plan=tp arch=sm_121a status=registered registered_version=1 fingerprint=<16 hex> evidence=logprobs overrides=none
 ```
 
-and `/v1/models` carries the same as `numerics` beside `build`. The status is one of:
+and `/v1/models` carries the same as `numerics` beside `build`. When the served entry records an
+approval, the line appends `approved=<date>` and the card's `numerics` carries the `approved`
+object (`decision`, `date`, `report`). The status is one of:
 
 - `registered`: the registry has an entry and no arithmetic switch is set; `version` is the
   entry's.
