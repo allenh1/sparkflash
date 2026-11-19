@@ -38,7 +38,11 @@ const ENV_READ_EXCEPTIONS: &[(&str, usize)] = &[
     ("sparkflash-model-dense", 2),
     ("sparkflash-model-glm5-next", 2),
     ("sparkflash-model-inkling2", 20),
-    ("sparkflash-model-qwen4-exp", 2),
+    // The device arm reads the numerics dumps' switches once a session
+    // (SPARKFLASH_NUMERICS_COVERAGE/_MONITORS/_MODEL/_SAMPLE). They select a diagnostic dump
+    // path, not served arithmetic, so they stay out of the profile table like the recorders'
+    // own reads in sparkflash-model; the third read is the device arm's `Switches`.
+    ("sparkflash-model-qwen4-exp", 3),
 ];
 
 /// The repository root, from this crate's manifest directory.

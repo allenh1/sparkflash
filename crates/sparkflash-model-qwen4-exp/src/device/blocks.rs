@@ -740,6 +740,9 @@ impl DeviceSequence {
             ],
         )?;
         self.prof_mark("router")?;
+        // One hit a chosen expert, into the input this forward opened (docs/NUMERICS.md §5);
+        // with SPARKFLASH_NUMERICS_COVERAGE unset this is one `Option` check.
+        self.record_routing(layer, batch)?;
         let tensor_cores = match moe.experts {
             GpuExperts::Nvfp4 { table, scales } if chunk => {
                 self.routed_experts_mma(table, scales, mixed, batch)?
@@ -788,7 +791,10 @@ impl DeviceSequence {
             "moe_combine_out",
             self.branch,
             batch * config.hidden_size,
-        )
+        )?;
+        // The first forward is the monitor probe; a later one is a different probe and the
+        // recorder's own rule stops it, once, in `begin` (docs/NUMERICS.md §5).
+        self.record_probe(layer)
     }
 
     /// The routed experts on the token kernels: the slots sorted into runs of one expert, then

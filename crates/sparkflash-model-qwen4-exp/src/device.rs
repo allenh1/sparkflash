@@ -90,6 +90,7 @@ use crate::tensor::{DEVICE_RESIDENT_BYTES, Role};
 mod batch;
 mod blocks;
 mod dflash;
+mod numerics;
 mod prefill;
 pub(crate) mod tp;
 mod walk;
@@ -3671,6 +3672,10 @@ struct DeviceSequence {
     spec_trace: bool,
     /// The rows of the forward in flight, so a hash probe can name each row's position.
     probe_rows: usize,
+    /// The numerics dumps' switches, read once when the session is made (docs/NUMERICS.md §5).
+    numerics: numerics::Switches,
+    /// This forward's recorders; `None` between forwards and with both switches unset.
+    record: RefCell<Option<numerics::Forward>>,
     sampling: Sampling,
     sampler: crate::sampling::Sampler,
     eos: Vec<u32>,
@@ -4329,6 +4334,115 @@ impl DeviceSequence {
             base + rows,
             fnv1a(&defined)
         );
+        Ok(())
+    }
+
+    /// Open this forward's numerics recorders, when a switch names a path (docs/NUMERICS.md §5).
+    ///
+    /// Off is the default: both switches unset leaves `None`, and the layer hooks below then cost
+    /// one `Option` check each.
+    fn begin_numerics(&self, tokens: &[u32]) {
+        self.record
+            .replace(self.numerics.begin(tokens, self.position));
+    }
+
+    /// Write the dumps this forward filled, if it had any. A write that fails is logged once by
+    /// the recorder's own wrapper; serving goes on.
+    fn finish_numerics(&self) {
+        if let Some(forward) = self.record.replace(None) {
+            forward.finish();
+        }
+    }
+
+    /// Count this layer's chosen experts in the coverage dump: copy the router's
+    /// `[batch][top-k]` ids back and hand them to the recorder.
+    fn record_routing(&self, layer: usize, batch: usize) -> Result<(), BackendError> {
+        let mut record = self.record.borrow_mut();
+        let Some(forward) = record.as_mut() else {
+            return Ok(());
+        };
+        if !forward.coverage_enabled() {
+            return Ok(());
+        }
+        let count = batch * self.backend.config.num_experts_per_tok;
+        let mut bytes = vec![0u8; count * 4];
+        self.backend
+            .cuda
+            .copy_dtoh_on(self.clock(), &mut bytes, &self.expert_indices)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        forward.routing(layer, &numerics::experts(&bytes));
+        Ok(())
+    }
+
+    /// Sample the probe's first row into the monitor dump: the layer's branch output and each
+    /// routed expert's output.
+    ///
+    /// The expert kernels write `weight * body` a slot into `expert_accumulator`, and
+    /// `moe_combine` writes the layer's branch; the sampled expert body is the slot divided by
+    /// its routing weight, which is the row's probability at that slot. The MTP layer is a draft
+    /// pass and is not recorded, and a sharded arm's branch is one rank's share of the sum, so
+    /// the monitor dump is the world-1 arm's.
+    fn record_probe(&self, layer: usize) -> Result<(), BackendError> {
+        let mut record = self.record.borrow_mut();
+        let Some(forward) = record.as_mut() else {
+            return Ok(());
+        };
+        if !forward.monitors_enabled() {
+            return Ok(());
+        }
+        let config = &self.backend.config;
+        if layer >= config.num_hidden_layers {
+            return Ok(());
+        }
+        if self.backend.tp.is_some() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "sparkflash numerics: the sharded arm combines only this rank's expert share, \
+                     so monitor dumps are recorded on the world-1 arm; not recording"
+                );
+            });
+            return Ok(());
+        }
+        let hidden = config.hidden_size;
+        let topk = config.num_experts_per_tok;
+        let cuda = &self.backend.cuda;
+        let mut branch = vec![0u8; hidden * 4];
+        cuda.copy_dtoh_on(self.clock(), &mut branch, &self.branch)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let mut ids = vec![0u8; topk * 4];
+        cuda.copy_dtoh_on(self.clock(), &mut ids, &self.expert_indices)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let mut weights = vec![0u8; config.num_experts * 4];
+        cuda.copy_dtoh_on(self.clock(), &mut weights, &self.probabilities)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let mut partials = vec![0u8; topk * hidden * 4];
+        cuda.copy_dtoh_on(self.clock(), &mut partials, &self.expert_accumulator)
+            .map_err(|error| BackendError::new("qwen4_device", error))?;
+        let ids: Vec<i32> = ids
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| i32::from_le_bytes(*chunk))
+            .collect();
+        let weights = numerics::floats(&weights);
+        let mut experts = Vec::with_capacity(topk);
+        for slot in 0..topk {
+            let Some(expert) = ids.get(slot).copied().filter(|expert| *expert >= 0) else {
+                continue;
+            };
+            let weight = weights.get(slot).copied().unwrap_or(0.0);
+            if weight == 0.0 || !weight.is_finite() {
+                continue;
+            }
+            let row = &partials[slot * hidden * 4..(slot + 1) * hidden * 4];
+            let values = numerics::floats(row)
+                .into_iter()
+                .map(|value| value / weight)
+                .collect();
+            experts.push((expert as usize, values));
+        }
+        forward.probe(layer, &numerics::floats(&branch), &experts);
         Ok(())
     }
 
@@ -5402,6 +5516,9 @@ impl DeviceSequence {
         let batch = tokens.len();
         self.back(self.position + batch)?;
         self.probe_rows = batch;
+        // This forward is one named coverage input and the monitor probe, when either switch
+        // names a path; off, `begin` is an `Option` check (docs/NUMERICS.md §5).
+        self.begin_numerics(tokens);
         debug_assert!((1..=self.backend.prefill.chunk).contains(&batch));
         debug_assert!(
             logit_rows == usize::MAX
@@ -5535,17 +5652,20 @@ impl DeviceSequence {
         let Some(last_hyper) = last_hyper else {
             prof::report(self.position + batch - 1, batch);
             self.position += batch;
+            self.finish_numerics();
             return Ok(None);
         };
         if defer {
             self.pending_head = Some(last_hyper);
             prof::report(self.position + batch - 1, batch);
             self.position += batch;
+            self.finish_numerics();
             return Ok(None);
         }
         let logits = self.finish_head(last_hyper, head_rows)?;
         prof::report(self.position + batch - 1, batch);
         self.position += batch;
+        self.finish_numerics();
         Ok(Some(logits))
     }
 
@@ -6261,6 +6381,12 @@ impl DeviceSequence {
                 .spec_trace
                 .unwrap_or(false),
             probe_rows: 1,
+            numerics: numerics::Switches::from_env(
+                crate::MODEL_ID,
+                vec![config.num_experts; config.num_hidden_layers],
+                config.hidden_size,
+            ),
+            record: RefCell::new(None),
             ple_host_staging: buffers.ple_host_staging,
             token_staging: buffers.token_staging,
             ple_hashers,
