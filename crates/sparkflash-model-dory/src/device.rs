@@ -2268,8 +2268,9 @@ fn dense_rows_fits(matrix: &DeviceMat, input: Deviceptr, batch: usize) -> bool {
 }
 
 /// One to four projections of one `input` of `batch` rows through `q4p_dense_rows`, the wide
-/// tile's few-row body: each output's row is `dory_mma_wide`'s row, and a matrix with a packed
-/// copy is read from the copy (its BF16 rows' bits from three quarters of the bytes).
+/// tile's few-row body: each output's row is `dory_mma_wide`'s row, read from the matrix's BF16
+/// rows. (The body's packed path is Qwen's packed copy of the same words; the arm's packed copies
+/// stay with the wider row GEMV.)
 fn dense_rows(
     cuda: &Cuda,
     kernels: &Kernels,
@@ -2294,18 +2295,6 @@ fn dense_rows(
             matrix.rows as u64,
             1,
         ]);
-        if let Some(copy) = matrix
-            .packed
-            .filter(|copy| copy.admits(batch, matrix.columns, input).is_ok())
-        {
-            let [rows, offsets, entries] = copy.planes();
-            args[45 + slot * 4..45 + slot * 4 + 4].copy_from_slice(&[
-                rows,
-                offsets,
-                entries,
-                copy.row_bytes() as u64,
-            ]);
-        }
         columns += matrix.rows.div_ceil(32);
     }
     args[27] = columns as u64;
@@ -2422,7 +2411,14 @@ fn gemv_group(
         .iter()
         .all(|(matrix, _)| dense_rows_fits(matrix, input, batch))
     {
-        return dense_rows(cuda, kernels, projections, input, batch);
+        // One launch a matrix: the body's chain is per matrix and row, so a matrix's output is
+        // the bytes its lone launch gives it, packed copy or not (the grouped launch is what
+        // the arm's old fused GEMV was; the rows body's launch does not need to fuse to keep
+        // the bits).
+        for (matrix, output) in projections {
+            dense_rows(cuda, kernels, &[(matrix, *output)], input, batch)?;
+        }
+        return Ok(());
     }
     // A missing slot is zero rows of the first matrix: the kernel never reaches it.
     let slot = |index: usize| {

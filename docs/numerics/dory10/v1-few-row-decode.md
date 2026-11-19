@@ -31,12 +31,14 @@ instead of `q4e_gemv_bf16` / `q4e_gemv4_bf16`. `dory_mma_wide` - the prompt tile
 split into a bf16 head and the bf16 of its remainder, each 16-column K step's head MMA and then
 its remainder, K ascending), so a decode row is a cold prompt row.
 
-- Up to four projections of one input go in one launch, as the arm's fused GEMV did; each
-  matrix's output keeps the tile's chain.
-- A matrix with a packed BF16 copy is read from the copy: the packed body rebuilds the BF16
-  rows' words, so the packed row is the BF16 tile's row from three quarters of the bytes.
+- Each projection is one `q4p_dense_rows` launch: the body's chain is per matrix and row, so
+  a matrix's output is the bytes its lone launch gives it (the arm's old fused GEMV grouped
+  four projections into one launch; the few-row body does not need to fuse to keep the bits).
+- The body reads each matrix's BF16 rows. The arm's packed copies stay with the wider row
+  GEMV: the catalogue's packed few-row symbol is a separate body, and the packed copy carries
+  the same words, so this is a bytes choice and not an arithmetic one.
 - A wider chunk keeps `dory_mma_wide` (nine rows up), and a shape the body does not cover
-  (whole eight-column writes and a whole 32-column K run) keeps the packed or BF16 row GEMV.
+  (whole eight-column writes and a whole 32-column K run) keeps the BF16 row GEMV.
 - No body was added: the catalogue's BF16 few-row body serves this precision.
 
 ## What was measured
