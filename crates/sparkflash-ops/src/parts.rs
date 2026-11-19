@@ -2816,6 +2816,12 @@ fn dense_arm_reads(format: WeightFormat) -> bool {
     )
 }
 
+/// Whether the shared dense arm reads routed experts stored as `format`: [dense_arm_reads], or
+/// NVFP4 (E2M1 codes, one E4M3 scale a 16-value group and a per-tensor f32).
+fn dense_arm_reads_experts(format: WeightFormat) -> bool {
+    dense_arm_reads(format) || matches!(format, WeightFormat::NvFp4 { .. })
+}
+
 /// Why the shared dense arm's routed experts cannot execute `moe`, if they cannot.
 fn dense_moe_refusal(
     architecture: &Architecture,
@@ -2823,9 +2829,9 @@ fn dense_moe_refusal(
 ) -> Option<String> {
     use sparkflash_model::architecture::{Activation, Score};
     let format = architecture.quantization.expert_format;
-    if !dense_arm_reads(format) {
+    if !dense_arm_reads_experts(format) {
         return Some(format!(
-            "they are {}, and the arm reads BF16 or 128 x 128 block-scaled FP8 experts",
+            "they are {}, and the arm reads BF16, 128 x 128 block-scaled FP8 or NVFP4 experts",
             format.name()
         ));
     }
@@ -2851,13 +2857,13 @@ fn dense_moe_refusal(
         ));
     }
     let hidden = architecture.hidden_size;
-    let (multiple, rows) = if format == WeightFormat::Bf16 {
-        (DENSE_BF16_EXPERT_RUN, "BF16 rows eight columns at a time")
-    } else {
-        (
+    let (multiple, rows) = match format {
+        WeightFormat::Bf16 => (DENSE_BF16_EXPERT_RUN, "BF16 rows eight columns at a time"),
+        WeightFormat::NvFp4 { .. } => (16, "NVFP4 rows a 16-value scale group at a time"),
+        _ => (
             E4M3_TILE,
             "block-scaled FP8 rows a 128-column scale tile at a time",
-        )
+        ),
     };
     if !hidden.is_multiple_of(multiple)
         || moe.intermediate == 0

@@ -83,8 +83,8 @@ use sparkflash_ops::calls::{self, Call, FullAttention, RmsNorm, Rope};
 use sparkflash_ops::dflash::{DraftUploader, Part as Run};
 use sparkflash_ops::engine_plan::{EnginePlan, PlanError};
 use sparkflash_ops::formats::{
-    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, PackedBf16, PackedOrder, Scales, Tensor,
-    upload as upload_format,
+    Bf16, F32 as F32Format, FormatKind, Fp8E4m3, Mat, NvFp4, PackedBf16, PackedOrder, Scales,
+    Tensor, upload as upload_format,
 };
 use sparkflash_ops::gdn::{self, GdnGeometry, gdn_qk_row};
 use sparkflash_ops::gemv::{
@@ -278,6 +278,10 @@ impl Shape {
             architecture.quantization.expert_format,
             WeightFormat::Fp8Tile { .. }
         );
+        let nvfp4_experts = matches!(
+            architecture.quantization.expert_format,
+            WeightFormat::NvFp4 { .. }
+        );
         let (intermediate, routed) = match &layer.ffn {
             Ffn::Dense(dense) => {
                 let (first, width) =
@@ -300,7 +304,9 @@ impl Shape {
                 // A share is whole runs of what the expert passes read at a time (a scale tile
                 // of FP8, eight BF16 columns), the remainder to the first ranks: an even split
                 // of a 136-wide expert is two 68-wide shares the BF16 passes cannot read.
-                let run = if fp8_experts {
+                let run = if nvfp4_experts {
+                    16
+                } else if fp8_experts {
                     E4M3_TILE
                 } else {
                     sparkflash_ops::parts::DENSE_BF16_EXPERT_RUN
@@ -436,7 +442,7 @@ impl Layer {
             .into_iter()
             .filter_map(|projection| match projection {
                 Proj::Bf16(mat) => Some(mat),
-                Proj::Fp8(_) => None,
+                Proj::Fp8(_) | Proj::NvFp4(_) => None,
             })
             .collect()
     }
@@ -450,6 +456,8 @@ impl Layer {
 enum Proj {
     Bf16(Mat<Bf16>),
     Fp8(Mat<Fp8E4m3>),
+    /// E2M1 codes under one E4M3 scale a 16-value group: the routed experts' form.
+    NvFp4(Mat<NvFp4>),
 }
 
 impl Proj {
@@ -458,6 +466,7 @@ impl Proj {
         match self {
             Self::Bf16(mat) => mat.rows(),
             Self::Fp8(mat) => mat.rows(),
+            Self::NvFp4(mat) => mat.rows(),
         }
     }
 
@@ -469,6 +478,30 @@ impl Proj {
                 mat.data().0,
                 mat.scales().blocks().map_or(0, |blocks| blocks.0),
             ],
+            Self::NvFp4(mat) => [
+                mat.data().0,
+                mat.scales().blocks().map_or(0, |blocks| blocks.0),
+            ],
+        }
+    }
+
+    /// The per-tensor f32 multiplier an NVFP4 expert's output takes.
+    fn global(&self) -> Option<f32> {
+        match self {
+            Self::NvFp4(mat) => match mat.scales() {
+                Scales::NvFp4 { global, .. } => Some(*global),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The storage form this projection was uploaded as.
+    fn form(&self) -> ExpertForm {
+        match self {
+            Self::Bf16(_) => ExpertForm::Bf16,
+            Self::Fp8(_) => ExpertForm::Fp8,
+            Self::NvFp4(_) => ExpertForm::NvFp4,
         }
     }
 }
@@ -482,6 +515,9 @@ struct Mlp {
 }
 
 /// A layer's MLP on the device.
+// A layer's tuple is one entry in a table of a few dozen; boxing the routed form would only move
+// the allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum LayerFfn {
     Dense(Mlp),
@@ -490,6 +526,9 @@ enum LayerFfn {
         router: Proj,
         /// The selection's correction bias, f32 an expert, when selection adds one.
         bias: Option<Deviceptr>,
+        /// The NVFP4 experts' three per-tensor scales an expert (gate, up, down), when they
+        /// are stored that way.
+        scales: Option<Deviceptr>,
         /// Six addresses an expert, the token passes' table: gate, its scale grid (unread for
         /// BF16), up, its grid, down, its grid.
         table: Deviceptr,
@@ -580,10 +619,12 @@ struct MoeKernels {
     route: Bound,
     plan: Bound,
     gate_up: Bound,
-    /// The gate/up pass under a `swiglu_limit`.
-    gate_up_clamped: Bound,
+    /// The gate/up pass under a `swiglu_limit`; the NVFP4 body has none.
+    gate_up_clamped: Option<Bound>,
     down: Bound,
     combine: Bound,
+    /// Whether the expert bodies read the NVFP4 scale table (their arguments carry it).
+    nvfp4: bool,
 }
 
 /// The packed BF16 form's four bodies ([sparkflash_ops::packed]), resolved through the catalogue
@@ -687,20 +728,25 @@ impl Kernels {
                 precision,
             )
         };
-        let (gate_up, gate_up_clamped, down, expert_precision) = if formats.fp8_experts {
-            (
+        let (gate_up, gate_up_clamped, down, expert_precision) = match formats.expert {
+            ExpertForm::Fp8 => (
                 "q4e_expert_gate_up_fp8",
-                "q4e_expert_gate_up_fp8_clamped",
+                Some("q4e_expert_gate_up_fp8_clamped"),
                 "q4e_expert_down_fp8",
                 Precision::Fp8E4M3,
-            )
-        } else {
-            (
+            ),
+            ExpertForm::NvFp4 => (
+                "q4e_expert_gate_up",
+                None,
+                "q4e_expert_down",
+                Precision::NvFp4,
+            ),
+            ExpertForm::Bf16 => (
                 "q4e_expert_gate_up_bf16",
-                "q4e_expert_gate_up_bf16_clamped",
+                Some("q4e_expert_gate_up_bf16_clamped"),
                 "q4e_expert_down_bf16",
                 Precision::Bf16,
-            )
+            ),
         };
         let staged = |symbol: &'static str, precision: Precision, bytes: u32| {
             Bound::shared(
@@ -729,8 +775,11 @@ impl Kernels {
                     Precision::Bf16,
                 )?,
                 gate_up: staged(gate_up, expert_precision, bytes)?,
-                gate_up_clamped: staged(gate_up_clamped, expert_precision, bytes)?,
+                gate_up_clamped: gate_up_clamped
+                    .map(|symbol| staged(symbol, expert_precision, bytes))
+                    .transpose()?,
                 down: staged(down, expert_precision, bytes)?,
+                nvfp4: formats.expert == ExpertForm::NvFp4,
                 combine: Bound::new(
                     cuda,
                     Image::Qwen4Moe,
@@ -830,20 +879,33 @@ impl Kernels {
 /// The weight formats a checkpoint declares, which pick the kernels the arm loads.
 #[derive(Debug, Clone, Copy)]
 struct Formats {
-    /// Any projection or expert is block-scaled FP8.
+    /// Any dense projection is block-scaled FP8.
     fp8: bool,
-    /// The routed experts are block-scaled FP8 (else BF16).
-    fp8_experts: bool,
+    /// The stored format of the routed experts, which the arm reads at that format.
+    expert: ExpertForm,
+}
+
+/// The three storage forms the routed experts are read at, and the token bodies that read each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertForm {
+    Bf16,
+    Fp8,
+    /// E2M1 codes with one E4M3 scale a 16-value group and a per-tensor f32 scale.
+    NvFp4,
 }
 
 impl Formats {
     fn of(architecture: &Architecture) -> Self {
         let tiled = |format: WeightFormat| matches!(format, WeightFormat::Fp8Tile { .. });
         let quantization = &architecture.quantization;
-        let fp8_experts = tiled(quantization.expert_format);
+        let expert = match quantization.expert_format {
+            WeightFormat::Fp8Tile { .. } => ExpertForm::Fp8,
+            WeightFormat::NvFp4 { .. } => ExpertForm::NvFp4,
+            _ => ExpertForm::Bf16,
+        };
         Self {
-            fp8: fp8_experts || tiled(quantization.dense_format),
-            fp8_experts,
+            fp8: tiled(quantization.dense_format) || expert == ExpertForm::Fp8,
+            expert,
         }
     }
 }
@@ -1423,6 +1485,7 @@ fn typed_bf16(
 
 /// The typed matrix of a stored FP8 E4M3 tensor: [upload] checks the stored dtype and that the
 /// inverse-scale plane has exactly one entry a 128 x 128 tile.
+#[allow(clippy::too_many_arguments)]
 fn typed_fp8(
     spec: &TensorSpec,
     rows: usize,
@@ -1446,6 +1509,113 @@ fn typed_fp8(
         scales: Scales::fp8_e4m3(blocks, entries, scale_dtype),
     })
     .map_err(|error| error.to_string())
+}
+
+/// The typed matrix of a stored NVFP4 expert weight: [upload] checks the packed U8 container
+/// against the logical shape and that the per-16 scale plane has one entry a group.
+fn typed_nvfp4(
+    spec: &TensorSpec,
+    rows: usize,
+    columns: usize,
+    data: Deviceptr,
+    blocks: Deviceptr,
+    entries: usize,
+    global: f32,
+) -> Result<Mat<NvFp4>, String> {
+    let stored = TensorSpec {
+        name: spec.name.clone(),
+        dtype: spec.dtype,
+        shape: vec![rows, columns.div_ceil(2)],
+    };
+    upload_format::<NvFp4>(Tensor {
+        stored: &stored,
+        shape: &[rows, columns],
+        data,
+        stride: columns.div_ceil(2),
+        scales: Scales::nvfp4(blocks, entries, global),
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// The shape `runs` select from a `[rows, columns]` matrix: row runs stacked, or column runs
+/// side by side.
+fn run_shape(runs: &[Run], (rows, columns): (usize, usize)) -> Result<(usize, usize), String> {
+    let stacked = runs.iter().all(|run| matches!(run, Run::Rows(..)));
+    if runs.is_empty() {
+        return Err("no part of the matrix is named".to_owned());
+    }
+    if !stacked && !runs.iter().all(|run| matches!(run, Run::Columns(..))) {
+        return Err("the parts mix row and column runs".to_owned());
+    }
+    let mut total = 0;
+    for run in runs {
+        let (first, count, within) = match *run {
+            Run::Rows(first, count) => (first, count, rows),
+            Run::Columns(first, count) => (first, count, columns),
+        };
+        if count == 0 || first + count > within {
+            return Err(format!(
+                "{run:?} is not a part of a [{rows}, {columns}] matrix"
+            ));
+        }
+        total += count;
+    }
+    Ok(if stacked {
+        (total, columns)
+    } else {
+        (rows, total)
+    })
+}
+
+/// The bytes `runs` select from the row-major `bytes` of a `[rows, columns]` matrix stored
+/// `unit` logical values to a byte, and the logical shape of the selection.
+fn run_slice(
+    bytes: &[u8],
+    (rows, columns): (usize, usize),
+    runs: &[Run],
+    unit: usize,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    if !columns.is_multiple_of(unit) {
+        return Err(format!(
+            "the [{rows}, {columns}] matrix is not a whole number of {unit}-value groups"
+        ));
+    }
+    let (out_rows, out_columns) = run_shape(runs, (rows, columns))?;
+    let stored_columns = columns / unit;
+    let row = stored_columns;
+    if bytes.len() != rows * row {
+        return Err(format!(
+            "the tensor is {} bytes, expected {} for a [{rows}, {columns}] matrix {unit} values a byte",
+            bytes.len(),
+            rows * row
+        ));
+    }
+    if runs.iter().all(|run| matches!(run, Run::Rows(..))) {
+        let out = runs
+            .iter()
+            .flat_map(|run| match *run {
+                Run::Rows(first, count) | Run::Columns(first, count) => {
+                    &bytes[first * row..(first + count) * row]
+                }
+            })
+            .copied()
+            .collect();
+        return Ok((out_rows, out_columns, out));
+    }
+    let mut out = Vec::with_capacity(out_rows * out_columns / unit);
+    for index in 0..rows {
+        let start = index * row;
+        for run in runs {
+            let Run::Columns(first, count) = *run else {
+                unreachable!("the runs are all columns");
+            };
+            if !first.is_multiple_of(unit) || !count.is_multiple_of(unit) {
+                return Err(format!("{run:?} splits a {unit}-value column group"));
+            }
+            out.extend_from_slice(&bytes[start + first / unit..start + (first + count) / unit]);
+        }
+    }
+    Ok((out_rows, out_columns, out))
 }
 
 /// One upload's tensors: each checked at its architecture shape (BF16, or a projection's
@@ -1515,6 +1685,43 @@ impl Uploads<'_> {
         runs: &[Run],
     ) -> Result<Proj, String> {
         let spec = self.source.spec(name).map_err(|error| error.to_string())?;
+        if spec.dtype == DType::U8 {
+            if self.formats.expert != ExpertForm::NvFp4 {
+                return Err(format!(
+                    "{name} is U8, the NVFP4 expert form, and the checkpoint declares {:?} experts",
+                    self.formats.expert
+                ));
+            }
+            let codes = self.uploader.read(name, rows * columns.div_ceil(2))?;
+            let scales_name = name
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.weight_scale"))
+                .ok_or_else(|| format!("{name} is not a .weight, so it names no weight_scale"))?;
+            let global_name = name
+                .strip_suffix(".weight")
+                .map(|prefix| format!("{prefix}.weight_scale_2"))
+                .ok_or_else(|| format!("{name} is not a .weight, so it names no weight_scale_2"))?;
+            let scales = self
+                .uploader
+                .read(&scales_name, rows * columns.div_ceil(16))?;
+            let global = self.uploader.read(&global_name, 4)?;
+            let global = f32::from_le_bytes(
+                global
+                    .as_chunks::<4>()
+                    .0
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("{global_name} holds no f32"))?,
+            );
+            let (out_rows, out_columns, codes) = run_slice(&codes, (rows, columns), runs, 2)?;
+            let (_, _, scales) = run_slice(&scales, (rows, columns), runs, 16)?;
+            let entries = out_rows * out_columns.div_ceil(16);
+            let data = self.keep(self.uploader.bytes(&codes)?, codes.len());
+            let blocks = self.keep(self.uploader.bytes(&scales)?, scales.len());
+            let typed = typed_nvfp4(&spec, out_rows, out_columns, data, blocks, entries, global)?;
+            self.record(name, typed.format(), typed.bytes_per_token());
+            return Ok(Proj::NvFp4(typed));
+        }
         if spec.dtype != DType::F8E4M3 {
             bf16(self.source, name, &[rows, columns])?;
             let mat = self.uploader.mat_parts(name, (rows, columns), runs)?;
@@ -1814,7 +2021,8 @@ impl Uploads<'_> {
             None => None,
         };
         let mut table = Vec::with_capacity(routed.experts * 6 * 8);
-        let fp8 = self.formats.fp8_experts;
+        let mut scales_table = Vec::with_capacity(routed.experts * 3 * 4);
+        let form = self.formats.expert;
         for (number, expert) in experts.iter().enumerate() {
             let Mlp { gate, up, down } = self.mlp(
                 expert,
@@ -1827,21 +2035,30 @@ impl Uploads<'_> {
                 (&up, &expert.up),
                 (&down, &expert.down),
             ] {
-                if matches!(proj, Proj::Fp8(_)) != fp8 {
+                if proj.form() != form {
                     return Err(format!(
-                        "layer {index}'s expert {number} stores {name} as {}, and the checkpoint \
-                         declares {} experts, the one form the expert passes are loaded in",
-                        if fp8 { "BF16" } else { "E4M3" },
-                        if fp8 { "block-scaled FP8" } else { "BF16" }
+                        "layer {index}'s expert {number} stores {name} as {:?}, and the checkpoint \
+                         declares {form:?} experts, the one form the expert passes are loaded in",
+                        proj.form()
                     ));
                 }
                 for address in proj.table() {
                     table.extend(address.to_le_bytes());
                 }
+                if let Some(global) = proj.global() {
+                    scales_table.extend(global.to_le_bytes());
+                }
             }
         }
         let table = self.uploader.bytes(&table)?;
         let table = self.keep(table, routed.experts * 6 * 8);
+        let scales = match form {
+            ExpertForm::NvFp4 => {
+                let bytes = self.uploader.bytes(&scales_table)?;
+                Some(self.keep(bytes, routed.experts * 3 * 4))
+            }
+            ExpertForm::Bf16 | ExpertForm::Fp8 => None,
+        };
         let shared = match (shared, shape.intermediate) {
             (Some(names), width) if width > 0 => Some(self.mlp(
                 names,
@@ -1885,6 +2102,7 @@ impl Uploads<'_> {
         Ok(LayerFfn::Routed {
             router,
             bias,
+            scales,
             table,
             shared,
             shared_gate,
@@ -2231,6 +2449,10 @@ impl Shared {
         match proj {
             Proj::Bf16(mat) => self.project_bf16(mat, input, output, rows, policy),
             Proj::Fp8(mat) => self.project_fp8(mat, b, input, output, rows, policy),
+            Proj::NvFp4(_) => Err(BackendError::new(
+                DEVICE,
+                "an NVFP4 dense projection: only the routed experts are stored that way",
+            )),
         }
     }
 
@@ -2451,6 +2673,7 @@ impl Shared {
             LayerFfn::Routed {
                 router,
                 bias,
+                scales,
                 table,
                 shared,
                 shared_gate,
@@ -2488,8 +2711,14 @@ impl Shared {
             (rows * top_k, experts, top_k),
         );
         self.launch(kernels.plan, MoePlanCall::launch(), &plan.args())?;
-        let gate_up = [
-            table.0,
+        // The NVFP4 body reads the per-tensor scale table as its second argument; the BF16 and
+        // FP8 bodies read the same six-address table with no second table.
+        let mut gate_up = Vec::with_capacity(11);
+        gate_up.push(table.0);
+        if kernels.nvfp4 {
+            gate_up.push(scales.unwrap_or(Deviceptr(0)).0);
+        }
+        gate_up.extend([
             b.indices.0,
             b.sorted.0,
             b.runs.0,
@@ -2498,33 +2727,40 @@ impl Shared {
             top_k as u64,
             hidden as u64,
             intermediate as u64,
-        ];
+        ]);
         let grid = token::gate_up_grid(intermediate, top_k, rows);
         match layer.shape.clamp {
             None => self.launch(kernels.gate_up, grid, &gate_up)?,
             Some(limit) => {
-                let mut clamped = gate_up.to_vec();
+                let Some(clamped_kernel) = kernels.gate_up_clamped else {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "an NVFP4 expert pass under a swiglu_limit: the body has no clamped form",
+                    ));
+                };
+                let mut clamped = gate_up.clone();
                 clamped.push(u64::from(limit.to_bits()));
-                self.launch(kernels.gate_up_clamped, grid, &clamped)?;
+                self.launch(clamped_kernel, grid, &clamped)?;
             }
         }
-        self.launch(
-            kernels.down,
-            token::down_grid(hidden, top_k, rows),
-            &[
-                table.0,
-                b.indices.0,
-                b.sorted.0,
-                b.runs.0,
-                b.weights.0,
-                b.activated.0,
-                b.expert_partials.0,
-                top_k as u64,
-                hidden as u64,
-                intermediate as u64,
-                top_k as u64,
-            ],
-        )?;
+        let mut down = Vec::with_capacity(12);
+        down.push(table.0);
+        if kernels.nvfp4 {
+            down.push(scales.unwrap_or(Deviceptr(0)).0);
+        }
+        down.extend([
+            b.indices.0,
+            b.sorted.0,
+            b.runs.0,
+            b.weights.0,
+            b.activated.0,
+            b.expert_partials.0,
+            top_k as u64,
+            hidden as u64,
+            intermediate as u64,
+            top_k as u64,
+        ]);
+        self.launch(kernels.down, token::down_grid(hidden, top_k, rows), &down)?;
         match shared {
             Some(mlp) => self.mlp(mlp, layer.shape.clamp, b, b.shared_out, rows, policy)?,
             // The combine always adds a shared row; a layer without one adds zeros.
@@ -3343,14 +3579,15 @@ impl ModelSession for DenseDeviceSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        Bound, CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, typed_bf16,
-        typed_fp8,
+        Bound, CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy, run_slice,
+        typed_bf16, typed_fp8, typed_nvfp4,
     };
     use sparkflash_kernels::cuda_driver::Deviceptr;
     use sparkflash_kernels::images::Image;
     use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
+    use sparkflash_ops::dflash::Part as Run;
     use sparkflash_ops::formats::{Bf16, F32 as F32Format, FormatKind, Scales};
     use sparkflash_ops::plan::Precision;
     use sparkflash_ops::projection::WidePolicy;
@@ -3426,6 +3663,89 @@ mod tests {
         .expect("two inverse scales");
         assert_eq!(typed.format(), FormatKind::Fp8E4m3);
         assert_eq!(typed.bytes_per_token(), 4 * 256);
+    }
+
+    /// An NVFP4 expert weight is a packed U8 container read at its logical shape, with one
+    /// E4M3 scale a 16-value group and the per-tensor f32 the body multiplies in.
+    #[test]
+    fn the_nvfp4_expert_load_checks_the_packing_and_the_scale_groups() {
+        let weight = spec(
+            "layers.0.mlp.experts.0.gate_proj.weight",
+            DType::U8,
+            &[64, 128],
+        );
+        let typed = typed_nvfp4(
+            &weight,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            64 * 16,
+            0.25,
+        )
+        .expect("a 64 x 256 NVFP4 matrix");
+        assert_eq!(typed.format(), FormatKind::NvFp4);
+        assert_eq!(typed.rows(), 64);
+        assert_eq!(typed.columns(), 256);
+        assert_eq!(typed.bytes_per_token(), 64 * 128);
+        assert!(matches!(
+            typed.scales(),
+            sparkflash_ops::formats::Scales::NvFp4 { global: 0.25, .. }
+        ));
+
+        // One scale a group is 16 an expert row, not one a row.
+        let error = typed_nvfp4(
+            &weight,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            64,
+            0.25,
+        )
+        .expect_err("the scale plane is short");
+        assert!(error.contains("needs 1024"), "{error}");
+
+        // A BF16 container is not the packed E2M1 form.
+        let unpacked = spec(
+            "layers.0.mlp.experts.0.gate_proj.weight",
+            DType::BF16,
+            &[64, 256],
+        );
+        let error = typed_nvfp4(
+            &unpacked,
+            64,
+            256,
+            Deviceptr(0x1000),
+            Deviceptr(0x2000),
+            1024,
+            0.25,
+        )
+        .expect_err("a BF16 container is not the packed E2M1 form");
+        assert!(error.contains("nvfp4"), "{error}");
+    }
+
+    /// The expert runs select rows or whole 16-column groups, and a run that splits a group is
+    /// refused rather than read at another group's scale.
+    #[test]
+    fn the_nvfp4_runs_slice_whole_scale_groups() {
+        let rows = 4;
+        let columns = 64;
+        let codes: Vec<u8> = (0..rows * columns / 2).map(|at| at as u8).collect();
+        let (out_rows, out_columns, selected) =
+            run_slice(&codes, (rows, columns), &[Run::Rows(1, 2)], 2).expect("two rows");
+        assert_eq!((out_rows, out_columns), (2, 64));
+        assert_eq!(selected, codes[32..96]);
+
+        let (out_rows, out_columns, selected) =
+            run_slice(&codes, (rows, columns), &[Run::Columns(16, 32)], 2).expect("32 columns");
+        assert_eq!((out_rows, out_columns), (4, 32));
+        assert_eq!(selected.len(), 4 * 16);
+
+        let scales: Vec<u8> = (0..rows * columns / 16).map(|at| at as u8).collect();
+        let error = run_slice(&scales, (rows, columns), &[Run::Columns(8, 16)], 16)
+            .expect_err("eight columns split a 16-value group");
+        assert!(error.contains("splits a 16-value column group"), "{error}");
     }
 
     /// Boot refuses a part read at a format its checkpoint does not store unless the load path
