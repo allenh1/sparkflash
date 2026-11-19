@@ -19,17 +19,38 @@ limitations under the License.
 No real dump is committed yet, so `[prerequisites] coverage` stays false. Do not add a dump that
 was not produced by a serving run; a synthetic fixture belongs in the self-tests, not here.
 
-## The judge and its report
+## The bar, and the judge
+
+`numerics/registry.toml` declares the agreed bar:
+
+```toml
+[prerequisites]
+coverage_slots = 0.93
+```
+
+It is the fraction of (layer, routed-expert) slots a committed dump must reach, not a count, and
+it is deliberately below 1.0. Real serving reached 92-93% of Qwen3.8's 48x512 slots after 240-330
+inputs and every layer still carried gaps, so "every routed expert of every layer" was an
+unstated bar a real run cannot meet. 0.93 is the owner's agreed value; the bar stays in the
+registry so no reader has to infer it.
 
 ```bash
 python3 scripts/numerics.py coverage --dump numerics/coverage/<model>-<world>.json --min-inputs 8
 python3 scripts/numerics.py coverage-gaps --dump "$W/qwen38-coverage.json" --json "$W/gaps.json"
 ```
 
-`coverage` is the gate: it refuses a dump that misses any routed expert. `coverage-gaps` is the
-same inspection without the gate: it prints the missing count per layer and writes every missing
-expert to JSON. The 48x512 Qwen3.8 layout has 24,576 routed slots; the two cluster runs left about
-1,720-1,966 of them unreached after 240-330 inputs.
+`coverage` passes when the dump reaches at least `coverage_slots` and exits non-zero below it.
+Either way it prints the achieved fraction, the declared bar and the missing expert ids per layer,
+so a reader can see how much headroom is left. It refuses a dump whose model and layout disagree,
+and a registry whose bar is missing or outside (0, 1]. `coverage-gaps` is the same inspection
+without the gate: it prints the missing count per layer and writes every missing expert to JSON;
+it does not decide a prerequisite. The 48x512 Qwen3.8 layout has 24,576 routed slots; the two
+cluster runs left about 1,720-1,966 of them unreached after 240-330 inputs.
+
+`[prerequisites] coverage` turns true only in a reviewed edit that also sets
+`coverage_dump = "numerics/coverage/<dump>.json"` and commits that dump. `scripts/numerics.py ci`
+then judges the named dump at `coverage_slots` and fails a true flag whose dump is missing, names
+another model, or is below the bar. A false flag makes no claim and names no dump.
 
 ## The sweep
 

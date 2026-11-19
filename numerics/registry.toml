@@ -39,12 +39,11 @@
 
 schema = 1
 
-# The four prerequisites docs/NUMERICS.md §5 names. The three global ones gate every bump; the
-# anchor is per model: a configuration may bump when its own model has a frozen anchor below and a
-# committed capture teacher-forced from it. `scripts/numerics.py ci` looks up the bumping entry's
-# model and names it when it is missing; it also refuses a true `anchor` flag whose coverage is
-# incomplete. Turning a prerequisite on is a reviewed edit with the tool or data it names in the
-# same diff.
+# The prerequisites docs/NUMERICS.md §5 names. The three global ones gate every bump; the anchor is
+# per model: a configuration may bump when its own model has a frozen anchor below and a committed
+# capture teacher-forced from it. `scripts/numerics.py ci` looks up the bumping entry's model and
+# names it when it is missing; it also refuses a true `anchor` flag whose coverage is incomplete.
+# Turning a prerequisite on is a reviewed edit with the tool or data it names in the same diff.
 [prerequisites]
 # Per model. Qwen3.8 and GLM-5.3 have an anchor and a committed teacher-forced capture; Inkling-2
 # and Dory1.0 have no anchor, so they cannot bump; DeepSeek is exempt because its device path
@@ -54,10 +53,25 @@ schema = 1
 anchor = false
 # The CI declaration check (`scripts/numerics.py ci`, run by the scripts-tests job).
 declaration_check = true
-# Inputs that reach every routed expert of every layer, with the per-layer hit counts to prove it.
-# Implemented: `scripts/numerics.py coverage --dump ... --min-inputs N` judges one against
-# numerics/layouts/. False because no real dump is committed yet; flip it with the first one.
+# The coverage bar: the fraction of (layer, routed-expert) slots a committed coverage dump must
+# reach. It is a fraction of the layout's routed slots, not a count, and it is deliberately below
+# 1.0: real serving reached 92-93% of Qwen3.8's 48x512 slots after 240-330 inputs and every layer
+# still carried gaps, so "every routed expert of every layer" was an unstated bar that a real run
+# cannot meet. 0.93 is the owner's agreed bar (this session's decision, docs/NUMERICS.md §5); a
+# bar of 1.0 would still mean every slot. It must be in (0, 1]; `scripts/numerics.py coverage`
+# prints the achieved fraction and the per-layer missing experts and fails below this value.
+coverage_slots = 0.93
+# Inputs that reach at least `coverage_slots` of the routed slots, with the per-layer hit counts to
+# prove it. `scripts/numerics.py coverage --dump ... --min-inputs N` judges one against
+# numerics/layouts/. False because no real dump is committed yet. It turns true only with a
+# reviewed edit that also names the committed dump below; `scripts/numerics.py ci` then judges that
+# dump at `coverage_slots` and fails a true flag whose dump is missing or below the bar.
 coverage = false
+# The committed dump the true `coverage` flag rests on, relative to the repository root. It is
+# omitted while the flag is false (a false flag makes no claim); turning the flag on requires this
+# pointer and the dump it names, in the same reviewed change. Its model must have a committed
+# layout under numerics/layouts/. Example once a real dump exists:
+# coverage_dump = "numerics/coverage/qwen38-world1.json"
 # Per-layer and per-expert relative error against the reference forward. Implemented:
 # `scripts/numerics.py monitors --reference ... --candidate ... --layer-bar X --expert-bar Y`, and
 # the Qwen host reference writes the dump under SPARKFLASH_NUMERICS_MONITORS. False because no real

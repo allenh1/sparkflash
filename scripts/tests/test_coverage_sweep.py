@@ -173,9 +173,15 @@ class CoverageGapsTests(unittest.TestCase):
         self.assertIn("5 missing", markdown)
         self.assertIn("| 1 | 4 | 3 |", markdown)
 
-    def test_the_judge_still_refuses_the_first_missing_layer(self) -> None:
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "layer 0 never reaches expert"):
-            NUMERICS.judge_coverage(self.dump, self.layout, "layout.json", 1)
+    def test_the_judge_reports_the_first_missing_layer_and_fails_below_the_bar(self) -> None:
+        result = NUMERICS.judge_coverage(self.dump, self.layout, "layout.json", 1, 0.5)
+        self.assertFalse(result["passes"])
+        self.assertEqual(result["missing_by_layer"], {0: [1, 3], 1: [0, 1, 2]})
+        markdown = NUMERICS.render_coverage(result)
+        self.assertIn("FAIL coverage", markdown)
+        self.assertIn("37.50%", markdown)
+        self.assertIn("50.00%", markdown)
+        self.assertIn("1, 3", markdown)
 
     def test_a_complete_dump_reports_no_gaps(self) -> None:
         complete = coverage_dump(inputs=["input-fd1f0f4381eb0395"], hits=[[1, 1, 1, 1], [1, 1, 1, 1]])

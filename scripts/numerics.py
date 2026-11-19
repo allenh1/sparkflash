@@ -45,9 +45,11 @@ check    recaptures the server's registered reference and fails on any bit that 
 compare  scores a teacher-forced capture against the anchor it was forced from: per-token NLL
          delta, top-1 agreement and a KL lower bound. --floor puts another comparison (the TP=1 to
          TP=4 divergence) beside it.
-coverage judges a coverage dump against the model's expert layout: every decoder layer present,
-         one hit count per routed expert, every routed expert positive, and at least the declared
-         number of inputs. coverage-gaps reports what a partial dump has not reached yet.
+coverage judges a coverage dump against the model's expert layout and the registry's declared
+         bar: every decoder layer present, one hit count per routed expert, at least the declared
+         number of inputs, and at least prerequisites.coverage_slots of the routed slots reached.
+         It prints the achieved fraction and the per-layer missing experts and exits non-zero
+         below the bar. coverage-gaps reports what a partial dump has not reached yet.
 coverage-sweep sends a deterministic corpus to a server that is writing the dump, reads the dump
          before and after each prompt, keeps a prompt only when its forward reached a slot no earlier
          kept prompt reached, and writes the kept prompts as the next suite. The dump is the
@@ -548,7 +550,30 @@ def first_difference(old: dict, new: dict) -> str:
 # --- the registry -----------------------------------------------------------------------------
 
 
-def parse_registry(text: str, origin: str) -> dict:
+def coverage_bar(value: object, origin: str) -> float:
+    """The declared coverage bar: the fraction of routed (layer, expert) slots a dump must reach.
+
+    It is a fraction of the committed layout's routed slots, not a count and not 1.0 by default.
+    Raising a gate to every slot is a choice the registry states, not an unstated implication of
+    "coverage" (docs/NUMERICS.md §5).
+    """
+    if value is None:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.coverage_slots is missing; state the fraction of routed "
+            "(layer, expert) slots a committed coverage dump must reach (for example 0.93)"
+        )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise NumericsFailure(f"{origin}: prerequisites.coverage_slots {value!r} is not a number")
+    bar = float(value)
+    if not math.isfinite(bar) or not 0.0 < bar <= 1.0:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.coverage_slots {value!r} is outside (0, 1]; it is the "
+            "fraction of routed (layer, expert) slots a coverage dump must reach"
+        )
+    return bar
+
+
+def parse_registry(text: str, origin: str, require_bar: bool = False) -> dict:
     try:
         registry = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
@@ -557,6 +582,24 @@ def parse_registry(text: str, origin: str) -> dict:
     missing = [name for name in PREREQUISITES if not isinstance(prerequisites.get(name), bool)]
     if missing:
         raise NumericsFailure(f"{origin}: prerequisites {missing} are not set to true or false")
+    # A registry written before the bar existed is readable as a base (the declaration check reads
+    # history); the head always states it. A bar that is present is valid everywhere.
+    if require_bar or "coverage_slots" in prerequisites:
+        coverage_bar(prerequisites.get("coverage_slots"), origin)
+    dump = prerequisites.get("coverage_dump")
+    if dump is not None:
+        if not isinstance(dump, str) or not dump:
+            raise NumericsFailure(f"{origin}: prerequisites.coverage_dump is not a non-empty string")
+        if not dump.startswith(f"{NUMERICS}/coverage/") or not dump.endswith(".json"):
+            raise NumericsFailure(
+                f"{origin}: prerequisites.coverage_dump {dump!r} is not a JSON dump under "
+                f"{NUMERICS}/coverage/"
+            )
+    elif prerequisites["coverage"]:
+        raise NumericsFailure(
+            f"{origin}: prerequisites.coverage is true, but it names no coverage_dump; the flag "
+            "is flipped by the reviewed edit that commits the dump it rests on (docs/NUMERICS.md §5)"
+        )
     for table in ("config", "anchor", "retired"):
         registry.setdefault(table, [])
     return registry
@@ -1147,6 +1190,44 @@ def read_at(revision: str | None) -> Callable[[str], bytes | None]:
     return read
 
 
+def coverage_findings(registry: dict, read: Callable[[str], bytes | None]) -> list[str]:
+    """Judge the dump the coverage prerequisite rests on, when its flag is true.
+
+    The flag is not a claim on its own: it is true only when `coverage_dump` names a committed
+    dump whose model has a committed layout and whose reached slots meet `coverage_slots`. A
+    false flag decides nothing and needs no dump.
+    """
+    prerequisites = registry["prerequisites"]
+    if not prerequisites["coverage"]:
+        return []
+    path = prerequisites["coverage_dump"]
+    data = read(path)
+    if data is None:
+        return [
+            f"prerequisites.coverage is true, but its coverage_dump {path} does not exist; the "
+            "flag is flipped by the reviewed edit that commits the dump (docs/NUMERICS.md §5)"
+        ]
+    try:
+        dump = json.loads(data)
+    except json.JSONDecodeError as error:
+        return [f"prerequisites.coverage_dump {path}: not JSON ({error})"]
+    try:
+        model = dump.get("model")
+        if not isinstance(model, str) or not model:
+            raise NumericsFailure("the dump names no model")
+        layout, origin = find_layout(model, None)
+        result = judge_coverage(dump, layout, origin, 1, prerequisites.get("coverage_slots"))
+    except NumericsFailure as error:
+        return [f"prerequisites.coverage_dump {path}: {error}"]
+    if result["passes"]:
+        return []
+    return [
+        f"prerequisites.coverage_dump {path}: achieved {result['coverage']:.2%} of "
+        f"{result['experts']} routed (layer, expert) slots, below the declared "
+        f"{result['bar']:.2%} bar"
+    ]
+
+
 def run_ci(base_argument: str | None) -> int:
     base = resolve_base(base_argument)
     read_base, read_head = read_at(base), read_at(None)
@@ -1155,7 +1236,7 @@ def run_ci(base_argument: str | None) -> int:
     head_text = read_head(REGISTRY)
     if head_text is None:
         raise NumericsFailure(f"{REGISTRY} does not exist")
-    head_registry = parse_registry(head_text.decode(), REGISTRY)
+    head_registry = parse_registry(head_text.decode(), REGISTRY, require_bar=True)
     # The working tree, not HEAD: a local run checks what is about to be committed too.
     paths = (NUMERICS, "docs/numerics", f":(glob){PROFILE_GLOB}", CLASSIFICATION)
     diff = git("diff", "--name-status", "--no-renames", base, "--", *paths).stdout.decode()
@@ -1178,12 +1259,20 @@ def run_ci(base_argument: str | None) -> int:
     )
     anchor_checks, coverage = anchor_findings(head_registry, read_head, capture_paths)
     findings += anchor_checks
+    findings += coverage_findings(head_registry, read_head)
     configs, anchors = len(head_registry["config"]), len(head_registry["anchor"])
     missing = missing_prerequisites(head_registry)
     print(
         f"numerics ci: base {base[:12]}, {configs} configuration(s), {anchors} anchor(s), "
         f"{len(changed)} changed path(s); prerequisites missing: {missing or 'none'}"
     )
+    prerequisites = head_registry["prerequisites"]
+    if prerequisites["coverage"]:
+        print(
+            f"numerics ci: coverage prerequisite: {prerequisites['coverage_dump']} at "
+            f"{coverage_bar(prerequisites.get('coverage_slots'), REGISTRY):.2%} of routed "
+            "(layer, expert) slots"
+        )
     print(
         "numerics ci: anchor coverage: "
         + (
@@ -1448,8 +1537,8 @@ def coverage_inspect(dump: dict, layout: dict, layout_origin: str, min_inputs: i
     """Inspect one coverage dump's shape and report what it has not reached.
 
     This is the judge without the gate: every structural refusal is the same, but a zero hit count
-    becomes a gap in the report instead of a failure. `judge_coverage` is this plus the refusal;
-    `coverage-gaps` and `coverage-sweep` use the report to plan the next inputs.
+    becomes a gap in the report instead of a failure. `judge_coverage` adds the declared bar's
+    verdict; `coverage-gaps` and `coverage-sweep` use the report to plan the next inputs.
     """
     if dump.get("schema") != COVERAGE_SCHEMA:
         raise NumericsFailure(f"coverage dump: schema {dump.get('schema')!r} is not {COVERAGE_SCHEMA}")
@@ -1568,48 +1657,72 @@ def coverage_inspect(dump: dict, layout: dict, layout_origin: str, min_inputs: i
     }
 
 
-def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int) -> dict:
-    """Judge one coverage dump against a model's expert layout.
+def judge_coverage(
+    dump: dict, layout: dict, layout_origin: str, min_inputs: int, bar: object
+) -> dict:
+    """Judge one coverage dump against a model's expert layout and the declared bar.
 
     Every decoder layer must appear once, with one hit count per routed expert; a dense layer has
-    an empty hit list. Every routed expert of every layer must have a positive count, and the dump
-    must name at least the declared number of inputs.
+    an empty hit list, and the dump must name at least the declared number of inputs. The verdict
+    is the achieved fraction of routed (layer, expert) slots against the registry's bar, not an
+    unstated demand for every slot: a bar of 1.0 still means every slot, and a lower bar leaves
+    the gaps named beside the count.
     """
     if min_inputs < 1:
         raise NumericsFailure(f"--min-inputs {min_inputs}: a coverage run needs at least one input")
+    fraction = coverage_bar(bar, "coverage bar")
     result = coverage_inspect(dump, layout, layout_origin, min_inputs)
-    if result["missing"]:
-        number = result["missing"][0][0]
-        missing = result["missing_by_layer"][number]
-        shown = ", ".join(str(expert) for expert in missing[:8])
-        more = "" if len(missing) <= 8 else f" and {len(missing) - 8} more"
-        raise NumericsFailure(
-            f"coverage dump: layer {number} never reaches expert(s) {shown}{more}; the coverage "
-            "inputs must reach every routed expert of every layer"
-        )
+    total = result["experts"]
+    achieved = (result["covered_experts"] / total) if total else 1.0
+    result["bar"] = fraction
+    result["coverage"] = achieved
+    result["passes"] = achieved >= fraction
     return result
 
 
+def missing_experts_text(missing: list[int], limit: int = 16) -> str:
+    """A layer's missing expert ids, shortened the same way everywhere they are printed."""
+    if not missing:
+        return "none"
+    shown = ", ".join(str(expert) for expert in missing[:limit])
+    more = "" if len(missing) <= limit else f" and {len(missing) - limit} more"
+    return f"{shown}{more}"
+
+
 def render_coverage(result: dict) -> str:
+    achieved = result["coverage"]
+    bar = result["bar"]
     lines = [
         f"coverage: {result['model']}, {len(result['layers'])} layer(s), "
         f"{result['experts']} routed expert(s), {result['inputs']} input(s); layout {result['layout']}",
+        f"achieved: {result['covered_experts']} of {result['experts']} routed (layer, expert) "
+        f"slots = {achieved:.2%}; declared bar {bar:.2%}",
         "",
-        "| layer | routed experts | hits | min | max |",
-        "| --: | --: | --: | --: | --: |",
+        "| layer | routed experts | hits | min | max | missing experts |",
+        "| --: | --: | --: | --: | --: | :-- |",
     ]
     for layer in result["layers"]:
         if layer["experts"] == 0:
-            lines.append(f"| {layer['layer']} | 0 (dense) | - | - | - |")
+            lines.append(f"| {layer['layer']} | 0 (dense) | - | - | - | - |")
         else:
             lines.append(
-                f"| {layer['layer']} | {layer['experts']} | {layer['hits']} | {layer['min']} | {layer['max']} |"
+                f"| {layer['layer']} | {layer['experts']} | {layer['hits']} | {layer['min']} | "
+                f"{layer['max']} | {missing_experts_text(layer['missing'])} |"
             )
-    lines += [
-        "",
-        f"PASS coverage: every routed expert of every layer has a positive hit count over "
-        f"{result['inputs']} input(s).",
-    ]
+    unreached = len(result["missing"])
+    if result["passes"]:
+        verdict = (
+            f"PASS coverage: achieved {achieved:.2%} of routed (layer, expert) slots over "
+            f"{result['inputs']} input(s), at or above the declared {bar:.2%} bar"
+        )
+    else:
+        verdict = (
+            f"FAIL coverage: achieved {achieved:.2%} of routed (layer, expert) slots over "
+            f"{result['inputs']} input(s), below the declared {bar:.2%} bar"
+        )
+    if unreached:
+        verdict += f"; {unreached} of {result['experts']} slot(s) unreached"
+    lines += ["", verdict + "."]
     return "\n".join(lines) + "\n"
 
 
@@ -2609,7 +2722,10 @@ def synthetic_registry(entries: list[dict], prerequisites: bool) -> dict:
             }
         )
     return {
-        "prerequisites": {name: prerequisites for name in PREREQUISITES},
+        "prerequisites": {
+            **{name: prerequisites for name in PREREQUISITES},
+            "coverage_slots": 0.93,
+        },
         "config": entries,
         "anchor": anchors,
         "retired": [],
@@ -3212,10 +3328,15 @@ def command_coverage(args: argparse.Namespace) -> int:
     model = dump.get("model")
     if not isinstance(model, str) or not model:
         raise NumericsFailure(f"{args.dump}: the dump names no model")
+    registry_path = REPO / REGISTRY
+    if not registry_path.is_file():
+        raise NumericsFailure(f"{REGISTRY} does not exist; the coverage bar is stated there")
+    registry = parse_registry(registry_path.read_text(), REGISTRY, require_bar=True)
+    bar = coverage_bar(registry["prerequisites"].get("coverage_slots"), REGISTRY)
     layout, origin = find_layout(model, args.layout)
-    result = judge_coverage(dump, layout, origin, args.min_inputs)
+    result = judge_coverage(dump, layout, origin, args.min_inputs, bar)
     print(render_coverage(result), end="")
-    return 0
+    return 0 if result["passes"] else 1
 
 
 def command_coverage_gaps(args: argparse.Namespace) -> int:

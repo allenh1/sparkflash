@@ -337,15 +337,23 @@ pub enum Evidence {
 /// committed capture teacher-forced from it, not against this aggregate. The other three gate
 /// every bump. This flag reports whether every `logprobs` model is anchored; a false value does
 /// not block a model that has its own anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prerequisites {
     /// The frozen anchors and teacher-forced comparisons, reported per model (see the type docs).
     pub anchor: bool,
     /// The CI declaration check.
     pub declaration_check: bool,
-    /// Coverage inputs that reach every routed expert.
+    /// The fraction of routed (layer, expert) slots a committed coverage dump must reach.
+    ///
+    /// A fraction of the layout's slots, not a count, and not 1.0 by default: real serving
+    /// reached 92-93% of Qwen3.8's 48x512 slots, so the agreed bar is 0.93 (docs/NUMERICS.md §5).
+    pub coverage_slots: f64,
+    /// Coverage inputs that reach at least [`Self::coverage_slots`] of the routed slots.
     pub coverage: bool,
+    /// The committed dump the true `coverage` flag rests on, under `numerics/coverage/`.
+    #[serde(default)]
+    pub coverage_dump: Option<String>,
     /// Per-layer and per-expert error monitors.
     pub monitors: bool,
 }
@@ -552,7 +560,7 @@ impl RetiredEntry {
 }
 
 /// The parsed registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Registry {
     /// The schema version, [SCHEMA].
@@ -603,6 +611,13 @@ impl Registry {
             return Err(NumericsError::Invalid(format!(
                 "schema {} is not the {SCHEMA} this build reads",
                 self.schema
+            )));
+        }
+        let bar = self.prerequisites.coverage_slots;
+        if !(bar > 0.0 && bar <= 1.0) {
+            return Err(NumericsError::Invalid(format!(
+                "prerequisites.coverage_slots {bar} is outside (0, 1]; it is the fraction of \
+                 routed (layer, expert) slots a coverage dump must reach"
             )));
         }
         let mut seen = BTreeSet::new();
@@ -960,7 +975,7 @@ mod tests {
     fn registry_with(entries: &str) -> String {
         format!(
             "schema = 1\n[prerequisites]\nanchor = false\ndeclaration_check = true\n\
-             coverage = false\nmonitors = false\n{entries}"
+             coverage_slots = 0.93\ncoverage = false\nmonitors = false\n{entries}"
         )
     }
 
@@ -1216,6 +1231,14 @@ mod tests {
     }
 
     #[test]
+    fn a_coverage_bar_outside_the_unit_interval_is_refused() {
+        let text =
+            registry_with(&entry(1, "")).replace("coverage_slots = 0.93", "coverage_slots = 1.5");
+        let error = Registry::from_toml(&text).unwrap_err().to_string();
+        assert!(error.contains("coverage_slots"), "{error}");
+    }
+
+    #[test]
     fn prerequisites_name_what_is_missing() {
         let registry = Registry::embedded().unwrap();
         let missing = registry.prerequisites.missing();
@@ -1225,7 +1248,9 @@ mod tests {
                 == Prerequisites {
                     anchor: true,
                     declaration_check: true,
+                    coverage_slots: 0.93,
                     coverage: true,
+                    coverage_dump: None,
                     monitors: true,
                 }
         );

@@ -94,9 +94,10 @@ monitors flag) and the rarity of these changes are the mitigations.
   so the result is too.
 - **Per-layer and per-expert error monitors.** Relative error against the reference at every
   layer and expert, so a bug in one expert shows as a spike when the end-to-end KL looks fine.
-- **Coverage inputs.** Prompts that reach every routed expert in every layer, chunk boundaries,
-  32k+ contexts, several batch shapes and speculation depths. The suite is grown and measured by
-  `coverage-sweep` (§5): the generator proposes candidates, the dump's hit delta selects them.
+- **Coverage inputs.** Prompts that reach at least the registry's `coverage_slots` of the
+  routed (layer, expert) slots, chunk boundaries, 32k+ contexts, several batch shapes and
+  speculation depths. The suite is grown and measured by `coverage-sweep` (§5): the generator
+  proposes candidates, the dump's hit delta selects them.
 - **Bars.** The TP=1 to TP=4 divergence already shipped is the reassociation floor: a change at
   or below it cannot be told apart from what is served today. A precision change above it is a
   real quality change, and its report says so in numbers.
@@ -241,8 +242,18 @@ flags but nothing else:
 | :-- | :-- |
 | `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8, GLM-5.3 and Dory1.0 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 does not, so its configuration cannot bump until it is anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
 | `declaration_check`: the CI check above | **done** |
-| `coverage`: inputs that reach every routed expert of every layer, with hit counts | **implemented**, no dump committed: `coverage` judges one, `coverage-gaps` reports what a partial one misses, and `coverage-sweep` measures a corpus and selects the next suite; the flag stays false until a real dump is in the repository |
+| `coverage`: inputs that reach at least `coverage_slots` of the routed (layer, expert) slots, with hit counts | **implemented**, no dump committed: the bar is declared at **0.93**, `coverage` judges one against it, `coverage-gaps` reports what a partial one misses, and `coverage-sweep` measures a corpus and selects the next suite; the flag stays false until a real dump is committed and named |
 | `monitors`: per-layer and per-expert relative error against the reference | **implemented**, no dump committed: the `monitors` command below compares two, and the flag stays false until a real pair is in the repository |
+
+`[prerequisites]` also states the coverage bar, `coverage_slots`, and — when the flag is true —
+`coverage_dump`. `coverage_slots` is the fraction of (layer, routed-expert) slots a committed dump
+must reach, in (0, 1]; it is **0.93**, not 1.0: real serving reached 92-93% of Qwen3.8's 48x512
+slots with 240-330 inputs and every layer still carried gaps, so requiring every slot would have
+made the prerequisite unattainable. `coverage = true` is a claim that the dump named by
+`coverage_dump` is committed, names a model with a committed layout, and reaches the bar;
+`scripts/numerics.py ci` judges exactly that dump and fails a true flag whose dump is missing,
+belongs to another model, or is below the bar. Turning it on is a reviewed edit adding both the
+pointer and the dump in the same change; a false flag names no dump and makes no claim.
 
 An `approved` record accepts that one bump when its `decision` is a non-empty one line, its
 `date` is the day the decision was taken, and its `report` exists and is new or changed in the same
@@ -290,10 +301,12 @@ python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --m
 
 The command refuses a dump whose schema or model is wrong, whose model has no committed layout,
 whose layer list omits, repeats or invents a layer, whose hit list does not have exactly one
-non-negative integer per routed expert, whose dense layer carries hits, whose routed expert has
-zero hits, or that names fewer distinct inputs than the required `--min-inputs` declaration of
-the coverage suite. It prints the per-layer hit count and the min/max per layer, and exits
-non-zero on the first refusal.
+non-negative integer per routed expert, whose dense layer carries hits, or that names fewer
+distinct inputs than the required `--min-inputs` declaration of the coverage suite. It also
+refuses a registry whose `coverage_slots` is missing or outside (0, 1]. It prints the achieved
+fraction of routed (layer, expert) slots, the declared bar, and the missing expert ids per layer;
+it passes at or above the bar and exits non-zero below it. A dump at 0.93 with every layer
+carrying gaps is a pass: the gaps are printed and counted, not hidden.
 
 #### Growing the coverage suite
 
@@ -584,7 +597,7 @@ python3 scripts/numerics.py check --url http://127.0.0.1:8000
 python3 scripts/numerics.py capture --url http://127.0.0.1:8000 --forced-from numerics/references/qwen38-anchor.json --top-logprobs 20 --out numerics/captures/qwen38/tp4-v1.json
 python3 scripts/numerics.py compare --anchor numerics/references/qwen38-anchor.json --candidate numerics/captures/qwen38/tp4-v1.json --markdown docs/numerics/qwen38/v1-tp-floor.md
 
-# Judge the coverage dump a run wrote against the model's committed expert layout.
+# Judge the coverage dump a run wrote against the committed layout and the registry's bar.
 python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --min-inputs 8
 
 # Report what a partial coverage dump still misses, with every expert in JSON.
@@ -691,7 +704,7 @@ the exemption ends with it, and an anchor capture would be the first requirement
 The aggregate `anchor` flag is **false**, and that is the honest value: Inkling-2 and Dory1.0
 have captured `logprobs` references but no `[[anchor]]`, so they are not covered and cannot bump.
 The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
-with an uncovered model fails `ci`. The two new dumps are implemented, but no real coverage or
+with an uncovered model fails `ci`. The coverage bar is declared at 0.93, but no real coverage or
 monitor dump is committed, so `coverage` and `monitors` are also false; they are not flipped on
 synthetic data. The coverage suite is now growable: `coverage-gaps` names the missing experts,
 `coverage-sweep` measures a deterministic corpus and writes the kept prompts as the next batch,

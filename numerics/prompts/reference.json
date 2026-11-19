@@ -1,6 +1,6 @@
 {
   "schema": "sparkflash-numerics-prompts/1",
-  "note": "The reference suite (docs/NUMERICS.md). Each prompt is tokenized by the server once, at capture, and the reference stores the ids; a check replays the ids, so it measures the model's arithmetic and never the tokenizer. Coverage of every routed expert is a separate suite (prerequisite `coverage`).",
+  "note": "The reference suite (docs/NUMERICS.md). Each prompt is tokenized by the server once, at capture, and the reference stores the ids; a check replays the ids, so it measures the model's arithmetic and never the tokenizer. Coverage against the registry's routed-slot bar is a separate suite (prerequisite `coverage`).",
   "prompts": [
     {
       "name": "arithmetic",

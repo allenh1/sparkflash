@@ -477,6 +477,7 @@ TOY_REGISTRY = """schema = 1
 [prerequisites]
 anchor = false
 declaration_check = true
+coverage_slots = 0.93
 coverage = false
 monitors = false
 """
@@ -870,8 +871,8 @@ class CoverageTests(unittest.TestCase):
     def setUp(self):
         self.layout = synthetic_layout()
 
-    def judge(self, dump: dict, min_inputs: int = 2):
-        return NUMERICS.judge_coverage(dump, self.layout, "layout.json", min_inputs)
+    def judge(self, dump: dict, min_inputs: int = 2, bar: float = 0.93):
+        return NUMERICS.judge_coverage(dump, self.layout, "layout.json", min_inputs, bar)
 
     def test_every_layer_and_expert_is_judged(self):
         dump = coverage_dump(
@@ -893,7 +894,7 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(NUMERICS.NumericsFailure, "layer 2 is missing"):
             self.judge(dump)
 
-    def test_an_unreached_expert_is_refused(self):
+    def test_an_unreached_expert_is_reported_and_fails_below_the_bar(self):
         dump = coverage_dump(
             [
                 {"layer": 0, "hits": []},
@@ -901,8 +902,68 @@ class CoverageTests(unittest.TestCase):
                 {"layer": 2, "hits": [4, 5, 6]},
             ]
         )
-        with self.assertRaisesRegex(NUMERICS.NumericsFailure, r"expert\(s\) 1"):
-            self.judge(dump)
+        result = self.judge(dump)
+        self.assertFalse(result["passes"])
+        self.assertEqual(result["missing"], [[1, 1]], "the layer and expert are still named")
+        markdown = NUMERICS.render_coverage(result)
+        self.assertIn("FAIL coverage", markdown)
+        self.assertIn("83.33%", markdown)
+        self.assertIn("93.00%", markdown)
+        self.assertIn("| 1 | 3 | 4 | 0 | 3 | 1 |", markdown)
+
+    def test_a_dump_at_the_declared_bar_passes(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 1, 0]},
+                {"layer": 2, "hits": [1, 0, 0]},
+            ]
+        )
+        result = self.judge(dump, bar=0.5)
+        self.assertTrue(result["passes"])
+        markdown = NUMERICS.render_coverage(result)
+        self.assertIn("PASS coverage", markdown)
+        self.assertIn("achieved: 3 of 6", markdown)
+        self.assertIn("50.00%; declared bar 50.00%", markdown)
+
+    def test_a_dump_just_below_the_bar_fails_and_names_both_fractions(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 1, 0]},
+                {"layer": 2, "hits": [1, 0, 0]},
+            ]
+        )
+        result = self.judge(dump, bar=0.5001)
+        self.assertFalse(result["passes"])
+        markdown = NUMERICS.render_coverage(result)
+        self.assertIn("FAIL coverage", markdown)
+        self.assertIn("50.00%", markdown)
+        self.assertIn("50.01%", markdown)
+        self.assertIn("3 of 6 slot(s) unreached", markdown)
+
+    def test_a_bar_outside_the_unit_interval_or_not_a_number_is_refused(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 1, 1]},
+                {"layer": 2, "hits": [1, 1, 1]},
+            ]
+        )
+        for bar in (0, -0.1, 1.0001, float("nan"), float("inf"), True, "0.93", None):
+            with self.assertRaisesRegex(NUMERICS.NumericsFailure, "coverage_slots"):
+                self.judge(dump, bar=bar)
+
+    def test_the_head_registry_must_state_the_bar(self):
+        without = TOY_REGISTRY.replace("coverage_slots = 0.93\n", "")
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "coverage_slots is missing"):
+            NUMERICS.parse_registry(without, "toy", require_bar=True)
+        # A base written before the bar existed stays readable; only its own bar is judged.
+        self.assertNotIn("coverage_slots", NUMERICS.parse_registry(without, "toy")["prerequisites"])
+
+    def test_a_true_coverage_flag_requires_a_named_dump(self):
+        with self.assertRaisesRegex(NUMERICS.NumericsFailure, "names no coverage_dump"):
+            NUMERICS.parse_registry(TOY_REGISTRY.replace("coverage = false", "coverage = true"), "toy")
 
     def test_a_wrong_expert_count_is_refused(self):
         dump = coverage_dump(
@@ -997,6 +1058,95 @@ class CoverageTests(unittest.TestCase):
                     0,
                 )
         self.assertIn("PASS coverage", out.getvalue())
+
+    def test_the_command_fails_below_the_registry_bar(self):
+        dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 1, 0]},
+                {"layer": 2, "hits": [1, 0, 0]},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            dump_path = Path(directory) / "coverage.json"
+            layout_path = Path(directory) / "layout.json"
+            dump_path.write_text(json.dumps(dump))
+            layout_path.write_text(json.dumps(self.layout))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = NUMERICS.main(
+                    [
+                        "coverage",
+                        "--dump",
+                        str(dump_path),
+                        "--layout",
+                        str(layout_path),
+                        "--min-inputs",
+                        "2",
+                    ]
+                )
+        self.assertEqual(code, 1)
+        output = out.getvalue()
+        self.assertIn("FAIL coverage", output)
+        self.assertIn("50.00%", output)
+        self.assertIn("93.00%", output)
+
+
+class CoveragePrerequisiteTests(unittest.TestCase):
+    """What `ci` does with the coverage flag: judge the dump the flag names."""
+
+    def setUp(self):
+        self.dump = coverage_dump(
+            [
+                {"layer": 0, "hits": []},
+                {"layer": 1, "hits": [1, 1, 0]},
+                {"layer": 2, "hits": [1, 0, 0]},
+            ]
+        )
+
+    def registry(self, coverage: bool = True, bar: float = 0.5) -> dict:
+        return {
+            "prerequisites": {
+                "coverage": coverage,
+                "coverage_slots": bar,
+                "coverage_dump": "numerics/coverage/toy.json",
+            }
+        }
+
+    def test_a_false_flag_makes_no_claim_and_reads_no_dump(self):
+        def read(path: str) -> bytes | None:
+            self.fail(f"a false coverage flag read {path}")
+
+        self.assertEqual(NUMERICS.coverage_findings(self.registry(False), read), [])
+
+    def test_a_missing_dump_is_named(self):
+        findings = NUMERICS.coverage_findings(self.registry(), lambda path: None)
+        self.assertTrue(any("does not exist" in finding for finding in findings), findings)
+        self.assertTrue(any("numerics/coverage/toy.json" in finding for finding in findings), findings)
+
+    def test_a_dump_below_the_bar_names_both_fractions(self):
+        with mock.patch.object(NUMERICS, "find_layout", return_value=(synthetic_layout(), "layout.json")):
+            findings = NUMERICS.coverage_findings(
+                self.registry(bar=0.93), lambda path: json.dumps(self.dump).encode()
+            )
+        self.assertTrue(any("50.00%" in finding and "93.00%" in finding for finding in findings), findings)
+
+    def test_a_dump_at_the_bar_passes(self):
+        with mock.patch.object(NUMERICS, "find_layout", return_value=(synthetic_layout(), "layout.json")):
+            findings = NUMERICS.coverage_findings(
+                self.registry(bar=0.5), lambda path: json.dumps(self.dump).encode()
+            )
+        self.assertEqual(findings, [])
+
+    def test_a_dump_for_another_model_is_refused(self):
+        with mock.patch.object(
+            NUMERICS,
+            "find_layout",
+            side_effect=NUMERICS.NumericsFailure("no expert layout names model 'toy/other'"),
+        ):
+            findings = NUMERICS.coverage_findings(
+                self.registry(), lambda path: json.dumps(dict(self.dump, model="toy/other")).encode()
+            )
+        self.assertTrue(any("no expert layout" in finding for finding in findings), findings)
 
 
 def monitor_dump(layer_values, experts, model: str = MODEL, probe: dict | None = None) -> dict:
