@@ -525,6 +525,24 @@ named follow-up rather than a second reference invented to match a broken regist
 Phase 5's three arms are now measured: GLM's declared change with a delta, Inkling's and Dory's
 first references with their speed gaps stated. `numerics.py ci` reports no uncaptured
 configuration.
+### The build the early cards could not name
+
+Three of the phase-5 artefacts - Inkling's anchor, its v1 anchor-forced capture and Dory's world-2
+ring - were taken on the same binary, `ef3d022e...`, and all three recorded `commit: null` with
+"the tree named by --repo is not a git work tree with a HEAD". The captures ran from
+`/home/allenh1/rsp-0611`, a staged source tree with no `.git`, so `--repo` could not name a
+revision. The source tree was staged from commit `a6ef32e4`: `Cargo.toml`,
+`crates/sparkflash-model-glm5-next/src/lib.rs` and `crates/sparkflash-cli/src/serve.rs` in the
+staged tree match that commit byte for byte. The registry file was restaged afterwards, so it is
+the source tree's identity that is recorded, not a hash of the whole tree.
+
+The three cards now record that inferred commit and say how it was inferred; the fingerprints did
+not change, because the server card is outside the fingerprint. The mechanism is closed rather than
+noted: the binary embeds its commit at build time, `/v1/models` reports it as `build.id` (with
+`-dirty` when the tree was dirty), the serve boot line names it, and `capture` records it as
+`server.commit` instead of reading `--repo` first. A new reference or anchor whose card names no
+commit is refused; the references committed before the record are grandfathered by the absent
+`server.build_source` key.
 ### The served A/B: what the harness got wrong
 
 `scripts/tick-trace-ab.py` was written against "the server", but it launched a single serve
@@ -1355,34 +1373,36 @@ change that would need a real `Vision` impl, not a wire.
 
 ### The Inkling reference no longer matches, and how far the bisect reached
 
-A window serving inkling-2-Small at world 4 on the branch head ran `scripts/numerics.py check` and
-it **fails**: the server serves `397907e6…` where the registry names `387647bc…`, with the first
-difference at the first position of the first prompt (`logprobs 'dee893bf' != '09f288bf'`). That
-is not a chunking or timing difference: the very first generated token has a different
-distribution.
+A window serving inkling-2-Small at world 4 on the branch head ran `scripts/numerics.py check`
+and it **failed**: the server served `397907e6…` where the registry names `387647bc…`, with the
+first difference at the first position of the first prompt (`logprobs 'dee893bf' != '09f288bf'`).
 
-Four windows were spent narrowing it, and they establish this much:
+**The answer is the prefill walk, not the build.** The decisive pair was served on one binary (the
+tip at `84f07153`, sha `1558ab2a…`, four ranks one hash), one checkpoint and one converted set:
 
-* **The context is not the cause.** The reference was captured at the launcher's default
-  1,048,576 positions; every failing run used `CONTEXT=32768`. A run at 1,048,576 on the same
-  binary produces the same failing fingerprint, character for character.
-* **The conversion commit cannot be measured as committed.** `540ae6d0` ("load every kernel
-  through a bound handle") does not boot: its tree has none of the six
-  `inkling_block_residual_chain_*` catalogue entries, its uploader refuses the short convolution
-  (`[4608, 1, 4]` as `[4608, 4]`) and the stacked experts (`U8 [384, 4608, 2304]` as a
-  `Mat<Nvfp4>`), and its checked-in registry spells the retired Dory entry's reason as `note`.
-  With exactly those four fixes cherry-picked (`parts.rs` entries, the unit-dimension rule, the
-  leading-dimension collapse, and the field rename) it boots and serves the **same** `397907e6…`,
-  so the move is at or before the conversion, not after it.
-* **The capture is an ancestor of the conversion**, and between them the only commit that touches
-  Inkling is the conversion itself. What remains unattributed is the build the reference was
-  actually captured on: the capture's `server` card records the checkpoint, the world and the
-  plan, but **not the commit**, so a bit difference between two builds cannot be pinned to one.
+| launch | verdict |
+| :-- | :-- |
+| `LANES=4`, `PREFILL=tensor`, `CONTEXT=1048576` (the capture's configuration) | **PASS** `387647bc…` |
+| the same binary, `PREFILL=chunk` | **FAIL** `397907e6…` - character for character the earlier failure |
 
-The consequence is stated rather than hidden: inkling-2-Small's registered version 1 now names a
-reference the branch does not reproduce, and it cannot be re-declared because `coverage` and
-`monitors` are still false. The next step is a bisect forward from the capture commit with the
-four boot fixes carried, or a capture that records its commit in the first place.
+So `397907e6` is the chunk prefill walk of the same code: under `tensor` a chunk's dense
+projections run on the wide tile (BF16 head and remainder, f32 accumulate), under `chunk` each
+prompt row takes the row kernels' arithmetic and is the decode step's bits. The earlier windows
+had compared a chunk-walk, one-slot run - the old `inkling-bin` launcher, which has no `LANES`
+and defaults to `PREFILL=chunk` - against a four-lane tensor-walk reference. The lane count turned
+out not to matter: `LANES=1` on the tensor walk also gives `387647bc…`. The context does not
+matter either. What made the investigation expensive was that neither the capture's card nor the
+boot ledger named the walk.
+
+**A real declaration gap, of the same class as GLM's inert decode switch:** the boot ledger prints
+"chunked prefill native (8192-row chunks from ChunkPolicy); tensor-core prompt native …" in both
+walks - it states the capability, not the selection, and `PrefillWalk::from_env` logs nothing. A
+run's own `/proc/<pid>/environ` was the only evidence of which arithmetic ran. The next small
+change declares the walk in the ledger and the card.
+
+The conversion `540ae6d0` remains unmeasured as committed: it does not boot without the six
+catalogue entries, the unit-dimension and leading-dimension upload rules and the retired-entry
+field rename cherry-picked, and with them it serves the chunk walk's fingerprint.
 
 The lesson is worth a mechanism: **a capture's server card has to name the build it came from**.
 Without that field, a frozen reference can only say that bits moved, never which commit moved
@@ -1551,11 +1571,11 @@ runtime's property, which is what Inkling's group relies on.
 * Speed: no tokens/s, no step time, no time to first token. Nothing here says the tick engine is
   as fast as the fused one, and the regression clause's A/B has not run.
 
-**This move is a schedule change: measure it against the same build's pre-move path.** Inkling's
-registered reference is stale - version 1 names `387647bc`, the branch serves `397907e6`, the
-first difference is at the first position, and the cause is not isolated (the section above). So
-no comparison in this window may use `387647bc` as the criterion: a difference against it says
-nothing about this move. The criterion is a **pre-move build of the same tree**:
+**This move is a schedule change: measure it against the same build's pre-move path.** (Inkling's
+registered reference is `387647bc` and the tip reproduces it on the capture's tensor prefill walk;
+`397907e6` is the same binary's chunk walk, not a stale reference - see "The Inkling reference
+does not match on one prefill walk" above.) A comparison against the reference therefore also
+depends on the walk, so the criterion for this move is a **pre-move build of the same tree**:
 
 ```sh
 # the frozen pre-move path: the commit this move's first commit follows
