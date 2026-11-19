@@ -15,11 +15,15 @@
 //! The device arm against its host twin: [Glm5NextConfig::small] written as the release stores it,
 //! 24 tokens through one, two and four ranks on one GPU, each world over a recording bus on the
 //! exact f32 wire, against the host world of the same ranks. Every device rank must agree with
-//! every other bit for bit. With the FP8 weights' inputs unquantised, rank 0's logits and every
-//! reduce's seam sit within [EXACT_WIRE_REL_L2_BAR] of the host world's; with the release's
-//! dynamic activation scheme, the median seam does, and the drift past it is printed. The device
-//! runs the tokens [MAX_ROWS] a step, so a seam carries a step's rows, which are unpicked into the
-//! host's one-token seams before they are compared.
+//! every other bit for bit. Since numerics version 2 the decode step's FP8 projections run the
+//! prompt tile's few-row body, which splits each activation into a bf16 head and remainder,
+//! where the host twin keeps its f32 chain; with the FP8 weights' inputs unquantised, rank 0's
+//! logits and every reduce's seam stay within [TOKEN_BODY_REL_L2_BAR] of the host world's. With
+//! the release's dynamic activation scheme the host also quantises each input per 128 columns
+//! and the body does not, so the median seam moves by the declared change and is printed against
+//! [TOKEN_BODY_QUANTISED_MEDIAN_BAR]. The device runs the tokens [MAX_ROWS] a step, so a seam
+//! carries a step's rows, which are unpicked into the host's one-token seams before they are
+//! compared.
 //!
 //! Rows batched in one step, from one sequence or several at different positions, must be the
 //! bits of the same tokens run one a step. A world whose collective has a device leg, here an
@@ -50,11 +54,20 @@ use sparkflash_weights::linalg::{self, EngineError, REFERENCE_TENSOR_LIMIT};
 use sparkflash_weights::rank_file::rank_file_name;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{
-    BitGatherHandle, EXACT_WIRE_REL_L2_BAR, LocalBus, LocalRank, TpCollective, TpLayout, TpRuntime,
-    Wire,
+    BitGatherHandle, LocalBus, LocalRank, TpCollective, TpLayout, TpRuntime, Wire,
 };
 
 const TOKENS: usize = 24;
+
+/// The relative-L2 bar between the device's FP8 token body and the host twin's f32 chain with
+/// both sides unquantised. The three worlds measure 1.3e-5, 1.8e-5 and 1.3e-5; the body's bf16
+/// head-and-remainder split is the difference; the f32 wire's own bar is 1e-5.
+const TOKEN_BODY_REL_L2_BAR: f64 = 2e-5;
+
+/// The median seam with the release's activation scheme. The host quantises each input per 128
+/// columns, the decode body takes the f32 row (numerics version 2), and the median measures
+/// 4.8e-2 across the three worlds; this bar only holds the paths in the same order.
+const TOKEN_BODY_QUANTISED_MEDIAN_BAR: f64 = 6e-2;
 
 fn tokens(config: &Glm5NextConfig) -> Vec<u32> {
     stride_tokens(config, TOKENS, 37, 11)
@@ -499,7 +512,7 @@ fn measure(config: &Glm5NextConfig) -> Vec<(usize, Distance)> {
                 .seams
                 .iter()
                 .enumerate()
-                .filter(|(_, seam)| **seam > EXACT_WIRE_REL_L2_BAR)
+                .filter(|(_, seam)| **seam > TOKEN_BODY_REL_L2_BAR)
                 .map(|(index, seam)| {
                     format!(
                         "token {} layer {} {} {seam:.1e}",
@@ -539,12 +552,12 @@ fn with_unquantised_activations_every_device_world_matches_the_host_world() {
     for (world, distance) in measure(&config) {
         for (index, seam) in distance.seams.iter().enumerate() {
             assert!(
-                *seam <= EXACT_WIRE_REL_L2_BAR,
+                *seam <= TOKEN_BODY_REL_L2_BAR,
                 "world {world} seam {index}: {seam:e}"
             );
         }
         assert!(
-            distance.logits <= EXACT_WIRE_REL_L2_BAR,
+            distance.logits <= TOKEN_BODY_REL_L2_BAR,
             "world {world} logits: {:e}",
             distance.logits
         );
@@ -552,14 +565,14 @@ fn with_unquantised_activations_every_device_world_matches_the_host_world() {
     }
 }
 
-/// The release quantises each FP8 weight's input per 128 columns, and a value the two sides
-/// associate one ulp apart can sit on either side of a code's rounding boundary: one code moves,
-/// and that seam and what follows it drift. The quantiser itself is the host's bit for bit on the
-/// same input (glm_kernels), so this run asserts what is exact - every device rank agrees with
-/// every other bit for bit - and that most seams still sit within the bar, which a quantiser the
-/// device skipped or misplaced would fail at every seam; it prints the drift.
+/// The release quantises each FP8 weight's input per 128 columns, where the decode body takes
+/// the f32 row (numerics version 2), so the host's quantised chain and the device's split chain
+/// are no longer the same arithmetic and the seams move by the declared change. This run asserts
+/// what still holds - every device rank agrees with every other bit for bit - and prints the
+/// drift, holding the median seam to the declared-change bar; a walk whose ranks disagreed, or a
+/// body misplaced in the layer, would move it much further.
 #[test]
-fn with_the_release_activation_scheme_the_device_ranks_agree_and_most_seams_are_exact() {
+fn with_the_release_activation_scheme_the_device_ranks_agree() {
     let Some(_cuda) = open() else {
         return;
     };
@@ -570,7 +583,7 @@ fn with_the_release_activation_scheme_the_device_ranks_agree_and_most_seams_are_
         seams.sort_by(f64::total_cmp);
         let median = seams[seams.len() / 2];
         assert!(
-            median <= EXACT_WIRE_REL_L2_BAR,
+            median <= TOKEN_BODY_QUANTISED_MEDIAN_BAR,
             "world {world}: the median seam is {median:e}"
         );
     }

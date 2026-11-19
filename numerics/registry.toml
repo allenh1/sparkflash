@@ -109,20 +109,22 @@ note = "Production's launch (debug build, NCCL reduce, prefix reuse on), 128 gre
 
 # GLM-5.3-Flash serves only at world 4. Its shipped default keeps the attention window's latent
 # cache in E4M3 and prefills in bulk with FP8 operands; v1-e4m3-window.md measures that trade
-# against the f32-cache anchor below.
+# against the f32-cache anchor below. Version 2 decodes one-to-eight-row FP8 projections on the
+# shared tile's few-row body (glm_decode_fp8b128_rows), the first change to move this model's
+# bits; v2-fp8-token-body.md declares it and records that the served delta is not measured yet.
 [[config]]
 model = "zai-org/GLM-5.3-Flash"
 world = 4
 profile = "reference"
 plan = "tp"
 arch = "sm_121a"
-version = 1
+version = 2
 evidence = "logprobs"
 reference = "references/glm53-tp4-sm121a.json"
 fingerprint = "827ec5f682d512ccc73f10e6145a1ada548fbc027710d09330b34da61c3bafd6"
-report = "docs/numerics/glm53/v1-e4m3-window.md"
+report = "docs/numerics/glm53/v2-fp8-token-body.md"
 captured = "2026-11-03"
-note = "The shipped default: E4M3 latent cache, bulk FP8 prefill, default context."
+note = "Version 2: E4M3 latent cache, bulk FP8 prefill, decode's 1..=8-row FP8 projections on the tile's few-row body. The reference and fingerprint are version 1's until the cluster capture; the served delta is unmeasured (docs/numerics/glm53/v2-fp8-token-body.md)."
 
 # Inkling-2-Small and Dory1.0-4B are registered before their first capture: both entries name the
 # configuration, version and evidence, and leave `reference` and `fingerprint` out. That is the

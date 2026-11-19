@@ -1918,27 +1918,31 @@ pub const WAIVERS: &[Waiver] = &[
         measurement: "Qwen's FP8 head is the row body q4e_argmax_prob_slices; no tensor-core \
                       head body and no measurement recorded",
     },
-    // GLM's and Inkling's decode steps keep the row GEMV. Their prompt tiles start at nine rows
-    // (MAX_ROWS/BATCH_ROWS = 8), so the token band is the gap. The numbers are the row-count
-    // thresholds, not a speed measurement; none is recorded.
+    // GLM's block-scaled FP8 decode rows take the tile's few-row body
+    // (glm_decode_fp8b128_rows, the Image::DECODE entry above); its BF16 parts have no few-row
+    // body yet and keep the row GEMV, as Inkling's do. Their prompt tiles start at nine rows
+    // (MAX_ROWS/BATCH_ROWS = 8), so the token band is the gap that remains. The numbers are the
+    // row-count thresholds, not a speed measurement; none is recorded.
     Waiver {
         part: Some(Part::DenseGemm),
         precision: Some(Precision::Bf16),
         phase: KernelPhase::Decode,
         rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "GLM keeps MAX_ROWS (8) row GEMV rows before glm_prefill_bf16_*; Inkling \
-                      keeps BATCH_ROWS (8) before its tile. Row band from the released \
-                      constants; no one-row measurement recorded",
+        measurement: "GLM's BF16 parts keep MAX_ROWS (8) row GEMV rows before \
+                      glm_prefill_bf16_*, now that its FP8 rows take the tile's few-row body \
+                      (glm_decode_fp8b128_rows); Inkling keeps BATCH_ROWS (8) before its tile. \
+                      Row band from the released constants; no one-row measurement recorded",
     },
     Waiver {
         part: Some(Part::DenseMlp),
         precision: None,
         phase: KernelPhase::Decode,
         rows: RowBand::at_most(crate::gemv::GEMV_MAX_BATCH),
-        measurement: "GLM (MAX_ROWS = 8), Inkling (BATCH_ROWS = 8) and Dory (TOKEN_ROWS = 8) \
-                      keep the row GEMV on this band; Dory's dory_mma_wide starts at nine rows \
-                      (crates/sparkflash-model-dory/src/device.rs:60-62). No tensor-core \
-                      few-row body and no one-row measurement recorded",
+        measurement: "Inkling (BATCH_ROWS = 8) and Dory (TOKEN_ROWS = 8) keep the row GEMV \
+                      on this band; GLM's MLP rows are FP8 and now take the tile's few-row body \
+                      (glm_decode_fp8b128_rows). Dory's dory_mma_wide starts at nine rows \
+                      (crates/sparkflash-model-dory/src/device.rs:60-62). No one-row \
+                      measurement recorded",
     },
     // Dory's attention and head are outside this assertion's GEMM parts; its MLP gap is the
     // DenseMlp line above. Its projections take q4e_gemv_bf16 on the same band.
