@@ -1912,6 +1912,108 @@ request's `cached_tokens` is zero on both builds, the one counter the adapters' 
 bookkeeping feeds is only exercised by a second turn of the same conversation; the window sends
 that second greedy turn too, and a build that dropped the bookkeeping answers a different count.
 
+### Inkling's registered v1 is degenerate: the head's few-row body read the row GEMV's packed layout
+
+A cluster window serving Inkling-2-Small at world 4 (`scripts/inkling-serve-group.sh`,
+`LANES=4`, `PREFILL=tensor`, `CONTEXT=1048576`, one checkpoint) forced the registered
+reference's tokens through two builds and measured:
+
+| build | generated | against `387647bc…` |
+| :-- | :-- | :-- |
+| the branch tip (`e60f00c5`, three commits past the decode change) | eight prompts decoded to multilingual token soup | **bit-identical**; `numerics.py check` PASS |
+| `7850cffc` (the last build before it, head still on the row GEMV) | a clean chat opener | mean NLL **+5.824**, top-1 **29.49%**, max **47.09** |
+
+The divergence is structured, not a precision tail: the worst position of every prompt is position
+0. There the reference puts essentially all mass on `200001` (`<|message_model|>`, logprob ~0),
+while `7850cffc`'s argmax is content token `125148` at `-1.156` and `200001` sits at `-48.25`.
+Equal prompt ids, equal forced tokens, one decode step apart.
+
+**What was wrong.** Commit `84f07db7` moved the head's one-to-eight-row projection to
+`q4p_dense_rows` and handed the launch the head's packed copy. That body's `Q4pRowsPacked` stage
+decodes the **tiled** packed layout (`q4e_packed_tiled_a/b` in
+`kernels/qwen4_prefill_sm121.cu`: plane A at `256 j + 8 l` of a step), while Inkling packs **in
+place in the row walk's layout**: `device/packed.rs` builds
+`PackedSet::new(form, Placement::InPlace)` and never calls `.tiled()`, and
+`q4e_gemv_packed` is that layout's reader. `Shared::dense_rows` filtered the copy only through
+`admits` (columns, row count, a 16-byte-aligned activation), which says nothing about layout, so
+every decode head row rebuilt its chunks from the wrong offsets: plane A from another chunk, the
+plane-B nibble from another chunk, the step's top from a different lane. The head's logits were
+garbage at the first decode row and at every one after; `200001` maximised them.
+
+The expert band's change is not implicated by this measurement. The few-row expert bodies take the
+same grouped table, plan, split activation planes, outer scales and routing-weight-one convention
+as `run_band_mma`'s `q4p_moe_gate_up_capped`/`q4p_moe_down` launches, and the window's signature
+is the head's: the first decode row's hidden state is the prompt's own last row, which the head
+change does not touch, so the reference putting probability ~1 on `200001` there is the packed
+read, not the band. The expert rows are still **unproven on the released checkpoint**, and the
+next window compares them (below).
+
+**The fix.** Commit `6dd347c9`: `Shared::dense_rows` routes by the packed copy's layout
+(`DenseRowsInput`): no copy → the BF16 rows; a tiled copy → the packed rows the body's stage
+reads; the walk layout → refuse, and the head falls back to the row GEMV, which is the arithmetic
+`7850cffc` ran and the window measured clean. `SPARKFLASH_DENSE_WEIGHTS=checkpoint` still takes
+the body over the checkpoint's BF16 rows, where the body is the wide tile's row. A CPU test pins
+the routing
+(`sparkflash-model-inkling2`'s `device::tests::the_few_row_head_body_takes_only_the_tiled_packed_copy`).
+No kernel changed, so the device test that compares the body with the wide tile is untouched and
+keeps passing (`token_bodies_device::the_bf16_rows_body_is_the_wide_tiles_row`).
+
+**The registered reference is degenerate.** `numerics/references/inkling2-tp4-sm121a.json`
+(`387647bc…`) reproduces the broken output bit for bit: it pins the defect, not clean arithmetic.
+It is **not** edited here and its registry entry is not moved. Inkling's v1 must be
+**re-declared** after the fix: a fresh capture from a clean build with the same forced-capture
+discipline (`capture --forced-from` the old reference, two captures bit-identical, the served
+gate's lanes check, and a server card that names the build), reviewed and registered as the arm's
+new version. **No deployment may be proposed on the current v2-less state**: the only declared
+reference is known degenerate, so there is no declared arithmetic to serve.
+
+**What the next GPU window runs.**
+
+```sh
+# 1. The bodies' device tests (unchanged: no .cu changed, nothing else on the device moved).
+cargo test -p sparkflash-kernels --test token_bodies_device -- --ignored --nocapture --test-threads=1
+cargo test -p sparkflash-kernels --test expert_rows_device -- --ignored --nocapture --test-threads=1
+
+# 2. The fixed group on the released checkpoint, the capture's configuration.
+BIN=<release build of the fix> LANES=4 PREFILL=tensor CONTEXT=1048576 \
+    ./scripts/inkling-serve-group.sh launch
+
+# 3. A greedy 32-token completion: the evidence is the text.
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"thinkingmachines/Inkling-2-Small","temperature":0,"max_tokens":32,
+         "messages":[{"role":"user","content":"Hello, who are you?"}]}'
+
+# 4. The forced comparison against the degenerate v1 reference, twice, bit-identical.
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+    --forced-from numerics/references/inkling2-tp4-sm121a.json \
+    --out /tmp/inkling2-tp4-v2-a.json --binary <release build>
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+    --forced-from numerics/references/inkling2-tp4-sm121a.json \
+    --out /tmp/inkling2-tp4-v2-b.json --binary <release build>
+sha256sum /tmp/inkling2-tp4-v2-a.json /tmp/inkling2-tp4-v2-b.json
+python3 scripts/numerics.py compare --anchor numerics/references/inkling2-tp4-sm121a.json \
+    --candidate /tmp/inkling2-tp4-v2-a.json
+
+# 5. The head's body against the row GEMV on the real checkpoint. Boot the same build with
+#    SPARKFLASH_DENSE_WEIGHTS=checkpoint: there is then no packed copy, the head takes the
+#    few-row body over its BF16 rows, and every other projection takes the BF16 GEMV. The packed
+#    form's round-trip is checked at load, so this forced capture must be bit-identical to
+#    /tmp/inkling2-tp4-v2-a.json.
+SPARKFLASH_DENSE_WEIGHTS=checkpoint BIN=<the same build> LANES=4 PREFILL=tensor \
+    CONTEXT=1048576 ./scripts/inkling-serve-group.sh launch
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+    --forced-from numerics/references/inkling2-tp4-sm121a.json \
+    --out /tmp/inkling2-tp4-checkpoint.json --binary <the same build>
+sha256sum /tmp/inkling2-tp4-v2-a.json /tmp/inkling2-tp4-checkpoint.json
+```
+
+Pass is: the bodies' device tests still pass; the greedy completion begins with a plausible
+assistant opener (not `200001` or a repeated special token); the two forced captures are
+byte-identical; the forced comparison reports a positive NLL delta against the old reference (a
+clean row where the degenerate one put probability ~1 on `200001`); and the checkpoint-form capture
+matches the packed-form capture bit for bit. Soup, a zero or negative delta, or a body/GEMV
+mismatch is a failed fix.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:

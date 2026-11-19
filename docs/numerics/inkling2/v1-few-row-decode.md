@@ -23,15 +23,28 @@ to move and no bump: version 1 is the arithmetic this change lands, and the firs
 it. Two captures on the served group are bit-identical and the served gate's lanes check passed;
 the numbers are below.
 
+**On 2026-11-19 this reference was found to pin degenerate output.** The window's forced captures
+showed the captured arithmetic decoding eight prompts to token soup, and the head's few-row body
+was reading the row GEMV's packed layout through the tiled stage. The fix is commit `6dd347c9`;
+the reference file and its registry entry are deliberately left as captured, because a reference
+is replaced by a reviewed re-declaration, not by an edit. **Version 1 must be re-declared from a
+clean build** (a new capture with the same forced-capture discipline), and **no deployment may be
+proposed on the current v2-less state**: the only declared arithmetic is the degenerate one. The
+full record is *The 2026-11-19 window* below.
+
 This is the first declared change to Inkling's arithmetic: its decode rows move from the row
 GEMV/matvec bodies to the prompt tile's bodies.
 
 ## What changed
 
-- **The head.** A decode head row (one to eight rows) now takes `q4p_dense_rows`, the shared
-  wide tile's few-row BF16 body. The row is `glm_prefill_bf16_wide`'s - the tile Inkling's
-  tensor walk runs - and the body reads the matrix's packed copy where the packed uploader made
-  one. A wider head walk, or a shape the body does not cover, keeps the batched row GEMV.
+- **The head.** A decode head row (one to eight rows) was moved to `q4p_dense_rows`, the
+  shared wide tile's few-row BF16 body, whose row is `glm_prefill_bf16_wide`'s - the tile
+  Inkling's tensor walk runs. As captured, the launch also handed the body the matrix's packed
+  copy; that is the defect below (the body decodes only the *tiled* packed layout and Inkling
+  packs in place in the *row walk's* layout). After `6dd347c9` a packed head keeps the batched
+  row GEMV - the body would otherwise read the packed bytes as BF16 words - and only a
+  checkpoint-form head, which has no packed copy, takes the body. A wider head walk, or a shape
+  the body does not cover, keeps the GEMV either way.
 - **The NVFP4 experts.** The one-to-eight-row steered band now takes
   `q4p_moe_rows_gate_up_capped` and `q4p_moe_rows_down`: the grouped tile's chain over the
   interleaved w13, the softcapped SwiGLU, the same split bf16 activation planes and the same
@@ -81,6 +94,109 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 
 Both compare bits. Neither is a speed measurement, and neither runs the released checkpoint.
 
+## The 2026-11-19 window: the registered v1 pins degenerate output
+
+A cluster window measured on one GPU, with the same launcher (`scripts/inkling-serve-group.sh`,
+`LANES=4`, `PREFILL=tensor`, `CONTEXT=1048576`), the same checkpoint, and the reference's own
+tokens forced through (`capture --forced-from`):
+
+| build | generated | against `387647bc…` |
+| :-- | :-- | :-- |
+| the branch tip (`e60f00c5`) | eight prompts decoded to multilingual token soup | **bit-identical**: `numerics.py check` PASS |
+| `7850cffc` (head still on the row GEMV) | a clean chat opener | mean NLL **+5.824**, top-1 **29.49%**, max **47.09** |
+
+The divergence is structured, not a precision tail. The worst position of every prompt is position
+0: there the reference puts essentially all mass on `200001` (`<|message_model|>`, logprob ~0),
+while `7850cffc`'s argmax is content token `125148` at `-1.156` and `200001` is at `-48.25`.
+Equal prompt ids, equal forced tokens, one decode step apart.
+
+### What was wrong
+
+Commit `84f07db7` handed `q4p_dense_rows` the head's packed copy. The body's `Q4pRowsPacked`
+stage decodes the **tiled** packed layout (`q4e_packed_tiled_a/b`: plane A at `256 j + 8 l` of a
+step), while Inkling packs **in place in the row walk's layout**
+(`PackedSet::new(form, Placement::InPlace)`, `Layout::Walk`, never `.tiled()`; its reader is
+`q4e_gemv_packed`). `Shared::dense_rows` filtered the copy only through `admits` (columns, row
+count, a 16-byte-aligned activation), which says nothing about layout, so every decode head row
+rebuilt its chunks from the wrong offsets: plane A from another chunk, the plane-B nibble from
+another chunk, the step's top from a different lane. The head's logits were garbage at the first
+decode row and at every one after, and `200001` maximised them.
+
+The expert band's change is not implicated by this measurement. The few-row NVFP4/MXFP8 bodies
+take the same grouped table, plan, split activation planes, outer scales and routing-weight-one
+convention as the `run_band_mma` launches, and the window's signature is the head's: the first
+decode row's hidden state is the prompt's own last row, which the change does not touch. The
+expert rows remain unproven on the released checkpoint.
+
+### The fix
+
+Commit `6dd347c9`: `Shared::dense_rows` routes by the packed copy's layout (`DenseRowsInput`):
+
+- **no packed copy** (`SPARKFLASH_DENSE_WEIGHTS=checkpoint`) - the body reads the matrix's BF16
+  rows, which is the wide tile's row;
+- **a tiled copy** - the body reads the packed rows its stage decodes;
+- **the walk layout** - the body refuses the projection and the head falls back to the row GEMV,
+  which is `7850cffc`'s arithmetic and the build the window measured clean.
+
+A CPU test pins the three-way routing:
+`sparkflash-model-inkling2`'s
+`device::tests::the_few_row_head_body_takes_only_the_tiled_packed_copy`. No kernel changed, so
+`token_bodies_device::the_bf16_rows_body_is_the_wide_tiles_row` - the body-equals-tile test - is
+unchanged and keeps passing; it cannot see a wrong *input*, which is exactly what this was.
+
+### The consequence for v1
+
+**`numerics/references/inkling2-tp4-sm121a.json` (`387647bc…`) pins the defect, not clean
+arithmetic.** It is not edited and its registry entry is not moved: a reference is replaced by a
+reviewed re-declaration. Inkling's v1 must be **re-declared** after the fix - a fresh capture from
+a clean release build with the same forced-capture discipline (two captures bit-identical, the
+served gate's lanes check, a server card that names the build), reviewed and registered as the
+arm's new version. **No deployment may be proposed on the current v2-less state.**
+
+### What the next GPU window runs
+
+```sh
+# 1. The bodies' device tests (unchanged: no .cu changed).
+cargo test -p sparkflash-kernels --test token_bodies_device -- --ignored --nocapture --test-threads=1
+cargo test -p sparkflash-kernels --test expert_rows_device -- --ignored --nocapture --test-threads=1
+
+# 2. The fixed group on the released checkpoint, the capture's configuration.
+BIN=<release build of 6dd347c9> LANES=4 PREFILL=tensor CONTEXT=1048576 \
+    ./scripts/inkling-serve-group.sh launch
+
+# 3. A greedy 32-token completion: the evidence is the text.
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
+    -d '{"model":"thinkingmachines/Inkling-2-Small","temperature":0,"max_tokens":32,
+         "messages":[{"role":"user","content":"Hello, who are you?"}]}'
+
+# 4. The forced comparison against the degenerate v1 reference, twice, bit-identical.
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+    --forced-from numerics/references/inkling2-tp4-sm121a.json \
+    --out /tmp/inkling2-tp4-v2-a.json --binary <release build of 6dd347c9>
+python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+    --forced-from numerics/references/inkling2-tp4-sm121a.json \
+    --out /tmp/inkling2-tp4-v2-b.json --binary <release build of 6dd347c9>
+sha256sum /tmp/inkling2-tp4-v2-a.json /tmp/inkling2-tp4-v2-b.json
+python3 scripts/numerics.py compare --anchor numerics/references/inkling2-tp4-sm121a.json \
+    --candidate /tmp/inkling2-tp4-v2-a.json
+
+# 5. The head's body against the row GEMV on the real checkpoint. With
+#    SPARKFLASH_DENSE_WEIGHTS=checkpoint the head has no packed copy, so the few-row body runs on
+#    its BF16 rows; with the default the head runs the walk-layout GEMV. The packed form's
+#    round-trip is checked at load, so the two forced captures must be bit-identical.
+SPARKFLASH_DENSE_WEIGHTS=checkpoint <the same launch> \
+    && python3 scripts/numerics.py capture --url http://127.0.0.1:8000 \
+        --forced-from numerics/references/inkling2-tp4-sm121a.json \
+        --out /tmp/inkling2-tp4-checkpoint.json --binary <the same build>
+```
+
+Pass is: the device tests pass; the greedy completion begins with a plausible assistant opener
+(not `200001` or a repeated special token); the two captures are byte-identical; the forced
+comparison against the old reference reports a positive NLL delta (a clean row where the
+degenerate one put probability ~1 on `200001`); and the checkpoint-form capture matches the
+packed-form capture bit for bit. Soup, a zero or negative delta, or a body/GEMV mismatch is a
+failed fix.
+
 ## Measured on the cluster, 2026-11-19
 
 Served at world 4 on the four DGX Sparks from the branch built at `f1f86bf4` (release,
@@ -99,16 +215,24 @@ Two captures are bit-identical, so the served configuration is deterministic:
 The served gate's lanes check passed on the same boot: four prompts together equal each alone,
 twice, in 58 s.
 
-There is **no delta** to report, and that is the honest shape of a first reference: the entry
-had no reference to move from, so version 1 does not declare a change, it pins the arithmetic.
-The measurement of this change against the row-GEMV decode would need a capture on a build that
-still runs those bodies, which no longer exists on this branch.
+There was **no delta** to report when the entry was captured, and that is the honest shape of a
+first reference: the entry had no reference to move from, so version 1 did not declare a change,
+it pinned the arithmetic. The 2026-11-19 window then measured the pre-change build against this
+reference (+5.824 mean NLL, 29.49% top-1), but the reference is the degenerate capture, so that
+delta measures the defect. Version 1 is being re-declared; see *The 2026-11-19 window* above.
 
 ## What is still not measured
 
 - **The change against the row-GEMV arithmetic.** The bodies are the tiles' rows bit for bit
-  (the device tests above), but how far the served logits move from the row GEMV's was never
-  captured, and this first reference cannot supply it.
+  (the device tests above), but this reference cannot measure the served distance: the 2026-11-19
+  window did measure `7850cffc` against it (+5.824 mean NLL, 29.49% top-1), but the reference is
+  the degenerate capture, so that number measures the defect, not the intended change. The clean
+  delta arrives with the re-declaration.
+- **The expert rows against the grouped tile on the released checkpoint.** The generated-operand
+  device test says the rows bodies are the tiles' rows; the released checkpoint's NVFP4 and MXFP8
+  operands have not been compared row against tile on a device. The next window's forced captures
+  cover it end to end when the group is booted once with the decode band's rows and once with the
+  chunk's grouped tile.
 - **The speed A/B.** Whether the one-row step is flat or slower and whether the several-row step
   is faster are both **unmeasured**. The plan expects flat-to-slightly-slower at one row and
   faster at several, as on DeepSeek and Qwen; that expectation is not evidence. The MXFP8 rows
@@ -132,9 +256,11 @@ fingerprint.
 
 ## Reading
 
-The device tests establish that the head's row and the NVFP4 experts' rows are the prompt tiles'
-rows, and that the MXFP8 rows are the tile itself. The cluster capture establishes the rest of
-what a first reference can: on the released checkpoint the group serves deterministically, four
-lanes together compute what each alone computes, and the bits are pinned by a fingerprint the
-declaration check can hold. Whether the step got faster, and how far these rows sit from the row
-GEMV's logits, remain open and are named above.
+The device tests establish that the head's body and the NVFP4 experts' rows are the prompt tiles'
+rows, and that the MXFP8 rows are the tile itself; the routing now keeps the packed head on the
+row GEMV, so on a served (packed) checkpoint it is the head *GEMV* that runs, and only a
+checkpoint-form head takes the body. The cluster capture establishes what a first reference can
+about determinism: on the released checkpoint the group served deterministically and four lanes
+together computed what each alone computed. It does not establish clean arithmetic, which is why
+the reference is being re-declared. Whether the step got faster, and how far the expert rows sit
+from the row GEMV's logits, remain open and are named above.
