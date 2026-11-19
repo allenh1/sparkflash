@@ -1768,6 +1768,14 @@ mod tests {
 
     /// A drafting walk is constructed and served: the round path exists, so the ledger states
     /// drafting and a run, and the joint row follows the switch rather than a constant.
+    /// The seventh generated check runs on the toy: a run with drafts (and a rejected one)
+    /// answers exactly the tokens the plain run does.
+    #[test]
+    fn the_toy_drafted_run_equals_a_plain_one() {
+        crate::run_check::<DraftWalk>(crate::ConformanceCheck::DraftedEqualsPlain)
+            .expect("drafted = plain on the toy");
+    }
+
     #[test]
     fn a_drafting_walk_serves_and_its_ledger_rows_are_derived() {
         let runtime = Runtime::new(DraftWalk::passing(), 0)

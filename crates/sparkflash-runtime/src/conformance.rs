@@ -26,10 +26,12 @@
 //! needs a device returns an operator-facing error from [`run_check`] until it is run under
 //! `scripts/onboard-gate.sh`.
 
-use sparkflash_model::backend::BackendError;
+use sparkflash_model::backend::{BackendError, StepOutput};
 
 use crate::layout::StateKind;
-use crate::walk::{Drafter, PassMask, Segments, Walk};
+use crate::pool::LaneMemory;
+use crate::runtime::Runtime;
+use crate::walk::{Drafter, HeadRow, Hidden, Pass, PassMask, Segment, Segments, Walk};
 
 /// One check the generated arm tests cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,13 +135,23 @@ pub fn check_claims<W: Walk>(claims: &[ConformanceCheck]) -> Result<(), String> 
     Ok(())
 }
 
-/// Runs one generated check. Until the fixture runner lands, this says what the check needs;
-/// the generated tests are `#[ignore]`d so a GPU-less host still compiles and passes.
+/// Runs one generated check.
+///
+/// [`ConformanceCheck::DraftedEqualsPlain`] runs with no device when the walk supplies one
+/// through [`Walk::cpu`]: it drives the same prompt through the runtime's drafted step and
+/// through a plain token loop, and requires the same tokens, rejected draft included. The other
+/// checks still need the arm's device fixture; the generated tests are `#[ignore]`d so a
+/// GPU-less host still compiles and passes.
 ///
 /// # Errors
-/// The check needs the arm's device fixture; the message names it.
+/// The check needs the arm's device fixture, or the drafted run disagrees with the plain one.
 pub fn run_check<W: Walk>(check: ConformanceCheck) -> Result<(), BackendError> {
     check_claims::<W>(&[check]).map_err(|why| BackendError::new("conformance", why))?;
+    if check == ConformanceCheck::DraftedEqualsPlain
+        && let Some(drafted) = W::cpu()
+    {
+        return drafted_equals_plain::<W>(drafted);
+    }
     Err(BackendError::new(
         "conformance",
         format!(
@@ -148,6 +160,103 @@ pub fn run_check<W: Walk>(check: ConformanceCheck) -> Result<(), BackendError> {
             std::any::type_name::<W>()
         ),
     ))
+}
+
+/// How many tokens [`run_check`] compares before it calls a drafted run plain.
+const CONFORMANCE_TOKENS: usize = 6;
+
+/// A prompt the toy walks can start from.
+const CONFORMANCE_PROMPT: [u32; 3] = [7, 9, 11];
+
+/// The drafted-equals-plain check over a walk the runtime can drive with no device.
+///
+/// The drafted side is [`Runtime`]'s step: a prompt, then a fed token a step. The plain side is
+/// the same walk driven a row at a time through [`Walk::walk`] and [`Walk::head`]. The two
+/// token runs must be equal, which is the property a rejected draft can break.
+fn drafted_equals_plain<W: Walk>(drafted: W) -> Result<(), BackendError> {
+    let plain = W::cpu().ok_or_else(|| {
+        BackendError::new("conformance", "the walk supplies only one CPU instance")
+    })?;
+    let expected = plain_run(&plain, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+    let runtime = Runtime::new(drafted, 0)?;
+    let mut slot = runtime.open_slot()?;
+    let first = runtime.prefill_slot(&mut slot, &CONFORMANCE_PROMPT)?;
+    let mut actual = vec![first.next_token];
+    let mut member = [(slot, first.next_token.unwrap_or_default())];
+    while actual.len() < CONFORMANCE_TOKENS {
+        let steps = runtime.step_slots(&mut member)?;
+        let next = steps.first().and_then(|step| step.next_token);
+        actual.push(next);
+        let Some(token) = next else {
+            break;
+        };
+        member[0].1 = token;
+    }
+    if actual != expected {
+        return Err(BackendError::new(
+            "conformance",
+            format!(
+                "drafted = plain failed for {}: drafted {actual:?}, plain {expected:?}",
+                std::any::type_name::<W>()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The plain token run: one bulk prompt pass, then a token row a step, headed directly.
+fn plain_run<W: Walk>(
+    walk: &W,
+    prompt: &[u32],
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
+    let mut seq = walk.open(LaneMemory::new(0, 0))?;
+    let hidden = walk.walk(
+        &mut [Segment::new(&mut seq, prompt)],
+        Pass::bulk(prompt.len()),
+    )?;
+    let step = head_one(
+        walk,
+        &mut seq,
+        &hidden,
+        hidden.rows.saturating_sub(1),
+        None,
+        prompt,
+    )?;
+    let mut run = vec![step.next_token];
+    let mut token = step.next_token;
+    while run.len() < tokens {
+        let Some(fed) = token else {
+            break;
+        };
+        let hidden = walk.walk(
+            &mut [Segment::new(&mut seq, std::slice::from_ref(&fed))],
+            Pass::token_rows(),
+        )?;
+        let step = head_one(walk, &mut seq, &hidden, 0, Some(fed), prompt)?;
+        token = step.next_token;
+        run.push(token);
+    }
+    Ok(run)
+}
+
+/// One head row, for the plain run.
+fn head_one<W: Walk>(
+    walk: &W,
+    seq: &mut W::Seq,
+    hidden: &Hidden,
+    row: usize,
+    token: Option<u32>,
+    prompt: &[u32],
+) -> Result<StepOutput, BackendError> {
+    let mut rows = [match token {
+        Some(token) => HeadRow::token(seq, row, token),
+        None => HeadRow::prompt(seq, row, prompt),
+    }];
+    let mut steps = walk.head(hidden, &mut rows)?;
+    steps
+        .pop()
+        .ok_or_else(|| BackendError::new("conformance", "the head answered no step"))
 }
 
 /// Emit the generated conformance checks for `Arm`: an `#[ignore]`d test a check, and the
