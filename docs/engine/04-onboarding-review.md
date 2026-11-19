@@ -1080,6 +1080,57 @@ dense declares no drafter, and `TP 1 = TP 2 = TP 4`, because the fixture is one 
 the `--include-ignored` forms and need no GPU. `scripts/onboard-gate.sh dense` and
 `scripts/onboard-gate.sh inkling` are the script forms of the same gate.
 
+### The short-convolution weight a container reports in three dimensions
+
+The four-DGX-Spark window that ran the branch's conformance checks at `57cd3c96` passed dense's
+generated checks and failed all seven of Inkling's with one error:
+
+```text
+conformance: drafted = plain: NEEDS-FIXTURE: model.llm.layers.0.attn_sconv.weight: upload::<bf16> refuses `model.llm.layers.0.attn_sconv.weight`: the tensor is stored as bf16 (BF16 [32, 1, 4]), and the Mat is bf16
+```
+
+The tensor is Inkling's per-layer short convolution. The fixture writes it (and `mlp_sconv`, and
+the GQA form's `k_sconv`/`v_sconv`) as `[hidden, 1, kernel]` = `[32, 1, 4]` BF16
+(`crates/sparkflash-model-inkling2/src/fixture.rs`), and the plan names the same three
+dimensions (`src/tensor.rs`), because that is how a container reports a 1-D convolution:
+`[out, in/groups, kernel]`. On the boot path `device::type_slots` flattens the stored
+dimensions with `flat_matrix` to the `[32, 4]` matrix the arithmetic sees and still passes the
+container's 3-D spec as `Tensor::stored`. `upload` rebuilt the logical spec from its 2-D view
+and required `TensorSpec::is_stored_as`, which demanded literal dtype and shape equality, so the
+same tensor in two honest notations was refused before any weight reached the device.
+
+The rule is in `TensorSpec::is_stored_as` (`crates/sparkflash-weights/src/spec.rs`), where the
+format rule lives, not in `upload`: a stored spec holds the logical spec when the dtypes agree,
+the element counts agree, and the stored shape with its unit dimensions removed equals the
+logical shape. A unit dimension carries no stride, so the row-major bytes are the same tensor;
+only unit dimensions may vanish, so a squeezed shape of another rank or another element count is
+refused, and only under the same dtype, so a `U8` or `F32` tensor never stands in for BF16. The
+FP4 packing arm is untouched: it still matches only an `F4E2M1` logical spec against ModelOpt's
+`U8` packing. The rule is general because it is a statement about a container's spelling of a
+tensor versus the plan's, which is what the other caller also asks -
+`parts_backend::open` checks a planned spec against the weight source before any kernel is
+resolved - and both call sites now mean the same thing.
+
+Two tests cover it. `a_unit_dimension_is_the_same_tensor` in `spec.rs` accepts `[32, 1, 4]` as
+`[32, 4]` (leading or trailing unit dimensions too), and refuses `[32, 1, 5]` (160 elements,
+not 128), a same-element-count shape whose squeezed rank differs (`[128]`), a genuine
+flattening (`[4, 2, 32]` is not the matrix `[8, 32]`), and `F32` or `U8` stored in place of
+BF16. `the_inkling_fixture_short_convolution_uploads_as_bf16` in
+`crates/sparkflash-ops/src/formats.rs` runs the fixture's exact `[32, 1, 4]` spec through
+`upload::<Bf16>` with the boot's `[32, 4]` view and stride 8, and asserts the resulting
+matrix's shape, dtype and row bytes. `upload` never dereferences the address, so both run
+without a device; the boot's own `type_slots` needs the CUDA-allocated `Slot` pointers, which is
+why the upload test enters at `upload` with an unbacked `Deviceptr`.
+
+**The device window must rerun these two commands** on the branch tip, with the same cubins and
+`SPARKFLASH_KERNEL_DIR` as the run above, expecting Inkling's six PASS and one SKIP (TP, one
+rank) and no `NEEDS-FIXTURE` line:
+
+```sh
+cargo test -p sparkflash-model-inkling2 --lib -- --include-ignored --test-threads=1
+cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture
+```
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
