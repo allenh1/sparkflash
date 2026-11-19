@@ -1131,6 +1131,196 @@ cargo test -p sparkflash-model-inkling2 --lib -- --include-ignored --test-thread
 cargo test -p sparkflash-model-inkling2 --lib conformance:: -- --ignored --nocapture
 ```
 
+### Qwen on the tick engine: the prefill plan's chunks and the batch's verify width
+
+Commits `659b2dad` (the single process) and `c4d0010d` (the group). Qwen has no `serve.rs`; its
+serving wiring is `crates/sparkflash-model-qwen4-exp/src/device.rs`, and the walk, the plan and
+the widths are in `device/walk.rs` and `device/prefill.rs`.
+
+`Qwen4ExpDeviceBackend::enable_fusion` now opens a `TickServe` over `QwenWalk` instead of
+`Fusion::local` over `Runtime<QwenWalk>`, and `enable_group_fusion`/`mirror_group` start
+rank 0 of the tick group and replay its frames, exactly as GLM's do. The walk, the drafter, the
+kernels and the layout are untouched: the engine chooses *when* a chunk or a step runs, and the
+runtime executes the same rows with the same shape.
+
+**Qwen's chunk was never a Qwen constant, and it does not move.** It is `PrefillPlan`'s chunk -
+clamped to 16..4,096 and rounded down to a multiple of `DENSE_ROWS` (512) above 512 - lifted by
+`pass_rows` to the smallest documented `ChunkPolicy` size at or above it that it divides, and
+handed to the runtime's `ChunkPolicy` over `Limits::new(pass_rows(chunk), context)` with
+`members = capacity.clamp(1, MAX_BATCH)`. The engine reads the same two functions
+(`TickConfig::for_runtime`, which is `ChunkPolicy::for_limits` over `Walk::limits`), so the part width
+is the runtime's by construction in every plan, including the odd ones (a 512-row plan chunk
+gives 1,024 rows a part and two 512-row forwards, a 2,560-row chunk gives 4,096 and 2,560 + 1,536,
+both before and after):
+
+| | Before (`Fusion` over `Runtime`) | After (`TickServe` over `TickEngine`) |
+| :-- | :-- | :-- |
+| prompt part, tensor-core plan (the default) | `ChunkPolicy` rows = **4,096** | `exact_tick_rows` = `busy_chunk` = `chunk_min` = `bulk_cap` = **4,096** |
+| prompt part, token-kernel plan (`SPARKFLASH_QWEN4_PREFILL_MMA=0`, or a build without the prefill cubin) | **256** (the plan's chunk is 128) | **256** |
+| a part's forwards | `PrefillPlan::forwards`: 4,096; or two 128-row forwards a 256-row part | unchanged - the arm still splits its own rows |
+| prompt rows | any prompt, one part a pass | the same rows: 5,000 is **4,096 + 904**; 600 at the token plan is **256/256/88** |
+| verify width | `Limits::members` = `capacity.clamp(1, MAX_BATCH)` = **4** | `TickConfig::members` = the same **4** |
+| a member's verify rows | 1 + depth: `verify_rows` = `MTP_VERIFY_ROWS` (3), or the DFlash 2 head's `block_size` when that is larger, so **3 rows and 2 drafts** on the MTP stage | `k = drafter.budget(1)` = **3 rows, 2 drafts** |
+| joint rounds | the runtime's `JOINT_ROUNDS` | `for_runtime` reads the same switch into `shared_rounds` |
+| decoder-layer skip | none; only DeepSeek has those layers | `decoder_skip = false` |
+| row exchange | none at TP=1 | `exchange = false` at TP=1, `true` in a group |
+| drafter | `QwenDrafter`: the DFlash 2 head or the checkpoint's MTP stage | unchanged |
+| a group's lane count, when the operator gives none | `lane_limit()` = `limits().members` = 4 | the same 4 |
+
+Neither path that could move the boundary does: `bulk_rows` returns the chunk and then its tail
+with `bulk_cap = chunk`, and the exact tick is `exact_tick_rows = chunk`, so a group's bulk
+chunks and a single process's exact ones name the same rows. A CPU test pins that on a 5,000-row
+prompt: `4,096, 904` on both.
+
+**What the group carries for Qwen.** The tick group's wire (`crates/sparkflash-runtime/src/group.rs`
+`TickGroup`, the section above) with Qwen's widths: `LaneRequest` with the start
+`start_prompt_slot` chose, `LaneRows` for every prompt chunk rank 0's tick decided,
+`LaneStepMode` with the member order and `Plain`/`Round { joint }`, `LaneGiveBack`,
+`LaneRelease` and `Error`. Rank 0 keeps every decision - `pick_lane`, `prefill_order`,
+`hold_prefill`, the chunk boundary, `decode_plan` and the tick-ahead plan - and a worker checks
+only that the lane is in its pool, that the request's start is the one its own
+`start_prompt_slot` reaches, that the rows fit the prompt left and that the step's members are the
+frame's. A worker runs `Runtime::run_part_rows` with the frame's row count and
+`step_mode_slots` with the frame's shape, so lane `n` is the same sequence on every rank and the
+collectives inside a verify line up. `TickServe::start_group` turns the row exchange on
+(`TickEngine::with_group`), which is what puts a prompt on the bulk path; its rows are the same
+split, as above.
+
+**Vision: nothing was left on `Fusion`, because there is no image path on either engine.** `QwenWalk`
+declares `type Vision = NoVision`, so the runtime's per-prompt `VisionImage` spans reach the walk
+through `Segment::with_images` and the walk has no encode hook to call; the unfused
+`DeviceSequence` session does not implement `prefill_images` at all, so it refuses an image. In a
+group, `TextWire::admit` refuses a prompt with images before the request frame, as the fused group
+already did. So no Qwen configuration was stranded on `Fusion` for images: the tick group carries
+exactly what the fused group carried, and the TP=1 path is unchanged. This is the arm's present
+state (the vision tower is planned and not loaded while `capabilities()` returns
+`Capabilities::ALL`), and this move neither creates nor closes it; loading the tower is a separate
+change that would need a real `Vision` impl, not a wire.
+
+**Measured on this host (CPU; it has no GPU).**
+
+* `cargo test -p sparkflash-model-qwen4-exp --lib`: **108 passed, 0 failed, 7 ignored** (the seven
+  are the generated checks, which boot the tiny checkpoint on a device). Six are new:
+  `the_generated_checks_drive_the_tick_engine` (the fixture now says `tick_engine() == true`, so
+  `whole = chunked = token`, `alone = four`, `continued = cold`, `rewound = cold`,
+  `drafted = plain` and `no unrecorded widening` drive the engine on the device host),
+  `the_tick_config_is_the_qwen_profile` (4,096 pass rows, 4 members, `k` = 3, a drafter present
+  and `shared_rounds` following the runtime's own switch, no decoder skip, no exchange at TP=1),
+  `the_tick_engine_hands_qwen_the_prefill_plans_chunks` (5,000 rows run 4,096 + 904 on the exact
+  path and again with `exchange = true`, the group's bulk path, and the plan's forwards of each
+  part are one 4,096-row forward and one 904-row one), `the_token_plans_pass_is_still_256_rows`
+  (600 rows run 256/256/88, each part two 128-row forwards), `the_tick_engine_keeps_qwens_joint_round`
+  (three lanes, one `Verify` pass of three segments and the trace's `plan=shared`) and
+  `a_speculative_round_keeps_its_accepted_rows_only` (one lane, `Round { joint: false }` over the
+  anchor and two drafts, the anchor and the accepted draft reach the request, the rejected token
+  never does, one verify of three rows, `plan=spec`).
+* `cargo test -p sparkflash-runtime`: **91 passed, 0 failed, 8 ignored** (77 library tests, then
+  `sealed` 2, `tick_engine_drafter` 5, `tick_engine_group` 2, `tick_engine_trace` 2 and
+  `tick_trace` 1, plus 2 doc-tests; the 8 ignored are the 7 conformance stubs and 1 doc-test).
+  The group's two tests are
+  **reused unchanged**, because the wire did not change: the frame order
+  (`request 0 [10, 11, 12] start=0`, `rows 1 2` ... `step [...] Round { joint: true }`,
+  `give back 0 1`) and the start agreement
+  (`rank 0 starts the prompt at 4, this rank starts it at 3: the ranks are out of step`, nothing
+  run). That second test is the start agreement this arm's group relies on; it is the runtime's
+  property, not an arm's, which is why it did not need extending.
+* `cargo test -p sparkflash-runtime -p sparkflash-model-qwen4-exp`: 0 failed.
+* `cargo clippy -p sparkflash-runtime -p sparkflash-model-qwen4-exp --all-targets -- -D warnings`
+  and `cargo fmt --all -- --check`: clean at this tip.
+* `cargo test --workspace`: **4,313 passed, 81 ignored, 0 failed** over 198 test binaries,
+  exit 0, at this tip.
+
+**Unverified without a cluster.**
+
+* Qwen's device walk through the engine: the tiny checkpoint's checks (seven, of which TP is a
+  SKIP at one rank) and the served gate.
+* The tiny checkpoint's own Qwen drafter through the engine: the CPU tests drive a shape walk, not
+  `DeviceSequence`, so the MTP/DFlash round's bits are the arm's existing claim, not a new
+  measurement.
+* The live trace on Qwen: `WallClock` readings, the per-tick flush and the rank-0 rule.
+* TP>1: no Qwen rank pair or group ran here. The claim that a TP=4 group on the tick group gives
+  the same token ids as the pre-move `Fusion::group` build is the first thing the window must
+  measure.
+* Speed: no tokens/s, no step time, no time to first token. Nothing here says the tick engine is
+  as fast as the fused one, and the regression clause's A/B has not run.
+
+**What a cluster window must run, and what counts as a pass.**
+
+1. The generated checks through the engine, then the first reference:
+
+   ```sh
+   cargo test -p sparkflash-model-qwen4-exp --lib -- --include-ignored --test-threads=1
+   cargo test -p sparkflash-model-qwen4-exp --lib conformance:: -- --ignored --nocapture
+   scripts/onboard-gate.sh Qwen --url http://127.0.0.1:8000 --port 8000 --world 1 --apply
+   scripts/onboard-gate.sh Qwen --url http://127.0.0.1:8000 --port 8000 --world 4 --apply
+   ```
+
+   Pass: six PASS and one SKIP - `TP 1 = TP 2 = TP 4`, whose SKIP names the world its fixture
+   cannot boot, because the Qwen fixture is one rank - with no `NEEDS-FIXTURE` line. Then a served
+   gate at one and four lanes and the first numerics reference at the world that is deployed
+   (`--world 4` writes the group's), as `NUMERICS.md` requires.
+
+2. Tokens and `cached_tokens` against the pre-move build at the deployed world. Build the frozen
+   tip before this move (`git worktree add /tmp/qwen-pre 659b2dad^`) and run the same fixed
+   prompts through both, greedy and sampled, at **TP=1 and TP=4**, at **2K and 16K** prompt
+   tokens, at **1, 4 and 8** concurrent requests, several reps each, alternating the launch order.
+   Pass: identical token ids and, per request, the same reported `cached_tokens`; a difference is
+   a regression, not a scheduling variance, because the move changes when a row runs, not which
+   row.
+
+3. The trace's chunk boundaries. Only the new build writes a tick trace - the fused engine has no
+   tick to trace - so this is the new build's evidence, not a diff against the old one:
+
+   ```sh
+   SPARKFLASH_TICK_TRACE=/tmp/qwen-tp1.trace sparkflash serve \
+       --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 --engine device --concurrency 4
+   # the group needs the tp4-serve feature and one process a rank; rank 0's trace only
+   cargo build --release -p sparkflash-cli --features tp4-serve
+   SPARKFLASH_TICK_TRACE=/tmp/qwen-tp4.trace sparkflash serve \
+       --checkpoint /models/Qwen3.8-Flash-Next-NVFP4 \
+       --tp4-rank 0 --tp4-world-size 4 --tp4-peers A,B,C,D
+   ```
+
+   Pass: every `prefill` line's rows are the prefill plan's chunk (4,096, or 256 at the
+   token-kernel plan) except a prompt's tail, each `LaneRows` frame carries exactly the chunk the
+   trace recorded, and a `LaneRows` frame never carries a step. `scripts/tick-trace-ab.py` can
+   compare two tick builds' decisions (`--checkpoint ... --model ... --streams 1,4,8
+   --prompt-tokens 2048,16384`); it cannot compare a fused build, which writes no trace.
+
+4. The verify shapes from the trace and the arm's counters. Pass: no decode step holds more than
+   `MAX_BATCH` = 4 members; several lanes take one `Round { joint: true }` whose rows are every
+   member's anchor and drafts, at most `budget(4)` = 12 rows; one lane takes
+   `Round { joint: false }`; a batch with `JOINT_ROUNDS=off` is `plan=plain` (a separate run,
+   the named deviation below); and a member's verify is at most `verify_rows` = 3 rows (or the
+   DFlash 2 head's `block_size`).
+
+5. Speed, at TP=1 with one and four lanes and at TP=4: tokens/s, mean step time and time to first
+   token, the old fused path against the tick engine, alternated launches, several reps. Under the
+   regression clause, a slower Qwen returns to `Fusion::local` (TP=1) and `Fusion::group` (TP>1):
+   that is a revert of `659b2dad` and `c4d0010d`, and this section then records the number, the
+   workload and why.
+
+**Named deviations, so none is implied.**
+
+* **The tick order is the engine's.** Which lanes step together and when is the scheduler's; the
+  rows and the shapes are the arm's. A greedy token does not depend on when its chunk ran.
+* **`JOINT_ROUNDS=off` plans `Plain`** (the earlier GLM deviation, unchanged by this move): one
+  plain token row a member in groups no wider than 4, where the fused runtime ran one round a
+  member. Qwen also turns its own speculation off on that setting (`QwenWalk::open` masks
+  `spec_enabled` with the drafter's `joint`, so a held chain is not run and thrown away), so the
+  rows are plain token rows and the tokens are still the `drafted = plain` property's. The switch
+  is off only when an operator sets it; the A/B runs the default.
+* **The engine's pacing values are DeepSeek's**: `share = DecodeShare::new(0.5, 200_000.0)`,
+  `model = (23.0, 4.0, 23.0, 4.0, 2.3)` and `prefix_reuse_min_rows`, from `TickConfig::for_walk`.
+  They decide when a decoding lane takes a row during a long prompt, not what a row computes; the
+  round's own cost stays the arm's `ExpertUnionWall` through `Drafter::wall`.
+* **The resume start is `resume`'s checkpoint**, never an arbitrary shared prefix (the earlier
+  deviation, unchanged): the engine picks the lane by its shared prefix and records the start
+  `start_prompt_slot` chose, and the group's frame carries that start and is checked.
+* **Adoption, lane growth, paired prompt chunks and preemption are still absent** (the earlier
+  deviation): `Pass::Paired` is unused, and a preempted prompt is served to its end.
+* **The group runs text only** (above): `TextWire` refuses images before the request frame.
+
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
