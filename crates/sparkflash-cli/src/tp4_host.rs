@@ -95,8 +95,10 @@ const ELEMENT_LIMIT: usize = 1 << 31;
 ///
 /// The serve control plane uses it to tell a deterministic, request-scoped refusal (the whole
 /// group made the same decision after the same collectives, so it can keep serving) from a
-/// group-fatal forward or transport failure.
-pub const PROMPT_LOGPROBS_REFUSED_PREFIX: &str = "TP=4 prompt logprobs refused:";
+/// group-fatal forward or transport failure. The constant is the rank seam's
+/// ([sparkflash_serve::tp4]) because an arm's step adapter builds its own refusal with it; this
+/// re-export keeps the `tp4_host::` path its callers already use.
+pub use sparkflash_serve::tp4::PROMPT_LOGPROBS_REFUSED_PREFIX;
 
 /// The token span one prompt-logprob forward scores.
 ///

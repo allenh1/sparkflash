@@ -172,12 +172,9 @@ use sparkflash_scheduler::prefill::ChunkedPrefillPlan;
 #[cfg(feature = "tp4-serve")]
 use sparkflash_engine::parallel_tp::{BitGatherHandle, TpLayout, TpRuntime, Wire};
 #[cfg(feature = "tp4-serve")]
-use sparkflash_model_glm5_next::device::{CudaHandle, LatentCache};
+use sparkflash_model_glm5_next::device::LatentCache;
 #[cfg(feature = "tp4-serve")]
-use sparkflash_model_glm5_next::{DeviceRank, DeviceSequence};
 use sparkflash_model_inkling2::GroupOptions;
-#[cfg(feature = "tp4-serve")]
-use sparkflash_model_qwen4_exp::sampling::Sampler;
 
 #[cfg(feature = "tp4-serve")]
 use crate::run_header::{COMM_REDUCE_ENV, ReducePath};
@@ -3971,135 +3968,14 @@ fn run_request(
 // TP=4 rank adapter, driver, and worker loop
 // ---------------------------------------------------------------------------------------
 
-/// One forward step's output, reduced to what serve needs.
+/// The serve-side seam over a rank: the step contract an arm's step adapter implements, and the
+/// shapes a step answers.
 ///
-/// The real Tp4Rank adapter maps the engine's StepOutput into this; serve reads only the logits
-/// and the rank-0 sampled token. Workers ignore next_token (it is computed identically on every
-/// rank, but it must not drive the token stream).
+/// The types are [sparkflash_serve::tp4]'s, because the arm that opens a rank holds its step
+/// adapter too: the seam is the group's and not the CLI's. These re-exports keep the `serve::`
+/// paths the driver, the tests and the pack registry already use.
 #[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, Default)]
-pub struct Tp4Step {
-    /// The raw logits for the position just fed; empty from a rank that was not asked for them
-    /// ([Tp4Sampling::logits]) and took its greedy pick on the device.
-    pub logits: Vec<f32>,
-    /// The greedy next token, when the rank produced one.
-    pub next_token: Option<u32>,
-    /// The tokens the step decoded before `next_token`: a speculative step's kept drafts, which
-    /// its verify already ran, so they are emitted and not fed back. Empty for a one-token step.
-    pub accepted: Vec<u32>,
-    /// The drafts the step's drafter offered before the depth policy shortened the chain.
-    pub proposed: usize,
-    /// The drafts the depth policy left unverified: `proposed - accepted - (1 if the chain ran)`.
-    pub gated: usize,
-    /// Prompt tokens this prefill found already in the rank's window, from the previous request.
-    /// Zero for every step but a prefill, and zero when the request could not reuse the window.
-    pub cached_tokens: usize,
-    /// What the rank's own speculator reported for this step, when the session keeps its own
-    /// accounting (`ModelSession::speculation`). A packed arm verifies a chain inside one session
-    /// call and hands the extra tokens back through later calls, so the fields above cannot
-    /// describe the step; this is the step's share of the session's counters instead.
-    pub speculation: Option<sparkflash_model::Speculation>,
-}
-
-/// The request sampler a rank applies before its first step.
-///
-/// The reference driver consumes its engine with with_sampling once per request. A resident TP=4
-/// rank holds one engine for the process lifetime, so the same choice arrives through
-/// begin_request instead. Sampling changes only which token rank 0 chooses; it does not change the
-/// forward arithmetic, and workers keep the greedy default because they ignore next_token.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct Tp4Sampling {
-    /// The request's whole sampler: temperature, top-p, top-k, the three penalties and the seed.
-    /// A rank honours all of it or refuses the request.
-    pub sampling: sparkflash_model::Sampling,
-    /// Whether each step's logits row is read (a request for logprobs). Without it a rank whose
-    /// pick is the row's argmax may take it on the device and leave the row there; the token is
-    /// the same.
-    pub logits: bool,
-    /// Whether the rank may decode the request speculatively: rank 0 sets it for a request whose
-    /// tokens are each its row's argmax and whose rows are never read (no temperature, no
-    /// penalty, no logprobs), and the Request frame carries it to the workers. A rank that drafts nothing
-    /// decodes a token a step.
-    pub speculative: bool,
-}
-
-/// The evidence counters the rank's extraction exposes.
-#[cfg(feature = "tp4-serve")]
-#[derive(Debug, Clone, Default)]
-pub struct Tp4RankMetrics {
-    /// Startup load time.
-    pub load_ms: u64,
-    /// Resident raw-cache bytes.
-    pub resident_cache_bytes: u64,
-    /// Resident raw-cache tensors.
-    pub resident_cache_tensors: usize,
-    /// Collective calls made by this rank.
-    pub reduce_calls: u64,
-    /// Collective elements reduced by this rank.
-    pub reduce_elements: u64,
-    /// Forward steps run by this rank.
-    pub steps: u64,
-    /// Wall milliseconds of the most recent step.
-    pub last_step_ms: u64,
-}
-
-/// The serve-side seam over tp-dev's Tp4Rank extraction.
-///
-/// This is deliberately a trait rather than a direct dependency: the serve branch compiles against
-/// a stub until the extraction lands, and the real adapter is one impl on top of the extracted
-/// Tp4Rank. The trait contains no forward arithmetic; Tp4Rank owns the lockstep loop and the
-/// resident cache.
-#[cfg(feature = "tp4-serve")]
-pub trait Tp4RankApi: Send {
-    /// Resets the per-request SequenceState and applies the request sampler.
-    ///
-    /// This runs exactly once per request on every rank, before that rank feeds the Request
-    /// frame's prompt ids: replace the rank's SequenceState with a fresh
-    /// SequenceState::new(global_config) and assert it is empty, then apply the sampler. It must
-    /// not read weights or touch the collective; the engine and collective are opened once in
-    /// open_tp4_rank and stay owned by Tp4Rank. A rank that holds InferenceEngine by value applies
-    /// the sampler with the non-consuming InferenceEngine::set_sampling(Sampling { temperature,
-    /// seed }) (task/engine-resident 74e9ff2); it must not rebuild the engine or re-read weights.
-    /// A rank that cannot apply a non-greedy sampler must return an error rather than silently run
-    /// greedy.
-    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String>;
-
-    /// The tokens of `prompt` this rank's window already holds and can keep.
-    ///
-    /// Rank 0 asks this before it broadcasts the Request, so the count every rank prefill uses is
-    /// read off one rank rather than inferred four times: two ranks that disagreed would run
-    /// different collectives in the same step.
-    fn plan_prefill(&mut self, _prompt: &[u32]) -> usize {
-        0
-    }
-
-    /// Runs the prompt through this rank's forward and returns the last position's step.
-    ///
-    /// `cached` is the group's decision, from [Self::plan_prefill] on rank 0: those leading tokens
-    /// are already in every rank's window and only `prompt[cached..]` is forwarded.
-    fn prefill(&mut self, prompt: &[u32], cached: usize) -> Result<Tp4Step, String>;
-
-    /// Runs the prompt through this rank's forward and returns the last position's step together
-    /// with every scored prompt position's merged logprob contract.
-    ///
-    /// Selection is the OpenAI-style top count: `None` scores only the owning token and its
-    /// competition rank, `Some(n)` also returns the n best alternatives. A contract refusal (a
-    /// certified rank entry, an unprovable f32 order, a malformed shard layout) comes back as a
-    /// string beginning with the refusal prefix; every rank makes the same decision after the
-    /// same collectives, so the group can keep serving.
-    fn prefill_prompt_logprobs(
-        &mut self,
-        prompt: &[u32],
-        selection: Option<usize>,
-    ) -> Result<(Tp4Step, Vec<MergedPosition>), String>;
-
-    /// Runs one sampled token through this rank's forward.
-    fn decode(&mut self, token: u32) -> Result<Tp4Step, String>;
-
-    /// The evidence counters this rank collected.
-    fn metrics(&self) -> Tp4RankMetrics;
-}
+pub use sparkflash_serve::tp4::{Tp4RankApi, Tp4RankMetrics, Tp4Sampling, Tp4Step};
 
 /// What rank 0 passes to the rank factory: the checkpoint and the group geometry, not a tokenizer.
 ///
@@ -4264,313 +4140,6 @@ fn open_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> 
     Ok(Box::new(HostTp4Rank { rank }))
 }
 
-/// The tokens a request may keep from the rank's window: the previous request's, when this prompt
-/// begins with all of them and continues past them.
-///
-/// The reuse is all-or-nothing on purpose. A Gated DeltaNet layer's convolution history and
-/// recurrent memory are running state, so a window cannot be rewound to an earlier position: a
-/// prompt that diverges from what the window holds, or that ends inside it, is served by a full
-/// prefill. A prompt equal to the window has no new row to run and no row to take logits from, so
-/// it is a full prefill too.
-fn reusable_prefix(held: &[u32], prompt: &[u32]) -> usize {
-    let shared = held
-        .iter()
-        .zip(prompt)
-        .take_while(|(held, asked)| held == asked)
-        .count();
-    if shared == held.len() && held.len() < prompt.len() {
-        held.len()
-    } else {
-        0
-    }
-}
-
-/// One GLM-5.3-Flash rank behind the serve-owned TP=4 control channel.
-///
-/// The rank mirrors [HostTp4Rank] over the device arm: every rank runs the same prompt and the
-/// same sampled token, and the workers ignore their own choice. Rank 0 samples on the host, or
-/// takes the device's greedy pick when the host sampler would take the argmax and no logprobs are
-/// asked for, which leaves the logits row on the device. Such a request decodes speculatively when
-/// rank 0 says so ([Tp4Sampling::speculative]): the MTP layer drafts, one verify step runs the
-/// token and its drafts, and the drafts greedy would have picked are kept, so the tokens are the
-/// one-token steps'. The sequence is put back at position 0 at the start of every request, so a
-/// request's state never leaks into the next one; its window is allocated once, at load, and kept.
-#[cfg(feature = "tp4-serve")]
-struct GlmTp4Rank {
-    rank: DeviceRank,
-    /// The request window, allocated at load. A request whose prompt extends the tokens the last
-    /// one left here keeps them and prefills only its suffix ([Self::prefill]).
-    sequence: DeviceSequence,
-    /// The ids `sequence` has consumed, in order: the last request's prompt, the tokens its steps
-    /// fed, and the drafts its verifies kept. The next request reuses the window only when its
-    /// prompt starts with all of them, because a Gated DeltaNet recurrence cannot be rewound to an
-    /// earlier position.
-    held: Vec<u32>,
-    tp: TpRuntime,
-    gather: BitGatherHandle,
-    sampler: Sampler,
-    sampling: sparkflash_model::Sampling,
-    /// Whether the request reads each step's logits row ([Tp4Sampling::logits]).
-    logits: bool,
-    /// How deep a speculative step drafts, and what its drafts were worth: the shared rule's
-    /// depth and counters ([sparkflash_model::Speculator]).
-    spec: sparkflash_model::Speculator,
-    /// Whether the request decodes speculatively ([Tp4Sampling::speculative]) with them.
-    speculative: bool,
-    eos: Vec<u32>,
-    load_ms: u64,
-    steps: u64,
-    last_step_ms: u64,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl GlmTp4Rank {
-    /// One greedy step of `rows` and the sampled token after the last of them.
-    fn step(&mut self, rows: &[u32]) -> Result<Tp4Step, String> {
-        let started = Instant::now();
-        let mut batch = [(&mut self.sequence, rows)];
-        let picks = self
-            .rank
-            .forward_batch_greedy(&self.tp, &self.gather, &mut batch)
-            .map_err(|error| format!("the GLM rank forward failed: {error}"))?;
-        let (logits, token) = if !self.logits && self.sampler.takes_argmax(&self.sampling) {
-            // The device picked the last row's argmax as the host sampler takes it, so the
-            // full-vocabulary row stays on the device.
-            let token = picks
-                .first()
-                .and_then(|rows| rows.last())
-                .copied()
-                .ok_or_else(|| "the GLM rank's step returned no pick".to_owned())?;
-            (Vec::new(), token)
-        } else {
-            let logits = self
-                .rank
-                .last_logits(batch[0].0)
-                .map_err(|error| format!("the GLM rank's last logits: {error}"))?;
-            let token = self.sampler.choose(&logits, &self.sampling);
-            (logits, token)
-        };
-        let next_token = if self.eos.contains(&token) {
-            None
-        } else {
-            Some(token)
-        };
-        self.held.extend_from_slice(rows);
-        self.steps += 1;
-        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Tp4Step {
-            speculation: None,
-            logits,
-            next_token,
-            accepted: Vec::new(),
-            proposed: 0,
-            gated: 0,
-            cached_tokens: 0,
-        })
-    }
-
-    /// One speculative step after `token`: the MTP layer drafts up to [Self::drafts] tokens, one
-    /// verify runs `token` and them, and the drafts each verify row picks are kept with the token
-    /// the last kept row picks: the tokens of one-token greedy steps
-    /// ([DeviceRank::verify_batch_greedy]).
-    fn speculate(&mut self, token: u32) -> Result<Tp4Step, String> {
-        let started = Instant::now();
-        // The verify runs the token and its drafts at the next positions, all inside the window.
-        let room = self
-            .sequence
-            .capacity()
-            .saturating_sub(self.sequence.position() + 1);
-        // The drafter says how sure it is of each draft; an adaptive policy stops the MTP layer
-        // and shortens the chain by those against a row's cost, as the fused lanes do.
-        let (drafted, confidence) = self
-            .rank
-            .draft_chain(
-                &self.tp,
-                &self.gather,
-                &mut self.sequence,
-                token,
-                &self.spec,
-                room,
-            )
-            .map_err(|error| format!("the GLM rank's draft failed: {error}"))?;
-        // What the drafter offered, then what the policy thought the rows were worth.
-        let proposed = confidence.len();
-        let gated = proposed.saturating_sub(drafted.len());
-        let chunk: Vec<u32> = std::iter::once(token).chain(drafted).collect();
-        let mut batch = [(&mut self.sequence, chunk.as_slice())];
-        let picks = self
-            .rank
-            .verify_batch_greedy(&self.tp, &self.gather, &mut batch)
-            .map_err(|error| format!("the GLM rank's verify failed: {error}"))?
-            .pop()
-            .unwrap_or_default();
-        // The shared rule decides how much of the chain survives: the leading drafts the model
-        // itself picked, plus the token after them (sparkflash_model::verdict).
-        let kept = sparkflash_model::verdict(&chunk, &picks);
-        self.spec.observe(&confidence, chunk.len() - 1, kept);
-        if chunk.len() > 1 {
-            self.rank
-                .commit(&mut self.sequence, kept)
-                .map_err(|error| format!("the GLM rank's commit failed: {error}"))?;
-        }
-        let picked = *picks
-            .get(kept - 1)
-            .ok_or_else(|| "the GLM rank's verify returned a pick a row short".to_owned())?;
-        let mut decoded = chunk[1..kept].to_vec();
-        decoded.push(picked);
-        // The request ends at the first end-of-sequence token, a kept draft or the pick.
-        let (accepted, next_token) = match decoded.iter().position(|id| self.eos.contains(id)) {
-            Some(end) => (decoded[..end].to_vec(), None),
-            None => {
-                let next = decoded.pop();
-                (decoded, next)
-            }
-        };
-        // The verify consumed its chain up to the row it kept; the drafts past it were written
-        // and rewound, so they are not in the window and the next request must not inherit them.
-        self.held.extend_from_slice(&chunk[..kept]);
-        for &id in &accepted {
-            self.sampler.record(id);
-        }
-        self.steps += 1;
-        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Tp4Step {
-            speculation: None,
-            logits: Vec::new(),
-            next_token,
-            accepted,
-            proposed,
-            gated,
-            cached_tokens: 0,
-        })
-    }
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4RankApi for GlmTp4Rank {
-    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-        // The window is reset and reused, not rebuilt: a fresh one costs every rank about a
-        // second of the request's first token at the 1M default, which rank 0 pays before it
-        // starts the prefill clock and the workers pay inside it. A block-drafting window resets
-        // in place too: the reset zeroes its drafter's rings, and the prompt refills the rows the
-        // first block reads.
-        //
-        // The reset moved to [Self::prefill]: whether the next request can keep the window at all
-        // depends on its prompt, which this call does not see, and a chat turn's prompt begins with
-        // everything the previous one left in the window.
-        self.sampler.reset();
-        self.sampling = sampling.sampling;
-        self.logits = sampling.logits;
-        self.speculative = sampling.speculative && self.spec.max_depth() > 0;
-        if self.speculative && (self.logits || !self.sampler.takes_argmax(&self.sampling)) {
-            return Err(
-                "a speculative request must take each row's argmax and read no row; this one \
-                 samples or asks for logprobs"
-                    .to_owned(),
-            );
-        }
-        Ok(())
-    }
-
-    fn plan_prefill(&mut self, prompt: &[u32]) -> usize {
-        // A chat turn's prompt begins with the previous turn's prompt and reply, which is exactly
-        // what the window holds, so the rows below the shared prefix need not be run again. The
-        // reuse is all-or-nothing: a Gated DeltaNet layer's convolution history and recurrent
-        // memory are running state, so a window cannot be rewound to an earlier position, and a
-        // prompt that diverges from it or stops inside it is served by a full prefill. A window
-        // whose position and history have drifted apart is not reusable at all.
-        if self.sequence.position() != self.held.len() {
-            return 0;
-        }
-        reusable_prefix(&self.held, prompt)
-    }
-
-    fn prefill(&mut self, prompt: &[u32], cached: usize) -> Result<Tp4Step, String> {
-        if prompt.is_empty() {
-            return Err("an empty prompt has no logits".to_owned());
-        }
-        // The count is rank 0's, taken from the same window this rank holds. A rank that cannot
-        // honour it is a different program from its peers, and says so instead of running a
-        // prefill the group did not agree to.
-        if cached > 0 && reusable_prefix(&self.held, prompt) != cached {
-            return Err(format!(
-                "the group's {cached}-token prefix is not this rank's: its window holds {} tokens \
-                 and the prompt does not extend them",
-                self.held.len()
-            ));
-        }
-        if cached == 0 {
-            self.rank
-                .reset(&mut self.sequence)
-                .map_err(|error| format!("resetting the GLM sequence: {error}"))?;
-            self.held.clear();
-        }
-        let started = Instant::now();
-        self.sampler.record_prompt(prompt);
-        let logits = self
-            .rank
-            .forward_prefill(
-                &self.tp,
-                &self.gather,
-                &mut self.sequence,
-                &prompt[cached..],
-            )
-            .map_err(|error| format!("the GLM rank's prefill failed: {error}"))?;
-        self.held.extend_from_slice(&prompt[cached..]);
-        let token = self.sampler.choose(&logits, &self.sampling);
-        let next_token = if self.eos.contains(&token) {
-            None
-        } else {
-            Some(token)
-        };
-        self.steps += 1;
-        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Tp4Step {
-            speculation: None,
-            logits,
-            next_token,
-            accepted: Vec::new(),
-            proposed: 0,
-            gated: 0,
-            cached_tokens: cached,
-        })
-    }
-
-    fn prefill_prompt_logprobs(
-        &mut self,
-        _prompt: &[u32],
-        _selection: Option<usize>,
-    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
-        // The rank's logits are one row a step; the prompt-logprob contract needs every scored
-        // position's row and a merged candidate order this arm does not produce yet.
-        Err(format!(
-            "{} the GLM-5.3-Flash four-rank arm does not score prompt logprobs yet",
-            crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
-        ))
-    }
-
-    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
-        self.sampler.record(token);
-        if self.speculative {
-            return self.speculate(token);
-        }
-        self.step(&[token])
-    }
-
-    fn metrics(&self) -> Tp4RankMetrics {
-        Tp4RankMetrics {
-            load_ms: self.load_ms,
-            resident_cache_bytes: u64::try_from(self.rank.device_bytes()).unwrap_or(u64::MAX),
-            // This arm does not instrument the collective or the tensor count; the fields report
-            // zero rather than a number nobody measured.
-            resident_cache_tensors: 0,
-            reduce_calls: 0,
-            reduce_elements: 0,
-            steps: self.steps,
-            last_step_ms: self.last_step_ms,
-        }
-    }
-}
 /// The engine collective of one rank of a pack's serve group: the TCP seams the pack's harness
 /// opens, on `base_port + rank`, with the run's NCCL communicator as their device leg.
 ///
@@ -4706,8 +4275,10 @@ fn glm_latent_cache() -> Result<LatentCache, String> {
 
 /// Opens one GLM-5.3-Flash rank of the serve-owned group serving one request at a time.
 ///
-/// The construction is the arm's ([sparkflash_model_glm5_next::rank::open_rank]); this maps its
-/// answer onto the serve seam's step adapter.
+/// The construction is the arm's ([sparkflash_model_glm5_next::rank::open_serve_rank]), which
+/// opens the rank and holds the step adapter that maps it onto the serve seam. The CLI supplies
+/// the collective's opener ([open_pack_collective]); the arithmetic and the step shape stay with
+/// the arm.
 #[cfg(feature = "tp4-serve")]
 fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
     let latent_cache = glm_latent_cache()?;
@@ -4715,23 +4286,7 @@ fn open_glm_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, Stri
         |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
             open_pack_collective(config, cuda, model, hidden, run)
         };
-    let rank = sparkflash_model_glm5_next::rank::open_rank(config, latent_cache, open)?;
-    Ok(Box::new(GlmTp4Rank {
-        eos: rank.eos,
-        rank: rank.rank,
-        sequence: rank.sequence,
-        held: Vec::new(),
-        tp: rank.tp,
-        gather: rank.gather,
-        sampler: Sampler::new(),
-        sampling: sparkflash_model::Sampling::default(),
-        logits: false,
-        spec: rank.spec,
-        speculative: false,
-        load_ms: rank.load_ms,
-        steps: 0,
-        last_step_ms: 0,
-    }))
+    sparkflash_model_glm5_next::rank::open_serve_rank(config, latent_cache, open)
 }
 
 /// Opens one GLM-5.3-Flash rank of the serve-owned group stepping `lanes` fused lanes
@@ -4755,131 +4310,6 @@ fn open_glm_lanes(
         };
     sparkflash_model_glm5_next::rank::open_lanes(config, lanes, latent_cache, open)
 }
-/// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
-///
-/// The backend holds this rank's share of the weights ([Qwen4ExpDeviceBackend::open_rank]) and
-/// every branch is summed over the group before it is injected, so each rank computes the same
-/// rows, logits and greedy picks. A request opens its own sequence: a speculative one (rank 0's
-/// decision, [Tp4Sampling::speculative]) drafts with the DFlash drafter every rank runs whole, and
-/// the verified tokens come back one decode call at a time on every rank alike, so the workers see
-/// the same token frames a one-token request sends.
-///
-/// [Qwen4ExpDeviceBackend::open_rank]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank
-#[cfg(feature = "tp4-serve")]
-struct QwenTp4Rank {
-    backend: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend,
-    /// The request's sequence; the last one is dropped before the next is allocated.
-    session: Option<Box<dyn sparkflash_model::ModelSession>>,
-    /// Keeps the primary context the collective's communicator was opened in.
-    _cuda: CudaHandle,
-    load_ms: u64,
-    steps: u64,
-    last_step_ms: u64,
-}
-
-#[cfg(feature = "tp4-serve")]
-impl QwenTp4Rank {
-    fn step<Run>(&mut self, run: Run) -> Result<Tp4Step, String>
-    where
-        Run: FnOnce(
-            &mut dyn sparkflash_model::ModelSession,
-        )
-            -> Result<sparkflash_model::StepOutput, sparkflash_model::BackendError>,
-    {
-        let session = self
-            .session
-            .as_deref_mut()
-            .ok_or_else(|| "the Qwen rank has no request open".to_owned())?;
-        let started = Instant::now();
-        // The session verifies its own draft chain inside the call and hands the extra tokens
-        // back through later ones, so what this step did is what its speculator counted while it
-        // ran. Reading before and after gives this step's share of a per-request total.
-        let before = session.speculation();
-        let output = run(session).map_err(|error| format!("the Qwen rank's step: {error}"))?;
-        let after = session.speculation();
-        let counted = sparkflash_model::Speculation {
-            verify_steps: after.verify_steps.saturating_sub(before.verify_steps),
-            drafts_proposed: after.drafts_proposed.saturating_sub(before.drafts_proposed),
-            drafts_accepted: after.drafts_accepted.saturating_sub(before.drafts_accepted),
-        };
-        self.steps += 1;
-        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(Tp4Step {
-            logits: output.logits,
-            next_token: output.next_token,
-            // The verified chain's later tokens are queued in the session and emitted by the
-            // calls that follow, so this step emits one token and reports the chain below.
-            accepted: Vec::new(),
-            proposed: counted.drafts_proposed,
-            // The depth a policy withheld is not in the session's counters; zero says "not
-            // reported" rather than inventing a gate count.
-            gated: 0,
-            // The reference session reports its own reuse through ModelSession::cached_tokens,
-            // not through this step.
-            cached_tokens: 0,
-            speculation: Some(counted),
-        })
-    }
-}
-
-#[cfg(feature = "tp4-serve")]
-impl Tp4RankApi for QwenTp4Rank {
-    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
-        let request = sampling.sampling;
-        if sampling.speculative && (sampling.logits || !Sampler::new().takes_argmax(&request)) {
-            return Err(
-                "a speculative request must take each row's argmax and read no row; this one \
-                 samples or asks for logprobs"
-                    .to_owned(),
-            );
-        }
-        self.session = None;
-        let mut session = self
-            .backend
-            .open_rank_session(sampling.speculative)
-            .map_err(|error| format!("the Qwen request window: {error}"))?;
-        session.set_sampling(request);
-        self.session = Some(session);
-        Ok(())
-    }
-
-    fn prefill(&mut self, prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
-        // This arm's session keeps its own window and reports its own reuse
-        // (`ModelSession::cached_tokens`), so the group's count is not applied here.
-        self.step(|session| session.prefill(prompt))
-    }
-
-    fn prefill_prompt_logprobs(
-        &mut self,
-        _prompt: &[u32],
-        _selection: Option<usize>,
-    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
-        // The session reads back one logits row a step; the prompt-logprob contract needs every
-        // scored position's row, which the TP=1 arm does not expose either.
-        Err(format!(
-            "{} the Qwen3.8-Flash-Next tensor-parallel arm does not score prompt logprobs yet",
-            crate::tp4_host::PROMPT_LOGPROBS_REFUSED_PREFIX
-        ))
-    }
-
-    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
-        self.step(|session| session.decode(token))
-    }
-
-    fn metrics(&self) -> Tp4RankMetrics {
-        Tp4RankMetrics {
-            load_ms: self.load_ms,
-            // Like the GLM arm, the collective and the resident bytes are not instrumented here;
-            // the fields report zero rather than a number nobody measured.
-            resident_cache_bytes: 0,
-            resident_cache_tensors: 0,
-            reduce_calls: 0,
-            reduce_elements: 0,
-            steps: self.steps,
-            last_step_ms: self.last_step_ms,
-        }
-    }
-}
 
 /// Opens one Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group of 2 or 4: its share
 /// of the checkpoint's weights and the collective [open_pack_collective] opens.
@@ -4889,23 +4319,16 @@ impl Tp4RankApi for QwenTp4Rank {
 /// file must have been written for this rank's world
 /// (`sparkflash convert --tp-world-size W`); the checkpoint directory stays the configuration,
 /// tokenizer and host-paged PLE source. The construction is the arm's
-/// ([sparkflash_model_qwen4_exp::rank::load_rank]); this maps its answer onto the serve seam's
-/// step adapter.
+/// ([sparkflash_model_qwen4_exp::rank::open_serve_rank]), which loads the rank and holds the step
+/// adapter that maps it onto the serve seam. The CLI supplies the collective's opener
+/// ([open_pack_collective]); the arithmetic and the step shape stay with the arm.
 #[cfg(feature = "tp4-serve")]
 fn open_qwen_tp4_rank(config: &Tp4RankConfig) -> Result<Box<dyn Tp4RankApi>, String> {
     let open =
         |cuda: &sparkflash_kernels::cuda_driver::Cuda, model: &str, hidden: usize, run: &str| {
             open_pack_collective(config, cuda, model, hidden, run)
         };
-    let (backend, cuda, load_ms) = sparkflash_model_qwen4_exp::rank::load_rank(config, open)?;
-    Ok(Box::new(QwenTp4Rank {
-        backend,
-        session: None,
-        _cuda: cuda,
-        load_ms,
-        steps: 0,
-        last_step_ms: 0,
-    }))
+    sparkflash_model_qwen4_exp::rank::open_serve_rank(config, open)
 }
 
 /// One Qwen3.8-Flash-Next rank of a group stepping `lanes` fused lanes ([PackArm::open_lanes]):
@@ -8612,25 +8035,6 @@ mod tests {
                 tp4_rank_config(&options, tp4, Duration::from_secs(1)).expect("the rank config");
             assert_eq!(config.context, expected, "{model}");
         }
-    }
-
-    #[test]
-    fn a_window_is_reused_only_by_a_prompt_that_extends_all_of_it() {
-        // A chat turn: the previous prompt and reply are the window's contents, and the new turn
-        // continues them, so only its own rows are new.
-        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
-        // The same prompt with nothing appended has no row to take logits from.
-        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 3]), 0);
-        // A prompt that stops inside the window cannot be served by it: the recurrence is running
-        // state and there is no earlier position to rewind to.
-        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2]), 0);
-        // An edited history diverges, at the first mismatching token.
-        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 9, 3, 4]), 0);
-        // A shared prefix that is not the whole window is still no reuse.
-        assert_eq!(reusable_prefix(&[1, 2, 3], &[1, 2, 9, 4]), 0);
-        // An empty window, and the first request of a process.
-        assert_eq!(reusable_prefix(&[], &[1, 2]), 0);
-        assert_eq!(reusable_prefix(&[1], &[1, 2]), 1);
     }
 
     /// A driver over the synthetic tiny plan: the path every behavioural test takes.

@@ -20,16 +20,21 @@
 //! transport is the group's and not the arm's; everything a Qwen rank is made of is here.
 //!
 //! Both of the group's serving shapes open their rank here: one request at a time
-//! ([load_rank]) and fused lanes ([open_lanes]).
+//! ([load_rank]) and fused lanes ([open_lanes]). The serve seam's step adapter for the one-request
+//! shape is here too ([open_serve_rank]): it maps this rank's session steps onto [Tp4RankApi] and
+//! performs no arithmetic of its own.
 
 use std::path::Path;
 use std::time::Instant;
 
 use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
 use sparkflash_kernels::cuda_driver::Cuda;
-use sparkflash_model::ModelBackend;
+use sparkflash_model::{BackendError, MergedPosition, ModelBackend, ModelSession, StepOutput};
 use sparkflash_ops::gemv::CudaHandle;
-use sparkflash_serve::tp4::{Tp4RankConfig, checkpoint_directory};
+use sparkflash_serve::tp4::{
+    PROMPT_LOGPROBS_REFUSED_PREFIX, Tp4RankApi, Tp4RankConfig, Tp4RankMetrics, Tp4Sampling,
+    Tp4Step, checkpoint_directory,
+};
 use sparkflash_weights::rank_file::converted_rank_file;
 use sparkflash_weights::tp::{BitGatherHandle, TpLayout, TpRuntime};
 
@@ -165,4 +170,203 @@ fn control_worker(config: &Tp4RankConfig) -> Result<Tp4ControlWorker, String> {
         .handshake()
         .map_err(|error| format!("rank {} control handshake: {error}", config.rank))?;
     Ok(control)
+}
+
+// ---------------------------------------------------------------------------------------
+// The step adapter the serve group drives
+// ---------------------------------------------------------------------------------------
+
+/// The counter delta one step reports from a session's per-request totals.
+///
+/// The session keeps its own accounting ([ModelSession::speculation]) because it verifies a draft
+/// chain inside one call and hands the extra tokens back through later calls. A step reads the
+/// totals before and after its call; the difference is what that step did. Saturating because a
+/// session that reset a request's counters (or moved one backwards) has nothing to report for this
+/// step, and a wrap would be a number nobody measured.
+fn this_step(
+    before: sparkflash_model::Speculation,
+    after: sparkflash_model::Speculation,
+) -> sparkflash_model::Speculation {
+    sparkflash_model::Speculation {
+        verify_steps: after.verify_steps.saturating_sub(before.verify_steps),
+        drafts_proposed: after.drafts_proposed.saturating_sub(before.drafts_proposed),
+        drafts_accepted: after.drafts_accepted.saturating_sub(before.drafts_accepted),
+    }
+}
+
+/// One Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group.
+///
+/// The backend holds this rank's share of the weights ([Qwen4ExpDeviceBackend::open_rank]) and
+/// every branch is summed over the group before it is injected, so each rank computes the same
+/// rows, logits and greedy picks. A request opens its own sequence: a speculative one (rank 0's
+/// decision, [Tp4Sampling::speculative]) drafts with the DFlash drafter every rank runs whole, and
+/// the verified tokens come back one decode call at a time on every rank alike, so the workers see
+/// the same token frames a one-token request sends.
+///
+/// [Qwen4ExpDeviceBackend::open_rank]: sparkflash_model_qwen4_exp::device::Qwen4ExpDeviceBackend::open_rank
+struct QwenTp4Rank {
+    backend: Qwen4ExpDeviceBackend,
+    /// The request's sequence; the last one is dropped before the next is allocated.
+    session: Option<Box<dyn ModelSession>>,
+    /// Keeps the primary context the collective's communicator was opened in.
+    _cuda: CudaHandle,
+    load_ms: u64,
+    steps: u64,
+    last_step_ms: u64,
+}
+
+impl QwenTp4Rank {
+    fn step<Run>(&mut self, run: Run) -> Result<Tp4Step, String>
+    where
+        Run: FnOnce(&mut dyn ModelSession) -> Result<StepOutput, BackendError>,
+    {
+        let session = self
+            .session
+            .as_deref_mut()
+            .ok_or_else(|| "the Qwen rank has no request open".to_owned())?;
+        let started = Instant::now();
+        // The session verifies its own draft chain inside the call and hands the extra tokens
+        // back through later ones, so what this step did is what its speculator counted while it
+        // ran. Reading before and after gives this step's share of a per-request total.
+        let before = session.speculation();
+        let output = run(session).map_err(|error| format!("the Qwen rank's step: {error}"))?;
+        let after = session.speculation();
+        let counted = this_step(before, after);
+        self.steps += 1;
+        self.last_step_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(Tp4Step {
+            logits: output.logits,
+            next_token: output.next_token,
+            // The verified chain's later tokens are queued in the session and emitted by the
+            // calls that follow, so this step emits one token and reports the chain below.
+            accepted: Vec::new(),
+            proposed: counted.drafts_proposed,
+            // The depth a policy withheld is not in the session's counters; zero says "not
+            // reported" rather than inventing a gate count.
+            gated: 0,
+            // The reference session reports its own reuse through ModelSession::cached_tokens,
+            // not through this step.
+            cached_tokens: 0,
+            speculation: Some(counted),
+        })
+    }
+}
+
+impl Tp4RankApi for QwenTp4Rank {
+    fn begin_request(&mut self, sampling: Tp4Sampling) -> Result<(), String> {
+        let request = sampling.sampling;
+        if sampling.speculative
+            && (sampling.logits || !sparkflash_model::Sampler::new().takes_argmax(&request))
+        {
+            return Err(
+                "a speculative request must take each row's argmax and read no row; this one \
+                 samples or asks for logprobs"
+                    .to_owned(),
+            );
+        }
+        self.session = None;
+        let mut session = self
+            .backend
+            .open_rank_session(sampling.speculative)
+            .map_err(|error| format!("the Qwen request window: {error}"))?;
+        session.set_sampling(request);
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn prefill(&mut self, prompt: &[u32], _cached: usize) -> Result<Tp4Step, String> {
+        // This arm's session keeps its own window and reports its own reuse
+        // (`ModelSession::cached_tokens`), so the group's count is not applied here.
+        self.step(|session| session.prefill(prompt))
+    }
+
+    fn prefill_prompt_logprobs(
+        &mut self,
+        _prompt: &[u32],
+        _selection: Option<usize>,
+    ) -> Result<(Tp4Step, Vec<MergedPosition>), String> {
+        // The session reads back one logits row a step; the prompt-logprob contract needs every
+        // scored position's row, which the TP=1 arm does not expose either.
+        Err(format!(
+            "{PROMPT_LOGPROBS_REFUSED_PREFIX} the Qwen3.8-Flash-Next tensor-parallel arm does not score prompt logprobs yet"
+        ))
+    }
+
+    fn decode(&mut self, token: u32) -> Result<Tp4Step, String> {
+        self.step(|session| session.decode(token))
+    }
+
+    fn metrics(&self) -> Tp4RankMetrics {
+        Tp4RankMetrics {
+            load_ms: self.load_ms,
+            // Like the GLM arm, the collective and the resident bytes are not instrumented here;
+            // the fields report zero rather than a number nobody measured.
+            resident_cache_bytes: 0,
+            resident_cache_tensors: 0,
+            reduce_calls: 0,
+            reduce_elements: 0,
+            steps: self.steps,
+            last_step_ms: self.last_step_ms,
+        }
+    }
+}
+
+/// Opens one Qwen3.8-Flash-Next rank of a serve-owned tensor-parallel group of 2 or 4, as the
+/// serve seam's step contract: [load_rank]'s backend and handle, boxed in the adapter that maps
+/// its session steps onto [Tp4Step]. The collective's opener is the process's, so the CLI passes
+/// it in.
+///
+/// # Errors
+/// As [load_rank].
+pub fn open_serve_rank<F>(config: &Tp4RankConfig, open: F) -> Result<Box<dyn Tp4RankApi>, String>
+where
+    F: FnOnce(&Cuda, &str, usize, &str) -> Result<(TpRuntime, BitGatherHandle), String>,
+{
+    let (backend, cuda, load_ms) = load_rank(config, open)?;
+    Ok(Box::new(QwenTp4Rank {
+        backend,
+        session: None,
+        _cuda: cuda,
+        load_ms,
+        steps: 0,
+        last_step_ms: 0,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::this_step;
+    use sparkflash_model::Speculation;
+
+    /// The Qwen adapter's step shape: a step reports its own delta of the session's per-request
+    /// counters, and a reset (or backwards) counter reports nothing rather than wrapping.
+    #[test]
+    fn a_step_reports_its_own_share_of_the_sessions_counters() {
+        let before = Speculation {
+            verify_steps: 3,
+            drafts_proposed: 9,
+            drafts_accepted: 6,
+        };
+        let after = Speculation {
+            verify_steps: 4,
+            drafts_proposed: 11,
+            drafts_accepted: 7,
+        };
+        assert_eq!(
+            this_step(before, after),
+            Speculation {
+                verify_steps: 1,
+                drafts_proposed: 2,
+                drafts_accepted: 1,
+            }
+        );
+        assert_eq!(
+            this_step(after, before),
+            Speculation {
+                verify_steps: 0,
+                drafts_proposed: 0,
+                drafts_accepted: 0,
+            }
+        );
+    }
 }
