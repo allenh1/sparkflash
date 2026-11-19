@@ -22,12 +22,15 @@
 //! * [Walk::layout] is what a sequence's state is: every layer's key and value rows grow with
 //!   position, and the four convolution histories a layer plus the drafter's Markov feature are
 //!   one live value that a rewind restores from the prompt-boundary checkpoint.
-//! * [Walk::limits] is [BATCH_ROWS] members a batch and the rank's widest prompt chunk
-//!   ([Shared::prefill_chunk]) rows a pass. The runtime's [sparkflash_runtime::ChunkPolicy]
-//!   returns that chunk, and [InklingWalk::walk_bulk] forwards it in the arm's own widths, so
-//!   the prompt boundaries - and the bits that depend on them - are the ones the arm measured.
-//!   All three widths (4,096, 8,192 and 65,535) are entries of
-//!   [sparkflash_runtime::CHUNK_SIZES], so the policy can return any of them.
+//! * [Walk::limits] is [BATCH_ROWS] members a batch and the rank's prompt pass rows: the
+//!   runtime's [sparkflash_runtime::ChunkPolicy] over the arm's widest width
+//!   ([Shared::prefill_chunk]). That width is 4,096, 8,192 or 65,535 - every one an entry of
+//!   [sparkflash_runtime::CHUNK_SIZES] - and a context or a switch that lowers it is quantised
+//!   to the documented list, which is what the runtime always did before it ran a chunk. So a
+//!   pass is the number the arm's prompt boundaries were already cut at, and
+//!   [InklingWalk::walk_bulk] forwards it in the arm's own widths (4,096 rows until 16,384
+//!   positions remain, 8,192 above that, or the switch's fixed width), which is what keeps the
+//!   boundaries - and the bits that depend on them - the ones the arm measured.
 //! * [Walk::walk] runs one of Inkling's row sets: a prompt chunk ([Rows::Chunk]), one token a
 //!   lane ([Rows::Lanes]), or an anchor and its drafts verified together ([Rows::Segments]).
 //! * [Walk::head] is the arm's sampler over the row a walk left.
@@ -38,10 +41,14 @@
 //! (members x (1 + depth)). With SPARKFLASH_INKLING_DRAFT unset the round is the plain step and
 //! the runtime takes its answer without a walk ([Draft::Held]).
 //!
-//! The arm serves through this walk: the group's rank 0 and workers both drive
-//! [sparkflash_runtime::Runtime] over it, and a single session is the runtime's one-slot
-//! adapter. The image path is [InklingVision]: the runtime encodes a prompt's fresh images once
-//! through rank 0's tower and passes them with each chunk, and this walk injects their rows.
+//! The arm serves through this walk: a single process's sessions are handles on
+//! [sparkflash_runtime::TickServe] over it, and a text-only group's rank 0 and workers drive the
+//! tick engine and its mirror. A group whose rank 0 holds the vision tower still serves through
+//! [sparkflash_runtime::Fusion]'s group: rank 0's image encode is a collective that would run
+//! before the tick group's request frame went out, and every worker's start waits for that frame
+//! ([crate::group]). The image path is [InklingVision]: the runtime encodes a prompt's fresh
+//! images once through rank 0's tower and passes them with each chunk, and this walk injects
+//! their rows.
 
 use std::sync::{Arc, Mutex};
 
@@ -49,9 +56,9 @@ use sparkflash_model::backend::{BackendError, Sampling, Speculation, StepOutput}
 use sparkflash_model::ledger::State;
 use sparkflash_model::vision::VisionImage;
 use sparkflash_runtime::{
-    ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden, LaneMemory,
-    LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Segment as RunSegment, Segments,
-    StateKind, StateLayout, StepWall, Vision, Walk, WalkCapabilities,
+    ChunkPolicy, ComputeDeclaration, Draft, Drafter, ExpertUnionWall, HeadInput, HeadRow, Hidden,
+    LaneMemory, LaneState, Limits, Opened, Pass, PassKind, PassMask, Region, Segment as RunSegment,
+    Segments, StateKind, StateLayout, StepWall, Vision, Walk, WalkCapabilities,
 };
 
 use super::chunk::{Injection, Rows, Segment, exchange_sum, walk_rows};
@@ -184,7 +191,15 @@ impl InklingWalk {
             },
         };
         let layout = layout_of(&shared);
-        let limits = Limits::new(shared.prefill_chunk, shared.context).with_members(BATCH_ROWS);
+        // The pass's rows, not the buffers' width: the widest chunk the arm can walk is what the
+        // rings are sized for, and the rows one prompt pass takes are the runtime's
+        // ChunkPolicy over it - 4,096, 8,192 or 65,535 at the three documented widths, and the
+        // largest documented size at or below anything lower. A tick engine reads its pass width
+        // from here, so stating the policy's number is what keeps a prompt's chunks the ones the
+        // runtime ran before the engine moved.
+        let pass =
+            ChunkPolicy::for_limits(Limits::new(shared.prefill_chunk, shared.context)).rows();
+        let limits = Limits::new(pass, shared.context).with_members(BATCH_ROWS);
         Ok(Self {
             shared,
             layout,
@@ -983,13 +998,19 @@ impl Walk for InklingWalk {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
+    use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::Strategy;
-    use sparkflash_runtime::{ChunkPolicy, Fixture, Walk, WalkFixture, ledger_for};
+    use sparkflash_runtime::{
+        ChunkPolicy, Fixture, OutputConstraint, RequestId, Runtime, TickConfig, TickEngine,
+        TickEvent, Walk, WalkFixture, ledger_for,
+    };
 
     use super::super::{
-        DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, MAX_PREFILL_CHUNK,
+        DEFAULT_DRAFT_DEPTH, DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM,
+        MAX_PREFILL_CHUNK,
     };
     use super::*;
 
@@ -1010,6 +1031,13 @@ mod tests {
     /// The Inkling fixture: the tiny host fixture the device tests share, opened through the
     /// arm's own TP=1 constructor.
     impl WalkFixture for InklingWalk {
+        /// Inkling's single-process path serves on the tick engine, so its generated checks drive
+        /// that engine exactly as dense's, GLM's and Qwen's do. Its TP leg skips because the
+        /// fixture is one rank.
+        fn tick_engine() -> bool {
+            true
+        }
+
         fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
             if world > 1 {
                 return Err(BackendError::new(
@@ -1077,7 +1105,7 @@ mod tests {
     }
 
     /// Every chunk width the arm can walk is a documented policy size, and the limits state the
-    /// widest prompt chunk with the rank's verify width for members.
+    /// pass [InklingWalk::new] gives the runtime with the rank's verify width for members.
     #[test]
     fn the_arms_three_chunk_widths_are_policy_sizes() {
         for size in [DEFAULT_PREFILL_CHUNK, LONG_PREFILL_CHUNK, MAX_PREFILL_CHUNK] {
@@ -1086,11 +1114,28 @@ mod tests {
                 size,
                 "{size} rows must be a documented ChunkPolicy size"
             );
+            // The walk's limits are this policy's rows, so a width stated as the widest chunk is
+            // also the width one prompt pass runs.
+            let limits = Limits::new(size, 1_048_576).with_members(BATCH_ROWS);
+            assert_eq!(
+                ChunkPolicy::for_limits(Limits::new(limits.rows, limits.context)).rows(),
+                size
+            );
         }
         let limits = Limits::new(LONG_PREFILL_CHUNK, 1_048_576).with_members(BATCH_ROWS);
         assert_eq!(limits.rows, LONG_PREFILL_CHUNK);
         assert_eq!(limits.members, BATCH_ROWS);
         assert_eq!(ChunkPolicy::for_limits(limits).rows(), LONG_PREFILL_CHUNK);
+        // A context or a switch below a documented size is quantised to the one below it, which
+        // is the number the runtime ran before the engine read the same limits: no chunk moves.
+        assert_eq!(
+            ChunkPolicy::for_limits(Limits::new(5_000, 8_192)).rows(),
+            DEFAULT_PREFILL_CHUNK
+        );
+        assert_eq!(
+            ChunkPolicy::for_limits(Limits::new(1_000, 1_000)).rows(),
+            256
+        );
     }
 
     /// A prompt the runtime cuts at its policy width falls on the same boundaries as the arm's
@@ -1102,7 +1147,10 @@ mod tests {
             1, 4_095, 4_096, 4_097, 8_192, 10_000, 16_383, 16_384, 40_000, 65_535, 100_000,
         ] {
             let want = chunk_splits(widths, total, 0);
-            let pass = LONG_PREFILL_CHUNK;
+            // The pass a chunked prompt runs is the policy over the widest width: 8,192 by
+            // default, and the same number the tick engine's exact tick runs.
+            let pass = ChunkPolicy::for_limits(Limits::new(LONG_PREFILL_CHUNK, 1_048_576)).rows();
+            assert_eq!(pass, LONG_PREFILL_CHUNK);
             let mut got = Vec::new();
             let mut start = 0usize;
             while start < total {
@@ -1198,6 +1246,559 @@ mod tests {
         assert!(
             <<InklingWalk as Walk>::Vision as Vision<InklingWalk>>::PRESENT,
             "the arm serves images through its tower"
+        );
+    }
+
+    // ---- the tick engine ------------------------------------------------------------------
+
+    /// The positions a shape walk's sequence may hold: a prompt past every chunk width the tests
+    /// split has to be admissible.
+    const SHAPE_CONTEXT: usize = 1_048_576;
+
+    /// The model's own pick after `token`: the plain path's next token.
+    fn pick(token: u32) -> u32 {
+        token.wrapping_add(1)
+    }
+
+    /// A token the drafter gets wrong, so a round's second draft is always rejected.
+    fn wrong(token: u32) -> u32 {
+        token.wrapping_add(7)
+    }
+
+    /// A CPU walk at the arm's widths: the pass rows a [ChunkPolicy] over Inkling's widest chunk
+    /// gives, [BATCH_ROWS] as the member cap, and a drafter whose chain is the model's own pick
+    /// followed by a deliberately wrong token. It is the shape the engine is driven at, not the
+    /// arm's arithmetic.
+    struct ShapeWalk {
+        layout: StateLayout,
+        limits: Limits,
+        drafter: ShapeDrafter,
+        /// Every prompt chunk the walk was handed, in order.
+        chunks: Mutex<Vec<usize>>,
+        /// Every verify pass, one entry a member's rows.
+        verifies: Mutex<Vec<Vec<usize>>>,
+    }
+
+    impl ShapeWalk {
+        /// A walk whose widest prompt chunk is `widest` rows, so its pass is the arm's
+        /// [InklingWalk::new] rule: [ChunkPolicy] over that width, [BATCH_ROWS] members and
+        /// `depth` drafts a member.
+        fn new(widest: usize, depth: usize) -> Self {
+            let pass = ChunkPolicy::for_limits(Limits::new(widest, SHAPE_CONTEXT)).rows();
+            Self {
+                layout: StateLayout::new(vec![
+                    Region::Positional {
+                        name: "kv-cache",
+                        bytes_per_row: 4,
+                    },
+                    Region::Recurrent {
+                        name: "conv-histories-and-drafter",
+                        bytes: 64,
+                    },
+                ]),
+                limits: Limits::new(pass, SHAPE_CONTEXT).with_members(BATCH_ROWS),
+                drafter: ShapeDrafter { depth },
+                chunks: Mutex::new(Vec::new()),
+                verifies: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn chunks(&self) -> Vec<usize> {
+            self.chunks.lock().expect("the chunk record").clone()
+        }
+
+        fn verifies(&self) -> Vec<Vec<usize>> {
+            self.verifies.lock().expect("the verify record").clone()
+        }
+    }
+
+    /// A sequence is the tokens it forwarded and still holds, plus the answers a round queued.
+    #[derive(Debug, Default)]
+    struct ShapeSeq {
+        rows: Vec<u32>,
+        pending: VecDeque<(u32, StepOutput)>,
+        point: Option<Vec<u32>>,
+    }
+
+    impl LaneState for ShapeSeq {
+        fn position(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn checkpoint(&mut self, at: usize) -> Result<(), BackendError> {
+            if at != self.rows.len() {
+                return Err(BackendError::new(DEVICE, "a checkpoint is at the position"));
+            }
+            self.point = Some(self.rows.clone());
+            Ok(())
+        }
+
+        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
+            if to > self.rows.len() {
+                return Err(BackendError::new(DEVICE, "a rewind past the position"));
+            }
+            match (to, self.point.take()) {
+                (0, _) => self.rows.clear(),
+                (_, Some(rows)) if rows.len() >= to => self.rows = rows[..to].to_vec(),
+                _ => self.rows.truncate(to),
+            }
+            self.pending.clear();
+            Ok(())
+        }
+
+        fn room(&self, _positions: usize, _reset: bool) -> bool {
+            true
+        }
+    }
+
+    /// The wall of a shape round: flat, so the row share spends the budget by confidence alone.
+    struct ShapeWall;
+
+    impl StepWall for ShapeWall {
+        fn ms(&self, _seqs: usize, _rows: usize) -> f64 {
+            1.0
+        }
+    }
+
+    static SHAPE_WALL: ShapeWall = ShapeWall;
+
+    struct ShapeDrafter {
+        /// The drafts a chain holds past the anchor.
+        depth: usize,
+    }
+
+    impl Walk for ShapeWalk {
+        type Seq = ShapeSeq;
+        type Drafter = ShapeDrafter;
+        type Vision = sparkflash_runtime::NoVision;
+
+        const CAPABILITIES: WalkCapabilities =
+            WalkCapabilities::all(sparkflash_runtime::StateKind::Both);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ShapeSeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            &self.drafter
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [RunSegment<'_, Self::Seq>],
+            mut pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            match pass.kind {
+                PassKind::TokenRows => {}
+                PassKind::Bulk { .. } => {
+                    if segments.len() != 1 {
+                        return Err(BackendError::new(DEVICE, "a prompt pass holds one segment"));
+                    }
+                    let rows = segments[0].rows.len();
+                    self.chunks.lock().expect("the chunk record").push(rows);
+                }
+                PassKind::Verify { .. } => self
+                    .verifies
+                    .lock()
+                    .expect("the verify record")
+                    .push(segments.iter().map(|segment| segment.rows.len()).collect()),
+                PassKind::Paired { .. } => {
+                    return Err(BackendError::new(
+                        DEVICE,
+                        "the Inkling arm does not pair several prompts in one pass",
+                    ));
+                }
+            }
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            let hidden = Hidden::new(rows);
+            if let Some(hook) = pass.hook.take() {
+                hook.after_layers(&hidden)?;
+            }
+            Ok(hidden)
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(rows
+                .iter_mut()
+                .map(|row| {
+                    let token = match &row.input {
+                        HeadInput::Verify { rows, row: index } => {
+                            pick(rows.get(*index).copied().unwrap_or_default())
+                        }
+                        HeadInput::Prompt(_) | HeadInput::Token(_) => {
+                            row.seq.rows.last().copied().map_or(0, pick)
+                        }
+                    };
+                    StepOutput {
+                        logits: Vec::new(),
+                        next_token: Some(token),
+                        draft: Vec::new(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    impl Drafter<ShapeWalk> for ShapeDrafter {
+        const PRESENT: bool = true;
+        type Rows = ();
+
+        fn wall(&self) -> &dyn StepWall {
+            &SHAPE_WALL
+        }
+
+        fn open_round(&self, seq: &mut ShapeSeq, token: u32) -> Result<Draft, BackendError> {
+            if let Some((front, _)) = seq.pending.front()
+                && *front == token
+            {
+                let (_, step) = seq.pending.pop_front().expect("the front was read");
+                return Ok(Draft::Held(step));
+            }
+            let drafts: Vec<u32> = match self.depth {
+                0 => Vec::new(),
+                1 => vec![pick(token)],
+                _ => vec![pick(token), wrong(token)],
+            };
+            let confidence = (0..drafts.len()).map(|at| 0.9 - 0.1 * at as f64).collect();
+            Ok(Draft::Chain { confidence, drafts })
+        }
+
+        fn verify(
+            &self,
+            walk: &ShapeWalk,
+            segments: &mut [RunSegment<'_, ShapeSeq>],
+            _depths: &[usize],
+        ) -> Result<Vec<Self::Rows>, BackendError> {
+            let rows: usize = segments.iter().map(|segment| segment.rows.len()).sum();
+            walk.walk(
+                segments,
+                Pass::verify(rows, OutputConstraint::new(&[], rows)),
+            )?;
+            Ok(vec![(); segments.len()])
+        }
+
+        fn settle(
+            &self,
+            seq: &mut ShapeSeq,
+            chunk: &[u32],
+            _rows: Self::Rows,
+        ) -> Result<StepOutput, BackendError> {
+            let picks: Vec<u32> = chunk.iter().map(|token| pick(*token)).collect();
+            let kept = sparkflash_model::verdict(chunk, &picks);
+            let base = seq.rows.len().saturating_sub(chunk.len());
+            seq.rows.truncate(base + kept);
+            for (index, &token) in chunk.iter().enumerate().take(kept).skip(1) {
+                seq.pending.push_back((
+                    token,
+                    StepOutput {
+                        logits: Vec::new(),
+                        next_token: picks.get(index).copied(),
+                        draft: Vec::new(),
+                    },
+                ));
+            }
+            Ok(StepOutput {
+                logits: Vec::new(),
+                next_token: picks.first().copied(),
+                draft: Vec::new(),
+            })
+        }
+
+        /// The arm's own rule: a verify is the members' anchors and their drafts, and the rank's
+        /// verify batch holds [BATCH_ROWS] rows.
+        fn budget(&self, seqs: usize) -> usize {
+            (seqs * self.depth).min(BATCH_ROWS.saturating_sub(seqs))
+        }
+
+        fn ready(&self, seq: &ShapeSeq, token: u32) -> bool {
+            seq.pending
+                .front()
+                .is_some_and(|(front, _)| *front == token)
+        }
+
+        fn give_back(&self, seq: &mut ShapeSeq, to: usize) -> Result<(), BackendError> {
+            seq.rows.truncate(to.min(seq.rows.len()));
+            seq.pending.clear();
+            Ok(())
+        }
+
+        fn speculation(&self, _seq: &ShapeSeq) -> Speculation {
+            Speculation::default()
+        }
+    }
+
+    /// Admits a prompt and ticks until its first step.
+    fn shape_prompt(engine: &mut TickEngine<ShapeWalk>, tokens: &[u32]) -> (RequestId, StepOutput) {
+        let id = engine
+            .admit(tokens, &[], Sampling::default())
+            .expect("the prompt is admitted");
+        loop {
+            for event in engine.tick().expect("the tick") {
+                if let TickEvent::Prompt { id: got, step } = event
+                    && got == id
+                {
+                    return (id, step);
+                }
+            }
+        }
+    }
+
+    /// Feeds one token and ticks until its answer.
+    fn shape_decode(
+        engine: &mut TickEngine<ShapeWalk>,
+        id: RequestId,
+        token: u32,
+    ) -> Vec<StepOutput> {
+        engine.feed(id, token).expect("the row is fed");
+        loop {
+            for event in engine.tick().expect("the tick") {
+                if let TickEvent::Decode { id: got, steps } = event
+                    && got == id
+                {
+                    return steps;
+                }
+            }
+        }
+    }
+
+    /// The generated checks drive the path Inkling serves its single process on, as dense's,
+    /// GLM's and Qwen's do.
+    #[test]
+    fn the_generated_checks_drive_the_tick_engine() {
+        assert!(<InklingWalk as WalkFixture>::tick_engine());
+    }
+
+    /// The tick engine's config is Inkling's profile: the arm's pass rows as the prompt chunk,
+    /// [BATCH_ROWS] as the verify width, the drafter's own depth and floor, the runtime's
+    /// joint-round switch, no decoder-layer skip and no row exchange at one rank.
+    #[test]
+    fn the_tick_config_is_the_inkling_profile() {
+        let widest = LONG_PREFILL_CHUNK;
+        let walk = ShapeWalk::new(widest, DEFAULT_DRAFT_DEPTH);
+        let config = TickConfig::for_walk(&walk, BATCH_ROWS);
+        assert_eq!(config.rows_max, widest, "the widest width is a policy size");
+        assert_eq!(
+            config.chunk_rows, widest,
+            "a prompt pass is the policy's `{widest}` rows"
+        );
+        assert_eq!(config.exact_tick_rows, widest);
+        assert_eq!(config.busy_chunk, widest);
+        assert_eq!(config.bulk_cap, Some(widest));
+        assert_eq!(
+            config.members, BATCH_ROWS,
+            "the verify width is the member cap"
+        );
+        assert_eq!(
+            config.k,
+            (DEFAULT_DRAFT_DEPTH).min(BATCH_ROWS - 1),
+            "a member's anchor and the drafter's own drafts"
+        );
+        assert!(config.batch_spec.is_some(), "the arm drafts");
+        assert!(
+            config.shared_rounds,
+            "the arm's joint rounds are on by default"
+        );
+        assert_eq!(
+            config.share_floor, 0.0,
+            "the arm states no confidence floor"
+        );
+        assert!(
+            !config.decoder_skip,
+            "Inkling has no decoder layers to skip"
+        );
+        assert!(!config.exchange, "TP=1 has no row exchange");
+
+        // The 65,535-row switch is a policy size too, so the arm's whole-context pass survives.
+        let whole = ShapeWalk::new(MAX_PREFILL_CHUNK, 0);
+        assert_eq!(
+            TickConfig::for_walk(&whole, 1).chunk_rows,
+            MAX_PREFILL_CHUNK
+        );
+
+        // The engine's shared-round switch is the runtime's, not a second rule.
+        let joint = Runtime::new(ShapeWalk::new(widest, DEFAULT_DRAFT_DEPTH), 0)
+            .expect("the runtime")
+            .with_joint_rounds(true);
+        assert!(
+            TickConfig::for_runtime(&joint, BATCH_ROWS).shared_rounds,
+            "joint rounds on: the shared verify"
+        );
+        let alone = Runtime::new(ShapeWalk::new(widest, DEFAULT_DRAFT_DEPTH), 0)
+            .expect("the runtime")
+            .with_joint_rounds(false);
+        assert!(
+            !TickConfig::for_runtime(&alone, BATCH_ROWS).shared_rounds,
+            "joint rounds off: plain rows, as the runtime would plan"
+        );
+    }
+
+    /// A prompt longer than one width runs the arm's own chunks: the engine hands the walk
+    /// `ChunkPolicy` rows at a time, and 8,192 rows is where the default schedule widens, so a
+    /// 20,000-row prompt is 8,192 + 8,192 + 3,616; at the 65,535-row switch it is 65,535 +
+    /// 34,465.
+    #[test]
+    fn the_tick_engine_hands_inkling_chunks_past_one_width() {
+        let mut engine = TickEngine::new(ShapeWalk::new(LONG_PREFILL_CHUNK, 0), 1)
+            .expect("the tick engine starts");
+        assert_eq!(engine.config().chunk_rows, LONG_PREFILL_CHUNK);
+        let id = engine
+            .admit(&vec![7u32; 20_000], &[], Sampling::default())
+            .expect("the prompt");
+        loop {
+            let events = engine.tick().expect("the tick");
+            if events
+                .iter()
+                .any(|event| matches!(event, TickEvent::Prompt { id: got, .. } if *got == id))
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            engine.walk().chunks(),
+            vec![
+                LONG_PREFILL_CHUNK,
+                LONG_PREFILL_CHUNK,
+                20_000 - 2 * LONG_PREFILL_CHUNK
+            ],
+            "a 20,000-row prompt runs 8,192, 8,192 then 3,616, as the old runtime ran it"
+        );
+
+        let mut wide = TickEngine::new(ShapeWalk::new(MAX_PREFILL_CHUNK, 0), 1)
+            .expect("the tick engine starts");
+        assert_eq!(wide.config().chunk_rows, MAX_PREFILL_CHUNK);
+        let _ = shape_prompt(&mut wide, &vec![7u32; 100_000]);
+        assert_eq!(
+            wide.walk().chunks(),
+            vec![MAX_PREFILL_CHUNK, 100_000 - MAX_PREFILL_CHUNK],
+            "the whole-context width splits a 100,000-row prompt twice"
+        );
+
+        // A group's row exchange marks the bulk path; the rows are the same split.
+        let walk = ShapeWalk::new(LONG_PREFILL_CHUNK, 0);
+        let mut group = TickConfig::for_walk(&walk, 1);
+        group.exchange = true;
+        let mut engine = TickEngine::new(walk, 1)
+            .expect("the tick engine starts")
+            .with_config(group)
+            .expect("the group config");
+        assert!(engine.config().exchange);
+        let _ = shape_prompt(&mut engine, &vec![7u32; 20_000]);
+        assert_eq!(
+            engine.walk().chunks(),
+            vec![
+                LONG_PREFILL_CHUNK,
+                LONG_PREFILL_CHUNK,
+                20_000 - 2 * LONG_PREFILL_CHUNK
+            ],
+            "the group's bulk chunks are the single process's chunks"
+        );
+    }
+
+    /// Several decoding lanes verify in one shared round: the old fused engine's joint round is
+    /// the engine's shared plan, one verify holds every member's chain, and the verify is no
+    /// wider than the rank's [BATCH_ROWS] rows.
+    #[test]
+    fn the_tick_engine_keeps_inklings_joint_round() {
+        let mut engine = TickEngine::new(ShapeWalk::new(LONG_PREFILL_CHUNK, 2), 3)
+            .expect("the tick engine starts")
+            .with_trace();
+        let mut ids = Vec::new();
+        let mut firsts = Vec::new();
+        for at in 0..3u32 {
+            let prompt: Vec<u32> = (0..7).map(|index| 1 + at * 13 + index).collect();
+            let (id, step) = shape_prompt(&mut engine, &prompt);
+            assert_eq!(engine.kept(id).and_then(|kept| kept.history), Some(7));
+            ids.push(id);
+            firsts.push(step.next_token.expect("a token"));
+        }
+        for (id, token) in ids.iter().zip(&firsts) {
+            engine.feed(*id, *token).expect("the row is fed");
+        }
+        let mut answered = 0;
+        while answered < ids.len() {
+            for event in engine.tick().expect("the shared tick") {
+                if matches!(event, TickEvent::Decode { .. }) {
+                    answered += 1;
+                }
+            }
+        }
+        let trace = engine.trace().expect("the trace").render();
+        assert!(
+            trace.contains("plan=shared"),
+            "three lanes share one verify: {trace}"
+        );
+        let verifies = engine.walk().verifies();
+        assert_eq!(verifies.len(), 1, "one shared verify, not one a lane");
+        assert_eq!(
+            verifies[0].len(),
+            3,
+            "every member's chain is in the pass: {verifies:?}"
+        );
+        assert!(
+            verifies[0].iter().sum::<usize>() <= BATCH_ROWS,
+            "the three anchors and the drafts they share fit one rank step: {verifies:?}"
+        );
+        assert!(
+            verifies[0].iter().sum::<usize>() >= 4,
+            "the row share drafts at least one of them: {verifies:?}"
+        );
+    }
+
+    /// One decoding row runs one speculative round; the draft it gets wrong is rejected, and only
+    /// the accepted rows reach the request.
+    #[test]
+    fn a_speculative_round_keeps_its_accepted_rows_only() {
+        let mut engine = TickEngine::new(ShapeWalk::new(LONG_PREFILL_CHUNK, 2), 1)
+            .expect("the tick engine starts")
+            .with_trace();
+        let (id, first) = shape_prompt(&mut engine, &[10, 11, 12, 13]);
+        let anchor = first.next_token.expect("a token");
+        let steps = shape_decode(&mut engine, id, anchor);
+        assert_eq!(steps.len(), 2, "the anchor and the accepted draft");
+        assert_eq!(steps[0].next_token, Some(pick(anchor)));
+        assert_eq!(steps[1].next_token, Some(pick(pick(anchor))));
+        assert_eq!(
+            engine.history(id).map(<[u32]>::to_vec),
+            Some(vec![10, 11, 12, 13, anchor, pick(anchor)]),
+            "the accepted draft reaches the history"
+        );
+        assert!(
+            !engine
+                .history(id)
+                .expect("the history")
+                .contains(&wrong(anchor)),
+            "the rejected draft never reaches the request"
+        );
+        assert_eq!(
+            engine.walk().verifies(),
+            vec![vec![3]],
+            "the anchor and both drafts verified in one pass"
+        );
+        assert!(
+            engine
+                .trace()
+                .expect("the trace")
+                .render()
+                .contains("plan=spec"),
+            "one row takes the speculative plan"
         );
     }
 

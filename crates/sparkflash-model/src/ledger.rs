@@ -301,7 +301,9 @@ pub static ARM_LEDGERS: &[ArmLedger] = &[
             (Strategy::Lanes, State::Native("four fused lanes")),
             (
                 Strategy::PromptParts,
-                State::Native("chunks of up to 4096 tokens"),
+                State::Native(
+                    "bulk chunks of up to 8,192 tokens: 4,096 until 16,384 positions remain",
+                ),
             ),
             (
                 Strategy::TensorCorePrompt,

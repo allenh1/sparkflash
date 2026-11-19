@@ -23,8 +23,11 @@
 //!
 //! # Prefill
 //!
-//! A session is the shared runtime's one-slot adapter ([sparkflash_runtime::RuntimeSession]),
-//! so its prompt takes the runtime's chunks and the walk's own widths.
+//! A session is a handle on the rank's tick engine ([sparkflash_runtime::TickServe]), so its
+//! prompt takes the runtime's chunks and the walk's own widths, and the engine decides when a
+//! chunk runs. A backend opened with `enable_fusion` serves every session on one engine;
+//! one opened without it starts a one-lane engine a session, the one sequence memory a
+//! [sparkflash_runtime::RuntimeSession] held before the move.
 //!
 //! # Tensor parallelism
 //!
@@ -57,7 +60,7 @@ use sparkflash_ops::formats::{
 };
 use sparkflash_ops::gemv::CudaHandle;
 use sparkflash_ops::projection::{WIDE_SHARED, WideTile};
-use sparkflash_runtime::{ExpertUnionWall, Opened, RuntimeSession};
+use sparkflash_runtime::{ExpertUnionWall, Opened, TickServe};
 use sparkflash_weights::quant::bf16_to_f32;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -2988,6 +2991,9 @@ impl Drop for Shared {
 pub struct InklingDeviceBackend {
     descriptor: ModelDescriptor,
     shared: Arc<Shared>,
+    /// The tick engine every session is a handle on, once `enable_fusion` opened it; `None`
+    /// means a session's own one-lane engine.
+    fused: Option<Arc<TickServe<InklingWalk>>>,
 }
 
 impl std::fmt::Debug for InklingDeviceBackend {
@@ -3269,6 +3275,7 @@ impl InklingDeviceBackend {
         }
         Ok(Self {
             descriptor,
+            fused: None,
             shared: Arc::new(Shared {
                 cuda,
                 plan,
@@ -3435,11 +3442,21 @@ impl ModelBackend for InklingDeviceBackend {
     }
 
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        // A CUDA context is per-thread: [Cuda::load] makes the primary context current on the
-        // thread that opened the backend, and the generic host driver opens a sequence on its own
-        // worker thread. Without this bind the first allocation answers CUDA_ERROR_INVALID_CONTEXT
-        // (201) - which is exactly how the four-rank server failed its first request.
-        Ok(Box::new(RuntimeSession::open(self.runtime()?)?))
+        // [Self::enable_fusion]'s engine when the backend opened one, so every session is a
+        // handle on the rank's lanes; otherwise this session's own one-lane engine, which is the
+        // one sequence memory a [sparkflash_runtime::RuntimeSession] held before the move. A
+        // CUDA context is per-thread: the engine's walk calls `make_current` for the thread that
+        // runs a pass, and the sequence opens with the same bind on this one, so a session the
+        // host driver opens on its own worker thread does not answer CUDA_ERROR_INVALID_CONTEXT
+        // (201) on its first allocation - which is exactly how the four-rank server failed its
+        // first request.
+        match self.fused.as_ref() {
+            Some(engine) => Ok(Box::new(engine.open()?)),
+            None => {
+                let engine = TickServe::start(self.walk_arm()?, 1)?;
+                Ok(Box::new(engine.open()?))
+            }
+        }
     }
 }
 
@@ -3454,12 +3471,38 @@ impl InklingDeviceBackend {
     }
 
     /// The shared runtime over this rank's walk: the lanes, the prompt parts, the history,
-    /// resume and rewind, the round path and the ledger are the runtime's.
+    /// resume and rewind, the round path and the ledger are the runtime's. A group's worker
+    /// mirror drives this one, and a one-lane engine wraps it.
     ///
     /// # Errors
     /// A walk the runtime refuses, or a switch that is not a switch.
     pub fn runtime(&self) -> Result<sparkflash_runtime::Runtime<InklingWalk>, BackendError> {
         sparkflash_runtime::Runtime::new(self.walk_arm()?, 0)
+    }
+
+    /// Serves this rank's single-process sessions on the tick engine
+    /// ([sparkflash_runtime::TickServe] over [InklingWalk]): DeepSeek's scheduler with `capacity`
+    /// lanes, one a sequence, instead of a runtime per session.
+    ///
+    /// The engine's config is Inkling's profile, read from the walk: the pass rows and chunk
+    /// [InklingWalk::limits] states - 4,096, 8,192 or 65,535, the `ChunkPolicy` size over the
+    /// arm's widest width - the verify width as the member cap ([BATCH_ROWS]), the drafter's own
+    /// depth as `k` and floor, no decoder-layer skip (only DeepSeek has those layers) and no row
+    /// exchange at one rank. The executor is the runtime, so a prompt is the chunk
+    /// [InklingWalk::walk_bulk] walked and a decode is the same round: the engine chooses *when*
+    /// a chunk or a step runs, not what it computes.
+    ///
+    /// A backend that does not call this still serves: [ModelBackend::open_session] starts a
+    /// one-lane engine for each session, which is the one sequence memory a
+    /// [sparkflash_runtime::RuntimeSession] held before the move, so the batch runner and the
+    /// device tests need no opener.
+    ///
+    /// # Errors
+    /// A walk the engine refuses (a switch that is not a switch, a lane the rank cannot open), or
+    /// a thread that cannot start.
+    pub fn enable_fusion(&mut self, capacity: usize) -> Result<(), BackendError> {
+        self.fused = Some(TickServe::start(self.walk_arm()?, capacity)?);
+        Ok(())
     }
 }
 
