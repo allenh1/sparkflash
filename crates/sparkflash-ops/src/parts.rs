@@ -105,6 +105,14 @@ const KDA_SCAN_HEAD_PAIRS: &[(usize, usize)] = &[(128, 128)];
 /// that asks for one is refused rather than booted against a 14-patch tower.
 const VISION_PATCH_SIZES: &[usize] = &[14];
 
+/// The vision patch side Inkling-2-Small's tower is released at.
+///
+/// Inkling runs its own patchify, rope and scale-add on the shared `opt_vision_*` gemm and
+/// attention bodies, so its entry must claim its own patch: without this constraint the vision
+/// part falls to `ShapeConstraint::ANY` and a Qwen 16-patch plan would resolve against
+/// Inkling's entry, which is the refusal D84 relies on.
+const INKLING_VISION_PATCH_SIZES: &[usize] = &[20];
+
 /// The routed-expert `(hidden, experts, top-k)` shapes the Qwen MoE images are published at.
 ///
 /// The token and grouped expert bodies are runtime-shaped (up to Q4E_MAX_TOPK = 64 active of
@@ -353,6 +361,9 @@ const fn shape_for(part: Part, image: Image) -> ShapeConstraint {
         (Part::Mtp, Image::Dflash2) => ShapeConstraint::ANY.hidden_multiple(256),
         // The shared vision tower's 16-patch kernel exists, but no orchestrated 16-patch tower.
         (Part::Vision, Image::Deepseek) => ShapeConstraint::ANY.patch_sizes(VISION_PATCH_SIZES),
+        (Part::Vision, Image::Inkling) => {
+            ShapeConstraint::ANY.patch_sizes(INKLING_VISION_PATCH_SIZES)
+        }
         _ => ShapeConstraint::ANY,
     }
 }
