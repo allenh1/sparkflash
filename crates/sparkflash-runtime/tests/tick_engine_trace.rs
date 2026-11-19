@@ -1,0 +1,355 @@
+// Copyright (c) 2026 Hunter L. Allen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The tick engine's gate: a fixed workload driven through [sparkflash_runtime::TickEngine] on a
+//! CPU walk, its decisions compared with the committed text.
+//!
+//! The engine runs the dense arm's serving path: it places, holds, chunks and decodes by
+//! sparkflash_runtime::tick's functions, and this file pins what those decisions are. The
+//! workload mirrors tests/tick_trace.rs (three prompts at once, the long one taking the decode
+//! share, a turn that reuses its prefix later), with the one structural difference the engine
+//! names: a prompt that finishes its prefill is headed in that tick and its decode row is fed by
+//! the caller on the next, where the replay decodes it in the same tick.
+//!
+//! What this cannot see: the device. Lane memory, growth, adoption from another lane, paired
+//! chunks, preemption and the drafter's depth need a cluster; they are named in
+//! docs/engine/04-onboarding-review.md.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use sparkflash_model::backend::{BackendError, ModelSession, Sampling, StepOutput};
+use sparkflash_runtime::tick::Clock;
+use sparkflash_runtime::{
+    Absent, ComputeDeclaration, HeadRow, Hidden, LaneMemory, LaneState, Limits, NoVision, Pass,
+    Segment, StateKind, StateLayout, TickConfig, TickEngine, TickEvent, Walk, WalkCapabilities,
+};
+
+/// A clock the test advances before each tick, so the engine's cost model reads the same scripted
+/// costs the replay does.
+#[derive(Clone, Default)]
+struct ScriptedClock(Arc<AtomicU64>);
+
+impl ScriptedClock {
+    fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::Relaxed);
+    }
+}
+
+impl Clock for ScriptedClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A sequence is the tokens it forwarded and still holds.
+#[derive(Debug, Default)]
+struct Seq {
+    rows: Vec<u32>,
+}
+
+impl LaneState for Seq {
+    fn position(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn checkpoint(&mut self, _at: usize) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
+        self.rows.truncate(to);
+        Ok(())
+    }
+
+    fn room(&self, _positions: usize, _reset: bool) -> bool {
+        true
+    }
+}
+
+/// The CPU walk the gate drives: a pass appends its rows, and the head reads the last one.
+struct ReplayWalk {
+    layout: StateLayout,
+    limits: Limits,
+}
+
+impl ReplayWalk {
+    fn new(rows: usize, context: usize) -> Self {
+        Self {
+            layout: StateLayout::new(Vec::new()),
+            limits: Limits::new(rows, context),
+        }
+    }
+}
+
+impl Walk for ReplayWalk {
+    type Seq = Seq;
+    type Drafter = Absent<&'static str>;
+    type Vision = NoVision;
+
+    const CAPABILITIES: WalkCapabilities = WalkCapabilities {
+        passes: sparkflash_runtime::PassMask::ALL,
+        segments: sparkflash_runtime::Segments::Many,
+        state: StateKind::Positional,
+        compute: ComputeDeclaration::none(
+            "the gate walks no tensor cores",
+            "the gate walks no tensor cores",
+            "the gate stores no weights",
+            "the gate keeps every position",
+        ),
+    };
+
+    fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+        Ok(Seq::default())
+    }
+
+    fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    fn drafter(&self) -> &Self::Drafter {
+        static ABSENT: Absent<&'static str> = Absent("the gate walks no drafter");
+        &ABSENT
+    }
+
+    fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+    fn walk(
+        &self,
+        segments: &mut [Segment<'_, Self::Seq>],
+        _pass: Pass<'_>,
+    ) -> Result<Hidden, BackendError> {
+        let mut rows = 0;
+        for segment in segments {
+            segment.seq.rows.extend_from_slice(segment.rows);
+            rows += segment.rows.len();
+        }
+        Ok(Hidden::new(rows))
+    }
+
+    fn head(
+        &self,
+        hidden: &Hidden,
+        rows: &mut [HeadRow<'_, Self::Seq>],
+    ) -> Result<Vec<StepOutput>, BackendError> {
+        let _ = hidden;
+        Ok(rows
+            .iter_mut()
+            .map(|row| {
+                let token = row.seq.rows.last().copied().unwrap_or(0);
+                let _ = &row.input;
+                StepOutput {
+                    logits: Vec::new(),
+                    next_token: Some(token.wrapping_add(1)),
+                    draft: Vec::new(),
+                }
+            })
+            .collect())
+    }
+}
+
+/// A prompt of len deterministic tokens.
+fn tokens(seed: u32, len: usize) -> Vec<u32> {
+    (0..len)
+        .map(|i| 1 + (seed.wrapping_mul(7919).wrapping_add(i as u32 * 31)) % 90_000)
+        .collect()
+}
+
+/// A prompt that begins exactly like head and continues on its own.
+fn shares(head: &[u32], len: usize) -> Vec<u32> {
+    let mut tokens = head[..len.min(head.len())].to_vec();
+    tokens.extend((tokens.len()..len).map(|i| 1 + (i as u32 * 131) % 90_000));
+    tokens
+}
+
+/// The committed decisions.
+fn expected() -> &'static str {
+    include_str!("data/tick_engine_trace.txt")
+}
+
+/// Drives the fixed workload and returns the engine's rendered trace.
+fn run() -> String {
+    let clock = ScriptedClock::default();
+    let walk = ReplayWalk::new(8_192, 200_000);
+    let mut engine = TickEngine::new(walk, 3)
+        .expect("the engine starts")
+        .with_config(TickConfig::deepseek(3))
+        .expect("the deepseek config fits the walk")
+        .with_clock(Box::new(clock.clone()))
+        .with_trace();
+    let long = tokens(1, 30_000);
+    let first = engine
+        .admit(&long, &[], Sampling::default())
+        .expect("seq 1");
+    let second = engine
+        .admit(&shares(&long, 2_000), &[], Sampling::default())
+        .expect("seq 2");
+    let third = engine
+        .admit(&tokens(3, 80), &[], Sampling::default())
+        .expect("seq 3");
+    // Each request's next token, once its last step has chosen one: the caller feeds it on the
+    // next tick, which is the engine's one structural difference from the replay.
+    let mut next: Vec<(sparkflash_runtime::RequestId, u32)> =
+        vec![(first, 0), (second, 0), (third, 0)];
+    let mut live: Vec<sparkflash_runtime::RequestId> = vec![first, second, third];
+    let costs = [
+        450u64, 40, 40, 40, 40, 40, 40, 40, 40, 40, 450, 40, 40, 40, 40, 40, 40, 40, 40, 40, 450,
+        40, 40, 40, 40, 40, 40, 40, 40, 40,
+    ];
+    let mut fourth = None;
+    for (tick, cost) in costs.into_iter().enumerate() {
+        if tick == 9 {
+            engine.finish(third);
+            live.retain(|id| *id != third);
+        }
+        if tick == 17 {
+            engine.finish(first);
+            live.retain(|id| *id != first);
+            let id = engine
+                .admit(&shares(&long, 25_000), &[], Sampling::default())
+                .expect("seq 4");
+            fourth = Some(id);
+            live.push(id);
+            next.push((id, 0));
+        }
+        if tick == 21 {
+            engine.finish(second);
+            live.retain(|id| *id != second);
+        }
+        if tick == 27
+            && let Some(seq4) = fourth
+        {
+            engine.finish(seq4);
+            live.retain(|id| *id != seq4);
+        }
+        // Feed every decoding request the token its last answer chose. The caller owns the
+        // token, so a request fed this tick runs its decode row this tick.
+        let mut feed = Vec::new();
+        for (id, token) in &next {
+            if live.contains(id) && *token != 0 {
+                feed.push((*id, *token));
+            }
+        }
+        for (id, token) in feed {
+            engine
+                .feed(id, token)
+                .unwrap_or_else(|error| panic!("feed {}: {error}", id.0));
+            if let Some(entry) = next.iter_mut().find(|(other, _)| *other == id) {
+                entry.1 = 0;
+            }
+        }
+        clock.advance(cost);
+        let events = engine.tick().expect("the tick");
+        for event in events {
+            match event {
+                TickEvent::Prompt { id, step } => {
+                    if let Some(entry) = next.iter_mut().find(|(other, _)| *other == id) {
+                        entry.1 = step.next_token.unwrap_or(0);
+                    }
+                }
+                TickEvent::Decode { id, steps } => {
+                    let token = steps.last().and_then(|step| step.next_token).unwrap_or(0);
+                    if let Some(entry) = next.iter_mut().find(|(other, _)| *other == id) {
+                        entry.1 = token;
+                    }
+                }
+                TickEvent::Failed { id, error } => {
+                    panic!("request {} failed: {error}", id.0);
+                }
+            }
+        }
+    }
+    engine.trace().expect("the engine keeps a trace").render()
+}
+
+#[test]
+fn the_serving_engine_answers_two_sessions_and_keeps_a_lane_s_prefix() {
+    let engine = sparkflash_runtime::TickServe::start(ReplayWalk::new(16, 64), 2)
+        .expect("the serving engine starts");
+    let mut alone = engine.open().expect("a handle");
+    let mut other = engine.open().expect("a handle");
+    let first = alone.prefill(&[1, 2, 3]).expect("the prompt");
+    let second = other.prefill(&[4, 5]).expect("the other prompt");
+    let next = first.next_token.expect("a token");
+    assert_eq!(
+        alone.decode(next).expect("the step").next_token,
+        Some(next.wrapping_add(1)),
+        "a session steps its own walk"
+    );
+    assert_eq!(
+        other
+            .decode(second.next_token.expect("a token"))
+            .unwrap()
+            .next_token,
+        Some(7)
+    );
+    assert_eq!(
+        alone.reusable_prefix(),
+        Some([1, 2, 3, next].as_slice()),
+        "the caller's history"
+    );
+    alone.park();
+    // The lane keeps its history across requests, so a prompt that extends it resumes.
+    let longer = [1, 2, 3, next, 9];
+    alone.prefill(&longer).expect("the continued prompt");
+    assert_eq!(
+        alone.cached_tokens(),
+        4,
+        "the next request resumed the lane's four tokens"
+    );
+    drop(alone);
+    drop(other);
+}
+
+#[test]
+fn the_engine_makes_the_committed_decisions() {
+    let got = run();
+    if std::env::var_os("UPDATE_ENGINE_TRACE").is_some() {
+        std::fs::write(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/tick_engine_trace.txt"
+            ),
+            &got,
+        )
+        .expect("write the committed engine trace");
+        return;
+    }
+    assert_eq!(
+        got,
+        expected(),
+        "the tick engine's decisions moved; if that was intended, regenerate          tests/data/tick_engine_trace.txt with UPDATE_ENGINE_TRACE=1"
+    );
+    assert!(
+        got.lines().count() > 40,
+        "a trace that records nothing passes vacuously"
+    );
+    assert!(got.contains("path=bulk"), "a long prompt takes bulk chunks");
+    assert!(
+        got.contains("path=exact"),
+        "a short prompt takes exact rows"
+    );
+    assert!(
+        got.contains("hold 1"),
+        "a long chunk is held for the decoders"
+    );
+    assert!(
+        got.contains("plan=plain"),
+        "a non-drafting walk steps plain rows"
+    );
+}

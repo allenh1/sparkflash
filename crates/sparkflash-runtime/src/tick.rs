@@ -355,8 +355,9 @@ pub fn decode_plan(
 }
 
 /// A monotonic millisecond clock. The tick trace takes one instead of reading wall time, so a
-/// replay's boundary decisions are the same on every host.
-pub trait Clock {
+/// replay's boundary decisions are the same on every host. It is `Send` because the tick engine
+/// that reads it runs on a serving thread.
+pub trait Clock: Send {
     fn now_ms(&self) -> u64;
 }
 
@@ -545,7 +546,7 @@ impl TickTrace {
 pub struct TraceSink {
     trace: TickTrace,
     clock: Box<dyn Clock>,
-    path: std::path::PathBuf,
+    path: Option<std::path::PathBuf>,
     failed: bool,
 }
 
@@ -555,7 +556,31 @@ impl TraceSink {
         Self {
             trace: TickTrace::new(),
             clock,
-            path: path.into(),
+            path: Some(path.into()),
+            failed: false,
+        }
+    }
+
+    /// A sink with no file: an engine that keeps its decisions in memory, as the CPU gate's
+    /// engine does. [Self::flush] writes nothing.
+    #[must_use]
+    pub fn in_memory() -> Self {
+        Self {
+            trace: TickTrace::new(),
+            clock: Box::new(InjectedClock::new(0)),
+            path: None,
+            failed: false,
+        }
+    }
+
+    /// A sink that writes to `path` and takes every reading from the caller ([Self::record_at]),
+    /// for an engine that already holds the clock its decisions are timed by.
+    #[must_use]
+    pub fn file(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            trace: TickTrace::new(),
+            clock: Box::new(InjectedClock::new(0)),
+            path: Some(path.into()),
             failed: false,
         }
     }
@@ -564,6 +589,12 @@ impl TraceSink {
     /// own tick counter), not the trace's entry index.
     pub fn record(&mut self, tick: u64, decision: Decision) {
         let clock_ms = self.clock.now_ms();
+        self.trace.record(tick, clock_ms, decision);
+    }
+
+    /// Records a decision at `clock_ms`, the reading the caller's own clock gave. The tick engine
+    /// uses this so the reading that timed the cost and the reading in the trace are one.
+    pub fn record_at(&mut self, tick: u64, clock_ms: u64, decision: Decision) {
         self.trace.record(tick, clock_ms, decision);
     }
 
@@ -576,11 +607,14 @@ impl TraceSink {
     /// that matches the decisions it has already made, and a crash loses at most the tick in
     /// flight. A write failure is reported once, not once a tick.
     pub fn flush(&mut self) {
-        if let Err(error) = std::fs::write(&self.path, self.trace.render())
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        if let Err(error) = std::fs::write(&path, self.trace.render())
             && !self.failed
         {
             self.failed = true;
-            eprintln!("sparkflash: tick trace {}: {error}", self.path.display());
+            eprintln!("sparkflash: tick trace {}: {error}", path.display());
         }
     }
 }

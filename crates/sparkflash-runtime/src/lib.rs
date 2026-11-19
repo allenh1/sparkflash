@@ -34,6 +34,7 @@
 
 pub mod chunk;
 pub mod conformance;
+pub mod engine;
 pub mod fused;
 pub mod group;
 pub mod layout;
@@ -51,6 +52,9 @@ pub use conformance::{
     CONFORMANCE_CHECKS, CheckOutcome, ConformanceCheck, Fixture, FormatRule, WalkFixture,
     check_claims, checks_for, run_check, run_generated,
 };
+pub use engine::{
+    Kept as TickKept, RequestId, TickConfig, TickEngine, TickEvent, TickServe, TickSession,
+};
 pub use fused::{
     FusedArm, FusedEngine, FusedSession, PREFILL_BYPASS_MAX_TOKENS, PREFILL_DECODE_INTERVAL,
     PROMPT_PARTS_ENV, Part, REWIND_ENV, Resume, extends, prompt_parts, resume, rewind,
@@ -65,7 +69,7 @@ pub use ledger::{Ledger, Mode, Strategy};
 pub use pool::{LaneMemory, LanePool};
 pub use resume::{Restore, Rewind, checkpoint_after, rewind_plan};
 pub use rounds::{JOINT_ROUNDS_ENV, Opened, RoundArm, joint_rounds, run_round};
-pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, ledger_for};
+pub use runtime::{Runtime, RuntimeSession, RuntimeSlot, StepMode, ledger_for};
 pub use share::{BandWall, ExpertUnionWall, StepWall, share_rows};
 pub use walk::{
     Absent, ComputeDeclaration, Draft, Drafter, HeadInput, HeadRow, Hidden, NoVision,

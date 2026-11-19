@@ -130,6 +130,19 @@ impl<W: Walk> RuntimeSlot<W> {
     }
 }
 
+/// Which shape a step takes over its members ([Runtime::step_mode_slots]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepMode {
+    /// One row a member: a plain token pass.
+    Plain,
+    /// The arm's round path: held answers cost no row, and the opened chains are verified with
+    /// or without the joint row share.
+    Round {
+        /// Whether the members' chains verify in one pass ([crate::share_rows]) or one at a time.
+        joint: bool,
+    },
+}
+
 /// Every strategy over one [`Walk`].
 pub struct Runtime<W: Walk> {
     walk: W,
@@ -383,11 +396,13 @@ impl<W: Walk> Runtime<W> {
 
     /// One step with the arm's drafter: held answers are handed back with no device work; the
     /// opened chains are verified in one pass (a joint round) or one lane at a time (a lone
-    /// member, or [`crate::JOINT_ROUNDS_ENV`] off), and settled.
+    /// member, or [`crate::JOINT_ROUNDS_ENV`] off), and settled. The second half of the answer is
+    /// the rows the round walked, for the tick engine's trace.
     fn draft_step(
         &self,
         members: &mut [(RuntimeSlot<W>, u32)],
-    ) -> Result<Vec<StepOutput>, BackendError> {
+        joint_round: bool,
+    ) -> Result<(Vec<StepOutput>, usize), BackendError> {
         struct Chain {
             confidence: Vec<f64>,
             drafts: Vec<u32>,
@@ -412,12 +427,15 @@ impl<W: Walk> Runtime<W> {
         // A lone member keeps the drafter's own depth: there is no other chain to share with,
         // and trimming it through the row share would hand back a shorter run than the request
         // drafted for.
-        let joint = self.joint && opened.len() > 1;
+        let joint = joint_round && opened.len() > 1;
         let groups: Vec<Vec<usize>> = if joint {
             vec![opened]
         } else {
             opened.iter().map(|index| vec![*index]).collect()
         };
+        // The rows the round actually walked: held answers cost none, and each opened chain's
+        // anchor plus its share of the depth is one row. The tick engine's trace records this.
+        let mut walked = 0usize;
         for group in groups {
             let depths: Vec<usize> = if joint {
                 let probabilities: Vec<Vec<f64>> = group
@@ -441,6 +459,7 @@ impl<W: Walk> Runtime<W> {
                     .map(|&index| chains[index].as_ref().map_or(0, |chain| chain.drafts.len()))
                     .collect()
             };
+            walked += depths.iter().map(|depth| depth + 1).sum::<usize>();
             let rows: Vec<Vec<u32>> = group
                 .iter()
                 .zip(&depths)
@@ -485,7 +504,7 @@ impl<W: Walk> Runtime<W> {
                 BackendError::new("runtime", "a round left a member without a step")
             })?);
         }
-        Ok(steps)
+        Ok((steps, walked))
     }
 
     /// A fresh slot, with no `Send` bound: [`FusedArm::open_slot`] delegates here, and so
@@ -656,19 +675,43 @@ impl<W: Walk> Runtime<W> {
         &self,
         members: &mut [(RuntimeSlot<W>, u32)],
     ) -> Result<Vec<StepOutput>, BackendError> {
+        let mode = if W::Drafter::PRESENT && self.walk.drafter().drafts() {
+            StepMode::Round { joint: self.joint }
+        } else {
+            StepMode::Plain
+        };
+        self.step_mode_slots(members, mode).map(|(steps, _)| steps)
+    }
+
+    /// One step over the members in `mode`, answering the steps and the rows they walked.
+    ///
+    /// The tick engine decides the step's shape ([crate::tick::decode_plan]) and calls this with
+    /// it, so the plan is the engine's and the round's execution is the runtime's.
+    ///
+    /// # Errors
+    /// A step before a prompt in parts finished, or a backend failure.
+    pub fn step_mode_slots(
+        &self,
+        members: &mut [(RuntimeSlot<W>, u32)],
+        mode: StepMode,
+    ) -> Result<(Vec<StepOutput>, usize), BackendError> {
         if members.iter().any(|(slot, _)| slot.prompt.is_some()) {
             return Err(BackendError::new(
                 "runtime",
                 "a prompt in parts was stepped before it finished",
             ));
         }
-        if W::Drafter::PRESENT && self.walk.drafter().drafts() {
-            self.draft_step(members)
-        } else {
-            // No round drafts: one plain token pass over every member, the old fused
-            // `Rows::Lanes` step. Taking this branch for a rank whose drafter is compiled in but
-            // configured off is what keeps a held decode from becoming one per lane.
-            self.plain_step(members)
+        match mode {
+            StepMode::Round { joint } if W::Drafter::PRESENT && self.walk.drafter().drafts() => {
+                self.draft_step(members, joint)
+            }
+            _ => {
+                // No round drafts: one plain token pass over every member, the old fused
+                // `Rows::Lanes` step. Taking this branch for a rank whose drafter is compiled in
+                // but configured off is what keeps a held decode from becoming one per lane.
+                let rows = members.len();
+                self.plain_step(members).map(|steps| (steps, rows))
+            }
         }
     }
 

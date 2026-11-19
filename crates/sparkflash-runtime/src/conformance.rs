@@ -225,6 +225,16 @@ pub trait WalkFixture: Walk {
     fn fixture(world: usize) -> Result<Fixture<Self>, BackendError>
     where
         Self: Sized;
+
+    /// Whether the generated checks drive this arm through the tick engine
+    /// ([`crate::TickEngine`]) instead of the runtime's own prompt loop.
+    ///
+    /// An arm that serves on the tick engine says so here, so its generated checks drive the
+    /// path it serves on. An arm still on [`crate::FusedEngine`] leaves the default and its
+    /// checks are unchanged.
+    fn tick_engine() -> bool {
+        false
+    }
 }
 
 /// The answer one generated check gives.
@@ -334,6 +344,19 @@ fn whole_prompt_equals_chunked<W: WalkFixture>() -> Result<CheckOutcome, Backend
             &fixture.source,
         ));
     }
+    // An arm that serves on the tick engine runs the prompt through it too: the engine's own
+    // chunk choices must leave the same tokens the arm's direct chunks do.
+    if W::tick_engine() {
+        let engine = engine_run(W::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+        if whole != engine {
+            return Err(disagreement(
+                "the tick engine = the whole prompt",
+                &whole,
+                &engine,
+                &fixture.source,
+            ));
+        }
+    }
     println!(
         "conformance: whole prompt = chunked = token by token: {} tokens over {}",
         whole.len(),
@@ -351,12 +374,22 @@ fn alone_equals_four<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
         CONFORMANCE_THIRD,
         CONFORMANCE_FOURTH,
     ];
-    let runtime = Runtime::new(fixture.walk, 0)?;
-    let mut alone = Vec::with_capacity(prompts.len());
-    for prompt in &prompts {
-        alone.push(runtime_run(&runtime, prompt, CONFORMANCE_TOKENS)?);
-    }
-    let together = runtime_four(&runtime, &prompts, CONFORMANCE_TOKENS)?;
+    let (alone, together) = if W::tick_engine() {
+        let mut alone = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            alone.push(engine_run(W::fixture(1)?.walk, prompt, CONFORMANCE_TOKENS)?);
+        }
+        let together = engine_four(fixture.walk, &prompts, CONFORMANCE_TOKENS)?;
+        (alone, together)
+    } else {
+        let runtime = Runtime::new(fixture.walk, 0)?;
+        let mut alone = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            alone.push(runtime_run(&runtime, prompt, CONFORMANCE_TOKENS)?);
+        }
+        let together = runtime_four(&runtime, &prompts, CONFORMANCE_TOKENS)?;
+        (alone, together)
+    };
     for (index, (single, four)) in alone.iter().zip(&together).enumerate() {
         if single != four {
             return Err(disagreement(
@@ -377,22 +410,43 @@ fn alone_equals_four<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
 /// A continued turn's tokens equal a cold turn's.
 fn continued_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
     let fixture = W::fixture(1)?;
-    let runtime = Runtime::new(fixture.walk, 0)?;
-    let cold = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-    let mut slot = runtime.open_slot()?;
-    let prefix = CONFORMANCE_PROMPT[..4].to_vec();
-    runtime.prefill_slot(&mut slot, &prefix)?;
-    let first = runtime.prefill_slot(&mut slot, &CONFORMANCE_PROMPT)?;
-    if slot.history() != CONFORMANCE_PROMPT {
-        return Err(BackendError::new(
-            "conformance",
-            format!(
-                "continued turn = cold: the runtime kept {:?}, not the prompt",
-                slot.history()
-            ),
-        ));
-    }
-    let continued = decode_slot(&runtime, slot, first, CONFORMANCE_TOKENS)?;
+    let (cold, continued) = if W::tick_engine() {
+        let cold = engine_run(W::fixture(1)?.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+        let mut engine = crate::TickEngine::new(W::fixture(1)?.walk, 1)?;
+        let prefix = CONFORMANCE_PROMPT[..4].to_vec();
+        let (id, _) = engine_turn(&mut engine, &prefix)?;
+        engine.finish(id);
+        let (id, first) = engine_turn(&mut engine, &CONFORMANCE_PROMPT)?;
+        if engine.history(id) != Some(CONFORMANCE_PROMPT.as_slice()) {
+            return Err(BackendError::new(
+                "conformance",
+                format!(
+                    "continued turn = cold: the tick engine kept {:?}, not the prompt",
+                    engine.history(id)
+                ),
+            ));
+        }
+        let continued = engine_decode(&mut engine, id, first, CONFORMANCE_TOKENS)?;
+        (cold, continued)
+    } else {
+        let runtime = Runtime::new(fixture.walk, 0)?;
+        let cold = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+        let mut slot = runtime.open_slot()?;
+        let prefix = CONFORMANCE_PROMPT[..4].to_vec();
+        runtime.prefill_slot(&mut slot, &prefix)?;
+        let first = runtime.prefill_slot(&mut slot, &CONFORMANCE_PROMPT)?;
+        if slot.history() != CONFORMANCE_PROMPT {
+            return Err(BackendError::new(
+                "conformance",
+                format!(
+                    "continued turn = cold: the runtime kept {:?}, not the prompt",
+                    slot.history()
+                ),
+            ));
+        }
+        let continued = decode_slot(&runtime, slot, first, CONFORMANCE_TOKENS)?;
+        (cold, continued)
+    };
     if cold != continued {
         return Err(disagreement(
             "continued turn = cold",
@@ -412,24 +466,46 @@ fn continued_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError>
 /// A rewound turn's tokens equal a cold turn's.
 fn rewound_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
     let fixture = W::fixture(1)?;
-    let runtime = Runtime::new(fixture.walk, 0)?;
     let changed = [7, 9, 11, 13, 15, 17, 23];
-    let cold = runtime_run(&runtime, &changed, CONFORMANCE_TOKENS)?;
-    let mut slot = runtime.open_slot()?;
-    let mut first_turn = CONFORMANCE_PROMPT;
-    *first_turn.last_mut().expect("a prompt") = 29;
-    runtime.prefill_slot(&mut slot, &first_turn)?;
-    let first = runtime.prefill_slot(&mut slot, &changed)?;
-    if slot.history() != changed {
-        return Err(BackendError::new(
-            "conformance",
-            format!(
-                "rewound turn = cold: the runtime kept {:?}, not the changed prompt",
-                slot.history()
-            ),
-        ));
-    }
-    let rewound = decode_slot(&runtime, slot, first, CONFORMANCE_TOKENS)?;
+    let (cold, rewound) = if W::tick_engine() {
+        let cold = engine_run(W::fixture(1)?.walk, &changed, CONFORMANCE_TOKENS)?;
+        let mut engine = crate::TickEngine::new(W::fixture(1)?.walk, 1)?;
+        let mut first_turn = CONFORMANCE_PROMPT;
+        *first_turn.last_mut().expect("a prompt") = 29;
+        let (id, _) = engine_turn(&mut engine, &first_turn)?;
+        engine.finish(id);
+        let (id, first) = engine_turn(&mut engine, &changed)?;
+        if engine.history(id) != Some(changed.as_slice()) {
+            return Err(BackendError::new(
+                "conformance",
+                format!(
+                    "rewound turn = cold: the tick engine kept {:?}, not the changed prompt",
+                    engine.history(id)
+                ),
+            ));
+        }
+        let rewound = engine_decode(&mut engine, id, first, CONFORMANCE_TOKENS)?;
+        (cold, rewound)
+    } else {
+        let runtime = Runtime::new(fixture.walk, 0)?;
+        let cold = runtime_run(&runtime, &changed, CONFORMANCE_TOKENS)?;
+        let mut slot = runtime.open_slot()?;
+        let mut first_turn = CONFORMANCE_PROMPT;
+        *first_turn.last_mut().expect("a prompt") = 29;
+        runtime.prefill_slot(&mut slot, &first_turn)?;
+        let first = runtime.prefill_slot(&mut slot, &changed)?;
+        if slot.history() != changed {
+            return Err(BackendError::new(
+                "conformance",
+                format!(
+                    "rewound turn = cold: the runtime kept {:?}, not the changed prompt",
+                    slot.history()
+                ),
+            ));
+        }
+        let rewound = decode_slot(&runtime, slot, first, CONFORMANCE_TOKENS)?;
+        (cold, rewound)
+    };
     if cold != rewound {
         return Err(disagreement(
             "rewound turn = cold",
@@ -449,8 +525,12 @@ fn rewound_equals_cold<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
 /// TP 1 = TP 2 = TP 4, or a named skip when the host has no group.
 fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
     let one = W::fixture(1)?;
-    let runtime = Runtime::new(one.walk, 0)?;
-    let baseline = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+    let baseline = if W::tick_engine() {
+        engine_run(one.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+    } else {
+        let runtime = Runtime::new(one.walk, 0)?;
+        runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+    };
     let mut compared = vec![1usize];
     for world in [2usize, 4] {
         let fixture = match W::fixture(world) {
@@ -463,8 +543,12 @@ fn tp_within_exactness<W: WalkFixture>() -> Result<CheckOutcome, BackendError> {
             }
             Err(error) => return Err(error),
         };
-        let runtime = Runtime::new(fixture.walk, 0)?;
-        let tokens = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+        let tokens = if W::tick_engine() {
+            engine_run(fixture.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+        } else {
+            let runtime = Runtime::new(fixture.walk, 0)?;
+            runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+        };
         if tokens != baseline {
             return Err(disagreement(
                 &format!("TP 1 = TP {world}"),
@@ -542,8 +626,12 @@ fn drafted_equals_plain<W: WalkFixture>() -> Result<CheckOutcome, BackendError> 
     let drafted = W::fixture(1)?;
     let plain = W::fixture(1)?;
     let expected = plain_run(&plain.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
-    let runtime = Runtime::new(drafted.walk, 0)?;
-    let actual = runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?;
+    let actual = if W::tick_engine() {
+        engine_run(drafted.walk, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+    } else {
+        let runtime = Runtime::new(drafted.walk, 0)?;
+        runtime_run(&runtime, &CONFORMANCE_PROMPT, CONFORMANCE_TOKENS)?
+    };
     if actual != expected {
         return Err(disagreement(
             "drafted = plain",
@@ -755,6 +843,159 @@ fn runtime_four<W: Walk>(
     Ok(runs)
 }
 
+/// One prompt through the tick engine, then `tokens` greedy tokens. The engine's own protocol:
+/// admit, tick until the first step, then feed each step's token and tick until its answer.
+fn engine_run<W: Walk>(
+    walk: W,
+    prompt: &[u32],
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
+    let mut engine = crate::TickEngine::new(walk, 1)?;
+    let (id, first) = engine_turn(&mut engine, prompt)?;
+    engine_decode(&mut engine, id, first, tokens)
+}
+
+/// A prompt admitted to an engine, ticked until its first step.
+fn engine_turn<W: Walk>(
+    engine: &mut crate::TickEngine<W>,
+    prompt: &[u32],
+) -> Result<(crate::RequestId, StepOutput), BackendError> {
+    let id = engine.admit(prompt, &[], sparkflash_model::backend::Sampling::default())?;
+    loop {
+        for event in engine.tick()? {
+            match event {
+                crate::TickEvent::Prompt { id: got, step } if got == id => return Ok((id, step)),
+                crate::TickEvent::Failed { id: got, error } if got == id => return Err(error),
+                _ => {}
+            }
+        }
+        if !engine.busy() {
+            return Err(BackendError::new(
+                "conformance",
+                "the tick engine stopped before the prompt's first step",
+            ));
+        }
+    }
+}
+
+/// `tokens` greedy tokens from a request whose prompt is in.
+fn engine_decode<W: Walk>(
+    engine: &mut crate::TickEngine<W>,
+    id: crate::RequestId,
+    first: StepOutput,
+    tokens: usize,
+) -> Result<Vec<Option<u32>>, BackendError> {
+    let mut run = vec![first.next_token];
+    let mut token = first.next_token;
+    while run.len() < tokens {
+        let Some(fed) = token else {
+            break;
+        };
+        engine.feed(id, fed)?;
+        let mut step = None;
+        loop {
+            for event in engine.tick()? {
+                match event {
+                    crate::TickEvent::Decode { id: got, steps } if got == id => {
+                        step = steps.into_iter().next();
+                    }
+                    crate::TickEvent::Failed { id: got, error } if got == id => return Err(error),
+                    _ => {}
+                }
+            }
+            if step.is_some() {
+                break;
+            }
+            if !engine.busy() {
+                return Err(BackendError::new(
+                    "conformance",
+                    "the tick engine stopped before the decode's answer",
+                ));
+            }
+        }
+        token = step.and_then(|step| step.next_token);
+        run.push(token);
+    }
+    Ok(run)
+}
+
+/// Four prompts prompted one after another, then stepped together, one token a round, through
+/// the tick engine.
+fn engine_four<W: Walk>(
+    walk: W,
+    prompts: &[[u32; 7]],
+    tokens: usize,
+) -> Result<Vec<Vec<Option<u32>>>, BackendError> {
+    let mut engine = crate::TickEngine::new(walk, prompts.len().max(1))?;
+    let mut ids = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        ids.push(engine.admit(prompt, &[], sparkflash_model::backend::Sampling::default())?);
+    }
+    let mut first: Vec<Option<StepOutput>> = vec![None; prompts.len()];
+    while first.iter().any(Option::is_none) {
+        for event in engine.tick()? {
+            match event {
+                crate::TickEvent::Prompt { id, step } => {
+                    let index = ids.iter().position(|other| *other == id).ok_or_else(|| {
+                        BackendError::new("conformance", "an unknown prompt finished")
+                    })?;
+                    first[index] = Some(step);
+                }
+                crate::TickEvent::Failed { id, error } => {
+                    let _ = id;
+                    return Err(error);
+                }
+                _ => {}
+            }
+        }
+        if !engine.busy() && first.iter().any(Option::is_none) {
+            return Err(BackendError::new(
+                "conformance",
+                "the tick engine stopped before every prompt's first step",
+            ));
+        }
+    }
+    let mut runs: Vec<Vec<Option<u32>>> = vec![Vec::new(); prompts.len()];
+    for (index, step) in first.iter().enumerate() {
+        runs[index].push(step.as_ref().and_then(|step| step.next_token));
+    }
+    for _ in 1..tokens {
+        for (index, id) in ids.iter().enumerate() {
+            let Some(token) = runs[index].last().copied().flatten() else {
+                continue;
+            };
+            engine.feed(*id, token)?;
+        }
+        let mut answered = 0;
+        let expected = runs
+            .iter()
+            .filter(|run| run.last().is_some_and(Option::is_some))
+            .count();
+        while answered < expected {
+            for event in engine.tick()? {
+                match event {
+                    crate::TickEvent::Decode { id, steps } => {
+                        let index = ids.iter().position(|other| *other == id).ok_or_else(|| {
+                            BackendError::new("conformance", "an unknown decode answered")
+                        })?;
+                        runs[index].push(steps.last().and_then(|step| step.next_token));
+                        answered += 1;
+                    }
+                    crate::TickEvent::Failed { error, .. } => return Err(error),
+                    _ => {}
+                }
+            }
+            if !engine.busy() && answered < expected {
+                return Err(BackendError::new(
+                    "conformance",
+                    "the tick engine stopped before every decode's answer",
+                ));
+            }
+        }
+    }
+    Ok(runs)
+}
+
 /// Emit the generated conformance checks for `Arm`: an `#[ignore]`d test a check, and the
 /// const list [`check_claims`] can read on a CPU-only host.
 ///
@@ -831,6 +1072,148 @@ macro_rules! conformance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CPU walk whose generated checks go through the tick engine, the path dense serves on.
+    struct TickToy {
+        layout: crate::StateLayout,
+        limits: crate::Limits,
+    }
+
+    impl TickToy {
+        fn new() -> Self {
+            Self {
+                layout: crate::StateLayout::new(Vec::new()),
+                limits: crate::Limits::new(4, 64),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TickSeq {
+        rows: Vec<u32>,
+    }
+
+    impl crate::LaneState for TickSeq {
+        fn position(&self) -> usize {
+            self.rows.len()
+        }
+
+        fn checkpoint(&mut self, _at: usize) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn rewind(&mut self, to: usize) -> Result<(), BackendError> {
+            self.rows.truncate(to);
+            Ok(())
+        }
+
+        fn room(&self, _positions: usize, _reset: bool) -> bool {
+            true
+        }
+    }
+
+    impl Walk for TickToy {
+        type Seq = TickSeq;
+        type Drafter = crate::Absent<&'static str>;
+        type Vision = crate::NoVision;
+
+        const CAPABILITIES: crate::WalkCapabilities =
+            crate::WalkCapabilities::all(StateKind::Positional);
+
+        fn layout(&self) -> &crate::StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(TickSeq::default())
+        }
+
+        fn limits(&self) -> crate::Limits {
+            self.limits
+        }
+
+        fn drafter(&self) -> &Self::Drafter {
+            static ABSENT: crate::Absent<&'static str> =
+                crate::Absent("the tick toy drafts nothing");
+            &ABSENT
+        }
+
+        fn set_sampling(
+            &self,
+            _seq: &mut Self::Seq,
+            _sampling: sparkflash_model::backend::Sampling,
+        ) {
+        }
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            _pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(rows
+                .iter_mut()
+                .map(|row| {
+                    let token = row.seq.rows.last().copied().unwrap_or(0);
+                    StepOutput {
+                        logits: Vec::new(),
+                        next_token: Some(token.wrapping_add(1)),
+                        draft: Vec::new(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    impl WalkFixture for TickToy {
+        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new("group", "the tick toy is one rank"));
+            }
+            Ok(Fixture::new(
+                Self::new(),
+                "the tick engine's CPU toy",
+                4,
+                4,
+                Vec::new(),
+                None,
+            ))
+        }
+
+        fn tick_engine() -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_generated_checks_drive_the_tick_engine() {
+        for check in [
+            ConformanceCheck::WholePromptEqualsChunked,
+            ConformanceCheck::AloneEqualsFour,
+            ConformanceCheck::ContinuedEqualsCold,
+            ConformanceCheck::RewoundEqualsCold,
+            ConformanceCheck::NoUnrecordedWidening,
+        ] {
+            let outcome = run_check::<TickToy>(check)
+                .unwrap_or_else(|error| panic!("{}: {}", check.name(), error.message()));
+            assert_eq!(outcome, CheckOutcome::Passed, "{}", check.name());
+        }
+        let tp = run_check::<TickToy>(ConformanceCheck::TpWithinExactness)
+            .expect("the TP check skips, it does not fail");
+        assert!(matches!(&tp, CheckOutcome::Skipped(reason) if reason.contains("one rank")));
+    }
 
     #[test]
     fn every_check_has_a_name_and_there_are_seven() {
