@@ -2145,8 +2145,9 @@ pub(super) fn walk_rows(
             (Op::Gemv, Target::Project(Projection::Head)) => {
                 let matrix = weight(step.weights[0]);
                 // The head's one-to-eight rows take the wide tile's few-row body
-                // (q4p_dense_rows), so a decode or verify row is the prompt tile's row; a wider
-                // walk and a shape the body does not cover keep the row GEMV.
+                // (q4p_dense_rows) where the body has the rows to read; a wider walk, a shape
+                // the body does not cover and the head's packed copy (the row walk's layout,
+                // which the body does not read) keep the row GEMV.
                 let body = if answers <= BATCH_ROWS {
                     shared
                         .dense_rows(

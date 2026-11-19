@@ -89,7 +89,7 @@ use chunk::{BandOut, Rows, band_exchange, band_mix, exchange_gather, exchange_su
 pub use draft::DRAFT_FILE;
 use draft::{DraftModel, DraftState, FINAL_TAP, TapSink};
 use packed::pack_dense;
-use sparkflash_ops::packed::{Form as DenseForm, PackedSet};
+use sparkflash_ops::packed::{Form as DenseForm, Layout, PackedSet};
 use sparkflash_ops::plan::Precision;
 use sparkflash_ops::widen::{FormatLedger, LedgerRow, WidenLog, widen};
 pub use tower::InklingVisionTower;
@@ -730,6 +730,36 @@ fn gemv_grid(rows: usize) -> u32 {
     u32::try_from(rows.div_ceil(warps).max(1))
         .unwrap_or(u32::MAX)
         .min(4_096)
+}
+
+/// What a few-row body (`q4p_dense_rows`) reads for a dense projection: the matrix's BF16 rows,
+/// or a packed copy in the one layout its stage takes.
+///
+/// The body's stage rebuilds a row's chunks from the *tiled* packed layout (`Q4pRowsPacked`,
+/// kernels/qwen4_prefill_sm121.cu), while the arm's row GEMVs read the row walk's
+/// ([sparkflash_ops::packed::Layout]); the two lay the same bytes out differently. A matrix
+/// packed in the walk layout is therefore the row GEMV's alone, and the body must keep off it:
+/// packing in place overwrites the BF16 rows, so a body handed that pointer reads the packed
+/// bytes as if they were BF16 words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseRowsInput {
+    /// The BF16 rows the matrix pointer names: no packed copy stands for this matrix.
+    Bf16,
+    /// The matrix's packed copy, which the arm packed in the body's tiled layout.
+    Packed,
+    /// The matrix's packed copy is the row walk's: the row GEMV must read the projection.
+    RowGemv,
+}
+
+/// The copy a projection offers the few-row body ([DenseRowsInput]), from the layout of the
+/// packed copy the arm holds for it (`None` when it holds none, so the BF16 rows are the
+/// matrix's).
+fn dense_rows_input(packed: Option<Layout>) -> DenseRowsInput {
+    match packed {
+        None => DenseRowsInput::Bf16,
+        Some(Layout::Tiled) => DenseRowsInput::Packed,
+        Some(Layout::Walk) => DenseRowsInput::RowGemv,
+    }
 }
 
 /// One f32 argument as the driver's one-word cell.
@@ -1588,9 +1618,11 @@ impl Shared {
 
     /// One dense BF16 projection of `batch` rows through `q4p_dense_rows`, the wide tile's
     /// few-row body: the row is `glm_prefill_bf16_wide`'s, the tile Inkling's prompt walk runs.
-    /// The body takes the matrix's packed copy where it has one. Only the shapes the body covers
-    /// take it (whole eight-column writes and a whole 32-column K run); everything else keeps
-    /// the row GEMV.
+    /// The body reads the matrix's packed copy only when the arm packed it in the body's tiled
+    /// layout ([DenseRowsInput::Packed]); Inkling packs in place in the row walk's layout, so a
+    /// packed projection is the row GEMV's and the body must keep off it. Only the shapes the
+    /// body covers take it (whole eight-column writes and a whole 32-column K run); everything
+    /// else keeps the row GEMV.
     fn dense_rows(
         &self,
         weight: Deviceptr,
@@ -1611,10 +1643,26 @@ impl Shared {
                  this projection is {width} x {inner}"
             ));
         }
-        let packed = self
-            .dense
-            .get(weight)
-            .filter(|copy| copy.admits(batch, inner, input).is_ok());
+        // The rows this launch reads, and the copy it reads them from. A walk-layout packed copy
+        // is refused rather than passed with a null packed pointer: in place it is the matrix's
+        // only copy, so the null form would read the packed bytes as BF16.
+        let held = self.dense.get(weight);
+        let packed = match dense_rows_input(held.map(|copy| copy.layout())) {
+            DenseRowsInput::Bf16 => None,
+            DenseRowsInput::Packed => {
+                let copy = held.unwrap_or_else(|| {
+                    unreachable!("only a packed copy selects DenseRowsInput::Packed")
+                });
+                copy.admits(batch, inner, input)?;
+                Some(copy)
+            }
+            DenseRowsInput::RowGemv => {
+                return Err(format!(
+                    "a {width} x {inner} projection is packed in the row walk's layout, which \
+                     q4p_dense_rows does not read; the row GEMV is its reader"
+                ));
+            }
+        };
         let [packed_rows, packed_offsets, packed_entries] =
             packed.map_or([0u64; 3], |copy| copy.planes());
         let packed_row_bytes = packed.map_or(0usize, |copy| copy.row_bytes());
@@ -6310,9 +6358,10 @@ impl InklingDeviceSession {
                 (Op::Gemv, Target::Project(Projection::Head)) => {
                     self.rms(&shared, "final_norm", self.state.scratch.final_row, hidden)?;
                     let weight = self.weight(step.weights[0]);
-                    // The head's one row takes the wide tile's few-row body (q4p_dense_rows),
-                    // so a decode row is the prompt tile's row; a shape it does not cover keeps
-                    // the row GEMV.
+                    // The head's one row takes the wide tile's few-row body (q4p_dense_rows)
+                    // where the body has the rows to read; the head's packed copy is the row
+                    // walk's, whose only few-row reader is the row GEMV, so a packed head keeps
+                    // the GEMV and a checkpoint-form (BF16) one takes the body.
                     let rows = plan.rank_vocab();
                     match shared.dense_rows(
                         weight,
@@ -6609,14 +6658,47 @@ impl InklingDeviceSession {
 mod tests {
     use super::{
         ActivationPlanes, AttentionWalk, Bound, ChunkWidths, DEFAULT_PREFILL_CHUNK,
-        DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV, DSPARK_STEP_COST, DepthPolicy, Drafter,
-        LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk, RESIDUAL_CHAIN_PAIRS,
-        REWIND_ENV, depth_policy_from_env, mma_attention_shared, overlap_request,
-        residual_chain_request, rewind_request,
+        DRAFT_MIN_DEPTH_ENV, DRAFT_POLICY_ENV, DSPARK_STEP_COST, DenseRowsInput, DepthPolicy,
+        Drafter, LONG_PREFILL_CHUNK, LONG_PREFILL_FROM, Mxfp8Walk, PrefillWalk,
+        RESIDUAL_CHAIN_PAIRS, REWIND_ENV, dense_rows_input, depth_policy_from_env,
+        mma_attention_shared, overlap_request, residual_chain_request, rewind_request,
     };
     use crate::config::Inkling2Config;
     use sparkflash_kernels::images::Image;
+    use sparkflash_ops::packed::Layout;
     use sparkflash_ops::plan::Precision;
+
+    /// The few-row head body (`q4p_dense_rows`) reads a packed copy only in the tiled layout its
+    /// stage takes. Inkling packs in place in the row walk's layout (`device/packed.rs` builds
+    /// `PackedSet::new(form, Placement::InPlace)` and never calls `.tiled()`), which the body's
+    /// `Q4pRowsPacked` stage does not decode: it rebuilds a chunk's planes from the tiled
+    /// offsets, so the walk layout's bytes land in the wrong lanes.
+    ///
+    /// The 2026-11-19 window measured the consequence on one GPU. The branch tip, whose head took
+    /// `q4p_dense_rows` over the walk-layout copy, decoded eight forced prompts to multilingual
+    /// token soup, and its registered reference reproduced that output bit for bit; the first
+    /// decode row was the worst position of every prompt, with essentially all mass on `200001`.
+    /// The pre-change build, whose head read the packed rows through the row GEMV, opened a clean
+    /// chat turn on the same tokens. The routing is therefore pinned here, on the CPU, rather
+    /// than left to a device window: the walk layout must select [DenseRowsInput::RowGemv] and
+    /// never the BF16 body (packing in place overwrites the BF16 rows, so the body would read
+    /// the packed bytes as BF16 words).
+    #[test]
+    fn the_few_row_head_body_takes_only_the_tiled_packed_copy() {
+        // No packed copy: the matrix's BF16 rows are the body's
+        // (SPARKFLASH_DENSE_WEIGHTS=checkpoint).
+        assert_eq!(dense_rows_input(None), DenseRowsInput::Bf16);
+        // A tiled copy is the body's stage's own layout.
+        assert_eq!(
+            dense_rows_input(Some(Layout::Tiled)),
+            DenseRowsInput::Packed
+        );
+        // The row walk's layout is the row GEMV's alone, so the head keeps the GEMV.
+        assert_eq!(
+            dense_rows_input(Some(Layout::Walk)),
+            DenseRowsInput::RowGemv
+        );
+    }
 
     /// The arm's catalogue rule, on the family that was missing: every symbol
     /// [RESIDUAL_CHAIN_PAIRS] loads is one the catalogue carries at the precision the load site
