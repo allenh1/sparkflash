@@ -383,9 +383,72 @@ impl Walk for DenseWalk {
 
 #[cfg(test)]
 mod tests {
-    use sparkflash_runtime::FusedArm;
+    use sparkflash_runtime::{Fixture, FusedArm, WalkFixture};
 
     use super::*;
+
+    /// The dense fixture: the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named
+    /// by `SPARKFLASH_CONFORMANCE_CHECKPOINT`. A missing path is a named fixture error, never a
+    /// skipped check.
+    impl WalkFixture for DenseWalk {
+        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the dense fixture is one rank; TP 2 and TP 4 need a group",
+                ));
+            }
+            let path = std::env::var("SPARKFLASH_CONFORMANCE_CHECKPOINT").map_err(|_| {
+                BackendError::new(
+                    "fixture",
+                    "dense needs SPARKFLASH_CONFORMANCE_CHECKPOINT; scripts/onboard-gate.sh \
+                     dense writes one with scripts/dense-synthetic-checkpoint.py",
+                )
+            })?;
+            let path = std::path::Path::new(&path);
+            let architecture = sparkflash_model::Architecture::from_checkpoint_dir(path)
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            let source = sparkflash_weights::safetensors::open_checkpoint(path)
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            let descriptor = sparkflash_model::ModelDescriptor::from_architecture(
+                "dense-conformance",
+                &architecture,
+                architecture.max_position_embeddings,
+                sparkflash_model::Capabilities::ALL,
+            );
+            let backend = crate::DenseDeviceBackend::open(
+                descriptor,
+                &architecture,
+                &source,
+                architecture.max_position_embeddings,
+            )
+            .map_err(|error| BackendError::new("fixture", error))?;
+            let walk = backend.walk_arm(4)?;
+            let bytes = backend.weight_bytes() as u64;
+            let mut formats = Vec::new();
+            for format in [
+                architecture.quantization.dense_format,
+                architecture.quantization.expert_format,
+            ] {
+                use sparkflash_model::architecture::WeightFormat;
+                let name = match format {
+                    WeightFormat::Bf16 => "BF16",
+                    WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+                    WeightFormat::MxFp8 { .. } => "MX FP8",
+                    WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+                };
+                formats.push(sparkflash_runtime::FormatRule::stored(name));
+            }
+            Ok(Fixture::new(
+                walk,
+                format!("the dense synthetic checkpoint at {}", path.display()),
+                bytes,
+                bytes,
+                formats,
+                None,
+            ))
+        }
+    }
 
     #[test]
     fn every_pass_routes_to_the_dense_policy() {

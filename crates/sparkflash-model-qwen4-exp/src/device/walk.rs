@@ -828,10 +828,87 @@ fn fresh_hashers(
 mod tests {
     use super::*;
     use sparkflash_model::ledger::{Strategy as LedgerStrategy, ledger_for_arm};
-    use sparkflash_runtime::ChunkPolicy;
+    use sparkflash_runtime::{ChunkPolicy, Fixture, WalkFixture};
 
     use crate::config::Qwen4ExpConfig;
     use crate::device::prefill::{DEFAULT_PREFILL_CHUNK, PrefillPlan};
+
+    /// The stored bytes a token pass must read at this rank, and the floor the plan states.
+    fn token_bytes(
+        architecture: &sparkflash_model::Architecture,
+        experts: usize,
+        top_k: usize,
+    ) -> Result<(u64, u64), BackendError> {
+        let tp = sparkflash_model::TpPlan::new(1, 0)
+            .map_err(|error| BackendError::new("fixture", error.detail))?;
+        let tensors =
+            sparkflash_ops::tensor_plan::ArchitectureTensorPlan::served_and_mtp(architecture, tp)
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+        let total = u64::try_from(tensors.rank_bytes()).unwrap_or(u64::MAX);
+        let expert = u64::try_from(tensors.role_bytes(sparkflash_ops::tensor_plan::Role::Experts))
+            .unwrap_or(u64::MAX);
+        let floor = total.saturating_sub(expert);
+        let share = if experts == 0 {
+            0
+        } else {
+            expert.saturating_mul(top_k as u64) / experts as u64
+        };
+        Ok((floor.saturating_add(share), floor))
+    }
+
+    /// The stored format names the fixture's classes use.
+    fn format_rule(
+        format: sparkflash_model::architecture::WeightFormat,
+    ) -> sparkflash_runtime::FormatRule {
+        use sparkflash_model::architecture::WeightFormat;
+        let name = match format {
+            WeightFormat::Bf16 => "BF16",
+            WeightFormat::Fp8Tile { .. } => "FP8 E4M3",
+            WeightFormat::MxFp8 { .. } => "MX FP8",
+            WeightFormat::NvFp4 { .. } | WeightFormat::MxFp4 { .. } => "NVFP4",
+        };
+        sparkflash_runtime::FormatRule::stored(name)
+    }
+
+    /// The Qwen fixture: the synthetic tiny checkpoint, opened through the arm's own TP=1
+    /// constructor. It is a real checkpoint in the released storage formats, not a served image.
+    impl WalkFixture for QwenWalk {
+        fn fixture(world: usize) -> Result<Fixture<Self>, BackendError> {
+            if world > 1 {
+                return Err(BackendError::new(
+                    "group",
+                    "the Qwen fixture is one rank; TP 2 and TP 4 need a group",
+                ));
+            }
+            let config = Qwen4ExpConfig::tiny();
+            let directory = tempfile::tempdir()
+                .map_err(|error| BackendError::new("fixture", error.to_string()))?;
+            crate::write_synthetic_checkpoint(directory.path(), &config, 7)
+                .map_err(|error| BackendError::new("fixture", error))?;
+            let backend = crate::device::Qwen4ExpDeviceBackend::open(
+                directory.path(),
+                config.max_position_embeddings,
+            )?;
+            let walk = backend.walk_arm(4)?;
+            let (bytes, floor) = token_bytes(
+                &config.architecture,
+                config.num_experts,
+                config.num_experts_per_tok,
+            )?;
+            let formats = vec![
+                format_rule(config.architecture.quantization.dense_format),
+                format_rule(config.architecture.quantization.expert_format),
+            ];
+            Ok(Fixture::new(
+                walk,
+                "the Qwen3.8 tiny synthetic checkpoint",
+                bytes,
+                floor,
+                formats,
+                Some(Box::new(directory)),
+            ))
+        }
+    }
 
     /// The walk's four declared rows are the arm's static declaration, so the runtime's ledger
     /// and the `sparkflash arms --ledger` table cannot drift while Qwen moves onto the runtime.
