@@ -881,6 +881,144 @@ stays as it is. It was not added here because it is a new wire protocol and a se
 and its TP>1 bits cannot be checked on this host; moving it without the cluster gate would
 make an unverified bit claim for a released arm, which phase 6 forbids.
 
+**Later:** the frames and the rank-0 form are now written, and GLM's group is on them. See
+[The tick group: rows and step shape on the wire](#the-tick-group-rows-and-step-shape-on-the-wire)
+below; that section is the current state, and this one records why it was not written at this
+commit.
+
+### The tick group: rows and step shape on the wire
+
+Commits `65f256ca` (the frames and the request's start), `2fa4b465` (the rank-0 form, the
+worker mirror and the CPU gate) and `f2497776` (GLM's group on it).
+
+`TickGroup` and `mirror_tick_lanes` (`crates/sparkflash-runtime/src/group.rs`),
+`TickEngine::with_group` and `TickServe::start_group` (`engine.rs`), the request's start and
+the two new frames (`crates/sparkflash-comm/src/control.rs`), and GLM's
+`enable_group_fusion`/`mirror_group` (`crates/sparkflash-model-glm5-next/src/serve.rs`) put
+GLM's TP>1 path on the tick engine. GLM is the first arm whose group is the tick engine; Qwen,
+Inkling, Dory and dense's TP>1 still serve through `Fusion::group`/`GroupLanes`, so neither is
+deleted.
+
+**The wire, message by message.** A tick group keeps the fused group's lane frames and adds the
+two a tick decides. Rank 0 sends these in the order its tick makes the decisions; every worker
+replays each one before it reads the next. Only the prompt starts, the chunks, the steps, the
+give-backs and the releases travel: the lane choice, the hold, the prompt order, the chunk
+boundary, the step shape and the tick-ahead plan stay rank 0's.
+
+| Frame | Fields | When rank 0 sends it | What a worker does |
+| :-- | :-- | :-- | :-- |
+| `LaneRelease` | lane | before rank 0's own `release_slot`: an idle lane evicted for room, or a lane whose prompt failed before its request frame | `release_slot` |
+| `LaneRequest` | lane, prompt ids, image spans, sampler, `start: Some(start)` | after rank 0's `start_prompt_slot` chose the start, before any row of the prompt | `set_sampling`, then `start_prompt_slot`; **refuses a start that differs** |
+| `LaneRows` | lane, rows | before each `run_part_rows_hooked` | `run_part_rows(slot, rows)` — exactly these rows, not the arm's `ChunkPolicy` chunk |
+| `LaneStepMode` | members `(lane, token)` in row order, mode `Plain` or `Round { joint }` | before each `step_mode_slots` | `step_mode_slots` with that mode, then the held-answer drain |
+| `LaneGiveBack` | lane, count | after rank 0's own give-back succeeded | `give_back_slot` |
+| `LaneRelease` | lane | before rank 0's own `release_slot` | `release_slot` |
+| `Error` | code, message | when rank 0's own half of a frame failed after the frame went out | the mirror returns, and the process ends |
+
+`LanePart` and `LaneStep` remain the fused group's frames; the tick mirror refuses them, and the
+fused mirror refuses `LaneRows`/`LaneStepMode`, so a half-updated rank pair is a named error rather
+than a wrong row. A prompt's images travel as spans (rank 0 encodes), and the sampler travels whole
+because every rank's picks decide what a verify keeps; the request's start is
+`Option<u32>` so a fused group's frame (which cannot know its arm's start without changing the
+fused arm's prompt path) leaves it absent, and a frame from an older rank 0 reads as absent.
+
+**What rank 0 decides, and what a worker checks.** Rank 0 decides the lane (`pick_lane`), the
+prompt order and hold (`prefill_order`, `hold_prefill`), the chunk boundary (`bulk_from`,
+`bulk_rows`, `tick_rows`), the step shape (`decode_plan`/`plan_for`), the tick-ahead plan
+(`Ahead`) and when to give back or release. A worker checks only what makes its replay the same
+execution: the lane is in its pool, the request's start equals the one *its* `start_prompt_slot`
+reaches from the history rank 0's frames built, the rows fit the prompt left, and the step's members
+are the frame's. It re-derives no decision: the row count comes from `LaneRows` and the shape from
+`LaneStepMode`.
+
+**The CPU gate.** `crates/sparkflash-runtime/tests/tick_engine_group.rs` drives a loopback
+`Tp4ControlHub` and one worker thread, over a toy `Walk` shaped like GLM's (two-row prompt chunks,
+a verify width of four, a drafter with one draft a member). The first test admits two prompts
+(three rows and two rows), runs the prompt chunks, one shared decode step over both lanes and a
+give-back, and asserts:
+
+* the exact frame order the worker received:
+  `request 0 [10, 11, 12] start=0`, `request 1 [20, 21] start=0`, `rows 1 2`, `rows 0 2`,
+  `rows 0 1`, `step [(0, 13), (1, 22)] Round { joint: true }`, `give back 0 1`;
+* the rows the worker ran are rank 0's chunk decisions, in rank 0's order, `[2, 2, 1]`;
+* the worker's passes are rank 0's, in order: `Bulk(2)`, `Bulk(2)`, `Bulk(1)`, then
+  `Verify([2, 2])` - one shared verify over both members - not a re-derived shape;
+* `with_group` turned `exchange` on and the engine reports itself as a group.
+
+The second test sends a lane a start the worker cannot reach (rank 0 claims 4, the history reaches
+3) and asserts the mirror refuses with `"rank 0 starts the prompt at 4, this rank starts it at 3:
+the ranks are out of step"` - both positions named, and nothing run.
+
+**Measured on this host (CPU; it has no GPU).**
+
+* `cargo test -p sparkflash-runtime --test tick_engine_group`: 2 passed.
+* `cargo test -p sparkflash-runtime`: 89 passed, 7 ignored (77 library tests, 2 sealed, 5
+  drafter, 2 group, 2 engine-trace, 1 tick-trace) and 2 doc-tests (1 ignored).
+* `cargo test -p sparkflash-model-glm5-next`: 93 passed, 8 ignored (71 library tests, 11
+  `device_forward`, 4 `engine_builder`, 7 `serve_tiny`). The group path itself compiles for
+  `GlmWalk` (`TickServe::start_group`'s `Send + Sync`/`Seq: Send` bounds), but no GLM rank runs
+  on this host.
+* `cargo test --workspace`: 4,305 passed, 81 ignored, 0 failed (220 test binaries), exit 0.
+* `cargo clippy -p sparkflash-runtime -p sparkflash-model-glm5-next -p sparkflash-model-dense
+  --all-targets -- -D warnings` and `cargo fmt --all -- --check`: clean at this tip.
+
+**What the tokens can and cannot be claimed to be.** GLM's token path is unchanged in shape: the
+same walk, the same 4,096-row prompt chunks (a group's `exchange = true` marks the bulk path but
+`bulk_rows` returns 4,096 then the tail either way), the same 8-row verify width as the member cap
+(`Round { joint: true }` for several lanes, `Round { joint: false }` for one), the same
+`GlmDrafter` verify and `verdict` settlement. What the group adds is that a worker runs rank 0's
+rows and shape instead of its own `ChunkPolicy` chunk, and the start is checked. On paper that is
+the same arithmetic on the same rows, so `drafted = plain` and prompt = chunked = token should
+hold; **it is unverified**: no GPU boot ran, and the claim that a TP=4 group produces the same
+token ids as the pre-move `Fusion::group` build is the first thing the cluster window must
+measure. The one GLM path the group does not reproduce is the fused engine's *schedule* (which
+lanes step together and when): the tokens are the arm's, the tick order is the engine's.
+
+**What a cluster window must run, and what counts as a pass.**
+
+1. A TP=4 GLM boot on `enable_group_fusion`, and the same prompts through a pre-move build on
+   `Fusion::group`. Pass: identical greedy token ids for a fixed prompt set at 2K and 16K, at
+   one, four and eight concurrent requests, and `cached_tokens` agreeing per request. A
+   difference is a regression, not a scheduling variance; the group changes rows, not sampling.
+2. A TP=1 and a TP=4 boot of the same build, same prompts. Pass: the token ids agree (the arm's
+   TP check) and the per-tick `SPARKFLASH_TICK_TRACE` from rank 0 shows the chunk rows and the
+   plans; a worker writes nothing.
+3. Chunk boundaries from the trace: every prompt chunk is 4,096 rows except its tail, and each
+   `LaneRows` frame's `rows` equals the chunk the trace recorded. Every chunk a prompt frame names
+   is at most the 4,096-row profile chunk; a `LaneRows` frame never carries a step.
+4. Verify shapes from the trace and the arm's counters: one `Round { joint: true }` for several
+   lanes whose whole verify (anchors plus shared drafts) is at most `MAX_ROWS` = 8 rows,
+   `Round { joint: false }` for one lane, and no verify at all while no lane drafts. With
+   `JOINT_ROUNDS=off` the engine plans `Plain` (the named deviation below), so that run is a
+   separate A/B and not the default.
+5. Speed: tokens/s, mean step time and time to first token at TP=4, old build against this one,
+   alternated launches, several reps. Under the regression clause a slower GLM group returns to
+   `Fusion::group` and this section records the number and why.
+6. A numerics check on a freshly booted server per `NUMERICS.md`, and the same prompt twice (cold
+   and continued) to show the group's lane reuse keeps the continued turn bit-equal.
+
+**Named deviations, so none is implied.**
+
+* **The request frame follows rank 0's start, not precedes it.** The frame carries the start
+  `start_prompt_slot` chose, so rank 0 must run its own start first; the frame is still before
+  every row, and the worker's start (the review's "before `start_prompt_slot`") runs after it. A
+  text arm's start is a local rewind/truncate with no collective, which is why the order is safe
+  here; a vision arm would need its encode after the frame, and that path is not written.
+* **The held-answer drain is local, not a frame.** The answers the arm already holds run no device
+  work; every rank runs the same `Runtime::step_slots` calls and keeps the same history. If the
+  states ever diverged, the next request's start check (or a differing verify shape) ends the
+  group rather than running a different row.
+* **The resume start still stands** (the earlier section's deviation 2): the frame carries
+  `resume`'s checkpoint start, never an arbitrary shared prefix; DeepSeek's arbitrary restart is
+  still not claimed.
+* **Adoption, lane growth, paired chunks and preemption still stand** (the earlier section's
+  deviation 5): the engine has none of them, so the group has none. A paired chunk never travels
+  (`Pass::Paired` is unused here); a preempted prompt is still served to its end.
+* **`JOINT_ROUNDS=off` plans `Plain` on a drafting arm** (the earlier GLM section's non-default
+  path): the engine's own rule, unchanged by the group.
+* **The group runs text arms only.** `TextWire` refuses images before the request frame, as it does
+  for a fused group; the tick group has no image path of its own.
+
 ### The device window's two gaps: a catalogue hole and a fixture checklist
 
 The four-DGX-Spark window at `a6091608` (sm_121a, the branch's ignored tests) passed every arm
