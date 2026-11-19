@@ -216,3 +216,20 @@ note = """\
 SPARKFLASH_GLM_KV_CACHE=f32 at --context 131072, top-20 logprobs. GLM has no world-1 device arm, \
 so the anchor is the smallest world with the attention window's latent cache in f32; an f32 cache \
 takes the token-path prefill."""
+
+[[anchor]]
+model = "nvidia/NVIDIA-Nemotron-Labs-Dory1.0-4B-BF16"
+world = 1
+profile = "reference"
+plan = "tp"
+arch = "sm_121a"
+evidence = "logprobs"
+reference = "references/dory10-anchor.json"
+fingerprint = "4ef5a65d741aee49ca1152e8ef88838fd50707fb66966be1afd86e90bab1152b"
+captured = "2026-11-19"
+note = """
+World 1 is Dory's only served world, so the anchor is its arithmetic as served: the same
+configuration as the reference above, taken as its own capture with top-20 logprobs at
+--context 8192. The teacher-forced capture beside it
+(numerics/captures/dory10/v1-anchor-forced.json) scores exactly zero against this anchor,
+which is what makes the comparison harness add nothing to a measured distance."""
