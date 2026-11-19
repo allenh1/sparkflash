@@ -25,9 +25,9 @@
 //! The prefill logits of the first two must agree with the plain session's, and every generated
 //! token of the two-slot run must equal the one-slot run's, member by member. The fixture's config
 //! carries an MTP layer, so fused members draft: two members verify their rounds in one batch
-//! (`sparkflash_runtime::run_round`), and a lone member decodes as the plain session does. The
-//! batch is compared against the fused one-slot run first, so a batch fault is not hidden behind a
-//! draft, and the one-slot run against the plain session.
+//! (`sparkflash_runtime::Runtime::step_slots`), and a lone member verifies its own chain as the
+//! plain session decodes. The batch is compared against the fused one-slot run first, so a batch
+//! fault is not hidden behind a draft, and the one-slot run against the plain session.
 //!
 //! The test skips - loudly - without a cubin or a CUDA driver. Once the device opens, a mismatch
 //! fails the test.
@@ -173,6 +173,12 @@ fn a_fused_batch_emits_what_its_members_emit_alone() {
     assert_eq!(
         alone_a, plain_tokens,
         "a lone fused member decoded other tokens than the plain session"
+    );
+    // The lone member keeps the drafter's own depth: it is not trimmed by a row share that has
+    // no other chain to share with, so it must still verify its chain.
+    assert!(
+        one.speculation().verify_steps > 0,
+        "a lone fused member stopped drafting"
     );
     let mut two = single.open_session().expect("a second fused session");
     let two_b = two.prefill(PROMPT_B).expect("the fused prefill");
