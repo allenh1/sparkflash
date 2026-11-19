@@ -16,14 +16,16 @@
 //!
 //! The runtime drives it: [runtime] opens a [`sparkflash_runtime::Runtime`] over this walk, and
 //! the runtime owns the prompt parts, history, reuse, rewind, lane pool and ledger. This walk
-//! routes every Pass to the same free walk the old serving loop called, with the policy that
-//! loop used for that pass: token rows pass no wide policy (a row GEMV is the same sum at any
-//! batch), and a bulk or paired prompt pass takes the arm's WidePolicy. Its head is the
-//! existing host logits path; the device head is phase 4's.
+//! routes every Pass to the same free walk the old serving loop called, with the arm's
+//! [`WidePolicy::DENSE`] for every pass: a prompt chunk takes the wide tile, and a token step
+//! takes the tile once it batches more than the row GEMV's eight rows (below that the policy still
+//! picks the row GEMV, so a one-to-eight-row step is the kernel it always was). Its head turns
+//! the final residual row into the token on the device for a greedy request, and only copies a
+//! logits row when the request samples with temperature or penalties.
 //!
 //! The layout and limits are the arm's: attention layers are positional BF16 key/value caches,
-//! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is
-//! CHUNK_ROWS rows.
+//! Gated DeltaNet layers are recurrent, the context is the served context, and a pass is the
+//! chunk [super::chunk_rows] takes from [sparkflash_runtime::ChunkPolicy] (256 rows by default).
 
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +40,7 @@ use sparkflash_runtime::{
 
 use super::{
     CHUNK_ROWS, DEVICE, Mixer, Scratch, Sequence, Shared, TOKEN_DECODE, head as dense_head,
-    walk as dense_walk,
+    head_choices as dense_head_choices, walk as dense_walk,
 };
 
 /// The rows of one walk, as offsets into the pass's residual buffer. The existing walk and this
@@ -62,12 +64,14 @@ pub(crate) fn row_plan(lengths: &[usize]) -> RowPlan {
     RowPlan { rows, offsets }
 }
 
-/// The wide policy the existing loop uses for a pass shape.
-pub(crate) fn policy_for_kind(kind: PassKind, policy: Option<WidePolicy>) -> Option<WidePolicy> {
-    match kind {
-        PassKind::TokenRows | PassKind::Verify { .. } => None,
-        PassKind::Bulk { .. } | PassKind::Paired { .. } => policy,
-    }
+/// The wide policy a pass shape takes: the arm's policy for every pass.
+///
+/// [`WidePolicy::DENSE`] keeps the row GEMV at eight rows or fewer, so a one-row or four-lane
+/// decode step still runs the kernel its bits were recorded under; a step that batches nine or
+/// more rows takes the shared wide tile, as the policy says. Passing `None` here would hide the
+/// tile from exactly those steps.
+pub(crate) fn policy_for_kind(_kind: PassKind, policy: Option<WidePolicy>) -> Option<WidePolicy> {
+    policy
 }
 
 /// The dense arm, exposed to the shared runtime as a Walk.
@@ -88,7 +92,7 @@ impl DenseWalk {
         let scratch = Scratch::new(Arc::clone(&shared), rows)
             .map_err(|error| BackendError::new(DEVICE, error))?;
         let layout = layout_of(&shared);
-        let limits = Limits::new(CHUNK_ROWS, shared.context);
+        let limits = Limits::new(shared.chunk, shared.context);
         Ok(Self {
             shared,
             layout,
@@ -271,6 +275,55 @@ impl Walk for DenseWalk {
         }
         let scratch = self.scratch()?;
         let contiguous = rows.iter().enumerate().all(|(index, row)| row.row == index);
+        // Record each row's token before asking whether its sampler is greedy: a prompt's record
+        // resets and fills the history the penalty check reads.
+        for row in rows.iter_mut() {
+            match &row.input {
+                HeadInput::Prompt(tokens) => {
+                    row.seq.sampler.reset();
+                    row.seq.sampler.record_prompt(tokens);
+                }
+                HeadInput::Token(token) => row.seq.sampler.record(*token),
+            }
+        }
+        // A greedy sampler whose penalties change nothing takes the row's argmax as it stands.
+        // Choose it on the device and copy one u32 a row, not the vocabulary.
+        if rows
+            .iter()
+            .all(|row| row.seq.sampler.takes_argmax(&row.seq.sampling))
+        {
+            let picks: Vec<u32> = if contiguous {
+                dense_head_choices(&self.shared, &scratch.buffers, 0, rows.len())?
+            } else {
+                rows.iter()
+                    .map(|row| dense_head_choices(&self.shared, &scratch.buffers, row.row, 1))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            };
+            if picks.len() != rows.len() {
+                return Err(BackendError::new(
+                    DEVICE,
+                    format!(
+                        "the head was asked for {} rows and made {}",
+                        rows.len(),
+                        picks.len()
+                    ),
+                ));
+            }
+            return Ok(rows
+                .iter()
+                .zip(picks)
+                .map(|(_, pick)| StepOutput {
+                    logits: Vec::new(),
+                    next_token: Some(pick),
+                    draft: Vec::new(),
+                })
+                .collect());
+        }
+        // A sampling request needs the row: temperature, top-k, top-p, penalties and the draw
+        // stay on the host over the logits the step copies back.
         let logits: Vec<Vec<f32>> = if contiguous {
             dense_head(&self.shared, &scratch.buffers, 0, rows.len())?
                 .chunks(self.shared.vocab)
@@ -294,13 +347,6 @@ impl Walk for DenseWalk {
         rows.iter_mut()
             .zip(logits)
             .map(|(row, logits)| {
-                match &row.input {
-                    HeadInput::Prompt(tokens) => {
-                        row.seq.sampler.reset();
-                        row.seq.sampler.record_prompt(tokens);
-                    }
-                    HeadInput::Token(token) => row.seq.sampler.record(*token),
-                }
                 let chosen = row.seq.sampler.choose(&logits, &row.seq.sampling);
                 Ok(StepOutput {
                     logits,
@@ -319,14 +365,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_pass_routes_to_the_policy_the_serving_loop_uses() {
+    fn every_pass_routes_to_the_dense_policy() {
         let policy = Some(WidePolicy::DENSE);
-        assert_eq!(policy_for_kind(PassKind::TokenRows, policy), None);
-        assert_eq!(policy_for_kind(PassKind::Verify { rows: 4 }, policy), None);
-        assert_eq!(policy_for_kind(PassKind::Bulk { rows: 1 }, policy), policy);
+        for kind in [
+            PassKind::TokenRows,
+            PassKind::Verify { rows: 4 },
+            PassKind::Bulk { rows: 1 },
+            PassKind::Paired { chunks: 2 },
+        ] {
+            assert_eq!(policy_for_kind(kind, policy), policy, "{kind:?}");
+        }
+    }
+
+    /// The policy's own threshold is dense's legacy input: eight rows or fewer keep the row
+    /// GEMV, so a decode step at the served lane count does not move; nine rows take the wide
+    /// tile. That boundary is where a bit delta can first appear.
+    #[test]
+    fn the_dense_policy_keeps_eight_rows_on_the_row_gemv_and_takes_the_tile_at_nine() {
+        use sparkflash_ops::projection::{Route, route_bf16, route_fp8};
+
+        let (columns, inner) = (256, 256);
+        for rows in 1..=8 {
+            assert_eq!(
+                route_bf16(Some(WidePolicy::DENSE), columns, inner, rows),
+                Route::RowGemv,
+                "{rows} rows stay on the row GEMV"
+            );
+            assert_eq!(
+                route_fp8(Some(WidePolicy::DENSE), columns, inner, rows),
+                Route::RowGemv,
+                "{rows} FP8 rows stay on the tiled E4M3 GEMV"
+            );
+        }
         assert_eq!(
-            policy_for_kind(PassKind::Paired { chunks: 2 }, policy),
-            policy
+            route_bf16(Some(WidePolicy::DENSE), columns, inner, 9),
+            Route::Wide,
+            "nine BF16 rows take dory_mma_wide"
+        );
+        assert_eq!(
+            route_fp8(Some(WidePolicy::DENSE), columns, inner, 9),
+            Route::Wide,
+            "nine FP8 rows take q4p_dense_fp8"
+        );
+        assert_eq!(
+            route_bf16(None, columns, inner, 9),
+            Route::BatchedGemv,
+            "without the policy the same rows stay on the row GEMV"
         );
     }
 
@@ -440,8 +524,8 @@ mod tests {
         }
     }
 
-    /// The runtime over a walk with dense's limits: CHUNK_ROWS a pass, a served context.
-    fn dense_shaped_runtime() -> Runtime<RecordingWalk> {
+    /// The runtime over a walk with dense's limits: `chunk` rows a pass, a served context.
+    fn dense_shaped_runtime(chunk: usize) -> Runtime<RecordingWalk> {
         Runtime::new(
             RecordingWalk {
                 layout: StateLayout::new(vec![
@@ -454,7 +538,7 @@ mod tests {
                         bytes: 16,
                     },
                 ]),
-                limits: Limits::new(CHUNK_ROWS, 32_768),
+                limits: Limits::new(chunk, 32_768),
                 passes: Mutex::new(Vec::new()),
             },
             0,
@@ -462,13 +546,7 @@ mod tests {
         .expect("the runtime starts")
     }
 
-    fn prompt_passes(len: usize) -> Vec<Recorded> {
-        let runtime = dense_shaped_runtime();
-        assert_eq!(
-            runtime.chunk_policy().rows(),
-            CHUNK_ROWS,
-            "dense's chunk size comes from its limits through ChunkPolicy"
-        );
+    fn prompt_passes_in(runtime: &Runtime<RecordingWalk>, len: usize) -> Vec<Recorded> {
         let mut slot = runtime.open_slot().expect("a slot");
         runtime
             .prefill(&mut slot, &vec![7u32; len])
@@ -479,6 +557,16 @@ mod tests {
             .lock()
             .expect("the pass record")
             .clone()
+    }
+
+    fn prompt_passes(len: usize) -> Vec<Recorded> {
+        let runtime = dense_shaped_runtime(CHUNK_ROWS);
+        assert_eq!(
+            runtime.chunk_policy().rows(),
+            CHUNK_ROWS,
+            "dense's chunk size comes from its limits through ChunkPolicy"
+        );
+        prompt_passes_in(&runtime, len)
     }
 
     /// The runtime's prompt loop is dense's old one: 256-row chunks and the remainder, in order.
@@ -498,6 +586,42 @@ mod tests {
             vec![
                 (PassKind::Bulk { rows: 256 }, vec![256]),
                 (PassKind::Bulk { rows: 1 }, vec![1]),
+            ]
+        );
+    }
+
+    /// The runtime's prompt chunk is the walk's Limits, and the Limits come from the arm's
+    /// ChunkPolicy: the default profile still gets 256, and a profile switch that the policy
+    /// documents gets the smaller pass.
+    #[test]
+    fn the_chunk_policy_keeps_256_unless_the_profile_switches_it() {
+        use sparkflash_model::profile::ModelProfile;
+
+        let default = crate::chunk_rows(&ModelProfile::default(), 32_768).expect("the default");
+        assert_eq!(default, CHUNK_ROWS);
+        let runtime = dense_shaped_runtime(default);
+        assert_eq!(runtime.chunk_policy().rows(), CHUNK_ROWS);
+        assert_eq!(
+            prompt_passes_in(&runtime, 600),
+            vec![
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 256 }, vec![256]),
+                (PassKind::Bulk { rows: 88 }, vec![88]),
+            ]
+        );
+
+        let mut profile = ModelProfile::default();
+        profile.prefill.chunk = Some(64);
+        let switched = crate::chunk_rows(&profile, 32_768).expect("the switch");
+        assert_eq!(switched, 64);
+        let runtime = dense_shaped_runtime(switched);
+        assert_eq!(runtime.chunk_policy().rows(), 64);
+        assert_eq!(
+            prompt_passes_in(&runtime, 150),
+            vec![
+                (PassKind::Bulk { rows: 64 }, vec![64]),
+                (PassKind::Bulk { rows: 64 }, vec![64]),
+                (PassKind::Bulk { rows: 22 }, vec![22]),
             ]
         );
     }
@@ -533,6 +657,24 @@ mod tests {
         ]);
         assert_eq!(both.kind(), StateKind::Both);
         assert!(both.needs_checkpoint());
+    }
+
+    /// The repository ships no draft head for the shared dense arm, so the walk names `Absent`
+    /// and the boot ledger prints no drafter. The day a head lands this test is the one that says
+    /// the type must change with it.
+    #[test]
+    fn no_draft_head_ships_so_the_walk_names_absent() {
+        use sparkflash_runtime::{Drafter, Mode, Strategy, ledger_for};
+        const {
+            assert!(
+                !<<DenseWalk as Walk>::Drafter as Drafter<DenseWalk>>::PRESENT,
+                "a draft head landed: give the walk a Drafter, not Absent"
+            );
+        }
+        assert_eq!(
+            ledger_for::<DenseWalk>().mode(Strategy::Drafting),
+            Mode::off("no drafter configured")
+        );
     }
 
     /// The runtime's boot ledger states the token row the profile refusal reads, so a dense boot

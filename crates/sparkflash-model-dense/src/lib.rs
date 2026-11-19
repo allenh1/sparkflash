@@ -19,8 +19,9 @@
 //! a plain residual and the head) needs no code of its own: this arm reads the shared
 //! [Architecture], resolves the checkpoint's own spelling through [sparkflash_ops::naming],
 //! uploads every tensor through [DraftUploader] and launches the shared token-image bodies through
-//! their typed [sparkflash_ops::calls]. Its prompt projections take the shared wide tile under
-//! [WidePolicy::DENSE]; decode rows keep the row GEMV.
+//! their typed [sparkflash_ops::calls]. Its projections take the shared wide tile under
+//! [WidePolicy::DENSE]; decode rows of eight or fewer keep the row GEMV, and a step that batches
+//! more takes the tile.
 //!
 //! A projection or expert stored as E4M3 codes under one BF16 inverse scale a 128 x 128 tile (the
 //! Qwen3 FP8 releases' form, [Proj::Fp8]) runs the kernels Qwen's and GLM's FP8 weights run: the
@@ -95,7 +96,7 @@ use sparkflash_ops::projection::{
 use sparkflash_ops::sampler::Sampler;
 use sparkflash_ops::scan::{ScanKind, ScanPlan};
 use sparkflash_ops::tp::RowSums;
-use sparkflash_runtime::{Fusion, TextWire};
+use sparkflash_runtime::{ChunkPolicy, Fusion, Limits, TextWire};
 use sparkflash_weights::tp::TpRuntime;
 use sparkflash_weights::{DType, WeightSource};
 
@@ -110,14 +111,17 @@ pub type DenseLanes = sparkflash_runtime::Runtime<DenseWalk>;
 /// The host-facing name of a device refusal.
 const DEVICE: &str = "dense_device";
 
-/// The prompt rows one pass of the layer walk takes: two of the wide tile's 128-row blocks. The
-/// runtime's [sparkflash_runtime::ChunkPolicy] reads this as the walk's [sparkflash_runtime::Limits], so a
-/// dense prompt keeps the 256-row chunks its kernels were chosen for.
+/// The prompt rows one pass of the layer walk takes by default: two of the wide tile's 128-row
+/// blocks. This is the arm's legacy input to [sparkflash_runtime::ChunkPolicy], so a profile that
+/// names no `prefill.chunk` keeps the 256-row chunks its kernels were chosen for. A profile may
+/// name a documented smaller size; [chunk_rows] quantises it and the walk's limits carry it.
 pub const CHUNK_ROWS: usize = 256;
 
-/// The dense arm's token step: the row GEMV, not a tensor-core body. The walk's capability row
-/// and the profile check that refuses `decode.tensor_cores = true` read this one value, so the
-/// ledger and the refusal cannot disagree.
+/// The dense arm's one-row token step: the row GEMV, not a tensor-core body. A step that batches
+/// more than [sparkflash_ops::gemv::GEMV_MAX_BATCH] rows takes the shared wide tile, but the
+/// single-row decode the strategy row is about does not. The walk's capability row and the profile
+/// check that refuses `decode.tensor_cores = true` read this one value, so the ledger and the
+/// refusal cannot disagree.
 pub(crate) const TOKEN_DECODE: State = State::Off("row GEMV; decode.tensor_cores=true is refused");
 
 /// One layer's attention and MLP shape. A Gated DeltaNet layer's attention fields are zero and
@@ -510,6 +514,8 @@ struct Kernels {
     combine: Kernel,
     cache: Kernel,
     wide: Kernel,
+    /// The vocabulary-wide argmax the greedy head chooses with (`q4e_argmax_slices`).
+    argmax: Kernel,
     moe: Option<MoeKernels>,
     fp8: Option<Fp8Kernels>,
     gdn: Option<GdnKernels>,
@@ -528,6 +534,10 @@ struct GdnKernels {
     gate: Kernel,
     zero: Kernel,
 }
+
+/// Threads in the block `q4e_argmax_slices` reduces a vocabulary with: the 32 warps its block
+/// reduction holds.
+const ARGMAX_BLOCK: u32 = 1024;
 
 /// The block-scaled FP8 projections' kernels, loaded when the checkpoint declares FP8: the
 /// tiled E4M3 GEMV for decode rows and the FP8 tensor-core tile for prompt chunks.
@@ -624,6 +634,7 @@ impl Kernels {
             attention: named(qwen4_attn_cubin(), "q4e_attn_full")?,
             combine: named(qwen4_attn_cubin(), "q4e_attn_full_combine")?,
             cache: named(qwen4_attn_cubin(), "q4e_cache_bf16")?,
+            argmax: named(qwen4_exp_cubin(), "q4e_argmax_slices")?,
             wide: cuda
                 .load_named_shared(dory_cubin(), "dory_mma_wide", WIDE_SHARED)
                 .map(|(_, kernel)| kernel)?,
@@ -665,6 +676,8 @@ struct Shared {
     eps: f32,
     zero_centred: bool,
     policy: Option<WidePolicy>,
+    /// The prompt rows one pass takes, from [chunk_rows].
+    chunk: usize,
     context: usize,
     /// The sequences' key/value caches' lanes, for sequences of `context` positions.
     lanes: Arc<SequenceLanes<LaneParts>>,
@@ -768,6 +781,7 @@ impl DenseDeviceBackend {
         }
         let profile = sparkflash_model::profile::active();
         let policy = profile_policy(profile)?;
+        let chunk = chunk_rows(profile, context)?;
         let rewind = sparkflash_runtime::rewind()?;
         let names = sparkflash_ops::naming::resolve(architecture, source)?;
         let shard = match &tp {
@@ -872,6 +886,7 @@ impl DenseDeviceBackend {
                 eps: architecture.norm_epsilon as f32,
                 zero_centred: architecture.zero_centered_norms(),
                 policy,
+                chunk,
                 context,
                 lanes,
                 linear_sizes,
@@ -1017,10 +1032,41 @@ impl ModelBackend for DenseDeviceBackend {
     }
 }
 
+/// The prompt rows one pass takes, from [sparkflash_runtime::ChunkPolicy].
+///
+/// The default input is [CHUNK_ROWS], dense's legacy chunk, so a profile that names nothing gets
+/// the 256 rows its kernels were chosen for. A profile may name a documented
+/// [sparkflash_runtime::ChunkPolicy] size at or below [CHUNK_ROWS]; memory and the context are
+/// the policy's business, and the answer is always a documented size. A larger size is refused
+/// because the arm's scratch is allocated for [CHUNK_ROWS] rows.
+fn chunk_rows(
+    profile: &sparkflash_model::profile::ModelProfile,
+    context: usize,
+) -> Result<usize, String> {
+    let asked = profile.prefill.chunk.unwrap_or(CHUNK_ROWS);
+    if !ChunkPolicy::sizes().contains(&asked) {
+        return Err(format!(
+            "the shared dense device arm takes a documented prompt chunk (one of {:?}), not \
+             prefill.chunk = {asked}; change the profile, or serve the checkpoint on the host \
+             reference (SPARKFLASH_DENSE_DEVICE=0)",
+            ChunkPolicy::sizes()
+        ));
+    }
+    let rows = ChunkPolicy::for_limits(Limits::new(asked, context)).rows();
+    if rows > CHUNK_ROWS {
+        return Err(format!(
+            "the shared dense device arm's scratch holds {CHUNK_ROWS} prompt rows, not \
+             prefill.chunk = {asked}; change the profile, or serve the checkpoint on the host \
+             reference (SPARKFLASH_DENSE_DEVICE=0)"
+        ));
+    }
+    Ok(rows)
+}
+
 /// The wide-tile policy a typed profile asks of the arm, or the field it cannot honour.
 ///
-/// The arm's chunk and its prompt-and-decode split are fixed by its kernels; a field it does not
-/// honour is refused by name rather than accepted and dropped. It honours
+/// The arm's prompt-and-decode split is fixed by its kernels; a field it does not honour is
+/// refused by name rather than accepted and dropped. The chunk is [chunk_rows]'s. It honours
 /// `prefill.tensor_cores = false`, which keeps every projection on the row GEMV; its lanes
 /// (`runtime.concurrency`) and lane memory (`runtime.lane_memory_mb`) are the serving engine's.
 fn profile_policy(
@@ -1033,13 +1079,6 @@ fn profile_policy(
              the host reference (SPARKFLASH_DENSE_DEVICE=0)"
         ))
     };
-    if let Some(chunk) = profile.prefill.chunk
-        && chunk != CHUNK_ROWS
-    {
-        return refuse(&format!(
-            "fixes its prompt chunk at {CHUNK_ROWS} rows, not prefill.chunk = {chunk}"
-        ));
-    }
     if profile.prefill.enabled == Some(false) {
         return refuse("always runs its prompt as a prefill, but prefill.enabled = false");
     }
@@ -2237,6 +2276,8 @@ struct Buffers {
     ffn_gate: Deviceptr,
     ffn_up: Deviceptr,
     logits: Deviceptr,
+    /// The greedy head's pick a row, from `q4e_argmax_slices`.
+    picks: Deviceptr,
     /// A routed layer's router logits, `[rows][experts]`.
     router: Deviceptr,
     /// The picked experts (i32) and their weights, `[rows][top_k]` each.
@@ -2270,7 +2311,7 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn all(&self) -> [&Deviceptr; 32] {
+    fn all(&self) -> [&Deviceptr; 33] {
         [
             &self.tokens,
             &self.x,
@@ -2304,6 +2345,7 @@ impl Buffers {
             &self.gdn_a,
             &self.gdn_qk,
             &self.gdn_decay,
+            &self.picks,
         ]
     }
 }
@@ -2388,6 +2430,7 @@ impl Scratch {
             rows * linear(|geometry| geometry.heads),
             linear(|geometry| geometry.qk_floats(CHUNK_ROWS)),
             rows * linear(|geometry| 2 * geometry.heads),
+            rows,
         ];
         let mut pointers = Vec::with_capacity(floats.len());
         let mut total = 0usize;
@@ -2435,6 +2478,7 @@ impl Scratch {
             gdn_a: p(29),
             gdn_qk: p(30),
             gdn_decay: p(31),
+            picks: p(32),
             logit_rows,
         };
         // The counters start at zero; every tiled launch leaves them so.
@@ -2650,14 +2694,14 @@ fn walk(
     Ok(())
 }
 
-/// The logits of `count` residual rows of the last walk from row `first`, row after row: the
-/// final norm and the head on the row GEMV.
-fn head(
+/// The final norm and the LM head of `count` residual rows from row `first`, leaving their
+/// logits in the scratch row after row.
+fn head_logits(
     shared: &Shared,
     b: &Buffers,
     first: usize,
     count: usize,
-) -> Result<Vec<f32>, BackendError> {
+) -> Result<(), BackendError> {
     if count == 0 || count > b.logit_rows {
         return Err(BackendError::new(
             DEVICE,
@@ -2678,13 +2722,70 @@ fn head(
         ),
         count,
     )?;
-    shared.project_bf16(&shared.head, b.normed.0, b.logits.0, count, None)?;
+    shared.project_bf16(&shared.head, b.normed.0, b.logits.0, count, None)
+}
+
+/// The logits of `count` residual rows of the last walk from row `first`, row after row: the
+/// final norm and the head on the row GEMV.
+fn head(
+    shared: &Shared,
+    b: &Buffers,
+    first: usize,
+    count: usize,
+) -> Result<Vec<f32>, BackendError> {
+    head_logits(shared, b, first, count)?;
     let mut bytes = vec![0u8; count * shared.vocab * 4];
     shared
         .cuda
         .copy_dtoh(&mut bytes, &b.logits)
         .map_err(|error| BackendError::new(DEVICE, format!("the logits: {error}")))?;
     Ok(floats(&bytes))
+}
+
+/// The chosen token of each of `count` residual rows from row `first`, on the device: the final
+/// norm and head as [head], then the vocabulary-wide argmax (`q4e_argmax_slices`) writes one
+/// u32 a row. Only the picks cross to the host, not the logits.
+///
+/// The kernel is the host [sparkflash_ops::sampler::argmax] for a finite row: the higher value
+/// wins and a tie takes the lower index. A NaN never wins. (A row whose first logit is NaN is
+/// the kernel's documented exception: it answers 0.) With every logit finite, a greedy request
+/// therefore gets the host sampler's token.
+fn head_choices(
+    shared: &Shared,
+    b: &Buffers,
+    first: usize,
+    count: usize,
+) -> Result<Vec<u32>, BackendError> {
+    head_logits(shared, b, first, count)?;
+    let rows = u32::try_from(count).map_err(|_| {
+        BackendError::new(DEVICE, format!("{count} head rows do not fit one launch"))
+    })?;
+    shared
+        .cuda
+        .launch_async(
+            shared.kernels.argmax,
+            (rows, 1, 1),
+            (ARGMAX_BLOCK, 1, 1),
+            &[
+                b.logits.0,
+                b.picks.0,
+                1,
+                u64::from(rows),
+                shared.vocab as u64,
+            ],
+        )
+        .map_err(|error| BackendError::new(DEVICE, format!("q4e_argmax_slices: {error}")))?;
+    let mut bytes = vec![0u8; count * 4];
+    shared
+        .cuda
+        .copy_dtoh(&mut bytes, &b.picks)
+        .map_err(|error| BackendError::new(DEVICE, format!("the picks: {error}")))?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
+        .collect())
 }
 
 /// One fused step: a row a member, each its own token, and each member's next.
@@ -2759,8 +2860,8 @@ impl DenseDeviceSession {
             .unwrap_or_default()
     }
 
-    /// Runs `tokens` from the session's position, [CHUNK_ROWS] rows a walk, and returns the last
-    /// row's logits. The sampler does not see them.
+    /// Runs `tokens` from the session's position, the walk's chunk rows a pass (256 by default),
+    /// and returns the last row's logits. The sampler does not see them.
     ///
     /// # Errors
     /// A token outside the vocabulary, a sequence past the served context, or a device failure.
@@ -2768,7 +2869,7 @@ impl DenseDeviceSession {
         let shared = Arc::clone(&self.sequence.shared);
         let b = &self.scratch.buffers;
         let mut last = 0;
-        for chunk in tokens.chunks(CHUNK_ROWS) {
+        for chunk in tokens.chunks(shared.chunk) {
             walk(
                 &shared,
                 b,
@@ -2809,7 +2910,7 @@ impl ModelSession for DenseDeviceSession {
             trace,
         } = self;
         let mut last = 0;
-        for chunk in tokens.chunks(CHUNK_ROWS) {
+        for chunk in tokens.chunks(shared.chunk) {
             walk(
                 &shared,
                 &scratch.buffers,
@@ -2848,11 +2949,227 @@ impl ModelSession for DenseDeviceSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, profile_policy};
+    use super::{CHUNK_ROWS, DenseWalk, TOKEN_DECODE, chunk_rows, profile_policy};
+    use sparkflash_model::backend::Sampling;
     use sparkflash_model::ledger::State;
     use sparkflash_model::profile::ModelProfile;
     use sparkflash_ops::projection::WidePolicy;
+    use sparkflash_ops::sampler::Sampler;
     use sparkflash_runtime::Walk;
+
+    /// The token the device head's kernel chooses, transcribed from `q4e_argmax_slices`: the
+    /// higher value wins, a tie takes the lower index, a NaN never wins, and a row whose first
+    /// logit is NaN answers 0.
+    fn device_argmax(row: &[f32]) -> u32 {
+        let mut value = f32::NEG_INFINITY;
+        let mut index = u32::MAX;
+        for (at, &logit) in row.iter().enumerate() {
+            if logit > value || (logit == value && (at as u32) < index) {
+                value = logit;
+                index = at as u32;
+            }
+        }
+        if row.first().is_some_and(|value| value.is_nan()) {
+            0
+        } else {
+            index
+        }
+    }
+
+    /// The toy rows: a clear maximum, a tie (the lower index), a negative row and a one-entry
+    /// row. A greedy sampler and the device kernel must agree on every one.
+    fn toy_rows() -> Vec<Vec<f32>> {
+        vec![
+            vec![0.5, -1.0, 2.0, 0.0],
+            vec![3.0, 3.0, 1.0, -2.0],
+            vec![-3.0, -2.0, -1.0, -4.0],
+            vec![7.0, -1.0, 0.0, 2.0],
+            vec![1.0, 1.0, 1.0, 1.0],
+        ]
+    }
+
+    #[test]
+    fn the_device_choice_is_the_host_samplers_token_on_the_toy_rows() {
+        for row in toy_rows() {
+            let mut host = Sampler::new();
+            let expected = host.choose(&row, &Sampling::default());
+            assert_eq!(
+                device_argmax(&row),
+                expected,
+                "the device kernel's argmax on {row:?}"
+            );
+        }
+    }
+
+    /// The bit delta the policy change can make, on a device: a nine-row BF16 projection through
+    /// `dory_mma_wide` (the policy's route at nine rows) against the row GEMV the same rows took
+    /// before (one row a launch). The test reports the largest absolute and ULP difference rather
+    /// than pinning the tile's arithmetic; it is the first dense number a device gate can compare
+    /// with the host reference.
+    #[test]
+    fn the_dense_tile_and_the_row_gemv_move_a_nine_row_projection_in_the_last_bits() {
+        let Ok(cuda) = sparkflash_kernels::cuda_driver::Cuda::load() else {
+            eprintln!("skipping the dense tile bit delta: no CUDA device");
+            return;
+        };
+        if sparkflash_kernels::images::dory_cubin().is_empty()
+            || sparkflash_kernels::images::qwen4_exp_cubin().is_empty()
+        {
+            eprintln!("skipping the dense tile bit delta: this build has no Dory/Qwen cubin");
+            return;
+        }
+        let (columns, inner, rows) = (256usize, 256usize, 9usize);
+        // A deterministic BF16 weight and f32 activation, in the shape the wide tile covers.
+        let mut state = 0x5eed_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let weight: Vec<u8> = (0..columns * inner)
+            .flat_map(|_| ((next().to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let input: Vec<u8> = (0..rows * inner)
+            .flat_map(|_| next().to_le_bytes())
+            .collect();
+        let (_, gemv) = cuda
+            .load_named(
+                sparkflash_kernels::images::qwen4_exp_cubin(),
+                "q4e_gemv_bf16",
+            )
+            .expect("the Qwen4-Exp image carries q4e_gemv_bf16");
+        let (_, wide) = cuda
+            .load_named_shared(
+                sparkflash_kernels::images::dory_cubin(),
+                "dory_mma_wide",
+                sparkflash_ops::projection::WIDE_SHARED,
+            )
+            .expect("the Dory image carries dory_mma_wide");
+        let mut total = 0;
+        let w = cuda.alloc(weight.len(), &mut total).expect("the weights");
+        let x = cuda.alloc(input.len(), &mut total).expect("the input");
+        let row_out = cuda
+            .alloc(rows * columns * 4, &mut total)
+            .expect("the GEMV output");
+        let tile_out = cuda
+            .alloc(rows * columns * 4, &mut total)
+            .expect("the tile output");
+        cuda.copy_htod(&w, &weight).expect("the weights upload");
+        cuda.copy_htod(&x, &input).expect("the input upload");
+        for row in 0..rows {
+            cuda.launch(
+                gemv,
+                (columns.div_ceil(8) as u32, 1, 1),
+                (256, 1, 1),
+                &[
+                    w.0,
+                    x.0 + (row * inner * 4) as u64,
+                    row_out.0 + (row * columns * 4) as u64,
+                    columns as u64,
+                    inner as u64,
+                    1,
+                ],
+            )
+            .expect("the row GEMV launches");
+        }
+        cuda.launch(
+            wide,
+            (
+                columns.div_ceil(sparkflash_ops::projection::WIDE_COLUMNS) as u32,
+                rows.div_ceil(sparkflash_ops::projection::WIDE_ROWS) as u32,
+                1,
+            ),
+            (sparkflash_ops::projection::WIDE_THREADS, 1, 1),
+            &[
+                w.0,
+                x.0,
+                tile_out.0,
+                columns as u64,
+                inner as u64,
+                rows as u64,
+            ],
+        )
+        .expect("the wide tile launches");
+        let mut left = vec![0u8; rows * columns * 4];
+        let mut right = vec![0u8; rows * columns * 4];
+        cuda.copy_dtoh(&mut left, &row_out)
+            .expect("the GEMV output");
+        cuda.copy_dtoh(&mut right, &tile_out)
+            .expect("the tile output");
+        cuda.free_buffers(&[&w, &x, &row_out, &tile_out]);
+        let left = super::floats(&left);
+        let right = super::floats(&right);
+        assert!(left.iter().chain(&right).all(|value| value.is_finite()));
+        let mut worst = 0.0f32;
+        let mut worst_ulp = 0u32;
+        let mut differing = 0usize;
+        for (a, b) in left.iter().zip(&right) {
+            worst = worst.max((a - b).abs());
+            worst_ulp = worst_ulp.max(a.to_bits().abs_diff(b.to_bits()));
+            differing += usize::from(a.to_bits() != b.to_bits());
+        }
+        eprintln!(
+            "dense tile vs row GEMV at {rows}x{columns}x{inner}: {differing} of {} values \
+             differ, largest |delta| {worst:e}, largest ULP {worst_ulp}",
+            rows * columns
+        );
+        assert!(worst.is_finite());
+    }
+
+    /// The same comparison against the real kernel, where this build and host have a CUDA device
+    /// and the Qwen4-Exp image. Without either it says so and passes, as the arm's other device
+    /// gates do.
+    #[test]
+    fn the_cuda_head_choice_is_the_host_samplers_token_on_the_toy_rows() {
+        let Ok(cuda) = sparkflash_kernels::cuda_driver::Cuda::load() else {
+            eprintln!("skipping the device head choice: no CUDA device");
+            return;
+        };
+        let image = sparkflash_kernels::images::qwen4_exp_cubin();
+        if image.is_empty() {
+            eprintln!("skipping the device head choice: this build has no Qwen4-Exp cubin");
+            return;
+        }
+        let (_, argmax) = cuda
+            .load_named(image, "q4e_argmax_slices")
+            .expect("the Qwen4-Exp image carries q4e_argmax_slices");
+        let rows = toy_rows();
+        let vocab = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == vocab));
+        let flat: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let mut total = 0;
+        let logits = cuda.alloc(flat.len(), &mut total).expect("the toy logits");
+        cuda.copy_htod(&logits, &flat)
+            .expect("the toy logits upload");
+        let picks = cuda
+            .alloc(rows.len() * 4, &mut total)
+            .expect("the toy picks");
+        cuda.launch(
+            argmax,
+            (rows.len() as u32, 1, 1),
+            (1024, 1, 1),
+            &[logits.0, picks.0, 1, rows.len() as u64, vocab as u64],
+        )
+        .expect("the argmax launches");
+        let mut bytes = vec![0u8; rows.len() * 4];
+        cuda.copy_dtoh(&mut bytes, &picks)
+            .expect("the toy picks download");
+        cuda.free_buffers(&[&logits, &picks]);
+        for (row, word) in rows.iter().zip(bytes.as_chunks::<4>().0) {
+            let chosen = u32::from_le_bytes(*word);
+            let mut host = Sampler::new();
+            assert_eq!(
+                chosen,
+                host.choose(row, &Sampling::default()),
+                "the kernel's argmax on {row:?}"
+            );
+        }
+    }
 
     /// The walk's token-decode capability row and the profile refusal are the same constant, so
     /// the ledger cannot state one thing while the switch is refused for another.
@@ -2889,7 +3206,6 @@ mod tests {
             edit(&mut profile);
             profile_policy(&profile).expect_err("the field is refused")
         };
-        assert!(refused(|profile| profile.prefill.chunk = Some(CHUNK_ROWS * 2)).contains("chunk"));
         assert!(refused(|profile| profile.prefill.enabled = Some(false)).contains("prefill"));
         assert!(refused(|profile| profile.prefill.exact = Some(true)).contains("exact"));
         assert!(refused(|profile| profile.decode.tensor_cores = Some(true)).contains("decode"));
@@ -2909,5 +3225,27 @@ mod tests {
             profile_policy(&chunk).is_ok(),
             "the arm's own chunk is honoured"
         );
+    }
+
+    /// The default is dense's legacy 256 through ChunkPolicy; a documented smaller switch moves
+    /// it, and an undocumented or larger one is refused rather than silently rounded.
+    #[test]
+    fn the_chunk_comes_from_the_policy_and_defaults_to_256() {
+        assert_eq!(chunk_rows(&ModelProfile::default(), 32_768), Ok(CHUNK_ROWS));
+        for size in [1usize, 2, 4, 8, 64, CHUNK_ROWS] {
+            let mut profile = ModelProfile::default();
+            profile.prefill.chunk = Some(size);
+            assert_eq!(
+                chunk_rows(&profile, 32_768),
+                Ok(size),
+                "a documented {size}-row chunk is honoured"
+            );
+        }
+        for size in [0usize, 3, 128, 300, 512, 1_024, 4_096] {
+            let mut profile = ModelProfile::default();
+            profile.prefill.chunk = Some(size);
+            let error = chunk_rows(&profile, 32_768).expect_err("the size is refused");
+            assert!(error.contains("prefill.chunk"), "{error}");
+        }
     }
 }
