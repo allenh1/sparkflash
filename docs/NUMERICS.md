@@ -399,7 +399,7 @@ versioned as `sparkflash-numerics-monitors/1`:
 {
   "schema": "sparkflash-numerics-monitors/1",
   "model": "zai-org/GLM-5.3-Flash",
-  "probe": {"name": "retrieval", "prompt_ids": [1, 2, 3], "position": 0},
+  "probe": {"name": "decode-position-3", "prompt_ids": [42], "position": 3, "rows": 1},
   "sample": {"width": 4096, "indices": [0, 1, 2, 3]},
   "layers": [
     {"layer": 3, "values": [0.1, 0.2, 0.3, 0.4],
@@ -428,11 +428,27 @@ The Rust writer is `sparkflash_model::numerics_monitors::Recorder`. It is off un
 of evenly spaced hidden indices (default 8) and `SPARKFLASH_NUMERICS_MODEL` overrides the model
 id. The document declares the exact indices it sampled, and the judge refuses two dumps whose
 indices differ. The recorder merges a document across forwards only when model, probe and sample
-all match and the values agree; a different probe or sample is refused. A monitor run is **one
-probe per process**: the first forward that reaches a MoE layer is the probe, and a later forward
-(the decode token, another request) is a different probe. The recorder reports that as
-`AlreadyExists`; the serving wrapper logs it and stops recording that forward rather than failing
-the request. Use a fresh path per run and send the probe first.
+all match and the values agree; a different probe or sample is refused.
+
+A monitor run is **one probe per process**, and the probe is the **first decode step**: the first
+forward that reaches a MoE layer with a row count at most the arm's few-row band, which is eight
+rows on both wired arms (the tiled GEMV's batch, and the few-row tile bodies' widest forward). A
+wider forward is a prefill chunk, and a prefill must not consume the probe. The document says what
+the probe is: `probe.rows` is the forward's row count (one for a plain decode step), `probe.position`
+is the absolute position of its first row (the prompt's length for the first decode step), and
+`probe.name` is `decode-position-<position>`. A prefill probe therefore cannot be written: the
+writer (`sparkflash_model::numerics_monitors::Recorder::new`) refuses a probe wider than the band,
+and each call site checks the row count before it opens the recorder. A later decode step is a
+different probe, which the recorder reports as `AlreadyExists`; the serving wrapper logs it and
+stops recording that forward rather than failing the request. Use a fresh path per run and send the
+request after `/readyz`.
+
+This rule is why the probe can see a decode-only change. Before it the probe was the process's
+first forward, which on a real request is the prompt's prefill; a prefill runs the bulk GEMM on
+both builds, so a pair taken then was blind to a difference confined to the decode body. The first
+GLM-5.3 pair — one build with `SPARKFLASH_DECODE_MMA=off`, one with the shipped default — came out
+byte-identical and the judge passed at 0.000e+00 without measuring the body. That pair has to be
+retaken; the retake below now probes the first decode step.
 
 A real reference/candidate pair needs two builds. The echo of one process is not a candidate, and
 `[prerequisites] monitors` stays false until a pair from a reference build and a candidate build
@@ -484,10 +500,12 @@ python3 scripts/numerics.py monitors \
   --json "$W/qwen38-monitors-result.json"
 ```
 
-The first forward's chunk is the probe. The reference and candidate must run the same prompt with
-the same tokenizer and context so the probe's ids and position match; a different chunking is
-refused by the judge. Check the document's `probe` before judging it: a boot warmup that reaches a
-MoE layer first becomes the probe, so use a fresh path and send the probe after `/readyz`.
+The first **decode step** is the probe: the request's prompt is a prefill, wider than the band
+and so not the probe, and the forward that generates its first token is. The reference and
+candidate must run the same prompt with the same tokenizer and context so the probe's ids and
+position match; a different chunking is refused by the judge. Check the document's `probe` before
+judging it — `rows` is 1 and `position` is the prompt's length — and use a fresh path and send the
+request after `/readyz`, because a boot warmup can be the first decode step.
 
 #### Emission sites
 
@@ -516,7 +534,10 @@ arm — the path the cluster window exercised — is wired for both as well:
 
 - `DeviceSequence::forward_batch` opens the recorders once a forward
   (`crates/sparkflash-model-qwen4-exp/src/device/numerics.rs`, `Switches::begin`), so coverage
-  opens one named input a forward and the monitor recorder takes that forward as the probe.
+  opens one named input a forward. The monitor recorder takes that forward as the probe only when
+  its row count is at most the few-row band (`DeviceSequence::begin_numerics` passes the batch's
+  row count); a prefill forward opens no monitor recorder and leaves the probe to the first decode
+  step after it.
 - `DeviceSequence::record_routing` copies the router's `[batch][top-k]` ids back after
   `mlp_branch`'s router launch and counts them.
 - `DeviceSequence::record_probe` samples the first row's `moe_combine` branch and each routed
@@ -556,7 +577,7 @@ world-1 arm's; a sharded arm logs once and records none. The device-batch path
 first real dumps are still ahead.
 
 The exact window command for the Qwen3.8 world-1 dumps (both switches on in one process, the
-first forward is the probe, then the two judges):
+first decode step is the probe, then the two judges):
 
 ```bash
 W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-numerics
@@ -586,11 +607,11 @@ python3 scripts/numerics.py monitors --reference "$W/qwen38-monitors-reference.j
   --candidate "$W/qwen38-monitors.json" --layer-bar <declared> --expert-bar <declared>
 ```
 
-The GLM-5.3-Flash arm serves only at world 4, so its pair is the two builds the declaration names:
-version 1's row-GEMV build (the arithmetic the registry's version-1 reference was captured on) and
-the tip, which decodes the FP8 parts on the tile's few-row body. Only rank 0 records — the dump is
-rank 0's slot of the tensor-parallel expert sum — so run with rank 0 local, use a fresh path for
-each build, and send the probe after `/readyz`:
+The GLM-5.3-Flash arm serves only at world 4, so its pair is **one build run twice**: the tip with
+`SPARKFLASH_DECODE_MMA=off` (the tiled row GEMV, which is version 1's arithmetic) and the tip with
+the shipped default (the tile's few-row body, version 2). Only rank 0 records — the dump is rank
+0's slot of the tensor-parallel expert sum — so run with rank 0 local, use a fresh path for each
+run, and send the request after `/readyz`:
 
 ```bash
 W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-glm53-monitors
@@ -600,7 +621,8 @@ cat > "$W/one.json" <<'JSON'
  "prompts": [{"name": "probe", "prompt": "<the fixed probe prompt>"}]}
 JSON
 
-# Reference build: version 1's row-GEMV build.
+# Reference build: the tip with SPARKFLASH_DECODE_MMA=off, the tiled row GEMV (version 1's
+# arithmetic).
 SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
 SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
 SPARKFLASH_CHECKPOINT="$GLM_CHECKPOINT" \
@@ -608,7 +630,8 @@ SPARKFLASH_TOKENIZER="$GLM_TOKENIZER" \
 SPARKFLASH_CONVERTED_DIR="$GLM_CONVERTED_DIR" \
 SPARKFLASH_CONTEXT=131072 \
 SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
-SPARKFLASH_BIN="$GLM_V1_ROW_GEMV_BIN" \
+SPARKFLASH_DECODE_MMA=off \
+SPARKFLASH_BIN="$GLM_TIP_BIN" \
 SPARKFLASH_NUMERICS_MONITORS="$W/glm53-monitors-reference.json" \
 SPARKFLASH_NUMERICS_SAMPLE=8 \
 SPARKFLASH_NUMERICS_MODEL=zai-org/GLM-5.3-Flash \
@@ -617,7 +640,8 @@ python3 scripts/numerics.py capture --url http://127.0.0.1:8002 \
   --suite "$W/one.json" --out "$W/reference-drive.json" --max-tokens 1
 scripts/serve-four-node.sh stop
 
-# Candidate build: the tip. Same nodes, checkpoint, tokenizer, context and probe.
+# Candidate build: the same binary with the shipped default, the tile's few-row body. Same nodes,
+# checkpoint, tokenizer, context and probe.
 SPARK_NODES="$GLM_NODES" SPARK_LOCAL_RANKS=0 \
 SPARKFLASH_MODEL=zai-org/GLM-5.3-Flash \
 SPARKFLASH_CHECKPOINT="$GLM_CHECKPOINT" \
@@ -642,8 +666,14 @@ python3 scripts/numerics.py monitors \
   --json "$W/glm53-monitors-result.json"
 ```
 
-The probe is the first step's first run. A boot warmup that reaches a MoE layer first becomes the
-probe, so a fresh path and a post-`/readyz` request are what name the forward the two builds share.
+**The probe is now the first decode step.** The pair above is a retake: its probe is the forward
+that generates the first token after the prompt's prefill, so the two runs measure the row the
+decode body writes. A pair taken before this rule recorded the prompt's prefill instead, whose bulk
+GEMM runs on both builds — that pair's dumps came out byte-identical and the judge passed at
+0.000e+00 without measuring the body, so it is blind to the difference it was meant to measure and
+must not be used. Before judging a dump, check that `probe.rows` is 1 and `probe.position` is the
+probe prompt's length. A boot warmup that generates a token first can still become the probe, so a
+fresh path and a post-`/readyz` request are what name the forward the two runs share.
 
 ### Across architectures and versions
 
