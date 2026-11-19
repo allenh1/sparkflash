@@ -578,4 +578,15 @@ pub trait Walk: 'static {
         let _ = seq;
         Speculation::default()
     }
+
+    /// The most segments one walk may hold, when that is narrower than [Self::limits]' rows.
+    ///
+    /// The fused engine caps a batch here rather than handing a walk more members than its row
+    /// buffers take. The default is the pass limit, which is the whole truth for an arm whose
+    /// prompt chunk and token batch are the same width; an arm with a wide prompt chunk and a
+    /// narrow token batch (Qwen's 4,096 and 4) states its own.
+    #[must_use]
+    fn max_segments(&self) -> usize {
+        self.limits().rows
+    }
 }

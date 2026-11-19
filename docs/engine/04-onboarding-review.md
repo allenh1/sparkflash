@@ -194,6 +194,34 @@ commit, shared by all three arms rather than designed from one:
 6. A seventh conformance check: **drafted = plain**, including a case where the draft is
    rejected. Its absence is why this got through.
 
+A review of GLM's `Walk` — the second arm to declare one, and the first that drafts — added five
+things the drafting contract must settle, and exposed a hole in the guard:
+
+* **The guard needs a second half.** `GlmWalk` declared `Absent` while its `open` built drafting
+  sequences and its `token_rows` ran the whole round inside a `TokenRows` pass. So an arm whose
+  profile ships a draft head passed the `Drafter::PRESENT` refusal vacuously and the ledger
+  printed "no drafter" for an arm that drafts. The rule must be: an arm whose profile or backend
+  carries a draft head may not name `Absent`.
+* **A one-row pass must not append drafts.** `Walk`'s contract says a token pass is one row a
+  member; a walk that drafts inside it changes the shape the runtime reasons about.
+* **The round cannot be copied.** GLM's walk copy differed from the served one in three places:
+  lone-request depth went through `share_rows` instead of the arm's own depth; with
+  `SPARKFLASH_JOINT_ROUNDS=off` it still verified everyone in one batch where the served arm and
+  `rounds.rs:32-34` run each lane alone; and more than eight members reached
+  `forward_batch_greedy` with more than `MAX_ROWS` rows because `max_batch` reports the prompt
+  chunk. Each is a policy the `Drafter` contract must name, not inherit by accident.
+* **The hooks belong on `Drafter`, as required methods.** `Walk::ready` and `Walk::speculation`
+  default to false and zero, so a drafting arm that forgets them silently loses multi-token runs
+  or reports nothing — the same class of silent default the plan exists to remove. Putting them
+  on `Walk` was staging, not the shape.
+* **`begin_prompt`'s new position test assumes `position() == history.len()`.** It is right for GLM
+  and dense. An arm whose position differs by convention (Dory's point one id short, Qwen's
+  respelled last id) would fall to rewind or cold on every turn with the same tokens and nothing
+  reporting it, so the conformance set needs a check that a continued turn forwards only the
+  suffix.
+* A backstop: an arm's `kv_plan` must not swallow an error into an empty layout, because
+  `StateKind::None` makes the runtime skip the rewind while still truncating history.
+
 Two smaller findings from the same review: the extra LM-head work per prompt chunk (old shape
 `forward_batch(chunk, usize::from(is_last), 0)`, `device.rs:6389`) is restorable because `head`
 is a separate call, but in a TP group the head rows are a collective (`tp.rs:545-559`), so the

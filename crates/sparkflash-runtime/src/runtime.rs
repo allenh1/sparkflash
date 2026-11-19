@@ -100,8 +100,19 @@ impl<W: Walk> Runtime<W> {
     /// A runtime over `walk`, with `free_bytes` free for chunk sizing (zero: not measured).
     ///
     /// # Errors
-    /// A [`crate::REWIND_ENV`] that is not a switch.
+    /// A [`crate::REWIND_ENV`] that is not a switch, or a walk whose drafter the runtime's
+    /// step cannot drive yet.
     pub fn new(walk: W, free_bytes: u64) -> Result<Self, BackendError> {
+        if W::Drafter::PRESENT {
+            return Err(BackendError::new(
+                "runtime",
+                format!(
+                    "{} declares a drafter ({}), and the runtime's step has no round path for it;                      serve this arm on its own fused arm until the runtime drafts, or remove the                      drafter",
+                    std::any::type_name::<W>(),
+                    std::any::type_name::<W::Drafter>()
+                ),
+            ));
+        }
         let layout = walk.layout().clone();
         let limits = walk.limits();
         let chunk = ChunkPolicy::new(limits, free_bytes, layout.bytes_per_row());
@@ -308,11 +319,19 @@ fn runtime_ledger<W: Walk>(chunk: Option<usize>, rewind: Option<bool>) -> Ledger
         },
     );
     if W::Drafter::PRESENT {
-        ledger.drafting(
-            Some(std::any::type_name::<W::Drafter>().to_owned()),
-            caps.passes.contains(crate::walk::PassMask::VERIFY)
-                && caps.segments == crate::walk::Segments::Many,
-            true,
+        // The runtime can state the arm's drafter, but its step does not drive it: the row is
+        // off until the round path lands. [Runtime::new] refuses such a walk outright, so a boot
+        // can never print a drafting strategy the step does not run.
+        let why = format!(
+            "{} declares a drafter ({}); the runtime's step has no round path yet",
+            std::any::type_name::<W>(),
+            std::any::type_name::<W::Drafter>()
+        );
+        ledger.set(Strategy::Drafting, Mode::off(why.clone()));
+        ledger.set(Strategy::JointRounds, Mode::off(why));
+        ledger.set(
+            Strategy::Runs,
+            Mode::off("the runtime's step does not draft"),
         );
     } else {
         ledger.drafting(None, false, false);
@@ -553,7 +572,7 @@ where
     }
 
     fn max_batch(&self) -> usize {
-        self.limits.rows
+        self.walk.max_segments().clamp(1, self.limits.rows)
     }
 
     fn ledger(&self) -> Ledger {
@@ -619,6 +638,8 @@ mod tests {
     struct ToyWalk {
         layout: StateLayout,
         limits: Limits,
+        /// The most segments one walk takes, when narrower than the pass width.
+        segments: usize,
         walks: Mutex<Vec<(PassKind, Vec<usize>)>>,
         sampling: Mutex<Option<Sampling>>,
         /// Rows the walk keeps past the ones the caller was given tokens for, as a verify keeps
@@ -640,6 +661,7 @@ mod tests {
                     bytes_per_row: 4,
                 }]),
                 limits: Limits::new(rows, context),
+                segments: rows,
                 walks: Mutex::new(Vec::new()),
                 sampling: Mutex::new(None),
                 kept_past: 0,
@@ -652,6 +674,11 @@ mod tests {
         /// The same walk, keeping `kept_past` rows past what the caller was given.
         fn keeping(mut self, kept_past: usize) -> Self {
             self.kept_past = kept_past;
+            self
+        }
+
+        fn with_segments(mut self, segments: usize) -> Self {
+            self.segments = segments;
             self
         }
     }
@@ -673,6 +700,10 @@ mod tests {
 
         fn limits(&self) -> Limits {
             self.limits
+        }
+
+        fn max_segments(&self) -> usize {
+            self.segments
         }
 
         fn set_sampling(&self, _seq: &mut Self::Seq, sampling: Sampling) {
@@ -930,6 +961,17 @@ mod tests {
     }
 
     #[test]
+    fn the_batch_cap_is_the_walks_and_not_the_pass_width() {
+        // A prompt chunk may be wider than a token batch: the runtime caps members at the walk's
+        // own answer, not at the prompt pass limit.
+        let capped =
+            Runtime::new(ToyWalk::new(64, 4_096).with_segments(3), 0).expect("the runtime starts");
+        assert_eq!(capped.max_batch(), 3);
+        assert_eq!(capped.limits().rows, 64);
+        assert_eq!(runtime(64).max_batch(), 64, "the default is the pass width");
+    }
+
+    #[test]
     fn four_slots_step_in_one_walk_and_keep_their_own_rows() {
         let runtime = runtime(256);
         let mut slots = [
@@ -1025,6 +1067,112 @@ mod tests {
     fn chunk_policy_names_are_the_documented_ones() {
         assert!(CHUNK_SIZES.contains(&256));
         assert_eq!(CHUNK_SIZES.iter().copied().max(), Some(65_535));
+    }
+
+    /// A drafter marker for the construction refusal.
+    struct RefusedDrafter;
+
+    impl Drafter<RefusedWalk> for RefusedDrafter {
+        const PRESENT: bool = true;
+
+        fn describe(&self) -> String {
+            "toy drafts".to_owned()
+        }
+    }
+
+    /// A walk that declares a drafter; the runtime has no round path to drive it yet.
+    struct RefusedWalk {
+        layout: StateLayout,
+        limits: Limits,
+    }
+
+    impl RefusedWalk {
+        fn new() -> Self {
+            Self {
+                layout: StateLayout::new(vec![Region::Positional {
+                    name: "toy",
+                    bytes_per_row: 4,
+                }]),
+                limits: Limits::new(8, 1_024),
+            }
+        }
+    }
+
+    impl Walk for RefusedWalk {
+        type Seq = ToySeq;
+        type Drafter = RefusedDrafter;
+        type Vision = NoVision;
+
+        const CAPABILITIES: WalkCapabilities = WalkCapabilities::all(StateKind::Positional);
+
+        fn layout(&self) -> &StateLayout {
+            &self.layout
+        }
+
+        fn open(&self, _memory: LaneMemory) -> Result<Self::Seq, BackendError> {
+            Ok(ToySeq::default())
+        }
+
+        fn limits(&self) -> Limits {
+            self.limits
+        }
+
+        fn set_sampling(&self, _seq: &mut Self::Seq, _sampling: Sampling) {}
+
+        fn walk(
+            &self,
+            segments: &mut [Segment<'_, Self::Seq>],
+            _pass: Pass<'_>,
+        ) -> Result<Hidden, BackendError> {
+            let mut rows = 0;
+            for segment in segments {
+                segment.seq.rows.extend_from_slice(segment.rows);
+                rows += segment.rows.len();
+            }
+            Ok(Hidden::new(rows))
+        }
+
+        fn head(
+            &self,
+            _hidden: &Hidden,
+            rows: &mut [HeadRow<'_, Self::Seq>],
+        ) -> Result<Vec<StepOutput>, BackendError> {
+            Ok(rows
+                .iter_mut()
+                .map(|_| StepOutput {
+                    next_token: Some(0),
+                    ..StepOutput::default()
+                })
+                .collect())
+        }
+    }
+
+    /// A drafting walk cannot be constructed: the runtime's step would silently drop the draft,
+    /// so it refuses at boot and its ledger says so.
+    #[test]
+    fn a_walk_with_a_drafter_is_refused_until_the_runtime_has_a_round_path() {
+        let error = match Runtime::new(RefusedWalk::new(), 0) {
+            Ok(_) => panic!("the drafter is refused"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("round path"), "{error}");
+        assert!(error.message().contains("RefusedWalk"), "{error}");
+        let ledger = ledger_for::<RefusedWalk>();
+        assert!(matches!(ledger.mode(Strategy::Drafting), Mode::Off(_)));
+        assert!(matches!(ledger.mode(Strategy::JointRounds), Mode::Off(_)));
+        assert!(matches!(ledger.mode(Strategy::Runs), Mode::Off(_)));
+    }
+
+    /// Drafted-equals-plain is claimed only by an arm that declares a drafter.
+    #[test]
+    fn the_seventh_check_requires_a_drafter() {
+        use crate::ConformanceCheck;
+        let drafted = ConformanceCheck::DraftedEqualsPlain;
+        assert!(crate::checks_for::<RefusedWalk>().contains(&drafted));
+        assert!(!crate::checks_for::<ToyWalk>().contains(&drafted));
+        assert!(crate::check_claims::<RefusedWalk>(&[drafted]).is_ok());
+        assert!(crate::check_claims::<ToyWalk>(&[drafted]).is_err());
+        assert_eq!(ConformanceCheck::ALL.len(), 7);
     }
 
     crate::conformance!(ToyWalk);
