@@ -1,0 +1,281 @@
+{
+  "schema": "sparkflash-numerics-coverage-corpus/1",
+  "license": "Apache-2.0",
+  "note": "The checked-in starting corpus for scripts/numerics.py coverage-sweep. It spans character classes, code, numerals, non-Latin scripts, long documents and repetition. These prompts are candidates only: the sweep measures each one against the dump and keeps it only when its forward reaches a slot no earlier kept prompt reached. The generator in the same tool adds a deterministic larger corpus with --generate.",
+  "prompts": [
+    {
+      "name": "charset/ascii-punctuation",
+      "family": "charset",
+      "prompt": "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_'abcdefghijklmnopqrstuvwxyz{|}~\nRepeat the punctuation exactly, then continue with the next code point: ~}|{zyxwvutsrqponmlkjihgfedcba'_^]\\[ZYXWVUTSRQPONMLKJIHGFEDCBA@?>=<;:9876543210/.-,+*)('&%$#\"! "
+    },
+    {
+      "name": "charset/control-escapes",
+      "family": "charset",
+      "prompt": "The literal escape forms are \\x00 \\x01 \\x07 \\x08 \\x09 \\x0a \\x0b \\x0c \\x0d \\x1b \\x7f. The characters themselves, where printable, are: \\t tab, \\r carriage return, \\n newline. Write a table mapping each escape to its decimal value and its C name."
+    },
+    {
+      "name": "charset/latin-extended",
+      "family": "charset",
+      "prompt": "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ ĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķĸĹĺĻļĽľĿŀŁł ŃńŅņŇňŉŊŋŌōŎŏŐőŒœŔŕŖŗŘřŚśŜŝŞşŠšŢţŤťŦŧŨũŪūŬŭŮůŰűŲųŴŵŶŷŸŹźŻżŽž"
+    },
+    {
+      "name": "charset/math-symbols",
+      "family": "charset",
+      "prompt": "∀∂∃∅∇∈∉∋∏∑−∗√∝∞∠∧∨∩∪∫∴∼≅≈≠≡≤≥⊂⊃⊄⊆⊇⊕⊗⊥⋅⌈⌉⌊⌋⟨⟩ Translate each symbol into its LaTeX command and its meaning in set theory or analysis."
+    },
+    {
+      "name": "charset/box-drawing",
+      "family": "charset",
+      "prompt": "┌─────────┬─────────┐\n│ alpha   │ 0x2E01  │\n├─────────┼─────────┤\n│ beta    │ 0x3A10  │\n└─────────┴─────────┘\n╔═════════╦═════════╗\n║ gamma   ║ 0x4C22  ║\n╚═════════╩═════════╝\nDraw the same table again with the doubled lines and explain the difference between U+2500 and U+2550."
+    },
+    {
+      "name": "charset/combining-marks",
+      "family": "charset",
+      "prompt": "àáâãäå éè öü ñ ç Each base letter above carries a combining mark. Name the mark and the composed code point."
+    },
+    {
+      "name": "charset/emoji",
+      "family": "charset",
+      "prompt": "😀😃😄😁😆😅🤣😂🙂🙃😉😊😇🥰😍🤩😘😗😚😙😋😛😜🤪😝🤑🤗🤭🤫🤔🤐🤨😐😑😶😏😒🙄😬 🚀🛰️🧪🔬🧬🦾🧠🕹️🪄🎼🌍🪐🫧🔥❄️ Describe the sequence and group each emoji by its Unicode block."
+    },
+    {
+      "name": "charset/braille",
+      "family": "charset",
+      "prompt": "⠀⠁⠂⠃⠄⠅⠆⠇⡀⡁⡂⡃⡄⡅⡆⡇⢀⢁⢂⢃⢄⢅⢆⢇⣀⣁⣂⣃⣄⣅⣆⣇ These are Braille patterns. Decode the dots in the last three and write the bit mask for each."
+    },
+    {
+      "name": "code/rust-merge-intervals",
+      "family": "code",
+      "prompt": "Write a Rust function 'fn merge_intervals(v: Vec<(i64, i64)>) -> Vec<(i64, i64)>' that merges overlapping closed intervals. Include unit tests for an empty input, a single interval, touching intervals and a nested interval. Explain the sort key and why the merge is O(n log n)."
+    },
+    {
+      "name": "code/python-asyncio",
+      "family": "code",
+      "prompt": "Write an asyncio producer/consumer with a bounded queue. The producer reads lines from a file, the consumer writes them to a second file with a sequence number. Handle cancellation and drain the queue on shutdown. Then list three race conditions the queue does not remove."
+    },
+    {
+      "name": "code/c-ring-buffer",
+      "family": "code",
+      "prompt": "Implement a lock-free single-producer single-consumer ring buffer in C11 with '_Atomic size_t' head and tail. Show the acquire/release ordering, the full/empty checks, and a test that runs the producer and consumer on two threads for ten million items."
+    },
+    {
+      "name": "code/javascript-fetch",
+      "family": "code",
+      "prompt": "Write a JavaScript function that fetches a JSON array from '/api/events', filters events after a cursor, sorts them by timestamp, and retries a 429 with exponential backoff and jitter. Show the AbortController wiring and the error paths."
+    },
+    {
+      "name": "code/sql-window",
+      "family": "code",
+      "prompt": "SELECT account_id, booked_at, amount,\n       SUM(amount) OVER (PARTITION BY account_id ORDER BY booked_at\n                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running,\n       LAG(amount, 1) OVER (PARTITION BY account_id ORDER BY booked_at) AS previous\nFROM ledger\nWHERE booked_at >= DATE '2026-01-01';\nExplain the frame clause, then rewrite it with a named window."
+    },
+    {
+      "name": "code/shell-pipeline",
+      "family": "code",
+      "prompt": "find /srv/data -type f -name '*.json' -print0 |\n  xargs -0 -n1 -P8 sha256sum |\n  sort -k2 |\n  awk '{ print $1, $2 }' > manifest.txt\nWrite the same pipeline so a filename with a newline cannot split a record, and explain each stage."
+    },
+    {
+      "name": "code/x86-loop",
+      "family": "code",
+      "prompt": "mov rax, 1024\nxor rcx, rcx\n.Lloop:\n  add rcx, [rdi + rax*8]\n  dec rax\n  jnz .Lloop\nmov [rsi], rcx\nret\nAnnotate each instruction, state the ABI assumptions, and describe the first input that would fault."
+    },
+    {
+      "name": "code/json-nested",
+      "family": "code",
+      "prompt": "{\"schema\":\"events/2\",\"batch\":{\"id\":\"b-29\",\"generated\":\"2026-11-19T12:00:00Z\"},\"events\":[{\"id\":1,\"tags\":[\"a\",\"b\"],\"payload\":{\"nested\":{\"ok\":true,\"value\":null}}},{\"id\":2,\"tags\":[],\"payload\":{\"nested\":{\"ok\":false,\"value\":-1.5}}}]}\nValidate this document against a JSON Schema that requires every event to have a unique id and a non-empty tags array."
+    },
+    {
+      "name": "code/yaml-kubernetes",
+      "family": "code",
+      "prompt": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: coverage-worker\n  labels:\n    app: coverage\nspec:\n  replicas: 3\n  selector:\n    matchLabels:\n      app: coverage\n  template:\n    metadata:\n      labels:\n        app: coverage\n    spec:\n      containers:\n        - name: worker\n          image: registry.example/coverage:2026.11\n          args: [\"--concurrency\", \"8\"]\n          resources:\n            limits:\n              memory: 2Gi\nExplain the selector/template label invariant and what breaks if the two labels differ."
+    },
+    {
+      "name": "code/regex-torture",
+      "family": "code",
+      "prompt": "^(?P<scheme>[a-z][a-z0-9+.-]*):(?://(?P<authority>[^/?#]*))?(?P<path>[^?#]*)(?:\\?(?P<query>[^#]*))?(?:#(?P<fragment>.*))?$\nApply this URI regex to 'https://example.com:8443/a/b?x=1&y=%20#top', name each group, and list two strings it accepts that are not valid RFC 3986 URIs."
+    },
+    {
+      "name": "code/html-table",
+      "family": "code",
+      "prompt": "<table>\n  <thead><tr><th scope=\"col\">name</th><th scope=\"col\">value</th></tr></thead>\n  <tbody>\n    <tr><td>alpha</td><td>1</td></tr>\n    <tr><td>beta</td><td>2</td></tr>\n  </tbody>\n</table>\nRewrite this table to be accessible, including a caption and a summary of the numeric column."
+    },
+    {
+      "name": "code/latex-equation",
+      "family": "code",
+      "prompt": "\\begin{equation}\n  \\mathcal{L}(\\theta) = \\frac{1}{N} \\sum_{i=1}^{N} \\left\\| y_i - f_\\theta(x_i) \\right\\|_2^2 + \\lambda \\|\\theta\\|_1\n\\end{equation}\nIdentify each term, then write its gradient with respect to $\\theta$ for the L2 loss only."
+    },
+    {
+      "name": "code/makefile",
+      "family": "code",
+      "prompt": ".PHONY: all test clean\nall: build/coverage\n\nbuild/coverage: src/main.c include/coverage.h\n\t@mkdir -p build\n\t$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)\n\ntest: build/coverage\n\t./build/coverage --self-test\n\nclean:\n\trm -rf build\nExplain '$@', '$<' and why 'clean' does not depend on 'all'."
+    },
+    {
+      "name": "numerals/decimal-long",
+      "family": "numerals",
+      "prompt": "31415926535897932384626433832795028841971693993751058209749445923078164062862089986280348253421170679 27182818284590452353602874713526624977572470936999595749669676277240766303535475945713821785251664274 14142135623730950488016887242096980785696718753769480731766797379907324784621070388503875343276415727\nGroup the first 120 digits into tens and then spell the third group in English words."
+    },
+    {
+      "name": "numerals/hex-dump",
+      "family": "numerals",
+      "prompt": "00000000  7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00  |.ELF............|\n00000010  03 00 3e 00 01 00 00 00  80 40 00 00 00 00 00 00  |..>......@......|\n00000020  40 00 00 00 00 00 00 00  e8 8f 00 00 00 00 00 00  |@...............|\nDecode the ELF header fields this excerpt shows: class, data, type, machine, entry and program header offset."
+    },
+    {
+      "name": "numerals/floats",
+      "family": "numerals",
+      "prompt": "0.1 0.2 0.30000000000000004 1.7976931348623157e308 2.2250738585072014e-308 6.02214076e23 1.602176634e-19 3.141592653589793 2.718281828459045 1.4142135623730951 -0.0 1e-45 3.4028235e38\nWhich of these are exactly representable in binary32, which overflow it, and which are subnormal?"
+    },
+    {
+      "name": "numerals/dates",
+      "family": "numerals",
+      "prompt": "1970-01-01T00:00:00Z\n2026-02-29T23:59:59Z\n2026-12-31T23:59:60Z\n2024-02-29T12:00:00+05:30\n2026-11-19T11:46:38-05:00\nIdentify the invalid timestamps, explain leap seconds and offsets, then sort the valid instants."
+    },
+    {
+      "name": "numerals/network",
+      "family": "numerals",
+      "prompt": "10.0.0.1/8 172.16.31.255/12 192.168.255.254/16 203.0.113.7/32 2001:db8::1/32 2001:db8:abcd:12::ff/64 127.0.0.1 0.0.0.0 255.255.255.255\nFor each prefix give the network address, the broadcast or last address, and the first usable host."
+    },
+    {
+      "name": "numerals/unicode-digits",
+      "family": "numerals",
+      "prompt": "٠١٢٣٤٥٦٧٨٩ ۰۱۲۳۴۵۶۷۸۹ ०१२३४५६७८९ ๐๑๒๓๔๕๖๗๘๙ ０１２３４５６７８９\nThese are Arabic-Indic, Extended Arabic-Indic, Devanagari, Thai and fullwidth digits. Transcribe each row to ASCII and name the block."
+    },
+    {
+      "name": "numerals/hashes",
+      "family": "numerals",
+      "prompt": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nsha1:da39a3ee5e6b4b0d3255bfef95601890afd80709\nmd5:d41d8cd98f00b204e9800998ecf8427e\nuuid:123e4567-e89b-12d3-a456-426614174000\nbase64:QUJDREVGR0g=\nDecode the base64, identify which digests correspond to the empty string, and parse the UUID fields."
+    },
+    {
+      "name": "numerals/financial",
+      "family": "numerals",
+      "prompt": "Opening balance: $1,234,567.89\n2026-01-03  Invoice INV-0042   +$12,500.00   balance $1,247,067.89\n2026-01-11  Wire fee             -$35.00   balance $1,247,032.89\n2026-02-01  Interest             +$1,024.17  balance $1,248,057.06\nReconcile the running balance, then compute the compound interest for twelve months at 3.25% APR."
+    },
+    {
+      "name": "numerals/binary-octal",
+      "family": "numerals",
+      "prompt": "0b111100001010 0o755 0xDEADBEEF 0b00000001 0o1777 0x7fffffff 0xffffffffffffffff\nConvert each literal to decimal, then explain the difference between a signed and unsigned interpretation of 0xffffffff."
+    },
+    {
+      "name": "scripts/greek",
+      "family": "scripts",
+      "prompt": "Η γρήγορη καφέ αλεπού πηδά πάνω από τον τεμπέλη σκύλο. Το πείραμα μέτρησε 48 στρώματα και 512 ειδικούς. Γράψε μια περίληψη και μετάβαλε την πρώτη πρόταση στα αγγλικά."
+    },
+    {
+      "name": "scripts/cyrillic",
+      "family": "scripts",
+      "prompt": "Съешь же ещё этих мягких французских булок, да выпей чаю. Быстрая коричневая лиса прыгает через ленивую собаку. В эксперименте было 48 слоёв и 512 экспертов. Переведи это на английский и объясни падежи."
+    },
+    {
+      "name": "scripts/hebrew",
+      "family": "scripts",
+      "prompt": "דג סקרן שט בים מאוכזב ולפתע מצא חברה. השועל החום המהיר קופץ מעל הכלב העצלן. בניסוי היו 48 שכבות ו-512 מומחים. תרגם לאנגלית והסבר את סדר המילים."
+    },
+    {
+      "name": "scripts/arabic",
+      "family": "scripts",
+      "prompt": "نص حكيم له سر قاطع وذو شأن عظيم مكتوب على ثوب أخضر ومغلف بجلد أزرق. الثعلب البني السريع يقفز فوق الكلب الكسول. كان في التجربة 48 طبقة و512 خبيرا. ترجم إلى الإنجليزية واشرح اتجاه الكتابة."
+    },
+    {
+      "name": "scripts/devanagari",
+      "family": "scripts",
+      "prompt": "पूर्णिमा के दिन चाँद अपनी पूरी रोशनी बिखेरता है। तेज़ भूरी लोमड़ी आलसी कुत्ते के ऊपर कूदती है। प्रयोग में 48 परतें और 512 विशेषज्ञ थे। इसे अंग्रेज़ी में अनुवाद करें और संधि समझाएँ।"
+    },
+    {
+      "name": "scripts/thai",
+      "family": "scripts",
+      "prompt": "เป็นมนุษย์สุดประเสริฐเลิศคุณค่า กว่าบรรดาฝูงสัตว์เดรัจฉาน จงฝ่าฟันพัฒนาวิชาการ อย่าล้างผลาญฤๅเข่นฆ่าบีฑาใคร การทดลองมี 48 ชั้นและผู้เชี่ยวชาญ 512 คน แปลเป็นภาษาอังกฤษและอธิบายวรรณยุกต์."
+    },
+    {
+      "name": "scripts/hangul",
+      "family": "scripts",
+      "prompt": "다람쥐 헌 쳇바퀴에 타고파. 빠른 갈색 여우가 게으른 개를 뛰어넘는다. 실험에는 48개 층과 512명의 전문가가 있었다. 영어로 번역하고 받침의 종류를 설명하라."
+    },
+    {
+      "name": "scripts/japanese",
+      "family": "scripts",
+      "prompt": "いろはにほへと ちりぬるを わかよたれそ つねならむ うゐのおくやま けふこえて あさきゆめみし ゑひもせす。 実験は48層、512人の専門家で構成されていた。英語に翻訳し、ひらがな・カタカナ・漢字の役割を説明してください。"
+    },
+    {
+      "name": "scripts/han",
+      "family": "scripts",
+      "prompt": "天地玄黄 宇宙洪荒 日月盈昃 辰宿列张 寒来暑往 秋收冬藏 闰余成岁 律吕调阳。该实验由48层和512个专家组成。请翻译成英文，并说明每个字的部首。"
+    },
+    {
+      "name": "scripts/mixed-direction",
+      "family": "scripts",
+      "prompt": "The invoice رقم 2026-114 totals 1,250.00 EUR. البند الأول: 750.00 EUR. البند الثاني: 500.00 EUR. סכום ביניים: 1,250.00 EUR. סך הכל: 1,250.00 EUR.\nReconcile the totals and explain how the bidirectional text reorders the numbers."
+    },
+    {
+      "name": "long/maintenance-log",
+      "family": "long",
+      "prompt": "Day 01: south pump at 41 psi; routine inspection, no findings.\nDay 02: west pump at 42 psi; routine inspection, no findings.\nDay 03: north pump at 43 psi; routine inspection, no findings.\nDay 04: east pump at 44 psi; routine inspection, no findings.\nDay 05: south pump at 45 psi; routine inspection, no findings.\nDay 06: west pump at 46 psi; filter changed.\nDay 07: north pump at 47 psi; routine inspection, no findings.\nDay 08: east pump at 48 psi; routine inspection, no findings.\nDay 09: south pump at 49 psi; routine inspection, no findings.\nDay 10: west pump at 50 psi; routine inspection, no findings.\nDay 11: north pump at 51 psi; routine inspection, no findings.\nDay 12: east pump at 52 psi; filter changed.\nDay 13: south pump at 40 psi; routine inspection, no findings.\nDay 14: west pump at 41 psi; routine inspection, no findings.\nDay 15: north pump at 42 psi; routine inspection, no findings.\nDay 16: east pump at 43 psi; routine inspection, no findings.\nDay 17: south pump at 44 psi; routine inspection, no findings.\nDay 18: west pump at 45 psi; filter changed.\nDay 19: north pump at 46 psi; routine inspection, no findings.\nDay 20: east pump at 47 psi; routine inspection, no findings.\nDay 21: south pump at 48 psi; routine inspection, no findings.\nDay 22: west pump at 49 psi; routine inspection, no findings.\nDay 23: north pump at 50 psi; routine inspection, no findings.\nDay 24: east pump at 51 psi; filter changed.\nDay 25: south pump at 52 psi; routine inspection, no findings.\nDay 26: west pump at 40 psi; routine inspection, no findings.\nDay 27: north pump at 41 psi; routine inspection, no findings.\nDay 28: east pump at 42 psi; routine inspection, no findings.\nDay 29: south pump at 43 psi; routine inspection, no findings.\nDay 30: west pump at 44 psi; filter changed.\nDay 31: north pump at 45 psi; routine inspection, no findings.\nDay 32: east pump at 46 psi; routine inspection, no findings.\nDay 33: south pump at 47 psi; routine inspection, no findings.\nDay 34: west pump at 48 psi; routine inspection, no findings.\nDay 35: north pump at 49 psi; routine inspection, no findings.\nDay 36: east pump at 50 psi; filter changed.\nDay 37: south pump at 51 psi; routine inspection, no findings.\nDay 38: west pump at 52 psi; routine inspection, no findings.\nDay 39: north pump at 40 psi; routine inspection, no findings.\nDay 40: east pump at 41 psi; routine inspection, no findings.\nOn which days was a filter changed, on which pumps, and what is the mean pressure of the east pump?"
+    },
+    {
+      "name": "long/legal-terms",
+      "family": "long",
+      "prompt": "SECTION 1. DEFINITIONS.\n\"Agreement\" means this instrument together with every schedule and annex attached to it. \"Business Day\" means a day other than a Saturday, Sunday or public holiday in the jurisdiction of the service provider. \"Confidential Information\" means any information disclosed by one party to the other that is marked confidential or that a reasonable recipient would understand to be confidential.\n\nSECTION 2. SCOPE.\nThe provider shall supply the services described in Schedule A with reasonable skill and care and in accordance with applicable law. The customer shall provide timely access to the systems and personnel reasonably required for the services.\n\nSECTION 3. FEES AND PAYMENT.\nInvoices are payable within thirty (30) Business Days of receipt. Late payments accrue interest at one percent (1%) per month. All amounts are exclusive of value added tax.\n\nSummarize the obligations of each party and list every defined term."
+    },
+    {
+      "name": "long/table-csv",
+      "family": "long",
+      "prompt": "id,region,requests,errors,p50_ms,p95_ms,p99_ms\n0001,r1,1037,1,13,81,241\n0002,r2,1074,2,14,82,242\n0003,r3,1111,3,15,83,243\n0004,r4,1148,4,16,84,244\n0005,r5,1185,5,17,85,245\n0006,r6,1222,6,18,86,246\n0007,r0,1259,7,19,87,247\n0008,r1,1296,8,20,88,248\n0009,r2,1333,9,21,89,249\n0010,r3,1370,10,22,90,250\n0011,r4,1407,0,23,91,251\n0012,r5,1444,1,24,92,252\n0013,r6,1481,2,25,93,253\n0014,r0,1518,3,26,94,254\n0015,r1,1555,4,27,95,255\n0016,r2,1592,5,28,96,256\n0017,r3,1629,6,29,97,257\n0018,r4,1666,7,30,98,258\n0019,r5,1703,8,31,99,259\n0020,r6,1740,9,32,100,260\n0021,r0,1777,10,33,101,261\n0022,r1,1814,0,34,102,262\n0023,r2,1851,1,35,103,263\n0024,r3,1888,2,36,104,264\n0025,r4,1925,3,37,105,265\n0026,r5,1962,4,38,106,266\n0027,r6,1999,5,39,107,267\n0028,r0,2036,6,40,108,268\n0029,r1,2073,7,41,109,269\n0030,r2,2110,8,42,110,270\n0031,r3,2147,9,43,111,271\n0032,r4,2184,10,44,112,272\n0033,r5,2221,0,45,113,273\n0034,r6,2258,1,46,114,274\n0035,r0,2295,2,47,115,275\n0036,r1,2332,3,48,116,276\n0037,r2,2369,4,49,117,277\n0038,r3,2406,5,50,118,278\n0039,r4,2443,6,51,119,279\n0040,r5,2480,7,12,120,280\n0041,r6,2517,8,13,121,281\n0042,r0,2554,9,14,122,282\n0043,r1,2591,10,15,123,283\n0044,r2,2628,0,16,124,284\n0045,r3,2665,1,17,125,285\n0046,r4,2702,2,18,126,286\n0047,r5,2739,3,19,127,287\n0048,r6,2776,4,20,128,288\n0049,r0,2813,5,21,129,289\n0050,r1,2850,6,22,130,290\n0051,r2,2887,7,23,131,291\n0052,r3,2924,8,24,132,292\n0053,r4,2961,9,25,133,293\n0054,r5,2998,10,26,134,294\n0055,r6,3035,0,27,135,295\n0056,r0,3072,1,28,136,296\n0057,r1,3109,2,29,137,297\n0058,r2,3146,3,30,138,298\n0059,r3,3183,4,31,139,299\n0060,r4,3220,5,32,140,300\nCompute the total error rate, the busiest region, and the p99 for the slowest ten rows."
+    },
+    {
+      "name": "long/repeated-paragraph",
+      "family": "long",
+      "prompt": "The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. The tide enters the estuary twice a day. At spring tide the salt wedge reaches the third bend; at neap tide it stops below the bridge. The survey team measured salinity at eleven stations and recorded the depth of the halocline. \nHow many times does the paragraph repeat, and what is the difference between a spring and a neap tide?"
+    },
+    {
+      "name": "long/code-diff",
+      "family": "long",
+      "prompt": "diff --git a/src/coverage.rs b/src/coverage.rs\nindex 1a2b3c4..5d6e7f8 100644\n--- a/src/coverage.rs\n+++ b/src/coverage.rs\n@@ -41,9 +41,13 @@ impl Recorder {\n-    pub fn input_auto(&mut self, tokens: usize) {\n-        let name = format!(\"input-{}\", self.dump.inputs.len());\n+    pub fn input_auto_ids(&mut self, tokens: &[u32]) {\n+        let name = input_name(tokens);\n+        if self.dump.inputs.iter().any(|input| input.name == name) {\n+            return;\n+        }\n         self.input(name, tokens);\n     }\nExplain what the diff changes, whether the new function can panic, and which test would catch a regression."
+    },
+    {
+      "name": "misc/raw-continuation",
+      "family": "misc",
+      "prompt": "The three laws of thermodynamics can be stated informally as follows. First,"
+    },
+    {
+      "name": "misc/math-word-problem",
+      "family": "misc",
+      "prompt": "A cylindrical tank of radius 1.8 m and height 4.5 m is filled at 12 litres per second. A leak at the base removes 0.4 litres per second per metre of water depth. How long does it take to fill from empty, and what is the steady-state depth if the inlet stays open?"
+    },
+    {
+      "name": "misc/chemistry",
+      "family": "misc",
+      "prompt": "Balance the reaction: C3H8 + O2 -> CO2 + H2O. Then compute the mass of CO2 produced from 44.0 g of propane and the volume it occupies at 298 K and 1 atm."
+    },
+    {
+      "name": "misc/music",
+      "family": "misc",
+      "prompt": "X:1\nT:Coverage Reel\nM:4/4\nL:1/8\nK:D\n|: A2FA BAFA | d2cd BAFD | E2GE BEGE | F2AF dAFD :|\nIdentify the key, the time signature and the interval pattern in the first bar. Then write a second strain that returns to the tonic."
+    },
+    {
+      "name": "misc/program-trace",
+      "family": "misc",
+      "prompt": "[2026-11-19T11:46:38.001Z] rank0 world=1 layer=00 experts=[17, 88, 191, 204, 255, 301, 377, 402, 455, 512]\n[2026-11-19T11:46:38.002Z] rank0 world=1 layer=01 experts=[03, 44, 129, 200, 288, 333, 390, 411, 477, 500]\n[2026-11-19T11:46:38.003Z] rank0 world=1 layer=02 experts=[01, 99, 101, 177, 202, 303, 404, 456, 499, 511]\nThis is a routing trace. Tabulate the experts per layer, spot the duplicates and the out-of-range id, and say which layer the trace does not cover."
+    },
+    {
+      "name": "misc/unicode-confusables",
+      "family": "misc",
+      "prompt": "PayPal vs PayPa1 vs PауРаl (Cyrillic а and у) vs 𝘗𝘢𝘺𝘗𝘢𝘭. Identify each confusable code point, its script, and a normalization that would not merge them."
+    },
+    {
+      "name": "misc/multi-turn",
+      "family": "misc",
+      "prompt": "First turn: explain what a routed expert is. Second turn: given 48 layers and 512 experts, how many slots must a coverage suite reach? Third turn: why is a hit count of one enough?"
+    },
+    {
+      "name": "misc/chat-messages",
+      "family": "misc",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a terse numerics assistant. Answer with one sentence."
+        },
+        {
+          "role": "user",
+          "content": "What does the coverage prerequisite require of 48 layers with 512 routed experts each?"
+        }
+      ]
+    }
+  ]
+}

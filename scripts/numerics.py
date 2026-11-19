@@ -22,6 +22,11 @@
     numerics.py compare --anchor REFERENCE --candidate CAPTURE [--floor COMPARE.json]
                         [--json OUT] [--markdown OUT]
     numerics.py coverage --dump FILE [--layout FILE] [--min-inputs N]
+    numerics.py coverage-gaps --dump FILE [--layout FILE] [--json OUT]
+    numerics.py coverage-sweep --url URL --dump FILE --out SUITE.json [--corpus FILE]
+                        [--input-suite FILE] [--seen FILE] [--generate N] [--seed N]
+                        [--order shuffled|corpus] [--batch N] [--max-candidates N]
+                        [--max-tokens N] [--timeout S] [--json OUT]
     numerics.py monitors --reference REF.json --candidate CAND.json
                         --layer-bar X --expert-bar Y [--json OUT] [--markdown OUT]
     numerics.py fingerprint FILE...
@@ -40,7 +45,11 @@ compare  scores a teacher-forced capture against the anchor it was forced from: 
          TP=4 divergence) beside it.
 coverage judges a coverage dump against the model's expert layout: every decoder layer present,
          one hit count per routed expert, every routed expert positive, and at least the declared
-         number of inputs.
+         number of inputs. coverage-gaps reports what a partial dump has not reached yet.
+coverage-sweep sends a deterministic corpus to a server that is writing the dump, reads the dump
+         before and after each prompt, keeps a prompt only when its forward reached a slot no earlier
+         kept prompt reached, and writes the kept prompts as the next suite. The dump is the
+         evidence; the selection is measured, never the generator's opinion.
 monitors compares a candidate monitor dump with the reference forward, per layer and per expert,
          and fails every relative-L2 bar it exceeds.
 ci       the declaration check: a changed reference without a version bump fails, a bump without a
@@ -62,6 +71,7 @@ import re
 import struct
 import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -74,11 +84,16 @@ REGISTRY = f"{NUMERICS}/registry.toml"
 REFERENCES = f"{NUMERICS}/references/"
 CAPTURES = f"{NUMERICS}/captures/"
 DEFAULT_SUITE = REPO / NUMERICS / "prompts" / "reference.json"
+DEFAULT_COVERAGE_CORPUS = REPO / NUMERICS / "coverage" / "corpus.json"
 
 REFERENCE_SCHEMA = "sparkflash-numerics-reference/1"
 SUITE_SCHEMA = "sparkflash-numerics-prompts/1"
 COMPARE_SCHEMA = "sparkflash-numerics-compare/1"
 COVERAGE_SCHEMA = "sparkflash-numerics-coverage/1"
+COVERAGE_GAPS_SCHEMA = "sparkflash-numerics-coverage-gaps/1"
+COVERAGE_SWEEP_SCHEMA = "sparkflash-numerics-coverage-sweep/1"
+COVERAGE_CORPUS_SCHEMA = "sparkflash-numerics-coverage-corpus/1"
+COVERAGE_SEEN_SCHEMA = "sparkflash-numerics-coverage-seen/1"
 MONITORS_SCHEMA = "sparkflash-numerics-monitors/1"
 MONITOR_RESULT_SCHEMA = "sparkflash-numerics-monitor-result/1"
 LAYOUT_SCHEMA = "sparkflash-numerics-expert-layout/1"
@@ -1287,19 +1302,19 @@ def find_layout(model: str, override: Path | None) -> tuple[dict, str]:
     )
 
 
-def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int) -> dict:
-    """Judge one coverage dump against a model's expert layout.
+def coverage_inspect(dump: dict, layout: dict, layout_origin: str, min_inputs: int = 0) -> dict:
+    """Inspect one coverage dump's shape and report what it has not reached.
 
-    Every decoder layer must appear once, with one hit count per routed expert; a dense layer has
-    an empty hit list. Every routed expert of every layer must have a positive count, and the dump
-    must name at least the declared number of inputs.
+    This is the judge without the gate: every structural refusal is the same, but a zero hit count
+    becomes a gap in the report instead of a failure. `judge_coverage` is this plus the refusal;
+    `coverage-gaps` and `coverage-sweep` use the report to plan the next inputs.
     """
     if dump.get("schema") != COVERAGE_SCHEMA:
         raise NumericsFailure(f"coverage dump: schema {dump.get('schema')!r} is not {COVERAGE_SCHEMA}")
     if not isinstance(dump.get("model"), str) or not dump["model"]:
         raise NumericsFailure("coverage dump: the dump names no model")
-    if min_inputs < 1:
-        raise NumericsFailure(f"--min-inputs {min_inputs}: a coverage run needs at least one input")
+    if min_inputs < 0:
+        raise NumericsFailure(f"--min-inputs {min_inputs}: it cannot be negative")
     expected = layout_experts(layout, layout_origin)
     if dump["model"] != layout.get("model"):
         raise NumericsFailure(
@@ -1307,7 +1322,9 @@ def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int
             f"{layout.get('model')!r}"
         )
     inputs = dump.get("inputs")
-    if not isinstance(inputs, list) or not inputs:
+    if not isinstance(inputs, list):
+        raise NumericsFailure("coverage dump: inputs is not a list")
+    if not inputs and min_inputs > 0:
         raise NumericsFailure("coverage dump: it holds no inputs")
     names = set()
     for entry in inputs:
@@ -1345,6 +1362,9 @@ def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int
         by_layer[number] = hits
     covered = []
     total_experts = 0
+    covered_experts = 0
+    missing_slots: list[list[int]] = []
+    missing_by_layer: dict[int, list[int]] = {}
     for number, experts in enumerate(expected):
         if number not in by_layer:
             raise NumericsFailure(
@@ -1358,7 +1378,17 @@ def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int
                     f"coverage dump: layer {number} is dense (no routed experts), but it holds "
                     f"{len(hits)} hit count(s)"
                 )
-            covered.append({"layer": number, "experts": 0, "hits": 0, "min": None, "max": None})
+            covered.append(
+                {
+                    "layer": number,
+                    "experts": 0,
+                    "hits": 0,
+                    "min": None,
+                    "max": None,
+                    "missing": [],
+                    "counts": [],
+                }
+            )
             continue
         if len(hits) != experts:
             raise NumericsFailure(
@@ -1366,25 +1396,56 @@ def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int
                 "experts; the count must match the layout exactly"
             )
         missing = [expert for expert, hit in enumerate(hits) if hit == 0]
+        missing_slots.extend([number, expert] for expert in missing)
         if missing:
-            shown = ", ".join(str(expert) for expert in missing[:8])
-            more = "" if len(missing) <= 8 else f" and {len(missing) - 8} more"
-            raise NumericsFailure(
-                f"coverage dump: layer {number} never reaches expert(s) {shown}{more}; the coverage "
-                "inputs must reach every routed expert of every layer"
-            )
+            missing_by_layer[number] = missing
         total_experts += experts
+        covered_experts += experts - len(missing)
         covered.append(
-            {"layer": number, "experts": experts, "hits": sum(hits), "min": min(hits), "max": max(hits)}
+            {
+                "layer": number,
+                "experts": experts,
+                "hits": sum(hits),
+                "min": min(hits),
+                "max": max(hits),
+                "missing": missing,
+                "counts": hits,
+            }
         )
     return {
         "schema": COVERAGE_SCHEMA,
         "model": dump["model"],
         "inputs": len(inputs),
+        "input_names": [entry["name"] for entry in inputs],
         "layers": covered,
         "experts": total_experts,
+        "covered_experts": covered_experts,
+        "missing": missing_slots,
+        "missing_by_layer": missing_by_layer,
         "layout": layout_origin,
     }
+
+
+def judge_coverage(dump: dict, layout: dict, layout_origin: str, min_inputs: int) -> dict:
+    """Judge one coverage dump against a model's expert layout.
+
+    Every decoder layer must appear once, with one hit count per routed expert; a dense layer has
+    an empty hit list. Every routed expert of every layer must have a positive count, and the dump
+    must name at least the declared number of inputs.
+    """
+    if min_inputs < 1:
+        raise NumericsFailure(f"--min-inputs {min_inputs}: a coverage run needs at least one input")
+    result = coverage_inspect(dump, layout, layout_origin, min_inputs)
+    if result["missing"]:
+        number = result["missing"][0][0]
+        missing = result["missing_by_layer"][number]
+        shown = ", ".join(str(expert) for expert in missing[:8])
+        more = "" if len(missing) <= 8 else f" and {len(missing) - 8} more"
+        raise NumericsFailure(
+            f"coverage dump: layer {number} never reaches expert(s) {shown}{more}; the coverage "
+            "inputs must reach every routed expert of every layer"
+        )
+    return result
 
 
 def render_coverage(result: dict) -> str:
@@ -1408,6 +1469,750 @@ def render_coverage(result: dict) -> str:
         f"{result['inputs']} input(s).",
     ]
     return "\n".join(lines) + "\n"
+
+
+# --- the growing coverage suite ---------------------------------------------------------------
+
+
+def coverage_gaps_document(result: dict, dump_origin: str) -> dict:
+    """The judge's missing-expert report, as a machine-readable document."""
+    total = result["experts"]
+    covered = result["covered_experts"]
+    return {
+        "schema": COVERAGE_GAPS_SCHEMA,
+        "model": result["model"],
+        "layout": result["layout"],
+        "dump": dump_origin,
+        "slots": total,
+        "covered": covered,
+        "missing": len(result["missing"]),
+        "coverage": (covered / total) if total else 1.0,
+        "complete": not result["missing"],
+        "layers": [
+            {"layer": layer["layer"], "experts": layer["experts"], "missing": layer["missing"]}
+            for layer in result["layers"]
+            if layer["experts"] and layer["missing"]
+        ],
+    }
+
+
+def render_coverage_gaps(result: dict) -> str:
+    total = result["experts"]
+    covered = result["covered_experts"]
+    missing = len(result["missing"])
+    ratio = (covered / total) if total else 1.0
+    lines = [
+        f"coverage gaps: {result['model']}, {len(result['layers'])} layer(s), {total} routed "
+        f"slot(s): {missing} missing ({ratio:.2%} covered); layout {result['layout']}",
+        "",
+    ]
+    if not missing:
+        lines.append("PASS coverage: every routed expert of every layer has a positive hit count.")
+        return "\n".join(lines) + "\n"
+    lines += [
+        "| layer | routed experts | missing | expert ids (first 16) |",
+        "| --: | --: | --: | :-- |",
+    ]
+    for layer in result["layers"]:
+        if not layer["experts"] or not layer["missing"]:
+            continue
+        shown = ", ".join(str(expert) for expert in layer["missing"][:16])
+        more = "" if len(layer["missing"]) <= 16 else f" and {len(layer['missing']) - 16} more"
+        lines.append(
+            f"| {layer['layer']} | {layer['experts']} | {len(layer['missing'])} | {shown}{more} |"
+        )
+    lines += ["", "The full list is in --json; coverage-sweep uses the same inspection."]
+    return "\n".join(lines) + "\n"
+
+
+def _coverage_entry(raw: object, origin: str) -> dict:
+    """One corpus or suite entry: a name and exactly one of prompt or messages."""
+    if not isinstance(raw, dict):
+        raise NumericsFailure(f"{origin}: a prompt is not an object")
+    name = raw.get("name")
+    if not isinstance(name, str) or not name:
+        raise NumericsFailure(f"{origin}: every prompt needs a non-empty name")
+    has_prompt, has_messages = "prompt" in raw, "messages" in raw
+    if has_prompt == has_messages:
+        raise NumericsFailure(f"{origin}: prompt {name!r} needs exactly one of prompt or messages")
+    entry: dict = {"name": name}
+    if has_prompt:
+        if not isinstance(raw["prompt"], str) or not raw["prompt"].strip():
+            raise NumericsFailure(f"{origin}: prompt {name!r} has no text")
+        entry["prompt"] = raw["prompt"]
+    else:
+        messages = raw["messages"]
+        if (
+            not isinstance(messages, list)
+            or not messages
+            or not all(isinstance(message, dict) and isinstance(message.get("content"), str) for message in messages)
+        ):
+            raise NumericsFailure(
+                f"{origin}: prompt {name!r} needs a non-empty messages list of role/content objects"
+            )
+        entry["messages"] = messages
+    family = raw.get("family")
+    if isinstance(family, str) and family:
+        entry["family"] = family
+    return entry
+
+
+def coverage_prompt_digest(entry: dict) -> str:
+    """The content identity of one corpus prompt, independent of its name."""
+    if "prompt" in entry:
+        text = entry["prompt"]
+    else:
+        text = json.dumps(entry["messages"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_coverage_corpus(path: Path) -> tuple[list[dict], list[str]]:
+    """A coverage corpus, with duplicate content dropped (first name wins)."""
+    document = load_json(path)
+    if document.get("schema") != COVERAGE_CORPUS_SCHEMA:
+        raise NumericsFailure(
+            f"{path}: schema {document.get('schema')!r} is not {COVERAGE_CORPUS_SCHEMA}"
+        )
+    raw = document.get("prompts")
+    if not isinstance(raw, list) or not raw:
+        raise NumericsFailure(f"{path}: the corpus holds no prompts")
+    entries: list[dict] = []
+    names: set[str] = set()
+    digests: set[str] = set()
+    duplicates: list[str] = []
+    for item in raw:
+        entry = _coverage_entry(item, str(path))
+        if entry["name"] in names:
+            raise NumericsFailure(f"{path}: prompt name {entry['name']!r} appears more than once")
+        names.add(entry["name"])
+        digest = coverage_prompt_digest(entry)
+        if digest in digests:
+            duplicates.append(entry["name"])
+            continue
+        digests.add(digest)
+        entries.append(entry)
+    return entries, duplicates
+
+
+def load_coverage_input_suite(path: Path) -> tuple[set[str], set[str]]:
+    """The content of a suite that produced the dump's existing inputs.
+
+    Returns the text digests and the content-addressed input names it declares, so a sweep can
+    skip every prompt that suite already ran. This is a declaration by the operator: the dump's
+    position-addressed inputs (input-0, ...) carry no content of their own.
+    """
+    document = load_json(path)
+    if document.get("schema") not in (SUITE_SCHEMA, COVERAGE_CORPUS_SCHEMA):
+        raise NumericsFailure(
+            f"{path}: schema {document.get('schema')!r} is not {SUITE_SCHEMA} or {COVERAGE_CORPUS_SCHEMA}"
+        )
+    raw = document.get("prompts")
+    if not isinstance(raw, list) or not raw:
+        raise NumericsFailure(f"{path}: the suite holds no prompts")
+    digests: set[str] = set()
+    input_names: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise NumericsFailure(f"{path}: a prompt is not an object")
+        if "prompt_ids" in item:
+            ids = item["prompt_ids"]
+            if not isinstance(ids, list) or not ids or not all(is_integer(token) and 0 <= token <= 0xFFFFFFFF for token in ids):
+                raise NumericsFailure(f"{path}: a prompt_ids entry needs a non-empty list of u32 ids")
+            input_names.add(token_input_name(ids))
+            digests.add(hashlib.sha256(json.dumps(ids).encode()).hexdigest())
+            continue
+        entry = _coverage_entry(item, str(path))
+        digests.add(coverage_prompt_digest(entry))
+    return digests, input_names
+
+
+def token_input_name(tokens: list[int]) -> str:
+    """The Rust recorder's content-addressed input name: FNV-1a 64 over little-endian u32s."""
+    digest = 0xCBF29CE484222325
+    for token in tokens:
+        for byte in struct.pack("<I", token):
+            digest ^= byte
+            digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"input-{digest:016x}"
+
+
+def load_coverage_seen(path: Path, model: str) -> dict:
+    """The prompts a sweep already sent for one dump, by content digest."""
+    if not path.exists():
+        return {"digests": set(), "inputs": set(), "entries": {}}
+    document = load_json(path)
+    if document.get("schema") != COVERAGE_SEEN_SCHEMA:
+        raise NumericsFailure(f"{path}: schema {document.get('schema')!r} is not {COVERAGE_SEEN_SCHEMA}")
+    if document.get("model") != model:
+        raise NumericsFailure(f"{path}: it names {document.get('model')!r}, but the dump names {model!r}")
+    raw = document.get("inputs")
+    if not isinstance(raw, list):
+        raise NumericsFailure(f"{path}: inputs is not a list")
+    digests: set[str] = set()
+    inputs: set[str] = set()
+    entries: dict[str, dict] = {}
+    for item in raw:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("sha256"), str)
+            or len(item["sha256"]) != 64
+            or not all(character in "0123456789abcdef" for character in item["sha256"])
+            or not isinstance(item.get("name"), str)
+            or not item["name"]
+        ):
+            raise NumericsFailure(f"{path}: every seen input needs a name and a sha256")
+        digest = item["sha256"]
+        if digest in digests:
+            continue
+        digests.add(digest)
+        input_name = item.get("input")
+        if isinstance(input_name, str) and input_name:
+            inputs.add(input_name)
+        entries[digest] = {
+            "name": item["name"],
+            "sha256": digest,
+            "input": input_name if isinstance(input_name, str) and input_name else None,
+        }
+    return {"digests": digests, "inputs": inputs, "entries": entries}
+
+
+def write_coverage_seen(path: Path, model: str, entries: dict[str, dict]) -> None:
+    """Write the seen manifest atomically, sorted by digest so a rerun is byte-identical."""
+    document = {
+        "schema": COVERAGE_SEEN_SCHEMA,
+        "model": model,
+        "inputs": [
+            {"name": entries[key]["name"], "sha256": key, "input": entries[key]["input"]}
+            for key in sorted(entries)
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def coverage_covered(result: dict) -> set[tuple[int, int]]:
+    return {
+        (layer["layer"], expert)
+        for layer in result["layers"]
+        if layer["experts"]
+        for expert, hit in enumerate(layer["counts"])
+        if hit > 0
+    }
+
+
+def coverage_counts(result: dict) -> dict[int, list[int]]:
+    return {layer["layer"]: layer["counts"] for layer in result["layers"] if layer["experts"]}
+
+
+# The generator's character classes. Each is a distinct part of a tokenizer's vocabulary; the
+# selection is measured, so this list only proposes inputs, it does not choose them.
+_COVERAGE_ALPHABETS = {
+    "ascii": "".join(chr(code) for code in range(32, 127)),
+    "latin-extended": "".join(chr(code) for code in range(0xA0, 0x100)),
+    "greek": "".join(chr(code) for code in range(0x391, 0x3CA)),
+    "cyrillic": "".join(chr(code) for code in range(0x410, 0x450)),
+    "hebrew": "".join(chr(code) for code in range(0x5D0, 0x5EB)),
+    "arabic": "".join(chr(code) for code in range(0x621, 0x64B)),
+    "devanagari": "".join(chr(code) for code in range(0x900, 0x951)),
+    "thai": "".join(chr(code) for code in range(0xE01, 0xE3B)),
+    "hangul": "".join(chr(code) for code in range(0xAC00, 0xAC00 + 200)),
+    "hiragana": "".join(chr(code) for code in range(0x3041, 0x3097)),
+    "han": "".join(chr(code) for code in range(0x4E00, 0x4E00 + 300)),
+    "math": "".join(chr(code) for code in range(0x2200, 0x22FF)),
+    "box": "".join(chr(code) for code in range(0x2500, 0x2580)),
+    "braille": "".join(chr(code) for code in range(0x2800, 0x2900)),
+    "combining": "".join(chr(code) for code in range(0x300, 0x370)),
+    "emoji": list("😀🚀🧪🔥🌍🎛️🧬🛰️📈🪐🫧🦾🧠🕹️🪄🎼"),
+}
+
+_COVERAGE_CODE = (
+    "fn @ID@(values: &[u32]) -> u64 {\n    values.iter().map(|value| u64::from(*value)).sum()\n}\n\n// @WORD@ @HEX@\n",
+    "def @ID@(values):\n    return sum(value * @N@ for value in values)\n\n# @WORD@ @HEX@\n",
+    "static uint64_t @ID@(const uint32_t *values, size_t count) {\n    uint64_t total = 0;\n    for (size_t i = 0; i < count; ++i) total += values[i];\n    return total;\n}\n/* @WORD@ @HEX@ */\n",
+    "const @ID@ = (values) => values.reduce((total, value) => total + value * @N@, 0);\n// @WORD@ @HEX@\n",
+    "SELECT @ID@, COUNT(*) FROM events\nWHERE stamp >= '2026-@N@-01' AND kind = '@WORD@'\nGROUP BY @ID@ ORDER BY 2 DESC;\n-- @HEX@\n",
+    "for file in \"$@\"; do\n  sha256sum \"$file\" | cut -c1-16\ndone\n# @WORD@ @HEX@\n",
+    "mov rax, @N@\nxor rcx, rcx\nloop_@N@:\n  add rcx, [rdi + rax * 8]\n  dec rax\n  jnz loop_@N@\nret\n; @WORD@ @HEX@\n",
+    "{\"name\": \"@WORD@\", \"id\": @N@, \"digest\": \"@HEX@\", \"values\": [@N@, @N@, @N@]}\n",
+    "@WORD@:\n  id: @N@\n  digest: @HEX@\n  paths:\n    - /var/lib/@WORD@/@N@\n    - /srv/@WORD@/cache\n",
+    "^(?P<@ID@>[a-z0-9_-]{2,32})(?:\\s+)(?P<@WORD@>\\d{1,9})(?:\\s+)(?P<@HEX@>[0-9a-f]{16})$\n",
+    "<section id=\"@ID@\" data-id=\"@N@\">\n  <p>@WORD@ @HEX@</p>\n  <span class=\"@WORD@\">@N@</span>\n</section>\n",
+    "\\begin{equation}\n  @ID@(x) = \\sum_{i=1}^{@N@} \\frac{x_i^{2}}{i + @N@}\n\\end{equation}\n% @WORD@ @HEX@\n",
+)
+
+_COVERAGE_WORDS = (
+    "alpha", "bridge", "cipher", "delta", "ember", "fathom", "glacier", "harbor", "isotope",
+    "juniper", "kestrel", "lattice", "magnet", "nebula", "obsidian", "prairie", "quartz",
+    "ripple", "saffron", "tundra", "umbra", "vector", "willow", "xenon", "yarrow", "zenith",
+)
+
+
+def _generation_bytes(seed: int, index: int, purpose: str) -> bytes:
+    return hashlib.sha256(f"coverage-generation:{seed}:{index}:{purpose}".encode()).digest()
+
+
+def _generation_string(alphabet: str | list[str], length: int, digest: bytes) -> str:
+    out: list[str] = []
+    block = digest
+    while len(out) < length:
+        for byte in block:
+            out.append(alphabet[byte % len(alphabet)])
+            if len(out) >= length:
+                break
+        block = hashlib.sha256(block).digest()
+    return "".join(out)
+
+
+def _generation_pick(values: tuple | list, digest: bytes, offset: int = 0) -> object:
+    return values[digest[offset % len(digest)] % len(values)]
+
+
+def _generate_charset(seed: int, index: int, digest: bytes) -> str:
+    names = sorted(_COVERAGE_ALPHABETS)
+    name = names[digest[0] % len(names)]
+    length = 64 + digest[1] * 8
+    body = _generation_string(_COVERAGE_ALPHABETS[name], length, _generation_bytes(seed, index, "charset"))
+    return f"[{name} {index}]\n{body}"
+
+
+def _generate_numerals(seed: int, index: int, digest: bytes) -> str:
+    mode = digest[0] % 4
+    body = _generation_bytes(seed, index, "numerals")
+    if mode == 0:
+        text = _generation_string("0123456789", 512, body)
+    elif mode == 1:
+        text = " ".join(f"{byte:02x}" for byte in body * 8)
+    elif mode == 2:
+        text = "\n".join(
+            f"{int.from_bytes(body[start : start + 8], 'big') / (10 ** (start % 12 + 1)):.9e}"
+            for start in range(0, 64, 8)
+        )
+    else:
+        text = "\n".join(
+            f"2026-{byte % 12 + 1:02d}-{byte % 28 + 1:02d}T{byte % 24:02d}:{byte % 60:02d}:{byte % 60:02d}Z "
+            f"{byte}.{byte % 256}.{byte % 256}.{byte % 256}/{byte % 32 + 1}"
+            for byte in body
+        )
+    return f"# numerals {index} mode {mode}\n{text}"
+
+
+def _generate_code(seed: int, index: int, digest: bytes) -> str:
+    template = _generation_pick(_COVERAGE_CODE, digest)
+    word = _generation_pick(_COVERAGE_WORDS, digest, 1)
+    identifier = f"{word}_{index:05d}"
+    text = (
+        template.replace("@ID@", identifier)
+        .replace("@WORD@", word)
+        .replace("@HEX@", digest.hex()[:32])
+        .replace("@N@", str(int.from_bytes(digest[:4], "big") % 100000 + 1))
+    )
+    return f"# code {index}\n{text}"
+
+
+def _generate_scripts(seed: int, index: int, digest: bytes) -> str:
+    names = sorted(name for name in _COVERAGE_ALPHABETS if name not in ("ascii", "latin-extended", "math", "box", "braille", "combining"))
+    name = names[digest[0] % len(names)]
+    alphabet = _COVERAGE_ALPHABETS[name]
+    words = 12 + digest[1] % 24
+    pieces = []
+    for word_index in range(words):
+        length = 3 + (digest[(word_index + 2) % len(digest)] % 7)
+        pieces.append(_generation_string(alphabet, length, _generation_bytes(seed, index, f"script-{word_index}")))
+    return f"[{name} {index}]\n" + " ".join(pieces)
+
+
+def _generate_long(seed: int, index: int, digest: bytes) -> str:
+    paragraphs = 6 + digest[0] % 20
+    lines = [
+        f"# long document {index}",
+        "",
+        "The following record is a fixed test document. It repeats a small vocabulary with changing "
+        "identifiers so the model sees a long, self-similar context rather than one short sentence.",
+    ]
+    for paragraph in range(paragraphs):
+        key = _generation_bytes(seed, index, f"paragraph-{paragraph}")
+        word = _generation_pick(_COVERAGE_WORDS, key)
+        lines += [
+            "",
+            f"Section {paragraph + 1}.{index}. The {word} record carries identifier "
+            f"{key.hex()[:12]} at offset {int.from_bytes(key[:4], 'big') % 100000}. "
+            f"Its measured value is {int.from_bytes(key[4:8], 'big') % 10000} units, and the "
+            f"corresponding control value is {int.from_bytes(key[8:12], 'big') % 10000} units. "
+            f"The same row is repeated in the appendix with the tag {key.hex()[12:20]}.",
+        ]
+    lines += ["", "Appendix table", "", "| key | value | tag |", "| :-- | --: | :-- |"]
+    for row in range(6):
+        key = _generation_bytes(seed, index, f"table-{row}")
+        lines.append(f"| {key.hex()[:8]} | {int.from_bytes(key[8:12], 'big') % 10000} | {key.hex()[12:20]} |")
+    return "\n".join(lines)
+
+
+def _generate_repetition(seed: int, index: int, digest: bytes) -> str:
+    unit = _generation_pick(("the ", "0", "ab", "αβ", "TODO: ", "1 2 3 ", "\n", "∑ "), digest)
+    count = 128 + digest[1] * 16
+    body = unit * count
+    return f"# repetition {index}\n{body}"
+
+
+def _generate_mixed(seed: int, index: int, digest: bytes) -> str:
+    charset = _generate_charset(seed, index + 100000, digest)
+    code = _generate_code(seed, index + 100000, _generation_bytes(seed, index, "mixed-code"))
+    numerals = _generate_numerals(seed, index + 100000, _generation_bytes(seed, index, "mixed-numerals"))
+    scripts = _generate_scripts(seed, index + 100000, _generation_bytes(seed, index, "mixed-scripts"))
+    return f"{charset}\n\n{code}\n\n{numerals}\n\n{scripts}"
+
+
+def generate_coverage_prompts(seed: int, count: int) -> list[dict]:
+    """A deterministic corpus of generated inputs; the sweep measures which ones help."""
+    if count < 0:
+        raise NumericsFailure(f"--generate {count}: it cannot be negative")
+    families = ("charset", "numerals", "code", "scripts", "long", "repetition", "mixed")
+    generators = {
+        "charset": _generate_charset,
+        "numerals": _generate_numerals,
+        "code": _generate_code,
+        "scripts": _generate_scripts,
+        "long": _generate_long,
+        "repetition": _generate_repetition,
+        "mixed": _generate_mixed,
+    }
+    prompts = []
+    for index in range(count):
+        family = families[index % len(families)]
+        digest = _generation_bytes(seed, index, family)
+        prompts.append(
+            {
+                "name": f"gen/{seed}/{index:05d}",
+                "family": family,
+                "prompt": generators[family](seed, index, digest),
+            }
+        )
+    return prompts
+
+
+def tokenize_coverage_prompt(url: str, model: str, entry: dict, timeout: float) -> list[int]:
+    if "prompt_ids" in entry:
+        ids = entry["prompt_ids"]
+    elif "messages" in entry:
+        try:
+            ids = http_json(f"{url}/tokenize", {"model": model, "messages": entry["messages"]}, timeout)["tokens"]
+        except KeyError as error:
+            raise NumericsFailure(f"prompt {entry['name']!r}: /tokenize returned no tokens") from error
+    else:
+        try:
+            ids = http_json(
+                f"{url}/tokenize",
+                {"model": model, "prompt": entry["prompt"], "add_special_tokens": True},
+                timeout,
+            )["tokens"]
+        except KeyError as error:
+            raise NumericsFailure(f"prompt {entry['name']!r}: /tokenize returned no tokens") from error
+    if not isinstance(ids, list) or not ids:
+        raise NumericsFailure(f"prompt {entry['name']!r}: tokenization returned no ids")
+    if not all(is_integer(token) and 0 <= token <= 0xFFFFFFFF for token in ids):
+        raise NumericsFailure(f"prompt {entry['name']!r}: tokenization returned a non-u32 id")
+    return ids
+
+
+def run_coverage_prompt(url: str, model: str, ids: list[int], max_tokens: int, timeout: float) -> None:
+    body = {"model": model, "prompt": ids, "temperature": 0, "max_tokens": max_tokens}
+    response = http_json(f"{url}/v1/completions", body, timeout)
+    if not isinstance(response.get("choices"), list) or not response["choices"]:
+        raise NumericsFailure(f"prompt {ids[0]}: the server returned no choice")
+
+
+def wait_for_coverage(
+    path: Path, before_inputs: int, layout: dict, layout_origin: str, timeout: float
+) -> tuple[dict, dict]:
+    """Wait for the server to write a dump with one more input, then inspect it."""
+    deadline = time.monotonic() + timeout
+    last = "the dump has not been read"
+    while True:
+        try:
+            document = load_json(path)
+            result = coverage_inspect(document, layout, layout_origin, 0)
+            if result["inputs"] > before_inputs:
+                return document, result
+            last = f"it still names {result['inputs']} input(s)"
+        except NumericsFailure as error:
+            last = str(error)
+        if time.monotonic() >= deadline:
+            raise NumericsFailure(
+                f"{path}: no new input appeared within {timeout:g}s ({last}); launch the server with "
+                "SPARKFLASH_NUMERICS_COVERAGE naming this path and leave the sweep on an idle server"
+            )
+        time.sleep(0.05)
+
+
+def render_coverage_sweep(report: dict) -> str:
+    lines = [
+        f"coverage sweep: {report['model']}, {report['slots']} routed slot(s); layout {report['layout']}",
+        f"seed {report['seed']}, order {report['order']}, batch {report['batch_size']}, "
+        f"dump {report['dump']}",
+        f"missing before: {report['missing_before']} ({report['coverage_before']:.2%} covered)",
+        "",
+        "| batch | sent | kept | discarded | empty | new slots | missing after | coverage after |",
+        "| --: | --: | --: | --: | --: | --: | --: | --: |",
+    ]
+    for batch in report["batches"]:
+        lines.append(
+            f"| {batch['index']} | {batch['sent']} | {batch['kept']} | {batch['discarded']} | "
+            f"{batch['empty']} | {batch['new_slots']} | {batch['missing_after']} | "
+            f"{batch['coverage_after']:.2%} |"
+        )
+    skipped = ", ".join(f"{name} {count}" for name, count in report["skipped"].items() if count) or "none"
+    lines += [
+        "",
+        f"selected {report['selected']} prompt(s) from {report['sent']} sent; skipped: {skipped}",
+        f"missing after: {report['missing_after']} ({report['coverage_after']:.2%} covered)",
+    ]
+    if report["complete"]:
+        lines.append("PASS coverage: the dump now reaches every routed expert of every layer.")
+    else:
+        lines.append(
+            "not complete: run another window with the same dump and seen manifest, or a larger "
+            "--generate corpus; the judge is still the gate."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def sweep_coverage(args: argparse.Namespace) -> tuple[dict, list[dict]]:
+    """Greedily select measured prompts from a corpus against a dump's missing experts.
+
+    Every candidate is sent to the live server and the dump is read before and after its forward,
+    so the slots a prompt actually reached are what decides whether it is kept. The dump itself is
+    the evidence; the returned selection is the suite that reproduces the measured additions.
+    """
+    dump = load_json(args.dump)
+    model = dump.get("model")
+    if not isinstance(model, str) or not model:
+        raise NumericsFailure(f"{args.dump}: the dump names no model")
+    layout, origin = find_layout(model, args.layout)
+    result = coverage_inspect(dump, layout, origin, 0)
+    total = result["experts"]
+    covered = coverage_covered(result)
+    missing_before = total - len(covered)
+    if args.batch < 1:
+        raise NumericsFailure(f"--batch {args.batch}: it must be at least one")
+    if args.max_candidates < 1:
+        raise NumericsFailure(f"--max-candidates {args.max_candidates}: it must be at least one")
+    if args.max_tokens < 1:
+        raise NumericsFailure(f"--max-tokens {args.max_tokens}: it must be at least one")
+    if missing_before == 0:
+        report = {
+            "schema": COVERAGE_SWEEP_SCHEMA,
+            "model": model,
+            "layout": origin,
+            "dump": str(args.dump),
+            "seed": args.seed,
+            "order": args.order,
+            "batch_size": args.batch,
+            "max_tokens": args.max_tokens,
+            "slots": total,
+            "missing_before": 0,
+            "coverage_before": 1.0,
+            "missing_after": 0,
+            "coverage_after": 1.0,
+            "complete": True,
+            "sent": 0,
+            "selected": 0,
+            "selected_names": [],
+            "skipped": {},
+            "duplicates": [],
+            "batches": [],
+            "seen": str(args.seen or Path(f"{args.dump}.seen.json")),
+        }
+        return report, []
+
+    card = fetch_card(args.url, args.timeout)
+    if card.get("id") != model:
+        raise NumericsFailure(
+            f"{args.url}: the server names {card.get('id')!r}, but {args.dump} names {model!r}; "
+            "the sweep would record another model's routing"
+        )
+
+    corpus, duplicates = load_coverage_corpus(args.corpus)
+    generated = generate_coverage_prompts(args.seed, args.generate) if args.generate else []
+    candidates: list[dict] = []
+    names: set[str] = set()
+    digests: set[str] = set()
+    for entry in [*corpus, *generated]:
+        if entry["name"] in names:
+            raise NumericsFailure(
+                f"the corpus and the generator both name {entry['name']!r}; rename one or change --seed"
+            )
+        names.add(entry["name"])
+        digest = coverage_prompt_digest(entry)
+        if digest in digests:
+            duplicates.append(entry["name"])
+            continue
+        digests.add(digest)
+        candidates.append(entry)
+    if not candidates:
+        raise NumericsFailure(
+            f"{args.corpus}: every prompt is already a duplicate; the sweep has nothing to measure"
+        )
+    if args.order == "shuffled":
+        candidates.sort(
+            key=lambda entry: hashlib.sha256(f"{args.seed}:{entry['name']}".encode()).hexdigest()
+        )
+
+    seen_path = args.seen or Path(f"{args.dump}.seen.json")
+    seen = load_coverage_seen(seen_path, model)
+    if args.input_suite:
+        suite_digests, suite_inputs = load_coverage_input_suite(args.input_suite)
+        seen["digests"] |= suite_digests
+        seen["inputs"] |= suite_inputs
+    seen_entries = dict(seen["entries"])
+    # The old recorder's position-addressed names are input-0, input-1, ...; a content-addressed
+    # name is 16 hex digits, so it cannot be mistaken for a legacy one.
+    legacy = {name for name in result["input_names"] if re.fullmatch(r"input-\d{1,15}", name)}
+    mapped = {entry["input"] for entry in seen_entries.values() if entry.get("input")}
+    if legacy and not args.input_suite and not legacy <= mapped:
+        raise NumericsFailure(
+            f"{args.dump}: it holds {len(legacy)} position-addressed input(s) (input-0, ...) with no "
+            "content identity, so the sweep cannot prove it would not repeat one; pass --input-suite "
+            "FILE (the suite that produced them) or a --seen manifest, or start a fresh dump"
+        )
+
+    def remember(entry: dict, input_name: str | None) -> None:
+        digest = coverage_prompt_digest(entry)
+        seen_entries[digest] = {
+            "name": entry["name"],
+            "sha256": digest,
+            "input": input_name,
+        }
+        seen["digests"].add(digest)
+        if input_name:
+            seen["inputs"].add(input_name)
+
+    dump_names = set(result["input_names"])
+    current = result
+    selected: list[dict] = []
+    batches: list[dict] = []
+    skipped = {"already-seen": 0, "already-in-dump": 0, "name-in-dump": 0}
+    sent = 0
+    batch = {
+        "sent": 0,
+        "kept": 0,
+        "discarded": 0,
+        "empty": 0,
+        "new_slots": 0,
+        "missing_before": missing_before,
+    }
+
+    def close_batch() -> None:
+        if not batch["sent"]:
+            return
+        missing_after = total - len(covered)
+        batches.append(
+            {
+                "index": len(batches) + 1,
+                "sent": batch["sent"],
+                "kept": batch["kept"],
+                "discarded": batch["discarded"],
+                "empty": batch["empty"],
+                "new_slots": batch["new_slots"],
+                "missing_before": batch["missing_before"],
+                "missing_after": missing_after,
+                "coverage_before": (total - batch["missing_before"]) / total,
+                "coverage_after": (total - missing_after) / total,
+            }
+        )
+        batch.update(
+            {
+                "sent": 0,
+                "kept": 0,
+                "discarded": 0,
+                "empty": 0,
+                "new_slots": 0,
+                "missing_before": missing_after,
+            }
+        )
+        # A window can be interrupted between batches; keep the manifest current so a rerun does
+        # not repeat what this one already measured.
+        write_coverage_seen(seen_path, model, seen_entries)
+
+    try:
+        for entry in candidates:
+            if sent >= args.max_candidates or len(covered) == total:
+                break
+            digest = coverage_prompt_digest(entry)
+            if digest in seen["digests"]:
+                skipped["already-seen"] += 1
+                continue
+            if entry["name"] in dump_names:
+                skipped["name-in-dump"] += 1
+                continue
+            ids = tokenize_coverage_prompt(args.url, model, entry, args.timeout)
+            input_name = token_input_name(ids)
+            if input_name in dump_names or input_name in seen["inputs"]:
+                skipped["already-in-dump"] += 1
+                remember(entry, input_name)
+                continue
+            before_inputs = current["inputs"]
+            before_counts = coverage_counts(current)
+            run_coverage_prompt(args.url, model, ids, args.max_tokens, args.timeout)
+            _, current = wait_for_coverage(args.dump, before_inputs, layout, origin, args.timeout)
+            after_counts = coverage_counts(current)
+            reached: set[tuple[int, int]] = set()
+            for layer, counts in after_counts.items():
+                previous = before_counts.get(layer)
+                if previous is None or len(previous) != len(counts):
+                    raise NumericsFailure(
+                        f"{args.dump}: layer {layer} changed shape during the sweep; the server is "
+                        "writing a different layout"
+                    )
+                for expert, count in enumerate(counts):
+                    if count > previous[expert]:
+                        reached.add((layer, expert))
+            new = reached - covered
+            if new:
+                covered |= reached
+                selected.append(entry)
+                batch["kept"] += 1
+                batch["new_slots"] += len(new)
+            else:
+                batch["discarded"] += 1
+                if not reached:
+                    batch["empty"] += 1
+            sent += 1
+            batch["sent"] += 1
+            remember(entry, input_name)
+            dump_names.add(input_name)
+            if batch["sent"] >= args.batch:
+                close_batch()
+        close_batch()
+    finally:
+        write_coverage_seen(seen_path, model, seen_entries)
+
+    missing_after = total - len(covered)
+    report = {
+        "schema": COVERAGE_SWEEP_SCHEMA,
+        "model": model,
+        "layout": origin,
+        "dump": str(args.dump),
+        "seed": args.seed,
+        "order": args.order,
+        "batch_size": args.batch,
+        "max_tokens": args.max_tokens,
+        "slots": total,
+        "missing_before": missing_before,
+        "coverage_before": (total - missing_before) / total,
+        "missing_after": missing_after,
+        "coverage_after": (total - missing_after) / total,
+        "complete": missing_after == 0,
+        "sent": sent,
+        "selected": len(selected),
+        "selected_names": [entry["name"] for entry in selected],
+        "skipped": skipped,
+        "duplicates": duplicates,
+        "batches": batches,
+        "seen": str(seen_path),
+    }
+    return report, selected
 
 
 def check_monitor_dump(dump: dict, origin: str) -> dict:
@@ -1898,6 +2703,44 @@ def main(argv: list[str]) -> int:
         help="the coverage suite's declared input count; a dump must name at least this many",
     )
 
+    gaps_parser = commands.add_parser(
+        "coverage-gaps", help="report the routed experts a coverage dump has not reached"
+    )
+    gaps_parser.add_argument("--dump", required=True, type=Path)
+    gaps_parser.add_argument("--layout", type=Path, help="the model's expert layout; looked up by model by default")
+    gaps_parser.add_argument("--json", type=Path, help="write the full missing-expert report here")
+
+    sweep_parser = commands.add_parser(
+        "coverage-sweep", help="measure a corpus and greedily select the next coverage inputs"
+    )
+    sweep_parser.add_argument("--url", required=True)
+    sweep_parser.add_argument("--dump", required=True, type=Path)
+    sweep_parser.add_argument("--layout", type=Path, help="the model's expert layout; looked up by model by default")
+    sweep_parser.add_argument("--corpus", type=Path, default=DEFAULT_COVERAGE_CORPUS)
+    sweep_parser.add_argument(
+        "--input-suite",
+        type=Path,
+        help="the suite that produced the dump's existing inputs; declares their content to the sweep",
+    )
+    sweep_parser.add_argument(
+        "--seen",
+        type=Path,
+        help="the prompts already sent for this dump (default: DUMP.seen.json)",
+    )
+    sweep_parser.add_argument(
+        "--generate", type=int, default=0, help="append N generated prompts, deterministic from --seed"
+    )
+    sweep_parser.add_argument("--seed", type=int, default=0)
+    sweep_parser.add_argument("--order", choices=("shuffled", "corpus"), default="shuffled")
+    sweep_parser.add_argument(
+        "--batch", type=int, default=32, help="report marginal coverage every N sent prompts"
+    )
+    sweep_parser.add_argument("--max-candidates", type=int, default=2048)
+    sweep_parser.add_argument("--max-tokens", type=int, default=1)
+    sweep_parser.add_argument("--timeout", type=float, default=1800.0)
+    sweep_parser.add_argument("--out", required=True, type=Path, help="the selected next-batch suite")
+    sweep_parser.add_argument("--json", type=Path, help="write the sweep report here")
+
     monitors_parser = commands.add_parser("monitors", help="compare a candidate monitor dump with the reference forward")
     monitors_parser.add_argument("--reference", required=True, type=Path)
     monitors_parser.add_argument("--candidate", required=True, type=Path)
@@ -1924,6 +2767,10 @@ def main(argv: list[str]) -> int:
             return command_compare(args)
         if args.command == "coverage":
             return command_coverage(args)
+        if args.command == "coverage-gaps":
+            return command_coverage_gaps(args)
+        if args.command == "coverage-sweep":
+            return command_coverage_sweep(args)
         if args.command == "monitors":
             return command_monitors(args)
         if args.command == "fingerprint":
@@ -2043,6 +2890,55 @@ def command_coverage(args: argparse.Namespace) -> int:
     layout, origin = find_layout(model, args.layout)
     result = judge_coverage(dump, layout, origin, args.min_inputs)
     print(render_coverage(result), end="")
+    return 0
+
+
+def command_coverage_gaps(args: argparse.Namespace) -> int:
+    dump = load_json(args.dump)
+    model = dump.get("model")
+    if not isinstance(model, str) or not model:
+        raise NumericsFailure(f"{args.dump}: the dump names no model")
+    layout, origin = find_layout(model, args.layout)
+    result = coverage_inspect(dump, layout, origin, 0)
+    document = coverage_gaps_document(result, str(args.dump))
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    print(render_coverage_gaps(result), end="")
+    return 0
+
+
+def command_coverage_sweep(args: argparse.Namespace) -> int:
+    report, selected = sweep_coverage(args)
+    suite = {
+        "schema": SUITE_SCHEMA,
+        "note": (
+            "The prompts a coverage sweep measured and kept: each reached at least one routed expert "
+            "slot that no earlier selected prompt reached. Run it with capture or as a coverage suite; "
+            "the dump is the evidence, this suite is what reproduces its additions."
+        ),
+        "coverage": {
+            "model": report["model"],
+            "layout": report["layout"],
+            "seed": report["seed"],
+            "order": report["order"],
+            "max_tokens": report["max_tokens"],
+            "selected": report["selected"],
+            "missing_after": report["missing_after"],
+            "complete": report["complete"],
+        },
+        "prompts": [
+            {key: entry[key] for key in ("name", "family", "prompt", "messages") if key in entry}
+            for entry in selected
+        ],
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(suite, indent=2, ensure_ascii=False) + "\n")
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(render_coverage_sweep(report), end="")
+    print(f"wrote {args.out}: {len(selected)} selected prompt(s)")
     return 0
 
 

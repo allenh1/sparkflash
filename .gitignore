@@ -38,6 +38,10 @@ __pycache__/
 # M7 harness build output
 out/
 
+# Coverage sweep run state: the dump and the selected suite are the artifacts to commit, not the
+# seen manifest a window resumes from.
+numerics/coverage/*.seen.json
+
 # Serving checkouts' artifacts: the converted weights a node serves from
 # (SPARKFLASH_CONVERTED_DIR), a second cargo target directory, and the bind
 # evidence a device arm writes beside the binary.

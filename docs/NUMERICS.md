@@ -94,7 +94,8 @@ monitors flag) and the rarity of these changes are the mitigations.
 - **Per-layer and per-expert error monitors.** Relative error against the reference at every
   layer and expert, so a bug in one expert shows as a spike when the end-to-end KL looks fine.
 - **Coverage inputs.** Prompts that reach every routed expert in every layer, chunk boundaries,
-  32k+ contexts, several batch shapes and speculation depths.
+  32k+ contexts, several batch shapes and speculation depths. The suite is grown and measured by
+  `coverage-sweep` (§5): the generator proposes candidates, the dump's hit delta selects them.
 - **Bars.** The TP=1 to TP=4 divergence already shipped is the reassociation floor: a change at
   or below it cannot be told apart from what is served today. A precision change above it is a
   real quality change, and its report says so in numbers.
@@ -211,7 +212,7 @@ model has a frozen anchor and a teacher-forced comparison:
 | :-- | :-- |
 | `anchor`: the frozen anchor and the teacher-forced comparison | per model. Qwen3.8 and GLM-5.3 have a `[[anchor]]` and a committed capture teacher-forced from it; Inkling-2 and Dory1.0 do not, so their configurations cannot bump until they are anchored; DeepSeek is exempt (its device path serves no logprobs, so a text reference has no token ids and cannot teacher-force), and a text-evidence change is refused rather than excused. The aggregate flag is **false** because not every `logprobs` model is anchored; `scripts/numerics.py ci` prints the covered, exempt and uncovered models, and refuses a true flag whose coverage is incomplete. The flag reports coverage; it does not gate a model that has its own anchor. |
 | `declaration_check`: the CI check above | **done** |
-| `coverage`: inputs that reach every routed expert of every layer, with hit counts | **implemented**, no dump committed: the `coverage` command below judges one, and the flag stays false until a real dump is in the repository |
+| `coverage`: inputs that reach every routed expert of every layer, with hit counts | **implemented**, no dump committed: `coverage` judges one, `coverage-gaps` reports what a partial one misses, and `coverage-sweep` measures a corpus and selects the next suite; the flag stays false until a real dump is in the repository |
 | `monitors`: per-layer and per-expert relative error against the reference | **implemented**, no dump committed: the `monitors` command below compares two, and the flag stays false until a real pair is in the repository |
 
 Until then the gate is exactly the bit gate. The per-model anchor gate is enforced by
@@ -255,6 +256,85 @@ non-negative integer per routed expert, whose dense layer carries hits, whose ro
 zero hits, or that names fewer distinct inputs than the required `--min-inputs` declaration of
 the coverage suite. It prints the per-layer hit count and the min/max per layer, and exits
 non-zero on the first refusal.
+
+#### Growing the coverage suite
+
+The judge's gaps are a planning input, not just a verdict. `coverage-gaps` prints them without the
+gate, and writes every missing expert to JSON:
+
+```bash
+python3 scripts/numerics.py coverage-gaps --dump "$W/qwen38-coverage.json" --json "$W/gaps.json"
+```
+
+`coverage-sweep` turns a corpus into the next batch and measures every prompt:
+
+- It reads the dump before and after each prompt, so the slots a prompt actually reached decide
+  whether it is kept. A prompt is kept only when its delta contains a slot no earlier kept prompt
+  reached; the rest are discarded. Per-batch rows report sent, kept, discarded, new slots, and
+  missing/coverage before and after. The final JSON is deterministic given the dump, server, seed
+  and corpus.
+- The order is the corpus order, or a seeded `sha256("<seed>:<name>")` shuffle. The generator is a
+  pure function of the seed; it proposes candidates, and the measured hit delta selects among them.
+- It does not repeat an input. A prompt whose content-addressed input name (`input-<16 hex>`, FNV-1a
+  over the token ids) is already in the dump is skipped without a request, and every sent prompt is
+  recorded in `DUMP.seen.json` (or `--seen FILE`). A legacy dump with `input-0` ... names carries
+  no content, so it needs `--input-suite FILE` (the suite that produced those inputs) or an
+  explicit seen manifest.
+- It refuses a layout whose model is not the dump's, a dump whose model is not the layout's, a
+  server that names another model, a layer whose hit list does not match the layout, and a corpus
+  whose schema or names are wrong.
+- `--out` is the kept prompts as a `sparkflash-numerics-prompts/1` suite; the dump remains the
+  evidence and contains every prompt the sweep sent. The suite reproduces the sweep's forwards with
+  greedy decode and the same `--max-tokens` (default 1); the base dump's inputs are not in it, so
+  reproduce the whole dump by appending to that dump or by prepending the `--input-suite`.
+
+The corpus is [`numerics/coverage/corpus.json`](../numerics/coverage/corpus.json); `--generate N`
+adds a deterministic generated corpus from character classes, code, numerals, non-Latin scripts,
+long documents and repetition.
+
+**Estimate.** 48 x 512 = 24,576 routed slots. The two runs reached 92-93%, leaving about
+1,720-1,966 of them (the judge's rounded gap is 1,800-2,000). Taken as a bracket (240 inputs at
+92%, 330 at 93%), the difference is 246 slots over 90 inputs, about 2.7 new slots per input at the
+tail, so the remaining gap needs roughly 650-750 *contributing* prompts. A greedy sweep discards non-contributors; budget 1,500-2,500 measured
+candidates for 650-800 kept. That is an estimate from the two runs' marginal rate, not a measured
+coverage claim.
+
+The window command, on an idle world-1 server already writing the dump:
+
+```bash
+W=/home/allenh1/cluster-tests/$(date +%Y%m%dT%H%M)-coverage-sweep
+mkdir -p "$W"
+cp "$QWEN_COVERAGE_DUMP" "$W/qwen38-coverage.json"
+
+SPARKFLASH_MODEL=qwen3.8-flash-next-nvfp4 \
+SPARKFLASH_CHECKPOINT="$QWEN_CHECKPOINT" \
+SPARKFLASH_TOKENIZER="$QWEN_TOKENIZER" \
+SPARKFLASH_CONTEXT=65536 \
+SPARKFLASH_HTTP_BIND=127.0.0.1:8002 \
+SPARKFLASH_NUMERICS_COVERAGE="$W/qwen38-coverage.json" \
+SPARKFLASH_NUMERICS_MODEL=nvidia/Qwen3.8-Flash-Next-NVFP4 \
+  scripts/serve-single-node.sh launch
+# Wait for /readyz.
+python3 scripts/numerics.py coverage-sweep \
+  --url http://127.0.0.1:8002 \
+  --dump "$W/qwen38-coverage.json" \
+  --layout numerics/layouts/qwen38.json \
+  --corpus numerics/coverage/corpus.json \
+  --generate 2000 --seed 20261119 --order shuffled \
+  --batch 64 --max-candidates 256 \
+  --out "$W/next-batch.json" --json "$W/sweep.json" \
+  --input-suite "$QWEN_OLD_SUITE"
+scripts/serve-single-node.sh stop
+
+python3 scripts/numerics.py coverage-gaps --dump "$W/qwen38-coverage.json" --json "$W/gaps.json"
+python3 scripts/numerics.py coverage --dump "$W/qwen38-coverage.json" \
+  --layout numerics/layouts/qwen38.json --min-inputs 8
+```
+
+Drop `--input-suite` when the starting dump's inputs are already content-addressed. The seen
+manifest belongs to the dump and makes each window continue where the last stopped; delete it when
+starting a fresh dump. Rerun the same command until `--max-candidates` exhausts the corpus, then
+raise `--generate` or change `--seed`.
 
 #### The monitor dump
 
@@ -366,8 +446,11 @@ expert counts, and each router decision calls `Recorder::hit(layer, expert)`. It
 `SPARKFLASH_NUMERICS_COVERAGE` names the output path and is unset by default, and
 `SPARKFLASH_NUMERICS_MODEL` overrides the model id for a tiny fixture. With the switch unset the
 caller holds `None` and records nothing. The recorder merges the document already at the path, so
-a serving process accumulates a suite across forwards (`input-0`, `input-1`, ...); a document
-for another model or expert layout is replaced by the new run, not merged.
+a serving process accumulates a suite across forwards. Each forward opens a content-addressed
+input, `input-<16 hex>` (FNV-1a 64 over the token ids' little-endian bytes); a repeated input adds
+no second entry, and `coverage-sweep` computes the same name from `/tokenize`'s ids to skip an
+input the dump already holds. A document for another model or expert layout is replaced by the new
+run, not merged.
 
 | Model | Coverage emission site | Monitor emission site |
 | :-- | :-- | :-- |
@@ -462,6 +545,15 @@ python3 scripts/numerics.py compare --anchor numerics/references/qwen38-anchor.j
 
 # Judge the coverage dump a run wrote against the model's committed expert layout.
 python3 scripts/numerics.py coverage --dump numerics/coverage/glm53-tp4.json --min-inputs 8
+
+# Report what a partial coverage dump still misses, with every expert in JSON.
+python3 scripts/numerics.py coverage-gaps --dump "$W/qwen38-coverage.json" --json "$W/gaps.json"
+
+# Measure a corpus against a live dump and write the next batch of prompts.
+python3 scripts/numerics.py coverage-sweep --url http://127.0.0.1:8002 \
+  --dump "$W/qwen38-coverage.json" --layout numerics/layouts/qwen38.json \
+  --corpus numerics/coverage/corpus.json --generate 2000 --seed 20261119 \
+  --out "$W/next-batch.json" --json "$W/sweep.json"
 
 # Compare a candidate monitor dump with the reference forward, per layer and per expert.
 python3 scripts/numerics.py monitors --reference numerics/monitors/glm53-tp4-reference.json --candidate numerics/monitors/glm53-tp4-candidate.json --layer-bar 2e-3 --expert-bar 5e-3 --json numerics/monitors/glm53-tp4-result.json
@@ -560,8 +652,13 @@ have captured `logprobs` references but no `[[anchor]]`, so they are not covered
 The flag reports that aggregate; it is not a gate on a model that has its own anchor. A true flag
 with an uncovered model fails `ci`. The two new dumps are implemented, but no real coverage or
 monitor dump is committed, so `coverage` and `monitors` are also false; they are not flipped on
-synthetic data. The first real dumps need the cluster command in §5, which now writes both from
-the Qwen3.8 world-1 device arm; the other arms' device sites are still named in §5.
+synthetic data. The coverage suite is now growable: `coverage-gaps` names the missing experts,
+`coverage-sweep` measures a deterministic corpus and writes the kept prompts as the next batch,
+and the corpus and generator live under `numerics/coverage/`. The first real dumps still need the
+cluster command in §5, which writes both from the Qwen3.8 world-1 device arm; the other arms'
+device sites are still named in §5. The sweep's estimate for Qwen3.8's remaining gap is 650-750
+contributing prompts (1,500-2,500 measured candidates); that is an estimate from the two runs'
+marginal rate, not a measured coverage claim.
 
 ## How this reconciles the earlier decisions
 
