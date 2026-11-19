@@ -12,85 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The serving backend: the device rank behind [ModelBackend], one session a request.
+//! The serving backend: the device rank behind [ModelBackend], one fused session a request.
 //!
-//! The rank is the resident half - its weights, kernels and scratch - and every session owns only
-//! a [DeviceSequence] (its KV state) plus its sampler. A rank's forward takes `&mut self` because a
-//! step writes the rank's scratch, so sessions share the rank through a mutex: one forward at a
-//! time, which is also what the tensor-parallel group requires (every rank runs the same step).
+//! The rank is the resident half - its weights, kernels and scratch. The shared runtime owns
+//! everything around it: the lanes, the prompt parts, the history, resume and rewind, the ledger
+//! and the round path. This file opens the rank, hands it to [Runtime] over [crate::walk::GlmWalk],
+//! and starts [Fusion]. A session is a handle on one engine thread, where the sessions of a step
+//! are one batch over the rank and the weights are read once for every member's row.
 //!
-//! The endpoint's sampling runs on the host over the row a greedy step leaves on the device
-//! ([DeviceRank::last_logits]), so temperature, top-k, top-p and the penalties cost one vocabulary
-//! copy a step rather than a second device kernel.
-//!
-//! A backend stepped together ([Glm5NextDeviceBackend::enable_fusion]) hands out handles on one
-//! engine thread instead ([GlmFusion]): the sessions of a step are one batch over the rank, so the
-//! weights are read once for every member's row. Fusion and drafting are two trades on the same
-//! step and this arm runs one of them.
-//!
-//! A session drafts once [Glm5NextDeviceBackend::enable_speculation] has been called: a decode
-//! drafts a chain after the token it was handed ([DeviceRank::draft]), verifies the chain and the
-//! token in one step ([DeviceRank::verify_batch]), keeps the leading drafts the model would have
-//! picked ([sparkflash_model::verdict]) and hands back every token the step produced, one per
-//! `decode` call ([sparkflash_model::Queue]). The draft depth and its accounting are
-//! [sparkflash_model::Speculator]'s, so the same rule and the same counters serve every drafting
-//! arm. A verify runs the head over every row, so each token carries the row that chose it and a
-//! logprob request scores a drafted answer exactly as it scores a plain one.
+//! A session drafts once [Glm5NextDeviceBackend::enable_speculation] has been called:
+//! [crate::walk::GlmDrafter] proposes a chain after the token it was handed
+//! ([DeviceRank::draft]), verifies the chain and the token in one step
+//! ([DeviceRank::verify_batch]), keeps the leading drafts the model would have picked
+//! ([sparkflash_model::verdict]) and queues every token the step produced for the calls that feed
+//! them. The draft depth and its accounting are [sparkflash_model::Speculator]'s, so the same
+//! rule and the same counters serve every drafting arm. A verify runs the head over every row, so
+//! each token carries the row that chose it and a logprob request scores a drafted answer exactly
+//! as it scores a plain one.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use sparkflash_comm::control::{Tp4ControlHub, Tp4ControlWorker};
-use sparkflash_model::vision::VisionImage;
 use sparkflash_model::{
     BackendError, Capabilities, DepthPolicy, ModelBackend, ModelDescriptor, ModelSession,
-    PackIdentity, Queue, Sampling, Speculation, Speculator, StepOutput, kept_to_end, verdict,
+    PackIdentity,
 };
 use sparkflash_ops::engine_plan::EnginePlan;
-use sparkflash_ops::sampler::Sampler;
-use sparkflash_runtime::{
-    ExpertUnionWall, FusedArm, Fusion, Ledger, Mode, Opened, Part, Resume, RoundArm, StepWall,
-    Strategy, TextWire, mirror_until_the_group_ends, run_round,
-};
+use sparkflash_runtime::{Fusion, Runtime, TextWire, mirror_until_the_group_ends};
 use sparkflash_weights::WeightSource;
 use sparkflash_weights::safetensors::{INDEX_NAME, SafeTensorsSource};
 use sparkflash_weights::tp::{BitGatherHandle, SingleRank, TpLayout, TpRuntime};
 
 use crate::config::Glm5NextConfig;
-use crate::device::{CudaHandle, DeviceRank, DeviceSequence, LatentCache, Prefill};
-use crate::walk::{Shared, SpecConfig};
-
-/// The arm that steps GLM slots together, behind [sparkflash_runtime::FusedEngine].
-///
-/// A slot is a whole [Glm5NextSession] minus its rank: the sequence, the sampler and the history.
-/// The engine's thread is the only stepper, so the rank lock is taken once a step, and a batch of
-/// members is one [DeviceRank::forward_batch_greedy] call: the wide stages read the weights once
-/// for every member's row.
-///
-/// With a drafter configured the members draft as they would alone and verify together
-/// ([run_round]): each drafts its chain, the walk's rows are shared among the chains, and one
-/// [DeviceRank::verify_batch] runs every member's token and the drafts it was given.
-pub struct GlmFusion {
-    shared: Arc<Shared>,
-    context_limit: usize,
-    /// Whether drafting members verify their rounds in one walk
-    /// ([sparkflash_runtime::JOINT_ROUNDS_ENV]); off, each member's round runs alone.
-    joint_rounds: bool,
-    /// What a shared walk costs, for the row share.
-    wall: ExpertUnionWall,
-}
-
-/// A shared walk's cost at TP=4 on four GB10-class nodes, from the device harness: a plain step
-/// 31.6 ms, about 0.75 ms a distinct expert, and the block drafter's 4.6-5 ms a stream for each
-/// member past the first. The expert counts are the checkpoint's.
-const JOINT_WALL: ExpertUnionWall = ExpertUnionWall {
-    fixed_ms: 25.0,
-    expert_ms: 0.75,
-    row_ms: 0.3,
-    seq_ms: 5.0,
-    experts: 0,
-    top_k: 0,
-};
+use crate::device::{CudaHandle, DeviceRank, LatentCache};
+use crate::walk::{GlmWalk, Shared, SpecConfig};
 
 /// The device backend: one GLM-5.3-Flash rank on this host's GPU, alone or one of a
 /// tensor-parallel group.
@@ -100,301 +56,7 @@ pub struct Glm5NextDeviceBackend {
     context_limit: usize,
     /// Set by [Glm5NextDeviceBackend::enable_fusion] or [Glm5NextDeviceBackend::enable_group_fusion]:
     /// sessions become handles on this engine.
-    fused: Option<Fusion<GlmFusion>>,
-}
-
-impl GlmFusion {
-    fn slot(&self, spec: Option<&SpecConfig>) -> Result<Glm5NextSession, BackendError> {
-        let rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let sequence = match spec {
-            Some(_) if rank.has_block_drafter() => {
-                rank.new_block_drafting_sequence(self.context_limit)?
-            }
-            Some(_) => rank.new_drafting_sequence(self.context_limit)?,
-            None => rank.new_sequence(self.context_limit)?,
-        };
-        Ok(Glm5NextSession {
-            shared: Arc::clone(&self.shared),
-            sequence,
-            sampler: Sampler::new(),
-            sampling: Sampling::default(),
-            spec: spec.map(|spec| Speculator::new(spec.drafts, spec.policy.clone())),
-            pending: Queue::new(),
-            confidence: Vec::new(),
-            opening: None,
-            consumed: Vec::new(),
-            prefill_cached: 0,
-            prompting: None,
-        })
-    }
-
-    /// The drafter the slots draft with, if one is configured.
-    fn spec(&self) -> Option<&SpecConfig> {
-        self.shared.spec.get()
-    }
-}
-
-impl RoundArm for GlmFusion {
-    type Member = Glm5NextSession;
-
-    fn open(&self, member: &mut Glm5NextSession, token: u32) -> Result<Opened, BackendError> {
-        if let Some(step) = member.feed(token)? {
-            return Ok(Opened::Held(step));
-        }
-        member.open_round(token)
-    }
-
-    /// One [DeviceRank::verify_batch] over every member's token and the drafts it was given, then
-    /// each member keeps what the model chose, as its round alone would.
-    fn verify(
-        &self,
-        round: &mut [(&mut Glm5NextSession, u32, usize)],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        let mut openings = Vec::with_capacity(round.len());
-        for (member, _, depth) in round.iter_mut() {
-            let (mut chunk, confidence) = member.opening.take().ok_or_else(|| {
-                BackendError::new("glm5_device", "a member walks a round it never opened")
-            })?;
-            chunk.truncate(*depth + 1);
-            openings.push((chunk, confidence));
-        }
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let rows = {
-            let mut batch: Vec<(&mut DeviceSequence, &[u32])> = round
-                .iter_mut()
-                .zip(&openings)
-                .map(|((member, _, _), (chunk, _))| (&mut member.sequence, chunk.as_slice()))
-                .collect();
-            rank.verify_batch(&self.shared.tp, &self.shared.gather, &mut batch)?
-        };
-        if rows.len() != round.len() {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "a verify of {} members answered {}",
-                    round.len(),
-                    rows.len()
-                ),
-            ));
-        }
-        round
-            .iter_mut()
-            .zip(openings)
-            .zip(rows)
-            .map(|(((member, _, _), (chunk, confidence)), rows)| {
-                member.settle(&rank, &chunk, &confidence, rows)
-            })
-            .collect()
-    }
-
-    fn wall(&self) -> &dyn StepWall {
-        &self.wall
-    }
-
-    /// A walk is one rank step of at most [crate::device::MAX_ROWS] rows, a row each member's
-    /// token.
-    fn budget(&self, seqs: usize) -> usize {
-        let depth = self.spec().map_or(0, |spec| spec.drafts);
-        (seqs * depth).min(crate::device::MAX_ROWS.saturating_sub(seqs))
-    }
-}
-
-impl FusedArm for GlmFusion {
-    type Slot = Glm5NextSession;
-
-    fn open_slot(&self) -> Result<Glm5NextSession, BackendError> {
-        self.slot(self.spec())
-    }
-
-    fn holds_request(&self, slot: &Glm5NextSession) -> bool {
-        !slot.consumed.is_empty() || slot.sequence.position() != 0
-    }
-
-    fn renew(&self, slot: &mut Glm5NextSession) -> Result<(), BackendError> {
-        *slot = self.slot(self.spec())?;
-        Ok(())
-    }
-
-    /// Whether the rank's lane pool can back the slot's next job now, as the prefill or step
-    /// would find it: a prompt that does not extend what the slot holds starts a fresh sequence,
-    /// and the chunks this one holds go back to the pool first.
-    fn room(&self, slot: &Glm5NextSession, prompt: Option<&[u32]>) -> bool {
-        let sequence = &slot.sequence;
-        match prompt {
-            Some(tokens) => sequence.room(tokens.len(), !self.continues(slot, tokens)),
-            None => {
-                let drafts = self.spec().map_or(0, |spec| spec.drafts);
-                sequence.room(sequence.position() + 1 + drafts, false)
-            }
-        }
-    }
-
-    fn set_sampling(&self, slot: &mut Glm5NextSession, sampling: Sampling) {
-        slot.set_sampling(sampling);
-    }
-
-    fn prefill(
-        &self,
-        slot: &mut Glm5NextSession,
-        tokens: &[u32],
-    ) -> Result<StepOutput, BackendError> {
-        slot.prefill(tokens)
-    }
-
-    /// A prompt's bulk chunks run one a part ([DeviceRank::begin_prefill]); the arm serves text,
-    /// so a prompt with images is refused as [FusedArm::prefill_images] refuses it.
-    fn begin_prompt(
-        &self,
-        slot: &mut Glm5NextSession,
-        tokens: &[u32],
-        images: &[VisionImage],
-    ) -> Result<Part, BackendError> {
-        if !images.is_empty() {
-            return self.prefill_images(slot, tokens, images).map(Part::Done);
-        }
-        slot.begin_prompt(tokens)
-    }
-
-    fn next_part(&self, slot: &mut Glm5NextSession) -> Result<Part, BackendError> {
-        slot.prompt_part()
-    }
-
-    /// Drafting members verify their rounds in one walk ([run_round]); a lone member, or every
-    /// member with [sparkflash_runtime::JOINT_ROUNDS_ENV] off, runs its round alone. Members that
-    /// draft nothing are one row each of one [DeviceRank::forward_batch_greedy].
-    fn step(
-        &self,
-        members: &mut [(Glm5NextSession, u32)],
-    ) -> Result<Vec<StepOutput>, BackendError> {
-        if self.spec().is_some() {
-            if members.len() > 1 && self.joint_rounds {
-                return run_round(self, members);
-            }
-            return members
-                .iter_mut()
-                .map(|(slot, token)| slot.decode(*token))
-                .collect();
-        }
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let rows: Vec<[u32; 1]> = members.iter().map(|(_, token)| [*token]).collect();
-        {
-            let mut batch: Vec<(&mut DeviceSequence, &[u32])> = members
-                .iter_mut()
-                .zip(&rows)
-                .map(|((slot, _), row)| (&mut slot.sequence, row.as_slice()))
-                .collect();
-            rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
-        }
-        let mut steps = Vec::with_capacity(members.len());
-        for ((slot, token), row) in members.iter_mut().zip(&rows) {
-            let _ = row;
-            slot.sampler.record(*token);
-            slot.consumed.push(*token);
-            let logits = rank.last_logits(&slot.sequence)?;
-            let chosen = slot.sampler.choose(&logits, &slot.sampling);
-            let next_token = if self.shared.eos.contains(&chosen) {
-                None
-            } else {
-                Some(chosen)
-            };
-            steps.push(StepOutput {
-                logits,
-                next_token,
-                draft: Vec::new(),
-            });
-        }
-        Ok(steps)
-    }
-
-    fn speculation(&self, slot: &Glm5NextSession) -> Speculation {
-        slot.speculation()
-    }
-
-    /// A kept draft's answer is held. The caches have consumed it already, so an unused run is
-    /// given back by cutting the history ([FusedArm::give_back]): the sequence is then ahead of
-    /// it, and its next prompt goes back to the last prompt's end ([FusedArm::rewind_prefix]).
-    fn ready(&self, slot: &Glm5NextSession, token: u32) -> bool {
-        slot.pending
-            .front()
-            .is_some_and(|front| front.token == token)
-    }
-
-    fn give_back(&self, slot: &mut Glm5NextSession, count: usize) -> Result<(), BackendError> {
-        slot.give_back(count)
-    }
-
-    fn rewind_prefix<'s>(&self, slot: &'s Glm5NextSession) -> Option<&'s [u32]> {
-        slot.rewind_prefix()
-    }
-
-    /// A slot keeps its sequence between requests as a session alone does: the next prompt that
-    /// extends it forwards only the rest ([Glm5NextSession::begin_prompt]). A sequence with a
-    /// draft still queued is ahead of its history and names none.
-    fn history<'s>(&self, slot: &'s Glm5NextSession) -> Option<&'s [u32]> {
-        slot.reusable_prefix()
-    }
-
-    fn cached_tokens(&self, slot: &Glm5NextSession) -> usize {
-        slot.cached_tokens()
-    }
-
-    fn max_batch(&self) -> usize {
-        // A step is one row a member and the rank's batch is `MAX_ROWS` rows wide.
-        crate::device::MAX_ROWS
-    }
-
-    fn ledger(&self) -> Ledger {
-        let mut ledger = Ledger::from_declaration(
-            sparkflash_model::ledger_for_arm("GLM").expect("the GLM arm is declared"),
-        );
-        ledger.set(Strategy::PromptParts, Mode::native("bulk prefill chunks"));
-        let block = self
-            .shared
-            .rank
-            .lock()
-            .is_ok_and(|rank| rank.has_block_drafter());
-        let drafter = self.spec().map(|spec| {
-            let depth = if spec.policy.is_some() {
-                "adaptive depth"
-            } else {
-                "fixed depth"
-            };
-            let kind = if block { "DFlash 2" } else { "MTP" };
-            format!("{kind}, up to {} drafts, {depth}", spec.drafts)
-        });
-        ledger.drafting(drafter, self.joint_rounds, true);
-        let rewinds = self.shared.rank.lock().is_ok_and(|rank| rank.rewinds());
-        let reuse = if rewinds {
-            "a prompt that extends a lane's sequence, or goes back to the last prompt's end"
-        } else {
-            "a prompt that extends a lane's sequence; no rewind (SPARKFLASH_REWIND=off)"
-        };
-        ledger.set(Strategy::PrefixReuse, Mode::native(reuse));
-        ledger.set(
-            Strategy::Rewind,
-            if rewinds {
-                Mode::native("a prompt that goes back to the last prompt's end")
-            } else {
-                Mode::off(format!(
-                    "{}=off keeps no rewind point",
-                    sparkflash_runtime::REWIND_ENV
-                ))
-            },
-        );
-        ledger
-    }
+    fused: Option<Fusion<Runtime<GlmWalk>>>,
 }
 
 impl std::fmt::Debug for Glm5NextDeviceBackend {
@@ -682,27 +344,10 @@ impl Glm5NextDeviceBackend {
         mirror_until_the_group_ends(control, &lanes, &wire, capacity)
     }
 
-    /// The fused arm over this rank: its slots, joint rounds and walk cost.
-    fn lanes(&self) -> Result<GlmFusion, BackendError> {
-        let joint = sparkflash_runtime::joint_rounds()
-            .map_err(|error| BackendError::new("config", error))?;
-        let config = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?
-            .config()
-            .clone();
-        Ok(GlmFusion {
-            shared: Arc::clone(&self.shared),
-            context_limit: self.context_limit,
-            joint_rounds: joint,
-            wall: ExpertUnionWall {
-                experts: config.n_routed_experts,
-                top_k: config.num_experts_per_tok,
-                ..JOINT_WALL
-            },
-        })
+    /// The runtime over this rank's walk: the lanes, the prompt parts, the history, the round
+    /// path and the ledger are all the runtime's.
+    fn lanes(&self) -> Result<Runtime<GlmWalk>, BackendError> {
+        crate::walk::runtime(Arc::clone(&self.shared), self.context_limit)
     }
 
     /// Whether this backend steps its sessions together.
@@ -851,484 +496,22 @@ impl ModelBackend for Glm5NextDeviceBackend {
         Capabilities::ALL
     }
 
+    /// A session on the fused runtime. The arm has no second session shape: the runtime owns
+    /// the prompt parts, the history and the round, so a backend that has not been fused has no
+    /// serving path (the CLI always fuses before it starts its driver).
+    ///
+    /// # Errors
+    /// [Self::enable_fusion] was not called.
     fn open_session(&self) -> Result<Box<dyn ModelSession>, BackendError> {
-        if let Some(fused) = &self.fused {
-            return fused.open();
-        }
-        let spec = self.shared.spec.get().cloned();
-        let rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let sequence = match spec.as_ref() {
-            Some(_) if rank.has_block_drafter() => {
-                rank.new_block_drafting_sequence(self.context_limit)?
-            }
-            Some(_) => rank.new_drafting_sequence(self.context_limit)?,
-            None => rank.new_sequence(self.context_limit)?,
-        };
-        Ok(Box::new(Glm5NextSession {
-            shared: Arc::clone(&self.shared),
-            sequence,
-            sampler: Sampler::new(),
-            sampling: Sampling::default(),
-            spec: spec
-                .as_ref()
-                .map(|spec| Speculator::new(spec.drafts, spec.policy.clone())),
-            pending: Queue::new(),
-            confidence: Vec::new(),
-            opening: None,
-            consumed: Vec::new(),
-            prefill_cached: 0,
-            prompting: None,
-        }))
-    }
-}
-
-/// One request's device state.
-///
-/// The sequence is the rank's cache and position; this type is the request around it. A serving
-/// adapter keeps one session per worker between requests and hands it the next prompt, which may
-/// extend the tokens the sequence already forwarded ([ModelSession::reusable_prefix]). The
-/// history it was given is kept beside the caches, not inside them, so the arm can report what it
-/// holds without the device arm knowing about serving.
-pub struct Glm5NextSession {
-    shared: Arc<Shared>,
-    sequence: DeviceSequence,
-    sampler: Sampler,
-    sampling: Sampling,
-    /// The draft depth and its accounting, when this sequence drafts.
-    spec: Option<Speculator>,
-    /// Tokens a verify already produced, oldest first, each with the token that follows it. The
-    /// adapter feeds them back one at a time; the model has consumed them already.
-    pending: Queue,
-    /// The drafter's confidence in each of the last round's drafts.
-    confidence: Vec<f32>,
-    /// A round opened for a shared walk: its token and drafts, and the confidence its depth was
-    /// chosen from ([GlmFusion]'s [RoundArm::open]).
-    opening: Option<(Vec<u32>, Vec<f32>)>,
-    /// Every token this sequence has forwarded, oldest first: every prefill's fresh tokens and
-    /// every decode's. A request that extends this list forwards only what it adds.
-    consumed: Vec<u32>,
-    /// How many of the last prefill's tokens its caches already held, for the request's usage.
-    prefill_cached: usize,
-    /// The prompt running a bulk chunk at a time, between its first chunk and its last.
-    prompting: Option<Prompting>,
-}
-
-/// A prompt running a bulk chunk at a time ([Glm5NextSession::begin_prompt]).
-struct Prompting {
-    /// The tokens it forwards: the prompt past what the caches held.
-    tokens: Vec<u32>,
-    /// Tokens forwarded so far.
-    at: usize,
-    /// The position past its last token.
-    end: usize,
-    /// The tokens a chunk takes.
-    width: usize,
-}
-
-impl std::fmt::Debug for Glm5NextSession {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("Glm5NextSession")
-            .field("position", &self.sequence.position())
-            .field("temperature", &self.sampling.temperature)
-            .finish_non_exhaustive()
-    }
-}
-
-impl Glm5NextSession {
-    /// Run `rows` through this rank and sample the token after the last of them.
-    ///
-    /// The greedy path leaves each row's pick on the device and the last kept row's logits behind
-    /// it, so a step reads back one vocabulary row, not one a row.
-    fn step(&mut self, rows: &[u32]) -> Result<StepOutput, BackendError> {
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let mut batch = [(&mut self.sequence, rows)];
-        rank.forward_batch_greedy(&self.shared.tp, &self.shared.gather, &mut batch)?;
-        let logits = rank.last_logits(&self.sequence)?;
-        let token = self.sampler.choose(&logits, &self.sampling);
-        let next_token = if self.shared.eos.contains(&token) {
-            None
-        } else {
-            Some(token)
-        };
-        Ok(StepOutput {
-            logits,
-            next_token,
-            draft: Vec::new(),
-        })
-    }
-
-    /// One speculative round: draft after `anchor`, verify the chain, keep what the model chose.
-    ///
-    /// This is the arm's whole speculative path. The rule that decides how much of the chain
-    /// survives is [sparkflash_model::verdict] and the depth and the counters are
-    /// [Speculator]'s, so this function only sequences the three device calls
-    /// ([DeviceRank::draft], [DeviceRank::verify_batch], [DeviceRank::commit]) and hands back the
-    /// rows the later `decode` calls will return.
-    ///
-    /// A verify runs the head over every row, so each row's logits are already on the host: a
-    /// token the round produces carries the row that chose it, and a logprob request scores the
-    /// drafted answer exactly as it would a plain one.
-    fn round(&mut self, anchor: u32) -> Result<StepOutput, BackendError> {
-        if self.spec.is_none() {
-            return self.step(&[anchor]);
-        }
-        let shared = Arc::clone(&self.shared);
-        let mut rank = shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let (chunk, confidence) = self.draft_after(&rank, anchor)?;
-        let rows = {
-            let mut batch = [(&mut self.sequence, chunk.as_slice())];
-            rank.verify_batch(&shared.tp, &shared.gather, &mut batch)?
-        };
-        let rows = rows.into_iter().next().unwrap_or_default();
-        self.settle(&rank, &chunk, &confidence, rows)
-    }
-
-    /// The chain a round verifies after `anchor`: the anchor and the drafts the depth allows
-    /// ([DeviceRank::draft_chain]), with the drafter's confidence in each draft it proposed, which
-    /// the depth was chosen from and the round's verdict calibrates.
-    fn draft_after(
-        &mut self,
-        rank: &DeviceRank,
-        anchor: u32,
-    ) -> Result<(Vec<u32>, Vec<f32>), BackendError> {
-        // A draft writes the MTP caches past what the sequence keeps, so a chain longer than the
-        // room left would draft past the window.
-        let room = self
-            .sequence
-            .capacity()
-            .saturating_sub(self.sequence.position() + 1);
-        let (drafts, confidence) = match self.spec.as_ref() {
-            Some(spec) => rank.draft_chain(
-                &self.shared.tp,
-                &self.shared.gather,
-                &mut self.sequence,
-                anchor,
-                spec,
-                room,
-            )?,
-            None => (Vec::new(), Vec::new()),
-        };
-        self.confidence.clone_from(&confidence);
-        let mut chunk = Vec::with_capacity(drafts.len() + 1);
-        chunk.push(anchor);
-        chunk.extend_from_slice(&drafts);
-        Ok((chunk, confidence))
-    }
-
-    /// A verify of `chunk` answered `rows`: keep what the model chose, give the rest back before
-    /// the rank's next step, and queue the kept rows for the `decode` calls that feed them.
-    fn settle(
-        &mut self,
-        rank: &DeviceRank,
-        chunk: &[u32],
-        confidence: &[f32],
-        rows: Vec<Vec<f32>>,
-    ) -> Result<StepOutput, BackendError> {
-        // Rows past the first disagreement draw nothing, so a seeded answer does not depend on
-        // how many drafts the round verified.
-        let picks =
-            self.sampler
-                .choose_verify(rows.iter().map(Vec::as_slice), &chunk[1..], &self.sampling);
-        let kept = verdict(chunk, &picks);
-        let eos = &self.shared.eos;
-        // No row past the reply's end stays in the caches, so a reply that ends inside the round
-        // leaves its sequence at the history its caller saw, which the next turn extends.
-        let held = kept_to_end(kept, &picks, eos);
-        if chunk.len() > 1 {
-            // Give back the rows the sequence does not keep, before this rank's next step.
-            rank.commit(&mut self.sequence, held)?;
-        }
-        if let Some(spec) = self.spec.as_mut() {
-            spec.observe(confidence, chunk.len() - 1, kept);
-        }
-        self.pending.extend_round(chunk, &picks, &rows, held, eos);
-        let next_token = picks.first().copied().filter(|token| !eos.contains(token));
-        Ok(StepOutput {
-            logits: rows.first().cloned().unwrap_or_default(),
-            next_token,
-            draft: Vec::new(),
-        })
-    }
-
-    /// The caller fed `token`: it joins the history, and the answer a verify already holds for
-    /// it is returned. `None` says the token still needs a round.
-    ///
-    /// # Errors
-    /// A token other than the one the verify kept: the caches have consumed that one already.
-    fn feed(&mut self, token: u32) -> Result<Option<StepOutput>, BackendError> {
-        self.sampler.record(token);
-        self.consumed.push(token);
-        // A verify already consumed this token and produced the answer: hand back the row it
-        // sampled, exactly as the one-token step it stands in for would have.
-        let Some(front) = self.pending.front() else {
-            return Ok(None);
-        };
-        let expected = front.token;
-        let Some(next) = self.pending.pop(token) else {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "the engine fed token {token} where the verify produced {expected}; a \
-                     check that did not accept the drafts must be re-drafted"
-                ),
-            ));
-        };
-        Ok(Some(StepOutput {
-            logits: next.logits,
-            next_token: next.next_token,
-            draft: Vec::new(),
-        }))
-    }
-
-    /// Opens this sequence's round on `token` for a shared walk: drafts its chain as
-    /// [Self::round] would and reports the chance each leading run of it is accepted. The chain
-    /// waits in [Self::opening] for the walk's share of it.
-    ///
-    /// # Errors
-    /// A device failure while drafting.
-    fn open_round(&mut self, token: u32) -> Result<Opened, BackendError> {
-        let shared = Arc::clone(&self.shared);
-        let rank = shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let (chunk, confidence) = self.draft_after(&rank, token)?;
-        let drafts = chunk.len() - 1;
-        let mut chain = self
-            .spec
-            .as_ref()
-            .map_or_else(Vec::new, |spec| spec.chain(&self.confidence, drafts));
-        chain.truncate(drafts);
-        self.opening = Some((chunk, confidence));
-        Ok(Opened::Round(chain))
-    }
-}
-
-impl ModelSession for Glm5NextSession {
-    fn set_sampling(&mut self, sampling: Sampling) {
-        // The penalties, temperature, top-k and top-p run on the host over the row this step
-        // already copies back, so a non-greedy request is served rather than approximated.
-        self.sampling = sampling;
-        self.sampler.reset();
-        // The adapter calls this once per request, and a kept sequence carries the last one's
-        // counts: a request reports its own speculation, not the session's lifetime.
-        if let Some(spec) = self.spec.as_mut() {
-            spec.reset();
-        }
-        // A non-greedy request runs a token a step: its answer is a draw, and the drafts were
-        // scored by the same rule the verify uses - but the sampler's history is what a draw
-        // depends on, and a verify advances it a row at a time. Quiet, exact, and one token a
-        // step is what the arm documented before it drafted.
-        self.confidence.clear();
-        self.pending.clear();
-    }
-
-    /// The tokens this sequence has forwarded, while its caches end exactly where they end.
-    ///
-    /// A sequence whose caches are ahead of the tokens the caller knows cannot honour a prefix it
-    /// would have to rewind to, so it reports nothing and the next request opens a fresh one.
-    fn reusable_prefix(&self) -> Option<&[u32]> {
-        (self.pending.is_empty() && self.sequence.position() == self.consumed.len())
-            .then_some(self.consumed.as_slice())
-    }
-
-    /// The end of the last prompt, while the sequence can go back to it
-    /// ([DeviceRank::rewind]) and something past it was forwarded.
-    fn rewind_prefix(&self) -> Option<&[u32]> {
-        let point = self.sequence.rewind_point()?;
-        (point < self.sequence.position() && point <= self.consumed.len())
-            .then(|| &self.consumed[..point])
-    }
-
-    fn cached_tokens(&self) -> usize {
-        self.prefill_cached
-    }
-
-    fn prefill(&mut self, tokens: &[u32]) -> Result<StepOutput, BackendError> {
-        let mut part = self.begin_prompt(tokens)?;
-        loop {
-            match part {
-                Part::Done(step) => return Ok(step),
-                Part::More => part = self.prompt_part()?,
-            }
-        }
-    }
-
-    fn decode(&mut self, token: u32) -> Result<StepOutput, BackendError> {
-        if let Some(step) = self.feed(token)? {
-            return Ok(step);
-        }
-        self.round(token)
-    }
-
-    fn speculation(&self) -> Speculation {
-        self.spec
-            .as_ref()
-            .map_or_else(Speculation::default, Speculator::stats)
-    }
-}
-
-impl Glm5NextSession {
-    /// Starts a prompt ([ModelSession::prefill]) and forwards its first bulk chunk, or all of it
-    /// on the token path; [Self::prompt_part] forwards each next chunk
-    /// ([DeviceRank::begin_prefill]).
-    fn begin_prompt(&mut self, tokens: &[u32]) -> Result<Part, BackendError> {
-        self.prompting = None;
-        if tokens.is_empty() {
-            return Err(BackendError::new(
-                "glm5_device",
-                "an empty prompt has no logits",
-            ));
-        }
-        // A sequence the serving adapter kept may already hold a prefix of this prompt, in which
-        // case only the tokens past it are forwarded. Its sampler history is the whole prompt
-        // either way: the penalties count every token the request reads.
-        // One that parts from the history, or that the sequence ran ahead of, may still keep the
-        // last prompt and go past it: the sequence goes back to that prompt's end first.
-        let current = self.pending.is_empty() && self.sequence.position() == self.consumed.len();
-        let resume = sparkflash_runtime::resume(
-            &self.consumed,
-            current,
-            self.sequence.rewind_point(),
-            tokens,
-        );
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let reused = match resume {
-            Some(Resume::Extend(held)) => held,
-            Some(Resume::Rewind(point)) => {
-                rank.rewind(&mut self.sequence, point)?;
-                self.consumed.truncate(point);
-                point
-            }
-            None => {
-                return Err(BackendError::new(
+        self.fused.as_ref().map_or_else(
+            || {
+                Err(BackendError::new(
                     "glm5_device",
-                    format!(
-                        "a prefill must extend the {} token(s) this sequence holds by at least \
-                         one, or go past its rewind point; this one does neither",
-                        self.consumed.len()
-                    ),
-                ));
-            }
-        };
-        // The prompt forwards past the point: its own end is the next one.
-        self.sequence.forget_point();
-        self.prefill_cached = reused;
-        // A new prompt's tokens replace any chain the last one left queued.
-        self.pending.clear();
-        self.confidence.clear();
-        self.consumed.extend_from_slice(&tokens[reused..]);
-        self.sampler.reset();
-        self.sampler.record_prompt(tokens);
-        let fresh = &tokens[reused..];
-        let begun = rank.begin_prefill(
-            &self.shared.tp,
-            &self.shared.gather,
-            &mut self.sequence,
-            fresh,
-        );
-        if matches!(begun, Ok(Prefill::Whole(_))) {
-            rank.keep_point(&mut self.sequence)?;
-        }
-        drop(rank);
-        match begun? {
-            Prefill::Whole(logits) => Ok(Part::Done(self.first_step(logits))),
-            Prefill::Chunks { end, width } => {
-                self.prompting = Some(Prompting {
-                    tokens: fresh.to_vec(),
-                    at: 0,
-                    end,
-                    width,
-                });
-                self.prompt_part()
-            }
-        }
-    }
-
-    /// Forwards the running prompt's next bulk chunk ([Self::begin_prompt]); the last one ends
-    /// the prompt and answers its first step.
-    fn prompt_part(&mut self) -> Result<Part, BackendError> {
-        let mut prompting = self.prompting.take().ok_or_else(|| {
-            BackendError::new(
-                "glm5_device",
-                "this sequence has no prompt running a chunk at a time",
-            )
-        })?;
-        let mut rank = self
-            .shared
-            .rank
-            .lock()
-            .map_err(|_| BackendError::new("glm5_device", "the rank lock is poisoned"))?;
-        let to = (prompting.at + prompting.width).min(prompting.tokens.len());
-        let logits = rank.prefill_chunk(
-            &self.shared.tp,
-            &self.shared.gather,
-            &mut self.sequence,
-            &prompting.tokens[prompting.at..to],
-            prompting.end,
-        )?;
-        prompting.at = to;
-        if to < prompting.tokens.len() {
-            self.prompting = Some(prompting);
-            return Ok(Part::More);
-        }
-        rank.keep_point(&mut self.sequence)?;
-        drop(rank);
-        Ok(Part::Done(self.first_step(logits)))
-    }
-
-    /// The caller never used the last `count` answers the sequence fed ([FusedArm::give_back]).
-    /// The caches consumed them and cannot give them back, so the history is cut there and the
-    /// queued answers dropped: the sequence is ahead of its history and names none
-    /// ([ModelSession::reusable_prefix]), and its next prompt goes back to its rewind point.
-    fn give_back(&mut self, count: usize) -> Result<(), BackendError> {
-        if count == 0 {
-            return Ok(());
-        }
-        if count > self.consumed.len() {
-            return Err(BackendError::new(
-                "glm5_device",
-                format!(
-                    "{count} answers to give back, and the history holds {}",
-                    self.consumed.len()
-                ),
-            ));
-        }
-        self.consumed.truncate(self.consumed.len() - count);
-        self.pending.clear();
-        self.confidence.clear();
-        Ok(())
-    }
-
-    /// The prompt's first step: the token its last row's logits choose.
-    fn first_step(&mut self, logits: Vec<f32>) -> StepOutput {
-        let token = self.sampler.choose(&logits, &self.sampling);
-        let next_token = if self.shared.eos.contains(&token) {
-            None
-        } else {
-            Some(token)
-        };
-        StepOutput {
-            logits,
-            next_token,
-            draft: Vec::new(),
-        }
+                    "the GLM arm serves on the shared runtime: call enable_fusion before opening                      a session",
+                ))
+            },
+            Fusion::open,
+        )
     }
 }
 
@@ -1364,13 +547,13 @@ pub fn descriptor_for(config: &Glm5NextConfig, context: usize) -> ModelDescripto
 mod tests {
     use super::*;
 
-    /// The backend is a factory the serving layer shares, and a session moves between workers.
+    /// The backend is a factory the serving layer shares, and the runtime it fuses moves between
+    /// workers.
     #[test]
-    fn the_backend_and_a_session_are_send_sync() {
+    fn the_backend_and_the_walk_are_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        fn assert_send<T: Send>() {}
         assert_send_sync::<Glm5NextDeviceBackend>();
-        assert_send::<Glm5NextSession>();
+        assert_send_sync::<Runtime<GlmWalk>>();
     }
 
     #[test]

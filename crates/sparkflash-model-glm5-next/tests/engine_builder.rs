@@ -95,7 +95,7 @@ fn a_small_checkpoint_opens_through_the_engine_builder() {
         .expect("the fixture opens");
     let plan = EnginePlan::for_architecture(config.architecture.clone(), Target::Sm121, 1, 0)
         .expect("the small plan builds");
-    let backend = <Glm5NextDeviceBackend as EngineBuilder>::open(
+    let mut backend = <Glm5NextDeviceBackend as EngineBuilder>::open(
         &plan,
         &source,
         plan.architecture().max_position_embeddings,
@@ -103,19 +103,26 @@ fn a_small_checkpoint_opens_through_the_engine_builder() {
     .expect("the engine builder opens the arm");
     assert_eq!(backend.rank().plan().family(), "glm5_next");
     assert_eq!(backend.descriptor().vocab_size, config.vocab_size);
+    backend
+        .arm_mut()
+        .enable_fusion(1)
+        .expect("the arm fuses onto the runtime");
     let mut session = backend.open_session().expect("a session opens");
     let first = session.prefill(&[1, 2, 3, 4]).expect("a prefill runs");
     assert_eq!(first.logits.len(), config.vocab_size);
 
     // The shared builder is the same numeric arm: the direct open returns the same bits.
     let cuda = sparkflash_kernels::cuda_driver::Cuda::load().expect("a CUDA context");
-    let direct = Glm5NextDeviceBackend::open_single_rank(
+    let mut direct = Glm5NextDeviceBackend::open_single_rank(
         std::sync::Arc::new(sparkflash_model_glm5_next::device::CudaHandle::new(cuda)),
         config.clone(),
         checkpoint.path(),
         plan.architecture().max_position_embeddings,
     )
     .expect("the direct arm opens");
+    direct
+        .enable_fusion(1)
+        .expect("the direct arm fuses onto the runtime");
     let mut direct_session = direct.open_session().expect("a direct session opens");
     let expected = direct_session
         .prefill(&[1, 2, 3, 4])
