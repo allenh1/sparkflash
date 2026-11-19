@@ -373,6 +373,51 @@ What remains separate, and why it is not a defect:
 * No real two-process TP2 group was booted: the device host has one GPU. World-2 evidence is
   plan construction (CPU), the CPU `GroupLanes` over a world-2 runtime, and TP1 device runs of
   each `PackArm`.
+### The generated checks now run
+
+`sparkflash_runtime::conformance::run_check` was a stub at the moves' tip: every generated
+`#[ignore]`d test panicked with "needs the arm's device fixture". It now has a fixture contract
+(`WalkFixture::fixture(world)` returning a `Fixture` with the walk, its source, its
+bytes-per-token and floor, its formats and its keep set) and the six checks are real: whole
+prompt = chunked = token by token, alone = four at once, continued = cold, rewound = cold,
+TP 1 = TP 2 = TP 4 within exactness (a named skip without a group), no unrecorded widening + the
+bytes-per-token floor, and drafted = plain (a named skip for an arm that declares no drafter,
+never a pass). A missing fixture is an error with code `fixture`, not a pass.
+
+Each arm supplies its own: GLM's and Qwen's are their existing synthetic checkpoints opened
+through the arm's TP=1 constructor (Qwen's is the 3.5-MoE spelling, because the hub cache's
+2,560-wide DFlash-2 drafter is refused by the 128-wide fixture), Inkling's is `TinySource`, and
+dense's is the checkpoint `scripts/dense-synthetic-checkpoint.py` writes, named by
+`SPARKFLASH_CONFORMANCE_CHECKPOINT`. `scripts/onboard-gate.sh` writes that fixture when absent,
+runs the checks, and reports PASS / SKIP / FAIL / NEEDS-FIXTURE, exiting non-zero on the last two.
+
+The `engine_builder` device failure was the fixture, not the check. `hidden 256` and `vocab 64`
+are correctly refused by the released-image boot check, so the fix is
+`Glm5NextConfig::serving_fixture()` and `Qwen4ExpConfig::serving_fixture()`: one decoder layer at
+the catalogue's widths and routed shapes. A separate test pins the tiny refusal, so the check
+cannot quietly relax.
+
+All five fixtures pass on the aarch64 device (details in
+[04-onboarding-device-gate.md](04-onboarding-device-gate.md)). TP 2 and TP 4 still skip on that
+host, which is one checkpoint-backed host's job.
+
+### Phase 7, first arm: dense
+
+The dense arm is the first arm on the typed weight API. `Proj` is
+`Bf16(Mat<Bf16>) | Fp8(Mat<Fp8E4m3>) | NvFp4(Mat<NvFp4>)`, embed and head are `Mat<Bf16>`, and
+every upload goes through `upload::<F>`, which checks the stored dtype and the scale count.
+Vectors stay `Deviceptr` with the reason written at the type: `Mat<F>` is a strided matrix with a
+format scale plane and a norm is neither. Each kernel is loaded once through `Bound`, which checks
+the image's exported symbols and the catalogue's precision mask, so no launch site looks a symbol
+up; `Kernels::load` no longer takes a name. The boot ledger names every part's stored and
+arithmetic format, every vector and every packed copy, and refuses an arithmetic format that
+differs from the stored one without a `widen` record (dense has one, the BF16 router bias read at
+f32).
+
+The ban is a test, not a convention: `crates/sparkflash-ops/tests/kernel_lookup.rs` scans every
+`sparkflash-model-*` crate and the DeepSeek forward for `load_named`, `load_named_shared` and
+`load_function`, and holds each file to a recorded count with a reason. A converted arm must
+tighten its line; an unconverted one records "not converted yet: phase 7 runs by arm".
 ## Order and ownership
 
 The plan's phase order is kept. Two changes are made to how it is executed:
